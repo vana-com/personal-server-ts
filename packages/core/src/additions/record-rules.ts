@@ -24,7 +24,20 @@ export interface MemoryRecordRule {
   rowIdFields: readonly string[];
   /** Rows form: keep a row only when this field equals this value (a stream that feeds several collections). */
   streamFilter?: { field: string; equals: string };
+  /**
+   * The scope is one record (a profile): counted as 1 when its body has any
+   * content (legacy form) or once per row (rows form), never tracked.
+   */
+  singleton?: true;
 }
+
+/** A single-record scope (a profile): counted, never tracked. */
+const singleton = (): MemoryRecordRule => ({
+  collection: "profile",
+  idFields: [],
+  rowIdFields: [],
+  singleton: true,
+});
 
 /** A collection counted toward the total but never tracked for additions. */
 const untracked = (
@@ -50,9 +63,10 @@ const sameId = (
 });
 
 /**
- * Scope -> its record collections. An empty list means the scope holds no
- * memory records (a singleton, or a stream that only joins into another
- * scope's legacy body).
+ * Scope -> its record collections. The server's `total` must agree with what
+ * the owner app counts, so a scope the app counts is never given an empty
+ * list; where identity is not provably stable it is counted but not tracked.
+ * An empty list means the owner app also counts 0 for the scope.
  *
  * Both stored forms of a scope must produce the same keys, so each rule names
  * the id field per form. Where the projection binding keeps no field that is
@@ -66,58 +80,17 @@ const sameId = (
 export const MEMORY_RECORD_RULES: Readonly<
   Record<string, readonly MemoryRecordRule[]>
 > = {
+  // --- Empty: the owner app counts 0 records for these. -------------------
+  "chatgpt.memories": [],
+  "chatgpt.messages": [],
+  "github.profile": [],
+  "instagram.profile": [],
+
+  // --- Tracked: an id that is equal in both stored forms. -----------------
   "chatgpt.conversations": [sameId("conversations", ["id"])],
   // Claude's conversations and projects keep the row id in both forms.
   "claude.conversations": [sameId("conversations", ["id"])],
   "claude.projects": [sameId("projects", ["id"])],
-  "chatgpt.memories": [],
-  "chatgpt.messages": [],
-  // The legacy body keeps the order number as `orderId`.
-  "amazon.orders": [
-    { collection: "orders", idFields: ["orderId"], rowIdFields: ["id"] },
-  ],
-  "shop.orders": [sameId("orders", ["id"])],
-  // No binding fixture proves an id equal in both forms: counted, untracked.
-  "heb.orders": [untracked("orders")],
-  "wholefoods.orders": [untracked("orders")],
-  "heb.nutrition": [],
-  "wholefoods.nutrition": [],
-  // Singletons.
-  "linkedin.profile": [],
-  "spotify.profile": [],
-  "heb.profile": [],
-  "wholefoods.profile": [],
-  "youtube.profile": [],
-  // The legacy body drops the row id: counted, never tracked.
-  "linkedin.connections": [untracked("connections")],
-  "linkedin.skills": [untracked("skills")],
-  "linkedin.languages": [untracked("languages")],
-  // One `sleep` stream feeds two legacy arrays (`dailyScores`, `sleepPeriods`).
-  "oura.activity": [sameId("days", ["id"], ["activity"])],
-  "oura.readiness": [sameId("days", ["id"], ["readiness"])],
-  "oura.sleep": [],
-  // No binding fixture proves the other youtube lists: untracked (total 0).
-  "youtube.playlists": [sameId("playlists", ["url"])],
-  "youtube.subscriptions": [],
-  "youtube.playlistItems": [],
-  "youtube.playlist_items": [],
-  "youtube.likes": [],
-  "youtube.watchLater": [],
-  "youtube.watch_later": [],
-  "youtube.history": [],
-  "youtube.watch_history": [],
-  // Line items that only join into their order's legacy body.
-  "amazon.order_items": [],
-  "heb.order_items": [],
-  "wholefoods.order_items": [],
-  "claude.messages": [],
-  "claude.account_profile": [],
-  "claude.project_documents": [],
-  "github.profile": [],
-  "github.user": [],
-  "github.user_stats": [],
-  "github.pinned_repositories": [],
-  "github.organizations": [],
   // The binding projects the row's `html_url` into the legacy `url`.
   "github.repositories": [
     {
@@ -148,8 +121,6 @@ export const MEMORY_RECORD_RULES: Readonly<
   "icloud_notes.folders": [
     { collection: "folders", idFields: ["recordName"], rowIdFields: ["id"] },
   ],
-  "instagram.profile": [],
-  "instagram.post_likes": [],
   // The legacy post has no id; `taken_at` is copied unchanged.
   "instagram.posts": [sameId("posts", ["taken_at"])],
   // The PDPP `following` stream's records become the legacy `accounts` array;
@@ -163,7 +134,8 @@ export const MEMORY_RECORD_RULES: Readonly<
     },
   ],
   // The PDPP `ads` stream carries all kinds; `streamFilter` keeps each
-  // collection to the rows the projection assigns to it.
+  // collection to the rows the projection assigns to it. The owner app counts
+  // the category rows too, so they are counted (untracked) here.
   "instagram.ads": [
     {
       ...sameId("ad_topics", ["name"], ["ads"]),
@@ -172,6 +144,10 @@ export const MEMORY_RECORD_RULES: Readonly<
     {
       ...sameId("advertisers", ["name"], ["ads"]),
       streamFilter: { field: "kind", equals: "advertiser" },
+    },
+    {
+      ...untracked("categories", ["ads"]),
+      streamFilter: { field: "kind", equals: "ad_category" },
     },
   ],
   "discord.servers": [sameId("servers", ["id"])],
@@ -183,15 +159,10 @@ export const MEMORY_RECORD_RULES: Readonly<
   "x.posts": [sameId("records", ["id"], ["posts"])],
   "x.likes": [sameId("records", ["id"], ["likes"])],
   "x.bookmarks": [sameId("records", ["id"], ["bookmarks"])],
-  // The legacy body drops the row id and keeps no other field that is
-  // equal in both forms: counted, never tracked.
-  "linkedin.experience": [untracked("items", ["experience", "experiences"])],
-  "linkedin.education": [untracked("items", ["education"])],
   // The binding projects the row `uri` unchanged.
   "spotify.playlists": [
     sameId("playlists", ["uri"], ["public_playlists", "items"]),
   ],
-  "spotify.playlist_items": [],
   "spotify.savedTracks": [
     sameId("savedTracks", ["uri"], ["tracks", "items", "saved_tracks"]),
   ],
@@ -200,6 +171,62 @@ export const MEMORY_RECORD_RULES: Readonly<
   "spotify.saved_tracks": [
     sameId("savedTracks", ["uri"], ["saved_tracks", "tracks", "items"]),
   ],
+  // The legacy body keeps the order number as `orderId`.
+  "amazon.orders": [
+    { collection: "orders", idFields: ["orderId"], rowIdFields: ["id"] },
+  ],
+  "shop.orders": [sameId("orders", ["id"])],
+  "oura.activity": [sameId("days", ["id"], ["activity"])],
+  "oura.readiness": [sameId("days", ["id"], ["readiness"])],
+  "youtube.playlists": [sameId("playlists", ["url"])],
+
+  // --- Counted, never tracked: the owner app counts them, but no field is --
+  // --- provably equal in both stored forms. They report a total and no -----
+  // --- additions, and a null trackedSince. ---------------------------------
+  // The legacy body drops the row id.
+  "linkedin.experience": [untracked("items", ["experience", "experiences"])],
+  "linkedin.education": [untracked("items", ["education"])],
+  "linkedin.connections": [untracked("connections")],
+  "linkedin.skills": [untracked("skills")],
+  "linkedin.languages": [untracked("languages")],
+  // One `sleep` stream feeds two legacy arrays, so both are counted.
+  "oura.sleep": [
+    untracked("sleepPeriods", ["sleep"]),
+    untracked("dailyScores"),
+  ],
+  // No binding fixture proves an id equal in both forms.
+  "heb.orders": [untracked("orders")],
+  "wholefoods.orders": [untracked("orders")],
+  "heb.nutrition": [untracked("nutrition")],
+  "wholefoods.nutrition": [untracked("nutrition")],
+  "youtube.subscriptions": [untracked("subscriptions")],
+  "youtube.likes": [untracked("likedVideos", ["likes"])],
+  "youtube.watchLater": [untracked("watchLater")],
+  "youtube.watch_later": [untracked("watchLater", ["watch_later"])],
+  "youtube.history": [untracked("history")],
+  "youtube.watch_history": [untracked("history", ["watch_history"])],
+  "youtube.playlistItems": [untracked("playlists", ["playlistItems"])],
+  "youtube.playlist_items": [untracked("playlists", ["playlist_items"])],
+  // Single-record scopes.
+  "linkedin.profile": [singleton()],
+  "spotify.profile": [singleton()],
+  "youtube.profile": [singleton()],
+  "heb.profile": [singleton()],
+  "wholefoods.profile": [singleton()],
+  // Streams that only join into another scope's legacy body, which the owner
+  // app counts when they are stored as their own scopes.
+  "amazon.order_items": [untracked("order_items")],
+  "heb.order_items": [untracked("order_items")],
+  "wholefoods.order_items": [untracked("order_items")],
+  "claude.messages": [untracked("messages")],
+  "claude.account_profile": [untracked("account_profile")],
+  "claude.project_documents": [untracked("project_documents")],
+  "github.user": [untracked("user")],
+  "github.user_stats": [untracked("user_stats")],
+  "github.pinned_repositories": [untracked("pinned_repositories")],
+  "github.organizations": [untracked("organizations")],
+  "instagram.post_likes": [untracked("post_likes")],
+  "spotify.playlist_items": [untracked("playlist_items")],
 };
 
 /** The rules for a scope, or null when the scope has no entry (generic default applies). */

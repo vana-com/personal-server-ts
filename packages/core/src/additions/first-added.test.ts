@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   LedgerFold,
@@ -307,13 +307,39 @@ describe("extractRecordKeys", () => {
       ).toEqual({ keys: [], total: 2 });
     });
 
-    it("keeps join-only streams untracked", async () => {
+    it("counts join-only streams like the owner app, but never tracks them", async () => {
       for (const scope of ["claude.messages", "instagram.post_likes"]) {
         expect(await keysOf(scope, { records: rows("a") })).toEqual({
           keys: [],
-          total: 0,
+          total: 1,
         });
       }
+    });
+
+    it("counts a profile as one record in either form, whatever arrays it carries", async () => {
+      expect(
+        await keysOf("spotify.profile", {
+          id: "u",
+          images: [{ url: "a" }, { url: "b" }],
+        }),
+      ).toEqual({ keys: [], total: 1 });
+      expect(await keysOf("spotify.profile", { records: rows("u") })).toEqual({
+        keys: [],
+        total: 1,
+      });
+      expect(await keysOf("youtube.profile", {})).toEqual({
+        keys: [],
+        total: 0,
+      });
+    });
+
+    it("counts a binary file as 0 in a scope whose rules hold nothing, like a rebuild", async () => {
+      expect(
+        await extractRecordKeys("chatgpt.messages", { $binary: {} }),
+      ).toEqual({
+        keys: [],
+        total: 0,
+      });
     });
 
     it("applies the stream filter to rows", async () => {
@@ -523,6 +549,22 @@ describe("foldVersion", () => {
     expect(reversed).toEqual(ledger);
   });
 
+  it("treats strings of one instant as one version, folded the same in either order (F6)", async () => {
+    const plain = "2026-01-05T12:00:00Z";
+    const millis = "2026-01-05T12:00:00.000Z";
+    const first = version(plain, ["a", "b", "c"]);
+    const second = version(millis, ["a"]);
+    const base = version(T1, ["a"]);
+    const one = await fold([base, first, second]);
+    const two = await fold([base, second, first]);
+    expect(one).toEqual(two);
+    // The greater string names the newest version; additions fit its total.
+    expect(one.latest.collectedAt).toBe(plain);
+    expect(listAddedTimestamps(one).length).toBeLessThanOrEqual(
+      one.latest.total,
+    );
+  });
+
   it("ignores a version whose collectedAt does not parse", async () => {
     const base = await fold([version(T1, ["a"])]);
     expect(await foldVersion(base, version("not a date", ["z"]))).toEqual(base);
@@ -653,51 +695,128 @@ describe("foldVersion", () => {
     expect(listAddedTimestamps(next)).toEqual([]);
   }, 30_000);
 
-  it("keeps tracking when the union passes the cap: absent keys go, oldest first", async () => {
-    const half = Math.floor(MAX_TRACKED_KEYS * 0.75);
-    const batch = (prefix: string, collectedAt: string) => ({
+  describe("at the key cap", () => {
+    const ids = (prefix: string, count: number, from = 0) =>
+      Array.from({ length: count }, (_, i) => ({ id: `${prefix}${from + i}` }));
+    const at = (n: number) =>
+      `2026-01-${String(n).padStart(2, "0")}T00:00:00.000Z`;
+    const v = (n: number, items: { id: string }[]): VersionToFold => ({
       scope: "notes.entries",
-      collectedAt,
-      data: {
-        items: Array.from({ length: half }, (_, i) => ({
-          id: `${prefix}${i}`,
-        })),
-      },
+      collectedAt: at(n),
+      data: { items },
     });
-    const ledger = (await fold([
-      batch("a", T1),
-      batch("b", T2),
-      batch("c", T3),
-    ]))!;
-    const count = Object.keys(ledger.records).length;
-    expect(count).toBeLessThanOrEqual(MAX_TRACKED_KEYS);
-    // Every key of the newest version is kept; the oldest batch lost most.
-    expect(
-      Object.keys(ledger.records).filter((key) => key.startsWith("items:i:c"))
-        .length,
-    ).toBe(half);
-    expect(ledger.skipped).toBeUndefined();
-    expect(ledger.latest.total).toBe(half);
-    // Still a document the reader accepts, and still tracking.
-    expect(
-      readScopeFirstSeenLedger(JSON.parse(JSON.stringify(ledger))),
-    ).toEqual(ledger);
-    const next = (await foldVersion(ledger, {
-      scope: "notes.entries",
-      collectedAt: "2026-01-04T00:00:00.000Z",
-      data: {
-        items: [
-          ...Array.from({ length: half }, (_, i) => ({ id: `c${i}` })),
-          { id: "new" },
-        ],
-      },
-    }))!;
-    const added = listAddedTimestamps(next);
-    expect(
-      added.filter((at) => at === "2026-01-04T00:00:00.000Z"),
-    ).toHaveLength(1);
-    expect(added.filter((at) => at === T3)).toHaveLength(half);
-  }, 60_000);
+    const KEEP = 150_000;
+
+    it("does not re-date records present in the version being folded, whatever their order (F1)", async () => {
+      // v1 is an empty baseline, so A (first seen at v2) is not pre-tracking.
+      const base = await fold([v(1, []), v(2, ids("A", KEEP))]);
+      const news = ids("N", 100_000);
+      const olds = ids("A", 100_000);
+      const newFirst = (await foldVersion(base, v(3, [...news, ...olds])))!;
+      const oldFirst = (await foldVersion(base, v(3, [...olds, ...news])))!;
+
+      // 50,000 absent A records make room; the 100,000 present ones keep v2.
+      expect(newFirst).toEqual(oldFirst);
+      const keys = Object.keys(newFirst.records);
+      expect(keys.length).toBe(200_000);
+      const redated = Object.entries(newFirst.records).filter(
+        ([key, pair]) => key.startsWith("items:i:A") && pair[0] !== at(2),
+      );
+      expect(redated).toHaveLength(0);
+      const added = listAddedTimestamps(newFirst);
+      expect(added.filter((when) => when === at(3))).toHaveLength(100_000);
+      expect(added.filter((when) => when === at(2))).toHaveLength(100_000);
+    }, 120_000);
+
+    it("folding an older version into a full ledger evicts and sorts at most once (F2)", async () => {
+      const full = (await fold([v(5, ids("K", 200_000))]))!;
+      expect(Object.keys(full.records)).toHaveLength(200_000);
+      const sort = vi.spyOn(Array.prototype, "sort");
+      let ticks = 0;
+      const timer = setInterval(() => {
+        ticks += 1;
+      }, 0);
+      let older: ScopeFirstSeenLedger | null;
+      let sorts = 0;
+      try {
+        older = await foldVersion(full, v(3, ids("unknown", 4_000)));
+        sorts = sort.mock.calls.length;
+      } finally {
+        clearInterval(timer);
+        sort.mockRestore();
+      }
+      // One sort for the new ids and at most one for the eviction candidates.
+      expect(sorts).toBeGreaterThan(0);
+      expect(sorts).toBeLessThanOrEqual(3);
+      expect(ticks).toBeGreaterThan(0);
+      // Nothing was evictable (every record is in the newest version), so the
+      // unknown ids are left out rather than evicting each other.
+      expect(Object.keys(older!.records)).toHaveLength(200_000);
+      expect(
+        Object.keys(older!.records).some((key) => key.includes("unknown")),
+      ).toBe(false);
+    }, 120_000);
+
+    it("gives the same ledger whatever the order of the ids in a version", async () => {
+      const base = await fold([v(1, []), v(2, ids("A", KEEP))]);
+      const items = [...ids("N", 90_000), ...ids("A", 60_000)];
+      const forward = await foldVersion(base, v(3, items));
+      const shuffled = await foldVersion(
+        base,
+        v(
+          3,
+          [...items].sort(() => 0.5 - Math.random()),
+        ),
+      );
+      expect(shuffled).toEqual(forward);
+    }, 120_000);
+
+    it("never evicts established (pre-tracking) records: a flood displaces itself (F3)", async () => {
+      const owner = ids("owner", 5_001);
+      const base = await fold([v(1, owner)]);
+      const flooded = (await foldVersion(base, v(2, ids("junk", 200_000))))!;
+      const ownerKept = Object.keys(flooded.records).filter((key) =>
+        key.startsWith("items:i:owner"),
+      );
+      expect(ownerKept).toHaveLength(5_001);
+      expect(Object.keys(flooded.records).length).toBeLessThanOrEqual(
+        MAX_TRACKED_KEYS,
+      );
+      // The owner imports the same records again: nothing is new to them.
+      const again = (await foldVersion(flooded, v(3, owner)))!;
+      expect(listAddedTimestamps(again)).toEqual([]);
+    }, 120_000);
+
+    it("keeps returning baseline records dated at the baseline after a disjoint version (F1b)", async () => {
+      const x = ids("x", KEEP);
+      const ledger = await fold([v(1, x), v(2, ids("y", KEEP))]);
+      expect(Object.keys(ledger.records).length).toBeLessThanOrEqual(
+        MAX_TRACKED_KEYS,
+      );
+      const back = (await foldVersion(ledger, v(3, x)))!;
+      // All of x is still known and pre-tracking: none of it is an addition.
+      expect(listAddedTimestamps(back)).toEqual([]);
+    }, 120_000);
+
+    it("evicts the most recently first-seen absent records first", async () => {
+      const ledger = (await fold([
+        v(1, []),
+        v(2, ids("old", 100_000)),
+        v(3, ids("mid", 50_000)),
+        v(4, ids("new", 40_000)),
+        v(5, ids("fresh", 30_000)),
+      ]))!;
+      const count = (prefix: string) =>
+        Object.keys(ledger.records).filter((key) =>
+          key.startsWith(`items:i:${prefix}`),
+        ).length;
+      // 20,000 had to go: the newest-first-seen absent ones.
+      expect(count("old")).toBe(100_000);
+      expect(count("mid")).toBe(50_000);
+      expect(count("new")).toBe(20_000);
+      expect(count("fresh")).toBe(30_000);
+    }, 120_000);
+  });
 
   it("holds __proto__ ids as ordinary own keys", async () => {
     const ledger = await fold([

@@ -316,5 +316,44 @@ describe("PS-Lite first-seen sidecar", () => {
       await storage.deleteScope("notes.a");
       expect(await storage.readFirstSeenLedger!("notes.a")).toBeNull();
     });
+
+    it("a failed ledger delete never blocks the data delete, and is collected on load (F5)", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      let failing = true;
+      const deleteAux = persistence.deleteAux!.bind(persistence);
+      persistence.deleteAux = async (name) => {
+        if (failing) throw new Error("aux store unavailable");
+        return deleteAux(name);
+      };
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      await ingestDataContract({
+        storage,
+        scopeParam: "notes.a",
+        body: items("secret"),
+        collectedAt: AT,
+        status: "stored",
+      });
+      await expect(storage.deleteScope("notes.a")).resolves.toBe(1);
+      expect(storage.countVersions("notes.a")).toBe(0);
+      expect(await persistence.readAux!("first-seen:notes.a")).not.toBeNull();
+      expect(
+        ((await persistence.read()) as { pendingLedgerDeletes?: string[] })
+          .pendingLedgerDeletes,
+      ).toEqual(["notes.a"]);
+
+      failing = false;
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      expect(await persistence.readAux!("first-seen:notes.a")).toBeNull();
+      expect(
+        (await persistence.read()) as { pendingLedgerDeletes?: string[] },
+      ).not.toHaveProperty("pendingLedgerDeletes");
+      expect(await reloaded.readFirstSeenLedger!("notes.a")).toBeNull();
+    });
   });
 });

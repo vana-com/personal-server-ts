@@ -325,6 +325,50 @@ const tracksAnything = (scope: string) =>
     (rule) => rule.idFields.length > 0 || rule.rowIdFields.length > 0,
   );
 
+/**
+ * What the owner app counts for each fixture, in each stored form (the app's
+ * `buildPersonalMemoryRecords`: one record per item of the scope's list, one
+ * per profile object). `legacy` is only given where the app counts a legacy
+ * body differently from the rows.
+ */
+const EXPECTED_TOTALS: Record<
+  string,
+  { rows: number; legacy?: number; why: string }
+> = {
+  "chatgpt.conversations": { rows: 2, why: "one per conversation" },
+  "github.repositories": { rows: 2, why: "one per repository" },
+  "github.starred": { rows: 2, why: "one per starred repository" },
+  "github.events": { rows: 1, why: "one per event" },
+  "github.contributions": { rows: 2, why: "one per day" },
+  "icloud_notes.notes": { rows: 2, why: "one per note" },
+  "icloud_notes.folders": { rows: 2, why: "one per folder" },
+  "instagram.posts": { rows: 2, why: "one per post" },
+  "instagram.following": { rows: 2, why: "one per account" },
+  "instagram.ads": {
+    rows: 3,
+    why: "topics, advertisers and categories all count (the app lists every ad row)",
+  },
+  "linkedin.experience": { rows: 2, why: "one per experience" },
+  "linkedin.education": { rows: 2, why: "one per school" },
+  "linkedin.connections": { rows: 2, why: "one per connection" },
+  "linkedin.skills": { rows: 1, why: "one per skill" },
+  "linkedin.languages": { rows: 1, why: "one per language" },
+  "spotify.playlists": { rows: 2, why: "one per playlist" },
+  "spotify.savedTracks": { rows: 2, why: "one per saved track" },
+  "oura.activity": { rows: 2, why: "one per day" },
+  "oura.readiness": { rows: 1, why: "one per day" },
+  "oura.sleep": {
+    rows: 1,
+    legacy: 2,
+    why: "the app counts every record array of the legacy body: the sleep row appears in dailyScores and in sleepPeriods",
+  },
+  "youtube.playlists": { rows: 1, why: "one per playlist" },
+  "shop.orders": { rows: 2, why: "one per order" },
+  "claude.conversations": { rows: 1, why: "one per conversation" },
+  "claude.projects": { rows: 1, why: "one per project" },
+  "amazon.orders": { rows: 1, why: "one per order" },
+};
+
 describe("record rules: rows form and legacy form agree for every fixture-backed binding", () => {
   const fixtures = { ...FIXTURES, ...repoFixtures() };
 
@@ -346,7 +390,14 @@ describe("record rules: rows form and legacy form agree for every fixture-backed
         "needs an explicit rule",
       ).toBeDefined();
       expect(new Set(rows!.keys)).toEqual(new Set(legacy!.keys));
-      expect(rows!.total).toBe(legacy!.total);
+      const expected = EXPECTED_TOTALS[scope];
+      expect(expected, `${scope} needs an expected total`).toBeDefined();
+      expect(rows!.total, `${scope} rows total: ${expected!.why}`).toBe(
+        expected!.rows,
+      );
+      expect(legacy!.total, `${scope} legacy total: ${expected!.why}`).toBe(
+        expected!.legacy ?? expected!.rows,
+      );
       // Tracked scopes really produce keys in both forms.
       if (tracksAnything(scope)) expect(legacy!.keys.length).toBeGreaterThan(0);
       else expect(legacy!.keys).toEqual([]);
@@ -411,5 +462,297 @@ describe("record rules: rows form and legacy form agree for every fixture-backed
     expect(legacy!.keys.length).toBeGreaterThan(0);
     const rowsKeys = new Set([...issues!.keys, ...pulls!.keys]);
     for (const key of legacy!.keys) expect(rowsKeys.has(key)).toBe(true);
+  });
+});
+
+describe("the server's total equals the owner app's count for scopes without a projection fixture", () => {
+  // [scope, rows body, rows total, legacy body, legacy total, why]
+  const cases: [
+    string,
+    Record<string, unknown>,
+    number,
+    Record<string, unknown> | null,
+    number,
+    string,
+  ][] = [
+    [
+      "linkedin.profile",
+      { records: [{ id: "p" }] },
+      1,
+      { fullName: "A" },
+      1,
+      "the profile object is one record",
+    ],
+    [
+      "spotify.profile",
+      { records: [{ id: "u" }] },
+      1,
+      { id: "u", display_name: "A", images: [{}, {}] },
+      1,
+      "one profile, whatever arrays it carries (the generic rule gave 2)",
+    ],
+    [
+      "youtube.profile",
+      { records: [{ id: "c" }] },
+      1,
+      { channelTitle: "A" },
+      1,
+      "the profile object is one record",
+    ],
+    [
+      "heb.profile",
+      { records: [{ id: "h" }] },
+      1,
+      { name: "A", deliveryAddresses: [] },
+      1,
+      "the profile object is one record",
+    ],
+    [
+      "wholefoods.profile",
+      { records: [{ id: "w" }] },
+      1,
+      { name: "A" },
+      1,
+      "the profile object is one record",
+    ],
+    [
+      "youtube.subscriptions",
+      { records: [{ id: "a" }, { id: "b" }] },
+      2,
+      { subscriptions: [{}, {}] },
+      2,
+      "one per subscription",
+    ],
+    [
+      "youtube.likes",
+      { records: [{ id: "a" }] },
+      1,
+      { likedVideos: [{}] },
+      1,
+      "one per liked video",
+    ],
+    [
+      "youtube.watchLater",
+      { records: [{ id: "a" }] },
+      1,
+      { watchLater: [{}] },
+      1,
+      "one per video",
+    ],
+    [
+      "youtube.watch_later",
+      { records: [{ id: "a" }, { id: "b" }] },
+      2,
+      null,
+      0,
+      "rows scope of watchLater",
+    ],
+    [
+      "youtube.history",
+      { records: [{ id: "a" }] },
+      1,
+      { history: [{}, {}] },
+      2,
+      "one per watched video",
+    ],
+    [
+      "youtube.watch_history",
+      { records: [{ id: "a" }, { id: "b" }] },
+      2,
+      null,
+      0,
+      "rows scope of history",
+    ],
+    [
+      "youtube.playlistItems",
+      { records: [{ id: "a" }] },
+      1,
+      { playlists: [{}] },
+      1,
+      "one per item",
+    ],
+    [
+      "youtube.playlist_items",
+      { records: [{ id: "a" }, { id: "b" }] },
+      2,
+      null,
+      0,
+      "rows scope of playlistItems",
+    ],
+    [
+      "heb.nutrition",
+      { records: [{ id: "a" }, { id: "b" }] },
+      2,
+      { nutrition: [{}, {}] },
+      2,
+      "one per product",
+    ],
+    [
+      "wholefoods.nutrition",
+      { records: [{ id: "a" }] },
+      1,
+      { nutrition: [{}] },
+      1,
+      "one per product",
+    ],
+    [
+      "heb.orders",
+      { records: [{ id: "a" }] },
+      1,
+      { orders: [{}] },
+      1,
+      "one per order",
+    ],
+    [
+      "wholefoods.orders",
+      { records: [{ id: "a" }] },
+      1,
+      { orders: [{}] },
+      1,
+      "one per order",
+    ],
+    [
+      "amazon.order_items",
+      { records: [{ id: "a" }, { id: "b" }] },
+      2,
+      null,
+      0,
+      "join-only stream, counted as its own scope",
+    ],
+    [
+      "heb.order_items",
+      { records: [{ id: "a" }] },
+      1,
+      null,
+      0,
+      "join-only stream",
+    ],
+    [
+      "wholefoods.order_items",
+      { records: [{ id: "a" }] },
+      1,
+      null,
+      0,
+      "join-only stream",
+    ],
+    [
+      "claude.messages",
+      { records: [{ id: "m" }] },
+      1,
+      null,
+      0,
+      "join-only stream",
+    ],
+    [
+      "claude.account_profile",
+      { records: [{ id: "m" }] },
+      1,
+      null,
+      0,
+      "join-only stream",
+    ],
+    [
+      "claude.project_documents",
+      { records: [{ id: "m" }, { id: "n" }] },
+      2,
+      null,
+      0,
+      "join-only stream",
+    ],
+    ["github.user", { records: [{ id: "u" }] }, 1, null, 0, "join-only stream"],
+    [
+      "github.user_stats",
+      { records: [{ id: "u" }] },
+      1,
+      null,
+      0,
+      "join-only stream",
+    ],
+    [
+      "github.organizations",
+      { records: [{ id: "o" }, { id: "p" }] },
+      2,
+      null,
+      0,
+      "join-only stream",
+    ],
+    [
+      "github.pinned_repositories",
+      { records: [{ id: "r" }] },
+      1,
+      null,
+      0,
+      "join-only stream",
+    ],
+    [
+      "instagram.post_likes",
+      { records: [{ id: "l" }, { id: "m" }] },
+      2,
+      null,
+      0,
+      "join-only stream",
+    ],
+    [
+      "spotify.playlist_items",
+      { records: [{ id: "i" }] },
+      1,
+      null,
+      0,
+      "join-only stream",
+    ],
+    [
+      "chatgpt.memories",
+      { records: [{ id: "m" }] },
+      0,
+      { memories: [{}] },
+      0,
+      "the app counts none",
+    ],
+    [
+      "chatgpt.messages",
+      { records: [{ id: "m" }] },
+      0,
+      null,
+      0,
+      "the app counts none",
+    ],
+    [
+      "github.profile",
+      { records: [{ id: "g" }] },
+      0,
+      { username: "a", pinnedRepositories: [{}] },
+      0,
+      "the app counts none",
+    ],
+    [
+      "instagram.profile",
+      { records: [{ id: "i" }] },
+      0,
+      { username: "a" },
+      0,
+      "the app counts none",
+    ],
+  ];
+
+  it.each(cases)(
+    "%s",
+    async (scope, rows, rowsTotal, legacy, legacyTotal, why) => {
+      expect(
+        (await extractRecordKeys(scope, rows))!.total,
+        `rows: ${why}`,
+      ).toBe(rowsTotal);
+      if (legacy) {
+        expect(
+          (await extractRecordKeys(scope, legacy))!.total,
+          `legacy: ${why}`,
+        ).toBe(legacyTotal);
+      }
+      // Counted here, never tracked: none of these produce additions.
+      expect((await extractRecordKeys(scope, rows))!.keys).toEqual([]);
+    },
+  );
+
+  it("an empty profile body is not a record", async () => {
+    expect((await extractRecordKeys("youtube.profile", {}))!.total).toBe(0);
   });
 });

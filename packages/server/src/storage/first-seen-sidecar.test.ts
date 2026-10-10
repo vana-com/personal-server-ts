@@ -346,6 +346,22 @@ describe("first-seen sidecar on the Node storage", () => {
     await expect(stat(sidecarPath())).rejects.toThrow();
   });
 
+  it("a sidecar that cannot be removed never blocks the data delete (F5)", async () => {
+    await ingest(items("secret-id"), T1);
+    await chmod(join(dataDir, "first-seen"), 0o555);
+    try {
+      await expect(storage.deleteScope(SCOPE)).resolves.toBe(1);
+    } finally {
+      await chmod(join(dataDir, "first-seen"), 0o755);
+    }
+    expect(storage.countVersions(SCOPE)).toBe(0);
+    await expect(stat(join(dataDir, "notes", "entries"))).rejects.toThrow();
+    // The leftover is harmless and collected: the next read drops it.
+    await stat(sidecarPath());
+    expect(await ensureScopeLedger(storage, SCOPE)).toBeNull();
+    await expect(stat(sidecarPath())).rejects.toThrow();
+  });
+
   it("buildDataBlocks of a stored envelope never sees the sidecar", async () => {
     await ingest(items("a"), T1);
     const stored = await storage.readEnvelope(SCOPE, T1);

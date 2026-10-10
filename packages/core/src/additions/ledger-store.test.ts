@@ -253,8 +253,9 @@ describe("negative outcomes are persisted", () => {
       ).toBeUndefined();
     }
     expect(readEnvelope).not.toHaveBeenCalled();
-    await ingest({ items: [...batch("b").items, { id: "fresh" }] }, at(2));
-    expect(listAddedTimestamps((await stored(storage))!)).toContain(at(2));
+    // The established records stay known: returning is not an addition.
+    await ingest(batch("a"), at(2));
+    expect(listAddedTimestamps((await stored(storage))!)).toEqual([]);
   }, 90_000);
 });
 
@@ -502,5 +503,104 @@ describe("added never exceeds total (B10)", () => {
     const marker = await ensureScopeLedger(storage, SCOPE, { byteBudget: 10 });
     expect(marker).toMatchObject({ skipped: "too_large" });
     expect(listAddedTimestamps(marker!)).toEqual([]);
+  });
+});
+
+describe("versions at the same instant (F6)", () => {
+  it("fold to the same ledger in either order, and added never exceeds total", async () => {
+    const a = createMemoryDataStorage();
+    const b = createMemoryDataStorage();
+    const plain = "2026-09-01T12:00:00Z";
+    const millis = "2026-09-01T12:00:00.000Z";
+    await put(a, SCOPE, plain, items("x", "y", "z"));
+    await put(a, SCOPE, millis, items("x"));
+    await put(b, SCOPE, millis, items("x"));
+    await put(b, SCOPE, plain, items("x", "y", "z"));
+    await put(a, SCOPE, at(5), items("x", "y", "z", "w"));
+    await put(b, SCOPE, at(5), items("x", "y", "z", "w"));
+    const one = await ensureScopeLedger(a, SCOPE);
+    const two = await ensureScopeLedger(b, SCOPE);
+    expect(one).toEqual(two);
+
+    // A newest pair at one instant: the greater string decides, and the
+    // additions it reports fit its total.
+    await put(a, SCOPE, "2026-10-01T00:00:00Z", items("x", "y", "z", "w", "v"));
+    await put(a, SCOPE, "2026-10-01T00:00:00.000Z", items("x"));
+    const ledger = await ensureScopeLedger(a, SCOPE);
+    expect(ledger?.latest.collectedAt).toBe("2026-10-01T00:00:00Z");
+    expect(listAddedTimestamps(ledger!).length).toBeLessThanOrEqual(
+      ledger!.latest.total,
+    );
+  });
+});
+
+describe("edges (F7)", () => {
+  it("counts a binary file in an empty-rule scope as 0 on the write and after a rebuild", async () => {
+    const storage = createMemoryDataStorage();
+    await ingestBinaryDataContract({
+      storage,
+      scopeParam: "chatgpt.messages",
+      bytes: new TextEncoder().encode("%PDF"),
+      mimeType: "application/pdf",
+      collectedAt: at(0),
+      status: "stored",
+    });
+    const written = await stored(storage, "chatgpt.messages");
+    await storage.deleteFirstSeenLedger!("chatgpt.messages");
+    const rebuilt = await ensureScopeLedger(storage, "chatgpt.messages");
+    expect(written?.latest.total).toBe(0);
+    expect(rebuilt?.latest.total).toBe(0);
+  });
+
+  it("is not partial when exactly 200 versions were folded and none skipped", async () => {
+    const storage = createMemoryDataStorage();
+    for (let i = 0; i < 200; i += 1)
+      await put(storage, SCOPE, at(i), items("a"));
+    expect((await ensureScopeLedger(storage, SCOPE))?.partial).toBeUndefined();
+
+    const caught = createMemoryDataStorage();
+    await put(caught, SCOPE, at(0), items("a"));
+    await ensureScopeLedger(caught, SCOPE);
+    for (let i = 1; i <= 200; i += 1)
+      await put(caught, SCOPE, at(i), items("a"));
+    // 200 newer versions plus the folded one: the window covers all but one
+    // that was already folded; nothing is skipped.
+    expect((await ensureScopeLedger(caught, SCOPE))?.partial).toBeUndefined();
+  });
+
+  it("rejects a through marker later than the latest version, so catch-up is not suppressed", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("a"));
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(readScopeFirstSeenLedger({ ...ledger, through: at(9) })).toBeNull();
+    await put(storage, SCOPE, at(1), items("a", "b"));
+    await storage.writeFirstSeenLedger!(SCOPE, { ...ledger, through: at(9) });
+    // The forged marker is discarded: the read rebuilds and sees version 1.
+    expect((await ensureScopeLedger(storage, SCOPE))?.latest.collectedAt).toBe(
+      at(1),
+    );
+  });
+
+  it("retries an unreadable newest version on later reads instead of skipping it", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("a"));
+    await ensureScopeLedger(storage, SCOPE);
+    await put(storage, SCOPE, at(1), items("a", "b"));
+    await put(storage, SCOPE, at(2), items("a", "b", "c"));
+    const readEnvelope = storage.readEnvelope.bind(storage);
+    let broken = true;
+    storage.readEnvelope = async (scope, collectedAt) => {
+      if (broken && collectedAt === at(2)) throw new Error("not yet");
+      return readEnvelope(scope, collectedAt);
+    };
+
+    const first = await ensureScopeLedger(storage, SCOPE);
+    expect(first?.latest.collectedAt).toBe(at(1));
+    expect(first?.through).toBe(at(1));
+
+    broken = false;
+    const second = await ensureScopeLedger(storage, SCOPE);
+    expect(second?.latest.collectedAt).toBe(at(2));
+    expect(second?.records["items:i:c"]).toEqual([at(2), at(2)]);
   });
 });

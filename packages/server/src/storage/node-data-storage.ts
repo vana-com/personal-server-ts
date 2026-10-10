@@ -141,10 +141,24 @@ export function createNodeDataStorage(
     deleteScope(scope: string) {
       return withScopeLock(scope, async () => {
         // The sidecar first: it holds record ids, so it must not survive a
-        // data delete that fails half way.
-        await deleteFirstSeenLedger(deps.hierarchyOptions, scope);
+        // data delete that fails half way. A sidecar that cannot be removed
+        // never blocks the data delete; it is tried once more afterwards, and
+        // a leftover is harmless (the next write or read finds its newest
+        // version gone and drops it).
+        const sidecarGone = await deleteFirstSeenLedger(
+          deps.hierarchyOptions,
+          scope,
+        ).then(
+          () => true,
+          () => false,
+        );
         const deletedCount = deps.indexManager.deleteByScope(scope);
         await deleteAllForScope(deps.hierarchyOptions, scope);
+        if (!sidecarGone) {
+          await deleteFirstSeenLedger(deps.hierarchyOptions, scope).catch(
+            () => undefined,
+          );
+        }
         return deletedCount;
       });
     },

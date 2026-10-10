@@ -287,11 +287,14 @@ export async function extractRecordKeys(
   data: Record<string, unknown>,
 ): Promise<RecordKeyExtraction | null> {
   if (!isRecord(data)) return null;
+  const rules = memoryRecordRulesFor(scope);
+  // A scope whose rules hold nothing counts 0, whatever it stores (a rebuild
+  // reads nothing there, so a write must count the same).
+  if (rules !== null && rules.length === 0) return { keys: [], total: 0 };
   // A binary payload has no addressable records and is never tracked.
   if (hasOwn(data, "$binary")) return null;
 
   const collector = new KeyCollector();
-  const rules = memoryRecordRulesFor(scope);
   const rows = isRowsBody(data) ? data.records : null;
 
   if (rules !== null) {
@@ -310,6 +313,10 @@ export async function extractRecordKeys(
         collector.total += rows.length;
       }
       for (const rule of chosen) {
+        if (rule.singleton) {
+          collector.total += rows.filter(isRecord).length;
+          continue;
+        }
         const items = rows
           .filter(isRecord)
           .filter((row) => passesStreamFilter(row, rule));
@@ -317,6 +324,13 @@ export async function extractRecordKeys(
       }
     } else {
       for (const rule of rules) {
+        if (rule.singleton) {
+          // The body is the record: counted once when it has any content.
+          if (Object.keys(data).some((key) => !key.startsWith("$"))) {
+            collector.total += 1;
+          }
+          continue;
+        }
         await collector.addItems(
           rule.collection,
           legacyItems(data, rule),
@@ -353,6 +367,24 @@ type Pair = [string, string];
 
 function ms(value: string | null): number {
   return value === null ? Number.NaN : Date.parse(value);
+}
+
+/**
+ * Whether `a` is the newer of two collectedAt strings. Instants decide
+ * ("…00Z" and "…00.000Z" are the same instant); a tie is broken by the
+ * greater string, so the outcome never depends on the order of folding. Equal
+ * strings (a rewrite of the same slot) count as newer, so the last one wins.
+ */
+function isNewer(a: string, b: string | null): boolean {
+  if (b === null) return true;
+  const difference = Date.parse(a) - Date.parse(b);
+  return difference > 0 || (difference === 0 && a >= b);
+}
+
+/** Whether `a` is strictly earlier than `b` (instant first, then the smaller string). */
+function isEarlier(a: string, b: string): boolean {
+  const difference = Date.parse(a) - Date.parse(b);
+  return difference < 0 || (difference === 0 && a < b);
 }
 
 /**
@@ -413,12 +445,13 @@ export class LedgerFold {
     // A binary file is one record of the scope (the owner app lists it so).
     const total = extraction?.total ?? 1;
 
-    // On a tie the version folded last describes the slot (a rewrite of the
-    // same collectedAt replaces its predecessor).
-    if (this.latest === null || at >= ms(this.latest.collectedAt)) {
+    if (
+      this.latest === null ||
+      isNewer(version.collectedAt, this.latest.collectedAt)
+    ) {
       this.latest = { collectedAt: version.collectedAt, total };
     }
-    if (this.through === null || at > ms(this.through)) {
+    if (isNewer(version.collectedAt, this.through)) {
       this.through = version.collectedAt;
     }
     // A negative-outcome marker keeps no keys; a binary file or a snapshot
@@ -428,48 +461,94 @@ export class LedgerFold {
 
     if (this.baseline === null) {
       this.baseline = version.collectedAt;
-    } else if (at < ms(this.baseline) && !this.partial) {
+    } else if (isEarlier(version.collectedAt, this.baseline) && !this.partial) {
       // A partial ledger never moves its baseline back over versions it did
       // not fold: their records would then look added.
       this.baseline = version.collectedAt;
     }
-    if (this.current === null || at >= ms(this.current)) {
+    if (isNewer(version.collectedAt, this.current)) {
       this.current = version.collectedAt;
     }
 
     const keys = extraction!.keys;
+    const fresh: string[] = [];
+    // First pass: records the ledger already knows move their first/last seen.
     for (let index = 0; index < keys.length; index += 1) {
       if (index % YIELD_EVERY === YIELD_EVERY - 1) await yieldToEventLoop();
       const key = keys[index]!;
       const existing = this.records.get(key);
       if (!existing) {
-        this.records.set(key, [version.collectedAt, version.collectedAt]);
-        if (this.records.size > MAX_TRACKED_KEYS) this.trim();
+        fresh.push(key);
         continue;
       }
-      if (at < Date.parse(existing[0])) existing[0] = version.collectedAt;
-      if (at > Date.parse(existing[1])) existing[1] = version.collectedAt;
+      if (isEarlier(version.collectedAt, existing[0])) {
+        existing[0] = version.collectedAt;
+      }
+      if (isNewer(version.collectedAt, existing[1])) {
+        existing[1] = version.collectedAt;
+      }
+    }
+    if (fresh.length > 0)
+      await this.insertFresh(fresh, keys, version.collectedAt);
+  }
+
+  /**
+   * Insert the records this version brings that the ledger does not know.
+   * Capacity is decided ONCE: when they do not fit, absent records are evicted
+   * in a single pass (see `evict`), and whatever still does not fit is left
+   * out, smallest keys first, so the result never depends on the order of the
+   * ids in the version.
+   */
+  private async insertFresh(
+    fresh: string[],
+    versionKeys: readonly string[],
+    collectedAt: string,
+  ): Promise<void> {
+    fresh.sort();
+    let room = MAX_TRACKED_KEYS - this.records.size;
+    if (fresh.length > room) {
+      room += await this.evict(fresh.length - room, new Set(versionKeys));
+    }
+    const take = Math.min(fresh.length, Math.max(0, room));
+    for (let index = 0; index < take; index += 1) {
+      if (index % YIELD_EVERY === YIELD_EVERY - 1) await yieldToEventLoop();
+      this.records.set(fresh[index]!, [collectedAt, collectedAt]);
     }
   }
 
   /**
-   * The union passed the cap: drop records absent from the newest tracked
-   * version, oldest last-seen first, down to 90% of the cap. The present ones
-   * always fit (one snapshot never holds more than the cap), so tracking
-   * continues; a dropped record that returns is dated as new.
+   * Make room for `need` records by dropping some that are absent: not in the
+   * newest tracked version, not in the version being folded, and not
+   * pre-tracking (first seen at or before the baseline). Established records
+   * therefore stay while a flood of new ids displaces itself. Among the
+   * evictable ones the most recently first seen go first. A record dropped
+   * this way and seen again is dated as new. Returns how many were dropped.
    */
-  private trim(): void {
+  private async evict(
+    need: number,
+    inVersion: ReadonlySet<string>,
+  ): Promise<number> {
     const currentMs = ms(this.current);
-    const absent: [number, string][] = [];
+    const baselineMs = ms(this.baseline);
+    const candidates: [number, string][] = [];
+    let seen = 0;
     for (const [key, pair] of this.records) {
-      const lastMs = Date.parse(pair[1]);
-      if (lastMs !== currentMs) absent.push([lastMs, key]);
+      seen += 1;
+      if (seen % (YIELD_EVERY * 5) === 0) await yieldToEventLoop();
+      if (inVersion.has(key)) continue;
+      if (Date.parse(pair[1]) === currentMs) continue;
+      const firstMs = Date.parse(pair[0]);
+      if (firstMs <= baselineMs) continue;
+      candidates.push([firstMs, key]);
     }
-    absent.sort((a, b) => a[0] - b[0]);
-    const excess = this.records.size - Math.floor(MAX_TRACKED_KEYS * 0.9);
-    for (let index = 0; index < excess && index < absent.length; index += 1) {
-      this.records.delete(absent[index]![1]);
+    candidates.sort(
+      (a, b) => b[0] - a[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0),
+    );
+    const count = Math.min(need, candidates.length);
+    for (let index = 0; index < count; index += 1) {
+      this.records.delete(candidates[index]![1]);
     }
+    return count;
   }
 
   /** Drop records that are not present and were last seen over 90 days before `current`. */
@@ -578,6 +657,12 @@ export function listAddedTimestamps(ledger: ScopeFirstSeenLedger): string[] {
     if (Date.parse(first) <= baselineMs) continue;
     added.push(first);
   }
+  // Two versions at one instant can both look present; never report more
+  // additions than the newest version has records.
+  if (added.length > ledger.latest.total) {
+    added.sort();
+    added.length = ledger.latest.total;
+  }
   return added;
 }
 
@@ -620,6 +705,9 @@ export function readScopeFirstSeenLedger(
     }
     if (!isRecord(latest) || !parseableString(latest.collectedAt)) return null;
     if (!parseableString(through)) return null;
+    // Completeness cannot run ahead of the newest folded version: such a
+    // marker would suppress the catch-up it exists to trigger.
+    if (Date.parse(through) > Date.parse(latest.collectedAt)) return null;
     const total = latest.total;
     if (typeof total !== "number" || !Number.isInteger(total) || total < 0) {
       return null;

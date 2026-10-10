@@ -93,7 +93,15 @@ function retainedVersions(
   return storage
     .listVersions(scope, { limit: REBUILD_VERSION_LIMIT })
     .filter((entry) => !Number.isNaN(Date.parse(entry.collectedAt)))
-    .sort((a, b) => Date.parse(b.collectedAt) - Date.parse(a.collectedAt));
+    .sort(
+      (a, b) =>
+        Date.parse(b.collectedAt) - Date.parse(a.collectedAt) ||
+        (a.collectedAt < b.collectedAt
+          ? 1
+          : a.collectedAt > b.collectedAt
+            ? -1
+            : 0),
+    );
 }
 
 /**
@@ -165,23 +173,53 @@ function newerThan(
   return retained.filter((entry) => Date.parse(entry.collectedAt) > throughMs);
 }
 
-/** Fold `entries` (newest first) into `fold`, oldest first, one envelope at a time. */
+/**
+ * Fold `entries` (newest first) into `fold`, oldest first, one envelope at a
+ * time. Returns how many were folded and the entries that could not be read.
+ */
 async function foldEntries(
   storage: DataStoragePort,
   scope: string,
   entries: readonly IndexEntry[],
   fold: LedgerFold,
-): Promise<number> {
+): Promise<{ folded: number; failed: IndexEntry[] }> {
   let folded = 0;
+  const failed: IndexEntry[] = [];
   for (const entry of [...entries].reverse()) {
     const version = await readVersionData(storage, scope, entry.collectedAt);
     if (version) {
       await fold.add(version);
       folded += 1;
+    } else {
+      failed.push(entry);
     }
     await yieldToEventLoop();
   }
-  return folded;
+  return { folded, failed };
+}
+
+/**
+ * How far a fold is complete. Without failures it is the newest retained
+ * version; an unreadable version holds the marker back to the newest version
+ * before it, so later reads try that version again instead of skipping it.
+ */
+function throughAfter(
+  retained: readonly IndexEntry[],
+  entries: readonly IndexEntry[],
+  failed: readonly IndexEntry[],
+  fallback: string | null,
+): string | undefined {
+  if (failed.length === 0) return retained[0]!.collectedAt;
+  const oldestFailedMs = Math.min(
+    ...failed.map((entry) => Date.parse(entry.collectedAt)),
+  );
+  const failedSet = new Set(failed);
+  const before = entries.filter(
+    (entry) =>
+      !failedSet.has(entry) && Date.parse(entry.collectedAt) < oldestFailedMs,
+  );
+  // `entries` is newest first.
+  return before[0]?.collectedAt ?? fallback ?? undefined;
 }
 
 /**
@@ -198,7 +236,7 @@ async function rebuild(
   if (retained.length === 0) return null;
   const selected = withinBudget(scope, retained, budget);
   const fold = new LedgerFold(null, scope);
-  const folded = await foldEntries(storage, scope, selected, fold);
+  const { folded, failed } = await foldEntries(storage, scope, selected, fold);
   if (folded === 0) {
     // Persisted so the next request does not repeat the failed work.
     return {
@@ -215,7 +253,7 @@ async function rebuild(
   const total = storage.countVersions(scope);
   return fold.finish({
     partial: folded < total,
-    through: retained[0]!.collectedAt,
+    through: throughAfter(retained, selected, failed, null),
   });
 }
 
@@ -234,14 +272,20 @@ async function catchUp(
   const selected = withinBudget(ledger.scope, newer, budget);
   if (selected.length === 0) return ledger;
   const fold = new LedgerFold(ledger);
-  await foldEntries(storage, ledger.scope, selected, fold);
+  const { failed } = await foldEntries(storage, ledger.scope, selected, fold);
+  // Only a window cut (more versions than the index window shows) or the
+  // byte budget leaves versions unfolded.
+  const beyond = storage.listVersions(ledger.scope, {
+    limit: 1,
+    offset: retained.length,
+  })[0];
+  const windowCut =
+    beyond !== undefined &&
+    Date.parse(beyond.collectedAt) > Date.parse(ledger.through);
   return (
     (await fold.finish({
-      // Everything newer was seen, but part of it may lie beyond the window
-      // or the budget and stay unfolded.
-      partial:
-        selected.length < newer.length || newer.length === retained.length,
-      through: retained[0]!.collectedAt,
+      partial: windowCut || selected.length < newer.length,
+      through: throughAfter(retained, selected, failed, ledger.through),
     })) ?? ledger
   );
 }

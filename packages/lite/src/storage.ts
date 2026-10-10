@@ -34,6 +34,13 @@ export interface PsLitePersistedStorageState {
     path: string;
     block: DataScopeBlock;
   }>;
+  /**
+   * Scopes whose first-seen ledger side record could not be deleted along
+   * with their data. Retried when the storage loads and on the next ledger
+   * delete; until then the leftover is harmless (it is never read once its
+   * newest version is gone).
+   */
+  pendingLedgerDeletes?: string[];
 }
 
 export type PsLiteFileStorageKind = "opfs" | "indexeddb" | "custom";
@@ -142,6 +149,9 @@ function normalizeState(
     envelopes: state.envelopes,
     blockManifests: state.blockManifests ?? [],
     blockPayloads: state.blockPayloads ?? [],
+    ...(state.pendingLedgerDeletes?.length
+      ? { pendingLedgerDeletes: state.pendingLedgerDeletes }
+      : {}),
   };
 }
 
@@ -480,6 +490,9 @@ export async function createPersistentPsLiteStorage(
   // inside the main state is ignored: it is a cache, rebuilt on demand.
   const ledgerAux = (scope: string) => `first-seen:${scope}`;
   const firstSeenLedgers = new Map<string, unknown>();
+  const pendingLedgerDeletes = new Set<string>(
+    state.pendingLedgerDeletes ?? [],
+  );
   const fallbackStore = createIndexedDbFallbackDataFileStore(
     fallbackEnvelopes,
     fallbackBlockManifests,
@@ -511,6 +524,10 @@ export async function createPersistentPsLiteStorage(
       blockPayloads: Array.from(fallbackBlockPayloads.entries()).map(
         ([path, block]) => ({ path, block }),
       ),
+      pendingLedgerDeletes:
+        pendingLedgerDeletes.size > 0
+          ? Array.from(pendingLedgerDeletes)
+          : undefined,
     };
     const write = persistQueue.then(() => persistence.write(snapshot));
     persistQueue = write.catch(() => undefined);
@@ -915,7 +932,7 @@ export async function createPersistentPsLiteStorage(
     // version, so no delete path leaves a stale ledger behind.
     deleteScope(scope) {
       return withScopeLock(scope, async () => {
-        await storagePort.deleteFirstSeenLedger!(scope);
+        await dropLedger(scope);
         let deleted = 0;
         const deletedPaths: string[] = [];
         const deletedBlockTrees: string[] = [];
@@ -965,6 +982,34 @@ export async function createPersistentPsLiteStorage(
     },
   };
 
+  /**
+   * Delete a scope's ledger side record without ever blocking the data
+   * delete that asked for it: a failure leaves the scope on the pending list,
+   * which is retried on load and on the next call.
+   */
+  async function dropLedger(scope: string): Promise<void> {
+    const attempt = async (name: string): Promise<boolean> => {
+      try {
+        await storagePort.deleteFirstSeenLedger!(name);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const before = pendingLedgerDeletes.size;
+    if (await attempt(scope)) pendingLedgerDeletes.delete(scope);
+    else pendingLedgerDeletes.add(scope);
+    for (const other of [...pendingLedgerDeletes]) {
+      if (other === scope) continue;
+      const stillStored = state.entries.some((e) => e.scope === other);
+      if (stillStored || (await attempt(other)))
+        pendingLedgerDeletes.delete(other);
+    }
+    if (pendingLedgerDeletes.size !== before) {
+      await persist().catch(() => undefined);
+    }
+  }
+
   async function removeEntry(entry: IndexEntry): Promise<boolean> {
     return withScopeLock(entry.scope, () => removeEntryLocked(entry));
   }
@@ -991,7 +1036,7 @@ export async function createPersistentPsLiteStorage(
     // The sidecar goes with the scope's last version.
     await persist();
     if (!state.entries.some((e) => e.scope === entry.scope)) {
-      await storagePort.deleteFirstSeenLedger!(entry.scope);
+      await dropLedger(entry.scope);
     }
     return true;
   }
@@ -1018,6 +1063,23 @@ export async function createPersistentPsLiteStorage(
       }
       return preview;
     };
+  }
+
+  // Collect leftovers from an earlier failed ledger delete.
+  if (pendingLedgerDeletes.size > 0) {
+    for (const scope of [...pendingLedgerDeletes]) {
+      if (state.entries.some((e) => e.scope === scope)) {
+        pendingLedgerDeletes.delete(scope);
+        continue;
+      }
+      try {
+        await storagePort.deleteFirstSeenLedger!(scope);
+        pendingLedgerDeletes.delete(scope);
+      } catch {
+        // Still pending; retried on the next ledger delete.
+      }
+    }
+    await persist().catch(() => undefined);
   }
 
   return storagePort;
