@@ -6,7 +6,12 @@
 
 import { describe, expect, it } from "vitest";
 import { ingestDataContract } from "@opendatalabs/personal-server-ts-core/contracts";
-import { readScopeFirstSeenLedger } from "@opendatalabs/personal-server-ts-core/additions";
+import {
+  ensureScopeLedger,
+  listAddedTimestamps,
+  readScopeFirstSeenLedger,
+} from "@opendatalabs/personal-server-ts-core/additions";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
   createMemoryPsLiteAccessLogStore,
@@ -355,5 +360,36 @@ describe("PS-Lite first-seen sidecar", () => {
       ).not.toHaveProperty("pendingLedgerDeletes");
       expect(await reloaded.readFirstSeenLedger!("notes.a")).toBeNull();
     });
+  });
+
+  it("a first version numbered above 1 is partial; after a deletion it counts (follow-up review)", async () => {
+    for (const [afterTombstone, partial] of [
+      [null, true],
+      [4, undefined],
+    ] as const) {
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        createMemoryPsLitePersistence(),
+      );
+      const envelope = createDataFileEnvelope(
+        SCOPE,
+        "2026-10-01T12:00:00.000Z",
+        items("a", "b"),
+      );
+      const written = await storage.writeEnvelope(envelope);
+      await storage.insertEntry({
+        fileId: null,
+        schemaId: null,
+        path: written.relativePath,
+        scope: SCOPE,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: written.sizeBytes,
+        version: 5,
+        afterTombstoneVersion: afterTombstone,
+      });
+      const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+      expect(ledger.partial).toBe(partial);
+      expect(listAddedTimestamps(ledger)).toHaveLength(partial ? 0 : 2);
+    }
   });
 });

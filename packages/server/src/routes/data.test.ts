@@ -805,6 +805,30 @@ describe("GET /v1/data/additions", () => {
     expect(json.partial).toBe(false);
   });
 
+  it("reports partial when the scope's first version is numbered above 1, and counts nothing at its baseline", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", {
+      items: [{ id: "a" }, { id: "b" }],
+    });
+    // An upload rebase (or a second device) leaves the oldest version at #7.
+    const entry = indexManager.findLatestByScope("notes.entries")!;
+    indexManager.updateVersion(entry.path, 7);
+
+    const json = await (await getAdditions(app)).json();
+    expect(json.partial).toBe(true);
+    expect(json.scopes[0]).toMatchObject({
+      scope: "notes.entries",
+      total: 2,
+      partial: true,
+    });
+    expect(
+      json.days.reduce(
+        (sum: number, day: { added: number }) => sum + day.added,
+        0,
+      ),
+    ).toBe(0);
+  });
+
   it("honours the tz parameter", async () => {
     const app = createApp();
     await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });

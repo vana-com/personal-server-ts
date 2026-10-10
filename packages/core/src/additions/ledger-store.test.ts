@@ -129,8 +129,8 @@ describe("a rebuild folds one envelope at a time", () => {
     for (let i = 0; i < 230; i += 1) {
       await put(storage, SCOPE, at(i), items(...upTo(Math.min(i + 1, 150))));
     }
-    await ensureScopeLedger(storage, SCOPE);
-    const before = await stored(storage);
+    const before = await ensureScopeLedger(storage, SCOPE);
+    expect((await stored(storage))?.truncated).toBe(true);
     expect(before?.partial).toBe(true);
 
     await put(storage, SCOPE, at(-5), items("r0"));
@@ -745,7 +745,7 @@ describe("when the baseline's records count as added (first-import rule)", () =>
       collectedAt: at(0),
       data: items("a", "b"),
     });
-    const ledger = (await stored(storage))!;
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
     expect(ledger.partial).toBe(true);
     expect(listAddedTimestamps(ledger)).toEqual([]);
   });
@@ -818,10 +818,10 @@ describe("when the baseline's records count as added (first-import rule)", () =>
     expect(listAddedTimestamps(ledger)).toEqual([at(9), at(9)]);
   });
 
-  it("(e) a version older than the baseline arriving later moves the baseline back", async () => {
+  it("(e) an older version arriving later moves the baseline back, and counts if it is a first version", async () => {
     const storage = createMemoryDataStorage();
     await ingest(storage, items("a", "b"), at(5));
-    await put(storage, SCOPE, at(2), items("a"));
+    await put(storage, SCOPE, at(2), items("a"), 100, { version: 1 });
     await recordStoredVersion(storage, {
       scope: SCOPE,
       collectedAt: at(2),
@@ -830,7 +830,18 @@ describe("when the baseline's records count as added (first-import rule)", () =>
     const ledger = (await ensureScopeLedger(storage, SCOPE))!;
     expect(ledger.baseline).toBe(at(2));
     expect(ledger.records["items:i:a"]).toEqual([at(2), at(5)]);
+    expect(ledger.partial).toBeUndefined();
     expect(listAddedTimestamps(ledger)).toEqual([at(2), at(5)]);
+  });
+
+  it("(d) #2 stored first and #1 arriving later: the oldest by collectedAt decides", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(2), items("a"), 100, { version: 2 });
+    await put(storage, SCOPE, at(5), items("a", "b"), 100, { version: 1 });
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    // The oldest version by collectedAt is #2, not the lowest-numbered #1.
+    expect(ledger.partial).toBe(true);
+    expect(listAddedTimestamps(ledger)).toEqual([at(5)]);
   });
 
   it("added never exceeds total over random sequences of writes, binaries and deletes", async () => {
@@ -863,6 +874,235 @@ describe("when the baseline's records count as added (first-import rule)", () =>
         if (!ledger) continue;
         expect(listAddedTimestamps(ledger).length).toBeLessThanOrEqual(
           ledger.latest.total,
+        );
+      }
+    }
+  });
+});
+
+describe("partial is decided from the index on every owner read (follow-up review)", () => {
+  const ingest = (
+    storage: DataStoragePort,
+    body: Record<string, unknown>,
+    collectedAt: string,
+  ) =>
+    ingestDataContract({
+      storage,
+      scopeParam: SCOPE,
+      body,
+      collectedAt,
+      status: "stored",
+    });
+  const download = async (
+    storage: DataStoragePort,
+    collectedAt: string,
+    data: Record<string, unknown>,
+    version: number,
+  ) => {
+    await put(storage, SCOPE, collectedAt, data, 100, { version });
+    await recordStoredVersion(storage, { scope: SCOPE, collectedAt, data });
+  };
+
+  it("1. discards a 1.33.0 (format 3) sidecar and rebuilds it under the new rule", async () => {
+    const storage = createMemoryDataStorage();
+    // A scope with one retained version #3 and 101 records.
+    await put(storage, SCOPE, at(0), items(...upTo(101)), 100, { version: 3 });
+    await storage.writeFirstSeenLedger!(SCOPE, {
+      version: 3,
+      scope: SCOPE,
+      baseline: at(0),
+      current: at(0),
+      latest: { collectedAt: at(0), total: 101 },
+      through: at(0),
+      records: Object.fromEntries(
+        upTo(101).map((id) => [`items:i:${id}`, [at(0), at(0)]]),
+      ),
+    });
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.partial).toBe(true);
+    expect(listAddedTimestamps(ledger)).toEqual([]);
+    expect(
+      ((await storage.readFirstSeenLedger!(SCOPE)) as { version: number })
+        .version,
+    ).toBe(4);
+  });
+
+  it("1. a second device that synced only version #12 reports 0, partial", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items(...upTo(500)), 100, { version: 12 });
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.partial).toBe(true);
+    expect(listAddedTimestamps(ledger)).toEqual([]);
+    expect(ledger.latest.total).toBe(500);
+  });
+
+  it("2a. a ledger that was complete turns partial after an upload rebase, and back", async () => {
+    const storage = createMemoryDataStorage();
+    await ingest(storage, items("a", "b"), at(0));
+    const before = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(before.partial).toBeUndefined();
+    expect(listAddedTimestamps(before)).toHaveLength(2);
+
+    // The upload worker rewrites the local #1 to the gateway's number.
+    await storage.updateEntryVersion(storage.entries[0]!.path, 7);
+    const rebased = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(rebased.partial).toBe(true);
+    expect(listAddedTimestamps(rebased)).toEqual([]);
+
+    await storage.updateEntryVersion(storage.entries[0]!.path, 1);
+    expect(
+      listAddedTimestamps((await ensureScopeLedger(storage, SCOPE))!),
+    ).toHaveLength(2);
+  });
+
+  it("2b. local #1 plus a downloaded older #12: the older version decides", async () => {
+    const storage = createMemoryDataStorage();
+    await ingest(storage, items("a", "b"), at(5));
+    await download(storage, at(2), items("a"), 12);
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.baseline).toBe(at(2));
+    expect(ledger.partial).toBe(true);
+    expect(listAddedTimestamps(ledger)).toEqual([at(5)]);
+  });
+
+  it("2c. the oldest version deleted while a sidecar exists", async () => {
+    const storage = createMemoryDataStorage();
+    await ingest(storage, items("a"), at(0));
+    await ingest(storage, items("a", "b"), at(1));
+    await ingest(storage, items("a", "b", "c"), at(2));
+    expect(await stored(storage)).not.toBeNull();
+    await storage.deleteVersion(SCOPE, at(0));
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    // Rebuilt: its baseline is now #2, which is not the scope's first.
+    expect(ledger.baseline).toBe(at(1));
+    expect(ledger.partial).toBe(true);
+    expect(listAddedTimestamps(ledger)).toEqual([at(2)]);
+  });
+
+  it("3. an earlier untrackable version keeps the first trackable one from counting", async () => {
+    const storage = createMemoryDataStorage();
+    await ingest(storage, { items: [{ name: "x" }, { name: "y" }] }, at(0));
+    await ingest(storage, items("a", "b", "c"), at(1));
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.baseline).toBe(at(1));
+    expect(ledger.partial).toBe(true);
+    expect(listAddedTimestamps(ledger)).toEqual([]);
+    // Later additions still count.
+    await ingest(storage, items("a", "b", "c", "d"), at(2));
+    expect(
+      listAddedTimestamps((await ensureScopeLedger(storage, SCOPE))!),
+    ).toEqual([at(2)]);
+  });
+
+  it("4. a scope with no baseline is never partial", async () => {
+    const storage = createMemoryDataStorage();
+    await put(
+      storage,
+      SCOPE,
+      at(0),
+      { $binary: { mimeType: "application/pdf" } },
+      100,
+      {
+        version: 9,
+      },
+    );
+    const ledger = (await ensureScopeLedger(storage, SCOPE))!;
+    expect(ledger.baseline).toBeNull();
+    expect(ledger.partial).toBeUndefined();
+  });
+
+  it("5. a transient read failure does not make the scope partial for good", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("a"));
+    await put(storage, SCOPE, at(1), items("a", "b"));
+    await put(storage, SCOPE, at(2), items("a", "b", "c"));
+    const readEnvelope = storage.readEnvelope.bind(storage);
+    let broken = true;
+    storage.readEnvelope = async (scope, collectedAt) => {
+      if (broken && collectedAt === at(0)) throw new Error("transient");
+      return readEnvelope(scope, collectedAt);
+    };
+    const clock = (hours: number) =>
+      new Date(Date.parse(at(0)) + hours * 3_600_000);
+
+    const first = (await ensureScopeLedger(storage, SCOPE, { now: clock(1) }))!;
+    // The oldest version is unreadable: its baseline is not known yet.
+    expect(first.partial).toBe(true);
+    expect((await stored(storage))?.truncated).toBeUndefined();
+
+    broken = false;
+    const healed = (await ensureScopeLedger(storage, SCOPE, {
+      now: clock(3),
+    }))!;
+    await storage.deleteFirstSeenLedger!(SCOPE);
+    const rebuilt = (await ensureScopeLedger(storage, SCOPE, {
+      now: clock(3),
+    }))!;
+    expect(healed.partial).toBeUndefined();
+    expect(listAddedTimestamps(healed)).toEqual(listAddedTimestamps(rebuilt));
+    expect(listAddedTimestamps(healed)).toEqual([at(0), at(1), at(2)]);
+  });
+
+  it("incremental reads equal a rebuild over random sequences with version rewrites, older downloads and oldest/newest deletes", async () => {
+    let seed = 99;
+    const random = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
+    for (let run = 0; run < 40; run += 1) {
+      const storage = createMemoryDataStorage();
+      const used = new Set<number>();
+      const slot = () => {
+        let n = 10 + Math.floor(random() * 60);
+        while (used.has(n)) n += 1;
+        used.add(n);
+        return n;
+      };
+      for (let step = 0; step < 9; step += 1) {
+        const roll = random();
+        const entries = [...storage.entries].sort(
+          (a, b) => Date.parse(a.collectedAt) - Date.parse(b.collectedAt),
+        );
+        if (roll < 0.3 || entries.length === 0) {
+          const n = slot();
+          await ingest(
+            storage,
+            items(...upTo(1 + Math.floor(random() * 6))),
+            at(n),
+          );
+        } else if (roll < 0.5) {
+          const n = slot();
+          await download(
+            storage,
+            at(n),
+            items(...upTo(1 + Math.floor(random() * 6))),
+            1 + Math.floor(random() * 12),
+          );
+        } else if (roll < 0.7) {
+          const entry = entries[Math.floor(random() * entries.length)]!;
+          await storage.updateEntryVersion(
+            entry.path,
+            1 + Math.floor(random() * 12),
+          );
+        } else if (roll < 0.8 && entries.length > 1) {
+          await storage.deleteVersion(SCOPE, entries[0]!.collectedAt);
+        } else if (roll < 0.9 && entries.length > 1) {
+          await storage.deleteVersion(
+            SCOPE,
+            entries[entries.length - 1]!.collectedAt,
+          );
+        }
+        const incremental = await ensureScopeLedger(storage, SCOPE);
+        const snapshot = await storage.readFirstSeenLedger!(SCOPE);
+        await storage.deleteFirstSeenLedger!(SCOPE);
+        const rebuilt = await ensureScopeLedger(storage, SCOPE);
+        if (snapshot) await storage.writeFirstSeenLedger!(SCOPE, snapshot);
+        if (!incremental || !rebuilt) {
+          expect(incremental).toEqual(rebuilt);
+          continue;
+        }
+        expect(incremental.partial).toBe(rebuilt.partial);
+        expect(incremental.baseline).toBe(rebuilt.baseline);
+        expect(incremental.latest).toEqual(rebuilt.latest);
+        expect(listAddedTimestamps(incremental).sort()).toEqual(
+          listAddedTimestamps(rebuilt).sort(),
         );
       }
     }

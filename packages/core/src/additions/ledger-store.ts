@@ -51,6 +51,8 @@ import {
 import { memoryRecordRulesFor } from "./record-rules.js";
 import { withScopeLock } from "./scope-lock.js";
 
+/** Index rows read from the oldest end to find the scope's oldest version(s). */
+const OLDEST_PAGE = 20;
 /** Most recent retained versions considered when a sidecar is rebuilt or caught up. */
 export const REBUILD_VERSION_LIMIT = 200;
 /** Envelope bytes (from the index) read for one scope in one rebuild or catch-up. */
@@ -170,6 +172,22 @@ function latestStillStored(
   );
 }
 
+/**
+ * Whether the baseline version still exists. A ledger whose baseline version
+ * was deleted still holds that version's ids and dates; it is rebuilt, as a
+ * rebuild would give.
+ */
+function baselineStillStored(
+  storage: DataStoragePort,
+  ledger: ScopeFirstSeenLedger,
+): boolean {
+  if (ledger.baseline === null) return true;
+  return (
+    storage.findEntry({ scope: ledger.scope, at: ledger.baseline })
+      ?.collectedAt === ledger.baseline
+  );
+}
+
 function isMarker(ledger: ScopeFirstSeenLedger): boolean {
   return ledger.skipped === "too_large" || ledger.skipped === "unreadable";
 }
@@ -208,18 +226,58 @@ async function foldEntries(
 }
 
 /**
- * Whether the oldest retained history looks like the scope's start.
- * Version numbers count a scope's versions from 1, so a higher number means
- * older versions existed and are gone (deleted, superseded, or never
- * downloaded here): the baseline is then not when its records arrived. A
- * version written after a deletion (`afterTombstoneVersion`) starts afresh.
- * A deleted version in the middle of the history leaves no such trace.
+ * Whether the scope's OLDEST retained version (by collectedAt) looks like its
+ * first. Version numbers count a scope's versions from 1, so a higher number
+ * means older versions existed and are gone (deleted, superseded, or never
+ * downloaded here, which is what a second device or a reinstall gets): its
+ * records did not arrive then. A version written after a deletion
+ * (`afterTombstoneVersion`) starts afresh. Among versions at the oldest
+ * instant the lowest number decides.
  */
-function startsAtFirst(retained: readonly IndexEntry[]): boolean {
-  // The lowest version number decides; versions at one instant are ordered by
-  // their string, which says nothing about their numbers.
-  const lowest = retained.reduce((a, b) => (b.version < a.version ? b : a));
+function oldestStartsAtFirst(oldestInstant: IndexEntry[]): boolean {
+  const lowest = oldestInstant.reduce((a, b) =>
+    b.version < a.version ? b : a,
+  );
   return lowest.version <= 1 || (lowest.afterTombstoneVersion ?? null) !== null;
+}
+
+/**
+ * Decide, from the index alone (no envelope is read), whether the ledger's
+ * baseline records have a known date: the baseline must be the oldest retained
+ * version, that version must be the scope's first, and the history must not
+ * have been truncated. Evaluated on every owner read, never persisted, so it
+ * follows version-number rewrites, older downloads and deletions exactly as a
+ * rebuild would.
+ */
+function baselineIsKnown(
+  storage: DataStoragePort,
+  ledger: ScopeFirstSeenLedger,
+): boolean {
+  if (ledger.baseline === null || ledger.skipped !== undefined) return true;
+  if (ledger.truncated === true) return false;
+  // The oldest versions are the tail of the newest-first listing.
+  const count = storage.countVersions(ledger.scope);
+  const tail = storage
+    .listVersions(ledger.scope, {
+      limit: OLDEST_PAGE,
+      offset: Math.max(0, count - OLDEST_PAGE),
+    })
+    .filter((entry) => !Number.isNaN(Date.parse(entry.collectedAt)));
+  if (tail.length === 0) return false;
+  const oldestMs = Math.min(...tail.map((e) => Date.parse(e.collectedAt)));
+  if (Date.parse(ledger.baseline) !== oldestMs) return false;
+  return oldestStartsAtFirst(
+    tail.filter((entry) => Date.parse(entry.collectedAt) === oldestMs),
+  );
+}
+
+/** The ledger as the owner's read reports it, with `partial` derived from the index. */
+function withDerivedPartial(
+  storage: DataStoragePort,
+  ledger: ScopeFirstSeenLedger,
+): ScopeFirstSeenLedger {
+  if (baselineIsKnown(storage, ledger)) return ledger;
+  return { ...ledger, partial: true };
 }
 
 /** The retry record for versions that could not be read, or null when there are none. */
@@ -238,7 +296,7 @@ function retryOf(
 
 /**
  * Rebuild a ledger from the scope's retained versions (see the cost rules in
- * the header). `partial` marks a ledger that covers only part of the
+ * the header). `truncated` marks a ledger that covers only part of the
  * history, so its baseline is the oldest version actually folded.
  */
 async function rebuild(
@@ -255,7 +313,7 @@ async function rebuild(
   if (folded === 0) {
     // Persisted so the next request does not repeat the failed work.
     return {
-      version: 3,
+      version: 4,
       scope,
       baseline: null,
       current: null,
@@ -267,10 +325,10 @@ async function rebuild(
   }
   const total = storage.countVersions(scope);
   return fold.finish({
-    // Not partial only when every version back to the oldest was folded AND
-    // the oldest looks like the scope's first (see `startsAtFirst`).
-    partial:
-      folded < total || (retained.length === total && !startsAtFirst(retained)),
+    // Truncated only when the window or the byte budget left versions out. A
+    // version that could not be read is not a truncation: it is retried (see
+    // `retry`), and the ledger converges once it is read or deleted.
+    truncated: selected.length < retained.length || retained.length < total,
     through: retained[0]!.collectedAt,
     retry: retryOf(failed, now),
   });
@@ -351,7 +409,7 @@ async function catchUp(
     Date.parse(beyond.collectedAt) > Date.parse(ledger.through);
   return (
     (await fold.finish({
-      partial: windowCut || selected.length < newer.length,
+      truncated: windowCut || selected.length < newer.length,
       through: selected.length > 0 ? retained[0]!.collectedAt : ledger.through,
       retry,
     })) ?? ledger
@@ -401,14 +459,7 @@ export async function recordStoredVersion(
       }
       const fold = new LedgerFold(existing, version.scope);
       await fold.add(version);
-      const next = await fold.finish({
-        through,
-        // A sidecar started from the only version is complete, unless that
-        // version is not the scope's first (its number is above 1).
-        ...(!existing && retained.length > 0 && !startsAtFirst(retained)
-          ? { partial: true }
-          : {}),
-      });
+      const next = await fold.finish({ through });
       if (!next) return;
       await storage.writeFirstSeenLedger!(version.scope, next);
       await dropIfScopeEmpty(storage, version.scope);
@@ -443,6 +494,7 @@ export async function ensureScopeLedger(
       if (
         existing &&
         (!latestStillStored(storage, existing) ||
+          !baselineStillStored(storage, existing) ||
           (isMarker(existing) && newerThan(retained, existing).length > 0))
       ) {
         existing = null;
@@ -458,7 +510,7 @@ export async function ensureScopeLedger(
           // Served from memory; the next read rebuilds it again.
         }
       }
-      return ledger;
+      return ledger ? withDerivedPartial(storage, ledger) : ledger;
     } catch {
       return null;
     }

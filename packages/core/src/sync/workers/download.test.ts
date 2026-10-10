@@ -7,7 +7,11 @@ import {
   downloadScopes,
   reconcileDeletedDataPoint,
 } from "./download.js";
-import { readScopeFirstSeenLedger } from "../../additions/first-added.js";
+import {
+  listAddedTimestamps,
+  readScopeFirstSeenLedger,
+} from "../../additions/first-added.js";
+import { ensureScopeLedger } from "../../additions/ledger-store.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
 import type {
   DataFileEnvelope,
@@ -1189,7 +1193,7 @@ describe("download worker", () => {
         await storage.readFirstSeenLedger!(REPOS),
       );
       expect(ledger).toEqual({
-        version: 3,
+        version: 4,
         scope: REPOS,
         baseline: V1,
         current: V2,
@@ -1201,6 +1205,34 @@ describe("download worker", () => {
           "repositories:i:https://x/c": [V2, V2],
         },
       });
+    });
+
+    it("a downloaded first version numbered above 1 starts partial; number 1 starts complete", async () => {
+      for (const [version, partial] of [
+        ["3", true],
+        ["1", undefined],
+      ] as const) {
+        const storage = createMemoryDataStorage();
+        const deps = makeMockDeps();
+        deps.storage = storage;
+        await downloadVersion(deps, version, V1, ["a", "b"]);
+        const ledger = (await ensureScopeLedger(storage, REPOS))!;
+        expect(ledger.partial).toBe(partial);
+        expect(listAddedTimestamps(ledger)).toHaveLength(partial ? 0 : 2);
+      }
+    });
+
+    it("an upload rebase of the local number turns a complete scope partial", async () => {
+      const storage = createMemoryDataStorage();
+      const deps = makeMockDeps();
+      deps.storage = storage;
+      await downloadVersion(deps, "1", V1, ["a", "b"]);
+      expect(
+        (await ensureScopeLedger(storage, REPOS))!.partial,
+      ).toBeUndefined();
+      // The upload worker's rebase calls exactly this port method.
+      await storage.updateEntryVersion(storage.entries[0]!.path, 6);
+      expect((await ensureScopeLedger(storage, REPOS))!.partial).toBe(true);
     });
 
     it("drops the sidecar when a gateway tombstone removes local versions", async () => {

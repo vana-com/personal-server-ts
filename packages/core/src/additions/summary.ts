@@ -147,7 +147,9 @@ export async function summarizeAdditions(
         trackedSince = scopeTrackedSince;
       }
     }
-    const partial = ledger.partial === true;
+    // Only a tracked scope can be partial: with no baseline there is nothing
+    // whose date could be unknown.
+    const partial = scopeTrackedSince !== null && ledger.partial === true;
     anyPartial ||= partial;
     scopes.push({
       scope: ledger.scope,

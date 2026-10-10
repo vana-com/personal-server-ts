@@ -423,7 +423,7 @@ describe("foldVersion", () => {
   it("starts a ledger at the first version, dating its records at that version", async () => {
     const ledger = await fold([version(T1, ["a", "b"])]);
     expect(ledger).toEqual({
-      version: 3,
+      version: 4,
       scope: "notes.entries",
       baseline: T1,
       current: T1,
@@ -895,7 +895,7 @@ describe("foldVersion", () => {
   });
 });
 
-describe("a partial ledger", () => {
+describe("a truncated ledger", () => {
   it("never moves its baseline back over versions it did not fold (reviewer: 107 false additions)", async () => {
     // Rebuilt from the newest versions only: day 100 is the oldest folded.
     const fold1 = new LedgerFold(null, "notes.entries");
@@ -911,16 +911,20 @@ describe("a partial ledger", () => {
         Array.from({ length: 108 }, (_, i) => `r${i}`),
       ),
     );
-    const partial = (await fold1.finish({ partial: true }))!;
-    expect(partial.partial).toBe(true);
-    expect(partial.baseline).toBe(iso(100));
+    const truncated = (await fold1.finish({ truncated: true }))!;
+    expect(truncated.truncated).toBe(true);
+    expect(truncated.baseline).toBe(iso(100));
+    // The owner's read marks it partial (derived from the index, not stored).
+    const partial = { ...truncated, partial: true as const };
     expect(listAddedTimestamps(partial)).toEqual([iso(101)]);
 
     // An older download arrives: it must not re-baseline the unfolded gap.
-    const withOlder = (await foldVersion(partial, version(iso(0), ["r0"])))!;
+    const withOlder = (await foldVersion(truncated, version(iso(0), ["r0"])))!;
     expect(withOlder.baseline).toBe(iso(100));
     expect(withOlder.records["items:i:r0"]).toEqual([iso(0), iso(101)]);
-    expect(listAddedTimestamps(withOlder)).toEqual([iso(101)]);
+    expect(
+      listAddedTimestamps({ ...withOlder, partial: true as const }),
+    ).toEqual([iso(101)]);
   });
 
   it("a complete ledger still lowers its baseline for an older version", async () => {
@@ -943,7 +947,7 @@ describe("foldVersions", () => {
 
 describe("readScopeFirstSeenLedger", () => {
   const valid: ScopeFirstSeenLedger = {
-    version: 3,
+    version: 4,
     scope: "notes.entries",
     baseline: T1,
     current: T2,
@@ -965,9 +969,9 @@ describe("readScopeFirstSeenLedger", () => {
         skipped,
       );
     }
-    expect(readScopeFirstSeenLedger({ ...valid, partial: true })?.partial).toBe(
-      true,
-    );
+    expect(
+      readScopeFirstSeenLedger({ ...valid, truncated: true })?.truncated,
+    ).toBe(true);
   });
 
   it.each<[string, unknown]>([
@@ -987,7 +991,8 @@ describe("readScopeFirstSeenLedger", () => {
       { ...valid, latest: { collectedAt: T2, total: -1 } },
     ],
     ["a bad skipped reason", { ...valid, skipped: "x" }],
-    ["a bad partial flag", { ...valid, partial: false }],
+    ["a bad truncated flag", { ...valid, truncated: false }],
+    ["a version-3 sidecar (partial meant truncated)", { ...valid, version: 3 }],
     ["records as an array", { ...valid, records: [] }],
     ["a record that is not a pair", { ...valid, records: { a: [T1] } }],
     [
