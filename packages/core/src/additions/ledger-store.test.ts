@@ -581,26 +581,130 @@ describe("edges (F7)", () => {
     );
   });
 
-  it("retries an unreadable newest version on later reads instead of skipping it", async () => {
-    const storage = createMemoryDataStorage();
-    await put(storage, SCOPE, at(0), items("a"));
-    await ensureScopeLedger(storage, SCOPE);
-    await put(storage, SCOPE, at(1), items("a", "b"));
-    await put(storage, SCOPE, at(2), items("a", "b", "c"));
-    const readEnvelope = storage.readEnvelope.bind(storage);
-    let broken = true;
-    storage.readEnvelope = async (scope, collectedAt) => {
-      if (broken && collectedAt === at(2)) throw new Error("not yet");
-      return readEnvelope(scope, collectedAt);
-    };
+  describe("an unreadable version is retried cheaply (P2)", () => {
+    const HOUR_MS = 60 * 60 * 1000;
+    const clock = (hours: number) =>
+      new Date(Date.parse(at(0)) + hours * HOUR_MS);
 
-    const first = await ensureScopeLedger(storage, SCOPE);
-    expect(first?.latest.collectedAt).toBe(at(1));
-    expect(first?.through).toBe(at(1));
+    /** A scope whose version 2 cannot be read until `fix()` is called. */
+    async function brokenScope() {
+      const storage = createMemoryDataStorage();
+      await put(storage, SCOPE, at(0), items("a"));
+      await ensureScopeLedger(storage, SCOPE, { now: clock(0) });
+      await put(storage, SCOPE, at(1), items("a", "b"));
+      await put(storage, SCOPE, at(2), items("a", "b", "c"));
+      const readEnvelope = storage.readEnvelope.bind(storage);
+      let broken = true;
+      let reads = 0;
+      storage.readEnvelope = async (scope, collectedAt) => {
+        reads += 1;
+        if (broken && collectedAt === at(2)) throw new Error("not yet");
+        return readEnvelope(scope, collectedAt);
+      };
+      return {
+        storage,
+        fix: () => {
+          broken = false;
+        },
+        reads: () => reads,
+        resetReads: () => {
+          reads = 0;
+        },
+      };
+    }
 
-    broken = false;
-    const second = await ensureScopeLedger(storage, SCOPE);
-    expect(second?.latest.collectedAt).toBe(at(2));
-    expect(second?.records["items:i:c"]).toEqual([at(2), at(2)]);
+    it("(a) reads only on the first of three polls within the hour", async () => {
+      const scope = await brokenScope();
+      const first = await ensureScopeLedger(scope.storage, SCOPE, {
+        now: clock(1),
+      });
+      expect(first?.latest.collectedAt).toBe(at(1));
+      expect(first?.retry).toEqual({
+        versions: [at(2)],
+        attemptedAt: clock(1).toISOString(),
+      });
+      expect(first?.through).toBe(at(2));
+      expect(scope.reads()).toBeGreaterThan(0);
+
+      scope.resetReads();
+      for (const minutes of [1, 30, 59]) {
+        const again = await ensureScopeLedger(scope.storage, SCOPE, {
+          now: new Date(clock(1).getTime() + minutes * 60_000),
+        });
+        expect(again?.latest.collectedAt).toBe(at(1));
+      }
+      expect(scope.reads()).toBe(0);
+    });
+
+    it("(b) retries once after an hour, and not again straight after", async () => {
+      const scope = await brokenScope();
+      await ensureScopeLedger(scope.storage, SCOPE, { now: clock(1) });
+      scope.resetReads();
+
+      await ensureScopeLedger(scope.storage, SCOPE, { now: clock(2) });
+      expect(scope.reads()).toBe(1);
+      const stored = await scope.storage.readFirstSeenLedger!(SCOPE);
+      expect(
+        (stored as { retry: { attemptedAt: string } }).retry.attemptedAt,
+      ).toBe(clock(2).toISOString());
+      await ensureScopeLedger(scope.storage, SCOPE, { now: clock(2.5) });
+      expect(scope.reads()).toBe(1);
+    });
+
+    it("(c) converges to a full rebuild once readable, and the marker clears", async () => {
+      const scope = await brokenScope();
+      await ensureScopeLedger(scope.storage, SCOPE, { now: clock(1) });
+      scope.fix();
+      const healed = (await ensureScopeLedger(scope.storage, SCOPE, {
+        now: clock(3),
+      }))!;
+      expect(healed.retry).toBeUndefined();
+      expect(healed.latest.collectedAt).toBe(at(2));
+
+      await scope.storage.deleteFirstSeenLedger!(SCOPE);
+      const rebuilt = (await ensureScopeLedger(scope.storage, SCOPE, {
+        now: clock(3),
+      }))!;
+      expect({ ...healed, through: undefined }).toEqual({
+        ...rebuilt,
+        through: undefined,
+      });
+    });
+
+    it("(c) converges too when the unreadable version is deleted, without reading", async () => {
+      const scope = await brokenScope();
+      await ensureScopeLedger(scope.storage, SCOPE, { now: clock(1) });
+      await scope.storage.deleteVersion(SCOPE, at(2));
+      scope.resetReads();
+      const after = (await ensureScopeLedger(scope.storage, SCOPE, {
+        now: clock(1.1),
+      }))!;
+      expect(after.retry).toBeUndefined();
+      expect(scope.reads()).toBe(0);
+      expect(after.latest.collectedAt).toBe(at(1));
+    });
+
+    it("(d) a version arriving after the unreadable one is folded on the write with zero reads", async () => {
+      const scope = await brokenScope();
+      await ensureScopeLedger(scope.storage, SCOPE, { now: clock(1) });
+      scope.resetReads();
+
+      await ingestDataContract({
+        storage: scope.storage,
+        scopeParam: SCOPE,
+        body: items("a", "b", "d"),
+        collectedAt: at(3),
+        status: "stored",
+      });
+      expect(scope.reads()).toBe(0);
+      const ledger = (await stored(scope.storage))!;
+      expect(ledger.latest).toEqual({ collectedAt: at(3), total: 3 });
+      expect(ledger.records["items:i:d"]).toEqual([at(3), at(3)]);
+      expect(ledger.retry?.versions).toEqual([at(2)]);
+
+      // A poll with nothing new reads nothing, even with the version pending.
+      await ensureScopeLedger(scope.storage, SCOPE, { now: clock(1.2) });
+      expect(scope.reads()).toBe(0);
+    });
   });
 });

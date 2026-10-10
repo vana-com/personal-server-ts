@@ -19,8 +19,10 @@
  *    of envelopes (index `sizeBytes`), oldest folded first, yielding to the
  *    event loop between versions. A scope whose rules track nothing is not
  *    read at all.
- *  - Negative outcomes (too large, unreadable) are persisted as a ledger with
- *    a `skipped` reason, so they are not retried on every request.
+ *  - Negative outcomes (too large, nothing readable) are persisted as a ledger
+ *    with a `skipped` reason, so they are not retried on every request. A
+ *    single unreadable version is remembered in the ledger's `retry` list and
+ *    read again at most once per hour; in between nothing is read.
  *
  * Guarantee, in order of strength:
  *  1. Updates and deletions of one scope are serialized inside this process
@@ -39,6 +41,8 @@ import type { DataStoragePort } from "../ports/index.js";
 import type { IndexEntry } from "../storage/index/types.js";
 import {
   LedgerFold,
+  MAX_RETRY_VERSIONS,
+  RETRY_UNREADABLE_MS,
   readScopeFirstSeenLedger,
   yieldToEventLoop,
   type ScopeFirstSeenLedger,
@@ -55,6 +59,11 @@ export const REBUILD_BYTE_BUDGET = 256 * 1024 * 1024;
 export interface LedgerStoreOptions {
   /** Override `REBUILD_BYTE_BUDGET`. */
   byteBudget?: number;
+  /**
+   * The caller's clock, used to space the retries of unreadable versions.
+   * Defaults to the current time.
+   */
+  now?: Date;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -198,28 +207,18 @@ async function foldEntries(
   return { folded, failed };
 }
 
-/**
- * How far a fold is complete. Without failures it is the newest retained
- * version; an unreadable version holds the marker back to the newest version
- * before it, so later reads try that version again instead of skipping it.
- */
-function throughAfter(
-  retained: readonly IndexEntry[],
-  entries: readonly IndexEntry[],
+/** The retry record for versions that could not be read, or null when there are none. */
+function retryOf(
   failed: readonly IndexEntry[],
-  fallback: string | null,
-): string | undefined {
-  if (failed.length === 0) return retained[0]!.collectedAt;
-  const oldestFailedMs = Math.min(
-    ...failed.map((entry) => Date.parse(entry.collectedAt)),
-  );
-  const failedSet = new Set(failed);
-  const before = entries.filter(
-    (entry) =>
-      !failedSet.has(entry) && Date.parse(entry.collectedAt) < oldestFailedMs,
-  );
-  // `entries` is newest first.
-  return before[0]?.collectedAt ?? fallback ?? undefined;
+  now: Date,
+): ScopeFirstSeenLedger["retry"] | null {
+  if (failed.length === 0) return null;
+  return {
+    versions: failed
+      .slice(0, MAX_RETRY_VERSIONS)
+      .map((entry) => entry.collectedAt),
+    attemptedAt: now.toISOString(),
+  };
 }
 
 /**
@@ -232,6 +231,7 @@ async function rebuild(
   scope: string,
   retained: readonly IndexEntry[],
   budget: number,
+  now: Date,
 ): Promise<ScopeFirstSeenLedger | null> {
   if (retained.length === 0) return null;
   const selected = withinBudget(scope, retained, budget);
@@ -253,28 +253,77 @@ async function rebuild(
   const total = storage.countVersions(scope);
   return fold.finish({
     partial: folded < total,
-    through: throughAfter(retained, selected, failed, null),
+    through: retained[0]!.collectedAt,
+    retry: retryOf(failed, now),
   });
 }
 
 /**
- * Catch a ledger up on the retained versions newer than its `through` marker
- * (the newest ones within the byte budget), refolding any that were already
- * folded: folding is idempotent. Only the owner's read calls this.
+ * Catch a ledger up for the owner's read. New versions (newer than `through`)
+ * are folded; a version that cannot be read is remembered in `retry` and
+ * tried again at most once per `RETRY_UNREADABLE_MS`. When nothing is new and
+ * no retry is due, nothing is read at all.
  */
 async function catchUp(
   storage: DataStoragePort,
   ledger: ScopeFirstSeenLedger,
   retained: readonly IndexEntry[],
   budget: number,
+  now: Date,
 ): Promise<ScopeFirstSeenLedger> {
   const newer = newerThan(retained, ledger);
   const selected = withinBudget(ledger.scope, newer, budget);
-  if (selected.length === 0) return ledger;
+
+  // Unreadable versions still stored; the deleted ones are forgotten.
+  const pending = (ledger.retry?.versions ?? []).filter((version) =>
+    retained.some((entry) => entry.collectedAt === version),
+  );
+  const due =
+    ledger.retry !== undefined &&
+    pending.length > 0 &&
+    now.getTime() - Date.parse(ledger.retry.attemptedAt) >= RETRY_UNREADABLE_MS;
+  const retryEntries = due
+    ? withinBudget(
+        ledger.scope,
+        retained.filter((entry) => pending.includes(entry.collectedAt)),
+        budget,
+      )
+    : [];
+
+  const forgotten = pending.length !== (ledger.retry?.versions.length ?? 0);
+  if (selected.length === 0 && retryEntries.length === 0 && !forgotten) {
+    return ledger;
+  }
+
   const fold = new LedgerFold(ledger);
-  const { failed } = await foldEntries(storage, ledger.scope, selected, fold);
+  const failedNew =
+    selected.length > 0
+      ? (await foldEntries(storage, ledger.scope, selected, fold)).failed
+      : [];
+  const failedRetry =
+    retryEntries.length > 0
+      ? (await foldEntries(storage, ledger.scope, retryEntries, fold)).failed
+      : [];
+
+  const stillFailing = due
+    ? failedRetry.map((entry) => entry.collectedAt)
+    : pending;
+  const versions = [
+    ...stillFailing,
+    ...failedNew.map((entry) => entry.collectedAt),
+  ].slice(0, MAX_RETRY_VERSIONS);
+  const attempted = due || failedNew.length > 0;
+  const retry =
+    versions.length === 0
+      ? null
+      : {
+          versions,
+          attemptedAt: attempted
+            ? now.toISOString()
+            : ledger.retry!.attemptedAt,
+        };
   // Only a window cut (more versions than the index window shows) or the
-  // byte budget leaves versions unfolded.
+  // byte budget leaves new versions unfolded.
   const beyond = storage.listVersions(ledger.scope, {
     limit: 1,
     offset: retained.length,
@@ -285,7 +334,8 @@ async function catchUp(
   return (
     (await fold.finish({
       partial: windowCut || selected.length < newer.length,
-      through: throughAfter(retained, selected, failed, ledger.through),
+      through: selected.length > 0 ? retained[0]!.collectedAt : ledger.through,
+      retry,
     })) ?? ledger
   );
 }
@@ -356,6 +406,7 @@ export async function ensureScopeLedger(
   options: LedgerStoreOptions = {},
 ): Promise<ScopeFirstSeenLedger | null> {
   const budget = options.byteBudget ?? REBUILD_BYTE_BUDGET;
+  const now = options.now ?? new Date();
   return withScopeLock(scope, async () => {
     try {
       const retained = retainedVersions(storage, scope);
@@ -372,8 +423,8 @@ export async function ensureScopeLedger(
         existing = null;
       }
       const ledger = existing
-        ? await catchUp(storage, existing, retained, budget)
-        : await rebuild(storage, scope, retained, budget);
+        ? await catchUp(storage, existing, retained, budget, now)
+        : await rebuild(storage, scope, retained, budget, now);
       if (ledger && ledger !== existing && storage.writeFirstSeenLedger) {
         try {
           await storage.writeFirstSeenLedger(scope, ledger);

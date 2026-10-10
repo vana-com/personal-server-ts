@@ -798,6 +798,28 @@ describe("foldVersion", () => {
       expect(listAddedTimestamps(back)).toEqual([]);
     }, 120_000);
 
+    it("KNOWN LIMITATION, not a guarantee: dated (not pre-tracking) records can be evicted and re-dated near the cap", async () => {
+      // Day 1: a one-record baseline. Day 2: the owner's 5,001 records, which
+      // are dated, so NOT pre-tracking. Day 3: a version of 199,000 other ids
+      // brings the ledger to the cap; the owner's records are absent from it
+      // and can be evicted. Day 4: the owner imports the same 5,001 again.
+      const owner = ids("owner", 5_001);
+      const ledger = (await fold([
+        v(1, ids("seed", 1)),
+        v(2, owner),
+        v(3, ids("junk", 199_000)),
+      ]))!;
+      const kept = Object.keys(ledger.records).filter((key) =>
+        key.startsWith("items:i:owner"),
+      ).length;
+      expect(kept).toBe(999);
+      const again = (await foldVersion(ledger, v(4, owner)))!;
+      const added = listAddedTimestamps(again);
+      // 999 kept their day-2 date; 4,002 were forgotten and are dated as new.
+      expect(added.filter((when) => when === at(2))).toHaveLength(999);
+      expect(added.filter((when) => when === at(4))).toHaveLength(4_002);
+    }, 120_000);
+
     it("evicts the most recently first-seen absent records first", async () => {
       const ledger = (await fold([
         v(1, []),

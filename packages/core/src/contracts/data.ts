@@ -436,7 +436,9 @@ export async function summarizeDataAdditionsContract(
   // One scope at a time: only one ledger is in memory at once.
   async function* ledgers(): AsyncGenerator<ScopeFirstSeenLedger> {
     for (const summary of scopes) {
-      const ledger = await ensureScopeLedger(input.storage, summary.scope);
+      const ledger = await ensureScopeLedger(input.storage, summary.scope, {
+        now: input.now,
+      });
       if (ledger) yield ledger;
     }
   }

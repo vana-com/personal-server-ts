@@ -32,6 +32,10 @@ export const MAX_ID_LENGTH = 64;
 export const MAX_COLLECTION_LENGTH = 64;
 /** A record absent from the newest tracked version is dropped after this long. */
 export const PRUNE_AFTER_MS = 90 * 24 * 60 * 60 * 1000;
+/** An unreadable version is read again at most this often. */
+export const RETRY_UNREADABLE_MS = 60 * 60 * 1000;
+/** At most this many unreadable versions are remembered for retry. */
+export const MAX_RETRY_VERSIONS = 20;
 /** Items processed between two yields to the event loop. */
 export const YIELD_EVERY = 2_000;
 
@@ -71,6 +75,14 @@ export interface ScopeFirstSeenLedger {
    * `/additions` read knows what to catch up on.
    */
   through: string;
+  /**
+   * Versions that could not be read when they were folded, and when the last
+   * attempt was made. They are retried at most once per `RETRY_UNREADABLE_MS`
+   * and meanwhile the ledger is served as it is (the numbers of the newest
+   * readable version) without reading anything. `through` has already moved
+   * past them, so a poll with nothing new reads nothing.
+   */
+  retry?: { versions: string[]; attemptedAt: string };
   /** Set when no per-record keys are kept (see `LedgerSkipReason`); `records` is then empty. */
   skipped?: LedgerSkipReason;
   /**
@@ -414,6 +426,7 @@ export class LedgerFold {
   private current: string | null = null;
   private latest: ScopeFirstSeenLedger["latest"] | null = null;
   private through: string | null = null;
+  private retry: ScopeFirstSeenLedger["retry"];
   private skipped: LedgerSkipReason | undefined;
   private partial = false;
   // A Map keeps arbitrary keys (including "__proto__") out of the prototype
@@ -427,6 +440,12 @@ export class LedgerFold {
     this.current = ledger.current;
     this.latest = { ...ledger.latest };
     this.through = ledger.through;
+    this.retry = ledger.retry
+      ? {
+          versions: [...ledger.retry.versions],
+          attemptedAt: ledger.retry.attemptedAt,
+        }
+      : undefined;
     this.skipped = ledger.skipped;
     this.partial = ledger.partial === true;
     // Copied, never shared: the input ledger is not mutated.
@@ -519,10 +538,11 @@ export class LedgerFold {
   /**
    * Make room for `need` records by dropping some that are absent: not in the
    * newest tracked version, not in the version being folded, and not
-   * pre-tracking (first seen at or before the baseline). Established records
-   * therefore stay while a flood of new ids displaces itself. Among the
-   * evictable ones the most recently first seen go first. A record dropped
-   * this way and seen again is dated as new. Returns how many were dropped.
+   * pre-tracking (first seen at or before the baseline). Pre-tracking records
+   * are never dropped. Dated records that are absent CAN be dropped (and are
+   * dated as new if they return): that needs a scope near the cap, and
+   * whoever can write the scope can provoke it. Among the evictable ones the
+   * most recently first seen go first. Returns how many were dropped.
    */
   private async evict(
     need: number,
@@ -571,11 +591,17 @@ export class LedgerFold {
    * `through` overrides the completeness marker (see `ScopeFirstSeenLedger`).
    */
   async finish(
-    options: { partial?: boolean; through?: string } = {},
+    options: {
+      partial?: boolean;
+      through?: string;
+      /** `null` clears the retry list; undefined keeps it. */
+      retry?: ScopeFirstSeenLedger["retry"] | null;
+    } = {},
   ): Promise<ScopeFirstSeenLedger | null> {
     if (this.scope === null || this.latest === null) return null;
     await this.prune();
     const partial = this.partial || options.partial === true;
+    const retry = options.retry === undefined ? this.retry : options.retry;
     return {
       version: 3,
       scope: this.scope,
@@ -583,6 +609,7 @@ export class LedgerFold {
       current: this.current,
       latest: this.latest,
       through: options.through ?? this.through ?? this.latest.collectedAt,
+      ...(retry ? { retry } : {}),
       ...(this.skipped ? { skipped: this.skipped } : {}),
       ...(partial ? { partial: true as const } : {}),
       records: Object.fromEntries(this.records),
@@ -705,9 +732,32 @@ export function readScopeFirstSeenLedger(
     }
     if (!isRecord(latest) || !parseableString(latest.collectedAt)) return null;
     if (!parseableString(through)) return null;
-    // Completeness cannot run ahead of the newest folded version: such a
-    // marker would suppress the catch-up it exists to trigger.
-    if (Date.parse(through) > Date.parse(latest.collectedAt)) return null;
+    let retryValue: ScopeFirstSeenLedger["retry"];
+    if (value.retry !== undefined) {
+      const retry = value.retry;
+      if (
+        !isRecord(retry) ||
+        !Array.isArray(retry.versions) ||
+        retry.versions.length === 0 ||
+        retry.versions.length > MAX_RETRY_VERSIONS ||
+        !retry.versions.every(parseableString) ||
+        !parseableString(retry.attemptedAt)
+      ) {
+        return null;
+      }
+      retryValue = {
+        versions: [...(retry.versions as string[])],
+        attemptedAt: retry.attemptedAt,
+      };
+    }
+    // Completeness cannot run ahead of the newest version the ledger knows
+    // (folded, or remembered as unreadable): such a marker would suppress the
+    // catch-up it exists to trigger.
+    const newestKnown = Math.max(
+      Date.parse(latest.collectedAt),
+      ...(retryValue?.versions.map((version) => Date.parse(version)) ?? []),
+    );
+    if (Date.parse(through) > newestKnown) return null;
     const total = latest.total;
     if (typeof total !== "number" || !Number.isInteger(total) || total < 0) {
       return null;
@@ -731,6 +781,7 @@ export function readScopeFirstSeenLedger(
       current,
       latest: { collectedAt: latest.collectedAt, total },
       through,
+      ...(retryValue ? { retry: retryValue } : {}),
       ...(skipped ? { skipped: skipped as LedgerSkipReason } : {}),
       ...(partial ? { partial: true as const } : {}),
       records: Object.fromEntries(copied),
