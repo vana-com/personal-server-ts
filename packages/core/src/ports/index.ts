@@ -153,6 +153,17 @@ export interface DataStoragePort extends RuntimeStoragePort {
     manifest: DataBlockManifest,
     blocks: DataScopeBlock[],
   ): Promise<void>;
+  /**
+   * The per-scope first-seen ledger (see `additions/first-added.ts`), or null
+   * when none is stored. A sidecar derived from the scope's stored versions:
+   * it is not a version, never appears in the index or a listing, is never
+   * uploaded by sync and is never served by a data, block, MCP, job or
+   * derivative read. Opaque to storage; callers validate it on read.
+   */
+  readFirstSeenLedger?(scope: string): Promise<unknown | null>;
+  writeFirstSeenLedger?(scope: string, ledger: unknown): Promise<void>;
+  /** Idempotent. `deleteScope` also removes the scope's ledger. */
+  deleteFirstSeenLedger?(scope: string): Promise<void>;
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   /** Highest stored DPv2 `version` for a scope; 0 if none. */

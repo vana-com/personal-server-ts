@@ -116,7 +116,15 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
   const envelopes = new Map<string, DataFileEnvelope>();
   const blockManifests = new Map<string, DataBlockManifest>();
   const blockPayloads = new Map<string, DataScopeBlock>();
+  const firstSeenLedgers = new Map<string, unknown>();
   let nextId = 1;
+
+  function dropEmptyLedger(scope: string): void {
+    for (const entry of entries.values()) {
+      if (entry.scope === scope) return;
+    }
+    firstSeenLedgers.delete(scope);
+  }
 
   function envelopeKey(scope: string, collectedAt: string): string {
     return `${scope}\n${collectedAt}`;
@@ -365,7 +373,20 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       return true;
     },
 
+    async readFirstSeenLedger(scope) {
+      return structuredClone(firstSeenLedgers.get(scope) ?? null);
+    },
+
+    async writeFirstSeenLedger(scope, ledger) {
+      firstSeenLedgers.set(scope, structuredClone(ledger));
+    },
+
+    async deleteFirstSeenLedger(scope) {
+      firstSeenLedgers.delete(scope);
+    },
+
     async deleteScope(scope) {
+      firstSeenLedgers.delete(scope);
       let deleted = 0;
       for (const [path, entry] of entries.entries()) {
         if (entry.scope === scope) {
@@ -396,6 +417,7 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
               blockPayloads.delete(payloadKey);
             }
           }
+          dropEmptyLedger(entry.scope);
           return true;
         }
       }
@@ -414,6 +436,7 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
               blockPayloads.delete(payloadKey);
             }
           }
+          dropEmptyLedger(entry.scope);
           return true;
         }
       }
@@ -426,7 +449,17 @@ export function createMemoryPsLitePersistence(
   seed?: PsLitePersistedStorageState,
 ): PsLitePersistenceAdapter {
   let state = seed ? clone(seed) : null;
+  const aux = new Map<string, unknown>();
   return {
+    async readAux(name) {
+      return aux.has(name) ? clone(aux.get(name)) : null;
+    },
+    async writeAux(name, value) {
+      aux.set(name, clone(value));
+    },
+    async deleteAux(name) {
+      aux.delete(name);
+    },
     async read() {
       return state ? clone(state) : null;
     },

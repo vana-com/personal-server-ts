@@ -31,6 +31,7 @@ import {
 } from "../issues.js";
 import { downloadRetryKey, type DownloadRetryMemory } from "../retry-memory.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
+import { recordStoredVersion } from "../../additions/ledger-store.js";
 
 /**
  * Minimal diagnostics hook — keeps core free of lite-specific imports.
@@ -447,6 +448,14 @@ export async function downloadOne(
   }
   diagnostics?.onIndexEnd(record.id, envelope.scope);
 
+  // Fold the stored version into the scope's first-seen sidecar. Best-effort
+  // and after indexing: a failure leaves the sidecar to be rebuilt later.
+  await recordStoredVersion(storage, {
+    scope: envelope.scope,
+    collectedAt: envelope.collectedAt,
+    data: envelope.data,
+  });
+
   logger.info(
     { dataPointId: record.id, scope: envelope.scope, path: relativePath },
     "Downloaded and indexed data point",
@@ -718,6 +727,16 @@ export async function reconcileDeletedDataPoint(
   }
   if (orphanKeys.length > 0 && deps.pendingBlobDeletions) {
     await deps.pendingBlobDeletions.add(orphanKeys);
+  }
+  // The first-seen sidecar was derived from versions that no longer exist.
+  // Dropping it lets the next write or additions read rebuild it from what
+  // this replica retains (a re-add above the tombstone included).
+  if (removed > 0 || kept === 0) {
+    try {
+      await storage.deleteFirstSeenLedger?.(record.scope);
+    } catch {
+      // Derived data; a stale sidecar is rebuilt on the next scope delete.
+    }
   }
 
   if (removed > 0 || kept > 0) {

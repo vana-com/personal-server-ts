@@ -6,6 +6,7 @@
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { DataStoragePort } from "../ports/index.js";
 import type { IndexEntry } from "../storage/index/types.js";
+import { withScopeLock } from "../additions/scope-lock.js";
 
 export interface MemoryDataStorage extends DataStoragePort {
   /** Every index row, oldest first (test inspection). */
@@ -15,6 +16,8 @@ export interface MemoryDataStorage extends DataStoragePort {
 export function createMemoryDataStorage(): MemoryDataStorage {
   const entries: IndexEntry[] = [];
   const envelopes = new Map<string, DataFileEnvelope>();
+  // Per-scope first-seen ledgers: beside the data, never an index row.
+  const ledgers = new Map<string, unknown>();
   let nextId = 1;
 
   const key = (scope: string, collectedAt: string) =>
@@ -37,6 +40,10 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       removed += 1;
     }
     return removed;
+  };
+
+  const dropEmptyLedger = (scope: string) => {
+    if (!entries.some((entry) => entry.scope === scope)) ledgers.delete(scope);
   };
 
   return {
@@ -153,26 +160,55 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       entry.version = version;
       return true;
     },
+    async readFirstSeenLedger(scope) {
+      return structuredClone(ledgers.get(scope) ?? null);
+    },
+    async writeFirstSeenLedger(scope, ledger) {
+      ledgers.set(scope, structuredClone(ledger));
+    },
+    async deleteFirstSeenLedger(scope) {
+      ledgers.delete(scope);
+    },
+    // Deletions run under the scope's sidecar lock, and the sidecar goes with
+    // the scope's last version, so a delete never leaves a stale ledger.
     async deleteScope(scope) {
-      return remove((entry) => entry.scope === scope);
+      return withScopeLock(scope, async () => {
+        ledgers.delete(scope);
+        return remove((entry) => entry.scope === scope);
+      });
     },
     async deleteByFileId(fileId) {
-      return remove((entry) => entry.fileId === fileId) > 0;
+      const scope = entries.find((entry) => entry.fileId === fileId)?.scope;
+      if (scope === undefined) return false;
+      return withScopeLock(scope, async () => {
+        const removed = remove((entry) => entry.fileId === fileId) > 0;
+        dropEmptyLedger(scope);
+        return removed;
+      });
     },
     async deleteVersion(scope, collectedAt) {
-      return (
-        remove(
-          (entry) => entry.scope === scope && entry.collectedAt === collectedAt,
-        ) > 0
-      );
+      return withScopeLock(scope, async () => {
+        const removed =
+          remove(
+            (entry) =>
+              entry.scope === scope && entry.collectedAt === collectedAt,
+          ) > 0;
+        dropEmptyLedger(scope);
+        return removed;
+      });
     },
-    dropUnsyncedEntry(path) {
-      const index = entries.findIndex(
-        (entry) => entry.path === path && entry.dataPointId === null,
+    async dropUnsyncedEntry(path) {
+      const entry = entries.find(
+        (row) => row.path === path && row.dataPointId === null,
       );
-      if (index === -1) return false;
-      entries.splice(index, 1);
-      return true;
+      if (!entry) return false;
+      return withScopeLock(entry.scope, async () => {
+        const index = entries.indexOf(entry);
+        if (index === -1) return false;
+        entries.splice(index, 1);
+        dropEmptyLedger(entry.scope);
+        return true;
+      });
     },
   };
 }

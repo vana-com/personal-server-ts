@@ -18,9 +18,20 @@ import {
   stampLineage,
   type StoredLineage,
 } from "../lineage/lineage.js";
+import {
+  ensureScopeLedger,
+  recordStoredVersion,
+} from "../additions/ledger-store.js";
+import {
+  InvalidTimezoneError,
+  summarizeAdditions,
+  validateTimezone,
+  type AdditionsSummary,
+} from "../additions/summary.js";
+import type { ScopeFirstSeenLedger } from "../additions/first-added.js";
 
 export type DataContractErrorCode =
-  "INVALID_SCOPE" | "INVALID_BODY" | "NOT_FOUND";
+  "INVALID_SCOPE" | "INVALID_BODY" | "INVALID_QUERY" | "NOT_FOUND";
 
 export interface DataContractErrorBody {
   error: DataContractErrorCode;
@@ -239,6 +250,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 const VISIBILITY_PAGE_SIZE = 200;
 
+/**
+ * Every scope whose latest entry passes `isVisible` (all of them when no
+ * filter is given). Walks the whole listing because the index cannot filter
+ * by tombstone; a scope with no latest entry is kept (nothing covers it).
+ */
+async function collectScopes(
+  storage: DataStoragePort,
+  scopePrefix: string | undefined,
+  isVisible: DataVisibilityFilter | undefined,
+): Promise<ScopeSummary[]> {
+  const scopes: ScopeSummary[] = [];
+  for (let scan = 0; ; scan += VISIBILITY_PAGE_SIZE) {
+    const batch = storage.listScopes({
+      scopePrefix,
+      limit: VISIBILITY_PAGE_SIZE,
+      offset: scan,
+    });
+    for (const summary of batch.scopes) {
+      if (!isVisible) {
+        scopes.push(summary);
+        continue;
+      }
+      const latest = storage.findEntry({
+        scope: summary.scope,
+        at: summary.latestCollectedAt,
+      });
+      if (!latest || (await isVisible(summary.scope, latest))) {
+        scopes.push(summary);
+      }
+    }
+    if (batch.scopes.length < VISIBILITY_PAGE_SIZE) break;
+  }
+  return scopes;
+}
+
 export async function listDataScopesContract(
   input: ListDataScopesContractInput,
 ): Promise<ListDataScopesContractResult> {
@@ -249,24 +295,11 @@ export async function listDataScopesContract(
   if (input.isVisible) {
     // Filtered listing: walk every scope so the page and the total both
     // describe the visible set (the index cannot filter by tombstone).
-    const visible: ScopeSummary[] = [];
-    for (let scan = 0; ; scan += VISIBILITY_PAGE_SIZE) {
-      const batch = input.storage.listScopes({
-        scopePrefix: input.scopePrefix,
-        limit: VISIBILITY_PAGE_SIZE,
-        offset: scan,
-      });
-      for (const summary of batch.scopes) {
-        const latest = input.storage.findEntry({
-          scope: summary.scope,
-          at: summary.latestCollectedAt,
-        });
-        if (!latest || (await input.isVisible(summary.scope, latest))) {
-          visible.push(summary);
-        }
-      }
-      if (batch.scopes.length < VISIBILITY_PAGE_SIZE) break;
-    }
+    const visible = await collectScopes(
+      input.storage,
+      input.scopePrefix,
+      input.isVisible,
+    );
     total = visible.length;
     page = visible.slice(offset, offset + limit);
   } else {
@@ -357,6 +390,65 @@ export async function listDataVersionsContract(
       offset,
     },
   };
+}
+
+export interface SummarizeDataAdditionsContractInput {
+  storage: DataStoragePort;
+  isVisible?: DataVisibilityFilter;
+  /** IANA timezone, e.g. "America/Toronto". */
+  timezone: string;
+  /** Number of local calendar days to report. Must be an integer 1..31. */
+  days: number;
+  now: Date;
+}
+
+function invalidQuery(message: string): DataContractError {
+  return {
+    ok: false,
+    status: 400,
+    body: { error: "INVALID_QUERY", message },
+  };
+}
+
+/**
+ * The owner's additions summary over every visible scope, computed from the
+ * per-scope first-seen sidecars only. Both query parameters are validated
+ * before storage is touched. A scope with no sidecar is rebuilt once from its
+ * retained versions and persisted; a scope with no readable version is left
+ * out.
+ */
+export async function summarizeDataAdditionsContract(
+  input: SummarizeDataAdditionsContractInput,
+): Promise<AdditionsSummary | DataContractError> {
+  if (!Number.isInteger(input.days) || input.days < 1 || input.days > 31) {
+    return invalidQuery("days must be an integer between 1 and 31");
+  }
+  try {
+    validateTimezone(input.timezone);
+  } catch (err) {
+    if (err instanceof InvalidTimezoneError) {
+      return invalidQuery("Unknown timezone");
+    }
+    throw err;
+  }
+
+  const scopes = await collectScopes(input.storage, undefined, input.isVisible);
+  // One scope at a time: only one ledger is in memory at once.
+  async function* ledgers(): AsyncGenerator<ScopeFirstSeenLedger> {
+    for (const summary of scopes) {
+      const ledger = await ensureScopeLedger(input.storage, summary.scope, {
+        now: input.now,
+      });
+      if (ledger) yield ledger;
+    }
+  }
+
+  return summarizeAdditions({
+    ledgers: ledgers(),
+    timezone: input.timezone,
+    days: input.days,
+    now: input.now,
+  });
 }
 
 export async function readDataContract(
@@ -461,6 +553,11 @@ export async function ingestDataContract(
     collectedAt: input.collectedAt,
     sizeBytes: writeResult.sizeBytes,
     afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+  });
+  await recordStoredVersion(input.storage, {
+    scope: scopeResult.scope,
+    collectedAt: input.collectedAt,
+    data: envelope.data,
   });
 
   return {
@@ -574,6 +671,11 @@ export async function ingestBinaryDataContract(
     sizeBytes: input.bytes.length,
     afterTombstoneVersion: input.afterTombstoneVersion ?? null,
   });
+  await recordStoredVersion(input.storage, {
+    scope: scopeResult.scope,
+    collectedAt: input.collectedAt,
+    data: envelope.data,
+  });
 
   return {
     ok: true,
@@ -590,10 +692,12 @@ export async function deleteDataScopeContract(
   const scopeResult = parseDataScopeContract(input.scopeParam);
   if (!scopeResult.ok) return scopeResult;
 
-  return {
-    ok: true,
-    deletedCount: await input.storage.deleteScope(scopeResult.scope),
-  };
+  // `deleteScope` removes the first-seen sidecar too, under the sidecar's
+  // lock so a rebuild in flight cannot write it back; the explicit call
+  // covers a storage port whose `deleteScope` predates the sidecar.
+  const deletedCount = await input.storage.deleteScope(scopeResult.scope);
+  await input.storage.deleteFirstSeenLedger?.(scopeResult.scope);
+  return { ok: true, deletedCount };
 }
 
 async function writeBlockSidecars(

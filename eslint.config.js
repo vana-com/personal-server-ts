@@ -15,7 +15,10 @@ export default tseslint.config(
   eslintConfigPrettier,
   {
     // Runs in browsers and WebViews: no Node built-ins.
-    files: ["packages/core/src/legacy-projection/**/*.ts"],
+    files: [
+      "packages/core/src/legacy-projection/**/*.ts",
+      "packages/core/src/additions/**/*.ts",
+    ],
     ignores: [
       "**/*.test.ts",
       "**/__fixtures__/**",

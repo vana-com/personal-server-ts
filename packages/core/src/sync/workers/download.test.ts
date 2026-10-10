@@ -1,7 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 import type { DownloadWorkerDeps } from "./download.js";
-import { downloadOne, downloadAll, downloadScopes } from "./download.js";
+import {
+  downloadOne,
+  downloadAll,
+  downloadScopes,
+  reconcileDeletedDataPoint,
+} from "./download.js";
+import { readScopeFirstSeenLedger } from "../../additions/first-added.js";
 import { createDownloadRetryMemory } from "../retry-memory.js";
 import type {
   DataFileEnvelope,
@@ -1136,6 +1142,82 @@ describe("download worker", () => {
         { scope: REPOS, version: 3, collectedAt: "2026-10-06T18:09:43Z" },
       ]);
       expect(JSON.stringify(provider.calls[0]!.messages)).toContain("repo-v3");
+    });
+  });
+  describe("first-seen sidecar", () => {
+    const REPOS = "github.repositories";
+    const V1 = "2026-10-06T18:02:27Z";
+    const V2 = "2026-10-06T18:04:01Z";
+
+    async function downloadVersion(
+      deps: DownloadWorkerDeps,
+      version: string,
+      collectedAt: string,
+      names: string[],
+    ) {
+      const envelope: DataFileEnvelope = {
+        version: "1.0",
+        scope: REPOS,
+        collectedAt,
+        data: {
+          repositories: names.map((name) => ({ url: `https://x/${name}` })),
+        },
+      };
+      (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+        new TextEncoder().encode(JSON.stringify(envelope)),
+      );
+      (
+        deps.gateway.listDataPointsByOwner as ReturnType<typeof vi.fn>
+      ).mockResolvedValue({
+        dataPoints: [
+          makeDataPointRecord({ scope: REPOS, expectedVersion: version }),
+        ],
+        cursor: null,
+      });
+      await downloadAll(deps);
+    }
+
+    it("folds each downloaded version into the scope's sidecar", async () => {
+      const storage = createMemoryDataStorage();
+      const deps = makeMockDeps();
+      deps.storage = storage;
+
+      await downloadVersion(deps, "1", V1, ["a", "b"]);
+      await downloadVersion(deps, "2", V2, ["a", "b", "c"]);
+
+      const ledger = readScopeFirstSeenLedger(
+        await storage.readFirstSeenLedger!(REPOS),
+      );
+      expect(ledger).toEqual({
+        version: 3,
+        scope: REPOS,
+        baseline: V1,
+        current: V2,
+        latest: { collectedAt: V2, total: 3 },
+        through: V2,
+        records: {
+          "repositories:i:https://x/a": [V1, V2],
+          "repositories:i:https://x/b": [V1, V2],
+          "repositories:i:https://x/c": [V2, V2],
+        },
+      });
+    });
+
+    it("drops the sidecar when a gateway tombstone removes local versions", async () => {
+      const storage = createMemoryDataStorage();
+      const deps = makeMockDeps();
+      deps.storage = storage;
+      await downloadVersion(deps, "1", V1, ["a"]);
+      expect(await storage.readFirstSeenLedger!(REPOS)).not.toBeNull();
+
+      const result = await reconcileDeletedDataPoint(
+        deps,
+        { id: DATA_POINT_ID, scope: REPOS, expectedVersion: "5" },
+        "2026-10-07T00:00:00.000Z",
+      );
+
+      expect(result.removed).toBe(1);
+      expect(await storage.readFirstSeenLedger!(REPOS)).toBeNull();
     });
   });
 });

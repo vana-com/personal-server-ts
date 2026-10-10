@@ -1,6 +1,9 @@
 import {
   deleteAllForScope,
   deleteDataFile,
+  deleteFirstSeenLedger,
+  readFirstSeenLedger,
+  writeFirstSeenLedger,
   readDataFile,
   readDataFileBytes,
   readDataFileStream,
@@ -11,6 +14,7 @@ import {
   writeBlockManifest,
   writeDataFile,
 } from "./hierarchy.js";
+import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
@@ -29,6 +33,12 @@ export interface NodeDataStorageDeps {
 export function createNodeDataStorage(
   deps: NodeDataStorageDeps,
 ): DataStoragePort {
+  async function dropLedgerIfEmpty(scope: string): Promise<void> {
+    if (deps.indexManager.countByScope(scope) === 0) {
+      await deleteFirstSeenLedger(deps.hierarchyOptions, scope);
+    }
+  }
+
   return {
     kind: "node-fs-sqlite",
     listScopes(options: DataStorageScopeListOptions) {
@@ -116,42 +126,84 @@ export function createNodeDataStorage(
     updateEntryVersion(path: string, version: number) {
       return deps.indexManager.updateVersion(path, version);
     },
-    async deleteScope(scope: string) {
-      const deletedCount = deps.indexManager.deleteByScope(scope);
-      await deleteAllForScope(deps.hierarchyOptions, scope);
-      return deletedCount;
+    readFirstSeenLedger(scope: string) {
+      return readFirstSeenLedger(deps.hierarchyOptions, scope);
+    },
+    writeFirstSeenLedger(scope: string, ledger: unknown) {
+      return writeFirstSeenLedger(deps.hierarchyOptions, scope, ledger);
+    },
+    deleteFirstSeenLedger(scope: string) {
+      return deleteFirstSeenLedger(deps.hierarchyOptions, scope);
+    },
+    // Deletions run under the scope's first-seen sidecar lock (so a rebuild in
+    // flight cannot write it back), and the sidecar goes with the scope's last
+    // version, so no delete path can leave a stale ledger behind.
+    deleteScope(scope: string) {
+      return withScopeLock(scope, async () => {
+        // The sidecar first: it holds record ids, so it must not survive a
+        // data delete that fails half way. A sidecar that cannot be removed
+        // never blocks the data delete; it is tried once more afterwards, and
+        // a leftover is harmless (the next write or read finds its newest
+        // version gone and drops it).
+        const sidecarGone = await deleteFirstSeenLedger(
+          deps.hierarchyOptions,
+          scope,
+        ).then(
+          () => true,
+          () => false,
+        );
+        const deletedCount = deps.indexManager.deleteByScope(scope);
+        await deleteAllForScope(deps.hierarchyOptions, scope);
+        if (!sidecarGone) {
+          await deleteFirstSeenLedger(deps.hierarchyOptions, scope).catch(
+            () => undefined,
+          );
+        }
+        return deletedCount;
+      });
     },
     async deleteByFileId(fileId: string) {
       const entry = deps.indexManager.findByFileId(fileId);
       if (!entry) return false;
-      // Delete the blob FIRST; only drop the index row once it's gone (deleteDataFile is
-      // ENOENT-tolerant). If blob deletion fails for a real reason, the row is preserved so the next
-      // sync retry re-attempts — rather than the row vanishing and the cursor advancing past an
-      // orphaned local blob.
-      await deleteDataFile(
-        deps.hierarchyOptions,
-        entry.scope,
-        entry.collectedAt,
-      );
-      deps.indexManager.deleteByPath(entry.path);
-      return true;
+      return withScopeLock(entry.scope, async () => {
+        // Delete the blob FIRST; only drop the index row once it's gone (deleteDataFile is
+        // ENOENT-tolerant). If blob deletion fails for a real reason, the row is preserved so the next
+        // sync retry re-attempts — rather than the row vanishing and the cursor advancing past an
+        // orphaned local blob.
+        await deleteDataFile(
+          deps.hierarchyOptions,
+          entry.scope,
+          entry.collectedAt,
+        );
+        deps.indexManager.deleteByPath(entry.path);
+        await dropLedgerIfEmpty(entry.scope);
+        return true;
+      });
     },
     async deleteVersion(scope: string, collectedAt: string) {
       const entry = deps.indexManager.findClosestByScope(scope, collectedAt);
       if (!entry || entry.collectedAt !== collectedAt) return false;
-      // Same ordering as deleteByFileId: blob first (ENOENT-tolerant), then
-      // the index row, so a real blob failure keeps the row for a retry.
-      await deleteDataFile(deps.hierarchyOptions, scope, collectedAt);
-      deps.indexManager.deleteByPath(entry.path);
-      return true;
+      return withScopeLock(scope, async () => {
+        // Same ordering as deleteByFileId: blob first (ENOENT-tolerant), then
+        // the index row, so a real blob failure keeps the row for a retry.
+        await deleteDataFile(deps.hierarchyOptions, scope, collectedAt);
+        deps.indexManager.deleteByPath(entry.path);
+        await dropLedgerIfEmpty(scope);
+        return true;
+      });
     },
-    dropUnsyncedEntry(path: string) {
+    async dropUnsyncedEntry(path: string) {
       // Index row only — the payload file is already gone (that is why the
       // caller is dropping it). No blob delete. Guarded to unsynced rows: if
       // the row raced to synced after selection, its metadata is preserved
       // and this returns false, so the caller surfaces the real error instead
       // of silently discarding registered data.
-      return deps.indexManager.deleteUnsyncedByPath(path);
+      const entry = deps.indexManager.findByPath(path);
+      const removed = deps.indexManager.deleteUnsyncedByPath(path);
+      if (removed && entry) {
+        await withScopeLock(entry.scope, () => dropLedgerIfEmpty(entry.scope));
+      }
+      return removed;
     },
   };
 }
