@@ -40,7 +40,7 @@ describe("extractRecordKeys", () => {
 
   it("accepts a numeric id and tries id, uuid, key, uri, url in order", async () => {
     expect((await keysOf("test.scope", { items: [{ id: 7 }] })).keys).toEqual([
-      "items:i:7",
+      "items:n:7",
     ]);
     expect(
       (
@@ -113,8 +113,8 @@ describe("extractRecordKeys", () => {
     expect(total).toBe(3000);
     expect(keys).toHaveLength(3000);
     // Every key is short, so the Set never hashes 20 KB strings.
-    expect(Math.max(...keys.map((key) => key.length))).toBeLessThanOrEqual(140);
-    expect(keys[0]).toMatch(/^h:[0-9a-f]{32}:i:1000000$/);
+    expect(Math.max(...keys.map((key) => key.length))).toBeLessThanOrEqual(200);
+    expect(keys[0]).toMatch(/^#[0-9a-f]{32}:n:1000000$/);
     // A name of exactly 64 characters stays readable.
     const edge = "c".repeat(64);
     expect(
@@ -129,7 +129,61 @@ describe("extractRecordKeys", () => {
     };
     const { keys } = await keysOf("myapp.notes", body);
     expect(keys).toHaveLength(2);
-    for (const key of keys) expect(key.length).toBeLessThanOrEqual(140);
+    for (const key of keys) expect(key.length).toBeLessThanOrEqual(200);
+  });
+
+  describe("keys are unambiguous within a scope (aliasing)", () => {
+    const distinct = async (data: Record<string, unknown>) => {
+      const { keys } = await keysOf("myapp.notes", data);
+      return new Set(keys).size === keys.length ? keys : null;
+    };
+
+    it("a collection literally named like a hash differs from the long name it hashes to", async () => {
+      const long = "k".repeat(70);
+      const hashed = (await keysOf("myapp.notes", { [long]: [{ id: "a" }] }))
+        .keys[0]!;
+      const literal = hashed.slice(0, hashed.indexOf(":n:") + 0).split(":")[0]!;
+      const keys = await distinct({
+        [long]: [{ id: "a" }],
+        [literal]: [{ id: "a" }],
+        [`h:${literal.slice(1)}`]: [{ id: "a" }],
+      });
+      expect(keys).toHaveLength(3);
+    });
+
+    it("collection a with id b:i:c differs from collection a:i:b with id c", async () => {
+      const keys = await distinct({
+        a: [{ id: "b:i:c" }],
+        "a:i:b": [{ id: "c" }],
+        "a:i": [{ id: "b:c" }],
+      });
+      expect(keys).toHaveLength(3);
+    });
+
+    it("a number and its string differ", async () => {
+      const keys = await distinct({ items: [{ id: 1 }, { id: "1" }] });
+      expect(keys).toEqual(["items:n:1", "items:i:1"]);
+    });
+
+    it("a hashed id differs from a string that looks like one", async () => {
+      const long = "x".repeat(100);
+      const hashed = (await keysOf("myapp.notes", { items: [{ id: long }] }))
+        .keys[0]!;
+      const lookalike = hashed.replace("items:h:", "");
+      const keys = await distinct({
+        items: [{ id: long }, { id: `h:${lookalike}` }, { id: lookalike }],
+      });
+      expect(keys).toHaveLength(3);
+    });
+
+    it("escapes the separator, backslash and hash in a collection name", async () => {
+      const { keys } = await keysOf("myapp.notes", {
+        "a:b": [{ id: "x" }],
+        "a\\b": [{ id: "x" }],
+        "#c": [{ id: "x" }],
+      });
+      expect(keys).toEqual(["a\\:b:i:x", "a\\\\b:i:x", "\\#c:i:x"]);
+    });
   });
 
   it("stops collecting once the tracked keys pass the cap, but still counts", async () => {
@@ -343,11 +397,12 @@ describe("foldVersion", () => {
   it("starts a ledger at the first version, dating nothing as new", async () => {
     const ledger = await fold([version(T1, ["a", "b"])]);
     expect(ledger).toEqual({
-      version: 2,
+      version: 3,
       scope: "notes.entries",
       baseline: T1,
       current: T1,
       latest: { collectedAt: T1, total: 2 },
+      through: T1,
       records: { "items:i:a": [T1, T1], "items:i:b": [T1, T1] },
     });
     expect(isPreTracking(ledger, "items:i:a")).toBe(true);
@@ -482,7 +537,9 @@ describe("foldVersion", () => {
     expect(afterBinary.baseline).toBe(T1);
     expect(afterBinary.current).toBe(T2);
     expect(afterBinary.records).toEqual(base.records);
-    expect(listAddedTimestamps(afterBinary)).toEqual([T2]);
+    // While the newest version is the binary file the scope reports its
+    // total and no additions, so `added` can never exceed `total`.
+    expect(listAddedTimestamps(afterBinary)).toEqual([]);
 
     const t4 = "2026-01-04T00:00:00.000Z";
     const after = (await foldVersion(
@@ -553,7 +610,7 @@ describe("foldVersion", () => {
     expect(returned!.records["items:i:back"]).toEqual([iso(0), iso(110)]);
   });
 
-  it("enters a terminal skipped state when one snapshot is over the cap", async () => {
+  it("treats a snapshot over the cap as untrackable for that version only", async () => {
     const many = Array.from({ length: MAX_TRACKED_KEYS + 1 }, (_, i) => ({
       id: `k${i}`,
     }));
@@ -563,41 +620,83 @@ describe("foldVersion", () => {
       collectedAt: T2,
       data: { items: many },
     }))!;
-    expect(capped.skipped).toBe("too_many_keys");
-    expect(capped.records).toEqual({});
+    // Its total is kept, but it adds no keys and is not the newest tracked one.
+    expect(capped.skipped).toBeUndefined();
+    expect(capped.records).toEqual(base.records);
     expect(capped.latest).toEqual({
       collectedAt: T2,
       total: MAX_TRACKED_KEYS + 1,
     });
+    expect(capped.current).toBe(T1);
     expect(listAddedTimestamps(capped)).toEqual([]);
     expect(readScopeFirstSeenLedger(capped)).toEqual(capped);
 
-    // Later folds stay cheap: `latest` moves, keys never accumulate again.
+    // Normal imports then resume tracking and date genuinely new records.
     const next = (await foldVersion(capped, version(T3, ["a", "b"])))!;
-    expect(next.skipped).toBe("too_many_keys");
-    expect(next.records).toEqual({});
     expect(next.latest).toEqual({ collectedAt: T3, total: 2 });
+    expect(next.records["items:i:b"]).toEqual([T3, T3]);
+    expect(listAddedTimestamps(next)).toEqual([T3]);
   }, 30_000);
 
-  it("enters the skipped state when the union over time passes the cap", async () => {
-    const half = Math.floor(MAX_TRACKED_KEYS * 0.6);
-    const batch = (prefix: string) => ({
+  it("never baselines an over-cap first snapshot", async () => {
+    const many = Array.from({ length: MAX_TRACKED_KEYS + 1 }, (_, i) => ({
+      id: `k${i}`,
+    }));
+    const capped = (await foldVersion(null, {
       scope: "notes.entries",
-      collectedAt: prefix === "a" ? T1 : T2,
+      collectedAt: T1,
+      data: { items: many },
+    }))!;
+    expect(capped.baseline).toBeNull();
+    const next = (await foldVersion(capped, version(T2, ["a", "b"])))!;
+    expect(next.baseline).toBe(T2);
+    expect(listAddedTimestamps(next)).toEqual([]);
+  }, 30_000);
+
+  it("keeps tracking when the union passes the cap: absent keys go, oldest first", async () => {
+    const half = Math.floor(MAX_TRACKED_KEYS * 0.75);
+    const batch = (prefix: string, collectedAt: string) => ({
+      scope: "notes.entries",
+      collectedAt,
       data: {
         items: Array.from({ length: half }, (_, i) => ({
           id: `${prefix}${i}`,
         })),
       },
     });
-    const ledger = (await fold([batch("a"), batch("b")]))!;
-    expect(ledger.skipped).toBe("too_many_keys");
-    expect(ledger.records).toEqual({});
+    const ledger = (await fold([
+      batch("a", T1),
+      batch("b", T2),
+      batch("c", T3),
+    ]))!;
+    const count = Object.keys(ledger.records).length;
+    expect(count).toBeLessThanOrEqual(MAX_TRACKED_KEYS);
+    // Every key of the newest version is kept; the oldest batch lost most.
+    expect(
+      Object.keys(ledger.records).filter((key) => key.startsWith("items:i:c"))
+        .length,
+    ).toBe(half);
+    expect(ledger.skipped).toBeUndefined();
     expect(ledger.latest.total).toBe(half);
-    // A document the reader accepts, so it is never rebuilt per request.
+    // Still a document the reader accepts, and still tracking.
     expect(
       readScopeFirstSeenLedger(JSON.parse(JSON.stringify(ledger))),
     ).toEqual(ledger);
+    const next = (await foldVersion(ledger, {
+      scope: "notes.entries",
+      collectedAt: "2026-01-04T00:00:00.000Z",
+      data: {
+        items: [
+          ...Array.from({ length: half }, (_, i) => ({ id: `c${i}` })),
+          { id: "new" },
+        ],
+      },
+    }))!;
+    const added = listAddedTimestamps(next);
+    expect(
+      added.filter((at) => at === "2026-01-04T00:00:00.000Z"),
+    ).toHaveLength(1);
+    expect(added.filter((at) => at === T3)).toHaveLength(half);
   }, 60_000);
 
   it("holds __proto__ ids as ordinary own keys", async () => {
@@ -696,11 +795,12 @@ describe("foldVersions", () => {
 
 describe("readScopeFirstSeenLedger", () => {
   const valid: ScopeFirstSeenLedger = {
-    version: 2,
+    version: 3,
     scope: "notes.entries",
     baseline: T1,
     current: T2,
     latest: { collectedAt: T2, total: 2 },
+    through: T2,
     records: { "items:i:a": [T1, T2] },
   };
 
@@ -709,10 +809,10 @@ describe("readScopeFirstSeenLedger", () => {
     expect(readScopeFirstSeenLedger(valid)).not.toBe(valid);
   });
 
-  it("accepts a ledger without a baseline and the terminal skipped states", () => {
+  it("accepts a ledger without a baseline and the negative-outcome markers", () => {
     const empty = { ...valid, baseline: null, current: null, records: {} };
     expect(readScopeFirstSeenLedger(empty)).toEqual(empty);
-    for (const skipped of ["too_many_keys", "too_large", "unreadable"]) {
+    for (const skipped of ["too_large", "unreadable"]) {
       expect(readScopeFirstSeenLedger({ ...empty, skipped })?.skipped).toBe(
         skipped,
       );
@@ -727,6 +827,9 @@ describe("readScopeFirstSeenLedger", () => {
     ["a string", "x"],
     ["an array", []],
     ["a wrong version", { ...valid, version: 1 }],
+    ["a version-2 sidecar (old key encoding)", { ...valid, version: 2 }],
+    ["a missing through marker", { ...valid, through: undefined }],
+    ["the retired too_many_keys state", { ...valid, skipped: "too_many_keys" }],
     ["a missing scope", { ...valid, scope: undefined }],
     ["an unparseable baseline", { ...valid, baseline: "nope" }],
     ["an unparseable current", { ...valid, current: "nope" }],

@@ -8,37 +8,37 @@
  *
  * Cost rules:
  *  - The WRITE path (`recordStoredVersion`: JSON ingest, binary ingest, sync
- *    download) never rebuilds and never reads a stored envelope to do so. It
- *    folds the version already in memory into an existing sidecar, starts a
- *    sidecar when the new version is the scope's only one, and otherwise
- *    leaves the sidecar absent for the owner-only `/additions` read.
- *  - A rebuild (`ensureScopeLedger`) folds ONE version at a time, newest
- *    `REBUILD_VERSION_LIMIT` versions at most and at most
- *    `REBUILD_BYTE_BUDGET` bytes of envelopes (index `sizeBytes`), oldest
- *    folded first, yielding to the event loop between versions. A scope whose
- *    rules track nothing is not read at all.
- *  - Negative outcomes (over the cap, too large, unreadable) are persisted
- *    as a ledger with a `skipped` reason, so they are not retried per request.
+ *    download) never reads a stored envelope. It folds ONLY the version
+ *    already in memory: into an existing sidecar, or into a new one when it
+ *    is the scope's only version; otherwise it leaves the sidecar absent.
+ *    Whatever it did not cover stays visible to the owner's read: the
+ *    ledger's `through` marker only advances over versions that were folded.
+ *  - The owner's `/additions` read (`ensureScopeLedger`) does all the
+ *    catching up and rebuilding. It folds ONE version at a time, at most the
+ *    newest `REBUILD_VERSION_LIMIT` versions and `REBUILD_BYTE_BUDGET` bytes
+ *    of envelopes (index `sizeBytes`), oldest folded first, yielding to the
+ *    event loop between versions. A scope whose rules track nothing is not
+ *    read at all.
+ *  - Negative outcomes (too large, unreadable) are persisted as a ledger with
+ *    a `skipped` reason, so they are not retried on every request.
  *
  * Guarantee, in order of strength:
  *  1. Updates and deletions of one scope are serialized inside this process
  *     (`withScopeLock`), and after a write the sidecar is removed again if the
  *     scope has no versions left, so a delete racing a rebuild leaves nothing.
  *  2. Across processes sharing one data directory a fold can still be lost.
- *     Each update also folds the retained versions newer than the sidecar's
- *     `latest` (within the byte budget), so a lost NEWER version is repaired
- *     by the next update or `/additions` read.
- *  3. A lost version that is not newer than `latest` is repaired only by a
- *     rebuild (delete the sidecar, or reimport).
- *  4. A sidecar whose `latest` matches no retained version (its newest version
- *     was deleted) is discarded and rebuilt.
+ *     A lost version newer than the sidecar's `through` marker is repaired by
+ *     the next `/additions` read.
+ *  3. A lost version at or before `through` is repaired only by a rebuild
+ *     (delete the sidecar, or reimport).
+ *  4. A sidecar whose `latest` version no longer exists (it was deleted) is
+ *     discarded and rebuilt.
  */
 
 import type { DataStoragePort } from "../ports/index.js";
 import type { IndexEntry } from "../storage/index/types.js";
 import {
   LedgerFold,
-  foldVersions,
   readScopeFirstSeenLedger,
   yieldToEventLoop,
   type ScopeFirstSeenLedger,
@@ -142,6 +142,17 @@ async function dropIfScopeEmpty(
   return true;
 }
 
+/** Whether the version the ledger calls its `latest` is still stored (a direct lookup, not a window). */
+function latestStillStored(
+  storage: DataStoragePort,
+  ledger: ScopeFirstSeenLedger,
+): boolean {
+  return (
+    storage.findEntry({ scope: ledger.scope, at: ledger.latest.collectedAt })
+      ?.collectedAt === ledger.latest.collectedAt
+  );
+}
+
 function isMarker(ledger: ScopeFirstSeenLedger): boolean {
   return ledger.skipped === "too_large" || ledger.skipped === "unreadable";
 }
@@ -150,8 +161,8 @@ function newerThan(
   retained: readonly IndexEntry[],
   ledger: ScopeFirstSeenLedger,
 ): IndexEntry[] {
-  const latestMs = Date.parse(ledger.latest.collectedAt);
-  return retained.filter((entry) => Date.parse(entry.collectedAt) > latestMs);
+  const throughMs = Date.parse(ledger.through);
+  return retained.filter((entry) => Date.parse(entry.collectedAt) > throughMs);
 }
 
 /** Fold `entries` (newest first) into `fold`, oldest first, one envelope at a time. */
@@ -191,40 +202,48 @@ async function rebuild(
   if (folded === 0) {
     // Persisted so the next request does not repeat the failed work.
     return {
-      version: 2,
+      version: 3,
       scope,
       baseline: null,
       current: null,
       latest: { collectedAt: retained[0]!.collectedAt, total: 0 },
+      through: retained[0]!.collectedAt,
       skipped: selected.length === 0 ? "too_large" : "unreadable",
       records: {},
     };
   }
   const total = storage.countVersions(scope);
-  return fold.finish({ partial: folded < total });
+  return fold.finish({
+    partial: folded < total,
+    through: retained[0]!.collectedAt,
+  });
 }
 
 /**
- * Fold the retained versions newer than the ledger's `latest` (the newest
- * ones within the byte budget). A ledger that keeps no keys only needs the
- * newest one, for its `latest`.
+ * Catch a ledger up on the retained versions newer than its `through` marker
+ * (the newest ones within the byte budget), refolding any that were already
+ * folded: folding is idempotent. Only the owner's read calls this.
  */
 async function catchUp(
   storage: DataStoragePort,
   ledger: ScopeFirstSeenLedger,
   retained: readonly IndexEntry[],
   budget: number,
-  exceptAt?: string,
 ): Promise<ScopeFirstSeenLedger> {
-  let newer = newerThan(retained, ledger).filter(
-    (entry) => entry.collectedAt !== exceptAt,
-  );
-  if (ledger.skipped === "too_many_keys") newer = newer.slice(0, 1);
+  const newer = newerThan(retained, ledger);
   const selected = withinBudget(ledger.scope, newer, budget);
   if (selected.length === 0) return ledger;
   const fold = new LedgerFold(ledger);
   await foldEntries(storage, ledger.scope, selected, fold);
-  return (await fold.finish()) ?? ledger;
+  return (
+    (await fold.finish({
+      // Everything newer was seen, but part of it may lie beyond the window
+      // or the budget and stay unfolded.
+      partial:
+        selected.length < newer.length || newer.length === retained.length,
+      through: retained[0]!.collectedAt,
+    })) ?? ledger
+  );
 }
 
 /**
@@ -236,42 +255,41 @@ async function catchUp(
 export async function recordStoredVersion(
   storage: DataStoragePort,
   version: VersionToFold,
-  options: LedgerStoreOptions = {},
 ): Promise<void> {
   if (!storage.readFirstSeenLedger || !storage.writeFirstSeenLedger) return;
-  const budget = options.byteBudget ?? REBUILD_BYTE_BUDGET;
   try {
     await withScopeLock(version.scope, async () => {
       const retained = retainedVersions(storage, version.scope);
       let existing = await readStoredLedger(storage, version.scope);
-      if (
-        existing &&
-        !retained.some((e) => e.collectedAt === existing!.latest.collectedAt)
-      ) {
+      if (existing && !latestStillStored(storage, existing)) {
         // Its newest version is gone: what it reports is stale.
         await storage.deleteFirstSeenLedger?.(version.scope);
         existing = null;
       }
-
-      let base: ScopeFirstSeenLedger | null = null;
+      const others = retained.filter(
+        (entry) => entry.collectedAt !== version.collectedAt,
+      );
+      let through = version.collectedAt;
       if (existing) {
         // A failed or oversized rebuild is retried by the owner's read.
         if (isMarker(existing)) return;
-        base = await catchUp(
-          storage,
-          existing,
-          retained,
-          budget,
-          version.collectedAt,
+        const throughMs = Date.parse(existing.through);
+        const unfolded = others.some(
+          (entry) => Date.parse(entry.collectedAt) > throughMs,
         );
-      } else if (
-        retained.some((entry) => entry.collectedAt !== version.collectedAt)
-      ) {
+        // Versions this write did not fold keep the marker where it was.
+        through =
+          unfolded || Date.parse(version.collectedAt) < throughMs
+            ? existing.through
+            : version.collectedAt;
+      } else if (others.length > 0) {
         // Older versions exist but no sidecar: leave it for `/additions` to
         // build, so a write never reads history.
         return;
       }
-      const next = await foldVersions(base, [version]);
+      const fold = new LedgerFold(existing, version.scope);
+      await fold.add(version);
+      const next = await fold.finish({ through });
       if (!next) return;
       await storage.writeFirstSeenLedger!(version.scope, next);
       await dropIfScopeEmpty(storage, version.scope);
@@ -304,9 +322,7 @@ export async function ensureScopeLedger(
       let existing = await readStoredLedger(storage, scope);
       if (
         existing &&
-        (!retained.some(
-          (e) => e.collectedAt === existing!.latest.collectedAt,
-        ) ||
+        (!latestStillStored(storage, existing) ||
           (isMarker(existing) && newerThan(retained, existing).length > 0))
       ) {
         existing = null;

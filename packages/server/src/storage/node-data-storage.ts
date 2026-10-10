@@ -140,9 +140,11 @@ export function createNodeDataStorage(
     // version, so no delete path can leave a stale ledger behind.
     deleteScope(scope: string) {
       return withScopeLock(scope, async () => {
+        // The sidecar first: it holds record ids, so it must not survive a
+        // data delete that fails half way.
+        await deleteFirstSeenLedger(deps.hierarchyOptions, scope);
         const deletedCount = deps.indexManager.deleteByScope(scope);
         await deleteAllForScope(deps.hierarchyOptions, scope);
-        await deleteFirstSeenLedger(deps.hierarchyOptions, scope);
         return deletedCount;
       });
     },

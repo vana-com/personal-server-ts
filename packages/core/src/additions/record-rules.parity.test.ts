@@ -1,11 +1,14 @@
 /**
- * For every legacy binding that has a record rule: rows go through the
- * binding's own projection, and the keys the rule extracts from the stored
- * ROWS form must equal the keys it extracts from the projected LEGACY body.
- * Otherwise a scope moving from one stored form to the other would report
- * every existing record as newly added.
+ * Rows form versus legacy form, for every legacy binding the test has a
+ * fixture for. The fixture's rows go through the binding's own projection;
+ * the keys the rules extract from the stored ROWS form must equal the keys
+ * extracted from the projected LEGACY body, or the collection must be
+ * untracked (counted, no keys) in both. Bindings with no fixture here must be
+ * untracked. Otherwise a scope moving from one stored form to the other would
+ * report every existing record as newly added.
  */
 
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   LEGACY_SCOPE_BINDINGS,
@@ -214,107 +217,199 @@ const FIXTURES: Record<string, { own: string; streams: Rows }> = {
       ],
     },
   },
+  "oura.activity": {
+    own: "activity",
+    streams: {
+      activity: [
+        { id: "a1", day: "2026-09-01" },
+        { id: "a2", day: "2026-09-02" },
+      ],
+    },
+  },
+  "oura.readiness": {
+    own: "readiness",
+    streams: { readiness: [{ id: "r1", day: "2026-09-01" }] },
+  },
+  // One stream feeds two legacy arrays: untracked.
+  "oura.sleep": {
+    own: "sleep",
+    streams: { sleep: [{ id: "s1", day: "2026-09-01", type: "long_sleep" }] },
+  },
+  "youtube.playlists": {
+    own: "playlists",
+    streams: {
+      playlists: [
+        {
+          id: "PL1",
+          url: "https://www.youtube.com/playlist?list=PL1",
+          title: "t",
+        },
+      ],
+    },
+  },
+  "shop.orders": {
+    own: "orders",
+    streams: { orders: [{ id: "o1" }, { id: "o2" }] },
+  },
+  "linkedin.connections": {
+    own: "connections",
+    streams: {
+      connections: [
+        { id: "c1", full_name: "A" },
+        { id: "c2", full_name: "B" },
+      ],
+    },
+  },
+  "linkedin.skills": {
+    own: "skills",
+    streams: { skills: [{ id: "s1", name: "A" }] },
+  },
+  "linkedin.languages": {
+    own: "languages",
+    streams: { languages: [{ id: "l1", name: "A" }] },
+  },
 };
 
-/** Bindings whose rows are not stored under the legacy scope's own name. */
-const NOT_ONE_ROWS_SCOPE = new Set(["github.history"]);
+type RepoFixture = { own: string; streams: Rows };
 
-describe("record rules: rows form and legacy form agree for every binding", () => {
-  const ruled = [...LEGACY_SCOPE_BINDINGS.keys()].filter(
-    (scope) => MEMORY_RECORD_RULES[scope] !== undefined,
+/** Fixtures the repo ships for its projection tests. */
+function repoFixtures(): Record<string, RepoFixture> {
+  const read = (name: string) =>
+    JSON.parse(
+      readFileSync(
+        new URL(`../legacy-projection/__fixtures__/${name}`, import.meta.url),
+        "utf8",
+      ),
+    ) as Record<string, unknown>;
+  const group = (
+    records: { stream: string; data: Record<string, unknown> }[],
+  ) => {
+    const streams: Rows = {};
+    for (const record of records)
+      (streams[record.stream] ??= []).push(record.data);
+    return streams;
+  };
+  const claude = read("claude-projection.json") as Record<
+    string,
+    { stream: string; data: Record<string, unknown> }[]
+  >;
+  const amazon = read("amazon.orders.pdpp-input.json") as {
+    records: { stream: string; data: Record<string, unknown> }[];
+  };
+  return {
+    "claude.conversations": {
+      own: "conversations",
+      streams: group(claude["claude.conversations"]!),
+    },
+    "claude.projects": {
+      own: "projects",
+      streams: group(claude["claude.projects"]!),
+    },
+    "amazon.orders": { own: "orders", streams: group(amazon.records) },
+  };
+}
+
+function project(scope: string, streams: Rows) {
+  const records = Object.entries(streams).flatMap(([stream, rows]) =>
+    rows.map((data) => ({ stream, data })),
+  );
+  return projectPdppRecordsToLegacyPayload(scope, records, {
+    fetchedStreams: Object.keys(streams),
+    now: "2026-10-01T00:00:00.000Z",
+    allowMissingJoinStreams: true,
+  });
+}
+
+const tracksAnything = (scope: string) =>
+  (MEMORY_RECORD_RULES[scope] ?? []).some(
+    (rule) => rule.idFields.length > 0 || rule.rowIdFields.length > 0,
   );
 
-  it("has a fixture for every ruled binding", () => {
-    const missing = ruled.filter(
-      (scope) => !FIXTURES[scope] && !NOT_ONE_ROWS_SCOPE.has(scope),
-    );
-    // Rule-less bindings (empty list) project nothing trackable.
-    expect(
-      missing.filter((scope) => MEMORY_RECORD_RULES[scope]!.length > 0),
-    ).toEqual([]);
-  });
+describe("record rules: rows form and legacy form agree for every fixture-backed binding", () => {
+  const fixtures = { ...FIXTURES, ...repoFixtures() };
 
-  for (const [scope, fixture] of Object.entries(FIXTURES)) {
-    it(`${scope}: rows keys equal projected legacy keys`, async () => {
+  for (const [scope, fixture] of Object.entries(fixtures)) {
+    it(`${scope}: consistent in both forms, or untracked in both`, async () => {
       const source = scope.slice(0, scope.indexOf("."));
-      const records = Object.entries(fixture.streams).flatMap(
-        ([stream, rows]) => rows.map((data) => ({ stream, data })),
-      );
-      const projected = projectPdppRecordsToLegacyPayload(scope, records, {
-        fetchedStreams: Object.keys(fixture.streams),
-        now: "2026-10-01T00:00:00.000Z",
-        allowMissingJoinStreams: true,
-      });
+      const projected = project(scope, fixture.streams);
       if (!projected.ok) throw new Error(JSON.stringify(projected.error));
-
       const legacy = await extractRecordKeys(scope, projected.payload);
-      // The rows are stored under `<source>.<stream>`, which is the legacy
-      // scope itself unless the stream is named differently.
-      const rowsScope = `${source}.${fixture.own}`;
-      const rows = await extractRecordKeys(rowsScope, {
+      // Rows are stored under `<source>.<stream>`.
+      const rows = await extractRecordKeys(`${source}.${fixture.own}`, {
         records: fixture.streams[fixture.own]!,
       });
 
       expect(legacy).not.toBeNull();
       expect(rows).not.toBeNull();
+      expect(
+        MEMORY_RECORD_RULES[scope],
+        "needs an explicit rule",
+      ).toBeDefined();
       expect(new Set(rows!.keys)).toEqual(new Set(legacy!.keys));
       expect(rows!.total).toBe(legacy!.total);
-      const rule = MEMORY_RECORD_RULES[scope]!;
-      const tracked = rule.some((r) => r.idFields.length > 0);
-      expect(legacy!.keys.length > 0).toBe(tracked);
+      // Tracked scopes really produce keys in both forms.
+      if (tracksAnything(scope)) expect(legacy!.keys.length).toBeGreaterThan(0);
+      else expect(legacy!.keys).toEqual([]);
     });
   }
 
-  it("github.history: the PDPP streams are stored as their own scopes", async () => {
-    // issues and pull_requests are stored under github.issues and
-    // github.pull_requests, never as one github.history rows scope, and their
-    // rules produce the same collection keys as the legacy body.
-    const legacy = await extractRecordKeys("github.history", {
-      issues: [{ id: "i1" }],
-      pullRequests: [{ id: "p1" }],
-    });
-    const issues = await extractRecordKeys("github.issues", {
-      records: [{ id: "i1" }],
-    });
-    const pulls = await extractRecordKeys("github.pull_requests", {
-      records: [{ id: "p1" }],
-    });
-    expect(new Set(legacy!.keys)).toEqual(
-      new Set([...issues!.keys, ...pulls!.keys]),
+  it("every other binding is untracked, so it cannot disagree between forms", () => {
+    const withoutFixture = [...LEGACY_SCOPE_BINDINGS.keys()].filter(
+      (scope) => !(scope in fixtures) && scope !== "github.history",
     );
+    expect(withoutFixture.length).toBeGreaterThan(0);
+    const tracked = withoutFixture.filter(tracksAnything);
+    expect(tracked, "tracked without a fixture proving both forms").toEqual([]);
+    for (const scope of withoutFixture) {
+      expect(MEMORY_RECORD_RULES[scope], scope).toBeDefined();
+    }
   });
 
-  it("untracks every join-only stream the bindings read", () => {
-    const joinOnly = new Set<string>();
+  it("every stream a binding joins in has an explicit rule", () => {
     for (const [scope, binding] of LEGACY_SCOPE_BINDINGS) {
       const source = scope.slice(0, scope.indexOf("."));
       for (const stream of binding.pdppStreams) {
-        const storedScope = `${source}.${stream}`;
-        if (!LEGACY_SCOPE_BINDINGS.has(storedScope)) joinOnly.add(storedScope);
+        expect(
+          MEMORY_RECORD_RULES[`${source}.${stream}`],
+          `${source}.${stream}`,
+        ).toBeDefined();
       }
     }
-    const trackedByRule = [...joinOnly].filter(
-      (scope) =>
-        MEMORY_RECORD_RULES[scope] !== undefined &&
-        MEMORY_RECORD_RULES[scope]!.some((r) => r.rowIdFields.length > 0),
-    );
-    // Streams a rule tracks on purpose: each is a list of records of its own.
-    expect(trackedByRule.sort()).toEqual(
-      ["github.issues", "github.pull_requests", "spotify.saved_tracks"].sort(),
-    );
-    for (const scope of [
-      "claude.messages",
-      "claude.account_profile",
-      "claude.project_documents",
-      "chatgpt.messages",
-      "instagram.post_likes",
-      "spotify.playlist_items",
-      "github.user",
-      "amazon.order_items",
-      "heb.order_items",
-      "wholefoods.order_items",
-    ]) {
-      expect(MEMORY_RECORD_RULES[scope]).toEqual([]);
-    }
+  });
+
+  it("github.history: the real projection's keys are a subset of the issues and pull_requests scopes' keys", async () => {
+    // The PDPP streams are stored as github.issues, github.pull_requests and
+    // github.user, never as one github.history rows scope; the legacy body is
+    // a filtered view (authored issues only).
+    const streams: Rows = {
+      user: [{ id: "u1", login: "me" }],
+      issues: [
+        {
+          id: "i1",
+          repository_full_name: "o/r",
+          user_login: "me",
+          is_pull_request: false,
+        },
+        {
+          id: "i2",
+          repository_full_name: "o/r",
+          user_login: "other",
+          is_pull_request: false,
+        },
+      ],
+      pull_requests: [{ id: "p1", repository_full_name: "o/r" }],
+    };
+    const projected = project("github.history", streams);
+    if (!projected.ok) throw new Error(JSON.stringify(projected.error));
+    const legacy = await extractRecordKeys("github.history", projected.payload);
+    const issues = await extractRecordKeys("github.issues", {
+      records: streams.issues!,
+    });
+    const pulls = await extractRecordKeys("github.pull_requests", {
+      records: streams.pull_requests!,
+    });
+    expect(legacy!.keys.length).toBeGreaterThan(0);
+    const rowsKeys = new Set([...issues!.keys, ...pulls!.keys]);
+    for (const key of legacy!.keys) expect(rowsKeys.has(key)).toBe(true);
   });
 });

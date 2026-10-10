@@ -167,10 +167,10 @@ describe("first-seen sidecar on ingest", () => {
     expect(caught?.baseline).toBe(T1);
     expect(caught?.records["items:i:b"]).toEqual([T2, T2]);
 
-    await storage.writeFirstSeenLedger!(SCOPE, { version: 2, junk: true });
+    await storage.writeFirstSeenLedger!(SCOPE, { version: 3, junk: true });
     await ingest(storage, items("a", "b", "c"), T3);
     expect(await storage.readFirstSeenLedger!(SCOPE)).toEqual({
-      version: 2,
+      version: 3,
       junk: true,
     });
     const rebuilt = await ensureScopeLedger(storage, SCOPE);
@@ -219,7 +219,7 @@ describe("first-seen sidecar on ingest", () => {
     expect(ledger.latest.collectedAt).toBe(T3);
   });
 
-  it("repairs a lost newer fold on the next update", async () => {
+  it("repairs a lost newer fold on the next /additions read, not on the write", async () => {
     const storage = createMemoryDataStorage();
     await ingest(storage, items("a"), T1);
     const lagging = await ledgerOf(storage);
@@ -227,8 +227,42 @@ describe("first-seen sidecar on ingest", () => {
     // Another process overwrote the sidecar with a view that missed T2.
     await storage.writeFirstSeenLedger!(SCOPE, lagging);
 
+    const readEnvelope = vi.spyOn(storage, "readEnvelope");
     await ingest(storage, items("a", "b", "c"), T3);
-    expect((await ledgerOf(storage)).records["items:i:b"]).toEqual([T2, T3]);
+    // The write folds only itself and does not claim the gap is covered.
+    expect(readEnvelope).not.toHaveBeenCalled();
+    const afterWrite = await ledgerOf(storage);
+    expect(afterWrite.records["items:i:b"]).toEqual([T3, T3]);
+    expect(afterWrite.through).toBe(T1);
+
+    const repaired = await ensureScopeLedger(storage, SCOPE);
+    expect(repaired?.records["items:i:b"]).toEqual([T2, T3]);
+    expect(repaired?.through).toBe(T3);
+  });
+
+  it("a lagging sidecar costs the write no envelope reads, and /additions equals a full rebuild", async () => {
+    const storage = createMemoryDataStorage();
+    await ingest(storage, items("r0"), T1);
+    const lagging = await ledgerOf(storage);
+    for (let i = 1; i <= 30; i += 1) {
+      const at = new Date(Date.parse(T1) + i * 3_600_000).toISOString();
+      await ingest(
+        storage,
+        items(...Array.from({ length: i + 1 }, (_, k) => `r${k}`)),
+        at,
+      );
+    }
+    await storage.writeFirstSeenLedger!(SCOPE, lagging);
+
+    const readEnvelope = vi.spyOn(storage, "readEnvelope");
+    await ingest(storage, items("r0", "new"), "2026-10-20T00:00:00.000Z");
+    expect(readEnvelope).not.toHaveBeenCalled();
+
+    const caughtUp = await ensureScopeLedger(storage, SCOPE);
+    await storage.deleteFirstSeenLedger!(SCOPE);
+    const rebuilt = await ensureScopeLedger(storage, SCOPE);
+    // Equal as documents (record order in the file follows insertion order).
+    expect(caughtUp).toEqual(rebuilt);
   });
 
   it("repairs a lagging sidecar when /additions reads it", async () => {
@@ -472,11 +506,12 @@ describe("sidecar shape", () => {
     await ingest(storage, items("a"), T1);
     const ledger: ScopeFirstSeenLedger = await ledgerOf(storage);
     expect(ledger).toEqual({
-      version: 2,
+      version: 3,
       scope: SCOPE,
       baseline: T1,
       current: T1,
       latest: { collectedAt: T1, total: 1 },
+      through: T1,
       records: { "items:i:a": [T1, T1] },
     });
   });

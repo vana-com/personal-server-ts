@@ -67,8 +67,45 @@ export const MEMORY_RECORD_RULES: Readonly<
   Record<string, readonly MemoryRecordRule[]>
 > = {
   "chatgpt.conversations": [sameId("conversations", ["id"])],
+  // Claude's conversations and projects keep the row id in both forms.
+  "claude.conversations": [sameId("conversations", ["id"])],
+  "claude.projects": [sameId("projects", ["id"])],
   "chatgpt.memories": [],
   "chatgpt.messages": [],
+  // The legacy body keeps the order number as `orderId`.
+  "amazon.orders": [
+    { collection: "orders", idFields: ["orderId"], rowIdFields: ["id"] },
+  ],
+  "shop.orders": [sameId("orders", ["id"])],
+  // No binding fixture proves an id equal in both forms: counted, untracked.
+  "heb.orders": [untracked("orders")],
+  "wholefoods.orders": [untracked("orders")],
+  "heb.nutrition": [],
+  "wholefoods.nutrition": [],
+  // Singletons.
+  "linkedin.profile": [],
+  "spotify.profile": [],
+  "heb.profile": [],
+  "wholefoods.profile": [],
+  "youtube.profile": [],
+  // The legacy body drops the row id: counted, never tracked.
+  "linkedin.connections": [untracked("connections")],
+  "linkedin.skills": [untracked("skills")],
+  "linkedin.languages": [untracked("languages")],
+  // One `sleep` stream feeds two legacy arrays (`dailyScores`, `sleepPeriods`).
+  "oura.activity": [sameId("days", ["id"], ["activity"])],
+  "oura.readiness": [sameId("days", ["id"], ["readiness"])],
+  "oura.sleep": [],
+  // No binding fixture proves the other youtube lists: untracked (total 0).
+  "youtube.playlists": [sameId("playlists", ["url"])],
+  "youtube.subscriptions": [],
+  "youtube.playlistItems": [],
+  "youtube.playlist_items": [],
+  "youtube.likes": [],
+  "youtube.watchLater": [],
+  "youtube.watch_later": [],
+  "youtube.history": [],
+  "youtube.watch_history": [],
   // Line items that only join into their order's legacy body.
   "amazon.order_items": [],
   "heb.order_items": [],

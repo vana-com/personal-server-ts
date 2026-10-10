@@ -34,12 +34,6 @@ export interface PsLitePersistedStorageState {
     path: string;
     block: DataScopeBlock;
   }>;
-  /**
-   * Per-scope first-seen ledgers. Kept beside, not inside, `entries` and
-   * `envelopes`: a ledger is never an index row, so it is not a version, is
-   * never selected for upload and is not served by any data read.
-   */
-  firstSeenLedgers?: Array<{ scope: string; ledger: unknown }>;
 }
 
 export type PsLiteFileStorageKind = "opfs" | "indexeddb" | "custom";
@@ -74,6 +68,15 @@ export interface PsLiteStoragePort extends DataStoragePort {
 export interface PsLitePersistenceAdapter {
   read(): Promise<PsLitePersistedStorageState | null>;
   write(state: PsLitePersistedStorageState): Promise<void>;
+  /**
+   * Optional named side records, each stored and rewritten on its own so a
+   * big one never inflates the main state. Used for the per-scope first-seen
+   * ledgers. An adapter without them keeps ledgers in memory only, and they
+   * are rebuilt from the stored versions after a reload.
+   */
+  readAux?(name: string): Promise<unknown | null>;
+  writeAux?(name: string, value: unknown): Promise<void>;
+  deleteAux?(name: string): Promise<void>;
 }
 
 export interface IndexedDbPsLitePersistenceOptions {
@@ -139,7 +142,6 @@ function normalizeState(
     envelopes: state.envelopes,
     blockManifests: state.blockManifests ?? [],
     blockPayloads: state.blockPayloads ?? [],
-    firstSeenLedgers: state.firstSeenLedgers ?? [],
   };
 }
 
@@ -430,6 +432,28 @@ export function createIndexedDbPsLitePersistence(
         (store) => store.put(state, resolved.key),
       );
     },
+    // Side records live in the same object store under their own keys, which
+    // a build that only knows `resolved.key` never reads.
+    async readAux(name) {
+      const value = await runIndexedDbTransaction<unknown>(
+        resolved,
+        "readonly",
+        (store) => store.get(`${resolved.key}:${name}`),
+      );
+      return value ?? null;
+    },
+    async writeAux(name, value) {
+      await runIndexedDbTransaction<IDBValidKey>(
+        resolved,
+        "readwrite",
+        (store) => store.put(value, `${resolved.key}:${name}`),
+      );
+    },
+    async deleteAux(name) {
+      await runIndexedDbTransaction<undefined>(resolved, "readwrite", (store) =>
+        store.delete(`${resolved.key}:${name}`),
+      );
+    },
   };
 }
 
@@ -451,9 +475,11 @@ export async function createPersistentPsLiteStorage(
   const fallbackBlockPayloads = new Map(
     (state.blockPayloads ?? []).map(({ path, block }) => [path, block]),
   );
-  const firstSeenLedgers = new Map<string, unknown>(
-    (state.firstSeenLedgers ?? []).map(({ scope, ledger }) => [scope, ledger]),
-  );
+  // First-seen ledgers: each persisted on its own (`persistence.*Aux`), read
+  // lazily, never part of the main state. A ledger the previous build kept
+  // inside the main state is ignored: it is a cache, rebuilt on demand.
+  const ledgerAux = (scope: string) => `first-seen:${scope}`;
+  const firstSeenLedgers = new Map<string, unknown>();
   const fallbackStore = createIndexedDbFallbackDataFileStore(
     fallbackEnvelopes,
     fallbackBlockManifests,
@@ -484,9 +510,6 @@ export async function createPersistentPsLiteStorage(
       ),
       blockPayloads: Array.from(fallbackBlockPayloads.entries()).map(
         ([path, block]) => ({ path, block }),
-      ),
-      firstSeenLedgers: Array.from(firstSeenLedgers.entries()).map(
-        ([scope, ledger]) => ({ scope, ledger }),
       ),
     };
     const write = persistQueue.then(() => persistence.write(snapshot));
@@ -870,16 +893,21 @@ export async function createPersistentPsLiteStorage(
     },
 
     async readFirstSeenLedger(scope) {
+      if (!firstSeenLedgers.has(scope)) {
+        const stored = (await persistence.readAux?.(ledgerAux(scope))) ?? null;
+        if (stored !== null) firstSeenLedgers.set(scope, stored);
+      }
       return structuredClone(firstSeenLedgers.get(scope) ?? null);
     },
 
     async writeFirstSeenLedger(scope, ledger) {
       firstSeenLedgers.set(scope, structuredClone(ledger));
-      await persist();
+      await persistence.writeAux?.(ledgerAux(scope), ledger);
     },
 
     async deleteFirstSeenLedger(scope) {
-      if (firstSeenLedgers.delete(scope)) await persist();
+      firstSeenLedgers.delete(scope);
+      await persistence.deleteAux?.(ledgerAux(scope));
     },
 
     // Deletions run under the scope's first-seen sidecar lock (a rebuild in
@@ -887,7 +915,7 @@ export async function createPersistentPsLiteStorage(
     // version, so no delete path leaves a stale ledger behind.
     deleteScope(scope) {
       return withScopeLock(scope, async () => {
-        firstSeenLedgers.delete(scope);
+        await storagePort.deleteFirstSeenLedger!(scope);
         let deleted = 0;
         const deletedPaths: string[] = [];
         const deletedBlockTrees: string[] = [];
@@ -961,10 +989,10 @@ export async function createPersistentPsLiteStorage(
       entries: state.entries.filter((e) => e !== entry),
     };
     // The sidecar goes with the scope's last version.
-    if (!state.entries.some((e) => e.scope === entry.scope)) {
-      firstSeenLedgers.delete(entry.scope);
-    }
     await persist();
+    if (!state.entries.some((e) => e.scope === entry.scope)) {
+      await storagePort.deleteFirstSeenLedger!(entry.scope);
+    }
     return true;
   }
 

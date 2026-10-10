@@ -449,7 +449,17 @@ export function createMemoryPsLitePersistence(
   seed?: PsLitePersistedStorageState,
 ): PsLitePersistenceAdapter {
   let state = seed ? clone(seed) : null;
+  const aux = new Map<string, unknown>();
   return {
+    async readAux(name) {
+      return aux.has(name) ? clone(aux.get(name)) : null;
+    },
+    async writeAux(name, value) {
+      aux.set(name, clone(value));
+    },
+    async deleteAux(name) {
+      aux.delete(name);
+    },
     async read() {
       return state ? clone(state) : null;
     },

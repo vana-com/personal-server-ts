@@ -21,8 +21,9 @@
 import { memoryRecordRulesFor, type MemoryRecordRule } from "./record-rules.js";
 
 /**
- * At most this many tracked keys per scope, in one snapshot AND in the ledger
- * (the union over time). Beyond it the ledger enters a terminal skipped state.
+ * At most this many tracked keys per scope snapshot AND in the ledger (the
+ * union over time). A snapshot over it is untrackable; when the union passes
+ * it, keys absent from the newest tracked version are dropped, oldest first.
  */
 export const MAX_TRACKED_KEYS = 200_000;
 /** Ids longer than this are replaced by a hash so keys stay bounded. */
@@ -40,20 +41,17 @@ export function yieldToEventLoop(): Promise<void> {
 }
 
 /**
- * Why a ledger holds no per-record keys:
- *  - `too_many_keys`: the scope has more tracked records than `MAX_TRACKED_KEYS`
- *    (one snapshot or the union over time). Terminal: later folds keep only
- *    `latest` current and never accumulate keys again. It ends only when the
- *    sidecar is deleted (scope deleted, or its newest version removed).
- *  - `too_large`, `unreadable`: a rebuild could not read any version within
- *    its byte budget, or none could be read. A negative result persisted so
- *    it is not retried on every request; a newer retained version retries.
+ * Why a ledger holds no per-record keys: a rebuild could not read any version
+ * within its byte budget (`too_large`), or none could be read (`unreadable`).
+ * A negative result persisted so it is not retried on every request; a newer
+ * retained version retries it. (A snapshot over the key cap is not a state of
+ * the ledger: that one version is simply untrackable, see `isTrackable`.)
  */
-export type LedgerSkipReason = "too_many_keys" | "too_large" | "unreadable";
+export type LedgerSkipReason = "too_large" | "unreadable";
 
 /** One document per scope, stored as a sidecar beside the data. */
 export interface ScopeFirstSeenLedger {
-  version: 2;
+  version: 3;
   scope: string;
   /**
    * collectedAt of the EARLIEST TRACKABLE version folded in (one with records
@@ -66,6 +64,13 @@ export interface ScopeFirstSeenLedger {
   current: string | null;
   /** collectedAt of the NEWEST version of any kind, and its record total (a binary file counts 1). */
   latest: { collectedAt: string; total: number };
+  /**
+   * The ledger is known complete up to this collectedAt: every retained
+   * version at or before it has been folded. A write that folds only itself
+   * advances it only when no other version is newer than it, so the owner's
+   * `/additions` read knows what to catch up on.
+   */
+  through: string;
   /** Set when no per-record keys are kept (see `LedgerSkipReason`); `records` is then empty. */
   skipped?: LedgerSkipReason;
   /**
@@ -149,18 +154,30 @@ function valueAtPath(obj: Record<string, unknown>, path: string): unknown {
   return current;
 }
 
-/** `i:<id>`, or `h:<32 hex of SHA-256>` when the id is longer than `MAX_ID_LENGTH`. */
-async function idToken(id: string): Promise<string> {
+/**
+ * The id part of a key, unambiguous by its tag: `i:<id>` for a string,
+ * `n:<number>` for a number (so 1 and "1" differ) and `h:<32 hex of SHA-256>`
+ * for a string longer than `MAX_ID_LENGTH`. It is the last part of the key, so
+ * it needs no escaping.
+ */
+async function idToken(id: string | number): Promise<string> {
+  if (typeof id === "number") return `n:${String(id)}`;
   return id.length > MAX_ID_LENGTH
     ? `h:${(await sha256Hex(id)).slice(0, 32)}`
     : `i:${id}`;
 }
 
-/** The collection part of a key, bounded because a generic scope takes it from the caller's data. */
+/**
+ * The collection part of a key: the name with `\`, `:` and `#` escaped, or
+ * `#<32 hex of SHA-256>` when it is longer than `MAX_COLLECTION_LENGTH` (it
+ * can come from the caller's data). The escaping keeps the first unescaped
+ * `:` the only separator, and a literal name can never equal a hashed one.
+ */
 async function collectionToken(name: string): Promise<string> {
-  return name.length > MAX_COLLECTION_LENGTH
-    ? `h:${(await sha256Hex(name)).slice(0, 32)}`
-    : name;
+  if (name.length > MAX_COLLECTION_LENGTH) {
+    return `#${(await sha256Hex(name)).slice(0, 32)}`;
+  }
+  return name.replace(/[\\:#]/g, (character) => `\\${character}`);
 }
 
 /**
@@ -176,7 +193,7 @@ async function idPart(
     const value = valueAtPath(obj, field);
     if (typeof value === "string" && value.length > 0) return idToken(value);
     if (typeof value === "number" && Number.isFinite(value)) {
-      return idToken(String(value));
+      return idToken(value);
     }
   }
   return null;
@@ -263,7 +280,7 @@ function legacyItems(
  * (a ruled scope names the id field per form, see `record-rules.ts`). A record
  * is tracked only when it has a usable id; records without one count toward
  * `total` but produce no key. Ids and collection names over 64 characters are
- * hashed, so every key is at most about 135 characters.
+ * hashed, so every key is at most about 200 characters.
  */
 export async function extractRecordKeys(
   scope: string,
@@ -364,6 +381,7 @@ export class LedgerFold {
   private baseline: string | null = null;
   private current: string | null = null;
   private latest: ScopeFirstSeenLedger["latest"] | null = null;
+  private through: string | null = null;
   private skipped: LedgerSkipReason | undefined;
   private partial = false;
   // A Map keeps arbitrary keys (including "__proto__") out of the prototype
@@ -376,6 +394,7 @@ export class LedgerFold {
     this.baseline = ledger.baseline;
     this.current = ledger.current;
     this.latest = { ...ledger.latest };
+    this.through = ledger.through;
     this.skipped = ledger.skipped;
     this.partial = ledger.partial === true;
     // Copied, never shared: the input ledger is not mutated.
@@ -399,7 +418,11 @@ export class LedgerFold {
     if (this.latest === null || at >= ms(this.latest.collectedAt)) {
       this.latest = { collectedAt: version.collectedAt, total };
     }
-    if (extraction?.tooMany) this.enterSkipped("too_many_keys");
+    if (this.through === null || at > ms(this.through)) {
+      this.through = version.collectedAt;
+    }
+    // A negative-outcome marker keeps no keys; a binary file or a snapshot
+    // over the key cap is counted above but contributes none.
     if (this.skipped !== undefined) return;
     if (!isTrackable(extraction)) return;
 
@@ -421,10 +444,7 @@ export class LedgerFold {
       const existing = this.records.get(key);
       if (!existing) {
         this.records.set(key, [version.collectedAt, version.collectedAt]);
-        if (this.records.size > MAX_TRACKED_KEYS) {
-          this.enterSkipped("too_many_keys");
-          return;
-        }
+        if (this.records.size > MAX_TRACKED_KEYS) this.trim();
         continue;
       }
       if (at < Date.parse(existing[0])) existing[0] = version.collectedAt;
@@ -432,9 +452,24 @@ export class LedgerFold {
     }
   }
 
-  private enterSkipped(reason: LedgerSkipReason): void {
-    this.skipped = reason;
-    this.records = new Map();
+  /**
+   * The union passed the cap: drop records absent from the newest tracked
+   * version, oldest last-seen first, down to 90% of the cap. The present ones
+   * always fit (one snapshot never holds more than the cap), so tracking
+   * continues; a dropped record that returns is dated as new.
+   */
+  private trim(): void {
+    const currentMs = ms(this.current);
+    const absent: [number, string][] = [];
+    for (const [key, pair] of this.records) {
+      const lastMs = Date.parse(pair[1]);
+      if (lastMs !== currentMs) absent.push([lastMs, key]);
+    }
+    absent.sort((a, b) => a[0] - b[0]);
+    const excess = this.records.size - Math.floor(MAX_TRACKED_KEYS * 0.9);
+    for (let index = 0; index < excess && index < absent.length; index += 1) {
+      this.records.delete(absent[index]![1]);
+    }
   }
 
   /** Drop records that are not present and were last seen over 90 days before `current`. */
@@ -453,20 +488,22 @@ export class LedgerFold {
 
   /**
    * Prune and return the ledger, or null when nothing was ever folded.
-   * `partial` marks a ledger rebuilt from only the newest retained versions.
+   * `partial` marks a ledger rebuilt from only the newest retained versions;
+   * `through` overrides the completeness marker (see `ScopeFirstSeenLedger`).
    */
   async finish(
-    options: { partial?: boolean } = {},
+    options: { partial?: boolean; through?: string } = {},
   ): Promise<ScopeFirstSeenLedger | null> {
     if (this.scope === null || this.latest === null) return null;
     await this.prune();
     const partial = this.partial || options.partial === true;
     return {
-      version: 2,
+      version: 3,
       scope: this.scope,
       baseline: this.baseline,
       current: this.current,
       latest: this.latest,
+      through: options.through ?? this.through ?? this.latest.collectedAt,
       ...(this.skipped ? { skipped: this.skipped } : {}),
       ...(partial ? { partial: true as const } : {}),
       records: Object.fromEntries(this.records),
@@ -519,13 +556,17 @@ export function isPreTracking(
 /**
  * First-seen timestamps of the records that count as additions: present in
  * the newest tracked version and first seen after the baseline. One per
- * record. A skipped ledger, or one with no baseline yet, dates nothing.
+ * record. A skipped ledger, one with no baseline yet, and a scope whose newest
+ * version is not its newest tracked one (a binary file or an over-cap
+ * snapshot, whose `latest.total` does not describe those records) report none,
+ * so `added` can never exceed `total`.
  */
 export function listAddedTimestamps(ledger: ScopeFirstSeenLedger): string[] {
   if (
     ledger.skipped !== undefined ||
     ledger.baseline === null ||
-    ledger.current === null
+    ledger.current === null ||
+    Date.parse(ledger.current) !== Date.parse(ledger.latest.collectedAt)
   ) {
     return [];
   }
@@ -552,28 +593,33 @@ function nullableParseable(value: unknown): value is string | null {
   return value === null || parseableString(value);
 }
 
-const SKIP_REASONS: ReadonlySet<unknown> = new Set([
-  "too_many_keys",
-  "too_large",
-  "unreadable",
-]);
+const SKIP_REASONS: ReadonlySet<unknown> = new Set(["too_large", "unreadable"]);
 
 /**
  * The ledger in `value`, or null unless it is a well-formed version-2
- * document. Never throws. The result is a fresh object.
+ * document (older versions are rejected and rebuilt). Never throws. The result is a fresh object.
  */
 export function readScopeFirstSeenLedger(
   value: unknown,
 ): ScopeFirstSeenLedger | null {
   try {
-    if (!isRecord(value) || value.version !== 2) return null;
-    const { scope, baseline, current, latest, records, skipped, partial } =
-      value;
+    if (!isRecord(value) || value.version !== 3) return null;
+    const {
+      scope,
+      baseline,
+      current,
+      latest,
+      through,
+      records,
+      skipped,
+      partial,
+    } = value;
     if (typeof scope !== "string" || scope.length === 0) return null;
     if (!nullableParseable(baseline) || !nullableParseable(current)) {
       return null;
     }
     if (!isRecord(latest) || !parseableString(latest.collectedAt)) return null;
+    if (!parseableString(through)) return null;
     const total = latest.total;
     if (typeof total !== "number" || !Number.isInteger(total) || total < 0) {
       return null;
@@ -591,11 +637,12 @@ export function readScopeFirstSeenLedger(
       copied.set(key, [pair[0], pair[1]]);
     }
     return {
-      version: 2,
+      version: 3,
       scope,
       baseline,
       current,
       latest: { collectedAt: latest.collectedAt, total },
+      through,
       ...(skipped ? { skipped: skipped as LedgerSkipReason } : {}),
       ...(partial ? { partial: true as const } : {}),
       records: Object.fromEntries(copied),

@@ -160,4 +160,161 @@ describe("PS-Lite first-seen sidecar", () => {
     await storage.deleteVersion(SCOPE, "2026-10-02T12:00:00.000Z");
     expect(await storage.readFirstSeenLedger!(SCOPE)).toBeNull();
   });
+
+  describe("each scope's ledger is persisted on its own (B3)", () => {
+    const AT = "2026-10-01T12:00:00.000Z";
+    const bigLedger = (scope: string, records: number) => ({
+      version: 3,
+      scope,
+      baseline: AT,
+      current: AT,
+      latest: { collectedAt: AT, total: records },
+      through: AT,
+      records: Object.fromEntries(
+        Array.from({ length: records }, (_, i) => [`items:i:r${i}`, [AT, AT]]),
+      ),
+    });
+
+    it("an ingest into scope A does not rewrite scope B's ledger", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const writes: string[] = [];
+      const writeAux = persistence.writeAux!.bind(persistence);
+      persistence.writeAux = async (name, value) => {
+        writes.push(name);
+        return writeAux(name, value);
+      };
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      await ingestDataContract({
+        storage,
+        scopeParam: "notes.b",
+        body: items("b1"),
+        collectedAt: AT,
+        status: "stored",
+      });
+      writes.length = 0;
+
+      await ingestDataContract({
+        storage,
+        scopeParam: "notes.a",
+        body: items("a1"),
+        collectedAt: AT,
+        status: "stored",
+      });
+      expect(writes).toEqual(["first-seen:notes.a"]);
+    });
+
+    it("keeps ledgers out of the main state, whatever their size", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      await ingestDataContract({
+        storage,
+        scopeParam: "notes.a",
+        body: items("a1"),
+        collectedAt: AT,
+        status: "stored",
+      });
+      const before = JSON.stringify(await persistence.read()).length;
+
+      await storage.writeFirstSeenLedger!(
+        "notes.big",
+        bigLedger("notes.big", 20_000),
+      );
+      await ingestDataContract({
+        storage,
+        scopeParam: "notes.a",
+        body: items("a1", "a2"),
+        collectedAt: "2026-10-02T12:00:00.000Z",
+        status: "stored",
+      });
+      const state = await persistence.read();
+      expect(Object.keys(state!)).not.toContain("firstSeenLedgers");
+      expect(JSON.stringify(state)).not.toContain("items:i:r");
+      // Only the second version's envelope and index row were added.
+      expect(JSON.stringify(state).length - before).toBeLessThan(2_000);
+    });
+
+    it("survives a reload", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const first = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      await first.writeFirstSeenLedger!(
+        "notes.big",
+        bigLedger("notes.big", 50),
+      );
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      expect(await reloaded.readFirstSeenLedger!("notes.big")).toEqual(
+        bigLedger("notes.big", 50),
+      );
+    });
+
+    it("discards ledgers the previous build kept inside the main state", async () => {
+      const seed = {
+        version: 1 as const,
+        nextId: 1,
+        entries: [],
+        envelopes: [],
+        firstSeenLedgers: [
+          { scope: "notes.old", ledger: { version: 2, scope: "notes.old" } },
+        ],
+      };
+      const persistence = createMemoryPsLitePersistence(seed);
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      expect(await storage.readFirstSeenLedger!("notes.old")).toBeNull();
+      await ingestDataContract({
+        storage,
+        scopeParam: "notes.a",
+        body: items("a1"),
+        collectedAt: AT,
+        status: "stored",
+      });
+      // The next persist drops the old field; the state keeps its old shape.
+      const state = (await persistence.read()) as Record<string, unknown>;
+      expect(Object.keys(state).sort()).toEqual(
+        [
+          "blockManifests",
+          "blockPayloads",
+          "entries",
+          "envelopes",
+          "nextId",
+          "version",
+        ].sort(),
+      );
+    });
+
+    it("keeps working with a persistence adapter that has no side records", async () => {
+      const full = createMemoryPsLitePersistence();
+      const persistence = {
+        read: full.read.bind(full),
+        write: full.write.bind(full),
+      };
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      await ingestDataContract({
+        storage,
+        scopeParam: "notes.a",
+        body: items("a1"),
+        collectedAt: AT,
+        status: "stored",
+      });
+      expect(await storage.readFirstSeenLedger!("notes.a")).not.toBeNull();
+      await storage.deleteScope("notes.a");
+      expect(await storage.readFirstSeenLedger!("notes.a")).toBeNull();
+    });
+  });
 });

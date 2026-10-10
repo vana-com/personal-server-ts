@@ -1189,11 +1189,12 @@ describe("download worker", () => {
         await storage.readFirstSeenLedger!(REPOS),
       );
       expect(ledger).toEqual({
-        version: 2,
+        version: 3,
         scope: REPOS,
         baseline: V1,
         current: V2,
         latest: { collectedAt: V2, total: 3 },
+        through: V2,
         records: {
           "repositories:i:https://x/a": [V1, V2],
           "repositories:i:https://x/b": [V1, V2],

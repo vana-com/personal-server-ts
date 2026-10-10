@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type Database from "better-sqlite3";
@@ -16,6 +16,7 @@ import {
 import {
   ensureScopeLedger,
   readScopeFirstSeenLedger,
+  withScopeLock,
 } from "@opendatalabs/personal-server-ts-core/additions";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks/build";
@@ -78,7 +79,7 @@ describe("first-seen sidecar on the Node storage", () => {
     await ingest(items("a", "b"), T2);
 
     const onDisk = JSON.parse(await readFile(sidecarPath(), "utf-8"));
-    expect(onDisk.version).toBe(2);
+    expect(onDisk.version).toBe(3);
     expect(onDisk.records["items:i:b"]).toEqual([T2, T2]);
     // The scope's own directory holds only the two version files.
     expect(await readdir(join(dataDir, "notes", "entries"))).toEqual([
@@ -289,6 +290,60 @@ describe("first-seen sidecar on the Node storage", () => {
       await expect(stat(sidecarPath())).rejects.toThrow();
       expect(storage.countVersions(SCOPE)).toBe(0);
     });
+  });
+
+  describe("deletes take the scope's sidecar lock (B8)", () => {
+    async function blockedBy(run: () => Promise<unknown>) {
+      let release!: () => void;
+      const held = withScopeLock(
+        SCOPE,
+        () => new Promise<void>((resolve) => (release = resolve)),
+      );
+      let finished = false;
+      const pending = run().then(() => {
+        finished = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const waited = !finished;
+      release();
+      await held;
+      await pending;
+      return waited;
+    }
+
+    it("deleteScope waits for the lock", async () => {
+      await ingest(items("a"), T1);
+      expect(await blockedBy(() => storage.deleteScope(SCOPE))).toBe(true);
+    });
+
+    it("deleteVersion waits for the lock", async () => {
+      await ingest(items("a"), T1);
+      expect(await blockedBy(() => storage.deleteVersion(SCOPE, T1))).toBe(
+        true,
+      );
+    });
+
+    it("deleteByFileId waits for the lock", async () => {
+      await ingest(items("a"), T1);
+      const entry = storage.findEntry({ scope: SCOPE })!;
+      await storage.updateFileId(entry.path, "file-lock");
+      expect(await blockedBy(() => storage.deleteByFileId("file-lock"))).toBe(
+        true,
+      );
+    });
+  });
+
+  it("deleteScope removes the sidecar even when the data delete fails (B9)", async () => {
+    await ingest(items("secret-id"), T1);
+    await stat(sidecarPath());
+    // Make the scope's parent read-only so removing the data directory fails.
+    await chmod(join(dataDir, "notes"), 0o555);
+    try {
+      await expect(storage.deleteScope(SCOPE)).rejects.toThrow();
+    } finally {
+      await chmod(join(dataDir, "notes"), 0o755);
+    }
+    await expect(stat(sidecarPath())).rejects.toThrow();
   });
 
   it("buildDataBlocks of a stored envelope never sees the sidecar", async () => {

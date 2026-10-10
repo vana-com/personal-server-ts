@@ -12,11 +12,7 @@ import {
   listAddedTimestamps,
   readScopeFirstSeenLedger,
 } from "./first-added.js";
-import {
-  ensureScopeLedger,
-  recordStoredVersion,
-  REBUILD_BYTE_BUDGET,
-} from "./ledger-store.js";
+import { ensureScopeLedger, recordStoredVersion } from "./ledger-store.js";
 import { withScopeLock } from "./scope-lock.js";
 
 const SCOPE = "notes.entries";
@@ -117,10 +113,6 @@ describe("a rebuild folds one envelope at a time", () => {
     expect(ledger?.records["items:i:r0"]).toEqual([at(3), at(5)]);
   });
 
-  it("uses a 256 MB default budget", () => {
-    expect(REBUILD_BYTE_BUDGET).toBe(256 * 1024 * 1024);
-  });
-
   it("clamps to the 200 newest versions", async () => {
     const storage = createMemoryDataStorage();
     for (let i = 0; i < 230; i += 1)
@@ -192,11 +184,48 @@ describe("negative outcomes are persisted", () => {
     expect(storage.readEnvelope).not.toHaveBeenCalled();
   });
 
-  it("persists the over-cap state and keeps later folds cheap (union cap)", async () => {
+  it("an over-cap version never disables tracking: normal imports resume (B1)", async () => {
     const storage = createMemoryDataStorage();
-    const half = Math.floor(MAX_TRACKED_KEYS * 0.6);
+    const ingest = (body: Record<string, unknown>, collectedAt: string) =>
+      ingestDataContract({
+        storage,
+        scopeParam: SCOPE,
+        body,
+        collectedAt,
+        status: "stored",
+      });
+    await ingest(items("a"), at(0));
+    await ingest(
+      {
+        items: Array.from({ length: MAX_TRACKED_KEYS + 1 }, (_, i) => ({
+          id: `k${i}`,
+        })),
+      },
+      at(1),
+    );
+    await ingest(items("a", "b"), at(2));
+
+    const ledger = await stored(storage);
+    expect(ledger?.skipped).toBeUndefined();
+    expect(ledger?.records["items:i:b"]).toEqual([at(2), at(2)]);
+    expect(listAddedTimestamps(ledger!)).toEqual([at(2)]);
+
+    // Rebuilding with the offending version inside the window ends the same
+    // way, and repeated reads make no envelope reads.
+    await storage.deleteFirstSeenLedger!(SCOPE);
+    const rebuilt = await ensureScopeLedger(storage, SCOPE);
+    expect(rebuilt?.skipped).toBeUndefined();
+    expect(listAddedTimestamps(rebuilt!)).toEqual([at(2)]);
+    const readEnvelope = vi.spyOn(storage, "readEnvelope");
+    for (let i = 0; i < 3; i += 1) await ensureScopeLedger(storage, SCOPE);
+    expect(readEnvelope).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it("two disjoint versions beyond the cap stay readable, bounded and tracking", async () => {
+    const storage = createMemoryDataStorage();
+    const part = Math.floor(MAX_TRACKED_KEYS * 0.75);
     const batch = (prefix: string) => ({
-      items: Array.from({ length: half }, (_, i) => ({ id: `${prefix}${i}` })),
+      items: Array.from({ length: part }, (_, i) => ({ id: `${prefix}${i}` })),
     });
     const ingest = (body: Record<string, unknown>, collectedAt: string) =>
       ingestDataContract({
@@ -210,25 +239,23 @@ describe("negative outcomes are persisted", () => {
     await ingest(batch("b"), at(1));
 
     const ledger = await stored(storage);
-    // The reader accepts what was written, so nothing is rebuilt per request.
-    expect(ledger).toMatchObject({
-      skipped: "too_many_keys",
-      records: {},
-      latest: { collectedAt: at(1), total: half },
-    });
+    expect(ledger).not.toBeNull();
+    expect(Object.keys(ledger!.records).length).toBeLessThanOrEqual(
+      MAX_TRACKED_KEYS,
+    );
+    expect(ledger?.skipped).toBeUndefined();
+    expect(ledger?.latest.total).toBe(part);
+
     const readEnvelope = vi.spyOn(storage, "readEnvelope");
     for (let i = 0; i < 3; i += 1) {
-      expect((await ensureScopeLedger(storage, SCOPE))?.skipped).toBe(
-        "too_many_keys",
-      );
+      expect(
+        (await ensureScopeLedger(storage, SCOPE))?.skipped,
+      ).toBeUndefined();
     }
-    await ingest(items("x"), at(2));
     expect(readEnvelope).not.toHaveBeenCalled();
-    const after = await stored(storage);
-    expect(after?.skipped).toBe("too_many_keys");
-    expect(after?.records).toEqual({});
-    expect(after?.latest).toEqual({ collectedAt: at(2), total: 1 });
-  }, 60_000);
+    await ingest({ items: [...batch("b").items, { id: "fresh" }] }, at(2));
+    expect(listAddedTimestamps((await stored(storage))!)).toContain(at(2));
+  }, 90_000);
 });
 
 describe("catch-up folds every missed version", () => {
@@ -413,5 +440,67 @@ describe("binary writes", () => {
       collectedAt: at(1),
       total: 1,
     });
+  });
+});
+
+describe("a sidecar far behind is not mistaken for a deleted one (B4)", () => {
+  it("keeps a ledger whose latest version is older than the 200 newest", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("r0"));
+    await ensureScopeLedger(storage, SCOPE);
+    for (let i = 1; i <= 230; i += 1)
+      await put(storage, SCOPE, at(i), items("r0", "r1"));
+
+    // `latest` (version 0) lies beyond the 200-version window; it still exists.
+    const caught = await ensureScopeLedger(storage, SCOPE);
+    expect(caught?.baseline).toBe(at(0));
+    expect(caught?.records["items:i:r0"]![0]).toBe(at(0));
+    expect(caught?.latest.collectedAt).toBe(at(230));
+  });
+});
+
+describe("added never exceeds total (B10)", () => {
+  it("reports no additions while the newest version is a binary file", async () => {
+    const storage = createMemoryDataStorage();
+    const ingest = (body: Record<string, unknown>, collectedAt: string) =>
+      ingestDataContract({
+        storage,
+        scopeParam: SCOPE,
+        body,
+        collectedAt,
+        status: "stored",
+      });
+    await ingest(items("a"), at(0));
+    await ingest(items("a", "b", "c"), at(1));
+    expect(listAddedTimestamps((await stored(storage))!)).toHaveLength(2);
+
+    await ingestBinaryDataContract({
+      storage,
+      scopeParam: SCOPE,
+      bytes: new TextEncoder().encode("%PDF"),
+      mimeType: "application/pdf",
+      collectedAt: at(2),
+      status: "stored",
+    });
+    const ledger = (await stored(storage))!;
+    expect(ledger.latest.total).toBe(1);
+    expect(listAddedTimestamps(ledger)).toEqual([]);
+
+    // The next JSON version brings the numbers back in step.
+    await ingest(items("a", "b", "c", "d"), at(3));
+    const after = (await stored(storage))!;
+    expect(after.latest.total).toBe(4);
+    expect(listAddedTimestamps(after).length).toBeLessThanOrEqual(
+      after.latest.total,
+    );
+    expect(listAddedTimestamps(after)).toHaveLength(3);
+  });
+
+  it("a too_large marker reports no additions and total 0", async () => {
+    const storage = createMemoryDataStorage();
+    await put(storage, SCOPE, at(0), items("a"), 10_000);
+    const marker = await ensureScopeLedger(storage, SCOPE, { byteBudget: 10 });
+    expect(marker).toMatchObject({ skipped: "too_large" });
+    expect(listAddedTimestamps(marker!)).toEqual([]);
   });
 });
