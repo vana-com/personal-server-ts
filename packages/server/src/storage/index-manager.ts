@@ -72,6 +72,14 @@ interface RawRow {
   after_tombstone_version: number | null;
 }
 
+const databases = new WeakMap<IndexManager, Database.Database>();
+
+export function indexDatabase(
+  index: IndexManager,
+): Database.Database | undefined {
+  return databases.get(index);
+}
+
 function rowToEntry(row: RawRow): IndexEntry {
   return {
     id: row.id,
@@ -164,32 +172,36 @@ export function createIndexManager(db: Database.Database): IndexManager {
     "DELETE FROM data_files WHERE scope = @scope",
   );
 
-  return {
+  const insert = db.transaction((entry: NewIndexEntry): IndexEntry => {
+    // Caller-supplied version wins; otherwise advance the per-scope
+    // counter atomically inside the same statement chain.
+    const version =
+      entry.version ??
+      (
+        maxVersionByScopeStmt.get({ scope: entry.scope }) as {
+          max_version: number;
+        }
+      ).max_version + 1;
+    const result = insertStmt.run({
+      file_id: entry.fileId,
+      schema_id: entry.schemaId ?? null,
+      path: entry.path,
+      scope: entry.scope,
+      collected_at: entry.collectedAt,
+      size_bytes: entry.sizeBytes,
+      version,
+      data_point_id: entry.dataPointId ?? null,
+      after_tombstone_version: entry.afterTombstoneVersion ?? null,
+    });
+    const row = db
+      .prepare("SELECT * FROM data_files WHERE id = ?")
+      .get(result.lastInsertRowid) as RawRow;
+    return rowToEntry(row);
+  });
+
+  const manager: IndexManager = {
     insert(entry) {
-      // Caller-supplied version wins; otherwise advance the per-scope
-      // counter atomically inside the same statement chain.
-      const version =
-        entry.version ??
-        (
-          maxVersionByScopeStmt.get({ scope: entry.scope }) as {
-            max_version: number;
-          }
-        ).max_version + 1;
-      const result = insertStmt.run({
-        file_id: entry.fileId,
-        schema_id: entry.schemaId ?? null,
-        path: entry.path,
-        scope: entry.scope,
-        collected_at: entry.collectedAt,
-        size_bytes: entry.sizeBytes,
-        version,
-        data_point_id: entry.dataPointId ?? null,
-        after_tombstone_version: entry.afterTombstoneVersion ?? null,
-      });
-      const row = db
-        .prepare("SELECT * FROM data_files WHERE id = ?")
-        .get(result.lastInsertRowid) as RawRow;
-      return rowToEntry(row);
+      return insert.immediate(entry);
     },
 
     findByPath(path) {
@@ -348,4 +360,6 @@ export function createIndexManager(db: Database.Database): IndexManager {
       db.close();
     },
   };
+  databases.set(manager, db);
+  return manager;
 }

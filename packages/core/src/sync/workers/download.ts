@@ -413,8 +413,25 @@ export async function downloadOne(
   diagnostics?.onIndexStart(record.id, envelope.scope);
   let relativePath: string;
   let sizeBytes: number;
+  let indexed = false;
   try {
-    ({ relativePath, sizeBytes } = await storage.writeEnvelope(envelope));
+    if (storage.commitVersion) {
+      const committed = await storage.commitVersion({
+        kind: "replica",
+        envelope,
+        metadata: {
+          schemaId: ctx.schemaId,
+          dataPointId: record.id,
+          version: expectedVersion,
+        },
+      });
+      if (committed.kind !== "stored")
+        throw new Error("Replica publication cannot replay an import");
+      ({ relativePath, sizeBytes } = committed.writeResult);
+      indexed = true;
+    } else {
+      ({ relativePath, sizeBytes } = await storage.writeEnvelope(envelope));
+    }
     await writeBlockSidecars(
       storage,
       envelope,
@@ -431,16 +448,17 @@ export async function downloadOne(
 
   // 8. Insert into local index (with dataPointId + version)
   try {
-    await storage.insertEntry({
-      fileId: null,
-      schemaId: ctx.schemaId,
-      path: relativePath,
-      scope: envelope.scope,
-      collectedAt: envelope.collectedAt,
-      sizeBytes,
-      version: expectedVersion,
-      dataPointId: record.id,
-    });
+    if (!indexed)
+      await storage.insertEntry({
+        fileId: null,
+        schemaId: ctx.schemaId,
+        path: relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes,
+        version: expectedVersion,
+        dataPointId: record.id,
+      });
   } catch (err) {
     const detail = (err as Error).message;
     diagnostics?.onIndexError(record.id, envelope.scope, detail);

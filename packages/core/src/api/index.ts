@@ -92,6 +92,8 @@ import {
   verifyPayment,
   type X402Challenge,
 } from "../payment/index.js";
+import { canonicalJsonBytes } from "../derivatives/e2ee/jcs.js";
+import { sha256Hex } from "../contracts/binary.js";
 
 export interface PersonalServerReadAuthInput {
   request: Request;
@@ -1203,6 +1205,81 @@ export async function handlePersonalServerDataRequest(
     }
 
     const parts = pathname.split("/").filter(Boolean);
+    if (parts.length === 3 && parts[1] === "imports") {
+      if (request.method !== "PUT") return methodNotAllowed();
+      await deps.auth.authorizeOwner(request);
+      const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+      if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+      const operation = decodePathPart(parts[2]);
+      if (!/^[a-f0-9]{64}$/.test(operation)) {
+        return errorResponse(
+          400,
+          "INVALID_IMPORT_OPERATION",
+          "operation must be 64 lowercase hexadecimal characters",
+        );
+      }
+      if (!deps.storage.commitVersion) {
+        throw new ProtocolError(
+          501,
+          "IMPORT_UNSUPPORTED",
+          "This storage backend does not support durable owner imports",
+        );
+      }
+      if (!deps.serverOwner)
+        throw new ServerNotConfiguredError({
+          reason: "serverOwner is required for durable owner imports",
+        });
+      if (!isJsonContentType(request) || url.search.length > 0) {
+        return errorResponse(
+          400,
+          "INVALID_IMPORT",
+          "Owner imports accept JSON root writes without query parameters",
+        );
+      }
+      const parsed = await parseJsonObjectBody(
+        request,
+        "Request body must be valid JSON",
+      );
+      if (!parsed.ok) return contractResponse(parsed.result);
+      if ("lineage" in parsed.body || "$binary" in parsed.body) {
+        return errorResponse(
+          400,
+          "INVALID_IMPORT",
+          "Owner imports do not accept binary or lineage writes",
+        );
+      }
+      const bodySha256 = await sha256Hex(canonicalJsonBytes(parsed.body));
+      const authority = deps.gatewayConfig
+        ? `${deps.gatewayConfig.chainId}:${deps.gatewayConfig.contracts.dataRegistry.toLowerCase()}`
+        : "local";
+      const result = await ingestDataContract({
+        storage: deps.storage,
+        scopeParam: scopeResult.scope,
+        body: parsed.body,
+        collectedAt: (deps.now ?? (() => new Date()))().toISOString(),
+        status: deps.syncManager ? "syncing" : "stored",
+        afterTombstoneVersion: await ingestTombstoneMarker(
+          deps,
+          scopeResult.scope,
+        ),
+        import: {
+          operation,
+          bodySha256,
+          owner: deps.serverOwner.toLowerCase(),
+          authority,
+        },
+      });
+      if (!result.ok) return contractErrorResponse(result);
+      notifyNewData(deps.syncManager);
+      if (!result.replay)
+        notifyDataWritten(deps, {
+          scope: result.scope,
+          collectedAt: result.collectedAt,
+        });
+      return jsonResponse(result.response, {
+        status: result.replay ? 200 : 201,
+      });
+    }
     if (parts.length === 2 && parts[1] === "versions") {
       if (request.method !== "GET") return methodNotAllowed();
       await deps.auth.authorizeBuilderList(request);
@@ -1630,11 +1707,16 @@ export async function handlePersonalServerDataRequest(
         const scopeResult = parseDataScopeContract(scopeParam);
         if (!scopeResult.ok)
           return failWrite(contractErrorResponse(scopeResult));
-        const stamp = reserveIngestStamp(
-          deps.storage,
-          scopeResult.scope,
-          deps.now ?? (() => new Date()),
-        );
+        const stamp = deps.storage.commitVersion
+          ? {
+              value: (deps.now ?? (() => new Date()))().toISOString(),
+              release: () => undefined,
+            }
+          : reserveIngestStamp(
+              deps.storage,
+              scopeResult.scope,
+              deps.now ?? (() => new Date()),
+            );
         releaseStamp = stamp.release;
         const collectedAtValue = stamp.value;
         const status = deps.syncManager ? "syncing" : "stored";
@@ -1721,7 +1803,7 @@ export async function handlePersonalServerDataRequest(
           deps.logger?.info?.(
             {
               scope: scopeResult.scope,
-              collectedAt: collectedAtValue,
+              collectedAt: result.collectedAt,
               path: result.writeResult.relativePath,
               mimeType: binaryMimeType(request),
               sizeBytes: bytes.length,
@@ -1733,7 +1815,7 @@ export async function handlePersonalServerDataRequest(
           notifyNewData(deps.syncManager);
           notifyDataWritten(deps, {
             scope: scopeResult.scope,
-            collectedAt: collectedAtValue,
+            collectedAt: result.collectedAt,
             lineageSources: lineage?.sources,
           });
           return jsonResponse(result.response, { status: 201 });
@@ -1764,11 +1846,13 @@ export async function handlePersonalServerDataRequest(
           afterTombstoneVersion,
         });
         if (!result.ok) return failWrite(contractErrorResponse(result));
+        if (result.replay)
+          throw new Error("Ordinary POST cannot replay an import");
         committed = true;
         deps.logger?.info?.(
           {
             scope: scopeResult.scope,
-            collectedAt: collectedAtValue,
+            collectedAt: result.collectedAt,
             path: result.writeResult.relativePath,
             ...(writeAuth ? { builder: writeAuth.builder } : {}),
           },
@@ -1780,13 +1864,13 @@ export async function handlePersonalServerDataRequest(
             ? await supersedeAfterCommit(
                 deps,
                 scopeResult.scope,
-                collectedAtValue,
+                result.collectedAt,
               )
             : undefined;
         notifyNewData(deps.syncManager);
         notifyDataWritten(deps, {
           scope: scopeResult.scope,
-          collectedAt: collectedAtValue,
+          collectedAt: result.collectedAt,
           lineageSources: lineage?.sources,
         });
         return jsonResponse(
@@ -1802,7 +1886,7 @@ export async function handlePersonalServerDataRequest(
           { status: 201 },
         );
       } catch (err) {
-        // An envelope that reached storage before indexing failed is
+        // An envelope published before persistence failed is
         // persisted (a re-index surfaces it): keep the proof consumed so a
         // retry cannot store it twice; the builder needs a fresh proof.
         if (err instanceof IngestPersistedError) {
@@ -1815,7 +1899,7 @@ export async function handlePersonalServerDataRequest(
                   ? err.cause.message
                   : String(err.cause),
             },
-            "Envelope written but indexing failed; record persisted unindexed",
+            "Envelope published but persistence failed; delegated proof retained",
           );
         } else if (!committed) {
           await writeAuth?.releaseProof?.();

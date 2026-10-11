@@ -78,6 +78,48 @@ export interface DataStorageEnvelopePreview {
   truncated: boolean;
 }
 
+export interface ImportReceipt {
+  readonly operation: string;
+  readonly bodySha256: string;
+  readonly scope: string;
+  readonly collectedAt: string;
+  readonly acceptedAt: string;
+}
+
+export interface ImportIntent {
+  operation: string;
+  bodySha256: string;
+  owner: string;
+  authority: string;
+}
+
+export type VersionCommit =
+  | {
+      kind: "append";
+      envelope: DataFileEnvelope;
+      metadata: { sizeBytes?: number; afterTombstoneVersion?: number | null };
+      import?: ImportIntent;
+    }
+  | {
+      kind: "replica";
+      envelope: DataFileEnvelope;
+      metadata: {
+        schemaId: string | null;
+        dataPointId: string;
+        version: number;
+      };
+    };
+
+export type VersionCommitResult =
+  | {
+      kind: "stored";
+      envelope: DataFileEnvelope;
+      entry: IndexEntry;
+      writeResult: WriteResult;
+      receipt?: ImportReceipt;
+    }
+  | { kind: "replay"; receipt: ImportReceipt };
+
 export interface DataStoragePort extends RuntimeStoragePort {
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
@@ -147,6 +189,8 @@ export interface DataStoragePort extends RuntimeStoragePort {
     collectedAt: string,
   ): boolean | Promise<boolean>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
+  /** Atomic file/index publication; owner imports require this capability. */
+  commitVersion?(command: VersionCommit): Promise<VersionCommitResult>;
   writeBlockManifest?(
     scope: string,
     collectedAt: string,
