@@ -382,6 +382,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   }): PdppInstanceBinding;
   deleteConnection(instance: string): PdppInstanceBinding;
   getInstanceBinding(instance: string): PdppInstanceBinding;
+  /**
+   * Run synchronous reads against one SQLite read snapshot. A write from any
+   * connection that commits while `read` runs stays invisible to it, so the
+   * bindings, listings and pages it sees belong to one point in time.
+   */
+  readSnapshot<T>(read: () => T): T;
   resetInstanceBinding(input: {
     instance: string;
     expectedMethod: string | null;
@@ -1363,6 +1369,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     deleteConnection,
     ingestBatch,
     getInstanceBinding,
+    readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
     resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,

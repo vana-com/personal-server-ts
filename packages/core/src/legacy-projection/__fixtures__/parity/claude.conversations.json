@@ -1,0 +1,411 @@
+{
+  "scope": "claude.conversations",
+  "provenance": {
+    "legacyConnector": "claude-export-playwright.js claude-export-playwright 2.0.1 sha256:12a068a5186aececdd13e999b84f14a281d8e3d256c1eec70b812afd17142152",
+    "pdppBundle": "claude-0.2.23.js sha256:570e3fe205f1f80b2ee35e3bcecc8d267cdb94f8ae06159cff072313a9b9721d",
+    "inputs": "inputs/claude/{export-entries,organizations,site}.json (synthetic; real export key names from data-connectors connectors/anthropic/__fixtures__/split-export + fixtures/scrubbed/pilot-real-shape, packed as one old-format ZIP); served by lib/claude-upstream.mjs to both scripts",
+    "generatedBy": "generate.mjs",
+    "clock": "frozen at 2026-10-01T00:00:00.000Z in both script runs (legacy now()-derived fields carry this value)",
+    "legacyRequestedScopes": [
+      "claude.conversations",
+      "claude.projects"
+    ],
+    "pdppRequestedScopes": [
+      "claude.account_profile",
+      "claude.conversations",
+      "claude.messages",
+      "claude.projects",
+      "claude.project_documents"
+    ],
+    "pdppStreamDedupe": {
+      "account_profile": {
+        "emitted": 1,
+        "stored": 1,
+        "unkeyed": 0
+      },
+      "conversations": {
+        "emitted": 5,
+        "stored": 5,
+        "unkeyed": 0
+      },
+      "messages": {
+        "emitted": 9,
+        "stored": 9,
+        "unkeyed": 0
+      }
+    }
+  },
+  "fetchedStreams": [
+    "account_profile",
+    "conversations",
+    "messages"
+  ],
+  "streams": {
+    "account_profile": [
+      {
+        "id": "0a9e1f00-0000-4000-8000-0000000000a1",
+        "organization_id": "0a9e1f00-0000-4000-8000-0000000000a1",
+        "full_name": "Synthetic Claude User",
+        "plan": "Pro plan",
+        "name_source": "browser_menu",
+        "metadata_status": "valid"
+      }
+    ],
+    "conversations": [
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c001",
+        "title": "Debugging a flaky test",
+        "create_time": "2026-09-10T09:00:00.000000Z",
+        "update_time": "2026-09-10T09:30:00.000000Z",
+        "project_id": "0a9e1f00-0000-4000-8000-0000000000d1",
+        "model": null,
+        "message_count": 3,
+        "is_starred": true
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c002",
+        "title": "Recipe ideas for a dinner party",
+        "create_time": "2026-09-11T18:00:00.000000Z",
+        "update_time": "2026-09-11T18:10:00.000000Z",
+        "project_id": null,
+        "model": null,
+        "message_count": 2,
+        "is_starred": false
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c003",
+        "title": null,
+        "create_time": "2026-09-12T07:00:00.000000Z",
+        "update_time": "2026-09-12T07:01:00.000000Z",
+        "project_id": null,
+        "model": null,
+        "message_count": 2,
+        "is_starred": null
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c004",
+        "title": "Empty chat",
+        "create_time": "2026-09-13T12:00:00.000000Z",
+        "update_time": "2026-09-13T12:00:00.000000Z",
+        "project_id": null,
+        "model": null,
+        "message_count": 0,
+        "is_starred": false
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c005",
+        "title": "Old travel notes",
+        "create_time": "2026-06-01T10:00:00.000000Z",
+        "update_time": "2026-06-01T10:05:00.000000Z",
+        "project_id": null,
+        "model": null,
+        "message_count": 2,
+        "is_starred": false
+      }
+    ],
+    "messages": [
+      {
+        "id": "0a9e1f00-0000-4000-8000-000000000101",
+        "conversation_id": "0a9e1f00-0000-4000-8000-00000000c001",
+        "role": "human",
+        "parent_id": "00000000-0000-4000-8000-000000000000",
+        "content": "Why does this test fail only on CI?",
+        "model": null,
+        "create_time": "2026-09-10T09:00:30.000000Z",
+        "update_time": "2026-09-10T09:00:30.000000Z",
+        "attachments": [
+          {
+            "file_name": "ci.log",
+            "file_size": 18,
+            "file_type": "txt",
+            "extracted_content": "FAIL clock.test.ts"
+          }
+        ]
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-000000000102",
+        "conversation_id": "0a9e1f00-0000-4000-8000-00000000c001",
+        "role": "assistant",
+        "parent_id": "0a9e1f00-0000-4000-8000-000000000101",
+        "content": "Let me check the test runner.\n```\nThis block is not supported on your current device yet.\n```\n\n```\nThis block is not supported on your current device yet.\n```\nThe test depends on wall-clock time.",
+        "model": null,
+        "create_time": "2026-09-10T09:01:00.000000Z",
+        "update_time": "2026-09-10T09:01:00.000000Z",
+        "attachments": []
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-000000000103",
+        "conversation_id": "0a9e1f00-0000-4000-8000-00000000c001",
+        "role": "human",
+        "parent_id": "0a9e1f00-0000-4000-8000-000000000102",
+        "content": "Thanks, that fixed it.",
+        "model": null,
+        "create_time": "2026-09-10T09:05:00.000000Z",
+        "update_time": "2026-09-10T09:06:00.000000Z",
+        "attachments": []
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-000000000201",
+        "conversation_id": "0a9e1f00-0000-4000-8000-00000000c002",
+        "role": "human",
+        "parent_id": "00000000-0000-4000-8000-000000000000",
+        "content": "Ideas for six people?",
+        "model": null,
+        "create_time": "2026-09-11T18:00:00.000000Z",
+        "update_time": "2026-09-11T18:00:00.000000Z",
+        "attachments": []
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-000000000202",
+        "conversation_id": "0a9e1f00-0000-4000-8000-00000000c002",
+        "role": "assistant",
+        "parent_id": "0a9e1f00-0000-4000-8000-000000000201",
+        "content": "Try a paella and a green salad.",
+        "model": null,
+        "create_time": "2026-09-11T18:00:10.000000Z",
+        "update_time": "2026-09-11T18:00:10.000000Z",
+        "attachments": []
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-000000000301",
+        "conversation_id": "0a9e1f00-0000-4000-8000-00000000c003",
+        "role": "human",
+        "parent_id": "00000000-0000-4000-8000-000000000000",
+        "content": "Block-only question?\nSecond block.",
+        "model": null,
+        "create_time": "2026-09-12T07:00:00.000000Z",
+        "update_time": "2026-09-12T07:00:00.000000Z",
+        "attachments": []
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-000000000302",
+        "conversation_id": "0a9e1f00-0000-4000-8000-00000000c003",
+        "role": "assistant",
+        "parent_id": "0a9e1f00-0000-4000-8000-000000000301",
+        "content": "Block-only answer.",
+        "model": null,
+        "create_time": "2026-09-12T07:00:05.000000Z",
+        "update_time": "2026-09-12T07:00:05.000000Z",
+        "attachments": []
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-000000000501",
+        "conversation_id": "0a9e1f00-0000-4000-8000-00000000c005",
+        "role": "human",
+        "parent_id": "00000000-0000-4000-8000-000000000000",
+        "content": "Best time to visit Porto?",
+        "model": null,
+        "create_time": "2026-06-01T10:00:00.000000Z",
+        "update_time": "2026-06-01T10:00:00.000000Z",
+        "attachments": []
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-000000000502",
+        "conversation_id": "0a9e1f00-0000-4000-8000-00000000c005",
+        "role": "assistant",
+        "parent_id": "0a9e1f00-0000-4000-8000-000000000501",
+        "content": "Late spring or early autumn.",
+        "model": null,
+        "create_time": "2026-06-01T10:00:05.000000Z",
+        "update_time": "2026-06-01T10:00:05.000000Z",
+        "attachments": []
+      }
+    ]
+  },
+  "legacyBody": {
+    "profile": {
+      "name": "Synthetic Claude User",
+      "plan": "Pro plan"
+    },
+    "organizationId": "0a9e1f00-0000-4000-8000-0000000000a1",
+    "conversations": [
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c001",
+        "title": "Debugging a flaky test",
+        "href": "/chat/0a9e1f00-0000-4000-8000-00000000c001",
+        "createdAt": "2026-09-10T09:00:00.000000Z",
+        "updatedAt": "2026-09-10T09:30:00.000000Z",
+        "starred": true,
+        "projectId": "0a9e1f00-0000-4000-8000-0000000000d1",
+        "messageCount": 3,
+        "messages": [
+          {
+            "id": "0a9e1f00-0000-4000-8000-000000000101",
+            "sender": "human",
+            "parentId": "00000000-0000-4000-8000-000000000000",
+            "createdAt": "2026-09-10T09:00:30.000000Z",
+            "updatedAt": "2026-09-10T09:00:30.000000Z",
+            "content": "Why does this test fail only on CI?",
+            "attachments": [
+              {
+                "file_name": "ci.log",
+                "file_size": 18,
+                "file_type": "txt",
+                "extracted_content": "FAIL clock.test.ts"
+              }
+            ]
+          },
+          {
+            "id": "0a9e1f00-0000-4000-8000-000000000102",
+            "sender": "assistant",
+            "parentId": "0a9e1f00-0000-4000-8000-000000000101",
+            "createdAt": "2026-09-10T09:01:00.000000Z",
+            "updatedAt": "2026-09-10T09:01:00.000000Z",
+            "content": "Let me check the test runner.\n```\nThis block is not supported on your current device yet.\n```\n\n```\nThis block is not supported on your current device yet.\n```\nThe test depends on wall-clock time.",
+            "attachments": []
+          },
+          {
+            "id": "0a9e1f00-0000-4000-8000-000000000103",
+            "sender": "human",
+            "parentId": "0a9e1f00-0000-4000-8000-000000000102",
+            "createdAt": "2026-09-10T09:05:00.000000Z",
+            "updatedAt": "2026-09-10T09:06:00.000000Z",
+            "content": "Thanks, that fixed it.",
+            "attachments": []
+          }
+        ],
+        "fetchError": null
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c002",
+        "title": "Recipe ideas for a dinner party",
+        "href": "/chat/0a9e1f00-0000-4000-8000-00000000c002",
+        "createdAt": "2026-09-11T18:00:00.000000Z",
+        "updatedAt": "2026-09-11T18:10:00.000000Z",
+        "starred": false,
+        "projectId": null,
+        "messageCount": 2,
+        "messages": [
+          {
+            "id": "0a9e1f00-0000-4000-8000-000000000201",
+            "sender": "human",
+            "parentId": "00000000-0000-4000-8000-000000000000",
+            "createdAt": "2026-09-11T18:00:00.000000Z",
+            "updatedAt": "2026-09-11T18:00:00.000000Z",
+            "content": "Ideas for six people?",
+            "attachments": []
+          },
+          {
+            "id": "0a9e1f00-0000-4000-8000-000000000202",
+            "sender": "assistant",
+            "parentId": "0a9e1f00-0000-4000-8000-000000000201",
+            "createdAt": "2026-09-11T18:00:10.000000Z",
+            "updatedAt": "2026-09-11T18:00:10.000000Z",
+            "content": "Try a paella and a green salad.",
+            "attachments": []
+          }
+        ],
+        "fetchError": null
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c003",
+        "title": "Untitled",
+        "href": "/chat/0a9e1f00-0000-4000-8000-00000000c003",
+        "createdAt": "2026-09-12T07:00:00.000000Z",
+        "updatedAt": "2026-09-12T07:01:00.000000Z",
+        "starred": null,
+        "projectId": null,
+        "messageCount": 2,
+        "messages": [
+          {
+            "id": "0a9e1f00-0000-4000-8000-000000000301",
+            "sender": "human",
+            "parentId": "00000000-0000-4000-8000-000000000000",
+            "createdAt": "2026-09-12T07:00:00.000000Z",
+            "updatedAt": "2026-09-12T07:00:00.000000Z",
+            "content": "Block-only question?\nSecond block.",
+            "attachments": []
+          },
+          {
+            "id": "0a9e1f00-0000-4000-8000-000000000302",
+            "sender": "assistant",
+            "parentId": "0a9e1f00-0000-4000-8000-000000000301",
+            "createdAt": "2026-09-12T07:00:05.000000Z",
+            "updatedAt": "2026-09-12T07:00:05.000000Z",
+            "content": "Block-only answer.",
+            "attachments": []
+          }
+        ],
+        "fetchError": null
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c004",
+        "title": "Empty chat",
+        "href": "/chat/0a9e1f00-0000-4000-8000-00000000c004",
+        "createdAt": "2026-09-13T12:00:00.000000Z",
+        "updatedAt": "2026-09-13T12:00:00.000000Z",
+        "starred": false,
+        "projectId": null,
+        "messageCount": 0,
+        "messages": [],
+        "fetchError": null
+      },
+      {
+        "id": "0a9e1f00-0000-4000-8000-00000000c005",
+        "title": "Old travel notes",
+        "href": "/chat/0a9e1f00-0000-4000-8000-00000000c005",
+        "createdAt": "2026-06-01T10:00:00.000000Z",
+        "updatedAt": "2026-06-01T10:05:00.000000Z",
+        "starred": false,
+        "projectId": null,
+        "messageCount": 2,
+        "messages": [
+          {
+            "id": "0a9e1f00-0000-4000-8000-000000000501",
+            "sender": "human",
+            "parentId": "00000000-0000-4000-8000-000000000000",
+            "createdAt": "2026-06-01T10:00:00.000000Z",
+            "updatedAt": "2026-06-01T10:00:00.000000Z",
+            "content": "Best time to visit Porto?",
+            "attachments": []
+          },
+          {
+            "id": "0a9e1f00-0000-4000-8000-000000000502",
+            "sender": "assistant",
+            "parentId": "0a9e1f00-0000-4000-8000-000000000501",
+            "createdAt": "2026-06-01T10:00:05.000000Z",
+            "updatedAt": "2026-06-01T10:00:05.000000Z",
+            "content": "Late spring or early autumn.",
+            "attachments": []
+          }
+        ],
+        "fetchError": null
+      }
+    ],
+    "total": 5,
+    "messageTotal": 9,
+    "source": "official-export"
+  },
+  "reviewedDifferences": [
+    {
+      "path": "conversations[id=0a9e1f00-0000-4000-8000-00000000c001].fetchError",
+      "legacy": null,
+      "projected": "<absent>",
+      "reason": "legacy-only constant: claude-export always writes fetchError: null; the binding omits it"
+    },
+    {
+      "path": "conversations[id=0a9e1f00-0000-4000-8000-00000000c002].fetchError",
+      "legacy": null,
+      "projected": "<absent>",
+      "reason": "legacy-only constant: claude-export always writes fetchError: null; the binding omits it"
+    },
+    {
+      "path": "conversations[id=0a9e1f00-0000-4000-8000-00000000c003].fetchError",
+      "legacy": null,
+      "projected": "<absent>",
+      "reason": "legacy-only constant: claude-export always writes fetchError: null; the binding omits it"
+    },
+    {
+      "path": "conversations[id=0a9e1f00-0000-4000-8000-00000000c004].fetchError",
+      "legacy": null,
+      "projected": "<absent>",
+      "reason": "legacy-only constant: claude-export always writes fetchError: null; the binding omits it"
+    },
+    {
+      "path": "conversations[id=0a9e1f00-0000-4000-8000-00000000c005].fetchError",
+      "legacy": null,
+      "projected": "<absent>",
+      "reason": "legacy-only constant: claude-export always writes fetchError: null; the binding omits it"
+    }
+  ]
+}

@@ -1,0 +1,166 @@
+{
+  "generated_file_notice": "GENERATED FILE — DO NOT HAND-EDIT. Rebuild with scripts/build-connector-oci-artifact.mjs.",
+  "connector_key": "github",
+  "connector_id": "https://registry.pdpp.dev/connectors/github",
+  "version": "0.7.2",
+  "protocol_version": "0.1.0",
+  "source": {
+    "repository": "https://github.com/PDP-Connect/data-connectors",
+    "revision": "7b18ff6968b8ee9496b3e16f31ce5b6c65dc2c40",
+    "package": "connectors/github"
+  },
+  "source_inventory": [
+    {
+      "path": "connectors/github/index.ts",
+      "sha256": "sha256:80078c2ce3c09d5de81fbffec4f2d9705d2880aef665bbcdc8b4803176322fa6"
+    },
+    {
+      "path": "connectors/github/parsers.ts",
+      "sha256": "sha256:807cde6c6383d566a29591939e1275b0c23506180d182825a3434aeea0d983e9"
+    },
+    {
+      "path": "connectors/github/schemas.ts",
+      "sha256": "sha256:052e41046f22938119d408d5c898b621cfd2707acac9e90642ebb0ee22d3f8f3"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/browser-handoff.ts",
+      "sha256": "sha256:dd316a8f9bce9a7f1a623d59612575d426d35b212ad3e8d075590ce9d2d1b6d7"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/browser-launch.ts",
+      "sha256": "sha256:914bc80f3a4c53a6f52324ece77e42fa0e0e762ab9d48604364fe346a9ed6607"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/capture-redaction.ts",
+      "sha256": "sha256:de9f0ef459574d5ef3a03b060e241dab705e8f981958c6d7d2eca8f7a97b4e4a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/connector-exit.ts",
+      "sha256": "sha256:395555db65b8760bd5f7812fe81c7b5922d84a25bfc8a1e82a925c9bd2ed0b56"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/connector-http-governor.ts",
+      "sha256": "sha256:90b162818da7481ffc954e297332f7e86890fa17da19854ffb8a2dbcdfa1e295"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/connector-paths.ts",
+      "sha256": "sha256:a8913acf76159270342d7a0bd709d2a85da0d5bfc683fbbd0a0d0f202e884038"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/connector-runtime.ts",
+      "sha256": "sha256:5cdeccd50034aff4f84b6e1105cb77201700ca2618c9f061fdcd63737daf8ca1"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/fingerprint-cursor.ts",
+      "sha256": "sha256:9e06e7d7796f99b352d85a3b5f30505e3393d555e82829fb331882fc4e695b9a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/fixture-capture.ts",
+      "sha256": "sha256:4005e66d066f45a28e1bd05599a4f959c96b383f043bf064f51c7c0366cd984b"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/profile-lock.ts",
+      "sha256": "sha256:e4398bd9a175edcc62cfed0df33bd5c2cd570450f846e5e9e73a8b99e523ad36"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/provider-budget.ts",
+      "sha256": "sha256:1dc04ec1a33497a99470d038f22df017aec99b05a7ae63f2c07a4608e072b0a7"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/provider-pacing.ts",
+      "sha256": "sha256:6a79661d584efb5198e8c2dd9c5545806238e2ae62f6fac2b0be7fe7ea422e8a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/provider-profile.ts",
+      "sha256": "sha256:f8ecae8def55569845a6b00be44c81d41b086815f0934125ea4e73dda255baa5"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/run-budget.ts",
+      "sha256": "sha256:f517dd6ac5b13a75bcea6035f9385753587e1487051ee1561583f6fb5b9d20f9"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/runtime-environment.ts",
+      "sha256": "sha256:93ad3686202601fe638f97d5278c80b521092b31d849d53d77fe93fb3154d57d"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/schema-registry.ts",
+      "sha256": "sha256:0babcc2e73431002b31e58bfd8754b85d10294cfa51058d4471db7f95a164b73"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/session-establish.ts",
+      "sha256": "sha256:8ceb1a0451ef5a03f5f83259a91cbe44401ad44ba82c8c5b0f4ee80579f30a42"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/shutdown-hook.ts",
+      "sha256": "sha256:20f2918a9c85e645776f3a5c2e46b9ec930d429e50443436978a5cccdabc604f"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/streaming-target-registration.ts",
+      "sha256": "sha256:12eaeeecd9fcbff8b2cd0846721163917df2f6f9e0692050fb581269ef6a76ca"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/terminal-error.ts",
+      "sha256": "sha256:4bc3efc944ca22615905239ee7f875cfc27aabd8ca5dafe28ee5cc8e6d8c426a"
+    }
+  ],
+  "build": {
+    "esbuild_version": "0.28.2",
+    "options": {
+      "bundle": true,
+      "format": "esm",
+      "minifyWhitespace": true,
+      "platform": "node",
+      "target": "node24"
+    }
+  },
+  "runtime_requirements": {
+    "bindings": {
+      "network": {
+        "required": true
+      }
+    }
+  },
+  "host_runtime_contract": {
+    "version": "1.1",
+    "node": ">=24.15.0 <25",
+    "packages": [
+      {
+        "specifier": "canvas",
+        "package": "canvas",
+        "declared_version": null,
+        "reason": "Optional native rendering backend that linkedom require()s behind a runtime guard (node_modules/linkedom/commonjs/canvas.cjs) and pdf-parse offers as @napi-rs/canvas. It is neither declared nor installed in this tree, so there are no bytes to bundle; linkedom degrades without it.",
+        "loaded": "require-call"
+      },
+      {
+        "specifier": "patchright",
+        "package": "patchright",
+        "declared_version": "1.63.0",
+        "reason": "Browser automation driver. Needs a downloaded Chromium build and a matching host OS, which an artifact cannot carry; bundling the JS alone would not make it runnable.",
+        "loaded": "dynamic-import"
+      }
+    ]
+  },
+  "bundled_dependencies": [
+    "@pdpp/connector-protocol",
+    "boolbase",
+    "css-select",
+    "css-what",
+    "cssom",
+    "dom-serializer",
+    "domelementtype",
+    "domhandler",
+    "domutils",
+    "entities",
+    "htmlparser2",
+    "linkedom",
+    "nth-check",
+    "uhyphen",
+    "zod"
+  ],
+  "outputs": {
+    "collection-profile.json": "sha256:c402cfd2f0f52a7949a3e7b310844535f39823b27d72342b0c0c7f9f3f5fefad",
+    "code.tar.gz": "sha256:bcaf49f4f2b2b9e3931bc03f2348a203d9751a9b2bfe0d3ee179e9764ec9e4aa",
+    "assets.tar.gz": "sha256:365eaddad34bd3634a26b7881dbd315d6b07a89da84fa9f055d33189b71f1c82",
+    "licenses.tar.gz": "sha256:8d502bb8a83e63101397c7a57af52da4a456d5bfe382c4731920594d485c3398"
+  }
+}

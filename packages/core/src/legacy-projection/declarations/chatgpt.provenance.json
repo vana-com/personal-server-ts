@@ -1,0 +1,164 @@
+{
+  "generated_file_notice": "GENERATED FILE — DO NOT HAND-EDIT. Rebuild with scripts/build-connector-oci-artifact.mjs.",
+  "connector_key": "chatgpt",
+  "connector_id": "https://registry.pdpp.dev/connectors/chatgpt",
+  "version": "0.1.0",
+  "protocol_version": "0.1.0",
+  "source": {
+    "repository": "https://github.com/PDP-Connect/data-connectors",
+    "revision": "3754d80d98e2f93c89a38be104231eb1b84a6ad5",
+    "package": "packages/polyfill-connectors"
+  },
+  "source_inventory": [
+    {
+      "path": "connectors/chatgpt/index.ts",
+      "sha256": "sha256:cd61de01b4d5c41a9533bd8641d79df009b1af4415460b204340a44a97dfd04b"
+    },
+    {
+      "path": "connectors/chatgpt/parsers.ts",
+      "sha256": "sha256:9ffb6bdb526f036c28fe1d3df519bc8b8c52b69ce49187a545c7d0262b3cd6b1"
+    },
+    {
+      "path": "connectors/chatgpt/schemas.ts",
+      "sha256": "sha256:36b5bfa22f057f1f6c2b7068bdbd7e99d117056b5eaf3e402093a23cd5e2af2c"
+    },
+    {
+      "path": "src/adaptive-lane.ts",
+      "sha256": "sha256:c697eac8725c694efd972d4c2a77b91e60c4e9cfd2c24b0852f8a57c8f322c5c"
+    },
+    {
+      "path": "src/auto-login/chatgpt.ts",
+      "sha256": "sha256:c1ee8f22c3627ca126dc7d4b3845bd676c0a2eb01f8def58677635c985034f4c"
+    },
+    {
+      "path": "src/auto-login/login-credentials.ts",
+      "sha256": "sha256:f7c5763fee3b38be70103350de9245c41874060d98d3c550ed5e67e59293b689"
+    },
+    {
+      "path": "src/browser-handoff.ts",
+      "sha256": "sha256:dd316a8f9bce9a7f1a623d59612575d426d35b212ad3e8d075590ce9d2d1b6d7"
+    },
+    {
+      "path": "src/browser-launch.ts",
+      "sha256": "sha256:914bc80f3a4c53a6f52324ece77e42fa0e0e762ab9d48604364fe346a9ed6607"
+    },
+    {
+      "path": "src/browser-surface-policy.ts",
+      "sha256": "sha256:e9827e585854b5ac3cdc60432dbb112cfdee4b2ff6fb1798fee402f68334032d"
+    },
+    {
+      "path": "src/capture-redaction.ts",
+      "sha256": "sha256:de9f0ef459574d5ef3a03b060e241dab705e8f981958c6d7d2eca8f7a97b4e4a"
+    },
+    {
+      "path": "src/connector-exit.ts",
+      "sha256": "sha256:395555db65b8760bd5f7812fe81c7b5922d84a25bfc8a1e82a925c9bd2ed0b56"
+    },
+    {
+      "path": "src/connector-runtime.ts",
+      "sha256": "sha256:73c8746a5a5900ddb5e57263669b5bb5feee55cdc9977ce51e19819d4c4e56ca"
+    },
+    {
+      "path": "src/fingerprint-cursor.ts",
+      "sha256": "sha256:9e06e7d7796f99b352d85a3b5f30505e3393d555e82829fb331882fc4e695b9a"
+    },
+    {
+      "path": "src/fixture-capture.ts",
+      "sha256": "sha256:29b8863a659f25c7946640c358bca543f33f4d942d8fd042b28884f4e5d1d653"
+    },
+    {
+      "path": "src/platform-probes.ts",
+      "sha256": "sha256:623402190b3b9ff14ac7d6f561a77bf58dba51f3a872f877a6e1bf5b9adcfa2f"
+    },
+    {
+      "path": "src/profile-lock.ts",
+      "sha256": "sha256:e4398bd9a175edcc62cfed0df33bd5c2cd570450f846e5e9e73a8b99e523ad36"
+    },
+    {
+      "path": "src/provider-budget.ts",
+      "sha256": "sha256:1dc04ec1a33497a99470d038f22df017aec99b05a7ae63f2c07a4608e072b0a7"
+    },
+    {
+      "path": "src/provider-pacing.ts",
+      "sha256": "sha256:6a79661d584efb5198e8c2dd9c5545806238e2ae62f6fac2b0be7fe7ea422e8a"
+    },
+    {
+      "path": "src/repair-budget.ts",
+      "sha256": "sha256:b3c076b9c3aa2f28df796d18fc400eb2a2df1394a780fb89cb2537f1de14dfda"
+    },
+    {
+      "path": "src/run-budget.ts",
+      "sha256": "sha256:f517dd6ac5b13a75bcea6035f9385753587e1487051ee1561583f6fb5b9d20f9"
+    },
+    {
+      "path": "src/runtime-environment.ts",
+      "sha256": "sha256:93ad3686202601fe638f97d5278c80b521092b31d849d53d77fe93fb3154d57d"
+    },
+    {
+      "path": "src/schema-registry.ts",
+      "sha256": "sha256:0babcc2e73431002b31e58bfd8754b85d10294cfa51058d4471db7f95a164b73"
+    },
+    {
+      "path": "src/session-establish.ts",
+      "sha256": "sha256:c204b0f5106def83cc517f0ddce3c1ac4910c49ecdd048542cc130dcbe046d2a"
+    },
+    {
+      "path": "src/shutdown-hook.ts",
+      "sha256": "sha256:20f2918a9c85e645776f3a5c2e46b9ec930d429e50443436978a5cccdabc604f"
+    },
+    {
+      "path": "src/streaming-target-registration.ts",
+      "sha256": "sha256:12eaeeecd9fcbff8b2cd0846721163917df2f6f9e0692050fb581269ef6a76ca"
+    },
+    {
+      "path": "src/terminal-error.ts",
+      "sha256": "sha256:4bc3efc944ca22615905239ee7f875cfc27aabd8ca5dafe28ee5cc8e6d8c426a"
+    }
+  ],
+  "build": {
+    "esbuild_version": "0.28.2",
+    "options": {
+      "bundle": true,
+      "format": "esm",
+      "minifyWhitespace": true,
+      "platform": "node",
+      "target": "node24"
+    }
+  },
+  "runtime_requirements": {
+    "bindings": {
+      "network": {
+        "required": true
+      },
+      "browser": {
+        "required": true
+      }
+    }
+  },
+  "host_runtime_contract": {
+    "version": "1.1",
+    "node": ">=24.15.0 <25",
+    "packages": [
+      {
+        "specifier": "patchright",
+        "package": "patchright",
+        "declared_version": "1.63.0",
+        "reason": "Browser automation driver. Needs a downloaded Chromium build and a matching host OS, which an artifact cannot carry; bundling the JS alone would not make it runnable.",
+        "loaded": "dynamic-import"
+      }
+    ]
+  },
+  "bundled_dependencies": [
+    "@pdpp/connector-protocol",
+    "eventemitter3",
+    "p-queue",
+    "p-timeout",
+    "zod"
+  ],
+  "outputs": {
+    "collection-profile.json": "sha256:eb491a782ba61925340c5334d3b35a6d0111757f63ccda72bc466f4f84b8f417",
+    "code.tar.gz": "sha256:fe8f1a5f8e77c009df4c079bfff92959f36d73be4141a2a26b8f98a563b77beb",
+    "assets.tar.gz": "sha256:5dd99080340c150cad813ad8a9493c880df9e050f6861b13621aa4dd66f0b18b",
+    "licenses.tar.gz": "sha256:8c753d01585a84cd993125b54c6f062d3ffea8e50069979e48ebb8a23682c623"
+  }
+}

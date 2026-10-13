@@ -11,3 +11,9 @@ package-lock.json
 # verifies against -- surfacing later as an unexplained digest_mismatch
 # rather than as a diff anyone reads. See __fixtures__/PROVENANCE.md.
 packages/core/src/pdpp/__fixtures__/*.source-declaration.json
+
+# Vendored, byte-identical legacy-projection reference artifacts (see __fixtures__/PROVENANCE.md)
+packages/core/src/legacy-projection/__fixtures__
+packages/core/src/legacy-projection/legacy-schemas
+packages/core/src/legacy-projection/declarations
+packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs

@@ -1,0 +1,89 @@
+{
+  "claude.conversations": [
+    {
+      "stream": "account_profile",
+      "data": {
+        "id": "org-1",
+        "organization_id": "org-1",
+        "plan": "Pro",
+        "full_name": "Ada Example",
+        "name_source": "browser_menu",
+        "metadata_status": "valid"
+      }
+    },
+    {
+      "stream": "conversations",
+      "data": {
+        "id": "chat-1",
+        "title": "Export chat",
+        "create_time": "2026-01-01T00:00:00Z",
+        "update_time": "2026-01-02T00:00:00Z",
+        "project_id": null,
+        "message_count": 2,
+        "is_starred": true
+      }
+    },
+    {
+      "stream": "messages",
+      "data": {
+        "id": "message-2",
+        "conversation_id": "chat-1",
+        "role": "assistant",
+        "parent_id": "message-1",
+        "content": "Answer",
+        "create_time": "2026-01-01T00:01:00Z",
+        "update_time": null,
+        "attachments": []
+      }
+    },
+    {
+      "stream": "messages",
+      "data": {
+        "id": "message-1",
+        "conversation_id": "chat-1",
+        "role": "human",
+        "parent_id": null,
+        "content": "Question",
+        "create_time": "2026-01-01T00:00:00Z",
+        "update_time": null,
+        "attachments": []
+      }
+    }
+  ],
+  "claude.projects": [
+    {
+      "stream": "account_profile",
+      "data": {
+        "id": "org-1",
+        "organization_id": "org-1",
+        "plan": null,
+        "full_name": null,
+        "name_source": "none",
+        "metadata_status": "absent"
+      }
+    },
+    {
+      "stream": "projects",
+      "data": {
+        "id": "project-1",
+        "name": "Research",
+        "description": "Notes",
+        "create_time": "2026-02-01T00:00:00Z",
+        "update_time": null,
+        "is_archived": false,
+        "prompt_template": null
+      }
+    },
+    {
+      "stream": "project_documents",
+      "data": {
+        "id": "doc-1",
+        "project_id": "project-1",
+        "filename": "brief.md",
+        "content": "Source text",
+        "create_time": null,
+        "update_time": null
+      }
+    }
+  ]
+}

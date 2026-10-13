@@ -1,0 +1,48 @@
+{
+  "sourceRecords": [
+    {
+      "stream": "posts",
+      "data": {
+        "id": "post-a",
+        "media_url": "https://example.test/a.jpg",
+        "caption": "A",
+        "like_count": 2,
+        "taken_at": "2026-09-22T12:30:00Z"
+      }
+    },
+    {
+      "stream": "posts",
+      "data": {
+        "id": "post-b",
+        "media_url": "https://example.test/b.jpg",
+        "caption": "B",
+        "like_count": 1
+      }
+    },
+    {
+      "stream": "post_likes",
+      "data": { "post_id": "post-b", "liker_ordinal": 0, "user_id": "user-2", "pk": "user-2", "id": "user-2", "username": "bea", "profile_pic_url": "https://cdn.example.test/bea.jpg" }
+    },
+    {
+      "stream": "post_likes",
+      "data": { "post_id": "post-a", "liker_ordinal": 0, "user_id": "user-1", "pk": "user-1", "id": "user-1", "username": "ada", "profile_pic_url": "https://cdn.example.test/ada.jpg" }
+    }
+  ],
+  "pinnedLegacyOutput": {
+    "posts": [
+      {
+        "img_url": "https://example.test/a.jpg",
+        "caption": "A",
+        "num_of_likes": 2,
+        "taken_at": "2026-09-22T12:30:00Z",
+        "who_liked": [{ "profile_pic_url": "https://cdn.example.test/ada.jpg", "pk": "user-1", "username": "ada", "id": "user-1" }]
+      },
+      {
+        "img_url": "https://example.test/b.jpg",
+        "caption": "B",
+        "num_of_likes": 1,
+        "who_liked": [{ "profile_pic_url": "https://cdn.example.test/bea.jpg", "pk": "user-2", "username": "bea", "id": "user-2" }]
+      }
+    ]
+  }
+}

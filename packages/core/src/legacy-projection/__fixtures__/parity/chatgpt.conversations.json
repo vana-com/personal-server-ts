@@ -1,0 +1,743 @@
+{
+  "scope": "chatgpt.conversations",
+  "provenance": {
+    "legacyConnector": "chatgpt-4.0.0-vana.1.js 4.0.0-vana.1 sha256:c1c9deff62b0c7e2d0ee613ba231dc660b3e9f1397ed7071fb0f05e4be527016",
+    "pdppBundle": "chatgpt-0.2.20.js sha256:2eb9f92755bb8a3598013e9eb3575d9cccf26f935b8c26d3e08bc794d26c395a",
+    "inputs": "inputs/chatgpt/{conversations,list-items,search-items,memories,session}.json (synthetic, authored by inputs/chatgpt/build-inputs.mjs); served by lib/chatgpt-upstream.mjs to both scripts",
+    "generatedBy": "generate.mjs",
+    "clock": "frozen at 2026-10-01T00:00:00.000Z in both script runs (legacy now()-derived fields carry this value)",
+    "legacyRequestedScopes": [
+      "chatgpt.conversations",
+      "chatgpt.memories"
+    ],
+    "pdppRequestedScopes": [
+      "chatgpt.conversations",
+      "chatgpt.messages",
+      "chatgpt.memories"
+    ],
+    "pdppStreamDedupe": {
+      "conversations": {
+        "emitted": 5,
+        "stored": 5,
+        "unkeyed": 0
+      },
+      "messages": {
+        "emitted": 22,
+        "stored": 22,
+        "unkeyed": 0
+      }
+    }
+  },
+  "fetchedStreams": [
+    "conversations",
+    "messages"
+  ],
+  "streams": {
+    "conversations": [
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c004",
+        "title": "Prime proof",
+        "create_time": "2026-09-12T11:00:00.000Z",
+        "update_time": "2026-09-12T11:03:20.000Z",
+        "is_archived": false,
+        "is_starred": null,
+        "workspace_id": null,
+        "current_node": "c004-a3",
+        "message_count_on_current_branch": 6,
+        "gizmo_id": null
+      },
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c003",
+        "title": null,
+        "create_time": "2026-09-12T10:00:00.000Z",
+        "update_time": "2026-09-12T10:01:40.000Z",
+        "is_archived": false,
+        "is_starred": null,
+        "workspace_id": null,
+        "current_node": "c003-a1",
+        "message_count_on_current_branch": 2,
+        "gizmo_id": null
+      },
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c002",
+        "title": "CSV analysis",
+        "create_time": "2026-09-12T09:00:00.000Z",
+        "update_time": "2026-09-12T09:06:40.000Z",
+        "is_archived": false,
+        "is_starred": null,
+        "workspace_id": null,
+        "current_node": "c002-a2",
+        "message_count_on_current_branch": 4,
+        "gizmo_id": null
+      },
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c001",
+        "title": "Weekend trip planning",
+        "create_time": "2026-09-12T08:00:00.000Z",
+        "update_time": "2026-09-12T08:15:00.000Z",
+        "is_archived": false,
+        "is_starred": null,
+        "workspace_id": null,
+        "current_node": "c001-a2",
+        "message_count_on_current_branch": 5,
+        "gizmo_id": null
+      },
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c005",
+        "title": "Old packing list",
+        "create_time": "2026-06-09T10:13:20.000Z",
+        "update_time": "2026-06-09T10:15:20.000Z",
+        "is_archived": false,
+        "is_starred": null,
+        "workspace_id": null,
+        "current_node": "c005-a1",
+        "message_count_on_current_branch": 2,
+        "gizmo_id": null
+      }
+    ],
+    "messages": [
+      {
+        "id": "c004-ctx",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c004",
+        "parent_id": "client-created-root",
+        "children_ids": [
+          "c004-u1"
+        ],
+        "role": "user",
+        "content": "Synthetic profile text.\n\nBe brief.",
+        "content_type": "user_editable_context",
+        "model_slug": null,
+        "create_time": null,
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c004-u1",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c004",
+        "parent_id": "c004-ctx",
+        "children_ids": [
+          "c004-th"
+        ],
+        "role": "user",
+        "content": "Prove there are infinitely many primes.",
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": "2026-09-12T11:00:01.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c004-th",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c004",
+        "parent_id": "c004-u1",
+        "children_ids": [
+          "c004-rr"
+        ],
+        "role": "assistant",
+        "content": "Euclid\nAssume finitely many and multiply them.",
+        "content_type": "thoughts",
+        "model_slug": "o3",
+        "create_time": "2026-09-12T11:00:02.000Z",
+        "finish_reason": "tool_calls",
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c004-rr",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c004",
+        "parent_id": "c004-th",
+        "children_ids": [
+          "c004-a-empty"
+        ],
+        "role": "assistant",
+        "content": "Thought for 4 seconds",
+        "content_type": "reasoning_recap",
+        "model_slug": "o3",
+        "create_time": "2026-09-12T11:00:03.000Z",
+        "finish_reason": "tool_calls",
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c004-a-empty",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c004",
+        "parent_id": "c004-rr",
+        "children_ids": [
+          "c004-a3"
+        ],
+        "role": "assistant",
+        "content": null,
+        "content_type": "text",
+        "model_slug": "o3",
+        "create_time": "2026-09-12T11:00:04.000Z",
+        "finish_reason": "tool_calls",
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c004-a3",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c004",
+        "parent_id": "c004-a-empty",
+        "children_ids": [],
+        "role": "assistant",
+        "content": "Suppose the primes are finite.\nTheir product plus one has a new prime factor.",
+        "content_type": "text",
+        "model_slug": "o3",
+        "create_time": "2026-09-12T11:00:05.000Z",
+        "finish_reason": "stop",
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c003-u1",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c003",
+        "parent_id": "client-created-root",
+        "children_ids": [
+          "c003-a1"
+        ],
+        "role": "user",
+        "content": "hello?",
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": "2026-09-12T10:00:01.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c003-a1",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c003",
+        "parent_id": "c003-u1",
+        "children_ids": [
+          "c003-u2"
+        ],
+        "role": "assistant",
+        "content": "Hi! How can I help?",
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": "2026-09-12T10:00:02.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c003-u2",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c003",
+        "parent_id": "c003-a1",
+        "children_ids": [],
+        "role": "user",
+        "content": "never mind",
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": "2026-09-12T10:00:03.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": false
+      },
+      {
+        "id": "c002-u1",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c002",
+        "parent_id": "client-created-root",
+        "children_ids": [
+          "c002-a1"
+        ],
+        "role": "user",
+        "content": "Which region sold the most?",
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": "2026-09-12T09:00:01.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [
+          "file-SynthCsv0002"
+        ],
+        "on_current_branch": true
+      },
+      {
+        "id": "c002-a1",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c002",
+        "parent_id": "c002-u1",
+        "children_ids": [
+          "c002-t1"
+        ],
+        "role": "assistant",
+        "content": "```unknown\nimport pandas as pd\ndf = pd.read_csv('/mnt/data/sales.csv')\ndf.groupby('region').total.sum()\n```",
+        "content_type": "code",
+        "model_slug": "gpt-4o",
+        "create_time": "2026-09-12T09:00:02.000Z",
+        "finish_reason": "tool_calls",
+        "citations": [],
+        "tool_calls": [
+          {
+            "recipient": "python",
+            "content_type": "code",
+            "language": "unknown",
+            "text": "import pandas as pd\ndf = pd.read_csv('/mnt/data/sales.csv')\ndf.groupby('region').total.sum()"
+          }
+        ],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c002-t1",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c002",
+        "parent_id": "c002-a1",
+        "children_ids": [
+          "c002-a2"
+        ],
+        "role": "tool",
+        "content": "region\nnorth    10\nsouth     7",
+        "content_type": "execution_output",
+        "model_slug": null,
+        "create_time": "2026-09-12T09:00:03.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c002-a2",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c002",
+        "parent_id": "c002-t1",
+        "children_ids": [],
+        "role": "assistant",
+        "content": "North sold the most, with a total of 10.",
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": "2026-09-12T09:00:04.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c001-sys",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c001",
+        "parent_id": "client-created-root",
+        "children_ids": [
+          "c001-u1"
+        ],
+        "role": "system",
+        "content": null,
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": null,
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c001-u1",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c001",
+        "parent_id": "c001-sys",
+        "children_ids": [
+          "c001-a1-old",
+          "c001-a1-new"
+        ],
+        "role": "user",
+        "content": "Plan a weekend in Lisbon for two.",
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": "2026-09-12T08:00:10.500Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c001-a1-old",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c001",
+        "parent_id": "c001-u1",
+        "children_ids": [
+          "c001-u2-old"
+        ],
+        "role": "assistant",
+        "content": "Draft itinerary: day one Alfama, day two Sintra.",
+        "content_type": "text",
+        "model_slug": "gpt-4o",
+        "create_time": "2026-09-12T08:00:20.250Z",
+        "finish_reason": "stop",
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": false
+      },
+      {
+        "id": "c001-u2-old",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c001",
+        "parent_id": "c001-a1-old",
+        "children_ids": [],
+        "role": "user",
+        "content": "Make it cheaper.",
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": "2026-09-12T08:00:30.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": false
+      },
+      {
+        "id": "c001-a1-new",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c001",
+        "parent_id": "c001-u1",
+        "children_ids": [
+          "c001-u2"
+        ],
+        "role": "assistant",
+        "content": "Here is a two-day plan: Alfama walk, tram 28, then Belem.",
+        "content_type": "text",
+        "model_slug": "gpt-4o",
+        "create_time": "2026-09-12T08:00:40.750Z",
+        "finish_reason": "stop",
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c001-u2",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c001",
+        "parent_id": "c001-a1-new",
+        "children_ids": [
+          "c001-a2"
+        ],
+        "role": "user",
+        "content": "[asset:file-service://file-SynthImage0001]\nWhat is this building?",
+        "content_type": "multimodal_text",
+        "model_slug": null,
+        "create_time": "2026-09-12T08:10:00.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [
+          "file-SynthImage0001"
+        ],
+        "on_current_branch": true
+      },
+      {
+        "id": "c001-a2",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c001",
+        "parent_id": "c001-u2",
+        "children_ids": [],
+        "role": "assistant",
+        "content": "That looks like the Belem Tower.",
+        "content_type": "text",
+        "model_slug": "gpt-4o",
+        "create_time": "2026-09-12T08:10:10.000Z",
+        "finish_reason": "stop",
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c005-u1",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c005",
+        "parent_id": "client-created-root",
+        "children_ids": [
+          "c005-a1"
+        ],
+        "role": "user",
+        "content": "Packing list for camping?",
+        "content_type": "text",
+        "model_slug": null,
+        "create_time": "2026-06-09T10:13:21.000Z",
+        "finish_reason": null,
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      },
+      {
+        "id": "c005-a1",
+        "conversation_id": "6700a1b2-0000-4000-8000-00000000c005",
+        "parent_id": "c005-u1",
+        "children_ids": [],
+        "role": "assistant",
+        "content": "Tent, sleeping bag, stove, water filter.",
+        "content_type": "text",
+        "model_slug": "gpt-4o-mini",
+        "create_time": "2026-06-09T10:13:22.000Z",
+        "finish_reason": "stop",
+        "citations": [],
+        "tool_calls": [],
+        "attachment_ids": [],
+        "on_current_branch": true
+      }
+    ]
+  },
+  "legacyBody": {
+    "conversations": [
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c004",
+        "title": "Prime proof",
+        "create_time": 1789210800,
+        "update_time": "2026-09-12T11:03:20.000000+00:00",
+        "message_count": 2,
+        "messages": [
+          {
+            "id": "c004-u1",
+            "role": "user",
+            "content": "Prove there are infinitely many primes.",
+            "content_type": "text",
+            "create_time": "2026-09-12T11:00:01.000Z",
+            "model": null
+          },
+          {
+            "id": "c004-a3",
+            "role": "assistant",
+            "content": "Suppose the primes are finite.\nTheir product plus one has a new prime factor.",
+            "content_type": "text",
+            "create_time": "2026-09-12T11:00:05.000Z",
+            "model": "o3"
+          }
+        ],
+        "fetched_at": "2026-10-01T00:00:00.000Z"
+      },
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c003",
+        "title": "Untitled",
+        "create_time": 1789207200,
+        "update_time": "2026-09-12T10:01:40.000000+00:00",
+        "message_count": 3,
+        "messages": [
+          {
+            "id": "c003-u1",
+            "role": "user",
+            "content": "hello?",
+            "content_type": "text",
+            "create_time": "2026-09-12T10:00:01.000Z",
+            "model": null
+          },
+          {
+            "id": "c003-a1",
+            "role": "assistant",
+            "content": "Hi! How can I help?",
+            "content_type": "text",
+            "create_time": "2026-09-12T10:00:02.000Z",
+            "model": null
+          },
+          {
+            "id": "c003-u2",
+            "role": "user",
+            "content": "never mind",
+            "content_type": "text",
+            "create_time": "2026-09-12T10:00:03.000Z",
+            "model": null
+          }
+        ],
+        "fetched_at": "2026-10-01T00:00:00.000Z"
+      },
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c002",
+        "title": "CSV analysis",
+        "create_time": 1789203600,
+        "update_time": "2026-09-12T09:06:40.000000+00:00",
+        "message_count": 2,
+        "messages": [
+          {
+            "id": "c002-u1",
+            "role": "user",
+            "content": "Which region sold the most?",
+            "content_type": "text",
+            "create_time": "2026-09-12T09:00:01.000Z",
+            "model": null
+          },
+          {
+            "id": "c002-a2",
+            "role": "assistant",
+            "content": "North sold the most, with a total of 10.",
+            "content_type": "text",
+            "create_time": "2026-09-12T09:00:04.000Z",
+            "model": null
+          }
+        ],
+        "fetched_at": "2026-10-01T00:00:00.000Z"
+      },
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c001",
+        "title": "Weekend trip planning",
+        "create_time": 1789200000,
+        "update_time": "2026-09-12T08:15:00.000000+00:00",
+        "message_count": 4,
+        "messages": [
+          {
+            "id": "c001-u1",
+            "role": "user",
+            "content": "Plan a weekend in Lisbon for two.",
+            "content_type": "text",
+            "create_time": "2026-09-12T08:00:10.500Z",
+            "model": null
+          },
+          {
+            "id": "c001-a1-new",
+            "role": "assistant",
+            "content": "Here is a two-day plan: Alfama walk, tram 28, then Belem.",
+            "content_type": "text",
+            "create_time": "2026-09-12T08:00:40.750Z",
+            "model": "gpt-4o"
+          },
+          {
+            "id": "c001-u2",
+            "role": "user",
+            "content": "What is this building?",
+            "content_type": "multimodal_text",
+            "create_time": "2026-09-12T08:10:00.000Z",
+            "model": null
+          },
+          {
+            "id": "c001-a2",
+            "role": "assistant",
+            "content": "That looks like the Belem Tower.",
+            "content_type": "text",
+            "create_time": "2026-09-12T08:10:10.000Z",
+            "model": "gpt-4o"
+          }
+        ],
+        "fetched_at": "2026-10-01T00:00:00.000Z"
+      },
+      {
+        "id": "6700a1b2-0000-4000-8000-00000000c005",
+        "title": "Old packing list",
+        "create_time": 1781000000,
+        "update_time": "2026-06-09T10:15:20.000000+00:00",
+        "message_count": 2,
+        "messages": [
+          {
+            "id": "c005-u1",
+            "role": "user",
+            "content": "Packing list for camping?",
+            "content_type": "text",
+            "create_time": "2026-06-09T10:13:21.000Z",
+            "model": null
+          },
+          {
+            "id": "c005-a1",
+            "role": "assistant",
+            "content": "Tent, sleeping bag, stove, water filter.",
+            "content_type": "text",
+            "create_time": "2026-06-09T10:13:22.000Z",
+            "model": "gpt-4o-mini"
+          }
+        ],
+        "fetched_at": "2026-10-01T00:00:00.000Z"
+      }
+    ],
+    "total": 5
+  },
+  "reviewedDifferences": [
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c004].create_time",
+      "legacy": 1789210800,
+      "projected": "2026-09-12T11:00:00.000Z",
+      "reason": "time format: legacy emits the detail body's epoch seconds, the PDPP stream stores ISO 8601; same instant"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c004].update_time",
+      "legacy": "2026-09-12T11:03:20.000000+00:00",
+      "projected": "2026-09-12T11:03:20.000Z",
+      "reason": "time format: legacy copies the provider string verbatim (microseconds, +00:00), the PDPP stream stores toISOString(); same instant"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c003].create_time",
+      "legacy": 1789207200,
+      "projected": "2026-09-12T10:00:00.000Z",
+      "reason": "time format: legacy emits the detail body's epoch seconds, the PDPP stream stores ISO 8601; same instant"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c003].message_count",
+      "legacy": 3,
+      "projected": 2,
+      "reason": "branch walk: legacy keeps walking past current_node into its last child; the projection stops at current_node"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c003].messages[id=c003-u2]",
+      "legacy": {
+        "id": "c003-u2",
+        "role": "user",
+        "content": "never mind",
+        "content_type": "text",
+        "create_time": "2026-09-12T10:00:03.000Z",
+        "model": null
+      },
+      "projected": "<absent>",
+      "reason": "branch walk: legacy keeps walking past current_node into its last child; the projection stops at current_node"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c003].update_time",
+      "legacy": "2026-09-12T10:01:40.000000+00:00",
+      "projected": "2026-09-12T10:01:40.000Z",
+      "reason": "time format: legacy copies the provider string verbatim (microseconds, +00:00), the PDPP stream stores toISOString(); same instant"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c002].create_time",
+      "legacy": 1789203600,
+      "projected": "2026-09-12T09:00:00.000Z",
+      "reason": "time format: legacy emits the detail body's epoch seconds, the PDPP stream stores ISO 8601; same instant"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c002].update_time",
+      "legacy": "2026-09-12T09:06:40.000000+00:00",
+      "projected": "2026-09-12T09:06:40.000Z",
+      "reason": "time format: legacy copies the provider string verbatim (microseconds, +00:00), the PDPP stream stores toISOString(); same instant"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c001].create_time",
+      "legacy": 1789200000,
+      "projected": "2026-09-12T08:00:00.000Z",
+      "reason": "time format: legacy emits the detail body's epoch seconds, the PDPP stream stores ISO 8601; same instant"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c001].messages[id=c001-u2].content",
+      "legacy": "What is this building?",
+      "projected": "[asset:file-service://file-SynthImage0001]\nWhat is this building?",
+      "reason": "content: the PDPP connector renders image parts as [asset:<pointer>] lines; legacy joins only string parts"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c001].update_time",
+      "legacy": "2026-09-12T08:15:00.000000+00:00",
+      "projected": "2026-09-12T08:15:00.000Z",
+      "reason": "time format: legacy copies the provider string verbatim (microseconds, +00:00), the PDPP stream stores toISOString(); same instant"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c005].create_time",
+      "legacy": 1781000000,
+      "projected": "2026-06-09T10:13:20.000Z",
+      "reason": "time format: legacy emits the detail body's epoch seconds, the PDPP stream stores ISO 8601; same instant"
+    },
+    {
+      "path": "conversations[id=6700a1b2-0000-4000-8000-00000000c005].update_time",
+      "legacy": "2026-06-09T10:15:20.000000+00:00",
+      "projected": "2026-06-09T10:15:20.000Z",
+      "reason": "time format: legacy copies the provider string verbatim (microseconds, +00:00), the PDPP stream stores toISOString(); same instant"
+    }
+  ]
+}
