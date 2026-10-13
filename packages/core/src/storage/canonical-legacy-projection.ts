@@ -207,6 +207,21 @@ export interface ReadCanonicalLegacyScopeInput {
   store: CanonicalLegacyReadStore;
   scope: string;
   selection: CanonicalConnectionSelection;
+  /**
+   * How the selected connection's declaration profile is found.
+   * `"source"` (default): from the last segment of the source id.
+   * `"method"`: the method id is the profile key, as in Desktop's trusted
+   * method configuration, where one public source has several methods
+   * (`oura` and `oura-browser` both collect `sources/oura`). The binding
+   * must then belong to that method; the source id is not derived from it.
+   */
+  profileBy?: "source" | "method";
+  /**
+   * Runs first inside the read snapshot. False means the caller's selection
+   * no longer holds in the state the rows come from, and the read is
+   * refused as `store_inconsistent_read`.
+   */
+  confirmSelection?: () => boolean;
   /** Rows per store page. Tests lower it to force several pages. */
   pageSize?: number;
 }
@@ -262,7 +277,10 @@ export async function readCanonicalLegacyScope(
   const { store, scope, selection } = input;
   const pageSize = Math.max(1, Math.floor(input.pageSize ?? DEFAULT_PAGE_SIZE));
 
-  const profileKey = profileKeyForSource(selection.sourceId);
+  const byMethod = input.profileBy === "method";
+  const profileKey = byMethod
+    ? profileKeyForMethod(selection.method)
+    : profileKeyForSource(selection.sourceId);
   const lookup = legacyScopeToPdppSelection(scope, { profileKey });
   const binding = bindingFor(scope, profileKey);
   if (!lookup.ok || !binding) {
@@ -271,19 +289,28 @@ export async function readCanonicalLegacyScope(
       lookup: lookup.ok ? { kind: "unknown_scope", scope } : lookup.error,
     });
   }
-  if (canonicalSourceId(binding.pdppSource) !== selection.sourceId) {
+  if (
+    byMethod
+      ? legacyConnectorKey(binding.pdppSource) !== selection.method
+      : canonicalSourceId(binding.pdppSource) !== selection.sourceId
+  ) {
     return unavailable({ reason: "scope_source_mismatch", scope });
   }
   const streams = lookup.selection.streams;
 
   const snapshot = store.readSnapshot(() =>
-    collectSnapshot(
-      store,
-      selection,
-      streams,
-      binding.rowOrder === "arrival",
-      pageSize,
-    ),
+    input.confirmSelection && !input.confirmSelection()
+      ? {
+          ok: false as const,
+          result: inconsistent("the connection selection changed"),
+        }
+      : collectSnapshot(
+          store,
+          selection,
+          streams,
+          binding.rowOrder === "arrival",
+          pageSize,
+        ),
   );
   if (!snapshot.ok) return snapshot.result;
 
@@ -794,6 +821,19 @@ function bindingFor(
 function profileKeyForSource(sourceId: string): string | undefined {
   const key = sourceId.slice(sourceId.lastIndexOf("/") + 1);
   return hasAlternateLegacyProfile(key) ? key : undefined;
+}
+
+/** A method id names its alternate profile directly; others use the default. */
+function profileKeyForMethod(method: string): string | undefined {
+  return hasAlternateLegacyProfile(method) ? method : undefined;
+}
+
+/**
+ * The connector key a binding was reviewed for: the last segment of its
+ * `pdppSource`. It is a profile name, not a store source id.
+ */
+export function legacyConnectorKey(pdppSource: string): string {
+  return pdppSource.slice(pdppSource.lastIndexOf("/") + 1);
 }
 
 /** Binding sources are `connectors/<name>`; the store registers `sources/<name>`. */

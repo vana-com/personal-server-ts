@@ -73,7 +73,7 @@ import {
   registerLegacyDataConnections,
 } from "./pdpp/records-bootstrap.js";
 import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
-import { createLegacyScopeViewStore } from "./storage/legacy-scope-view-store.js";
+import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
@@ -916,15 +916,16 @@ export async function createServer(
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
     // Latest legacy reads of connector scopes the owner collects into the
-    // record store come from its rows. Only with the mounted RS: the same
-    // store and the same configured methods the RS enforces.
-    legacyScopeView: pdppRecords
-      ? createLegacyScopeView({
-          store: createLegacyScopeViewStore(db, pdppRecords.bindingStore),
-          configuredMethods: (sourceId) =>
-            pdppRecords.configuredMethods.get(sourceId) ?? [],
-        })
-      : undefined,
+    // record store come from its rows: the same store and the same
+    // configured methods the RS enforces. Composed with or without the RS,
+    // so a scope whose data moved there is refused, not read from its stale
+    // file, on a boot that does not mount the RS.
+    legacyScopeView: createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: pdppRecords?.bindingStore,
+      configuredMethods: (sourceId) =>
+        pdppRecords?.configuredMethods.get(sourceId) ?? [],
+    }),
     scopeDeletions,
     cloudMode,
     devToken,

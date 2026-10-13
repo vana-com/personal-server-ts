@@ -2,13 +2,13 @@ import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   GITHUB_BROWSER_BINDINGS,
   LEGACY_SCOPE_BINDINGS,
+  legacyBindingsForProfile,
   META_040_BINDINGS,
   OURA_BROWSER_BINDINGS,
-  type LegacyScopeBinding,
 } from "../legacy-projection/index.js";
 import {
+  legacyConnectorKey,
   readCanonicalLegacyScope,
-  resolveCanonicalConnection,
   type CanonicalConnectionBinding,
   type CanonicalConnectionSelection,
   type CanonicalLegacyReadFailure,
@@ -20,34 +20,49 @@ import {
  * Decides, per legacy scope, whether the latest body comes from the
  * canonical rows or from the existing legacy file, and reads it.
  *
- * A scope is canonical when its connector source holds owner evidence in the
- * connection registry: a connection that has held rows or a completion
- * receipt, was reset, or was deleted. A connection that boot registered and
- * nothing ever wrote to is not evidence, so a legacy-only owner keeps the
- * file. For a canonical scope the file is never the latest body: any failure
- * is a refusal.
+ * Only a bound scope can move. Its binding names the connector key it was
+ * reviewed for (`oura`, `oura-browser`, `github-browser`, `meta`, ...), and
+ * that key is the method id a connection is registered with: the operator's
+ * trusted method configuration names methods the same way. The store source
+ * id is never derived from the key; it is the connection's registered
+ * source, and that (source, method) pair must be configured on this boot.
  *
- * The connection comes only from the registry: the single live connection of
- * the scope's sources, with a method configured on this boot. A request
- * cannot name one.
+ * A bound scope is canonical-owned when a connection of one of its methods
+ * has held a row of, or a completion receipt for, one of the scope's
+ * streams, or was reset or deleted (both erase the rows that would show
+ * this). The evidence is durable in SQLite, so ownership holds when the
+ * record server is not mounted: the scope is then refused, never served
+ * from its file. Every other scope, unbound ones included, keeps the file.
+ *
+ * The connection comes only from the registry: the single live connection
+ * of the scope's methods that has held any data. A request cannot name one.
  */
 
-const SOURCE_ID_PREFIX = "https://registry.pdpp.dev/sources/";
-const CONNECTOR_ID_PREFIX = "https://registry.pdpp.dev/connectors/";
-
 /** Every declaration profile the pure module serves a scope from. */
-const BINDING_PROFILES: readonly ReadonlyMap<string, LegacyScopeBinding>[] = [
+const BINDING_PROFILES = [
   LEGACY_SCOPE_BINDINGS,
   GITHUB_BROWSER_BINDINGS,
   META_040_BINDINGS,
   OURA_BROWSER_BINDINGS,
 ];
 
-export interface LegacyScopeViewStore extends CanonicalLegacyReadStore {
-  /** Every connection registered for the source, deleted ones included. */
-  listSourceBindings(sourceId: string): CanonicalConnectionBinding[];
-  /** True once the instance has held a record, live or tombstoned. */
-  hasRecordHistory(instance: string): boolean;
+/**
+ * Read-only registry facts the decision needs. They come from the same
+ * SQLite database as the rows, and must work when the record server is not
+ * mounted (its tables may then be absent: no connection, no evidence).
+ */
+export interface LegacyScopeAuthority {
+  /** Connections registered with one of `methods`, deleted ones included. */
+  listMethodConnections(
+    methods: readonly string[],
+  ): CanonicalConnectionBinding[];
+  /**
+   * True when the instance has held a row (live or tombstoned) of one of
+   * `streams`, or holds a completion receipt for one. Null `streams`: any.
+   */
+  hasHeldData(instance: string, streams: readonly string[] | null): boolean;
+  /** See `CanonicalLegacyReadStore.readSnapshot`. Same database connection. */
+  readSnapshot<T>(read: () => T): T;
 }
 
 export type LegacyScopeRefusal =
@@ -56,6 +71,12 @@ export type LegacyScopeRefusal =
       status: "unavailable";
       reason: "no_connection" | "ambiguous_connection";
       candidates: number;
+    }
+  | {
+      /** The record server is not mounted, or does not configure the pair. */
+      status: "unavailable";
+      reason: "connection_unavailable";
+      detail: "method_not_configured";
     }
   | {
       status: "incomplete";
@@ -92,14 +113,23 @@ export interface LegacyScopeViewPort {
    * this lists (for example a projection rejection).
    */
   listingFor(scope: string): LegacyScopeListing;
+  /** Bound scopes under `scopePrefix` that `listingFor` lists as canonical. */
+  listCanonicalScopes(
+    scopePrefix: string | undefined,
+  ): { scope: string; collectedAt: string }[];
+  /** True when the scope's latest body is no longer the file's to give. */
+  ownsScope(scope: string): boolean;
 }
 
 export interface CreateLegacyScopeViewInput {
-  store: LegacyScopeViewStore;
+  authority: LegacyScopeAuthority;
   /**
-   * Methods this boot configures for a canonical source id. A connection
-   * bound to another method is refused, never read.
+   * The mounted record store, over the authority's database connection.
+   * Absent when the record server is not mounted: canonical-owned scopes
+   * are then refused.
    */
+  records?: CanonicalLegacyReadStore;
+  /** Methods this boot configures for a store source id. */
   configuredMethods(sourceId: string): readonly string[];
 }
 
@@ -108,104 +138,107 @@ type Decision =
   | { kind: "refused"; refusal: LegacyScopeRefusal }
   | {
       kind: "canonical";
+      records: CanonicalLegacyReadStore;
       selection: CanonicalConnectionSelection;
-      binding: LegacyScopeBinding;
+      generation: number;
+      streams: readonly string[];
     };
 
 export function createLegacyScopeView(
   input: CreateLegacyScopeViewInput,
 ): LegacyScopeViewPort {
-  const { store } = input;
+  const { authority, records } = input;
 
   function decide(scope: string): Decision {
-    const targets = scopeTargets(scope);
-    if (targets.length === 0) return { kind: "file" };
-    const evidenced = targets.filter((target) =>
-      store
-        .listSourceBindings(target.sourceId)
-        .some((binding) => isEvidence(store, binding)),
+    const streamsByMethod = scopeMethods(scope);
+    if (streamsByMethod.size === 0) return { kind: "file" };
+    const connections = authority.listMethodConnections([
+      ...streamsByMethod.keys(),
+    ]);
+    const owned = connections.some(
+      (connection) =>
+        connection.deletedAt !== null ||
+        connection.generation > 1 ||
+        authority.hasHeldData(
+          connection.instance,
+          streamsByMethod.get(connection.method ?? "") ?? [],
+        ),
     );
-    if (evidenced.length === 0) return { kind: "file" };
+    if (!owned) return { kind: "file" };
 
-    const exact = evidenced.filter((target) => target.binding !== null);
-    if (exact.length === 0) {
-      // A connector namespace the owner collects into, but no binding maps
-      // this scope. Its file cannot be told apart from stale connector data.
-      return {
-        kind: "refused",
-        refusal: {
-          status: "unavailable",
-          reason: "unbound_scope",
-          lookup: { kind: "unknown_scope", scope },
-        },
-      };
-    }
-
-    const chosen: {
-      selection: CanonicalConnectionSelection;
-      binding: LegacyScopeBinding;
-    }[] = [];
-    let candidates = 0;
-    for (const target of exact) {
-      const resolved = resolveCanonicalConnection(store, {
-        sourceId: target.sourceId,
+    // A connection that never held anything (boot registers one per source)
+    // is not a candidate; any other live one is, whatever stream it holds,
+    // so two accounts never split one namespace between them.
+    const candidates = connections.filter(
+      (connection) =>
+        connection.deletedAt === null &&
+        authority.hasHeldData(connection.instance, null),
+    );
+    const [only] = candidates;
+    if (!only) {
+      return refused({
+        status: "unavailable",
+        reason: "no_connection",
+        candidates: 0,
       });
-      if (resolved.ok) {
-        candidates += 1;
-        chosen.push({
-          selection: resolved.selection,
-          binding: target.binding!,
-        });
-      } else {
-        candidates += resolved.candidates;
-      }
     }
-    if (candidates === 0) {
-      return {
-        kind: "refused",
-        refusal: {
-          status: "unavailable",
-          reason: "no_connection",
-          candidates: 0,
-        },
-      };
+    if (candidates.length > 1) {
+      return refused({
+        status: "unavailable",
+        reason: "ambiguous_connection",
+        candidates: candidates.length,
+      });
     }
-    const [only] = chosen;
-    if (candidates > 1 || !only) {
-      return {
-        kind: "refused",
-        refusal: {
-          status: "unavailable",
-          reason: "ambiguous_connection",
-          candidates,
-        },
-      };
-    }
+    const { instance, sourceId, method } = only;
     if (
-      !input
-        .configuredMethods(only.selection.sourceId)
-        .includes(only.selection.method)
+      !records ||
+      sourceId === null ||
+      method === null ||
+      !input.configuredMethods(sourceId).includes(method)
     ) {
-      return {
-        kind: "refused",
-        refusal: {
-          status: "unavailable",
-          reason: "connection_unavailable",
-          detail: "method_mismatch",
-        },
-      };
+      return refused({
+        status: "unavailable",
+        reason: "connection_unavailable",
+        detail: "method_not_configured",
+      });
     }
-    return { kind: "canonical", ...only };
+    return {
+      kind: "canonical",
+      records,
+      selection: { instance, sourceId, method },
+      generation: only.generation,
+      streams: streamsByMethod.get(method) ?? [],
+    };
+  }
+
+  function listingFor(scope: string): LegacyScopeListing {
+    return authority.readSnapshot((): LegacyScopeListing => {
+      const decision = decide(scope);
+      if (decision.kind !== "canonical") return { kind: decision.kind };
+      const collectedAt = listedCollectedAt(
+        decision.records,
+        decision.selection.instance,
+        decision.streams,
+      );
+      return collectedAt === null
+        ? { kind: "refused" }
+        : { kind: "canonical", collectedAt };
+    });
   }
 
   return {
     async readLatest(scope) {
-      const decision = store.readSnapshot(() => decide(scope));
+      const decision = authority.readSnapshot(() => decide(scope));
       if (decision.kind !== "canonical") return decision;
       const read = await readCanonicalLegacyScope({
-        store,
+        store: decision.records,
         scope,
         selection: decision.selection,
+        profileBy: "method",
+        // The rows must come from a state in which this is still the one
+        // connection: a second account appearing between the decision and
+        // the rows refuses instead of serving a body chosen while ambiguous.
+        confirmSelection: () => sameSelection(decide(scope), decision),
       });
       if (!read.ok) {
         const { ok: _ok, ...refusal } = read;
@@ -228,66 +261,68 @@ export function createLegacyScopeView(
       };
     },
 
-    listingFor(scope) {
-      return store.readSnapshot((): LegacyScopeListing => {
-        const decision = decide(scope);
-        if (decision.kind !== "canonical") return { kind: decision.kind };
-        const collectedAt = listedCollectedAt(
-          store,
-          decision.selection.instance,
-          decision.binding.pdppStreams,
-        );
-        return collectedAt === null
-          ? { kind: "refused" }
-          : { kind: "canonical", collectedAt };
-      });
+    listingFor,
+
+    listCanonicalScopes(scopePrefix) {
+      const listed: { scope: string; collectedAt: string }[] = [];
+      for (const scope of boundScopes()) {
+        if (scopePrefix !== undefined && !scope.startsWith(scopePrefix)) {
+          continue;
+        }
+        const listing = listingFor(scope);
+        if (listing.kind === "canonical") {
+          listed.push({ scope, collectedAt: listing.collectedAt });
+        }
+      }
+      return listed;
+    },
+
+    ownsScope(scope) {
+      return authority.readSnapshot(() => decide(scope)).kind !== "file";
     },
   };
 }
 
-interface ScopeTarget {
-  sourceId: string;
-  /** Null when the source only shares the scope's namespace. */
-  binding: LegacyScopeBinding | null;
+function refused(refusal: LegacyScopeRefusal): Decision {
+  return { kind: "refused", refusal };
+}
+
+function sameSelection(
+  again: Decision,
+  decision: Extract<Decision, { kind: "canonical" }>,
+): boolean {
+  return (
+    again.kind === "canonical" &&
+    again.selection.instance === decision.selection.instance &&
+    again.selection.sourceId === decision.selection.sourceId &&
+    again.selection.method === decision.selection.method &&
+    again.generation === decision.generation
+  );
 }
 
 /**
- * The canonical sources that could hold a scope: every profile binding of
- * the scope, else every source bound anywhere in the scope's namespace.
+ * The methods that may serve a scope, each with the streams its binding
+ * reads. A method id is a binding's connector key; its binding is the one
+ * the reader will use for that method.
  */
-function scopeTargets(scope: string): ScopeTarget[] {
-  const exact = new Map<string, ScopeTarget>();
+function scopeMethods(scope: string): Map<string, readonly string[]> {
+  const methods = new Map<string, readonly string[]>();
   for (const profile of BINDING_PROFILES) {
-    const binding = profile.get(scope);
-    if (binding) {
-      const sourceId = canonicalSourceId(binding.pdppSource);
-      exact.set(sourceId, { sourceId, binding });
-    }
+    const bound = profile.get(scope);
+    if (!bound) continue;
+    const method = legacyConnectorKey(bound.pdppSource);
+    const binding = legacyBindingsForProfile(method).get(scope);
+    if (binding) methods.set(method, binding.pdppStreams);
   }
-  if (exact.size > 0) return [...exact.values()];
-
-  const namespace = `${scope.split(".", 1)[0]}.`;
-  const shared = new Map<string, ScopeTarget>();
-  for (const profile of BINDING_PROFILES) {
-    for (const [bound, binding] of profile) {
-      if (!bound.startsWith(namespace)) continue;
-      const sourceId = canonicalSourceId(binding.pdppSource);
-      shared.set(sourceId, { sourceId, binding: null });
-    }
-  }
-  return [...shared.values()];
+  return methods;
 }
 
-function isEvidence(
-  store: LegacyScopeViewStore,
-  binding: CanonicalConnectionBinding,
-): boolean {
-  return (
-    binding.deletedAt !== null ||
-    binding.generation > 1 ||
-    store.hasRecordHistory(binding.instance) ||
-    store.listStreamCompletions(binding.instance).length > 0
-  );
+function boundScopes(): string[] {
+  const scopes = new Set<string>();
+  for (const profile of BINDING_PROFILES) {
+    for (const scope of profile.keys()) scopes.add(scope);
+  }
+  return [...scopes].sort();
 }
 
 /**
@@ -296,7 +331,7 @@ function isEvidence(
  * stream is empty without a valid receipt, which a read refuses.
  */
 function listedCollectedAt(
-  store: LegacyScopeViewStore,
+  store: CanonicalLegacyReadStore,
   instance: string,
   streams: readonly string[],
 ): string | null {
@@ -342,17 +377,11 @@ function incompleteness(
       kind: "partial" as const,
       detail: `${entry.count} rows: ${entry.reasons.join("; ")}`,
     })),
-    ...unproven.map((entry) => ({
+    // Optional on the canonical-legacy-view/4 contract: omitted when empty.
+    ...(unproven ?? []).map((entry) => ({
       stream: entry.stream,
       kind: "unproven" as const,
       detail: `${entry.aspect}: ${entry.reason}`,
     })),
   ];
-}
-
-/** Binding sources are `connectors/<name>`; the store registers `sources/<name>`. */
-function canonicalSourceId(pdppSource: string): string {
-  return pdppSource.startsWith(CONNECTOR_ID_PREFIX)
-    ? SOURCE_ID_PREFIX + pdppSource.slice(CONNECTOR_ID_PREFIX.length)
-    : pdppSource;
 }

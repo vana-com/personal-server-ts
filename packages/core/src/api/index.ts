@@ -1099,6 +1099,40 @@ function listingVisibility(
 }
 
 /**
+ * Bound scopes served only from canonical records, for the listing: no
+ * legacy write is needed to discover them. A gateway deletion hides them
+ * the way it hides a stored scope.
+ */
+function canonicalOnlyScopes(
+  deps: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner" | "legacyScopeView"
+  >,
+):
+  | ((
+      scopePrefix: string | undefined,
+      stored: ReadonlySet<string>,
+    ) => Promise<ScopeSummary[]>)
+  | undefined {
+  const view = deps.legacyScopeView;
+  if (!view) return undefined;
+  return async (scopePrefix, stored) => {
+    const listed: ScopeSummary[] = [];
+    for (const { scope, collectedAt } of view.listCanonicalScopes(
+      scopePrefix,
+    )) {
+      if (stored.has(scope)) continue;
+      if ((await resolveReadDeletion(deps, scope, undefined)) !== null) {
+        continue;
+      }
+      // No legacy version exists to count or to ask `/versions` for.
+      listed.push({ scope, latestCollectedAt: collectedAt, versionCount: 0 });
+    }
+    return listed;
+  };
+}
+
+/**
  * A canonical scope's listing row carries the canonical freshness. The
  * legacy head's size and block readiness describe a file the latest read
  * does not serve, so they are dropped.
@@ -1117,13 +1151,24 @@ function withCanonicalListing(
 }
 
 /**
+ * X402 binds a payment to a registered data point version
+ * (`RecordDataAccess`). A canonical body has none, and the legacy entry's
+ * would attest a different body, so a charged canonical read is refused
+ * before any challenge until a real binding exists.
+ */
+type PaidCanonicalReadRefusal = {
+  status: "unavailable";
+  reason: "paid_read_unsupported";
+};
+
+/**
  * 409 when the owner must choose between connections, 503 otherwise. The
  * body names the reason and stream names only: no instance id, no row data,
  * no legacy content.
  */
 function legacyViewRefusalResponse(
   scope: string,
-  refusal: LegacyScopeRefusal,
+  refusal: LegacyScopeRefusal | PaidCanonicalReadRefusal,
 ): Response {
   const status = refusal.reason === "ambiguous_connection" ? 409 : 503;
   return jsonResponse(
@@ -1495,6 +1540,7 @@ export async function handlePersonalServerDataRequest(
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
         isVisible: listingVisibility(deps),
+        extraScopes: canonicalOnlyScopes(deps),
       });
       return jsonResponse({
         ...result.response,
@@ -1642,10 +1688,14 @@ export async function handlePersonalServerDataRequest(
       const scopeResult = parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
       logContext.detail = { scope: scopeResult.scope };
+      // An empty `fileId=` or `at=` selects no version: it is the latest
+      // read, as storage already treats it.
+      const fileIdParam = url.searchParams.get("fileId") || undefined;
+      const atParam = url.searchParams.get("at") || undefined;
       const selectedEntry = deps.storage.findEntry({
         scope: scopeResult.scope,
-        fileId: url.searchParams.get("fileId") ?? undefined,
-        at: url.searchParams.get("at") ?? undefined,
+        fileId: fileIdParam,
+        at: atParam,
       });
       // Holds the base64-encoded gateway payForOperation response body when
       // X402 succeeds — emitted on the final read response as X-PAYMENT-RESPONSE.
@@ -1655,9 +1705,8 @@ export async function handlePersonalServerDataRequest(
         request,
         scope: scopeResult.scope,
         grantId,
-        fileId:
-          url.searchParams.get("fileId") ?? selectedEntry?.fileId ?? undefined,
-        at: url.searchParams.get("at") ?? undefined,
+        fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
+        at: atParam,
       });
 
       // Deletion gate, after auth (so unauthenticated callers learn nothing)
@@ -1674,6 +1723,18 @@ export async function handlePersonalServerDataRequest(
       // answer unreachable through this route. Nothing here blocks: a
       // previous version is served now, the fresh one lands in a later read.
       notifyDataRead(deps, { scope: scopeResult.scope });
+
+      // A canonical scope's latest body is the canonical view, and only it:
+      // a refusal is answered, never replaced by the legacy file. Explicit
+      // versions stay legacy history. Read before payment, so a builder is
+      // never challenged or charged for a read that is then refused.
+      const latest =
+        fileIdParam === undefined && atParam === undefined
+          ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
+          : undefined;
+      if (latest?.kind === "refused") {
+        return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
+      }
 
       // X402 payment dance for builder reads. Owner-exempt reads (the
       // grantId sentinels "owner" / "policy-bypass") skip payment entirely
@@ -1734,6 +1795,12 @@ export async function handlePersonalServerDataRequest(
           willCharge,
         });
       }
+      if (willCharge && latest?.kind === "canonical") {
+        return legacyViewRefusalResponse(scopeResult.scope, {
+          status: "unavailable",
+          reason: "paid_read_unsupported",
+        });
+      }
       // Keep the full condition inline (not `if (willCharge)`) so TS narrows
       // deps.gateway/gatewayConfig/gatewayUrl to non-undefined in the block.
       if (
@@ -1750,8 +1817,8 @@ export async function handlePersonalServerDataRequest(
           deps,
           request,
           scope: scopeResult.scope,
-          fileIdParam: url.searchParams.get("fileId") ?? undefined,
-          atParam: url.searchParams.get("at") ?? undefined,
+          fileIdParam,
+          atParam,
           grantId: resolvedGrantId,
           builder: builder as `0x${string}`,
           gateway: deps.gateway,
@@ -1776,17 +1843,6 @@ export async function handlePersonalServerDataRequest(
       }
 
       const headers: Record<string, string> = {};
-      // A canonical scope's latest body is the canonical view, and only it:
-      // a refusal is answered, never replaced by the legacy file. Explicit
-      // versions stay legacy history.
-      const explicitVersion =
-        url.searchParams.has("fileId") || url.searchParams.has("at");
-      const latest = explicitVersion
-        ? undefined
-        : await deps.legacyScopeView?.readLatest(scopeResult.scope);
-      if (latest?.kind === "refused") {
-        return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
-      }
       let envelope: DataFileEnvelope;
       let servedFileId: string | undefined;
       if (latest?.kind === "canonical") {
@@ -1796,8 +1852,8 @@ export async function handlePersonalServerDataRequest(
         const result = await readDataContract({
           storage: deps.storage,
           scopeParam: scopeResult.scope,
-          fileId: url.searchParams.get("fileId") ?? undefined,
-          at: url.searchParams.get("at") ?? undefined,
+          fileId: fileIdParam,
+          at: atParam,
         });
         if (!result.ok) {
           if (result.status === 404) {
@@ -1809,8 +1865,7 @@ export async function handlePersonalServerDataRequest(
           return contractErrorResponse(result);
         }
         envelope = result.envelope;
-        servedFileId =
-          url.searchParams.get("fileId") ?? selectedEntry?.fileId ?? undefined;
+        servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
       }
 
       const servedEnvelope = isOwnerView(authResult)
@@ -2142,6 +2197,22 @@ export async function handlePersonalServerDataRequest(
         // truncation and cross-owner handling, all-or-nothing before the
         // first tombstone). Until that lands the only honest answer is 501.
         throw new LineageCascadeUnavailableError({ scope: parsed.scope });
+      }
+
+      // A canonical-owned scope's latest body is its connection's rows. No
+      // store seam deletes one legacy scope's rows (streams can be shared,
+      // and the account and its generation are the unit of erasure), so a
+      // 200 here would leave the data readable. Refuse before any gateway or
+      // file change; the connection's own delete erases its rows.
+      if (deps.legacyScopeView?.ownsScope(parsed.scope)) {
+        return jsonResponse(
+          {
+            error: "CANONICAL_DELETE_UNSUPPORTED",
+            message: `Scope "${parsed.scope}" is served from the owner's connector records, which this route cannot delete. Nothing was deleted; delete the connection to erase its records.`,
+            scope: parsed.scope,
+          },
+          { status: 409 },
+        );
       }
 
       // Durable order: gateway tombstone -> storage blobs -> local copy. The

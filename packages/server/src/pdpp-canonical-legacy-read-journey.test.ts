@@ -19,7 +19,15 @@ import type {
   GatewayGrantResponse,
 } from "@opendatalabs/vana-sdk/node";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
+import {
+  escrowPaymentDomain,
+  GENERIC_PAYMENT_TYPES,
+} from "@opendatalabs/vana-sdk/browser";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  encodePaymentHeader,
+  nextPaymentNonce,
+} from "@opendatalabs/personal-server-ts-core/payment";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
   buildWeb3SignedHeader,
@@ -33,7 +41,8 @@ const KNOWN_SIG =
 const CONTROL_PLANE_TOKEN = "canonical-read-journey-control-plane";
 const OURA = "https://registry.pdpp.dev/sources/oura";
 const SECOND_ACCOUNT = "conn_123e4567-e89b-42d3-a456-426614174000";
-const GRANT_ID = "grant-legacy-oura";
+// X402 pays against the grant id as an opId, so it must be bytes32.
+const GRANT_ID = `0x${"11".repeat(32)}`;
 const BUILDER_ID = "builder-legacy-oura";
 const builder = createTestWallet(0);
 
@@ -114,11 +123,19 @@ function grant(): GatewayGrantResponse {
   };
 }
 
-async function boot(methodId = "oura") {
+interface BootOptions {
+  declaration?: string;
+  payment?: boolean;
+}
+
+async function boot(
+  methodId = "oura",
+  { declaration = OURA_DECLARATION, payment = false }: BootOptions = {},
+) {
   const dir = join(tempDir, "declarations");
   await mkdir(dir, { recursive: true });
-  const path = join(dir, "oura.json");
-  await writeFile(path, OURA_DECLARATION, "utf-8");
+  const path = join(dir, "declaration.json");
+  await writeFile(path, declaration, "utf-8");
   const gateway = {
     getBuilder: vi.fn().mockResolvedValue({
       id: BUILDER_ID,
@@ -133,6 +150,7 @@ async function boot(methodId = "oura") {
   return createServer(
     ServerConfigSchema.parse({
       tunnel: { enabled: false },
+      payment: { enabled: payment },
       pdpp: {
         enabled: true,
         declarationPaths: [path],
@@ -149,7 +167,7 @@ async function boot(methodId = "oura") {
 
 async function ownerPdppToken(instanceId?: string): Promise<string> {
   if (!instanceId) {
-    return registerTestConnection(ctx!.app, ctx!.devToken, owner, OURA);
+    return registerTestConnection(ctx!.app, ctx!.devToken!, owner, OURA);
   }
   const response = await ctx!.app.request("/pdpp/v1/owner/token", {
     method: "POST",
@@ -363,7 +381,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     ]);
   });
 
-  it("serves a known-empty stream as empty and refuses an uncollected one even when its legacy file exists", async () => {
+  it("serves a known-empty stream as empty, and refuses a collected stream whose rows cannot be proven current", async () => {
     await legacyWrite("oura.activity", STALE);
     await legacyWrite("oura.readiness", {
       readiness: [{ id: "stale-legacy", day: "2026-01-01", score: 1 }],
@@ -378,30 +396,42 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       data: { days: [] },
     });
 
-    // Nothing live anywhere on the connection yet.
-    const nothingSynced = await ownerGet("/v1/data/oura.readiness");
-    expect(nothingSynced.status).toBe(503);
-    expect(JSON.parse(nothingSynced.text)).toMatchObject({
-      error: "CANONICAL_VIEW_UNAVAILABLE",
-      reason: "no_synced_data",
-    });
-    expect(nothingSynced.text).not.toContain("stale-legacy");
+    // Readiness was never collected canonically: its file is still the
+    // only copy, so the scope stays the file's. A sibling stream's rows
+    // do not make it canonical.
+    const uncollected = await ownerGet("/v1/data/oura.readiness");
+    expect(uncollected.status).toBe(200);
+    expect(uncollected.text).toContain("stale-legacy");
 
-    // A sibling stream's rows are not evidence that readiness is empty.
+    // Once readiness has canonical history it is canonical for good. With
+    // its only row deleted and no completion receipt, an empty body cannot
+    // be told apart from an unfinished one, even though a sibling stream
+    // has rows: refused, never the file.
     await replace(
       token,
       "activity",
       [day("a1", "2026-09-01")],
       "2026-09-11T06:00:00Z",
     );
-    const uncollected = await ownerGet("/v1/data/oura.readiness");
-    expect(uncollected.status).toBe(503);
-    expect(JSON.parse(uncollected.text)).toMatchObject({
+    await replace(
+      token,
+      "readiness",
+      [{ id: "r1", day: "2026-09-01", score: 70 }],
+      "2026-09-11T06:00:00Z",
+    );
+    const deleted = await ctx!.app.request("/v1/streams/readiness/records/r1", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(deleted.status).toBe(204);
+    const unproven = await ownerGet("/v1/data/oura.readiness");
+    expect(unproven.status).toBe(503);
+    expect(JSON.parse(unproven.text)).toMatchObject({
       error: "CANONICAL_VIEW_UNAVAILABLE",
       reason: "stream_completion_unknown",
       streams: ["readiness"],
     });
-    expect(uncollected.text).not.toContain("stale-legacy");
+    expect(unproven.text).not.toContain("stale-legacy");
   });
 
   it("refuses two accounts with no trusted choice and leaks neither", async () => {
@@ -484,27 +514,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(JSON.parse(read.text)).toMatchObject({
       error: "CANONICAL_VIEW_UNAVAILABLE",
       reason: "connection_unavailable",
-      detail: "method_mismatch",
+      detail: "method_not_configured",
     });
     expect(read.text).not.toContain("stale-legacy");
-  });
-
-  it("refuses an unbound scope in a bound connector namespace instead of serving its file", async () => {
-    await legacyWrite("oura.personal_info", { email: "stale@example.com" });
-    const token = await ownerPdppToken();
-    await replace(
-      token,
-      "activity",
-      [day("a1", "2026-09-01")],
-      "2026-09-10T06:00:00Z",
-    );
-    const read = await ownerGet("/v1/data/oura.personal_info");
-    expect(read.status).toBe(503);
-    expect(JSON.parse(read.text)).toMatchObject({
-      error: "CANONICAL_VIEW_UNAVAILABLE",
-      reason: "unbound_scope",
-    });
-    expect(read.text).not.toContain("stale@example.com");
   });
 
   it("refuses a body the projector could only deliver with rows left out", async () => {
@@ -619,6 +631,7 @@ describe("GET /v1/data listing", () => {
   it("does not list a bound scope whose latest read would be refused", async () => {
     await legacyWrite("oura.activity", STALE);
     await legacyWrite("oura.readiness", { readiness: [] });
+    await legacyWrite("notes.manual", { text: "kept" });
     const token = await ownerPdppToken();
     await replace(
       token,
@@ -626,12 +639,502 @@ describe("GET /v1/data listing", () => {
       [day("a1", "2026-09-01")],
       "2026-09-10T06:00:00Z",
     );
+    await registerSecondAccount(token);
+    const second = await ownerPdppToken(SECOND_ACCOUNT);
+    await replace(
+      second,
+      "readiness",
+      [{ id: "r1", day: "2026-09-01", score: 70 }],
+      "2026-09-10T06:00:00Z",
+      SECOND_ACCOUNT,
+    );
+    // Two accounts hold data: both bound scopes would be refused as
+    // ambiguous, so neither is listed. The manual scope still is.
     const listing = await ownerGet("/v1/data");
     const body = JSON.parse(listing.text) as {
       scopes: { scope: string }[];
       total: number;
     };
-    expect(body.scopes.map((s) => s.scope)).toEqual(["oura.activity"]);
+    expect(body.scopes.map((s) => s.scope)).toEqual(["notes.manual"]);
     expect(body.total).toBe(1);
+  });
+
+  it("lists a scope served only from canonical rows, without a legacy write", async () => {
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+    expect(ctx!.indexManager.listDistinctScopes().scopes).toEqual([]);
+
+    const listing = await ownerGet("/v1/data");
+    expect(listing.status).toBe(200);
+    expect(JSON.parse(listing.text)).toEqual({
+      scopes: [
+        {
+          scope: "oura.activity",
+          latestCollectedAt: "2026-09-10T06:00:00.000Z",
+          versionCount: 0,
+        },
+      ],
+      total: 1,
+      limit: 20,
+      offset: 0,
+    });
+    // The listing still creates no legacy entry.
+    expect(ctx!.indexManager.listDistinctScopes().scopes).toEqual([]);
+  });
+
+  it("merges canonical-only and stored scopes in one ordered, paged listing", async () => {
+    await legacyWrite("notes.manual", { text: "kept" });
+    await legacyWrite("oura.readiness", { readiness: [] });
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+    const scopesOf = async (query: string) => {
+      const body = JSON.parse((await ownerGet(`/v1/data${query}`)).text) as {
+        scopes: { scope: string }[];
+        total: number;
+      };
+      return { scopes: body.scopes.map((s) => s.scope), total: body.total };
+    };
+    // oura.readiness has no canonical data: it stays its file's.
+    expect(await scopesOf("")).toEqual({
+      scopes: ["notes.manual", "oura.activity", "oura.readiness"],
+      total: 3,
+    });
+    expect(await scopesOf("?limit=1&offset=1")).toEqual({
+      scopes: ["oura.activity"],
+      total: 3,
+    });
+    expect(await scopesOf("?scopePrefix=oura.")).toEqual({
+      scopes: ["oura.activity", "oura.readiness"],
+      total: 2,
+    });
+    expect(await scopesOf("?scopePrefix=notes.")).toEqual({
+      scopes: ["notes.manual"],
+      total: 1,
+    });
+  });
+});
+
+describe("scopes the canonical view does not convert", () => {
+  it("keeps unbound scopes of a collected namespace on their files", async () => {
+    await legacyWrite("oura.personal_info", { email: "kept@example.com" });
+    await legacyWrite("oura.manual", { text: "owner-note" });
+    await legacyWrite("oura.readiness", STALE);
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+
+    const personal = await ownerGet("/v1/data/oura.personal_info");
+    expect(personal.status).toBe(200);
+    expect(JSON.parse(personal.text)).toMatchObject({
+      data: { email: "kept@example.com" },
+    });
+    const manual = await ownerGet("/v1/data/oura.manual");
+    expect(manual.status).toBe(200);
+    expect(JSON.parse(manual.text)).toMatchObject({
+      data: { text: "owner-note" },
+    });
+    // A bound scope the connection holds no data for is not converted
+    // either: its file is still the only copy.
+    const readiness = await ownerGet("/v1/data/oura.readiness");
+    expect(readiness.status).toBe(200);
+    expect(ids(readiness.text)).toEqual(["stale-legacy"]);
+  });
+
+  it("keeps an unbound scope on its file after a never-used connection is deleted", async () => {
+    await legacyWrite("oura.manual", { text: "owner-note" });
+    const token = await ownerPdppToken();
+    const deleted = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(accountOne)}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(deleted.status).toBe(200);
+
+    const manual = await ownerGet("/v1/data/oura.manual");
+    expect(manual.status).toBe(200);
+    expect(JSON.parse(manual.text)).toMatchObject({
+      data: { text: "owner-note" },
+    });
+  });
+});
+
+describe("selectors, payment, restart and deletion around a canonical scope", () => {
+  async function collectActivity() {
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+    return token;
+  }
+
+  it.each(["at=", "fileId=", "at=&fileId="])(
+    "treats an empty selector (%s) as the latest read",
+    async (query) => {
+      await legacyWrite("oura.activity", STALE);
+      await collectActivity();
+      const read = await ownerGet(`/v1/data/oura.activity?${query}`);
+      expect(read.status).toBe(200);
+      expect(ids(read.text)).toEqual(["a1"]);
+      expect(read.etag).toBe((await ownerGet("/v1/data/oura.activity")).etag);
+    },
+  );
+
+  async function signedRead(scope: string, payment?: string) {
+    return ctx!.app.request(`/v1/data/${scope}`, {
+      headers: {
+        authorization: await buildWeb3SignedHeader({
+          wallet: builder,
+          aud: ctx!.config.server.origin,
+          method: "GET",
+          uri: `/v1/data/${scope}`,
+          grantId: GRANT_ID,
+        }),
+        ...(payment ? { "x-payment": payment } : {}),
+      },
+    });
+  }
+
+  /** A well-formed, locally verifiable payment for the grant's fee. */
+  async function paymentHeader(): Promise<string> {
+    const { fee } = grant();
+    const message = {
+      payerAddress: builder.address,
+      opType: "grant" as const,
+      opId: GRANT_ID as `0x${string}`,
+      asset: fee.asset as `0x${string}`,
+      amount: BigInt(fee.totalDue),
+      paymentNonce: nextPaymentNonce(),
+    };
+    const signature = await builder.signTypedData({
+      domain: escrowPaymentDomain(ctx!.config.gateway),
+      types: GENERIC_PAYMENT_TYPES,
+      primaryType: "GenericPayment",
+      message,
+    });
+    return encodePaymentHeader({
+      x402Version: 1,
+      scheme: "vana-escrow-grant",
+      network: `vana:${ctx!.config.gateway.chainId}`,
+      payload: {
+        message: {
+          ...message,
+          amount: message.amount.toString(),
+          paymentNonce: message.paymentNonce.toString(),
+        },
+        signature,
+      },
+    });
+  }
+
+  function stubEscrow() {
+    const pay = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ success: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", pay);
+    return pay;
+  }
+
+  it("refuses an ambiguous paid read before any challenge or payment", async () => {
+    await ctx!.cleanup();
+    ctx = await boot("oura", { payment: true });
+    const token = await collectActivity();
+    await registerSecondAccount(token);
+    const second = await ownerPdppToken(SECOND_ACCOUNT);
+    await replace(
+      second,
+      "activity",
+      [day("two", "2026-09-02")],
+      "2026-09-10T06:00:00Z",
+      SECOND_ACCOUNT,
+    );
+    const pay = stubEscrow();
+    try {
+      for (const response of [
+        await signedRead("oura.activity"),
+        await signedRead("oura.activity", await paymentHeader()),
+      ]) {
+        expect(response.status).toBe(409);
+        expect(response.headers.get("x-payment-response")).toBeNull();
+        expect(await response.json()).toMatchObject({
+          error: "CANONICAL_VIEW_UNAVAILABLE",
+          reason: "ambiguous_connection",
+        });
+      }
+      expect(pay).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("refuses a charged read of a canonical scope before the challenge, so no legacy version is attested", async () => {
+    await ctx!.cleanup();
+    ctx = await boot("oura", { payment: true });
+    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.readiness", { readiness: [] });
+    for (const scope of ["oura.activity", "oura.readiness"]) {
+      const entry = ctx!.indexManager.findLatestByScope(scope)!;
+      ctx!.indexManager.updateDataPointId(entry.path, `0x${"22".repeat(32)}`);
+    }
+    await collectActivity();
+    const pay = stubEscrow();
+    try {
+      for (const response of [
+        await signedRead("oura.activity"),
+        await signedRead("oura.activity", await paymentHeader()),
+      ]) {
+        expect(response.status).toBe(503);
+        const text = await response.text();
+        expect(JSON.parse(text)).toMatchObject({
+          error: "CANONICAL_VIEW_UNAVAILABLE",
+          reason: "paid_read_unsupported",
+        });
+        expect(text).not.toContain("accessRecord");
+        expect(text).not.toContain("stale-legacy");
+      }
+      expect(pay).not.toHaveBeenCalled();
+
+      // The owner is not charged and still reads the canonical body.
+      const owned = await ownerGet("/v1/data/oura.activity");
+      expect(owned.status).toBe(200);
+      expect(ids(owned.text)).toEqual(["a1"]);
+
+      // A scope still served from its file keeps the existing challenge,
+      // bound to that file's registered version.
+      const challenged = await signedRead("oura.readiness");
+      expect(challenged.status).toBe(402);
+      const challenge = (await challenged.json()) as {
+        accepts: { accessRecord?: { dataPointId: string } }[];
+      };
+      expect(challenge.accepts[0]?.accessRecord?.dataPointId).toBe(
+        `0x${"22".repeat(32)}`,
+      );
+      expect(pay).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps refusing a canonical scope after a restart with PDPP disabled", async () => {
+    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.readiness", { readiness: [] });
+    await legacyWrite("notes.manual", { text: "kept" });
+    await collectActivity();
+    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(200);
+    await ctx!.cleanup();
+    ctx = await createServer(
+      ServerConfigSchema.parse({
+        tunnel: { enabled: false },
+        pdpp: { enabled: false },
+      }),
+      { serverDir: tempDir, dataDir: join(tempDir, "data") },
+    );
+
+    const read = await ownerGet("/v1/data/oura.activity");
+    expect(read.status).toBe(503);
+    expect(JSON.parse(read.text)).toMatchObject({
+      error: "CANONICAL_VIEW_UNAVAILABLE",
+      reason: "connection_unavailable",
+      detail: "method_not_configured",
+    });
+    expect(read.text).not.toContain("stale-legacy");
+    // Only the owned scope is refused; the others keep their files.
+    expect((await ownerGet("/v1/data/oura.readiness")).status).toBe(200);
+    expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
+    const listing = JSON.parse((await ownerGet("/v1/data")).text) as {
+      scopes: { scope: string }[];
+    };
+    expect(listing.scopes.map((s) => s.scope)).toEqual([
+      "notes.manual",
+      "oura.readiness",
+    ]);
+  });
+
+  it("refuses a local DELETE of a canonical scope and changes nothing", async () => {
+    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("notes.manual", { text: "kept" });
+    await collectActivity();
+    const before = ctx!.indexManager.findLatestByScope("oura.activity");
+    expect(before).toBeDefined();
+
+    const deletion = await ctx!.app.request("/v1/data/oura.activity", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(deletion.status).toBe(409);
+    expect(await deletion.json()).toMatchObject({
+      error: "CANONICAL_DELETE_UNSUPPORTED",
+      scope: "oura.activity",
+    });
+    // Nothing was deleted, and nothing claims it was: the legacy history
+    // and the canonical latest body are both as before.
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(
+      before,
+    );
+    const latest = await ownerGet("/v1/data/oura.activity");
+    expect(latest.status).toBe(200);
+    expect(ids(latest.text)).toEqual(["a1"]);
+
+    // A scope the view does not own is still deleted as before.
+    const manual = await ctx!.app.request("/v1/data/notes.manual", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(manual.status).toBe(200);
+    expect((await ownerGet("/v1/data/notes.manual")).status).toBe(404);
+  });
+});
+
+describe("configured methods that share one public source", () => {
+  // The github-browser method collects source `github`, as Desktop's
+  // pdpp-methods.json admits it. Profile fields as in the github-browser
+  // 0.2.30 manifest; this is a routing check, not provider parity with the
+  // 0.2.15 artifact Desktop pins.
+  const GITHUB = "https://registry.pdpp.dev/sources/github";
+  const GITHUB_PROFILE_FIELDS = [
+    "id",
+    "username",
+    "fullName",
+    "bio",
+    "company",
+    "location",
+    "website",
+    "avatarUrl",
+    "followers",
+    "following",
+    "repositoryCount",
+    "profileUrl",
+    "pinnedRepositories",
+    "organizations",
+    "achievements",
+    "contributionsLastYear",
+  ];
+
+  it("serves github.profile through the github-browser projection on source github", async () => {
+    await ctx!.cleanup();
+    ctx = await boot("github-browser", {
+      declaration: JSON.stringify({
+        source_id: GITHUB,
+        source_kind: "connector",
+        version: "1",
+        streams: [
+          {
+            name: "profile",
+            fields: GITHUB_PROFILE_FIELDS,
+            required_fields: ["id", "username", "profileUrl"],
+            primary_key: ["id"],
+          },
+        ],
+      }),
+    });
+    await legacyWrite("github.profile", { username: "stale-legacy" });
+    const token = await registerTestConnection(
+      ctx.app,
+      ctx.devToken!,
+      owner,
+      GITHUB,
+      "github-browser",
+    );
+    const write = await ctx.app.request(
+      "/v1/streams/profile/records/replace?method=github-browser&binding_generation=1",
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          instance: `github:${owner}`,
+          emitted_at: "2026-09-10T12:00:00Z",
+          source_collected_at: "2026-09-10T06:00:00Z",
+          records: [
+            {
+              key: "profile",
+              data: {
+                id: "profile",
+                username: "current-user",
+                profileUrl: "https://github.com/current-user",
+              },
+              emitted_at: "2026-09-10T07:00:00Z",
+            },
+          ],
+        }),
+      },
+    );
+    expect(write.status).toBe(200);
+
+    const read = await ownerGet("/v1/data/github.profile");
+    expect(read.status).toBe(200);
+    const body = JSON.parse(read.text) as { data: Record<string, unknown> };
+    expect(body.data).toMatchObject({
+      username: "current-user",
+      profileUrl: "https://github.com/current-user",
+    });
+    // The browser profile drops the PDPP runtime key from the legacy body.
+    expect(body.data).not.toHaveProperty("id");
+    expect(read.text).not.toContain("stale-legacy");
+  });
+
+  it("serves an Oura scope from an oura-browser connection on source oura", async () => {
+    // The default boot registered account one with method oura; start over.
+    // Registration accepts one configured method per source, so this boot
+    // configures oura-browser alone for source oura.
+    await ctx!.cleanup();
+    await rm(tempDir, { recursive: true, force: true });
+    await mkdir(tempDir);
+    ctx = await boot("oura-browser");
+    await legacyWrite("oura.activity", STALE);
+    const token = await registerTestConnection(
+      ctx.app,
+      ctx.devToken!,
+      owner,
+      OURA,
+      "oura-browser",
+    );
+    const write = await ctx.app.request(
+      "/v1/streams/activity/records/replace?method=oura-browser&binding_generation=1",
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          instance: accountOne,
+          emitted_at: "2026-09-10T12:00:00Z",
+          source_collected_at: "2026-09-10T06:00:00Z",
+          records: [
+            {
+              key: "b1",
+              data: day("b1", "2026-09-01"),
+              emitted_at: "2026-09-10T07:00:00Z",
+            },
+          ],
+        }),
+      },
+    );
+    expect(write.status).toBe(200);
+    const read = await ownerGet("/v1/data/oura.activity");
+    expect(read.status).toBe(200);
+    expect(ids(read.text)).toEqual(["b1"]);
   });
 });
