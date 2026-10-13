@@ -323,12 +323,14 @@ export interface McpDataReadClient {
   /**
    * Perform `GET /v1/data?scopePrefix=…` as the connection grantee. This is
    * used only for discovery/expanding wildcard grants before a grant-gated
-   * read; it does not return scope contents.
+   * read; it does not return scope contents. The listing only shows scopes
+   * the signed `grantId` covers (absent: the owner's grants to the grantee).
    */
   listScopes(params?: {
     scopePrefix?: string;
     limit?: number;
     offset?: number;
+    grantId?: string;
   }): Promise<McpDataListResult>;
 
   /**
@@ -602,7 +604,7 @@ export function createMcpDataReadClient(
 
   return {
     enforcesPayment: options.enforcesPayment ?? false,
-    async listScopes({ scopePrefix, limit, offset } = {}) {
+    async listScopes({ scopePrefix, limit, offset, grantId } = {}) {
       const params = new URLSearchParams();
       if (scopePrefix) params.set("scopePrefix", scopePrefix);
       if (limit !== undefined) params.set("limit", String(limit));
@@ -615,7 +617,7 @@ export function createMcpDataReadClient(
         aud: options.serverOrigin,
         method: "GET",
         uri: basePath,
-        grantId: "mcp-list",
+        grantId,
       });
 
       const url = new URL(pathWithQuery, options.serverOrigin).toString();

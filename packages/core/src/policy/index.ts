@@ -1,6 +1,9 @@
 export {
   verifyDataReadPolicy,
+  resolveDataListGrantScopes,
   parseGrantExpiresAtSeconds,
+  type DataListPolicyInput,
+  type DataListPolicyPorts,
   type DataReadPolicyInput,
   type DataReadPolicyPorts,
 } from "./data-read.js";

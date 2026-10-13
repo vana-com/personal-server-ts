@@ -326,6 +326,30 @@ describe("createMcpSessionAuthPort", () => {
     ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
   });
 
+  it("scopes a data listing to the session grant", async () => {
+    const port = createMcpSessionAuthPort({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      authSessionVerifier: fakeGateway(grant()),
+      grantVerifier: fakeGateway(grant()),
+      serverOwner: OWNER,
+    });
+    await expect(
+      port.authorizeBuilderList(new Request("http://ps.local/")),
+    ).resolves.toEqual({ grantedScopes: ["instagram.profile"] });
+
+    const foreign = fakeGateway(grant({ grantorAddress: OTHER }));
+    await expect(
+      createMcpSessionAuthPort({
+        builderAddress: BUILDER,
+        grantId: "grant_1",
+        authSessionVerifier: foreign,
+        grantVerifier: foreign,
+        serverOwner: OWNER,
+      }).authorizeBuilderList(new Request("http://ps.local/")),
+    ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
+  });
+
   it("refuses owner operations", async () => {
     const gw = fakeGateway(grant());
     const port = createMcpSessionAuthPort({

@@ -110,7 +110,7 @@ export async function signMcpGranteeRequest(params: {
   aud: string;
   method: string;
   uri: string;
-  grantId: string;
+  grantId?: string;
   body?: Uint8Array;
 }): Promise<string> {
   return buildWeb3SignedHeader({

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { Hono } from "hono";
 import { authDeviceRoutes, sessions } from "./auth-device.js";
 import type { TokenStore } from "../token-store.js";
 import pino from "pino";
@@ -9,6 +10,15 @@ import {
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const TEST_REMOTE_ADDR_HEADER = "x-test-remote-addr";
+const MAIN_PORT = 8080;
+const APPROVAL_PORT = 34127;
+// Node socket of a connection accepted by the loopback approval listener
+// (what @hono/node-server exposes as `c.env.incoming.socket`).
+const VIA_APPROVAL_LISTENER = {
+  incoming: {
+    socket: { localPort: APPROVAL_PORT, localAddress: "127.0.0.1" },
+  },
+};
 const ownerWallet = createTestWallet(0);
 const SERVER_OWNER = ownerWallet.address;
 
@@ -39,6 +49,8 @@ function createApp(options?: {
     logger: pino({ level: "silent" }),
     serverOrigin: SERVER_ORIGIN,
     localApprovalOrigin: options?.localApprovalOrigin,
+    localApprovalPort: APPROVAL_PORT,
+    serverPort: MAIN_PORT,
     serverOwner,
     tokenStore: options?.tokenStore ?? createMockTokenStore(),
     accessToken: options?.accessToken,
@@ -84,7 +96,10 @@ describe("POST /auth/device", () => {
     const app = createApp({
       localApprovalOrigin: "http://127.0.0.1:34127",
     });
-    const res = await request(app, "/", { method: "POST" });
+    const res = await request(app, "/", {
+      method: "POST",
+      headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1" },
+    });
 
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -253,12 +268,38 @@ describe("GET /auth/device/approve", () => {
       new Request(`http://127.0.0.1:34127/approve?session=${sessionId}`, {
         method: "GET",
       }),
+      undefined,
+      VIA_APPROVAL_LISTENER,
     );
 
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain(SERVER_ORIGIN);
     expect(html).not.toContain("127.0.0.1:34127</dd>");
+  });
+
+  it("forbids framing of the approval, success and error pages", async () => {
+    const app = createApp();
+    const initRes = await request(app, "/", { method: "POST" });
+    const sessionId = new URL((await initRes.json()).login).searchParams.get(
+      "session",
+    )!;
+
+    const approve = await request(app, `/approve?session=${sessionId}`);
+    sessions.get(sessionId)!.status = "approved";
+    const success = await request(app, `/approve?session=${sessionId}`);
+    const missing = await request(app, "/approve");
+    const unknown = await request(app, "/approve?session=nonexistent");
+
+    for (const res of [approve, success, missing, unknown]) {
+      expect(res.headers.get("x-frame-options")).toBe("DENY");
+      expect(res.headers.get("content-security-policy")).toBe(
+        "frame-ancestors 'none'",
+      );
+    }
+    expect(await success.text()).toContain("Device authorized!");
+    expect(missing.status).toBe(400);
+    expect(unknown.status).toBe(404);
   });
 
   it("returns success page if session already approved", async () => {
@@ -382,7 +423,10 @@ describe("POST /auth/device/approve", () => {
       localApprovalOrigin: "http://127.0.0.1:34127",
     });
 
-    const initRes = await request(app, "/", { method: "POST" });
+    const initRes = await request(app, "/", {
+      method: "POST",
+      headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1" },
+    });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
@@ -394,6 +438,8 @@ describe("POST /auth/device/approve", () => {
           [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
         },
       }),
+      undefined,
+      VIA_APPROVAL_LISTENER,
     );
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "approved" });
@@ -486,7 +532,10 @@ describe("POST /auth/device/approve", () => {
       localApprovalOrigin: "http://127.0.0.1:34127",
     });
 
-    const initRes = await request(app, "/", { method: "POST" });
+    const initRes = await request(app, "/", {
+      method: "POST",
+      headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1" },
+    });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
@@ -498,6 +547,8 @@ describe("POST /auth/device/approve", () => {
           [TEST_REMOTE_ADDR_HEADER]: "::1",
         },
       }),
+      undefined,
+      VIA_APPROVAL_LISTENER,
     );
     expect(res.status).toBe(200);
   });
@@ -507,7 +558,10 @@ describe("POST /auth/device/approve", () => {
       localApprovalOrigin: "http://127.0.0.1:34127",
     });
 
-    const initRes = await request(app, "/", { method: "POST" });
+    const initRes = await request(app, "/", {
+      method: "POST",
+      headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1" },
+    });
     const initBody = await initRes.json();
     const sessionId = new URL(initBody.login).searchParams.get("session")!;
 
@@ -520,6 +574,8 @@ describe("POST /auth/device/approve", () => {
           [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
         },
       }),
+      undefined,
+      VIA_APPROVAL_LISTENER,
     );
 
     // Second approval
@@ -531,10 +587,320 @@ describe("POST /auth/device/approve", () => {
           [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
         },
       }),
+      undefined,
+      VIA_APPROVAL_LISTENER,
     );
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.status).toBe("already_approved");
+  });
+});
+
+describe("POST /auth/device/approve local shortcut hardening", () => {
+  const LOCAL_APPROVAL_ORIGIN = "http://127.0.0.1:34127";
+
+  beforeEach(() => {
+    sessions.clear();
+  });
+
+  // The CLI on the same machine: plain Node fetch from a loopback peer to a
+  // loopback URL, no browser headers.
+  async function initLocalSession(app: ReturnType<typeof authDeviceRoutes>) {
+    const res = await request(app, "/", {
+      method: "POST",
+      headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1" },
+    });
+    const body = await res.json();
+    return new URL(body.login).searchParams.get("session")!;
+  }
+
+  function approveLocally(
+    app: ReturnType<typeof authDeviceRoutes>,
+    sessionId: string,
+    headers: Record<string, string> = {},
+    origin = LOCAL_APPROVAL_ORIGIN,
+  ) {
+    return app.request(
+      new Request(`${origin}/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1", ...headers },
+      }),
+      undefined,
+      VIA_APPROVAL_LISTENER,
+    );
+  }
+
+  it("approves a locally initiated session with no Origin header", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: LOCAL_APPROVAL_ORIGIN,
+    });
+    const sessionId = await initLocalSession(app);
+
+    const res = await approveLocally(app, sessionId);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ status: "approved" });
+    expect(tokenStore.addToken).toHaveBeenCalledTimes(1);
+    expect(sessions.get(sessionId)!.status).toBe("approved");
+  });
+
+  it("approves from the approval page's own origin", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: LOCAL_APPROVAL_ORIGIN,
+    });
+    const sessionId = await initLocalSession(app);
+
+    const res = await approveLocally(app, sessionId, {
+      Origin: LOCAL_APPROVAL_ORIGIN,
+      "Sec-Fetch-Site": "same-origin",
+    });
+
+    expect(res.status).toBe(200);
+    expect(tokenStore.addToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a cross-origin Origin header on the local channel", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: LOCAL_APPROVAL_ORIGIN,
+    });
+    const sessionId = await initLocalSession(app);
+
+    const res = await approveLocally(app, sessionId, {
+      Origin: "https://example.com",
+    });
+
+    expect([401, 403]).toContain(res.status);
+    expect(tokenStore.addToken).not.toHaveBeenCalled();
+    expect(sessions.get(sessionId)!.status).toBe("pending");
+  });
+
+  it("rejects Sec-Fetch-Site: cross-site on the local channel", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: LOCAL_APPROVAL_ORIGIN,
+    });
+    const sessionId = await initLocalSession(app);
+
+    const res = await approveLocally(app, sessionId, {
+      "Sec-Fetch-Site": "cross-site",
+    });
+
+    expect([401, 403]).toContain(res.status);
+    expect(tokenStore.addToken).not.toHaveBeenCalled();
+    expect(sessions.get(sessionId)!.status).toBe("pending");
+  });
+
+  it("rejects a non-loopback Host (DNS rebinding) even when it is the configured channel", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: "http://evil.example:34127",
+    });
+    const sessionId = await initLocalSession(app);
+
+    const res = await approveLocally(
+      app,
+      sessionId,
+      {},
+      "http://evil.example:34127",
+    );
+
+    expect([401, 403]).toContain(res.status);
+    expect(tokenStore.addToken).not.toHaveBeenCalled();
+    expect(sessions.get(sessionId)!.status).toBe("pending");
+  });
+
+  it("requires the owner signature for sessions initiated through a public origin", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: LOCAL_APPROVAL_ORIGIN,
+    });
+    // Tunneled request: frpc connects from loopback, Host is the public name.
+    const initRes = await app.request(
+      new Request("https://ps.alice.com/", {
+        method: "POST",
+        headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1" },
+      }),
+    );
+    const sessionId = new URL((await initRes.json()).login).searchParams.get(
+      "session",
+    )!;
+
+    const res = await approveLocally(app, sessionId);
+
+    expect([401, 403]).toContain(res.status);
+    expect(tokenStore.addToken).not.toHaveBeenCalled();
+    expect(sessions.get(sessionId)!.status).toBe("pending");
+  });
+
+  it("requires the owner signature for sessions initiated by a non-loopback peer", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: LOCAL_APPROVAL_ORIGIN,
+    });
+    // LAN peer addressing the main port as "localhost".
+    const initRes = await request(app, "/", {
+      method: "POST",
+      headers: { [TEST_REMOTE_ADDR_HEADER]: "192.168.1.20" },
+    });
+    const sessionId = new URL((await initRes.json()).login).searchParams.get(
+      "session",
+    )!;
+
+    const res = await approveLocally(app, sessionId);
+
+    expect([401, 403]).toContain(res.status);
+    expect(tokenStore.addToken).not.toHaveBeenCalled();
+  });
+
+  it("requires the owner signature for sessions initiated from another browser origin", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: LOCAL_APPROVAL_ORIGIN,
+    });
+    const initRes = await request(app, "/", {
+      method: "POST",
+      headers: {
+        [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
+        Origin: "https://example.com",
+      },
+    });
+    const sessionId = new URL((await initRes.json()).login).searchParams.get(
+      "session",
+    )!;
+
+    const res = await approveLocally(app, sessionId);
+
+    expect([401, 403]).toContain(res.status);
+    expect(tokenStore.addToken).not.toHaveBeenCalled();
+  });
+
+  it("refuses the shortcut on the main port even with the approval listener's Host", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: LOCAL_APPROVAL_ORIGIN,
+    });
+    const sessionId = await initLocalSession(app);
+    // Same Host string as the approval channel, but the connection was
+    // accepted by the main (tunneled) listener.
+    const viaMainPort = {
+      incoming: {
+        socket: { localPort: MAIN_PORT, localAddress: "127.0.0.1" },
+      },
+    };
+
+    const res = await app.request(
+      new Request(`${LOCAL_APPROVAL_ORIGIN}/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1" },
+      }),
+      undefined,
+      viaMainPort,
+    );
+    expect(res.status).toBe(403);
+    expect(tokenStore.addToken).not.toHaveBeenCalled();
+
+    const page = await app.request(
+      new Request(`${LOCAL_APPROVAL_ORIGIN}/approve?session=${sessionId}`),
+      undefined,
+      viaMainPort,
+    );
+    expect(await page.text()).toContain(
+      "const LOCAL_APPROVAL_SHORTCUT_ENABLED = false;",
+    );
+  });
+
+  it("refuses the shortcut when no socket information is available", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = createApp({
+      tokenStore,
+      localApprovalOrigin: LOCAL_APPROVAL_ORIGIN,
+    });
+    const sessionId = await initLocalSession(app);
+
+    const res = await app.request(
+      new Request(`${LOCAL_APPROVAL_ORIGIN}/approve?session=${sessionId}`, {
+        method: "POST",
+        headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1" },
+      }),
+    );
+
+    expect(res.status).toBe(403);
+    expect(tokenStore.addToken).not.toHaveBeenCalled();
+  });
+
+  it("accepts an owner-signed approval of a tunneled session at the public origin", async () => {
+    const tokenStore = createMockTokenStore();
+    // Mounted like app.ts so the signed path is the real one.
+    const app = new Hono().route(
+      "/auth/device",
+      createApp({ tokenStore, localApprovalOrigin: LOCAL_APPROVAL_ORIGIN }),
+    );
+    // Tunneled: frpc connects from loopback to the main port, public Host.
+    const viaTunnel = {
+      incoming: {
+        socket: {
+          localPort: MAIN_PORT,
+          localAddress: "127.0.0.1",
+          remoteAddress: "127.0.0.1",
+        },
+      },
+    };
+    const initRes = await app.request(
+      new Request("https://ps.alice.com/auth/device", { method: "POST" }),
+      undefined,
+      viaTunnel,
+    );
+    const login = new URL((await initRes.json()).login);
+    expect(login.origin).toBe("https://ps.alice.com");
+    const auth = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: "https://ps.alice.com",
+      method: "POST",
+      uri: "/auth/device/approve",
+    });
+
+    const res = await app.request(
+      new Request(`${login.origin}${login.pathname}${login.search}`, {
+        method: "POST",
+        headers: { Authorization: auth, Origin: "https://ps.alice.com" },
+      }),
+      undefined,
+      viaTunnel,
+    );
+
+    expect(res.status).toBe(200);
+    expect(tokenStore.addToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the wallet approval page for sessions that cannot use the shortcut", async () => {
+    const app = createApp({ localApprovalOrigin: LOCAL_APPROVAL_ORIGIN });
+    const initRes = await app.request(
+      new Request("https://ps.alice.com/", { method: "POST" }),
+    );
+    const sessionId = new URL((await initRes.json()).login).searchParams.get(
+      "session",
+    )!;
+
+    const res = await app.request(
+      new Request(`${LOCAL_APPROVAL_ORIGIN}/approve?session=${sessionId}`),
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(
+      "const LOCAL_APPROVAL_SHORTCUT_ENABLED = false;",
+    );
   });
 });
 
@@ -551,7 +917,10 @@ describe("full login flow", () => {
     });
 
     // 1. Initiate login
-    const initRes = await request(app, "/", { method: "POST" });
+    const initRes = await request(app, "/", {
+      method: "POST",
+      headers: { [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1" },
+    });
     expect(initRes.status).toBe(200);
     const initBody = await initRes.json();
 
@@ -578,6 +947,8 @@ describe("full login flow", () => {
           [TEST_REMOTE_ADDR_HEADER]: "127.0.0.1",
         },
       }),
+      undefined,
+      VIA_APPROVAL_LISTENER,
     );
     expect(approveRes.status).toBe(200);
 

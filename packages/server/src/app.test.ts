@@ -156,6 +156,7 @@ describe("createApp", () => {
       cloudMode?: boolean;
       accessToken?: string;
       localApprovalOrigin?: string | (() => string | undefined);
+      localApprovalPort?: number;
     },
   ) {
     const logger = pino({ level: "silent" });
@@ -167,6 +168,8 @@ describe("createApp", () => {
       hierarchyOptions: { dataDir: join(tempDir, "data") },
       serverOrigin: SERVER_ORIGIN,
       localApprovalOrigin: options?.localApprovalOrigin,
+      localApprovalPort: options?.localApprovalPort,
+      serverPort: 8080,
       serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
@@ -452,6 +455,8 @@ describe("createApp", () => {
 
     const res = await app.request(
       new Request("http://localhost:8080/auth/device", { method: "POST" }),
+      undefined,
+      { incoming: { socket: { remoteAddress: "127.0.0.1" } } },
     );
 
     expect(res.status).toBe(200);
@@ -514,6 +519,112 @@ describe("createApp", () => {
     expect((await approveRes.json()).error.message).toContain(
       "Remote approval requires owner wallet authentication",
     );
+  });
+
+  it("/auth/device/* responses do not carry wildcard CORS", async () => {
+    const app = makeAppWithTokenStore(createMockTokenStore(), {
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+    const crossOrigin = { origin: "https://example.com" };
+
+    const initRes = await app.request(
+      new Request("https://ps.alice.com/auth/device", {
+        method: "POST",
+        headers: crossOrigin,
+      }),
+    );
+    expect(initRes.headers.get("access-control-allow-origin")).toBeNull();
+    const sessionId = new URL((await initRes.json()).login).searchParams.get(
+      "session",
+    )!;
+
+    const pageRes = await app.request(
+      new Request(
+        `https://ps.alice.com/auth/device/approve?session=${sessionId}`,
+        { headers: crossOrigin },
+      ),
+    );
+    expect(pageRes.status).toBe(200);
+    expect(pageRes.headers.get("access-control-allow-origin")).toBeNull();
+
+    const approveRes = await app.request(
+      new Request(
+        `http://127.0.0.1:34127/auth/device/approve?session=${sessionId}`,
+        { method: "POST", headers: crossOrigin },
+      ),
+    );
+    expect(approveRes.headers.get("access-control-allow-origin")).toBeNull();
+
+    const preflightRes = await app.request(
+      new Request("http://127.0.0.1:34127/auth/device/approve?session=x", {
+        method: "OPTIONS",
+        headers: {
+          ...crossOrigin,
+          "access-control-request-method": "POST",
+          "access-control-request-headers": "authorization",
+        },
+      }),
+    );
+    expect(preflightRes.headers.get("access-control-allow-origin")).toBeNull();
+
+    // Other routes keep the permissive CORS browser clients rely on.
+    const healthRes = await app.request(
+      new Request("https://ps.alice.com/health", { headers: crossOrigin }),
+    );
+    expect(healthRes.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
+  it("same-machine CLI login approves in one click on the loopback channel", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = makeAppWithTokenStore(tokenStore, {
+      localApprovalOrigin: "http://127.0.0.1:34127",
+      localApprovalPort: 34127,
+    });
+    // The CLI dials the main port; the browser then opens the login URL on
+    // the loopback approval listener.
+    const viaMainPort = {
+      incoming: {
+        socket: {
+          remoteAddress: "127.0.0.1",
+          localAddress: "127.0.0.1",
+          localPort: 8080,
+        },
+      },
+    };
+    const viaApprovalListener = {
+      incoming: {
+        socket: {
+          remoteAddress: "127.0.0.1",
+          localAddress: "127.0.0.1",
+          localPort: 34127,
+        },
+      },
+    };
+
+    const initRes = await app.request(
+      new Request("http://localhost:8080/auth/device", { method: "POST" }),
+      undefined,
+      viaMainPort,
+    );
+    const login = new URL((await initRes.json()).login);
+    expect(login.origin).toBe("http://127.0.0.1:34127");
+
+    // What the approval page's fetch() sends from its own origin.
+    const approveRes = await app.request(
+      new Request(`${login.origin}/auth/device/approve${login.search}`, {
+        method: "POST",
+        headers: {
+          origin: login.origin,
+          "sec-fetch-site": "same-origin",
+        },
+      }),
+      undefined,
+      viaApprovalListener,
+    );
+
+    expect(approveRes.status).toBe(200);
+    expect(await approveRes.json()).toEqual({ status: "approved" });
+    expect(tokenStore.addToken).toHaveBeenCalledTimes(1);
   });
 
   it("cloud mode disables interactive /auth/device login flow", async () => {

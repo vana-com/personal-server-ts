@@ -21,6 +21,11 @@ import {
 } from "./test-support/memory.js";
 import { createMockPsLiteGateway } from "./test-support/gateway.js";
 import {
+  buildWeb3SignedHeader,
+  createTestWallet,
+} from "@opendatalabs/personal-server-ts-core/test-utils";
+import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
+import {
   createInMemoryMcpConnectionStore,
   createInMemoryMcpOAuthAuthorizationStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
@@ -263,5 +268,122 @@ describe("createIndexedDbPsLiteRuntime write sessions", () => {
       }),
     });
     expect((await handshake(withOwnAuth.runtime)).status).toBe(404);
+  });
+});
+
+describe("createIndexedDbPsLiteRuntime data listings", () => {
+  it("scopes a builder's listing via the default adapter's grantLister when no grantId is presented", async () => {
+    const builder = createTestWallet(1);
+    const grant = (overrides: Partial<GatewayGrantResponse>) =>
+      ({
+        id: "grant-1",
+        grantorAddress: ownerAddress,
+        granteeId: "builder-1",
+        scopes: ["instagram.*"],
+        status: "confirmed",
+        addedAt: "2026-05-08T00:00:00.000Z",
+        expiresAt: null,
+        expired: false,
+        revokedAt: null,
+        revocationSignature: null,
+        paymentStatus: "paid",
+        paidAt: null,
+        paidBy: null,
+        grantVersion: "1",
+        settleTxHash: null,
+        settleSubmittedAt: null,
+        revocationTxHash: null,
+        revocationSubmittedAt: null,
+        fee: {
+          asset: "0x0000000000000000000000000000000000000000",
+          registrationFee: "0",
+          dataAccessFee: "0",
+          totalDue: "0",
+        },
+        ...overrides,
+      }) as GatewayGrantResponse;
+    const listGrantsByUser = vi.fn(async () => [
+      grant({}),
+      grant({ id: "grant-other", granteeId: "builder-2", scopes: ["*"] }),
+    ]);
+    const getGrant = vi.fn(async () => null);
+    const { runtime } = await createIndexedDbPsLiteRuntime({
+      ownerAddress,
+      ownerSignature,
+      persistence: memoryBundle(),
+      gateway: {
+        ...createMockPsLiteGateway(),
+        listGrantsByUser,
+        getGrant,
+        async getBuilder(address: string) {
+          return address.toLowerCase() === builder.address.toLowerCase()
+            ? {
+                id: "builder-1",
+                ownerAddress: builder.address,
+                granteeAddress: builder.address,
+                publicKey: "0x04",
+                appUrl: "https://builder.local",
+                addedAt: "2026-05-08T00:00:00.000Z",
+              }
+            : null;
+        },
+      },
+      // No `auth`: the factory's own Web3Signed adapter (with grantLister).
+      accessToken: "control-plane-token",
+      serverOrigin: "https://ps.local",
+      active: true,
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: false },
+      },
+    });
+
+    for (const scope of ["instagram.profile", "twitter.posts"]) {
+      const write = await runtime.fetch(
+        new Request(`https://ps.local/v1/data/${scope}`, {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer control-plane-token",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ scope }),
+        }),
+      );
+      expect(write.status).toBe(201);
+    }
+
+    const builderList = await runtime.fetch(
+      new Request("https://ps.local/v1/data", {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: builder,
+            aud: "https://ps.local",
+            method: "GET",
+            uri: "/v1/data",
+          }),
+        },
+      }),
+    );
+    expect(builderList.status).toBe(200);
+    await expect(builderList.json()).resolves.toMatchObject({
+      scopes: [{ scope: "instagram.profile" }],
+      total: 1,
+    });
+    expect(listGrantsByUser).toHaveBeenCalledWith(ownerAddress);
+    expect(getGrant).not.toHaveBeenCalled();
+
+    // The control-plane token is owner-equivalent: full listing, no lookup.
+    listGrantsByUser.mockClear();
+    const controlPlaneList = await runtime.fetch(
+      new Request("https://ps.local/v1/data", {
+        headers: { Authorization: "Bearer control-plane-token" },
+      }),
+    );
+    expect(controlPlaneList.status).toBe(200);
+    await expect(controlPlaneList.json()).resolves.toMatchObject({
+      scopes: [{ scope: "instagram.profile" }, { scope: "twitter.posts" }],
+      total: 2,
+    });
+    expect(listGrantsByUser).not.toHaveBeenCalled();
   });
 });

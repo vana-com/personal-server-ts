@@ -9,7 +9,6 @@ import {
   NotOwnerError,
   ProtocolError,
   PsUnavailableError,
-  UnregisteredBuilderError,
 } from "@opendatalabs/personal-server-ts-core/errors";
 import {
   authenticateRequest,
@@ -44,8 +43,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import {
+  resolveDataListGrantScopes,
   verifyDataReadPolicy,
-  type DataReadPolicyPorts,
+  type DataListPolicyPorts,
   type DataWritePolicyPorts,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import {
@@ -295,6 +295,12 @@ export interface PsLiteWriteSessionAuthOptions {
 
 export interface BearerTokenPsLiteAuthOptions {
   ownerToken: string;
+  /**
+   * Owner-equivalent for listings by design: `authorizeBuilderList` returns
+   * void for it, so it sees every scope. The token names no builder, so there
+   * is no grant to scope a listing by; reads still require a grantId. Hand it
+   * only to a party trusted with the owner's scope inventory.
+   */
   builderToken: string;
   /**
    * Optional delegated-write support. The static builder token never gains
@@ -311,7 +317,8 @@ export interface BearerTokenPsLiteAuthOptions {
 export interface Web3SignedPsLiteAuthOptions {
   origin: string | (() => string);
   ownerAddress: `0x${string}`;
-  dataReadPolicyPorts?: DataReadPolicyPorts;
+  /** `grantLister` lets a builder list without presenting a grantId. */
+  dataReadPolicyPorts?: DataListPolicyPorts;
   accessToken?: string;
   tokenStore?: SessionTokenVerifierPort;
   now?: () => number;
@@ -536,6 +543,7 @@ export function createBearerTokenPsLiteAuth(
       : {}),
     async authorizeBuilderList(request) {
       if (parseBearerToken(request) === options.ownerToken) return;
+      // Owner-equivalent listing by design; see `builderToken`.
       assertBearerToken(request, options.builderToken);
     },
     async authorizeBuilderRead(input) {
@@ -618,7 +626,7 @@ export function createWeb3SignedPsLiteAuth(
           authorizeOwner,
         )
       : {}),
-    async authorizeBuilderList(request) {
+    async authorizeBuilderList(request, listOptions) {
       const auth = await authenticatePsLiteRequest(request, options);
       if (auth.isPolicyBypass || isOwnerSigner(auth, options.ownerAddress)) {
         return;
@@ -626,13 +634,16 @@ export function createWeb3SignedPsLiteAuth(
       if (!options.dataReadPolicyPorts) {
         throw dataReadPolicyPortsRequired();
       }
-      const builder =
-        await options.dataReadPolicyPorts.authSessionVerifier.getBuilder(
-          auth.auth.signer,
-        );
-      if (!builder) {
-        throw new UnregisteredBuilderError();
-      }
+      // A builder lists only what its grants from this PS's owner cover.
+      const grantedScopes = await resolveDataListGrantScopes(
+        {
+          signer: auth.auth.signer,
+          grantId: auth.auth.payload.grantId ?? listOptions?.grantId,
+          serverOwner: options.ownerAddress,
+        },
+        options.dataReadPolicyPorts,
+      );
+      return { grantedScopes };
     },
     async authorizeBuilderRead(input) {
       const auth = await authenticatePsLiteRequest(input.request, options);
