@@ -12,4 +12,5 @@ export { web3SignedProofId, boundedProofExpiry } from "./proof-id.js";
 export {
   isWeb3SignedLifetimeError,
   MAX_WEB3SIGNED_LIFETIME_SEC,
+  TokenLifetimeError,
 } from "./request.js";

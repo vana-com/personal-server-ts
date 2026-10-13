@@ -24,19 +24,29 @@ export type AuthMechanism =
  */
 export const MAX_WEB3SIGNED_LIFETIME_SEC = 15 * 60;
 
-const LIFETIME_REASON = "Token lifetime exceeds the server cap";
-
 /**
- * True when `err` is the request-auth lifetime-cap rejection. Handshake
- * routes that carry their own proof-lifetime error code use this to keep
- * reporting that code instead of a generic auth failure.
+ * The request-auth lifetime-cap rejection. Same errorCode as an expired
+ * token so clients re-sign; the message names the cap because the fix is a
+ * shorter window, not a fresh clock. A distinct class so handshake routes
+ * that carry their own proof-lifetime error code can recognise it.
  */
+export class TokenLifetimeError extends ProtocolError {
+  constructor(lifetimeSeconds: number) {
+    super(
+      401,
+      "EXPIRED_TOKEN",
+      `Token lifetime (exp - iat) must be between 1 and ${MAX_WEB3SIGNED_LIFETIME_SEC} seconds`,
+      {
+        reason: "Token lifetime exceeds the server cap",
+        maxLifetimeSeconds: MAX_WEB3SIGNED_LIFETIME_SEC,
+        lifetimeSeconds,
+      },
+    );
+  }
+}
+
 export function isWeb3SignedLifetimeError(err: unknown): boolean {
-  return (
-    err instanceof ProtocolError &&
-    err.errorCode === "EXPIRED_TOKEN" &&
-    err.details?.["reason"] === LIFETIME_REASON
-  );
+  return err instanceof TokenLifetimeError;
 }
 
 export interface RequestAuth {
@@ -181,24 +191,14 @@ export async function authenticateRequest(
       now: input.now?.(),
     });
 
+    // The SDK already guarantees finite iat/exp (fractional seconds allowed).
     const lifetime = (auth.payload.exp ?? 0) - (auth.payload.iat ?? 0);
     if (
-      !Number.isSafeInteger(lifetime) ||
+      !Number.isFinite(lifetime) ||
       lifetime <= 0 ||
       lifetime > MAX_WEB3SIGNED_LIFETIME_SEC
     ) {
-      // Same errorCode as an expired token so clients re-sign; the message
-      // names the cap because the fix is a shorter window, not a fresh clock.
-      throw new ProtocolError(
-        401,
-        "EXPIRED_TOKEN",
-        `Token lifetime (exp - iat) must be between 1 and ${MAX_WEB3SIGNED_LIFETIME_SEC} seconds`,
-        {
-          reason: LIFETIME_REASON,
-          maxLifetimeSeconds: MAX_WEB3SIGNED_LIFETIME_SEC,
-          lifetimeSeconds: lifetime,
-        },
-      );
+      throw new TokenLifetimeError(lifetime);
     }
 
     return {

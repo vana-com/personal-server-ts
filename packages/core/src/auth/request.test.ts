@@ -50,6 +50,20 @@ describe("authenticateRequest Web3Signed lifetime", () => {
     });
   });
 
+  it("accepts fractional-second timestamps (the SDK verifier allows any finite number)", async () => {
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/v1/data",
+      iat: now + 0.25,
+      exp: now + 300.75,
+    });
+    await expect(authenticate(header, now)).resolves.toMatchObject({
+      mechanism: "web3-signed",
+    });
+  });
+
   it("rejects a signature whose exp - iat exceeds the cap, even while unexpired", async () => {
     // A signer-chosen window: valid for a year. Without a server-side cap a
     // captured copy of this request replays until the grant is revoked.
