@@ -73,6 +73,8 @@ import {
   registerLegacyDataConnections,
 } from "./pdpp/records-bootstrap.js";
 import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
+import { createLegacyScopeViewStore } from "./storage/legacy-scope-view-store.js";
+import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
@@ -913,6 +915,16 @@ export async function createServer(
     accessLogReader,
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
+    // Latest legacy reads of connector scopes the owner collects into the
+    // record store come from its rows. Only with the mounted RS: the same
+    // store and the same configured methods the RS enforces.
+    legacyScopeView: pdppRecords
+      ? createLegacyScopeView({
+          store: createLegacyScopeViewStore(db, pdppRecords.bindingStore),
+          configuredMethods: (sourceId) =>
+            pdppRecords.configuredMethods.get(sourceId) ?? [],
+        })
+      : undefined,
     scopeDeletions,
     cloudMode,
     devToken,

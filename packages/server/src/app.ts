@@ -87,6 +87,7 @@ import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
 import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
 import type { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type { LegacyScopeViewPort } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type {
   PdppRecordStore,
   StreamDeclarationRegistry,
@@ -134,6 +135,8 @@ export interface AppDeps {
   tokenStore?: TokenStore;
   runtimeAvailability?: RuntimeAvailabilityPort;
   dataStorage?: DataStoragePort;
+  /** Canonical latest bodies for GET /v1/data; absent = file reads only. */
+  legacyScopeView?: LegacyScopeViewPort;
   /**
    * Gateway base URL — wired into the data route so the GET handler can
    * forward validated X-PAYMENTs to POST /v1/escrow/pay via direct fetch.
@@ -401,6 +404,7 @@ export function createApp(deps: AppDeps): Hono {
       scopeDeletions: deps.scopeDeletions,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
+      legacyScopeView: deps.legacyScopeView,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,

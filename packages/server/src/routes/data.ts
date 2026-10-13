@@ -29,6 +29,7 @@ import type {
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type { Logger } from "pino";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type { LegacyScopeViewPort } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import {
   ContentTooLargeError,
   ProtocolError,
@@ -85,6 +86,11 @@ export interface DataRouteDeps {
   accessToken?: string;
   tokenStore?: TokenStore;
   dataStorage?: DataStoragePort;
+  /**
+   * Latest bodies of connector scopes from the canonical record store; see
+   * `PersonalServerDataApiDeps.legacyScopeView`. Absent = file reads only.
+   */
+  legacyScopeView?: LegacyScopeViewPort;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /**
    * Write API sessions (POST /v1/write/session). When present, the ingest
@@ -315,6 +321,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
       c.req.raw,
       {
         storage: dataStorage,
+        legacyScopeView: deps.legacyScopeView,
         auth,
         accessLogWriter: deps.accessLogWriter,
         readFulfillmentReporter: deps.readFulfillmentReporter,
