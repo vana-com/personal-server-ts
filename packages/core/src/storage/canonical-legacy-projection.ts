@@ -107,6 +107,15 @@ export interface CanonicalReadDiagnostics {
   omissions: { stream: string; count: number; reasons: string[] }[];
   /** Rows delivered although their source says detail is missing. */
   partialRows: { stream: string; count: number; reasons: string[] }[];
+  /**
+   * Properties of the legacy body the canonical rows cannot show, such as
+   * the order the legacy export gave. The rows are all delivered.
+   */
+  unproven: {
+    stream: string;
+    aspect: "record_order" | "collection_coverage";
+    reason: string;
+  }[];
 }
 
 export interface CanonicalLegacyReadOk {
@@ -120,7 +129,10 @@ export interface CanonicalLegacyReadOk {
    * reads back the same value.
    */
   revision: string;
-  /** False when `diagnostics.omissions` or `diagnostics.partialRows` is not empty. */
+  /**
+   * False when `diagnostics.omissions`, `diagnostics.partialRows` or
+   * `diagnostics.unproven` is not empty.
+   */
   complete: boolean;
   diagnostics: CanonicalReadDiagnostics;
 }
@@ -418,7 +430,15 @@ async function projectSnapshot(
 
   const omissions: CanonicalReadDiagnostics["omissions"] = [];
   const partialRows: CanonicalReadDiagnostics["partialRows"] = [];
+  const unproven: CanonicalReadDiagnostics["unproven"] = [];
   for (const diagnostic of projected.diagnostics ?? []) {
+    if (diagnostic.kind === "unproven") {
+      unproven.push({
+        stream: diagnostic.stream,
+        aspect: diagnostic.aspect,
+        reason: diagnostic.reason,
+      });
+    }
     if (
       diagnostic.kind === "records_dropped" ||
       diagnostic.kind === "records_partial"
@@ -475,8 +495,11 @@ async function projectSnapshot(
       data: projected.payload,
     },
     revision,
-    complete: omissions.length === 0 && partialRows.length === 0,
-    diagnostics: { sourceRowCounts, omissions, partialRows },
+    complete:
+      omissions.length === 0 &&
+      partialRows.length === 0 &&
+      unproven.length === 0,
+    diagnostics: { sourceRowCounts, omissions, partialRows, unproven },
   };
 }
 

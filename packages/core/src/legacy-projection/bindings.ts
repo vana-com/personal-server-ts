@@ -4512,6 +4512,121 @@ const icloudNotes: LegacyScopeBinding = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// strava (strava.activities, strava.coverage_diagnostics)
+// declarations/strava.collection-profile.json (1.0.8, digest-pinned)
+// connector_id: https://registry.pdpp.dev/connectors/strava
+//
+// Desktop's export served each scope as `{ <stream>: [record.data, ...] }`
+// (apps/desktop pdpp_export_projection.rs at e970213f). Both bindings are
+// that identity: every native field, null and unknown field is kept, and the
+// two streams never read each other.
+// ---------------------------------------------------------------------------
+
+const STRAVA_DIGEST =
+  "sha256:b33086156d3003d0cbe48cb0de4adf48a7fde7241f28c2ea5e350cff1f17c82c";
+
+const STRAVA_FIELDS = {
+  activities: [
+    "id",
+    "activity_type",
+    "start_date",
+    "start_time",
+    "start_time_basis",
+    "distance_m",
+    "moving_time_s",
+    "elapsed_time_s",
+    "total_elevation_gain_m",
+    "average_heartrate",
+    "max_heartrate",
+    "calories_kcal",
+    "gear",
+    "freshness",
+    "exported_at",
+  ],
+  coverage_diagnostics: [
+    "id",
+    "stream",
+    "status",
+    "reason",
+    "record_count",
+    "fields_unavailable",
+    "window_requested_from",
+    "window_requested_to",
+    "window_covered_from",
+    "window_covered_to",
+    "freshness",
+    "exported_at",
+  ],
+} as const;
+
+function stravaIdentity(
+  stream: keyof typeof STRAVA_FIELDS,
+  lossy: string[],
+): LegacyScopeBinding {
+  const scope = `strava.${stream}`;
+  return {
+    scope,
+    pdppSource: "https://registry.pdpp.dev/connectors/strava",
+    pdppStreams: [stream],
+    legacySchemaPath: `${scope}.json`,
+    fieldsRead: { [stream]: [...STRAVA_FIELDS[stream]] },
+    primaryKey: { [stream]: ["id"] },
+    lossy,
+    provenance: [
+      {
+        kind: "oci",
+        ref: "ghcr.io/pdp-connect/connector/strava:1.0.8",
+        digest: STRAVA_DIGEST,
+        path: `declarations/strava.collection-profile.json#streams[name=${stream}]`,
+      },
+    ],
+    project(records, options): ProjectionResult {
+      const guard = requireStreams(scope, options, [stream]);
+      if (guard) return guard;
+      const rows = byStream(records, stream);
+      const unproven: ProjectionDiagnostic[] = [];
+      if (stream === "activities") {
+        unproven.push({
+          kind: "unproven",
+          scope,
+          stream,
+          aspect: "collection_coverage",
+          reason:
+            "activities rows do not say whether the export was read in full; coverage is only in strava.coverage_diagnostics",
+        });
+      }
+      if (rows.length > 1) {
+        unproven.push({
+          kind: "unproven",
+          scope,
+          stream,
+          aspect: "record_order",
+          reason:
+            "Desktop served rows in snapshot arrival order; the canonical store does not keep that order",
+        });
+      }
+      return {
+        ok: true,
+        payload: { [stream]: rows },
+        ...withDiagnostics(unproven),
+      };
+    },
+  };
+}
+
+const stravaActivities = stravaIdentity("activities", [
+  "No field is dropped, derived or defaulted: the body is the native records.",
+  "Row order: Desktop's snapshot was in arrival order (a re-emitted id moved to the end); this projection cannot reproduce it. An `unproven` record_order diagnostic is returned whenever there are two or more rows.",
+  "Coverage: the body carries rows only. Whether the export was read in full is in strava.coverage_diagnostics; an `unproven` collection_coverage diagnostic is always returned.",
+]);
+
+const stravaCoverageDiagnostics = stravaIdentity("coverage_diagnostics", [
+  "No field is dropped, derived or defaulted: the body is the native records, so a partial or empty status, its reason and fields_unavailable reach the reader as written.",
+  "Row order: as for strava.activities.",
+  "Absence of a row is not evidence of a complete collection: the producer emits no diagnostic when only diagnostics are requested and the import directory exists. The read facade serves an empty list only with that stream's own completion receipt.",
+]);
+
 export const LEGACY_SCOPE_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
   new Map(
     Object.entries({
@@ -4558,6 +4673,8 @@ export const LEGACY_SCOPE_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
       "youtube.history": youtubeHistory,
       "claude.conversations": claudeConversations,
       "claude.projects": claudeProjects,
+      "strava.activities": stravaActivities,
+      "strava.coverage_diagnostics": stravaCoverageDiagnostics,
     }),
   );
 

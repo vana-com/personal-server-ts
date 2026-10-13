@@ -16,6 +16,7 @@ import metaDeclaration from "./declarations/meta.collection-profile.json";
 import ouraDeclaration from "./declarations/oura.collection-profile.json";
 import shopifyDeclaration from "./declarations/shopify.collection-profile.json";
 import spotifyDeclaration from "./declarations/spotify.collection-profile.json";
+import stravaDeclaration from "./declarations/strava.collection-profile.json";
 import wholefoodsDeclaration from "./declarations/wholefoods.collection-profile.json";
 import wholefoodsProvenance from "./declarations/wholefoods.provenance.json";
 import youtubeDeclaration from "./declarations/youtube.collection-profile.json";
@@ -64,6 +65,8 @@ import spotifyPlaylistsSchema from "./legacy-schemas/spotify.playlists.json";
 import spotifyProfileSchema from "./legacy-schemas/spotify.profile.json";
 import claudeConversationsSchema from "./legacy-schemas/claude.conversations.json";
 import claudeProjectsSchema from "./legacy-schemas/claude.projects.json";
+import stravaActivitiesSchema from "./legacy-schemas/strava.activities.json";
+import stravaCoverageDiagnosticsSchema from "./legacy-schemas/strava.coverage_diagnostics.json";
 import type { PdppRecord } from "./types.js";
 
 interface CollectionProfileStream {
@@ -92,6 +95,7 @@ const DECLARATIONS: Record<string, CollectionProfile> = {
   oura: ouraDeclaration as CollectionProfile,
   shopify: shopifyDeclaration as CollectionProfile,
   spotify: spotifyDeclaration as CollectionProfile,
+  strava: stravaDeclaration as CollectionProfile,
   wholefoods: wholefoodsDeclaration as CollectionProfile,
   youtube: youtubeDeclaration as CollectionProfile,
   "anthropic-0.1.3": anthropicDeclaration as CollectionProfile,
@@ -128,6 +132,8 @@ const LEGACY_SCHEMAS: Record<string, { schema: unknown }> = {
   "oura.readiness.json": ouraReadinessSchema,
   "oura.sleep.json": ouraSleepSchema,
   "icloud_notes.notes.json": icloudNotesSchema,
+  "strava.activities.json": stravaActivitiesSchema,
+  "strava.coverage_diagnostics.json": stravaCoverageDiagnosticsSchema,
   "heb.orders.json": hebOrdersSchema,
   "heb.profile.json": hebProfileSchema,
   "heb.nutrition.json": hebNutritionSchema,

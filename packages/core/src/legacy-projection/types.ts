@@ -63,6 +63,10 @@ export interface ProjectionOk {
  * payload is served without the named rows (`records_dropped`, `count` is
  * distinct source rows of `stream`), or with rows the source says are short
  * of detail (`records_partial`), and the diagnostic says how many.
+ * `unproven` serves every row and drops none, and names a property of the
+ * legacy body that the canonical rows cannot show (`record_order`: the
+ * order the legacy export gave; `collection_coverage`: whether the source
+ * was read in full). A reader must not present that property as matched.
  */
 export type ProjectionDiagnostic =
   | {
@@ -85,7 +89,14 @@ export type ProjectionDiagnostic =
       scope: string;
       stream: string;
     }
-  | { kind: "stream_missing"; scope: string; stream: string };
+  | { kind: "stream_missing"; scope: string; stream: string }
+  | {
+      kind: "unproven";
+      scope: string;
+      stream: string;
+      aspect: "record_order" | "collection_coverage";
+      reason: string;
+    };
 export interface ProjectionErr {
   error: ProjectionError;
   ok: false;
