@@ -82,10 +82,48 @@ function projectionTime(options: ProjectPdppRecordsOptions): string {
   return options.now ?? new Date().toISOString();
 }
 
-const OURA_BAD_DAY = "Oura day is missing or not a YYYY-MM-DD date";
+/**
+ * Counts source rows a binding leaves out and turns them into one
+ * `records_dropped` diagnostic per (stream, reason). Each row is counted
+ * once, under the first reason it failed, so counts sum to distinct rows.
+ */
+class DroppedRows {
+  private readonly counts = new Map<string, number>();
+  constructor(private readonly scope: string) {}
+
+  add(stream: string, reason: string, count = 1): void {
+    if (count <= 0) return;
+    const key = JSON.stringify([stream, reason]);
+    this.counts.set(key, (this.counts.get(key) ?? 0) + count);
+  }
+
+  diagnostics(): ProjectionDiagnostic[] {
+    return [...this.counts].map(([key, count]) => {
+      const [stream, reason] = JSON.parse(key) as [string, string];
+      return {
+        kind: "records_dropped" as const,
+        scope: this.scope,
+        stream,
+        count,
+        reasons: [reason],
+      };
+    });
+  }
+}
+
+/** `{ diagnostics }` when there are any, else nothing, for spreading into a result. */
+function withDiagnostics(diagnostics: ProjectionDiagnostic[]): {
+  diagnostics?: ProjectionDiagnostic[];
+} {
+  return diagnostics.length > 0 ? { diagnostics } : {};
+}
+
+export const OURA_BAD_DAY = "Oura day is missing or not a YYYY-MM-DD date";
+export const OURA_BAD_SCORE =
+  "Oura score is absent or not an integer from 0 to 100 or null";
 
 /** A real calendar date in the legacy `format: date` shape. */
-function isCalendarDay(value: unknown): value is string {
+export function isCalendarDay(value: unknown): value is string {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
     return false;
   }
@@ -96,32 +134,44 @@ function isCalendarDay(value: unknown): value is string {
 }
 
 /**
- * Oura rows the legacy schema cannot hold (no valid `day`) are left out and
- * counted, never emitted with a null or malformed day. The caller decides
- * what an all-dropped stream means.
+ * The legacy Oura daily schemas require `score`, typed integer 0-100 or
+ * null. The source declares the field nullable but optional, and the
+ * connector writes `null` for an unknown score, so `null` passes through.
+ * An absent key has no declared meaning; it is not turned into `null`.
  */
-function partitionOuraRows(
+function isOuraScore(value: unknown): value is number | null {
+  return (
+    value === null ||
+    (typeof value === "number" &&
+      Number.isInteger(value) &&
+      value >= 0 &&
+      value <= 100)
+  );
+}
+
+/**
+ * Oura rows the legacy schema cannot hold are left out and counted, never
+ * emitted with a null or impossible day, or without the required score.
+ * `scoreField` names the source field that becomes the legacy `score`
+ * (per row, or undefined for a row that produces no daily score). The
+ * caller decides what an all-dropped stream means.
+ */
+export function partitionOuraRows(
   scope: string,
   stream: string,
   rows: Record<string, unknown>[],
+  scoreField: (row: Record<string, unknown>) => string | undefined,
 ): { rows: Record<string, unknown>[]; diagnostics: ProjectionDiagnostic[] } {
-  const valid = rows.filter((row) => isCalendarDay(row.day));
-  const dropped = rows.length - valid.length;
-  return {
-    rows: valid,
-    diagnostics:
-      dropped > 0
-        ? [
-            {
-              kind: "records_dropped",
-              scope,
-              stream,
-              count: dropped,
-              reasons: [OURA_BAD_DAY],
-            },
-          ]
-        : [],
-  };
+  const dropped = new DroppedRows(scope);
+  const valid = rows.filter((row) => {
+    const field = scoreField(row);
+    if (!isCalendarDay(row.day)) dropped.add(stream, OURA_BAD_DAY);
+    else if (field !== undefined && !isOuraScore(row[field]))
+      dropped.add(stream, OURA_BAD_SCORE);
+    else return true;
+    return false;
+  });
+  return { rows: valid, diagnostics: dropped.diagnostics() };
 }
 
 function requireStreams(
@@ -843,6 +893,7 @@ const instagramPosts: LegacyScopeBinding = {
     "media_url is only available for images and the first image in a carousel; video posts and later carousel images are absent from the artifact's parser output",
     "who_liked.profile_pic_url is omitted because the post_likes stream does not declare it",
     "who_liked.pk and who_liked.id both use post_likes.user_id because the source exposes one liker identity field",
+    "likers without post_id, user_id, or username, or without a matching post, are dropped and counted",
   ],
   provenance: [
     {
@@ -863,6 +914,8 @@ const instagramPosts: LegacyScopeBinding = {
     }
 
     const sourcePosts = byStream(records, "posts");
+    const postIds = new Set(sourcePosts.map((post) => post.id));
+    const dropped = new DroppedRows("instagram.posts");
     const likesByPost = new Map<string, Record<string, unknown>[]>();
     for (const liker of byStream(records, "post_likes")) {
       if (
@@ -870,6 +923,11 @@ const instagramPosts: LegacyScopeBinding = {
         typeof liker.user_id !== "string" ||
         typeof liker.username !== "string"
       ) {
+        dropped.add("post_likes", "Liker lacks post_id, user_id, or username");
+        continue;
+      }
+      if (!postIds.has(liker.post_id)) {
+        dropped.add("post_likes", "Liker has no matching post");
         continue;
       }
       const whoLiked = likesByPost.get(liker.post_id) ?? [];
@@ -900,6 +958,7 @@ const instagramPosts: LegacyScopeBinding = {
     return {
       ok: true,
       payload: { posts },
+      ...withDiagnostics(dropped.diagnostics()),
     };
   },
 };
@@ -926,7 +985,7 @@ const instagramFollowing: LegacyScopeBinding = {
   },
   primaryKey: { following: ["id"] },
   lossy: [
-    "rows without a non-empty string username are skipped because the legacy account schema requires username",
+    "rows without a non-empty string username are dropped and counted because the legacy account schema requires username",
   ],
   provenance: [
     {
@@ -940,8 +999,12 @@ const instagramFollowing: LegacyScopeBinding = {
   project(records, options): ProjectionResult {
     const guard = requireStreams("instagram.following", options, ["following"]);
     if (guard) return guard;
+    const dropped = new DroppedRows("instagram.following");
     const accounts = byStream(records, "following").flatMap((r) => {
-      if (typeof r.username !== "string" || !r.username) return [];
+      if (typeof r.username !== "string" || !r.username) {
+        dropped.add("following", "Account lacks a nonempty username");
+        return [];
+      }
       const account: Record<string, unknown> = {
         username: r.username,
         full_name: typeof r.full_name === "string" ? r.full_name : "",
@@ -955,7 +1018,11 @@ const instagramFollowing: LegacyScopeBinding = {
       if (typeof r.id === "string") account.pk = r.id;
       return [account];
     });
-    return { ok: true, payload: { accounts, total: accounts.length } };
+    return {
+      ok: true,
+      payload: { accounts, total: accounts.length },
+      ...withDiagnostics(dropped.diagnostics()),
+    };
   },
 };
 
@@ -968,7 +1035,7 @@ const instagramAds: LegacyScopeBinding = {
   primaryKey: { ads: ["id"] },
   lossy: [
     "ads rows with a null description omit the optional legacy category description",
-    "malformed ads rows without a string name or one of the declaration's three kinds are skipped",
+    "malformed ads rows without a string name or one of the declaration's three kinds are dropped and counted",
   ],
   provenance: [
     {
@@ -985,8 +1052,15 @@ const instagramAds: LegacyScopeBinding = {
     const advertisers: Record<string, string>[] = [];
     const ad_topics: Record<string, string>[] = [];
     const categories: Record<string, unknown>[] = [];
+    const dropped = new DroppedRows("instagram.ads");
     for (const row of byStream(records, "ads")) {
-      if (typeof row.name !== "string") continue;
+      if (
+        typeof row.name !== "string" ||
+        !["advertiser", "ad_topic", "ad_category"].includes(row.kind as string)
+      ) {
+        dropped.add("ads", "Ad row lacks a string name or a declared kind");
+        continue;
+      }
       if (row.kind === "advertiser") advertisers.push({ name: row.name });
       if (row.kind === "ad_topic") ad_topics.push({ name: row.name });
       if (row.kind === "ad_category") {
@@ -998,7 +1072,11 @@ const instagramAds: LegacyScopeBinding = {
         });
       }
     }
-    return { ok: true, payload: { advertisers, ad_topics, categories } };
+    return {
+      ok: true,
+      payload: { advertisers, ad_topics, categories },
+      ...withDiagnostics(dropped.diagnostics()),
+    };
   },
 };
 
@@ -1175,7 +1253,7 @@ const githubHistory: LegacyScopeBinding = {
     "body is truncated to the legacy connector's 500-character limit",
     "repoUrl is omitted because no repository URL field is declared on issue or pull request streams",
     "fetchedAt is set at projection time because the legacy schema requires it and PDPP history records have no fetch timestamp",
-    "items with missing required legacy repo names or malformed declared fields are skipped",
+    "an authored item without an id or repository name, or an issue by the signed user without a boolean is_pull_request, fails the scope",
   ],
   provenance: [
     {
@@ -1250,6 +1328,21 @@ const githubHistory: LegacyScopeBinding = {
         : [];
       return item;
     };
+    if (
+      sourceIssues.some(
+        (r) => r.user_login === login && typeof r.is_pull_request !== "boolean",
+      )
+    ) {
+      return {
+        ok: false,
+        error: {
+          kind: "incomplete_scope",
+          scope: "github.history",
+          reason:
+            "An issue by the signed user has no boolean is_pull_request, so it cannot be classified",
+        },
+      };
+    }
     const pullRequests = byStream(records, "pull_requests").flatMap((r) => {
       const item = projectItem(r, "pr");
       return item ? [item] : [];
@@ -1357,6 +1450,7 @@ const githubProfile: LegacyScopeBinding = {
         error: { kind: "empty_singleton", scope: "github.profile" },
       };
     }
+    const dropped = new DroppedRows("github.profile");
     const payload: Record<string, unknown> = {
       username: user.login,
       profileUrl: `https://github.com/${user.login}`,
@@ -1372,7 +1466,11 @@ const githubProfile: LegacyScopeBinding = {
       if (typeof user[source] === "string") payload[target] = user[source];
     }
     const stats = byStream(records, "user_stats")
-      .filter((r) => typeof r.observed_on === "string")
+      .filter((r) => {
+        if (typeof r.observed_on === "string") return true;
+        dropped.add("user_stats", "Stats record lacks observed_on");
+        return false;
+      })
       .sort((a, b) =>
         String(b.observed_on).localeCompare(String(a.observed_on)),
       )[0];
@@ -1404,7 +1502,10 @@ const githubProfile: LegacyScopeBinding = {
       records,
       "pinned_repositories",
     ).flatMap((r) => {
-      if (typeof r.full_name !== "string") return [];
+      if (typeof r.full_name !== "string") {
+        dropped.add("pinned_repositories", "Pinned repository lacks full_name");
+        return [];
+      }
       const item: Record<string, unknown> = { fullName: r.full_name };
       if (typeof r.html_url === "string" || r.html_url === null)
         item.url = r.html_url;
@@ -1416,7 +1517,10 @@ const githubProfile: LegacyScopeBinding = {
       return [item];
     });
     payload.organizations = byStream(records, "organizations").flatMap((r) => {
-      if (typeof r.login !== "string") return [];
+      if (typeof r.login !== "string") {
+        dropped.add("organizations", "Organization lacks login");
+        return [];
+      }
       return [
         {
           login: r.login,
@@ -1426,7 +1530,7 @@ const githubProfile: LegacyScopeBinding = {
         },
       ];
     });
-    return { ok: true, payload };
+    return { ok: true, payload, ...withDiagnostics(dropped.diagnostics()) };
   },
 };
 
@@ -1443,7 +1547,7 @@ const githubEvents: LegacyScopeBinding = {
     "the events API retains only roughly 90 days; the connector emits each collected public event as a legacy event",
     "legacy action, title, body, URL, branch, commit count, repository URL, and window description are omitted because events records do not declare those values",
     "fetchedAt is set at projection time because the stream has no collection timestamp",
-    "malformed records missing legacy-required fields are skipped",
+    "malformed records missing legacy-required fields are dropped and counted",
   ],
   provenance: [
     {
@@ -1457,6 +1561,7 @@ const githubEvents: LegacyScopeBinding = {
   project(records, options): ProjectionResult {
     const guard = requireStreams("github.events", options, ["events"]);
     if (guard) return guard;
+    const dropped = new DroppedRows("github.events");
     const events = byStream(records, "events").flatMap((r) => {
       if (
         typeof r.id !== "string" ||
@@ -1464,8 +1569,13 @@ const githubEvents: LegacyScopeBinding = {
         typeof r.created_at !== "string" ||
         typeof r.repository_full_name !== "string" ||
         typeof r.is_public !== "boolean"
-      )
+      ) {
+        dropped.add(
+          "events",
+          "Event lacks a legacy-required id, type, created_at, repository_full_name, or is_public",
+        );
         return [];
+      }
       return [
         {
           id: r.id,
@@ -1479,6 +1589,7 @@ const githubEvents: LegacyScopeBinding = {
     return {
       ok: true,
       payload: { events, fetchedAt: projectionTime(options) },
+      ...withDiagnostics(dropped.diagnostics()),
     };
   },
 };
@@ -1494,6 +1605,7 @@ const githubContributions: LegacyScopeBinding = {
     "daily records are projected to legacy days; level is absent from the source and omitted",
     "totalContributionsLastYear, yearTotals, monthlyTotals, and topDay are omitted because collected contribution records may cover only an incremental or caller-limited interval",
     "fetchedAt is set at projection time because contribution records have no collection timestamp",
+    "days without a date or numeric count are dropped and counted",
   ],
   provenance: [
     {
@@ -1509,15 +1621,25 @@ const githubContributions: LegacyScopeBinding = {
       "contributions",
     ]);
     if (guard) return guard;
+    const dropped = new DroppedRows("github.contributions");
     const days = byStream(records, "contributions").flatMap((r) => {
       if (
         typeof r.date !== "string" ||
         typeof r.contribution_count !== "number"
-      )
+      ) {
+        dropped.add(
+          "contributions",
+          "Contribution day lacks a date or a numeric contribution_count",
+        );
         return [];
+      }
       return [{ date: r.date, count: r.contribution_count }];
     });
-    return { ok: true, payload: { days, fetchedAt: projectionTime(options) } };
+    return {
+      ok: true,
+      payload: { days, fetchedAt: projectionTime(options) },
+      ...withDiagnostics(dropped.diagnostics()),
+    };
   },
 };
 
@@ -1641,6 +1763,7 @@ const chatgptConversations: LegacyScopeBinding = {
     const drop = (reason: string) =>
       dropped.set(reason, (dropped.get(reason) ?? 0) + 1);
     let malformedMessages = 0;
+    let unlinkedMessages = 0;
 
     const messagesByConversation = new Map<string, Record<string, unknown>[]>();
     for (const message of byStream(records, "messages")) {
@@ -1648,7 +1771,10 @@ const chatgptConversations: LegacyScopeBinding = {
         malformedMessages += 1;
         continue;
       }
-      if (typeof message.conversation_id !== "string") continue;
+      if (typeof message.conversation_id !== "string") {
+        unlinkedMessages += 1;
+        continue;
+      }
       const group = messagesByConversation.get(message.conversation_id) ?? [];
       group.push(message);
       messagesByConversation.set(message.conversation_id, group);
@@ -1769,17 +1895,18 @@ const chatgptConversations: LegacyScopeBinding = {
         reasons: [...dropped.keys()],
       });
     }
-    if (orphanMessages + malformedMessages > 0) {
+    if (orphanMessages + malformedMessages + unlinkedMessages > 0) {
       diagnostics.push({
         kind: "records_dropped",
         scope,
         stream: "messages",
-        count: orphanMessages + malformedMessages,
+        count: orphanMessages + malformedMessages + unlinkedMessages,
         reasons: [
           ...(orphanMessages > 0
             ? ["Messages have no matching conversation"]
             : []),
           ...(malformedMessages > 0 ? ["Message record is not an object"] : []),
+          ...(unlinkedMessages > 0 ? ["Message lacks a conversation id"] : []),
         ],
       });
     }
@@ -2697,7 +2824,7 @@ const spotifySavedTracks: LegacyScopeBinding = {
   },
   primaryKey: { saved_tracks: ["id"] },
   lossy: [
-    "Rows without the required legacy name and artist list are skipped; nullable album and optional fields retain the connector's empty-string, zero, and false sentinels.",
+    "Rows without the required legacy name and artist list are dropped and counted; nullable album and optional fields retain the connector's empty-string, zero, and false sentinels.",
     "isrc, popularity, and id have no corresponding legacy fields and are omitted.",
   ],
   provenance: [
@@ -2826,7 +2953,16 @@ const spotifyPlaylists: LegacyScopeBinding = {
     const itemsByPlaylist = new Map<string, Record<string, unknown>[]>();
     for (const item of byStream(records, "playlist_items")) {
       const playlistId = item.playlist_id;
-      if (typeof playlistId !== "string") continue;
+      if (typeof playlistId !== "string") {
+        return {
+          ok: false,
+          error: {
+            kind: "incomplete_scope",
+            scope: "spotify.playlists",
+            reason: "A playlist item has no playlist_id to join on",
+          },
+        };
+      }
       const group = itemsByPlaylist.get(playlistId);
       if (group) {
         group.push(item);
@@ -3051,6 +3187,7 @@ const ouraActivity: LegacyScopeBinding = {
       "oura.activity",
       "activity",
       byStream(records, "activity"),
+      () => "score",
     );
     return {
       ok: true,
@@ -3059,7 +3196,7 @@ const ouraActivity: LegacyScopeBinding = {
         days: rows.map((r) => ({
           id: r.id,
           day: r.day,
-          ...ifDefined(r, "score", "score"),
+          score: r.score,
           ...ifDefined(r, "active_calories", "activeCalories"),
           ...ifDefined(r, "total_calories", "totalCalories"),
           ...ifDefined(r, "steps", "steps"),
@@ -3118,6 +3255,7 @@ const ouraReadiness: LegacyScopeBinding = {
       "oura.readiness",
       "readiness",
       byStream(records, "readiness"),
+      () => "score",
     );
     return {
       ok: true,
@@ -3126,7 +3264,7 @@ const ouraReadiness: LegacyScopeBinding = {
         days: rows.map((r) => ({
           id: r.id,
           day: r.day,
-          ...ifDefined(r, "score", "score"),
+          score: r.score,
           ...ifDefined(r, "temperature_deviation", "temperatureDeviation"),
           ...ifDefined(
             r,
@@ -3193,51 +3331,56 @@ const ouraSleep: LegacyScopeBinding = {
       "oura.sleep",
       "sleep",
       byStream(records, "sleep"),
+      () => "sleep_score",
     );
-    const periods = rows.map((r) => ({
-      id: r.id,
-      day: r.day,
-      ...(r.type === "long_sleep" ||
-      r.type === "short_sleep" ||
-      r.type === "rest"
-        ? { type: r.type }
-        : {}),
-      ...ifDefined(r, "bedtime_start", "bedtimeStart"),
-      ...ifDefined(r, "bedtime_end", "bedtimeEnd"),
-      ...ifDefined(r, "total_sleep_duration", "totalSleepDuration"),
-      ...ifDefined(r, "time_in_bed", "timeInBed"),
-      ...ifDefined(r, "deep_sleep_duration", "deepSleepDuration"),
-      ...ifDefined(r, "light_sleep_duration", "lightSleepDuration"),
-      ...ifDefined(r, "rem_sleep_duration", "remSleepDuration"),
-      ...ifDefined(r, "efficiency", "efficiency"),
-      ...ifDefined(r, "latency", "latency"),
-      ...ifDefined(r, "average_heart_rate", "averageHeartRate"),
-      ...(r.average_hrv === null
-        ? { averageHrv: null }
-        : typeof r.average_hrv === "number" && Number.isInteger(r.average_hrv)
-          ? { averageHrv: r.average_hrv }
-          : {}),
-      ...ifDefined(r, "lowest_heart_rate", "lowestHeartRate"),
-      ...ifDefined(r, "average_breath", "averageBreath"),
-      ...ifDefined(r, "restless_periods", "restlessPeriods"),
-    }));
     return {
       ok: true,
-      ...(diagnostics.length > 0 ? { diagnostics } : {}),
+      ...withDiagnostics(diagnostics),
       payload: {
         dailyScores: rows.map((r) => ({
           id: r.id,
           day: r.day,
-          ...ifDefined(r, "sleep_score", "score"),
+          score: r.sleep_score,
           ...(r.contributors && typeof r.contributors === "object"
             ? { contributors: r.contributors }
             : {}),
         })),
-        sleepPeriods: periods,
+        sleepPeriods: rows.map(ouraSleepPeriod),
       },
     };
   },
 };
+
+/** One legacy `sleepPeriods` entry from a source sleep session row with a valid day. */
+export function ouraSleepPeriod(
+  r: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    id: r.id,
+    day: r.day,
+    ...(r.type === "long_sleep" || r.type === "short_sleep" || r.type === "rest"
+      ? { type: r.type }
+      : {}),
+    ...ifDefined(r, "bedtime_start", "bedtimeStart"),
+    ...ifDefined(r, "bedtime_end", "bedtimeEnd"),
+    ...ifDefined(r, "total_sleep_duration", "totalSleepDuration"),
+    ...ifDefined(r, "time_in_bed", "timeInBed"),
+    ...ifDefined(r, "deep_sleep_duration", "deepSleepDuration"),
+    ...ifDefined(r, "light_sleep_duration", "lightSleepDuration"),
+    ...ifDefined(r, "rem_sleep_duration", "remSleepDuration"),
+    ...ifDefined(r, "efficiency", "efficiency"),
+    ...ifDefined(r, "latency", "latency"),
+    ...ifDefined(r, "average_heart_rate", "averageHeartRate"),
+    ...(r.average_hrv === null
+      ? { averageHrv: null }
+      : typeof r.average_hrv === "number" && Number.isInteger(r.average_hrv)
+        ? { averageHrv: r.average_hrv }
+        : {}),
+    ...ifDefined(r, "lowest_heart_rate", "lowestHeartRate"),
+    ...ifDefined(r, "average_breath", "averageBreath"),
+    ...ifDefined(r, "restless_periods", "restlessPeriods"),
+  };
+}
 
 // ---------------------------------------------------------------------------
 // amazon
@@ -3279,6 +3422,10 @@ const amazonOrders: LegacyScopeBinding = {
     }
     const orders = byStream(records, "orders");
     const items = byStream(records, "order_items");
+    const orderIds = new Set(orders.map((o) => o.id));
+    const orphanItems = items.filter((i) => !orderIds.has(i.order_id)).length;
+    const dropped = new DroppedRows("amazon.orders");
+    dropped.add("order_items", "Order item has no matching order", orphanItems);
     // orderDate: legacy scrapes "MonthName D, YYYY" out of card text via
     // regex (amazon-playwright.js:184-187); toLegacyLongDate reproduces
     // that exact text shape from PDPP's ISO order_date, not an ISO
@@ -3305,6 +3452,7 @@ const amazonOrders: LegacyScopeBinding = {
         })),
         total: orders.length,
       },
+      ...withDiagnostics(dropped.diagnostics()),
     };
   },
 };
@@ -3615,8 +3763,42 @@ const hebNutrition: LegacyScopeBinding = {
   },
 };
 
-// Retained legacy H-E-B order projection, unchanged.
+// Grocery order semantics follow the accepted Unity projection fold
+// (vana-unity 9256b5a8e): an order with no usable line is a detail gap unless
+// the source count is a known zero; a gap or an unkeyable order is left out and
+// counted; zero survivors from nonempty orders is rejected, never served empty.
+// Reason strings are that fold's diagnostic codes.
 // ---------------------------------------------------------------------------
+
+/** Reason for an order dropped because its id is unusable; index.ts lets exactly these rows past its primary-key check. */
+export const GROCERY_INVALID_ORDER = "projection_invalid_order";
+const GROCERY_ORDER_ITEMS_GAP = "projection_order_items_gap";
+
+function partialRows(
+  scope: string,
+  stream: string,
+  reason: string,
+  count: number,
+): ProjectionDiagnostic[] {
+  return count > 0
+    ? [{ kind: "records_partial", scope, stream, count, reasons: [reason] }]
+    : [];
+}
+
+function groceryRejection(
+  scope: string,
+  diagnostics: ProjectionDiagnostic[],
+): ProjectionResult {
+  return {
+    ok: false,
+    error: {
+      kind: "incomplete_scope",
+      scope,
+      reason: "No source order could be projected",
+      diagnostics,
+    },
+  };
+}
 
 const hebOrders: LegacyScopeBinding = {
   scope: "heb.orders",
@@ -3640,7 +3822,9 @@ const hebOrders: LegacyScopeBinding = {
     "orderUrl and address: the signed profile has no equivalent fields; fulfillment_location is not treated as an address.",
     "status_code, store_name, timeslot_start/end, unfulfilled_count, fulfillment_method, and fetched_at are not represented by the legacy schema.",
     "total and item price: derived from declared integer cents when present; omitted when absent. No currency or decimal text is guessed.",
-    "the retained collector emitted only product-linked named lines; a source line without either field cannot be safely counted as complete and fails this scope.",
+    "the retained collector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
+    "An order without a usable id, or with no usable line and an item_count that is not a known zero, is left out and counted; valid peers are still delivered.",
+    "item_count counts quantity units; an order whose summed line quantities differ is delivered and reported partial.",
     "quantity: a declared numeric quantity is converted to its decimal string form to match the legacy connector output type.",
   ],
   provenance: [
@@ -3657,13 +3841,8 @@ const hebOrders: LegacyScopeBinding = {
     if (guard) return guard;
 
     const sourceItems = byStream(records, "order_items");
-    const sourceOrderIds = new Set(
-      byStream(records, "orders").map((order) => order.id),
-    );
-    let skippedItems = 0;
-    let skippedOrders = 0;
-    let orderItemsShortOfDeclaredCount = false;
-    const missingFields = new Set<string>();
+    const sourceOrders = byStream(records, "orders");
+    const sourceOrderIds = new Set(sourceOrders.map((order) => order.id));
     if (sourceItems.some((item) => !sourceOrderIds.has(item.order_id))) {
       return {
         ok: false,
@@ -3674,25 +3853,27 @@ const hebOrders: LegacyScopeBinding = {
         },
       };
     }
-    const orders = byStream(records, "orders").flatMap((order) => {
+    const dropped = new DroppedRows("heb.orders");
+    let unitCountMismatches = 0;
+    const orders = sourceOrders.flatMap((order) => {
+      // Without a usable id an order cannot be keyed: it is left out and
+      // counted (see GROCERY_INVALID_ORDER), never failing its valid peers.
       if (!isNonEmptyString(order.id)) {
-        skippedOrders += 1;
-        missingFields.add("orders.id");
+        dropped.add("orders", GROCERY_INVALID_ORDER);
         return [];
       }
       const items = sourceItems
         .filter((item) => item.order_id === order.id)
         .flatMap((item) => {
-          if (
-            !isNonEmptyString(item.name) ||
-            !isNonEmptyString(item.product_id)
-          ) {
-            skippedItems += 1;
-            if (!isNonEmptyString(item.name))
-              missingFields.add("order_items.name");
-            if (!isNonEmptyString(item.product_id)) {
-              missingFields.add("order_items.product_id");
-            }
+          if (!isNonEmptyString(item.name)) {
+            dropped.add("order_items", "projection_order_item_missing_name");
+            return [];
+          }
+          if (!isNonEmptyString(item.product_id)) {
+            dropped.add(
+              "order_items",
+              "projection_order_item_missing_product_id",
+            );
             return [];
           }
           const quantity =
@@ -3717,14 +3898,23 @@ const hebOrders: LegacyScopeBinding = {
           ];
         });
       // No usable line proves an empty order only when the source count is a
-      // known zero. A positive, missing, or malformed count is a detail gap.
+      // known zero. A positive, missing, or malformed count is a detail gap:
+      // the order is left out until its lines arrive.
+      if (items.length === 0 && order.item_count !== 0) {
+        dropped.add("orders", GROCERY_ORDER_ITEMS_GAP);
+        return [];
+      }
+      // H-E-B item_count counts quantity units, not lines.
       if (
-        (items.length === 0 && order.item_count !== 0) ||
-        (typeof order.item_count === "number" &&
-          Number.isInteger(order.item_count) &&
-          order.item_count > items.length)
+        typeof order.item_count === "number" &&
+        Number.isInteger(order.item_count)
       ) {
-        orderItemsShortOfDeclaredCount = true;
+        const units = items.reduce(
+          (total, item) =>
+            total + (item.quantity === null ? 0 : Number(item.quantity)),
+          0,
+        );
+        if (units !== order.item_count) unitCountMismatches += 1;
       }
       return [
         {
@@ -3744,37 +3934,18 @@ const hebOrders: LegacyScopeBinding = {
       ];
     });
 
-    const diagnostics =
-      skippedItems + skippedOrders > 0
-        ? [
-            {
-              kind: "records_skipped" as const,
-              scope: "heb.orders",
-              count: skippedItems + skippedOrders,
-              missingFields: [...missingFields],
-            },
-          ]
-        : undefined;
-    if (diagnostics) {
-      return {
-        ok: false,
-        error: {
-          kind: "incomplete_scope",
-          scope: "heb.orders",
-          reason: `Cannot preserve every valid order line: ${[...missingFields].join(", ")}`,
-        },
-      };
-    }
-    if (orderItemsShortOfDeclaredCount) {
-      return {
-        ok: false,
-        error: {
-          kind: "incomplete_scope",
-          scope: "heb.orders",
-          reason:
-            "order_items are short of the count H-E-B reported for an order",
-        },
-      };
+    // Zero survivors from nonempty orders is not an empty history.
+    const diagnostics = [
+      ...dropped.diagnostics(),
+      ...partialRows(
+        "heb.orders",
+        "orders",
+        "projection_order_unit_count_mismatch",
+        unitCountMismatches,
+      ),
+    ];
+    if (sourceOrders.length > 0 && orders.length === 0) {
+      return groceryRejection("heb.orders", diagnostics);
     }
     return {
       ok: true,
@@ -3786,7 +3957,7 @@ const hebOrders: LegacyScopeBinding = {
           0,
         ),
       },
-      ...(diagnostics ? { diagnostics } : {}),
+      ...withDiagnostics(diagnostics),
     };
   },
 };
@@ -3885,7 +4056,8 @@ const wholefoodsOrders: LegacyScopeBinding = {
   },
   primaryKey: { orders: ["id"], order_items: ["id"] },
   lossy: [
-    "The retained collector emitted only product-linked named lines; a source line without either field fails this scope as incomplete.",
+    "The retained collector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
+    "An order with no usable line and an item_count that is not a known zero is left out and counted; an order whose line count differs from item_count, or whose item_count is unknown, is delivered and reported partial. A missing or duplicate order id still fails the scope.",
     "Product identity is the source Amazon ASIN in product_id.",
   ],
   provenance: [
@@ -3916,50 +4088,33 @@ const wholefoodsOrders: LegacyScopeBinding = {
         },
       };
     }
-    const unrepresentableItem = sourceItems.some(
-      (item) =>
-        !sourceOrderIds.has(item.order_id) ||
-        !isNonEmptyString(item.name) ||
-        !isNonEmptyString(item.product_id),
-    );
-    if (unrepresentableItem) {
+    if (sourceItems.some((item) => !sourceOrderIds.has(item.order_id))) {
       return {
         ok: false,
         error: {
           kind: "incomplete_scope",
           scope: "wholefoods.orders",
-          reason:
-            "Cannot preserve every valid order line: order_items.name or order_items.product_id is missing",
+          reason: "order_items.order_id has no matching order",
         },
       };
     }
-    if (
-      sourceOrders.some(
-        (order) =>
-          typeof order.item_count !== "number" ||
-          !Number.isSafeInteger(order.item_count) ||
-          order.item_count < 0 ||
-          sourceItems.filter((item) => item.order_id === order.id).length !==
-            order.item_count,
-      )
-    ) {
-      return {
-        ok: false,
-        error: {
-          kind: "incomplete_scope",
-          scope: "wholefoods.orders",
-          reason:
-            "order item count is missing or does not match the observed lines",
-        },
-      };
-    }
-    const orders = byStream(records, "orders").flatMap((o) => {
-      if (!isNonEmptyString(o.id)) return [];
+    const dropped = new DroppedRows("wholefoods.orders");
+    let countMismatches = 0;
+    const orders = sourceOrders.flatMap((o) => {
       const items = sourceItems
         .filter((i) => i.order_id === o.id)
         .flatMap((i) => {
-          if (!isNonEmptyString(i.name) || !isNonEmptyString(i.product_id))
+          if (!isNonEmptyString(i.name)) {
+            dropped.add("order_items", "projection_order_item_missing_name");
             return [];
+          }
+          if (!isNonEmptyString(i.product_id)) {
+            dropped.add(
+              "order_items",
+              "projection_order_item_missing_product_id",
+            );
+            return [];
+          }
           return [
             {
               name: i.name,
@@ -3979,6 +4134,18 @@ const wholefoodsOrders: LegacyScopeBinding = {
             },
           ];
         });
+      // Whole Foods item_count counts lines. Only a known zero proves an
+      // order with no usable line is empty; otherwise it is a detail gap.
+      const itemCount = o.item_count;
+      const knownCount =
+        typeof itemCount === "number" &&
+        Number.isSafeInteger(itemCount) &&
+        itemCount >= 0;
+      if (items.length === 0 && !(knownCount && itemCount === 0)) {
+        dropped.add("orders", GROCERY_ORDER_ITEMS_GAP);
+        return [];
+      }
+      if (!knownCount || items.length !== itemCount) countMismatches += 1;
       return [
         {
           orderId: o.id,
@@ -4003,6 +4170,18 @@ const wholefoodsOrders: LegacyScopeBinding = {
         },
       ];
     });
+    const diagnostics = [
+      ...dropped.diagnostics(),
+      ...partialRows(
+        "wholefoods.orders",
+        "orders",
+        "projection_order_item_count_mismatch",
+        countMismatches,
+      ),
+    ];
+    if (sourceOrders.length > 0 && orders.length === 0) {
+      return groceryRejection("wholefoods.orders", diagnostics);
+    }
     return {
       ok: true,
       payload: {
@@ -4010,6 +4189,7 @@ const wholefoodsOrders: LegacyScopeBinding = {
         totalOrders: orders.length,
         totalItems: orders.reduce((sum, o) => sum + o.items.length, 0),
       },
+      ...withDiagnostics(diagnostics),
     };
   },
 };

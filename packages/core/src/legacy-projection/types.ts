@@ -39,7 +39,16 @@ export type ProjectionError =
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
   | { kind: "missing_stream"; scope: string; expectedStream: string }
   | { kind: "invalid_value"; scope: string; reason: string }
-  | { kind: "incomplete_scope"; scope: string; reason: string }
+  | {
+      kind: "incomplete_scope";
+      scope: string;
+      reason: string;
+      /**
+       * Rows behind a rejection in which source rows existed but none could
+       * be projected. Absent for other incomplete scopes.
+       */
+      diagnostics?: ProjectionDiagnostic[];
+    }
   | { kind: "gap"; scope: string; reason: string }
   | { kind: "empty_singleton"; scope: string };
 
@@ -50,8 +59,10 @@ export interface ProjectionOk {
 }
 /**
  * `records_skipped` makes the whole projection `incomplete_scope`.
- * `records_dropped` and `stream_missing` do not: the payload is served
- * without the named rows, and the diagnostic says how many were left out.
+ * `records_dropped`, `records_partial` and `stream_missing` do not: the
+ * payload is served without the named rows (`records_dropped`, `count` is
+ * distinct source rows of `stream`), or with rows the source says are short
+ * of detail (`records_partial`), and the diagnostic says how many.
  */
 export type ProjectionDiagnostic =
   | {
@@ -63,6 +74,13 @@ export type ProjectionDiagnostic =
   | {
       count: number;
       kind: "records_dropped";
+      reasons: string[];
+      scope: string;
+      stream: string;
+    }
+  | {
+      count: number;
+      kind: "records_partial";
       reasons: string[];
       scope: string;
       stream: string;

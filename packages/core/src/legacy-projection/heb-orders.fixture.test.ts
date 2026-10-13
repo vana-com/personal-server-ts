@@ -18,6 +18,7 @@ describe("heb.orders legacy projection fixture", () => {
             order_id: "order-1",
             name: "Apples",
             product_id: "12345678",
+            quantity: 1,
           },
         },
       ],
@@ -36,7 +37,7 @@ describe("heb.orders legacy projection fixture", () => {
                 productId: "12345678",
                 productUrl: null,
                 imageUrl: null,
-                quantity: null,
+                quantity: "1",
               },
             ],
             orderDate: "September 15, 2026",
@@ -66,15 +67,25 @@ describe("heb.orders legacy projection fixture", () => {
     });
   });
 
-  it("rejects valid source lines that the retained Desktop payload cannot represent", () => {
+  it("drops and counts a source line the retained Desktop payload cannot represent", () => {
     const result = LEGACY_SCOPE_BINDINGS.get("heb.orders")?.project(
       fixture.records as PdppRecord[],
       { fetchedStreams: ["orders", "order_items"] },
     );
 
     expect(result).toMatchObject({
-      ok: false,
-      error: { kind: "incomplete_scope", scope: "heb.orders" },
+      ok: true,
+      payload: {
+        orders: [{ orderId: "HEB12345", items: [{ name: "Apples" }] }],
+      },
+      diagnostics: [
+        {
+          kind: "records_dropped",
+          stream: "order_items",
+          count: 1,
+          reasons: ["projection_order_item_missing_product_id"],
+        },
+      ],
     });
   });
 });

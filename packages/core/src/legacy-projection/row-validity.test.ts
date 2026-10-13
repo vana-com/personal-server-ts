@@ -113,8 +113,11 @@ describe("oura.sleep drops a bad-day row from sleepPeriods as well", () => {
     const result = projectPdppRecordsToLegacyPayload(
       "oura.sleep",
       [
-        { stream: "sleep", data: { id: "s1", day: "2026-08-01" } },
-        { stream: "sleep", data: { id: "s2", day: null } },
+        {
+          stream: "sleep",
+          data: { id: "s1", day: "2026-08-01", sleep_score: 70 },
+        },
+        { stream: "sleep", data: { id: "s2", day: null, sleep_score: 70 } },
       ],
       { fetchedStreams: ["sleep"] },
     );

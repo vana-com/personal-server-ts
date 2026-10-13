@@ -30,7 +30,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/1";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/2";
 
 const DEFAULT_PAGE_SIZE = 500;
 const SOURCE_ID_PREFIX = "https://registry.pdpp.dev/sources/";
@@ -79,8 +79,14 @@ export interface CanonicalConnectionSelection {
 export interface CanonicalReadDiagnostics {
   /** Live source rows read per bound stream. Counts only, no row content. */
   sourceRowCounts: Record<string, number>;
-  /** Rows the projector left out of a still-deliverable payload. */
+  /**
+   * Source rows the projector left out of a still-deliverable payload, one
+   * entry per (stream, reason) the projector reported. Counts are distinct
+   * source rows.
+   */
   omissions: { stream: string; count: number; reasons: string[] }[];
+  /** Rows delivered although their source says detail is missing. */
+  partialRows: { stream: string; count: number; reasons: string[] }[];
 }
 
 export interface CanonicalLegacyReadOk {
@@ -93,7 +99,7 @@ export interface CanonicalLegacyReadOk {
    * unchanged source reads back the same value.
    */
   revision: string;
-  /** False when `diagnostics.omissions` is not empty. */
+  /** False when `diagnostics.omissions` or `diagnostics.partialRows` is not empty. */
   complete: boolean;
   diagnostics: CanonicalReadDiagnostics;
 }
@@ -353,9 +359,13 @@ async function projectSnapshot(
   }
 
   const omissions: CanonicalReadDiagnostics["omissions"] = [];
+  const partialRows: CanonicalReadDiagnostics["partialRows"] = [];
   for (const diagnostic of projected.diagnostics ?? []) {
-    if (diagnostic.kind === "records_dropped") {
-      omissions.push({
+    if (
+      diagnostic.kind === "records_dropped" ||
+      diagnostic.kind === "records_partial"
+    ) {
+      (diagnostic.kind === "records_dropped" ? omissions : partialRows).push({
         stream: diagnostic.stream,
         count: diagnostic.count,
         reasons: diagnostic.reasons,
@@ -406,8 +416,8 @@ async function projectSnapshot(
       data: projected.payload,
     },
     revision,
-    complete: omissions.length === 0,
-    diagnostics: { sourceRowCounts, omissions },
+    complete: omissions.length === 0 && partialRows.length === 0,
+    diagnostics: { sourceRowCounts, omissions, partialRows },
   };
 }
 

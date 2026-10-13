@@ -1,5 +1,9 @@
 // biome-ignore lint/performance/noBarrelFile: re-exported through @vana-unity/app-runtime/sources
-import { LEGACY_SCOPE_BINDINGS, LEGACY_SCOPE_GAPS } from "./bindings.js";
+import {
+  GROCERY_INVALID_ORDER,
+  LEGACY_SCOPE_BINDINGS,
+  LEGACY_SCOPE_GAPS,
+} from "./bindings.js";
 import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
 import { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
@@ -154,6 +158,17 @@ export function projectPdppRecordsToLegacyPayload(
   // records_dropped diagnostics) instead of failing the whole scope.
   if (DROP_AND_COUNT_SCOPES.has(scope)) return result;
 
+  // An order dropped and counted for its unusable id may pass the key check;
+  // every other malformed key stays fatal.
+  let reportedInvalidOrders = (result.diagnostics ?? []).reduce(
+    (total, diagnostic) =>
+      diagnostic.kind === "records_dropped" &&
+      diagnostic.stream === "orders" &&
+      diagnostic.reasons.includes(GROCERY_INVALID_ORDER)
+        ? total + diagnostic.count
+        : total,
+    0,
+  );
   for (const record of records) {
     if (!binding.pdppStreams.includes(record.stream)) continue;
     if (
@@ -177,6 +192,10 @@ export function projectPdppRecordsToLegacyPayload(
         value === undefined ||
         (typeof value === "string" && !value.trim())
       ) {
+        if (record.stream === "orders" && reportedInvalidOrders > 0) {
+          reportedInvalidOrders -= 1;
+          break;
+        }
         return {
           ok: false,
           error: {
