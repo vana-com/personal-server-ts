@@ -2249,6 +2249,130 @@ describe("P7: stream snapshot replace", () => {
   });
 });
 
+describe("P7: completion receipt from source_collected_at", () => {
+  function receipts() {
+    const db = new Database(join(tempDir, "index.db"), { readonly: true });
+    try {
+      return db
+        .prepare(
+          "SELECT instance, stream, method, generation, source_collected_at, live_count FROM pdpp_stream_completion ORDER BY instance, stream",
+        )
+        .all();
+    } finally {
+      db.close();
+    }
+  }
+  const profile = (key: string, email: string) => ({
+    key,
+    data: { user_id: key, email },
+    emitted_at: "2026-09-02T00:00:00Z",
+  });
+
+  it("records an empty full replace only when the producer names its collection time", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx, OURA);
+    const instance = `oura:${owner}`;
+
+    const empty = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      source_collected_at: "2026-09-02T11:59:00Z",
+      records: [],
+    });
+    expect(empty.status).toBe(200);
+    expect(receipts()).toEqual([
+      {
+        instance,
+        stream: "profile",
+        method: "oura",
+        generation: 1,
+        source_collected_at: "2026-09-02T11:59:00Z",
+        live_count: 0,
+      },
+    ]);
+
+    // An old client omits the field: same result as before, and the older
+    // receipt no longer stands for the latest collection.
+    const old = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-03T12:00:00Z",
+      records: [profile("k1", "k1@a")],
+    });
+    expect(old.status).toBe(200);
+    expect(old.body).toMatchObject({ accepted: 1, deleted: 0 });
+    expect(receipts()).toEqual([]);
+  });
+
+  it("refuses an invalid source_collected_at with 400 and writes nothing", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx, OURA);
+    const instance = `oura:${owner}`;
+    await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      source_collected_at: "2026-09-02T11:59:00Z",
+      records: [profile("k1", "k1@a")],
+    });
+    const before = { counters: storeCounters(), receipts: receipts() };
+    for (const bad of [null, 1789, "", "2026-09-02", "2026-02-30T00:00:00Z"]) {
+      const result = await replace(ctx, token, "profile", {
+        instance,
+        emitted_at: "2026-09-03T12:00:00Z",
+        source_collected_at: bad,
+        records: [],
+      });
+      expect(result.status).toBe(400);
+      expect(result.body.error.code).toBe("invalid_request");
+      expect({ counters: storeCounters(), receipts: receipts() }).toEqual(
+        before,
+      );
+    }
+  });
+
+  it("keeps the prior receipt when the replace is rejected, and ingest never writes one", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx, OURA);
+    const instance = `oura:${owner}`;
+    await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-02T12:00:00Z",
+      source_collected_at: "2026-09-02T11:59:00Z",
+      records: [],
+    });
+    const before = receipts();
+
+    const rejected = await replace(ctx, token, "profile", {
+      instance,
+      emitted_at: "2026-09-03T12:00:00Z",
+      source_collected_at: "2026-09-03T11:59:00Z",
+      records: [profile("k1", "k1@a"), profile("k1", "again")],
+    });
+    expect(rejected.status).toBe(422);
+    const stale = await replace(
+      ctx,
+      token,
+      "profile",
+      {
+        instance,
+        emitted_at: "2026-09-03T12:00:00Z",
+        source_collected_at: "2026-09-03T11:59:00Z",
+        records: [],
+      },
+      "oura",
+      2,
+    );
+    expect(stale.status).toBe(409);
+    expect(receipts()).toEqual(before);
+
+    const ingested = await ingest(ctx, token, "profile", {
+      instance,
+      ...profile("k2", "k2@a"),
+    });
+    expect(outcomes(ingested.body)).toEqual(["accepted"]);
+    expect(receipts()).toEqual([]);
+  });
+});
+
 describe("P5: record data is validated against the declared stream schema", () => {
   const WHOOP = "https://registry.pdpp.dev/connectors/whoop";
 

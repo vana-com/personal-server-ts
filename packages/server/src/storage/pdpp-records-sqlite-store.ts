@@ -46,6 +46,46 @@ export interface ReplaceStreamResult extends IngestResult {
   deleted: number;
 }
 
+/** One P7 completion receipt, see migration v7. */
+export interface StreamCompletionReceipt {
+  instance: string;
+  stream: string;
+  method: string;
+  generation: number;
+  sourceCollectedAt: string;
+  /** Write clock value when the replace committed. */
+  writeSeq: number;
+  liveCount: number;
+}
+
+const RFC3339_DATE_TIME =
+  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?(?:[Zz]|[+-](\d{2}):(\d{2}))$/;
+
+/** RFC 3339 `date-time`, with calendar-valid fields. No clock check. */
+export function isRfc3339DateTime(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = RFC3339_DATE_TIME.exec(value);
+  if (!match) return false;
+  const [year, month, day, hour, minute, second] = match
+    .slice(1, 7)
+    .map(Number);
+  const offsetHour = Number(match[8] ?? 0);
+  const offsetMinute = Number(match[9] ?? 0);
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return (
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= daysInMonth &&
+    hour <= 23 &&
+    minute <= 59 &&
+    second <= 59 &&
+    offsetHour <= 23 &&
+    offsetMinute <= 59 &&
+    !Number.isNaN(Date.parse(value))
+  );
+}
+
 export class PdppBindingError extends Error {
   constructor(public readonly reason: string) {
     super(reason);
@@ -182,6 +222,22 @@ CREATE TABLE IF NOT EXISTS pdpp_store_metadata (
 ALTER TABLE pdpp_instance_binding ADD COLUMN source_id TEXT;
 ALTER TABLE pdpp_instance_binding ADD COLUMN label TEXT NOT NULL DEFAULT '';
 ALTER TABLE pdpp_instance_binding ADD COLUMN deleted_at TEXT;
+`,
+  // v7: completion evidence for P7. A row says the stream's current live set
+  // is exactly what one full replace by `method` in `generation` delivered,
+  // collected at the producer's `source_collected_at`. Only `replaceStream`
+  // writes it; any other write to the stream deletes it.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_stream_completion (
+  instance TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  method TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  source_collected_at TEXT NOT NULL,
+  write_seq INTEGER NOT NULL,
+  live_count INTEGER NOT NULL,
+  PRIMARY KEY (instance, stream)
+);
 `,
 ];
 
@@ -410,7 +466,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     envelopes: PdppRecordEnvelopeInput[];
     primaryKey: string[];
     validateData?: RecordDataValidator;
+    sourceCollectedAt?: string;
   }): ReplaceStreamResult;
+  /** Completion receipts of one instance, as stored. */
+  listStreamCompletions(instance: string): StreamCompletionReceipt[];
 } {
   db.pragma("journal_mode = WAL");
   migrate(db);
@@ -459,6 +518,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   );
   const getBlobBytesStmt = db.prepare(
     "SELECT bytes FROM pdpp_blob_bytes WHERE blob_id = ?",
+  );
+  const dropCompletionStmt = db.prepare(
+    "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
   );
 
   function latestVersion(
@@ -577,6 +639,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     const deleted = data === null;
     const version = latestVersion(instance, stream, recordKey) + 1;
     const writtenAt = nextWriteSeq.get() as { value: number };
+    // The stream no longer holds what a replace delivered. `replaceStream`
+    // writes its own receipt after its writes.
+    dropCompletionStmt.run(instance, stream);
     const dataJson = deleted ? null : JSON.stringify(data);
     const deletedAt = deleted ? emittedAt : null;
     upsertCurrentStmt.run({
@@ -608,6 +673,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   // instance was written by that method in this generation, so a live key the
   // snapshot lacks has no other evidence and is tombstoned. Any rejected
   // record rejects the whole request before anything is written.
+  //
+  // With `sourceCollectedAt`, an applied replace also stores its completion
+  // receipt in the same transaction. Without it there is no receipt, and an
+  // older one is deleted: it would describe a collection that is no longer
+  // the latest.
   function replaceStream(input: {
     instance: string;
     stream: string;
@@ -617,7 +687,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     envelopes: PdppRecordEnvelopeInput[];
     primaryKey: string[];
     validateData?: RecordDataValidator;
+    sourceCollectedAt?: string;
   }): ReplaceStreamResult {
+    if (
+      input.sourceCollectedAt !== undefined &&
+      !isRfc3339DateTime(input.sourceCollectedAt)
+    ) {
+      throw new TypeError("invalid_source_collected_at");
+    }
     return db.transaction((): ReplaceStreamResult => {
       checkInstanceBinding(input.instance, input.method, input.generation);
 
@@ -702,6 +779,28 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           record_key,
           null,
           input.emittedAt,
+        );
+      }
+      dropCompletionStmt.run(input.instance, input.stream);
+      if (input.sourceCollectedAt !== undefined) {
+        db.prepare(
+          `INSERT INTO pdpp_stream_completion
+             (instance, stream, method, generation, source_collected_at, write_seq, live_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          input.instance,
+          input.stream,
+          input.method,
+          input.generation,
+          input.sourceCollectedAt,
+          readWriteClock(),
+          (
+            db
+              .prepare(
+                "SELECT COUNT(*) AS n FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+              )
+              .get(input.instance, input.stream) as { n: number }
+          ).n,
         );
       }
       return { ...summary, applied: true, deleted: missing.length };
@@ -871,7 +970,35 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       instance,
     );
     db.prepare("DELETE FROM pdpp_blob_claims WHERE instance = ?").run(instance);
+    db.prepare("DELETE FROM pdpp_stream_completion WHERE instance = ?").run(
+      instance,
+    );
     deleteUnclaimedBlobs(db);
+  }
+
+  function listStreamCompletions(instance: string): StreamCompletionReceipt[] {
+    const rows = db
+      .prepare(
+        "SELECT * FROM pdpp_stream_completion WHERE instance = ? ORDER BY stream",
+      )
+      .all(instance) as {
+      instance: string;
+      stream: string;
+      method: string;
+      generation: number;
+      source_collected_at: string;
+      write_seq: number;
+      live_count: number;
+    }[];
+    return rows.map((row) => ({
+      instance: row.instance,
+      stream: row.stream,
+      method: row.method,
+      generation: row.generation,
+      sourceCollectedAt: row.source_collected_at,
+      writeSeq: row.write_seq,
+      liveCount: row.live_count,
+    }));
   }
 
   function getRecord(
@@ -1009,6 +1136,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
 
       const version = existing.version + 1;
       const writtenAt = nextWriteSeq.get() as { value: number };
+      dropCompletionStmt.run(instance, stream);
       upsertCurrentStmt.run({
         instance,
         stream,
@@ -1373,6 +1501,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,
+    listStreamCompletions,
     getRecord,
     listRecords,
     deleteRecord,

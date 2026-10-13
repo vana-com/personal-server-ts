@@ -46,6 +46,24 @@ export interface CanonicalConnectionBinding {
 }
 
 /**
+ * Evidence that one full replace delivered the stream's current live set.
+ * The store writes it only inside a successful P7 replace that named
+ * `sourceCollectedAt`, and deletes it on any other write to the stream and on
+ * reset or delete of the connection.
+ */
+export interface CanonicalStreamCompletion {
+  stream: string;
+  method: string;
+  generation: number;
+  /** Producer collection time (RFC 3339), never the store clock. */
+  sourceCollectedAt: string;
+  /** Store write sequence when the replace committed. */
+  writeSeq: number;
+  /** Live rows the replace left. */
+  liveCount: number;
+}
+
+/**
  * The slice of the SQLite record store this reader needs. Read methods only.
  * The calls are synchronous.
  */
@@ -55,6 +73,8 @@ export interface CanonicalLegacyReadStore extends Pick<
 > {
   getInstanceBinding(instance: string): CanonicalConnectionBinding;
   listConnections(sourceId: string): CanonicalConnectionBinding[];
+  /** Completion receipts stored for one instance. */
+  listStreamCompletions(instance: string): CanonicalStreamCompletion[];
   /**
    * Run `read` against one point-in-time snapshot of the store: a write that
    * commits meanwhile, from any connection, is invisible to every call made
@@ -94,9 +114,10 @@ export interface CanonicalLegacyReadOk {
   envelope: DataFileEnvelope;
   /**
    * Opaque view revision: a hash of the contract version, connection,
-   * method, generation, declaration, and per-stream row horizons. It does
-   * not depend on the wall clock or on writes to other connections, so an
-   * unchanged source reads back the same value.
+   * method, generation, declaration, per-stream row horizons, and the
+   * completion receipts that prove empty streams. It does not depend on the
+   * wall clock or on writes to other connections, so an unchanged source
+   * reads back the same value.
    */
   revision: string;
   /** False when `diagnostics.omissions` or `diagnostics.partialRows` is not empty. */
@@ -123,10 +144,10 @@ export type CanonicalLegacyReadFailure =
   | { status: "unavailable"; reason: "no_synced_data" }
   | {
       /**
-       * A bound stream has no live rows. The store records no per-stream
-       * completion (no "this stream was fetched and had zero rows" marker, no
-       * stream sync state), so an empty stream cannot be told apart from one
-       * never collected. Another stream having data is not evidence.
+       * A bound stream has no live rows and no completion receipt from the
+       * connection's current method and generation, so it cannot be told
+       * apart from a stream never collected. Another stream having data, or
+       * another stream's receipt, is not evidence.
        */
       status: "unavailable";
       reason: "stream_completion_unknown";
@@ -254,6 +275,8 @@ interface Snapshot {
   generation: number;
   listing: StreamListing[];
   rowsByStream: Map<string, PdppStoredRecord[]>;
+  /** Valid receipts of the bound streams that have no live rows. */
+  emptyStreamEvidence: Map<string, CanonicalStreamCompletion>;
 }
 
 /** Everything the view needs from the store, read inside one snapshot. */
@@ -294,7 +317,25 @@ function collectSnapshot(
     }
     throw error;
   }
-  return { ok: true, generation: binding.generation, listing, rowsByStream };
+  const emptyStreamEvidence = new Map<string, CanonicalStreamCompletion>();
+  for (const receipt of store.listStreamCompletions(instance)) {
+    if (
+      streams.includes(receipt.stream) &&
+      receipt.method === binding.method &&
+      receipt.generation === binding.generation &&
+      receipt.liveCount === 0 &&
+      rowsByStream.get(receipt.stream)?.length === 0
+    ) {
+      emptyStreamEvidence.set(receipt.stream, receipt);
+    }
+  }
+  return {
+    ok: true,
+    generation: binding.generation,
+    listing,
+    rowsByStream,
+    emptyStreamEvidence,
+  };
 }
 
 interface ProjectInput extends Snapshot {
@@ -308,23 +349,35 @@ interface ProjectInput extends Snapshot {
 async function projectSnapshot(
   input: ProjectInput,
 ): Promise<CanonicalLegacyReadResult> {
-  const { scope, selection, streams, binding, profileKey, rowsByStream } =
-    input;
+  const {
+    scope,
+    selection,
+    streams,
+    binding,
+    profileKey,
+    rowsByStream,
+    emptyStreamEvidence,
+  } = input;
   const listingBefore = input.listing;
   const sourceRowCounts = Object.fromEntries(
     streams.map((stream) => [stream, rowsByStream.get(stream)?.length ?? 0]),
   );
 
-  if (listingBefore.every((entry) => entry.recordCount === 0)) {
+  if (
+    emptyStreamEvidence.size === 0 &&
+    listingBefore.every((entry) => entry.recordCount === 0)
+  ) {
     return unavailable({ reason: "no_synced_data" });
   }
-  const emptyStreams = streams.filter(
-    (stream) => (rowsByStream.get(stream)?.length ?? 0) === 0,
+  const unprovenEmpty = streams.filter(
+    (stream) =>
+      (rowsByStream.get(stream)?.length ?? 0) === 0 &&
+      !emptyStreamEvidence.has(stream),
   );
-  if (emptyStreams.length > 0) {
+  if (unprovenEmpty.length > 0) {
     return unavailable({
       reason: "stream_completion_unknown",
-      streams: emptyStreams,
+      streams: unprovenEmpty,
     });
   }
 
@@ -341,7 +394,11 @@ async function projectSnapshot(
     }
   }
 
-  const collectedAt = latestCollectedAt(rowsByStream, listingBefore);
+  const collectedAt = latestCollectedAt(
+    rowsByStream,
+    emptyStreamEvidence,
+    listingBefore,
+  );
   if (collectedAt === null)
     return unavailable({ reason: "invalid_collected_at" });
 
@@ -404,6 +461,7 @@ async function projectSnapshot(
     generation: input.generation,
     streams,
     rowsByStream,
+    emptyStreamEvidence,
     listing: listingBefore,
   });
 
@@ -537,17 +595,22 @@ function countFor(listing: StreamListing[], stream: string): number {
 }
 
 /**
- * Newest `emittedAt` among the rows read (the importer stamps it from the
- * original envelope `collectedAt`). With no bound rows, the newest stream
+ * Newest of the rows' `emittedAt` (the importer stamps it from the original
+ * envelope `collectedAt`) and the producer `sourceCollectedAt` of each
+ * receipt that proves an empty bound stream. With neither, the newest stream
  * horizon of the connection. Never the wall clock.
  */
 function latestCollectedAt(
   rowsByStream: Map<string, PdppStoredRecord[]>,
+  emptyStreamEvidence: Map<string, CanonicalStreamCompletion>,
   listing: StreamListing[],
 ): string | null {
   const stamps: string[] = [];
   for (const rows of rowsByStream.values()) {
     for (const row of rows) stamps.push(row.emittedAt);
+  }
+  for (const receipt of emptyStreamEvidence.values()) {
+    stamps.push(receipt.sourceCollectedAt);
   }
   if (stamps.length === 0) {
     for (const entry of listing) {
@@ -571,6 +634,7 @@ async function viewRevision(input: {
   generation: number;
   streams: string[];
   rowsByStream: Map<string, PdppStoredRecord[]>;
+  emptyStreamEvidence: Map<string, CanonicalStreamCompletion>;
   listing: StreamListing[];
 }): Promise<string> {
   const horizons = [];
@@ -609,6 +673,26 @@ async function viewRevision(input: {
         provenance: input.binding.provenance,
       },
       horizons,
+      // Only reads that use receipts hash them, so revisions of reads
+      // without receipts do not change.
+      ...(input.emptyStreamEvidence.size > 0
+        ? {
+            completions: input.streams.flatMap((stream) => {
+              const receipt = input.emptyStreamEvidence.get(stream);
+              return receipt
+                ? [
+                    {
+                      stream,
+                      method: receipt.method,
+                      generation: receipt.generation,
+                      sourceCollectedAt: receipt.sourceCollectedAt,
+                      writeSeq: receipt.writeSeq,
+                    },
+                  ]
+                : [];
+            }),
+          }
+        : {}),
     }),
   );
   return `v1:${digest}`;

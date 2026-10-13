@@ -312,7 +312,7 @@ describe("sqlite record store: blob bytes (real on-disk database)", () => {
     const version = db
       .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
       .get() as { version: number };
-    expect(version.version).toBe(6);
+    expect(version.version).toBe(7);
 
     store.close();
   });

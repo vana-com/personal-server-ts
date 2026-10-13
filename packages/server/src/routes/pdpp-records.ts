@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import {
+  isRfc3339DateTime,
   PdppBindingError,
   type createSqliteRecordStore,
 } from "../storage/pdpp-records-sqlite-store.js";
@@ -1458,11 +1459,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   });
 
   // P7, owner-authenticated snapshot replace of one (instance, stream). A
-  // Vana PS contract, not Core. Body: `{instance, emitted_at, records[]}`;
-  // `records` is the complete live set from a covered full refresh by the
-  // instance's bound method, and `emitted_at` is the time stamped on the
-  // tombstone of each live key the snapshot lacks. One transaction: a binding
-  // failure is 409, any rejected record is 422, and neither writes anything.
+  // Vana PS contract, not Core. Body: `{instance, emitted_at,
+  // source_collected_at?, records[]}`; `records` is the complete live set from
+  // a covered full refresh by the instance's bound method, and `emitted_at` is
+  // the time stamped on the tombstone of each live key the snapshot lacks.
+  // `source_collected_at` (RFC 3339) is when the producer collected that set;
+  // with it, the replace also stores a completion receipt. One transaction: a
+  // binding failure is 409, any rejected record is 422, and neither writes
+  // anything.
   // It exists only under method authority, so a server without configured
   // methods does not mount it.
   if (deps.bindingStore) {
@@ -1500,7 +1504,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         const body = parseIngestBody(
           await readBoundedBody(c.req.raw, MAX_INGEST_BODY_BYTES, "Ingest"),
         ) as Record<string, unknown>;
-        const { instance, emitted_at: emittedAt, records } = body;
+        const {
+          instance,
+          emitted_at: emittedAt,
+          source_collected_at: sourceCollectedAt,
+          records,
+        } = body;
         if (
           Array.isArray(body) ||
           typeof instance !== "string" ||
@@ -1511,6 +1520,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           throw new PdppError(
             "invalid_request",
             "Replace body must be {instance, emitted_at, records[]}",
+          );
+        }
+        if (
+          sourceCollectedAt !== undefined &&
+          !isRfc3339DateTime(sourceCollectedAt)
+        ) {
+          throw new PdppError(
+            "invalid_request",
+            "source_collected_at must be an RFC 3339 date-time",
           );
         }
         const ownedInstances = ownerInstances(context!);
@@ -1546,6 +1564,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           emittedAt,
           primaryKey: declaration.primaryKey,
           validateData,
+          ...(sourceCollectedAt === undefined ? {} : { sourceCollectedAt }),
           envelopes: records.map((entry) => {
             const e = (
               entry !== null && typeof entry === "object" ? entry : {}

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   readCanonicalLegacyScope,
   resolveCanonicalConnection,
@@ -315,6 +315,71 @@ describe("canonical legacy projection over the real SQLite record store", () => 
         next.ok &&
           (next.envelope.data.days as { score: number }[]).map((d) => d.score),
       ).toEqual([99, 10, 10, 10, 10, 99]);
+    });
+
+    it("reads receipts in the same snapshot as the rows", async () => {
+      fileStore.registerConnection({
+        instance: "conn_a",
+        sourceId: SRC("oura"),
+        method: METHOD,
+        label: "a",
+      });
+      fileStore.ingestBatch(
+        [
+          {
+            instance: "conn_a",
+            stream: "sleep",
+            key: "s1",
+            data: { id: "s1", day: "2026-08-01" },
+            emitted_at: stamp(0),
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+        { method: METHOD, generation: 1 },
+      );
+      const selection = {
+        instance: "conn_a",
+        sourceId: SRC("oura"),
+        method: METHOD,
+      };
+      // Another process commits an empty replace with its receipt after the
+      // reader has seen the stream's (empty) rows.
+      let injected = false;
+      const racing: CanonicalLegacyReadStore = {
+        ...fileStore,
+        listRecords(stream, options) {
+          const page = fileStore.listRecords(stream, options);
+          if (!injected) {
+            injected = true;
+            writerStore.replaceStream({
+              instance: "conn_a",
+              stream: "activity",
+              method: METHOD,
+              generation: 1,
+              emittedAt: stamp(1),
+              primaryKey: ["id"],
+              envelopes: [],
+              sourceCollectedAt: stamp(1),
+            });
+          }
+          return page;
+        },
+      };
+      expect(
+        await readCanonicalLegacyScope({
+          store: racing,
+          scope: "oura.activity",
+          selection,
+        }),
+      ).toMatchObject({ ok: false, reason: "stream_completion_unknown" });
+      expect(injected).toBe(true);
+      const after = await readCanonicalLegacyScope({
+        store: fileStore,
+        scope: "oura.activity",
+        selection,
+      });
+      expect(after.ok && after.envelope.collectedAt).toBe(stamp(1));
     });
 
     it("keeps every stream of a multi-stream scope in the same snapshot", async () => {
@@ -908,6 +973,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
           "readSnapshot",
           "getInstanceBinding",
           "listStreams",
+          "listStreamCompletions",
           "listRecords",
         ]),
       );
@@ -1014,6 +1080,335 @@ describe("canonical legacy projection over the real SQLite record store", () => 
         read.ok &&
           (read.envelope.data.days as { id: string }[]).map((d) => d.id),
       ).toEqual(["a1"]);
+    });
+  });
+
+  describe("completion receipts from a full replace", () => {
+    const COLLECTED = "2026-09-10T08:30:00+02:00";
+    const COLLECTED_ISO = "2026-09-10T06:30:00.000Z";
+
+    function replace(
+      instance: string,
+      stream: string,
+      rows: Record<string, unknown>[],
+      sourceCollectedAt?: string,
+      binding: { method?: string; generation?: number } = {},
+    ) {
+      return store.replaceStream({
+        instance,
+        stream,
+        method: binding.method ?? METHOD,
+        generation: binding.generation ?? 1,
+        emittedAt: "2026-09-10T07:00:00.000Z",
+        primaryKey: ["id"],
+        envelopes: rows.map((data) => ({
+          instance,
+          stream,
+          key: String(data.id),
+          data,
+          emitted_at: "2026-09-10T07:00:00.000Z",
+        })),
+        ...(sourceCollectedAt === undefined ? {} : { sourceCollectedAt }),
+      });
+    }
+
+    const receipts = () =>
+      db
+        .prepare(
+          "SELECT instance, stream, method, generation, source_collected_at FROM pdpp_stream_completion ORDER BY instance, stream",
+        )
+        .all();
+
+    const readOura = (selection: {
+      instance: string;
+      sourceId: string;
+      method: string;
+    }) =>
+      readCanonicalLegacyScope({ store, scope: "oura.activity", selection });
+
+    it("serves a genuine empty replace as an empty stream stamped with the source time", async () => {
+      const a = connect("conn_a", "oura");
+      expect(replace("conn_a", "activity", [], COLLECTED).applied).toBe(true);
+
+      const read = await readOura(a);
+      expect(read).toMatchObject({ ok: true, complete: true });
+      if (!read.ok) return;
+      expect(read.envelope.data.days).toEqual([]);
+      expect(read.envelope.collectedAt).toBe(COLLECTED_ISO);
+      expect(read.diagnostics.sourceRowCounts).toEqual({ activity: 0 });
+    });
+
+    it("serves an empty stream next to a nonempty one only with that stream's own receipt", async () => {
+      const a = connect("conn_a", "chatgpt");
+      const conversation = {
+        id: "c1",
+        title: "t",
+        create_time: "2026-01-01T00:00:00.000Z",
+        update_time: "2026-01-01T00:00:00.000Z",
+        current_node: null,
+        message_count_on_current_branch: 0,
+      };
+      replace("conn_a", "conversations", [conversation], COLLECTED);
+      // The parent's receipt and row count say nothing about messages.
+      expect(
+        await readCanonicalLegacyScope({
+          store,
+          scope: "chatgpt.conversations",
+          selection: a,
+        }),
+      ).toMatchObject({
+        ok: false,
+        reason: "stream_completion_unknown",
+        streams: ["messages"],
+      });
+    });
+
+    it("keeps a never-collected stream unavailable", async () => {
+      const a = connect("conn_a", "oura");
+      replace("conn_a", "sleep", [], COLLECTED);
+      expect(await readOura(a)).toMatchObject({
+        ok: false,
+        reason: "no_synced_data",
+      });
+      put("conn_a", "sleep", [{ id: "s1", day: "2026-08-01" }]);
+      expect(await readOura(a)).toMatchObject({
+        ok: false,
+        reason: "stream_completion_unknown",
+        streams: ["activity"],
+      });
+    });
+
+    it("writes no receipt for a replace without a source time and drops the older one", async () => {
+      const a = connect("conn_a", "oura");
+      put("conn_a", "sleep", [{ id: "s1", day: "2026-08-01" }]);
+      expect(replace("conn_a", "activity", []).applied).toBe(true);
+      expect(receipts()).toEqual([]);
+      expect(await readOura(a)).toMatchObject({
+        reason: "stream_completion_unknown",
+      });
+
+      replace("conn_a", "activity", [], COLLECTED);
+      expect(receipts()).toHaveLength(1);
+      // An old client's later replace is a newer collection with no time:
+      // the older receipt must not stand as proof of it.
+      expect(replace("conn_a", "activity", []).applied).toBe(true);
+      expect(receipts()).toEqual([]);
+      expect(await readOura(a)).toMatchObject({
+        reason: "stream_completion_unknown",
+      });
+    });
+
+    it("refuses an invalid source time and keeps the rows and the prior receipt", () => {
+      connect("conn_a", "oura");
+      replace("conn_a", "activity", [activity("a1", "2026-08-01")], COLLECTED);
+      const before = {
+        receipts: receipts(),
+        rows: db.prepare("SELECT * FROM pdpp_records").all(),
+      };
+      for (const bad of [
+        "",
+        "yesterday",
+        "2026-09-10",
+        "2026-09-10 08:30:00Z",
+        "2026-02-30T00:00:00Z",
+        "2026-09-10T24:00:00Z",
+        "2026-09-10T08:30:00+25:00",
+      ]) {
+        expect(() => replace("conn_a", "activity", [], bad)).toThrow(
+          "invalid_source_collected_at",
+        );
+      }
+      expect({
+        receipts: receipts(),
+        rows: db.prepare("SELECT * FROM pdpp_records").all(),
+      }).toEqual(before);
+    });
+
+    it("rolls back rows and the prior receipt together when the replace is rejected", () => {
+      connect("conn_a", "oura");
+      replace("conn_a", "activity", [activity("a1", "2026-08-01")], COLLECTED);
+      const before = {
+        receipts: receipts(),
+        rows: db.prepare("SELECT * FROM pdpp_records").all(),
+      };
+      const rejected = replace(
+        "conn_a",
+        "activity",
+        [activity("a2", "2026-08-02"), { day: "2026-08-03" }],
+        "2026-09-11T00:00:00Z",
+      );
+      expect(rejected.applied).toBe(false);
+      expect(() =>
+        replace("conn_a", "activity", [], "2026-09-11T00:00:00Z", {
+          generation: 2,
+        }),
+      ).toThrow("binding_generation_mismatch");
+      expect(() =>
+        replace("conn_a", "activity", [], "2026-09-11T00:00:00Z", {
+          method: "other_method",
+        }),
+      ).toThrow("instance_bound_to_other_method");
+      expect({
+        receipts: receipts(),
+        rows: db.prepare("SELECT * FROM pdpp_records").all(),
+      }).toEqual(before);
+
+      // A fault after the rows are written, at the receipt insert, rolls the
+      // rows and the dropped prior receipt back together.
+      db.exec(`CREATE TRIGGER fail_receipt BEFORE INSERT ON pdpp_stream_completion
+        BEGIN SELECT RAISE(ABORT, 'injected receipt fault'); END`);
+      expect(() =>
+        replace(
+          "conn_a",
+          "activity",
+          [activity("a2", "2026-08-02")],
+          "2026-09-11T00:00:00Z",
+        ),
+      ).toThrow("injected receipt fault");
+      db.exec("DROP TRIGGER fail_receipt");
+      expect({
+        receipts: receipts(),
+        rows: db.prepare("SELECT * FROM pdpp_records").all(),
+      }).toEqual(before);
+    });
+
+    it("erases receipts on reset and delete, and ignores a receipt from another generation or method", async () => {
+      const a = connect("conn_a", "oura");
+      replace("conn_a", "activity", [], COLLECTED);
+      store.resetInstanceBinding({
+        instance: "conn_a",
+        expectedMethod: METHOD,
+        expectedGeneration: 1,
+        nextMethod: METHOD,
+      });
+      expect(receipts()).toEqual([]);
+      expect(await readOura(a)).toMatchObject({ reason: "no_synced_data" });
+
+      // A row left behind by another generation or method is not evidence.
+      const insert = db.prepare(
+        "INSERT INTO pdpp_stream_completion (instance, stream, method, generation, source_collected_at, write_seq, live_count) VALUES (?, 'activity', ?, ?, ?, 0, 0)",
+      );
+      insert.run("conn_a", METHOD, 1, COLLECTED);
+      expect(await readOura(a)).toMatchObject({ reason: "no_synced_data" });
+      db.prepare("DELETE FROM pdpp_stream_completion").run();
+      insert.run("conn_a", "other_method", 2, COLLECTED);
+      expect(await readOura(a)).toMatchObject({ reason: "no_synced_data" });
+      db.prepare("DELETE FROM pdpp_stream_completion").run();
+
+      replace("conn_a", "activity", [], COLLECTED, { generation: 2 });
+      expect((await readOura(a)).ok).toBe(true);
+      store.deleteConnection("conn_a");
+      expect(receipts()).toEqual([]);
+    });
+
+    it("does not let incremental writes or deletes stand in for a full refresh", async () => {
+      const a = connect("conn_a", "oura");
+      put("conn_a", "sleep", [{ id: "s1", day: "2026-08-01" }]);
+
+      // An empty or unchanged ingest is not a completion.
+      store.ingestBatch(
+        [],
+        () => "mutable_state",
+        () => ["id"],
+        {
+          method: METHOD,
+          generation: 1,
+        },
+      );
+      expect(receipts()).toEqual([]);
+
+      replace("conn_a", "activity", [activity("a1", "2026-08-01")], COLLECTED);
+      expect(receipts()).toHaveLength(1);
+      // An unchanged replay writes nothing, so the receipt still describes
+      // the stream.
+      put(
+        "conn_a",
+        "activity",
+        [activity("a1", "2026-08-01")],
+        "2026-09-10T07:00:00.000Z",
+      );
+      expect(receipts()).toHaveLength(1);
+
+      // A changed ingest, then a tombstone, empties the stream outside any
+      // replace: that is not a collected empty stream.
+      put("conn_a", "activity", [activity("a1", "2026-08-01", 90)]);
+      expect(receipts()).toEqual([]);
+      replace(
+        "conn_a",
+        "activity",
+        [activity("a1", "2026-08-01", 90)],
+        COLLECTED,
+      );
+      store.deleteRecord(
+        "conn_a",
+        "activity",
+        "a1",
+        "2026-09-12T00:00:00.000Z",
+        "mutable_state",
+      );
+      expect(receipts()).toEqual([]);
+      expect(await readOura(a)).toMatchObject({
+        reason: "stream_completion_unknown",
+        streams: ["activity"],
+      });
+
+      // A rejected ingest writes no receipt either.
+      const rejected = store.ingestBatch(
+        [
+          {
+            instance: "conn_a",
+            stream: "activity",
+            key: "x",
+            data: { day: "2026-08-02" },
+            emitted_at: "2026-09-12T00:00:00.000Z",
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+        { method: METHOD, generation: 1 },
+      );
+      expect(rejected.rejected).toHaveLength(1);
+      expect(receipts()).toEqual([]);
+    });
+
+    it("never lends one account's receipt to another", async () => {
+      connect("conn_a", "oura");
+      const b = connect("conn_b", "oura");
+      replace("conn_a", "activity", [], COLLECTED);
+      put("conn_b", "sleep", [{ id: "s1", day: "2026-08-01" }]);
+      expect(await readOura(b)).toMatchObject({
+        reason: "stream_completion_unknown",
+        streams: ["activity"],
+      });
+    });
+
+    it("keeps bytes and revision stable across wall-clock changes and unrelated writes", async () => {
+      const a = connect("conn_a", "oura");
+      replace("conn_a", "activity", [], COLLECTED);
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date("2030-01-01T00:00:00.000Z"));
+        const first = await readOura(a);
+        vi.setSystemTime(new Date("2031-06-01T00:00:00.000Z"));
+        connect("conn_b", "oura");
+        replace("conn_b", "activity", [], "2026-09-20T00:00:00Z");
+        put("conn_a", "sleep", [{ id: "s1", day: "2026-08-01" }]);
+        const second = await readOura(a);
+        expect(first.ok && first.envelope.collectedAt).toBe(COLLECTED_ISO);
+        expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+
+        // A new collection of this stream is new evidence.
+        replace("conn_a", "activity", [], "2026-09-21T00:00:00Z");
+        const third = await readOura(a);
+        expect(third.ok && third.envelope.collectedAt).toBe(
+          "2026-09-21T00:00:00.000Z",
+        );
+        expect(third.ok && first.ok && third.revision).not.toBe(
+          first.ok && first.revision,
+        );
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });
