@@ -239,6 +239,25 @@ CREATE TABLE IF NOT EXISTS pdpp_stream_completion (
   PRIMARY KEY (instance, stream)
 );
 `,
+  // v8: arrival order for the legacy view. Desktop served a stream in the
+  // order each live key last arrived, and an unchanged re-delivery moved a
+  // key to the end without a new version. A row holds the latest arrival of
+  // one live key in the generation that wrote it. It is not record state:
+  // no version, emitted_at, history row or write clock moves with it. Rows
+  // stored before v8 have none, and none is guessed for them.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_record_arrival (
+  instance TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  record_key TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  arrival INTEGER NOT NULL,
+  PRIMARY KEY (instance, stream, record_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_arrival_order
+  ON pdpp_record_arrival (instance, stream, arrival);
+`,
 ];
 
 function migrate(db: Database): void {
@@ -470,6 +489,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   }): ReplaceStreamResult;
   /** Completion receipts of one instance, as stored. */
   listStreamCompletions(instance: string): StreamCompletionReceipt[];
+  /**
+   * Live record keys of one stream in the order each last arrived in the
+   * current generation, for the legacy view only. A key with no arrival
+   * since v8 is absent.
+   */
+  listArrivalOrder(instance: string, stream: string): string[];
 } {
   db.pragma("journal_mode = WAL");
   migrate(db);
@@ -522,6 +547,34 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   const dropCompletionStmt = db.prepare(
     "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
   );
+  const noteArrivalStmt = db.prepare(`
+    INSERT INTO pdpp_record_arrival (instance, stream, record_key, generation, arrival)
+    VALUES (@instance, @stream, @record_key, @generation, (
+      SELECT COALESCE(MAX(arrival), 0) + 1 FROM pdpp_record_arrival
+      WHERE instance = @instance AND stream = @stream
+    ))
+    ON CONFLICT (instance, stream, record_key) DO UPDATE SET
+      generation = excluded.generation,
+      arrival = excluded.arrival
+  `);
+  const forgetArrivalStmt = db.prepare(
+    "DELETE FROM pdpp_record_arrival WHERE instance = ? AND stream = ? AND record_key = ?",
+  );
+
+  /** `recordKey` is now the last live key of its stream to arrive. */
+  function noteArrival(
+    instance: string,
+    stream: string,
+    recordKey: string,
+    generation: number,
+  ): void {
+    noteArrivalStmt.run({
+      instance,
+      stream,
+      record_key: recordKey,
+      generation,
+    });
+  }
 
   function latestVersion(
     instance: string,
@@ -549,9 +602,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     // Reads inside the transaction see earlier writes of the same batch, so
     // two envelopes for one key are decided in order.
     const runBatch = db.transaction(() => {
-      if (binding && envelopes.length > 0) {
-        checkBinding(binding.method, binding.generation, envelopes);
-      } else if (envelopes.length > 0) {
+      if (!binding) {
         // P8a: every canonical write names its method and generation. A write
         // without them (the sync importer, which has no method identity)
         // cannot be checked against the binding or the blob claims, so it is
@@ -564,6 +615,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           }),
         );
         return;
+      }
+      const { generation } = binding;
+      if (envelopes.length > 0) {
+        checkBinding(binding.method, generation, envelopes);
       }
       envelopes.forEach((envelope, index) => {
         const plan = planIngest(
@@ -587,7 +642,23 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           validateData,
         );
         results.push(plan.outcome);
-        if (!plan.write) return;
+        if (!plan.write) {
+          // An equal re-delivery is still an arrival. A delete of a missing
+          // key and an append_only conflict are not.
+          if (
+            plan.outcome.outcome === "unchanged" &&
+            !plan.outcome.flag &&
+            envelope.op !== "delete"
+          ) {
+            noteArrival(
+              envelope.instance,
+              envelope.stream,
+              encodeRecordKey(envelope.key),
+              generation,
+            );
+          }
+          return;
+        }
 
         const { recordKey, data } = plan.write;
         const blobId = extractBlobId(data);
@@ -610,6 +681,16 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           data,
           envelope.emitted_at,
         );
+        if (data === null) {
+          forgetArrivalStmt.run(envelope.instance, envelope.stream, recordKey);
+        } else {
+          noteArrival(
+            envelope.instance,
+            envelope.stream,
+            recordKey,
+            generation,
+          );
+        }
       });
     });
 
@@ -699,6 +780,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       checkInstanceBinding(input.instance, input.method, input.generation);
 
       const seen = new Set<string>();
+      /** Live keys of the snapshot, in the order it delivered them. */
+      const snapshotOrder: string[] = [];
       const results: IngestOutcome[] = [];
       const writes: {
         recordKey: string;
@@ -738,6 +821,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           },
           input.validateData,
         );
+        if (plan.outcome.outcome === "rejected") {
+          return void results.push(plan.outcome);
+        }
+        if (envelope.op !== "delete") snapshotOrder.push(recordKey);
         if (!plan.write) return void results.push(plan.outcome);
         const blobId = extractBlobId(plan.write.data);
         if (blobId && !blobClaimedByCurrentGeneration(blobId, input.instance)) {
@@ -780,6 +867,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           null,
           input.emittedAt,
         );
+      }
+      // Desktop rebuilt a fully refreshed stream in emit order, unchanged
+      // keys included.
+      db.prepare(
+        "DELETE FROM pdpp_record_arrival WHERE instance = ? AND stream = ?",
+      ).run(input.instance, input.stream);
+      for (const recordKey of snapshotOrder) {
+        noteArrival(input.instance, input.stream, recordKey, input.generation);
       }
       dropCompletionStmt.run(input.instance, input.stream);
       if (input.sourceCollectedAt !== undefined) {
@@ -973,6 +1068,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     db.prepare("DELETE FROM pdpp_stream_completion WHERE instance = ?").run(
       instance,
     );
+    db.prepare("DELETE FROM pdpp_record_arrival WHERE instance = ?").run(
+      instance,
+    );
     deleteUnclaimedBlobs(db);
   }
 
@@ -999,6 +1097,19 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       writeSeq: row.write_seq,
       liveCount: row.live_count,
     }));
+  }
+
+  function listArrivalOrder(instance: string, stream: string): string[] {
+    const rows = db
+      .prepare(
+        `SELECT a.record_key FROM pdpp_record_arrival a
+         JOIN pdpp_instance_binding b
+           ON b.instance = a.instance AND b.generation = a.generation
+         WHERE a.instance = ? AND a.stream = ?
+         ORDER BY a.arrival`,
+      )
+      .all(instance, stream) as { record_key: string }[];
+    return rows.map((row) => row.record_key);
   }
 
   function getRecord(
@@ -1159,6 +1270,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         deleted_at: deletedAt,
         written_at: writtenAt.value,
       });
+      forgetArrivalStmt.run(instance, stream, recordKey);
       result = true;
     });
     run();
@@ -1502,6 +1614,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     storeBlobBytesForInstance,
     replaceStream,
     listStreamCompletions,
+    listArrivalOrder,
     getRecord,
     listRecords,
     deleteRecord,

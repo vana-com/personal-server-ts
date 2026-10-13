@@ -724,6 +724,131 @@ describe("sqlite record store", () => {
     });
   });
 
+  describe("arrival order (private to the legacy view)", () => {
+    const at = "2026-04-01T00:00:00.000Z";
+    const put = (
+      stream: string,
+      rows: (Record<string, unknown> | string)[],
+      semantics: "append_only" | "mutable_state" = "mutable_state",
+    ) =>
+      store.ingestBatch(
+        rows.map((row) =>
+          typeof row === "string"
+            ? {
+                instance: "inst_1",
+                stream,
+                key: row,
+                data: null,
+                emitted_at: at,
+                op: "delete" as const,
+              }
+            : {
+                instance: "inst_1",
+                stream,
+                key: String(row.id),
+                data: row,
+                emitted_at: at,
+              },
+        ),
+        () => semantics,
+        () => ["id"],
+      );
+    const order = (stream: string) => store.listArrivalOrder("inst_1", stream);
+
+    it("moves a truly unchanged append_only key but not a conflicting one", () => {
+      put(
+        "messages",
+        [
+          { id: "a", v: 1 },
+          { id: "b", v: 1 },
+        ],
+        "append_only",
+      );
+      const conflict = put("messages", [{ id: "a", v: 2 }], "append_only");
+      expect(conflict.results).toEqual([
+        { index: 0, outcome: "unchanged", flag: "append_only_conflict" },
+      ]);
+      expect(order("messages")).toEqual(["a", "b"]);
+      put("messages", [{ id: "a", v: 1 }], "append_only");
+      expect(order("messages")).toEqual(["b", "a"]);
+    });
+
+    it("lists only live keys after deletes and a replace", () => {
+      put("playlists", [{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }]);
+      put("playlists", ["a", "missing"]);
+      store.deleteRecord("inst_1", "playlists", "b", at, "mutable_state");
+      expect(order("playlists")).toEqual(["c", "d"]);
+
+      store.replaceStream({
+        instance: "inst_1",
+        stream: "playlists",
+        method: "test_method",
+        generation: 1,
+        emittedAt: at,
+        primaryKey: ["id"],
+        envelopes: [
+          {
+            instance: "inst_1",
+            stream: "playlists",
+            key: "e",
+            data: { id: "e" },
+            emitted_at: at,
+          },
+          {
+            instance: "inst_1",
+            stream: "playlists",
+            key: "d",
+            data: { id: "d" },
+            emitted_at: at,
+          },
+        ],
+      });
+      expect(order("playlists")).toEqual(["e", "d"]);
+      expect(
+        store
+          .listRecords("playlists", {
+            instanceIds: ["inst_1"],
+            limit: 10,
+            order: "asc",
+          })
+          .data.map((row) => row.recordKey)
+          .sort(),
+      ).toEqual(["d", "e"]);
+    });
+
+    it("forgets the order on reset and on connection delete", () => {
+      put("playlists", [{ id: "a" }, { id: "b" }]);
+      store.resetInstanceBinding({
+        instance: "inst_1",
+        expectedMethod: "test_method",
+        expectedGeneration: 1,
+        nextMethod: "test_method",
+      });
+      expect(order("playlists")).toEqual([]);
+
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "playlists",
+            key: "c",
+            data: { id: "c" },
+            emitted_at: at,
+          },
+        ],
+        playlistsSemantics,
+        playlistsPk,
+        { method: "test_method", generation: 2 },
+      );
+      expect(order("playlists")).toEqual(["c"]);
+      store.deleteConnection("inst_1");
+      expect(order("playlists")).toEqual([]);
+      expect(
+        db.prepare("SELECT COUNT(*) AS n FROM pdpp_record_arrival").get(),
+      ).toEqual({ n: 0 });
+    });
+  });
+
   describe("schema migration", () => {
     it("tracks a schema version and does not re-run migrations on reopen", () => {
       store.putBlobMeta({
