@@ -87,6 +87,27 @@ describe("createWeb3AuthMiddleware", () => {
     expect(json.error.errorCode).toBe("EXPIRED_TOKEN");
   });
 
+  it("signature valid for a day returns 401 EXPIRED_TOKEN (lifetime cap)", async () => {
+    const app = createApp();
+    const now = Math.floor(Date.now() / 1000);
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/test",
+      iat: now,
+      exp: now + 24 * 3600,
+    });
+
+    const res = await app.request("/test", {
+      headers: { Authorization: header },
+    });
+
+    expect(res.status).toBe(401);
+    const json = await res.json();
+    expect(json.error.errorCode).toBe("EXPIRED_TOKEN");
+  });
+
   it('signer accessible downstream via c.get("auth")', async () => {
     const app = createApp();
     const header = await buildWeb3SignedHeader({

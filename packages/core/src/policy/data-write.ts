@@ -16,7 +16,7 @@ import {
   type GrantVerifierPort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
-import { parseGrantExpiresAtSeconds } from "./data-read.js";
+import { parseGrantExpiresAtSeconds, SENTINEL_GRANT_IDS } from "./data-read.js";
 
 /**
  * Write-grant encoding: a grant scope entry prefixed with `write:` authorizes
@@ -124,10 +124,26 @@ export async function verifyDataWritePolicy(
     });
   }
 
+  // Same reserved-id rule as verifyDataReadPolicy: the auth-result sentinels
+  // are never a grant, whether the caller or the gateway supplies them.
+  if (SENTINEL_GRANT_IDS.has(input.grantId)) {
+    throw new GrantRequiredError({
+      reason: "Reserved grantId",
+      grantId: input.grantId,
+    });
+  }
+
   const grant = await ports.grantVerifier.getGrant(input.grantId);
   if (!grant) {
     throw new GrantRequiredError({
       reason: "Grant not found",
+      grantId: input.grantId,
+    });
+  }
+
+  if (SENTINEL_GRANT_IDS.has(grant.id)) {
+    throw new GrantRequiredError({
+      reason: "Grant resolved to a reserved id",
       grantId: input.grantId,
     });
   }

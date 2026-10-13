@@ -77,6 +77,22 @@ describe("createWriteSession", () => {
     ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
   });
 
+  it("rejects a reserved grantId in the handshake before any gateway lookup", async () => {
+    const gw = fakeGateway(grant({ id: "owner" }));
+    await expect(
+      createWriteSession(
+        { builderAddress: BUILDER, grantId: "owner" },
+        {
+          store: createInMemoryWriteSessionStore(),
+          authSessionVerifier: gw,
+          grantVerifier: gw,
+          serverOwner: OWNER,
+          randomToken: () => "t",
+        },
+      ),
+    ).rejects.toMatchObject({ errorCode: "GRANT_REQUIRED" });
+  });
+
   it("rejects an unregistered builder", async () => {
     const gw = fakeGateway(grant(), null);
     await expect(
