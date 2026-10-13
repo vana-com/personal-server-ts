@@ -206,16 +206,7 @@ describe("strava pass-through against the Desktop export function", () => {
 
   it("separates a fetched empty stream from a stream never fetched", () => {
     expect(project(ACTIVITIES, [], { fetchedStreams: ["activities"] })).toEqual(
-      {
-        ok: true,
-        payload: { activities: [] },
-        diagnostics: [
-          expect.objectContaining({
-            kind: "unproven",
-            aspect: "collection_coverage",
-          }),
-        ],
-      },
+      { ok: true, payload: { activities: [] } },
     );
     expect(project(DIAGNOSTICS, [], { fetchedStreams: [] })).toEqual({
       ok: false,
@@ -258,44 +249,23 @@ describe("strava limits the projection reports instead of hiding", () => {
     });
   });
 
-  it("never lets activities claim coverage, with or without a diagnostic in the input", () => {
-    const withDiagnostic = project(
-      ACTIVITIES,
-      [
-        rec("activities", activity("11")),
-        rec(
-          "coverage_diagnostics",
-          diagnostic({ status: "complete", reason: "covered_in_full" }),
-        ),
-      ],
-      { fetchedStreams: ["activities", "coverage_diagnostics"] },
-    );
-    const without = project(ACTIVITIES, [rec("activities", activity("11"))]);
-    for (const result of [withDiagnostic, without]) {
-      expect(result.ok && result.diagnostics).toEqual([
-        expect.objectContaining({
-          kind: "unproven",
-          scope: ACTIVITIES,
-          stream: "activities",
-          aspect: "collection_coverage",
-        }),
-      ]);
-    }
-  });
-
-  it("flags record order only when there is an order to compare", () => {
-    const { activities } = desktopExport.snapshotOrder;
-    const rows = activities.map((row) => rec("activities", row));
-    const order = (aspect: string) => (result: ReturnType<typeof project>) =>
-      result.ok &&
-      result.diagnostics?.some(
-        (d) => d.kind === "unproven" && d.aspect === aspect,
+  it("maps activities without reading or judging a coverage diagnostic", () => {
+    // Source coverage is the diagnostics scope's data. It neither completes
+    // nor taints the activities body.
+    for (const status of ["complete", "partial"]) {
+      const result = project(
+        ACTIVITIES,
+        [
+          rec("activities", activity("11")),
+          rec("coverage_diagnostics", diagnostic({ status })),
+        ],
+        { fetchedStreams: ["activities", "coverage_diagnostics"] },
       );
-
-    expect(order("record_order")(project(ACTIVITIES, rows))).toBe(true);
-    expect(order("record_order")(project(ACTIVITIES, rows.slice(0, 1)))).toBe(
-      false,
-    );
+      expect(result).toEqual({
+        ok: true,
+        payload: { activities: [activity("11")] },
+      });
+    }
   });
 
   it("returns snapshot order as given, and key order when the reader asks for it", () => {
@@ -306,6 +276,12 @@ describe("strava limits the projection reports instead of hiding", () => {
       (result.payload.activities as { id: string }[]).map((row) => row.id);
 
     const snapshotOrder = activities.map((row) => row.id);
+    // The binding keeps the order it is given and reports nothing: proving
+    // that order is the reader's job.
+    expect(project(ACTIVITIES, rows)).toEqual({
+      ok: true,
+      payload: { activities },
+    });
     expect(ids(project(ACTIVITIES, rows))).toEqual(snapshotOrder);
 
     const byKey = ids(project(ACTIVITIES, rows, { orderByPrimaryKey: true }));

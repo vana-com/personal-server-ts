@@ -4573,6 +4573,7 @@ function stravaIdentity(
     fieldsRead: { [stream]: [...STRAVA_FIELDS[stream]] },
     primaryKey: { [stream]: ["id"] },
     lossy,
+    rowOrder: "arrival",
     provenance: [
       {
         kind: "oci",
@@ -4584,41 +4585,15 @@ function stravaIdentity(
     project(records, options): ProjectionResult {
       const guard = requireStreams(scope, options, [stream]);
       if (guard) return guard;
-      const rows = byStream(records, stream);
-      const unproven: ProjectionDiagnostic[] = [];
-      if (stream === "activities") {
-        unproven.push({
-          kind: "unproven",
-          scope,
-          stream,
-          aspect: "collection_coverage",
-          reason:
-            "activities rows do not say whether the export was read in full; coverage is only in strava.coverage_diagnostics",
-        });
-      }
-      if (rows.length > 1) {
-        unproven.push({
-          kind: "unproven",
-          scope,
-          stream,
-          aspect: "record_order",
-          reason:
-            "Desktop served rows in snapshot arrival order; the canonical store does not keep that order",
-        });
-      }
-      return {
-        ok: true,
-        payload: { [stream]: rows },
-        ...withDiagnostics(unproven),
-      };
+      return { ok: true, payload: { [stream]: byStream(records, stream) } };
     },
   };
 }
 
 const stravaActivities = stravaIdentity("activities", [
   "No field is dropped, derived or defaulted: the body is the native records.",
-  "Row order: Desktop's snapshot was in arrival order (a re-emitted id moved to the end); this projection cannot reproduce it. An `unproven` record_order diagnostic is returned whenever there are two or more rows.",
-  "Coverage: the body carries rows only. Whether the export was read in full is in strava.coverage_diagnostics; an `unproven` collection_coverage diagnostic is always returned.",
+  "Row order: Desktop's snapshot was in arrival order (a re-emitted id, changed or not, moved to the end). The binding keeps its input order; the read facade supplies arrival order and reports rows it cannot place.",
+  "Coverage: the body carries rows only, as Desktop's did. Whether the export was read in full is producer data in strava.coverage_diagnostics; this scope neither reads nor judges it.",
 ]);
 
 const stravaCoverageDiagnostics = stravaIdentity("coverage_diagnostics", [

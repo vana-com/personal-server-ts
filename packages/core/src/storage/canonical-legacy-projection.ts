@@ -30,7 +30,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/3";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/4";
 
 const DEFAULT_PAGE_SIZE = 500;
 const SOURCE_ID_PREFIX = "https://registry.pdpp.dev/sources/";
@@ -76,6 +76,12 @@ export interface CanonicalLegacyReadStore extends Pick<
   /** Completion receipts stored for one instance. */
   listStreamCompletions(instance: string): CanonicalStreamCompletion[];
   /**
+   * Live record keys of one stream in the order each last arrived in the
+   * connection's current generation. A key the store holds no arrival for
+   * is absent. Read only for a binding with `rowOrder: "arrival"`.
+   */
+  listArrivalOrder(instance: string, stream: string): string[];
+  /**
    * Run `read` against one point-in-time snapshot of the store: a write that
    * commits meanwhile, from any connection, is invisible to every call made
    * inside it. The reader relies on this instead of guessing from counts or
@@ -108,12 +114,15 @@ export interface CanonicalReadDiagnostics {
   /** Rows delivered although their source says detail is missing. */
   partialRows: { stream: string; count: number; reasons: string[] }[];
   /**
-   * Properties of the legacy body the canonical rows cannot show, such as
-   * the order the legacy export gave. The rows are all delivered.
+   * Properties of the legacy body the canonical rows cannot show. Today one:
+   * a stream of two or more rows served in arrival order whose rows the
+   * store holds no arrival for (rows stored before it kept one). Those rows
+   * are all delivered, in primary-key order. Present only when not empty,
+   * so no other scope's result changes shape.
    */
-  unproven: {
+  unproven?: {
     stream: string;
-    aspect: "record_order" | "collection_coverage";
+    aspect: "record_order";
     reason: string;
   }[];
 }
@@ -123,10 +132,10 @@ export interface CanonicalLegacyReadOk {
   envelope: DataFileEnvelope;
   /**
    * Opaque view revision: a hash of the contract version, connection,
-   * method, generation, declaration, per-stream row horizons, and the
-   * completion receipts the read used. It does not depend on the
-   * wall clock or on writes to other connections, so an unchanged source
-   * reads back the same value.
+   * method, generation, declaration, per-stream row horizons in served
+   * order, order gaps, and the completion receipts the read used. It does
+   * not depend on the wall clock or on writes to other connections, so an
+   * unchanged source reads back the same value.
    */
   revision: string;
   /**
@@ -268,7 +277,13 @@ export async function readCanonicalLegacyScope(
   const streams = lookup.selection.streams;
 
   const snapshot = store.readSnapshot(() =>
-    collectSnapshot(store, selection, streams, pageSize),
+    collectSnapshot(
+      store,
+      selection,
+      streams,
+      binding.rowOrder === "arrival",
+      pageSize,
+    ),
   );
   if (!snapshot.ok) return snapshot.result;
 
@@ -286,7 +301,10 @@ interface Snapshot {
   ok: true;
   generation: number;
   listing: StreamListing[];
+  /** In arrival order for an arrival-ordered binding, unless a gap says not. */
   rowsByStream: Map<string, PdppStoredRecord[]>;
+  /** Streams of an arrival-ordered binding whose order the store cannot prove. */
+  orderGaps: string[];
   /**
    * Valid receipts of the bound streams: current method and generation, and
    * a live count equal to the rows read in this snapshot.
@@ -299,6 +317,7 @@ function collectSnapshot(
   store: CanonicalLegacyReadStore,
   selection: CanonicalConnectionSelection,
   streams: string[],
+  arrivalOrder: boolean,
   pageSize: number,
 ): Snapshot | { ok: false; result: CanonicalLegacyReadResult } {
   const { instance } = selection;
@@ -308,6 +327,7 @@ function collectSnapshot(
   const listing = store.listStreams([instance]);
 
   const rowsByStream = new Map<string, PdppStoredRecord[]>();
+  const orderGaps: string[] = [];
   try {
     for (const stream of streams) {
       const rows = readAllRows(store, instance, stream, pageSize);
@@ -321,7 +341,11 @@ function collectSnapshot(
           result: inconsistent(`${stream} pages disagree with the listing`),
         };
       }
-      rowsByStream.set(stream, rows);
+      const ordered = arrivalOrder
+        ? inArrivalOrder(rows, store.listArrivalOrder(instance, stream))
+        : rows;
+      if (!ordered) orderGaps.push(stream);
+      rowsByStream.set(stream, ordered ?? rows);
     }
   } catch (error) {
     if (
@@ -348,8 +372,24 @@ function collectSnapshot(
     generation: binding.generation,
     listing,
     rowsByStream,
+    orderGaps,
     completions,
   };
+}
+
+/**
+ * `rows` in the order their keys last arrived, or null when a row has no
+ * arrival to place it by. Zero or one row has only one order.
+ */
+function inArrivalOrder(
+  rows: PdppStoredRecord[],
+  arrival: string[],
+): PdppStoredRecord[] | null {
+  if (rows.length < 2) return rows;
+  const position = new Map(arrival.map((key, index) => [key, index]));
+  const placed = rows.map((row) => ({ row, at: position.get(row.recordKey) }));
+  if (placed.some(({ at }) => at === undefined)) return null;
+  return placed.sort((a, b) => (a.at ?? 0) - (b.at ?? 0)).map(({ row }) => row);
 }
 
 interface ProjectInput extends Snapshot {
@@ -370,6 +410,7 @@ async function projectSnapshot(
     binding,
     profileKey,
     rowsByStream,
+    orderGaps,
     completions,
   } = input;
   const listingBefore = input.listing;
@@ -422,7 +463,9 @@ async function projectSnapshot(
     fetchedStreams: streams,
     ...(profileKey ? { profileKey } : {}),
     now: collectedAt,
-    orderByPrimaryKey: true,
+    // Rows of an arrival-ordered scope go in as read. Without proof of that
+    // order the view falls back to key order and reports the gap below.
+    orderByPrimaryKey: binding.rowOrder !== "arrival" || orderGaps.length > 0,
   });
   if (!projected.ok) {
     return rejection(projected.error, sourceRowCounts);
@@ -430,15 +473,14 @@ async function projectSnapshot(
 
   const omissions: CanonicalReadDiagnostics["omissions"] = [];
   const partialRows: CanonicalReadDiagnostics["partialRows"] = [];
-  const unproven: CanonicalReadDiagnostics["unproven"] = [];
+  const unproven: NonNullable<CanonicalReadDiagnostics["unproven"]> =
+    orderGaps.map((stream) => ({
+      stream,
+      aspect: "record_order",
+      reason:
+        "some rows were stored before the store kept arrival order; they are served in primary-key order",
+    }));
   for (const diagnostic of projected.diagnostics ?? []) {
-    if (diagnostic.kind === "unproven") {
-      unproven.push({
-        stream: diagnostic.stream,
-        aspect: diagnostic.aspect,
-        reason: diagnostic.reason,
-      });
-    }
     if (
       diagnostic.kind === "records_dropped" ||
       diagnostic.kind === "records_partial"
@@ -482,6 +524,7 @@ async function projectSnapshot(
     generation: input.generation,
     streams,
     rowsByStream,
+    orderGaps,
     completions,
     listing: listingBefore,
   });
@@ -499,7 +542,12 @@ async function projectSnapshot(
       omissions.length === 0 &&
       partialRows.length === 0 &&
       unproven.length === 0,
-    diagnostics: { sourceRowCounts, omissions, partialRows, unproven },
+    diagnostics: {
+      sourceRowCounts,
+      omissions,
+      partialRows,
+      ...(unproven.length > 0 ? { unproven } : {}),
+    },
   };
 }
 
@@ -659,6 +707,7 @@ async function viewRevision(input: {
   generation: number;
   streams: string[];
   rowsByStream: Map<string, PdppStoredRecord[]>;
+  orderGaps: string[];
   completions: Map<string, CanonicalStreamCompletion>;
   listing: StreamListing[];
 }): Promise<string> {
@@ -697,7 +746,10 @@ async function viewRevision(input: {
         fieldsRead: input.binding.fieldsRead,
         provenance: input.binding.provenance,
       },
+      // Rows hash in served order, so a re-delivery that moves a key moves
+      // the revision even though no row version changed.
       horizons,
+      orderGaps: input.orderGaps,
       // Not `writeSeq`: the write clock is shared by all connections, so an
       // unchanged replay after another account's write would move it.
       completions: input.streams.flatMap((stream) => {
