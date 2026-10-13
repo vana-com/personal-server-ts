@@ -69,6 +69,7 @@ import type {
   DataPortabilityGatewayConfig,
   GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
+import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
 import {
   WRITER_ATTRIBUTION_KEY,
@@ -202,9 +203,33 @@ export interface PersonalServerReadFulfillmentReporter {
   reportDenied?(event: PersonalServerReadFulfillment): Promise<void>;
 }
 
+/**
+ * What a non-owner caller may see in a data listing: the scope patterns of
+ * the grants it holds from this server's owner. Only scopes they cover are
+ * listed, and versions of any other scope are refused.
+ */
+export interface PersonalServerListAuthResult {
+  grantedScopes: readonly string[];
+}
+
 export interface PersonalServerApiAuthPort {
   authorizeOwner(request: Request): Promise<void>;
-  authorizeBuilderList(request: Request): Promise<void>;
+  /**
+   * Authorize `GET /v1/data` and `GET /v1/data/:scope/versions`.
+   *
+   * Returning void means a FULL listing: every scope, and versions of any
+   * scope, exactly as the owner sees them. Return void only for the owner or
+   * an owner-equivalent credential (dev token, control-plane token, owner
+   * session token, PS-Lite's bearer `builderToken`, which is owner-equivalent
+   * by design). Any other caller must get a result naming its granted scopes
+   * (possibly `[]`), or the call must throw.
+   * `grantId` is the unsigned hint a read also takes (`?grantId=` /
+   * `X-PS-Grant-Id`); a signed `grantId` claim takes precedence.
+   */
+  authorizeBuilderList(
+    request: Request,
+    options?: { grantId?: string },
+  ): Promise<PersonalServerListAuthResult | void>;
   authorizeBuilderRead(
     input: PersonalServerReadAuthInput,
   ): Promise<PersonalServerReadAuthResult | void>;
@@ -562,6 +587,13 @@ export function selectedGrantId(
     request.headers.get("x-ps-grant-id") ??
     undefined
   );
+}
+
+function listAuthCovers(
+  listAuth: PersonalServerListAuthResult,
+  scope: string,
+): boolean {
+  return scopeCoveredByGrant(scope, [...listAuth.grantedScopes]);
 }
 
 export interface X402CycleInput {
@@ -1169,13 +1201,18 @@ export async function handlePersonalServerDataRequest(
 
     if (pathname === "/" || pathname === "") {
       if (request.method !== "GET") return methodNotAllowed();
-      await deps.auth.authorizeBuilderList(request);
+      const listAuth = await deps.auth.authorizeBuilderList(request, {
+        grantId: selectedGrantId(request, url),
+      });
       const result = await listDataScopesContract({
         storage: deps.storage,
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
         isVisible: discoveryVisibility(deps),
+        isListable: listAuth
+          ? (scope) => listAuthCovers(listAuth, scope)
+          : undefined,
       });
       return jsonResponse(result.response);
     }
@@ -1282,7 +1319,22 @@ export async function handlePersonalServerDataRequest(
     }
     if (parts.length === 2 && parts[1] === "versions") {
       if (request.method !== "GET") return methodNotAllowed();
-      await deps.auth.authorizeBuilderList(request);
+      const listAuth = await deps.auth.authorizeBuilderList(request, {
+        grantId: selectedGrantId(request, url),
+      });
+      // A scope's version history is as much its data as its content is, so
+      // a non-owner needs a grant covering it, exactly like a read.
+      const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+      if (
+        scopeResult.ok &&
+        listAuth &&
+        !listAuthCovers(listAuth, scopeResult.scope)
+      ) {
+        throw new GrantRequiredError({
+          reason: "No grant covers this scope",
+          requestedScope: scopeResult.scope,
+        });
+      }
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),

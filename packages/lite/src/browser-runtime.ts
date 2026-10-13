@@ -271,6 +271,7 @@ export async function createIndexedDbPsLiteRuntime(
       dataReadPolicyPorts: {
         authSessionVerifier: gateway,
         grantVerifier: gateway,
+        grantLister: gateway,
         runtimeAvailability,
       },
       ...(writeSessionStore

@@ -38,12 +38,25 @@ import {
   mapSdkAuthError,
 } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
+import {
+  arrivedOnLoopbackListener,
+  isLoopbackIp,
+  isSameOriginLoopbackRequest,
+} from "../middleware/local-listener.js";
 import { escapeHtml, renderAccountPage } from "../ui/account-page.js";
 
 export interface LoginV2Deps {
   logger: Logger;
   serverOrigin: string | (() => string);
   localApprovalOrigin?: string | (() => string | undefined);
+  /**
+   * Port of the loopback approval listener (see `index.ts`). The
+   * signature-free approval shortcut is honored only on connections that
+   * this listener accepted; `undefined` disables the shortcut.
+   */
+  localApprovalPort?: number;
+  /** Main server port; a collision with `localApprovalPort` disables the shortcut. */
+  serverPort?: number;
   serverOwner?: `0x${string}`;
   tokenStore: TokenStore;
   devToken?: string;
@@ -115,58 +128,59 @@ function resolveOrigin(
   return typeof origin === "function" ? origin() : origin;
 }
 
-function isLocalhostRequest(remoteAddr: string | undefined): boolean {
-  if (!remoteAddr) return false;
-  return (
-    remoteAddr === "127.0.0.1" ||
-    remoteAddr === "::1" ||
-    remoteAddr === "localhost" ||
-    remoteAddr.startsWith("127.") ||
-    remoteAddr === "::ffff:127.0.0.1"
-  );
-}
-
-function isLoopbackHost(hostname: string): boolean {
-  return (
-    hostname === "localhost" ||
-    hostname === "::1" ||
-    hostname === "127.0.0.1" ||
-    hostname.startsWith("127.")
-  );
-}
-
-function isLocalhostOrigin(origin: string): boolean {
-  try {
-    return isLoopbackHost(new URL(origin).hostname);
-  } catch {
-    return false;
-  }
-}
-
 function getSocketRemoteAddress(c: Context): string | undefined {
   // Access Node.js socket via Hono's env bindings when running on the real server.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (c.env as any)?.incoming?.socket?.remoteAddress;
 }
 
+/**
+ * The request comes from this machine and not from another site open in the
+ * user's browser: a loopback TCP peer (never X-Forwarded-For / X-Real-IP,
+ * which are trivially spoofable), a loopback Host (DNS rebinding), and no
+ * foreign `Origin` / cross-site `Sec-Fetch-Site`. The tunnel client also
+ * connects from loopback but keeps the public Host, so tunneled requests
+ * never qualify.
+ */
+function isLocalRequest(c: Context, deps: LoginV2Deps): boolean {
+  const remoteAddr = deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
+  return isLoopbackIp(remoteAddr) && isSameOriginLoopbackRequest(c);
+}
+
+/**
+ * The request is on the loopback approval channel: the TCP connection was
+ * accepted by the loopback approval listener (socket port + loopback local
+ * address, the same check that gates the dev UI), and it addressed that
+ * listener by its own origin. `Host` alone proves nothing — a request to the
+ * main port can carry `Host: 127.0.0.1:<approvalPort>`. Fails closed when the
+ * socket is unavailable.
+ */
 function usesLocalApprovalChannel(c: Context, deps: LoginV2Deps): boolean {
   const localApprovalOrigin = resolveOrigin(deps.localApprovalOrigin);
   if (!localApprovalOrigin) {
     return false;
   }
 
-  return getRequestOrigin(c) === localApprovalOrigin;
+  return (
+    arrivedOnLoopbackListener(c, {
+      localApprovalPort: deps.localApprovalPort,
+      serverPort: deps.serverPort,
+    }) && getRequestOrigin(c) === localApprovalOrigin
+  );
 }
 
-function getApprovalOrigin(c: Context, deps: LoginV2Deps): string {
-  const requestOrigin = getRequestOrigin(c);
-  const localApprovalOrigin = resolveOrigin(deps.localApprovalOrigin);
-
-  if (localApprovalOrigin && isLocalhostOrigin(requestOrigin)) {
-    return localApprovalOrigin;
-  }
-
-  return requestOrigin;
+/**
+ * Approval pages must never render inside another site's frame (clickjacking
+ * the Approve button).
+ */
+function noFrameHtml(
+  c: Context,
+  html: string,
+  status: 200 | 400 | 404 = 200,
+): Response {
+  c.header("Content-Security-Policy", "frame-ancestors 'none'");
+  c.header("X-Frame-Options", "DENY");
+  return c.html(html, status);
 }
 
 async function verifyRemoteOwnerApproval(
@@ -250,17 +264,36 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     app.post("/", (c) => {
       const sessionId = randomBytes(32).toString("hex");
       const pollToken = randomBytes(32).toString("hex");
+      const requestOrigin = getRequestOrigin(c);
+      const localApprovalOrigin = resolveOrigin(deps.localApprovalOrigin);
+      // Bind the session to where it was started: only a login initiated
+      // locally (the CLI on this machine) may later be approved through the
+      // signature-free loopback channel. Anything else, e.g. via the public
+      // tunnel URL, needs the owner wallet.
+      //
+      // Caveat: "local" is judged from the loopback peer plus a loopback
+      // Host. A reverse proxy on this machine that rewrites Host to
+      // localhost would make remote sessions look local here. Such a session
+      // still needs the owner to click Approve on the loopback approval
+      // listener, which only this machine can reach.
+      const localApprovalAllowed =
+        localApprovalOrigin !== undefined && isLocalRequest(c, deps);
       const result = initiateDeviceSessionContract({
         sessionStore: sessions,
         serverOwner: deps.serverOwner,
-        requestOrigin: getRequestOrigin(c),
-        approvalOrigin: getApprovalOrigin(c, deps),
+        requestOrigin,
+        approvalOrigin:
+          (localApprovalAllowed && localApprovalOrigin) || requestOrigin,
+        localApprovalAllowed,
         sessionId,
         pollToken,
         now: Date.now(),
       });
 
-      deps.logger.info({ sessionId }, "Login flow initiated");
+      deps.logger.info(
+        { sessionId, localApprovalAllowed },
+        "Login flow initiated",
+      );
       return c.json(result.body, result.status as 200 | 500);
     });
 
@@ -288,22 +321,25 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 
       const sessionId = c.req.query("session");
       if (!sessionId) {
-        return c.html(errorPage("Missing session parameter"), 400);
+        return noFrameHtml(c, errorPage("Missing session parameter"), 400);
       }
 
       const session = sessions.get(sessionId);
       if (!session) {
-        return c.html(errorPage("Session expired or invalid"), 404);
+        return noFrameHtml(c, errorPage("Session expired or invalid"), 404);
       }
 
       if (session.status === "approved") {
-        return c.html(successPage());
+        return noFrameHtml(c, successPage());
       }
 
       const owner = deps.serverOwner ?? "unknown";
-      const localApprovalShortcutEnabled = usesLocalApprovalChannel(c, deps);
+      const localApprovalShortcutEnabled =
+        session.localApprovalAllowed === true &&
+        usesLocalApprovalChannel(c, deps);
 
-      return c.html(
+      return noFrameHtml(
+        c,
         approvePage(
           session.requestedServerOrigin,
           owner,
@@ -338,13 +374,15 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       }
 
       // v1: localhost auto-approve — user is physically at the server.
-      // SECURITY: Use the direct TCP peer address, NOT X-Forwarded-For
-      // or X-Real-IP headers which are trivially spoofable by remote attackers.
+      // Only for sessions initiated locally, on the loopback channel, from
+      // the approval page itself (not another site in the same browser).
+      // Anything else falls through to the owner-wallet check.
       const remoteAddr =
         deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
       const allowLocalShortcut =
+        session.localApprovalAllowed === true &&
         usesLocalApprovalChannel(c, deps) &&
-        isLocalhostRequest(remoteAddr as string | undefined);
+        isLocalRequest(c, deps);
 
       if (!allowLocalShortcut) {
         const approvalAuth = await verifyRemoteOwnerApproval(
@@ -353,7 +391,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
         );
         if (approvalAuth instanceof Response) {
           deps.logger.warn(
-            { remoteAddr, sessionId },
+            { remoteAddr, sessionId, origin: c.req.header("origin") },
             "Remote approval rejected",
           );
           return approvalAuth;

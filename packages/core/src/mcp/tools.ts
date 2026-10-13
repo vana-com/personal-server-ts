@@ -625,6 +625,7 @@ async function resolveSearchScopes({
         readClient.listScopes({
           scopePrefix: prefix,
           limit: LIST_SCOPES_LIMIT,
+          grantId: grant.grantId,
         }),
         discoveryTimeoutMs,
         `list scopes for ${requested}`,

@@ -95,11 +95,15 @@ export interface AppDeps {
   cloudMode?: boolean;
   devToken?: string;
   /**
-   * Port of the loopback-only auth listener. The dev UI subtree is served
-   * only to connections that arrived on it (never via the tunnel).
+   * Port of the loopback-only auth listener. The dev UI subtree and the
+   * signature-free device-login approval are served only to connections
+   * that arrived on it (never via the tunnel).
    */
   localApprovalPort?: number;
-  /** Main server port; a loopback-port collision disables the dev UI. */
+  /**
+   * Main server port; a loopback-port collision disables the dev UI and the
+   * signature-free device-login approval.
+   */
   serverPort?: number;
   ownerSignature?: `0x${string}`;
   ownerPrivateKey?: `0x${string}`;
@@ -202,7 +206,19 @@ export function createApp(deps: AppDeps): Hono {
   app.use("/ui", uiLoopbackOnly);
   app.use("/ui/*", uiLoopbackOnly);
 
-  app.use("*", corsMiddleware());
+  // The whole /auth/device subtree stays out of the wildcard CORS: no other
+  // origin may read the approval page or the approve/initiate responses
+  // (which carry session ids). That includes /auth/device/token (the
+  // control-plane POST and the CLI logout DELETE). No browser cross-origin
+  // caller of any of these exists: the CLI and control plane use server-side
+  // fetch (unaffected by CORS) and the approval page calls its own origin,
+  // so a cross-origin preflight for them must fail.
+  const cors = corsMiddleware();
+  app.use("*", (c, next) =>
+    c.req.path === "/auth/device" || c.req.path.startsWith("/auth/device/")
+      ? next()
+      : cors(c, next),
+  );
 
   // Mount health route
   app.route(
@@ -449,6 +465,8 @@ export function createApp(deps: AppDeps): Hono {
         logger: deps.logger,
         serverOrigin: deps.serverOrigin,
         localApprovalOrigin: deps.localApprovalOrigin,
+        localApprovalPort: deps.localApprovalPort,
+        serverPort: deps.serverPort,
         serverOwner: deps.serverOwner,
         tokenStore: deps.tokenStore,
         devToken: deps.devToken,

@@ -7,6 +7,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 
 const wallet = createTestWallet(0);
+const LIST_GRANT_ID = "e2e-list-grant";
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 
@@ -19,6 +20,21 @@ describe("Data read endpoint (e2e)", () => {
     server = await startTestServer({
       gatewayUrl: gateway.url,
       masterKeySignature: KNOWN_SIG,
+    });
+
+    // A builder lists only the scopes its grant from the owner covers.
+    const health = await fetch(`${server.url}/health`);
+    const owner = (await health.json()).owner as string;
+    gateway.setGrant(LIST_GRANT_ID, {
+      id: LIST_GRANT_ID,
+      grantorAddress: owner,
+      granteeId: "0xbuilder1",
+      scopes: ["instagram.*", "twitter.*", "reddit.*"],
+      status: "confirmed",
+      addedAt: new Date().toISOString(),
+      expiresAt: null,
+      expired: false,
+      revokedAt: null,
     });
   });
 
@@ -42,12 +58,13 @@ describe("Data read endpoint (e2e)", () => {
     return res.json();
   }
 
-  async function getListWithAuth(query = "") {
+  async function getListWithAuth(query = "", grantId = LIST_GRANT_ID) {
     const header = await buildWeb3SignedHeader({
       wallet,
       aud: server.url,
       method: "GET",
       uri: "/v1/data",
+      grantId,
     });
     const url = query
       ? `${server.url}/v1/data${query}`
@@ -76,6 +93,15 @@ describe("Data read endpoint (e2e)", () => {
     expect(body.scopes).toBeDefined();
     expect(Array.isArray(body.scopes)).toBe(true);
     expect(body.scopes.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("GET /v1/data lists nothing to a builder presenting no grant", async () => {
+    const res = await getListWithAuth("", "");
+    expect(res.status).toBe(200);
+
+    const body = await res.json();
+    expect(body.scopes).toEqual([]);
+    expect(body.total).toBe(0);
   });
 
   it("GET /v1/data filters by scopePrefix", async () => {

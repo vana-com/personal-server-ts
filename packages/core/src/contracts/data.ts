@@ -67,6 +67,11 @@ export interface ListDataScopesContractInput {
   limit?: number;
   offset?: number;
   isVisible?: DataVisibilityFilter;
+  /**
+   * Which scopes the caller may see at all (a non-owner's grant coverage).
+   * Applied before `isVisible`, and before the page and total are taken.
+   */
+  isListable?: (scope: string) => boolean;
 }
 
 export interface ListDataScopesContractResult {
@@ -264,14 +269,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 const VISIBILITY_PAGE_SIZE = 200;
 
 /**
- * Every scope whose latest entry passes `isVisible` (all of them when no
- * filter is given). Walks the whole listing because the index cannot filter
- * by tombstone; a scope with no latest entry is kept (nothing covers it).
+ * Every listable scope whose latest entry passes `isVisible` (all of them
+ * when no filter is given). Walks the whole listing because the index cannot
+ * filter by tombstone or grant; a listable scope with no latest entry is kept
+ * (no tombstone covers it).
  */
 async function collectScopes(
   storage: DataStoragePort,
   scopePrefix: string | undefined,
   isVisible: DataVisibilityFilter | undefined,
+  isListable?: (scope: string) => boolean,
 ): Promise<ScopeSummary[]> {
   const scopes: ScopeSummary[] = [];
   for (let scan = 0; ; scan += VISIBILITY_PAGE_SIZE) {
@@ -281,6 +288,7 @@ async function collectScopes(
       offset: scan,
     });
     for (const summary of batch.scopes) {
+      if (isListable && !isListable(summary.scope)) continue;
       if (!isVisible) {
         scopes.push(summary);
         continue;
@@ -305,13 +313,14 @@ export async function listDataScopesContract(
   const offset = normalizeOffset(input.offset);
   let page: ScopeSummary[];
   let total: number;
-  if (input.isVisible) {
+  if (input.isVisible || input.isListable) {
     // Filtered listing: walk every scope so the page and the total both
     // describe the visible set (the index cannot filter by tombstone).
     const visible = await collectScopes(
       input.storage,
       input.scopePrefix,
       input.isVisible,
+      input.isListable,
     );
     total = visible.length;
     page = visible.slice(offset, offset + limit);

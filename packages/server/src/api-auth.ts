@@ -8,7 +8,10 @@ import type {
   PersonalServerReadAuthInput,
   PersonalServerWriteAuthInput,
 } from "@opendatalabs/personal-server-ts-core/api";
-import { verifyDataReadPolicy } from "@opendatalabs/personal-server-ts-core/policy";
+import {
+  resolveDataListGrantScopes,
+  verifyDataReadPolicy,
+} from "@opendatalabs/personal-server-ts-core/policy";
 import {
   createInMemoryWriteProofReplayStore,
   createWriteSessionAuthorization,
@@ -18,7 +21,6 @@ import {
 import {
   NotOwnerError,
   ProtocolError,
-  UnregisteredBuilderError,
 } from "@opendatalabs/personal-server-ts-core/errors";
 import type {
   DataStoragePort,
@@ -80,18 +82,6 @@ async function authenticate(
     sessionTokenVerifier: deps.tokenStore,
     serverOwner: deps.serverOwner,
   });
-}
-
-async function assertRegisteredBuilder(
-  gateway: GatewayClient,
-  signer: `0x${string}`,
-): Promise<void> {
-  // vana-sdk 3.14.0's GatewayClient always exposes isRegisteredBuilder, so the
-  // legacy getBuilder feature-detect fallback is now unreachable (its else
-  // branch narrows the client to `never`). Query registration directly, matching
-  // middleware/builder-check.ts.
-  if (await gateway.isRegisteredBuilder(signer)) return;
-  throw new UnregisteredBuilderError();
 }
 
 export function createServerApiAuth(
@@ -160,7 +150,7 @@ export function createServerApiAuth(
     authorizeWrite,
     authorizeWriteSession,
 
-    async authorizeBuilderList(request) {
+    async authorizeBuilderList(request, options) {
       const result = await authenticate(request, deps);
       if (
         result.isPolicyBypass ||
@@ -168,7 +158,25 @@ export function createServerApiAuth(
       ) {
         return;
       }
-      await assertRegisteredBuilder(deps.gateway, result.auth.signer);
+      // A builder lists only what its grants cover, bound to this server's
+      // owner like a read; fail closed when we can't identify the owner.
+      // resolveDataListGrantScopes does the one builder lookup (and throws
+      // UnregisteredBuilderError), so no separate registration check here.
+      if (!deps.serverOwner) throw serverNotConfigured();
+      const grantedScopes = await resolveDataListGrantScopes(
+        {
+          signer: result.auth.signer,
+          grantId: result.auth.payload.grantId ?? options?.grantId,
+          serverOwner: deps.serverOwner,
+        },
+        {
+          authSessionVerifier: deps.gateway,
+          grantVerifier: deps.gateway,
+          grantLister: deps.gateway,
+          runtimeAvailability: deps.runtimeAvailability,
+        },
+      );
+      return { grantedScopes };
     },
 
     async authorizeBuilderRead(input: PersonalServerReadAuthInput) {

@@ -37,6 +37,11 @@ export interface GrantVerifierPort {
   getGrant(grantId: string): Promise<GatewayGrantResponse | null>;
 }
 
+export interface GrantListerPort {
+  /** Every grant `grantorAddress` issued, live or not. */
+  listGrantsByUser(grantorAddress: string): Promise<GatewayGrantResponse[]>;
+}
+
 export interface AuthSessionVerifierPort {
   getBuilder(address: string): Promise<Builder | null>;
 }

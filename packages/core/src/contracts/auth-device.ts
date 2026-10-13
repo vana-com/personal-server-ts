@@ -15,6 +15,14 @@ export interface DeviceSession {
   sessionId: string;
   pollToken: string;
   requestedServerOrigin: string;
+  /**
+   * True only when the session was initiated from this machine over a
+   * loopback connection, so approval may use the signature-free local
+   * channel. Sessions started any other way need the owner wallet. Optional
+   * so existing DeviceSessionStore implementations keep compiling; a missing
+   * value means false.
+   */
+  localApprovalAllowed?: boolean;
   status: "pending" | "approved";
   accessToken?: string;
   accessTokenExpiresAt?: string;
@@ -25,6 +33,7 @@ export interface DeviceSession {
 export interface DeviceSessionStore {
   create(input: {
     requestedServerOrigin: string;
+    localApprovalAllowed?: boolean;
     sessionId: string;
     pollToken: string;
     now: number;
@@ -43,6 +52,7 @@ export function createMemoryDeviceSessionStore(): DeviceSessionStore {
         sessionId: input.sessionId,
         pollToken: input.pollToken,
         requestedServerOrigin: input.requestedServerOrigin,
+        localApprovalAllowed: input.localApprovalAllowed === true,
         status: "pending",
         createdAt: input.now,
         lastPollAt: 0,
@@ -103,6 +113,7 @@ export function initiateDeviceSessionContract(input: {
   serverOwner?: `0x${string}`;
   requestOrigin: string;
   approvalOrigin: string;
+  localApprovalAllowed?: boolean;
   sessionId: string;
   pollToken: string;
   now: number;
@@ -111,6 +122,7 @@ export function initiateDeviceSessionContract(input: {
   input.sessionStore.purgeExpired(input.now);
   input.sessionStore.create({
     requestedServerOrigin: input.requestOrigin,
+    localApprovalAllowed: input.localApprovalAllowed,
     sessionId: input.sessionId,
     pollToken: input.pollToken,
     now: input.now,

@@ -1,4 +1,7 @@
-import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
+import type {
+  Builder,
+  GatewayGrantResponse,
+} from "@opendatalabs/vana-sdk/browser";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import {
   GrantExpiredError,
@@ -6,6 +9,7 @@ import {
   GrantRequiredError,
   GrantRevokedError,
   InvalidSignatureError,
+  ProtocolError,
   PsUnavailableError,
   ScopeMismatchError,
   ServerNotConfiguredError,
@@ -13,6 +17,7 @@ import {
 } from "../errors/catalog.js";
 import {
   type AuthSessionVerifierPort,
+  type GrantListerPort,
   type GrantVerifierPort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
@@ -103,6 +108,26 @@ export async function verifyDataReadPolicy(
     });
   }
 
+  assertGrantAuthorizesBuilder(grant, builder, input);
+  return grant;
+}
+
+/**
+ * Every check a resolved grant must pass before it authorizes `builder`:
+ * live (not revoked, not expired), issued by this server's owner, to this
+ * builder, and — when `requestedScope` is given — covering that scope. Throws
+ * the same errors the read policy always has.
+ */
+function assertGrantAuthorizesBuilder(
+  grant: GatewayGrantResponse,
+  builder: Builder,
+  input: {
+    signer: `0x${string}`;
+    grantId?: string;
+    requestedScope?: string;
+    serverOwner: `0x${string}`;
+  },
+): void {
   if (SENTINEL_GRANT_IDS.has(grant.id)) {
     throw new GrantRequiredError({
       reason: "Grant resolved to a reserved id",
@@ -145,7 +170,10 @@ export async function verifyDataReadPolicy(
     }
   }
 
-  if (!scopeCoveredByGrant(input.requestedScope, grant.scopes)) {
+  if (
+    input.requestedScope !== undefined &&
+    !scopeCoveredByGrant(input.requestedScope, grant.scopes)
+  ) {
     throw new ScopeMismatchError({
       requestedScope: input.requestedScope,
       grantedScopes: grant.scopes,
@@ -182,6 +210,110 @@ export async function verifyDataReadPolicy(
       actual: grant.grantorAddress ?? null,
     });
   }
+}
 
-  return grant;
+/**
+ * True when a gateway grant row carries every field
+ * `assertGrantAuthorizesBuilder` and the listing read, with the right types.
+ * `grantorAddress` and `expiresAt` may be absent (the checks reject those
+ * themselves); `revokedAt` is checked with `!== null`, so absent = revoked.
+ */
+function isWellFormedGrantRow(grant: unknown): grant is GatewayGrantResponse {
+  if (typeof grant !== "object" || grant === null) return false;
+  const row = grant as Record<string, unknown>;
+  return (
+    typeof row.id === "string" &&
+    typeof row.granteeId === "string" &&
+    Array.isArray(row.scopes) &&
+    row.scopes.every((scope) => typeof scope === "string") &&
+    (row.grantorAddress === undefined ||
+      row.grantorAddress === null ||
+      typeof row.grantorAddress === "string")
+  );
+}
+
+export interface DataListPolicyInput {
+  signer: `0x${string}`;
+  /** The grant the caller presented, exactly as a read takes it. */
+  grantId?: string;
+  serverOwner: `0x${string}`;
+}
+
+export interface DataListPolicyPorts extends DataReadPolicyPorts {
+  /**
+   * Resolves grants when the caller presents none. Absent = a caller without
+   * a grantId is covered by nothing.
+   */
+  grantLister?: GrantListerPort;
+}
+
+/**
+ * The scope patterns a non-owner builder may see in a data listing
+ * (`GET /v1/data`, `GET /v1/data/:scope/versions`). A presented grantId must
+ * pass every read-policy check except scope coverage, and its failures throw
+ * exactly as a read's would. Without one, the owner's grants to this builder
+ * are looked up and each is held to the same checks; those that fail (and
+ * malformed rows) are skipped, so a builder with no live grant gets `[]`, not
+ * an error. A failed lookup (gateway outage) throws: the listing fails closed,
+ * surfacing like a read whose grant lookup failed.
+ *
+ * Throws `UnregisteredBuilderError` itself, so callers need no separate
+ * registration check (that would be a second gateway round-trip).
+ */
+export async function resolveDataListGrantScopes(
+  input: DataListPolicyInput,
+  ports: DataListPolicyPorts,
+): Promise<string[]> {
+  const available = await ports.runtimeAvailability?.isAvailable();
+  if (available === false) {
+    throw new PsUnavailableError();
+  }
+  if (!input.serverOwner) {
+    throw new ServerNotConfiguredError({
+      reason: "serverOwner is required to verify grant ownership",
+    });
+  }
+
+  const builder = await ports.authSessionVerifier.getBuilder(input.signer);
+  if (!builder) {
+    throw new UnregisteredBuilderError();
+  }
+
+  if (input.grantId) {
+    if (SENTINEL_GRANT_IDS.has(input.grantId)) {
+      throw new GrantRequiredError({
+        reason: "Reserved grantId",
+        grantId: input.grantId,
+      });
+    }
+    const grant = await ports.grantVerifier.getGrant(input.grantId);
+    if (!grant) {
+      throw new GrantRequiredError({
+        reason: "Grant not found",
+        grantId: input.grantId,
+      });
+    }
+    assertGrantAuthorizesBuilder(grant, builder, input);
+    return [...grant.scopes];
+  }
+
+  if (!ports.grantLister) return [];
+  // A lookup failure (gateway outage, malformed envelope) propagates: the
+  // listing fails closed rather than silently coming back empty.
+  const grants = await ports.grantLister.listGrantsByUser(input.serverOwner);
+  const scopes = new Set<string>();
+  for (const grant of grants) {
+    // Gateway rows are untrusted runtime data. One that lacks the fields the
+    // checks below read can't authorize anything, so it is skipped like any
+    // other non-matching grant instead of aborting the whole listing.
+    if (!isWellFormedGrantRow(grant)) continue;
+    try {
+      assertGrantAuthorizesBuilder(grant, builder, input);
+    } catch (err) {
+      if (err instanceof ProtocolError) continue;
+      throw err;
+    }
+    for (const scope of grant.scopes) scopes.add(scope);
+  }
+  return [...scopes];
 }

@@ -18,7 +18,7 @@ export interface LoopbackListenerDeps {
 const LOOPBACK_V4 = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
 
 /** Socket-level check: is this IP address (not a hostname) loopback? */
-function isLoopbackIp(address: string | undefined): boolean {
+export function isLoopbackIp(address: string | undefined): boolean {
   if (!address) return false;
   return (
     address === "::1" ||
@@ -80,6 +80,81 @@ function hasForeignOrigin(c: Context, requestOrigin: string): boolean {
 }
 
 /**
+ * Fetch Metadata check. Browsers that send `Sec-Fetch-Site` label every
+ * request with its initiator; only the page itself (`same-origin`) and a
+ * user-typed or externally opened URL (`none`) may act on the loopback
+ * listener.
+ */
+function hasCrossSiteFetchMetadata(c: Context): boolean {
+  const site = c.req.header("sec-fetch-site");
+  if (site === undefined) return false;
+  return site !== "same-origin" && site !== "none";
+}
+
+/**
+ * Request-level half of the loopback gate, for routes that cannot 404 the
+ * whole subtree: the request addressed this server by a loopback name and
+ * was not issued by another browser origin. Socket checks (listener port,
+ * peer address) are the caller's job.
+ */
+/**
+ * The raw Host header names the same host as the request URL. Node builds
+ * `c.req.url` from an absolute-form request line (`POST http://localhost/...`)
+ * and ignores Host, so a forwarder that passes the request line through could
+ * pair a loopback URL with a public Host. Require both to agree. A request
+ * with no Host never reaches a handler on the real server (node-server answers
+ * 400), so an absent header only occurs in-process and has nothing to disagree
+ * with; the socket checks still apply.
+ */
+function hostHeaderMatchesUrl(c: Context, requestUrl: URL): boolean {
+  const host = c.req.header("host");
+  if (!host) return true;
+  try {
+    return new URL(`${requestUrl.protocol}//${host}`).host === requestUrl.host;
+  } catch {
+    return false;
+  }
+}
+
+export function isSameOriginLoopbackRequest(c: Context): boolean {
+  let requestUrl: URL;
+  try {
+    requestUrl = new URL(c.req.url);
+  } catch {
+    return false;
+  }
+  return (
+    isLoopbackRequestHost(requestUrl.hostname) &&
+    hostHeaderMatchesUrl(c, requestUrl) &&
+    !hasForeignOrigin(c, requestUrl.origin) &&
+    !hasCrossSiteFetchMetadata(c)
+  );
+}
+
+/**
+ * Socket-level half of the loopback gate: the connection was accepted by the
+ * loopback auth listener (its port, on a loopback address). This is the one
+ * fact a remote caller cannot influence — the tunnel forwards the main port
+ * only, and `Host` is just a header. Fails closed when the listener is not
+ * configured, collides with the main port, or there is no socket info.
+ */
+export function arrivedOnLoopbackListener(
+  c: Context,
+  deps: LoopbackListenerDeps,
+): boolean {
+  const port = deps.localApprovalPort;
+  if (port === undefined || port === deps.serverPort) return false;
+  const socket = getSocket(c);
+  return (
+    !!socket &&
+    socket.localPort === port &&
+    isLoopbackIp(
+      typeof socket.localAddress === "string" ? socket.localAddress : undefined,
+    )
+  );
+}
+
+/**
  * Restrict a route subtree to requests that physically arrived on the
  * loopback auth listener, addressed it by a loopback name, and did not come
  * from another browser origin.
@@ -99,20 +174,7 @@ export function requireLoopbackListener(
   deps: LoopbackListenerDeps,
 ): MiddlewareHandler {
   return async (c, next) => {
-    const port = deps.localApprovalPort;
-    if (port === undefined || port === deps.serverPort) {
-      return c.notFound();
-    }
-    const socket = getSocket(c);
-    if (
-      !socket ||
-      socket.localPort !== port ||
-      !isLoopbackIp(
-        typeof socket.localAddress === "string"
-          ? socket.localAddress
-          : undefined,
-      )
-    ) {
+    if (!arrivedOnLoopbackListener(c, deps)) {
       return c.notFound();
     }
     let requestUrl: URL;
