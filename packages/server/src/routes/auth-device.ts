@@ -335,7 +335,8 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 
       const owner = deps.serverOwner ?? "unknown";
       const localApprovalShortcutEnabled =
-        session.localApprovalAllowed && usesLocalApprovalChannel(c, deps);
+        session.localApprovalAllowed === true &&
+        usesLocalApprovalChannel(c, deps);
 
       return noFrameHtml(
         c,
@@ -379,7 +380,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       const remoteAddr =
         deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
       const allowLocalShortcut =
-        session.localApprovalAllowed &&
+        session.localApprovalAllowed === true &&
         usesLocalApprovalChannel(c, deps) &&
         isLocalRequest(c, deps);
 

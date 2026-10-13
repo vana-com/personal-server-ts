@@ -18,9 +18,11 @@ export interface DeviceSession {
   /**
    * True only when the session was initiated from this machine over a
    * loopback connection, so approval may use the signature-free local
-   * channel. Sessions started any other way need the owner wallet.
+   * channel. Sessions started any other way need the owner wallet. Optional
+   * so existing DeviceSessionStore implementations keep compiling; a missing
+   * value means false.
    */
-  localApprovalAllowed: boolean;
+  localApprovalAllowed?: boolean;
   status: "pending" | "approved";
   accessToken?: string;
   accessTokenExpiresAt?: string;
