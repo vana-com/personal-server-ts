@@ -82,6 +82,7 @@ import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
 import {
   authenticateRequest,
+  isWeb3SignedLifetimeError,
   web3SignedProofId,
   boundedProofExpiry,
 } from "@opendatalabs/personal-server-ts-core/auth";
@@ -1156,10 +1157,15 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         serverOwner: deps.serverOwner,
       });
     } catch (err) {
+      // The request-auth lifetime cap fires before boundedProofExpiry below;
+      // keep the handshake's own error code for an over-long proof.
+      const errorCode = isWeb3SignedLifetimeError(err)
+        ? "MCP_SESSION_PROOF_LIFETIME"
+        : "MCP_SESSION_AUTH_FAILED";
       return c.json(
         jsonError(
           401,
-          "MCP_SESSION_AUTH_FAILED",
+          errorCode,
           err instanceof Error ? err.message : String(err),
         ),
         401,
