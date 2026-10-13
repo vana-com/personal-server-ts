@@ -24,6 +24,21 @@ export type AuthMechanism =
  */
 export const MAX_WEB3SIGNED_LIFETIME_SEC = 15 * 60;
 
+const LIFETIME_REASON = "Token lifetime exceeds the server cap";
+
+/**
+ * True when `err` is the request-auth lifetime-cap rejection. Handshake
+ * routes that carry their own proof-lifetime error code use this to keep
+ * reporting that code instead of a generic auth failure.
+ */
+export function isWeb3SignedLifetimeError(err: unknown): boolean {
+  return (
+    err instanceof ProtocolError &&
+    err.errorCode === "EXPIRED_TOKEN" &&
+    err.details?.["reason"] === LIFETIME_REASON
+  );
+}
+
 export interface RequestAuth {
   signer: `0x${string}`;
   payload: Partial<Web3SignedPayload>;
@@ -179,7 +194,7 @@ export async function authenticateRequest(
         "EXPIRED_TOKEN",
         `Token lifetime (exp - iat) must be between 1 and ${MAX_WEB3SIGNED_LIFETIME_SEC} seconds`,
         {
-          reason: "Token lifetime exceeds the server cap",
+          reason: LIFETIME_REASON,
           maxLifetimeSeconds: MAX_WEB3SIGNED_LIFETIME_SEC,
           lifetimeSeconds: lifetime,
         },

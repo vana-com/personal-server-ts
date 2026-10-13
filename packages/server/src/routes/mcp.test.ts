@@ -2746,11 +2746,9 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
       headers: { Authorization: longLived },
     });
     expect(res.status).toBe(401);
-    // The request-auth lifetime cap (MAX_WEB3SIGNED_LIFETIME_SEC) rejects
-    // the proof before the handshake's own MCP_SESSION_PROOF_LIFETIME check,
-    // and the handshake reports request-auth failures as AUTH_FAILED.
-    const body = await res.json();
-    expect(body.error.errorCode).toBe("MCP_SESSION_AUTH_FAILED");
+    expect((await res.json()).error.errorCode).toBe(
+      "MCP_SESSION_PROOF_LIFETIME",
+    );
   });
 
   it("rejects a handshake for a grant issued by a grantor that is not the server owner", async () => {
