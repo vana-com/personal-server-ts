@@ -2371,6 +2371,53 @@ describe("P7: completion receipt from source_collected_at", () => {
     expect(outcomes(ingested.body)).toEqual(["accepted"]);
     expect(receipts()).toEqual([]);
   });
+
+  it("moves only the receipt time when an unchanged nonempty set is collected again", async () => {
+    ctx = await bootBoth();
+    const token = await ownerToken(ctx, OURA);
+    const instance = `oura:${owner}`;
+    const records = [profile("k1", "k1@a"), profile("k2", "k2@a")];
+    const collected = (at: string) =>
+      replace(ctx!, token, "profile", {
+        instance,
+        emitted_at: at,
+        source_collected_at: at,
+        records: records.map((record) => ({ ...record, emitted_at: at })),
+      });
+    const nativeRows = () => {
+      const db = new Database(join(tempDir, "index.db"), { readonly: true });
+      try {
+        return {
+          rows: db
+            .prepare("SELECT * FROM pdpp_records ORDER BY record_key")
+            .all(),
+          history: db
+            .prepare("SELECT * FROM pdpp_record_changes ORDER BY id")
+            .all(),
+        };
+      } finally {
+        db.close();
+      }
+    };
+
+    expect((await collected("2026-09-01T09:00:00Z")).status).toBe(200);
+    const before = { native: nativeRows(), counters: storeCounters() };
+
+    const again = await collected("2026-09-11T09:00:00Z");
+    expect(again.status).toBe(200);
+    expect(outcomes(again.body)).toEqual(["unchanged", "unchanged"]);
+    expect({ native: nativeRows(), counters: storeCounters() }).toEqual(before);
+    expect(receipts()).toEqual([
+      {
+        instance,
+        stream: "profile",
+        method: "oura",
+        generation: 1,
+        source_collected_at: "2026-09-11T09:00:00Z",
+        live_count: 2,
+      },
+    ]);
+  });
 });
 
 describe("P5: record data is validated against the declared stream schema", () => {

@@ -1410,5 +1410,181 @@ describe("canonical legacy projection over the real SQLite record store", () => 
         vi.useRealTimers();
       }
     });
+
+    describe("freshness of a nonempty stream", () => {
+      const SEPT_1 = "2026-09-01T09:00:00.000Z";
+      const SEPT_11 = "2026-09-11T09:00:00.000Z";
+
+      /** One full replace whose rows are stamped with the collection time. */
+      function collect(
+        instance: string,
+        stream: string,
+        rows: Record<string, unknown>[],
+        collectedAt: string,
+        /** `null` sends no source time, like an older client. */
+        sourceCollectedAt: string | null = collectedAt,
+      ) {
+        const result = store.replaceStream({
+          instance,
+          stream,
+          method: METHOD,
+          generation: 1,
+          emittedAt: collectedAt,
+          primaryKey: ["id"],
+          envelopes: rows.map((data) => ({
+            instance,
+            stream,
+            key: String(data.id),
+            data,
+            emitted_at: collectedAt,
+          })),
+          ...(sourceCollectedAt === null ? {} : { sourceCollectedAt }),
+        });
+        expect(result.applied).toBe(true);
+        return result;
+      }
+
+      const nativeState = () => ({
+        rows: db.prepare("SELECT * FROM pdpp_records ORDER BY 1, 2, 3").all(),
+        history: db
+          .prepare("SELECT * FROM pdpp_record_changes ORDER BY id")
+          .all(),
+      });
+
+      const days = [activity("a1", "2026-08-01"), activity("a2", "2026-08-02")];
+
+      it("advances collectedAt and revision when an unchanged full replace is collected again", async () => {
+        const a = connect("conn_a", "oura");
+        collect("conn_a", "activity", days, SEPT_1);
+        const first = await readOura(a);
+        expect(first.ok && first.envelope.collectedAt).toBe(SEPT_1);
+        const native = nativeState();
+
+        expect(collect("conn_a", "activity", days, SEPT_11)).toMatchObject({
+          accepted: 0,
+          unchanged: 2,
+          deleted: 0,
+        });
+        // The unchanged rows keep their own versions and emittedAt.
+        expect(nativeState()).toEqual(native);
+
+        const second = await readOura(a);
+        expect(second).toMatchObject({ ok: true, complete: true });
+        if (!first.ok || !second.ok) return;
+        expect(second.envelope.collectedAt).toBe(SEPT_11);
+        expect(second.envelope.data).toEqual(first.envelope.data);
+        expect(second.revision).not.toBe(first.revision);
+      });
+
+      it("keeps bytes and revision when the same collection is replayed, also after another account's writes", async () => {
+        const a = connect("conn_a", "oura");
+        connect("conn_b", "oura");
+        collect("conn_a", "activity", days, SEPT_11);
+        const first = await readOura(a);
+
+        // Other accounts move the shared write clock.
+        collect("conn_b", "activity", [activity("b1", "2026-08-05")], SEPT_11);
+        collect("conn_a", "activity", days, SEPT_11);
+        put("conn_b", "activity", [activity("b1", "2026-08-05", 10)]);
+        expect(JSON.stringify(await readOura(a))).toBe(JSON.stringify(first));
+      });
+
+      it("uses only a receipt of the current method and generation that counts the live rows", async () => {
+        const a = connect("conn_a", "oura");
+        collect("conn_a", "activity", days, SEPT_1);
+        const insert = db.prepare(
+          "INSERT INTO pdpp_stream_completion (instance, stream, method, generation, source_collected_at, write_seq, live_count) VALUES ('conn_a', 'activity', ?, ?, ?, 0, ?)",
+        );
+        for (const [method, generation, liveCount] of [
+          ["other_method", 1, 2],
+          [METHOD, 2, 2],
+          [METHOD, 1, 1],
+          [METHOD, 1, 3],
+        ] as const) {
+          db.prepare("DELETE FROM pdpp_stream_completion").run();
+          insert.run(method, generation, SEPT_11, liveCount);
+          const read = await readOura(a);
+          expect(read.ok && read.envelope.collectedAt).toBe(SEPT_1);
+        }
+      });
+
+      it("falls back to row timestamps for an older client that sends no source time", async () => {
+        const a = connect("conn_a", "oura");
+        collect("conn_a", "activity", days, SEPT_1, null);
+        const first = await readOura(a);
+        expect(first.ok && first.envelope.collectedAt).toBe(SEPT_1);
+
+        // A receipted collection, then an old client's unchanged replace:
+        // the receipt is gone and nothing claims the newer collection.
+        collect("conn_a", "activity", days, SEPT_11);
+        collect("conn_a", "activity", days, "2026-09-20T09:00:00.000Z", null);
+        expect(receipts()).toEqual([]);
+        expect(JSON.stringify(await readOura(a))).toBe(JSON.stringify(first));
+      });
+
+      it("takes the newest stream collection across nonempty and empty streams", async () => {
+        const a = connect("conn_a", "anthropic");
+        const profile = {
+          id: "org1",
+          organization_id: "org1",
+          full_name: "N",
+          plan: null,
+          name_source: "none",
+          metadata_status: "valid",
+        };
+        const conversation = {
+          id: "cv1",
+          title: "T",
+          create_time: null,
+          update_time: null,
+          project_id: null,
+          message_count: 0,
+          is_starred: false,
+        };
+        const readClaude = () =>
+          readCanonicalLegacyScope({
+            store,
+            scope: "claude.conversations",
+            selection: a,
+          });
+        collect("conn_a", "account_profile", [profile], SEPT_1);
+        collect("conn_a", "conversations", [conversation], SEPT_1);
+        collect("conn_a", "messages", [], "2026-09-05T09:00:00.000Z");
+        const first = await readClaude();
+        expect(first.ok && first.envelope.collectedAt).toBe(
+          "2026-09-05T09:00:00.000Z",
+        );
+
+        collect("conn_a", "conversations", [conversation], SEPT_11);
+        const second = await readClaude();
+        expect(second.ok && second.envelope.collectedAt).toBe(SEPT_11);
+        expect(second.ok && first.ok && second.revision).not.toBe(
+          first.ok && first.revision,
+        );
+      });
+
+      it("keeps omission diagnostics: a receipt does not prove every row mapped", async () => {
+        const a = connect("conn_a", "oura");
+        collect(
+          "conn_a",
+          "activity",
+          [activity("a1", "2026-08-01"), { ...activity("a2", "x"), day: null }],
+          SEPT_1,
+        );
+        collect(
+          "conn_a",
+          "activity",
+          [activity("a1", "2026-08-01"), { ...activity("a2", "x"), day: null }],
+          SEPT_11,
+        );
+        const read = await readOura(a);
+        expect(read).toMatchObject({
+          ok: true,
+          complete: false,
+          envelope: { collectedAt: SEPT_11 },
+          diagnostics: { omissions: [{ stream: "activity", count: 1 }] },
+        });
+      });
+    });
   });
 });

@@ -30,7 +30,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/2";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/3";
 
 const DEFAULT_PAGE_SIZE = 500;
 const SOURCE_ID_PREFIX = "https://registry.pdpp.dev/sources/";
@@ -115,7 +115,7 @@ export interface CanonicalLegacyReadOk {
   /**
    * Opaque view revision: a hash of the contract version, connection,
    * method, generation, declaration, per-stream row horizons, and the
-   * completion receipts that prove empty streams. It does not depend on the
+   * completion receipts the read used. It does not depend on the
    * wall clock or on writes to other connections, so an unchanged source
    * reads back the same value.
    */
@@ -275,8 +275,11 @@ interface Snapshot {
   generation: number;
   listing: StreamListing[];
   rowsByStream: Map<string, PdppStoredRecord[]>;
-  /** Valid receipts of the bound streams that have no live rows. */
-  emptyStreamEvidence: Map<string, CanonicalStreamCompletion>;
+  /**
+   * Valid receipts of the bound streams: current method and generation, and
+   * a live count equal to the rows read in this snapshot.
+   */
+  completions: Map<string, CanonicalStreamCompletion>;
 }
 
 /** Everything the view needs from the store, read inside one snapshot. */
@@ -317,16 +320,15 @@ function collectSnapshot(
     }
     throw error;
   }
-  const emptyStreamEvidence = new Map<string, CanonicalStreamCompletion>();
+  const completions = new Map<string, CanonicalStreamCompletion>();
   for (const receipt of store.listStreamCompletions(instance)) {
     if (
       streams.includes(receipt.stream) &&
       receipt.method === binding.method &&
       receipt.generation === binding.generation &&
-      receipt.liveCount === 0 &&
-      rowsByStream.get(receipt.stream)?.length === 0
+      receipt.liveCount === rowsByStream.get(receipt.stream)?.length
     ) {
-      emptyStreamEvidence.set(receipt.stream, receipt);
+      completions.set(receipt.stream, receipt);
     }
   }
   return {
@@ -334,7 +336,7 @@ function collectSnapshot(
     generation: binding.generation,
     listing,
     rowsByStream,
-    emptyStreamEvidence,
+    completions,
   };
 }
 
@@ -356,7 +358,7 @@ async function projectSnapshot(
     binding,
     profileKey,
     rowsByStream,
-    emptyStreamEvidence,
+    completions,
   } = input;
   const listingBefore = input.listing;
   const sourceRowCounts = Object.fromEntries(
@@ -364,15 +366,14 @@ async function projectSnapshot(
   );
 
   if (
-    emptyStreamEvidence.size === 0 &&
+    completions.size === 0 &&
     listingBefore.every((entry) => entry.recordCount === 0)
   ) {
     return unavailable({ reason: "no_synced_data" });
   }
   const unprovenEmpty = streams.filter(
     (stream) =>
-      (rowsByStream.get(stream)?.length ?? 0) === 0 &&
-      !emptyStreamEvidence.has(stream),
+      (rowsByStream.get(stream)?.length ?? 0) === 0 && !completions.has(stream),
   );
   if (unprovenEmpty.length > 0) {
     return unavailable({
@@ -396,7 +397,7 @@ async function projectSnapshot(
 
   const collectedAt = latestCollectedAt(
     rowsByStream,
-    emptyStreamEvidence,
+    completions,
     listingBefore,
   );
   if (collectedAt === null)
@@ -461,7 +462,7 @@ async function projectSnapshot(
     generation: input.generation,
     streams,
     rowsByStream,
-    emptyStreamEvidence,
+    completions,
     listing: listingBefore,
   });
 
@@ -595,22 +596,23 @@ function countFor(listing: StreamListing[], stream: string): number {
 }
 
 /**
- * Newest of the rows' `emittedAt` (the importer stamps it from the original
- * envelope `collectedAt`) and the producer `sourceCollectedAt` of each
- * receipt that proves an empty bound stream. With neither, the newest stream
- * horizon of the connection. Never the wall clock.
+ * Newest collection time over the bound streams. A stream with a valid
+ * receipt was collected at its producer `sourceCollectedAt`, even when an
+ * unchanged replace left older rows. A stream without one falls back to its
+ * rows' `emittedAt` (the importer stamps it from the original envelope
+ * `collectedAt`). With neither, the newest stream horizon of the connection.
+ * Never the wall clock.
  */
 function latestCollectedAt(
   rowsByStream: Map<string, PdppStoredRecord[]>,
-  emptyStreamEvidence: Map<string, CanonicalStreamCompletion>,
+  completions: Map<string, CanonicalStreamCompletion>,
   listing: StreamListing[],
 ): string | null {
   const stamps: string[] = [];
-  for (const rows of rowsByStream.values()) {
-    for (const row of rows) stamps.push(row.emittedAt);
-  }
-  for (const receipt of emptyStreamEvidence.values()) {
-    stamps.push(receipt.sourceCollectedAt);
+  for (const [stream, rows] of rowsByStream) {
+    const receipt = completions.get(stream);
+    if (receipt) stamps.push(receipt.sourceCollectedAt);
+    else for (const row of rows) stamps.push(row.emittedAt);
   }
   if (stamps.length === 0) {
     for (const entry of listing) {
@@ -634,7 +636,7 @@ async function viewRevision(input: {
   generation: number;
   streams: string[];
   rowsByStream: Map<string, PdppStoredRecord[]>;
-  emptyStreamEvidence: Map<string, CanonicalStreamCompletion>;
+  completions: Map<string, CanonicalStreamCompletion>;
   listing: StreamListing[];
 }): Promise<string> {
   const horizons = [];
@@ -673,26 +675,22 @@ async function viewRevision(input: {
         provenance: input.binding.provenance,
       },
       horizons,
-      // Only reads that use receipts hash them, so revisions of reads
-      // without receipts do not change.
-      ...(input.emptyStreamEvidence.size > 0
-        ? {
-            completions: input.streams.flatMap((stream) => {
-              const receipt = input.emptyStreamEvidence.get(stream);
-              return receipt
-                ? [
-                    {
-                      stream,
-                      method: receipt.method,
-                      generation: receipt.generation,
-                      sourceCollectedAt: receipt.sourceCollectedAt,
-                      writeSeq: receipt.writeSeq,
-                    },
-                  ]
-                : [];
-            }),
-          }
-        : {}),
+      // Not `writeSeq`: the write clock is shared by all connections, so an
+      // unchanged replay after another account's write would move it.
+      completions: input.streams.flatMap((stream) => {
+        const receipt = input.completions.get(stream);
+        return receipt
+          ? [
+              {
+                stream,
+                method: receipt.method,
+                generation: receipt.generation,
+                sourceCollectedAt: receipt.sourceCollectedAt,
+                liveCount: receipt.liveCount,
+              },
+            ]
+          : [];
+      }),
     }),
   );
   return `v1:${digest}`;
