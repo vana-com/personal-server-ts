@@ -32,6 +32,7 @@ export const CORS_ALLOW_HEADERS: readonly string[] = [
 /** Response headers a browser client must be able to read back. */
 export const CORS_EXPOSE_HEADERS: readonly string[] = [
   "X-Vana-Metadata",
+  "X-Vana-Data-Source",
   "X-PAYMENT-RESPONSE",
   "Content-Disposition",
 ];

@@ -34,7 +34,18 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 7;
+export const INDEX_SCHEMA_VERSION = 8;
+
+const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
+CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
+  scope TEXT NOT NULL,
+  superseded_version INTEGER NOT NULL,
+  superseded_cas_revision INTEGER NOT NULL,
+  superseded_collected_at TEXT NOT NULL,
+  superseded_path TEXT NOT NULL,
+  taken_over_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (scope, superseded_path)
+)`;
 
 function hasColumn(
   db: Database.Database,
@@ -123,6 +134,7 @@ export function initializeDatabase(dbPath: string): Database.Database {
   db.exec(CREATE_TABLE_SQL);
   db.exec(CREATE_SCOPE_REVISIONS_SQL);
   ensureSchemaVersion(db);
+  db.exec(CREATE_LEGACY_SCOPE_TAKEOVERS_SQL);
   for (const sql of CREATE_INDEXES_SQL) {
     db.exec(sql);
   }

@@ -9,6 +9,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
+import { initializeDatabase } from "./index-schema.js";
 
 const OURA = "https://registry.pdpp.dev/sources/oura";
 const GITHUB = "https://registry.pdpp.dev/sources/github";
@@ -89,7 +90,7 @@ describe("legacy scope view over the real SQLite record store", () => {
   let view: ReturnType<typeof createLegacyScopeView>;
 
   beforeEach(() => {
-    db = new Database(":memory:");
+    db = initializeDatabase(":memory:");
     store = createSqliteRecordStore(db);
     view = createLegacyScopeView({
       authority: createLegacyScopeAuthority(db),
@@ -143,6 +144,38 @@ describe("legacy scope view over the real SQLite record store", () => {
     // ... and an unbound scope of the namespace is never converted.
     expect(view.ownsScope("oura.manual")).toBe(false);
     expect(view.ownsScope("oura.readiness")).toBe(true);
+  });
+
+  it("does not record a takeover when the canonical scope has no data", async () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-01-01T00:00:00.000Z",
+      12,
+    );
+    connect(store, "conn_a", "oura");
+
+    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+  });
+
+  it("keeps listings on legacy until an unreceipted canonical view is taken over", async () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-01-01T00:00:00.000Z",
+      12,
+    );
+    connect(store, "conn_a", "oura");
+    ingest(store, "conn_a", "a1", "2026-09-10T07:00:00.000Z");
+
+    expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
   });
 
   it("keeps a reset or deleted connection's scopes canonical, never back to the file", async () => {
@@ -258,6 +291,229 @@ describe("legacy scope view over the real SQLite record store", () => {
       { scope: "oura.activity", collectedAt: "2026-09-12T00:00:00.000Z" },
     ]);
     expect(view.listCanonicalScopes("github.")).toEqual([]);
+  });
+
+  it("records automatic takeover without changing the superseded legacy index entry", async () => {
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "oura.activity",
+      7,
+      9,
+      "2026-01-01T00:00:00.000Z",
+      "oura/activity/old.json",
+      null,
+    );
+    const before = db.prepare("SELECT * FROM data_files").all();
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+    expect(db.prepare("SELECT * FROM data_files").all()).toEqual(before);
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual([
+      expect.objectContaining({
+        scope: "oura.activity",
+        superseded_version: 7,
+        superseded_collected_at: "2026-01-01T00:00:00.000Z",
+        superseded_path: "oura/activity/old.json",
+        taken_over_at: expect.any(String),
+      }),
+    ]);
+  });
+
+  it("records every eligible version once, including a later legacy head", async () => {
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "oura.activity",
+      7,
+      9,
+      "2026-01-01T00:00:00.000Z",
+      "oura/activity/old.json",
+      null,
+    );
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "oura.activity",
+      6,
+      8,
+      "2025-12-01T00:00:00.000Z",
+      "oura/activity/older.json",
+      null,
+    );
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "oura.activity",
+      8,
+      10,
+      "2026-02-01T00:00:00.000Z",
+      "oura/activity/new.json",
+      null,
+    );
+    replace(store, "conn_a", "activity", ["a2"], {
+      collectedAt: "2026-02-02T00:00:00.000Z",
+    });
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+    expect(
+      db
+        .prepare(
+          "SELECT superseded_version, superseded_cas_revision, superseded_path FROM legacy_scope_takeovers ORDER BY superseded_version",
+        )
+        .all(),
+    ).toEqual([
+      {
+        superseded_version: 6,
+        superseded_cas_revision: 8,
+        superseded_path: "oura/activity/older.json",
+      },
+      {
+        superseded_version: 7,
+        superseded_cas_revision: 9,
+        superseded_path: "oura/activity/old.json",
+      },
+      {
+        superseded_version: 8,
+        superseded_cas_revision: 10,
+        superseded_path: "oura/activity/new.json",
+      },
+    ]);
+  });
+
+  it("keeps legacy reads when canonical rows were emptied without completion proof", async () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-01-01T00:00:00.000Z",
+      12,
+    );
+    connect(store, "conn_a", "oura");
+    ingest(store, "conn_a", "a1", "2026-09-10T07:00:00.000Z");
+    store.replaceStream({
+      instance: "conn_a",
+      stream: "activity",
+      method: "oura",
+      generation: 1,
+      primaryKey: ["id"],
+      emittedAt: "2026-09-11T07:00:00.000Z",
+      envelopes: [],
+    });
+    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+  });
+
+  it("keeps the legacy head when valid rows have no matching completion receipt", async () => {
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "oura.activity",
+      7,
+      9,
+      "2026-01-01T00:00:00.000Z",
+      "oura/activity/old.json",
+      null,
+    );
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    ingest(store, "conn_a", "a1", "2026-09-10T08:00:00.000Z", 91);
+    expect(
+      store.listStreams(["conn_a"]).find((entry) => entry.stream === "activity")
+        ?.recordCount,
+    ).toBe(1);
+    expect(store.listStreamCompletions("conn_a")).toEqual([]);
+
+    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+  });
+
+  it("does not use a later completion receipt to take over an earlier partial snapshot", async () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-01-01T00:00:00.000Z",
+      12,
+    );
+    connect(store, "conn_a", "oura");
+    ingest(store, "conn_a", "uncompleted", "2026-09-10T07:00:00.000Z");
+    const racing = {
+      ...store,
+      readSnapshot<T>(read: () => T): T {
+        const snapshot = store.readSnapshot(read);
+        replace(store, "conn_a", "activity", ["completed"]);
+        return snapshot;
+      },
+    };
+    const racingView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: racing,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+    });
+    expect(await racingView.readLatest("oura.activity")).toEqual({
+      kind: "file",
+    });
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+  });
+
+  it("does not classify an explicitly produced legacy row as an old connector file", async () => {
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "oura.activity",
+      7,
+      9,
+      "2026-01-01T00:00:00.000Z",
+      "oura/activity/projected.json",
+      "pdpp-projector",
+    );
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+  });
+
+  it("records a non-projector producer as a superseded legacy version", async () => {
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      "oura.activity",
+      7,
+      9,
+      "2026-01-01T00:00:00.000Z",
+      "oura/activity/foreign.json",
+      "foreign-writer",
+    );
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+    expect(
+      db.prepare("SELECT superseded_path FROM legacy_scope_takeovers").all(),
+    ).toEqual([{ superseded_path: "oura/activity/foreign.json" }]);
   });
 
   it("writes nothing while deciding, reading or listing", async () => {

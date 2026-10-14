@@ -244,6 +244,8 @@ export interface ReadCanonicalLegacyScopeInput {
    * refused as `store_inconsistent_read`.
    */
   confirmSelection?: () => boolean;
+  /** Require a matching completion receipt for every stream in the row snapshot. */
+  requireCompletionReceipts?: boolean;
   /** Rows per store page. Tests lower it to force several pages. */
   pageSize?: number;
   /** @internal Tests may lower the blob budget; never raises the 64 MiB limit. */
@@ -340,6 +342,7 @@ export async function readCanonicalLegacyScope(
             (input.blobByteBudget ?? -1) >= 0
             ? Math.min(MAX_BLOB_READ_BYTES, input.blobByteBudget!)
             : MAX_BLOB_READ_BYTES,
+          input.requireCompletionReceipts === true,
         ),
   );
   if (!snapshot.ok) return snapshot.result;
@@ -378,6 +381,7 @@ function collectSnapshot(
   arrivalOrder: boolean,
   pageSize: number,
   blobByteBudget: number,
+  requireCompletionReceipts: boolean,
 ): Snapshot | { ok: false; result: CanonicalLegacyReadResult } {
   const { instance } = selection;
   const binding = store.getInstanceBinding(instance);
@@ -435,16 +439,18 @@ function collectSnapshot(
   ) {
     return { ok: false, result: unavailable({ reason: "no_synced_data" }) };
   }
-  const unprovenEmpty = streams.filter(
+  const unprovenStreams = streams.filter(
     (stream) =>
-      (rowsByStream.get(stream)?.length ?? 0) === 0 && !completions.has(stream),
+      !completions.has(stream) &&
+      (requireCompletionReceipts ||
+        (rowsByStream.get(stream)?.length ?? 0) === 0),
   );
-  if (unprovenEmpty.length > 0) {
+  if (unprovenStreams.length > 0) {
     return {
       ok: false,
       result: unavailable({
         reason: "stream_completion_unknown",
-        streams: unprovenEmpty,
+        streams: unprovenStreams,
       }),
     };
   }

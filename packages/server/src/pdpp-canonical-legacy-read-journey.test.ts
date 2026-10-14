@@ -6,11 +6,12 @@
  * legacy files written through POST /v1/data, and the legacy read auth
  * (owner control-plane token, and a builder's Web3Signed legacy grant).
  *
- * The legacy file of a bound scope is never served as its latest body. A
+ * A stored legacy head remains latest until a complete canonical projection
+ * with matching completion receipts records takeover. After takeover, a
  * canonical read that cannot be served is a typed refusal, not the file.
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
@@ -266,6 +267,7 @@ async function ownerGet(path: string) {
   return {
     status: response.status,
     etag: response.headers.get("etag"),
+    dataSource: response.headers.get("X-Vana-Data-Source"),
     text: await response.text(),
   };
 }
@@ -703,10 +705,8 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(uncollected.status).toBe(200);
     expect(uncollected.text).toContain("stale-legacy");
 
-    // Once readiness has canonical history it is canonical for good. With
-    // its only row deleted and no completion receipt, an empty body cannot
-    // be told apart from an unfinished one, even though a sibling stream
-    // has rows: refused, never the file.
+    // After a complete canonical read records takeover, an unproven empty
+    // stream must refuse rather than resurrect the superseded legacy file.
     await replace(
       token,
       "activity",
@@ -719,6 +719,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       [{ id: "r1", day: "2026-09-01", score: 70 }],
       "2026-09-11T06:00:00Z",
     );
+    const takenOver = await ownerGet("/v1/data/oura.readiness");
+    expect(takenOver.dataSource).toBe("canonical");
+    expect(ids(takenOver.text)).toEqual(["r1"]);
     const deleted = await ctx!.app.request("/v1/streams/readiness/records/r1", {
       method: "DELETE",
       headers: { authorization: `Bearer ${token}` },
@@ -819,7 +822,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(read.text).not.toContain("stale-legacy");
   });
 
-  it("refuses a body the projector could only deliver with rows left out", async () => {
+  it("keeps the legacy file until a complete canonical projection succeeds", async () => {
     await legacyWrite("oura.activity", STALE);
     const token = await ownerPdppToken();
     await replace(
@@ -829,14 +832,37 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       "2026-09-10T06:00:00Z",
     );
     const read = await builderGet("oura.activity");
+    expect(read.status).toBe(200);
+    expect(ids(read.text)).toEqual(["stale-legacy"]);
+  });
+
+  it("does not resurrect the legacy file after a complete canonical takeover", async () => {
+    await legacyWrite("oura.activity", STALE);
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+    expect(ids((await ownerGet("/v1/data/oura.activity")).text)).toEqual([
+      "a1",
+    ]);
+
+    await replace(
+      token,
+      "activity",
+      [day("a2", "not-a-day")],
+      "2026-09-11T06:00:00Z",
+    );
+    const read = await ownerGet("/v1/data/oura.activity");
     expect(read.status).toBe(503);
     expect(JSON.parse(read.text)).toMatchObject({
       error: "CANONICAL_VIEW_UNAVAILABLE",
       status: "incomplete",
-      reason: "canonical_view_incomplete",
+      reason: "all_rows_rejected",
     });
     expect(read.text).not.toContain("stale-legacy");
-    expect(read.text).not.toContain('"a1"');
   });
 
   it("returns every row of a body larger than one store page", async () => {
@@ -862,6 +888,12 @@ describe("paths the canonical view leaves to existing storage", () => {
 
   it("serves an explicitly requested historical version and manual scopes from storage", async () => {
     await legacyWrite("oura.activity", STALE);
+    const legacyEntryBefore = {
+      ...ctx!.indexManager.findLatestByScope("oura.activity")!,
+    };
+    const legacyBytesBefore = await readFile(
+      join(tempDir, "data", legacyEntryBefore.path),
+    );
     await legacyWrite("notes.manual", { text: "kept" });
     const token = await ownerPdppToken();
     await replace(
@@ -878,18 +910,55 @@ describe("paths the canonical view leaves to existing storage", () => {
     };
     expect(listed.versions).toHaveLength(1);
     const at = listed.versions[0]!.collectedAt;
+
+    const latest = await ownerGet("/v1/data/oura.activity");
+    expect(latest.dataSource).toBe("canonical");
+    expect(ids(latest.text)).toEqual(["a1"]);
+
     const historical = await ownerGet(
       `/v1/data/oura.activity?at=${encodeURIComponent(at)}`,
     );
     expect(historical.status).toBe(200);
+    expect(historical.dataSource).toBe("legacy");
     expect(ids(historical.text)).toEqual(["stale-legacy"]);
 
     const manual = await ownerGet("/v1/data/notes.manual");
     expect(manual.status).toBe(200);
     expect(JSON.parse(manual.text)).toMatchObject({ data: { text: "kept" } });
 
-    const latest = await ownerGet("/v1/data/oura.activity");
-    expect(ids(latest.text)).toEqual(["a1"]);
+    expect(
+      await readFile(join(tempDir, "data", legacyEntryBefore.path)),
+    ).toEqual(legacyBytesBefore);
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(
+      legacyEntryBefore,
+    );
+
+    const ledgerDb = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      expect(
+        ledgerDb
+          .prepare(
+            `SELECT scope, superseded_version, superseded_cas_revision,
+                    superseded_collected_at, superseded_path, taken_over_at
+               FROM legacy_scope_takeovers`,
+          )
+          .all(),
+      ).toEqual([
+        expect.objectContaining({
+          scope: "oura.activity",
+          superseded_version: legacyEntryBefore.version,
+          superseded_cas_revision: legacyEntryBefore.casRevision,
+          superseded_collected_at: legacyEntryBefore.collectedAt,
+          superseded_path: legacyEntryBefore.path,
+          taken_over_at: expect.any(String),
+        }),
+      ]);
+    } finally {
+      ledgerDb.close();
+    }
   });
 });
 
@@ -904,6 +973,19 @@ describe("GET /v1/data listing", () => {
       [day("a1", "2026-09-01")],
       "2026-09-10T06:00:00Z",
     );
+    const legacyHead = ctx!.indexManager.findLatestByScope("oura.activity")!;
+    const beforeTakeover = await ownerGet("/v1/data");
+    const beforeBody = JSON.parse(beforeTakeover.text) as {
+      scopes: { scope: string; latestCollectedAt: string }[];
+    };
+    expect(
+      beforeBody.scopes.find((scope) => scope.scope === "oura.activity")
+        ?.latestCollectedAt,
+    ).toBe(legacyHead.collectedAt);
+
+    const latest = await ownerGet("/v1/data/oura.activity");
+    expect(latest.dataSource).toBe("canonical");
+
     const listing = await ownerGet("/v1/data");
     expect(listing.status).toBe(200);
     const body = JSON.parse(listing.text) as {

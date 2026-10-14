@@ -27,12 +27,14 @@ import {
  * id is never derived from the key; it is the connection's registered
  * source, and that (source, method) pair must be configured on this boot.
  *
- * A bound scope is canonical-owned when a connection of one of its methods
- * has held a row of, or a completion receipt for, one of the scope's
- * streams, or was reset or deleted (both erase the rows that would show
- * this). The evidence is durable in SQLite, so ownership holds when the
- * record server is not mounted: the scope is then refused, never served
- * from its file. Every other scope, unbound ones included, keeps the file.
+ * A bound scope is canonical-owned for write/refusal safety when a connection
+ * of one of its methods has held a row of, or a completion receipt for, one
+ * of the scope's streams, or was reset or deleted (both erase the rows that
+ * would show this). With a stored legacy head, latest reads keep serving that
+ * head until a complete projection has matching current completion receipts
+ * and records takeover. After takeover, a failed read refuses instead of
+ * resurrecting the file. Every other scope, unbound ones included, keeps the
+ * file.
  *
  * The connection comes only from the registry: the single live connection
  * of the scope's methods that has held any data. A request cannot name one.
@@ -47,9 +49,9 @@ const BINDING_PROFILES = [
 ];
 
 /**
- * Read-only registry facts the decision needs. They come from the same
- * SQLite database as the rows, and must work when the record server is not
- * mounted (its tables may then be absent: no connection, no evidence).
+ * Registry facts and takeover diagnostics from the same SQLite database as
+ * the rows. Facts must work when the record server is not mounted (its tables
+ * may then be absent: no connection, no evidence).
  */
 export interface LegacyScopeAuthority {
   /** Connections registered with one of `methods`, deleted ones included. */
@@ -63,6 +65,12 @@ export interface LegacyScopeAuthority {
   hasHeldData(instance: string, streams: readonly string[] | null): boolean;
   /** See `CanonicalLegacyReadStore.readSnapshot`. Same database connection. */
   readSnapshot<T>(read: () => T): T;
+  /** Whether a complete canonical read has already superseded the legacy head. */
+  hasTakeover(scope: string): boolean;
+  /** Whether the latest index entry is not owned by a known projector. */
+  hasEligibleLegacyHead(scope: string): boolean;
+  /** Records every eligible legacy version once, without changing its data. */
+  recordTakeover(scope: string): void;
 }
 
 export type LegacyScopeRefusal =
@@ -117,7 +125,7 @@ export interface LegacyScopeViewPort {
   listCanonicalScopes(
     scopePrefix: string | undefined,
   ): { scope: string; collectedAt: string }[];
-  /** True when the scope's latest body is no longer the file's to give. */
+  /** True when canonical history makes a legacy-only deletion unsafe. */
   ownsScope(scope: string): boolean;
 }
 
@@ -215,6 +223,16 @@ export function createLegacyScopeView(
     return authority.readSnapshot((): LegacyScopeListing => {
       const decision = decide(scope);
       if (decision.kind !== "canonical") return { kind: decision.kind };
+      const hasLegacyHead = authority.hasEligibleLegacyHead(scope);
+      const hasTakeover = authority.hasTakeover(scope);
+      if (hasLegacyHead && !hasTakeover) return { kind: "file" };
+      if (
+        hasLegacyHead &&
+        hasTakeover &&
+        missingCompletionReceipts(decision).length > 0
+      ) {
+        return { kind: "refused" };
+      }
       const collectedAt = listedCollectedAt(
         decision.records,
         decision.selection.instance,
@@ -235,16 +253,30 @@ export function createLegacyScopeView(
         scope,
         selection: decision.selection,
         profileBy: "method",
+        requireCompletionReceipts: authority.hasEligibleLegacyHead(scope),
         // The rows must come from a state in which this is still the one
         // connection: a second account appearing between the decision and
         // the rows refuses instead of serving a body chosen while ambiguous.
         confirmSelection: () => sameSelection(decide(scope), decision),
       });
+      const hasLegacyHead = authority.hasEligibleLegacyHead(scope);
+      const hasTakeover = authority.hasTakeover(scope);
       if (!read.ok) {
+        if (
+          hasLegacyHead &&
+          !hasTakeover &&
+          (read.reason === "projection_rejected" ||
+            read.reason === "all_rows_rejected" ||
+            read.reason === "no_synced_data" ||
+            read.reason === "stream_completion_unknown")
+        ) {
+          return { kind: "file" };
+        }
         const { ok: _ok, ...refusal } = read;
         return { kind: "refused", refusal };
       }
       if (!read.complete) {
+        if (hasLegacyHead && !hasTakeover) return { kind: "file" };
         return {
           kind: "refused",
           refusal: {
@@ -254,6 +286,7 @@ export function createLegacyScopeView(
           },
         };
       }
+      if (hasLegacyHead) authority.recordTakeover(scope);
       return {
         kind: "canonical",
         envelope: read.envelope,
@@ -281,6 +314,29 @@ export function createLegacyScopeView(
       return authority.readSnapshot(() => decide(scope)).kind !== "file";
     },
   };
+}
+
+function missingCompletionReceipts(
+  decision: Extract<Decision, { kind: "canonical" }>,
+): string[] {
+  const binding = decision.records.getInstanceBinding(
+    decision.selection.instance,
+  );
+  const listings = decision.records.listStreams([decision.selection.instance]);
+  const receipts = decision.records.listStreamCompletions(
+    decision.selection.instance,
+  );
+  return decision.streams.filter((stream) => {
+    const liveCount =
+      listings.find((entry) => entry.stream === stream)?.recordCount ?? 0;
+    return !receipts.some(
+      (receipt) =>
+        receipt.stream === stream &&
+        receipt.method === binding.method &&
+        receipt.generation === binding.generation &&
+        receipt.liveCount === liveCount,
+    );
+  });
 }
 
 function refused(refusal: LegacyScopeRefusal): Decision {

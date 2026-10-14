@@ -1882,6 +1882,8 @@ export async function handlePersonalServerDataRequest(
       }
 
       const headers: Record<string, string> = {};
+      headers["X-Vana-Data-Source"] =
+        latest?.kind === "canonical" ? "canonical" : "legacy";
       let envelope: DataFileEnvelope;
       let servedFileId: string | undefined;
       if (latest?.kind === "canonical") {
