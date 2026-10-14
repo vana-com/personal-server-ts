@@ -430,6 +430,7 @@ export function createLegacyScopeView(
         requireCompletionReceipts: legacyHead !== null && !input.readLegacyHead,
         allowUnprovenEmptyStreams:
           legacyHead !== null && !!input.readLegacyHead,
+        includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
         // The rows must come from a state in which this is still the one
         // connection: a second account appearing between the decision and
         // the rows refuses instead of serving a body chosen while ambiguous.
@@ -489,16 +490,11 @@ export function createLegacyScopeView(
               },
             };
           }
-          return coveredHead
-            ? {
-                kind: "refused",
-                refusal: {
-                  status: "incomplete",
-                  reason: "canonical_view_incomplete",
-                  diagnostics: [],
-                },
-              }
-            : { kind: "file" };
+          if (coveredHead) {
+            const { ok: _ok, ...refusal } = read;
+            return { kind: "refused", refusal };
+          }
+          return { kind: "file" };
         }
         if (
           legacyHead !== null &&
@@ -796,7 +792,7 @@ function allStreamsNewerThan(
   const legacyTime = Date.parse(legacyCollectedAt);
   if (!Number.isFinite(legacyTime)) return false;
   return streams.every((stream) => {
-    const time = Date.parse(read.streamCollectionTimes[stream] ?? "");
+    const time = Date.parse(read.streamCollectionTimes?.[stream] ?? "");
     return Number.isFinite(time) && time > legacyTime;
   });
 }
@@ -810,7 +806,7 @@ function allStreamsProvenAfter(
   const legacyTime = Date.parse(legacyCollectedAt);
   if (!Number.isFinite(legacyTime)) return false;
   return streams.every((stream) => {
-    const time = Date.parse(read.streamCompletionTimes[stream] ?? "");
+    const time = Date.parse(read.streamCompletionTimes?.[stream] ?? "");
     return Number.isFinite(time) && time > legacyTime;
   });
 }

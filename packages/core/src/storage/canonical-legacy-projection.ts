@@ -146,9 +146,9 @@ export interface CanonicalLegacyReadOk {
   ok: true;
   envelope: DataFileEnvelope;
   /** Conservative collection horizon for each input stream in this snapshot. */
-  streamCollectionTimes: Record<string, string | null>;
+  streamCollectionTimes?: Record<string, string | null>;
   /** Current accepted P7 completion time for each input stream, if any. */
-  streamCompletionTimes: Record<string, string | null>;
+  streamCompletionTimes?: Record<string, string | null>;
   /**
    * Opaque view revision: a hash of the contract version, connection,
    * method, generation, declaration, per-stream row horizons in served
@@ -252,6 +252,8 @@ export interface ReadCanonicalLegacyScopeInput {
   requireCompletionReceipts?: boolean;
   /** A parity caller can compare an unproven empty stream with the actual legacy body. */
   allowUnprovenEmptyStreams?: boolean;
+  /** Include the per-stream time evidence used by the parity takeover caller. */
+  includeStreamTimes?: boolean;
   /** Rows per store page. Tests lower it to force several pages. */
   pageSize?: number;
   /** @internal Tests may lower the blob budget; never raises the 64 MiB limit. */
@@ -360,6 +362,7 @@ export async function readCanonicalLegacyScope(
     streams,
     binding,
     profileKey,
+    includeStreamTimes: input.includeStreamTimes === true,
     ...snapshot,
   });
 }
@@ -603,6 +606,7 @@ interface ProjectInput extends Snapshot {
   streams: string[];
   binding: LegacyScopeBinding;
   profileKey: string | undefined;
+  includeStreamTimes: boolean;
 }
 
 async function projectSnapshot(
@@ -769,35 +773,39 @@ async function projectSnapshot(
       collectedAt,
       data: projected.payload,
     },
-    streamCollectionTimes: Object.fromEntries(
-      streams.map((stream) => {
-        const receipt = completions.get(stream);
-        if (receipt) return [stream, receipt.sourceCollectedAt];
-        const rows = rowsByStream.get(stream) ?? [];
-        const times = rows.map((row) => Date.parse(row.emittedAt));
-        if (
-          times.length === 0 ||
-          times.some((time) => !Number.isFinite(time))
-        ) {
-          return [stream, null];
+    ...(input.includeStreamTimes
+      ? {
+          streamCollectionTimes: Object.fromEntries(
+            streams.map((stream) => {
+              const receipt = completions.get(stream);
+              if (receipt) return [stream, receipt.sourceCollectedAt];
+              const rows = rowsByStream.get(stream) ?? [];
+              const times = rows.map((row) => Date.parse(row.emittedAt));
+              if (
+                times.length === 0 ||
+                times.some((time) => !Number.isFinite(time))
+              ) {
+                return [stream, null];
+              }
+              return [
+                stream,
+                new Date(
+                  times.reduce(
+                    (oldest, time) => Math.min(oldest, time),
+                    Number.POSITIVE_INFINITY,
+                  ),
+                ).toISOString(),
+              ];
+            }),
+          ),
+          streamCompletionTimes: Object.fromEntries(
+            streams.map((stream) => [
+              stream,
+              completions.get(stream)?.sourceCollectedAt ?? null,
+            ]),
+          ),
         }
-        return [
-          stream,
-          new Date(
-            times.reduce(
-              (oldest, time) => Math.min(oldest, time),
-              Number.POSITIVE_INFINITY,
-            ),
-          ).toISOString(),
-        ];
-      }),
-    ),
-    streamCompletionTimes: Object.fromEntries(
-      streams.map((stream) => [
-        stream,
-        completions.get(stream)?.sourceCollectedAt ?? null,
-      ]),
-    ),
+      : {}),
     revision,
     complete:
       omissions.length === 0 &&
