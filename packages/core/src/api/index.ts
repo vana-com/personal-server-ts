@@ -1111,14 +1111,15 @@ function listingVisibility(
   return async (scope, entry) => {
     const listing = view.listingFor(scope);
     if (listing.kind === "refused") return false;
+    const canonicalOwned = view.ownsScope(scope);
     // A file's re-add marker cannot revive the canonical body this row
     // describes. Canonical re-adds have no registered version yet.
     return (
       (await resolveReadDeletion(
         deps,
         scope,
-        listing.kind === "canonical" ? undefined : entry,
-        listing.kind === "canonical" ? "canonical" : "file",
+        canonicalOwned ? undefined : entry,
+        canonicalOwned ? "canonical" : "file",
       )) === null
     );
   };
@@ -1744,6 +1745,9 @@ export async function handlePersonalServerDataRequest(
         fileIdParam === undefined && atParam === undefined
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
+      const canonicalOwned =
+        latest !== undefined &&
+        deps.legacyScopeView?.ownsScope(scopeResult.scope);
 
       // Deletion gate, after auth (so unauthenticated callers learn nothing)
       // and before payment (so nobody is charged for deleted data). Covers
@@ -1751,10 +1755,8 @@ export async function handlePersonalServerDataRequest(
       await assertScopeNotDeleted(
         deps,
         scopeResult.scope,
-        latest === undefined || latest.kind === "file"
-          ? selectedEntry
-          : undefined,
-        latest === undefined || latest.kind === "file" ? "file" : "canonical",
+        canonicalOwned ? undefined : selectedEntry,
+        canonicalOwned ? "canonical" : "file",
       );
 
       // Demand: this authorized read is what pays for a recompute of a
