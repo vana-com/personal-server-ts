@@ -229,22 +229,15 @@ type SchemaIssue = {
   rule: string;
 };
 
-// Filled from the frozen Desktop schema oracle below. A listed violation is a
-// visible parity gap, and the companion `it.fails` case keeps it visible in the
-// test report while the exact register prevents new or changed violations.
-const KNOWN_FROZEN_SCHEMA_GAPS: Record<string, SchemaIssue[]> = {
+// Reviewed extra properties are accepted additions, not parity gaps. Keep their
+// exact cases, bodies, paths and rules pinned so new or changed additions fail.
+const KNOWN_FROZEN_SCHEMA_ADDITIONS: Record<string, SchemaIssue[]> = {
   "chatgpt.conversations": [
     {
       case: "normal",
       body: "expected",
       path: "$.conversations[*].fetched_at",
       rule: "additionalProperties: should NOT have additional properties",
-    },
-    {
-      case: "normal",
-      body: "expected",
-      path: "$.conversations[*].create_time",
-      rule: "type: should be string",
     },
     {
       case: "normal",
@@ -278,6 +271,22 @@ const KNOWN_FROZEN_SCHEMA_GAPS: Record<string, SchemaIssue[]> = {
     },
   ],
 };
+
+// Other violations remain visible parity gaps with companion `it.fails` cases.
+const KNOWN_FROZEN_SCHEMA_GAPS: Record<string, SchemaIssue[]> = {
+  "chatgpt.conversations": [
+    {
+      case: "normal",
+      body: "expected",
+      path: "$.conversations[*].create_time",
+      rule: "type: should be string",
+    },
+  ],
+};
+
+function isSchemaAddition(issue: SchemaIssue): boolean {
+  return issue.rule.startsWith("additionalProperties:");
+}
 
 function schemaIssues(
   scope: string,
@@ -389,25 +398,52 @@ describe("frozen Desktop schema conformance", () => {
     }
   });
 
-  it("matches the explicit known-gap register", () => {
+  it("matches the explicit known-addition and known-gap registers", () => {
     const actual = Object.fromEntries(
       SCOPES.map((scope) => [scope, frozenSchemaIssuesForScope(scope)]),
     );
-    const actualGaps = Object.fromEntries(
-      Object.entries(actual).filter(([, issues]) => issues.length > 0),
+    const actualAdditions = Object.fromEntries(
+      Object.entries(actual)
+        .map(
+          ([scope, issues]) =>
+            [scope, issues.filter(isSchemaAddition)] as const,
+        )
+        .filter(([, issues]) => issues.length > 0),
     );
+    const actualGaps = Object.fromEntries(
+      Object.entries(actual)
+        .map(
+          ([scope, issues]) =>
+            [
+              scope,
+              issues.filter((issue) => !isSchemaAddition(issue)),
+            ] as const,
+        )
+        .filter(([, issues]) => issues.length > 0),
+    );
+    expect(actualAdditions).toEqual(KNOWN_FROZEN_SCHEMA_ADDITIONS);
     expect(actualGaps).toEqual(KNOWN_FROZEN_SCHEMA_GAPS);
   });
 
   for (const scope of SCOPES) {
     const gaps = KNOWN_FROZEN_SCHEMA_GAPS[scope];
+    const additions = KNOWN_FROZEN_SCHEMA_ADDITIONS[scope];
     if (gaps) {
       it.fails(
         `${scope} is a known frozen-schema GAP: ${gaps.map((gap) => `${gap.path} ${gap.rule}`).join("; ")}`,
         () => {
-          expect(frozenSchemaIssuesForScope(scope)).toEqual([]);
+          expect(
+            frozenSchemaIssuesForScope(scope).filter(
+              (issue) => !isSchemaAddition(issue),
+            ),
+          ).toEqual([]);
         },
       );
+    } else if (additions) {
+      const paths = [...new Set(additions.map((addition) => addition.path))];
+      it(`${scope} validates (known additions: ${paths.join(", ")})`, () => {
+        expect(frozenSchemaIssuesForScope(scope)).toEqual(additions);
+      });
     } else {
       it(`${scope} expected and projected bodies validate`, () => {
         expect(frozenSchemaIssuesForScope(scope)).toEqual([]);
