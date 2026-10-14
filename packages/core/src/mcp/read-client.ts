@@ -531,6 +531,8 @@ export function createMcpDataReadClient(
      * The owner/OAuth path never sets this.
      */
     payment?: string;
+    /** A block manifest read: no values, so never charged. */
+    metadataOnly?: boolean;
   }): Promise<{ request: Request; authResult?: BuilderReadAuthorization }> {
     const safeScope = encodeURIComponent(params.scope);
     const signingUri = `${basePath}/${safeScope}`;
@@ -557,6 +559,7 @@ export function createMcpDataReadClient(
         grantId: params.grantId,
         fileId: params.fileId,
         ...(params.at ? { at: params.at } : {}),
+        ...(params.metadataOnly ? { metadataOnly: true } : {}),
       });
       return { request, authResult };
     } catch (err) {
@@ -798,6 +801,7 @@ export function createMcpDataReadClient(
         scope,
         grantId,
         fileId: selectedEntry.fileId ?? undefined,
+        metadataOnly: true,
       });
       const manifest = await storage.readBlockManifest(
         scope,
