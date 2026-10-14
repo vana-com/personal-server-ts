@@ -1,0 +1,122 @@
+{
+  "scope": "youtube.playlistItems",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; youtube.playlistItems from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic youtube.playlistItems records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{playlists:Array<{playlistId:string, items:Array<{videoId:string|null, videoUrl:string, videoTitle:string, channelTitle:string|null, channelUrl:string|null, durationText:string|null, thumbnailUrl:string|null}>, playlistTitle:null, playlistUrl:null}>}.",
+    "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. id is not emitted; duration_seconds becomes durationText. No input playlist headers are present; generated null headers are not evidence of an input field drop."
+  },
+  "fetchedStreams": [
+    "playlist_items"
+  ],
+  "streams": {
+    "playlist_items": [
+      {
+        "id": "video-a",
+        "playlist_id": "PL-a",
+        "video_id": "a",
+        "video_url": "https://www.youtube.com/watch?v=a",
+        "video_title": "Video A",
+        "channel_title": "Channel A",
+        "channel_url": "https://www.youtube.com/@channel-a",
+        "duration_seconds": 3661,
+        "thumbnail_url": "https://example.com/a.jpg"
+      }
+    ]
+  },
+  "legacyBody": {
+    "playlists": [
+      {
+        "playlistId": "PL-a",
+        "items": [
+          {
+            "videoId": "a",
+            "videoUrl": "https://www.youtube.com/watch?v=a",
+            "videoTitle": "Video A",
+            "channelTitle": "Channel A",
+            "channelUrl": "https://www.youtube.com/@channel-a",
+            "durationText": "1:01:01",
+            "thumbnailUrl": "https://example.com/a.jpg"
+          }
+        ],
+        "playlistTitle": null,
+        "playlistUrl": null
+      }
+    ]
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "youtube.playlistItems",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; youtube.playlistItems from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic youtube.playlistItems records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{playlists:Array<{playlistId:string, items:Array<{videoId:string|null, videoUrl:string, videoTitle:string, channelTitle:string|null, channelUrl:string|null, durationText:string|null, thumbnailUrl:string|null}>, playlistTitle:null, playlistUrl:null}>}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. id is not emitted; duration_seconds becomes durationText. No input playlist headers are present; generated null headers are not evidence of an input field drop."
+      },
+      "fetchedStreams": [
+        "playlist_items"
+      ],
+      "streams": {
+        "playlist_items": []
+      },
+      "legacyBody": {
+        "playlists": []
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "youtube.playlistItems",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; youtube.playlistItems from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic youtube.playlistItems records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{playlists:Array<{playlistId:string, items:Array<{videoId:string|null, videoUrl:string, videoTitle:string, channelTitle:string|null, channelUrl:string|null, durationText:string|null, thumbnailUrl:string|null}>, playlistTitle:null, playlistUrl:null}>}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. id is not emitted; duration_seconds becomes durationText. No input playlist headers are present; generated null headers are not evidence of an input field drop."
+      },
+      "fetchedStreams": [
+        "playlist_items"
+      ],
+      "streams": {
+        "playlist_items": [
+          {
+            "id": "video-a",
+            "playlist_id": "PL-a",
+            "video_id": "a",
+            "video_url": "https://www.youtube.com/watch?v=a",
+            "video_title": "Video A",
+            "channel_title": "Channel A",
+            "channel_url": "https://www.youtube.com/@channel-a",
+            "duration_seconds": 3661,
+            "thumbnail_url": "https://example.com/a.jpg"
+          },
+          {
+            "id": "video-b",
+            "playlist_id": "PL-a",
+            "video_id": "a",
+            "video_url": "https://www.youtube.com/watch?v=a",
+            "video_title": null,
+            "channel_title": "Channel A",
+            "channel_url": "https://www.youtube.com/@channel-a",
+            "duration_seconds": 3661,
+            "thumbnail_url": "https://example.com/a.jpg"
+          }
+        ]
+      },
+      "expectedResult": {
+        "ok": false,
+        "error": {
+          "kind": "incomplete_scope",
+          "scope": "youtube.playlistItems",
+          "reason": "1 source records missing playlist_items.playlist_id, playlist_items.video_url, playlist_items.video_title"
+        }
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

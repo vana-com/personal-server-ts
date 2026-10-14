@@ -1,0 +1,115 @@
+{
+  "scope": "youtube.profile",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; youtube.profile from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic youtube.profile records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "Success with a row: {email:string|null, channelUrl:string|null, handle:string|null, joinedDate:string|null, channelTitle:string|null, channelId:string, avatarUrl:string|null, description:string|null, country:string|null, subscriberCount:number|null, viewCount:number|null, videoCount:number|null}. Empty: {}.",
+    "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. id maps to channelId; channel_id is not read. Non-string optional values and non-number counts normalize to null."
+  },
+  "fetchedStreams": [
+    "profile"
+  ],
+  "streams": {
+    "profile": [
+      {
+        "id": "UC-owner",
+        "channel_url": "https://www.youtube.com/channel/UC-owner",
+        "title": "Owner Channel",
+        "handle": "@owner",
+        "email": "owner@example.com",
+        "joined_at": "2020-01-02",
+        "avatar_url": "https://example.com/owner.png",
+        "description": "A channel",
+        "country": "US",
+        "subscriber_count": 12,
+        "view_count": 340,
+        "video_count": 5
+      }
+    ]
+  },
+  "legacyBody": {
+    "email": "owner@example.com",
+    "channelUrl": "https://www.youtube.com/channel/UC-owner",
+    "handle": "@owner",
+    "joinedDate": "2020-01-02",
+    "channelTitle": "Owner Channel",
+    "channelId": "UC-owner",
+    "avatarUrl": "https://example.com/owner.png",
+    "description": "A channel",
+    "country": "US",
+    "subscriberCount": 12,
+    "viewCount": 340,
+    "videoCount": 5
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "youtube.profile",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; youtube.profile from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic youtube.profile records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "Success with a row: {email:string|null, channelUrl:string|null, handle:string|null, joinedDate:string|null, channelTitle:string|null, channelId:string, avatarUrl:string|null, description:string|null, country:string|null, subscriberCount:number|null, viewCount:number|null, videoCount:number|null}. Empty: {}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. id maps to channelId; channel_id is not read. Non-string optional values and non-number counts normalize to null."
+      },
+      "fetchedStreams": [
+        "profile"
+      ],
+      "streams": {
+        "profile": []
+      },
+      "legacyBody": {},
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "youtube.profile",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; youtube.profile from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic youtube.profile records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "Success with a row: {email:string|null, channelUrl:string|null, handle:string|null, joinedDate:string|null, channelTitle:string|null, channelId:string, avatarUrl:string|null, description:string|null, country:string|null, subscriberCount:number|null, viewCount:number|null, videoCount:number|null}. Empty: {}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. id maps to channelId; channel_id is not read. Non-string optional values and non-number counts normalize to null."
+      },
+      "fetchedStreams": [
+        "profile"
+      ],
+      "streams": {
+        "profile": [
+          {
+            "id": "UC-dirty",
+            "email": 42,
+            "channel_url": null,
+            "handle": false,
+            "joined_at": [],
+            "title": 17,
+            "avatar_url": null,
+            "description": {},
+            "country": false,
+            "subscriber_count": "12",
+            "view_count": null,
+            "video_count": true
+          }
+        ]
+      },
+      "legacyBody": {
+        "email": null,
+        "channelUrl": null,
+        "handle": null,
+        "joinedDate": null,
+        "channelTitle": null,
+        "channelId": "UC-dirty",
+        "avatarUrl": null,
+        "description": null,
+        "country": null,
+        "subscriberCount": null,
+        "viewCount": null,
+        "videoCount": null
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

@@ -5,7 +5,7 @@
  * both produced from the same upstream responses (see parity-oracle/). The
  * projection must reproduce that body except for the reviewed differences
  * the golden lists, and must validate against the pinned legacy schema.
- * Shop/Spotify/LinkedIn/Instagram expectations are current binding output,
+ * Shop/Spotify/LinkedIn/Instagram/YouTube expectations are current binding output,
  * not captured legacy-connector output; passing does not establish legacy parity.
  * Social fixtures separately expose synthetic consumer-contract differences.
  */
@@ -16,17 +16,19 @@ import Ajv from "ajv";
 import { describe, expect, it } from "vitest";
 import { diffBodies, type BodyDifference } from "./__fixtures__/parity/diff.js";
 import { projectPdppRecordsToLegacyPayload } from "./index.js";
-import type { PdppRecord } from "./types.js";
+import type {
+  PdppRecord,
+  ProjectionDiagnostic,
+  ProjectionErr,
+} from "./types.js";
 
 interface Golden {
   scope: string;
   profileKey?: string;
   case?: string;
   cases?: Golden[];
-  expectedResult?: {
-    ok: false;
-    error: { kind: "empty_singleton"; scope: string };
-  };
+  expectedResult?: ProjectionErr;
+  expectedDiagnostics?: ProjectionDiagnostic[];
   provenance: {
     legacyConnector: string;
     pdppBundle: string;
@@ -35,6 +37,7 @@ interface Golden {
     emptyOrNullEdge?: string;
     expectedSideNote?: string;
     consumerContractNote?: string;
+    outputKeysAndTypes?: string;
   };
   fetchedStreams: string[];
   streams: Record<string, Record<string, unknown>[]>;
@@ -58,6 +61,15 @@ const SOCIAL_SCOPES = [
   "instagram.profile",
   "instagram.posts",
 ];
+const YOUTUBE_SCOPES = [
+  "youtube.profile",
+  "youtube.subscriptions",
+  "youtube.playlists",
+  "youtube.playlistItems",
+  "youtube.likes",
+  "youtube.watchLater",
+  "youtube.history",
+];
 const SCOPES = [
   "chatgpt.conversations",
   "chatgpt.memories",
@@ -73,6 +85,7 @@ const SCOPES = [
   "spotify.profile",
   "spotify.playlists",
   ...SOCIAL_SCOPES,
+  ...YOUTUBE_SCOPES,
 ];
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -192,6 +205,19 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
       expect(golden.profileKey).toBe(
         scope.startsWith("instagram.") ? "meta" : undefined,
       );
+    } else if (YOUTUBE_SCOPES.includes(scope)) {
+      expect(golden.provenance.legacyConnector).toMatch(
+        /^current binding output, not captured legacy-connector output; youtube\.(profile|subscriptions|playlists|playlistItems|likes|watchLater|history) from packages\/core\/src\/legacy-projection\/bindings\.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665$/,
+      );
+      expect(golden.provenance.pdppBundle).toMatch(
+        /^synthetic youtube\.(profile|subscriptions|playlists|playlistItems|likes|watchLater|history) records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed$/,
+      );
+      expect(golden.provenance.expectedSideNote).toBe(
+        "current binding output, not captured legacy-connector output",
+      );
+      expect(golden.provenance.outputKeysAndTypes).toBeTruthy();
+      expect(golden.case).toBe("normal");
+      expect(golden.reviewedDifferences).toEqual([]);
     } else {
       expect(golden.provenance.legacyConnector).toMatch(
         /^OpenPet nullable-score contract from .*\/client-reconciliation\.md sha256:[0-9a-f]{64} \(evidence checkout has no Git metadata\); expected field assertions from .*\/oura-browser\.test\.ts at unity-surfaces commit [0-9a-f]{40} sha256:[0-9a-f]{64}$/,
@@ -227,7 +253,7 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
 
       expect(result.ok).toBe(true);
       if (!result.ok) return;
-      expect(result.diagnostics).toBeUndefined();
+      expect(result.diagnostics).toEqual(golden.expectedDiagnostics);
       if (golden.expectedLegacySha256) {
         expect(payloadSha256(result.payload)).toBe(golden.expectedLegacySha256);
       } else {
@@ -273,6 +299,7 @@ describe.each([
   "spotify.profile",
   "spotify.playlists",
   ...SOCIAL_SCOPES,
+  ...YOUTUBE_SCOPES,
 ])("%s current-binding empty and dirty-row regressions", (scope) => {
   const golden = load(scope);
 
@@ -322,6 +349,13 @@ describe.each([
           expect(edge.expectedResult).toEqual(expected);
           expect(edge.legacyBody).toBeUndefined();
           expect(result).toEqual(expected);
+          return;
+        }
+
+        if (edge.expectedResult) {
+          expect(edge.expectedResult.error.scope).toBe(scope);
+          expect(edge.legacyBody).toBeUndefined();
+          expect(result).toEqual(edge.expectedResult);
           return;
         }
 
