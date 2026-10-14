@@ -48,6 +48,22 @@ describe("sqlite record store", () => {
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
   });
 
+  it("uses a covering index for per-instance stream summaries", () => {
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT stream, COUNT(*) as count, MAX(emitted_at) as last_updated
+         FROM pdpp_records
+         WHERE deleted = 0 AND instance IN (?)
+         GROUP BY stream`,
+      )
+      .all("inst_1") as Array<{ detail: string }>;
+
+    expect(plan.map((row) => row.detail).join("\n")).toContain(
+      "idx_pdpp_records_live_instance_stream_emitted_at",
+    );
+  });
+
   it("test fixture forwards validateData with and without an explicit binding", () => {
     const rejectBad = (
       _stream: string,

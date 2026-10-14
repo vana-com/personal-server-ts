@@ -284,6 +284,12 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_arrival_order
   // only if it is a compatible nullable TEXT column, so a database whose
   // version was only rewound can be upgraded again.
   "",
+  // v10: cover the stream-summary query so it need not visit JSON record rows.
+  `
+CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_at
+  ON pdpp_records (instance, stream, emitted_at)
+  WHERE deleted = 0;
+`,
 ];
 
 function addCompletionProofColumns(db: Database): void {
