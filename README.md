@@ -95,21 +95,34 @@ Tests are co-located with source (`foo.ts` → `foo.test.ts`).
 
 All authenticated endpoints use `Authorization: Web3Signed <base64url(json)>.<signature>` — no sessions, no cookies.
 
-| Endpoint                    | Method | Auth            | Purpose                |
-| --------------------------- | ------ | --------------- | ---------------------- |
-| `/health`                   | GET    | None            | Health check           |
-| `/v1/data/{scope}`          | POST   | Owner           | Ingest data            |
-| `/v1/data`                  | GET    | Builder         | List scopes            |
-| `/v1/data/{scope}`          | GET    | Builder + Grant | Read data              |
-| `/v1/data/{scope}/versions` | GET    | Builder         | List versions          |
-| `/v1/data/additions`        | GET    | Owner           | Additions summary      |
-| `/v1/data/{scope}`          | DELETE | Owner           | Delete data (durable)  |
-| `/v1/grants`                | GET    | Owner           | List grants            |
-| `/v1/grants/verify`         | POST   | None            | Verify grant signature |
-| `/v1/access-logs`           | GET    | Owner           | Access history         |
-| `/v1/sync/trigger`          | POST   | Owner           | Force sync             |
-| `/v1/sync/status`           | GET    | Owner           | Sync status            |
-| `/v1/sync/file/{fileId}`    | POST   | Owner           | Sync specific file     |
+| Endpoint                               | Method | Auth            | Purpose                        |
+| -------------------------------------- | ------ | --------------- | ------------------------------ |
+| `/health`                              | GET    | None            | Health check                   |
+| `/v1/data/{scope}`                     | POST   | Owner           | Ingest data                    |
+| `/v1/data/{scope}/imports/{operation}` | PUT    | Owner           | Accept or replay a JSON import |
+| `/v1/data`                             | GET    | Builder         | List scopes                    |
+| `/v1/data/{scope}`                     | GET    | Builder + Grant | Read data                      |
+| `/v1/data/{scope}/versions`            | GET    | Builder         | List versions                  |
+| `/v1/data/additions`                   | GET    | Owner           | Additions summary              |
+| `/v1/data/{scope}`                     | DELETE | Owner           | Delete data (durable)          |
+| `/v1/grants`                           | GET    | Owner           | List grants                    |
+| `/v1/grants/verify`                    | POST   | None            | Verify grant signature         |
+| `/v1/access-logs`                      | GET    | Owner           | Access history                 |
+| `/v1/sync/trigger`                     | POST   | Owner           | Force sync                     |
+| `/v1/sync/status`                      | GET    | Owner           | Sync status                    |
+| `/v1/sync/file/{fileId}`               | POST   | Owner           | Sync specific file             |
+
+### Owner import acceptance
+
+`PUT /v1/data/{scope}/imports/{operation}` accepts an owner root JSON object up to 50 MiB. `operation` is a stable 64-character lowercase hexadecimal identifier for one intended import; derive it from the owner, saved run identity and scope, excluding the body digest and server port. Ordinary `POST` continues to create a distinct write on each request. Binary, lineage and query parameters (including `supersede`) are refused on import PUT.
+
+First acceptance returns `201`; a matching replay returns `200` with the original `{ scope, collectedAt, status, importReceipt: { operation, bodySha256, scope, collectedAt, acceptedAt } }`. `bodySha256` is SHA-256 over the UTF-8 RFC 8785 canonical JSON body: object key ordering and whitespace do not change identity; changed values or array order return `409 IMPORT_CONFLICT`. The receipt identifies local acceptance, not settled remote propagation or a final gateway version. Replaying an accepted import after a later write does not append data or make the old import newest. Replay can wake unfinished sync without another data-written event.
+
+Node storage persists the exact prepared envelope and original causal deletion marker in SQLite before publishing it without replacement, then commits the index and immutable receipt together. Startup and subsequent publication recover prepared imports at their original timestamp. JSON, binary and replica publication share the same short SQLite writer gate; ordinary and replica payloads are not journaled. This gives processes sharing one root a single import authority; independent roots retain independent acceptance. Import identities and receipts do not expire. Deleting a version or scope durably retires its operations before cleanup; matching retries return `410 IMPORT_DELETED` with the original accepted receipt in `error.details.importReceipt`, and an intentional re-add needs a new operation. A cancelled preparation has no accepted receipt. Scope cleanup removes the files and index rows captured at retirement, preserving later writes. Failed deletion keeps cleanup retryable.
+
+Older servers reject the dedicated PUT route before ingestion; unsupported storage returns `501 IMPORT_UNSUPPORTED`. Clients must retain pending delivery and request an upgrade, never fall back to POST. Before upgrading a shared root to schema 5, stop all old writers: migration prevents newly starting old binaries, but cannot evict already-open old connections. Back up `index.db`, its WAL and data files as one root; do not discard receipts or downgrade the schema. Historical POST acceptances cannot acquire trustworthy operation receipts retrospectively.
+
+Windows skips directory fsync barriers; file fsync and journal recovery remain in place. Directory-entry and power-loss durability are outside the Windows guarantee.
 
 ### Additions summary
 

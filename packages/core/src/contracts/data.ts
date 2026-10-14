@@ -1,4 +1,8 @@
-import { type DataStoragePort } from "../ports/index.js";
+import {
+  type DataStoragePort,
+  type ImportIntent,
+  type ImportReceipt,
+} from "../ports/index.js";
 import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
 import {
   createDataFileEnvelope,
@@ -29,6 +33,7 @@ import {
   type AdditionsSummary,
 } from "../additions/summary.js";
 import type { ScopeFirstSeenLedger } from "../additions/first-added.js";
+import { ProtocolError } from "../errors/catalog.js";
 
 export type DataContractErrorCode =
   "INVALID_SCOPE" | "INVALID_BODY" | "INVALID_QUERY" | "NOT_FOUND";
@@ -123,7 +128,7 @@ export interface ReadDataContractResult {
 
 /**
  * Thrown by the ingest contracts when the envelope was already written to
- * storage but a later step (indexing) failed. The record is on disk and a
+ * storage but durability, indexing, or transaction commit failed. It is on disk;
  * re-index can surface it, so callers must treat the write as persisted:
  * never retry it under the same proof, never release a replay reservation.
  */
@@ -133,7 +138,7 @@ export class IngestPersistedError extends Error {
     public readonly cause: unknown,
   ) {
     super(
-      `Envelope written to ${relativePath} but indexing failed: ${
+      `Envelope published to ${relativePath} but persistence failed: ${
         cause instanceof Error ? cause.message : String(cause)
       }`,
     );
@@ -174,6 +179,7 @@ export interface IngestDataContractInput {
   lineage?: StoredLineage;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
+  import?: ImportIntent;
 }
 
 export interface IngestDataContractResult {
@@ -186,9 +192,16 @@ export interface IngestDataContractResult {
     status: "stored" | "syncing";
     /** Echoed for a derivative write: the accepted, normalized sources. */
     lineage?: { sources: `0x${string}`[] };
+    importReceipt?: ImportReceipt;
   };
   writeResult: WriteResult;
+  replay?: false;
 }
+
+export type IngestImportReplayResult = Omit<
+  IngestDataContractResult,
+  "writeResult" | "replay"
+> & { replay: true };
 
 export interface IngestBinaryDataContractInput {
   storage: DataStoragePort;
@@ -501,7 +514,9 @@ export async function readDataContract(
 
 export async function ingestDataContract(
   input: IngestDataContractInput,
-): Promise<IngestDataContractResult | DataContractError> {
+): Promise<
+  IngestDataContractResult | IngestImportReplayResult | DataContractError
+> {
   const scopeResult = parseDataScopeContract(input.scopeParam);
   if (!scopeResult.ok) return scopeResult;
 
@@ -543,37 +558,78 @@ export async function ingestDataContract(
     };
   }
 
-  const envelope = createDataFileEnvelope(
+  if (input.import && !input.storage.commitVersion) {
+    throw new ProtocolError(
+      501,
+      "IMPORT_UNSUPPORTED",
+      "This storage backend does not support durable owner imports",
+    );
+  }
+
+  let envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
     stampServerKeys(input.body, input),
   );
-  const writeResult = await input.storage.writeEnvelope(envelope);
+  const committed = input.storage.commitVersion
+    ? await input.storage.commitVersion({
+        kind: "append",
+        envelope,
+        metadata: {
+          afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+        },
+        import: input.import,
+      })
+    : undefined;
+  if (committed?.kind === "replay") {
+    return {
+      ok: true,
+      scope: committed.receipt.scope,
+      collectedAt: committed.receipt.collectedAt,
+      response: {
+        scope: committed.receipt.scope,
+        collectedAt: committed.receipt.collectedAt,
+        status: input.status,
+        importReceipt: committed.receipt,
+      },
+      replay: true,
+    };
+  }
+  if (committed) envelope = committed.envelope;
+  const writeResult =
+    committed?.writeResult ?? (await input.storage.writeEnvelope(envelope));
   try {
     await writeBlockSidecars(input.storage, envelope);
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await indexWrittenEnvelope(input.storage, {
-    fileId: null,
-    schemaId: null,
-    path: writeResult.relativePath,
-    scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    sizeBytes: writeResult.sizeBytes,
-    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
-  });
+  if (!committed)
+    await indexWrittenEnvelope(input.storage, {
+      fileId: null,
+      schemaId: null,
+      path: writeResult.relativePath,
+      scope: scopeResult.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: writeResult.sizeBytes,
+      afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+    });
   await recordStoredVersion(input.storage, {
     scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
+    collectedAt: envelope.collectedAt,
     data: envelope.data,
   });
 
   return {
     ok: true,
     scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    response: ingestResponse(scopeResult.scope, input),
+    collectedAt: envelope.collectedAt,
+    response: {
+      ...ingestResponse(scopeResult.scope, {
+        ...input,
+        collectedAt: envelope.collectedAt,
+      }),
+      ...(committed?.receipt ? { importReceipt: committed.receipt } : {}),
+    },
     writeResult,
   };
 }
@@ -660,37 +716,55 @@ export async function ingestBinaryDataContract(
     metadata: input.metadata,
   });
 
-  const envelope = createDataFileEnvelope(
+  let envelope = createDataFileEnvelope(
     scopeResult.scope,
     input.collectedAt,
     stampServerKeys(data, input),
   );
-  const writeResult = await input.storage.writeEnvelope(envelope);
+  const committed = input.storage.commitVersion
+    ? await input.storage.commitVersion({
+        kind: "append",
+        envelope,
+        metadata: {
+          sizeBytes: input.bytes.length,
+          afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+        },
+      })
+    : undefined;
+  if (committed?.kind === "replay")
+    throw new Error("Binary write cannot replay an import");
+  if (committed) envelope = committed.envelope;
+  const writeResult =
+    committed?.writeResult ?? (await input.storage.writeEnvelope(envelope));
   try {
     await writeBlockSidecars(input.storage, envelope);
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await indexWrittenEnvelope(input.storage, {
-    fileId: null,
-    schemaId: null,
-    path: writeResult.relativePath,
-    scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    sizeBytes: input.bytes.length,
-    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
-  });
+  if (!committed)
+    await indexWrittenEnvelope(input.storage, {
+      fileId: null,
+      schemaId: null,
+      path: writeResult.relativePath,
+      scope: scopeResult.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: input.bytes.length,
+      afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+    });
   await recordStoredVersion(input.storage, {
     scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
+    collectedAt: envelope.collectedAt,
     data: envelope.data,
   });
 
   return {
     ok: true,
     scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    response: ingestResponse(scopeResult.scope, input),
+    collectedAt: envelope.collectedAt,
+    response: ingestResponse(scopeResult.scope, {
+      ...input,
+      collectedAt: envelope.collectedAt,
+    }),
     writeResult,
   };
 }
