@@ -447,4 +447,346 @@ describe("canonical Claude source blobs", () => {
       detail: "inline_child_absent_from_blob",
     });
   });
+  it("refuses known missing completion before reading any selected source blob bytes", async () => {
+    const parents = Array.from({ length: 4 }, (_, index) =>
+      blob("projects", {
+        uuid: `bulk-${index}`,
+        name: "Tiny metadata",
+        docs: [],
+        ignored_large_raw_field: "x".repeat(1024 * 1024),
+      }),
+    );
+    replace("projects", parents);
+    let byteCalls = 0;
+    const readStore = {
+      ...store,
+      getBlobBytes(id: string) {
+        byteCalls++;
+        return store.getBlobBytes(id);
+      },
+    };
+    expect(
+      await readCanonicalLegacyScope({
+        store: readStore,
+        selection,
+        scope: "claude.projects",
+        profileBy: "method",
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "stream_completion_unknown",
+      streams: ["account_profile", "project_documents"],
+    });
+    expect(byteCalls).toBe(0);
+  });
+
+  it("refuses a read above its aggregate blob budget before copying any body", async () => {
+    replace("account_profile", [profile]);
+    const parents = Array.from({ length: 4 }, (_, index) =>
+      blob("projects", {
+        uuid: `bulk-${index}`,
+        name: "Tiny metadata",
+        docs: [],
+        ignored_large_raw_field: "x".repeat(1024 * 1024),
+      }),
+    );
+    replace("projects", parents);
+    replace("project_documents", []);
+    const total = parents.reduce(
+      (sum, parent) => sum + parent.blob_ref.size_bytes,
+      0,
+    );
+    let byteCalls = 0;
+    const readStore = {
+      ...store,
+      getBlobBytes(id: string) {
+        byteCalls++;
+        return store.getBlobBytes(id);
+      },
+    };
+    const input = {
+      store: readStore,
+      selection,
+      scope: "claude.projects",
+      profileBy: "method" as const,
+      blobByteBudget: 1,
+    };
+    expect(await readCanonicalLegacyScope(input)).toMatchObject({
+      ok: false,
+      reason: "blob_read_budget_exceeded",
+      requiredBytes: total,
+      maxBytes: 1,
+    });
+    expect(byteCalls).toBe(0);
+  });
+
+  it.each([
+    [
+      "nonempty",
+      [
+        {
+          uuid: "d",
+          filename: "file",
+          content: "contradictory stored raw document",
+        },
+      ],
+    ],
+    ["null", null],
+    ["object", {}],
+    ["scalar", "malformed"],
+    ["malformed array", [null]],
+  ])(
+    "refuses %s raw_docs summary when source project metadata omitted docs",
+    async (_label, raw_docs) => {
+      replace("account_profile", [profile]);
+      replace("projects", [
+        { ...blob("projects", { uuid: "p", name: "Metadata only" }), raw_docs },
+      ]);
+      replace("project_documents", [
+        {
+          id: "d",
+          project_id: "p",
+          filename: "file",
+          content: "Separate canonical document",
+          create_time: null,
+          update_time: null,
+        },
+      ]);
+      expect(
+        await readCanonicalLegacyScope({
+          store,
+          selection,
+          scope: "claude.projects",
+          profileBy: "method",
+        }),
+      ).toMatchObject({
+        ok: false,
+        reason: "blob_backed_record_invalid",
+        detail: "parent_blob_conflict",
+      });
+    },
+  );
+  it.each([-1, 0, 1])(
+    "checks the exact aggregate boundary with budget offset %s",
+    async (offset) => {
+      replace("account_profile", [profile]);
+      const parents = [
+        blob("projects", { uuid: "a", name: "A", docs: [] }),
+        blob("projects", { uuid: "b", name: "B", docs: [] }),
+      ];
+      replace("projects", parents);
+      replace("project_documents", []);
+      const total = parents.reduce(
+        (sum, parent) => sum + parent.blob_ref.size_bytes,
+        0,
+      );
+      const before = db.prepare("SELECT total_changes() AS n").get();
+      let byteCalls = 0;
+      const readStore = {
+        ...store,
+        getBlobBytes(id: string) {
+          byteCalls++;
+          return store.getBlobBytes(id);
+        },
+      };
+      const result = await readCanonicalLegacyScope({
+        store: readStore,
+        selection,
+        scope: "claude.projects",
+        profileBy: "method",
+        blobByteBudget: total + offset,
+      });
+      if (offset < 0) {
+        expect(result).toEqual({
+          ok: false,
+          status: "unavailable",
+          reason: "blob_read_budget_exceeded",
+          requiredBytes: total,
+          maxBytes: total - 1,
+        });
+        expect(byteCalls).toBe(0);
+      } else {
+        expect(result).toMatchObject({
+          ok: true,
+          envelope: { data: { total: 2 } },
+        });
+        expect(byteCalls).toBe(2);
+      }
+      expect(db.prepare("SELECT total_changes() AS n").get()).toEqual(before);
+    },
+  );
+
+  it("counts duplicate blob references once without accepting a false parent identity", async () => {
+    replace("account_profile", [profile]);
+    const parent = blob("projects", { uuid: "p", name: "Project", docs: [] });
+    replace("projects", [parent, { ...parent, id: "other-parent" }]);
+    replace("project_documents", []);
+    let byteCalls = 0,
+      metadataCalls = 0;
+    const readStore = {
+      ...store,
+      getBlobBytes(id: string) {
+        byteCalls++;
+        return store.getBlobBytes(id);
+      },
+      getBlobMeta(id: string) {
+        metadataCalls++;
+        return store.getBlobMeta(id);
+      },
+    };
+    expect(
+      await readCanonicalLegacyScope({
+        store: readStore,
+        selection,
+        scope: "claude.projects",
+        profileBy: "method",
+        blobByteBudget: parent.blob_ref.size_bytes,
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "blob_backed_record_invalid",
+      detail: "source_envelope_mismatch",
+    });
+    expect(metadataCalls).toBe(1);
+    expect(byteCalls).toBe(1);
+  });
+
+  it("refuses malformed or missing metadata before loading any otherwise-valid peer blob", async () => {
+    replace("account_profile", [profile]);
+    const good = blob("projects", { uuid: "a", name: "A", docs: [] });
+    const bad = blob("projects", { uuid: "b", name: "B", docs: [] });
+    replace("projects", [good, bad]);
+    replace("project_documents", []);
+    db.prepare(
+      "UPDATE pdpp_blobs SET mime_type='text/plain' WHERE blob_id=?",
+    ).run(bad.blob_ref.blob_id);
+    let byteCalls = 0;
+    const readStore = {
+      ...store,
+      getBlobBytes(id: string) {
+        byteCalls++;
+        return store.getBlobBytes(id);
+      },
+    };
+    expect(
+      await readCanonicalLegacyScope({
+        store: readStore,
+        selection,
+        scope: "claude.projects",
+        profileBy: "method",
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "blob_backed_record_invalid",
+      detail: "blob_metadata_mismatch",
+    });
+    expect(byteCalls).toBe(0);
+    db.transaction(() => {
+      db.prepare("DELETE FROM pdpp_blob_claims WHERE blob_id=?").run(
+        bad.blob_ref.blob_id,
+      );
+      db.prepare("DELETE FROM pdpp_blob_bytes WHERE blob_id=?").run(
+        bad.blob_ref.blob_id,
+      );
+      db.prepare("DELETE FROM pdpp_blobs WHERE blob_id=?").run(
+        bad.blob_ref.blob_id,
+      );
+    })();
+    expect(
+      await readCanonicalLegacyScope({
+        store: readStore,
+        selection,
+        scope: "claude.projects",
+        profileBy: "method",
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "blob_backed_record_invalid",
+      detail: "blob_missing_or_corrupt",
+    });
+    expect(byteCalls).toBe(0);
+  });
+
+  it("accepts the legitimate empty omitted-docs summary without adding raw_docs to app data", async () => {
+    replace("account_profile", [profile]);
+    replace("projects", [
+      {
+        ...blob("projects", { uuid: "p", name: "Metadata only" }),
+        raw_docs: [],
+      },
+    ]);
+    replace("project_documents", [
+      {
+        id: "d",
+        project_id: "p",
+        filename: "file",
+        content: "Separate document",
+        create_time: null,
+        update_time: null,
+      },
+    ]);
+    const result = await readCanonicalLegacyScope({
+      store,
+      selection,
+      scope: "claude.projects",
+      profileBy: "method",
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      envelope: {
+        data: {
+          projects: [{ detail: { docs: [{ content: "Separate document" }] } }],
+        },
+      },
+    });
+    if (result.ok)
+      expect(
+        (result.envelope.data.projects as { detail: unknown }[])[0]?.detail,
+      ).not.toHaveProperty("raw_docs");
+  });
+  it("refuses invalid peer references and unsupported child blobs without loading a valid parent body", async () => {
+    replace("account_profile", [profile]);
+    const good = blob("projects", { uuid: "p", name: "P", docs: [] });
+    replace("projects", [good, { id: "bad", blob_ref: null }]);
+    replace("project_documents", []);
+    let byteCalls = 0;
+    const readStore = {
+      ...store,
+      getBlobBytes(id: string) {
+        byteCalls++;
+        return store.getBlobBytes(id);
+      },
+    };
+    expect(
+      await readCanonicalLegacyScope({
+        store: readStore,
+        selection,
+        scope: "claude.projects",
+        profileBy: "method",
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "blob_backed_record_invalid",
+      detail: "invalid_blob_reference",
+    });
+    expect(byteCalls).toBe(0);
+    replace("projects", [good]);
+    replace("project_documents", [
+      { id: "d", project_id: "p", blob_ref: good.blob_ref },
+    ]);
+    expect(
+      await readCanonicalLegacyScope({
+        store: readStore,
+        selection,
+        scope: "claude.projects",
+        profileBy: "method",
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "blob_backed_records_unsupported",
+      stream: "project_documents",
+      recordCount: 1,
+    });
+    expect(byteCalls).toBe(0);
+  });
 });

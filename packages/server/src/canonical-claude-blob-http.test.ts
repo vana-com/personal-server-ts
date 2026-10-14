@@ -13,6 +13,7 @@ import Database from "better-sqlite3";
 import Ajv from "ajv";
 import { recoverServerOwner } from "@opendatalabs/vana-sdk/node";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import * as canonicalReader from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createServer, type ServerContext } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
@@ -93,6 +94,7 @@ afterEach(async () => {
   await ctx?.cleanup();
   await rm(root, { recursive: true, force: true });
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
 });
 
 async function replace(stream: string, rows: Record<string, unknown>[]) {
@@ -288,4 +290,64 @@ it("serves the owner's actual app envelope directly from SQLite/blob bytes witho
   } finally {
     db.close();
   }
+});
+
+it("returns an owner HTTP 503 budget refusal with zero copied bodies and no stored projection", async () => {
+  const payload = { uuid: "p", name: "Small source", docs: [] };
+  const bytes = new TextEncoder().encode(
+    JSON.stringify({
+      format: "anthropic-source-record-v1",
+      stream: "projects",
+      record_key: "p",
+      payload,
+    }),
+  );
+  const upload = await ctx.app.request(
+    `/v1/blobs/ingest?instance=${encodeURIComponent(instance)}&method=anthropic&binding_generation=1`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: bytes,
+    },
+  );
+  expect(upload.status).toBe(200);
+  const blob_ref = await upload.json();
+  await replace("account_profile", [profile]);
+  await replace("projects", [{ id: "p", name: "Small source", blob_ref }]);
+  await replace("project_documents", []);
+  const readActual = canonicalReader.readCanonicalLegacyScope;
+  let byteCalls = 0;
+  // Lower only the private read budget; the actual route, authority and SQLite reader run.
+  vi.spyOn(canonicalReader, "readCanonicalLegacyScope").mockImplementation(
+    (input) =>
+      readActual({
+        ...input,
+        blobByteBudget: bytes.length - 1,
+        store: {
+          ...input.store,
+          getBlobBytes(id) {
+            byteCalls++;
+            return input.store.getBlobBytes?.(id);
+          },
+        },
+      }),
+  );
+  const response = await ctx.app.request("/v1/data/claude.projects", {
+    headers: { authorization: `Bearer ${CONTROL}` },
+  });
+  expect(response.status).toBe(503);
+  expect(await response.json()).toMatchObject({
+    error: "CANONICAL_VIEW_UNAVAILABLE",
+    reason: "blob_read_budget_exceeded",
+    status: "unavailable",
+  });
+  expect(byteCalls).toBe(0);
+  expect(
+    (await files(join(root, "data"))).filter((path) =>
+      path.includes("claude.projects"),
+    ),
+  ).toEqual([]);
 });

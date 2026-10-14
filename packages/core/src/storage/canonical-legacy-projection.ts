@@ -40,6 +40,7 @@ import {
 export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/5";
 
 const DEFAULT_PAGE_SIZE = 500;
+const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
 const SOURCE_ID_PREFIX = "https://registry.pdpp.dev/sources/";
 const CONNECTOR_ID_PREFIX = "https://registry.pdpp.dev/connectors/";
 
@@ -195,6 +196,12 @@ export type CanonicalLegacyReadFailure =
     }
   | {
       status: "unavailable";
+      reason: "blob_read_budget_exceeded";
+      requiredBytes?: number;
+      maxBytes: number;
+    }
+  | {
+      status: "unavailable";
       reason: "blob_backed_record_invalid";
       detail: string;
     }
@@ -239,6 +246,8 @@ export interface ReadCanonicalLegacyScopeInput {
   confirmSelection?: () => boolean;
   /** Rows per store page. Tests lower it to force several pages. */
   pageSize?: number;
+  /** @internal Tests may lower the blob budget; never raises the 64 MiB limit. */
+  blobByteBudget?: number;
 }
 
 export type ResolveCanonicalConnectionResult =
@@ -325,6 +334,10 @@ export async function readCanonicalLegacyScope(
           streams,
           binding.rowOrder === "arrival",
           pageSize,
+          Number.isSafeInteger(input.blobByteBudget) &&
+            (input.blobByteBudget ?? -1) >= 0
+            ? Math.min(MAX_BLOB_READ_BYTES, input.blobByteBudget!)
+            : MAX_BLOB_READ_BYTES,
         ),
   );
   if (!snapshot.ok) return snapshot.result;
@@ -362,6 +375,7 @@ function collectSnapshot(
   streams: string[],
   arrivalOrder: boolean,
   pageSize: number,
+  blobByteBudget: number,
 ): Snapshot | { ok: false; result: CanonicalLegacyReadResult } {
   const { instance } = selection;
   const binding = store.getInstanceBinding(instance);
@@ -399,37 +413,6 @@ function collectSnapshot(
     }
     throw error;
   }
-  // Copy bytes and metadata while the authorizing rows/binding still share one snapshot.
-  // Async hashing and projection happen after SQLite releases that snapshot.
-  const blobContents = new Map<string, ClaudeBlobContents>();
-  if (selection.sourceId === `${SOURCE_ID_PREFIX}anthropic`) {
-    for (const stream of ["conversations", "projects"]) {
-      for (const row of rowsByStream.get(stream) ?? []) {
-        if (!hasBlobRef(row)) continue;
-        try {
-          const ref = claudeBlobReference(row.data);
-          if (!blobContents.has(ref.blobId)) {
-            const meta = store.getBlobMeta?.(ref.blobId);
-            // Do not load oversized/mismatched metadata before rejecting it.
-            const bytes =
-              meta?.sizeBytes === ref.size &&
-              meta.mimeType === "application/json"
-                ? store.getBlobBytes?.(ref.blobId)?.slice()
-                : undefined;
-            blobContents.set(ref.blobId, {
-              meta: meta ? { ...meta } : undefined,
-              bytes,
-            });
-          }
-        } catch (error) {
-          if (!(error instanceof ClaudeSourceRecordError)) throw error;
-          // The projector reports malformed references after the existing
-          // completion guard; absence of source evidence keeps priority.
-          continue;
-        }
-      }
-    }
-  }
   const completions = new Map<string, CanonicalStreamCompletion>();
   for (const receipt of store.listStreamCompletions(instance)) {
     if (
@@ -440,6 +423,136 @@ function collectSnapshot(
     ) {
       completions.set(receipt.stream, receipt);
     }
+  }
+
+  // Refuse missing source evidence before reading even one blob body.
+  // Binding, rows, receipts, metadata and the later copies share this snapshot.
+  if (
+    completions.size === 0 &&
+    listing.every((entry) => entry.recordCount === 0)
+  ) {
+    return { ok: false, result: unavailable({ reason: "no_synced_data" }) };
+  }
+  const unprovenEmpty = streams.filter(
+    (stream) =>
+      (rowsByStream.get(stream)?.length ?? 0) === 0 && !completions.has(stream),
+  );
+  if (unprovenEmpty.length > 0) {
+    return {
+      ok: false,
+      result: unavailable({
+        reason: "stream_completion_unknown",
+        streams: unprovenEmpty,
+      }),
+    };
+  }
+
+  // Preflight all unique references/metadata before copying ANY body. A legal
+  // per-blob size does not bound fan-in; excluded raw fields still cost bytes.
+  const blobContents = new Map<string, ClaudeBlobContents>();
+  let requiredBytes = 0;
+  for (const stream of streams) {
+    const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
+    if (blobBacked.length === 0) continue;
+    if (
+      selection.sourceId !== `${SOURCE_ID_PREFIX}anthropic` ||
+      (stream !== "conversations" && stream !== "projects")
+    ) {
+      return {
+        ok: false,
+        result: unavailable({
+          reason: "blob_backed_records_unsupported",
+          stream,
+          recordCount: blobBacked.length,
+          blocker:
+            "This scope/stream has no verified mapping from blob bytes to its legacy fields.",
+        }),
+      };
+    }
+    for (const row of blobBacked) {
+      let ref;
+      try {
+        ref = claudeBlobReference(row.data);
+      } catch (error) {
+        if (!(error instanceof ClaudeSourceRecordError)) throw error;
+        return {
+          ok: false,
+          result: unavailable({
+            reason: "blob_backed_record_invalid",
+            detail: error.message,
+          }),
+        };
+      }
+      const prior = blobContents.get(ref.blobId);
+      const meta = prior?.meta ?? store.getBlobMeta?.(ref.blobId);
+      if (!meta)
+        return {
+          ok: false,
+          result: unavailable({
+            reason: "blob_backed_record_invalid",
+            detail: "blob_missing_or_corrupt",
+          }),
+        };
+      if (
+        meta.blobId !== ref.blobId ||
+        meta.mimeType !== "application/json" ||
+        meta.sizeBytes !== ref.size ||
+        meta.sha256 !== ref.sha256
+      ) {
+        return {
+          ok: false,
+          result: unavailable({
+            reason: "blob_backed_record_invalid",
+            detail: "blob_metadata_mismatch",
+          }),
+        };
+      }
+      if (prior) continue;
+      const sum = requiredBytes + ref.size;
+      // Never accumulate an inexact integer, even for a refused request.
+      if (!Number.isSafeInteger(sum)) {
+        return {
+          ok: false,
+          result: unavailable({
+            reason: "blob_read_budget_exceeded",
+            maxBytes: blobByteBudget,
+          }),
+        };
+      }
+      requiredBytes = sum;
+      blobContents.set(ref.blobId, { meta: { ...meta }, bytes: undefined });
+    }
+  }
+  if (requiredBytes > blobByteBudget) {
+    return {
+      ok: false,
+      result: unavailable({
+        reason: "blob_read_budget_exceeded",
+        requiredBytes,
+        maxBytes: blobByteBudget,
+      }),
+    };
+  }
+  for (const [blobId, contents] of blobContents) {
+    const bytes = store.getBlobBytes?.(blobId);
+    if (!bytes)
+      return {
+        ok: false,
+        result: unavailable({
+          reason: "blob_backed_record_invalid",
+          detail: "blob_missing_or_corrupt",
+        }),
+      };
+    if (bytes.byteLength !== contents.meta?.sizeBytes) {
+      return {
+        ok: false,
+        result: unavailable({
+          reason: "blob_backed_record_invalid",
+          detail: "blob_metadata_mismatch",
+        }),
+      };
+    }
+    contents.bytes = bytes.slice();
   }
   return {
     ok: true,
@@ -492,23 +605,6 @@ async function projectSnapshot(
   const sourceRowCounts = Object.fromEntries(
     streams.map((stream) => [stream, rowsByStream.get(stream)?.length ?? 0]),
   );
-
-  if (
-    completions.size === 0 &&
-    listingBefore.every((entry) => entry.recordCount === 0)
-  ) {
-    return unavailable({ reason: "no_synced_data" });
-  }
-  const unprovenEmpty = streams.filter(
-    (stream) =>
-      (rowsByStream.get(stream)?.length ?? 0) === 0 && !completions.has(stream),
-  );
-  if (unprovenEmpty.length > 0) {
-    return unavailable({
-      reason: "stream_completion_unknown",
-      streams: unprovenEmpty,
-    });
-  }
 
   const expanded = [];
   const canExpandClaude =

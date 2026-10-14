@@ -130,6 +130,14 @@ export async function decodeClaudeSourceRecord(
   // Multipart project metadata can omit docs; the canonical document stream
   // then supplies the detail. A missing conversation body is not an empty chat.
   const separateDocuments = stream === "projects" && payload.docs === undefined;
+  // The source parser emits [] for omitted docs. A present nonempty/malformed
+  // declared summary cannot describe this metadata-only source record.
+  if (
+    separateDocuments &&
+    Object.hasOwn(row.data, "raw_docs") &&
+    (!Array.isArray(row.data.raw_docs) || row.data.raw_docs.length !== 0)
+  )
+    reject("parent_blob_conflict");
   if (!separateDocuments && !Array.isArray(payload[childKey]))
     reject("source_children_unknown");
   const rawChildren = separateDocuments ? [] : (payload[childKey] as unknown[]);
