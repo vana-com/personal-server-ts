@@ -474,6 +474,196 @@ describe("legacy scope view over the real SQLite record store", () => {
     );
   });
 
+  it("does not take over a first legacy head inserted after an unreceipted row snapshot", async () => {
+    connect(store, "conn_a", "oura");
+    ingest(store, "conn_a", "uncompleted", "2026-09-10T07:00:00.000Z");
+    let inserted = false;
+    const racing = {
+      ...store,
+      readSnapshot<T>(read: () => T): T {
+        const snapshot = store.readSnapshot(read);
+        if (!inserted) {
+          inserted = true;
+          db.prepare(
+            "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+          ).run(
+            "oura/activity/concurrent.json",
+            "oura.activity",
+            "2026-01-01T00:00:00.000Z",
+            12,
+          );
+        }
+        return snapshot;
+      },
+    };
+    const racingView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: racing,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+    });
+    expect((await racingView.readLatest("oura.activity")).kind).not.toBe(
+      "canonical",
+    );
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(db.prepare("SELECT path FROM data_files").all()).toEqual([
+      { path: "oura/activity/concurrent.json" },
+    ]);
+  });
+
+  it("does not take over a legacy head that changes after a receipted row snapshot", async () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-01-01T00:00:00.000Z",
+      12,
+    );
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    let inserted = false;
+    const racing = {
+      ...store,
+      readSnapshot<T>(read: () => T): T {
+        const snapshot = store.readSnapshot(read);
+        if (!inserted) {
+          inserted = true;
+          db.prepare(
+            "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+          ).run(
+            "oura/activity/new.json",
+            "oura.activity",
+            "2026-02-01T00:00:00.000Z",
+            12,
+          );
+        }
+        return snapshot;
+      },
+    };
+    const racingView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: racing,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+    });
+
+    expect((await racingView.readLatest("oura.activity")).kind).toBe("file");
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+    expect(
+      db.prepare("SELECT path FROM data_files ORDER BY path").all(),
+    ).toEqual([
+      { path: "oura/activity/new.json" },
+      { path: "oura/activity/old.json" },
+    ]);
+  });
+
+  it("refuses when another account appears after a receipted projection snapshot", async () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-01-01T00:00:00.000Z",
+      12,
+    );
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    let inserted = false;
+    const racing = {
+      ...store,
+      readSnapshot<T>(read: () => T): T {
+        const snapshot = store.readSnapshot(read);
+        if (!inserted) {
+          inserted = true;
+          connect(store, "conn_b", "oura");
+          ingest(store, "conn_b", "other-account", "2026-09-10T07:00:00.000Z");
+        }
+        return snapshot;
+      },
+    };
+    const racingView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: racing,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+    });
+    expect((await racingView.readLatest("oura.activity")).kind).toBe("refused");
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+  });
+
+  it("does not expose a deleted connection's legacy data when an empty live connection exists", async () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-01-01T00:00:00.000Z",
+      12,
+    );
+    connect(store, "conn_a", "oura");
+    store.deleteConnection("conn_a");
+    connect(store, "conn_b", "oura");
+    expect((await view.readLatest("oura.activity")).kind).toBe("refused");
+    expect(view.listingFor("oura.activity")).toEqual({ kind: "refused" });
+  });
+
+  it("keeps legacy reads and listing after a reset before first takeover", async () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-01-01T00:00:00.000Z",
+      12,
+    );
+    connect(store, "conn_a", "oura");
+    store.resetInstanceBinding({
+      instance: "conn_a",
+      expectedMethod: "oura",
+      expectedGeneration: 1,
+      nextMethod: "oura",
+    });
+    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
+    expect(view.ownsScope("oura.activity")).toBe(true);
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+  });
+
+  it("refuses legacy fallback after reset has erased a successful takeover", async () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-01-01T00:00:00.000Z",
+      12,
+    );
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+    expect(
+      db.prepare("SELECT * FROM legacy_scope_takeovers").all(),
+    ).not.toEqual([]);
+
+    store.resetInstanceBinding({
+      instance: "conn_a",
+      expectedMethod: "oura",
+      expectedGeneration: 1,
+      nextMethod: "oura",
+    });
+
+    expect((await view.readLatest("oura.activity")).kind).toBe("refused");
+    expect(view.listingFor("oura.activity")).toEqual({ kind: "refused" });
+    expect(view.ownsScope("oura.activity")).toBe(true);
+  });
+
   it("does not classify an explicitly produced legacy row as an old connector file", async () => {
     db.prepare(
       `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
