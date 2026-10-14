@@ -26,7 +26,7 @@ import {
   type PdppRecordStore,
   type PdppStoredRecord,
   type StreamListing,
-} from "./pdpp-records/index.js";
+} from "./pdpp-records/portable.js";
 
 /**
  * Read-time legacy view over canonical PDPP records.

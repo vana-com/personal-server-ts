@@ -167,6 +167,30 @@
     "./write": {
       "types": "./dist/write/index.d.ts",
       "import": "./dist/write/index.js"
+    },
+    "./storage/pdpp-records/portable": {
+      "types": "./dist/storage/pdpp-records/portable.d.ts",
+      "import": "./dist/storage/pdpp-records/portable.js"
+    },
+    "./storage/pdpp-records/completion": {
+      "types": "./dist/storage/pdpp-records/completion.d.ts",
+      "import": "./dist/storage/pdpp-records/completion.js"
+    },
+    "./storage/pdpp-records/schema": {
+      "types": "./dist/storage/pdpp-records/schema.d.ts",
+      "import": "./dist/storage/pdpp-records/schema.js"
+    },
+    "./storage/pdpp-records/memory": {
+      "types": "./dist/storage/pdpp-records/memory-store.d.ts",
+      "import": "./dist/storage/pdpp-records/memory-store.js"
+    },
+    "./legacy-projection": {
+      "types": "./dist/legacy-projection/index.d.ts",
+      "import": "./dist/legacy-projection/index.js"
+    },
+    "./storage/legacy-projection": {
+      "types": "./dist/legacy-projection/index.d.ts",
+      "import": "./dist/legacy-projection/index.js"
     }
   },
   "scripts": {
@@ -175,6 +199,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@opendatalabs/vana-sdk": "3.23.0-pr.211.36da1d8",
+    "ajv2020": "npm:ajv@^8.20.0",
     "minisearch": "^7.2.0",
     "unpdf": "^1.6.2",
     "viem": "^2.54.2",
