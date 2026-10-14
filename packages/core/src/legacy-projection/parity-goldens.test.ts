@@ -5,7 +5,7 @@
  * both produced from the same upstream responses (see parity-oracle/). The
  * projection must reproduce that body except for the reviewed differences
  * the golden lists, and must validate against the pinned legacy schema.
- * Shop/Spotify/LinkedIn/Instagram/YouTube/Grocery expectations are current binding output,
+ * Shop/Spotify/LinkedIn/Instagram/YouTube/Grocery and MISC_SCOPES expectations are current binding output,
  * not captured legacy-connector output; passing does not establish legacy parity.
  * Social fixtures separately expose synthetic consumer-contract differences.
  */
@@ -41,6 +41,8 @@ interface Golden {
     legacySchemaNote?: string;
     outputContractNote?: string;
     behaviorNote?: string;
+    legacySchemaComparison?: string;
+    inputHandling?: string;
   };
   fetchedStreams: string[];
   streams: Record<string, Record<string, unknown>[]>;
@@ -81,6 +83,19 @@ const GROCERY_SCOPES = [
   "wholefoods.orders",
   "wholefoods.nutrition",
 ];
+// Current-binding regressions at the 71a43bce cutover pin.
+const MISC_SCOPES = [
+  "github.repositories",
+  "github.starred",
+  "github.history",
+  "icloud_notes.folders",
+  "icloud_notes.notes",
+  "linkedin.skills",
+  "linkedin.languages",
+  "linkedin.connections",
+  "instagram.following",
+  "instagram.ads",
+];
 const SCOPES = [
   "chatgpt.conversations",
   "chatgpt.memories",
@@ -98,6 +113,7 @@ const SCOPES = [
   ...SOCIAL_SCOPES,
   ...YOUTUBE_SCOPES,
   ...GROCERY_SCOPES,
+  ...MISC_SCOPES,
 ];
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -196,6 +212,33 @@ function expectGoldenBody(golden: Golden, payload: Record<string, unknown>) {
   }
 }
 
+function expectMiscProvenance(golden: Golden) {
+  expect(golden.provenance.legacyConnector).toMatch(
+    /^current binding output, not captured legacy-connector output; (github\.(repositories|starred|history)|icloud_notes\.(notes|folders)|linkedin\.(skills|languages|connections)|instagram\.(following|ads)|chatgpt\.memories) from packages\/core\/src\/legacy-projection\/bindings\.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665$/,
+  );
+  expect(golden.provenance.pdppBundle).toMatch(
+    /^synthetic (github\.(repositories|starred|history)|icloud_notes\.(notes|folders)|linkedin\.(skills|languages|connections)|instagram\.(following|ads)|chatgpt\.memories) records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed$/,
+  );
+  expect(golden.provenance.legacyConnector).toContain(
+    "; " + golden.scope + " from ",
+  );
+  expect(golden.provenance.pdppBundle).toContain(
+    "synthetic " + golden.scope + " records ",
+  );
+  expect(golden.provenance.expectedSideNote).toBe(
+    "current binding output, not captured legacy-connector output",
+  );
+  expect(golden.provenance.outputKeysAndTypes).toBeTruthy();
+  expect(golden.provenance.legacySchemaComparison).toBe(
+    "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+  );
+  expect(golden.case).toBe("normal");
+  expect(golden.reviewedDifferences).toEqual([]);
+  expect(golden.profileKey).toBe(
+    golden.scope.startsWith("instagram.") ? "meta" : undefined,
+  );
+}
+
 describe.each(SCOPES)("%s golden projection contract", (scope) => {
   const golden = load(scope);
 
@@ -213,6 +256,8 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
         /^(chatgpt-4\.0\.0-vana\.1\.js|claude-export-playwright\.js) .* sha256:[0-9a-f]{64}$/,
       );
       expect(golden.provenance.pdppBundle).toMatch(/sha256:[0-9a-f]{64}$/);
+    } else if (MISC_SCOPES.includes(scope)) {
+      expectMiscProvenance(golden);
     } else if (scope.startsWith("github.")) {
       expect(golden.provenance.legacyConnector).toMatch(
         /^frozen github-playwright 1\.5\.1; archive sha256:[0-9a-f]{64}; script\.js sha256:[0-9a-f]{64}; expected output and PDPP record source: .*github-browser-parity-fixtures\.ts at unity-surfaces commit [0-9a-f]{40} sha256:[0-9a-f]{64}$/,
@@ -369,6 +414,7 @@ describe.each([
   ...SOCIAL_SCOPES,
   ...YOUTUBE_SCOPES,
   ...GROCERY_SCOPES,
+  ...MISC_SCOPES,
 ])("%s current-binding empty and dirty-row regressions", (scope) => {
   const golden = load(scope);
 
@@ -673,5 +719,52 @@ describe("ChatGPT edge-case parity observations", () => {
       result.ok &&
         (result.payload.conversations as { id: string }[]).map(({ id }) => id),
     ).toEqual(["newer", "older"]);
+  });
+});
+
+// Keep the existing captured chatgpt.memories golden and its provenance intact.
+describe("chatgpt.memories supplementary current-binding goldens", () => {
+  const golden = load("chatgpt.memories.edges");
+
+  it("records the separate current-binding provenance and required cases", () => {
+    expect(golden.scope).toBe("chatgpt.memories");
+    expectMiscProvenance(golden);
+    expect(golden.cases?.map((entry) => entry.case)).toEqual([
+      "empty",
+      "dirty-row",
+    ]);
+  });
+
+  describe.each([golden, ...(golden.cases ?? [])])("$case", (entry) => {
+    it.each([
+      ["source order", false],
+      ["primary-key order", true],
+    ])("matches the traced memory output (%s)", (_label, orderByPrimaryKey) => {
+      expect(entry.scope).toBe(golden.scope);
+      expect(entry.provenance).toEqual(golden.provenance);
+      expect(entry.profileKey).toBeUndefined();
+      expect(entry.reviewedDifferences).toEqual([]);
+      expect(entry.expectedResult).toBeUndefined();
+      const result = projectPdppRecordsToLegacyPayload(
+        entry.scope,
+        records(entry),
+        {
+          fetchedStreams: entry.fetchedStreams,
+          now: ORACLE_CLOCK,
+          orderByPrimaryKey,
+        },
+      );
+      expect(result).toEqual({ ok: true, payload: entry.legacyBody });
+      if (!result.ok) return;
+      expectGoldenBody(entry, result.payload);
+      expect(Object.keys(result.payload)).toEqual(
+        Object.keys(entry.legacyBody!),
+      );
+      const validate = ajv.compile(schemaFor(entry.scope));
+      expect(
+        validate(result.payload),
+        JSON.stringify(validate.errors, null, 2),
+      ).toBe(true);
+    });
   });
 });
