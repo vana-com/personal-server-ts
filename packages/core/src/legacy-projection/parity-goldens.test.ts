@@ -1,9 +1,12 @@
 /**
- * Parity with the real legacy connectors. Each golden pairs the PDPP streams
+ * Captured connector parity and explicitly labelled binding regression goldens.
+ * Captured goldens pair the PDPP streams
  * a PDPP bundle stored with the body the frozen legacy connector delivered,
  * both produced from the same upstream responses (see parity-oracle/). The
  * projection must reproduce that body except for the reviewed differences
  * the golden lists, and must validate against the pinned legacy schema.
+ * Shop/Spotify expectations are current binding output, not captured
+ * legacy-connector output; their passing tests do not establish legacy parity.
  */
 
 import { createHash } from "node:crypto";
@@ -17,6 +20,12 @@ import type { PdppRecord } from "./types.js";
 interface Golden {
   scope: string;
   profileKey?: string;
+  case?: string;
+  cases?: Golden[];
+  expectedResult?: {
+    ok: false;
+    error: { kind: "empty_singleton"; scope: string };
+  };
   provenance: {
     legacyConnector: string;
     pdppBundle: string;
@@ -47,6 +56,9 @@ const SCOPES = [
   "oura.readiness",
   "oura.sleep",
   "oura.activity",
+  "shop.orders",
+  "spotify.profile",
+  "spotify.playlists",
 ];
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -93,7 +105,7 @@ function payloadSha256(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
 }
 
-describe.each(SCOPES)("%s parity with the legacy connector", (scope) => {
+describe.each(SCOPES)("%s golden projection contract", (scope) => {
   const golden = load(scope);
 
   it("records the legacy and fixture provenance", () => {
@@ -116,6 +128,18 @@ describe.each(SCOPES)("%s parity with the legacy connector", (scope) => {
       );
       expect(golden.provenance.pdppBundle).toMatch(
         /^github-browser 0\.2\.0 snapshots from PDP-Connect\/data-connectors commit [0-9a-f]{40}; frozen inputs recorded in github-browser-parity-fixtures\.ts; provenance source: .*github-browser-parity-fixtures\.ts at unity-surfaces commit [0-9a-f]{40} sha256:[0-9a-f]{64}; read-time projection source: personal-server-ts commit [0-9a-f]{40}; fixture source sha256:[0-9a-f]{64}$/,
+      );
+    } else if (
+      ["shop.orders", "spotify.profile", "spotify.playlists"].includes(scope)
+    ) {
+      expect(golden.provenance.legacyConnector).toMatch(
+        /^current binding output, not captured legacy-connector output; (shop\.orders|spotify\.(profile|playlists)) from packages\/core\/src\/legacy-projection\/bindings\.ts at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553$/,
+      );
+      expect(golden.provenance.pdppBundle).toMatch(
+        /^synthetic (shop\.orders|spotify\.(profile|playlists)) records against vendored declarations at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553; no bundle executed$/,
+      );
+      expect(golden.provenance.expectedSideNote).toBe(
+        "current binding output, not captured legacy-connector output",
       );
     } else {
       expect(golden.provenance.legacyConnector).toMatch(
@@ -198,6 +222,73 @@ describe.each(SCOPES)("%s parity with the legacy connector", (scope) => {
     }
   });
 });
+
+describe.each(["shop.orders", "spotify.profile", "spotify.playlists"])(
+  "%s current-binding empty and dirty-row regressions",
+  (scope) => {
+    const golden = load(scope);
+
+    it("includes both required edge cases", () => {
+      expect(golden.cases?.map((entry) => entry.case)).toEqual([
+        "empty",
+        "dirty-row",
+      ]);
+    });
+
+    describe.each(golden.cases ?? [])("$case", (edge) => {
+      it("retains the explicitly non-legacy provenance", () => {
+        expect(edge.scope).toBe(scope);
+        expect(edge.provenance).toEqual(golden.provenance);
+        expect(edge.reviewedDifferences).toEqual([]);
+      });
+
+      it.each([
+        ["source order", false],
+        ["primary-key order", true],
+      ])(
+        "matches the traced binding result (%s)",
+        (_label, orderByPrimaryKey) => {
+          const result = projectPdppRecordsToLegacyPayload(
+            scope,
+            records(edge),
+            {
+              fetchedStreams: edge.fetchedStreams,
+              now: ORACLE_CLOCK,
+              orderByPrimaryKey,
+            },
+          );
+
+          if (scope === "spotify.profile" && edge.case === "empty") {
+            const expected = {
+              ok: false,
+              error: { kind: "empty_singleton", scope: "spotify.profile" },
+            };
+            expect(edge.expectedResult).toEqual(expected);
+            expect(edge.legacyBody).toBeUndefined();
+            expect(result).toEqual(expected);
+            return;
+          }
+
+          expect(edge.expectedResult).toBeUndefined();
+          expect(edge.legacyBody).toBeDefined();
+          expect(result.ok).toBe(true);
+          if (!result.ok) return;
+          expect(result.diagnostics).toBeUndefined();
+          expect(result.payload).toEqual(edge.legacyBody);
+          expect(diffBodies(edge.legacyBody, result.payload)).toEqual([]);
+          expect(Object.keys(result.payload)).toEqual(
+            Object.keys(edge.legacyBody!),
+          );
+          const validate = ajv.compile(schemaFor(scope));
+          expect(
+            validate(result.payload),
+            JSON.stringify(validate.errors, null, 2),
+          ).toBe(true);
+        },
+      );
+    });
+  },
+);
 
 describe("the parity diff", () => {
   const conversations = [{ id: "a" }, { id: "b" }, { id: "c" }];
