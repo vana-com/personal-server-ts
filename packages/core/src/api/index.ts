@@ -105,6 +105,12 @@ export interface PersonalServerReadAuthInput {
    * x402 challenge/settlement to the exact version served, not the latest.
    */
   at?: string;
+  /**
+   * The read serves no block values, only a scope's table of contents (block
+   * ids, paths, sizes). Grant policy still applies; payment-enforcing auth
+   * ports do not charge it, the same way search is free discovery.
+   */
+  metadataOnly?: boolean;
 }
 
 export interface PersonalServerReadAuthResult {
