@@ -323,6 +323,56 @@ describe("POST /v1/records/completions", () => {
     expect(chunked.status).toBe(413);
     expect(inspect((db) => dumpState(db))).toEqual(before);
   });
+
+  it("keeps a P7 receipt only under the opt-in policy, with real owner tokens", async () => {
+    const token = await ownerToken(CLAUDE);
+    const replace = (body: Record<string, unknown>) =>
+      fetch(
+        `${baseUrl}/v1/streams/profile/records/replace?method=claude&binding_generation=1`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            instance: claudeInstance(),
+            emitted_at: "2026-09-02T00:00:00Z",
+            records: [
+              {
+                key: "p",
+                data: { id: "p", name: "a" },
+                emitted_at: "2026-09-01T00:00:00Z",
+              },
+            ],
+            ...body,
+          }),
+        },
+      );
+    const receipts = () => inspect((db) => dumpState(db).receipts);
+
+    expect((await replace({ source_collected_at: T1 })).status).toBe(200);
+    const stored = receipts();
+    expect(stored).toHaveLength(1);
+
+    expect(
+      (await replace({ completion_policy: "preserve_if_unchanged" })).status,
+    ).toBe(200);
+    expect(receipts()).toEqual(stored);
+
+    expect(
+      (
+        await replace({
+          completion_policy: "preserve_if_unchanged",
+          source_collected_at: T1,
+        })
+      ).status,
+    ).toBe(400);
+    expect(receipts()).toEqual(stored);
+
+    expect((await replace({})).status).toBe(200);
+    expect(receipts()).toEqual([]);
+  });
 });
 
 /** Every table the completion route must leave alone, plus the receipts. */

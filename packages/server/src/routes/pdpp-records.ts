@@ -1584,6 +1584,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           instance,
           emitted_at: emittedAt,
           source_collected_at: sourceCollectedAt,
+          completion_policy: completionPolicy,
           records,
         } = body;
         if (
@@ -1605,6 +1606,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           throw new PdppError(
             "invalid_request",
             "source_collected_at must be an RFC 3339 date-time",
+          );
+        }
+        if (
+          completionPolicy !== undefined &&
+          (completionPolicy !== "preserve_if_unchanged" ||
+            sourceCollectedAt !== undefined)
+        ) {
+          throw new PdppError(
+            "invalid_request",
+            'completion_policy must be "preserve_if_unchanged" and cannot be sent with source_collected_at',
           );
         }
         const ownedInstances = ownerInstances(context!);
@@ -1641,6 +1652,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           primaryKey: declaration.primaryKey,
           validateData,
           ...(sourceCollectedAt === undefined ? {} : { sourceCollectedAt }),
+          ...(completionPolicy === undefined
+            ? {}
+            : { completionPolicy: "preserve_if_unchanged" as const }),
           envelopes: records.map((entry) => {
             const e = (
               entry !== null && typeof entry === "object" ? entry : {}

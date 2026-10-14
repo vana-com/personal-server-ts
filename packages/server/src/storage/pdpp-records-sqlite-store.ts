@@ -545,6 +545,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     primaryKey: string[];
     validateData?: RecordDataValidator;
     sourceCollectedAt?: string;
+    completionPolicy?: "preserve_if_unchanged";
   }): ReplaceStreamResult;
   /** Completion receipts of one instance, as stored. */
   listStreamCompletions(instance: string): StreamCompletionReceipt[];
@@ -844,12 +845,20 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     primaryKey: string[];
     validateData?: RecordDataValidator;
     sourceCollectedAt?: string;
+    completionPolicy?: "preserve_if_unchanged";
   }): ReplaceStreamResult {
     if (
       input.sourceCollectedAt !== undefined &&
       !isRfc3339DateTime(input.sourceCollectedAt)
     ) {
       throw new TypeError("invalid_source_collected_at");
+    }
+    if (
+      input.completionPolicy !== undefined &&
+      (input.completionPolicy !== "preserve_if_unchanged" ||
+        input.sourceCollectedAt !== undefined)
+    ) {
+      throw new TypeError("invalid_completion_policy");
     }
     return db.transaction((): ReplaceStreamResult => {
       checkInstanceBinding(input.instance, input.method, input.generation);
@@ -918,6 +927,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         return { ...summary, applied: false, deleted: 0 };
       }
 
+      const preserved = input.completionPolicy
+        ? validReceiptOfUnchangedSet(input, writes.length, seen)
+        : false;
+
       for (const write of writes) {
         writeVersion(
           input.instance,
@@ -951,7 +964,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       for (const recordKey of snapshotOrder) {
         noteArrival(input.instance, input.stream, recordKey, input.generation);
       }
-      dropCompletionStmt.run(input.instance, input.stream);
+      if (!preserved) dropCompletionStmt.run(input.instance, input.stream);
       if (input.sourceCollectedAt !== undefined) {
         db.prepare(
           `INSERT INTO pdpp_stream_completion
@@ -975,6 +988,68 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       }
       return { ...summary, applied: true, deleted: missing.length };
     })();
+  }
+
+  // Under `preserve_if_unchanged`: true when this replace writes nothing to
+  // the stream's rows, no live key is missing from the snapshot, and the
+  // stream's current receipt still describes the live set. The receipt is then
+  // left as stored. Changed content is judged by `planIngest` (`writes` is
+  // empty only when every snapshot key is live and equal), and a retained
+  // extra key shows up as a live key the snapshot lacks. Anything else,
+  // including a stale or tampered receipt, returns false and the caller drops
+  // the receipt as P7 always has.
+  function validReceiptOfUnchangedSet(
+    input: {
+      instance: string;
+      stream: string;
+      method: string;
+      generation: number;
+      primaryKey: string[];
+    },
+    writeCount: number,
+    seen: Set<string>,
+  ): boolean {
+    if (writeCount > 0) return false;
+    const rows = db
+      .prepare(
+        "SELECT record_key, data FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+      )
+      .all(input.instance, input.stream) as {
+      record_key: string;
+      data: string;
+    }[];
+    if (rows.some((row) => !seen.has(row.record_key))) return false;
+    const prior = db
+      .prepare(
+        "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+      )
+      .get(input.instance, input.stream) as CompletionRowDb | undefined;
+    if (!prior) return false;
+    const binding = db
+      .prepare("SELECT source_id FROM pdpp_instance_binding WHERE instance = ?")
+      .get(input.instance) as { source_id: string };
+    try {
+      return receiptInvariantsHold(prior, {
+        method: input.method,
+        generation: input.generation,
+        liveCount: rows.length,
+        clock: readWriteClock(),
+        lastChange: lastChangeSeq(input.instance, input.stream),
+        digest: () =>
+          liveSnapshotDigest(
+            { ...input, sourceId: binding.source_id },
+            input.primaryKey,
+            rows.map((row) => ({
+              recordKey: row.record_key,
+              dataJson: row.data,
+            })),
+          ),
+      });
+    } catch (error) {
+      // A live set the digest cannot describe cannot match a native receipt.
+      if (error instanceof StreamCompletionError) return false;
+      throw error;
+    }
   }
 
   function checkBinding(
@@ -1186,6 +1261,52 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     collection_time_basis: string | null;
   };
 
+  function lastChangeSeq(instance: string, stream: string): number {
+    return (
+      db
+        .prepare(
+          "SELECT COALESCE(MAX(written_at), 0) AS seq FROM pdpp_record_changes WHERE instance = ? AND stream = ?",
+        )
+        .get(instance, stream) as { seq: number }
+    ).seq;
+  }
+
+  /**
+   * Whether a stored receipt still describes the live set it was written
+   * for. It never compares the write clock to the global one: unrelated
+   * writes move that without touching this stream.
+   */
+  function receiptInvariantsHold(
+    prior: CompletionRowDb,
+    expected: {
+      method: string;
+      generation: number;
+      liveCount: number;
+      clock: number;
+      lastChange: number;
+      /** The digest of the current live set, asked for only by a native receipt. */
+      digest: () => string;
+    },
+  ): boolean {
+    const native = prior.snapshot_sha256 !== null;
+    return (
+      prior.method === expected.method &&
+      prior.generation === expected.generation &&
+      prior.live_count === expected.liveCount &&
+      Number.isSafeInteger(prior.write_seq) &&
+      prior.write_seq >= 0 &&
+      prior.write_seq <= expected.clock &&
+      prior.write_seq >= expected.lastChange &&
+      (native
+        ? isCompletionTime(prior.source_collected_at)
+        : isRfc3339DateTime(prior.source_collected_at)) &&
+      native === (prior.collection_time_basis !== null) &&
+      (!native ||
+        (prior.snapshot_sha256 === expected.digest() &&
+          prior.collection_time_basis === "host_run_finished"))
+    );
+  }
+
   function completeStreams(
     rawRequest: StreamCompletionRequest,
     declarations: StreamDeclarationResolver,
@@ -1262,29 +1383,16 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           }
           // A receipt is deleted by every write that could invalidate it, so a
           // stored one that disagrees with the live data was tampered with.
-          const lastChange = (
-            db
-              .prepare(
-                "SELECT COALESCE(MAX(written_at), 0) AS seq FROM pdpp_record_changes WHERE instance = ? AND stream = ?",
-              )
-              .get(request.instance, proof.stream) as { seq: number }
-          ).seq;
           const native = prior.snapshot_sha256 !== null;
           if (
-            prior.method !== request.method ||
-            prior.generation !== request.generation ||
-            prior.live_count !== rows.length ||
-            !Number.isSafeInteger(prior.write_seq) ||
-            prior.write_seq < 0 ||
-            prior.write_seq > clock ||
-            prior.write_seq < lastChange ||
-            !(native
-              ? isCompletionTime(prior.source_collected_at)
-              : isRfc3339DateTime(prior.source_collected_at)) ||
-            native !== (prior.collection_time_basis !== null) ||
-            (native &&
-              (prior.snapshot_sha256 !== digest ||
-                prior.collection_time_basis !== request.collectionTimeBasis))
+            !receiptInvariantsHold(prior, {
+              method: request.method,
+              generation: request.generation,
+              liveCount: rows.length,
+              clock,
+              lastChange: lastChangeSeq(request.instance, proof.stream),
+              digest: () => digest,
+            })
           ) {
             throw new StreamCompletionError("invalid_prior_receipt");
           }
