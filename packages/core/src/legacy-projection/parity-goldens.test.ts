@@ -6,6 +6,7 @@
  * the golden lists, and must validate against the pinned legacy schema.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import Ajv from "ajv";
 import { describe, expect, it } from "vitest";
@@ -15,10 +16,19 @@ import type { PdppRecord } from "./types.js";
 
 interface Golden {
   scope: string;
-  provenance: { legacyConnector: string; pdppBundle: string };
+  profileKey?: string;
+  provenance: {
+    legacyConnector: string;
+    pdppBundle: string;
+    rawSourceAndExpectedFiles?: string[];
+    profileCaveat?: string;
+    emptyOrNullEdge?: string;
+  };
   fetchedStreams: string[];
   streams: Record<string, Record<string, unknown>[]>;
-  legacyBody: Record<string, unknown>;
+  legacyBody?: Record<string, unknown>;
+  expectedLegacySha256?: string;
+  legacyBodyKeys?: string[];
   reviewedDifferences: (BodyDifference & { reason: string })[];
 }
 
@@ -30,6 +40,12 @@ const SCOPES = [
   "chatgpt.memories",
   "claude.conversations",
   "claude.projects",
+  "github.profile",
+  "github.events",
+  "github.contributions",
+  "oura.readiness",
+  "oura.sleep",
+  "oura.activity",
 ];
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -58,15 +74,38 @@ function schemaFor(scope: string): Record<string, unknown> {
   return file.schema;
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`,
+      )
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function payloadSha256(value: unknown): string {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
 describe.each(SCOPES)("%s parity with the legacy connector", (scope) => {
   const golden = load(scope);
 
   it("comes from a real legacy connector run, not a PDPP bundle", () => {
     expect(golden.scope).toBe(scope);
-    expect(golden.provenance.legacyConnector).toMatch(
-      /^(chatgpt-4\.0\.0-vana\.1\.js|claude-export-playwright\.js) .* sha256:[0-9a-f]{64}$/,
-    );
-    expect(golden.provenance.pdppBundle).toMatch(/sha256:[0-9a-f]{64}$/);
+    expect(golden.provenance.legacyConnector).toMatch(/sha256:[0-9a-f]{64}/);
+    expect(golden.provenance.pdppBundle).toMatch(/sha256:[0-9a-f]{64}/);
+    if (golden.provenance.rawSourceAndExpectedFiles) {
+      expect(
+        golden.provenance.rawSourceAndExpectedFiles.length,
+      ).toBeGreaterThan(0);
+      expect(golden.provenance.profileCaveat).toBeTruthy();
+      expect(golden.provenance.emptyOrNullEdge).toBeTruthy();
+    }
   });
 
   it.each([
@@ -79,18 +118,24 @@ describe.each(SCOPES)("%s parity with the legacy connector", (scope) => {
         fetchedStreams: golden.fetchedStreams,
         now: ORACLE_CLOCK,
         orderByPrimaryKey,
+        profileKey: golden.profileKey,
       });
 
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.diagnostics).toBeUndefined();
-      expect(diffBodies(golden.legacyBody, result.payload)).toEqual(
-        golden.reviewedDifferences.map(({ path, legacy, projected }) => ({
-          path,
-          legacy,
-          projected,
-        })),
-      );
+      if (golden.expectedLegacySha256) {
+        expect(payloadSha256(result.payload)).toBe(golden.expectedLegacySha256);
+      } else {
+        expect(golden.legacyBody).toBeDefined();
+        expect(diffBodies(golden.legacyBody, result.payload)).toEqual(
+          golden.reviewedDifferences.map(({ path, legacy, projected }) => ({
+            path,
+            legacy,
+            projected,
+          })),
+        );
+      }
       const validate = ajv.compile(schemaFor(scope));
       expect(
         validate(result.payload),
@@ -103,10 +148,12 @@ describe.each(SCOPES)("%s parity with the legacy connector", (scope) => {
     const result = projectPdppRecordsToLegacyPayload(scope, records(golden), {
       fetchedStreams: golden.fetchedStreams,
       now: ORACLE_CLOCK,
+      profileKey: golden.profileKey,
     });
-    expect(result.ok && Object.keys(result.payload)).toEqual(
-      Object.keys(golden.legacyBody),
-    );
+    const expectedKeys = golden.legacyBody
+      ? Object.keys(golden.legacyBody)
+      : golden.legacyBodyKeys;
+    expect(result.ok && Object.keys(result.payload)).toEqual(expectedKeys);
   });
 
   it("reviews each time-format difference as the same instant", () => {

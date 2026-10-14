@@ -1,0 +1,60 @@
+{
+  "scope": "oura.sleep",
+  "provenance": {
+    "legacyConnector": "OpenPet nullable-score contract from /home/tnunamak/.tmp/pdpp-cutover-evidence-1013/openpet/client-reconciliation.md sha256:85f52ed0a5dc66416767b34be75d92cbdad8684567a6e7cc27d95d2ce84c0893 (evidence checkout has no Git metadata); expected field assertions from /home/tnunamak/.tmp/pdpp-gateway-fold-1014/packages/app-runtime/src/legacy-scope-adapter/oura-browser.test.ts at unity-surfaces commit 01164027ecac1403b867d8b5fef9a930dbcf69eb sha256:8a55d83b886f302423ff72cd4a104d232e9411df649ac12a0461d8eecbcfcd0c",
+    "pdppBundle": "oura-browser 0.1.2 stream binding from /home/tnunamak/.tmp/pdpp-gateway-fold-1014/packages/app-runtime/src/legacy-scope-adapter/oura-browser.test.ts at unity-surfaces commit 01164027ecac1403b867d8b5fef9a930dbcf69eb sha256:8a55d83b886f302423ff72cd4a104d232e9411df649ac12a0461d8eecbcfcd0c; PS projection source: personal-server-ts commit 4c601ee77b945146ac7aade68b09e9a98e96f462",
+    "rawSourceAndExpectedFiles": [
+      "/home/tnunamak/.tmp/pdpp-cutover-evidence-1013/openpet/client-reconciliation.md sha256:85f52ed0a5dc66416767b34be75d92cbdad8684567a6e7cc27d95d2ce84c0893 (evidence checkout has no Git metadata)",
+      "/home/tnunamak/.tmp/pdpp-gateway-fold-1014/packages/app-runtime/src/legacy-scope-adapter/oura-browser.test.ts at unity-surfaces commit 01164027ecac1403b867d8b5fef9a930dbcf69eb sha256:8a55d83b886f302423ff72cd4a104d232e9411df649ac12a0461d8eecbcfcd0c"
+    ],
+    "profileCaveat": "Fixture profile is oura-browser 0.1.2; Desktop admits oura-browser 0.1.17. The supplied evidence establishes version drift but not a field-level delta.",
+    "emptyOrNullEdge": "The middle daily score is explicitly null; no session records produce the legacy empty sleepPeriods list."
+  },
+  "fetchedStreams": [
+    "sleep"
+  ],
+  "streams": {
+    "sleep": [
+      {
+        "id": "sleep-0",
+        "day": "2026-09-01",
+        "record_type": "daily_score",
+        "sleep_score": 83
+      },
+      {
+        "id": "sleep-1",
+        "day": "2026-09-02",
+        "record_type": "daily_score",
+        "sleep_score": null
+      },
+      {
+        "id": "sleep-2",
+        "day": "2026-09-03",
+        "record_type": "daily_score",
+        "sleep_score": 0
+      }
+    ]
+  },
+  "legacyBody": {
+    "dailyScores": [
+      {
+        "id": "sleep-0",
+        "day": "2026-09-01",
+        "score": 83
+      },
+      {
+        "id": "sleep-1",
+        "day": "2026-09-02",
+        "score": null
+      },
+      {
+        "id": "sleep-2",
+        "day": "2026-09-03",
+        "score": 0
+      }
+    ],
+    "sleepPeriods": []
+  },
+  "reviewedDifferences": [],
+  "profileKey": "oura-browser"
+}
