@@ -35,7 +35,7 @@
     "pdppBundle": "synthetic wholefoods.profile records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
     "expectedSideNote": "current binding output, not captured legacy-connector output",
     "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
-    "legacySchemaNote": "Frozen LEGACY schema unavailable in this checkout; owner comparison pending. Desktop schemas are not used as a substitute. These current-binding regressions do not certify legacy compatibility.",
+    "legacySchemaNote": "Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, apps/desktop/connectors/wholefoods/schemas/wholefoods.profile.json; sha256:53643cbb7f783a759691ad7eb25c06d41a4d6e245bde0e948fbccf2e60379bf1.",
     "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.name\":\"string\",\"$.email\":\"string\"},\"empty\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\"},\"dirty-row\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\",\"$.error.reason\":\"string\"}}",
     "behaviorNote": "Malformed non-null profile names fail closed; empty fetched profile is empty_singleton. Failure cases have no payload."
   },
@@ -62,7 +62,7 @@
         "pdppBundle": "synthetic wholefoods.profile records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
         "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
-        "legacySchemaNote": "Frozen LEGACY schema unavailable in this checkout; owner comparison pending. Desktop schemas are not used as a substitute. These current-binding regressions do not certify legacy compatibility.",
+        "legacySchemaNote": "Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, apps/desktop/connectors/wholefoods/schemas/wholefoods.profile.json; sha256:53643cbb7f783a759691ad7eb25c06d41a4d6e245bde0e948fbccf2e60379bf1.",
         "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.name\":\"string\",\"$.email\":\"string\"},\"empty\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\"},\"dirty-row\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\",\"$.error.reason\":\"string\"}}",
         "behaviorNote": "Malformed non-null profile names fail closed; empty fetched profile is empty_singleton. Failure cases have no payload."
       }
@@ -96,7 +96,7 @@
         "pdppBundle": "synthetic wholefoods.profile records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
         "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
-        "legacySchemaNote": "Frozen LEGACY schema unavailable in this checkout; owner comparison pending. Desktop schemas are not used as a substitute. These current-binding regressions do not certify legacy compatibility.",
+        "legacySchemaNote": "Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, apps/desktop/connectors/wholefoods/schemas/wholefoods.profile.json; sha256:53643cbb7f783a759691ad7eb25c06d41a4d6e245bde0e948fbccf2e60379bf1.",
         "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.name\":\"string\",\"$.email\":\"string\"},\"empty\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\"},\"dirty-row\":{\"$\":\"object\",\"$.ok\":\"boolean\",\"$.error\":\"object\",\"$.error.kind\":\"string\",\"$.error.scope\":\"string\",\"$.error.reason\":\"string\"}}",
         "behaviorNote": "Malformed non-null profile names fail closed; empty fetched profile is empty_singleton. Failure cases have no payload."
       }

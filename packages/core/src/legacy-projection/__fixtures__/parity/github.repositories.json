@@ -6,7 +6,7 @@
     "pdppBundle": "synthetic github.repositories records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
     "expectedSideNote": "current binding output, not captured legacy-connector output",
     "outputKeysAndTypes": "{repositories: Array<{name:string,url:string,description:string,language:string,stars:number,forks:number,visibility:string,topics:array,updatedAt:string|null}>}",
-    "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+    "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
     "inputHandling": "Input id is omitted; topics arrays pass through without element normalization."
   },
   "fetchedStreams": [
@@ -57,7 +57,7 @@
         "pdppBundle": "synthetic github.repositories records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
         "outputKeysAndTypes": "{repositories: Array<{name:string,url:string,description:string,language:string,stars:number,forks:number,visibility:string,topics:array,updatedAt:string|null}>}",
-        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
         "inputHandling": "Input id is omitted; topics arrays pass through without element normalization."
       },
       "fetchedStreams": [
@@ -79,7 +79,7 @@
         "pdppBundle": "synthetic github.repositories records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
         "outputKeysAndTypes": "{repositories: Array<{name:string,url:string,description:string,language:string,stars:number,forks:number,visibility:string,topics:array,updatedAt:string|null}>}",
-        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
         "inputHandling": "Input id is omitted; topics arrays pass through without element normalization."
       },
       "fetchedStreams": [
