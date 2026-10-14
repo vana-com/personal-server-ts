@@ -13,6 +13,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import Database from "better-sqlite3";
 import type {
   Builder,
   GatewayClient,
@@ -316,6 +317,118 @@ afterEach(async () => {
 });
 
 describe("GET /v1/data/:scope for a bound connector scope", () => {
+  it.each(["writer lock", "persistent insert trigger"])(
+    "retains a failed deletion observation through offline reads and file re-add (%s)",
+    async (failureMode) => {
+      let remote: "deleted" | "offline" | "live" = "deleted";
+      const getDataPoint = vi.fn(
+        async ({
+          ownerAddress,
+          scope,
+        }: {
+          ownerAddress: string;
+          scope: string;
+        }) => {
+          if (remote === "offline") throw new Error("gateway offline");
+          return {
+            id: "synthetic-point",
+            ownerAddress,
+            scope,
+            dataHash: `0x${(remote === "deleted" ? "00" : "11").repeat(32)}`,
+            metadataHash: `0x${(remote === "deleted" ? "00" : "11").repeat(32)}`,
+            expectedVersion: remote === "deleted" ? "1" : "2",
+            addedAt: "2026-09-01T00:00:00Z",
+            deletedAt: remote === "deleted" ? "2026-09-11T00:00:00Z" : null,
+          };
+        },
+      );
+      await ctx!.cleanup();
+      ctx = await boot("oura", {
+        dataPointFeed: {
+          getDataPoint,
+          listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+        },
+      });
+      const token = await ownerPdppToken();
+      await replace(
+        token,
+        "activity",
+        [day("before-deletion", "2026-09-10")],
+        "2026-09-10T06:00:00Z",
+      );
+      const nativeRows = async () => {
+        const response = await ctx!.app.request(
+          "/v1/streams/activity/records",
+          {
+            headers: { authorization: `Bearer ${token}` },
+          },
+        );
+        expect(response.status).toBe(200);
+        return response.json();
+      };
+      const before = await nativeRows();
+      const blocker = new Database(join(tempDir, "index.db"));
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        if (failureMode === "writer lock") blocker.exec("BEGIN IMMEDIATE");
+        else
+          blocker.exec(
+            `CREATE TRIGGER fail_history BEFORE INSERT ON vana_scope_deletion_history BEGIN SELECT RAISE(ABORT, 'synthetic metadata failure'); END;`,
+          );
+        const first = await ownerGet("/v1/data/oura.activity");
+        expect(first.status).toBe(500);
+        expect(first.text).not.toContain("before-deletion");
+        expect(getDataPoint).toHaveBeenCalledTimes(1);
+        if (blocker.inTransaction) blocker.exec("ROLLBACK");
+        remote = "offline";
+        const assertRefused = async () => {
+          const ownerRead = await ownerGet("/v1/data/oura.activity");
+          const builderRead = await builderGet("oura.activity");
+          expect(ownerRead.status).toBe(410);
+          expect(builderRead.status).toBe(410);
+          expect(ownerRead.text).not.toContain("before-deletion");
+          expect(builderRead.text).not.toContain("before-deletion");
+          const listing = await ownerGet("/v1/data");
+          expect(listing.status).toBe(200);
+          expect(JSON.parse(listing.text)).toMatchObject({
+            scopes: [],
+            total: 0,
+          });
+        };
+        await assertRefused();
+        await legacyWrite("oura.activity", {
+          days: [day("readded-file", "2026-09-15")],
+        });
+        const entry = ctx!.indexManager.findLatestByScope("oura.activity")!;
+        expect(entry.afterTombstoneVersion).toBe(1);
+        const historyPath = `/v1/data/oura.activity?at=${encodeURIComponent(entry.collectedAt)}`;
+        const historical = await ownerGet(historyPath);
+        expect(historical.status).toBe(200);
+        expect(ids(historical.text)).toEqual(["readded-file"]);
+        await assertRefused();
+
+        remote = "live";
+        vi.setSystemTime(Date.now() + 120_001);
+        await assertRefused();
+        expect(getDataPoint).toHaveBeenCalledTimes(2);
+        expect((await ownerGet(historyPath)).status).toBe(200);
+        expect(await nativeRows()).toEqual(before);
+        // The trigger variant remains unavailable throughout. Refusal is
+        // still authoritative even though no history write has succeeded.
+        expect(
+          blocker
+            .prepare("SELECT count(*) AS n FROM vana_scope_deletion_history")
+            .get(),
+        ).toEqual({ n: 0 });
+      } finally {
+        vi.useRealTimers();
+        if (blocker.inTransaction) blocker.exec("ROLLBACK");
+        blocker.close();
+      }
+    },
+    15_000,
+  );
+
   it.each(["1", "0", "9007199254740992"])(
     "does not let a file-only re-add resurrect deleted canonical data or discovery (tombstone %s)",
     async (tombstoneVersion) => {

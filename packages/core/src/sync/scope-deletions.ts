@@ -75,7 +75,7 @@ export interface ScopeDeletionResolveOptions {
  *     does.
  */
 export interface ScopeDeletionTracker {
-  /** Observed deletions retained independently of the registry's current file state. */
+  /** Durable or pending observations, independent of the registry's current file state. */
   readonly deletionHistory?: ScopeDeletionHistory;
   /**
    * Record a gateway tombstone for `scope`. `source` names who learned it
@@ -97,6 +97,8 @@ export interface ScopeDeletionTracker {
    * tombstones re-validated as of `at`. An incremental pass (`since` the
    * cursor) proves nothing about tombstones it did not list, so those keep
    * ageing and are re-checked at the gateway after `maxStalenessMs`.
+   * Retries pending history writes before recording completion. A storage
+   * error propagates and leaves the unsuccessful observations pending.
    */
   noteFeedSynced(at?: Date, options?: { full?: boolean }): void;
   /** Synchronous view: a known tombstone, or null when none is known. */
@@ -177,6 +179,31 @@ export function createScopeDeletionTracker(
   let lastGatewayFailureMs: number | null = null;
   // Coalesce concurrent lookups of the same scope into one request.
   const inflight = new Map<string, Promise<ScopeDeletionVerdict | null>>();
+  // A live file may clear `deleted`, but cannot clear an observed canonical
+  // refusal whose history write failed. Remove it only after persistence.
+  const pendingHistory = new Map<string, ScopeTombstone>();
+  const history = options.deletionHistory;
+
+  function persistPendingHistory(scope: string): void {
+    const tombstone = pendingHistory.get(scope);
+    if (!history || !tombstone) return;
+    history.remember(scope, tombstone);
+    pendingHistory.delete(scope);
+  }
+
+  const deletionHistory: ScopeDeletionHistory | undefined = history
+    ? {
+        remember(scope, tombstone) {
+          pendingHistory.set(scope, tombstone);
+          persistPendingHistory(scope);
+        },
+        get(scope) {
+          // Preserve durable-read errors and the existing durable fact when
+          // an update failed. Either fact is sufficient to refuse canonical.
+          return history.get(scope) ?? pendingHistory.get(scope) ?? null;
+        },
+      }
+    : undefined;
 
   function rememberLive(scope: string, at: number): void {
     deleted.delete(scope);
@@ -195,17 +222,17 @@ export function createScopeDeletionTracker(
     tombstone: ScopeTombstone,
     source: KnownTombstone["source"],
   ): void {
-    options.deletionHistory?.remember(scope, {
+    const normalized = {
       deletedAt: tombstone.deletedAt,
       version: normalizeVersion(tombstone.version),
-    });
+    };
     deleted.set(scope, {
-      deletedAt: tombstone.deletedAt,
-      version: normalizeVersion(tombstone.version),
+      ...normalized,
       source,
       verifiedAtMs: nowMs(),
     });
     live.delete(scope);
+    deletionHistory?.remember(scope, normalized);
   }
 
   function isFresh(at: number | null): boolean {
@@ -279,7 +306,7 @@ export function createScopeDeletionTracker(
 
   return {
     maxStalenessMs,
-    deletionHistory: options.deletionHistory,
+    deletionHistory,
 
     markDeleted(scope, tombstone, source = "feed") {
       rememberDeleted(scope, tombstone, source);
@@ -290,6 +317,9 @@ export function createScopeDeletionTracker(
     },
 
     noteFeedSynced(at, options) {
+      // One attempt per pending scope per completed feed pass, including
+      // live/empty passes after the gateway has stopped listing a deletion.
+      for (const scope of pendingHistory.keys()) persistPendingHistory(scope);
       lastFeedSyncMs = (at ?? now()).getTime();
       if (!options?.full) return;
       // A full listing would have shown any re-add as a live row (and marked
