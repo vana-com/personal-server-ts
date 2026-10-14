@@ -23,6 +23,7 @@ interface Golden {
     rawSourceAndExpectedFiles?: string[];
     profileCaveat?: string;
     emptyOrNullEdge?: string;
+    expectedSideNote?: string;
   };
   fetchedStreams: string[];
   streams: Record<string, Record<string, unknown>[]>;
@@ -95,10 +96,38 @@ function payloadSha256(value: unknown): string {
 describe.each(SCOPES)("%s parity with the legacy connector", (scope) => {
   const golden = load(scope);
 
-  it("comes from a real legacy connector run, not a PDPP bundle", () => {
+  it("records the legacy and fixture provenance", () => {
     expect(golden.scope).toBe(scope);
-    expect(golden.provenance.legacyConnector).toMatch(/sha256:[0-9a-f]{64}/);
-    expect(golden.provenance.pdppBundle).toMatch(/sha256:[0-9a-f]{64}/);
+    if (
+      [
+        "chatgpt.conversations",
+        "chatgpt.memories",
+        "claude.conversations",
+        "claude.projects",
+      ].includes(scope)
+    ) {
+      expect(golden.provenance.legacyConnector).toMatch(
+        /^(chatgpt-4\.0\.0-vana\.1\.js|claude-export-playwright\.js) .* sha256:[0-9a-f]{64}$/,
+      );
+      expect(golden.provenance.pdppBundle).toMatch(/sha256:[0-9a-f]{64}$/);
+    } else if (scope.startsWith("github.")) {
+      expect(golden.provenance.legacyConnector).toMatch(
+        /^frozen github-playwright 1\.5\.1; archive sha256:[0-9a-f]{64}; script\.js sha256:[0-9a-f]{64}; expected output and PDPP record source: .*github-browser-parity-fixtures\.ts at unity-surfaces commit [0-9a-f]{40} sha256:[0-9a-f]{64}$/,
+      );
+      expect(golden.provenance.pdppBundle).toMatch(
+        /^github-browser 0\.2\.0 snapshots from PDP-Connect\/data-connectors commit [0-9a-f]{40}; frozen inputs recorded in github-browser-parity-fixtures\.ts; provenance source: .*github-browser-parity-fixtures\.ts at unity-surfaces commit [0-9a-f]{40} sha256:[0-9a-f]{64}; read-time projection source: personal-server-ts commit [0-9a-f]{40}; fixture source sha256:[0-9a-f]{64}$/,
+      );
+    } else {
+      expect(golden.provenance.legacyConnector).toMatch(
+        /^OpenPet nullable-score contract from .*\/client-reconciliation\.md sha256:[0-9a-f]{64} \(evidence checkout has no Git metadata\); expected field assertions from .*\/oura-browser\.test\.ts at unity-surfaces commit [0-9a-f]{40} sha256:[0-9a-f]{64}$/,
+      );
+      expect(golden.provenance.pdppBundle).toMatch(
+        /^oura-browser 0\.1\.2 stream binding from .*\/oura-browser\.test\.ts at unity-surfaces commit [0-9a-f]{40} sha256:[0-9a-f]{64}; PS projection source: personal-server-ts commit [0-9a-f]{40}; fixture source sha256:[0-9a-f]{64}$/,
+      );
+      expect(golden.provenance.expectedSideNote).toBe(
+        "OpenPet-shaped expectation from Desktop's oura-browser test, not a captured legacy-connector output.",
+      );
+    }
     if (golden.provenance.rawSourceAndExpectedFiles) {
       expect(
         golden.provenance.rawSourceAndExpectedFiles.length,
