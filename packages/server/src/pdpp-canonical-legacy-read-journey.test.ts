@@ -33,7 +33,11 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import { createServer, type ServerContext } from "./bootstrap.js";
+import {
+  createServer,
+  type CreateServerOptions,
+  type ServerContext,
+} from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const KNOWN_SIG =
@@ -126,11 +130,18 @@ function grant(): GatewayGrantResponse {
 interface BootOptions {
   declaration?: string;
   payment?: boolean;
+  dataPointFeed?: CreateServerOptions["dataPointFeed"];
+  pdppEnabled?: boolean;
 }
 
 async function boot(
   methodId = "oura",
-  { declaration = OURA_DECLARATION, payment = false }: BootOptions = {},
+  {
+    declaration = OURA_DECLARATION,
+    payment = false,
+    dataPointFeed,
+    pdppEnabled = true,
+  }: BootOptions = {},
 ) {
   const dir = join(tempDir, "declarations");
   await mkdir(dir, { recursive: true });
@@ -152,7 +163,7 @@ async function boot(
       tunnel: { enabled: false },
       payment: { enabled: payment },
       pdpp: {
-        enabled: true,
+        enabled: pdppEnabled,
         declarationPaths: [path],
         methods: [{ method_id: methodId, declaration_path: path }],
       },
@@ -161,6 +172,7 @@ async function boot(
       serverDir: tempDir,
       dataDir: join(tempDir, "data"),
       gatewayClient: gateway,
+      ...(dataPointFeed ? { dataPointFeed } : {}),
     },
   );
 }
@@ -304,6 +316,181 @@ afterEach(async () => {
 });
 
 describe("GET /v1/data/:scope for a bound connector scope", () => {
+  it.each(["1", "0", "9007199254740992"])(
+    "does not let a file-only re-add resurrect deleted canonical data or discovery (tombstone %s)",
+    async (tombstoneVersion) => {
+      let deleted = false;
+      let registeredFile = false;
+      let offline = false;
+      const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+        getDataPoint: async ({ ownerAddress, scope }) => {
+          if (offline) throw new Error("gateway offline");
+          return deleted
+            ? {
+                id: "synthetic-point",
+                ownerAddress,
+                scope,
+                dataHash: `0x${(registeredFile ? "11" : "00").repeat(32)}`,
+                metadataHash: `0x${(registeredFile ? "11" : "00").repeat(32)}`,
+                expectedVersion: registeredFile
+                  ? tombstoneVersion === "9007199254740992"
+                    ? "9007199254740993"
+                    : "2"
+                  : tombstoneVersion,
+                addedAt: "2026-09-01T00:00:00Z",
+                deletedAt: registeredFile ? null : "2026-09-11T00:00:00Z",
+              }
+            : null;
+        },
+      };
+      await ctx!.cleanup();
+      ctx = await boot("oura", { dataPointFeed });
+      let token = await ownerPdppToken();
+      await replace(
+        token,
+        "activity",
+        [day("before-deletion", "2026-09-10")],
+        "2026-09-10T06:00:00Z",
+      );
+      const nativeRows = async () => {
+        const response = await ctx!.app.request(
+          "/v1/streams/activity/records",
+          {
+            headers: { authorization: `Bearer ${token}` },
+          },
+        );
+        expect(response.status).toBe(200);
+        return response.json();
+      };
+      const before = await nativeRows();
+      deleted = true;
+      expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
+
+      await legacyWrite("oura.activity", {
+        days: [day("readded-file", "2026-09-15")],
+      });
+      const entry = ctx!.indexManager.findLatestByScope("oura.activity")!;
+      expect(entry.afterTombstoneVersion).toBe(
+        tombstoneVersion === "1" ? 1 : null,
+      );
+      expect(await nativeRows()).toEqual(before);
+
+      const ownerRead = await ownerGet("/v1/data/oura.activity");
+      const builderRead = await builderGet("oura.activity");
+      expect.soft(ownerRead.status).toBe(410);
+      expect.soft(builderRead.status).toBe(410);
+      expect.soft(ownerRead.text).not.toContain("before-deletion");
+      expect.soft(builderRead.text).not.toContain("before-deletion");
+      const listing = await ownerGet("/v1/data");
+      expect(listing.status).toBe(200);
+      expect
+        .soft(JSON.parse(listing.text))
+        .toMatchObject({ scopes: [], total: 0 });
+
+      const history = await ownerGet(
+        `/v1/data/oura.activity?at=${encodeURIComponent(entry.collectedAt)}`,
+      );
+      // Unknown/unsafe tombstones cannot authorize even the file's re-add
+      // until the registry actually reports that file live.
+      expect(history.status).toBe(tombstoneVersion === "1" ? 200 : 410);
+      if (history.status === 200)
+        expect(ids(history.text)).toEqual(["readded-file"]);
+
+      // Registering the file and restarting also gives no causal evidence
+      // that the old canonical records were re-added.
+      registeredFile = true;
+      await ctx!.cleanup();
+      ctx = await boot("oura", { dataPointFeed });
+      token = await ownerPdppToken();
+      expect(
+        ctx.indexManager.findLatestByScope("oura.activity")
+          ?.afterTombstoneVersion,
+      ).toBe(tombstoneVersion === "1" ? 1 : null);
+      expect(await nativeRows()).toEqual(before);
+      const afterRestart = await ownerGet("/v1/data/oura.activity");
+      const builderAfterRestart = await builderGet("oura.activity");
+      expect.soft(afterRestart.status).toBe(410);
+      expect.soft(builderAfterRestart.status).toBe(410);
+      expect.soft(afterRestart.text).not.toContain("before-deletion");
+      expect.soft(builderAfterRestart.text).not.toContain("before-deletion");
+      const listingAfterRestart = await ownerGet("/v1/data");
+      expect
+        .soft(JSON.parse(listingAfterRestart.text))
+        .toMatchObject({ scopes: [], total: 0 });
+      const historyAfterRestart = await ownerGet(
+        `/v1/data/oura.activity?at=${encodeURIComponent(entry.collectedAt)}`,
+      );
+      expect(historyAfterRestart.status).toBe(200);
+      expect(ids(historyAfterRestart.text)).toEqual(["readded-file"]);
+
+      offline = true;
+      await ctx!.cleanup();
+      ctx = await boot("oura", { dataPointFeed });
+      expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
+      expect((await builderGet("oura.activity")).status).toBe(410);
+      expect(JSON.parse((await ownerGet("/v1/data")).text)).toMatchObject({
+        scopes: [],
+        total: 0,
+      });
+      expect(
+        (
+          await ownerGet(
+            `/v1/data/oura.activity?at=${encodeURIComponent(entry.collectedAt)}`,
+          )
+        ).status,
+      ).toBe(200);
+    },
+  );
+
+  it("retains a deletion observed with PDPP disabled and no canonical rows without sticking ordinary files deleted", async () => {
+    let deleted = true;
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope }) => ({
+        id: "synthetic-point",
+        ownerAddress,
+        scope,
+        dataHash: `0x${(deleted ? "00" : "11").repeat(32)}`,
+        metadataHash: `0x${(deleted ? "00" : "11").repeat(32)}`,
+        expectedVersion: deleted ? "1" : "2",
+        addedAt: "2026-09-01T00:00:00Z",
+        deletedAt: deleted ? "2026-09-11T00:00:00Z" : null,
+      }),
+    };
+    await ctx!.cleanup();
+    ctx = await boot("oura", { dataPointFeed, pdppEnabled: false });
+    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
+    expect((await ownerGet("/v1/data/notes.manual")).status).toBe(410);
+    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("notes.manual", { text: "readded" });
+    // No canonical rows yet: the causally marked file remains readable.
+    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(200);
+    expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
+
+    deleted = false;
+    await ctx!.cleanup();
+    ctx = await boot("oura", { dataPointFeed });
+    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(200);
+    await legacyWrite("oura.readiness", { readiness: [] });
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("canonical-without-readd", "2026-09-10")],
+      "2026-09-10T06:00:00Z",
+    );
+    expect((await ownerGet("/v1/data/oura.activity")).status).toBe(410);
+    expect((await builderGet("oura.activity")).status).toBe(410);
+    expect((await ownerGet("/v1/data/notes.manual")).status).toBe(200);
+    expect((await ownerGet("/v1/data/oura.readiness")).status).toBe(200);
+    expect(
+      JSON.parse((await ownerGet("/v1/data")).text).scopes.map(
+        (row: { scope: string }) => row.scope,
+      ),
+    ).toEqual(["notes.manual", "oura.readiness"]);
+  });
+
   it("serves the canonical rows, not a stale legacy file, to a legacy grant and to the owner", async () => {
     await legacyWrite("oura.activity", STALE);
     const token = await ownerPdppToken();

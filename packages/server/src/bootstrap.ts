@@ -74,6 +74,7 @@ import {
 } from "./pdpp/records-bootstrap.js";
 import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
+import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
@@ -541,6 +542,9 @@ export async function createServer(
     feed: dataPointFeed,
     serverOwner,
     logger,
+    deletionHistory: serverOwner
+      ? createScopeDeletionHistory(db, serverOwner)
+      : undefined,
   });
 
   // --- Derivative compute (question -> derivative) ---

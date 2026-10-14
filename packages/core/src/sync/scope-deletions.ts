@@ -75,6 +75,8 @@ export interface ScopeDeletionResolveOptions {
  *     does.
  */
 export interface ScopeDeletionTracker {
+  /** Observed deletions retained independently of the registry's current file state. */
+  readonly deletionHistory?: ScopeDeletionHistory;
   /**
    * Record a gateway tombstone for `scope`. `source` names who learned it
    * (default "feed"; the delete worker passes "local-delete").
@@ -115,7 +117,14 @@ export interface ScopeTombstone {
   version: string | null;
 }
 
+/** Owner-partitioned metadata supplied by the runtime, never projected data. */
+export interface ScopeDeletionHistory {
+  remember(scope: string, tombstone: ScopeTombstone): void;
+  get(scope: string): ScopeTombstone | null;
+}
+
 export interface ScopeDeletionTrackerOptions {
+  deletionHistory?: ScopeDeletionHistory;
   /** Deletion-aware registry lookup for on-demand checks. Optional: without it the tracker only knows what it is told. */
   feed?: DataPointFeedPort;
   /** Data owner used for on-demand lookups. Optional for the same reason. */
@@ -186,6 +195,10 @@ export function createScopeDeletionTracker(
     tombstone: ScopeTombstone,
     source: KnownTombstone["source"],
   ): void {
+    options.deletionHistory?.remember(scope, {
+      deletedAt: tombstone.deletedAt,
+      version: normalizeVersion(tombstone.version),
+    });
     deleted.set(scope, {
       deletedAt: tombstone.deletedAt,
       version: normalizeVersion(tombstone.version),
@@ -237,13 +250,13 @@ export function createScopeDeletionTracker(
     const pending = inflight.get(scope);
     if (pending) return pending;
     const request = (async () => {
+      let record: DataPointFeedRecord | null;
       try {
-        const record = await feed.getDataPoint({
+        record = await feed.getDataPoint({
           ownerAddress: owner,
           scope,
         });
         lastGatewayFailureMs = null;
-        return verdictFromRecord(scope, record);
       } catch (err) {
         lastGatewayFailureMs = nowMs();
         options.logger?.warn?.(
@@ -255,16 +268,18 @@ export function createScopeDeletionTracker(
           "Could not check gateway deletion state; serving last known state",
         );
         return null;
-      } finally {
-        inflight.delete(scope);
       }
-    })();
+      // Persistence failures must propagate. Treating them as a network
+      // outage could answer assumed-live before the deletion is recorded.
+      return verdictFromRecord(scope, record);
+    })().finally(() => inflight.delete(scope));
     inflight.set(scope, request);
     return request;
   }
 
   return {
     maxStalenessMs,
+    deletionHistory: options.deletionHistory,
 
     markDeleted(scope, tombstone, source = "feed") {
       rememberDeleted(scope, tombstone, source);

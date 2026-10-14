@@ -6,6 +6,7 @@ import {
   deletionTimestamp,
   isEntryCoveredByTombstone,
   tombstoneVersion,
+  type ScopeTombstone,
 } from "./scope-deletions.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "./tombstone.js";
 
@@ -63,6 +64,45 @@ function makeTracker(options: {
 }
 
 describe("scope deletion tracker", () => {
+  it("retains deletion history independently of a live file and tracker restart", async () => {
+    const facts = new Map<string, ScopeTombstone>();
+    const deletionHistory = {
+      remember: (scope: string, tombstone: ScopeTombstone) => {
+        facts.set(scope, tombstone);
+      },
+      get: (scope: string) => facts.get(scope) ?? null,
+    };
+    const tracker = createScopeDeletionTracker({ deletionHistory });
+    tracker.markDeleted(SCOPE, TOMB);
+    tracker.markLive(SCOPE);
+    expect(tracker.knownDeletion(SCOPE)).toBeNull();
+    await expect(tracker.resolve(SCOPE)).resolves.toMatchObject({
+      deleted: false,
+    });
+    const restarted = createScopeDeletionTracker({ deletionHistory });
+    expect(restarted.deletionHistory?.get(SCOPE)).toEqual(TOMB);
+    expect(restarted.deletionHistory?.get("other.scope")).toBeNull();
+  });
+
+  it("does not turn failed deletion persistence into an assumed-live verdict", async () => {
+    const tracker = createScopeDeletionTracker({
+      serverOwner: OWNER,
+      feed: {
+        getDataPoint: async () => record({ deletedAt: DELETED_AT }),
+        listDataPointsByOwner: vi.fn(),
+      },
+      deletionHistory: {
+        get: () => null,
+        remember: () => {
+          throw new Error("metadata unavailable");
+        },
+      },
+    });
+    await expect(tracker.resolve(SCOPE)).rejects.toThrow(
+      "metadata unavailable",
+    );
+  });
+
   it("answers a known tombstone synchronously, without a gateway lookup", async () => {
     const { tracker, getDataPoint } = makeTracker({ remote: record() });
     tracker.markDeleted(SCOPE, TOMB);
