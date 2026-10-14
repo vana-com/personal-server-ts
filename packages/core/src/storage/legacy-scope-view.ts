@@ -20,6 +20,7 @@ import {
   type CanonicalLegacyReadFailure,
   type CanonicalLegacyReadOk,
   type CanonicalLegacyReadStore,
+  CANONICAL_LEGACY_VIEW_CONTRACT,
 } from "./canonical-legacy-projection.js";
 
 /**
@@ -54,7 +55,21 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 3;
+const COVERAGE_RULE_VERSION = 4;
+
+function scopeDeclarationCursor(scope: string): string {
+  return JSON.stringify(
+    BINDING_PROFILES.flatMap((profile) => [...profile.values()])
+      .filter((binding) => binding.scope === scope)
+      .map((binding) => ({
+        pdppSource: binding.pdppSource,
+        pdppStreams: binding.pdppStreams,
+        primaryKey: binding.primaryKey,
+        fieldsRead: binding.fieldsRead,
+        provenance: binding.provenance,
+      })),
+  );
+}
 
 /**
  * Registry facts and takeover diagnostics from the same SQLite database as
@@ -75,16 +90,17 @@ export interface LegacyScopeAuthority {
   readSnapshot<T>(read: () => T): T;
   writeClock(): number;
   /** Whether a complete canonical read has already superseded the legacy head. */
-  hasTakeover(scope: string, instance?: string): boolean;
+  hasTakeover(scope: string, instance?: string, generation?: number): boolean;
   hasCoveredHead(
     scope: string,
     head: LegacyScopeHead,
-    instance: string,
+    instance?: string,
   ): boolean;
   isReset(scope: string): boolean;
   cachedVerdict(
     scope: string,
     instance: string,
+    generation: number,
     legacyVersionId: number,
     canonicalCursor: string,
   ): LegacyCoverageVerdict | null;
@@ -103,6 +119,7 @@ export interface LegacyScopeAuthority {
     selectionIsCurrent: () => boolean,
     verdict?: {
       instance: string;
+      generation: number;
       writeClock: number;
       canonicalCursor: string;
       coverage: LegacyCoverageVerdict;
@@ -114,6 +131,7 @@ export interface LegacyScopeAuthority {
 export interface LegacyScopeVerdictRecord {
   scope: string;
   instance: string;
+  generation: number;
   legacyVersionId: number;
   canonicalCursor: string;
   verdict: "covered" | "not_covered";
@@ -229,6 +247,10 @@ export function createLegacyScopeView(
   input: CreateLegacyScopeViewInput,
 ): LegacyScopeViewPort {
   const { authority, records } = input;
+  const coveredProjection = new Map<
+    string,
+    { key: string; envelope: DataFileEnvelope; revision: string }
+  >();
 
   function decide(scope: string): Decision {
     const streamsByMethod = scopeMethods(scope);
@@ -326,6 +348,7 @@ export function createLegacyScopeView(
       !authority.hasTakeover(
         scope,
         current.kind === "canonical" ? current.selection.instance : undefined,
+        current.kind === "canonical" ? current.generation : undefined,
       )
     );
   }
@@ -338,6 +361,7 @@ export function createLegacyScopeView(
       const hasTakeover = authority.hasTakeover(
         scope,
         decision.kind === "canonical" ? decision.selection.instance : undefined,
+        decision.kind === "canonical" ? decision.generation : undefined,
       );
       if (
         decision.kind === "refused" &&
@@ -355,13 +379,10 @@ export function createLegacyScopeView(
           .find(
             (row) =>
               row.instance === decision.selection.instance &&
+              row.generation === decision.generation &&
               row.legacyVersionId === legacyHead.id,
           );
-        const coveredHead = authority.hasCoveredHead(
-          scope,
-          legacyHead,
-          decision.selection.instance,
-        );
+        const coveredHead = authority.hasCoveredHead(scope, legacyHead);
         if (verdict?.verdict !== "covered") {
           return { kind: coveredHead ? "refused" : "file" };
         }
@@ -405,6 +426,7 @@ export function createLegacyScopeView(
             decision.kind === "canonical"
               ? decision.selection.instance
               : undefined,
+            decision.kind === "canonical" ? decision.generation : undefined,
           ),
           canServeLegacy: canServeLegacyBeforeTakeover(scope),
           writeClock: authority.writeClock(),
@@ -422,6 +444,137 @@ export function createLegacyScopeView(
         return { kind: "file" };
       }
       if (decision.kind !== "canonical") return decision;
+      const canonicalCursor = legacyHead
+        ? [
+            initial.writeClock,
+            initial.receiptCursor,
+            decision.generation,
+            CANONICAL_LEGACY_VIEW_CONTRACT,
+            scopeDeclarationCursor(scope),
+            COVERAGE_RULE_VERSION,
+            input.coverageThresholds?.maxPayloadRatio ?? 1.5,
+            input.coverageThresholds?.maxExtraBytes ?? 256 * 1024,
+          ].join(":")
+        : "";
+      const projectionKey = legacyHead
+        ? JSON.stringify([
+            decision.selection.instance,
+            decision.generation,
+            legacyHead.id,
+            canonicalCursor,
+          ])
+        : "";
+      const projectionOwner = scope;
+      const cachedCoverage =
+        legacyHead !== null && input.readLegacyHead
+          ? authority.cachedVerdict(
+              scope,
+              decision.selection.instance,
+              decision.generation,
+              legacyHead.id,
+              canonicalCursor,
+            )
+          : null;
+      const cachedProjection = coveredProjection.get(projectionOwner);
+      if (cachedCoverage?.covered && cachedProjection?.key === projectionKey) {
+        const confirmed = authority.confirmRead(
+          scope,
+          legacyHead,
+          () =>
+            sameSelection(decide(scope), decision) &&
+            receiptCursor(decision) === initial.receiptCursor,
+          {
+            instance: decision.selection.instance,
+            generation: decision.generation,
+            writeClock: initial.writeClock,
+            canonicalCursor,
+            coverage: cachedCoverage,
+            cached: true,
+          },
+        );
+        if (!confirmed) {
+          if (authority.isReset(scope)) return { kind: "file" };
+          return {
+            kind: "refused",
+            refusal: {
+              status: "unavailable",
+              reason: "store_inconsistent_read",
+              detail:
+                "legacy head or canonical cursor changed during parity evaluation",
+            },
+          };
+        }
+        return {
+          kind: "canonical",
+          envelope: cachedProjection.envelope,
+          revision: cachedProjection.revision,
+        };
+      }
+      if (cachedCoverage && !cachedCoverage.covered && legacyHead) {
+        let legacy: DataFileEnvelope;
+        try {
+          legacy = await input.readLegacyHead!(legacyHead);
+        } catch {
+          return hasTakeover
+            ? {
+                kind: "refused",
+                refusal: {
+                  status: "unavailable",
+                  reason: "store_inconsistent_read",
+                  detail: "indexed legacy head could not be read",
+                },
+              }
+            : { kind: "file" };
+        }
+        if (legacy.scope !== scope) {
+          return {
+            kind: "refused",
+            refusal: {
+              status: "unavailable",
+              reason: "store_inconsistent_read",
+              detail: "indexed legacy head has another scope",
+            },
+          };
+        }
+        const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
+        const confirmed = authority.confirmRead(
+          scope,
+          legacyHead,
+          () =>
+            sameSelection(decide(scope), decision) &&
+            receiptCursor(decision) === initial.receiptCursor,
+          {
+            instance: decision.selection.instance,
+            generation: decision.generation,
+            writeClock: initial.writeClock,
+            canonicalCursor,
+            coverage: cachedCoverage,
+            cached: true,
+          },
+        );
+        if (!confirmed) {
+          if (authority.isReset(scope)) return { kind: "file" };
+          return {
+            kind: "refused",
+            refusal: {
+              status: "unavailable",
+              reason: "store_inconsistent_read",
+              detail:
+                "legacy head or canonical cursor changed during parity evaluation",
+            },
+          };
+        }
+        return alreadyCovered
+          ? {
+              kind: "refused",
+              refusal: {
+                status: "incomplete",
+                reason: "canonical_view_incomplete",
+                diagnostics: [],
+              },
+            }
+          : { kind: "file" };
+      }
       const read = await readCanonicalLegacyScope({
         store: decision.records,
         scope,
@@ -459,11 +612,7 @@ export function createLegacyScopeView(
               },
             };
           }
-          const coveredHead = authority.hasCoveredHead(
-            scope,
-            legacyHead,
-            decision.selection.instance,
-          );
+          const coveredHead = authority.hasCoveredHead(scope, legacyHead);
           const coverage = projectionUnavailableCoverage(legacy.data);
           const confirmed = authority.confirmRead(
             scope,
@@ -473,6 +622,7 @@ export function createLegacyScopeView(
               receiptCursor(decision) === initial.receiptCursor,
             {
               instance: decision.selection.instance,
+              generation: decision.generation,
               writeClock: initial.writeClock,
               canonicalCursor: `${initial.writeClock}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
               coverage,
@@ -480,6 +630,7 @@ export function createLegacyScopeView(
             },
           );
           if (!confirmed) {
+            if (authority.isReset(scope)) return { kind: "file" };
             return {
               kind: "refused",
               refusal: {
@@ -516,20 +667,7 @@ export function createLegacyScopeView(
         return { kind: "refused", refusal };
       }
       if (legacyHead !== null && input.readLegacyHead) {
-        const canonicalCursor = [
-          initial.writeClock,
-          initial.receiptCursor,
-          read.revision,
-          COVERAGE_RULE_VERSION,
-          input.coverageThresholds?.maxPayloadRatio ?? 1.5,
-          input.coverageThresholds?.maxExtraBytes ?? 256 * 1024,
-        ].join(":");
-        let coverage = authority.cachedVerdict(
-          scope,
-          decision.selection.instance,
-          legacyHead.id,
-          canonicalCursor,
-        );
+        let coverage = cachedCoverage;
         const cached = coverage !== null;
         if (!coverage) {
           let legacy: DataFileEnvelope;
@@ -575,11 +713,7 @@ export function createLegacyScopeView(
             ...input.coverageThresholds,
           });
         }
-        const alreadyCovered = authority.hasCoveredHead(
-          scope,
-          legacyHead,
-          decision.selection.instance,
-        );
+        const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
         const confirmed = authority.confirmRead(
           scope,
           legacyHead,
@@ -588,6 +722,7 @@ export function createLegacyScopeView(
             receiptCursor(decision) === initial.receiptCursor,
           {
             instance: decision.selection.instance,
+            generation: decision.generation,
             writeClock: initial.writeClock,
             canonicalCursor,
             coverage,
@@ -595,6 +730,7 @@ export function createLegacyScopeView(
           },
         );
         if (!confirmed) {
+          if (authority.isReset(scope)) return { kind: "file" };
           return {
             kind: "refused",
             refusal: {
@@ -608,7 +744,7 @@ export function createLegacyScopeView(
         if (!coverage.covered) {
           // A newer file is an explicit, recorded rollback. A canonical
           // regression against the same file must still refuse after takeover.
-          return hasTakeover && alreadyCovered
+          return alreadyCovered
             ? {
                 kind: "refused",
                 refusal: {
@@ -619,6 +755,11 @@ export function createLegacyScopeView(
               }
             : { kind: "file" };
         }
+        coveredProjection.set(projectionOwner, {
+          key: projectionKey,
+          envelope: read.envelope,
+          revision: read.revision,
+        });
         return {
           kind: "canonical",
           envelope: read.envelope,
@@ -650,6 +791,7 @@ export function createLegacyScopeView(
           hasTakeover: authority.hasTakeover(
             scope,
             decision.selection.instance,
+            decision.generation,
           ),
         }));
         if (current.canServeLegacy && !current.hasTakeover)

@@ -39,6 +39,7 @@ describe("initializeDatabase", () => {
     expect(columns.map((column) => column.name)).toEqual([
       "scope",
       "instance",
+      "generation",
       "superseded_version",
       "superseded_cas_revision",
       "superseded_collected_at",
@@ -71,13 +72,14 @@ describe("initializeDatabase", () => {
       expect(
         migrated
           .prepare(
-            "SELECT scope, instance, superseded_path FROM legacy_scope_takeovers",
+            "SELECT scope, instance, generation, superseded_path FROM legacy_scope_takeovers",
           )
           .all(),
       ).toEqual([
         {
           scope: "oura.activity",
           instance: "",
+          generation: 1,
           superseded_path: "oura/activity/old.json",
         },
       ]);
@@ -100,6 +102,10 @@ describe("initializeDatabase", () => {
       const path = join(dir, "index.db");
       const old = initializeDatabase(path);
       old.exec(`DROP TABLE legacy_scope_takeover_verdicts;
+        CREATE TABLE pdpp_instance_binding (
+          instance TEXT PRIMARY KEY, generation INTEGER NOT NULL
+        );
+        INSERT INTO pdpp_instance_binding VALUES ('owner-1', 3);
         CREATE TABLE legacy_scope_takeover_verdicts (
           scope TEXT NOT NULL, instance TEXT NOT NULL,
           legacy_version_id INTEGER NOT NULL, canonical_cursor TEXT NOT NULL,
@@ -118,16 +124,17 @@ describe("initializeDatabase", () => {
       expect(
         migrated
           .prepare(
-            "SELECT legacy_version_id, comparison_case, reason_counts_json, applied_exceptions_json FROM legacy_scope_takeover_verdicts",
+            "SELECT generation, legacy_version_id, comparison_case, reason_counts_json, applied_exceptions_json FROM legacy_scope_takeover_verdicts",
           )
           .get(),
       ).toEqual({
+        generation: 3,
         legacy_version_id: 42,
         comparison_case: "same_time",
         reason_counts_json: "{}",
         applied_exceptions_json: "[]",
       });
-      expect(migrated.pragma("user_version", { simple: true })).toBe(13);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(14);
       migrated.close();
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -209,7 +216,7 @@ describe("initializeDatabase", () => {
       .get("instagram/profile.json") as
       { path: string; scope: string; size_bytes: number } | undefined;
 
-    expect(version).toBe(13);
+    expect(version).toBe(14);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -265,7 +272,7 @@ describe("initializeDatabase", () => {
         }
       | undefined;
 
-    expect(version).toBe(13);
+    expect(version).toBe(14);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
@@ -314,7 +321,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(13);
+    expect(db.pragma("user_version", { simple: true })).toBe(14);
     const row = db
       .prepare(
         "SELECT path, schema_id, version, cas_revision, data_point_id FROM data_files WHERE path = ?",
@@ -374,7 +381,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(13);
+    expect(db.pragma("user_version", { simple: true })).toBe(14);
     const row = db
       .prepare(
         "SELECT path, version, cas_revision, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",
@@ -417,7 +424,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(13);
+    expect(db.pragma("user_version", { simple: true })).toBe(14);
     expect(
       db
         .prepare(

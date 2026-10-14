@@ -235,67 +235,80 @@ export function compareLegacyCoverage(
     if (Array.isArray(legacy)) {
       // Equal JSON types above establish that canonical is an array.
       if (!Array.isArray(canonical)) return;
-      if (legacy.length === 0) return;
-
-      if (legacy.some((item) => item !== null && typeof item === "object")) {
-        const fields = options.entityKeys?.[arrayPath] ?? schemaKeys(schema);
-        if (fields.length === 0) {
-          mark("no_stable_key", path);
+      const entityFields =
+        options.entityKeys?.[arrayPath] ?? schemaKeys(schema);
+      if (
+        legacy.length === 0 ||
+        legacy.some((item) => item !== null && typeof item === "object")
+      ) {
+        // There are no old entity keys to lose from an empty array. Newer
+        // entities are additions under the same rule as a nonempty array.
+        if (legacy.length === 0) {
+          if (entityFields.length > 0) return;
+        } else {
+          const fields = entityFields;
+          if (fields.length === 0) {
+            mark("no_stable_key", path);
+            return;
+          }
+          const legacyKeys = new Set<string>();
+          const canonicalPositions = new Map<string, number>();
+          for (const item of legacy) {
+            const key = stableKey(item, fields);
+            if (key === null || legacyKeys.has(key)) {
+              mark("no_stable_key", path);
+              return;
+            }
+            legacyKeys.add(key);
+          }
+          for (const [index, item] of canonical.entries()) {
+            const key = stableKey(item, fields);
+            if (key === null) continue;
+            if (canonicalPositions.has(key)) {
+              mark("no_stable_key", path);
+              return;
+            }
+            canonicalPositions.set(key, index);
+          }
+          let lastPosition = -1;
+          for (const [index, item] of legacy.entries()) {
+            const key = stableKey(item, fields);
+            // Every legacy key was checked above.
+            const position = canonicalPositions.get(key!);
+            if (position === undefined) {
+              missingEntityCount += 1;
+              mark("missing_entity", undefined, !deletionAllowed);
+              continue;
+            }
+            if (!options.canonicalNewer && position < lastPosition)
+              mark("array_order", path);
+            lastPosition = position;
+            compare(
+              item,
+              canonical[position],
+              `${path}[${index}]`,
+              `${arrayPath}[]`,
+              schema?.items,
+              undefined,
+              fields,
+            );
+          }
           return;
         }
-        const legacyKeys = new Set<string>();
-        const canonicalPositions = new Map<string, number>();
-        for (const item of legacy) {
-          const key = stableKey(item, fields);
-          if (key === null || legacyKeys.has(key)) {
-            mark("no_stable_key", path);
-            return;
-          }
-          legacyKeys.add(key);
-        }
-        for (const [index, item] of canonical.entries()) {
-          const key = stableKey(item, fields);
-          if (key === null) continue;
-          if (canonicalPositions.has(key)) {
-            mark("no_stable_key", path);
-            return;
-          }
-          canonicalPositions.set(key, index);
-        }
-        let lastPosition = -1;
-        for (const [index, item] of legacy.entries()) {
-          const key = stableKey(item, fields);
-          // Every legacy key was checked above.
-          const position = canonicalPositions.get(key!);
-          if (position === undefined) {
-            missingEntityCount += 1;
-            mark("missing_entity", undefined, !deletionAllowed);
-            continue;
-          }
-          if (!options.canonicalNewer && position < lastPosition)
-            mark("array_order", path);
-          lastPosition = position;
-          compare(
-            item,
-            canonical[position],
-            `${path}[${index}]`,
-            `${arrayPath}[]`,
-            schema?.items,
-            undefined,
-            fields,
-          );
-        }
+      }
+
+      if (legacy.length === 0) {
+        if (!options.canonicalNewer && canonical.length > 0)
+          mark("array_order", path);
         return;
       }
 
-      // Same-time scalar arrays retain values and order. Newer arrays may
-      // change values and order, but retain the type/format of each element.
+      // Scalar values have no identity key, so newer state must retain the
+      // legacy multiset. Same-time state must retain the exact sequence.
       const encoded = (value: unknown): string => {
         const timestampLike =
           (field !== undefined && isTimestampField(field)) ||
           isTimestampLikeValue(value);
-        if (options.canonicalNewer)
-          return `${jsonType(value)}:${timestampLike ? timestampFormat(value) : ""}`;
         if (timestampLike && timestampFormat(value) === "iso_datetime") {
           const milliseconds = Date.parse(value as string);
           if (Number.isFinite(milliseconds))
@@ -305,31 +318,85 @@ export function compareLegacyCoverage(
       };
       const available = canonical.map(encoded);
       const expected = legacy.map(encoded);
+      const expectedTypes = new Set(legacy.map(jsonType));
+      if (canonical.some((value) => !expectedTypes.has(jsonType(value)))) {
+        mark("type_mismatch", path);
+        return;
+      }
+      if (
+        field !== undefined &&
+        isTimestampField(field) &&
+        canonical.some((value) => {
+          const expectedFormats = new Set(legacy.map(timestampFormat));
+          return !expectedFormats.has(timestampFormat(value));
+        })
+      ) {
+        mark("timestamp_format", path);
+        return;
+      }
       const counts = new Map<string | undefined, number>();
       for (const item of available)
         counts.set(item, (counts.get(item) ?? 0) + 1);
-      let trulyMissing = 0;
-      for (const item of expected) {
+      let missingValues = 0;
+      let hadMissingValue = false;
+      for (const [index, item] of expected.entries()) {
         const count = counts.get(item) ?? 0;
-        if (count === 0) trulyMissing += 1;
-        else counts.set(item, count - 1);
+        if (count !== 0) {
+          counts.set(item, count - 1);
+          continue;
+        }
+        hadMissingValue = true;
+        missingValues += 1;
+        const legacyValue = legacy[index];
+        const hasTypeMismatch = canonical.some(
+          (value) => jsonType(value) !== jsonType(legacyValue),
+        );
+        const hasTimestampFormatMismatch = canonical.some(
+          (value) =>
+            jsonType(value) === jsonType(legacyValue) &&
+            ((field !== undefined && isTimestampField(field)) ||
+              isTimestampLikeValue(legacyValue) ||
+              isTimestampLikeValue(value)) &&
+            timestampFormat(value) !== timestampFormat(legacyValue),
+        );
+        if (hasTypeMismatch) {
+          mark("type_mismatch", path);
+          missingValues -= 1;
+        } else if (hasTimestampFormatMismatch) {
+          mark("timestamp_format", path);
+          missingValues -= 1;
+        } else if (field && isCreationField(field)) {
+          const normalizedPath = path.replace(/\[\d+\]/g, "[]");
+          const exception = LEGACY_COVERAGE_EXCEPTIONS.find(
+            (entry) =>
+              entry.scope === options.scope && entry.path === normalizedPath,
+          );
+          if (exception) {
+            appliedExceptions.set(normalizedPath, {
+              path: exception.path,
+              reason: exception.reason,
+              authority: exception.authority,
+            });
+          } else {
+            mark("creation_mismatch", path);
+          }
+          missingValues -= 1;
+        }
       }
-      if (trulyMissing > 0) {
-        missingEntityCount += trulyMissing;
-        mark("missing_entity", path, !deletionAllowed, trulyMissing);
+      if (hadMissingValue) {
+        missingEntityCount += missingValues;
+        // A scalar has no stable entity identity. Completion proof cannot
+        // distinguish a deleted value from a changed value in this array.
+        if (missingValues > 0)
+          mark("missing_entity", path, true, missingValues);
         return;
       }
       if (options.canonicalNewer) return;
-      let cursor = 0;
-      for (const item of expected) {
-        while (cursor < available.length && available[cursor] !== item)
-          cursor++;
-        if (cursor === available.length) {
-          mark("array_order", path);
-          break;
-        }
-        cursor++;
-      }
+      if (
+        expected.length !== available.length ||
+        expected.some((item, index) => item !== available[index])
+      )
+        mark("array_order", path);
       return;
     }
 

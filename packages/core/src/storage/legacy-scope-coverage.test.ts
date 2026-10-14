@@ -128,7 +128,7 @@ describe("legacy scope coverage", () => {
           },
         ],
       },
-      { entityKeys: keys },
+      { entityKeys: keys, canonicalNewer: true },
     );
     expect(covered.covered).toBe(true);
     const changed = compareLegacyCoverage(
@@ -330,6 +330,122 @@ describe("legacy scope coverage", () => {
       updatedAt: "2024-01-01",
     });
     expect(differentFormat.reason).toBe("timestamp_format");
+  });
+
+  it("requires scalar arrays to retain their values and same-time sequence", () => {
+    expect(
+      compareLegacyCoverage(
+        { values: ["one", "two"] },
+        { values: ["one"] },
+        { canonicalNewer: true, allowProvenDeletion: true },
+      ).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(
+        { values: ["one"] },
+        { values: ["changed"] },
+        { canonicalNewer: true, allowProvenDeletion: true },
+      ).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(
+        { values: ["one", "two"] },
+        { values: ["two", "one"] },
+        { canonicalNewer: false },
+      ).reason,
+    ).toBe("array_order");
+    expect(
+      compareLegacyCoverage(
+        { values: ["one"] },
+        { values: ["one", "extra"] },
+        { canonicalNewer: false },
+      ).reason,
+    ).toBe("array_order");
+  });
+
+  it("keeps scalar-array type and nullability checks blocking with deletion proof", () => {
+    const changedType = compareLegacyCoverage(
+      { updatedAt: ["2024-01-01T00:00:00Z"] },
+      { updatedAt: [123] },
+      { canonicalNewer: true, allowProvenDeletion: true },
+    );
+    expect(changedType.covered).toBe(false);
+    expect(changedType.reason).toBe("type_mismatch");
+    const becameNull = compareLegacyCoverage(
+      { updatedAt: ["2024-01-01T00:00:00Z"] },
+      { updatedAt: [null] },
+      { canonicalNewer: true, allowProvenDeletion: true },
+    );
+    expect(becameNull.covered).toBe(false);
+    expect(becameNull.reason).toBe("type_mismatch");
+    const changedTimestampFormat = compareLegacyCoverage(
+      { updatedAt: ["2024-01-01T00:00:00Z"] },
+      { updatedAt: ["2024-01-01"] },
+      { canonicalNewer: true, allowProvenDeletion: true },
+    );
+    expect(changedTimestampFormat.covered).toBe(false);
+    expect(changedTimestampFormat.reason).toBe("timestamp_format");
+    const extraNull = compareLegacyCoverage(
+      { updatedAt: ["2024-01-01T00:00:00Z"] },
+      { updatedAt: ["2024-01-01T00:00:00Z", null] },
+      { canonicalNewer: true },
+    );
+    expect(extraNull.covered).toBe(false);
+    expect(extraNull.reason).toBe("type_mismatch");
+    const extraNumber = compareLegacyCoverage(
+      { updatedAt: ["2024-01-01T00:00:00Z"] },
+      { updatedAt: ["2024-01-01T00:00:00Z", 123] },
+      { canonicalNewer: true },
+    );
+    expect(extraNumber.covered).toBe(false);
+    expect(extraNumber.reason).toBe("type_mismatch");
+  });
+
+  it("allows newer object arrays to add entities when the legacy array is empty", () => {
+    const verdict = compareLegacyCoverage(
+      { items: [] },
+      { items: [{ id: "new" }] },
+      {
+        entityKeys: { "$.items": ["id"] },
+        canonicalNewer: true,
+      },
+    );
+    expect(verdict.covered).toBe(true);
+  });
+
+  it("keeps creation values immutable through scalar-array comparison", () => {
+    const verdict = compareLegacyCoverage(
+      { created_at: ["2024-01-01T00:00:00Z"] },
+      { created_at: ["2025-01-01T00:00:00Z"] },
+      { canonicalNewer: true },
+    );
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("creation_mismatch");
+  });
+
+  it("records the reviewed creation-time exception through scalar arrays", () => {
+    const verdict = compareLegacyCoverage(
+      {
+        memories: [{ id: "a", created_at: ["2024-01-01T00:00:00Z"] }],
+      },
+      {
+        memories: [{ id: "a", created_at: ["2025-01-01T00:00:00Z"] }],
+      },
+      {
+        entityKeys: { "$.memories": ["id"] },
+        scope: "chatgpt.memories",
+        canonicalNewer: true,
+      },
+    );
+    expect(verdict.covered).toBe(true);
+    expect(verdict.appliedExceptions).toEqual([
+      {
+        path: "$.memories[].created_at",
+        reason:
+          "legacy collector wrote collection time; canonical carries source creation time",
+        authority: "canonical",
+      },
+    ]);
   });
 
   it("compares immutable creation timestamps as millisecond instants", () => {

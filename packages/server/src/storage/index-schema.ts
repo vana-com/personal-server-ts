@@ -34,24 +34,26 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 13;
+export const INDEX_SCHEMA_VERSION = 14;
 
 const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
   scope TEXT NOT NULL,
   instance TEXT NOT NULL DEFAULT '',
+  generation INTEGER NOT NULL DEFAULT 1,
   superseded_version INTEGER NOT NULL,
   superseded_cas_revision INTEGER NOT NULL,
   superseded_collected_at TEXT NOT NULL,
   superseded_path TEXT NOT NULL,
   taken_over_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  PRIMARY KEY (scope, instance, superseded_path)
+  PRIMARY KEY (scope, instance, generation, superseded_path)
 )`;
 
 const CREATE_LEGACY_SCOPE_VERDICTS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeover_verdicts (
   scope TEXT NOT NULL,
   instance TEXT NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 1,
   legacy_version_id INTEGER NOT NULL,
   canonical_cursor TEXT NOT NULL,
   verdict TEXT NOT NULL CHECK (verdict IN ('covered', 'not_covered')),
@@ -63,7 +65,7 @@ CREATE TABLE IF NOT EXISTS legacy_scope_takeover_verdicts (
   canonical_bytes INTEGER NOT NULL,
   byte_delta INTEGER NOT NULL,
   evaluated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  PRIMARY KEY (scope, instance)
+  PRIMARY KEY (scope, instance, generation)
 )`;
 
 const CREATE_LEGACY_SCOPE_RESETS_SQL = `
@@ -79,6 +81,14 @@ function hasColumn(
 ): boolean {
   const rows = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
   return rows.some((row) => row.name === column);
+}
+
+function hasTable(db: Database.Database, table: string): boolean {
+  return (
+    db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table) !== undefined
+  );
 }
 
 function migrateSchema(db: Database.Database, currentVersion: number): void {
@@ -188,6 +198,41 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
         db.exec("DROP TABLE legacy_scope_takeovers_old");
       })();
     }
+  }
+  if (currentVersion < 14) {
+    db.transaction(() => {
+      db.exec(
+        "ALTER TABLE legacy_scope_takeovers RENAME TO legacy_scope_takeovers_old",
+      );
+      db.exec(CREATE_LEGACY_SCOPE_TAKEOVERS_SQL);
+      const takeoverGeneration = hasTable(db, "pdpp_instance_binding")
+        ? "COALESCE((SELECT generation FROM pdpp_instance_binding WHERE instance = legacy_scope_takeovers_old.instance), 1)"
+        : "1";
+      db.exec(`INSERT INTO legacy_scope_takeovers
+        (scope, instance, generation, superseded_version, superseded_cas_revision,
+         superseded_collected_at, superseded_path, taken_over_at)
+        SELECT scope, instance, ${takeoverGeneration}, superseded_version, superseded_cas_revision,
+               superseded_collected_at, superseded_path, taken_over_at
+        FROM legacy_scope_takeovers_old`);
+      db.exec("DROP TABLE legacy_scope_takeovers_old");
+
+      db.exec(
+        "ALTER TABLE legacy_scope_takeover_verdicts RENAME TO legacy_scope_takeover_verdicts_old",
+      );
+      db.exec(CREATE_LEGACY_SCOPE_VERDICTS_SQL);
+      const verdictGeneration = hasTable(db, "pdpp_instance_binding")
+        ? "COALESCE((SELECT generation FROM pdpp_instance_binding WHERE instance = legacy_scope_takeover_verdicts_old.instance), 1)"
+        : "1";
+      db.exec(`INSERT INTO legacy_scope_takeover_verdicts
+        (scope, instance, generation, legacy_version_id, canonical_cursor,
+         verdict, comparison_case, reason_counts_json, applied_exceptions_json,
+         reason_json, legacy_bytes, canonical_bytes, byte_delta, evaluated_at)
+        SELECT scope, instance, ${verdictGeneration}, legacy_version_id, canonical_cursor, verdict,
+               comparison_case, reason_counts_json, applied_exceptions_json,
+               reason_json, legacy_bytes, canonical_bytes, byte_delta, evaluated_at
+        FROM legacy_scope_takeover_verdicts_old`);
+      db.exec("DROP TABLE legacy_scope_takeover_verdicts_old");
+    })();
   }
 }
 

@@ -8,6 +8,7 @@ import type {
 interface VerdictRow {
   scope: string;
   instance: string;
+  generation: number;
   legacy_version_id: number;
   canonical_cursor: string;
   verdict: "covered" | "not_covered";
@@ -68,6 +69,11 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
     db
       .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(name) !== undefined;
+  const isReset = (scope: string) =>
+    hasTable("legacy_scope_takeover_resets") &&
+    db
+      .prepare("SELECT 1 FROM legacy_scope_takeover_resets WHERE scope = ?")
+      .get(scope) !== undefined;
 
   return {
     listMethodConnections(methods) {
@@ -133,48 +139,64 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       );
     },
 
-    hasTakeover(scope, instance) {
+    hasTakeover(scope, instance, generation) {
+      const instanceFilter =
+        instance === undefined
+          ? ""
+          : generation === undefined
+            ? " AND (instance = ? OR instance = '')"
+            : " AND ((instance = ? AND generation = ?) OR instance = '')";
+      const params =
+        instance === undefined
+          ? [scope]
+          : generation === undefined
+            ? [scope, instance]
+            : [scope, instance, generation];
       return (
         hasTable("legacy_scope_takeovers") &&
         db
           .prepare(
-            instance === undefined
-              ? "SELECT 1 FROM legacy_scope_takeovers WHERE scope = ?"
-              : "SELECT 1 FROM legacy_scope_takeovers WHERE scope = ? AND (instance = ? OR instance = '')",
+            `SELECT 1 FROM legacy_scope_takeovers WHERE scope = ?${instanceFilter}`,
           )
-          .get(...(instance === undefined ? [scope] : [scope, instance])) !==
-          undefined
+          .get(...params) !== undefined
       );
     },
 
     hasCoveredHead(scope, head, instance) {
+      const instanceFilter =
+        instance === undefined ? "" : " AND (instance = ? OR instance = '')";
+      const params =
+        instance === undefined
+          ? [scope, head.path]
+          : [scope, head.path, instance];
       return (
         hasTable("legacy_scope_takeovers") &&
         db
           .prepare(
-            "SELECT 1 FROM legacy_scope_takeovers WHERE scope = ? AND superseded_path = ? AND (instance = ? OR instance = '')",
+            `SELECT 1 FROM legacy_scope_takeovers WHERE scope = ? AND superseded_path = ?${instanceFilter}`,
           )
-          .get(scope, head.path, instance) !== undefined
+          .get(...params) !== undefined
       );
     },
 
     isReset(scope) {
-      return (
-        hasTable("legacy_scope_takeover_resets") &&
-        db
-          .prepare("SELECT 1 FROM legacy_scope_takeover_resets WHERE scope = ?")
-          .get(scope) !== undefined
-      );
+      return isReset(scope);
     },
 
-    cachedVerdict(scope, instance, legacyVersionId, canonicalCursor) {
+    cachedVerdict(
+      scope,
+      instance,
+      generation,
+      legacyVersionId,
+      canonicalCursor,
+    ) {
       if (!hasTable("legacy_scope_takeover_verdicts")) return null;
       const row = db
         .prepare(
           `SELECT * FROM legacy_scope_takeover_verdicts
-        WHERE scope = ? AND instance = ? AND legacy_version_id = ? AND canonical_cursor = ?`,
+        WHERE scope = ? AND instance = ? AND generation = ? AND legacy_version_id = ? AND canonical_cursor = ?`,
         )
-        .get(scope, instance, legacyVersionId, canonicalCursor) as
+        .get(scope, instance, generation, legacyVersionId, canonicalCursor) as
         VerdictRow | undefined;
       return row ? coverageFromRow(row) : null;
     },
@@ -189,6 +211,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       return rows.map((row) => ({
         scope: row.scope,
         instance: row.instance,
+        generation: row.generation,
         legacyVersionId: row.legacy_version_id,
         canonicalCursor: row.canonical_cursor,
         verdict: row.verdict,
@@ -232,6 +255,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
     confirmRead(scope, expectedHead, selectionIsCurrent, verdict) {
       if (!hasTable("data_files")) return expectedHead === null;
       const validate = () => {
+        if (isReset(scope)) return false;
         const currentHead = readEligibleLegacyHead(scope);
         if (!sameHead(currentHead, expectedHead) || !selectionIsCurrent()) {
           return false;
@@ -255,10 +279,10 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           const coverage = verdict.coverage;
           db.prepare(
             `INSERT INTO legacy_scope_takeover_verdicts
-            (scope, instance, legacy_version_id, canonical_cursor, verdict, comparison_case, reason_counts_json, applied_exceptions_json, reason_json,
+            (scope, instance, generation, legacy_version_id, canonical_cursor, verdict, comparison_case, reason_counts_json, applied_exceptions_json, reason_json,
              legacy_bytes, canonical_bytes, byte_delta)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(scope, instance) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope, instance, generation) DO UPDATE SET
               legacy_version_id = excluded.legacy_version_id,
               canonical_cursor = excluded.canonical_cursor,
               verdict = excluded.verdict,
@@ -274,6 +298,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           ).run(
             scope,
             verdict.instance,
+            verdict.generation,
             expectedHead.id,
             verdict.canonicalCursor,
             coverage.covered ? "covered" : "not_covered",
@@ -296,11 +321,12 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           if (!coverage.covered) return true;
           db.prepare(
             `INSERT OR IGNORE INTO legacy_scope_takeovers
-            (scope, instance, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
-            VALUES (?, ?, ?, ?, ?, ?)`,
+            (scope, instance, generation, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`,
           ).run(
             scope,
             verdict.instance,
+            verdict.generation,
             expectedHead.version,
             expectedHead.casRevision,
             expectedHead.collectedAt,
