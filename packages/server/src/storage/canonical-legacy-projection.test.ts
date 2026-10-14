@@ -1587,4 +1587,139 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       });
     });
   });
+
+  describe("ChatGPT read edge cases", () => {
+    const COLLECTED = "2026-09-10T06:30:00.000Z";
+
+    function replace(
+      instance: string,
+      stream: string,
+      rows: Record<string, unknown>[],
+      withReceipt = true,
+    ) {
+      return store.replaceStream({
+        instance,
+        stream,
+        method: METHOD,
+        generation: 1,
+        emittedAt: COLLECTED,
+        primaryKey: ["id"],
+        envelopes: rows.map((data) => ({
+          instance,
+          stream,
+          key: String(data.id),
+          data,
+          emitted_at: COLLECTED,
+        })),
+        ...(withReceipt ? { sourceCollectedAt: COLLECTED } : {}),
+      });
+    }
+
+    const conversation = (
+      id: string,
+      update_time: string,
+      extras: Record<string, unknown> = {},
+    ) => ({
+      id,
+      title: id,
+      create_time: "2026-09-01T00:00:00.000Z",
+      update_time,
+      current_node: null,
+      message_count_on_current_branch: 0,
+      ...extras,
+    });
+
+    it("returns valid peers with omissions for a bad timestamp and missing title", async () => {
+      const selection = connect("conn_chatgpt", "chatgpt");
+      replace("conn_chatgpt", "conversations", [
+        conversation("valid", "2026-09-03T00:00:00.000Z"),
+        conversation("bad-time", "2026-09-02T00:00:00.000Z", {
+          create_time: 17,
+        }),
+        conversation("missing-title", "2026-09-01T00:00:00.000Z", {
+          title: undefined,
+        }),
+      ]);
+      replace("conn_chatgpt", "messages", []);
+
+      const read = await readCanonicalLegacyScope({
+        store,
+        scope: "chatgpt.conversations",
+        selection,
+      });
+
+      expect(read).toMatchObject({
+        ok: true,
+        complete: false,
+        envelope: {
+          data: {
+            conversations: [
+              { id: "valid", title: "valid", messages: [] },
+              { id: "missing-title", title: "Untitled", messages: [] },
+            ],
+            total: 2,
+          },
+        },
+        diagnostics: {
+          sourceRowCounts: { conversations: 3, messages: 0 },
+          omissions: [
+            {
+              stream: "conversations",
+              count: 1,
+              reasons: [
+                "Conversation timestamps must be strings, null, or absent",
+              ],
+            },
+          ],
+        },
+      });
+    });
+
+    it("returns stream_completion_unknown for an empty memories stream without its receipt", async () => {
+      const selection = connect("conn_memories", "chatgpt");
+      // Activity on another bound source stream rules out the no-data case,
+      // but cannot prove that this empty memories stream completed.
+      replace(
+        "conn_memories",
+        "conversations",
+        [conversation("other-stream", "2026-09-01T00:00:00.000Z")],
+        false,
+      );
+      replace("conn_memories", "memories", [], false);
+
+      expect(
+        await readCanonicalLegacyScope({
+          store,
+          scope: "chatgpt.memories",
+          selection,
+        }),
+      ).toMatchObject({
+        ok: false,
+        reason: "stream_completion_unknown",
+        streams: ["memories"],
+      });
+    });
+
+    it("orders reverse-supplied conversations newest update first", async () => {
+      const selection = connect("conn_order", "chatgpt");
+      replace("conn_order", "conversations", [
+        conversation("older", "2026-09-01T00:00:00.000Z"),
+        conversation("newer", "2026-09-03T00:00:00.000Z"),
+      ]);
+      replace("conn_order", "messages", []);
+
+      const read = await readCanonicalLegacyScope({
+        store,
+        scope: "chatgpt.conversations",
+        selection,
+      });
+
+      expect(
+        read.ok &&
+          (read.envelope.data.conversations as { id: string }[]).map(
+            ({ id }) => id,
+          ),
+      ).toEqual(["newer", "older"]);
+    });
+  });
 });
