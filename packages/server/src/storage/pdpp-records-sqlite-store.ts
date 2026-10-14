@@ -27,6 +27,23 @@ import {
   type StreamListing,
   type StreamSemantics,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import {
+  liveSnapshotDigest,
+  parseCompletionRequest,
+  StreamCompletionError,
+  type NativeStreamCompletionReceipt,
+  type StreamCompletionRequest,
+  type StreamDeclarationResolver,
+} from "./pdpp-stream-completion.js";
+
+export {
+  StreamCompletionError,
+  type NativeStreamCompletionReceipt,
+  type StreamCompletionFailure,
+  type StreamCompletionProof,
+  type StreamCompletionRequest,
+  type StreamDeclarationResolver,
+} from "./pdpp-stream-completion.js";
 
 export interface PdppInstanceBinding {
   instance: string;
@@ -258,7 +275,29 @@ CREATE TABLE IF NOT EXISTS pdpp_record_arrival (
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_arrival_order
   ON pdpp_record_arrival (instance, stream, arrival);
 `,
+  // v9: native completion receipts (completeStreams). A receipt may now carry
+  // the digest of the live set it describes and how its time was taken. Both
+  // are null on every receipt P7 writes and on every receipt stored before
+  // v9, which stay producer-asserted and are never relabeled. The columns are
+  // added by `addCompletionProofColumns`, which skips one that already exists
+  // so a database whose version was only rewound can be upgraded again.
+  "",
 ];
+
+function addCompletionProofColumns(db: Database): void {
+  const existing = new Set(
+    (
+      db.prepare("PRAGMA table_info(pdpp_stream_completion)").all() as {
+        name: string;
+      }[]
+    ).map((column) => column.name),
+  );
+  for (const column of ["snapshot_sha256", "collection_time_basis"]) {
+    if (!existing.has(column)) {
+      db.exec(`ALTER TABLE pdpp_stream_completion ADD COLUMN ${column} TEXT`);
+    }
+  }
+}
 
 function migrate(db: Database): void {
   db.exec(`
@@ -275,6 +314,7 @@ function migrate(db: Database): void {
   const applyFrom = db.transaction((fromVersion: number) => {
     for (let v = fromVersion; v < MIGRATIONS.length; v++) {
       db.exec(MIGRATIONS[v]);
+      if (v === 8) addCompletionProofColumns(db);
       if (v === 4) {
         db.prepare(
           "INSERT OR IGNORE INTO pdpp_store_metadata (id, epoch) VALUES (1, ?)",
@@ -489,6 +529,20 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   }): ReplaceStreamResult;
   /** Completion receipts of one instance, as stored. */
   listStreamCompletions(instance: string): StreamCompletionReceipt[];
+  /**
+   * Metadata-only completion: proves, for each requested stream, that the
+   * live set SQLite holds is exactly the one the digest names, then stores
+   * every receipt in one immediate transaction. It writes no rows, history,
+   * arrival or clock. The binding must already be registered, undeleted and
+   * equal to the request's source, method and generation; nothing is
+   * registered here. The caller is not authenticated at this seam.
+   * Throws `PdppBindingError` for the binding and `StreamCompletionError`
+   * for everything else; a throw leaves the database unchanged.
+   */
+  completeStreams(
+    request: StreamCompletionRequest,
+    declarations: StreamDeclarationResolver,
+  ): { receipts: NativeStreamCompletionReceipt[] };
   /**
    * Live record keys of one stream in the order each last arrived in the
    * current generation, for the legacy view only. A key with no arrival
@@ -1099,6 +1153,188 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     }));
   }
 
+  type CompletionRowDb = {
+    instance: string;
+    stream: string;
+    method: string;
+    generation: number;
+    source_collected_at: string;
+    write_seq: number;
+    live_count: number;
+    snapshot_sha256: string | null;
+    collection_time_basis: string | null;
+  };
+
+  function completeStreams(
+    rawRequest: StreamCompletionRequest,
+    declarations: StreamDeclarationResolver,
+  ): { receipts: NativeStreamCompletionReceipt[] } {
+    const request = parseCompletionRequest(rawRequest);
+    return db
+      .transaction(() => {
+        const binding = db
+          .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
+          .get(request.instance) as BindingRowDb | undefined;
+        if (!binding || binding.source_id === null) {
+          throw new PdppBindingError("connection_required");
+        }
+        if (binding.deleted_at !== null) {
+          throw new PdppBindingError("connection_deleted");
+        }
+        if (binding.source_id !== request.sourceId) {
+          throw new PdppBindingError("source_mismatch");
+        }
+        if (binding.generation !== request.generation) {
+          throw new PdppBindingError("binding_generation_mismatch");
+        }
+        if (binding.method !== request.method) {
+          throw new PdppBindingError("instance_bound_to_other_method");
+        }
+
+        const clock = readWriteClock();
+        const requestedAt = Date.parse(request.sourceCollectedAt);
+        // Validate every stream before the first receipt is written.
+        const writes: { stream: string; kind: "insert" | "update" | "keep" }[] =
+          [];
+        for (const proof of request.streams) {
+          const primaryKey = declarations(request.sourceId, proof.stream);
+          if (primaryKey === undefined) {
+            throw new StreamCompletionError("unknown_stream");
+          }
+          if (
+            primaryKey.length === 0 ||
+            !primaryKey.every((field) => typeof field === "string" && field)
+          ) {
+            throw new StreamCompletionError("invalid_declaration");
+          }
+          const rows = db
+            .prepare(
+              "SELECT record_key, data FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+            )
+            .all(request.instance, proof.stream) as {
+            record_key: string;
+            data: string;
+          }[];
+          if (rows.length !== proof.liveCount) {
+            throw new StreamCompletionError("snapshot_conflict");
+          }
+          const digest = liveSnapshotDigest(
+            { ...request, stream: proof.stream },
+            primaryKey,
+            rows.map((row) => ({
+              recordKey: row.record_key,
+              dataJson: row.data,
+            })),
+          );
+          if (digest !== proof.snapshotSha256) {
+            throw new StreamCompletionError("snapshot_conflict");
+          }
+
+          const prior = db
+            .prepare(
+              "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+            )
+            .get(request.instance, proof.stream) as CompletionRowDb | undefined;
+          if (!prior) {
+            writes.push({ stream: proof.stream, kind: "insert" });
+            continue;
+          }
+          // A receipt is deleted by every write that could invalidate it, so a
+          // stored one that disagrees with the live data was tampered with.
+          const lastChange = (
+            db
+              .prepare(
+                "SELECT COALESCE(MAX(written_at), 0) AS seq FROM pdpp_record_changes WHERE instance = ? AND stream = ?",
+              )
+              .get(request.instance, proof.stream) as { seq: number }
+          ).seq;
+          const native = prior.snapshot_sha256 !== null;
+          if (
+            prior.method !== request.method ||
+            prior.generation !== request.generation ||
+            prior.live_count !== rows.length ||
+            prior.write_seq > clock ||
+            prior.write_seq < lastChange ||
+            !isRfc3339DateTime(prior.source_collected_at) ||
+            native !== (prior.collection_time_basis !== null) ||
+            (native &&
+              (prior.snapshot_sha256 !== digest ||
+                prior.collection_time_basis !== request.collectionTimeBasis))
+          ) {
+            throw new StreamCompletionError("invalid_prior_receipt");
+          }
+          const priorAt = Date.parse(prior.source_collected_at);
+          if (requestedAt < priorAt) {
+            throw new StreamCompletionError("time_conflict");
+          }
+          if (requestedAt === priorAt) {
+            // Same instant: an exact replay keeps its bytes. A digest-less
+            // receipt cannot be relabeled as native proof at its own time.
+            if (!native) throw new StreamCompletionError("time_conflict");
+            writes.push({ stream: proof.stream, kind: "keep" });
+          } else {
+            writes.push({ stream: proof.stream, kind: "update" });
+          }
+        }
+
+        for (const [index, write] of writes.entries()) {
+          const proof = request.streams[index];
+          if (write.kind === "insert") {
+            db.prepare(
+              `INSERT INTO pdpp_stream_completion
+               (instance, stream, method, generation, source_collected_at, write_seq, live_count, snapshot_sha256, collection_time_basis)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ).run(
+              request.instance,
+              proof.stream,
+              request.method,
+              request.generation,
+              request.sourceCollectedAt,
+              clock,
+              proof.liveCount,
+              proof.snapshotSha256,
+              request.collectionTimeBasis,
+            );
+          } else if (write.kind === "update") {
+            db.prepare(
+              `UPDATE pdpp_stream_completion
+                SET source_collected_at = ?, write_seq = ?, snapshot_sha256 = ?, collection_time_basis = ?
+              WHERE instance = ? AND stream = ?`,
+            ).run(
+              request.sourceCollectedAt,
+              clock,
+              proof.snapshotSha256,
+              request.collectionTimeBasis,
+              request.instance,
+              proof.stream,
+            );
+          }
+        }
+
+        return {
+          receipts: request.streams.map((proof) => {
+            const row = db
+              .prepare(
+                "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+              )
+              .get(request.instance, proof.stream) as CompletionRowDb;
+            return {
+              instance: row.instance,
+              stream: row.stream,
+              method: row.method,
+              generation: row.generation,
+              sourceCollectedAt: row.source_collected_at,
+              writeSeq: row.write_seq,
+              liveCount: row.live_count,
+              snapshotSha256: row.snapshot_sha256 as string,
+              collectionTimeBasis: "host_run_finished" as const,
+            };
+          }),
+        };
+      })
+      .immediate();
+  }
+
   function listArrivalOrder(instance: string, stream: string): string[] {
     const rows = db
       .prepare(
@@ -1614,6 +1850,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     storeBlobBytesForInstance,
     replaceStream,
     listStreamCompletions,
+    completeStreams,
     listArrivalOrder,
     getRecord,
     listRecords,
