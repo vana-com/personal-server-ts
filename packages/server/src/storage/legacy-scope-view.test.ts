@@ -13,12 +13,24 @@ import { initializeDatabase } from "./index-schema.js";
 
 const OURA = "https://registry.pdpp.dev/sources/oura";
 const GITHUB = "https://registry.pdpp.dev/sources/github";
+const CLAUDE = "https://registry.pdpp.dev/sources/claude";
 
 /** The (source, method) pairs a boot configures, as Desktop names them. */
 const CONFIGURED: Record<string, string[]> = {
   [OURA]: ["oura", "oura-browser"],
   [GITHUB]: ["github-browser"],
+  [CLAUDE]: ["anthropic"],
 };
+
+const CLAUDE_PROFILE = {
+  id: "org",
+  organization_id: "org",
+  full_name: "Synthetic reader",
+  plan: null,
+  name_source: "users_json",
+  metadata_status: "valid",
+};
+const CLAUDE_COLLECTED = "2026-09-10T07:00:00.000Z";
 
 type Store = ReturnType<typeof createSqliteRecordStore>;
 
@@ -82,6 +94,102 @@ function ingest(
     { method: "oura", generation: 1 },
   );
   expect(result.rejected).toEqual([]);
+}
+
+function addClaudeProjects(store: Store, count = 1) {
+  const projects = Array.from({ length: count }, (_, index) => {
+    const payload = {
+      uuid: `project-${index + 1}`,
+      name: "Research",
+      docs: [],
+    };
+    const bytes = new TextEncoder().encode(
+      JSON.stringify({
+        format: "anthropic-source-record-v1",
+        stream: "projects",
+        record_key: payload.uuid,
+        payload,
+      }),
+    );
+    const meta = store.storeBlobBytesForInstance({
+      instance: "conn_claude",
+      method: "anthropic",
+      generation: 1,
+      bytes,
+      mimeType: "application/json",
+    });
+    return {
+      key: payload.uuid,
+      blobId: meta.blobId,
+      bytes,
+      project: {
+        id: payload.uuid,
+        blob_ref: {
+          blob_id: meta.blobId,
+          sha256: meta.sha256,
+          size_bytes: meta.sizeBytes,
+          mime_type: meta.mimeType,
+        },
+      },
+    };
+  });
+
+  store.replaceStream({
+    instance: "conn_claude",
+    stream: "account_profile",
+    method: "anthropic",
+    generation: 1,
+    primaryKey: ["id"],
+    emittedAt: CLAUDE_COLLECTED,
+    sourceCollectedAt: CLAUDE_COLLECTED,
+    envelopes: [
+      {
+        instance: "conn_claude",
+        stream: "account_profile",
+        key: "org",
+        data: CLAUDE_PROFILE,
+        emitted_at: CLAUDE_COLLECTED,
+      },
+    ],
+  });
+  store.replaceStream({
+    instance: "conn_claude",
+    stream: "projects",
+    method: "anthropic",
+    generation: 1,
+    primaryKey: ["id"],
+    emittedAt: CLAUDE_COLLECTED,
+    sourceCollectedAt: CLAUDE_COLLECTED,
+    envelopes: projects.map(({ key, project }) => ({
+      instance: "conn_claude",
+      stream: "projects",
+      key,
+      data: project,
+      emitted_at: CLAUDE_COLLECTED,
+    })),
+  });
+  store.replaceStream({
+    instance: "conn_claude",
+    stream: "project_documents",
+    method: "anthropic",
+    generation: 1,
+    primaryKey: ["id"],
+    emittedAt: CLAUDE_COLLECTED,
+    sourceCollectedAt: CLAUDE_COLLECTED,
+    envelopes: [],
+  });
+  return projects;
+}
+
+function addLegacyClaudeHead(db: InstanceType<typeof Database>) {
+  db.prepare(
+    "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+  ).run(
+    "claude/projects/old.json",
+    "claude.projects",
+    "2026-01-01T00:00:00.000Z",
+    12,
+  );
 }
 
 describe("legacy scope view over the real SQLite record store", () => {
@@ -414,6 +522,74 @@ describe("legacy scope view over the real SQLite record store", () => {
       [],
     );
   });
+
+  it.each(["budget", "invalid bytes"] as const)(
+    "serves the current legacy head around Claude blob %s failures only before takeover",
+    async (failure) => {
+      addLegacyClaudeHead(db);
+      const legacyRows = db.prepare("SELECT * FROM data_files").all();
+      connect(store, "conn_claude", "anthropic", CLAUDE);
+      const blobs = addClaudeProjects(store, failure === "budget" ? 3 : 1);
+      const oversized = 22 * 1024 * 1024;
+
+      const setSize = (blob: (typeof blobs)[number], size: number) => {
+        const row = db
+          .prepare(
+            "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
+          )
+          .get("conn_claude", "projects", blob.key) as { data: string };
+        const data = JSON.parse(row.data) as {
+          blob_ref: { size_bytes: number };
+        };
+        data.blob_ref.size_bytes = size;
+        db.prepare(
+          "UPDATE pdpp_records SET data = ? WHERE instance = ? AND stream = ? AND record_key = ?",
+        ).run(JSON.stringify(data), "conn_claude", "projects", blob.key);
+        db.prepare(
+          "UPDATE pdpp_blobs SET size_bytes = ? WHERE blob_id = ?",
+        ).run(size, blob.blobId);
+      };
+
+      const makeFailure = () => {
+        if (failure === "invalid bytes") {
+          db.prepare(
+            "UPDATE pdpp_blob_bytes SET bytes = ? WHERE blob_id = ?",
+          ).run(Buffer.from("corrupt"), blobs[0]!.blobId);
+          return;
+        }
+        for (const blob of blobs) setSize(blob, oversized);
+      };
+      const clearFailure = () => {
+        if (failure === "invalid bytes") {
+          db.prepare(
+            "UPDATE pdpp_blob_bytes SET bytes = ? WHERE blob_id = ?",
+          ).run(Buffer.from(blobs[0]!.bytes), blobs[0]!.blobId);
+          return;
+        }
+        for (const blob of blobs)
+          setSize(blob, blob.project.blob_ref.size_bytes);
+      };
+
+      makeFailure();
+      expect(await view.readLatest("claude.projects")).toEqual({
+        kind: "file",
+      });
+      expect(view.listingFor("claude.projects")).toEqual({ kind: "file" });
+      expect(db.prepare("SELECT * FROM data_files").all()).toEqual(legacyRows);
+      expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+        [],
+      );
+
+      clearFailure();
+      expect((await view.readLatest("claude.projects")).kind).toBe("canonical");
+      expect(
+        db.prepare("SELECT * FROM legacy_scope_takeovers").all(),
+      ).not.toEqual([]);
+
+      makeFailure();
+      expect((await view.readLatest("claude.projects")).kind).toBe("refused");
+    },
+  );
 
   it("keeps the legacy head when valid rows have no matching completion receipt", async () => {
     db.prepare(

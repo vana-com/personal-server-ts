@@ -836,6 +836,64 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(ids(read.text)).toEqual(["stale-legacy"]);
   });
 
+  it("serves the indexed legacy file when blob materialization is unsupported before takeover", async () => {
+    await legacyWrite("oura.activity", STALE);
+    const legacyHead = {
+      ...ctx!.indexManager.findLatestByScope("oura.activity")!,
+    };
+    const legacyBytes = await readFile(join(tempDir, "data", legacyHead.path));
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+
+    const recordDb = new Database(join(tempDir, "index.db"));
+    try {
+      const row = recordDb
+        .prepare(
+          "SELECT data FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
+        )
+        .get(accountOne, "activity", "a1") as { data: string };
+      const data = JSON.parse(row.data) as Record<string, unknown>;
+      data.blob_ref = {};
+      recordDb
+        .prepare(
+          "UPDATE pdpp_records SET data = ? WHERE instance = ? AND stream = ? AND record_key = ?",
+        )
+        .run(JSON.stringify(data), accountOne, "activity", "a1");
+      expect(
+        recordDb.prepare("SELECT * FROM legacy_scope_takeovers").all(),
+      ).toEqual([]);
+    } finally {
+      recordDb.close();
+    }
+
+    const read = await ownerGet("/v1/data/oura.activity");
+    expect(read.status).toBe(200);
+    expect(read.dataSource).toBe("legacy");
+    expect(ids(read.text)).toEqual(["stale-legacy"]);
+    expect(ctx!.indexManager.findLatestByScope("oura.activity")).toEqual(
+      legacyHead,
+    );
+    expect(await readFile(join(tempDir, "data", legacyHead.path))).toEqual(
+      legacyBytes,
+    );
+    const ledgerDb = new Database(join(tempDir, "index.db"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    try {
+      expect(
+        ledgerDb.prepare("SELECT * FROM legacy_scope_takeovers").all(),
+      ).toEqual([]);
+    } finally {
+      ledgerDb.close();
+    }
+  });
+
   it("does not resurrect the legacy file after a complete canonical takeover", async () => {
     await legacyWrite("oura.activity", STALE);
     const token = await ownerPdppToken();

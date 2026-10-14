@@ -330,7 +330,10 @@ export function createLegacyScopeView(
           (read.reason === "projection_rejected" ||
             read.reason === "all_rows_rejected" ||
             read.reason === "no_synced_data" ||
-            read.reason === "stream_completion_unknown")
+            read.reason === "stream_completion_unknown" ||
+            read.reason === "blob_read_budget_exceeded" ||
+            read.reason === "blob_backed_record_invalid" ||
+            read.reason === "blob_backed_records_unsupported")
         ) {
           const stillLegacyOwned = authority.readSnapshot(() =>
             canServeLegacyBeforeTakeover(scope),
