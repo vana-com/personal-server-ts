@@ -10,6 +10,13 @@ import {
   type ProjectionError,
 } from "../legacy-projection/index.js";
 import {
+  claudeBlobReference,
+  ClaudeSourceRecordError,
+  decodeClaudeSourceRecord,
+  mergeClaudeSourceRecords,
+  type ClaudeBlobContents,
+} from "../legacy-projection/claude-source-record.js";
+import {
   CursorExpiredError,
   InvalidCursorError,
   type PdppRecordStore,
@@ -30,7 +37,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/4";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/5";
 
 const DEFAULT_PAGE_SIZE = 500;
 const SOURCE_ID_PREFIX = "https://registry.pdpp.dev/sources/";
@@ -71,6 +78,9 @@ export interface CanonicalLegacyReadStore extends Pick<
   PdppRecordStore,
   "listRecords" | "listStreams"
 > {
+  /** Optional for non-blob stores. Byte reads are synchronous inside readSnapshot. */
+  getBlobMeta?: PdppRecordStore["getBlobMeta"];
+  getBlobBytes?: PdppRecordStore["getBlobBytes"];
   getInstanceBinding(instance: string): CanonicalConnectionBinding;
   listConnections(sourceId: string): CanonicalConnectionBinding[];
   /** Completion receipts stored for one instance. */
@@ -182,6 +192,11 @@ export type CanonicalLegacyReadFailure =
       stream: string;
       recordCount: number;
       blocker: string;
+    }
+  | {
+      status: "unavailable";
+      reason: "blob_backed_record_invalid";
+      detail: string;
     }
   | {
       status: "incomplete";
@@ -337,6 +352,7 @@ interface Snapshot {
    * a live count equal to the rows read in this snapshot.
    */
   completions: Map<string, CanonicalStreamCompletion>;
+  blobContents: Map<string, ClaudeBlobContents>;
 }
 
 /** Everything the view needs from the store, read inside one snapshot. */
@@ -383,6 +399,37 @@ function collectSnapshot(
     }
     throw error;
   }
+  // Copy bytes and metadata while the authorizing rows/binding still share one snapshot.
+  // Async hashing and projection happen after SQLite releases that snapshot.
+  const blobContents = new Map<string, ClaudeBlobContents>();
+  if (selection.sourceId === `${SOURCE_ID_PREFIX}anthropic`) {
+    for (const stream of ["conversations", "projects"]) {
+      for (const row of rowsByStream.get(stream) ?? []) {
+        if (!hasBlobRef(row)) continue;
+        try {
+          const ref = claudeBlobReference(row.data);
+          if (!blobContents.has(ref.blobId)) {
+            const meta = store.getBlobMeta?.(ref.blobId);
+            // Do not load oversized/mismatched metadata before rejecting it.
+            const bytes =
+              meta?.sizeBytes === ref.size &&
+              meta.mimeType === "application/json"
+                ? store.getBlobBytes?.(ref.blobId)?.slice()
+                : undefined;
+            blobContents.set(ref.blobId, {
+              meta: meta ? { ...meta } : undefined,
+              bytes,
+            });
+          }
+        } catch (error) {
+          if (!(error instanceof ClaudeSourceRecordError)) throw error;
+          // The projector reports malformed references after the existing
+          // completion guard; absence of source evidence keeps priority.
+          continue;
+        }
+      }
+    }
+  }
   const completions = new Map<string, CanonicalStreamCompletion>();
   for (const receipt of store.listStreamCompletions(instance)) {
     if (
@@ -401,6 +448,7 @@ function collectSnapshot(
     rowsByStream,
     orderGaps,
     completions,
+    blobContents,
   };
 }
 
@@ -462,15 +510,45 @@ async function projectSnapshot(
     });
   }
 
+  const expanded = [];
+  const canExpandClaude =
+    selection.sourceId === `${SOURCE_ID_PREFIX}anthropic` &&
+    (scope === "claude.conversations" || scope === "claude.projects");
   for (const stream of streams) {
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
+    if (
+      canExpandClaude &&
+      (stream === "conversations" || stream === "projects")
+    ) {
+      try {
+        for (const row of blobBacked) {
+          const ref = claudeBlobReference(row.data);
+          expanded.push(
+            ...(await decodeClaudeSourceRecord(
+              row,
+              input.blobContents.get(ref.blobId) ?? {
+                meta: undefined,
+                bytes: undefined,
+              },
+            )),
+          );
+        }
+      } catch (error) {
+        if (!(error instanceof ClaudeSourceRecordError)) throw error;
+        return unavailable({
+          reason: "blob_backed_record_invalid",
+          detail: error.message,
+        });
+      }
+      continue;
+    }
     if (blobBacked.length > 0) {
       return unavailable({
         reason: "blob_backed_records_unsupported",
         stream,
         recordCount: blobBacked.length,
         blocker:
-          "Blob bytes are an anthropic-source-record-v1 envelope (see evidence/claude-blob-contract.md). Hydrating them needs the connector parsers ported, blob byte access in this reader, and tests; until then a row served without its blob would fabricate an empty body.",
+          "This scope/stream has no verified mapping from blob bytes to its legacy fields.",
       });
     }
   }
@@ -483,9 +561,23 @@ async function projectSnapshot(
   if (collectedAt === null)
     return unavailable({ reason: "invalid_collected_at" });
 
-  const records = streams.flatMap((stream) =>
+  let records = streams.flatMap((stream) =>
     (rowsByStream.get(stream) ?? []).map((row) => ({ stream, data: row.data })),
   );
+  if (expanded.length > 0) {
+    try {
+      records = mergeClaudeSourceRecords(
+        records.filter((record) => !Object.hasOwn(record.data, "blob_ref")),
+        expanded,
+      );
+    } catch (error) {
+      if (!(error instanceof ClaudeSourceRecordError)) throw error;
+      return unavailable({
+        reason: "blob_backed_record_invalid",
+        detail: error.message,
+      });
+    }
+  }
   const projected = projectPdppRecordsToLegacyPayload(scope, records, {
     fetchedStreams: streams,
     ...(profileKey ? { profileKey } : {}),
@@ -606,7 +698,11 @@ function readAllRows(
     first = false;
     for (const row of page.data) {
       const identity = `${row.instance}\u0000${row.recordKey}`;
-      if (row.instance !== instance || seen.has(identity)) {
+      if (
+        row.instance !== instance ||
+        row.stream !== stream ||
+        seen.has(identity)
+      ) {
         return `${stream} returned a foreign or repeated row`;
       }
       seen.add(identity);
@@ -685,8 +781,7 @@ function unavailable(
 }
 
 function hasBlobRef(row: PdppStoredRecord): boolean {
-  const ref = row.data.blob_ref;
-  return typeof ref === "object" && ref !== null;
+  return Object.hasOwn(row.data, "blob_ref");
 }
 
 function countFor(listing: StreamListing[], stream: string): number {
