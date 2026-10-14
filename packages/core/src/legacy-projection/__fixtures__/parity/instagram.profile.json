@@ -37,6 +37,7 @@
     "external_url": "https://example.com",
     "follower_count": 12,
     "following_count": 3,
+    "media_count": 2,
     "is_private": false,
     "is_verified": true,
     "is_business": false
@@ -54,26 +55,20 @@
     "is_business": false,
     "id": "instagram-a",
     "post_count": 2,
-    "media_count": 4
+    "media_count": 2
   },
   "reviewedDifferences": [
     {
       "path": "id",
       "legacy": "instagram-a",
       "projected": "<absent>",
-      "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile."
-    },
-    {
-      "path": "media_count",
-      "legacy": 4,
-      "projected": "<absent>",
-      "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile."
+      "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to the legacy media_count. Web Source Detail retains following_count but cannot read post_count from this profile."
     },
     {
       "path": "post_count",
       "legacy": 2,
       "projected": "<absent>",
-      "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile."
+      "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to the legacy media_count. Web Source Detail retains following_count but cannot read post_count from this profile."
     }
   ],
   "cases": [
@@ -147,7 +142,6 @@
         "follower_count": "12",
         "following_count": null,
         "post_count": null,
-        "media_count": null,
         "is_private": "false",
         "is_verified": 0,
         "is_business": null
@@ -157,73 +151,67 @@
           "path": "bio",
           "legacy": null,
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "external_url",
           "legacy": false,
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "follower_count",
           "legacy": "12",
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "following_count",
           "legacy": null,
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "full_name",
           "legacy": null,
           "projected": "",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "id",
           "legacy": "instagram-dirty",
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "is_business",
           "legacy": null,
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "is_private",
           "legacy": "false",
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "is_verified",
           "legacy": 0,
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
-        },
-        {
-          "path": "media_count",
-          "legacy": null,
-          "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "post_count",
           "legacy": null,
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         },
         {
           "path": "profile_pic_url",
           "legacy": 42,
           "projected": "<absent>",
-          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. media_count has no equivalent declared source field and must not be fabricated from post_count; its synthetic value probes the unavailable legacy field. Web Source Detail retains following_count but cannot read post_count/media_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
+          "reason": "Hoe-kemon consumes the whole Instagram payload: profile id and post_count are omitted. The meta connector's post_count maps to legacy media_count when numeric. Web Source Detail retains following_count but cannot read post_count from this profile. Null full_name becomes ''; malformed/null optional fields are omitted, including following_count, so the full LLM payload and count availability change."
         }
       ]
     }

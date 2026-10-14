@@ -1891,6 +1891,57 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     if (result.ok) validateAgainst(instagramProfileSchema, result.payload);
   });
 
+  it("maps numeric Instagram profile post_count to legacy media_count", () => {
+    const result = projectPdppRecordsToLegacyPayload(
+      "instagram.profile",
+      [
+        {
+          stream: "profile",
+          data: {
+            id: "profile-1",
+            username: "example",
+            full_name: "Example User",
+            post_count: 42,
+          },
+        },
+      ],
+      { fetchedStreams: ["profile"] },
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      payload: { media_count: 42 },
+    });
+  });
+
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["string", "42"],
+  ])(
+    "omits Instagram media_count when post_count is %s",
+    (_label, postCount) => {
+      const data: Record<string, unknown> = {
+        id: "profile-1",
+        username: "example",
+        full_name: "Example User",
+      };
+      if (postCount !== undefined) data.post_count = postCount;
+
+      const result = projectPdppRecordsToLegacyPayload(
+        "instagram.profile",
+        [{ stream: "profile", data }],
+        { fetchedStreams: ["profile"] },
+      );
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.payload).not.toHaveProperty("media_count");
+        validateAgainst(instagramProfileSchema, result.payload);
+      }
+    },
+  );
+
   for (const prototypeKey of [
     "constructor",
     "toString",
@@ -2035,7 +2086,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       ["empty", instagramProfileEmpty],
       ["large", instagramProfileLarge],
     ] as const) {
-      it(`does NOT reproduce the real "${label}" legacy fixture byte-for-byte — is_private/media_count/is_business/profile_pic_url/external_url have no PDPP source (B1, B2: documented gap, not silently passed)`, () => {
+      it(`does NOT reproduce the real "${label}" legacy fixture byte-for-byte — is_private/is_business/profile_pic_url/external_url are not provided by this PDPP row (B1, B2: documented gap, not silently passed)`, () => {
         const pdppRecords: PdppRecord[] = [
           {
             stream: "profile",
