@@ -127,7 +127,7 @@ export function createNodeDataStorage(
     findLatestVersionByScope(scope: string) {
       return deps.indexManager.findLatestVersionByScope(scope);
     },
-    updateDataPointId(path: string, dataPointId: string) {
+    updateDataPointId(path: string, dataPointId: string | null) {
       return deps.indexManager.updateDataPointId(path, dataPointId);
     },
     updateEntryVersion(path: string, version: number) {
