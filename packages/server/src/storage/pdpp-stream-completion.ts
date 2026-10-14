@@ -81,11 +81,10 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 const UTC_MILLIS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 export function isCompletionTime(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    UTC_MILLIS.test(value) &&
-    new Date(value).toISOString() === value
-  );
+  if (typeof value !== "string" || !UTC_MILLIS.test(value)) return false;
+  // `toISOString` throws on an invalid Date, so test for one first.
+  const instant = Date.parse(value);
+  return !Number.isNaN(instant) && new Date(instant).toISOString() === value;
 }
 
 function nonEmptyString(value: unknown): value is string {
@@ -230,7 +229,12 @@ export function liveSnapshotDigest(
   rows: readonly LiveSnapshotRow[],
 ): string {
   const pairs: [string, unknown][] = rows.map((row) => {
-    const data: unknown = JSON.parse(row.dataJson);
+    let data: unknown;
+    try {
+      data = JSON.parse(row.dataJson);
+    } catch {
+      throw badData();
+    }
     if (data === null || typeof data !== "object" || Array.isArray(data)) {
       throw badData();
     }

@@ -6,6 +6,12 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { PdppRecordEnvelopeInput } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import {
+  isCompletionTime,
+  liveSnapshotDigest,
+  parseCompletionRequest,
+  StreamCompletionError,
+} from "./pdpp-stream-completion.js";
 
 const SOURCE = "https://registry.pdpp.dev/sources/claude";
 const OTHER_SOURCE = "https://registry.pdpp.dev/sources/oura";
@@ -1145,6 +1151,254 @@ describe("stream completion over the real SQLite record store", () => {
           again.prepare("SELECT epoch FROM pdpp_store_metadata").get(),
         ).toEqual(epoch);
         reopened.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // --- R1 repairs: malformed times, tampered receipts, schema drift ------
+
+  describe("regex-shaped invalid times", () => {
+    it.each([
+      "2026-13-01T00:00:00.000Z",
+      "2026-00-10T00:00:00.000Z",
+      "2026-01-01T25:00:00.000Z",
+      "2026-01-01T00:60:00.000Z",
+      "2026-01-01T00:00:60.000Z",
+      "2026-02-30T00:00:00.000Z",
+    ])(
+      "%s is not a completion time, and refuses typed with no reads or writes",
+      (value) => {
+        expect(isCompletionTime(value)).toBe(false);
+        expect(() =>
+          parseCompletionRequest(
+            request([proof("messages", 0, EMPTY_MESSAGES_SHA)], value),
+          ),
+        ).toThrow(expect.objectContaining({ reason: "invalid_request" }));
+        expectRefusedWithoutChange(
+          () => complete([proof("messages", 0, EMPTY_MESSAGES_SHA)], value),
+          { reason: "invalid_request" },
+        );
+      },
+    );
+  });
+
+  describe("a native receipt whose stored fields left their domain", () => {
+    const profile = () =>
+      proof("profiles", 1, sha(preimage("profiles", `[["p",{"id":"p"}]]`)));
+    beforeEach(() => {
+      ingest("profiles", [{ key: "p", data: { id: "p" } }], "mutable_state");
+      complete([profile()], T1);
+      // An unrelated write moves the clock past the receipt.
+      store.registerConnection({
+        instance: "conn_b",
+        sourceId: SOURCE,
+        method: METHOD,
+        label: "b",
+      });
+      ingest(
+        "profiles",
+        [{ key: "z", data: { id: "z" } }],
+        "mutable_state",
+        "conn_b",
+      );
+    });
+
+    it.each([
+      ["non-numeric text write_seq", "write_seq = 'garbage'"],
+      ["fractional write_seq", "write_seq = 1.5"],
+    ])(
+      "refuses a %s for replay and for a newer proof, without repairing it",
+      (_name, set) => {
+        db.exec(`UPDATE pdpp_stream_completion SET ${set}`);
+        for (const at of [T1, T2]) {
+          expectRefusedWithoutChange(() => complete([profile()], at), {
+            reason: "invalid_prior_receipt",
+          });
+        }
+      },
+    );
+
+    it.each([
+      ["a sub-millisecond time", "2026-09-10T06:30:00.0001Z"],
+      ["a UTC offset time", "2026-09-10T08:30:00.000+02:00"],
+      ["a time without milliseconds", "2026-09-10T06:30:00Z"],
+    ])("refuses %s for exact replay and newer proof", (_name, stored) => {
+      db.prepare(
+        "UPDATE pdpp_stream_completion SET source_collected_at = ?",
+      ).run(stored);
+      for (const at of [T1, T2]) {
+        expectRefusedWithoutChange(() => complete([profile()], at), {
+          reason: "invalid_prior_receipt",
+        });
+      }
+    });
+  });
+
+  it("still compares a digest-less P7 sub-millisecond time by parsed instant", () => {
+    ingest("profiles", [{ key: "p", data: { id: "p" } }], "mutable_state");
+    const result = store.replaceStream({
+      instance: INSTANCE,
+      stream: "profiles",
+      method: METHOD,
+      generation: 1,
+      emittedAt: "2026-09-01T00:00:00.000Z",
+      envelopes: [
+        {
+          instance: INSTANCE,
+          stream: "profiles",
+          key: "p",
+          data: { id: "p" },
+          emitted_at: "2026-09-01T00:00:00.000Z",
+        },
+      ],
+      primaryKey: ["id"],
+      sourceCollectedAt: "2026-09-10T06:30:00.0005Z",
+    });
+    expect(result.applied).toBe(true);
+    const profile = proof(
+      "profiles",
+      1,
+      sha(preimage("profiles", `[["p",{"id":"p"}]]`)),
+    );
+    expectRefusedWithoutChange(() => complete([profile], T1), {
+      reason: "time_conflict",
+    });
+    complete([profile], "2026-09-10T06:30:00.001Z");
+  });
+
+  it("refuses malformed stored JSON as invalid snapshot data", () => {
+    db.prepare(
+      "INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at) VALUES (?, 'messages', 'k', '{not json', 1, 'x')",
+    ).run(INSTANCE);
+    expectRefusedWithoutChange(
+      () => complete([proof("messages", 1, EMPTY_MESSAGES_SHA)]),
+      { reason: "invalid_snapshot_data" },
+    );
+  });
+
+  it("refuses two rows with one encoded key in the digest helper", () => {
+    const identity = {
+      sourceId: SOURCE,
+      instance: INSTANCE,
+      method: METHOD,
+      generation: 1,
+      stream: "messages",
+    };
+    const row = { recordKey: "a", dataJson: '{"id":"a"}' };
+    expect(() => liveSnapshotDigest(identity, ["id"], [row, row])).toThrow(
+      expect.any(StreamCompletionError),
+    );
+    expect(() => liveSnapshotDigest(identity, ["id"], [row])).not.toThrow();
+  });
+
+  describe("v9 column drift", () => {
+    const columns = (database: InstanceType<typeof Database>) =>
+      database.prepare("PRAGMA table_xinfo(pdpp_stream_completion)").all();
+
+    /** A real v8 database file holding one seven-field receipt. */
+    function v8File(dir: string, extraColumns = "") {
+      const path = join(dir, "drift.sqlite");
+      const first = new Database(path);
+      createSqliteRecordStore(first).close();
+      const old = new Database(path);
+      old.exec(`
+        ALTER TABLE pdpp_stream_completion DROP COLUMN snapshot_sha256;
+        ALTER TABLE pdpp_stream_completion DROP COLUMN collection_time_basis;
+        UPDATE pdpp_schema_version SET version = 8;
+        INSERT INTO pdpp_stream_completion
+          (instance, stream, method, generation, source_collected_at, write_seq, live_count)
+        VALUES ('${INSTANCE}', 'profiles', '${METHOD}', 1, '2026-09-10T08:30:00+02:00', 0, 0);
+        ${extraColumns}
+      `);
+      old.close();
+      return path;
+    }
+
+    it.each([
+      [
+        "NOT NULL with a default",
+        `ALTER TABLE pdpp_stream_completion ADD COLUMN snapshot_sha256 TEXT NOT NULL DEFAULT '';
+         ALTER TABLE pdpp_stream_completion ADD COLUMN collection_time_basis TEXT NOT NULL DEFAULT '';`,
+      ],
+      [
+        "another type",
+        `ALTER TABLE pdpp_stream_completion ADD COLUMN snapshot_sha256 INTEGER;
+         ALTER TABLE pdpp_stream_completion ADD COLUMN collection_time_basis TEXT;`,
+      ],
+      [
+        "a non-null default",
+        `ALTER TABLE pdpp_stream_completion ADD COLUMN snapshot_sha256 TEXT;
+         ALTER TABLE pdpp_stream_completion ADD COLUMN collection_time_basis TEXT DEFAULT 'host_run_finished';`,
+      ],
+      [
+        "a generated column",
+        `ALTER TABLE pdpp_stream_completion ADD COLUMN snapshot_sha256 TEXT;
+         ALTER TABLE pdpp_stream_completion ADD COLUMN collection_time_basis TEXT GENERATED ALWAYS AS (NULL) VIRTUAL;`,
+      ],
+    ])(
+      "refuses to open a v8 database whose columns are %s, changing nothing",
+      (_name, ddl) => {
+        const dir = mkdtempSync(join(tmpdir(), "stream-completion-drift-"));
+        try {
+          const path = v8File(dir, ddl);
+          const probe = new Database(path);
+          const before = {
+            columns: columns(probe),
+            rows: probe.prepare("SELECT * FROM pdpp_stream_completion").all(),
+            version: probe
+              .prepare("SELECT version FROM pdpp_schema_version")
+              .get(),
+          };
+          probe.close();
+
+          const target = new Database(path);
+          expect(() => createSqliteRecordStore(target)).toThrow(
+            /snapshot_sha256|collection_time_basis/,
+          );
+          target.close();
+
+          const after = new Database(path);
+          expect({
+            columns: columns(after),
+            rows: after.prepare("SELECT * FROM pdpp_stream_completion").all(),
+            version: after
+              .prepare("SELECT version FROM pdpp_schema_version")
+              .get(),
+          }).toEqual(before);
+          expect(before.version).toEqual({ version: 8 });
+          after.close();
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      },
+    );
+
+    it("accepts a rewound current schema and a genuine v8 upgrade", () => {
+      const dir = mkdtempSync(join(tmpdir(), "stream-completion-rewind-"));
+      try {
+        const rewound = join(dir, "rewound.sqlite");
+        createSqliteRecordStore(new Database(rewound)).close();
+        const raw = new Database(rewound);
+        raw.exec("UPDATE pdpp_schema_version SET version = 8");
+        raw.close();
+        const reopened = new Database(rewound);
+        createSqliteRecordStore(reopened).close();
+
+        const genuine = new Database(v8File(dir));
+        const upgraded = createSqliteRecordStore(genuine);
+        expect(
+          genuine.prepare("SELECT version FROM pdpp_schema_version").get(),
+        ).toEqual({ version: 9 });
+        expect(
+          genuine
+            .prepare(
+              "SELECT snapshot_sha256, collection_time_basis FROM pdpp_stream_completion",
+            )
+            .get(),
+        ).toEqual({ snapshot_sha256: null, collection_time_basis: null });
+        upgraded.close();
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }

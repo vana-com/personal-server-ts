@@ -28,6 +28,7 @@ import {
   type StreamSemantics,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import {
+  isCompletionTime,
   liveSnapshotDigest,
   parseCompletionRequest,
   StreamCompletionError,
@@ -279,22 +280,40 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_arrival_order
   // the digest of the live set it describes and how its time was taken. Both
   // are null on every receipt P7 writes and on every receipt stored before
   // v9, which stay producer-asserted and are never relabeled. The columns are
-  // added by `addCompletionProofColumns`, which skips one that already exists
-  // so a database whose version was only rewound can be upgraded again.
+  // added by `addCompletionProofColumns`, which keeps one that already exists
+  // only if it is a compatible nullable TEXT column, so a database whose
+  // version was only rewound can be upgraded again.
   "",
 ];
 
 function addCompletionProofColumns(db: Database): void {
-  const existing = new Set(
+  // `table_xinfo`, unlike `table_info`, also lists generated columns.
+  const existing = new Map(
     (
-      db.prepare("PRAGMA table_info(pdpp_stream_completion)").all() as {
+      db.prepare("PRAGMA table_xinfo(pdpp_stream_completion)").all() as {
         name: string;
+        type: string;
+        notnull: number;
+        dflt_value: string | null;
+        pk: number;
+        hidden: number;
       }[]
-    ).map((column) => column.name),
+    ).map((column) => [column.name, column]),
   );
-  for (const column of ["snapshot_sha256", "collection_time_basis"]) {
-    if (!existing.has(column)) {
-      db.exec(`ALTER TABLE pdpp_stream_completion ADD COLUMN ${column} TEXT`);
+  for (const name of ["snapshot_sha256", "collection_time_basis"]) {
+    const column = existing.get(name);
+    if (!column) {
+      db.exec(`ALTER TABLE pdpp_stream_completion ADD COLUMN ${name} TEXT`);
+    } else if (
+      column.type.toUpperCase() !== "TEXT" ||
+      column.notnull !== 0 ||
+      column.dflt_value !== null ||
+      column.pk !== 0 ||
+      column.hidden !== 0
+    ) {
+      throw new Error(
+        `pdpp_stream_completion.${name} exists with an incompatible definition; v9 needs a nullable TEXT column with no default. Refusing to open.`,
+      );
     }
   }
 }
@@ -537,7 +556,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    * equal to the request's source, method and generation; nothing is
    * registered here. The caller is not authenticated at this seam.
    * Throws `PdppBindingError` for the binding and `StreamCompletionError`
-   * for everything else; a throw leaves the database unchanged.
+   * for a malformed request, declaration, stored data or receipt, or a
+   * conflicting proof. SQLite failures (busy, trigger aborts) propagate
+   * unchanged. Any throw rolls the transaction back.
    */
   completeStreams(
     request: StreamCompletionRequest,
@@ -1253,9 +1274,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             prior.method !== request.method ||
             prior.generation !== request.generation ||
             prior.live_count !== rows.length ||
+            !Number.isSafeInteger(prior.write_seq) ||
+            prior.write_seq < 0 ||
             prior.write_seq > clock ||
             prior.write_seq < lastChange ||
-            !isRfc3339DateTime(prior.source_collected_at) ||
+            !(native
+              ? isCompletionTime(prior.source_collected_at)
+              : isRfc3339DateTime(prior.source_collected_at)) ||
             native !== (prior.collection_time_basis !== null) ||
             (native &&
               (prior.snapshot_sha256 !== digest ||
