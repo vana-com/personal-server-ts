@@ -281,3 +281,144 @@ describe("chatgpt.conversations in a stable order", () => {
     ).toEqual(["b", "a", "c", "z"]);
   });
 });
+
+describe("ChatGPT edge-case parity observations", () => {
+  const conversation = (
+    id: string,
+    update_time: string,
+    extras: Record<string, unknown> = {},
+  ): PdppRecord => ({
+    stream: "conversations",
+    data: {
+      id,
+      title: id,
+      create_time: "2026-09-01T00:00:00.000Z",
+      update_time,
+      current_node: null,
+      message_count_on_current_branch: 0,
+      ...extras,
+    },
+  });
+
+  it("projects a conversation with zero messages as an empty message list", () => {
+    // Current behavior, not legacy-verified: the ChatGPT parity fixture has
+    // no zero-message row; the Unity adapter test is a projector assertion,
+    // not a captured legacy output (Unity commit 01164027ecac1403b867d8b5fef9a930dbcf69eb).
+    const result = projectPdppRecordsToLegacyPayload(
+      "chatgpt.conversations",
+      [conversation("empty", "2026-09-01T00:00:00.000Z")],
+      { fetchedStreams: ["conversations", "messages"], now: ORACLE_CLOCK },
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      payload: {
+        conversations: [
+          {
+            id: "empty",
+            title: "empty",
+            create_time: "2026-09-01T00:00:00.000Z",
+            update_time: "2026-09-01T00:00:00.000Z",
+            message_count: 0,
+            messages: [],
+            fetched_at: ORACLE_CLOCK,
+          },
+        ],
+        total: 1,
+      },
+    });
+  });
+
+  it("omits the bad-timestamp peer, falls back for a missing title, and keeps the valid peer", () => {
+    // Current behavior, not legacy-verified: neither the PS ChatGPT parity
+    // fixture nor Unity's legacy-scope-adapter index.test.ts captures output
+    // from the legacy connector for these peers (Unity commit above).
+    const result = projectPdppRecordsToLegacyPayload(
+      "chatgpt.conversations",
+      [
+        conversation("valid", "2026-09-03T00:00:00.000Z"),
+        conversation("bad-time", "2026-09-02T00:00:00.000Z", {
+          create_time: 17,
+        }),
+        conversation("missing-title", "2026-09-01T00:00:00.000Z", {
+          title: undefined,
+        }),
+      ],
+      {
+        fetchedStreams: ["conversations", "messages"],
+        now: ORACLE_CLOCK,
+        orderByPrimaryKey: true,
+      },
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      payload: {
+        conversations: [
+          {
+            id: "valid",
+            title: "valid",
+            create_time: "2026-09-01T00:00:00.000Z",
+            update_time: "2026-09-03T00:00:00.000Z",
+            message_count: 0,
+            messages: [],
+            fetched_at: ORACLE_CLOCK,
+          },
+          {
+            id: "missing-title",
+            title: "Untitled",
+            create_time: "2026-09-01T00:00:00.000Z",
+            update_time: "2026-09-01T00:00:00.000Z",
+            message_count: 0,
+            messages: [],
+            fetched_at: ORACLE_CLOCK,
+          },
+        ],
+        total: 2,
+      },
+      diagnostics: [
+        {
+          kind: "records_dropped",
+          scope: "chatgpt.conversations",
+          stream: "conversations",
+          count: 1,
+          reasons: ["Conversation timestamps must be strings, null, or absent"],
+        },
+      ],
+    });
+  });
+
+  it("projects a zero-row fetched memories stream as an empty payload", () => {
+    // Current behavior, not legacy-verified: the existing captured memories
+    // fixture contains rows, while Unity's zero-row case is a projector test.
+    const result = projectPdppRecordsToLegacyPayload("chatgpt.memories", [], {
+      fetchedStreams: ["memories"],
+      now: ORACLE_CLOCK,
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      payload: { memories: [], total: 0 },
+    });
+  });
+
+  it("orders reverse-supplied conversations by newest update first", () => {
+    const result = projectPdppRecordsToLegacyPayload(
+      "chatgpt.conversations",
+      [
+        conversation("newer", "2026-09-03T00:00:00.000Z"),
+        conversation("older", "2026-09-01T00:00:00.000Z"),
+      ],
+      {
+        fetchedStreams: ["conversations", "messages"],
+        now: ORACLE_CLOCK,
+        orderByPrimaryKey: true,
+      },
+    );
+
+    expect(
+      result.ok &&
+        (result.payload.conversations as { id: string }[]).map(({ id }) => id),
+    ).toEqual(["newer", "older"]);
+  });
+});
