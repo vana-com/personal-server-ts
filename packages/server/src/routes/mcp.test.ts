@@ -2782,6 +2782,53 @@ describe("MCP /mcp/session (self-signing handshake)", () => {
     expect((await res.json()).error.errorCode).toBe("GRANT_OWNER_MISMATCH");
   });
 
+  it("stops an open session on any tool call once the grant is revoked", async () => {
+    const { gateway, grant } = makeGatewayForGrantee({
+      granteeAddress: appWallet.address,
+      grantId: GRANT_ID,
+      scopes: ["instagram.profile"],
+    });
+    const app = new Hono();
+    app.route(
+      "/mcp",
+      mcpStreamableHttpRoutes({
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        gatewayConfig,
+        accessLogWriter: createMockAccessLogWriter(),
+        indexManager: createIndexManager(initializeDatabase(":memory:")),
+        hierarchyOptions: { dataDir: "/tmp" },
+      }),
+    );
+    const minted = (await (
+      await app.request("/mcp/session", {
+        method: "POST",
+        headers: { Authorization: await sessionProof() },
+      })
+    ).json()) as { access_token: string };
+    const listTools = () =>
+      app.request("/mcp", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${minted.access_token}`,
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+
+    const before = await listTools();
+    expect(before.status).toBe(200);
+
+    (grant as { revokedAt: string | null }).revokedAt =
+      "2026-10-14T06:40:08.102Z";
+    const after = await listTools();
+    expect(after.status).toBe(403);
+    expect((await after.json()).error.errorCode).toBe("GRANT_REVOKED");
+  });
+
   it("fails closed on a session read when payment is enabled but the gateway is unconfigured", async () => {
     // paymentEnabled true, but NO gatewayConfig — must refuse, not serve free.
     const app = buildApp({ paymentEnabled: true });
