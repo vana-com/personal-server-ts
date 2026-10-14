@@ -6,7 +6,7 @@
     "pdppBundle": "synthetic chatgpt.memories records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
     "expectedSideNote": "current binding output, not captured legacy-connector output",
     "outputKeysAndTypes": "{memories:Array<{id:string,content:string,created_at:string,type:'memory',updated_at?:string}>,total:number}",
-    "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+    "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
     "inputHandling": "Supplementary current-binding fixture; original captured memory golden remains untouched. Dirty non-string updated_at is omitted; non-string content defaults to empty and created_at defaults to the frozen projection clock."
   },
   "fetchedStreams": [
@@ -44,7 +44,7 @@
         "pdppBundle": "synthetic chatgpt.memories records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
         "outputKeysAndTypes": "{memories:Array<{id:string,content:string,created_at:string,type:'memory',updated_at?:string}>,total:number}",
-        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
         "inputHandling": "Supplementary current-binding fixture; original captured memory golden remains untouched. Dirty non-string updated_at is omitted; non-string content defaults to empty and created_at defaults to the frozen projection clock."
       },
       "fetchedStreams": [
@@ -67,7 +67,7 @@
         "pdppBundle": "synthetic chatgpt.memories records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
         "outputKeysAndTypes": "{memories:Array<{id:string,content:string,created_at:string,type:'memory',updated_at?:string}>,total:number}",
-        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
         "inputHandling": "Supplementary current-binding fixture; original captured memory golden remains untouched. Dirty non-string updated_at is omitted; non-string content defaults to empty and created_at defaults to the frozen projection clock."
       },
       "fetchedStreams": [

@@ -83,6 +83,47 @@ const GROCERY_SCOPES = [
   "wholefoods.orders",
   "wholefoods.nutrition",
 ];
+const FROZEN_DESKTOP_SCHEMA_PROVENANCE: Record<
+  string,
+  { path: string; sha256: string }
+> = {
+  "heb.profile": {
+    path: "apps/desktop/connectors/heb/schemas/heb.profile.json",
+    sha256: "0a27981ccdcffad91afd2a78a80407c67227b05ea1cf0c918ddfa5cb6338a3e0",
+  },
+  "heb.orders": {
+    path: "apps/desktop/connectors/heb/schemas/heb.orders.json",
+    sha256: "d3579f4ae1b163a1bbcbfb9d2177892d81c395cd29cc81937ac21b8d8cff2b45",
+  },
+  "heb.nutrition": {
+    path: "apps/desktop/connectors/heb/schemas/heb.nutrition.json",
+    sha256: "2dbc47a40391b7ee11c8601a2b2cd5bf327aaa552898f0d8c957dc111d92807c",
+  },
+  "wholefoods.profile": {
+    path: "apps/desktop/connectors/wholefoods/schemas/wholefoods.profile.json",
+    sha256: "53643cbb7f783a759691ad7eb25c06d41a4d6e245bde0e948fbccf2e60379bf1",
+  },
+  "wholefoods.orders": {
+    path: "apps/desktop/connectors/wholefoods/schemas/wholefoods.orders.json",
+    sha256: "0e3cfe49b006ea9811df4d398c131cc5c8f4a14137aea359a20777162bed1b1b",
+  },
+  "wholefoods.nutrition": {
+    path: "apps/desktop/connectors/wholefoods/schemas/wholefoods.nutrition.json",
+    sha256: "e362ab6d391debd007fa13df8fe8743a67439ce5e2395d41c14aa89f987882fa",
+  },
+  "chatgpt.conversations": {
+    path: "apps/desktop/connectors/openai/schemas/chatgpt.conversations.json",
+    sha256: "c83eba044962dfe4401c6f8637daac7aa7273fe88eaa9cd1734b7f51ca61265b",
+  },
+  "shop.orders": {
+    path: "apps/desktop/connectors/shopify/schemas/shop.orders.json",
+    sha256: "13ace1a15d6d5e4d19ed1e77169d50d203fd9f16d608e8e8f133a55b06199713",
+  },
+  "youtube.history": {
+    path: "apps/desktop/connectors/google/schemas/youtube.history.json",
+    sha256: "224811b6b73834e542f5d84f54a82acba095dfa64688592b658b0c97a73ba352",
+  },
+};
 // Current-binding regressions at the 71a43bce cutover pin.
 const MISC_SCOPES = [
   "github.repositories",
@@ -115,7 +156,9 @@ const SCOPES = [
   ...GROCERY_SCOPES,
   ...MISC_SCOPES,
 ];
-const ajv = new Ajv({ allErrors: true, strict: false });
+// Ajv follows each frozen schema's explicit additionalProperties rules. Some
+// Desktop schemas intentionally leave selected objects open.
+const ajv = new Ajv({ allErrors: true });
 
 function load(scope: string): Golden {
   return JSON.parse(
@@ -142,8 +185,24 @@ function schemaFor(scope: string): Record<string, unknown> {
   return file.schema;
 }
 
-// Exact per-case output keys/types are provided for owner comparison with the
-// unavailable frozen grocery LEGACY schemas. Desktop schemas are not substitutes.
+function frozenDesktopSchemaFor(scope: string): Record<string, unknown> {
+  // The 33 matching Desktop schemas stay in legacy-schemas. These nine need
+  // separate frozen copies because three active PS schemas were revised and
+  // six were missing at the base revision.
+  const directory = FROZEN_DESKTOP_SCHEMA_PROVENANCE[scope]
+    ? "./__fixtures__/desktop-schemas"
+    : "./legacy-schemas";
+  const file = JSON.parse(
+    readFileSync(
+      new URL(`${directory}/${scope}.json`, import.meta.url),
+      "utf8",
+    ),
+  ) as { schema: Record<string, unknown> };
+  return file.schema;
+}
+
+// Exact per-case output keys/types keep the intentionally synthetic grocery
+// binding regressions inspectable alongside the frozen Desktop schema oracle.
 function outputKeyTypes(
   value: unknown,
   path = "$",
@@ -163,17 +222,198 @@ function outputKeyTypes(
   return result;
 }
 
-function expectPinnedSchema(scope: string, payload: Record<string, unknown>) {
-  // Explicitly deferred below; do not load a different schema as a fallback.
-  if (GROCERY_SCOPES.includes(scope)) return;
-  const validate = ajv.compile(schemaFor(scope));
-  expect(validate(payload), JSON.stringify(validate.errors, null, 2)).toBe(
-    true,
-  );
+type SchemaIssue = {
+  case: string;
+  body: "expected" | "projected";
+  path: string;
+  rule: string;
+};
+
+// Filled from the frozen Desktop schema oracle below. A listed violation is a
+// visible parity gap, and the companion `it.fails` case keeps it visible in the
+// test report while the exact register prevents new or changed violations.
+const KNOWN_FROZEN_SCHEMA_GAPS: Record<string, SchemaIssue[]> = {
+  "chatgpt.conversations": [
+    {
+      case: "normal",
+      body: "expected",
+      path: "$.conversations[*].fetched_at",
+      rule: "additionalProperties: should NOT have additional properties",
+    },
+    {
+      case: "normal",
+      body: "expected",
+      path: "$.conversations[*].create_time",
+      rule: "type: should be string",
+    },
+    {
+      case: "normal",
+      body: "projected",
+      path: "$.conversations[*].fetched_at",
+      rule: "additionalProperties: should NOT have additional properties",
+    },
+  ],
+  "shop.orders": [
+    ...["normal", "empty", "dirty-row"].flatMap((caseName) =>
+      (["expected", "projected"] as const).map((body) => ({
+        case: caseName,
+        body,
+        path: "$.total",
+        rule: "additionalProperties: should NOT have additional properties",
+      })),
+    ),
+  ],
+  "youtube.history": [
+    {
+      case: "normal",
+      body: "expected",
+      path: "$.history[*].watchedAt",
+      rule: "additionalProperties: should NOT have additional properties",
+    },
+    {
+      case: "normal",
+      body: "projected",
+      path: "$.history[*].watchedAt",
+      rule: "additionalProperties: should NOT have additional properties",
+    },
+  ],
+};
+
+function schemaIssues(
+  scope: string,
+  caseName: string,
+  body: "expected" | "projected",
+  payload: Record<string, unknown>,
+): SchemaIssue[] {
+  const validate = ajv.compile(frozenDesktopSchemaFor(scope));
+  if (validate(payload)) return [];
+  const issues = (validate.errors ?? []).map((error) => {
+    const legacyDataPath = (error as { dataPath?: string }).dataPath;
+    const rawPath =
+      error.instancePath ||
+      (legacyDataPath ?? "")
+        .replace(/\[(\d+)\]/g, "[*]")
+        .replace(/^\./, (path) => `$${path}`);
+    const parentPath = rawPath || "$";
+    const issuePath =
+      error.keyword === "additionalProperties" &&
+      typeof error.params.additionalProperty === "string"
+        ? `${parentPath}.${error.params.additionalProperty}`
+        : parentPath;
+    return {
+      case: caseName,
+      body,
+      path: issuePath,
+      rule: `${error.keyword}: ${error.message}`,
+    };
+  });
+  return [
+    ...new Map(issues.map((issue) => [JSON.stringify(issue), issue])).values(),
+  ];
 }
 
-describe.each(GROCERY_SCOPES)("%s frozen LEGACY schema comparison", () => {
-  it.skip("requires the owner-provided frozen schema; current-binding tests do not certify legacy parity", () => {});
+function frozenSchemaIssuesForScope(scope: string): SchemaIssue[] {
+  const golden = load(scope);
+  const goldens = [golden, ...(golden.cases ?? [])];
+  return goldens.flatMap((entry) => {
+    if (entry.expectedResult) return [];
+    const result = projectPdppRecordsToLegacyPayload(scope, records(entry), {
+      fetchedStreams: entry.fetchedStreams,
+      now: ORACLE_CLOCK,
+      profileKey: entry.profileKey,
+    });
+    if (!result.ok) {
+      throw new Error(
+        `Cannot validate projected ${scope} ${entry.case ?? "normal"}: ${result.error.kind}`,
+      );
+    }
+    // GitHub contributions stores its expected body as a SHA-256 plus key list.
+    // The existing golden hash assertion binds this projected value to that
+    // compact expected body before it is validated as both expected and output.
+    const expectedBody =
+      entry.legacyBody ??
+      (entry.expectedLegacySha256 &&
+      payloadSha256(result.payload) === entry.expectedLegacySha256
+        ? result.payload
+        : undefined);
+    if (!expectedBody) {
+      throw new Error(
+        `Missing expected legacy body for ${scope} ${entry.case ?? "normal"}`,
+      );
+    }
+    const expectedIssues = schemaIssues(
+      scope,
+      entry.case ?? "normal",
+      "expected",
+      expectedBody,
+    );
+    const projectedIssues = schemaIssues(
+      scope,
+      entry.case ?? "normal",
+      "projected",
+      result.payload,
+    );
+    return [...expectedIssues, ...projectedIssues];
+  });
+}
+
+describe("frozen Desktop schema conformance", () => {
+  it("keeps the vendored Desktop schemas byte-identical", () => {
+    for (const [scope, provenance] of Object.entries(
+      FROZEN_DESKTOP_SCHEMA_PROVENANCE,
+    )) {
+      const bytes = readFileSync(
+        new URL(
+          `./__fixtures__/desktop-schemas/${scope}.json`,
+          import.meta.url,
+        ),
+      );
+      expect(createHash("sha256").update(bytes).digest("hex"), scope).toBe(
+        provenance.sha256,
+      );
+      if (
+        [
+          "heb.profile",
+          "heb.orders",
+          "heb.nutrition",
+          "wholefoods.profile",
+          "wholefoods.orders",
+          "wholefoods.nutrition",
+        ].includes(scope)
+      ) {
+        const legacyBytes = readFileSync(
+          new URL(`./legacy-schemas/${scope}.json`, import.meta.url),
+        );
+        expect(legacyBytes.equals(bytes), `${scope} legacy copy`).toBe(true);
+      }
+    }
+  });
+
+  it("matches the explicit known-gap register", () => {
+    const actual = Object.fromEntries(
+      SCOPES.map((scope) => [scope, frozenSchemaIssuesForScope(scope)]),
+    );
+    const actualGaps = Object.fromEntries(
+      Object.entries(actual).filter(([, issues]) => issues.length > 0),
+    );
+    expect(actualGaps).toEqual(KNOWN_FROZEN_SCHEMA_GAPS);
+  });
+
+  for (const scope of SCOPES) {
+    const gaps = KNOWN_FROZEN_SCHEMA_GAPS[scope];
+    if (gaps) {
+      it.fails(
+        `${scope} is a known frozen-schema GAP: ${gaps.map((gap) => `${gap.path} ${gap.rule}`).join("; ")}`,
+        () => {
+          expect(frozenSchemaIssuesForScope(scope)).toEqual([]);
+        },
+      );
+    } else {
+      it(`${scope} expected and projected bodies validate`, () => {
+        expect(frozenSchemaIssuesForScope(scope)).toEqual([]);
+      });
+    }
+  }
 });
 
 function canonicalJson(value: unknown): string {
@@ -230,7 +470,7 @@ function expectMiscProvenance(golden: Golden) {
   );
   expect(golden.provenance.outputKeysAndTypes).toBeTruthy();
   expect(golden.provenance.legacySchemaComparison).toBe(
-    "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+    "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
   );
   expect(golden.case).toBe("normal");
   expect(golden.reviewedDifferences).toEqual([]);
@@ -287,9 +527,23 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
       expect(golden.provenance.expectedSideNote).toBe(
         "current binding output, not captured legacy-connector output",
       );
+      const schemaProvenance = FROZEN_DESKTOP_SCHEMA_PROVENANCE[scope];
+      expect(schemaProvenance).toBeDefined();
       expect(golden.provenance.legacySchemaNote).toBe(
-        "Frozen LEGACY schema unavailable in this checkout; owner comparison pending. Desktop schemas are not used as a substitute. These current-binding regressions do not certify legacy compatibility.",
+        `Frozen Desktop schema from vana-com/unity-surfaces commit 9155456f7a90a10b7af902c7ae5ea68ee8cef12d, ${schemaProvenance.path}; sha256:${schemaProvenance.sha256}.`,
       );
+      expect(
+        createHash("sha256")
+          .update(
+            readFileSync(
+              new URL(
+                `./__fixtures__/desktop-schemas/${scope}.json`,
+                import.meta.url,
+              ),
+            ),
+          )
+          .digest("hex"),
+      ).toBe(schemaProvenance.sha256);
       expect(golden.provenance.consumerContractNote).toBe(
         "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
       );
@@ -377,7 +631,6 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
         expect(golden.legacyBody).toBeDefined();
         expectGoldenBody(golden, result.payload);
       }
-      expectPinnedSchema(scope, result.payload);
     },
   );
 
@@ -492,7 +745,6 @@ describe.each([
         expect(Object.keys(result.payload)).toEqual(
           Object.keys(edge.legacyBody!),
         );
-        expectPinnedSchema(scope, result.payload);
       },
     );
   });
