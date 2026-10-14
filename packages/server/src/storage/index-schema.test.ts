@@ -25,6 +25,28 @@ describe("initializeDatabase", () => {
     db.close();
   });
 
+  it("creates the durable legacy scope takeover ledger", () => {
+    const db = initializeDatabase(":memory:");
+    const row = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='legacy_scope_takeovers'",
+      )
+      .get() as { name: string } | undefined;
+    expect(row?.name).toBe("legacy_scope_takeovers");
+    const columns = db
+      .prepare("PRAGMA table_info(legacy_scope_takeovers)")
+      .all() as { name: string }[];
+    expect(columns.map((column) => column.name)).toEqual([
+      "scope",
+      "superseded_version",
+      "superseded_cas_revision",
+      "superseded_collected_at",
+      "superseded_path",
+      "taken_over_at",
+    ]);
+    db.close();
+  });
+
   it("has all expected columns", () => {
     const db = initializeDatabase(":memory:");
     const columns = db.prepare("PRAGMA table_info(data_files)").all() as {
@@ -100,7 +122,7 @@ describe("initializeDatabase", () => {
       .get("instagram/profile.json") as
       { path: string; scope: string; size_bytes: number } | undefined;
 
-    expect(version).toBe(7);
+    expect(version).toBe(8);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -156,7 +178,7 @@ describe("initializeDatabase", () => {
         }
       | undefined;
 
-    expect(version).toBe(7);
+    expect(version).toBe(8);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
@@ -205,7 +227,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(7);
+    expect(db.pragma("user_version", { simple: true })).toBe(8);
     const row = db
       .prepare(
         "SELECT path, schema_id, version, cas_revision, data_point_id FROM data_files WHERE path = ?",
@@ -265,7 +287,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(7);
+    expect(db.pragma("user_version", { simple: true })).toBe(8);
     const row = db
       .prepare(
         "SELECT path, version, cas_revision, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",
@@ -308,7 +330,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(7);
+    expect(db.pragma("user_version", { simple: true })).toBe(8);
     expect(
       db
         .prepare(
