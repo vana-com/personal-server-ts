@@ -7,7 +7,7 @@ import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 
 const selection = {
   instance: "claude-test",
-  sourceId: "https://registry.pdpp.dev/sources/anthropic",
+  sourceId: "https://registry.pdpp.dev/sources/claude",
   method: "anthropic",
 };
 const collected = "2026-09-01T12:00:00.000Z";
@@ -113,6 +113,14 @@ describe("canonical Claude source blobs", () => {
       profileBy: "method",
     });
     if (!result.ok) throw new Error(JSON.stringify(result));
+    expect(
+      await readCanonicalLegacyScope({
+        store,
+        selection,
+        scope: "claude.projects",
+        profileBy: "source",
+      }),
+    ).toEqual(result);
     expect(result).toMatchObject({
       ok: true,
       complete: true,
@@ -259,6 +267,14 @@ describe("canonical Claude source blobs", () => {
       },
     });
     if (!result.ok) throw new Error(JSON.stringify(result));
+    expect(
+      await readCanonicalLegacyScope({
+        store,
+        selection,
+        scope: "claude.conversations",
+        profileBy: "source",
+      }),
+    ).toEqual(result);
     const schema = JSON.parse(
       await readFile(
         new URL(

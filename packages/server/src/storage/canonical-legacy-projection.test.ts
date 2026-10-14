@@ -844,7 +844,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("joins messages to their conversation within the selected connection", async () => {
-      const a = connect("conn_a", "anthropic");
+      const a = connect("conn_a", "claude");
       put("conn_a", "account_profile", [profile]);
       put("conn_a", "conversations", [conversation(1)]);
       put("conn_a", "messages", [message("m1")]);
@@ -862,7 +862,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("reports incomplete, not empty or short, when the detail rows are missing", async () => {
-      const a = connect("conn_a", "anthropic");
+      const a = connect("conn_a", "claude");
       put("conn_a", "account_profile", [profile]);
       put("conn_a", "conversations", [conversation(2)]);
       put("conn_a", "messages", [message("m1")]);
@@ -881,8 +881,8 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("never joins detail rows from another connection", async () => {
-      const a = connect("conn_a", "anthropic");
-      connect("conn_b", "anthropic");
+      const a = connect("conn_a", "claude");
+      connect("conn_b", "claude");
       put("conn_a", "account_profile", [profile]);
       put("conn_a", "conversations", [conversation(1)]);
       put("conn_a", "messages", [
@@ -903,7 +903,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     });
 
     it("fails explicitly for blob-backed rows instead of serving them empty", async () => {
-      const a = connect("conn_a", "anthropic");
+      const a = connect("conn_a", "claude");
       put("conn_a", "account_profile", [profile]);
       put("conn_a", "conversations", [conversation(1)]);
       const blob = store.storeBlobBytesForInstance({
@@ -1523,7 +1523,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       });
 
       it("takes the newest stream collection across nonempty and empty streams", async () => {
-        const a = connect("conn_a", "anthropic");
+        const a = connect("conn_a", "claude");
         const profile = {
           id: "org1",
           organization_id: "org1",

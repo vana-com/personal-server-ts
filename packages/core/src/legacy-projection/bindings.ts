@@ -1944,8 +1944,10 @@ function newestUpdateFirst(
 
 // This is the merged 0.1.3 source declaration. Admission remains a separate
 // decision; this local manifest hash is not the signed OCI artifact digest.
-const anthropicProjectionSource =
+export const ANTHROPIC_CONNECTOR_ID =
   "https://registry.pdpp.dev/connectors/anthropic";
+// Connector/method identity differs from the public source in the admitted declaration.
+export const CLAUDE_SOURCE_ID = "https://registry.pdpp.dev/sources/claude";
 const anthropicProjectionProvenance: LegacyScopeBindingProvenance[] = [
   {
     kind: "collection-profile",
@@ -2016,7 +2018,7 @@ function claudeConversationsBinding(): LegacyScopeBinding {
   const scope = "claude.conversations";
   return {
     scope,
-    pdppSource: anthropicProjectionSource,
+    pdppSource: ANTHROPIC_CONNECTOR_ID,
     pdppStreams: ["account_profile", "conversations", "messages"],
     legacySchemaPath: "claude.conversations.json",
     fieldsRead: {
@@ -2202,7 +2204,7 @@ const claudeConversations = claudeConversationsBinding();
 
 const claudeProjects: LegacyScopeBinding = {
   scope: "claude.projects",
-  pdppSource: anthropicProjectionSource,
+  pdppSource: ANTHROPIC_CONNECTOR_ID,
   pdppStreams: ["account_profile", "projects", "project_documents"],
   legacySchemaPath: "claude.projects.json",
   fieldsRead: {
