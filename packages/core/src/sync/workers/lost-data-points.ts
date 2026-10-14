@@ -3,21 +3,26 @@
  *
  * The upload worker marks an entry synced (stamps its dataPointId) as soon as
  * the gateway accepts the registration, before it settles on chain. If the
- * settle later fails terminally, the gateway rolls the head back to an older
- * version or deletes it outright. The entry still reads as synced, so the
- * worker never re-posts it and the scope is missing from the gateway for good:
- * no replica can download it, and every paid read fails because the gateway
- * cannot find the data point the access record names.
+ * settle later fails terminally and no version survives, the gateway deletes
+ * the data point. The entry still reads as synced, so the worker never
+ * re-posts it and the scope is missing from the gateway for good: no replica
+ * can download it, and every paid read fails because the gateway cannot find
+ * the data point the access record names.
  *
- * Once per boot, check each scope's latest synced entry against the gateway
- * and clear its dataPointId when the gateway has no data point at all, or only
- * an older version. The next upload cycle registers it again (rebasing onto
- * the registry's live version when needed).
+ * Check each scope's latest synced entry against the gateway and clear its
+ * dataPointId when the gateway has no data point at all; the next upload cycle
+ * registers it again. Only the "gone entirely" case is re-queued: when the
+ * head merely rolled back to an older version, the download worker would
+ * re-stamp the row from that older version before a failed re-upload could be
+ * retried, so that case is left to a dedicated fix.
  */
 
+import {
+  DataPointDeletedError,
+  type GatewayClient,
+} from "@opendatalabs/vana-sdk/browser";
 import type { DataStoragePort } from "../../ports/index.js";
 import type { Logger } from "../../logger/index.js";
-import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 
 export interface LostDataPointDeps {
   storage: Pick<
@@ -28,13 +33,19 @@ export interface LostDataPointDeps {
   logger: Logger;
 }
 
+export interface LostDataPointResult {
+  /** Scopes re-queued for upload. */
+  requeued: string[];
+  /** A gateway lookup failed; run the check again on a later cycle. */
+  complete: boolean;
+}
+
 const SCOPE_PAGE = 200;
 const CONCURRENCY = 8;
 
-/** Returns the scopes re-queued for upload. */
 export async function requeueLostDataPoints(
   deps: LostDataPointDeps,
-): Promise<string[]> {
+): Promise<LostDataPointResult> {
   const latest = [];
   for (let offset = 0; ; offset += SCOPE_PAGE) {
     const page = deps.storage.listScopes({ limit: SCOPE_PAGE, offset });
@@ -46,31 +57,29 @@ export async function requeueLostDataPoints(
   }
 
   const requeued: string[] = [];
+  let complete = true;
   for (let i = 0; i < latest.length; i += CONCURRENCY) {
     await Promise.all(
       latest.slice(i, i + CONCURRENCY).map(async (entry) => {
         let record;
         try {
           record = await deps.gateway.getDataPoint(entry.dataPointId!);
-        } catch {
-          // Deleted by the owner (tombstone) or the gateway is unreachable:
-          // neither is evidence that the registration was lost.
+        } catch (err) {
+          // A tombstone is the owner's deletion, not a lost registration.
+          // Anything else is a failed lookup: no evidence either way, so the
+          // caller retries the check later instead of trusting this pass.
+          if (!(err instanceof DataPointDeletedError)) complete = false;
           return;
         }
-        const registered = record ? Number(record.expectedVersion) : 0;
-        if (registered >= entry.version) return;
+        if (record) return;
         await deps.storage.updateDataPointId(entry.path, null);
         requeued.push(entry.scope);
         deps.logger.warn(
-          {
-            scope: entry.scope,
-            version: entry.version,
-            registeredVersion: record ? registered : null,
-          },
-          "Gateway lost this scope's registration; re-queued for upload",
+          { scope: entry.scope, version: entry.version },
+          "Gateway has no data point for this synced scope; re-queued for upload",
         );
       }),
     );
   }
-  return requeued;
+  return { requeued, complete };
 }

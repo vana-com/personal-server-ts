@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { DataPointDeletedError } from "@opendatalabs/vana-sdk/browser";
 import { requeueLostDataPoints } from "./lost-data-points.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
 import type { Logger } from "../../logger/index.js";
@@ -45,9 +46,9 @@ describe("requeueLostDataPoints", () => {
     const storage = await seed("chatgpt.memories", 1, "0xlost");
     const gateway = gatewayReturning({ "0xlost": null });
 
-    const requeued = await requeueLostDataPoints({ storage, gateway, logger });
+    const result = await requeueLostDataPoints({ storage, gateway, logger });
 
-    expect(requeued).toEqual(["chatgpt.memories"]);
+    expect(result).toEqual({ requeued: ["chatgpt.memories"], complete: true });
     expect(
       storage.findEntry({ scope: "chatgpt.memories" })?.dataPointId,
     ).toBeNull();
@@ -56,21 +57,14 @@ describe("requeueLostDataPoints", () => {
     ]);
   });
 
-  it("re-queues when the gateway head was rolled back below the local version", async () => {
-    const storage = await seed("chatgpt.memories", 3, "0xdp");
-    const gateway = gatewayReturning({ "0xdp": { expectedVersion: "2" } });
-
-    expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual([
-      "chatgpt.memories",
-    ]);
-  });
-
-  it("leaves a scope alone when the gateway has this version or a newer one", async () => {
-    for (const expectedVersion of ["1", "4"]) {
-      const storage = await seed("chatgpt.memories", 1, "0xdp");
+  it("leaves a scope alone whenever the gateway has any version of it", async () => {
+    // An older head (rolled back) is deliberately not re-queued: the download
+    // worker would re-stamp the row from it before a failed re-upload retried.
+    for (const expectedVersion of ["1", "2", "4"]) {
+      const storage = await seed("chatgpt.memories", 3, "0xdp");
       const gateway = gatewayReturning({ "0xdp": { expectedVersion } });
       expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual(
-        [],
+        { requeued: [], complete: true },
       );
       expect(
         storage.findEntry({ scope: "chatgpt.memories" })?.dataPointId,
@@ -78,15 +72,33 @@ describe("requeueLostDataPoints", () => {
     }
   });
 
-  it("never re-queues on a tombstone or a gateway error", async () => {
+  it("treats a tombstone as the owner's deletion: nothing re-queued, check complete", async () => {
     const storage = await seed("chatgpt.memories", 1, "0xdp");
     const gateway = gatewayReturning({
-      "0xdp": new Error("Data point 0xdp has been deleted"),
+      "0xdp": new DataPointDeletedError("Data point 0xdp has been deleted", {
+        dataPointId: "0xdp",
+      } as never),
     });
 
-    expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual(
-      [],
+    expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual({
+      requeued: [],
+      complete: true,
+    });
+    expect(storage.findEntry({ scope: "chatgpt.memories" })?.dataPointId).toBe(
+      "0xdp",
     );
+  });
+
+  it("reports an incomplete check on a gateway error so the caller retries", async () => {
+    const storage = await seed("chatgpt.memories", 1, "0xdp");
+    const gateway = gatewayReturning({
+      "0xdp": new Error("Gateway error: 503 Service Unavailable"),
+    });
+
+    expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual({
+      requeued: [],
+      complete: false,
+    });
     expect(storage.findEntry({ scope: "chatgpt.memories" })?.dataPointId).toBe(
       "0xdp",
     );
@@ -96,9 +108,10 @@ describe("requeueLostDataPoints", () => {
     const storage = await seed("chatgpt.memories", 1, null);
     const gateway = gatewayReturning({});
 
-    expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual(
-      [],
-    );
+    expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual({
+      requeued: [],
+      complete: true,
+    });
     expect(gateway.getDataPoint).not.toHaveBeenCalled();
   });
 });

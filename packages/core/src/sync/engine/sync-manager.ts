@@ -180,8 +180,9 @@ export function createSyncManager(
             // Once per boot: a registration the gateway accepted and later
             // dropped (failed settle) still reads as synced locally.
             try {
-              await requeueLostDataPoints(uploadDeps);
-              needsLostDataPointCheck = false;
+              const { complete } = await requeueLostDataPoints(uploadDeps);
+              // A failed lookup leaves the check for a later cycle.
+              needsLostDataPointCheck = !complete;
             } catch (err) {
               uploadDeps.logger.warn(
                 { error: (err as Error).message },
