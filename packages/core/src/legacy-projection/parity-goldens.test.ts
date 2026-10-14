@@ -5,7 +5,7 @@
  * both produced from the same upstream responses (see parity-oracle/). The
  * projection must reproduce that body except for the reviewed differences
  * the golden lists, and must validate against the pinned legacy schema.
- * Shop/Spotify/LinkedIn/Instagram/YouTube expectations are current binding output,
+ * Shop/Spotify/LinkedIn/Instagram/YouTube/Grocery expectations are current binding output,
  * not captured legacy-connector output; passing does not establish legacy parity.
  * Social fixtures separately expose synthetic consumer-contract differences.
  */
@@ -38,6 +38,9 @@ interface Golden {
     expectedSideNote?: string;
     consumerContractNote?: string;
     outputKeysAndTypes?: string;
+    legacySchemaNote?: string;
+    outputContractNote?: string;
+    behaviorNote?: string;
   };
   fetchedStreams: string[];
   streams: Record<string, Record<string, unknown>[]>;
@@ -70,6 +73,14 @@ const YOUTUBE_SCOPES = [
   "youtube.watchLater",
   "youtube.history",
 ];
+const GROCERY_SCOPES = [
+  "heb.profile",
+  "heb.orders",
+  "heb.nutrition",
+  "wholefoods.profile",
+  "wholefoods.orders",
+  "wholefoods.nutrition",
+];
 const SCOPES = [
   "chatgpt.conversations",
   "chatgpt.memories",
@@ -86,6 +97,7 @@ const SCOPES = [
   "spotify.playlists",
   ...SOCIAL_SCOPES,
   ...YOUTUBE_SCOPES,
+  ...GROCERY_SCOPES,
 ];
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -113,6 +125,40 @@ function schemaFor(scope: string): Record<string, unknown> {
   ) as { schema: Record<string, unknown> };
   return file.schema;
 }
+
+// Exact per-case output keys/types are provided for owner comparison with the
+// unavailable frozen grocery LEGACY schemas. Desktop schemas are not substitutes.
+function outputKeyTypes(
+  value: unknown,
+  path = "$",
+  result: Record<string, string> = {},
+): Record<string, string> {
+  result[path] =
+    value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+  if (value !== null && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      outputKeyTypes(
+        child,
+        Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`,
+        result,
+      );
+    }
+  }
+  return result;
+}
+
+function expectPinnedSchema(scope: string, payload: Record<string, unknown>) {
+  // Explicitly deferred below; do not load a different schema as a fallback.
+  if (GROCERY_SCOPES.includes(scope)) return;
+  const validate = ajv.compile(schemaFor(scope));
+  expect(validate(payload), JSON.stringify(validate.errors, null, 2)).toBe(
+    true,
+  );
+}
+
+describe.each(GROCERY_SCOPES)("%s frozen LEGACY schema comparison", () => {
+  it.skip("requires the owner-provided frozen schema; current-binding tests do not certify legacy parity", () => {});
+});
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -185,6 +231,32 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
       );
       expect(golden.provenance.expectedSideNote).toBe(
         "current binding output, not captured legacy-connector output",
+      );
+    } else if (GROCERY_SCOPES.includes(scope)) {
+      expect(golden.provenance.legacyConnector).toMatch(
+        /^current binding output, not captured legacy-connector output; (heb|wholefoods)\.(profile|orders|nutrition) from packages\/core\/src\/legacy-projection\/bindings\.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665$/,
+      );
+      expect(golden.provenance.pdppBundle).toMatch(
+        /^synthetic (heb|wholefoods)\.(profile|orders|nutrition) records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed$/,
+      );
+      expect(golden.provenance.expectedSideNote).toBe(
+        "current binding output, not captured legacy-connector output",
+      );
+      expect(golden.provenance.legacySchemaNote).toBe(
+        "Frozen LEGACY schema unavailable in this checkout; owner comparison pending. Desktop schemas are not used as a substitute. These current-binding regressions do not certify legacy compatibility.",
+      );
+      expect(golden.provenance.consumerContractNote).toBe(
+        "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+      );
+      expect(golden.case).toBe("normal");
+      expect(golden.provenance.behaviorNote?.length).toBeGreaterThan(0);
+      expect(JSON.parse(golden.provenance.outputContractNote!)).toEqual(
+        Object.fromEntries(
+          [golden, ...(golden.cases ?? [])].map((entry) => [
+            entry.case,
+            outputKeyTypes(entry.legacyBody ?? entry.expectedResult),
+          ]),
+        ),
       );
     } else if (SOCIAL_SCOPES.includes(scope)) {
       expect(golden.provenance.legacyConnector).toMatch(
@@ -260,11 +332,7 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
         expect(golden.legacyBody).toBeDefined();
         expectGoldenBody(golden, result.payload);
       }
-      const validate = ajv.compile(schemaFor(scope));
-      expect(
-        validate(result.payload),
-        JSON.stringify(validate.errors, null, 2),
-      ).toBe(true);
+      expectPinnedSchema(scope, result.payload);
     },
   );
 
@@ -300,6 +368,7 @@ describe.each([
   "spotify.playlists",
   ...SOCIAL_SCOPES,
   ...YOUTUBE_SCOPES,
+  ...GROCERY_SCOPES,
 ])("%s current-binding empty and dirty-row regressions", (scope) => {
   const golden = load(scope);
 
@@ -318,6 +387,13 @@ describe.each([
       if (SOCIAL_SCOPES.includes(scope) && edge.case === "dirty-row") {
         expect(edge.consumerContractBody).toBeDefined();
         expect(edge.reviewedDifferences.length).toBeGreaterThan(0);
+      } else if (GROCERY_SCOPES.includes(scope) && edge.consumerContractBody) {
+        expect(edge.reviewedDifferences.length).toBeGreaterThan(0);
+        expect(
+          edge.reviewedDifferences.every(
+            (entry) => entry.projected === "<absent>",
+          ),
+        ).toBe(true);
       } else {
         expect(edge.reviewedDifferences).toEqual([]);
       }
@@ -355,6 +431,7 @@ describe.each([
         if (edge.expectedResult) {
           expect(edge.expectedResult.error.scope).toBe(scope);
           expect(edge.legacyBody).toBeUndefined();
+          expect(edge.expectedDiagnostics).toBeUndefined();
           expect(result).toEqual(edge.expectedResult);
           return;
         }
@@ -363,17 +440,13 @@ describe.each([
         expect(edge.legacyBody).toBeDefined();
         expect(result.ok).toBe(true);
         if (!result.ok) return;
-        expect(result.diagnostics).toBeUndefined();
+        expect(result.diagnostics).toEqual(edge.expectedDiagnostics);
         expect(result.payload).toEqual(edge.legacyBody);
         expectGoldenBody(edge, result.payload);
         expect(Object.keys(result.payload)).toEqual(
           Object.keys(edge.legacyBody!),
         );
-        const validate = ajv.compile(schemaFor(scope));
-        expect(
-          validate(result.payload),
-          JSON.stringify(validate.errors, null, 2),
-        ).toBe(true);
+        expectPinnedSchema(scope, result.payload);
       },
     );
   });
