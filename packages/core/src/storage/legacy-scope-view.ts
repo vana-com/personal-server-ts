@@ -232,19 +232,29 @@ export function createLegacyScopeView(
 
   function decide(scope: string): Decision {
     const streamsByMethod = scopeMethods(scope);
-    if (streamsByMethod.size === 0) return { kind: "file" };
+    if (streamsByMethod.size === 0) {
+      return authority.hasTakeover(scope)
+        ? refused({
+            status: "unavailable",
+            reason: "connection_unavailable",
+            detail: "method_not_configured",
+          })
+        : { kind: "file" };
+    }
     const connections = authority.listMethodConnections([
       ...streamsByMethod.keys(),
     ]);
-    const owned = connections.some(
-      (connection) =>
-        connection.deletedAt !== null ||
-        connection.generation > 1 ||
-        authority.hasHeldData(
-          connection.instance,
-          streamsByMethod.get(connection.method ?? "") ?? [],
-        ),
-    );
+    const owned =
+      authority.hasTakeover(scope) ||
+      connections.some(
+        (connection) =>
+          connection.deletedAt !== null ||
+          connection.generation > 1 ||
+          authority.hasHeldData(
+            connection.instance,
+            streamsByMethod.get(connection.method ?? "") ?? [],
+          ),
+      );
     if (!owned) return { kind: "file" };
 
     // A connection that never held anything (boot registers one per source)
@@ -355,7 +365,11 @@ export function createLegacyScopeView(
         if (verdict?.verdict !== "covered") {
           return { kind: coveredHead ? "refused" : "file" };
         }
-        if (!verdict.canonicalCursor.startsWith(`${authority.writeClock()}:`)) {
+        if (
+          !verdict.canonicalCursor.startsWith(
+            `${authority.writeClock()}:${receiptCursor(decision)}:`,
+          )
+        ) {
           return { kind: "refused" };
         }
       } else if (hasLegacyHead && !hasTakeover) return { kind: "file" };
@@ -394,6 +408,8 @@ export function createLegacyScopeView(
           ),
           canServeLegacy: canServeLegacyBeforeTakeover(scope),
           writeClock: authority.writeClock(),
+          receiptCursor:
+            decision.kind === "canonical" ? receiptCursor(decision) : "",
         };
       });
       const { decision, legacyHead, hasTakeover, canServeLegacy } = initial;
@@ -451,11 +467,13 @@ export function createLegacyScopeView(
           const confirmed = authority.confirmRead(
             scope,
             legacyHead,
-            () => sameSelection(decide(scope), decision),
+            () =>
+              sameSelection(decide(scope), decision) &&
+              receiptCursor(decision) === initial.receiptCursor,
             {
               instance: decision.selection.instance,
               writeClock: initial.writeClock,
-              canonicalCursor: `${initial.writeClock}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
+              canonicalCursor: `${initial.writeClock}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
               coverage,
               cached: false,
             },
@@ -504,6 +522,7 @@ export function createLegacyScopeView(
       if (legacyHead !== null && input.readLegacyHead) {
         const canonicalCursor = [
           initial.writeClock,
+          initial.receiptCursor,
           read.revision,
           COVERAGE_RULE_VERSION,
           input.coverageThresholds?.maxPayloadRatio ?? 1.5,
@@ -568,7 +587,9 @@ export function createLegacyScopeView(
         const confirmed = authority.confirmRead(
           scope,
           legacyHead,
-          () => sameSelection(decide(scope), decision),
+          () =>
+            sameSelection(decide(scope), decision) &&
+            receiptCursor(decision) === initial.receiptCursor,
           {
             instance: decision.selection.instance,
             writeClock: initial.writeClock,
@@ -713,6 +734,25 @@ function isProjectionDataFailure(reason: string): boolean {
     "blob_backed_record_invalid",
     "blob_backed_records_unsupported",
   ].includes(reason);
+}
+
+function receiptCursor(
+  decision: Extract<Decision, { kind: "canonical" }>,
+): string {
+  return JSON.stringify(
+    decision.records
+      .listStreamCompletions(decision.selection.instance)
+      .filter((receipt) => decision.streams.includes(receipt.stream))
+      .map((receipt) => [
+        receipt.stream,
+        receipt.method,
+        receipt.generation,
+        receipt.sourceCollectedAt,
+        receipt.writeSeq,
+        receipt.liveCount,
+      ])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+  );
 }
 
 function projectionUnavailableCoverage(

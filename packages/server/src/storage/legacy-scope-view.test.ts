@@ -352,6 +352,13 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
       "canonical",
     );
+    db.prepare(
+      "UPDATE pdpp_stream_completion SET source_collected_at = ? WHERE instance = ? AND stream = ?",
+    ).run("2026-09-12T00:00:00.000Z", "conn_a", "activity");
+    expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
     store.deleteConnection("conn_a");
     connect(store, "conn_b", "oura");
     replace(store, "conn_b", "activity", ["a1"]);

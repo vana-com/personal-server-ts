@@ -6,9 +6,9 @@
  * legacy files written through POST /v1/data, and the legacy read auth
  * (owner control-plane token, and a builder's Web3Signed legacy grant).
  *
- * A stored legacy head remains latest until a complete canonical projection
- * with matching completion receipts records takeover. After takeover, a
- * canonical read that cannot be served is a typed refusal, not the file.
+ * A stored legacy head remains latest until its canonical projection covers
+ * it. A regression against a covered head refuses; a newer legacy head is
+ * checked again and may explicitly return to the file.
  */
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
