@@ -786,15 +786,14 @@ const instagramProfile: LegacyScopeBinding = {
       "external_url",
       "follower_count",
       "following_count",
+      "post_count",
       "is_private",
       "is_verified",
       "is_business",
     ],
   },
   primaryKey: { profile: ["id"] },
-  lossy: [
-    "media_count (no PDPP equivalent; post_count is a different concept — Instagram's media_count includes non-post media types the posts stream does not cover)",
-  ],
+  lossy: [],
   provenance: [
     {
       kind: "oci",
@@ -861,6 +860,7 @@ const instagramProfile: LegacyScopeBinding = {
     if (typeof p.following_count === "number") {
       payload.following_count = p.following_count;
     }
+    if (typeof p.post_count === "number") payload.media_count = p.post_count;
     if (typeof p.is_private === "boolean") payload.is_private = p.is_private;
     if (typeof p.is_verified === "boolean") payload.is_verified = p.is_verified;
     if (typeof p.is_business === "boolean") payload.is_business = p.is_business;

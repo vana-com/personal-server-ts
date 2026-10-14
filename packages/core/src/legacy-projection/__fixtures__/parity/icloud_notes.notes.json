@@ -1,0 +1,129 @@
+{
+  "scope": "icloud_notes.notes",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; icloud_notes.notes from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic icloud_notes.notes records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{notes:Array<{recordName:string,title:string|null,snippet:string|null,folder:string|null,isPinned:boolean,createdDate:string|null,modifiedDate:string|null,hasAttachments:boolean,textContent:string|null}>,total:number,userName:null}",
+    "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+    "inputHandling": "Dirty-row uses absent/null optional strings and unresolved folder fallback while preserving required booleans."
+  },
+  "fetchedStreams": [
+    "notes",
+    "folders"
+  ],
+  "streams": {
+    "notes": [
+      {
+        "id": "note-a",
+        "title": "Plan",
+        "snippet": "Next steps",
+        "folder_id": "folder-a",
+        "is_pinned": true,
+        "created_at": "2026-09-01T00:00:00Z",
+        "modified_at": "2026-09-02T00:00:00Z",
+        "has_attachments": false,
+        "text_content": "Next steps in full"
+      }
+    ],
+    "folders": [
+      {
+        "id": "folder-a",
+        "name": "Work"
+      }
+    ]
+  },
+  "legacyBody": {
+    "notes": [
+      {
+        "recordName": "note-a",
+        "title": "Plan",
+        "snippet": "Next steps",
+        "folder": "Work",
+        "isPinned": true,
+        "createdDate": "2026-09-01T00:00:00Z",
+        "modifiedDate": "2026-09-02T00:00:00Z",
+        "hasAttachments": false,
+        "textContent": "Next steps in full"
+      }
+    ],
+    "total": 1,
+    "userName": null
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "icloud_notes.notes",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; icloud_notes.notes from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic icloud_notes.notes records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{notes:Array<{recordName:string,title:string|null,snippet:string|null,folder:string|null,isPinned:boolean,createdDate:string|null,modifiedDate:string|null,hasAttachments:boolean,textContent:string|null}>,total:number,userName:null}",
+        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Dirty-row uses absent/null optional strings and unresolved folder fallback while preserving required booleans."
+      },
+      "fetchedStreams": [
+        "notes",
+        "folders"
+      ],
+      "streams": {
+        "notes": [],
+        "folders": []
+      },
+      "legacyBody": {
+        "notes": [],
+        "total": 0,
+        "userName": null
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "icloud_notes.notes",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; icloud_notes.notes from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic icloud_notes.notes records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{notes:Array<{recordName:string,title:string|null,snippet:string|null,folder:string|null,isPinned:boolean,createdDate:string|null,modifiedDate:string|null,hasAttachments:boolean,textContent:string|null}>,total:number,userName:null}",
+        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Dirty-row uses absent/null optional strings and unresolved folder fallback while preserving required booleans."
+      },
+      "fetchedStreams": [
+        "notes",
+        "folders"
+      ],
+      "streams": {
+        "notes": [
+          {
+            "id": "note-dirty",
+            "title": null,
+            "folder_id": "unresolved-folder",
+            "is_pinned": false,
+            "has_attachments": true
+          }
+        ],
+        "folders": []
+      },
+      "legacyBody": {
+        "notes": [
+          {
+            "recordName": "note-dirty",
+            "title": null,
+            "snippet": null,
+            "folder": "unresolved-folder",
+            "isPinned": false,
+            "createdDate": null,
+            "modifiedDate": null,
+            "hasAttachments": true,
+            "textContent": null
+          }
+        ],
+        "total": 1,
+        "userName": null
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

@@ -1,0 +1,91 @@
+{
+  "scope": "icloud_notes.folders",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; icloud_notes.folders from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic icloud_notes.folders records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{folders:Array<{recordName:string,title:string}>,total:number}",
+    "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+    "inputHandling": "Only source-declared mappings and observed normalization are represented; no hypothetical consumer fields are added."
+  },
+  "fetchedStreams": [
+    "folders"
+  ],
+  "streams": {
+    "folders": [
+      {
+        "id": "folder-a",
+        "name": "Work"
+      }
+    ]
+  },
+  "legacyBody": {
+    "folders": [
+      {
+        "recordName": "folder-a",
+        "title": "Work"
+      }
+    ],
+    "total": 1
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "icloud_notes.folders",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; icloud_notes.folders from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic icloud_notes.folders records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{folders:Array<{recordName:string,title:string}>,total:number}",
+        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Only source-declared mappings and observed normalization are represented; no hypothetical consumer fields are added."
+      },
+      "fetchedStreams": [
+        "folders"
+      ],
+      "streams": {
+        "folders": []
+      },
+      "legacyBody": {
+        "folders": [],
+        "total": 0
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "icloud_notes.folders",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; icloud_notes.folders from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic icloud_notes.folders records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{folders:Array<{recordName:string,title:string}>,total:number}",
+        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Only source-declared mappings and observed normalization are represented; no hypothetical consumer fields are added."
+      },
+      "fetchedStreams": [
+        "folders"
+      ],
+      "streams": {
+        "folders": [
+          {
+            "id": "folder-dirty",
+            "name": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "folders": [
+          {
+            "recordName": "folder-dirty",
+            "title": ""
+          }
+        ],
+        "total": 1
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

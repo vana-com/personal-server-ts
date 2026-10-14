@@ -1,0 +1,190 @@
+{
+  "scope": "wholefoods.nutrition",
+  "case": "normal",
+  "fetchedStreams": [
+    "nutrition",
+    "order_items"
+  ],
+  "streams": {
+    "nutrition": [
+      {
+        "product_id": "B000OATS",
+        "name": "Oats",
+        "product_url": "https://example.test/oats",
+        "source": "wholefoods_product_page",
+        "confidence": "high",
+        "calories": 150,
+        "protein_g": 5,
+        "serving_size": "40 g",
+        "servings_per_container": 10
+      }
+    ],
+    "order_items": [
+      {
+        "id": "line-a",
+        "product_id": "B000OATS",
+        "name": "Oats",
+        "product_url": "https://example.test/oats",
+        "image_url": "https://example.test/oats.jpg"
+      }
+    ]
+  },
+  "legacyBody": {
+    "items": {
+      "B000OATS": {
+        "name": "Oats",
+        "productUrl": "https://example.test/oats",
+        "source": "wholefoods_product_page",
+        "confidence": "high",
+        "calories": 150,
+        "protein_g": 5,
+        "servingSize": "40 g",
+        "servingsPerContainer": "10",
+        "images": "https://example.test/oats.jpg"
+      }
+    },
+    "coverage": {
+      "total": 1,
+      "found": 1,
+      "foundUSDA": 0,
+      "blocked": 0,
+      "percentCovered": 100
+    }
+  },
+  "reviewedDifferences": [],
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; wholefoods.nutrition from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic wholefoods.nutrition records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+    "legacySchemaNote": "Frozen LEGACY schema unavailable in this checkout; owner comparison pending. Desktop schemas are not used as a substitute. These current-binding regressions do not certify legacy compatibility.",
+    "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.B000OATS\":\"object\",\"$.items.B000OATS.name\":\"string\",\"$.items.B000OATS.productUrl\":\"string\",\"$.items.B000OATS.source\":\"string\",\"$.items.B000OATS.confidence\":\"string\",\"$.items.B000OATS.calories\":\"number\",\"$.items.B000OATS.protein_g\":\"number\",\"$.items.B000OATS.servingSize\":\"string\",\"$.items.B000OATS.servingsPerContainer\":\"string\",\"$.items.B000OATS.images\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"empty\":{\"$\":\"object\",\"$.items\":\"object\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"dirty-row\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.B000OATS\":\"object\",\"$.items.B000OATS.name\":\"string\",\"$.items.B000OATS.productUrl\":\"string\",\"$.items.B000OATS.source\":\"string\",\"$.items.B000OATS.confidence\":\"string\",\"$.items.B000OATS.protein_g\":\"null\",\"$.items.B000OATS.servingSize\":\"string\",\"$.items.B000OATS.servingsPerContainer\":\"string\",\"$.items.B000OATS.images\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"}}",
+    "behaviorNote": "Source ASIN keys the map; images is the order item's image URL string. Numeric servings_per_container becomes a string. Dirty string calories is omitted while null protein_g is preserved."
+  },
+  "cases": [
+    {
+      "scope": "wholefoods.nutrition",
+      "case": "empty",
+      "fetchedStreams": [
+        "nutrition",
+        "order_items"
+      ],
+      "streams": {
+        "nutrition": [],
+        "order_items": []
+      },
+      "legacyBody": {
+        "items": {},
+        "coverage": {
+          "total": 0,
+          "found": 0,
+          "foundUSDA": 0,
+          "blocked": 0,
+          "percentCovered": 0
+        }
+      },
+      "reviewedDifferences": [],
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; wholefoods.nutrition from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic wholefoods.nutrition records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+        "legacySchemaNote": "Frozen LEGACY schema unavailable in this checkout; owner comparison pending. Desktop schemas are not used as a substitute. These current-binding regressions do not certify legacy compatibility.",
+        "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.B000OATS\":\"object\",\"$.items.B000OATS.name\":\"string\",\"$.items.B000OATS.productUrl\":\"string\",\"$.items.B000OATS.source\":\"string\",\"$.items.B000OATS.confidence\":\"string\",\"$.items.B000OATS.calories\":\"number\",\"$.items.B000OATS.protein_g\":\"number\",\"$.items.B000OATS.servingSize\":\"string\",\"$.items.B000OATS.servingsPerContainer\":\"string\",\"$.items.B000OATS.images\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"empty\":{\"$\":\"object\",\"$.items\":\"object\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"dirty-row\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.B000OATS\":\"object\",\"$.items.B000OATS.name\":\"string\",\"$.items.B000OATS.productUrl\":\"string\",\"$.items.B000OATS.source\":\"string\",\"$.items.B000OATS.confidence\":\"string\",\"$.items.B000OATS.protein_g\":\"null\",\"$.items.B000OATS.servingSize\":\"string\",\"$.items.B000OATS.servingsPerContainer\":\"string\",\"$.items.B000OATS.images\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"}}",
+        "behaviorNote": "Source ASIN keys the map; images is the order item's image URL string. Numeric servings_per_container becomes a string. Dirty string calories is omitted while null protein_g is preserved."
+      }
+    },
+    {
+      "scope": "wholefoods.nutrition",
+      "case": "dirty-row",
+      "fetchedStreams": [
+        "nutrition",
+        "order_items"
+      ],
+      "streams": {
+        "nutrition": [
+          {
+            "product_id": "B000OATS",
+            "name": "Oats",
+            "product_url": "https://example.test/oats",
+            "source": "wholefoods_product_page",
+            "confidence": "high",
+            "calories": "unknown",
+            "protein_g": null,
+            "serving_size": "40 g",
+            "servings_per_container": 10
+          }
+        ],
+        "order_items": [
+          {
+            "id": "line-a",
+            "product_id": "B000OATS",
+            "name": "Oats",
+            "product_url": "https://example.test/oats",
+            "image_url": "https://example.test/oats.jpg"
+          }
+        ]
+      },
+      "legacyBody": {
+        "items": {
+          "B000OATS": {
+            "name": "Oats",
+            "productUrl": "https://example.test/oats",
+            "source": "wholefoods_product_page",
+            "confidence": "high",
+            "protein_g": null,
+            "servingSize": "40 g",
+            "servingsPerContainer": "10",
+            "images": "https://example.test/oats.jpg"
+          }
+        },
+        "coverage": {
+          "total": 1,
+          "found": 1,
+          "foundUSDA": 0,
+          "blocked": 0,
+          "percentCovered": 100
+        }
+      },
+      "reviewedDifferences": [
+        {
+          "path": "items.B000OATS.calories",
+          "legacy": "unknown",
+          "projected": "<absent>",
+          "reason": "Source nutrition.calories is present as a malformed string; the binding emits only number or null nutrient values and omits this field."
+        }
+      ],
+      "consumerContractBody": {
+        "items": {
+          "B000OATS": {
+            "name": "Oats",
+            "productUrl": "https://example.test/oats",
+            "source": "wholefoods_product_page",
+            "confidence": "high",
+            "protein_g": null,
+            "servingSize": "40 g",
+            "servingsPerContainer": "10",
+            "images": "https://example.test/oats.jpg",
+            "calories": "unknown"
+          }
+        },
+        "coverage": {
+          "total": 1,
+          "found": 1,
+          "foundUSDA": 0,
+          "blocked": 0,
+          "percentCovered": 100
+        }
+      },
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; wholefoods.nutrition from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic wholefoods.nutrition records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+        "legacySchemaNote": "Frozen LEGACY schema unavailable in this checkout; owner comparison pending. Desktop schemas are not used as a substitute. These current-binding regressions do not certify legacy compatibility.",
+        "outputContractNote": "{\"normal\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.B000OATS\":\"object\",\"$.items.B000OATS.name\":\"string\",\"$.items.B000OATS.productUrl\":\"string\",\"$.items.B000OATS.source\":\"string\",\"$.items.B000OATS.confidence\":\"string\",\"$.items.B000OATS.calories\":\"number\",\"$.items.B000OATS.protein_g\":\"number\",\"$.items.B000OATS.servingSize\":\"string\",\"$.items.B000OATS.servingsPerContainer\":\"string\",\"$.items.B000OATS.images\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"empty\":{\"$\":\"object\",\"$.items\":\"object\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"},\"dirty-row\":{\"$\":\"object\",\"$.items\":\"object\",\"$.items.B000OATS\":\"object\",\"$.items.B000OATS.name\":\"string\",\"$.items.B000OATS.productUrl\":\"string\",\"$.items.B000OATS.source\":\"string\",\"$.items.B000OATS.confidence\":\"string\",\"$.items.B000OATS.protein_g\":\"null\",\"$.items.B000OATS.servingSize\":\"string\",\"$.items.B000OATS.servingsPerContainer\":\"string\",\"$.items.B000OATS.images\":\"string\",\"$.coverage\":\"object\",\"$.coverage.total\":\"number\",\"$.coverage.found\":\"number\",\"$.coverage.foundUSDA\":\"number\",\"$.coverage.blocked\":\"number\",\"$.coverage.percentCovered\":\"number\"}}",
+        "behaviorNote": "Source ASIN keys the map; images is the order item's image URL string. Numeric servings_per_container becomes a string. Dirty string calories is omitted while null protein_g is preserved."
+      }
+    }
+  ]
+}

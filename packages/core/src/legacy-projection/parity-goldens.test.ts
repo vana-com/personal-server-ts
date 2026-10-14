@@ -5,7 +5,7 @@
  * both produced from the same upstream responses (see parity-oracle/). The
  * projection must reproduce that body except for the reviewed differences
  * the golden lists, and must validate against the pinned legacy schema.
- * Shop/Spotify/LinkedIn/Instagram expectations are current binding output,
+ * Shop/Spotify/LinkedIn/Instagram/YouTube/Grocery and MISC_SCOPES expectations are current binding output,
  * not captured legacy-connector output; passing does not establish legacy parity.
  * Social fixtures separately expose synthetic consumer-contract differences.
  */
@@ -16,17 +16,19 @@ import Ajv from "ajv";
 import { describe, expect, it } from "vitest";
 import { diffBodies, type BodyDifference } from "./__fixtures__/parity/diff.js";
 import { projectPdppRecordsToLegacyPayload } from "./index.js";
-import type { PdppRecord } from "./types.js";
+import type {
+  PdppRecord,
+  ProjectionDiagnostic,
+  ProjectionErr,
+} from "./types.js";
 
 interface Golden {
   scope: string;
   profileKey?: string;
   case?: string;
   cases?: Golden[];
-  expectedResult?: {
-    ok: false;
-    error: { kind: "empty_singleton"; scope: string };
-  };
+  expectedResult?: ProjectionErr;
+  expectedDiagnostics?: ProjectionDiagnostic[];
   provenance: {
     legacyConnector: string;
     pdppBundle: string;
@@ -35,6 +37,12 @@ interface Golden {
     emptyOrNullEdge?: string;
     expectedSideNote?: string;
     consumerContractNote?: string;
+    outputKeysAndTypes?: string;
+    legacySchemaNote?: string;
+    outputContractNote?: string;
+    behaviorNote?: string;
+    legacySchemaComparison?: string;
+    inputHandling?: string;
   };
   fetchedStreams: string[];
   streams: Record<string, Record<string, unknown>[]>;
@@ -58,6 +66,36 @@ const SOCIAL_SCOPES = [
   "instagram.profile",
   "instagram.posts",
 ];
+const YOUTUBE_SCOPES = [
+  "youtube.profile",
+  "youtube.subscriptions",
+  "youtube.playlists",
+  "youtube.playlistItems",
+  "youtube.likes",
+  "youtube.watchLater",
+  "youtube.history",
+];
+const GROCERY_SCOPES = [
+  "heb.profile",
+  "heb.orders",
+  "heb.nutrition",
+  "wholefoods.profile",
+  "wholefoods.orders",
+  "wholefoods.nutrition",
+];
+// Current-binding regressions at the 71a43bce cutover pin.
+const MISC_SCOPES = [
+  "github.repositories",
+  "github.starred",
+  "github.history",
+  "icloud_notes.folders",
+  "icloud_notes.notes",
+  "linkedin.skills",
+  "linkedin.languages",
+  "linkedin.connections",
+  "instagram.following",
+  "instagram.ads",
+];
 const SCOPES = [
   "chatgpt.conversations",
   "chatgpt.memories",
@@ -73,6 +111,9 @@ const SCOPES = [
   "spotify.profile",
   "spotify.playlists",
   ...SOCIAL_SCOPES,
+  ...YOUTUBE_SCOPES,
+  ...GROCERY_SCOPES,
+  ...MISC_SCOPES,
 ];
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -100,6 +141,40 @@ function schemaFor(scope: string): Record<string, unknown> {
   ) as { schema: Record<string, unknown> };
   return file.schema;
 }
+
+// Exact per-case output keys/types are provided for owner comparison with the
+// unavailable frozen grocery LEGACY schemas. Desktop schemas are not substitutes.
+function outputKeyTypes(
+  value: unknown,
+  path = "$",
+  result: Record<string, string> = {},
+): Record<string, string> {
+  result[path] =
+    value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+  if (value !== null && typeof value === "object") {
+    for (const [key, child] of Object.entries(value)) {
+      outputKeyTypes(
+        child,
+        Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`,
+        result,
+      );
+    }
+  }
+  return result;
+}
+
+function expectPinnedSchema(scope: string, payload: Record<string, unknown>) {
+  // Explicitly deferred below; do not load a different schema as a fallback.
+  if (GROCERY_SCOPES.includes(scope)) return;
+  const validate = ajv.compile(schemaFor(scope));
+  expect(validate(payload), JSON.stringify(validate.errors, null, 2)).toBe(
+    true,
+  );
+}
+
+describe.each(GROCERY_SCOPES)("%s frozen LEGACY schema comparison", () => {
+  it.skip("requires the owner-provided frozen schema; current-binding tests do not certify legacy parity", () => {});
+});
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -137,6 +212,33 @@ function expectGoldenBody(golden: Golden, payload: Record<string, unknown>) {
   }
 }
 
+function expectMiscProvenance(golden: Golden) {
+  expect(golden.provenance.legacyConnector).toMatch(
+    /^current binding output, not captured legacy-connector output; (github\.(repositories|starred|history)|icloud_notes\.(notes|folders)|linkedin\.(skills|languages|connections)|instagram\.(following|ads)|chatgpt\.memories) from packages\/core\/src\/legacy-projection\/bindings\.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665$/,
+  );
+  expect(golden.provenance.pdppBundle).toMatch(
+    /^synthetic (github\.(repositories|starred|history)|icloud_notes\.(notes|folders)|linkedin\.(skills|languages|connections)|instagram\.(following|ads)|chatgpt\.memories) records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed$/,
+  );
+  expect(golden.provenance.legacyConnector).toContain(
+    "; " + golden.scope + " from ",
+  );
+  expect(golden.provenance.pdppBundle).toContain(
+    "synthetic " + golden.scope + " records ",
+  );
+  expect(golden.provenance.expectedSideNote).toBe(
+    "current binding output, not captured legacy-connector output",
+  );
+  expect(golden.provenance.outputKeysAndTypes).toBeTruthy();
+  expect(golden.provenance.legacySchemaComparison).toBe(
+    "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+  );
+  expect(golden.case).toBe("normal");
+  expect(golden.reviewedDifferences).toEqual([]);
+  expect(golden.profileKey).toBe(
+    golden.scope.startsWith("instagram.") ? "meta" : undefined,
+  );
+}
+
 describe.each(SCOPES)("%s golden projection contract", (scope) => {
   const golden = load(scope);
 
@@ -154,6 +256,8 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
         /^(chatgpt-4\.0\.0-vana\.1\.js|claude-export-playwright\.js) .* sha256:[0-9a-f]{64}$/,
       );
       expect(golden.provenance.pdppBundle).toMatch(/sha256:[0-9a-f]{64}$/);
+    } else if (MISC_SCOPES.includes(scope)) {
+      expectMiscProvenance(golden);
     } else if (scope.startsWith("github.")) {
       expect(golden.provenance.legacyConnector).toMatch(
         /^frozen github-playwright 1\.5\.1; archive sha256:[0-9a-f]{64}; script\.js sha256:[0-9a-f]{64}; expected output and PDPP record source: .*github-browser-parity-fixtures\.ts at unity-surfaces commit [0-9a-f]{40} sha256:[0-9a-f]{64}$/,
@@ -172,6 +276,32 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
       );
       expect(golden.provenance.expectedSideNote).toBe(
         "current binding output, not captured legacy-connector output",
+      );
+    } else if (GROCERY_SCOPES.includes(scope)) {
+      expect(golden.provenance.legacyConnector).toMatch(
+        /^current binding output, not captured legacy-connector output; (heb|wholefoods)\.(profile|orders|nutrition) from packages\/core\/src\/legacy-projection\/bindings\.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665$/,
+      );
+      expect(golden.provenance.pdppBundle).toMatch(
+        /^synthetic (heb|wholefoods)\.(profile|orders|nutrition) records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed$/,
+      );
+      expect(golden.provenance.expectedSideNote).toBe(
+        "current binding output, not captured legacy-connector output",
+      );
+      expect(golden.provenance.legacySchemaNote).toBe(
+        "Frozen LEGACY schema unavailable in this checkout; owner comparison pending. Desktop schemas are not used as a substitute. These current-binding regressions do not certify legacy compatibility.",
+      );
+      expect(golden.provenance.consumerContractNote).toBe(
+        "consumerContractBody is a synthetic input-field-preservation probe, not captured legacy output; reviewedDifferences contain only fields actually present in the input and omitted by the binding.",
+      );
+      expect(golden.case).toBe("normal");
+      expect(golden.provenance.behaviorNote?.length).toBeGreaterThan(0);
+      expect(JSON.parse(golden.provenance.outputContractNote!)).toEqual(
+        Object.fromEntries(
+          [golden, ...(golden.cases ?? [])].map((entry) => [
+            entry.case,
+            outputKeyTypes(entry.legacyBody ?? entry.expectedResult),
+          ]),
+        ),
       );
     } else if (SOCIAL_SCOPES.includes(scope)) {
       expect(golden.provenance.legacyConnector).toMatch(
@@ -192,6 +322,19 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
       expect(golden.profileKey).toBe(
         scope.startsWith("instagram.") ? "meta" : undefined,
       );
+    } else if (YOUTUBE_SCOPES.includes(scope)) {
+      expect(golden.provenance.legacyConnector).toMatch(
+        /^current binding output, not captured legacy-connector output; youtube\.(profile|subscriptions|playlists|playlistItems|likes|watchLater|history) from packages\/core\/src\/legacy-projection\/bindings\.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665$/,
+      );
+      expect(golden.provenance.pdppBundle).toMatch(
+        /^synthetic youtube\.(profile|subscriptions|playlists|playlistItems|likes|watchLater|history) records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed$/,
+      );
+      expect(golden.provenance.expectedSideNote).toBe(
+        "current binding output, not captured legacy-connector output",
+      );
+      expect(golden.provenance.outputKeysAndTypes).toBeTruthy();
+      expect(golden.case).toBe("normal");
+      expect(golden.reviewedDifferences).toEqual([]);
     } else {
       expect(golden.provenance.legacyConnector).toMatch(
         /^OpenPet nullable-score contract from .*\/client-reconciliation\.md sha256:[0-9a-f]{64} \(evidence checkout has no Git metadata\); expected field assertions from .*\/oura-browser\.test\.ts at unity-surfaces commit [0-9a-f]{40} sha256:[0-9a-f]{64}$/,
@@ -227,18 +370,14 @@ describe.each(SCOPES)("%s golden projection contract", (scope) => {
 
       expect(result.ok).toBe(true);
       if (!result.ok) return;
-      expect(result.diagnostics).toBeUndefined();
+      expect(result.diagnostics).toEqual(golden.expectedDiagnostics);
       if (golden.expectedLegacySha256) {
         expect(payloadSha256(result.payload)).toBe(golden.expectedLegacySha256);
       } else {
         expect(golden.legacyBody).toBeDefined();
         expectGoldenBody(golden, result.payload);
       }
-      const validate = ajv.compile(schemaFor(scope));
-      expect(
-        validate(result.payload),
-        JSON.stringify(validate.errors, null, 2),
-      ).toBe(true);
+      expectPinnedSchema(scope, result.payload);
     },
   );
 
@@ -273,6 +412,9 @@ describe.each([
   "spotify.profile",
   "spotify.playlists",
   ...SOCIAL_SCOPES,
+  ...YOUTUBE_SCOPES,
+  ...GROCERY_SCOPES,
+  ...MISC_SCOPES,
 ])("%s current-binding empty and dirty-row regressions", (scope) => {
   const golden = load(scope);
 
@@ -291,6 +433,13 @@ describe.each([
       if (SOCIAL_SCOPES.includes(scope) && edge.case === "dirty-row") {
         expect(edge.consumerContractBody).toBeDefined();
         expect(edge.reviewedDifferences.length).toBeGreaterThan(0);
+      } else if (GROCERY_SCOPES.includes(scope) && edge.consumerContractBody) {
+        expect(edge.reviewedDifferences.length).toBeGreaterThan(0);
+        expect(
+          edge.reviewedDifferences.every(
+            (entry) => entry.projected === "<absent>",
+          ),
+        ).toBe(true);
       } else {
         expect(edge.reviewedDifferences).toEqual([]);
       }
@@ -325,21 +474,25 @@ describe.each([
           return;
         }
 
+        if (edge.expectedResult) {
+          expect(edge.expectedResult.error.scope).toBe(scope);
+          expect(edge.legacyBody).toBeUndefined();
+          expect(edge.expectedDiagnostics).toBeUndefined();
+          expect(result).toEqual(edge.expectedResult);
+          return;
+        }
+
         expect(edge.expectedResult).toBeUndefined();
         expect(edge.legacyBody).toBeDefined();
         expect(result.ok).toBe(true);
         if (!result.ok) return;
-        expect(result.diagnostics).toBeUndefined();
+        expect(result.diagnostics).toEqual(edge.expectedDiagnostics);
         expect(result.payload).toEqual(edge.legacyBody);
         expectGoldenBody(edge, result.payload);
         expect(Object.keys(result.payload)).toEqual(
           Object.keys(edge.legacyBody!),
         );
-        const validate = ajv.compile(schemaFor(scope));
-        expect(
-          validate(result.payload),
-          JSON.stringify(validate.errors, null, 2),
-        ).toBe(true);
+        expectPinnedSchema(scope, result.payload);
       },
     );
   });
@@ -566,5 +719,52 @@ describe("ChatGPT edge-case parity observations", () => {
       result.ok &&
         (result.payload.conversations as { id: string }[]).map(({ id }) => id),
     ).toEqual(["newer", "older"]);
+  });
+});
+
+// Keep the existing captured chatgpt.memories golden and its provenance intact.
+describe("chatgpt.memories supplementary current-binding goldens", () => {
+  const golden = load("chatgpt.memories.edges");
+
+  it("records the separate current-binding provenance and required cases", () => {
+    expect(golden.scope).toBe("chatgpt.memories");
+    expectMiscProvenance(golden);
+    expect(golden.cases?.map((entry) => entry.case)).toEqual([
+      "empty",
+      "dirty-row",
+    ]);
+  });
+
+  describe.each([golden, ...(golden.cases ?? [])])("$case", (entry) => {
+    it.each([
+      ["source order", false],
+      ["primary-key order", true],
+    ])("matches the traced memory output (%s)", (_label, orderByPrimaryKey) => {
+      expect(entry.scope).toBe(golden.scope);
+      expect(entry.provenance).toEqual(golden.provenance);
+      expect(entry.profileKey).toBeUndefined();
+      expect(entry.reviewedDifferences).toEqual([]);
+      expect(entry.expectedResult).toBeUndefined();
+      const result = projectPdppRecordsToLegacyPayload(
+        entry.scope,
+        records(entry),
+        {
+          fetchedStreams: entry.fetchedStreams,
+          now: ORACLE_CLOCK,
+          orderByPrimaryKey,
+        },
+      );
+      expect(result).toEqual({ ok: true, payload: entry.legacyBody });
+      if (!result.ok) return;
+      expectGoldenBody(entry, result.payload);
+      expect(Object.keys(result.payload)).toEqual(
+        Object.keys(entry.legacyBody!),
+      );
+      const validate = ajv.compile(schemaFor(entry.scope));
+      expect(
+        validate(result.payload),
+        JSON.stringify(validate.errors, null, 2),
+      ).toBe(true);
+    });
   });
 });

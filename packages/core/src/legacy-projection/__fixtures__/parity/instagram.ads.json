@@ -1,0 +1,118 @@
+{
+  "scope": "instagram.ads",
+  "case": "normal",
+  "profileKey": "meta",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; instagram.ads from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic instagram.ads records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{advertisers:Array<{name:string}>,ad_topics:Array<{name:string}>,categories:Array<{name:string,description?:string}>}",
+    "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+    "inputHandling": "Input id and kind are not emitted as item fields; kind selects the destination array. A supplied null description is omitted."
+  },
+  "fetchedStreams": [
+    "ads"
+  ],
+  "streams": {
+    "ads": [
+      {
+        "id": "ad-a",
+        "kind": "advertiser",
+        "name": "Example Brand"
+      },
+      {
+        "id": "ad-b",
+        "kind": "ad_topic",
+        "name": "Travel"
+      },
+      {
+        "id": "ad-c",
+        "kind": "ad_category",
+        "name": "Outdoors",
+        "description": "Outdoor activities"
+      }
+    ]
+  },
+  "legacyBody": {
+    "advertisers": [
+      {
+        "name": "Example Brand"
+      }
+    ],
+    "ad_topics": [
+      {
+        "name": "Travel"
+      }
+    ],
+    "categories": [
+      {
+        "name": "Outdoors",
+        "description": "Outdoor activities"
+      }
+    ]
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "instagram.ads",
+      "case": "empty",
+      "profileKey": "meta",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; instagram.ads from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic instagram.ads records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{advertisers:Array<{name:string}>,ad_topics:Array<{name:string}>,categories:Array<{name:string,description?:string}>}",
+        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Input id and kind are not emitted as item fields; kind selects the destination array. A supplied null description is omitted."
+      },
+      "fetchedStreams": [
+        "ads"
+      ],
+      "streams": {
+        "ads": []
+      },
+      "legacyBody": {
+        "advertisers": [],
+        "ad_topics": [],
+        "categories": []
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "instagram.ads",
+      "case": "dirty-row",
+      "profileKey": "meta",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; instagram.ads from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic instagram.ads records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{advertisers:Array<{name:string}>,ad_topics:Array<{name:string}>,categories:Array<{name:string,description?:string}>}",
+        "legacySchemaComparison": "Frozen legacy schema not inspected; owner must compare these exact output keys and types against the frozen schema. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Input id and kind are not emitted as item fields; kind selects the destination array. A supplied null description is omitted."
+      },
+      "fetchedStreams": [
+        "ads"
+      ],
+      "streams": {
+        "ads": [
+          {
+            "id": "ad-dirty",
+            "kind": "ad_category",
+            "name": "Outdoors",
+            "description": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "advertisers": [],
+        "ad_topics": [],
+        "categories": [
+          {
+            "name": "Outdoors"
+          }
+        ]
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}
