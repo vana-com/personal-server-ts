@@ -1,0 +1,26 @@
+{
+  "heb.profile": [
+    {
+      "records": [{ "stream": "profile", "data": {
+        "id": "heb-account-1", "name": "Ada Example", "email": "ada@example.test", "phone": "555-0100",
+        "delivery_addresses": [{ "address": "1 Main St", "label": "Home", "is_primary": true }]
+      } }],
+      "expected": { "name": "Ada Example", "email": "ada@example.test", "phone": "555-0100",
+        "deliveryAddresses": [{ "address": "1 Main St", "label": "Home", "isPrimary": true }] }
+    },
+    {
+      "records": [{ "stream": "profile", "data": { "id": "heb-account-2", "delivery_addresses": [] } }],
+      "expected": { "name": null, "email": null, "phone": null, "deliveryAddresses": [] }
+    }
+  ],
+  "wholefoods.profile": [
+    {
+      "records": [{ "stream": "profile", "data": { "id": "amazon-account-1", "name": "Ada Example", "email": "ada@example.test" } }],
+      "expected": { "name": "Ada Example", "email": "ada@example.test" }
+    },
+    {
+      "records": [{ "stream": "profile", "data": { "id": "amazon-account-2" } }],
+      "expected": { "name": null, "email": null }
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "instagram.posts": [
+    { "stream": "posts", "data": { "id": "post-1", "media_url": "https://img.test/1", "caption": "kept", "like_count": 2 } },
+    { "stream": "posts", "data": { "id": "post-2", "media_url": null, "caption": "nullable media is declared", "like_count": null } }
+  ],
+  "github.history": [
+    { "stream": "user", "data": { "id": "user-1", "login": "octocat" } },
+    { "stream": "issues", "data": { "id": "issue-1", "number": 1, "is_pull_request": false, "user_login": "octocat", "repository_full_name": null } }
+  ],
+  "github.history.assigned": [
+    { "stream": "user", "data": { "id": "user-1", "login": "octocat" } },
+    { "stream": "issues", "data": { "id": "issue-assigned", "is_pull_request": false, "user_login": null, "repository_full_name": null } },
+    { "stream": "issues", "data": { "id": "issue-authored", "is_pull_request": false, "user_login": "octocat", "repository_full_name": "octocat/repo" } },
+    { "stream": "pull_requests", "data": { "id": "pr-1", "repository_full_name": "octocat/repo" } }
+  ],
+  "spotify.playlists": [
+    { "stream": "playlists", "data": { "id": "list-1", "name": "Mix", "uri": "spotify:playlist:list-1", "track_count": 3 } },
+    { "stream": "playlist_items", "data": { "id": "list-1:1", "playlist_id": "list-1", "position": 0, "name": "Known", "track_id": "11dFghVXANMlKmJXsNCbNl" } },
+    { "stream": "playlist_items", "data": { "id": "list-1:2", "playlist_id": "list-1", "position": 1, "name": "Unavailable", "track_id": null } }
+  ],
+  "spotify.savedTracks": [
+    { "stream": "saved_tracks", "data": { "id": "track-1", "name": "Nullable Track", "artist_names": ["One Artist"], "album_name": null, "duration_ms": null, "added_at": null, "uri": null, "explicit": null, "album_artist_names": [] } }
+  ],
+  "wholefoods.orders": [
+    { "stream": "orders", "data": { "id": "order-1", "item_count": 1 } },
+    { "stream": "order_items", "data": { "id": "item-1", "order_id": "order-1", "name": "Unidentified product", "product_id": null } }
+  ]
+}

@@ -75,6 +75,7 @@ export {
   type ScopeDeletionResolveOptions,
   type ScopeDeletionSource,
   type ScopeDeletionTracker,
+  type ScopeDeletionHistory,
   type ScopeDeletionTrackerOptions,
   type ScopeDeletionVerdict,
   type ScopeTombstone,

@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import {
+  isRfc3339DateTime,
   PdppBindingError,
   type createSqliteRecordStore,
 } from "../storage/pdpp-records-sqlite-store.js";
@@ -30,10 +31,14 @@ import {
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createRecordDataValidator } from "../pdpp/record-schema.js";
+import {
+  StreamCompletionError,
+  type StreamCompletionFailure,
+} from "../storage/pdpp-stream-completion.js";
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
-export const MAX_BLOB_UPLOAD_BYTES = 32 * 1024 * 1024;
+export const MAX_BLOB_UPLOAD_BYTES = 512 * 1024 * 1024;
 
 function rebindListCursor(
   template: string,
@@ -49,12 +54,76 @@ function rebindListCursor(
     recordKey: last.recordKey,
   });
 }
+/** 512 MiB — max body size for PDPP record ingest and replace routes. */
+export const MAX_INGEST_BODY_BYTES = 512 * 1024 * 1024;
+/** 64 KiB of UTF-8 — max body size for the completion metadata route. */
+export const MAX_COMPLETION_BODY_BYTES = 64 * 1024;
+
+class CompletionBodyTooLarge extends Error {}
+
 /**
- * Desktop caps one connector run's captured records at 32 MiB, and it sends
- * one record per ingest request. JSON escaping can grow a record's encoded
- * size, so the limit leaves room above the capture cap rather than matching it.
+ * Read a completion body, counting the bytes actually received. Unlike
+ * `readBoundedBody`, the size decision never consults Content-Length, so an
+ * absent or lying header cannot move the limit, and the over-limit answer is
+ * a 413 rather than a 400.
  */
-export const MAX_INGEST_BODY_BYTES = 64 * 1024 * 1024;
+async function readCompletionBody(request: Request): Promise<Uint8Array> {
+  const reader = request.body?.getReader();
+  if (!reader) {
+    throw new PdppError("invalid_request", "Completion body is empty");
+  }
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_COMPLETION_BODY_BYTES) {
+      void reader.cancel().catch(() => undefined);
+      throw new CompletionBodyTooLarge();
+    }
+    chunks.push(value);
+  }
+  if (size === 0) {
+    throw new PdppError("invalid_request", "Completion body is empty");
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+const COMPLETION_BODY_KEYS = [
+  "source_id",
+  "instance",
+  "source_collected_at",
+  "collection_time_basis",
+  "streams",
+];
+const COMPLETION_STREAM_KEYS = [
+  "stream",
+  "coverage",
+  "live_count",
+  "snapshot_sha256",
+];
+
+function hasExactKeys(value: object, keys: string[]): boolean {
+  const actual = Object.keys(value);
+  return (
+    actual.length === keys.length && keys.every((key) => actual.includes(key))
+  );
+}
+
+/** Store refusals that are the caller's conflict with current state. */
+const COMPLETION_CONFLICTS: StreamCompletionFailure[] = [
+  "snapshot_conflict",
+  "time_conflict",
+  "invalid_snapshot_data",
+  "invalid_prior_receipt",
+];
 
 const BLOB_MEDIA_TYPE =
   /^(application|audio|example|font|haptics|image|message|model|multipart|text|video)\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/i;
@@ -155,6 +224,10 @@ export interface PdppRecordsRouteDeps {
       mimeType: string;
     }): ReturnType<PdppRecordStore["storeBlobBytes"]>;
     replaceStream: ReturnType<typeof createSqliteRecordStore>["replaceStream"];
+    /** Absent on a store that cannot record completion metadata. */
+    completeStreams?: ReturnType<
+      typeof createSqliteRecordStore
+    >["completeStreams"];
   };
   configuredMethods?: Map<string, string[]>;
   auth: PdppAuthorizationService;
@@ -1462,11 +1535,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   });
 
   // P7, owner-authenticated snapshot replace of one (instance, stream). A
-  // Vana PS contract, not Core. Body: `{instance, emitted_at, records[]}`;
-  // `records` is the complete live set from a covered full refresh by the
-  // instance's bound method, and `emitted_at` is the time stamped on the
-  // tombstone of each live key the snapshot lacks. One transaction: a binding
-  // failure is 409, any rejected record is 422, and neither writes anything.
+  // Vana PS contract, not Core. Body: `{instance, emitted_at,
+  // source_collected_at?, records[]}`; `records` is the complete live set from
+  // a covered full refresh by the instance's bound method, and `emitted_at` is
+  // the time stamped on the tombstone of each live key the snapshot lacks.
+  // `source_collected_at` (RFC 3339) is when the producer collected that set;
+  // with it, the replace also stores a completion receipt. One transaction: a
+  // binding failure is 409, any rejected record is 422, and neither writes
+  // anything.
   // It exists only under method authority, so a server without configured
   // methods does not mount it.
   if (deps.bindingStore) {
@@ -1504,7 +1580,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         const body = parseIngestBody(
           await readBoundedBody(c.req.raw, MAX_INGEST_BODY_BYTES, "Ingest"),
         ) as Record<string, unknown>;
-        const { instance, emitted_at: emittedAt, records } = body;
+        const {
+          instance,
+          emitted_at: emittedAt,
+          source_collected_at: sourceCollectedAt,
+          completion_policy: completionPolicy,
+          records,
+        } = body;
         if (
           Array.isArray(body) ||
           typeof instance !== "string" ||
@@ -1515,6 +1597,25 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           throw new PdppError(
             "invalid_request",
             "Replace body must be {instance, emitted_at, records[]}",
+          );
+        }
+        if (
+          sourceCollectedAt !== undefined &&
+          !isRfc3339DateTime(sourceCollectedAt)
+        ) {
+          throw new PdppError(
+            "invalid_request",
+            "source_collected_at must be an RFC 3339 date-time",
+          );
+        }
+        if (
+          completionPolicy !== undefined &&
+          (completionPolicy !== "preserve_if_unchanged" ||
+            sourceCollectedAt !== undefined)
+        ) {
+          throw new PdppError(
+            "invalid_request",
+            'completion_policy must be "preserve_if_unchanged" and cannot be sent with source_collected_at',
           );
         }
         const ownedInstances = ownerInstances(context!);
@@ -1550,6 +1651,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           emittedAt,
           primaryKey: declaration.primaryKey,
           validateData,
+          ...(sourceCollectedAt === undefined ? {} : { sourceCollectedAt }),
+          ...(completionPolicy === undefined
+            ? {}
+            : { completionPolicy: "preserve_if_unchanged" as const }),
           envelopes: records.map((entry) => {
             const e = (
               entry !== null && typeof entry === "object" ? entry : {}
@@ -1609,6 +1714,213 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             reqId,
             err,
           ),
+          reqId,
+        );
+      }
+    });
+  }
+
+  // Owner-authenticated completion metadata: "this stream's live set is
+  // exactly what the host's full-stream collection saw". It writes only
+  // completion receipts (never records, history, arrival or the write
+  // clock) and is mounted only over a store that can record them. Authority
+  // is the replace route's: an owner token of the server owner, an owned
+  // instance, the instance's one configured method. Primary keys come from
+  // the loaded declarations, never from the body.
+  if (deps.bindingStore?.completeStreams) {
+    const bindingStore = deps.bindingStore;
+    const completeStreams = deps.bindingStore.completeStreams;
+    app.post("/records/completions", async (c) => {
+      const reqId = requestId();
+      const { context, error } = await authenticate(c, reqId);
+      if (error) return error;
+      const headers = { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION };
+
+      try {
+        if (
+          context!.tokenKind !== "owner" ||
+          !context!.subjectId ||
+          !deps.ownerSubjectId ||
+          context!.subjectId.toLowerCase() !== deps.ownerSubjectId.toLowerCase()
+        ) {
+          throw new PdppError(
+            "authentication_error",
+            "Completion requires an owner token",
+          );
+        }
+        const method = c.req.query("method");
+        const generation = Number(c.req.query("binding_generation") ?? NaN);
+        if (!method || !Number.isSafeInteger(generation) || generation < 1) {
+          throw new PdppError(
+            "invalid_request",
+            "method and positive binding_generation query parameters are required",
+          );
+        }
+        let bytes: Uint8Array;
+        try {
+          bytes = await readCompletionBody(c.req.raw);
+        } catch (err) {
+          if (!(err instanceof CompletionBodyTooLarge)) throw err;
+          return c.json(
+            {
+              error: {
+                type: "invalid_request_error",
+                code: "invalid_request",
+                message: `Completion body exceeds the ${MAX_COMPLETION_BODY_BYTES} byte limit`,
+                request_id: reqId,
+              },
+            },
+            413,
+            headers,
+          );
+        }
+        let body: unknown;
+        try {
+          body = JSON.parse(
+            new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+          );
+        } catch {
+          throw new PdppError(
+            "invalid_request",
+            "Completion body is not valid JSON",
+          );
+        }
+        const shapeError = () =>
+          new PdppError(
+            "invalid_request",
+            "Completion body must be {source_id, instance, source_collected_at, collection_time_basis, streams[{stream, coverage, live_count, snapshot_sha256}]}",
+          );
+        if (
+          body === null ||
+          typeof body !== "object" ||
+          Array.isArray(body) ||
+          !hasExactKeys(body, COMPLETION_BODY_KEYS)
+        ) {
+          throw shapeError();
+        }
+        const wire = body as Record<string, unknown>;
+        const streams = wire.streams;
+        if (
+          typeof wire.source_id !== "string" ||
+          typeof wire.instance !== "string" ||
+          typeof wire.source_collected_at !== "string" ||
+          typeof wire.collection_time_basis !== "string" ||
+          !Array.isArray(streams) ||
+          streams.length === 0 ||
+          // No source declares more streams than the registry holds.
+          streams.length > deps.declarations.list().length ||
+          !streams.every(
+            (entry) =>
+              entry !== null &&
+              typeof entry === "object" &&
+              !Array.isArray(entry) &&
+              hasExactKeys(entry, COMPLETION_STREAM_KEYS) &&
+              typeof entry.stream === "string" &&
+              typeof entry.coverage === "string" &&
+              typeof entry.live_count === "number" &&
+              typeof entry.snapshot_sha256 === "string",
+          )
+        ) {
+          throw shapeError();
+        }
+
+        // Authority. A source-scoped token is for that source alone, and the
+        // instance must be one the token currently covers.
+        if (context!.sourceId && context!.sourceId !== wire.source_id) {
+          throw new PdppError(
+            "authentication_error",
+            "Completion requires the source of the owner token",
+          );
+        }
+        if (!ownerInstances(context!).includes(wire.instance)) {
+          throw new PdppError(
+            "authentication_error",
+            "Completion requires an owned instance",
+          );
+        }
+        const configured = deps.configuredMethods?.get(wire.instance) ?? [];
+        if (configured.length > 1) {
+          throw new PdppBindingError("config_multiple_active_methods");
+        }
+        if (configured.length !== 1 || configured[0] !== method) {
+          throw new PdppBindingError("method_inactive");
+        }
+        if (
+          bindingStore.getInstanceBinding(wire.instance).sourceId !==
+          wire.source_id
+        ) {
+          throw new PdppBindingError("source_mismatch");
+        }
+
+        const result = completeStreams(
+          {
+            instance: wire.instance,
+            sourceId: wire.source_id,
+            method,
+            generation,
+            sourceCollectedAt: wire.source_collected_at,
+            collectionTimeBasis:
+              wire.collection_time_basis as "host_run_finished",
+            streams: (streams as Record<string, unknown>[]).map((entry) => ({
+              stream: entry.stream as string,
+              coverage: entry.coverage as "full_stream",
+              liveCount: entry.live_count as number,
+              snapshotSha256: entry.snapshot_sha256 as string,
+            })),
+          },
+          (sourceId, stream) =>
+            deps.declarations.get(stream, sourceId)?.primaryKey,
+        );
+        return c.json(
+          {
+            receipts: result.receipts.map((receipt) => ({
+              instance: receipt.instance,
+              stream: receipt.stream,
+              method: receipt.method,
+              generation: receipt.generation,
+              source_collected_at: receipt.sourceCollectedAt,
+              write_seq: receipt.writeSeq,
+              live_count: receipt.liveCount,
+              snapshot_sha256: receipt.snapshotSha256,
+              collection_time_basis: receipt.collectionTimeBasis,
+            })),
+          },
+          200,
+          headers,
+        );
+      } catch (err) {
+        if (err instanceof PdppBindingError) {
+          return c.json(
+            {
+              error: { code: err.reason, message: err.reason },
+              request_id: reqId,
+            },
+            409,
+            headers,
+          );
+        }
+        if (err instanceof StreamCompletionError) {
+          if (COMPLETION_CONFLICTS.includes(err.reason)) {
+            return c.json(
+              {
+                error: { code: err.reason, message: err.reason },
+                request_id: reqId,
+              },
+              409,
+              headers,
+            );
+          }
+          if (err.reason !== "invalid_declaration") {
+            return sendError(
+              c,
+              new PdppError("invalid_request", err.reason),
+              reqId,
+            );
+          }
+        }
+        return sendError(
+          c,
+          mapAndLog(deps, "POST /v1/records/completions", reqId, err),
           reqId,
         );
       }

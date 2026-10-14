@@ -8,6 +8,25 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   eslintConfigPrettier,
   {
+    // Runs in browsers and WebViews: no Node built-ins.
+    files: ["packages/core/src/legacy-projection/**/*.ts"],
+    ignores: [
+      "**/*.test.ts",
+      "**/__fixtures__/**",
+      "**/github-browser-parity-fixtures.ts",
+    ],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            { group: ["node:*"], message: "Keep this module browser-safe." },
+          ],
+        },
+      ],
+    },
+  },
+  {
     files: ["packages/*/src/**/*.ts"],
     rules: {
       "@typescript-eslint/no-unused-vars": [

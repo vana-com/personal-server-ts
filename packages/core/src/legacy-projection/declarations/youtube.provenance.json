@@ -1,0 +1,18 @@
+{
+  "generated_file_notice": "EVIDENCE RECORD — collection profile copied from the source manifest at the recorded revision; no OCI publication or artifact signature is claimed.",
+  "signed_artifact_digest": null,
+  "connector_key": "youtube",
+  "connector_id": "https://registry.pdpp.dev/connectors/youtube",
+  "version": "0.2.0",
+  "protocol_version": "0.1.0",
+  "source": {
+    "repository": "https://github.com/PDP-Connect/data-connectors",
+    "revision": "fe871c128a",
+    "package": "connectors/youtube"
+  },
+  "source_inventory": [],
+  "outputs": {
+    "collection-profile.json": "sha256:bc6bcb2704bd52d9c002eb0c1810bceb15c4a07469f07a326ff08553b3b5e41f"
+  },
+  "note": "Browser-first source declaration copied from the recorded data-connectors browser profile batch source branch. No signed OCI artifact digest was available. The seven retained legacy scope schemas remain unchanged. The optional Takeout source retains its distinct youtube_takeout identity."
+}

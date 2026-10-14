@@ -9,7 +9,8 @@ export function legacyTestConnectionId(
 
 export async function registerTestConnection(
   app: {
-    request(path: string, init?: RequestInit): Promise<Response>;
+    // Hono's `app.request` may return a Response synchronously.
+    request(path: string, init?: RequestInit): Response | Promise<Response>;
   },
   devToken: string,
   owner: string,

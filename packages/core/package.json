@@ -76,6 +76,14 @@
       "types": "./dist/storage/index/index.d.ts",
       "import": "./dist/storage/index/index.js"
     },
+    "./storage/canonical-legacy-projection": {
+      "types": "./dist/storage/canonical-legacy-projection.d.ts",
+      "import": "./dist/storage/canonical-legacy-projection.js"
+    },
+    "./storage/legacy-scope-view": {
+      "types": "./dist/storage/legacy-scope-view.d.ts",
+      "import": "./dist/storage/legacy-scope-view.js"
+    },
     "./storage/pdpp-records": {
       "types": "./dist/storage/pdpp-records/index.d.ts",
       "import": "./dist/storage/pdpp-records/index.js"

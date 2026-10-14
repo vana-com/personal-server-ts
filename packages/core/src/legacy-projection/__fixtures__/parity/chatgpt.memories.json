@@ -1,0 +1,80 @@
+{
+  "scope": "chatgpt.memories",
+  "provenance": {
+    "legacyConnector": "chatgpt-4.0.0-vana.1.js 4.0.0-vana.1 sha256:c1c9deff62b0c7e2d0ee613ba231dc660b3e9f1397ed7071fb0f05e4be527016",
+    "pdppBundle": "chatgpt-0.2.20.js sha256:2eb9f92755bb8a3598013e9eb3575d9cccf26f935b8c26d3e08bc794d26c395a",
+    "inputs": "inputs/chatgpt/{conversations,list-items,search-items,memories,session}.json (synthetic, authored by inputs/chatgpt/build-inputs.mjs); served by lib/chatgpt-upstream.mjs to both scripts",
+    "generatedBy": "generate.mjs",
+    "clock": "frozen at 2026-10-01T00:00:00.000Z in both script runs (legacy now()-derived fields carry this value)",
+    "legacyRequestedScopes": [
+      "chatgpt.conversations",
+      "chatgpt.memories"
+    ],
+    "pdppRequestedScopes": [
+      "chatgpt.conversations",
+      "chatgpt.messages",
+      "chatgpt.memories"
+    ],
+    "pdppStreamDedupe": {
+      "memories": {
+        "emitted": 3,
+        "stored": 3,
+        "unkeyed": 0
+      }
+    }
+  },
+  "fetchedStreams": [
+    "memories"
+  ],
+  "streams": {
+    "memories": [
+      {
+        "id": "mem-synth-0001",
+        "content": "Prefers metric units.",
+        "created_at": "2026-08-01T10:00:00.123456+00:00",
+        "updated_at": "2026-08-02T11:30:00.654321+00:00",
+        "type": null
+      },
+      {
+        "id": "mem-synth-0002",
+        "content": "Is learning Portuguese.",
+        "created_at": null,
+        "updated_at": "2026-09-03T09:15:00.000000+00:00",
+        "type": null
+      },
+      {
+        "id": "mem-synth-0003",
+        "content": "Has a dog named Pixel.",
+        "created_at": "2026-07-20T08:00:00.000000+00:00",
+        "updated_at": null,
+        "type": null
+      }
+    ]
+  },
+  "legacyBody": {
+    "memories": [
+      {
+        "id": "mem-synth-0001",
+        "content": "Prefers metric units.",
+        "created_at": "2026-08-01T10:00:00.123456+00:00",
+        "updated_at": "2026-08-02T11:30:00.654321+00:00",
+        "type": "memory"
+      },
+      {
+        "id": "mem-synth-0002",
+        "content": "Is learning Portuguese.",
+        "created_at": "2026-10-01T00:00:00.000Z",
+        "updated_at": "2026-09-03T09:15:00.000000+00:00",
+        "type": "memory"
+      },
+      {
+        "id": "mem-synth-0003",
+        "content": "Has a dog named Pixel.",
+        "created_at": "2026-07-20T08:00:00.000000+00:00",
+        "type": "memory"
+      }
+    ],
+    "total": 3
+  },
+  "reviewedDifferences": []
+}

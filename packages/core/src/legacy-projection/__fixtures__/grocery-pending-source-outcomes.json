@@ -1,0 +1,18 @@
+{
+  "heb": [
+    { "stream": "nutrition", "data": { "id": "heb-found", "product_id": "heb-1", "product_url": "https://www.heb.com/product-detail/heb-1", "name": "Oats", "source": "heb_product_page", "confidence": "high", "calories": 150 } },
+    { "stream": "nutrition", "data": { "id": "heb-blocked", "product_id": "heb-2", "product_url": "https://www.heb.com/product-detail/heb-2", "name": "Milk", "source": "blocked", "confidence": "low", "calories": null } }
+  ],
+  "wholefoods": [
+    { "stream": "order_items", "data": { "id": "order-1#B000000001", "order_id": "order-1", "product_id": "B000000001", "name": "Oats", "product_url": "https://www.amazon.com/dp/B000000001", "image_url": null } },
+    { "stream": "order_items", "data": { "id": "order-1#B000000002", "order_id": "order-1", "product_id": "B000000002", "name": "Milk", "product_url": null, "image_url": null } },
+    { "stream": "order_items", "data": { "id": "order-1#B000000003", "order_id": "order-1", "product_id": "B000000003", "name": "Rice", "product_url": null, "image_url": null } },
+    { "stream": "order_items", "data": { "id": "order-1#B000000004", "order_id": "order-1", "product_id": "B000000004", "name": "Beans", "product_url": null, "image_url": null } },
+    { "stream": "order_items", "data": { "id": "order-1#B000000005", "order_id": "order-1", "product_id": "B000000005", "name": "Apples", "product_url": null, "image_url": null } },
+    { "stream": "nutrition", "data": { "product_id": "B000000001", "name": "Oats", "source": "wholefoods_product_page", "confidence": "high", "calories": 150 } },
+    { "stream": "nutrition", "data": { "product_id": "B000000002", "name": "Milk", "source": "usda_fdc", "confidence": "medium", "calories": 60 } },
+    { "stream": "nutrition", "data": { "product_id": "B000000003", "name": "Rice", "source": "not_found", "confidence": "low", "calories": null } },
+    { "stream": "nutrition", "data": { "product_id": "B000000004", "name": "Beans", "source": "error", "confidence": "low", "calories": null } },
+    { "stream": "nutrition", "data": { "product_id": "B000000005", "name": "Apples", "source": "blocked", "confidence": "low", "calories": null } }
+  ]
+}

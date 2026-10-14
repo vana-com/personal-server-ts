@@ -77,6 +77,15 @@ export interface ListDataScopesContractInput {
   limit?: number;
   offset?: number;
   isVisible?: DataVisibilityFilter;
+  /**
+   * Scopes to list that have no stored entry, such as a scope served only
+   * from canonical records. A scope that storage holds is never added here,
+   * visible or not. Merged into the visible set in scope order.
+   */
+  extraScopes?: (
+    scopePrefix: string | undefined,
+    stored: ReadonlySet<string>,
+  ) => Promise<ScopeSummary[]>;
 }
 
 export interface ListDataScopesContractResult {
@@ -308,10 +317,11 @@ export async function listDataScopesContract(
   const offset = normalizeOffset(input.offset);
   let page: ScopeSummary[];
   let total: number;
-  if (input.isVisible) {
+  if (input.isVisible || input.extraScopes) {
     // Filtered listing: walk every scope so the page and the total both
     // describe the visible set (the index cannot filter by tombstone).
     const visible: ScopeSummary[] = [];
+    const stored = new Set<string>();
     for (let scan = 0; ; scan += VISIBILITY_PAGE_SIZE) {
       const batch = input.storage.listScopes({
         scopePrefix: input.scopePrefix,
@@ -319,15 +329,30 @@ export async function listDataScopesContract(
         offset: scan,
       });
       for (const summary of batch.scopes) {
+        stored.add(summary.scope);
         const latest = input.storage.findEntry({
           scope: summary.scope,
           at: summary.latestCollectedAt,
         });
-        if (!latest || (await input.isVisible(summary.scope, latest))) {
+        if (
+          !latest ||
+          !input.isVisible ||
+          (await input.isVisible(summary.scope, latest))
+        ) {
           visible.push(summary);
         }
       }
       if (batch.scopes.length < VISIBILITY_PAGE_SIZE) break;
+    }
+    if (input.extraScopes) {
+      const extras = await input.extraScopes(input.scopePrefix, stored);
+      for (const extra of extras) {
+        if (!stored.has(extra.scope)) visible.push(extra);
+      }
+      // The index lists in SQLite binary order; `<` compares the same way.
+      visible.sort((a, b) =>
+        a.scope < b.scope ? -1 : a.scope > b.scope ? 1 : 0,
+      );
     }
     total = visible.length;
     page = visible.slice(offset, offset + limit);
