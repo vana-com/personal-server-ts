@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createLegacyScopeView,
   type LegacyScopeAuthority,
+  type LegacyCoverageVerdict,
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
@@ -225,6 +226,71 @@ describe("legacy scope view over the real SQLite record store", () => {
       });
       expect(view.listingFor(scope)).toEqual({ kind: "refused" });
     }
+  });
+
+  it("persists reviewed exception evidence in the verdict ledger", () => {
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "chatgpt/memories/old.json",
+      "chatgpt.memories",
+      "2026-06-08T18:05:53.547Z",
+      1,
+    );
+    const authority = createLegacyScopeAuthority(db);
+    const head = authority.eligibleLegacyHead("chatgpt.memories")!;
+    const exception = {
+      path: "$.memories[].created_at",
+      reason:
+        "legacy collector wrote collection time; canonical carries source creation time",
+      authority: "canonical" as const,
+    };
+    const coverage: LegacyCoverageVerdict = {
+      covered: true,
+      comparisonCase: "canonical_newer",
+      reason: null,
+      reasonCounts: {
+        no_stable_key: 0,
+        missing_entity: 0,
+        missing_field: 0,
+        field_mismatch: 0,
+        type_mismatch: 0,
+        timestamp_format: 0,
+        identity_mismatch: 0,
+        creation_mismatch: 0,
+        array_order: 0,
+        payload_growth: 0,
+        projection_unavailable: 0,
+      },
+      appliedExceptions: [exception],
+      missingEntityCount: 0,
+      mismatchedFieldPaths: [],
+      legacyBytes: 100,
+      canonicalBytes: 100,
+      byteDelta: 0,
+    };
+    expect(
+      authority.confirmRead("chatgpt.memories", head, () => true, {
+        instance: "conn_a",
+        writeClock: authority.writeClock(),
+        canonicalCursor: "0:receipt:revision:3",
+        coverage,
+        cached: false,
+      }),
+    ).toBe(true);
+    expect(authority.verdictFor("chatgpt.memories")[0]).toMatchObject({
+      verdict: "covered",
+      comparisonCase: "canonical_newer",
+      appliedExceptions: [exception],
+    });
+    expect(
+      authority.cachedVerdict(
+        "chatgpt.memories",
+        "conn_a",
+        head.id,
+        "0:receipt:revision:3",
+      )?.appliedExceptions,
+    ).toEqual([exception]);
   });
 
   it("reads the one connection that holds data, beside one that never did", async () => {
