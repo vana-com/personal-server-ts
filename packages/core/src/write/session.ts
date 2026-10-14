@@ -23,6 +23,7 @@ import {
   type McpProofReplayStore,
 } from "../mcp/session.js";
 import { writeScopePatterns } from "../policy/data-write.js";
+import { SENTINEL_GRANT_IDS } from "../policy/data-read.js";
 import type {
   AuthSessionVerifierPort,
   GrantVerifierPort,
@@ -145,10 +146,23 @@ export async function createWriteSession(
   );
   if (!builder) throw new UnregisteredBuilderError();
 
+  if (SENTINEL_GRANT_IDS.has(input.grantId)) {
+    throw new GrantRequiredError({
+      reason: "Reserved grantId",
+      grantId: input.grantId,
+    });
+  }
+
   const grant = await options.grantVerifier.getGrant(input.grantId);
   if (!grant) {
     throw new GrantRequiredError({
       reason: "Grant not found",
+      grantId: input.grantId,
+    });
+  }
+  if (SENTINEL_GRANT_IDS.has(grant.id)) {
+    throw new GrantRequiredError({
+      reason: "Grant resolved to a reserved id",
       grantId: input.grantId,
     });
   }

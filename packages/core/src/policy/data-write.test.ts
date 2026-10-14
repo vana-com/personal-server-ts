@@ -114,6 +114,43 @@ describe("verifyDataWritePolicy", () => {
     expect(result).toBe(grant);
   });
 
+  it("rejects a reserved grantId as caller input (same as the read policy)", async () => {
+    const ports = makePorts(makeGrant({ id: "owner" }));
+    await expect(
+      verifyDataWritePolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "owner",
+          requestedScope: "notes.entries",
+          serverOwner: SERVER_OWNER,
+        },
+        ports,
+      ),
+    ).rejects.toMatchObject({
+      errorCode: "GRANT_REQUIRED",
+      details: { reason: "Reserved grantId" },
+    });
+    expect(ports.grantVerifier.getGrant).not.toHaveBeenCalled();
+  });
+
+  it("rejects a grant the gateway resolves to a reserved id", async () => {
+    const grant = makeGrant({ id: "policy-bypass" });
+    await expect(
+      verifyDataWritePolicy(
+        {
+          signer: BUILDER_ADDRESS,
+          grantId: "grant-w-1",
+          requestedScope: "notes.entries",
+          serverOwner: SERVER_OWNER,
+        },
+        makePorts(grant),
+      ),
+    ).rejects.toMatchObject({
+      errorCode: "GRANT_REQUIRED",
+      details: { reason: "Grant resolved to a reserved id" },
+    });
+  });
+
   it("rejects when the grant only carries READ scopes for the target (separation of powers)", async () => {
     const grant = makeGrant({ scopes: ["notes.entries", "write:other.scope"] });
     await expect(

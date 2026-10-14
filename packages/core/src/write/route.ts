@@ -18,7 +18,10 @@
  * is one implementation of who may open a write session.
  */
 
-import { authenticateRequest } from "../auth/index.js";
+import {
+  authenticateRequest,
+  isWeb3SignedLifetimeError,
+} from "../auth/index.js";
 import type { SessionTokenVerifierPort } from "../auth/index.js";
 import { ProtocolError } from "../errors/catalog.js";
 import { web3SignedProofId, boundedProofExpiry } from "../auth/proof-id.js";
@@ -139,6 +142,14 @@ export async function handleWriteSessionRequest(
   } catch (err) {
     if (!(err instanceof ProtocolError)) {
       return internalError(deps.logger, err, "authenticate");
+    }
+    // The request-auth lifetime cap fires before boundedProofExpiry below;
+    // keep the handshake's own error code for an over-long proof.
+    if (isWeb3SignedLifetimeError(err)) {
+      return jsonResponse(
+        jsonError(401, "WRITE_SESSION_PROOF_LIFETIME", err.message),
+        401,
+      );
     }
     return jsonResponse(
       jsonError(401, "WRITE_SESSION_AUTH_FAILED", err.message),

@@ -2004,6 +2004,17 @@ async function handleMcpRoute(input: {
     });
   }
 
+  // The self-signing app handshake (Node server only). Without this it falls
+  // into the legacy /mcp/:token route below, which reads "session" as a
+  // connection token and answers "Unknown or revoked MCP connection".
+  if (pathname === "/mcp/session") {
+    return errorResponse(
+      501,
+      "MCP_SESSION_NOT_SUPPORTED",
+      "Third-party MCP sessions are not available on this Personal Server. The user needs Vana Desktop.",
+    );
+  }
+
   // Legacy Claude-facing endpoint: /mcp/:token
   const mcpPrefix = "/mcp/";
   if (pathname.startsWith(mcpPrefix)) {

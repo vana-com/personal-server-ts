@@ -346,7 +346,9 @@ export function createMcpSessionAuthPort(params: {
 
       // Paid session: enforce x402 per read (reuses the exact HTTP cycle). The
       // read client forwards the app's `X-PAYMENT` proof on `input.request`.
-      if (params.payment) {
+      // A table-of-contents read carries no values and its tool takes no
+      // `payment` argument, so charging it would make it unreachable.
+      if (params.payment && !input.metadataOnly) {
         // Settlement happens here, ahead of the HTTP handler's own deletion
         // gate, so the gate must run here too: never challenge or settle a
         // read of a scope the owner deleted.

@@ -422,6 +422,20 @@ describe("createPsLiteRuntime + /mcp/:token route", () => {
     expect((await res.json()).error.errorCode).toBe("INVALID_TOKEN");
   });
 
+  it("refuses the third-party session handshake with an explicit code", async () => {
+    const { runtime } = buildRuntime();
+    const res = await runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/mcp/session`, {
+        method: "POST",
+        headers: { authorization: "Web3Signed e30.0x00" },
+      }),
+    );
+    expect(res.status).toBe(501);
+    expect((await res.json()).error.errorCode).toBe(
+      "MCP_SESSION_NOT_SUPPORTED",
+    );
+  });
+
   it("rejects pending tokens", async () => {
     const { runtime, store } = buildRuntime();
     const created = await createMcpConnection(
