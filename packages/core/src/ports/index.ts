@@ -173,10 +173,13 @@ export interface DataStoragePort extends RuntimeStoragePort {
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   /** Highest stored DPv2 `version` for a scope; 0 if none. */
   findLatestVersionByScope(scope: string): number | Promise<number>;
-  /** Stamps the DPv2 dataPointId on an entry after registerDataPoint. */
+  /**
+   * Stamps the DPv2 dataPointId on an entry after registerDataPoint; `null`
+   * marks it unsynced again (the gateway lost the registration).
+   */
   updateDataPointId(
     path: string,
-    dataPointId: string,
+    dataPointId: string | null,
   ): boolean | Promise<boolean>;
   /**
    * Rewrites the DPv2 `version` on an entry. Used when the upload worker
