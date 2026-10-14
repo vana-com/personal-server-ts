@@ -239,6 +239,241 @@ describe("legacy scope view over the real SQLite record store", () => {
     });
   });
 
+  it("compares the projected Claude conversation joined from three streams", async () => {
+    connect(store, "conn_claude", "anthropic", CLAUDE);
+    const rows = [
+      ["account_profile", CLAUDE_PROFILE],
+      [
+        "conversations",
+        {
+          id: "cv1",
+          title: "A",
+          create_time: null,
+          update_time: null,
+          project_id: null,
+          message_count: 1,
+          is_starred: false,
+        },
+      ],
+      [
+        "messages",
+        {
+          id: "m1",
+          conversation_id: "cv1",
+          role: "user",
+          parent_id: null,
+          content: "hello",
+          create_time: "2026-09-01T00:00:00.000Z",
+          update_time: null,
+          attachments: [],
+        },
+      ],
+    ] as const;
+    for (const [stream, data] of rows) {
+      store.replaceStream({
+        instance: "conn_claude",
+        stream,
+        method: "anthropic",
+        generation: 1,
+        primaryKey: ["id"],
+        emittedAt: CLAUDE_COLLECTED,
+        sourceCollectedAt: CLAUDE_COLLECTED,
+        envelopes: [
+          {
+            instance: "conn_claude",
+            stream,
+            key: data.id,
+            data,
+            emitted_at: CLAUDE_COLLECTED,
+          },
+        ],
+      });
+    }
+    const projected = await view.readLatest("claude.conversations");
+    expect(projected.kind).toBe("canonical");
+    if (projected.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "claude/conversations/old.json",
+      "claude.conversations",
+      "2026-10-01T00:00:00.000Z",
+      1,
+    );
+    const legacyData = structuredClone(projected.envelope.data);
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => ({ ...projected.envelope, data: legacyData }),
+    });
+    expect((await parityView.readLatest("claude.conversations")).kind).toBe(
+      "canonical",
+    );
+    const conversations = legacyData.conversations as { messages: object[] }[];
+    conversations[0]!.messages.push({ id: "old-only-message" });
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "claude/conversations/new.json",
+      "claude.conversations",
+      "2026-10-02T00:00:00.000Z",
+      1,
+    );
+    expect((await parityView.readLatest("claude.conversations")).kind).toBe(
+      "file",
+    );
+    expect(
+      parityView.verdictFor("claude.conversations")[0]?.reasonCounts
+        .missing_entity,
+    ).toBe(1);
+  });
+
+  it("keeps parity verdicts isolated by connection instance", async () => {
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    const projected = await view.readLatest("oura.activity");
+    expect(projected.kind).toBe("canonical");
+    if (projected.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-10-01T00:00:00.000Z",
+      1,
+    );
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => projected.envelope,
+    });
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    store.deleteConnection("conn_a");
+    connect(store, "conn_b", "oura");
+    replace(store, "conn_b", "activity", ["a1"]);
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    expect(
+      db
+        .prepare(
+          "SELECT instance FROM legacy_scope_takeovers ORDER BY instance",
+        )
+        .all(),
+    ).toEqual([{ instance: "conn_a" }, { instance: "conn_b" }]);
+    ingest(store, "conn_b", "a1", "2026-09-10T08:00:00.000Z", 91);
+    expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
+    expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
+    expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
+    expect(parityView.verdictFor("oura.activity")).toMatchObject([
+      { instance: "conn_a", verdict: "covered" },
+      {
+        instance: "conn_b",
+        verdict: "not_covered",
+        reason: { reason: "field_mismatch" },
+      },
+    ]);
+  });
+
+  it("does not treat one newer unproven upsert as a newer full stream", async () => {
+    connect(store, "conn_a", "oura");
+    store.replaceStream({
+      instance: "conn_a",
+      stream: "activity",
+      method: "oura",
+      generation: 1,
+      primaryKey: ["id"],
+      emittedAt: "2026-03-01T00:00:00.000Z",
+      sourceCollectedAt: "2026-03-01T00:00:00.000Z",
+      envelopes: [
+        {
+          instance: "conn_a",
+          stream: "activity",
+          key: "a1",
+          data: { id: "a1", day: "2026-03-01", score: 90 },
+          emitted_at: "2026-03-01T00:00:00.000Z",
+        },
+      ],
+    });
+    ingest(store, "conn_a", "a2", "2026-10-01T00:00:00.000Z");
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/june.json",
+      "oura.activity",
+      "2026-06-01T00:00:00.000Z",
+      1,
+    );
+    const legacyData = { days: [{ id: "a1", day: "2026-03-01", score: 80 }] };
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => ({
+        version: "1.0",
+        scope: "oura.activity",
+        collectedAt: "2026-06-01T00:00:00.000Z",
+        data: legacyData,
+      }),
+    });
+    expect((await parityView.readLatest("oura.activity")).kind).toBe("file");
+    expect(parityView.verdictFor("oura.activity")[0]).toMatchObject({
+      comparisonCase: "same_time",
+      reason: { reason: "field_mismatch" },
+    });
+  });
+
+  it("records a newer file fallback when the canonical projection becomes unavailable", async () => {
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    const projected = await view.readLatest("oura.activity");
+    expect(projected.kind).toBe("canonical");
+    if (projected.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-10-01T00:00:00.000Z",
+      1,
+    );
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => projected.envelope,
+    });
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    store.replaceStream({
+      instance: "conn_a",
+      stream: "activity",
+      method: "oura",
+      generation: 1,
+      primaryKey: ["id"],
+      emittedAt: "2026-10-02T00:00:00.000Z",
+      envelopes: [],
+    });
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/new.json",
+      "oura.activity",
+      "2026-10-02T00:00:00.000Z",
+      1,
+    );
+    expect((await parityView.readLatest("oura.activity")).kind).toBe("file");
+    expect(parityView.verdictFor("oura.activity")[0]).toMatchObject({
+      verdict: "not_covered",
+      reason: { reason: "projection_unavailable" },
+    });
+  });
+
   it("leaves a scope to its file until a connection of its methods holds its streams", async () => {
     connect(store, "conn_a", "oura");
     expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });

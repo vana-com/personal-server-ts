@@ -38,6 +38,7 @@ describe("initializeDatabase", () => {
       .all() as { name: string }[];
     expect(columns.map((column) => column.name)).toEqual([
       "scope",
+      "instance",
       "superseded_version",
       "superseded_cas_revision",
       "superseded_collected_at",
@@ -45,6 +46,92 @@ describe("initializeDatabase", () => {
       "taken_over_at",
     ]);
     db.close();
+  });
+
+  it("migrates a v8 takeover ledger without losing its recorded file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "legacy-takeover-schema-"));
+    try {
+      const path = join(dir, "index.db");
+      const old = initializeDatabase(path);
+      old.exec(`DROP TABLE legacy_scope_takeovers;
+        CREATE TABLE legacy_scope_takeovers (
+          scope TEXT NOT NULL, superseded_version INTEGER NOT NULL,
+          superseded_cas_revision INTEGER NOT NULL,
+          superseded_collected_at TEXT NOT NULL, superseded_path TEXT NOT NULL,
+          taken_over_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          PRIMARY KEY (scope, superseded_path)
+        );
+        INSERT INTO legacy_scope_takeovers
+          (scope, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+          VALUES ('oura.activity', 7, 9, '2026-01-01T00:00:00Z', 'oura/activity/old.json');
+      `);
+      old.pragma("user_version = 8");
+      old.close();
+      const migrated = initializeDatabase(path);
+      expect(
+        migrated
+          .prepare(
+            "SELECT scope, instance, superseded_path FROM legacy_scope_takeovers",
+          )
+          .all(),
+      ).toEqual([
+        {
+          scope: "oura.activity",
+          instance: "",
+          superseded_path: "oura/activity/old.json",
+        },
+      ]);
+      expect(
+        migrated
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE name = 'legacy_scope_takeover_verdicts'",
+          )
+          .get(),
+      ).toBeDefined();
+      migrated.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("migrates a v10 verdict row with comparison diagnostics", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "legacy-verdict-schema-"));
+    try {
+      const path = join(dir, "index.db");
+      const old = initializeDatabase(path);
+      old.exec(`DROP TABLE legacy_scope_takeover_verdicts;
+        CREATE TABLE legacy_scope_takeover_verdicts (
+          scope TEXT NOT NULL, instance TEXT NOT NULL,
+          legacy_version_id INTEGER NOT NULL, canonical_cursor TEXT NOT NULL,
+          verdict TEXT NOT NULL, reason_json TEXT,
+          legacy_bytes INTEGER NOT NULL, canonical_bytes INTEGER NOT NULL,
+          byte_delta INTEGER NOT NULL, evaluated_at TEXT NOT NULL,
+          PRIMARY KEY (scope, instance)
+        );
+        INSERT INTO legacy_scope_takeover_verdicts VALUES
+          ('oura.activity', 'owner-1', 42, '1:revision', 'covered', NULL,
+           10, 10, 0, '2026-01-01T00:00:00Z');
+      `);
+      old.pragma("user_version = 10");
+      old.close();
+      const migrated = initializeDatabase(path);
+      expect(
+        migrated
+          .prepare(
+            "SELECT legacy_version_id, comparison_case, reason_counts_json, applied_exceptions_json FROM legacy_scope_takeover_verdicts",
+          )
+          .get(),
+      ).toEqual({
+        legacy_version_id: 42,
+        comparison_case: "same_time",
+        reason_counts_json: "{}",
+        applied_exceptions_json: "[]",
+      });
+      expect(migrated.pragma("user_version", { simple: true })).toBe(13);
+      migrated.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("has all expected columns", () => {
@@ -122,7 +209,7 @@ describe("initializeDatabase", () => {
       .get("instagram/profile.json") as
       { path: string; scope: string; size_bytes: number } | undefined;
 
-    expect(version).toBe(8);
+    expect(version).toBe(13);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -178,7 +265,7 @@ describe("initializeDatabase", () => {
         }
       | undefined;
 
-    expect(version).toBe(8);
+    expect(version).toBe(13);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
@@ -227,7 +314,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(8);
+    expect(db.pragma("user_version", { simple: true })).toBe(13);
     const row = db
       .prepare(
         "SELECT path, schema_id, version, cas_revision, data_point_id FROM data_files WHERE path = ?",
@@ -287,7 +374,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(8);
+    expect(db.pragma("user_version", { simple: true })).toBe(13);
     const row = db
       .prepare(
         "SELECT path, version, cas_revision, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",
@@ -330,7 +417,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(8);
+    expect(db.pragma("user_version", { simple: true })).toBe(13);
     expect(
       db
         .prepare(
