@@ -1,0 +1,214 @@
+{
+  "scope": "spotify.playlists",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; spotify.playlists from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553",
+    "pdppBundle": "synthetic spotify.playlists records against vendored declarations at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output"
+  },
+  "fetchedStreams": [
+    "playlists",
+    "playlist_items"
+  ],
+  "streams": {
+    "playlists": [
+      {
+        "id": "playlist-a",
+        "name": "Road songs",
+        "description": "Synthetic playlist",
+        "owner_name": "Synthetic Owner",
+        "uri": "spotify:playlist:playlist-a",
+        "followers": 5,
+        "images": [
+          {
+            "url": "https://example.com/cover.jpg"
+          }
+        ],
+        "track_count": 99
+      }
+    ],
+    "playlist_items": [
+      {
+        "id": "item-b",
+        "playlist_id": "playlist-a",
+        "position": 2,
+        "added_at": "2026-10-02T00:00:00.000Z",
+        "added_by": "listener-a",
+        "name": "Second",
+        "artist_names": [
+          "Artist B"
+        ],
+        "album_name": "Album B",
+        "duration_ms": 200000,
+        "track_id": "1234567890123456789012"
+      },
+      {
+        "id": "item-a",
+        "playlist_id": "playlist-a",
+        "position": 1,
+        "added_at": "2026-10-01T00:00:00.000Z",
+        "added_by": "listener-a",
+        "name": "First",
+        "artist_names": [
+          "Artist A"
+        ],
+        "album_name": "Album A",
+        "duration_ms": 100000,
+        "uri": "spotify:local:artist:album:track",
+        "track_id": null
+      }
+    ]
+  },
+  "legacyBody": {
+    "playlists": [
+      {
+        "name": "Road songs",
+        "description": "Synthetic playlist",
+        "owner": "Synthetic Owner",
+        "uri": "spotify:playlist:playlist-a",
+        "followers": 5,
+        "images": [
+          "https://example.com/cover.jpg"
+        ],
+        "tracks_total": 2,
+        "tracks": [
+          {
+            "added_at": "2026-10-01T00:00:00.000Z",
+            "added_by": "listener-a",
+            "name": "First",
+            "artists": [
+              {
+                "name": "Artist A"
+              }
+            ],
+            "album": "Album A",
+            "duration_ms": 100000,
+            "uri": "spotify:local:artist:album:track"
+          },
+          {
+            "added_at": "2026-10-02T00:00:00.000Z",
+            "added_by": "listener-a",
+            "name": "Second",
+            "artists": [
+              {
+                "name": "Artist B"
+              }
+            ],
+            "album": "Album B",
+            "duration_ms": 200000,
+            "uri": "spotify:track:1234567890123456789012"
+          }
+        ]
+      }
+    ],
+    "total": 1
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "spotify.playlists",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; spotify.playlists from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553",
+        "pdppBundle": "synthetic spotify.playlists records against vendored declarations at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output"
+      },
+      "fetchedStreams": [
+        "playlists",
+        "playlist_items"
+      ],
+      "streams": {
+        "playlists": [],
+        "playlist_items": []
+      },
+      "legacyBody": {
+        "playlists": [],
+        "total": 0
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "spotify.playlists",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; spotify.playlists from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553",
+        "pdppBundle": "synthetic spotify.playlists records against vendored declarations at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output"
+      },
+      "fetchedStreams": [
+        "playlists",
+        "playlist_items"
+      ],
+      "streams": {
+        "playlists": [
+          {
+            "id": "playlist-dirty",
+            "name": null,
+            "description": null,
+            "owner_name": 4,
+            "uri": null,
+            "followers": "5",
+            "images": [
+              null,
+              {
+                "url": 1
+              },
+              "https://example.com/keep.jpg"
+            ],
+            "track_count": 99
+          }
+        ],
+        "playlist_items": [
+          {
+            "id": "item-dirty",
+            "playlist_id": "playlist-dirty",
+            "position": null,
+            "added_at": null,
+            "added_by": 3,
+            "name": null,
+            "artist_names": [
+              "Artist",
+              null,
+              8
+            ],
+            "album_name": null,
+            "duration_ms": "100",
+            "track_id": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "playlists": [
+          {
+            "name": "",
+            "description": "",
+            "owner": "",
+            "uri": "",
+            "followers": 0,
+            "images": [
+              "https://example.com/keep.jpg"
+            ],
+            "tracks_total": 1,
+            "tracks": [
+              {
+                "added_at": "",
+                "added_by": "",
+                "name": "",
+                "artists": [
+                  {
+                    "name": "Artist"
+                  }
+                ],
+                "album": "",
+                "duration_ms": 0,
+                "uri": ""
+              }
+            ]
+          }
+        ],
+        "total": 1
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}
