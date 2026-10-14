@@ -34,17 +34,42 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 8;
+export const INDEX_SCHEMA_VERSION = 13;
 
 const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
   scope TEXT NOT NULL,
+  instance TEXT NOT NULL DEFAULT '',
   superseded_version INTEGER NOT NULL,
   superseded_cas_revision INTEGER NOT NULL,
   superseded_collected_at TEXT NOT NULL,
   superseded_path TEXT NOT NULL,
   taken_over_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  PRIMARY KEY (scope, superseded_path)
+  PRIMARY KEY (scope, instance, superseded_path)
+)`;
+
+const CREATE_LEGACY_SCOPE_VERDICTS_SQL = `
+CREATE TABLE IF NOT EXISTS legacy_scope_takeover_verdicts (
+  scope TEXT NOT NULL,
+  instance TEXT NOT NULL,
+  legacy_version_id INTEGER NOT NULL,
+  canonical_cursor TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('covered', 'not_covered')),
+  comparison_case TEXT NOT NULL,
+  reason_counts_json TEXT NOT NULL,
+  applied_exceptions_json TEXT NOT NULL,
+  reason_json TEXT,
+  legacy_bytes INTEGER NOT NULL,
+  canonical_bytes INTEGER NOT NULL,
+  byte_delta INTEGER NOT NULL,
+  evaluated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (scope, instance)
+)`;
+
+const CREATE_LEGACY_SCOPE_RESETS_SQL = `
+CREATE TABLE IF NOT EXISTS legacy_scope_takeover_resets (
+  scope TEXT PRIMARY KEY,
+  reset_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 )`;
 
 function hasColumn(
@@ -112,6 +137,58 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
       "ALTER TABLE scope_revisions ADD COLUMN closed_for_writes INTEGER NOT NULL DEFAULT 0",
     );
   }
+  if (
+    currentVersion < 10 &&
+    !hasColumn(db, "legacy_scope_takeovers", "instance")
+  ) {
+    db.exec("ALTER TABLE legacy_scope_takeovers ADD COLUMN instance TEXT");
+  }
+  if (
+    currentVersion < 11 &&
+    !hasColumn(db, "legacy_scope_takeover_verdicts", "comparison_case")
+  ) {
+    db.exec(
+      "ALTER TABLE legacy_scope_takeover_verdicts ADD COLUMN comparison_case TEXT NOT NULL DEFAULT 'same_time'",
+    );
+  }
+  if (
+    currentVersion < 11 &&
+    !hasColumn(db, "legacy_scope_takeover_verdicts", "reason_counts_json")
+  ) {
+    db.exec(
+      "ALTER TABLE legacy_scope_takeover_verdicts ADD COLUMN reason_counts_json TEXT NOT NULL DEFAULT '{}'",
+    );
+  }
+  if (
+    currentVersion < 12 &&
+    !hasColumn(db, "legacy_scope_takeover_verdicts", "applied_exceptions_json")
+  ) {
+    db.exec(
+      "ALTER TABLE legacy_scope_takeover_verdicts ADD COLUMN applied_exceptions_json TEXT NOT NULL DEFAULT '[]'",
+    );
+  }
+  if (currentVersion < 13) {
+    const columns = db.pragma("table_info(legacy_scope_takeovers)") as Array<{
+      name: string;
+      pk: number;
+    }>;
+    if (columns.find((column) => column.name === "instance")?.pk !== 2) {
+      db.transaction(() => {
+        db.exec(
+          "ALTER TABLE legacy_scope_takeovers RENAME TO legacy_scope_takeovers_old",
+        );
+        db.exec(CREATE_LEGACY_SCOPE_TAKEOVERS_SQL);
+        db.exec(`INSERT INTO legacy_scope_takeovers
+          (scope, instance, superseded_version, superseded_cas_revision,
+           superseded_collected_at, superseded_path, taken_over_at)
+          SELECT scope, COALESCE(instance, ''), superseded_version,
+                 superseded_cas_revision, superseded_collected_at,
+                 superseded_path, taken_over_at
+          FROM legacy_scope_takeovers_old`);
+        db.exec("DROP TABLE legacy_scope_takeovers_old");
+      })();
+    }
+  }
 }
 
 function ensureSchemaVersion(db: Database.Database): void {
@@ -133,8 +210,10 @@ export function initializeDatabase(dbPath: string): Database.Database {
 
   db.exec(CREATE_TABLE_SQL);
   db.exec(CREATE_SCOPE_REVISIONS_SQL);
-  ensureSchemaVersion(db);
   db.exec(CREATE_LEGACY_SCOPE_TAKEOVERS_SQL);
+  db.exec(CREATE_LEGACY_SCOPE_VERDICTS_SQL);
+  db.exec(CREATE_LEGACY_SCOPE_RESETS_SQL);
+  ensureSchemaVersion(db);
   for (const sql of CREATE_INDEXES_SQL) {
     db.exec(sql);
   }

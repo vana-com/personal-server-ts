@@ -1,5 +1,11 @@
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
+  compareLegacyCoverage,
+  type LegacyCoverageVerdict,
+} from "./legacy-scope-coverage.js";
+export type { LegacyCoverageVerdict } from "./legacy-scope-coverage.js";
+import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
+import {
   GITHUB_BROWSER_BINDINGS,
   LEGACY_SCOPE_BINDINGS,
   legacyBindingsForProfile,
@@ -30,11 +36,11 @@ import {
  * A bound scope is canonical-owned for write/refusal safety when a connection
  * of one of its methods has held a row of, or a completion receipt for, one
  * of the scope's streams, or was reset or deleted (both erase the rows that
- * would show this). With a stored legacy head, latest reads keep serving that
- * head until a complete projection has matching current completion receipts
- * and records takeover. After takeover, a failed read refuses instead of
- * resurrecting the file. Every other scope, unbound ones included, keeps the
- * file.
+ * would show this). With a stored legacy head, the first eligible GET checks
+ * the projected body against the latest legacy body and records the verdict.
+ * A newer legacy version is checked again; a mismatch explicitly returns
+ * that file. A regression against an already covered version refuses.
+ * Every other scope, unbound ones included, keeps the file.
  *
  * The connection comes only from the registry: the single live connection
  * of the scope's methods that has held any data. A request cannot name one.
@@ -47,6 +53,8 @@ const BINDING_PROFILES = [
   META_040_BINDINGS,
   OURA_BROWSER_BINDINGS,
 ];
+
+const COVERAGE_RULE_VERSION = 3;
 
 /**
  * Registry facts and takeover diagnostics from the same SQLite database as
@@ -65,8 +73,23 @@ export interface LegacyScopeAuthority {
   hasHeldData(instance: string, streams: readonly string[] | null): boolean;
   /** See `CanonicalLegacyReadStore.readSnapshot`. Same database connection. */
   readSnapshot<T>(read: () => T): T;
+  writeClock(): number;
   /** Whether a complete canonical read has already superseded the legacy head. */
-  hasTakeover(scope: string): boolean;
+  hasTakeover(scope: string, instance?: string): boolean;
+  hasCoveredHead(
+    scope: string,
+    head: LegacyScopeHead,
+    instance: string,
+  ): boolean;
+  isReset(scope: string): boolean;
+  cachedVerdict(
+    scope: string,
+    instance: string,
+    legacyVersionId: number,
+    canonicalCursor: string,
+  ): LegacyCoverageVerdict | null;
+  verdictFor(scope: string): LegacyScopeVerdictRecord[];
+  resetTakeover(scope: string): void;
   /** Identity of the latest index entry not owned by a known projector. */
   eligibleLegacyHead(scope: string): LegacyScopeHead | null;
   /**
@@ -78,7 +101,34 @@ export interface LegacyScopeAuthority {
     scope: string,
     expectedHead: LegacyScopeHead | null,
     selectionIsCurrent: () => boolean,
+    verdict?: {
+      instance: string;
+      writeClock: number;
+      canonicalCursor: string;
+      coverage: LegacyCoverageVerdict;
+      cached: boolean;
+    },
   ): boolean;
+}
+
+export interface LegacyScopeVerdictRecord {
+  scope: string;
+  instance: string;
+  legacyVersionId: number;
+  canonicalCursor: string;
+  verdict: "covered" | "not_covered";
+  comparisonCase: "same_time" | "canonical_newer";
+  reasonCounts: Record<string, number>;
+  appliedExceptions: LegacyCoverageVerdict["appliedExceptions"];
+  reason: {
+    reason: string;
+    missingEntityCount: number;
+    mismatchedFieldPaths: string[];
+  } | null;
+  legacyBytes: number;
+  canonicalBytes: number;
+  byteDelta: number;
+  evaluatedAt: string;
 }
 
 export interface LegacyScopeHead {
@@ -143,6 +193,9 @@ export interface LegacyScopeViewPort {
   ): { scope: string; collectedAt: string }[];
   /** True when canonical history makes a legacy-only deletion unsafe. */
   ownsScope(scope: string): boolean;
+  verdictFor(scope: string): LegacyScopeVerdictRecord[];
+  resetTakeover(scope: string): void;
+  isReset(scope: string): boolean;
 }
 
 export interface CreateLegacyScopeViewInput {
@@ -155,6 +208,10 @@ export interface CreateLegacyScopeViewInput {
   records?: CanonicalLegacyReadStore;
   /** Methods this boot configures for a store source id. */
   configuredMethods(sourceId: string): readonly string[];
+  /** Read the exact latest indexed legacy file; omitted by in-memory adapters. */
+  readLegacyHead?(head: LegacyScopeHead): Promise<DataFileEnvelope>;
+  /** Optional payload growth limits for the takeover check. */
+  coverageThresholds?: { maxPayloadRatio?: number; maxExtraBytes?: number };
 }
 
 type Decision =
@@ -256,15 +313,22 @@ export function createLegacyScopeView(
     }
     return (
       authority.eligibleLegacyHead(scope) !== null &&
-      !authority.hasTakeover(scope)
+      !authority.hasTakeover(
+        scope,
+        current.kind === "canonical" ? current.selection.instance : undefined,
+      )
     );
   }
 
   function listingFor(scope: string): LegacyScopeListing {
     return authority.readSnapshot((): LegacyScopeListing => {
+      if (authority.isReset(scope)) return { kind: "file" };
       const decision = decide(scope);
       const legacyHead = authority.eligibleLegacyHead(scope);
-      const hasTakeover = authority.hasTakeover(scope);
+      const hasTakeover = authority.hasTakeover(
+        scope,
+        decision.kind === "canonical" ? decision.selection.instance : undefined,
+      );
       if (
         decision.kind === "refused" &&
         decision.refusal.status === "unavailable" &&
@@ -275,8 +339,28 @@ export function createLegacyScopeView(
       }
       if (decision.kind !== "canonical") return { kind: decision.kind };
       const hasLegacyHead = legacyHead !== null;
-      if (hasLegacyHead && !hasTakeover) return { kind: "file" };
+      if (hasLegacyHead && input.readLegacyHead) {
+        const verdict = authority
+          .verdictFor(scope)
+          .find(
+            (row) =>
+              row.instance === decision.selection.instance &&
+              row.legacyVersionId === legacyHead.id,
+          );
+        const coveredHead = authority.hasCoveredHead(
+          scope,
+          legacyHead,
+          decision.selection.instance,
+        );
+        if (verdict?.verdict !== "covered") {
+          return { kind: coveredHead ? "refused" : "file" };
+        }
+        if (!verdict.canonicalCursor.startsWith(`${authority.writeClock()}:`)) {
+          return { kind: "refused" };
+        }
+      } else if (hasLegacyHead && !hasTakeover) return { kind: "file" };
       if (
+        !input.readLegacyHead &&
         hasLegacyHead &&
         hasTakeover &&
         missingCompletionReceipts(decision).length > 0
@@ -296,12 +380,22 @@ export function createLegacyScopeView(
 
   return {
     async readLatest(scope) {
-      const initial = authority.readSnapshot(() => ({
-        decision: decide(scope),
-        legacyHead: authority.eligibleLegacyHead(scope),
-        hasTakeover: authority.hasTakeover(scope),
-        canServeLegacy: canServeLegacyBeforeTakeover(scope),
-      }));
+      if (authority.isReset(scope)) return { kind: "file" };
+      const initial = authority.readSnapshot(() => {
+        const decision = decide(scope);
+        return {
+          decision,
+          legacyHead: authority.eligibleLegacyHead(scope),
+          hasTakeover: authority.hasTakeover(
+            scope,
+            decision.kind === "canonical"
+              ? decision.selection.instance
+              : undefined,
+          ),
+          canServeLegacy: canServeLegacyBeforeTakeover(scope),
+          writeClock: authority.writeClock(),
+        };
+      });
       const { decision, legacyHead, hasTakeover, canServeLegacy } = initial;
       if (
         decision.kind === "refused" &&
@@ -317,13 +411,77 @@ export function createLegacyScopeView(
         scope,
         selection: decision.selection,
         profileBy: "method",
-        requireCompletionReceipts: legacyHead !== null,
+        requireCompletionReceipts: legacyHead !== null && !input.readLegacyHead,
+        allowUnprovenEmptyStreams:
+          legacyHead !== null && !!input.readLegacyHead,
         // The rows must come from a state in which this is still the one
         // connection: a second account appearing between the decision and
         // the rows refuses instead of serving a body chosen while ambiguous.
         confirmSelection: () => sameSelection(decide(scope), decision),
       });
       if (!read.ok) {
+        if (
+          legacyHead !== null &&
+          input.readLegacyHead &&
+          isProjectionDataFailure(read.reason)
+        ) {
+          let legacy: DataFileEnvelope;
+          try {
+            legacy = await input.readLegacyHead(legacyHead);
+          } catch {
+            const { ok: _ok, ...refusal } = read;
+            return { kind: "refused", refusal };
+          }
+          if (legacy.scope !== scope) {
+            return {
+              kind: "refused",
+              refusal: {
+                status: "unavailable",
+                reason: "store_inconsistent_read",
+                detail: "indexed legacy head has another scope",
+              },
+            };
+          }
+          const coveredHead = authority.hasCoveredHead(
+            scope,
+            legacyHead,
+            decision.selection.instance,
+          );
+          const coverage = projectionUnavailableCoverage(legacy.data);
+          const confirmed = authority.confirmRead(
+            scope,
+            legacyHead,
+            () => sameSelection(decide(scope), decision),
+            {
+              instance: decision.selection.instance,
+              writeClock: initial.writeClock,
+              canonicalCursor: `${initial.writeClock}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
+              coverage,
+              cached: false,
+            },
+          );
+          if (!confirmed) {
+            return {
+              kind: "refused",
+              refusal: {
+                status: "unavailable",
+                reason: "store_inconsistent_read",
+                detail:
+                  "legacy head or canonical cursor changed during parity evaluation",
+              },
+            };
+          }
+          return coveredHead
+            ? {
+                kind: "refused",
+                refusal: {
+                  status: "incomplete",
+                  reason: "canonical_view_incomplete",
+                  diagnostics: [],
+                },
+              }
+            : { kind: "file" };
+        }
         if (
           legacyHead !== null &&
           !hasTakeover &&
@@ -342,6 +500,113 @@ export function createLegacyScopeView(
         }
         const { ok: _ok, ...refusal } = read;
         return { kind: "refused", refusal };
+      }
+      if (legacyHead !== null && input.readLegacyHead) {
+        const canonicalCursor = [
+          initial.writeClock,
+          read.revision,
+          COVERAGE_RULE_VERSION,
+          input.coverageThresholds?.maxPayloadRatio ?? 1.5,
+          input.coverageThresholds?.maxExtraBytes ?? 256 * 1024,
+        ].join(":");
+        let coverage = authority.cachedVerdict(
+          scope,
+          decision.selection.instance,
+          legacyHead.id,
+          canonicalCursor,
+        );
+        const cached = coverage !== null;
+        if (!coverage) {
+          let legacy: DataFileEnvelope;
+          try {
+            legacy = await input.readLegacyHead(legacyHead);
+          } catch {
+            return hasTakeover
+              ? {
+                  kind: "refused",
+                  refusal: {
+                    status: "unavailable",
+                    reason: "store_inconsistent_read",
+                    detail: "indexed legacy head could not be read",
+                  },
+                }
+              : { kind: "file" };
+          }
+          if (legacy.scope !== scope) {
+            return {
+              kind: "refused",
+              refusal: {
+                status: "unavailable",
+                reason: "store_inconsistent_read",
+                detail: "indexed legacy head has another scope",
+              },
+            };
+          }
+          coverage = compareLegacyCoverage(legacy.data, read.envelope.data, {
+            scope,
+            entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+            canonicalNewer: allStreamsNewerThan(
+              read,
+              decision.streams,
+              legacyHead.collectedAt,
+            ),
+            allowProvenDeletion:
+              read.complete &&
+              allStreamsProvenAfter(
+                read,
+                decision.streams,
+                legacyHead.collectedAt,
+              ),
+            ...input.coverageThresholds,
+          });
+        }
+        const alreadyCovered = authority.hasCoveredHead(
+          scope,
+          legacyHead,
+          decision.selection.instance,
+        );
+        const confirmed = authority.confirmRead(
+          scope,
+          legacyHead,
+          () => sameSelection(decide(scope), decision),
+          {
+            instance: decision.selection.instance,
+            writeClock: initial.writeClock,
+            canonicalCursor,
+            coverage,
+            cached,
+          },
+        );
+        if (!confirmed) {
+          return {
+            kind: "refused",
+            refusal: {
+              status: "unavailable",
+              reason: "store_inconsistent_read",
+              detail:
+                "legacy head or canonical cursor changed during parity evaluation",
+            },
+          };
+        }
+        if (!coverage.covered) {
+          // A newer file is an explicit, recorded rollback. A canonical
+          // regression against the same file must still refuse after takeover.
+          return hasTakeover && alreadyCovered
+            ? {
+                kind: "refused",
+                refusal: {
+                  status: "incomplete",
+                  reason: "canonical_view_incomplete",
+                  diagnostics: [],
+                },
+              }
+            : { kind: "file" };
+        }
+        return {
+          kind: "canonical",
+          envelope: read.envelope,
+          revision: read.revision,
+        };
       }
       if (!read.complete) {
         if (legacyHead !== null && !hasTakeover) {
@@ -365,7 +630,10 @@ export function createLegacyScopeView(
       if (!confirmed) {
         const current = authority.readSnapshot(() => ({
           canServeLegacy: canServeLegacyBeforeTakeover(scope),
-          hasTakeover: authority.hasTakeover(scope),
+          hasTakeover: authority.hasTakeover(
+            scope,
+            decision.selection.instance,
+          ),
         }));
         if (current.canServeLegacy && !current.hasTakeover)
           return { kind: "file" };
@@ -405,6 +673,9 @@ export function createLegacyScopeView(
     ownsScope(scope) {
       return authority.readSnapshot(() => decide(scope)).kind !== "file";
     },
+    verdictFor: (scope) => authority.verdictFor(scope),
+    resetTakeover: (scope) => authority.resetTakeover(scope),
+    isReset: (scope) => authority.isReset(scope),
   };
 }
 
@@ -428,6 +699,79 @@ function missingCompletionReceipts(
         receipt.generation === binding.generation &&
         receipt.liveCount === liveCount,
     );
+  });
+}
+
+function isProjectionDataFailure(reason: string): boolean {
+  return [
+    "projection_rejected",
+    "all_rows_rejected",
+    "no_synced_data",
+    "stream_completion_unknown",
+    "invalid_collected_at",
+    "blob_read_budget_exceeded",
+    "blob_backed_record_invalid",
+    "blob_backed_records_unsupported",
+  ].includes(reason);
+}
+
+function projectionUnavailableCoverage(
+  legacyPayload: unknown,
+): LegacyCoverageVerdict {
+  const legacyBytes = new TextEncoder().encode(
+    JSON.stringify(legacyPayload),
+  ).length;
+  return {
+    comparisonCase: "same_time",
+    covered: false,
+    reason: "projection_unavailable",
+    reasonCounts: {
+      no_stable_key: 0,
+      missing_entity: 0,
+      missing_field: 0,
+      field_mismatch: 0,
+      type_mismatch: 0,
+      timestamp_format: 0,
+      identity_mismatch: 0,
+      creation_mismatch: 0,
+      array_order: 0,
+      payload_growth: 0,
+      projection_unavailable: 1,
+    },
+    appliedExceptions: [],
+    missingEntityCount: 0,
+    mismatchedFieldPaths: [],
+    legacyBytes,
+    canonicalBytes: 0,
+    byteDelta: -legacyBytes,
+  };
+}
+
+/** A newer scope snapshot requires a newer collection horizon for each input stream. */
+function allStreamsNewerThan(
+  read: CanonicalLegacyReadOk,
+  streams: readonly string[],
+  legacyCollectedAt: string,
+): boolean {
+  const legacyTime = Date.parse(legacyCollectedAt);
+  if (!Number.isFinite(legacyTime)) return false;
+  return streams.every((stream) => {
+    const time = Date.parse(read.streamCollectionTimes[stream] ?? "");
+    return Number.isFinite(time) && time > legacyTime;
+  });
+}
+
+/** Only current P7 receipts from every input stream prove a later deletion. */
+function allStreamsProvenAfter(
+  read: CanonicalLegacyReadOk,
+  streams: readonly string[],
+  legacyCollectedAt: string,
+): boolean {
+  const legacyTime = Date.parse(legacyCollectedAt);
+  if (!Number.isFinite(legacyTime)) return false;
+  return streams.every((stream) => {
+    const time = Date.parse(read.streamCompletionTimes[stream] ?? "");
+    return Number.isFinite(time) && time > legacyTime;
   });
 }
 
