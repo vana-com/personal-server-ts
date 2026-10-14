@@ -2,6 +2,7 @@ import type { UploadWorkerDeps } from "../workers/upload.js";
 import type { DownloadWorkerDeps } from "../workers/download.js";
 import type { SyncStatus, SyncError, SyncBlockedReason } from "../types.js";
 import { uploadAll } from "../workers/upload.js";
+import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
 import {
   deleteScope,
@@ -93,6 +94,7 @@ export function createSyncManager(
   let cycleInFlight: Promise<void> | null = null;
   let rerunRequested = false;
   let needsFullReconcile = true;
+  let needsLostDataPointCheck = true;
   let needsStartupHydration = startupHydrateScopes.length > 0;
   const hydratedScopes = new Set<string>();
   // One retry memory per manager (= per boot session): a blob that 404s is
@@ -174,6 +176,19 @@ export function createSyncManager(
         // Finish blob deletions whose tombstone landed but whose storage
         // DELETE did not. Cheap when nothing is pending; never blocks sync.
         if (transferMode === "upload-download") {
+          if (needsLostDataPointCheck) {
+            // Once per boot: a registration the gateway accepted and later
+            // dropped (failed settle) still reads as synced locally.
+            try {
+              await requeueLostDataPoints(uploadDeps);
+              needsLostDataPointCheck = false;
+            } catch (err) {
+              uploadDeps.logger.warn(
+                { error: (err as Error).message },
+                "Lost data point check failed; continuing with sync",
+              );
+            }
+          }
           await runUploadCycle();
         }
 
