@@ -48,7 +48,7 @@ describe("requeueLostDataPoints", () => {
 
     const result = await requeueLostDataPoints({ storage, gateway, logger });
 
-    expect(result).toEqual({ requeued: ["chatgpt.memories"], complete: true });
+    expect(result).toEqual({ requeued: ["chatgpt.memories"], failed: [] });
     expect(
       storage.findEntry({ scope: "chatgpt.memories" })?.dataPointId,
     ).toBeNull();
@@ -64,7 +64,7 @@ describe("requeueLostDataPoints", () => {
       const storage = await seed("chatgpt.memories", 3, "0xdp");
       const gateway = gatewayReturning({ "0xdp": { expectedVersion } });
       expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual(
-        { requeued: [], complete: true },
+        { requeued: [], failed: [] },
       );
       expect(
         storage.findEntry({ scope: "chatgpt.memories" })?.dataPointId,
@@ -72,7 +72,7 @@ describe("requeueLostDataPoints", () => {
     }
   });
 
-  it("treats a tombstone as the owner's deletion: nothing re-queued, check complete", async () => {
+  it("treats a tombstone as the owner's deletion: nothing re-queued or retried", async () => {
     const storage = await seed("chatgpt.memories", 1, "0xdp");
     const gateway = gatewayReturning({
       "0xdp": new DataPointDeletedError("Data point 0xdp has been deleted", {
@@ -82,14 +82,14 @@ describe("requeueLostDataPoints", () => {
 
     expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual({
       requeued: [],
-      complete: true,
+      failed: [],
     });
     expect(storage.findEntry({ scope: "chatgpt.memories" })?.dataPointId).toBe(
       "0xdp",
     );
   });
 
-  it("reports an incomplete check on a gateway error so the caller retries", async () => {
+  it("reports a scope whose lookup failed so the caller can retry it", async () => {
     const storage = await seed("chatgpt.memories", 1, "0xdp");
     const gateway = gatewayReturning({
       "0xdp": new Error("Gateway error: 503 Service Unavailable"),
@@ -97,7 +97,7 @@ describe("requeueLostDataPoints", () => {
 
     expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual({
       requeued: [],
-      complete: false,
+      failed: ["chatgpt.memories"],
     });
     expect(storage.findEntry({ scope: "chatgpt.memories" })?.dataPointId).toBe(
       "0xdp",
@@ -110,8 +110,29 @@ describe("requeueLostDataPoints", () => {
 
     expect(await requeueLostDataPoints({ storage, gateway, logger })).toEqual({
       requeued: [],
-      complete: true,
+      failed: [],
     });
     expect(gateway.getDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("re-checks only the given scopes on a retry", async () => {
+    const storage = await seed("chatgpt.memories", 1, "0xlost");
+    await storage.insertEntry({
+      fileId: null,
+      path: "github.repositories/2026-10-13T20-29-35Z.json",
+      scope: "github.repositories",
+      collectedAt: "2026-10-13T20:29:35Z",
+      sizeBytes: 10,
+      version: 1,
+      dataPointId: "0xother",
+    });
+    const gateway = gatewayReturning({ "0xlost": null, "0xother": null });
+
+    expect(
+      await requeueLostDataPoints({ storage, gateway, logger }, [
+        "chatgpt.memories",
+      ]),
+    ).toEqual({ requeued: ["chatgpt.memories"], failed: [] });
+    expect(gateway.getDataPoint).toHaveBeenCalledTimes(1);
   });
 });

@@ -36,28 +36,40 @@ export interface LostDataPointDeps {
 export interface LostDataPointResult {
   /** Scopes re-queued for upload. */
   requeued: string[];
-  /** A gateway lookup failed; run the check again on a later cycle. */
-  complete: boolean;
+  /** Scopes whose gateway lookup failed; worth checking again later. */
+  failed: string[];
 }
 
 const SCOPE_PAGE = 200;
 const CONCURRENCY = 8;
 
+/**
+ * Checks every local scope, or only `onlyScopes` (a retry of the scopes whose
+ * lookup failed last time).
+ */
 export async function requeueLostDataPoints(
   deps: LostDataPointDeps,
+  onlyScopes?: readonly string[],
 ): Promise<LostDataPointResult> {
   const latest = [];
-  for (let offset = 0; ; offset += SCOPE_PAGE) {
-    const page = deps.storage.listScopes({ limit: SCOPE_PAGE, offset });
-    for (const summary of page.scopes) {
-      const entry = deps.storage.findEntry({ scope: summary.scope });
+  if (onlyScopes) {
+    for (const scope of onlyScopes) {
+      const entry = deps.storage.findEntry({ scope });
       if (entry?.dataPointId) latest.push(entry);
     }
-    if (page.scopes.length < SCOPE_PAGE) break;
+  } else {
+    for (let offset = 0; ; offset += SCOPE_PAGE) {
+      const page = deps.storage.listScopes({ limit: SCOPE_PAGE, offset });
+      for (const summary of page.scopes) {
+        const entry = deps.storage.findEntry({ scope: summary.scope });
+        if (entry?.dataPointId) latest.push(entry);
+      }
+      if (page.scopes.length < SCOPE_PAGE) break;
+    }
   }
 
   const requeued: string[] = [];
-  let complete = true;
+  const failed: string[] = [];
   for (let i = 0; i < latest.length; i += CONCURRENCY) {
     await Promise.all(
       latest.slice(i, i + CONCURRENCY).map(async (entry) => {
@@ -67,8 +79,8 @@ export async function requeueLostDataPoints(
         } catch (err) {
           // A tombstone is the owner's deletion, not a lost registration.
           // Anything else is a failed lookup: no evidence either way, so the
-          // caller retries the check later instead of trusting this pass.
-          if (!(err instanceof DataPointDeletedError)) complete = false;
+          // caller may retry just this scope later.
+          if (!(err instanceof DataPointDeletedError)) failed.push(entry.scope);
           return;
         }
         if (record) return;
@@ -81,5 +93,5 @@ export async function requeueLostDataPoints(
       }),
     );
   }
-  return { requeued, complete };
+  return { requeued, failed };
 }

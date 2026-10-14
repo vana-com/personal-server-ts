@@ -23,8 +23,13 @@ vi.mock("../workers/download.js", () => ({
   downloadScopes: vi.fn(),
 }));
 
+vi.mock("../workers/lost-data-points.js", () => ({
+  requeueLostDataPoints: vi.fn(async () => ({ requeued: [], failed: [] })),
+}));
+
 import { uploadAll } from "../workers/upload.js";
 import { downloadAll, downloadScopes } from "../workers/download.js";
+import { requeueLostDataPoints } from "../workers/lost-data-points.js";
 import { createSyncManager } from "./sync-manager.js";
 
 function makeMockLogger(): Logger {
@@ -222,6 +227,44 @@ describe("SyncManager", () => {
 
     expect(uploadAll).toHaveBeenCalledTimes(1);
     expect(downloadAll).toHaveBeenCalledTimes(1);
+  });
+
+  it("checks for lost data points once per boot, then retries only failed scopes, a bounded number of times", async () => {
+    const check = vi.mocked(requeueLostDataPoints);
+    check.mockReset();
+    check
+      .mockResolvedValueOnce({ requeued: [], failed: ["a.scope"] })
+      .mockResolvedValue({ requeued: [], failed: ["a.scope"] });
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      {
+        pollInterval: 60_000,
+      },
+    );
+
+    for (let i = 0; i < 8; i += 1) await manager.trigger();
+
+    expect(check).toHaveBeenCalledTimes(5);
+    expect(check.mock.calls[0]?.[1]).toBeUndefined();
+    expect(check.mock.calls[1]?.[1]).toEqual(["a.scope"]);
+  });
+
+  it("stops checking after a clean full pass", async () => {
+    const check = vi.mocked(requeueLostDataPoints);
+    check.mockReset();
+    check.mockResolvedValue({ requeued: ["x"], failed: [] });
+    const manager = createSyncManager(
+      makeMockUploadDeps(),
+      makeMockDownloadDeps(),
+      {
+        pollInterval: 60_000,
+      },
+    );
+
+    for (let i = 0; i < 3; i += 1) await manager.trigger();
+
+    expect(check).toHaveBeenCalledTimes(1);
   });
 
   it("skips sync cycles when runtime registration blocks sync", async () => {

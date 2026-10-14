@@ -94,7 +94,10 @@ export function createSyncManager(
   let cycleInFlight: Promise<void> | null = null;
   let rerunRequested = false;
   let needsFullReconcile = true;
-  let needsLostDataPointCheck = true;
+  // Once per boot, then only the scopes whose lookup failed, a few times.
+  let lostDataPointRetryScopes: string[] | null = null;
+  let lostDataPointAttempts = 0;
+  const MAX_LOST_DATA_POINT_ATTEMPTS = 5;
   let needsStartupHydration = startupHydrateScopes.length > 0;
   const hydratedScopes = new Set<string>();
   // One retry memory per manager (= per boot session): a blob that 404s is
@@ -176,13 +179,22 @@ export function createSyncManager(
         // Finish blob deletions whose tombstone landed but whose storage
         // DELETE did not. Cheap when nothing is pending; never blocks sync.
         if (transferMode === "upload-download") {
-          if (needsLostDataPointCheck) {
-            // Once per boot: a registration the gateway accepted and later
-            // dropped (failed settle) still reads as synced locally.
+          if (
+            lostDataPointAttempts < MAX_LOST_DATA_POINT_ATTEMPTS &&
+            // null: no full pass has completed yet (first cycle, or it threw).
+            (lostDataPointRetryScopes === null ||
+              lostDataPointRetryScopes.length > 0)
+          ) {
+            // A registration the gateway accepted and later dropped (failed
+            // settle) still reads as synced locally. Full pass once per boot;
+            // later cycles retry only scopes whose lookup failed.
+            lostDataPointAttempts += 1;
             try {
-              const { complete } = await requeueLostDataPoints(uploadDeps);
-              // A failed lookup leaves the check for a later cycle.
-              needsLostDataPointCheck = !complete;
+              const { failed } = await requeueLostDataPoints(
+                uploadDeps,
+                lostDataPointRetryScopes ?? undefined,
+              );
+              lostDataPointRetryScopes = failed;
             } catch (err) {
               uploadDeps.logger.warn(
                 { error: (err as Error).message },
