@@ -20,7 +20,7 @@ import { registerTestConnection } from "./pdpp/test-connections.js";
 
 const SIGNATURE =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
-const SOURCE = "https://registry.pdpp.dev/sources/anthropic";
+const SOURCE = "https://registry.pdpp.dev/sources/claude";
 const CONTROL = "claude-blob-http-synthetic-control";
 const collected = "2026-09-01T12:00:00Z";
 const profile = {
@@ -40,7 +40,7 @@ beforeEach(async () => {
   vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", SIGNATURE);
   vi.stubEnv("PS_ACCESS_TOKEN", CONTROL);
   const owner = (await recoverServerOwner(SIGNATURE)).toLowerCase();
-  instance = `anthropic:${owner}`;
+  instance = `claude:${owner}`;
   const declaration = join(root, "declaration.json");
   await writeFile(
     declaration,
@@ -88,7 +88,13 @@ beforeEach(async () => {
     }),
     { serverDir: root, dataDir: join(root, "data") },
   );
-  token = await registerTestConnection(ctx.app, ctx.devToken!, owner, SOURCE);
+  token = await registerTestConnection(
+    ctx.app,
+    ctx.devToken!,
+    owner,
+    SOURCE,
+    "anthropic",
+  );
 });
 afterEach(async () => {
   await ctx?.cleanup();
@@ -136,7 +142,7 @@ async function files(path: string): Promise<string[]> {
   ).flat();
 }
 
-it("serves the owner's actual app envelope directly from SQLite/blob bytes without storing a projected file", async () => {
+it("serves the admitted claude source's app envelope from SQLite/blob bytes without storing a projected file", async () => {
   const payload = {
     uuid: "project-1",
     name: "Research",
@@ -203,7 +209,7 @@ it("serves the owner's actual app envelope directly from SQLite/blob bytes witho
     const first = await ctx.app.request("/v1/data/claude.projects", {
       headers: { authorization: `Bearer ${CONTROL}` },
     });
-    expect(first.status).toBe(200);
+    expect(first.status, await first.clone().text()).toBe(200);
     const firstText = await first.text();
     const body = JSON.parse(firstText);
     expect(body).toEqual({

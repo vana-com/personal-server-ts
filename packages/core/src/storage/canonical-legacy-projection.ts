@@ -1,5 +1,9 @@
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
+  ANTHROPIC_CONNECTOR_ID,
+  CLAUDE_SOURCE_ID,
+} from "../legacy-projection/bindings.js";
+import {
   hasAlternateLegacyProfile,
   LEGACY_SCOPE_BINDINGS,
   legacyBindingsForProfile,
@@ -168,10 +172,7 @@ export type CanonicalLegacyReadFailure =
       status: "unavailable";
       reason: "connection_unavailable";
       detail:
-        | "not_registered"
-        | "deleted"
-        | "source_mismatch"
-        | "method_mismatch";
+        "not_registered" | "deleted" | "source_mismatch" | "method_mismatch";
     }
   | { status: "unavailable"; reason: "no_synced_data" }
   | {
@@ -222,8 +223,7 @@ export type CanonicalLegacyReadFailure =
     };
 
 export type CanonicalLegacyReadResult =
-  | CanonicalLegacyReadOk
-  | ({ ok: false } & CanonicalLegacyReadFailure);
+  CanonicalLegacyReadOk | ({ ok: false } & CanonicalLegacyReadFailure);
 
 export interface ReadCanonicalLegacyScopeInput {
   store: CanonicalLegacyReadStore;
@@ -314,9 +314,11 @@ export async function readCanonicalLegacyScope(
     });
   }
   if (
-    byMethod
+    (binding.pdppSource === ANTHROPIC_CONNECTOR_ID &&
+      selection.sourceId !== CLAUDE_SOURCE_ID) ||
+    (byMethod
       ? legacyConnectorKey(binding.pdppSource) !== selection.method
-      : canonicalSourceId(binding.pdppSource) !== selection.sourceId
+      : canonicalSourceId(binding.pdppSource) !== selection.sourceId)
   ) {
     return unavailable({ reason: "scope_source_mismatch", scope });
   }
@@ -455,7 +457,7 @@ function collectSnapshot(
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (blobBacked.length === 0) continue;
     if (
-      selection.sourceId !== `${SOURCE_ID_PREFIX}anthropic` ||
+      selection.sourceId !== CLAUDE_SOURCE_ID ||
       (stream !== "conversations" && stream !== "projects")
     ) {
       return {
@@ -608,7 +610,7 @@ async function projectSnapshot(
 
   const expanded = [];
   const canExpandClaude =
-    selection.sourceId === `${SOURCE_ID_PREFIX}anthropic` &&
+    selection.sourceId === CLAUDE_SOURCE_ID &&
     (scope === "claude.conversations" || scope === "claude.projects");
   for (const stream of streams) {
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
@@ -1027,8 +1029,9 @@ export function legacyConnectorKey(pdppSource: string): string {
   return pdppSource.slice(pdppSource.lastIndexOf("/") + 1);
 }
 
-/** Binding sources are `connectors/<name>`; the store registers `sources/<name>`. */
+/** Most connector keys match their public source; Anthropic collects Claude. */
 function canonicalSourceId(pdppSource: string): string {
+  if (pdppSource === ANTHROPIC_CONNECTOR_ID) return CLAUDE_SOURCE_ID;
   return pdppSource.startsWith(CONNECTOR_ID_PREFIX)
     ? SOURCE_ID_PREFIX + pdppSource.slice(CONNECTOR_ID_PREFIX.length)
     : pdppSource;

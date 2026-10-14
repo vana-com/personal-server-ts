@@ -500,22 +500,29 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
   });
 
   describe("Claude source identity", () => {
-    // The only Claude bindings follow the frozen connectors/anthropic 0.1.3
-    // profile (inline content). The current declaration is sources/claude
-    // with blob-backed parents; until a hydration slice declares that
-    // mapping, a sources/claude connection is refused, not projected.
-    it("refuses a sources/claude connection instead of guessing an anthropic alias", async () => {
-      const a = connect("conn_a", "claude");
-      put(a, "account_profile", [{ id: "org", organization_id: "org" }]);
-      for (const scope of ["claude.conversations", "claude.projects"]) {
-        expect(await read(a, scope)).toMatchObject({
-          ok: false,
-          status: "unavailable",
-          reason: "scope_source_mismatch",
-          scope,
-        });
-      }
-    });
+    // Retained profiles name the connector, not a public sources/anthropic declaration.
+    it.each(["source", "method"] as const)(
+      "refuses the undeclared sources/anthropic alias when selected by %s",
+      async (profileBy) => {
+        const a = connect("conn_a", "anthropic", "anthropic");
+        put(a, "account_profile", [{ id: "org", organization_id: "org" }]);
+        for (const scope of ["claude.conversations", "claude.projects"]) {
+          expect(
+            await readCanonicalLegacyScope({
+              store,
+              scope,
+              selection: a,
+              profileBy,
+            }),
+          ).toMatchObject({
+            ok: false,
+            status: "unavailable",
+            reason: "scope_source_mismatch",
+            scope,
+          });
+        }
+      },
+    );
   });
 
   describe("grocery orders: partial first read, complete after repair", () => {
