@@ -1,0 +1,221 @@
+{
+  "scope": "linkedin.experience",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.experience from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+    "pdppBundle": "synthetic linkedin.experience records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+  },
+  "fetchedStreams": [
+    "experience"
+  ],
+  "streams": {
+    "experience": [
+      {
+        "id": "role-a",
+        "title": "Engineer",
+        "company": "Example Studio",
+        "employment_type": "Full-time",
+        "start_date": "2022-03",
+        "end_date": null,
+        "location": "Remote",
+        "description": "Built tools"
+      }
+    ]
+  },
+  "legacyBody": {
+    "experiences": [
+      {
+        "jobTitle": "Engineer",
+        "companyName": "Example Studio",
+        "dates": "3/2022 - Present",
+        "location": "Remote",
+        "description": "Built tools"
+      }
+    ]
+  },
+  "consumerContractBody": {
+    "experiences": [
+      {
+        "jobTitle": "Engineer",
+        "companyName": "Example Studio",
+        "dates": "3/2022 - Present",
+        "location": "Remote",
+        "description": "Built tools",
+        "company": "Example Studio",
+        "title": "Engineer",
+        "position": "Engineer",
+        "id": "role-a",
+        "url": "https://example.com/role-a",
+        "start": "2022-03",
+        "date": "2022-03"
+      }
+    ]
+  },
+  "reviewedDifferences": [
+    {
+      "path": "experiences[0].company",
+      "legacy": "Example Studio",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "experiences[0].date",
+      "legacy": "2022-03",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "experiences[0].id",
+      "legacy": "role-a",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "experiences[0].position",
+      "legacy": "Engineer",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "experiences[0].start",
+      "legacy": "2022-03",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "experiences[0].title",
+      "legacy": "Engineer",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "experiences[0].url",
+      "legacy": "https://example.com/role-a",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field."
+    }
+  ],
+  "cases": [
+    {
+      "scope": "linkedin.experience",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.experience from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic linkedin.experience records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "experience"
+      ],
+      "streams": {
+        "experience": []
+      },
+      "legacyBody": {
+        "experiences": []
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "linkedin.experience",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.experience from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic linkedin.experience records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "experience"
+      ],
+      "streams": {
+        "experience": [
+          {
+            "id": "role-dirty",
+            "title": 42,
+            "company": null,
+            "start_date": "invalid",
+            "end_date": null,
+            "location": false,
+            "description": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "experiences": [
+          {
+            "jobTitle": "",
+            "companyName": "",
+            "dates": "- Present",
+            "location": "",
+            "description": ""
+          }
+        ]
+      },
+      "consumerContractBody": {
+        "experiences": [
+          {
+            "jobTitle": "",
+            "companyName": "",
+            "dates": "- Present",
+            "location": "",
+            "description": "",
+            "company": null,
+            "title": 42,
+            "position": 42,
+            "id": "role-dirty",
+            "url": "https://example.com/role-dirty",
+            "start": "invalid",
+            "date": "invalid"
+          }
+        ]
+      },
+      "reviewedDifferences": [
+        {
+          "path": "experiences[0].company",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field. Malformed strings and dates normalize to empty strings and '- Present'."
+        },
+        {
+          "path": "experiences[0].date",
+          "legacy": "invalid",
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field. Malformed strings and dates normalize to empty strings and '- Present'."
+        },
+        {
+          "path": "experiences[0].id",
+          "legacy": "role-dirty",
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field. Malformed strings and dates normalize to empty strings and '- Present'."
+        },
+        {
+          "path": "experiences[0].position",
+          "legacy": 42,
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field. Malformed strings and dates normalize to empty strings and '- Present'."
+        },
+        {
+          "path": "experiences[0].start",
+          "legacy": "invalid",
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field. Malformed strings and dates normalize to empty strings and '- Present'."
+        },
+        {
+          "path": "experiences[0].title",
+          "legacy": 42,
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field. Malformed strings and dates normalize to empty strings and '- Present'."
+        },
+        {
+          "path": "experiences[0].url",
+          "legacy": "https://example.com/role-dirty",
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: company/title are renamed companyName/jobTitle; position is not emitted; id and url are absent; start/date aliases are collapsed to the free-text dates field. The URL is a synthetic consumer requirement, not a declared source field. Malformed strings and dates normalize to empty strings and '- Present'."
+        }
+      ]
+    }
+  ]
+}

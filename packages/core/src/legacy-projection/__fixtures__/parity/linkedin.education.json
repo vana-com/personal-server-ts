@@ -1,0 +1,220 @@
+{
+  "scope": "linkedin.education",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.education from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+    "pdppBundle": "synthetic linkedin.education records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+  },
+  "fetchedStreams": [
+    "education"
+  ],
+  "streams": {
+    "education": [
+      {
+        "id": "school-a",
+        "school": "Example University",
+        "degree": "BSc",
+        "field_of_study": "Computing",
+        "start_date": "2017",
+        "end_date": "2021-06",
+        "grade": "Honors",
+        "logo_url": "https://example.com/school.png"
+      }
+    ]
+  },
+  "legacyBody": {
+    "education": [
+      {
+        "schoolName": "Example University",
+        "degree": "BSc, Computing",
+        "years": "2017 - 6/2021",
+        "grade": "Honors",
+        "logoUrl": "https://example.com/school.png"
+      }
+    ]
+  },
+  "consumerContractBody": {
+    "education": [
+      {
+        "schoolName": "Example University",
+        "degree": "BSc",
+        "years": "2017 - 6/2021",
+        "grade": "Honors",
+        "logoUrl": "https://example.com/school.png",
+        "school": "Example University",
+        "id": "school-a",
+        "url": "https://example.com/school-a",
+        "end": "2021-06",
+        "start": "2017",
+        "date": "2021-06"
+      }
+    ]
+  },
+  "reviewedDifferences": [
+    {
+      "path": "education[0].date",
+      "legacy": "2021-06",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "education[0].degree",
+      "legacy": "BSc",
+      "projected": "BSc, Computing",
+      "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "education[0].end",
+      "legacy": "2021-06",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "education[0].id",
+      "legacy": "school-a",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "education[0].school",
+      "legacy": "Example University",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "education[0].start",
+      "legacy": "2017",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field."
+    },
+    {
+      "path": "education[0].url",
+      "legacy": "https://example.com/school-a",
+      "projected": "<absent>",
+      "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field."
+    }
+  ],
+  "cases": [
+    {
+      "scope": "linkedin.education",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.education from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic linkedin.education records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "education"
+      ],
+      "streams": {
+        "education": []
+      },
+      "legacyBody": {
+        "education": []
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "linkedin.education",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.education from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382",
+        "pdppBundle": "synthetic linkedin.education records against vendored declarations at personal-server-ts commit 0369cea68154b9bc01c37acccb66c2d5c01e4382; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "consumerContractNote": "consumerContractBody is a synthetic field-preservation probe, not captured legacy output; legacyBody is the traced current binding output. reviewedDifferences compare the probe with that output and do not certify consumer compatibility."
+      },
+      "fetchedStreams": [
+        "education"
+      ],
+      "streams": {
+        "education": [
+          {
+            "id": "school-dirty",
+            "school": null,
+            "degree": null,
+            "field_of_study": 42,
+            "start_date": null,
+            "end_date": "invalid",
+            "grade": false,
+            "logo_url": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "education": [
+          {
+            "schoolName": "",
+            "degree": "",
+            "years": "- Present",
+            "grade": "",
+            "logoUrl": ""
+          }
+        ]
+      },
+      "consumerContractBody": {
+        "education": [
+          {
+            "schoolName": "",
+            "degree": null,
+            "years": "- Present",
+            "grade": "",
+            "logoUrl": "",
+            "school": null,
+            "id": "school-dirty",
+            "url": "https://example.com/school-dirty",
+            "end": "invalid",
+            "start": null,
+            "date": "invalid"
+          }
+        ]
+      },
+      "reviewedDifferences": [
+        {
+          "path": "education[0].date",
+          "legacy": "invalid",
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field. Dirty non-string fields normalize to empty strings; invalid dates produce '- Present'."
+        },
+        {
+          "path": "education[0].degree",
+          "legacy": null,
+          "projected": "",
+          "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field. Dirty non-string fields normalize to empty strings; invalid dates produce '- Present'."
+        },
+        {
+          "path": "education[0].end",
+          "legacy": "invalid",
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field. Dirty non-string fields normalize to empty strings; invalid dates produce '- Present'."
+        },
+        {
+          "path": "education[0].id",
+          "legacy": "school-dirty",
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field. Dirty non-string fields normalize to empty strings; invalid dates produce '- Present'."
+        },
+        {
+          "path": "education[0].school",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field. Dirty non-string fields normalize to empty strings; invalid dates produce '- Present'."
+        },
+        {
+          "path": "education[0].start",
+          "legacy": null,
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field. Dirty non-string fields normalize to empty strings; invalid dates produce '- Present'."
+        },
+        {
+          "path": "education[0].url",
+          "legacy": "https://example.com/school-dirty",
+          "projected": "<absent>",
+          "reason": "Web timeline consumer-contract probe: school becomes schoolName; degree joins field_of_study; id/url are absent; end/start/date aliases are collapsed to years. The URL is a synthetic consumer requirement, not a declared source field. Dirty non-string fields normalize to empty strings; invalid dates produce '- Present'."
+        }
+      ]
+    }
+  ]
+}
