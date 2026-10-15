@@ -89,7 +89,7 @@ function grant(
     id: GRANT_ID,
     grantorAddress: OWNER,
     granteeId: ("0x" + "bb".repeat(32)) as `0x${string}`,
-    scopes: ["instagram.*"],
+    scopes: ["instagram.profile"],
     status: "confirmed",
     addedAt: "2026-01-21T10:00:00.000Z",
     expiresAt: null,
@@ -246,6 +246,11 @@ describe("paid-read contract: every client shape the protocol has published", ()
       overrides: { revokedAt: "2026-01-22T00:00:00.000Z" },
     },
     { why: "expired", overrides: { expired: true } },
+    // The read is covered here, but the gateway matches the scope exactly.
+    {
+      why: "the grant covers the scope by wildcard",
+      overrides: { scopes: ["instagram.*"] },
+    },
     {
       why: "data-access fee disabled",
       overrides: {

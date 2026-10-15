@@ -203,13 +203,20 @@ const DATA_ACCESS_GRANT_STATES: readonly string[] = [
  *
  * - registration paid: data_access never carries the registration fee;
  * - grant live: an accepted chain state, not revoked, not expired;
+ * - the served scope listed in the grant verbatim: the gateway matches the
+ *   receipt's scope exactly, so a wildcard grant (`instagram.*`) that covers
+ *   the read here still pays through the grant offer;
  * - a non-zero data-access fee: with that fee disabled the gateway prices
  *   data_access in the zero asset while the grant quotes the registration
  *   asset, so the two offers would disagree and nothing is left to pay.
  */
-function dataAccessPayable(grant: GatewayGrantResponse): boolean {
+function dataAccessPayable(
+  grant: GatewayGrantResponse,
+  scope: string,
+): boolean {
   return (
     grant.paymentStatus === "paid" &&
+    grant.scopes.includes(scope) &&
     DATA_ACCESS_GRANT_STATES.includes(grant.status) &&
     grant.revokedAt === null &&
     !grant.expired &&
@@ -327,7 +334,11 @@ export async function buildChallenge(
   // and only with a receipt to bind to. Both offers share the accessRecord
   // and nonce; whichever the builder pays consumes the recordId, so the
   // other cannot be paid as well.
-  if (accessRecord && dataAccessPayable(input.grant)) {
+  if (
+    accessRecord &&
+    input.entry &&
+    dataAccessPayable(input.grant, input.entry.scope)
+  ) {
     accepts.push(
       offer({
         payerAddress: input.builder,
@@ -555,7 +566,7 @@ export async function verifyPayment(
         reason: "grant registration is unpaid; pay the grant offer",
       };
     }
-    if (!dataAccessPayable(grant)) {
+    if (!input.entry || !dataAccessPayable(grant, input.entry.scope)) {
       return {
         ok: false,
         reason:
