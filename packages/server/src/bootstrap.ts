@@ -976,17 +976,28 @@ export async function createServer(
     jobWorker,
   });
 
-  const cleanup = async () => {
-    backgroundClosed = true;
-    clearRegistrationPoll();
-    derivativeScheduler.stop();
-    if (tunnelManager) {
-      await tunnelManager.stop();
-    }
-    if (syncManager) {
-      await syncManager.stop();
-    }
-    indexManager.close();
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanup = (): Promise<void> => {
+    if (cleanupPromise) return cleanupPromise;
+    cleanupPromise = (async () => {
+      backgroundClosed = true;
+      clearRegistrationPoll();
+      const errors: unknown[] = [];
+      const attempt = async (close: () => void | Promise<void>) => {
+        try {
+          await close();
+        } catch (error) {
+          errors.push(error);
+        }
+      };
+      await attempt(() => derivativeScheduler.stop());
+      if (tunnelManager) await attempt(() => tunnelManager!.stop());
+      if (syncManager) await attempt(() => syncManager!.stop());
+      if (pdppAuth) await attempt(() => pdppAuth.close());
+      await attempt(() => indexManager.close());
+      if (errors.length > 0) throw errors[0];
+    })();
+    return cleanupPromise;
   };
 
   const context: ServerContext = {

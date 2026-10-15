@@ -85,6 +85,8 @@ export type PdppAuthBootResult = PdppAuthRouteDeps & {
    * still cannot see, which is the restart problem wearing a new hat.
    */
   declarationRegistry: MutableDeclarationRegistry;
+  /** Close this boot's SQLite handles in reverse order of opening. */
+  close(): void;
   /** The connector gate this boot derived, so callers do not recompute it. */
   supportedConnectors: string[];
 };
@@ -198,6 +200,7 @@ export async function createPdppAuthDeps(
       { supportedConnectors, configured: config.pdpp.declarationPaths.length },
       "PDPP enabled but no declarations were retained — authorization server not mounted",
     );
+    declarationRegistry.close();
     return undefined;
   }
 
@@ -214,10 +217,30 @@ export async function createPdppAuthDeps(
         { err: err.message },
         "PDPP authorization state is unsupported — authorization server not mounted",
       );
+      declarationRegistry.close();
       return undefined;
     }
+    declarationRegistry.close();
     throw err;
   }
+
+  let closed = false;
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    let closeError: unknown;
+    try {
+      store.close();
+    } catch (error) {
+      closeError = error;
+    }
+    try {
+      declarationRegistry.close();
+    } catch (error) {
+      closeError ??= error;
+    }
+    if (closeError !== undefined) throw closeError;
+  };
 
   const tokens = new PdppTokenService(store);
   const sessions = new AuthorizationSessionStore();
@@ -245,6 +268,7 @@ export async function createPdppAuthDeps(
       resolveRetainedSourceId(requested, connectionSourceIds),
     resolveDeclaration: config.pdpp.enabled ? registry.resolve : () => null,
     declarationRegistry,
+    close,
     supportedConnectors,
     // The AS's own issuer identity, for its metadata document. Carried as the
     // same thunk-or-string `serverOrigin` already is, so a deployment that
