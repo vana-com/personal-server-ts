@@ -430,7 +430,7 @@ describe("legacy scope coverage", () => {
     expect(verdict.reason).toBe("creation_mismatch");
   });
 
-  it("records the reviewed creation-time exception through scalar arrays", () => {
+  it("does not blanket-exempt creation-time differences in scalar arrays", () => {
     const verdict = compareLegacyCoverage(
       {
         memories: [{ id: "a", created_at: ["2024-01-01T00:00:00Z"] }],
@@ -444,15 +444,8 @@ describe("legacy scope coverage", () => {
         canonicalNewer: true,
       },
     );
-    expect(verdict.covered).toBe(true);
-    expect(verdict.appliedExceptions).toEqual([
-      {
-        path: "$.memories[].created_at",
-        reason:
-          "legacy collector wrote collection time; canonical carries source creation time",
-        authority: "canonical",
-      },
-    ]);
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("creation_mismatch");
   });
 
   it("compares immutable creation timestamps as millisecond instants", () => {
@@ -524,7 +517,7 @@ describe("legacy scope coverage", () => {
     expect(changedId.reasonCounts.timestamp_format).toBe(0);
   });
 
-  it("applies only the reviewed ChatGPT memory creation-time exception", () => {
+  it("requires canonical creation times to match ChatGPT legacy values", () => {
     const legacy = {
       memories: [{ id: "secret-id", created_at: "2024-01-01T00:00:00Z" }],
     };
@@ -536,15 +529,8 @@ describe("legacy scope coverage", () => {
       scope: "chatgpt.memories",
     };
     const verdict = compareLegacyCoverage(legacy, canonical, options);
-    expect(verdict.covered).toBe(true);
-    expect(verdict.appliedExceptions).toEqual([
-      {
-        path: "$.memories[].created_at",
-        reason:
-          "legacy collector wrote collection time; canonical carries source creation time",
-        authority: "canonical",
-      },
-    ]);
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("creation_mismatch");
     expect(JSON.stringify(verdict)).not.toContain("secret-id");
     expect(
       compareLegacyCoverage(legacy, canonical, {
@@ -556,8 +542,8 @@ describe("legacy scope coverage", () => {
       compareLegacyCoverage(legacy, canonical, {
         ...options,
         scope: undefined,
-      }).appliedExceptions,
-    ).toEqual([]);
+      }).covered,
+    ).toBe(false);
   });
 
   it("keeps format class mandatory for an allowlisted creation field", () => {

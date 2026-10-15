@@ -31,6 +31,7 @@ export type {
   PdppRecord,
   PdppSelection,
   ProjectionDiagnostic,
+  ProjectionOmission,
   ProjectionError,
   ProjectionResult,
   ProjectPdppRecordsOptions,
@@ -239,7 +240,7 @@ const DROP_AND_COUNT_SCOPES: ReadonlySet<string> = new Set([
   "chatgpt.conversations",
 ]);
 
-/** Keep OpenPet's Go `int` score decoding safe for every Oura projection. */
+/** Keep OpenPet's Go `*int` score decoding safe for every Oura projection. */
 function assertOuraLegacyScoresAreIntegers(
   scope: string,
   payload: Record<string, unknown>,
@@ -257,11 +258,12 @@ function assertOuraLegacyScoresAreIntegers(
       const score = (row as Record<string, unknown>).score;
       if (
         score === undefined ||
+        score === null ||
         (typeof score === "number" && Number.isInteger(score))
       )
         continue;
       throw new Error(
-        `${scope}.${collection}[${index}].score must be an integer or absent`,
+        `${scope}.${collection}[${index}].score must be an integer, null, or absent`,
       );
     }
   }

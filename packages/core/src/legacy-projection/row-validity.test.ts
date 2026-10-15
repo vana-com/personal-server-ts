@@ -78,7 +78,7 @@ describe.each(ouraCases)("$scope row validity", (c) => {
     ]);
   });
 
-  it("drops null scores and invalid days, keeps valid peers, and validates", () => {
+  it("keeps null scores, drops invalid days, and validates", () => {
     const result = project([
       c.row("good1", "2026-08-01", null),
       c.row("bad", null),
@@ -87,14 +87,10 @@ describe.each(ouraCases)("$scope row validity", (c) => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     const list = result.payload[c.listKey] as { id: string; score?: unknown }[];
-    expect(list.map((r) => r.id)).toEqual(["good2"]);
-    expect(list[0]?.score).toBe(77);
+    expect(list.map((r) => r.id)).toEqual(["good1", "good2"]);
+    expect(list[0]?.score).toBeNull();
+    expect(list[1]?.score).toBe(77);
     expect(result.diagnostics).toEqual([
-      expect.objectContaining({
-        kind: "records_dropped",
-        count: 1,
-        reasons: [expect.stringContaining("score")],
-      }),
       expect.objectContaining({
         kind: "records_dropped",
         count: 1,

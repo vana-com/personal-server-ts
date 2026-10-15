@@ -13,6 +13,7 @@ import {
   type LegacyScopeLookupError,
   type ProjectionError,
 } from "../legacy-projection/index.js";
+import type { ProjectionOmission } from "../legacy-projection/types.js";
 import {
   claudeBlobReference,
   ClaudeSourceRecordError,
@@ -145,6 +146,7 @@ export interface CanonicalReadDiagnostics {
 export interface CanonicalLegacyReadOk {
   ok: true;
   envelope: DataFileEnvelope;
+  projectionOmissions?: ProjectionOmission[];
   /** Conservative collection horizon for each input stream in this snapshot. */
   streamCollectionTimes?: Record<string, string | null>;
   /** Current accepted P7 completion time for each input stream, if any. */
@@ -789,6 +791,9 @@ async function projectSnapshot(
 
   return {
     ok: true,
+    ...(projected.projectionOmissions
+      ? { projectionOmissions: projected.projectionOmissions }
+      : {}),
     envelope: {
       version: "1.0",
       scope,

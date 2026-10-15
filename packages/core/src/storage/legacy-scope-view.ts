@@ -55,7 +55,7 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 4;
+const COVERAGE_RULE_VERSION = 5;
 
 function scopeDeclarationCursor(scope: string): string {
   return JSON.stringify(
@@ -711,6 +711,7 @@ export function createLegacyScopeView(
           coverage = compareLegacyCoverage(legacy.data, read.envelope.data, {
             scope,
             entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+            projectionOmissions: read.projectionOmissions,
             canonicalNewer: allStreamsNewerThan(
               read,
               decision.streams,

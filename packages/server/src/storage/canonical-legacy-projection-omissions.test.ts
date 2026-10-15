@@ -368,7 +368,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
         ...(score === absent ? {} : { [c.score]: score }),
       });
 
-      it(`${c.scope}: keeps integer and rounded scores; drops null, absent, malformed and impossible-day rows`, async () => {
+      it(`${c.scope}: keeps integer, rounded and null scores; drops absent, malformed and impossible-day rows`, async () => {
         const a = connect("conn_a", "oura");
         put(a, c.stream, [
           row("good", "2026-02-01", 80),
@@ -388,10 +388,11 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
         expect(list.map((entry) => [entry.id, entry.score])).toEqual([
           ["fraction", 81],
           ["good", 80],
+          ["null", null],
           ["zero", 0],
         ]);
         expect(result.complete).toBe(false);
-        expect(omitted(result)).toEqual({ [c.stream]: 5 });
+        expect(omitted(result)).toEqual({ [c.stream]: 4 });
         legacySchemaValid(c.scope, result.envelope.data);
       });
 
@@ -417,6 +418,83 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
       legacySchemaValid("oura.sleep", result.envelope.data);
     });
 
+    it("keeps PAT sleep periods when sleep_score is null", async () => {
+      const a = connect("conn_a", "oura");
+      put(a, "sleep", [
+        {
+          id: "s-null",
+          day: "2026-02-01",
+          sleep_score: null,
+          type: "long_sleep",
+          total_sleep_duration: 3600,
+        },
+      ]);
+      const result = okBody(await read(a, "oura.sleep"));
+      expect(result.complete).toBe(true);
+      expect(result.envelope.data).toEqual({
+        dailyScores: [{ id: "s-null", day: "2026-02-01", score: null }],
+        sleepPeriods: [
+          {
+            id: "s-null",
+            day: "2026-02-01",
+            type: "long_sleep",
+            totalSleepDuration: 3600,
+          },
+        ],
+      });
+      legacySchemaValid("oura.sleep", result.envelope.data);
+    });
+
+    it("carries Oura omission provenance beside the projected payload", async () => {
+      const a = connect("conn_a", "oura-browser");
+      put(a, "sleep", [
+        {
+          id: "d1",
+          day: "2026-02-01",
+          record_type: "daily_score",
+          sleep_score: 70,
+          daily_sleep_timestamp: null,
+        },
+        {
+          id: "s1",
+          day: "2026-02-01",
+          record_type: "sleep_session",
+          sleep_score: null,
+          type: "awake",
+          bedtime_start: null,
+          bedtime_end: null,
+        },
+      ]);
+      const result = okBody(await read(a, "oura.sleep"));
+      expect(result.projectionOmissions).toEqual([
+        {
+          entityPath: "$.sleepPeriods[]",
+          entityKey: "s1",
+          fieldPath: "type",
+          reason: "off_enum_type",
+        },
+        {
+          entityPath: "$.sleepPeriods[]",
+          entityKey: "s1",
+          fieldPath: "bedtimeStart",
+          reason: "null_timestamp",
+        },
+        {
+          entityPath: "$.sleepPeriods[]",
+          entityKey: "s1",
+          fieldPath: "bedtimeEnd",
+          reason: "null_timestamp",
+        },
+        {
+          entityPath: "$.dailyScores[]",
+          entityKey: "d1",
+          fieldPath: "timestamp",
+          reason: "null_timestamp",
+        },
+      ]);
+      legacySchemaValid("oura.sleep", result.envelope.data);
+    });
+
     describe("Oura Browser profile", () => {
       const score = (id: string, day: string, value: unknown) => ({
         id,
@@ -431,19 +509,22 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
         sleep_score: null,
       });
 
-      it("omits null daily scores from an otherwise valid score-only stream", async () => {
+      it("keeps null daily scores in an otherwise valid score-only stream", async () => {
         const a = connect("conn_a", "oura-browser");
         put(a, "sleep", [
           score("d1", "2026-02-01", 70),
           score("d2", "2026-02-02", null),
         ]);
         const result = okBody(await read(a, "oura.sleep"));
-        expect(result.complete).toBe(false);
+        expect(result.complete).toBe(true);
         expect(result.envelope.data).toEqual({
-          dailyScores: [{ id: "d1", day: "2026-02-01", score: 70 }],
+          dailyScores: [
+            { id: "d1", day: "2026-02-01", score: 70 },
+            { id: "d2", day: "2026-02-02", score: null },
+          ],
           sleepPeriods: [],
         });
-        expect(omitted(result)).toEqual({ sleep: 1 });
+        expect(omitted(result)).toEqual({});
         legacySchemaValid("oura.sleep", result.envelope.data);
       });
 

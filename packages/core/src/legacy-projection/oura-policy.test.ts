@@ -220,6 +220,23 @@ describe("Oura legacy projection policy", () => {
 
   it.each([
     {
+      scope: "oura.activity" as const,
+      stream: "activity" as const,
+      collection: "days",
+      records: [
+        { id: "whole", day: "2026-10-01", score: 80.0 },
+        { id: "half", day: "2026-10-02", score: 79.5 },
+        { id: "fraction", day: "2026-10-03", score: 80.49 },
+        { id: "null", day: "2026-10-04", score: null },
+      ],
+      expected: [
+        { id: "whole", day: "2026-10-01", score: 80 },
+        { id: "half", day: "2026-10-02", score: 80 },
+        { id: "fraction", day: "2026-10-03", score: 80 },
+        { id: "null", day: "2026-10-04", score: null },
+      ],
+    },
+    {
       scope: "oura.readiness" as const,
       stream: "readiness" as const,
       collection: "days",
@@ -233,6 +250,7 @@ describe("Oura legacy projection policy", () => {
         { id: "whole", day: "2026-10-01", score: 80 },
         { id: "half", day: "2026-10-02", score: 80 },
         { id: "fraction", day: "2026-10-03", score: 80 },
+        { id: "null", day: "2026-10-04", score: null },
       ],
     },
     {
@@ -263,12 +281,14 @@ describe("Oura legacy projection policy", () => {
           day: "2026-10-04",
           record_type: "daily_score",
           sleep_score: null,
+          daily_sleep_timestamp: null,
         },
       ],
       expected: [
         { id: "whole", day: "2026-10-01", score: 80 },
         { id: "half", day: "2026-10-02", score: 80 },
         { id: "fraction", day: "2026-10-03", score: 80 },
+        { id: "null", day: "2026-10-04", score: null },
       ],
     },
   ])(
@@ -292,11 +312,22 @@ describe("Oura legacy projection policy", () => {
         expect(entries).toEqual(testCase.expected);
         expect(JSON.stringify(entries)).toBe(JSON.stringify(testCase.expected));
         expect(
-          (entries as { score: number }[]).every(({ score }) =>
-            Number.isInteger(score),
+          (entries as { score: number | null }[]).every(
+            ({ score }) => score === null || Number.isInteger(score),
           ),
         ).toBe(true);
         expectSchemaValid(testCase.scope, result.payload);
+        if (testCase.scope === "oura.sleep" && profileKey === "oura-browser") {
+          expect(
+            result.projectionOmissions?.some(
+              (omission) =>
+                omission.entityKey === "null" &&
+                omission.entityPath === "$.dailyScores[]" &&
+                omission.fieldPath === "timestamp" &&
+                omission.reason === "null_timestamp",
+            ),
+          ).toBe(true);
+        }
       }
     },
   );
@@ -331,39 +362,114 @@ describe("Oura legacy projection policy", () => {
         });
         if (result.ok) {
           expect(result.payload.sleepPeriods).not.toHaveProperty("0.type");
+          expect(result.projectionOmissions).toContainEqual({
+            entityPath: "$.sleepPeriods[]",
+            entityKey: "session-1",
+            fieldPath: "type",
+            reason: type === null ? "null_type" : "off_enum_type",
+          });
           expectSchemaValid("oura.sleep", result.payload);
         }
       }
     }
   });
 
-  it("omits a null browser daily sleep timestamp", () => {
+  it.each([undefined, "oura-browser"] as const)(
+    "omits null sleep timestamps for profile %s",
+    (profileKey) => {
+      const result = projectPdppRecordsToLegacyPayload(
+        "oura.sleep",
+        [
+          {
+            stream: "sleep",
+            data: {
+              id: "score-1",
+              day: "2026-10-01",
+              record_type: "daily_score",
+              sleep_score: 80,
+              daily_sleep_timestamp: null,
+              bedtime_start: null,
+              bedtime_end: null,
+            },
+          },
+          {
+            stream: "sleep",
+            data: {
+              id: "session-1",
+              day: "2026-10-01",
+              sleep_score: 80,
+              record_type: "sleep_session",
+              bedtime_start: null,
+              bedtime_end: null,
+            },
+          },
+        ],
+        {
+          fetchedStreams: ["sleep"],
+          ...(profileKey ? { profileKey } : {}),
+        },
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const period = result.payload.sleepPeriods as Record<string, unknown>[];
+      const session = period.find(({ id }) => id === "session-1");
+      expect(session).toBeDefined();
+      expect(session).not.toHaveProperty("bedtimeStart");
+      expect(session).not.toHaveProperty("bedtimeEnd");
+      expect(result.projectionOmissions).toEqual(
+        expect.arrayContaining([
+          {
+            entityPath: "$.sleepPeriods[]",
+            entityKey: "session-1",
+            fieldPath: "bedtimeStart",
+            reason: "null_timestamp",
+          },
+          {
+            entityPath: "$.sleepPeriods[]",
+            entityKey: "session-1",
+            fieldPath: "bedtimeEnd",
+            reason: "null_timestamp",
+          },
+        ]),
+      );
+      if (profileKey) {
+        expect(result.payload.dailyScores).not.toHaveProperty("0.timestamp");
+      }
+      expectSchemaValid("oura.sleep", result.payload);
+    },
+  );
+
+  it("keeps PAT sleep periods when sleep_score is null and emits null score", () => {
     const result = projectPdppRecordsToLegacyPayload(
       "oura.sleep",
       [
         {
           stream: "sleep",
           data: {
-            id: "score-1",
+            id: "session-null-score",
             day: "2026-10-01",
-            record_type: "daily_score",
-            sleep_score: 80,
-            daily_sleep_timestamp: null,
+            sleep_score: null,
+            type: "long_sleep",
+            total_sleep_duration: 3600,
           },
         },
       ],
-      { fetchedStreams: ["sleep"], profileKey: "oura-browser" },
+      { fetchedStreams: ["sleep"] },
     );
     expect(result).toMatchObject({
       ok: true,
       payload: {
-        dailyScores: [{ id: "score-1", day: "2026-10-01", score: 80 }],
+        dailyScores: [{ id: "session-null-score", score: null }],
+        sleepPeriods: [
+          {
+            id: "session-null-score",
+            type: "long_sleep",
+            totalSleepDuration: 3600,
+          },
+        ],
       },
     });
-    if (result.ok) {
-      expect(result.payload.dailyScores).not.toHaveProperty("0.timestamp");
-      expectSchemaValid("oura.sleep", result.payload);
-    }
+    if (result.ok) expectSchemaValid("oura.sleep", result.payload);
   });
 
   it("keeps normal integer values and known sleep types unchanged", () => {
@@ -430,7 +536,7 @@ describe("Oura legacy projection policy", () => {
     });
   });
 
-  it("keeps rounded values parity-covered and permits policy omissions", () => {
+  it("keeps rounded values parity-covered and requires omission provenance", () => {
     const projected = project(CASES[4]!, 12.5).payload;
     const legacy = {
       days: [
@@ -466,12 +572,34 @@ describe("Oura legacy projection policy", () => {
       dailyScores: [{ id: "score-1", day: "2026-10-01", score: 80 }],
       sleepPeriods: [{ id: "session-1", day: "2026-10-01" }],
     };
+    const verdictWithoutEvidence = compareLegacyCoverage(sleep, omitted, {
+      scope: "oura.sleep",
+      entityKeys: {
+        "$.dailyScores": ["id"],
+        "$.sleepPeriods": ["id"],
+      },
+    });
+    expect(verdictWithoutEvidence.covered).toBe(false);
     const verdict = compareLegacyCoverage(sleep, omitted, {
       scope: "oura.sleep",
       entityKeys: {
         "$.dailyScores": ["id"],
         "$.sleepPeriods": ["id"],
       },
+      projectionOmissions: [
+        {
+          entityPath: "$.dailyScores[]",
+          entityKey: "score-1",
+          fieldPath: "timestamp",
+          reason: "null_timestamp",
+        },
+        {
+          entityPath: "$.sleepPeriods[]",
+          entityKey: "session-1",
+          fieldPath: "type",
+          reason: "off_enum_type",
+        },
+      ],
     });
     expect(verdict.covered).toBe(true);
     expect(verdict.appliedExceptions.map(({ path }) => path)).toEqual(
@@ -482,7 +610,117 @@ describe("Oura legacy projection policy", () => {
     );
   });
 
-  it("keeps null-score row omissions covered by the parity comparator", () => {
+  it("does not excuse omitted valid types or timestamps without raw-value evidence", () => {
+    const verdict = compareLegacyCoverage(
+      {
+        dailyScores: [
+          { id: "score-1", day: "2026-10-01", score: 80, timestamp: "t" },
+        ],
+        sleepPeriods: [{ id: "session-1", day: "2026-10-01", type: "rest" }],
+      },
+      {
+        dailyScores: [{ id: "score-1", day: "2026-10-01", score: 80 }],
+        sleepPeriods: [{ id: "session-1", day: "2026-10-01" }],
+      },
+      {
+        scope: "oura.sleep",
+        entityKeys: {
+          "$.dailyScores": ["id"],
+          "$.sleepPeriods": ["id"],
+        },
+        projectionOmissions: [],
+      },
+    );
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("missing_field");
+  });
+
+  it("requires omission evidence to match the exact entity and field", () => {
+    const verdict = compareLegacyCoverage(
+      { sleepPeriods: [{ id: "session-1", type: "rest" }] },
+      { sleepPeriods: [{ id: "session-1" }] },
+      {
+        entityKeys: { "$.sleepPeriods": ["id"] },
+        projectionOmissions: [
+          {
+            entityPath: "$.sleepPeriods[]",
+            entityKey: "another-session",
+            fieldPath: "type",
+            reason: "null_type",
+          },
+        ],
+      },
+    );
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("missing_field");
+  });
+
+  it("takes over with only per-entity omissions emitted from canonical values", () => {
+    const result = projectPdppRecordsToLegacyPayload(
+      "oura.sleep",
+      [
+        {
+          stream: "sleep",
+          data: {
+            id: "score-1",
+            day: "2026-10-01",
+            record_type: "daily_score",
+            sleep_score: 80,
+            daily_sleep_timestamp: null,
+          },
+        },
+        {
+          stream: "sleep",
+          data: {
+            id: "session-1",
+            day: "2026-10-01",
+            record_type: "sleep_session",
+            sleep_score: null,
+            type: "awake",
+            bedtime_start: null,
+            bedtime_end: null,
+          },
+        },
+      ],
+      { fetchedStreams: ["sleep"], profileKey: "oura-browser" },
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const verdict = compareLegacyCoverage(
+      {
+        dailyScores: [
+          {
+            id: "score-1",
+            day: "2026-10-01",
+            score: 80,
+            timestamp: "2026-10-01T07:00:00Z",
+          },
+        ],
+        sleepPeriods: [
+          {
+            id: "session-1",
+            day: "2026-10-01",
+            type: "long_sleep",
+            bedtimeStart: "2026-10-01T00:00:00Z",
+            bedtimeEnd: "2026-10-01T07:00:00Z",
+          },
+        ],
+      },
+      result.payload,
+      {
+        scope: "oura.sleep",
+        entityKeys: {
+          "$.dailyScores": ["id"],
+          "$.sleepPeriods": ["id"],
+        },
+        projectionOmissions: result.projectionOmissions,
+      },
+    );
+    expect(verdict.covered).toBe(true);
+    expect(verdict.appliedExceptions).toHaveLength(4);
+  });
+
+  it("does not excuse a missing canonical row for a nullable score", () => {
     const cases = [
       ["oura.activity", "days"],
       ["oura.readiness", "days"],
@@ -494,15 +732,21 @@ describe("Oura legacy projection policy", () => {
           [collection]: [{ id: "null-score", day: "2026-10-01", score: null }],
         },
         { [collection]: [] },
-        {
-          scope,
-          entityKeys: { [`$.${collection}`]: ["id"] },
-        },
+        { scope, entityKeys: { [`$.${collection}`]: ["id"] } },
       );
-      expect(verdict.covered).toBe(true);
-      expect(verdict.appliedExceptions).toContainEqual(
-        expect.objectContaining({ path: `$.${collection}[]` }),
-      );
+      expect(verdict.covered).toBe(false);
+      expect(verdict.reason).toBe("missing_entity");
     }
+  });
+
+  it("blocks takeover when legacy has a score but canonical score is null", () => {
+    const verdict = compareLegacyCoverage(
+      { dailyScores: [{ id: "score-1", day: "2026-10-01", score: 80 }] },
+      { dailyScores: [{ id: "score-1", day: "2026-10-01", score: null }] },
+      { entityKeys: { "$.dailyScores": ["id"] } },
+    );
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("type_mismatch");
+    expect(verdict.mismatchedFieldPaths).toEqual(["$.dailyScores[0].score"]);
   });
 });
