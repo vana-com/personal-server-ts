@@ -278,6 +278,23 @@ export function compareLegacyCoverage(
             // Every legacy key was checked above.
             const position = canonicalPositions.get(key!);
             if (position === undefined) {
+              const omissionPath = `${arrayPath}[]`;
+              const nullScoreException =
+                object(item) && item.score === null
+                  ? LEGACY_COVERAGE_EXCEPTIONS.find(
+                      (entry) =>
+                        entry.scope === options.scope &&
+                        entry.path === omissionPath,
+                    )
+                  : undefined;
+              if (nullScoreException) {
+                appliedExceptions.set(omissionPath, {
+                  path: nullScoreException.path,
+                  reason: nullScoreException.reason,
+                  authority: nullScoreException.authority,
+                });
+                continue;
+              }
               missingEntityCount += 1;
               mark("missing_entity", undefined, !deletionAllowed);
               continue;
@@ -409,7 +426,20 @@ export function compareLegacyCoverage(
         if (METADATA_FIELDS.has(field)) continue;
         const childPath = `${path}.${field}`;
         if (!Object.hasOwn(canonical, field)) {
-          mark("missing_field", childPath);
+          const normalizedPath = childPath.replace(/\[\d+\]/g, "[]");
+          const exception = LEGACY_COVERAGE_EXCEPTIONS.find(
+            (entry) =>
+              entry.scope === options.scope && entry.path === normalizedPath,
+          );
+          if (exception) {
+            appliedExceptions.set(normalizedPath, {
+              path: exception.path,
+              reason: exception.reason,
+              authority: exception.authority,
+            });
+          } else {
+            mark("missing_field", childPath);
+          }
           continue;
         }
         compare(

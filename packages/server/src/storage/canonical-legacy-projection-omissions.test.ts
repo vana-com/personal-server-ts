@@ -368,7 +368,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
         ...(score === absent ? {} : { [c.score]: score }),
       });
 
-      it(`${c.scope}: keeps null and zero scores, drops absent, malformed and impossible-day rows`, async () => {
+      it(`${c.scope}: keeps integer and rounded scores; drops null, absent, malformed and impossible-day rows`, async () => {
         const a = connect("conn_a", "oura");
         put(a, c.stream, [
           row("good", "2026-02-01", 80),
@@ -386,8 +386,8 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
           score: unknown;
         }[];
         expect(list.map((entry) => [entry.id, entry.score])).toEqual([
+          ["fraction", 81],
           ["good", 80],
-          ["null", null],
           ["zero", 0],
         ]);
         expect(result.complete).toBe(false);
@@ -431,21 +431,19 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
         sleep_score: null,
       });
 
-      it("serves a valid daily-score-only stream with an empty sleepPeriods list", async () => {
+      it("omits null daily scores from an otherwise valid score-only stream", async () => {
         const a = connect("conn_a", "oura-browser");
         put(a, "sleep", [
           score("d1", "2026-02-01", 70),
           score("d2", "2026-02-02", null),
         ]);
         const result = okBody(await read(a, "oura.sleep"));
-        expect(result.complete).toBe(true);
+        expect(result.complete).toBe(false);
         expect(result.envelope.data).toEqual({
-          dailyScores: [
-            { id: "d1", day: "2026-02-01", score: 70 },
-            { id: "d2", day: "2026-02-02", score: null },
-          ],
+          dailyScores: [{ id: "d1", day: "2026-02-01", score: 70 }],
           sleepPeriods: [],
         });
+        expect(omitted(result)).toEqual({ sleep: 1 });
         legacySchemaValid("oura.sleep", result.envelope.data);
       });
 
