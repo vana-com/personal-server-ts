@@ -89,6 +89,8 @@ export interface LegacyScopeAuthority {
   /** See `CanonicalLegacyReadStore.readSnapshot`. Same database connection. */
   readSnapshot<T>(read: () => T): T;
   writeClock(): number;
+  /** Monotonic arrival revision, independent of record content writes. */
+  arrivalRevision(): number;
   /** Whether a complete canonical read has already superseded the legacy head. */
   hasTakeover(scope: string, instance?: string, generation?: number): boolean;
   hasCoveredHead(
@@ -121,6 +123,7 @@ export interface LegacyScopeAuthority {
       instance: string;
       generation: number;
       writeClock: number;
+      arrivalRevision: number;
       canonicalCursor: string;
       coverage: LegacyCoverageVerdict;
       cached: boolean;
@@ -388,7 +391,7 @@ export function createLegacyScopeView(
         }
         if (
           !verdict.canonicalCursor.startsWith(
-            `${authority.writeClock()}:${receiptCursor(decision)}:`,
+            `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(decision)}:`,
           )
         ) {
           return { kind: "refused" };
@@ -430,6 +433,7 @@ export function createLegacyScopeView(
           ),
           canServeLegacy: canServeLegacyBeforeTakeover(scope),
           writeClock: authority.writeClock(),
+          arrivalRevision: authority.arrivalRevision(),
           receiptCursor:
             decision.kind === "canonical" ? receiptCursor(decision) : "",
         };
@@ -447,6 +451,7 @@ export function createLegacyScopeView(
       const canonicalCursor = legacyHead
         ? [
             initial.writeClock,
+            initial.arrivalRevision,
             initial.receiptCursor,
             decision.generation,
             CANONICAL_LEGACY_VIEW_CONTRACT,
@@ -487,6 +492,7 @@ export function createLegacyScopeView(
             instance: decision.selection.instance,
             generation: decision.generation,
             writeClock: initial.writeClock,
+            arrivalRevision: initial.arrivalRevision,
             canonicalCursor,
             coverage: cachedCoverage,
             cached: true,
@@ -547,6 +553,7 @@ export function createLegacyScopeView(
             instance: decision.selection.instance,
             generation: decision.generation,
             writeClock: initial.writeClock,
+            arrivalRevision: initial.arrivalRevision,
             canonicalCursor,
             coverage: cachedCoverage,
             cached: true,
@@ -624,7 +631,8 @@ export function createLegacyScopeView(
               instance: decision.selection.instance,
               generation: decision.generation,
               writeClock: initial.writeClock,
-              canonicalCursor: `${initial.writeClock}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
+              arrivalRevision: initial.arrivalRevision,
+              canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
               coverage,
               cached: false,
             },
@@ -724,6 +732,7 @@ export function createLegacyScopeView(
             instance: decision.selection.instance,
             generation: decision.generation,
             writeClock: initial.writeClock,
+            arrivalRevision: initial.arrivalRevision,
             canonicalCursor,
             coverage,
             cached,

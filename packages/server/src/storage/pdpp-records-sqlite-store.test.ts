@@ -902,6 +902,34 @@ describe("sqlite record store", () => {
       expect(version.version).toBeGreaterThan(0);
     });
 
+    it("creates the v10 stream-summary index when upgrading a v9 database without it", () => {
+      db.exec("DROP INDEX idx_pdpp_records_live_instance_stream_emitted_at");
+      db.prepare(
+        "UPDATE pdpp_schema_version SET version = 9 WHERE id = 1",
+      ).run();
+
+      const before = db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        )
+        .get("idx_pdpp_records_live_instance_stream_emitted_at");
+      expect(before).toBeUndefined();
+
+      const upgraded = createSqliteRecordStore(db);
+      const after = db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        )
+        .get("idx_pdpp_records_live_instance_stream_emitted_at");
+      const version = db
+        .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
+        .get() as { version: number };
+
+      expect(after).toBeDefined();
+      expect(version.version).toBeGreaterThanOrEqual(10);
+      upgraded.close();
+    });
+
     it("persists the store epoch across reopen", () => {
       const first = db
         .prepare("SELECT epoch FROM pdpp_store_metadata WHERE id = 1")

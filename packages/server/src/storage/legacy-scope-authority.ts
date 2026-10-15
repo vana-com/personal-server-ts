@@ -139,6 +139,17 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       );
     },
 
+    arrivalRevision() {
+      if (!hasTable("pdpp_record_arrival_clock")) return 0;
+      return (
+        (
+          db
+            .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
+            .get() as { value: number } | undefined
+        )?.value ?? 0
+      );
+    },
+
     hasTakeover(scope, instance, generation) {
       const instanceFilter =
         instance === undefined
@@ -266,6 +277,18 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             (
               db
                 .prepare("SELECT value FROM pdpp_write_clock WHERE id = 1")
+                .get() as { value: number }
+            ).value
+        )
+          return false;
+        if (
+          verdict &&
+          verdict.arrivalRevision !==
+            (
+              db
+                .prepare(
+                  "SELECT value FROM pdpp_record_arrival_clock WHERE id = 1",
+                )
                 .get() as { value: number }
             ).value
         )

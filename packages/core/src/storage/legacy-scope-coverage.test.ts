@@ -356,6 +356,13 @@ describe("legacy scope coverage", () => {
     ).toBe("array_order");
     expect(
       compareLegacyCoverage(
+        { values: ["x", "x"] },
+        { values: ["x"] },
+        { canonicalNewer: true, allowProvenDeletion: true },
+      ).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(
         { values: ["one"] },
         { values: ["one", "extra"] },
         { canonicalNewer: false },

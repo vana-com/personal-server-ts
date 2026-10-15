@@ -15,12 +15,14 @@ import { initializeDatabase } from "./index-schema.js";
 const OURA = "https://registry.pdpp.dev/sources/oura";
 const GITHUB = "https://registry.pdpp.dev/sources/github";
 const CLAUDE = "https://registry.pdpp.dev/sources/claude";
+const STRAVA = "https://registry.pdpp.dev/sources/strava";
 
 /** The (source, method) pairs a boot configures, as Desktop names them. */
 const CONFIGURED: Record<string, string[]> = {
   [OURA]: ["oura", "oura-browser"],
   [GITHUB]: ["github-browser"],
   [CLAUDE]: ["anthropic"],
+  [STRAVA]: ["strava"],
 };
 
 const CLAUDE_PROFILE = {
@@ -80,12 +82,13 @@ function ingest(
   id: string,
   emittedAt: string,
   score = 80,
+  { stream = "activity", method = "oura" } = {},
 ) {
   const result = store.ingestBatch(
     [
       {
         instance,
-        stream: "activity",
+        stream,
         key: id,
         data: { id, day: "2026-09-01", score },
         emitted_at: emittedAt,
@@ -93,7 +96,7 @@ function ingest(
     ],
     () => "mutable_state",
     () => ["id"],
-    { method: "oura", generation: 1 },
+    { method, generation: 1 },
   );
   expect(result.rejected).toEqual([]);
 }
@@ -275,7 +278,8 @@ describe("legacy scope view over the real SQLite record store", () => {
         instance: "conn_a",
         generation: 1,
         writeClock: authority.writeClock(),
-        canonicalCursor: "0:receipt:revision:3",
+        arrivalRevision: authority.arrivalRevision(),
+        canonicalCursor: "0:0:receipt:revision:3",
         coverage,
         cached: false,
       }),
@@ -291,7 +295,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         "conn_a",
         1,
         head.id,
-        "0:receipt:revision:3",
+        "0:0:receipt:revision:3",
       )?.appliedExceptions,
     ).toEqual([exception]);
   });
@@ -618,6 +622,138 @@ describe("legacy scope view over the real SQLite record store", () => {
     );
 
     expect(listRecords).toHaveBeenCalledTimes(callsAfterFirstRead);
+  });
+
+  it("refreshes a covered projection after an unchanged re-delivery changes arrival order", async () => {
+    connect(store, "conn_a", "strava", STRAVA);
+    replace(store, "conn_a", "activities", ["a", "b"], { method: "strava" });
+    const initialProjection = await view.readLatest("strava.activities");
+    expect(initialProjection.kind).toBe("canonical");
+    if (initialProjection.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "strava/activities/old.json",
+      "strava.activities",
+      "2026-09-01T00:00:00.000Z",
+      1,
+    );
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => initialProjection.envelope,
+    });
+    const listRecords = vi.spyOn(store, "listRecords");
+
+    const warm = await parityView.readLatest("strava.activities");
+    expect(warm.kind).toBe("canonical");
+    if (warm.kind !== "canonical") return;
+    const callsAfterWarm = listRecords.mock.calls.length;
+    const repeated = await parityView.readLatest("strava.activities");
+    expect(repeated.kind).toBe("canonical");
+    expect(listRecords).toHaveBeenCalledTimes(callsAfterWarm);
+
+    ingest(store, "conn_a", "a", "2026-09-10T07:00:00.000Z", 80, {
+      stream: "activities",
+      method: "strava",
+    });
+    expect(store.listArrivalOrder("conn_a", "activities")).toEqual(["b", "a"]);
+    const refreshed = await parityView.readLatest("strava.activities");
+    expect(listRecords.mock.calls.length).toBeGreaterThan(callsAfterWarm);
+
+    expect(refreshed.kind).toBe("canonical");
+    if (refreshed.kind !== "canonical") return;
+    expect(refreshed.envelope.data).toMatchObject({
+      activities: [{ id: "b" }, { id: "a" }],
+    });
+    expect(refreshed.revision).not.toBe(warm.revision);
+    const callsAfterRefresh = listRecords.mock.calls.length;
+    expect(callsAfterRefresh).toBeGreaterThan(callsAfterWarm);
+
+    expect((await parityView.readLatest("strava.activities")).kind).toBe(
+      "canonical",
+    );
+    expect(listRecords).toHaveBeenCalledTimes(callsAfterRefresh);
+  });
+
+  it("refreshes a covered projection after an unchanged replacement reorders records", async () => {
+    connect(store, "conn_a", "strava", STRAVA);
+    replace(store, "conn_a", "activities", ["a", "b"], { method: "strava" });
+    const initialProjection = await view.readLatest("strava.activities");
+    expect(initialProjection.kind).toBe("canonical");
+    if (initialProjection.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "strava/activities/old.json",
+      "strava.activities",
+      "2026-09-01T00:00:00.000Z",
+      1,
+    );
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => initialProjection.envelope,
+    });
+    const warm = await parityView.readLatest("strava.activities");
+    expect(warm.kind).toBe("canonical");
+    if (warm.kind !== "canonical") return;
+
+    replace(store, "conn_a", "activities", ["b", "a"], { method: "strava" });
+    expect(store.listArrivalOrder("conn_a", "activities")).toEqual(["b", "a"]);
+    const refreshed = await parityView.readLatest("strava.activities");
+
+    expect(refreshed.kind).toBe("canonical");
+    if (refreshed.kind !== "canonical") return;
+    expect(refreshed.envelope.data).toMatchObject({
+      activities: [{ id: "b" }, { id: "a" }],
+    });
+    expect(refreshed.revision).not.toBe(warm.revision);
+  });
+
+  it("re-evaluates a same-time parity verdict after only arrival order changes", async () => {
+    connect(store, "conn_a", "strava", STRAVA);
+    replace(store, "conn_a", "activities", ["a", "b"], { method: "strava" });
+    const initialProjection = await view.readLatest("strava.activities");
+    expect(initialProjection.kind).toBe("canonical");
+    if (initialProjection.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "strava/activities/old.json",
+      "strava.activities",
+      "2026-09-09T07:00:00.000Z",
+      1,
+    );
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => initialProjection.envelope,
+    });
+
+    expect((await parityView.readLatest("strava.activities")).kind).toBe(
+      "canonical",
+    );
+    expect(parityView.verdictFor("strava.activities")[0]).toMatchObject({
+      verdict: "covered",
+      comparisonCase: "same_time",
+    });
+
+    ingest(store, "conn_a", "a", "2026-09-10T07:00:00.000Z", 80, {
+      stream: "activities",
+      method: "strava",
+    });
+    expect(store.listArrivalOrder("conn_a", "activities")).toEqual(["b", "a"]);
+    await parityView.readLatest("strava.activities");
+
+    expect(parityView.verdictFor("strava.activities")[0]).toMatchObject({
+      verdict: "not_covered",
+      comparisonCase: "same_time",
+      reason: { reason: "array_order" },
+    });
   });
 
   it("reuses a not-covered verdict without rebuilding the projection", async () => {
