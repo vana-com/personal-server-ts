@@ -451,6 +451,141 @@ describe("legacy scope view over the real SQLite record store", () => {
     });
   });
 
+  it("counts missing Claude raw blobs across mixed populations without relabeling mismatches", async () => {
+    connect(store, "conn_claude", "anthropic", CLAUDE);
+    const validProjects = addClaudeProjects(store);
+    const validProject = validProjects[0]!;
+    const put = (
+      stream: string,
+      rows: { key: string; data: Record<string, unknown> }[],
+    ) =>
+      store.replaceStream({
+        instance: "conn_claude",
+        stream,
+        method: "anthropic",
+        generation: 1,
+        primaryKey: ["id"],
+        emittedAt: CLAUDE_COLLECTED,
+        sourceCollectedAt: CLAUDE_COLLECTED,
+        envelopes: rows.map(({ key, data }) => ({
+          instance: "conn_claude",
+          stream,
+          key,
+          data,
+          emitted_at: CLAUDE_COLLECTED,
+        })),
+      });
+    put("conversations", [
+      { key: "cv1", data: { id: "cv1", title: "One", message_count: 0 } },
+      { key: "cv2", data: { id: "cv2", title: "Two", message_count: 0 } },
+    ]);
+    put("projects", [
+      { key: "project-missing-1", data: { id: "project-missing-1" } },
+      { key: "project-missing-2", data: { id: "project-missing-2" } },
+      { key: validProject.key, data: validProject.project },
+    ]);
+    for (const [scope, path] of [
+      ["claude.conversations", "claude/conversations/old.json"],
+      ["claude.projects", "claude/projects/old.json"],
+    ] as const) {
+      db.prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+      ).run(path, scope, "2026-09-01T00:00:00.000Z", 1);
+    }
+    expect(
+      createLegacyScopeAuthority(db).eligibleLegacyHead("claude.conversations"),
+    ).toMatchObject({
+      path: "claude/conversations/old.json",
+    });
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
+    const legacyHead = (scope: string) => ({
+      version: "1.0",
+      scope,
+      collectedAt: "2026-09-01T00:00:00.000Z",
+      data: scope.endsWith("projects")
+        ? { projects: [] }
+        : { conversations: [] },
+    });
+    const readLegacy = vi.fn(async (head: { path: string }) =>
+      legacyHead(
+        head.path.includes("/projects/")
+          ? "claude.projects"
+          : "claude.conversations",
+      ),
+    );
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: readLegacy,
+    });
+
+    expect(parityView.listingFor("claude.conversations")).toEqual({
+      kind: "file",
+    });
+    const conversationRead = await parityView.readLatest(
+      "claude.conversations",
+    );
+    expect(readLegacy).toHaveBeenCalled();
+    expect(conversationRead).toEqual({ kind: "file" });
+    expect(parityView.verdictFor("claude.conversations")[0]).toMatchObject({
+      verdict: "not_covered",
+      reason: { reason: "missing_raw_blob" },
+      reasonCounts: { missing_raw_blob: 2 },
+    });
+    expect(await parityView.readLatest("claude.projects")).toEqual({
+      kind: "file",
+    });
+    expect(parityView.verdictFor("claude.projects")[0]).toMatchObject({
+      verdict: "not_covered",
+      reason: { reason: "missing_raw_blob" },
+      reasonCounts: { missing_raw_blob: 2 },
+    });
+    expect(store.findBlobReferences(validProject.blobId)).toEqual([
+      {
+        instance: "conn_claude",
+        stream: "projects",
+        recordKey: validProject.key,
+      },
+    ]);
+
+    connect(store, "conn_strava", "strava", STRAVA);
+    replace(store, "conn_strava", "activities", ["same-id"], {
+      method: "strava",
+    });
+    const projected = await view.readLatest("strava.activities");
+    expect(projected.kind).toBe("canonical");
+    if (projected.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "strava/activities/old.json",
+      "strava.activities",
+      "2026-09-09T07:00:00.000Z",
+      1,
+    );
+    const mismatchView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => ({
+        ...projected.envelope,
+        data: {
+          ...projected.envelope.data,
+          activities: [{ id: "same-id", day: "2026-09-01", score: 81 }],
+        },
+      }),
+    });
+    await mismatchView.readLatest("strava.activities");
+    expect(mismatchView.verdictFor("strava.activities")[0]).toMatchObject({
+      verdict: "not_covered",
+      reason: { reason: "field_mismatch" },
+      reasonCounts: { missing_raw_blob: 0, field_mismatch: 1 },
+    });
+  });
+
   it("keeps covering Claude project rows with their raw blob references", async () => {
     connect(store, "conn_claude", "anthropic", CLAUDE);
     addClaudeProjects(store);

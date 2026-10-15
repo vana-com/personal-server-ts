@@ -6,6 +6,10 @@ import { tmpdir } from "node:os";
 import { pino } from "pino";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
+import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import { createLegacyScopeAuthority } from "../storage/legacy-scope-authority.js";
+import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
+import Database from "better-sqlite3";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import {
@@ -958,32 +962,90 @@ describe("GET /v1/data/:scope", () => {
     vi.unstubAllGlobals();
   });
 
-  it("includes missing raw blob reasons and counts in the owner takeover verdict", async () => {
-    const verdict = {
-      scope: "claude.conversations",
+  it("serves persisted missing raw blob diagnostics in a signed owner takeover GET", async () => {
+    const path = join(dataDir, "parity-index.db");
+    const db = initializeDatabase(path);
+    const store = createSqliteRecordStore(db);
+    store.registerConnection({
       instance: "conn_claude",
-      generation: 1,
-      legacyVersionId: 4,
-      canonicalCursor: "cursor",
-      verdict: "not_covered" as const,
-      comparisonCase: "same_time" as const,
-      reasonCounts: { missing_raw_blob: 3 },
-      appliedExceptions: [],
-      reason: {
-        reason: "missing_raw_blob",
-        missingEntityCount: 0,
-        mismatchedFieldPaths: [],
+      sourceId: "https://registry.pdpp.dev/sources/claude",
+      method: "anthropic",
+      label: "Claude",
+    });
+    const collectedAt = "2026-09-10T07:00:00.000Z";
+    for (const [stream, rows] of [
+      ["account_profile", [{ id: "org", organization_id: "org" }]],
+      [
+        "conversations",
+        [
+          { id: "conversation-1", title: "First", message_count: 0 },
+          { id: "conversation-2", title: "Second", message_count: 0 },
+        ],
+      ],
+    ] as const) {
+      store.replaceStream({
+        instance: "conn_claude",
+        stream,
+        method: "anthropic",
+        generation: 1,
+        primaryKey: ["id"],
+        emittedAt: collectedAt,
+        sourceCollectedAt: collectedAt,
+        envelopes: rows.map((data) => ({
+          instance: "conn_claude",
+          stream,
+          key: data.id,
+          data,
+          emitted_at: collectedAt,
+        })),
+      });
+    }
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "claude/conversations/old.json",
+      "claude.conversations",
+      "2026-09-01T00:00:00.000Z",
+      100,
+    );
+    const readLegacyHead = async () => ({
+      version: "1.0",
+      scope: "claude.conversations",
+      collectedAt: "2026-09-01T00:00:00.000Z",
+      data: { conversations: [{ id: "conversation-1", messages: [] }] },
+    });
+    let legacyScopeView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) =>
+        sourceId === "https://registry.pdpp.dev/sources/claude"
+          ? ["anthropic"]
+          : [],
+      readLegacyHead,
+    });
+    expect(await legacyScopeView.readLatest("claude.conversations")).toEqual({
+      kind: "file",
+    });
+    expect(legacyScopeView.verdictFor("claude.conversations")[0]).toMatchObject(
+      {
+        verdict: "not_covered",
+        reason: { reason: "missing_raw_blob" },
+        reasonCounts: { missing_raw_blob: 2 },
       },
-      legacyBytes: 100,
-      canonicalBytes: 0,
-      byteDelta: -100,
-      evaluatedAt: "2026-10-14T00:00:00.000Z",
-    };
-    const legacyScopeView = {
-      isReset: () => false,
-      verdictFor: () => [verdict],
-      resetTakeover: vi.fn(),
-    } as unknown as NonNullable<DataRouteDeps["legacyScopeView"]>;
+    );
+    store.close();
+
+    const reopenedDb = new Database(path);
+    const reopenedStore = createSqliteRecordStore(reopenedDb);
+    legacyScopeView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(reopenedDb),
+      records: reopenedStore,
+      configuredMethods: (sourceId) =>
+        sourceId === "https://registry.pdpp.dev/sources/claude"
+          ? ["anthropic"]
+          : [],
+      readLegacyHead,
+    });
     const app = createApp({ legacyScopeView });
     const uri = "/claude.conversations/takeover";
     const header = await buildWeb3SignedHeader({
@@ -1004,10 +1066,11 @@ describe("GET /v1/data/:scope", () => {
         {
           verdict: "not_covered",
           reason: { reason: "missing_raw_blob" },
-          reasonCounts: { missing_raw_blob: 3 },
+          reasonCounts: { missing_raw_blob: 2 },
         },
       ],
     });
+    reopenedStore.close();
   });
 
   it("returns 200 with DataFileEnvelope for valid auth + grant", async () => {
