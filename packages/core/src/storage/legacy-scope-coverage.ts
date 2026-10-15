@@ -408,15 +408,22 @@ export function compareLegacyCoverage(
         if (METADATA_FIELDS.has(field)) continue;
         const childPath = `${path}.${field}`;
         if (!Object.hasOwn(canonical, field)) {
-          const omission = options.projectionOmissions?.find(
-            (entry) =>
-              entry.entityPath === entityPath &&
-              entry.entityKey === entityKey &&
-              entry.fieldPath === field,
-          );
+          // Omission evidence names a path relative to its entity. Match the
+          // full relative path so evidence for `timestamp` cannot excuse a
+          // nested `contributors.timestamp` on the same entity.
+          const schemaPath = `${arrayPath}.${field}`;
+          const omission =
+            entityPath !== undefined && schemaPath.startsWith(`${entityPath}.`)
+              ? options.projectionOmissions?.find(
+                  (entry) =>
+                    entry.entityPath === entityPath &&
+                    entry.entityKey === entityKey &&
+                    entry.fieldPath === schemaPath.slice(entityPath.length + 1),
+                )
+              : undefined;
           if (omission) {
-            appliedExceptions.set(`${entityPath}.${field}`, {
-              path: `${entityPath}.${field}`,
+            appliedExceptions.set(schemaPath, {
+              path: schemaPath,
               reason: omission.reason,
               authority: "canonical",
             });

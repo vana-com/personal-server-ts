@@ -2,7 +2,10 @@ import { readFileSync } from "node:fs";
 import Ajv from "ajv";
 import { describe, expect, it } from "vitest";
 import { compareLegacyCoverage } from "../storage/legacy-scope-coverage.js";
-import { projectPdppRecordsToLegacyPayload } from "./index.js";
+import {
+  assertOuraLegacyScoresAreIntegers,
+  projectPdppRecordsToLegacyPayload,
+} from "./index.js";
 
 type IntegerCase = {
   inputPath: string[];
@@ -718,6 +721,97 @@ describe("Oura legacy projection policy", () => {
     );
     expect(verdict.covered).toBe(true);
     expect(verdict.appliedExceptions).toHaveLength(4);
+  });
+
+  it("excuses only the exact omitted field path, not a same-named nested field", () => {
+    const result = projectPdppRecordsToLegacyPayload(
+      "oura.sleep",
+      [
+        {
+          stream: "sleep",
+          data: {
+            id: "s",
+            day: "2026-10-01",
+            record_type: "daily_score",
+            sleep_score: 80,
+            daily_sleep_timestamp: null,
+            contributors: {},
+          },
+        },
+      ],
+      { fetchedStreams: ["sleep"], profileKey: "oura-browser" },
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payload.dailyScores).toEqual([
+      { id: "s", day: "2026-10-01", score: 80, contributors: {} },
+    ]);
+    const options = {
+      scope: "oura.sleep",
+      entityKeys: { "$.dailyScores": ["id"] },
+      projectionOmissions: result.projectionOmissions,
+    };
+    const legacyScore = {
+      id: "s",
+      day: "2026-10-01",
+      score: 80,
+      timestamp: "2026-10-01T00:00:00Z",
+    };
+
+    const nested = compareLegacyCoverage(
+      {
+        dailyScores: [
+          {
+            ...legacyScore,
+            contributors: { timestamp: "2026-09-30T00:00:00Z" },
+          },
+        ],
+      },
+      result.payload,
+      options,
+    );
+    expect(nested.covered).toBe(false);
+    expect(nested.reason).toBe("missing_field");
+    expect(nested.mismatchedFieldPaths).toEqual([
+      "$.dailyScores[0].contributors.timestamp",
+    ]);
+
+    const topLevel = compareLegacyCoverage(
+      { dailyScores: [{ ...legacyScore, contributors: {} }] },
+      result.payload,
+      options,
+    );
+    expect(topLevel.covered).toBe(true);
+    expect(topLevel.appliedExceptions).toEqual([
+      {
+        path: "$.dailyScores[].timestamp",
+        reason: "null_timestamp",
+        authority: "canonical",
+      },
+    ]);
+  });
+
+  it("rejects daily score rows whose score is absent or undefined", () => {
+    for (const collection of ["days", "dailyScores"]) {
+      expect(() =>
+        assertOuraLegacyScoresAreIntegers("oura.test", {
+          [collection]: [{ id: "a", day: "2026-10-01" }],
+        }),
+      ).toThrow(`oura.test.${collection}[0].score must be an integer or null`);
+      expect(() =>
+        assertOuraLegacyScoresAreIntegers("oura.test", {
+          [collection]: [{ id: "u", day: "2026-10-01", score: undefined }],
+        }),
+      ).toThrow(`oura.test.${collection}[0].score must be an integer or null`);
+      expect(() =>
+        assertOuraLegacyScoresAreIntegers("oura.test", {
+          [collection]: [
+            { id: "n", score: null },
+            { id: "i", score: 80 },
+          ],
+        }),
+      ).not.toThrow();
+    }
   });
 
   it("does not excuse a missing canonical row for a nullable score", () => {

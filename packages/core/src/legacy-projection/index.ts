@@ -241,7 +241,7 @@ const DROP_AND_COUNT_SCOPES: ReadonlySet<string> = new Set([
 ]);
 
 /** Keep OpenPet's Go `*int` score decoding safe for every Oura projection. */
-function assertOuraLegacyScoresAreIntegers(
+export function assertOuraLegacyScoresAreIntegers(
   scope: string,
   payload: Record<string, unknown>,
 ): void {
@@ -249,21 +249,17 @@ function assertOuraLegacyScoresAreIntegers(
     const rows = payload[collection];
     if (!Array.isArray(rows)) continue;
     for (const [index, row] of rows.entries()) {
-      if (
-        row === null ||
-        typeof row !== "object" ||
-        !Object.hasOwn(row, "score")
-      )
-        continue;
+      if (row === null || typeof row !== "object") continue;
+      // `score` is required on every daily score row: absent and undefined
+      // (dropped by JSON serialization) are both rejected.
       const score = (row as Record<string, unknown>).score;
       if (
-        score === undefined ||
         score === null ||
         (typeof score === "number" && Number.isInteger(score))
       )
         continue;
       throw new Error(
-        `${scope}.${collection}[${index}].score must be an integer, null, or absent`,
+        `${scope}.${collection}[${index}].score must be an integer or null`,
       );
     }
   }

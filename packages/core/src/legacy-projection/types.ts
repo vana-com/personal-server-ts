@@ -62,6 +62,7 @@ export interface ProjectionOk {
 export interface ProjectionOmission {
   entityKey: string | number | boolean;
   entityPath: string;
+  /** Dot path relative to the entity, e.g. `timestamp` or `contributors.timestamp`. */
   fieldPath: string;
   reason: "off_enum_type" | "null_type" | "null_timestamp";
 }
