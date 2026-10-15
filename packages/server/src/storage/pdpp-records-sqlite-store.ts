@@ -284,6 +284,20 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_arrival_order
   // only if it is a compatible nullable TEXT column, so a database whose
   // version was only rewound can be upgraded again.
   "",
+  // v10: cover the stream-summary query so it need not visit JSON record rows.
+  `
+CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_at
+  ON pdpp_records (instance, stream, emitted_at)
+  WHERE deleted = 0;
+`,
+  // v11: monotonic cursor for arrival-only ordering changes in the legacy view.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_record_arrival_clock (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO pdpp_record_arrival_clock (id, value) VALUES (1, 0);
+`,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -650,6 +664,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       record_key: recordKey,
       generation,
     });
+    db.prepare(
+      "UPDATE pdpp_record_arrival_clock SET value = value + 1 WHERE id = 1",
+    ).run();
   }
 
   function latestVersion(

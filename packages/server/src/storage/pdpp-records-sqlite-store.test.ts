@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import Database from "better-sqlite3";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 import {
@@ -46,6 +49,22 @@ describe("sqlite record store", () => {
     expect(result.accepted).toBe(1);
     const record = store.getRecord("inst_1", "messages", "msg_1");
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
+  });
+
+  it("uses a covering index for per-instance stream summaries", () => {
+    const plan = db
+      .prepare(
+        `EXPLAIN QUERY PLAN
+         SELECT stream, COUNT(*) as count, MAX(emitted_at) as last_updated
+         FROM pdpp_records
+         WHERE deleted = 0 AND instance IN (?)
+         GROUP BY stream`,
+      )
+      .all("inst_1") as Array<{ detail: string }>;
+
+    expect(plan.map((row) => row.detail).join("\n")).toContain(
+      "idx_pdpp_records_live_instance_stream_emitted_at",
+    );
   });
 
   it("test fixture forwards validateData with and without an explicit binding", () => {
@@ -850,6 +869,139 @@ describe("sqlite record store", () => {
   });
 
   describe("schema migration", () => {
+    it("upgrades a raw v10 records database with rows and arrival order", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pdpp-records-v10-"));
+      const path = join(dir, "records.db");
+      let historical: Database.Database | undefined;
+      let upgraded: ReturnType<typeof createSqliteRecordStore> | undefined;
+      try {
+        historical = new Database(path);
+        historical.exec(`
+          CREATE TABLE pdpp_records (
+            instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL,
+            data TEXT, version INTEGER NOT NULL, emitted_at TEXT NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0, deleted_at TEXT, blob_id TEXT,
+            PRIMARY KEY (instance, stream, record_key)
+          );
+          CREATE TABLE pdpp_record_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, instance TEXT NOT NULL,
+            stream TEXT NOT NULL, record_key TEXT NOT NULL, version INTEGER NOT NULL,
+            data TEXT, emitted_at TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+            deleted_at TEXT, written_at INTEGER NOT NULL
+          );
+          CREATE TABLE pdpp_blobs (
+            blob_id TEXT PRIMARY KEY, mime_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL
+          );
+          CREATE TABLE pdpp_blob_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
+          CREATE TABLE pdpp_write_clock (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
+          CREATE TABLE pdpp_instance_binding (
+            instance TEXT PRIMARY KEY, method TEXT, generation INTEGER NOT NULL,
+            reset_clock INTEGER NOT NULL DEFAULT 0, source_id TEXT,
+            label TEXT NOT NULL DEFAULT '', deleted_at TEXT
+          );
+          CREATE TABLE pdpp_blob_claims (
+            blob_id TEXT NOT NULL, instance TEXT NOT NULL, generation INTEGER NOT NULL,
+            PRIMARY KEY (blob_id, instance)
+          );
+          CREATE TABLE pdpp_store_metadata (id INTEGER PRIMARY KEY CHECK (id = 1), epoch TEXT NOT NULL);
+          CREATE TABLE pdpp_stream_completion (
+            instance TEXT NOT NULL, stream TEXT NOT NULL, method TEXT NOT NULL,
+            generation INTEGER NOT NULL, source_collected_at TEXT NOT NULL,
+            write_seq INTEGER NOT NULL, live_count INTEGER NOT NULL,
+            PRIMARY KEY (instance, stream)
+          );
+          CREATE TABLE pdpp_record_arrival (
+            instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL,
+            generation INTEGER NOT NULL, arrival INTEGER NOT NULL,
+            PRIMARY KEY (instance, stream, record_key)
+          );
+          CREATE TABLE pdpp_schema_version (
+            id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL
+          );
+          INSERT INTO pdpp_schema_version VALUES (1, 10);
+          INSERT INTO pdpp_write_clock VALUES (1, 4);
+          INSERT INTO pdpp_instance_binding VALUES ('owner', 'messages', 1, 0, 'source', '', NULL);
+          INSERT INTO pdpp_store_metadata VALUES (1, 'historical-epoch');
+          INSERT INTO pdpp_records VALUES
+            ('owner', 'messages', 'a', '{"id":"a","text":"A"}', 1, '2026-01-01T00:00:00Z', 0, NULL, NULL),
+            ('owner', 'messages', 'b', '{"id":"b","text":"B"}', 1, '2026-01-01T00:00:00Z', 0, NULL, NULL);
+          INSERT INTO pdpp_record_changes
+            (instance, stream, record_key, version, data, emitted_at, written_at)
+          VALUES
+            ('owner', 'messages', 'a', 1, '{"id":"a","text":"A"}', '2026-01-01T00:00:00Z', 1),
+            ('owner', 'messages', 'b', 1, '{"id":"b","text":"B"}', '2026-01-01T00:00:00Z', 2);
+          INSERT INTO pdpp_record_arrival VALUES
+            ('owner', 'messages', 'a', 1, 1), ('owner', 'messages', 'b', 1, 2);
+        `);
+        historical.close();
+        historical = undefined;
+
+        const dbAfterUpgrade = new Database(path);
+        upgraded = createSqliteRecordStore(dbAfterUpgrade);
+        expect(
+          dbAfterUpgrade
+            .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
+            .get(),
+        ).toEqual({ version: 11 });
+        expect(
+          dbAfterUpgrade
+            .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
+            .get(),
+        ).toEqual({ value: 0 });
+        expect(upgraded.getRecord("owner", "messages", "a")?.data).toEqual({
+          id: "a",
+          text: "A",
+        });
+        expect(upgraded.getRecord("owner", "messages", "b")?.data).toEqual({
+          id: "b",
+          text: "B",
+        });
+        expect(upgraded.listArrivalOrder("owner", "messages")).toEqual([
+          "a",
+          "b",
+        ]);
+
+        const before = dbAfterUpgrade
+          .prepare("SELECT value FROM pdpp_write_clock WHERE id = 1")
+          .get();
+        const redelivery = upgraded.ingestBatch(
+          [
+            {
+              instance: "owner",
+              stream: "messages",
+              key: "a",
+              data: { id: "a", text: "A" },
+              emitted_at: "2026-01-01T00:00:00Z",
+            },
+          ],
+          () => "mutable_state",
+          () => ["id"],
+          { method: "messages", generation: 1 },
+        );
+        expect(redelivery.unchanged).toBe(1);
+        expect(upgraded.listArrivalOrder("owner", "messages")).toEqual([
+          "b",
+          "a",
+        ]);
+        expect(
+          dbAfterUpgrade
+            .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
+            .get(),
+        ).toEqual({ value: 1 });
+        expect(
+          dbAfterUpgrade
+            .prepare("SELECT value FROM pdpp_write_clock WHERE id = 1")
+            .get(),
+        ).toEqual(before);
+        expect(upgraded.getRecord("owner", "messages", "a")?.version).toBe(1);
+      } finally {
+        upgraded?.close();
+        historical?.close();
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
     it("tracks a schema version and does not re-run migrations on reopen", () => {
       store.putBlobMeta({
         blobId: "blob_y",
@@ -884,6 +1036,34 @@ describe("sqlite record store", () => {
         .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
         .get() as { version: number };
       expect(version.version).toBeGreaterThan(0);
+    });
+
+    it("creates the v10 stream-summary index when upgrading a v9 database without it", () => {
+      db.exec("DROP INDEX idx_pdpp_records_live_instance_stream_emitted_at");
+      db.prepare(
+        "UPDATE pdpp_schema_version SET version = 9 WHERE id = 1",
+      ).run();
+
+      const before = db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        )
+        .get("idx_pdpp_records_live_instance_stream_emitted_at");
+      expect(before).toBeUndefined();
+
+      const upgraded = createSqliteRecordStore(db);
+      const after = db
+        .prepare(
+          "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+        )
+        .get("idx_pdpp_records_live_instance_stream_emitted_at");
+      const version = db
+        .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
+        .get() as { version: number };
+
+      expect(after).toBeDefined();
+      expect(version.version).toBeGreaterThanOrEqual(10);
+      upgraded.close();
     });
 
     it("persists the store epoch across reopen", () => {

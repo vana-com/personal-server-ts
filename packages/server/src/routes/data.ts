@@ -311,6 +311,36 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     ),
   );
 
+  app.get("/:scope/takeover", (c) =>
+    importRoute(c, async () => {
+      const parsed = parseDataScopeContract(c.req.param("scope"));
+      if (!parsed.ok)
+        throw new ScopeImportError(400, "INVALID_SCOPE", parsed.body.message);
+      await auth.authorizeOwnerScope({
+        request: c.req.raw,
+        scope: parsed.scope,
+      });
+      return {
+        scope: parsed.scope,
+        reset: deps.legacyScopeView?.isReset(parsed.scope) ?? false,
+        verdicts: deps.legacyScopeView?.verdictFor(parsed.scope) ?? [],
+      };
+    }),
+  );
+  app.delete("/:scope/takeover", (c) =>
+    importRoute(c, async () => {
+      const parsed = parseDataScopeContract(c.req.param("scope"));
+      if (!parsed.ok)
+        throw new ScopeImportError(400, "INVALID_SCOPE", parsed.body.message);
+      await auth.authorizeOwnerScope({
+        request: c.req.raw,
+        scope: parsed.scope,
+      });
+      deps.legacyScopeView?.resetTakeover(parsed.scope);
+      return { scope: parsed.scope, reset: true };
+    }),
+  );
+
   const legacyWriteBodyLimit = createBodyLimit(DATA_INGEST_MAX_SIZE);
   app.use("/:scope", (c, next) => {
     if (c.req.path.split("/").includes("imports")) return next();

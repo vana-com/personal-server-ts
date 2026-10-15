@@ -145,6 +145,10 @@ export interface CanonicalReadDiagnostics {
 export interface CanonicalLegacyReadOk {
   ok: true;
   envelope: DataFileEnvelope;
+  /** Conservative collection horizon for each input stream in this snapshot. */
+  streamCollectionTimes?: Record<string, string | null>;
+  /** Current accepted P7 completion time for each input stream, if any. */
+  streamCompletionTimes?: Record<string, string | null>;
   /**
    * Opaque view revision: a hash of the contract version, connection,
    * method, generation, declaration, per-stream row horizons in served
@@ -207,6 +211,11 @@ export type CanonicalLegacyReadFailure =
       detail: string;
     }
   | {
+      status: "unavailable";
+      reason: "missing_raw_blob";
+      recordCount: number;
+    }
+  | {
       status: "incomplete";
       reason: "projection_rejected";
       error: ProjectionError;
@@ -246,6 +255,12 @@ export interface ReadCanonicalLegacyScopeInput {
   confirmSelection?: () => boolean;
   /** Require a matching completion receipt for every stream in the row snapshot. */
   requireCompletionReceipts?: boolean;
+  /** A parity caller can compare an unproven empty stream with the actual legacy body. */
+  allowUnprovenEmptyStreams?: boolean;
+  /** Include the per-stream time evidence used by the parity takeover caller. */
+  includeStreamTimes?: boolean;
+  /** Require raw Claude envelopes when deciding whether a legacy head is covered. */
+  requireClaudeRawBlobs?: boolean;
   /** Rows per store page. Tests lower it to force several pages. */
   pageSize?: number;
   /** @internal Tests may lower the blob budget; never raises the 64 MiB limit. */
@@ -343,6 +358,7 @@ export async function readCanonicalLegacyScope(
             ? Math.min(MAX_BLOB_READ_BYTES, input.blobByteBudget!)
             : MAX_BLOB_READ_BYTES,
           input.requireCompletionReceipts === true,
+          input.allowUnprovenEmptyStreams === true,
         ),
   );
   if (!snapshot.ok) return snapshot.result;
@@ -353,6 +369,8 @@ export async function readCanonicalLegacyScope(
     streams,
     binding,
     profileKey,
+    includeStreamTimes: input.includeStreamTimes === true,
+    requireClaudeRawBlobs: input.requireClaudeRawBlobs === true,
     ...snapshot,
   });
 }
@@ -382,6 +400,7 @@ function collectSnapshot(
   pageSize: number,
   blobByteBudget: number,
   requireCompletionReceipts: boolean,
+  allowUnprovenEmptyStreams: boolean,
 ): Snapshot | { ok: false; result: CanonicalLegacyReadResult } {
   const { instance } = selection;
   const binding = store.getInstanceBinding(instance);
@@ -443,7 +462,8 @@ function collectSnapshot(
     (stream) =>
       !completions.has(stream) &&
       (requireCompletionReceipts ||
-        (rowsByStream.get(stream)?.length ?? 0) === 0),
+        (!allowUnprovenEmptyStreams &&
+          (rowsByStream.get(stream)?.length ?? 0) === 0)),
   );
   if (unprovenStreams.length > 0) {
     return {
@@ -594,6 +614,8 @@ interface ProjectInput extends Snapshot {
   streams: string[];
   binding: LegacyScopeBinding;
   profileKey: string | undefined;
+  includeStreamTimes: boolean;
+  requireClaudeRawBlobs: boolean;
 }
 
 async function projectSnapshot(
@@ -618,6 +640,19 @@ async function projectSnapshot(
   const canExpandClaude =
     selection.sourceId === CLAUDE_SOURCE_ID &&
     (scope === "claude.conversations" || scope === "claude.projects");
+  if (canExpandClaude && input.requireClaudeRawBlobs) {
+    const parentStream =
+      scope === "claude.conversations" ? "conversations" : "projects";
+    const missingRawBlobCount = (rowsByStream.get(parentStream) ?? []).filter(
+      (row) => !hasBlobRef(row),
+    ).length;
+    if (missingRawBlobCount > 0) {
+      return unavailable({
+        reason: "missing_raw_blob",
+        recordCount: missingRawBlobCount,
+      });
+    }
+  }
   for (const stream of streams) {
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (
@@ -760,6 +795,39 @@ async function projectSnapshot(
       collectedAt,
       data: projected.payload,
     },
+    ...(input.includeStreamTimes
+      ? {
+          streamCollectionTimes: Object.fromEntries(
+            streams.map((stream) => {
+              const receipt = completions.get(stream);
+              if (receipt) return [stream, receipt.sourceCollectedAt];
+              const rows = rowsByStream.get(stream) ?? [];
+              const times = rows.map((row) => Date.parse(row.emittedAt));
+              if (
+                times.length === 0 ||
+                times.some((time) => !Number.isFinite(time))
+              ) {
+                return [stream, null];
+              }
+              return [
+                stream,
+                new Date(
+                  times.reduce(
+                    (oldest, time) => Math.min(oldest, time),
+                    Number.POSITIVE_INFINITY,
+                  ),
+                ).toISOString(),
+              ];
+            }),
+          ),
+          streamCompletionTimes: Object.fromEntries(
+            streams.map((stream) => [
+              stream,
+              completions.get(stream)?.sourceCollectedAt ?? null,
+            ]),
+          ),
+        }
+      : {}),
     revision,
     complete:
       omissions.length === 0 &&

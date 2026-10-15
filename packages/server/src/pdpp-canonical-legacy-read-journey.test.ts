@@ -6,9 +6,9 @@
  * legacy files written through POST /v1/data, and the legacy read auth
  * (owner control-plane token, and a builder's Web3Signed legacy grant).
  *
- * A stored legacy head remains latest until a complete canonical projection
- * with matching completion receipts records takeover. After takeover, a
- * canonical read that cannot be served is a typed refusal, not the file.
+ * A stored legacy head remains latest until its canonical projection covers
+ * it. A regression against a covered head refuses; a newer legacy head is
+ * checked again and may explicitly return to the file.
  */
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -247,6 +247,26 @@ async function replace(
   expect(response.status).toBe(200);
 }
 
+async function upsert(token: string, data: Record<string, unknown>) {
+  const response = await ctx!.app.request(
+    "/v1/streams/activity/records/ingest?method=oura&binding_generation=1",
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        instance: accountOne,
+        key: String(data.id),
+        data,
+        emitted_at: "2026-09-10T07:00:00Z",
+      }),
+    },
+  );
+  expect(response.status).toBe(200);
+}
+
 /** A legacy file written the way older collectors write one. */
 async function legacyWrite(scope: string, data: Record<string, unknown>) {
   const response = await ctx!.app.request(`/v1/data/${scope}`, {
@@ -296,6 +316,7 @@ const day = (id: string, date: string, score = 80) => ({
 });
 
 const STALE = { days: [{ id: "stale-legacy", day: "2026-01-01", score: 1 }] };
+const COVERED_A1 = { days: [day("a1", "2026-09-01")] };
 
 function ids(text: string): string[] {
   const body = JSON.parse(text) as { data: { days: { id: string }[] } };
@@ -319,6 +340,216 @@ afterEach(async () => {
 });
 
 describe("GET /v1/data/:scope for a bound connector scope", () => {
+  it("accepts mutable value drift from a newer canonical collection", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-03-01T00:00:00Z"));
+      await legacyWrite("oura.activity", {
+        days: [day("a1", "2026-09-01", 80)],
+      });
+      vi.setSystemTime(new Date("2026-10-14T00:00:00Z"));
+      const token = await ownerPdppToken();
+      await replace(
+        token,
+        "activity",
+        [day("a1", "2026-09-01", 95)],
+        "2026-09-10T06:00:00Z",
+      );
+      const read = await ownerGet("/v1/data/oura.activity");
+      expect(read.dataSource).toBe("canonical");
+      expect(JSON.parse(read.text).data.days[0].score).toBe(95);
+      expect(
+        JSON.parse((await ownerGet("/v1/data/oura.activity/takeover")).text)
+          .verdicts,
+      ).toMatchObject([
+        { comparisonCase: "canonical_newer", verdict: "covered" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts a missing legacy entity only with a newer completion proof", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-03-01T00:00:00Z"));
+      await legacyWrite("oura.activity", {
+        days: [day("deleted", "2026-02-01")],
+      });
+      vi.setSystemTime(new Date("2026-10-14T00:00:00Z"));
+      const token = await ownerPdppToken();
+      await upsert(token, day("a1", "2026-09-01"));
+      expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+        "legacy",
+      );
+      await replace(
+        token,
+        "activity",
+        [day("a1", "2026-09-01")],
+        "2026-09-10T06:00:00Z",
+      );
+      const read = await ownerGet("/v1/data/oura.activity");
+      expect(read.dataSource).toBe("canonical");
+      expect(ids(read.text)).toEqual(["a1"]);
+      expect(
+        JSON.parse((await ownerGet("/v1/data/oura.activity/takeover")).text)
+          .verdicts,
+      ).toMatchObject([
+        {
+          comparisonCase: "canonical_newer",
+          verdict: "covered",
+          reasonCounts: { missing_entity: 1 },
+        },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("switches an unproven upsert to canonical when it covers the latest legacy body", async () => {
+    await legacyWrite("oura.activity", { days: [day("a1", "2026-09-01")] });
+    const token = await ownerPdppToken();
+    await upsert(token, day("a1", "2026-09-01"));
+    const read = await ownerGet("/v1/data/oura.activity");
+    expect(read.status).toBe(200);
+    expect(read.dataSource).toBe("canonical");
+    expect(ids(read.text)).toEqual(["a1"]);
+  });
+
+  it("rechecks a newer legacy version and records either continued coverage or file fallback", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-10-14T22:00:00Z"));
+      await legacyWrite("oura.activity", { days: [day("a1", "2026-09-01")] });
+      const token = await ownerPdppToken();
+      await replace(
+        token,
+        "activity",
+        [day("a1", "2026-09-01"), day("a2", "2026-09-02")],
+        "2026-09-10T06:00:00Z",
+      );
+      expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+        "canonical",
+      );
+
+      vi.setSystemTime(new Date("2026-10-14T22:00:01Z"));
+      await legacyWrite("oura.activity", { days: [day("a1", "2026-09-01")] });
+      expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+        "canonical",
+      );
+
+      vi.setSystemTime(new Date("2026-10-14T22:00:02Z"));
+      await legacyWrite("oura.activity", {
+        days: [day("a1", "2026-09-01"), day("missing", "2026-09-03")],
+      });
+      const fallback = await ownerGet("/v1/data/oura.activity");
+      expect(fallback.dataSource).toBe("legacy");
+      expect(ids(fallback.text)).toEqual(["a1", "missing"]);
+      const verdict = await ownerGet("/v1/data/oura.activity/takeover");
+      expect(verdict.status).toBe(200);
+      expect(JSON.parse(verdict.text).verdicts).toMatchObject([
+        {
+          verdict: "not_covered",
+          reason: { reason: "missing_entity", missingEntityCount: 1 },
+        },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 20000);
+
+  it("lets the owner reset takeover without deleting canonical rows", async () => {
+    await legacyWrite("oura.activity", { days: [day("a1", "2026-09-01")] });
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+    expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+      "canonical",
+    );
+    const reset = await ctx!.app.request("/v1/data/oura.activity/takeover", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(reset.status).toBe(200);
+    expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+      "legacy",
+    );
+    expect(
+      JSON.parse((await ownerGet("/v1/data/oura.activity/takeover")).text),
+    ).toMatchObject({ reset: true, verdicts: [] });
+    const records = await ctx!.app.request("/v1/streams/activity/records", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(records.status).toBe(200);
+    expect(await records.text()).toContain("a1");
+  });
+
+  it("keeps a mismatched legacy field and exposes only its path in the verdict", async () => {
+    await legacyWrite("oura.activity", {
+      days: [day("private-a1", "2026-09-01", 81)],
+    });
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("private-a1", "2026-09-01", 80)],
+      "2026-09-10T06:00:00Z",
+    );
+    expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+      "legacy",
+    );
+    const diagnostics = (await ownerGet("/v1/data/oura.activity/takeover"))
+      .text;
+    expect(JSON.parse(diagnostics).verdicts).toMatchObject([
+      {
+        verdict: "not_covered",
+        reason: {
+          reason: "field_mismatch",
+          mismatchedFieldPaths: ["$.days[0].score"],
+        },
+      },
+    ]);
+    expect(diagnostics).not.toContain("private-a1");
+  });
+
+  it("keeps existing rows on an unproven upsert and deletes only on proven replace", async () => {
+    await legacyWrite("oura.activity", { days: [day("a1", "2026-09-01")] });
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+    expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+      "canonical",
+    );
+    await upsert(token, day("a2", "2026-09-02"));
+    const afterUpsert = await ownerGet("/v1/data/oura.activity");
+    expect(afterUpsert.dataSource).toBe("canonical");
+    expect(ids(afterUpsert.text)).toEqual(["a1", "a2"]);
+
+    await replace(
+      token,
+      "activity",
+      [day("a2", "2026-09-02")],
+      "2026-09-11T06:00:00Z",
+    );
+    const native = await ctx!.app.request("/v1/streams/activity/records", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(native.status).toBe(200);
+    const nativeText = await native.text();
+    expect(nativeText).toContain("a2");
+    expect(nativeText).not.toContain('"a1"');
+    const read = await ownerGet("/v1/data/oura.activity");
+    expect(read.status).toBe(503);
+    expect(read.text).not.toContain("stale-legacy");
+  });
   it.each(["writer lock", "persistent insert trigger"])(
     "retains a failed deletion observation through offline reads and file re-add (%s)",
     async (failureMode) => {
@@ -606,8 +837,8 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     ).toEqual(["notes.manual", "oura.readiness"]);
   });
 
-  it("serves the canonical rows, not a stale legacy file, to a legacy grant and to the owner", async () => {
-    await legacyWrite("oura.activity", STALE);
+  it("serves canonical rows to a legacy grant and the owner after coverage", async () => {
+    await legacyWrite("oura.activity", COVERED_A1);
     const token = await ownerPdppToken();
     await replace(
       token,
@@ -619,7 +850,6 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     const asBuilder = await builderGet("oura.activity");
     expect(asBuilder.status).toBe(200);
     expect(ids(asBuilder.text)).toEqual(["a1", "a2"]);
-    expect(asBuilder.text).not.toContain("stale-legacy");
 
     const asOwner = await ownerGet("/v1/data/oura.activity");
     expect(asOwner.status).toBe(200);
@@ -650,7 +880,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
   });
 
   it("reflects a later repair and keeps the revision stable while nothing changes", async () => {
-    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.activity", { days: [day("a1", "2026-09-01", 10)] });
     const token = await ownerPdppToken();
     await replace(
       token,
@@ -666,7 +896,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     await replace(
       token,
       "activity",
-      [day("a1", "2026-09-01", 90), day("a3", "2026-09-03")],
+      [day("a1", "2026-09-01", 10), day("a3", "2026-09-03")],
       "2026-09-11T06:00:00Z",
     );
     const repaired = await ownerGet("/v1/data/oura.activity");
@@ -678,15 +908,15 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     };
     expect(body.collectedAt).toBe("2026-09-11T06:00:00.000Z");
     expect(body.data.days.map((d) => [d.id, d.score])).toEqual([
-      ["a1", 90],
+      ["a1", 10],
       ["a3", 80],
     ]);
   });
 
-  it("serves a known-empty stream as empty, and refuses a collected stream whose rows cannot be proven current", async () => {
-    await legacyWrite("oura.activity", STALE);
+  it("serves a covered empty stream and refuses a later loss of legacy data", async () => {
+    await legacyWrite("oura.activity", { days: [] });
     await legacyWrite("oura.readiness", {
-      readiness: [{ id: "stale-legacy", day: "2026-01-01", score: 1 }],
+      days: [{ id: "r1", day: "2026-09-01", score: 70 }],
     });
     const token = await ownerPdppToken();
     await replace(token, "activity", [], "2026-09-10T06:00:00Z");
@@ -703,7 +933,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     // do not make it canonical.
     const uncollected = await ownerGet("/v1/data/oura.readiness");
     expect(uncollected.status).toBe(200);
-    expect(uncollected.text).toContain("stale-legacy");
+    expect(uncollected.text).toContain('"r1"');
 
     // After a complete canonical read records takeover, an unproven empty
     // stream must refuse rather than resurrect the superseded legacy file.
@@ -731,10 +961,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(unproven.status).toBe(503);
     expect(JSON.parse(unproven.text)).toMatchObject({
       error: "CANONICAL_VIEW_UNAVAILABLE",
-      reason: "stream_completion_unknown",
-      streams: ["readiness"],
+      reason: "canonical_view_incomplete",
     });
-    expect(unproven.text).not.toContain("stale-legacy");
+    expect(unproven.text).not.toContain('"r1"');
   });
 
   it("refuses two accounts with no trusted choice and leaks neither", async () => {
@@ -895,7 +1124,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
   });
 
   it("does not resurrect the legacy file after a complete canonical takeover", async () => {
-    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.activity", COVERED_A1);
     const token = await ownerPdppToken();
     await replace(
       token,
@@ -945,7 +1174,7 @@ describe("paths the canonical view leaves to existing storage", () => {
   });
 
   it("serves an explicitly requested historical version and manual scopes from storage", async () => {
-    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.activity", COVERED_A1);
     const legacyEntryBefore = {
       ...ctx!.indexManager.findLatestByScope("oura.activity")!,
     };
@@ -978,7 +1207,7 @@ describe("paths the canonical view leaves to existing storage", () => {
     );
     expect(historical.status).toBe(200);
     expect(historical.dataSource).toBe("legacy");
-    expect(ids(historical.text)).toEqual(["stale-legacy"]);
+    expect(ids(historical.text)).toEqual(["a1"]);
 
     const manual = await ownerGet("/v1/data/notes.manual");
     expect(manual.status).toBe(200);
@@ -1022,7 +1251,7 @@ describe("paths the canonical view leaves to existing storage", () => {
 
 describe("GET /v1/data listing", () => {
   it("lists a bound scope with canonical freshness, never the legacy head's", async () => {
-    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.activity", COVERED_A1);
     await legacyWrite("notes.manual", { text: "kept" });
     const token = await ownerPdppToken();
     await replace(
@@ -1226,7 +1455,7 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
   it.each(["at=", "fileId=", "at=&fileId="])(
     "treats an empty selector (%s) as the latest read",
     async (query) => {
-      await legacyWrite("oura.activity", STALE);
+      await legacyWrite("oura.activity", COVERED_A1);
       await collectActivity();
       const read = await ownerGet(`/v1/data/oura.activity?${query}`);
       expect(read.status).toBe(200);
@@ -1329,7 +1558,7 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
   it("refuses a charged read of a canonical scope before the challenge, so no legacy version is attested", async () => {
     await ctx!.cleanup();
     ctx = await boot("oura", { payment: true });
-    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.activity", COVERED_A1);
     await legacyWrite("oura.readiness", { readiness: [] });
     for (const scope of ["oura.activity", "oura.readiness"]) {
       const entry = ctx!.indexManager.findLatestByScope(scope)!;
@@ -1349,7 +1578,7 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
           reason: "paid_read_unsupported",
         });
         expect(text).not.toContain("accessRecord");
-        expect(text).not.toContain("stale-legacy");
+        expect(text).not.toContain('"a1"');
       }
       expect(pay).not.toHaveBeenCalled();
 
@@ -1375,7 +1604,7 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
   });
 
   it("keeps refusing a canonical scope after a restart with PDPP disabled", async () => {
-    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.activity", COVERED_A1);
     await legacyWrite("oura.readiness", { readiness: [] });
     await legacyWrite("notes.manual", { text: "kept" });
     await collectActivity();
@@ -1410,7 +1639,7 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
   });
 
   it("refuses a local DELETE of a canonical scope and changes nothing", async () => {
-    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.activity", COVERED_A1);
     await legacyWrite("notes.manual", { text: "kept" });
     await collectActivity();
     const before = ctx!.indexManager.findLatestByScope("oura.activity");
@@ -1486,7 +1715,7 @@ describe("configured methods that share one public source", () => {
         ],
       }),
     });
-    await legacyWrite("github.profile", { username: "stale-legacy" });
+    await legacyWrite("github.profile", { username: "current-user" });
     const token = await registerTestConnection(
       ctx.app,
       ctx.devToken!,
@@ -1531,7 +1760,7 @@ describe("configured methods that share one public source", () => {
     });
     // The browser profile drops the PDPP runtime key from the legacy body.
     expect(body.data).not.toHaveProperty("id");
-    expect(read.text).not.toContain("stale-legacy");
+    expect(read.dataSource).toBe("canonical");
   });
 
   it("serves an Oura scope from an oura-browser connection on source oura", async () => {
@@ -1542,7 +1771,9 @@ describe("configured methods that share one public source", () => {
     await rm(tempDir, { recursive: true, force: true });
     await mkdir(tempDir);
     ctx = await boot("oura-browser");
-    await legacyWrite("oura.activity", STALE);
+    await legacyWrite("oura.activity", {
+      days: [{ id: "b1", day: "2026-09-01", score: 80 }],
+    });
     const token = await registerTestConnection(
       ctx.app,
       ctx.devToken!,

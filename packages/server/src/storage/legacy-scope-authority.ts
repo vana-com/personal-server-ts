@@ -2,7 +2,57 @@ import type { Database } from "better-sqlite3";
 import type {
   LegacyScopeAuthority,
   LegacyScopeHead,
+  LegacyCoverageVerdict,
 } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
+
+interface VerdictRow {
+  scope: string;
+  instance: string;
+  generation: number;
+  legacy_version_id: number;
+  canonical_cursor: string;
+  verdict: "covered" | "not_covered";
+  comparison_case: "same_time" | "canonical_newer";
+  reason_counts_json: string;
+  applied_exceptions_json: string;
+  reason_json: string | null;
+  legacy_bytes: number;
+  canonical_bytes: number;
+  byte_delta: number;
+  evaluated_at: string;
+}
+
+function reasonForRow(row: VerdictRow) {
+  return row.reason_json
+    ? (JSON.parse(row.reason_json) as {
+        reason: string;
+        missingEntityCount: number;
+        mismatchedFieldPaths: string[];
+      })
+    : null;
+}
+
+function coverageFromRow(row: VerdictRow): LegacyCoverageVerdict {
+  const reason = reasonForRow(row);
+  return {
+    covered: row.verdict === "covered",
+    comparisonCase: row.comparison_case,
+    reasonCounts: JSON.parse(
+      row.reason_counts_json,
+    ) as LegacyCoverageVerdict["reasonCounts"],
+    appliedExceptions: JSON.parse(
+      row.applied_exceptions_json,
+    ) as LegacyCoverageVerdict["appliedExceptions"],
+    reason: (row.verdict === "covered"
+      ? null
+      : (reason?.reason ?? null)) as LegacyCoverageVerdict["reason"],
+    missingEntityCount: reason?.missingEntityCount ?? 0,
+    mismatchedFieldPaths: reason?.mismatchedFieldPaths ?? [],
+    legacyBytes: row.legacy_bytes,
+    canonicalBytes: row.canonical_bytes,
+    byteDelta: row.byte_delta,
+  };
+}
 
 /**
  * Registry facts for the legacy scope view, plus its durable takeover ledger.
@@ -19,6 +69,11 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
     db
       .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(name) !== undefined;
+  const isReset = (scope: string) =>
+    hasTable("legacy_scope_takeover_resets") &&
+    db
+      .prepare("SELECT 1 FROM legacy_scope_takeover_resets WHERE scope = ?")
+      .get(scope) !== undefined;
 
   return {
     listMethodConnections(methods) {
@@ -73,28 +128,235 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
 
     readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
 
-    hasTakeover(scope) {
+    writeClock() {
+      if (!hasTable("pdpp_write_clock")) return 0;
+      return (
+        (
+          db
+            .prepare("SELECT value FROM pdpp_write_clock WHERE id = 1")
+            .get() as { value: number } | undefined
+        )?.value ?? 0
+      );
+    },
+
+    arrivalRevision() {
+      if (!hasTable("pdpp_record_arrival_clock")) return 0;
+      return (
+        (
+          db
+            .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
+            .get() as { value: number } | undefined
+        )?.value ?? 0
+      );
+    },
+
+    hasTakeover(scope, instance, generation) {
+      const instanceFilter =
+        instance === undefined
+          ? ""
+          : generation === undefined
+            ? " AND (instance = ? OR instance = '')"
+            : " AND ((instance = ? AND generation = ?) OR instance = '')";
+      const params =
+        instance === undefined
+          ? [scope]
+          : generation === undefined
+            ? [scope, instance]
+            : [scope, instance, generation];
       return (
         hasTable("legacy_scope_takeovers") &&
         db
-          .prepare("SELECT 1 FROM legacy_scope_takeovers WHERE scope = ?")
-          .get(scope) !== undefined
+          .prepare(
+            `SELECT 1 FROM legacy_scope_takeovers WHERE scope = ?${instanceFilter}`,
+          )
+          .get(...params) !== undefined
       );
+    },
+
+    hasCoveredHead(scope, head, instance) {
+      const instanceFilter =
+        instance === undefined ? "" : " AND (instance = ? OR instance = '')";
+      const params =
+        instance === undefined
+          ? [scope, head.path]
+          : [scope, head.path, instance];
+      return (
+        hasTable("legacy_scope_takeovers") &&
+        db
+          .prepare(
+            `SELECT 1 FROM legacy_scope_takeovers WHERE scope = ? AND superseded_path = ?${instanceFilter}`,
+          )
+          .get(...params) !== undefined
+      );
+    },
+
+    isReset(scope) {
+      return isReset(scope);
+    },
+
+    cachedVerdict(
+      scope,
+      instance,
+      generation,
+      legacyVersionId,
+      canonicalCursor,
+    ) {
+      if (!hasTable("legacy_scope_takeover_verdicts")) return null;
+      const row = db
+        .prepare(
+          `SELECT * FROM legacy_scope_takeover_verdicts
+        WHERE scope = ? AND instance = ? AND generation = ? AND legacy_version_id = ? AND canonical_cursor = ?`,
+        )
+        .get(scope, instance, generation, legacyVersionId, canonicalCursor) as
+        VerdictRow | undefined;
+      return row ? coverageFromRow(row) : null;
+    },
+
+    verdictFor(scope) {
+      if (!hasTable("legacy_scope_takeover_verdicts")) return [];
+      const rows = db
+        .prepare(
+          "SELECT * FROM legacy_scope_takeover_verdicts WHERE scope = ? ORDER BY instance",
+        )
+        .all(scope) as VerdictRow[];
+      return rows.map((row) => ({
+        scope: row.scope,
+        instance: row.instance,
+        generation: row.generation,
+        legacyVersionId: row.legacy_version_id,
+        canonicalCursor: row.canonical_cursor,
+        verdict: row.verdict,
+        comparisonCase: row.comparison_case,
+        reasonCounts: JSON.parse(row.reason_counts_json) as Record<
+          string,
+          number
+        >,
+        appliedExceptions: JSON.parse(
+          row.applied_exceptions_json,
+        ) as LegacyCoverageVerdict["appliedExceptions"],
+        reason: reasonForRow(row),
+        legacyBytes: row.legacy_bytes,
+        canonicalBytes: row.canonical_bytes,
+        byteDelta: row.byte_delta,
+        evaluatedAt: row.evaluated_at,
+      }));
+    },
+
+    resetTakeover(scope) {
+      db.transaction(() => {
+        if (hasTable("legacy_scope_takeover_verdicts"))
+          db.prepare(
+            "DELETE FROM legacy_scope_takeover_verdicts WHERE scope = ?",
+          ).run(scope);
+        if (hasTable("legacy_scope_takeovers"))
+          db.prepare("DELETE FROM legacy_scope_takeovers WHERE scope = ?").run(
+            scope,
+          );
+        if (hasTable("legacy_scope_takeover_resets"))
+          db.prepare(
+            "INSERT OR REPLACE INTO legacy_scope_takeover_resets (scope) VALUES (?)",
+          ).run(scope);
+      }).immediate();
     },
 
     eligibleLegacyHead(scope) {
       return readEligibleLegacyHead(scope);
     },
 
-    confirmRead(scope, expectedHead, selectionIsCurrent) {
+    confirmRead(scope, expectedHead, selectionIsCurrent, verdict) {
       if (!hasTable("data_files")) return expectedHead === null;
       const validate = () => {
+        if (isReset(scope)) return false;
         const currentHead = readEligibleLegacyHead(scope);
         if (!sameHead(currentHead, expectedHead) || !selectionIsCurrent()) {
           return false;
         }
+        if (
+          verdict &&
+          verdict.writeClock !==
+            (
+              db
+                .prepare("SELECT value FROM pdpp_write_clock WHERE id = 1")
+                .get() as { value: number }
+            ).value
+        )
+          return false;
+        if (
+          verdict &&
+          verdict.arrivalRevision !==
+            (
+              db
+                .prepare(
+                  "SELECT value FROM pdpp_record_arrival_clock WHERE id = 1",
+                )
+                .get() as { value: number }
+            ).value
+        )
+          return false;
         if (expectedHead === null) return true;
+        if (verdict?.cached) return true;
         if (!hasTable("legacy_scope_takeovers")) return false;
+
+        if (verdict) {
+          if (!hasTable("legacy_scope_takeover_verdicts")) return false;
+          const coverage = verdict.coverage;
+          db.prepare(
+            `INSERT INTO legacy_scope_takeover_verdicts
+            (scope, instance, generation, legacy_version_id, canonical_cursor, verdict, comparison_case, reason_counts_json, applied_exceptions_json, reason_json,
+             legacy_bytes, canonical_bytes, byte_delta)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope, instance, generation) DO UPDATE SET
+              legacy_version_id = excluded.legacy_version_id,
+              canonical_cursor = excluded.canonical_cursor,
+              verdict = excluded.verdict,
+              comparison_case = excluded.comparison_case,
+              reason_counts_json = excluded.reason_counts_json,
+              applied_exceptions_json = excluded.applied_exceptions_json,
+              reason_json = excluded.reason_json,
+              legacy_bytes = excluded.legacy_bytes,
+              canonical_bytes = excluded.canonical_bytes,
+              byte_delta = excluded.byte_delta,
+              evaluated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          `,
+          ).run(
+            scope,
+            verdict.instance,
+            verdict.generation,
+            expectedHead.id,
+            verdict.canonicalCursor,
+            coverage.covered ? "covered" : "not_covered",
+            coverage.comparisonCase,
+            JSON.stringify(coverage.reasonCounts),
+            JSON.stringify(coverage.appliedExceptions),
+            coverage.covered && coverage.missingEntityCount === 0
+              ? null
+              : JSON.stringify({
+                  reason: coverage.covered
+                    ? "proven_deletion"
+                    : coverage.reason,
+                  missingEntityCount: coverage.missingEntityCount,
+                  mismatchedFieldPaths: coverage.mismatchedFieldPaths,
+                }),
+            coverage.legacyBytes,
+            coverage.canonicalBytes,
+            coverage.byteDelta,
+          );
+          if (!coverage.covered) return true;
+          db.prepare(
+            `INSERT OR IGNORE INTO legacy_scope_takeovers
+            (scope, instance, generation, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            scope,
+            verdict.instance,
+            verdict.generation,
+            expectedHead.version,
+            expectedHead.casRevision,
+            expectedHead.collectedAt,
+            expectedHead.path,
+          );
+          return true;
+        }
 
         // A non-null producer is explicit ownership evidence from another
         // legacy pipeline. Null covers manual and old connector files.
@@ -114,7 +376,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
         return true;
       };
       try {
-        return expectedHead === null
+        return expectedHead === null || verdict?.cached
           ? db.transaction(validate).deferred()
           : db.transaction(validate).immediate();
       } catch (error) {

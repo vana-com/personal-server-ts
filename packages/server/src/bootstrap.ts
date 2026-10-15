@@ -10,10 +10,21 @@ import {
 import { createRequire } from "node:module";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { privateKeyToAccount } from "viem/accounts";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
+
+function takeoverLimit(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative finite number`);
+  }
+  return value;
+}
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
@@ -929,6 +940,24 @@ export async function createServer(
       records: pdppRecords?.bindingStore,
       configuredMethods: (sourceId) =>
         pdppRecords?.configuredMethods.get(sourceId) ?? [],
+      readLegacyHead: async (head) => {
+        if (
+          head.path.startsWith("/") ||
+          head.path.split(/[\\/]/).includes("..")
+        ) {
+          throw new Error("Unsafe indexed legacy path");
+        }
+        return DataFileEnvelopeSchema.passthrough().parse(
+          JSON.parse(await readFile(join(dataDir, head.path), "utf8")),
+        );
+      },
+      coverageThresholds: {
+        maxPayloadRatio: takeoverLimit("PDPP_TAKEOVER_MAX_PAYLOAD_RATIO", 1.5),
+        maxExtraBytes: takeoverLimit(
+          "PDPP_TAKEOVER_MAX_EXTRA_BYTES",
+          256 * 1024,
+        ),
+      },
     }),
     scopeDeletions,
     cloudMode,
