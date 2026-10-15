@@ -4,6 +4,7 @@ import type {
   ProjectPdppRecordsOptions,
   ProjectionDiagnostic,
   ProjectionErr,
+  ProjectionOmission,
   ProjectionResult,
 } from "./types.js";
 import type { LegacyScopeBindingProvenance } from "./provenance.js";
@@ -202,11 +203,12 @@ export function isCalendarDay(value: unknown): value is string {
 }
 
 /**
- * The legacy Oura daily schemas require `score`, typed integer 0-100. The
- * OpenPet consumer decodes this field as Go `int`, so null and absent scores
- * cannot be represented as valid array entries and are dropped.
+ * The legacy Oura daily schemas require `score`, typed integer 0-100 or null.
+ * OpenPet decodes it as `*int`, so null is valid while fractional numbers are
+ * not. Rounding happens at the projection boundary.
  */
-function isOuraScore(value: unknown): value is number {
+function isOuraScore(value: unknown): value is number | null {
+  if (value === null) return true;
   return (
     typeof value === "number" &&
     Number.isFinite(value) &&
@@ -217,7 +219,8 @@ function isOuraScore(value: unknown): value is number {
 
 /**
  * Oura rows the legacy schema cannot hold are left out and counted, never
- * emitted with a null or impossible day, or without the required score.
+ * emitted with an impossible day or without the required score. A null score
+ * is valid under the frozen legacy schema.
  * `scoreField` names the source field that becomes the legacy `score`
  * (per row, or undefined for a row that produces no daily score). The
  * caller decides what an all-dropped stream means.
@@ -3404,15 +3407,24 @@ const ouraSleep: LegacyScopeBinding = {
   project(records, options): ProjectionResult {
     const guard = requireStreams("oura.sleep", options, ["sleep"]);
     if (guard) return guard;
+    const sourceRows = byStream(records, "sleep");
     const { rows, diagnostics } = partitionOuraRows(
       "oura.sleep",
       "sleep",
-      byStream(records, "sleep"),
+      sourceRows,
       () => "sleep_score",
     );
+    const { rows: periodRows } = partitionOuraRows(
+      "oura.sleep",
+      "sleep",
+      sourceRows,
+      () => undefined,
+    );
+    const projectionOmissions = periodRows.flatMap(ouraSleepPeriodOmissions);
     return {
       ok: true,
       ...withDiagnostics(diagnostics),
+      ...(projectionOmissions.length > 0 ? { projectionOmissions } : {}),
       payload: {
         dailyScores: rows.map((r) => ({
           id: r.id,
@@ -3423,7 +3435,7 @@ const ouraSleep: LegacyScopeBinding = {
             OURA_SLEEP_CONTRIBUTOR_INTEGERS,
           ),
         })),
-        sleepPeriods: rows.map(ouraSleepPeriod),
+        sleepPeriods: periodRows.map(ouraSleepPeriod),
       },
     };
   },
@@ -3439,8 +3451,12 @@ export function ouraSleepPeriod(
     ...(r.type === "long_sleep" || r.type === "short_sleep" || r.type === "rest"
       ? { type: r.type }
       : {}),
-    ...ifDefined(r, "bedtime_start", "bedtimeStart"),
-    ...ifDefined(r, "bedtime_end", "bedtimeEnd"),
+    ...(r.bedtime_start === null
+      ? {}
+      : ifDefined(r, "bedtime_start", "bedtimeStart")),
+    ...(r.bedtime_end === null
+      ? {}
+      : ifDefined(r, "bedtime_end", "bedtimeEnd")),
     ...ifDefinedOuraInteger(r, "total_sleep_duration", "totalSleepDuration"),
     ...ifDefinedOuraInteger(r, "time_in_bed", "timeInBed"),
     ...ifDefinedOuraInteger(r, "deep_sleep_duration", "deepSleepDuration"),
@@ -3454,6 +3470,44 @@ export function ouraSleepPeriod(
     ...ifDefined(r, "average_breath", "averageBreath"),
     ...ifDefinedOuraInteger(r, "restless_periods", "restlessPeriods"),
   };
+}
+
+export function ouraSleepPeriodOmissions(
+  r: Record<string, unknown>,
+): ProjectionOmission[] {
+  const entityKey = r.id;
+  if (
+    (typeof entityKey !== "string" &&
+      typeof entityKey !== "number" &&
+      typeof entityKey !== "boolean") ||
+    entityKey === ""
+  ) {
+    return [];
+  }
+  const omissions: ProjectionOmission[] = [];
+  if (
+    r.type === null ||
+    (r.type !== undefined &&
+      !["long_sleep", "short_sleep", "rest"].includes(String(r.type)))
+  ) {
+    omissions.push({
+      entityPath: "$.sleepPeriods[]",
+      entityKey,
+      fieldPath: "type",
+      reason: r.type === null ? "null_type" : "off_enum_type",
+    });
+  }
+  for (const field of ["bedtime_start", "bedtime_end"] as const) {
+    if (r[field] === null) {
+      omissions.push({
+        entityPath: "$.sleepPeriods[]",
+        entityKey,
+        fieldPath: field === "bedtime_start" ? "bedtimeStart" : "bedtimeEnd",
+        reason: "null_timestamp",
+      });
+    }
+  }
+  return omissions;
 }
 
 // ---------------------------------------------------------------------------

@@ -1483,7 +1483,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     if (result.ok) validateAgainst(ouraSleepSchema, result.payload);
   });
 
-  it("drops Oura rows with null scores so every emitted score is an integer", () => {
+  it("keeps nullable Oura scores so every emitted score is integer or null", () => {
     const cases = [
       {
         scope: "oura.activity",
@@ -1516,7 +1516,18 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           entry.scope === "oura.sleep"
             ? result.payload.dailyScores
             : result.payload.days;
-        expect(list).toEqual([]);
+        expect(list).toEqual([
+          {
+            id:
+              entry.scope === "oura.sleep"
+                ? "sleep-min"
+                : entry.scope === "oura.readiness"
+                  ? "readiness-min"
+                  : "activity-min",
+            day: "2026-09-01",
+            score: null,
+          },
+        ]);
         validateAgainst(entry.schema, result.payload);
       }
     }
