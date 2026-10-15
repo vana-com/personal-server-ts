@@ -51,6 +51,8 @@ export interface CreatePdppAuthDepsOptions {
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
+  /** Register each opened database immediately for startup rollback. */
+  onDatabaseOpened?: (close: () => void) => void;
 }
 
 /**
@@ -90,6 +92,15 @@ export type PdppAuthBootResult = PdppAuthRouteDeps & {
   /** The connector gate this boot derived, so callers do not recompute it. */
   supportedConnectors: string[];
 };
+
+function closeOnce(close: () => void): () => void {
+  let closed = false;
+  return () => {
+    if (closed) return;
+    closed = true;
+    close();
+  };
+}
 
 export async function createPdppAuthDeps(
   options: CreatePdppAuthDepsOptions,
@@ -166,6 +177,8 @@ export async function createPdppAuthDeps(
       document: d.document,
     })),
   });
+  const closeDeclarationRegistry = closeOnce(() => declarationRegistry.close());
+  options.onDatabaseOpened?.(closeDeclarationRegistry);
 
   const registry = {
     resolve: declarationRegistry.resolve,
@@ -200,7 +213,7 @@ export async function createPdppAuthDeps(
       { supportedConnectors, configured: config.pdpp.declarationPaths.length },
       "PDPP enabled but no declarations were retained — authorization server not mounted",
     );
-    declarationRegistry.close();
+    closeDeclarationRegistry();
     return undefined;
   }
 
@@ -217,25 +230,24 @@ export async function createPdppAuthDeps(
         { err: err.message },
         "PDPP authorization state is unsupported — authorization server not mounted",
       );
-      declarationRegistry.close();
+      closeDeclarationRegistry();
       return undefined;
     }
-    declarationRegistry.close();
+    closeDeclarationRegistry();
     throw err;
   }
 
-  let closed = false;
+  const closeStore = closeOnce(() => store.close());
+  options.onDatabaseOpened?.(closeStore);
   const close = (): void => {
-    if (closed) return;
-    closed = true;
     let closeError: unknown;
     try {
-      store.close();
+      closeStore();
     } catch (error) {
       closeError = error;
     }
     try {
-      declarationRegistry.close();
+      closeDeclarationRegistry();
     } catch (error) {
       closeError ??= error;
     }

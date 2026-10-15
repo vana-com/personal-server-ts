@@ -207,57 +207,67 @@ interface GrantRow {
  */
 export function openPdppAuthStore(dbPath: string): PdppAuthStore {
   const db = new Database(dbPath);
-  db.pragma("journal_mode = WAL");
-  // Transactions here express atomicity guarantees; a torn write would defeat
-  // exactly the single-use and code-consumption invariants they protect.
-  db.pragma("synchronous = FULL");
-  db.pragma("foreign_keys = ON");
-  db.exec(SCHEMA_SQL);
+  try {
+    db.pragma("journal_mode = WAL");
+    // Transactions here express atomicity guarantees; a torn write would defeat
+    // exactly the single-use and code-consumption invariants they protect.
+    db.pragma("synchronous = FULL");
+    db.pragma("foreign_keys = ON");
+    db.exec(SCHEMA_SQL);
 
-  // Additive column migration. `CREATE TABLE IF NOT EXISTS` above does not
-  // alter an existing table, so a database created before `document` existed
-  // still lacks it. Adding a nullable column is backward compatible in both
-  // directions: an older build ignores it, and this build treats NULL as
-  // "not verifiable from the store" rather than as a failure. That is why
-  // this does NOT bump PDPP_AUTH_STATE_VERSION, which would throw
-  // UnsupportedAuthStateError and refuse to boot an existing deployment.
-  const declarationColumns = db
-    .prepare("PRAGMA table_info(pdpp_declarations)")
-    .all() as { name: string }[];
-  if (!declarationColumns.some((column) => column.name === "document")) {
-    db.exec("ALTER TABLE pdpp_declarations ADD COLUMN document TEXT");
+    // Additive column migration. `CREATE TABLE IF NOT EXISTS` above does not
+    // alter an existing table, so a database created before `document` existed
+    // still lacks it. Adding a nullable column is backward compatible in both
+    // directions: an older build ignores it, and this build treats NULL as
+    // "not verifiable from the store" rather than as a failure. That is why
+    // this does NOT bump PDPP_AUTH_STATE_VERSION, which would throw
+    // UnsupportedAuthStateError and refuse to boot an existing deployment.
+    const declarationColumns = db
+      .prepare("PRAGMA table_info(pdpp_declarations)")
+      .all() as { name: string }[];
+    if (!declarationColumns.some((column) => column.name === "document")) {
+      db.exec("ALTER TABLE pdpp_declarations ADD COLUMN document TEXT");
+    }
+
+    const accessTokenColumns = db
+      .prepare("PRAGMA table_info(pdpp_access_tokens)")
+      .all() as { name: string }[];
+    if (
+      !accessTokenColumns.some((column) => column.name === "owner_source_id")
+    ) {
+      db.exec("ALTER TABLE pdpp_access_tokens ADD COLUMN owner_source_id TEXT");
+    }
+    if (
+      !accessTokenColumns.some(
+        (column) => column.name === "owner_instance_ids_json",
+      )
+    ) {
+      db.exec(
+        "ALTER TABLE pdpp_access_tokens ADD COLUMN owner_instance_ids_json TEXT",
+      );
+    }
+
+    const meta = db
+      .prepare("SELECT version FROM pdpp_state_meta WHERE id = 1")
+      .get() as { version: number } | undefined;
+
+    if (meta === undefined) {
+      db.prepare("INSERT INTO pdpp_state_meta (id, version) VALUES (1, ?)").run(
+        PDPP_AUTH_STATE_VERSION,
+      );
+    } else if (meta.version !== PDPP_AUTH_STATE_VERSION) {
+      throw new UnsupportedAuthStateError(meta.version);
+    }
+
+    return new PdppAuthStore(db);
+  } catch (error) {
+    try {
+      db.close();
+    } catch {
+      // Preserve the original open/migration error.
+    }
+    throw error;
   }
-
-  const accessTokenColumns = db
-    .prepare("PRAGMA table_info(pdpp_access_tokens)")
-    .all() as { name: string }[];
-  if (!accessTokenColumns.some((column) => column.name === "owner_source_id")) {
-    db.exec("ALTER TABLE pdpp_access_tokens ADD COLUMN owner_source_id TEXT");
-  }
-  if (
-    !accessTokenColumns.some(
-      (column) => column.name === "owner_instance_ids_json",
-    )
-  ) {
-    db.exec(
-      "ALTER TABLE pdpp_access_tokens ADD COLUMN owner_instance_ids_json TEXT",
-    );
-  }
-
-  const meta = db
-    .prepare("SELECT version FROM pdpp_state_meta WHERE id = 1")
-    .get() as { version: number } | undefined;
-
-  if (meta === undefined) {
-    db.prepare("INSERT INTO pdpp_state_meta (id, version) VALUES (1, ?)").run(
-      PDPP_AUTH_STATE_VERSION,
-    );
-  } else if (meta.version !== PDPP_AUTH_STATE_VERSION) {
-    db.close();
-    throw new UnsupportedAuthStateError(meta.version);
-  }
-
-  return new PdppAuthStore(db);
 }
 
 export class PdppAuthStore {

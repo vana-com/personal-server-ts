@@ -31,11 +31,19 @@ await writeFile(declarationPath, process.env.PDPP_CLEANUP_TEST_DECLARATION);
 const { loadConfig } = await import("./packages/server/dist/config/index.js");
 const { createServer } = await import("./packages/server/dist/bootstrap.js");
 const { initializeDatabase } = await import("./packages/server/dist/storage/index-schema.js");
+const { createSqliteRecordStore } = await import("./packages/server/dist/storage/pdpp-records-sqlite-store.js");
 const config = await loadConfig({ rootPath });
 const indexDb = initializeDatabase(join(rootPath, "index.db"));
 indexDb.prepare(
   "INSERT INTO data_files (file_id, path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?, ?)",
 ).run("file-1", "spotify/top_artists/fixture.json", "spotify.top_artists", "2026-01-01T00:00:00Z", 1);
+const forceBootstrapFailure = process.env.PDPP_CLEANUP_TEST_FAIL_BOOTSTRAP === "1";
+if (forceBootstrapFailure) {
+  createSqliteRecordStore(indexDb);
+  indexDb.exec(
+    "CREATE TRIGGER force_bootstrap_failure BEFORE UPDATE ON pdpp_instance_binding BEGIN SELECT RAISE(ABORT, 'PDPP_BOOTSTRAP_FAILURE_ORIGINAL'); END",
+  );
+}
 indexDb.close();
 config.pdpp.enabled = true;
 config.pdpp.declarationPaths = [declarationPath];
@@ -47,10 +55,20 @@ config.pdpp.clients = [{
 config.devUi.enabled = true;
 config.sync.enabled = false;
 config.tunnel.enabled = false;
-const context = await createServer(config, {
-  rootPath,
-  ownerSignature: process.env.PDPP_CLEANUP_TEST_SIGNATURE,
-});
+let context;
+try {
+  context = await createServer(config, {
+    rootPath,
+    ownerSignature: process.env.PDPP_CLEANUP_TEST_SIGNATURE,
+  });
+} catch (error) {
+  if (!forceBootstrapFailure) throw error;
+  console.error("ORIGINAL_BOOTSTRAP_ERROR:" + error.message);
+  process.exitCode = 23;
+}
+if (!context) {
+  if (!forceBootstrapFailure) throw new Error("bootstrap returned no context");
+} else {
 console.log("PDPP_DATABASES_OPENED", config.pdpp.enabled);
 const ownerTokenResponse = await context.app.request("/pdpp/v1/owner/token", {
   method: "POST",
@@ -97,17 +115,19 @@ const reviewResponse = await context.app.request(
 if (!reviewResponse.ok) throw new Error("review failed: " + reviewResponse.status);
 await context.cleanup();
 console.log("CLEANUP_COMPLETED");
+}
 `;
 
 describe("Personal Server SQLite cleanup in a Node child process", () => {
   let rootPath: string;
+  const node24Test =
+    process.versions.node.split(".")[0] === "24" ? it : it.skip;
 
   afterEach(async () => {
     if (rootPath) await rm(rootPath, { recursive: true, force: true });
   });
 
-  it("closes the PDPP SQLite databases before Node exits", async () => {
-    expect(process.versions.node.split(".")[0]).toBe("24");
+  node24Test("closes the PDPP SQLite databases before Node exits", async () => {
     rootPath = await mkdtemp(join(tmpdir(), "ps-bootstrap-cleanup-"));
     const child = spawnSync(
       process.execPath,
@@ -140,4 +160,42 @@ describe("Personal Server SQLite cleanup in a Node child process", () => {
       access(join(rootPath, "pdpp-auth.db")),
     ).resolves.toBeUndefined();
   });
+
+  node24Test(
+    "closes opened SQLite databases after a later bootstrap error",
+    async () => {
+      rootPath = await mkdtemp(join(tmpdir(), "ps-bootstrap-failure-"));
+      const child = spawnSync(
+        process.execPath,
+        ["--input-type=module", "-e", CHILD],
+        {
+          cwd: process.cwd(),
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PDPP_CLEANUP_TEST_ROOT: rootPath,
+            PDPP_CLEANUP_TEST_DECLARATION: DECLARATION,
+            PDPP_CLEANUP_TEST_SIGNATURE: KNOWN_SIGNATURE,
+            PDPP_CLEANUP_TEST_FAIL_BOOTSTRAP: "1",
+          },
+        },
+      );
+
+      expect(child.error).toBeUndefined();
+      expect(child.signal).toBeNull();
+      expect(
+        child.status,
+        `child stdout:\n${child.stdout}\nchild stderr:\n${child.stderr}`,
+      ).toBe(23);
+      expect(child.stderr).toContain(
+        "ORIGINAL_BOOTSTRAP_ERROR:PDPP_BOOTSTRAP_FAILURE_ORIGINAL",
+      );
+      await expect(
+        access(join(rootPath, "pdpp-declarations.db")),
+      ).resolves.toBeUndefined();
+      await expect(
+        access(join(rootPath, "pdpp-auth.db")),
+      ).resolves.toBeUndefined();
+    },
+  );
 });

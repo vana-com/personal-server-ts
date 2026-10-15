@@ -169,6 +169,11 @@ export interface CreateServerOptions {
 
 const DEFAULT_LOCAL_APPROVAL_PORT = 34127;
 
+type StartupResource = {
+  kind: "database" | "worker";
+  close: () => void | Promise<void>;
+};
+
 function resolveLocalApprovalPort(serverPort: number): number {
   const raw = process.env.LOCAL_AUTH_PORT;
   if (raw !== undefined) {
@@ -194,6 +199,31 @@ function resolveLocalApprovalPort(serverPort: number): number {
 export async function createServer(
   config: ServerConfig,
   options?: CreateServerOptions,
+): Promise<ServerContext> {
+  const resources: StartupResource[] = [];
+  try {
+    return await createServerWithStartupCleanup(config, options, (resource) => {
+      resources.push(resource);
+    });
+  } catch (error) {
+    for (const kind of ["worker", "database"] as const) {
+      for (const resource of [...resources].reverse()) {
+        if (resource.kind !== kind) continue;
+        try {
+          await resource.close();
+        } catch {
+          // Preserve the bootstrap error while still attempting every close.
+        }
+      }
+    }
+    throw error;
+  }
+}
+
+async function createServerWithStartupCleanup(
+  config: ServerConfig,
+  options: CreateServerOptions | undefined,
+  registerStartupResource: (resource: StartupResource) => void,
 ): Promise<ServerContext> {
   const logger = createLogger(config.logging);
   const startedAt = new Date();
@@ -322,6 +352,12 @@ export async function createServer(
   };
 
   const db = initializeDatabase(indexPath);
+  registerStartupResource({
+    kind: "database",
+    close: () => {
+      db.close();
+    },
+  });
   await migrateLocalState({
     storageRoot,
     dataDir,
@@ -626,6 +662,10 @@ export async function createServer(
         logger,
       }),
   });
+  registerStartupResource({
+    kind: "worker",
+    close: () => derivativeScheduler.stop(),
+  });
   const derivativeCompute = {
     store: questionStore,
     scheduler: derivativeScheduler,
@@ -731,6 +771,10 @@ export async function createServer(
         }
       },
     });
+    registerStartupResource({
+      kind: "worker",
+      close: () => syncManager?.stop(),
+    });
     syncManager.start();
     logger.info("Sync engine started");
   } else if (config.sync.enabled) {
@@ -819,6 +863,8 @@ export async function createServer(
     devToken,
     accessToken,
     tokenStore,
+    onDatabaseOpened: (close) =>
+      registerStartupResource({ kind: "database", close }),
   });
 
   if (pdppAuth) {

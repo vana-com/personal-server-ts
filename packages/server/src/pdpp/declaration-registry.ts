@@ -110,8 +110,17 @@ export function openDeclarationRegistry(
   options: OpenDeclarationRegistryOptions,
 ): MutableDeclarationRegistry {
   const db = new Database(options.path);
-  db.pragma("journal_mode = WAL");
-  migrateSchema(db);
+  try {
+    db.pragma("journal_mode = WAL");
+    migrateSchema(db);
+  } catch (error) {
+    try {
+      db.close();
+    } catch {
+      // Preserve the schema/open error.
+    }
+    throw error;
+  }
 
   const supported = new Set(options.supportedConnectors);
 
@@ -216,21 +225,30 @@ export function openDeclarationRegistry(
   // submitted is skipped: the operator's later explicit decision wins over
   // boot config. Otherwise the seed becomes current, so an installer that
   // upgrades a declaration and restarts the server is followed.
-  for (const seed of options.seed ?? []) {
-    const submitted = db
-      .prepare(
-        `SELECT 1 FROM pdpp_current_declarations
-         WHERE source_id = ? AND is_current = 1 AND origin = 'submitted'`,
-      )
-      .get(seed.sourceId);
-    if (submitted) continue;
-    const result = accept(seed.document, "configured");
-    if (!result.ok) {
-      options.logger.warn(
-        { sourceId: seed.sourceId, reason: result.failure.message },
-        "PDPP declaration rejected: not retained",
-      );
+  try {
+    for (const seed of options.seed ?? []) {
+      const submitted = db
+        .prepare(
+          `SELECT 1 FROM pdpp_current_declarations
+           WHERE source_id = ? AND is_current = 1 AND origin = 'submitted'`,
+        )
+        .get(seed.sourceId);
+      if (submitted) continue;
+      const result = accept(seed.document, "configured");
+      if (!result.ok) {
+        options.logger.warn(
+          { sourceId: seed.sourceId, reason: result.failure.message },
+          "PDPP declaration rejected: not retained",
+        );
+      }
     }
+  } catch (error) {
+    try {
+      db.close();
+    } catch {
+      // Preserve the seed error.
+    }
+    throw error;
   }
 
   return {
