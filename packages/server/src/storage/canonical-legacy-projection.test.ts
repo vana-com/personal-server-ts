@@ -462,7 +462,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
   });
 
   describe("real source shapes", () => {
-    it("keeps Oura days and null scores", async () => {
+    it("keeps null and integer Oura scores", async () => {
       const a = connect("conn_a", "oura");
       put("conn_a", "activity", [
         activity("a1", "2026-08-01", null),
@@ -701,7 +701,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
   });
 
   describe("rows the legacy schema cannot hold", () => {
-    it("never emits an Oura row without a valid day; peers and null scores survive", async () => {
+    it("never emits Oura rows with invalid days and keeps nullable scores", async () => {
       const a = connect("conn_a", "oura");
       put("conn_a", "activity", [
         activity("good1", "2026-08-01", null),

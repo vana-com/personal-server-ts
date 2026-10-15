@@ -31,6 +31,7 @@ export type {
   PdppRecord,
   PdppSelection,
   ProjectionDiagnostic,
+  ProjectionOmission,
   ProjectionError,
   ProjectionResult,
   ProjectPdppRecordsOptions,
@@ -153,6 +154,9 @@ export function projectPdppRecordsToLegacyPayload(
     options,
   );
   if (!result.ok) return result;
+  if (scope.startsWith("oura.")) {
+    assertOuraLegacyScoresAreIntegers(scope, result.payload);
+  }
 
   // These bindings drop and count malformed rows themselves (see their
   // records_dropped diagnostics) instead of failing the whole scope.
@@ -235,6 +239,31 @@ export function projectPdppRecordsToLegacyPayload(
 const DROP_AND_COUNT_SCOPES: ReadonlySet<string> = new Set([
   "chatgpt.conversations",
 ]);
+
+/** Keep OpenPet's Go `*int` score decoding safe for every Oura projection. */
+export function assertOuraLegacyScoresAreIntegers(
+  scope: string,
+  payload: Record<string, unknown>,
+): void {
+  for (const collection of ["days", "dailyScores"] as const) {
+    const rows = payload[collection];
+    if (!Array.isArray(rows)) continue;
+    for (const [index, row] of rows.entries()) {
+      if (row === null || typeof row !== "object") continue;
+      // `score` is required on every daily score row: absent and undefined
+      // (dropped by JSON serialization) are both rejected.
+      const score = (row as Record<string, unknown>).score;
+      if (
+        score === null ||
+        (typeof score === "number" && Number.isInteger(score))
+      )
+        continue;
+      throw new Error(
+        `${scope}.${collection}[${index}].score must be an integer or null`,
+      );
+    }
+  }
+}
 
 type RecordsSkipped = Extract<
   ProjectionDiagnostic,

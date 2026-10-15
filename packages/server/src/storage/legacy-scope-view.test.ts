@@ -232,21 +232,15 @@ describe("legacy scope view over the real SQLite record store", () => {
     }
   });
 
-  it("persists reviewed exception evidence in the verdict ledger", () => {
+  it("persists provenance-backed omission evidence in the verdict ledger", () => {
     db.prepare(
       "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
-    ).run(
-      "chatgpt/memories/old.json",
-      "chatgpt.memories",
-      "2026-06-08T18:05:53.547Z",
-      1,
-    );
+    ).run("oura/sleep/old.json", "oura.sleep", "2026-06-08T18:05:53.547Z", 1);
     const authority = createLegacyScopeAuthority(db);
-    const head = authority.eligibleLegacyHead("chatgpt.memories")!;
-    const exception = {
-      path: "$.memories[].created_at",
-      reason:
-        "legacy collector wrote collection time; canonical carries source creation time",
+    const head = authority.eligibleLegacyHead("oura.sleep")!;
+    const omission = {
+      path: "$.sleepPeriods[].type",
+      reason: "off_enum_type",
       authority: "canonical" as const,
     };
     const coverage: LegacyCoverageVerdict = {
@@ -267,7 +261,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         missing_raw_blob: 0,
         projection_unavailable: 0,
       },
-      appliedExceptions: [exception],
+      appliedExceptions: [omission],
       missingEntityCount: 0,
       mismatchedFieldPaths: [],
       legacyBytes: 100,
@@ -275,30 +269,30 @@ describe("legacy scope view over the real SQLite record store", () => {
       byteDelta: 0,
     };
     expect(
-      authority.confirmRead("chatgpt.memories", head, () => true, {
+      authority.confirmRead("oura.sleep", head, () => true, {
         instance: "conn_a",
         generation: 1,
         writeClock: authority.writeClock(),
         arrivalRevision: authority.arrivalRevision(),
-        canonicalCursor: "0:0:receipt:revision:3",
+        canonicalCursor: "0:0:receipt:revision:5",
         coverage,
         cached: false,
       }),
     ).toBe(true);
-    expect(authority.verdictFor("chatgpt.memories")[0]).toMatchObject({
+    expect(authority.verdictFor("oura.sleep")[0]).toMatchObject({
       verdict: "covered",
       comparisonCase: "canonical_newer",
-      appliedExceptions: [exception],
+      appliedExceptions: [omission],
     });
     expect(
       authority.cachedVerdict(
-        "chatgpt.memories",
+        "oura.sleep",
         "conn_a",
         1,
         head.id,
-        "0:0:receipt:revision:3",
+        "0:0:receipt:revision:5",
       )?.appliedExceptions,
-    ).toEqual([exception]);
+    ).toEqual([omission]);
   });
 
   it("reads the one connection that holds data, beside one that never did", async () => {

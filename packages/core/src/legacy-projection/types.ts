@@ -54,8 +54,17 @@ export type ProjectionError =
 
 export interface ProjectionOk {
   diagnostics?: ProjectionDiagnostic[];
+  projectionOmissions?: ProjectionOmission[];
   ok: true;
   payload: Record<string, unknown>;
+}
+/** A field omitted by policy because of the raw canonical value on this entity. */
+export interface ProjectionOmission {
+  entityKey: string | number | boolean;
+  entityPath: string;
+  /** Dot path relative to the entity, e.g. `timestamp` or `contributors.timestamp`. */
+  fieldPath: string;
+  reason: "off_enum_type" | "null_type" | "null_timestamp";
 }
 /**
  * `records_skipped` makes the whole projection `incomplete_scope`.

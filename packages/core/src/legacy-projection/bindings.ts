@@ -4,6 +4,7 @@ import type {
   ProjectPdppRecordsOptions,
   ProjectionDiagnostic,
   ProjectionErr,
+  ProjectionOmission,
   ProjectionResult,
 } from "./types.js";
 import type { LegacyScopeBindingProvenance } from "./provenance.js";
@@ -52,6 +53,74 @@ function ifDefined(
     ? {}
     : { [targetField]: record[sourceField] };
 }
+
+export function ouraInteger(value: unknown): unknown {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.round(value)
+    : value;
+}
+
+function ifDefinedOuraInteger(
+  record: Record<string, unknown>,
+  sourceField: string,
+  targetField: string,
+): Record<string, unknown> {
+  return record[sourceField] === undefined
+    ? {}
+    : { [targetField]: ouraInteger(record[sourceField]) };
+}
+
+export function ouraContributors(
+  value: unknown,
+  integerFields: readonly string[],
+): Record<string, unknown> | undefined {
+  if (!isObjectRow(value)) return undefined;
+  const contributors = { ...value };
+  for (const field of integerFields) {
+    if (Object.hasOwn(contributors, field)) {
+      contributors[field] = ouraInteger(contributors[field]);
+    }
+  }
+  return contributors;
+}
+
+export function withOuraContributors(
+  value: unknown,
+  integerFields: readonly string[],
+): Record<string, unknown> {
+  const contributors = ouraContributors(value, integerFields);
+  return contributors ? { contributors } : {};
+}
+
+const OURA_ACTIVITY_CONTRIBUTOR_INTEGERS = [
+  "meet_daily_targets",
+  "move_every_hour",
+  "recovery_time",
+  "stay_active",
+  "training_frequency",
+  "training_volume",
+];
+
+const OURA_READINESS_CONTRIBUTOR_INTEGERS = [
+  "activity_balance",
+  "body_temperature",
+  "hrv_balance",
+  "previous_day_activity",
+  "previous_night",
+  "recovery_index",
+  "resting_heart_rate",
+  "sleep_balance",
+];
+
+export const OURA_SLEEP_CONTRIBUTOR_INTEGERS = [
+  "deep_sleep",
+  "efficiency",
+  "latency",
+  "rem_sleep",
+  "restfulness",
+  "timing",
+  "total_sleep",
+];
 
 function missingStream(
   scope: string,
@@ -120,7 +189,7 @@ function withDiagnostics(diagnostics: ProjectionDiagnostic[]): {
 
 export const OURA_BAD_DAY = "Oura day is missing or not a YYYY-MM-DD date";
 export const OURA_BAD_SCORE =
-  "Oura score is absent or not an integer from 0 to 100 or null";
+  "Oura score is absent or does not round to an integer from 0 to 100";
 
 /** A real calendar date in the legacy `format: date` shape. */
 export function isCalendarDay(value: unknown): value is string {
@@ -134,24 +203,24 @@ export function isCalendarDay(value: unknown): value is string {
 }
 
 /**
- * The legacy Oura daily schemas require `score`, typed integer 0-100 or
- * null. The source declares the field nullable but optional, and the
- * connector writes `null` for an unknown score, so `null` passes through.
- * An absent key has no declared meaning; it is not turned into `null`.
+ * The legacy Oura daily schemas require `score`, typed integer 0-100 or null.
+ * OpenPet decodes it as `*int`, so null is valid while fractional numbers are
+ * not. Rounding happens at the projection boundary.
  */
 function isOuraScore(value: unknown): value is number | null {
+  if (value === null) return true;
   return (
-    value === null ||
-    (typeof value === "number" &&
-      Number.isInteger(value) &&
-      value >= 0 &&
-      value <= 100)
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    Math.round(value) >= 0 &&
+    Math.round(value) <= 100
   );
 }
 
 /**
  * Oura rows the legacy schema cannot hold are left out and counted, never
- * emitted with a null or impossible day, or without the required score.
+ * emitted with an impossible day or without the required score. A null score
+ * is valid under the frozen legacy schema.
  * `scoreField` names the source field that becomes the legacy `score`
  * (per row, or undefined for a row that produces no daily score). The
  * caller decides what an all-dropped stream means.
@@ -3172,6 +3241,7 @@ const ouraActivity: LegacyScopeBinding = {
   lossy: [
     "timestamp: no source field; omitted (legacy schema makes it optional)",
     "target_calories: has no legacy field and is not projected",
+    "Legacy integer fields: fractional source numbers are rounded with Math.round at projection time",
   ],
   provenance: [
     {
@@ -3198,24 +3268,29 @@ const ouraActivity: LegacyScopeBinding = {
         days: rows.map((r) => ({
           id: r.id,
           day: r.day,
-          score: r.score,
-          ...ifDefined(r, "active_calories", "activeCalories"),
-          ...ifDefined(r, "total_calories", "totalCalories"),
-          ...ifDefined(r, "steps", "steps"),
-          ...ifDefined(
+          score: ouraInteger(r.score),
+          ...ifDefinedOuraInteger(r, "active_calories", "activeCalories"),
+          ...ifDefinedOuraInteger(r, "total_calories", "totalCalories"),
+          ...ifDefinedOuraInteger(r, "steps", "steps"),
+          ...ifDefinedOuraInteger(
             r,
             "equivalent_walking_distance",
             "equivalentWalkingDistance",
           ),
-          ...ifDefined(r, "high_activity_time", "highActivityTime"),
-          ...ifDefined(r, "medium_activity_time", "mediumActivityTime"),
-          ...ifDefined(r, "low_activity_time", "lowActivityTime"),
-          ...ifDefined(r, "sedentary_time", "sedentaryTime"),
-          ...ifDefined(r, "resting_time", "restingTime"),
-          ...ifDefined(r, "inactivity_alerts", "inactivityAlerts"),
-          ...(r.contributors && typeof r.contributors === "object"
-            ? { contributors: r.contributors }
-            : {}),
+          ...ifDefinedOuraInteger(r, "high_activity_time", "highActivityTime"),
+          ...ifDefinedOuraInteger(
+            r,
+            "medium_activity_time",
+            "mediumActivityTime",
+          ),
+          ...ifDefinedOuraInteger(r, "low_activity_time", "lowActivityTime"),
+          ...ifDefinedOuraInteger(r, "sedentary_time", "sedentaryTime"),
+          ...ifDefinedOuraInteger(r, "resting_time", "restingTime"),
+          ...ifDefinedOuraInteger(r, "inactivity_alerts", "inactivityAlerts"),
+          ...withOuraContributors(
+            r.contributors,
+            OURA_ACTIVITY_CONTRIBUTOR_INTEGERS,
+          ),
         })),
       },
     };
@@ -3240,6 +3315,7 @@ const ouraReadiness: LegacyScopeBinding = {
   primaryKey: { readiness: ["id"] },
   lossy: [
     "timestamp: no source field; omitted (legacy schema makes it optional)",
+    "Legacy integer fields: fractional source numbers are rounded with Math.round at projection time",
   ],
   provenance: [
     {
@@ -3266,16 +3342,17 @@ const ouraReadiness: LegacyScopeBinding = {
         days: rows.map((r) => ({
           id: r.id,
           day: r.day,
-          score: r.score,
+          score: ouraInteger(r.score),
           ...ifDefined(r, "temperature_deviation", "temperatureDeviation"),
           ...ifDefined(
             r,
             "temperature_trend_deviation",
             "temperatureTrendDeviation",
           ),
-          ...(r.contributors && typeof r.contributors === "object"
-            ? { contributors: r.contributors }
-            : {}),
+          ...withOuraContributors(
+            r.contributors,
+            OURA_READINESS_CONTRIBUTOR_INTEGERS,
+          ),
         })),
       },
     };
@@ -3314,8 +3391,9 @@ const ouraSleep: LegacyScopeBinding = {
   lossy: [
     "awakeTime: no declared PDPP field and is omitted",
     "dailyScores.timestamp: no source field and is omitted",
-    "sleepPeriods.averageHrv: PDPP allows a non-integer number but legacy schema allows only integer or null; non-integer values are omitted",
+    "sleepPeriods.averageHrv: fractional PDPP numbers are rounded with Math.round to satisfy the legacy integer type",
     "sleepPeriods.type: unrecognized or null values are omitted because the legacy enum accepts only long_sleep, short_sleep or rest",
+    "Legacy integer fields: fractional source numbers are rounded with Math.round at projection time",
   ],
   provenance: [
     {
@@ -3329,25 +3407,35 @@ const ouraSleep: LegacyScopeBinding = {
   project(records, options): ProjectionResult {
     const guard = requireStreams("oura.sleep", options, ["sleep"]);
     if (guard) return guard;
+    const sourceRows = byStream(records, "sleep");
     const { rows, diagnostics } = partitionOuraRows(
       "oura.sleep",
       "sleep",
-      byStream(records, "sleep"),
+      sourceRows,
       () => "sleep_score",
     );
+    const { rows: periodRows } = partitionOuraRows(
+      "oura.sleep",
+      "sleep",
+      sourceRows,
+      () => undefined,
+    );
+    const projectionOmissions = periodRows.flatMap(ouraSleepPeriodOmissions);
     return {
       ok: true,
       ...withDiagnostics(diagnostics),
+      ...(projectionOmissions.length > 0 ? { projectionOmissions } : {}),
       payload: {
         dailyScores: rows.map((r) => ({
           id: r.id,
           day: r.day,
-          score: r.sleep_score,
-          ...(r.contributors && typeof r.contributors === "object"
-            ? { contributors: r.contributors }
-            : {}),
+          score: ouraInteger(r.sleep_score),
+          ...withOuraContributors(
+            r.contributors,
+            OURA_SLEEP_CONTRIBUTOR_INTEGERS,
+          ),
         })),
-        sleepPeriods: rows.map(ouraSleepPeriod),
+        sleepPeriods: periodRows.map(ouraSleepPeriod),
       },
     };
   },
@@ -3363,25 +3451,63 @@ export function ouraSleepPeriod(
     ...(r.type === "long_sleep" || r.type === "short_sleep" || r.type === "rest"
       ? { type: r.type }
       : {}),
-    ...ifDefined(r, "bedtime_start", "bedtimeStart"),
-    ...ifDefined(r, "bedtime_end", "bedtimeEnd"),
-    ...ifDefined(r, "total_sleep_duration", "totalSleepDuration"),
-    ...ifDefined(r, "time_in_bed", "timeInBed"),
-    ...ifDefined(r, "deep_sleep_duration", "deepSleepDuration"),
-    ...ifDefined(r, "light_sleep_duration", "lightSleepDuration"),
-    ...ifDefined(r, "rem_sleep_duration", "remSleepDuration"),
-    ...ifDefined(r, "efficiency", "efficiency"),
-    ...ifDefined(r, "latency", "latency"),
+    ...(r.bedtime_start === null
+      ? {}
+      : ifDefined(r, "bedtime_start", "bedtimeStart")),
+    ...(r.bedtime_end === null
+      ? {}
+      : ifDefined(r, "bedtime_end", "bedtimeEnd")),
+    ...ifDefinedOuraInteger(r, "total_sleep_duration", "totalSleepDuration"),
+    ...ifDefinedOuraInteger(r, "time_in_bed", "timeInBed"),
+    ...ifDefinedOuraInteger(r, "deep_sleep_duration", "deepSleepDuration"),
+    ...ifDefinedOuraInteger(r, "light_sleep_duration", "lightSleepDuration"),
+    ...ifDefinedOuraInteger(r, "rem_sleep_duration", "remSleepDuration"),
+    ...ifDefinedOuraInteger(r, "efficiency", "efficiency"),
+    ...ifDefinedOuraInteger(r, "latency", "latency"),
     ...ifDefined(r, "average_heart_rate", "averageHeartRate"),
-    ...(r.average_hrv === null
-      ? { averageHrv: null }
-      : typeof r.average_hrv === "number" && Number.isInteger(r.average_hrv)
-        ? { averageHrv: r.average_hrv }
-        : {}),
-    ...ifDefined(r, "lowest_heart_rate", "lowestHeartRate"),
+    ...ifDefinedOuraInteger(r, "average_hrv", "averageHrv"),
+    ...ifDefinedOuraInteger(r, "lowest_heart_rate", "lowestHeartRate"),
     ...ifDefined(r, "average_breath", "averageBreath"),
-    ...ifDefined(r, "restless_periods", "restlessPeriods"),
+    ...ifDefinedOuraInteger(r, "restless_periods", "restlessPeriods"),
   };
+}
+
+export function ouraSleepPeriodOmissions(
+  r: Record<string, unknown>,
+): ProjectionOmission[] {
+  const entityKey = r.id;
+  if (
+    (typeof entityKey !== "string" &&
+      typeof entityKey !== "number" &&
+      typeof entityKey !== "boolean") ||
+    entityKey === ""
+  ) {
+    return [];
+  }
+  const omissions: ProjectionOmission[] = [];
+  if (
+    r.type === null ||
+    (r.type !== undefined &&
+      !["long_sleep", "short_sleep", "rest"].includes(String(r.type)))
+  ) {
+    omissions.push({
+      entityPath: "$.sleepPeriods[]",
+      entityKey,
+      fieldPath: "type",
+      reason: r.type === null ? "null_type" : "off_enum_type",
+    });
+  }
+  for (const field of ["bedtime_start", "bedtime_end"] as const) {
+    if (r[field] === null) {
+      omissions.push({
+        entityPath: "$.sleepPeriods[]",
+        entityKey,
+        fieldPath: field === "bedtime_start" ? "bedtimeStart" : "bedtimeEnd",
+        reason: "null_timestamp",
+      });
+    }
+  }
+  return omissions;
 }
 
 // ---------------------------------------------------------------------------

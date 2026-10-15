@@ -4,7 +4,7 @@
  * newer canonical state may reorder or, with proof, delete entities.
  * Diagnostics contain paths and counts, never entity keys or field values.
  */
-import { LEGACY_COVERAGE_EXCEPTIONS } from "./legacy-scope-coverage-exceptions.js";
+import type { ProjectionOmission } from "../legacy-projection/types.js";
 
 export interface LegacyCoverageSchema {
   type?: string | readonly string[];
@@ -14,8 +14,10 @@ export interface LegacyCoverageSchema {
 }
 
 export interface LegacyCoverageOptions {
-  /** Scope selects only reviewed, scope-specific legacy defect exceptions. */
+  /** Scope being compared. */
   scope?: string;
+  /** Raw-value-backed omissions emitted by this exact canonical projection. */
+  projectionOmissions?: readonly ProjectionOmission[];
   /** JSON paths to entity arrays; [] marks each array element, e.g. $.posts[].comments. */
   entityKeys?: Readonly<Record<string, readonly string[]>>;
   /** Legacy payload schema. An `id` or `uuid` item field supplies a key. */
@@ -50,7 +52,7 @@ export interface LegacyCoverageVerdict {
   reason: LegacyCoverageReason | null;
   /** Counts include accepted proven deletions, which do not block coverage. */
   reasonCounts: Record<LegacyCoverageReason, number>;
-  /** Reviewed exceptions actually used in this evaluation. */
+  /** Provenance-backed field omissions used in this evaluation. */
   appliedExceptions: {
     path: string;
     reason: string;
@@ -229,6 +231,8 @@ export function compareLegacyCoverage(
     schema: LegacyCoverageSchema | undefined,
     field: string | undefined = undefined,
     identityFields: readonly string[] = [],
+    entityPath?: string,
+    entityKey?: string | number | boolean,
   ): void {
     if (jsonType(legacy) !== jsonType(canonical)) {
       mark("type_mismatch", path);
@@ -293,6 +297,14 @@ export function compareLegacyCoverage(
               schema?.items,
               undefined,
               fields,
+              `${arrayPath}[]`,
+              fields.length === 1 &&
+                object(item) &&
+                (typeof item[fields[0]!] === "string" ||
+                  typeof item[fields[0]!] === "number" ||
+                  typeof item[fields[0]!] === "boolean")
+                ? (item[fields[0]!] as string | number | boolean)
+                : undefined,
             );
           }
           return;
@@ -368,20 +380,7 @@ export function compareLegacyCoverage(
           mark("timestamp_format", path);
           missingValues -= 1;
         } else if (field && isCreationField(field)) {
-          const normalizedPath = path.replace(/\[\d+\]/g, "[]");
-          const exception = LEGACY_COVERAGE_EXCEPTIONS.find(
-            (entry) =>
-              entry.scope === options.scope && entry.path === normalizedPath,
-          );
-          if (exception) {
-            appliedExceptions.set(normalizedPath, {
-              path: exception.path,
-              reason: exception.reason,
-              authority: exception.authority,
-            });
-          } else {
-            mark("creation_mismatch", path);
-          }
+          mark("creation_mismatch", path);
           missingValues -= 1;
         }
       }
@@ -409,7 +408,28 @@ export function compareLegacyCoverage(
         if (METADATA_FIELDS.has(field)) continue;
         const childPath = `${path}.${field}`;
         if (!Object.hasOwn(canonical, field)) {
-          mark("missing_field", childPath);
+          // Omission evidence names a path relative to its entity. Match the
+          // full relative path so evidence for `timestamp` cannot excuse a
+          // nested `contributors.timestamp` on the same entity.
+          const schemaPath = `${arrayPath}.${field}`;
+          const omission =
+            entityPath !== undefined && schemaPath.startsWith(`${entityPath}.`)
+              ? options.projectionOmissions?.find(
+                  (entry) =>
+                    entry.entityPath === entityPath &&
+                    entry.entityKey === entityKey &&
+                    entry.fieldPath === schemaPath.slice(entityPath.length + 1),
+                )
+              : undefined;
+          if (omission) {
+            appliedExceptions.set(schemaPath, {
+              path: schemaPath,
+              reason: omission.reason,
+              authority: "canonical",
+            });
+          } else {
+            mark("missing_field", childPath);
+          }
           continue;
         }
         compare(
@@ -420,6 +440,8 @@ export function compareLegacyCoverage(
           schema?.properties?.[field],
           field,
           identityFields,
+          entityPath,
+          entityKey,
         );
       }
       return;
@@ -447,19 +469,6 @@ export function compareLegacyCoverage(
     if (field && (identityFields.includes(field) || isIdentityField(field))) {
       mark("identity_mismatch", path);
     } else if (field && isCreationField(field)) {
-      const normalizedPath = path.replace(/\[\d+\]/g, "[]");
-      const exception = LEGACY_COVERAGE_EXCEPTIONS.find(
-        (entry) =>
-          entry.scope === options.scope && entry.path === normalizedPath,
-      );
-      if (exception) {
-        appliedExceptions.set(normalizedPath, {
-          path: exception.path,
-          reason: exception.reason,
-          authority: exception.authority,
-        });
-        return;
-      }
       mark("creation_mismatch", path);
     } else if (!options.canonicalNewer) {
       mark("field_mismatch", path);

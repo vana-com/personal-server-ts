@@ -78,7 +78,7 @@ describe.each(ouraCases)("$scope row validity", (c) => {
     ]);
   });
 
-  it("keeps valid peers, counts the dropped row, and the payload validates", () => {
+  it("keeps null scores, drops invalid days, and validates", () => {
     const result = project([
       c.row("good1", "2026-08-01", null),
       c.row("bad", null),
@@ -88,10 +88,14 @@ describe.each(ouraCases)("$scope row validity", (c) => {
     if (!result.ok) return;
     const list = result.payload[c.listKey] as { id: string; score?: unknown }[];
     expect(list.map((r) => r.id)).toEqual(["good1", "good2"]);
-    // A valid row with a null score is data, not a defect.
     expect(list[0]?.score).toBeNull();
+    expect(list[1]?.score).toBe(77);
     expect(result.diagnostics).toEqual([
-      expect.objectContaining({ kind: "records_dropped", count: 1 }),
+      expect.objectContaining({
+        kind: "records_dropped",
+        count: 1,
+        reasons: [BAD_DAY],
+      }),
     ]);
     for (const entry of list as { day?: unknown }[]) {
       expect(entry.day).toMatch(/^\d{4}-\d{2}-\d{2}$/);
