@@ -211,6 +211,11 @@ export type CanonicalLegacyReadFailure =
       detail: string;
     }
   | {
+      status: "unavailable";
+      reason: "missing_raw_blob";
+      recordCount: number;
+    }
+  | {
       status: "incomplete";
       reason: "projection_rejected";
       error: ProjectionError;
@@ -254,6 +259,8 @@ export interface ReadCanonicalLegacyScopeInput {
   allowUnprovenEmptyStreams?: boolean;
   /** Include the per-stream time evidence used by the parity takeover caller. */
   includeStreamTimes?: boolean;
+  /** Require raw Claude envelopes when deciding whether a legacy head is covered. */
+  requireClaudeRawBlobs?: boolean;
   /** Rows per store page. Tests lower it to force several pages. */
   pageSize?: number;
   /** @internal Tests may lower the blob budget; never raises the 64 MiB limit. */
@@ -363,6 +370,7 @@ export async function readCanonicalLegacyScope(
     binding,
     profileKey,
     includeStreamTimes: input.includeStreamTimes === true,
+    requireClaudeRawBlobs: input.requireClaudeRawBlobs === true,
     ...snapshot,
   });
 }
@@ -607,6 +615,7 @@ interface ProjectInput extends Snapshot {
   binding: LegacyScopeBinding;
   profileKey: string | undefined;
   includeStreamTimes: boolean;
+  requireClaudeRawBlobs: boolean;
 }
 
 async function projectSnapshot(
@@ -631,6 +640,19 @@ async function projectSnapshot(
   const canExpandClaude =
     selection.sourceId === CLAUDE_SOURCE_ID &&
     (scope === "claude.conversations" || scope === "claude.projects");
+  if (canExpandClaude && input.requireClaudeRawBlobs) {
+    const parentStream =
+      scope === "claude.conversations" ? "conversations" : "projects";
+    const missingRawBlobCount = (rowsByStream.get(parentStream) ?? []).filter(
+      (row) => !hasBlobRef(row),
+    ).length;
+    if (missingRawBlobCount > 0) {
+      return unavailable({
+        reason: "missing_raw_blob",
+        recordCount: missingRawBlobCount,
+      });
+    }
+  }
   for (const stream of streams) {
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (

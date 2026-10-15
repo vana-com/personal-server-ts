@@ -958,6 +958,58 @@ describe("GET /v1/data/:scope", () => {
     vi.unstubAllGlobals();
   });
 
+  it("includes missing raw blob reasons and counts in the owner takeover verdict", async () => {
+    const verdict = {
+      scope: "claude.conversations",
+      instance: "conn_claude",
+      generation: 1,
+      legacyVersionId: 4,
+      canonicalCursor: "cursor",
+      verdict: "not_covered" as const,
+      comparisonCase: "same_time" as const,
+      reasonCounts: { missing_raw_blob: 3 },
+      appliedExceptions: [],
+      reason: {
+        reason: "missing_raw_blob",
+        missingEntityCount: 0,
+        mismatchedFieldPaths: [],
+      },
+      legacyBytes: 100,
+      canonicalBytes: 0,
+      byteDelta: -100,
+      evaluatedAt: "2026-10-14T00:00:00.000Z",
+    };
+    const legacyScopeView = {
+      isReset: () => false,
+      verdictFor: () => [verdict],
+      resetTakeover: vi.fn(),
+    } as unknown as NonNullable<DataRouteDeps["legacyScopeView"]>;
+    const app = createApp({ legacyScopeView });
+    const uri = "/claude.conversations/takeover";
+    const header = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri,
+    });
+
+    const response = await app.request(uri, {
+      headers: { Authorization: header },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      scope: "claude.conversations",
+      verdicts: [
+        {
+          verdict: "not_covered",
+          reason: { reason: "missing_raw_blob" },
+          reasonCounts: { missing_raw_blob: 3 },
+        },
+      ],
+    });
+  });
+
   it("returns 200 with DataFileEnvelope for valid auth + grant", async () => {
     const app = createApp();
 

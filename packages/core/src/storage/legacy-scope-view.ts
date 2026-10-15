@@ -591,6 +591,7 @@ export function createLegacyScopeView(
         allowUnprovenEmptyStreams:
           legacyHead !== null && !!input.readLegacyHead,
         includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
+        requireClaudeRawBlobs: legacyHead !== null && !!input.readLegacyHead,
         // The rows must come from a state in which this is still the one
         // connection: a second account appearing between the decision and
         // the rows refuses instead of serving a body chosen while ambiguous.
@@ -620,7 +621,10 @@ export function createLegacyScopeView(
             };
           }
           const coveredHead = authority.hasCoveredHead(scope, legacyHead);
-          const coverage = projectionUnavailableCoverage(legacy.data);
+          const coverage = projectionUnavailableCoverage(
+            legacy.data,
+            read.reason === "missing_raw_blob" ? read.recordCount : 0,
+          );
           const confirmed = authority.confirmRead(
             scope,
             legacyHead,
@@ -664,6 +668,7 @@ export function createLegacyScopeView(
             read.reason === "stream_completion_unknown" ||
             read.reason === "blob_read_budget_exceeded" ||
             read.reason === "blob_backed_record_invalid" ||
+            read.reason === "missing_raw_blob" ||
             read.reason === "blob_backed_records_unsupported")
         ) {
           const stillLegacyOwned = authority.readSnapshot(() =>
@@ -879,6 +884,7 @@ function isProjectionDataFailure(reason: string): boolean {
     "invalid_collected_at",
     "blob_read_budget_exceeded",
     "blob_backed_record_invalid",
+    "missing_raw_blob",
     "blob_backed_records_unsupported",
   ].includes(reason);
 }
@@ -904,6 +910,7 @@ function receiptCursor(
 
 function projectionUnavailableCoverage(
   legacyPayload: unknown,
+  missingRawBlobCount = 0,
 ): LegacyCoverageVerdict {
   const legacyBytes = new TextEncoder().encode(
     JSON.stringify(legacyPayload),
@@ -911,7 +918,8 @@ function projectionUnavailableCoverage(
   return {
     comparisonCase: "same_time",
     covered: false,
-    reason: "projection_unavailable",
+    reason:
+      missingRawBlobCount > 0 ? "missing_raw_blob" : "projection_unavailable",
     reasonCounts: {
       no_stable_key: 0,
       missing_entity: 0,
@@ -923,7 +931,8 @@ function projectionUnavailableCoverage(
       creation_mismatch: 0,
       array_order: 0,
       payload_growth: 0,
-      projection_unavailable: 1,
+      missing_raw_blob: missingRawBlobCount,
+      projection_unavailable: missingRawBlobCount > 0 ? 0 : 1,
     },
     appliedExceptions: [],
     missingEntityCount: 0,

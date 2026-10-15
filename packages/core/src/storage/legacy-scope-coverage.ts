@@ -41,6 +41,7 @@ export type LegacyCoverageReason =
   | "creation_mismatch"
   | "array_order"
   | "payload_growth"
+  | "missing_raw_blob"
   | "projection_unavailable";
 
 export interface LegacyCoverageVerdict {
@@ -204,6 +205,7 @@ export function compareLegacyCoverage(
     creation_mismatch: 0,
     array_order: 0,
     payload_growth: 0,
+    missing_raw_blob: 0,
     projection_unavailable: 0,
   };
   let missingEntityCount = 0;

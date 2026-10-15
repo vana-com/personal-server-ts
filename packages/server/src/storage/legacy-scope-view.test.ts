@@ -264,6 +264,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         creation_mismatch: 0,
         array_order: 0,
         payload_growth: 0,
+        missing_raw_blob: 0,
         projection_unavailable: 0,
       },
       appliedExceptions: [exception],
@@ -364,42 +365,113 @@ describe("legacy scope view over the real SQLite record store", () => {
     }
     const projected = await view.readLatest("claude.conversations");
     expect(projected.kind).toBe("canonical");
-    if (projected.kind !== "canonical") return;
+    expect(
+      projected.kind === "canonical" &&
+        (projected.envelope.data.conversations as unknown[]).length,
+    ).toBe(1);
+  });
+
+  it("keeps Claude legacy authoritative when a conversation lacks its raw blob reference", async () => {
+    connect(store, "conn_claude", "anthropic", CLAUDE);
+    const rows = [
+      ["account_profile", CLAUDE_PROFILE],
+      [
+        "conversations",
+        {
+          id: "cv1",
+          title: "A",
+          create_time: null,
+          update_time: null,
+          project_id: null,
+          message_count: 1,
+          is_starred: false,
+        },
+      ],
+      [
+        "messages",
+        {
+          id: "m1",
+          conversation_id: "cv1",
+          role: "user",
+          parent_id: null,
+          content: "hello",
+          create_time: "2026-09-01T00:00:00.000Z",
+          update_time: null,
+          attachments: [],
+        },
+      ],
+    ] as const;
+    for (const [stream, data] of rows) {
+      store.replaceStream({
+        instance: "conn_claude",
+        stream,
+        method: "anthropic",
+        generation: 1,
+        primaryKey: ["id"],
+        emittedAt: CLAUDE_COLLECTED,
+        sourceCollectedAt: CLAUDE_COLLECTED,
+        envelopes: [
+          {
+            instance: "conn_claude",
+            stream,
+            key: data.id,
+            data,
+            emitted_at: CLAUDE_COLLECTED,
+          },
+        ],
+      });
+    }
     db.prepare(
       "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
     ).run(
       "claude/conversations/old.json",
       "claude.conversations",
-      "2026-10-01T00:00:00.000Z",
+      "2026-09-01T00:00:00.000Z",
       1,
     );
-    const legacyData = structuredClone(projected.envelope.data);
     const parityView = createLegacyScopeView({
       authority: createLegacyScopeAuthority(db),
       records: store,
       configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
-      readLegacyHead: async () => ({ ...projected.envelope, data: legacyData }),
+      readLegacyHead: async () => ({
+        version: "1.0",
+        scope: "claude.conversations",
+        collectedAt: "2026-09-01T00:00:00.000Z",
+        data: { conversations: [{ id: "cv1", messages: [] }] },
+      }),
     });
-    expect((await parityView.readLatest("claude.conversations")).kind).toBe(
-      "canonical",
-    );
-    const conversations = legacyData.conversations as { messages: object[] }[];
-    conversations[0]!.messages.push({ id: "old-only-message" });
-    db.prepare(
-      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
-    ).run(
-      "claude/conversations/new.json",
-      "claude.conversations",
-      "2026-10-02T00:00:00.000Z",
-      1,
-    );
-    expect((await parityView.readLatest("claude.conversations")).kind).toBe(
-      "file",
-    );
+
+    expect(await parityView.readLatest("claude.conversations")).toEqual({
+      kind: "file",
+    });
+    expect(parityView.verdictFor("claude.conversations")[0]).toMatchObject({
+      verdict: "not_covered",
+      reason: { reason: "missing_raw_blob" },
+      reasonCounts: { missing_raw_blob: 1 },
+    });
+  });
+
+  it("keeps covering Claude project rows with their raw blob references", async () => {
+    connect(store, "conn_claude", "anthropic", CLAUDE);
+    addClaudeProjects(store);
+    const projected = await view.readLatest("claude.projects");
+    expect(projected.kind).toBe("canonical");
+    if (projected.kind !== "canonical") return;
+    addLegacyClaudeHead(db);
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => projected.envelope,
+    });
+
+    expect(await parityView.readLatest("claude.projects")).toMatchObject({
+      kind: "canonical",
+    });
     expect(
-      parityView.verdictFor("claude.conversations")[0]?.reasonCounts
-        .missing_entity,
-    ).toBe(1);
+      parityView.verdictFor("claude.projects")[0]?.reasonCounts
+        .missing_raw_blob,
+    ).toBe(0);
   });
 
   it("keeps parity verdicts isolated by connection instance", async () => {
