@@ -1483,7 +1483,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     if (result.ok) validateAgainst(ouraSleepSchema, result.payload);
   });
 
-  it("omits absent optional Oura fields without turning undefined into schema failures", () => {
+  it("drops Oura rows with null scores so every emitted score is an integer", () => {
     const cases = [
       {
         scope: "oura.activity",
@@ -1511,7 +1511,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         { fetchedStreams: [entry.stream] },
       );
       expect(result.ok, `${entry.scope}: ${JSON.stringify(result)}`).toBe(true);
-      if (result.ok) validateAgainst(entry.schema, result.payload);
+      if (result.ok) {
+        const list =
+          entry.scope === "oura.sleep"
+            ? result.payload.dailyScores
+            : result.payload.days;
+        expect(list).toEqual([]);
+        validateAgainst(entry.schema, result.payload);
+      }
     }
   });
 

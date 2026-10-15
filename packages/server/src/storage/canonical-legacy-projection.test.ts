@@ -462,7 +462,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
   });
 
   describe("real source shapes", () => {
-    it("keeps Oura days and null scores", async () => {
+    it("omits null Oura scores and keeps integer-scored days", async () => {
       const a = connect("conn_a", "oura");
       put("conn_a", "activity", [
         activity("a1", "2026-08-01", null),
@@ -480,7 +480,6 @@ describe("canonical legacy projection over the real SQLite record store", () => 
         scope: "oura.activity",
       });
       expect(read.envelope.data.days).toEqual([
-        expect.objectContaining({ id: "a1", day: "2026-08-01", score: null }),
         expect.objectContaining({ id: "a2", day: "2026-08-02", score: 77 }),
       ]);
     });
@@ -701,7 +700,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
   });
 
   describe("rows the legacy schema cannot hold", () => {
-    it("never emits an Oura row without a valid day; peers and null scores survive", async () => {
+    it("never emits Oura rows with invalid days or null scores", async () => {
       const a = connect("conn_a", "oura");
       put("conn_a", "activity", [
         activity("good1", "2026-08-01", null),
@@ -723,13 +722,15 @@ describe("canonical legacy projection over the real SQLite record store", () => 
           count: 2,
           reasons: ["Oura day is missing or not a YYYY-MM-DD date"],
         },
+        {
+          stream: "activity",
+          count: 1,
+          reasons: [
+            "Oura score is absent or does not round to an integer from 0 to 100",
+          ],
+        },
       ]);
       expect(read.envelope.data.days).toEqual([
-        expect.objectContaining({
-          id: "good1",
-          day: "2026-08-01",
-          score: null,
-        }),
         expect.objectContaining({ id: "good2", day: "2026-08-02", score: 77 }),
       ]);
     });

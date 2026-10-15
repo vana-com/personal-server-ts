@@ -1,6 +1,9 @@
 import {
   LEGACY_SCOPE_BINDINGS,
+  OURA_SLEEP_CONTRIBUTOR_INTEGERS,
+  ouraInteger,
   ouraSleepPeriod,
+  withOuraContributors,
   partitionOuraRows,
 } from "./bindings.js";
 import type { LegacyScopeBinding, ProjectionResult } from "./types.js";
@@ -124,7 +127,7 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                 ...ouraSleepPeriod(session),
                 ...(typeof session.awake_time === "number" ||
                 session.awake_time === null
-                  ? { awakeTime: session.awake_time }
+                  ? { awakeTime: ouraInteger(session.awake_time) }
                   : {}),
               }));
               const dailyScores = scores.map((data) => ({
@@ -133,13 +136,14 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                     ? data.daily_sleep_id
                     : data.id,
                 day: data.day,
-                score: data.sleep_score,
+                score: ouraInteger(data.sleep_score),
                 ...(typeof data.daily_sleep_timestamp === "string"
                   ? { timestamp: data.daily_sleep_timestamp }
                   : {}),
-                ...(data.contributors && typeof data.contributors === "object"
-                  ? { contributors: data.contributors }
-                  : {}),
+                ...withOuraContributors(
+                  data.contributors,
+                  OURA_SLEEP_CONTRIBUTOR_INTEGERS,
+                ),
               }));
               return {
                 ok: true,
