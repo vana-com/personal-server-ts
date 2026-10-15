@@ -186,6 +186,37 @@ const SIGNATURE_REGEX = /^0x[0-9a-fA-F]{130}$/;
 const POSITIVE_DECIMAL_INT_REGEX = /^[1-9]\d*$/;
 const NON_NEGATIVE_DECIMAL_INT_REGEX = /^(0|[1-9]\d*)$/;
 
+// Grant states in which the gateway takes a standalone data_access payment
+// (data-gateway api/v1/escrow/pay.ts, STANDALONE_ACCESS_GRANT_STATES).
+const DATA_ACCESS_GRANT_STATES: readonly string[] = [
+  "pending",
+  "submitting",
+  "confirmed",
+  "finalized",
+];
+
+/**
+ * Whether the gateway would take a standalone data_access payment under this
+ * grant. Mirrors the gateway's own checks so the server never offers (or
+ * forwards) one that is bound to fail, which would strand SDK clients: they
+ * prefer data_access whenever it is offered.
+ *
+ * - registration paid: data_access never carries the registration fee;
+ * - grant live: an accepted chain state, not revoked, not expired;
+ * - a non-zero data-access fee: with that fee disabled the gateway prices
+ *   data_access in the zero asset while the grant quotes the registration
+ *   asset, so the two offers would disagree and nothing is left to pay.
+ */
+function dataAccessPayable(grant: GatewayGrantResponse): boolean {
+  return (
+    grant.paymentStatus === "paid" &&
+    DATA_ACCESS_GRANT_STATES.includes(grant.status) &&
+    grant.revokedAt === null &&
+    !grant.expired &&
+    POSITIVE_DECIMAL_INT_REGEX.test(grant.fee.dataAccessFee)
+  );
+}
+
 export interface BuildChallengeInput {
   // Recovered Web3Signed signer for the GET — the builder.
   builder: `0x${string}`;
@@ -292,12 +323,11 @@ export async function buildChallenge(
     }),
   ];
 
-  // A standalone data_access payment never carries the registration fee
-  // (the gateway prices it as data-access only), so it is offered only once
-  // registration is paid. It needs a receipt to bind to: no accessRecord,
-  // no offer. Both offers share the accessRecord; whichever the builder
-  // pays consumes its recordId, so the other cannot be paid as well.
-  if (!registrationOwed && accessRecord) {
+  // Offered only where the gateway would take it (see dataAccessPayable),
+  // and only with a receipt to bind to. Both offers share the accessRecord
+  // and nonce; whichever the builder pays consumes the recordId, so the
+  // other cannot be paid as well.
+  if (accessRecord && dataAccessPayable(input.grant)) {
     accepts.push(
       offer({
         payerAddress: input.builder,
@@ -523,6 +553,13 @@ export async function verifyPayment(
       return {
         ok: false,
         reason: "grant registration is unpaid; pay the grant offer",
+      };
+    }
+    if (!dataAccessPayable(grant)) {
+      return {
+        ok: false,
+        reason:
+          "grant does not admit a data_access payment; pay the grant offer",
       };
     }
   } else {

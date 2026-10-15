@@ -80,7 +80,10 @@ const serverSigner = {
     }),
 };
 
-function grant(paymentStatus: "pending" | "paid"): GatewayGrantResponse {
+function grant(
+  paymentStatus: "pending" | "paid",
+  overrides: Partial<GatewayGrantResponse> = {},
+): GatewayGrantResponse {
   const paid = paymentStatus === "paid";
   return {
     id: GRANT_ID,
@@ -108,17 +111,19 @@ function grant(paymentStatus: "pending" | "paid"): GatewayGrantResponse {
       dataAccessFee: "1000000000000000",
       totalDue: paid ? "1000000000000000" : "11000000000000000",
     },
+    ...overrides,
   };
 }
 
 async function challengeFor(
   paymentStatus: "pending" | "paid",
   withRecord: boolean,
+  overrides: Partial<GatewayGrantResponse> = {},
 ): Promise<X402Challenge> {
   return buildChallenge({
     builder: builder.address,
     grantId: GRANT_ID,
-    grant: grant(paymentStatus),
+    grant: grant(paymentStatus, overrides),
     network: "vana:14800",
     gatewayConfig,
     ...(withRecord
@@ -160,13 +165,14 @@ async function serverAccepts(
   header: string,
   paymentStatus: "pending" | "paid",
   withRecord: boolean,
+  overrides: Partial<GatewayGrantResponse> = {},
 ) {
   const payment = parsePaymentHeader(header);
   if (!payment) return { ok: false as const, reason: "unparseable" };
   return verifyPayment({
     builder: builder.address,
     grantId: GRANT_ID,
-    grant: grant(paymentStatus),
+    grant: grant(paymentStatus, overrides),
     entry: withRecord ? ENTRY : { ...ENTRY, dataPointId: null },
     serverAddress: server.address,
     gatewayConfig,
@@ -226,6 +232,44 @@ describe("paid-read contract: every client shape the protocol has published", ()
       const challenge = await challengeFor(paymentStatus, withRecord);
       expect(offerOf(challenge, DATA_ACCESS_OP_TYPE)).toBeUndefined();
       expect(challenge.accepts).toHaveLength(1);
+    },
+  );
+
+  // A paid grant the gateway still refuses data_access under. SDK clients
+  // prefer data_access whenever offered, so offering it here would turn a
+  // payable read (via the grant offer) into a gateway 403 or an endless
+  // re-challenge. The grant offer stays.
+  it.each([
+    { why: "chain sync failed", overrides: { status: "failed" } },
+    {
+      why: "revoked",
+      overrides: { revokedAt: "2026-01-22T00:00:00.000Z" },
+    },
+    { why: "expired", overrides: { expired: true } },
+    {
+      why: "data-access fee disabled",
+      overrides: {
+        fee: {
+          asset: "0x00000000000000000000000000000000000000aa",
+          registrationFee: "10000000000000000",
+          dataAccessFee: "0",
+          totalDue: "0",
+        },
+      },
+    },
+  ] as const)(
+    "no data_access offer, and none accepted, when $why",
+    async ({ overrides }) => {
+      const o = overrides as Partial<GatewayGrantResponse>;
+      const challenge = await challengeFor("paid", true, o);
+      expect(offerOf(challenge, DATA_ACCESS_OP_TYPE)).toBeUndefined();
+      expect(challenge.accepts[0].message.opType).toBe(GRANT_OP_TYPE);
+      // A client that builds data_access anyway is refused locally, not
+      // forwarded to a gateway that would reject it.
+      const live = await challengeFor("paid", true);
+      const header = await pay(offerOf(live, DATA_ACCESS_OP_TYPE)!);
+      const result = await serverAccepts(header, "paid", true, o);
+      expect(result).toMatchObject({ ok: false });
     },
   );
 
