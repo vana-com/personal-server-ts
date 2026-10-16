@@ -519,6 +519,8 @@ function projectFields(
 /**
  * SQLite-backed PdppRecordStore for desktop persistence. Requires
  * `better-sqlite3` (already a `packages/server` dependency in this repo).
+ * A readonly database must already have the current schema; no migration,
+ * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
 export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   listConnections(sourceId: string): PdppInstanceBinding[];
@@ -586,9 +588,18 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    */
   listArrivalOrder(instance: string, stream: string): string[];
 } {
-  db.pragma("journal_mode = WAL");
-  migrate(db);
-  sweepStaleBlobClaims(db);
+  if (db.readonly) {
+    const current = db
+      .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
+      .get() as { version: number } | undefined;
+    if (current?.version !== MIGRATIONS.length) {
+      throw new Error("Readonly PDPP store requires the current schema version");
+    }
+  } else {
+    db.pragma("journal_mode = WAL");
+    migrate(db);
+    sweepStaleBlobClaims(db);
+  }
 
   const nextWriteSeq = db.prepare(
     "UPDATE pdpp_write_clock SET value = value + 1 WHERE id = 1 RETURNING value",

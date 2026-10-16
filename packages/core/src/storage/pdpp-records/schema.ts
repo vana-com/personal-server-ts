@@ -21,6 +21,20 @@ import type {
   StreamDeclarationRegistry,
 } from "./portable.js";
 
+/** Shared 2020-12 compiler for writes and declaration-upgrade witnesses. */
+export function compileRecordSchema(
+  schema: Record<string, unknown>,
+): ValidateFunction {
+  // A fresh Ajv instance allows separate sources to reuse the same `$id`
+  // and lets root references (`$ref: "#"`) resolve normally.
+  const ajv = new Ajv2020({
+    allErrors: false,
+    strict: false,
+    validateFormats: false,
+  });
+  return ajv.compile(schema);
+}
+
 /**
  * A validator for every stream the registry declares.
  *
@@ -37,14 +51,7 @@ export function createRecordDataValidator(
   function validatorFor(schema: Record<string, unknown>): ValidateFunction {
     let validate = compiled.get(schema);
     if (!validate) {
-      // A fresh Ajv instance allows separate sources to reuse the same `$id`
-      // and lets root references (`$ref: "#"`) resolve normally.
-      const ajv = new Ajv2020({
-        allErrors: false,
-        strict: false,
-        validateFormats: false,
-      });
-      validate = ajv.compile(schema);
+      validate = compileRecordSchema(schema);
       compiled.set(schema, validate);
     }
     return validate;
@@ -91,7 +98,7 @@ export function createRecordDataValidator(
  * follow the schema (a combinator, a non-local `$ref`), every later segment
  * is redacted. The instance root is shown as `(root)`.
  */
-function redactedPath(
+export function redactedPath(
   schema: Record<string, unknown>,
   instancePath: string,
   data: unknown,
