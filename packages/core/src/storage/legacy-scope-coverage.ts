@@ -5,6 +5,7 @@
  * Diagnostics contain paths and counts, never entity keys or field values.
  */
 import type { ProjectionOmission } from "../legacy-projection/types.js";
+import { LEGACY_COVERAGE_EXCEPTIONS } from "./legacy-scope-coverage-exceptions.js";
 
 export interface LegacyCoverageSchema {
   type?: string | readonly string[];
@@ -52,7 +53,7 @@ export interface LegacyCoverageVerdict {
   reason: LegacyCoverageReason | null;
   /** Counts include accepted proven deletions, which do not block coverage. */
   reasonCounts: Record<LegacyCoverageReason, number>;
-  /** Provenance-backed field omissions used in this evaluation. */
+  /** Reviewed legacy defects and provenance-backed omissions used in this evaluation. */
   appliedExceptions: {
     path: string;
     reason: string;
@@ -380,7 +381,20 @@ export function compareLegacyCoverage(
           mark("timestamp_format", path);
           missingValues -= 1;
         } else if (field && isCreationField(field)) {
-          mark("creation_mismatch", path);
+          const normalizedPath = path.replace(/\[\d+\]/g, "[]");
+          const exception = LEGACY_COVERAGE_EXCEPTIONS.find(
+            (entry) =>
+              entry.scope === options.scope && entry.path === normalizedPath,
+          );
+          if (exception) {
+            appliedExceptions.set(normalizedPath, {
+              path: exception.path,
+              reason: exception.reason,
+              authority: exception.authority,
+            });
+          } else {
+            mark("creation_mismatch", path);
+          }
           missingValues -= 1;
         }
       }
@@ -469,6 +483,19 @@ export function compareLegacyCoverage(
     if (field && (identityFields.includes(field) || isIdentityField(field))) {
       mark("identity_mismatch", path);
     } else if (field && isCreationField(field)) {
+      const normalizedPath = path.replace(/\[\d+\]/g, "[]");
+      const exception = LEGACY_COVERAGE_EXCEPTIONS.find(
+        (entry) =>
+          entry.scope === options.scope && entry.path === normalizedPath,
+      );
+      if (exception) {
+        appliedExceptions.set(normalizedPath, {
+          path: exception.path,
+          reason: exception.reason,
+          authority: exception.authority,
+        });
+        return;
+      }
       mark("creation_mismatch", path);
     } else if (!options.canonicalNewer) {
       mark("field_mismatch", path);
