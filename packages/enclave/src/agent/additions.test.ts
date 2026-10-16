@@ -370,3 +370,28 @@ it("derives long ledger scopes from non-system sources and permits the exact sum
       .status,
   ).toBe(403);
 });
+
+it.each([
+  "test.percent%scope",
+  "test.control\u0001scope",
+  `${"x".repeat(235)}/suffix`,
+  `${"x".repeat(235)}\\suffix`,
+])(
+  "signs canonical checkpoint scopes for existing registered source %j",
+  async (sourceScope) => {
+    const literal = `vana.system.additions.${sourceScope}`;
+    const checkpoint =
+      Buffer.byteLength(literal) <= 256
+        ? literal
+        : `vana.system.additions-hash.${keccak256(stringToHex(sourceScope)).slice(2)}`;
+    const result = await call({
+      kind: "register",
+      scope: checkpoint,
+      sourceScope,
+      version: "1",
+      dataHash: commitment,
+      metadataHash: commitment,
+    });
+    expect(result.status).toBe(200);
+  },
+);

@@ -25,22 +25,15 @@ const scopeValid = (value: unknown): value is string =>
   typeof value === "string" &&
   Buffer.byteLength(value) > 0 &&
   Buffer.byteLength(value) <= 256;
-const safeScope = (scope: string) =>
-  !/[\\/\x00-\x1f%]/.test(scope) && scope !== "." && scope !== "..";
 const checkpointScope = (scope: string, source: unknown) => {
   if (scope === "vana.system.additions") return source === undefined;
-  if (
-    !scopeValid(source) ||
-    source.startsWith("vana.system.") ||
-    !safeScope(source)
-  )
-    return false;
+  if (!scopeValid(source) || source.startsWith("vana.system.")) return false;
   const literal = `vana.system.additions.${source}`;
   const derived =
     Buffer.byteLength(literal) <= 256
       ? literal
       : `vana.system.additions-hash.${keccak256(stringToHex(source)).slice(2)}`;
-  return scope === derived;
+  return scope === derived && !/[\\/]/.test(derived);
 };
 const tombstones = new Set<string>([
   keccak256(stringToHex("vana.data-point.tombstone.v1")),
