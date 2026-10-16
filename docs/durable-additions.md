@@ -1,43 +1,64 @@
 # Durable additions producer
 
-This draft implements the Personal Server part of BUI-904/VANA-12 against Gateway draft PR #168, exact head `228bbf1cd6893a5b34da248832d8861f245d6d3d`. It is not a release, deployed service or proof of cross-surface equality. Desktop and Web integrations remain separate work.
+Personal Server producer for BUI-904/VANA-12, based on `main@76c3a2f72a809d26169d675199dcfac9fdae4dcc`. Gateway draft #168 is pinned at `228bbf1cd6893a5b34da248832d8861f245d6d3d`. Both PRs remain unpublished, draft and unmerged. Desktop/Web rendered acceptance belongs to the later consumer issues.
 
 ## Storage and authority
 
-`createDurableAdditions` receives a fixed owner, network identity, master key, owner-authenticated inventory client, encrypted storage adapter and AddData signer. Runtime network identities include both chain ID and Gateway origin. Each document repeats owner, network and exact source scope; a mismatched document rebuilds rather than contributing counts. No owner key is extracted from a master-key signature, and no registered server is silently treated as the owner.
+`createDurableAdditions` receives one fixed owner, network, master key, inventory client, encrypted storage adapter and AddData signer. Network identities include chain ID and Gateway origin. Encrypted documents repeat owner, network and exact source; mismatches cannot contribute counts. Storage URLs include chain and owner. Envelope plaintext and encrypted-size metadata must match both inventory hashes before folding. Original source envelopes are unchanged.
 
-The storage adapter already namespaces blob URLs by chain and owner. Ledger and summary envelopes use the existing per-scope derived key and OpenPGP encryption. Plaintext and encrypted-size metadata are verified against both inventory hashes before folding. No derived data is stamped into original source envelopes.
+Ordinary ledger names are `vana.system.additions.<source>`. When that name exceeds 256 UTF-8 bytes, the selected mapping is `vana.system.additions-hash.<keccak256(exact source)>`. The exact source remains inside the validated encrypted document. The separate namespace cannot collide with a literal source suffix. This fallback is coordinator-approved; it is no longer a pending format decision.
 
-Ordinary names use `vana.system.additions.<source>`. If that exceeds Gateway's 256 UTF-8-byte limit, `additionsLedgerScope` uses `vana.system.additions-hash.<keccak256(source)>`, retaining the exact source inside the encrypted document. The separate hash namespace avoids collisions with literal source suffixes. This bounded fallback is a proposed resolution of the accepted literal-name/length conflict; it requires coordinator acceptance before release.
+Inventory remains owner-wallet only. Every request includes a fresh signed nonce because Gateway consumes read proofs once. No server key is silently promoted to owner authority. `CreateServerOptions.additionsWriter` accepts an already-authorized storage/AddData/Gateway capability for TEE checkpoints. TEE additions remain unavailable without both owner inventory signing and that injected writer. The ordinary enclave public-read adapter still cannot upload. This injection creates no credential, registration, grant or egress permission.
 
 ## Recovery
 
-1. Discover source scopes including tombstones. Reserved scopes are omitted before counting.
-2. Read numeric-string version pages, including both hashes, status and tombstone markers.
-3. Locate the latest settled tombstone and discard prior-incarnation ledger contributions. Reimport baseline identities have unknown arrival dates and are not new arrivals.
-4. Load the encrypted derived ledger and compare its entire claimed prefix with the current commitments and lifecycle observations. A changed slot, including same-version replacement, invalidates that prefix and triggers replay.
-5. Fold readable source envelopes in numeric version order. Dates come only from envelope `collectedAt`. A missing version/blob, failed or unknown lifecycle remains partial. Pending/submitting content can contribute tentative counts but prevents complete coverage.
-6. Repeat the complete inventory observation before certifying coverage. Recheck source discovery after recovery. These are separate Gateway snapshots, not an atomic owner-wide snapshot or chain finality proof.
-7. Publish changed encrypted ledger checkpoints and, on reads only, a changed portable UTC summary. Upload hooks can use verified in-memory envelope bytes. Reserved writes never recursively fold.
+1. Discover source scopes, including deleted rows, and exclude literal `vana.system.`.
+2. Read numeric-string version pages with both hashes, lifecycle status and tombstones.
+3. Start after the last settled tombstone. Reimport baseline identities have unknown arrival dates and are not new arrivals.
+4. Validate the entire stored checkpoint prefix against current commitments. Same-version replacement invalidates the prefix.
+5. Fold readable envelopes in numeric order using only `collectedAt`. Retain exact permanent identity/timestamp evidence. Missing evidence, failed/unknown slots and tentative pending slots prevent complete coverage.
+6. Re-read the inventory and source listing before certifying. Pages are separate snapshots, not owner-wide atomic finality.
+7. Publish encrypted checkpoints and a changed portable summary. Re-read registration and blob commitments after publication. System writes never recursively fold.
 
-No numeric cursor alone certifies coverage. Independent writers may lose derived writes because Gateway registration is not CAS. A later reader checks the surviving document's commitments and repairs lower-prefix or replaced-slot state. No process-local lock is relied on for cross-device correctness. If old source blobs are missing during a necessary replay, coverage remains partial; the code does not invent prior content.
+Cross-device correctness does not depend on process-local locks or CAS registration. A later reader repairs lost or lower-prefix checkpoints. If source blobs are missing during required replay, history remains partial. An inaccessible checkpoint is never overwritten with a failed rebuild. Full runtime has no 200-version/256-MiB backfill cap. Inventory pages are still accumulated, with a configurable page limit, so full-runtime memory includes the version inventory and one scope ledger.
 
-The full producer has no 200-version or 256-MiB rebuild cap. The local-only sidecar fallback retains its older bounded rebuild for diagnostics, always marked unavailable for authoritative coverage. Version traversal has a configurable page bound; inventory pages are currently materialized in memory.
+## Summary contract
 
-## Summary and deletion
+The version-1 payload retains local route fields and adds coverage, through markers, recent `buckets`, `fineSince`, and older `daily` UTC counts, globally and per source. Ten complete UTC days plus today retain quarter-hours. This covers the current seven-local-day chart at UTC-12 through UTC+14, DST transitions and current fractional-hour zones. Counts older than `fineSince` compact into UTC days without deleting permanent ledger evidence.
 
-The version-1 payload keeps Desktop's existing fields and adds `coverage`, per-source numeric `through`, and UTC 15-minute buckets globally and per source. `partial` means historical dates are unknown, while `coverage` means current recovery is complete, behind, partial, or unavailable. Read consumers must inspect coverage before presenting zero as measured zero. The supported browser-safe summary subpath contains a Zod validator and local-day helper.
+Full-runtime requested local days are rebuilt directly from exact ledger timestamps, including older intervals. `projectPortableAdditionsByLocalDay` returns `partial` with `days: null` when an older non-UTC interval cannot be reconstructed from the portable document. UTC intervals can use older daily counts exactly. Consumers must not feed compacted UTC days into the quarter-hour-only helper and invent local boundaries.
 
-Identities and fine buckets are retained permanently. Compacting fine buckets into UTC days would prevent accurate old local days in DST and fractional-hour zones without rereading the ledger. Keeping fine buckets is the proposed minimum retention resolution, with storage proportional to history. Individual snapshots above 200,000 identities remain explicitly incomplete.
+`readAdditionsSummaryJson` enforces an 8-MiB UTF-8 document limit; bounded HTTP readers must enforce the limit before materializing JSON. The producer refuses to publish an oversized portable summary and returns behind instead. This is a transport limit, not a claim that arbitrarily many sources or years always fit in one browser document. Ordinary route summaries can still reconstruct older requested days from exact ledgers.
 
-Source deletion uses the existing durable delete pipeline to delete its derived ledger and invalidate the summary. Reserved callbacks cannot recursively delete their own derived data. A subsequent reader rebuilds the summary from current source tombstones. Ciphertext captured before deletion remains owner-decryptable, as with existing source deletion.
+Source deletion uses the existing durable deletion pipeline for its checkpoint and summary invalidation. Subsequent recovery reads current source tombstones. Captured prior ciphertext remains owner-decryptable, as with ordinary source data deletion.
 
-## Remaining required gates
+## Budgeted hosts
 
-- The pinned inventory API requires fresh owner wallet signatures. Desktop and TEE normally have derived server keys. Supply an authorized owner request signer or amend Gateway to allow an active registered server for this specific read. The draft exposes `ownerRequestSigner` and returns unavailable without one. TEE's existing public-read adapter also refuses uploads; its durable producer needs an authorized write adapter before it can persist checkpoints.
-- Lite supplies a shared 8-MiB read budget and ten-second inventory signal. Ciphertext and plaintext bytes are charged, including derived ledgers. The Storage SDK exposes whole-blob download without abort or streaming limits. Checks between atomic operations cannot guarantee a hard transfer/time bound. Checkpoint writes finish after byte exhaustion so progress can resume. Add bounded/abortable storage reads and bounded inventory parsing before claiming the accepted browser-budget gate passed.
-- Owner-wide source discovery uses the public head listing, including tombstones. It cannot enumerate failed slots whose head disappeared. Exact known-scope inventory can still read those slots. No universal historical owner-inventory certificate is claimed.
-- Gateway and blob fixtures in Personal Server tests are simulated ports, with real filesystem persistence and encryption. They are not an end-to-end run of the Gateway SQL handler, chain settlement, actual Storage service, browser, Desktop or TEE. The prerequisite Gateway SQL suite has its own retained evidence.
-- Large real backfill beyond 256 MiB, native cross-surface equality and production data were not exercised. No release, deployment, merge or shared-branch push is authorized.
+One `AdditionsBudget` covers inventory bodies, ciphertext, contiguous copies, decoded plaintext, parse input work, checkpoint verification and derived summary work across scopes. Exhaustion is sticky. Monotonic deadline checks catch CPU work that runs past an undelivered timer callback. Real fetch/stream cancellation is awaited; no timeout race abandons an SDK operation.
 
-These gates keep VANA-12 blocked rather than accepted. The draft preserves supported source work for review and the coordinator's next contract decision.
+Vana's signed adapter exposes `downloadBounded`, using the already-public canonical blob GET with namespace validation and redirect rejection. It checks advertised length and actual stream chunks, including missing/false lengths and HTTP decompression expansion. Inventory readers bound JSON before parsing and share the accumulator's budget. They require a cancellation-aware signing capability rather than letting wallet prompts outlive the deadline.
+
+The SDK crypto and checkpoint APIs still do not expose cancellation or a preallocation plaintext/decompression ceiling. Therefore the installed Lite path returns **unavailable** before starting recovery when bounded crypto/publication capability is absent. It no longer claims behind progress after whole-object SDK work or runs checkpoint publication under a fresh unlimited budget. A host may inject `boundedWork` only if it cancels and settles crypto/publication and enforces the plaintext limit. Returned checkpoint proofs are revalidated by the coordinator under the same budget. No production bounded-work implementation is supplied in this PR; incremental Lite progress and checkpoint resume acceptance remain **unproved**. This safe unavailable state is an explicit remaining gate, not completion of browser catch-up.
+
+## Reproducible evidence
+
+With dependencies installed in both isolated checkouts:
+
+```sh
+npm test -- packages/core/src/additions packages/core/src/storage/adapters/vana-bounded.test.ts packages/core/src/signing
+node --import tsx scripts/verify-additions-gateway.mjs ../data-gateway
+node --import tsx scripts/verify-additions-gateway.mjs ../data-gateway --large
+npm run validate
+npm run build
+```
+
+The runner refuses any Gateway revision other than the pinned commit. It owns a disposable PostgreSQL cluster and loopback HTTP/blob service, uses a throwaway owner key, real Gateway inventory/listing handlers, replay fencing, real encryption and exact commitments. It checks numeric paging, invalid proof denial, authoritative revalidation and restart after original blob pruning. Registrations are explicitly SQL-seeded confirmed fixtures; checkpoint registration is a fixture port. This does not prove POST AddData authorization, chain settlement, production Storage, browser worker or native behavior.
+
+Observed full-runtime runs: 102 versions passed the paging proof. The large run replayed 90 versions / **377,509,603 ciphertext bytes**, returned complete/total 2, and recovered identical counts after original pruning. Peak process RSS was **487,292,928 bytes**, including fixture generation and imported Gateway code. This is measured evidence, not a constant-memory guarantee for unbounded identities or versions.
+
+## Remaining acceptance gates
+
+- Registered-server INVENTORY authorization remains pending Callum's confirmation. No Gateway permission change is included. An existing owner signing capability remains the supported alternative.
+- TEE needs an actual authorized owner inventory signer and host-injected writable checkpoint capability. The injection is prepared; no authority was manufactured.
+- Lite needs concrete cancellation-aware bounded signing, crypto and checkpoint adapters with real worker/transport proof, plus resumable interrupted checkpoints. Missing capability returns unavailable. The hard 8-MiB/ten-second incremental catch-up gate is not accepted.
+- Browser/native cross-surface rendered equality is later consumer work. No production data, publishing, deployment or shared-branch writes were used.

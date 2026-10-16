@@ -1,3 +1,4 @@
+import type { ByteBudget } from "../../additions/budget.js";
 /**
  * Abstract storage backend adapter.
  * All methods operate on encrypted binary blobs.
@@ -30,6 +31,9 @@ export interface StorageAdapter {
    * @throws if blob not found
    */
   download(url: string): Promise<Uint8Array>;
+
+  /** Optional bounded transport. Absence means budgeted recovery is unavailable. */
+  downloadBounded?(url: string, budget: ByteBudget): Promise<Uint8Array>;
 
   /**
    * Delete an encrypted blob from the storage backend.

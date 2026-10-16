@@ -37,12 +37,23 @@ export interface AdditionsBucket {
   added: number;
 }
 export const ADDITIONS_BUCKET_MS = 15 * 60 * 1000;
+const UTC_DAY_MS = 24 * 60 * 60 * 1000;
+// Ten complete UTC days plus today cover a seven-local-day chart even at
+// UTC-12/UTC+14 and across DST changes. Exact ledgers retain older timestamps.
+export const ADDITIONS_FINE_DAYS = 10;
+export interface AdditionsDailyCount {
+  date: string;
+  added: number;
+}
 
 export interface AdditionsSummary {
   version: 1;
   coverage: AdditionsCoverage;
   through: Record<string, string>;
-  /** Permanent arrivals in UTC buckets; rebucket into local days at display time. */
+  /** UTC midnight cutoff. Older daily counts cannot prove exact local days. */
+  fineSince: string;
+  daily: AdditionsDailyCount[];
+  /** Recent arrivals in UTC quarter-hours. */
   buckets: AdditionsBucket[];
   timezone: string;
   /** Records in each scope's newest version (tracked or not), summed. */
@@ -56,7 +67,8 @@ export interface AdditionsSummary {
   scopes: {
     scope: string;
     total: number;
-    /** Permanent scope arrivals, retaining quarter-hour resolution for every date. */
+    daily: AdditionsDailyCount[];
+    /** Recent scope arrivals. */
     buckets: AdditionsBucket[];
     /**
      * The scope's baseline: records first seen then predate tracking. Null
@@ -100,6 +112,8 @@ export const AdditionsSummarySchema = z.object({
   version: z.literal(1),
   coverage: z.enum(["complete", "behind", "partial", "unavailable"]),
   through: z.record(z.string(), z.string().regex(/^(0|[1-9]\d*)$/)),
+  fineSince: instantSchema,
+  daily: z.array(z.object({ date: daySchema, added: countSchema })),
   buckets: bucketsSchema,
   timezone: z.string().refine((value) => {
     try {
@@ -124,6 +138,7 @@ export const AdditionsSummarySchema = z.object({
         .refine((scope) => !scope.startsWith("vana.system.")),
       total: countSchema,
       buckets: bucketsSchema,
+      daily: z.array(z.object({ date: daySchema, added: countSchema })),
       trackedSince: instantSchema.nullable(),
       partial: z.boolean(),
     }),
@@ -221,7 +236,7 @@ export function bucketAdditionsByLocalDay(
   return rows;
 }
 
-/** Retain fine resolution for all history so timezone changes can rebucket old days. */
+/** Sort the recent UTC intervals. */
 function sortedBuckets(counts: ReadonlyMap<number, number>): AdditionsBucket[] {
   return [...counts]
     .sort(([a], [b]) => a - b)
@@ -233,7 +248,23 @@ export async function summarizeAdditions(
 ): Promise<AdditionsSummary> {
   const { timezone, days, now } = input;
   validateTimezone(timezone);
+  const fineSinceAt =
+    Math.floor(now.getTime() / UTC_DAY_MS) * UTC_DAY_MS -
+    ADDITIONS_FINE_DAYS * UTC_DAY_MS;
   const bucketCounts = new Map<number, number>();
+  const dailyCounts = new Map<number, number>();
+  const exactDays = buildDayRows(createFormatter(timezone), now, days);
+  const byDate = new Map(exactDays.map((row) => [row.date, row]));
+  const formatter = createFormatter(timezone);
+  const sortedDays = (
+    counts: ReadonlyMap<number, number>,
+  ): AdditionsDailyCount[] =>
+    [...counts]
+      .sort(([a], [b]) => a - b)
+      .map(([at, added]) => ({
+        date: new Date(at).toISOString().slice(0, 10),
+        added,
+      }));
   let incomplete = false;
 
   const scopes: AdditionsSummary["scopes"] = [];
@@ -248,12 +279,21 @@ export async function summarizeAdditions(
       ledger.skipped || ledger.incomplete || ledger.truncated || ledger.retry,
     );
     const scopeBucketCounts = new Map<number, number>();
+    const scopeDailyCounts = new Map<number, number>();
     for (const firstSeen of listAddedTimestamps(ledger)) {
       const start =
         Math.floor(Date.parse(firstSeen) / ADDITIONS_BUCKET_MS) *
         ADDITIONS_BUCKET_MS;
-      bucketCounts.set(start, (bucketCounts.get(start) ?? 0) + 1);
-      scopeBucketCounts.set(start, (scopeBucketCounts.get(start) ?? 0) + 1);
+      const row = byDate.get(localDate(formatter, new Date(firstSeen)));
+      if (row) row.added++;
+      if (start >= fineSinceAt) {
+        bucketCounts.set(start, (bucketCounts.get(start) ?? 0) + 1);
+        scopeBucketCounts.set(start, (scopeBucketCounts.get(start) ?? 0) + 1);
+      } else {
+        const day = Math.floor(start / UTC_DAY_MS) * UTC_DAY_MS;
+        dailyCounts.set(day, (dailyCounts.get(day) ?? 0) + 1);
+        scopeDailyCounts.set(day, (scopeDailyCounts.get(day) ?? 0) + 1);
+      }
     }
 
     total += ledger.latest.total;
@@ -274,6 +314,7 @@ export async function summarizeAdditions(
       scope: ledger.scope,
       total: ledger.latest.total,
       buckets: sortedBuckets(scopeBucketCounts),
+      daily: sortedDays(scopeDailyCounts),
       trackedSince: scopeTrackedSince,
       partial,
     });
@@ -290,11 +331,65 @@ export async function summarizeAdditions(
         : (input.coverage ?? "complete"),
     through: { ...input.through },
     buckets,
+    fineSince: new Date(fineSinceAt).toISOString(),
+    daily: sortedDays(dailyCounts),
     timezone,
     total,
-    days: bucketAdditionsByLocalDay(buckets, timezone, days, now),
+    days: exactDays,
     trackedSince,
     partial: anyPartial,
     scopes,
+  };
+}
+
+export const ADDITIONS_SUMMARY_MAX_BYTES = 8 * 1024 * 1024;
+
+/** Parse a portable document only within its browser transport size limit. */
+export function readAdditionsSummaryJson(
+  json: string,
+): AdditionsSummary | null {
+  if (
+    json.length > ADDITIONS_SUMMARY_MAX_BYTES ||
+    new TextEncoder().encode(json).byteLength > ADDITIONS_SUMMARY_MAX_BYTES
+  )
+    return null;
+  try {
+    return readAdditionsSummary(JSON.parse(json));
+  } catch {
+    return null;
+  }
+}
+
+/** Old UTC days cannot be split into exact local days without the owner ledger. */
+export function projectPortableAdditionsByLocalDay(
+  summary: AdditionsSummary,
+  timezone: string,
+  days: number,
+  now: Date,
+): { coverage: AdditionsCoverage; days: AdditionsSummary["days"] | null } {
+  const formatter = createFormatter(timezone);
+  const rows = buildDayRows(formatter, now, days);
+  if (timezone === "UTC") {
+    const byDate = new Map(rows.map((row) => [row.date, row]));
+    for (const count of summary.daily) {
+      const row = byDate.get(count.date);
+      if (row) row.added += count.added;
+    }
+    for (const bucket of summary.buckets) {
+      const row = byDate.get(new Date(bucket.start).toISOString().slice(0, 10));
+      if (row) row.added += bucket.added;
+    }
+    return { coverage: summary.coverage, days: rows };
+  }
+  // Reject the cutoff's local day too, since it may begin before UTC midnight.
+  if (
+    rows.some(
+      (row) => row.date <= localDate(formatter, new Date(summary.fineSince)),
+    )
+  )
+    return { coverage: "partial", days: null };
+  return {
+    coverage: summary.coverage,
+    days: bucketAdditionsByLocalDay(summary.buckets, timezone, days, now),
   };
 }

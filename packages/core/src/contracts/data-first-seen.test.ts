@@ -161,6 +161,7 @@ describe("first-seen sidecar on ingest", () => {
         trackedSince: null,
         partial: false,
         buckets: [],
+        daily: [],
       },
     ]);
   });

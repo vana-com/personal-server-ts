@@ -1,3 +1,8 @@
+import {
+  AdditionsBudget,
+  AdditionsBudgetExceeded as BudgetExceeded,
+  type ByteBudget,
+} from "./budget.js";
 import { z } from "zod";
 import { getAddress, keccak256, stringToHex } from "viem";
 import {
@@ -19,6 +24,7 @@ import {
 } from "./first-added.js";
 import {
   summarizeAdditions,
+  ADDITIONS_SUMMARY_MAX_BYTES,
   type AdditionsCoverage,
   type AdditionsSummary,
 } from "./summary.js";
@@ -71,8 +77,28 @@ export interface DurableAdditionsOptions {
   masterKey: Uint8Array;
   signer: Pick<ServerSigner, "signAddData">;
   gateway: Pick<GatewayClient, "registerDataPoint">;
-  /** Full PS is unbounded; Lite charges read bytes and checks time between atomic SDK operations. */
+  /** Full PS defaults remain unlimited. Bounded hosts must also supply boundedWork. */
   byteBudget?: number;
+  /** Host operations must cancel and settle all work before returning on abort.
+   * Crypto must enforce a plaintext limit before decompression/allocation.
+   * No SDK whole-object fallback is allowed under a finite budget.
+   */
+  boundedWork?: {
+    decrypt(
+      encrypted: Uint8Array,
+      password: string,
+      budget: ByteBudget,
+    ): Promise<Uint8Array>;
+    publish(
+      scope: string,
+      data: Record<string, unknown>,
+      budget: ByteBudget,
+    ): Promise<{
+      expectedVersion: string;
+      dataHash: string;
+      metadataHash: string;
+    }>;
+  };
   timeBudgetMs?: number;
   /** Existing durable delete pipeline, including exact-key cleanup/retry. */
   deleteSystemScope?: (scope: string) => Promise<void>;
@@ -91,26 +117,20 @@ export interface DurableAdditionsService {
   deleteScope(scope: string): Promise<void>;
 }
 
-class BudgetExceeded extends Error {}
 class InaccessibleLedger extends Error {}
-class ReadBudget {
-  used = 0;
-  readonly signal: AbortSignal | undefined;
-  private readonly start = performance.now();
-  constructor(private readonly options: DurableAdditionsOptions) {
-    this.signal =
-      options.timeBudgetMs === undefined
-        ? undefined
-        : AbortSignal.timeout(options.timeBudgetMs);
+class BoundedWorkUnavailable extends Error {}
+class ReadBudget extends AdditionsBudget {
+  readonly limited: boolean;
+  constructor(options: DurableAdditionsOptions) {
+    super(options.byteBudget, options.timeBudgetMs);
+    this.limited =
+      options.byteBudget !== undefined || options.timeBudgetMs !== undefined;
   }
   check(bytes = 0) {
-    this.used += bytes;
-    if (
-      this.used > (this.options.byteBudget ?? Infinity) ||
-      performance.now() - this.start >= (this.options.timeBudgetMs ?? Infinity)
-    ) {
-      throw new BudgetExceeded();
-    }
+    this.charge(bytes);
+  }
+  get readOptions() {
+    return { signal: this.signal, ...(this.limited ? { budget: this } : {}) };
   }
 }
 
@@ -162,17 +182,28 @@ export function createDurableAdditions(
     budget: ReadBudget,
   ) {
     budget.check();
-    const encrypted = await storageAdapter.download(
-      storageAdapter.urlForKey(`${scope}/${slot.expectedVersion}`),
-    );
-    budget.check(encrypted.byteLength);
-    const plaintext = await decryptWithPassword(
-      encrypted,
-      hex(deriveScopeKey(options.masterKey, scope)),
-    );
+    if (
+      budget.limited &&
+      (!storageAdapter.downloadBounded || !options.boundedWork)
+    )
+      throw new BoundedWorkUnavailable(
+        "Abortable bounded crypto/storage capability unavailable",
+      );
+    const url = storageAdapter.urlForKey(`${scope}/${slot.expectedVersion}`);
+    const encrypted =
+      budget.limited && storageAdapter.downloadBounded
+        ? await storageAdapter.downloadBounded(url, budget)
+        : await storageAdapter.download(url);
+    if (!budget.limited) budget.check(encrypted.byteLength);
+    const password = hex(deriveScopeKey(options.masterKey, scope));
+    const plaintext =
+      budget.limited && options.boundedWork
+        ? await options.boundedWork.decrypt(encrypted, password, budget)
+        : await decryptWithPassword(encrypted, password);
     budget.check(plaintext.byteLength);
     if (keccak256(plaintext).toLowerCase() !== slot.dataHash.toLowerCase())
       throw new Error("Additions content commitment mismatch");
+    budget.check(plaintext.byteLength * 3);
     const envelope = DataFileEnvelopeSchema.parse(
       JSON.parse(new TextDecoder().decode(plaintext)),
     );
@@ -191,12 +222,13 @@ export function createDurableAdditions(
       metadataHash.toLowerCase() !== slot.metadataHash.toLowerCase()
     )
       throw new Error("Additions metadata commitment mismatch");
+    budget.check();
     return envelope;
   }
 
   async function current(scope: string, budget: ReadBudget) {
     budget.check();
-    const snapshot = await inventory.list(scope, { signal: budget.signal });
+    const snapshot = await inventory.list(scope, budget.readOptions);
     budget.check();
     const head = snapshot.head;
     if (!head || head.deletedAt !== null) return null;
@@ -216,9 +248,7 @@ export function createDurableAdditions(
     budget: ReadBudget,
   ): Promise<LedgerDocument | null> {
     const systemScope = additionsLedgerScope(scope);
-    const snapshot = await inventory.list(systemScope, {
-      signal: budget.signal,
-    });
+    const snapshot = await inventory.list(systemScope, budget.readOptions);
     if (!snapshot.head || snapshot.head.deletedAt !== null) return null;
     const boundary =
       snapshot.versions.filter((row) => row.isTombstone).at(-1)
@@ -269,8 +299,35 @@ export function createDurableAdditions(
     return null;
   }
 
-  async function publish(scope: string, data: Record<string, unknown>) {
-    const snapshot = await inventory.list(scope);
+  async function publish(
+    scope: string,
+    data: Record<string, unknown>,
+    budget: ReadBudget,
+  ) {
+    budget.check();
+    if (budget.limited) {
+      if (!options.boundedWork)
+        throw new BoundedWorkUnavailable(
+          "Bounded checkpoint publication unavailable",
+        );
+      const proof = await options.boundedWork.publish(scope, data, budget);
+      budget.check();
+      const check = await inventory.list(scope, budget.readOptions);
+      const slot = check.versions.find(
+        (row) =>
+          row.expectedVersion === proof.expectedVersion &&
+          row.dataHash === proof.dataHash &&
+          row.metadataHash === proof.metadataHash,
+      );
+      if (!slot)
+        throw new Error("Bounded checkpoint registration was replaced");
+      const envelope = await readEnvelope(scope, slot, budget);
+      if (JSON.stringify(envelope.data) !== JSON.stringify(data))
+        throw new Error("Bounded checkpoint content was replaced");
+      budget.check();
+      return;
+    }
+    const snapshot = await inventory.list(scope, budget.readOptions);
     const version =
       BigInt(snapshot.versions.at(-1)?.expectedVersion ?? "0") + 1n;
     const envelope = createDataFileEnvelope(
@@ -311,7 +368,7 @@ export function createDurableAdditions(
     });
     // A concurrent upload can replace the bytes at this shared version key
     // independently of registration. Never claim durability without checking.
-    const check = await inventory.list(scope);
+    const check = await inventory.list(scope, budget.readOptions);
     const registered = check.versions.find(
       (slot) =>
         slot.expectedVersion === String(version) &&
@@ -322,15 +379,7 @@ export function createDurableAdditions(
       throw new Error(
         "Concurrent additions publication replaced the registration",
       );
-    await readEnvelope(
-      scope,
-      registered,
-      new ReadBudget({
-        ...options,
-        byteBudget: undefined,
-        timeBudgetMs: undefined,
-      }),
-    );
+    await readEnvelope(scope, registered, budget);
   }
 
   async function recover(
@@ -347,7 +396,7 @@ export function createDurableAdditions(
     coverage: AdditionsCoverage;
   }> {
     budget.check();
-    const snapshot = await inventory.list(scope, { signal: budget.signal });
+    const snapshot = await inventory.list(scope, budget.readOptions);
     budget.check();
     const head = snapshot.head;
     if (!head || head.deletedAt !== null) {
@@ -361,7 +410,7 @@ export function createDurableAdditions(
               settled(slot),
           )
         : null;
-      const check = await inventory.list(scope, { signal: budget.signal });
+      const check = await inventory.list(scope, budget.readOptions);
       return {
         ledger: null,
         currentTotal: 0,
@@ -501,7 +550,7 @@ export function createDurableAdditions(
     if (ledger?.incomplete || ledger?.skipped) coverage = "partial";
     // The pages above are separate snapshots. Never certify against an old view.
     if (coverage !== "behind") {
-      const check = await inventory.list(scope, { signal: budget.signal });
+      const check = await inventory.list(scope, budget.readOptions);
       if (!sameInventory(snapshot, check))
         return {
           ledger: null,
@@ -529,7 +578,7 @@ export function createDurableAdditions(
     ) {
       // A write failure affects durability, never hides the verified in-memory result.
       try {
-        await publish(additionsLedgerScope(scope), { ...document });
+        await publish(additionsLedgerScope(scope), { ...document }, budget);
       } catch {
         coverage = coverage === "complete" ? "behind" : coverage;
       }
@@ -540,12 +589,21 @@ export function createDurableAdditions(
   return {
     async summarize(input) {
       const budget = new ReadBudget(options);
+      if (
+        budget.limited &&
+        (!options.boundedWork || !storageAdapter.downloadBounded)
+      )
+        return summarizeAdditions({
+          ...input,
+          ledgers: [],
+          coverage: "unavailable",
+        });
       const ledgers: ScopeFirstSeenLedger[] = [];
       const through: Record<string, string> = {};
       let coverage: AdditionsCoverage = "complete";
       let scopes: string[] = [];
       try {
-        scopes = (await inventory.listScopes({ signal: budget.signal }))
+        scopes = (await inventory.listScopes(budget.readOptions))
           .filter((scope) => !isSystemScope(scope))
           .sort();
         for (const scope of scopes) {
@@ -562,7 +620,7 @@ export function createDurableAdditions(
           )
             coverage = result.coverage;
         }
-        const check = (await inventory.listScopes({ signal: budget.signal }))
+        const check = (await inventory.listScopes(budget.readOptions))
           .filter((scope) => !isSystemScope(scope))
           .sort();
         if (JSON.stringify(scopes) !== JSON.stringify(check))
@@ -589,6 +647,15 @@ export function createDurableAdditions(
             coverage,
             through,
           });
+          const serialized = JSON.stringify(portable);
+          if (
+            new TextEncoder().encode(serialized).byteLength >
+            ADDITIONS_SUMMARY_MAX_BYTES
+          )
+            throw new Error(
+              "Portable additions summary exceeds browser size limit",
+            );
+          budget.check(serialized.length * 2);
           let previous: Awaited<ReturnType<typeof current>> = null;
           try {
             previous = await current(ADDITIONS_SUMMARY_SCOPE, budget);
@@ -599,17 +666,23 @@ export function createDurableAdditions(
           if (
             JSON.stringify(previous?.envelope.data) !== JSON.stringify(portable)
           ) {
+            budget.check();
             await new Promise((resolve) =>
               setTimeout(
                 resolve,
                 Math.floor(crypto.getRandomValues(new Uint8Array(1))[0]! / 8),
               ),
             );
-            await publish(ADDITIONS_SUMMARY_SCOPE, { ...portable });
+            await publish(ADDITIONS_SUMMARY_SCOPE, { ...portable }, budget);
           }
         } catch {
           result.coverage = "behind";
         }
+      }
+      try {
+        budget.check();
+      } catch {
+        result.coverage = "behind";
       }
       return result;
     },
@@ -618,9 +691,15 @@ export function createDurableAdditions(
       // Optional optimization only. Correctness always comes from read recovery.
       try {
         const budget = new ReadBudget(options);
-        const snapshot = await inventory.list(version.scope, {
-          signal: budget.signal,
-        });
+        if (
+          budget.limited &&
+          (!options.boundedWork || !storageAdapter.downloadBounded)
+        )
+          return;
+        const snapshot = await inventory.list(
+          version.scope,
+          budget.readOptions,
+        );
         const head = snapshot.head;
         if (!head || head.deletedAt !== null) return;
         if (

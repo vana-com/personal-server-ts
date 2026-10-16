@@ -32,6 +32,7 @@ describe("owner version inventory", () => {
     expect(signRequest).toHaveBeenCalledWith({
       aud: "https://gateway.example",
       method: "GET",
+      nonce: expect.any(String),
       uri: `/v1/data/${id}/versions?user=${owner}&scope=+scope+&after=0&limit=100`,
     });
     expect(fetcher.mock.calls[0]?.[1].headers.Authorization).toBe(

@@ -4,6 +4,8 @@ import {
   InvalidTimezoneError,
   bucketAdditionsByLocalDay,
   readAdditionsSummary,
+  projectPortableAdditionsByLocalDay,
+  readAdditionsSummaryJson,
   summarizeAdditions,
   validateTimezone,
   type AdditionsSummary,
@@ -218,6 +220,7 @@ describe("summarizeAdditions", () => {
     expect(summary.total).toBe(300_002);
     expect(summary.scopes).toEqual([
       {
+        daily: [],
         scope: "a.binary",
         total: 1,
         trackedSince: null,
@@ -225,6 +228,7 @@ describe("summarizeAdditions", () => {
         buckets: [],
       },
       {
+        daily: [],
         scope: "b.huge",
         total: 300_000,
         trackedSince: null,
@@ -232,6 +236,7 @@ describe("summarizeAdditions", () => {
         buckets: [],
       },
       {
+        daily: [],
         scope: "c.normal",
         total: 1,
         trackedSince: BASELINE,
@@ -371,11 +376,92 @@ describe("summarizeAdditions", () => {
       expect(readAdditionsSummary(invalid)).toBeNull();
   });
 
+  it("compacts old UTC counts without losing exact requested local days", async () => {
+    const records: Record<string, [string, string]> = {
+      old: ["2026-09-15T23:50:00.000Z", NOW],
+      edge: ["2026-09-29T00:00:00.000Z", NOW],
+      recent: ["2026-10-08T23:50:00.000Z", NOW],
+    };
+    const summary = await summarize([ledger("notes.entries", records)], {
+      timezone: "Asia/Kathmandu",
+      days: 31,
+    });
+    expect(summary.daily).toEqual([{ date: "2026-09-15", added: 1 }]);
+    expect(summary.buckets).toHaveLength(2);
+    expect(summary.fineSince).toBe("2026-09-29T00:00:00.000Z");
+    expect(addedOn(summary, "2026-10-09")).toBe(1);
+    expect(addedOn(summary, "2026-09-29")).toBe(1);
+    // Older local days are reconstructed from exact ledger timestamps.
+    expect(addedOn(summary, "2026-09-16")).toBe(1);
+    expect(
+      projectPortableAdditionsByLocalDay(
+        summary,
+        "Asia/Kathmandu",
+        31,
+        new Date(NOW),
+      ),
+    ).toEqual({ coverage: "partial", days: null });
+    expect(
+      projectPortableAdditionsByLocalDay(summary, "UTC", 31, new Date(NOW))
+        .days,
+    ).toContainEqual({ date: "2026-09-15", added: 1 });
+    expect(readAdditionsSummaryJson(JSON.stringify(summary))).toEqual(summary);
+    expect(
+      readAdditionsSummaryJson(" ".repeat(8 * 1024 * 1024 + 1)),
+    ).toBeNull();
+    expect(readAdditionsSummary(summary)).toEqual(summary);
+  });
+
+  it("normalizes accepted offset timestamps for portable UTC projection", async () => {
+    const summary = await summarize([]);
+    summary.buckets = [{ start: "2026-10-09T00:00:00+05:45", added: 2 }];
+    const parsed = readAdditionsSummary(summary);
+    expect(parsed).not.toBeNull();
+    if (!parsed) throw new Error("Valid transport rejected");
+    const projection = projectPortableAdditionsByLocalDay(
+      parsed,
+      "UTC",
+      2,
+      new Date(NOW),
+    );
+    expect(projection.days).toEqual([
+      { date: "2026-10-08", added: 2 },
+      { date: "2026-10-09", added: 0 },
+    ]);
+  });
+
+  it.each([
+    "Pacific/Kiritimati",
+    "Etc/GMT+12",
+    "America/New_York",
+    "Australia/Lord_Howe",
+    "Asia/Kolkata",
+    "Asia/Kathmandu",
+    "Pacific/Chatham",
+  ])("keeps seven local days in the fine window for %s", async (timezone) => {
+    const now = new Date("2026-11-02T00:01:00Z");
+    const summary = await summarize(
+      [
+        ledger("notes.entries", {
+          a: ["2026-10-26T23:59:59Z", NOW],
+          b: ["2026-11-01T05:59:59Z", NOW],
+          c: ["2026-11-01T06:00:00Z", NOW],
+        }),
+      ],
+      { now, timezone },
+    );
+    expect(
+      projectPortableAdditionsByLocalDay(summary, timezone, 7, now),
+    ).toEqual({ coverage: "complete", days: summary.days });
+  });
+
   it("throws InvalidTimezoneError for an unknown timezone", async () => {
     await expect(summarize([], { timezone: "Not/AZone" })).rejects.toThrow(
       InvalidTimezoneError,
       bucketAdditionsByLocalDay,
       readAdditionsSummary,
+      projectPortableAdditionsByLocalDay,
+      readAdditionsSummaryJson,
     );
     expect(() => validateTimezone("Not/AZone")).toThrow(InvalidTimezoneError);
     expect(() => validateTimezone("America/Toronto")).not.toThrow();

@@ -391,7 +391,7 @@ describe("durable owner additions recovery", () => {
     },
   );
 
-  it("reports bounded Lite progress as behind and lets a fresh full actor finish", async () => {
+  it("refuses budgeted work without cancellable crypto and lets a full actor finish", async () => {
     const f = await fixture();
     const first = await f.source("1", T1, ["a"]);
     await f.source("2", T2, ["a", "b"]);
@@ -400,11 +400,14 @@ describe("durable owner additions recovery", () => {
     });
     const progress = await lite.summarize(QUERY);
     expect(progress).toMatchObject({
-      coverage: "behind",
-      total: 1,
-      through: { [SOURCE]: "1" },
+      coverage: "unavailable",
+      total: 0,
+      through: {},
     });
-    expect(progress.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
+    expect(await f.readRegistry()).not.toHaveProperty(
+      additionsLedgerScope(SOURCE),
+    );
+    expect(progress.days.map((day) => day.added)).toEqual([0, 0, 0, 0]);
     expect(await f.actor().summarize(QUERY)).toMatchObject({
       coverage: "complete",
       total: 2,
@@ -730,4 +733,20 @@ it("persists the on-upload fold from registered in-memory bytes before any sourc
     through: { [SOURCE]: "1" },
   });
   expect(restarted.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
+});
+
+it("keeps Unicode byte-edge names and literal hash-looking sources collision-separated", () => {
+  const prefixBytes = new TextEncoder().encode("vana.system.additions.").length;
+  const edge = "é".repeat(Math.floor((256 - prefixBytes) / 2));
+  expect(
+    new TextEncoder().encode(additionsLedgerScope(edge)).length,
+  ).toBeLessThanOrEqual(256);
+  expect(additionsLedgerScope(edge)).toBe(`vana.system.additions.${edge}`);
+  const long = `${edge}é`;
+  const hashed = additionsLedgerScope(long);
+  expect(hashed).toMatch(/^vana\.system\.additions-hash\.[a-f0-9]{64}$/);
+  expect(additionsLedgerScope(`hash.${hashed.split(".").at(-1)}`)).not.toBe(
+    hashed,
+  );
+  expect(additionsLedgerScope(long + " ")).not.toBe(hashed);
 });

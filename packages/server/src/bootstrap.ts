@@ -1,3 +1,4 @@
+import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   createDurableAdditions,
   createVersionInventoryClient,
@@ -109,6 +110,13 @@ export interface ServerContext {
 export interface CreateServerOptions {
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
+  /** Host-authorized checkpoint capability. TEE public-read adapters cannot write.
+   * The host supplies an existing AddData signer/storage pair; this creates no grant.
+   */
+  additionsWriter?: Pick<
+    DurableAdditionsOptions,
+    "storageAdapter" | "signer" | "gateway"
+  >;
   rootPath?: string;
   /** Exact owner scopes to hydrate before the first full sync pass. */
   hydrateScopes?: string[];
@@ -484,6 +492,7 @@ export async function createServer(
   let additions: DurableAdditionsService | undefined;
   if (
     additionsOwnerSigner &&
+    (!isEnclave || options?.additionsWriter) &&
     masterKeySignature &&
     serverOwner &&
     serverAccount &&
@@ -505,15 +514,17 @@ export async function createServer(
         ownerAddress: serverOwner,
         ownerSigner: additionsOwnerSigner,
       }),
-      storageAdapter: createVanaSyncStorageAdapter({
-        config,
-        serverOwner,
-        serverAccount,
-        reads: isEnclave ? "public" : "signed",
-      }),
+      storageAdapter:
+        options?.additionsWriter?.storageAdapter ??
+        createVanaSyncStorageAdapter({
+          config,
+          serverOwner,
+          serverAccount,
+          reads: isEnclave ? "public" : "signed",
+        }),
       masterKey: deriveMasterKey(masterKeySignature),
-      signer: serverSigner,
-      gateway: gatewayClient,
+      signer: options?.additionsWriter?.signer ?? serverSigner,
+      gateway: options?.additionsWriter?.gateway ?? gatewayClient,
     });
   }
 

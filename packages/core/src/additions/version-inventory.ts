@@ -1,3 +1,4 @@
+import { readBoundedJson, type ByteBudget } from "./budget.js";
 import {
   encodeAbiParameters,
   getAddress,
@@ -78,6 +79,7 @@ export interface VersionInventory {
 export interface InventoryReadOptions {
   signal?: AbortSignal;
   maxPages?: number;
+  budget?: ByteBudget;
 }
 
 /** Owner-wallet reads only. Registered Personal Server signatures do not authorize this API. */
@@ -85,6 +87,11 @@ export function createVersionInventoryClient(options: {
   gatewayUrl: string;
   ownerAddress: string;
   ownerSigner: RequestSigner;
+  /** A host signer that settles on cancellation; wallet prompts must not outlive recovery. */
+  boundedOwnerSigner?: (
+    params: Parameters<RequestSigner["signRequest"]>[0],
+    signal?: AbortSignal,
+  ) => Promise<string>;
   fetch?: typeof globalThis.fetch;
 }) {
   const origin = new URL(options.gatewayUrl).origin;
@@ -102,14 +109,26 @@ export function createVersionInventoryClient(options: {
     uri: string,
     signal?: AbortSignal,
     authenticated = true,
+    budget?: ByteBudget,
   ): Promise<unknown> {
+    signal =
+      signal && budget?.signal
+        ? AbortSignal.any([signal, budget.signal])
+        : (signal ?? budget?.signal);
     signal?.throwIfAborted();
+    budget?.charge();
+    if (authenticated && budget && !options.boundedOwnerSigner)
+      throw new Error("Bounded inventory signing capability unavailable");
+    const signing = {
+      aud: origin,
+      method: "GET",
+      uri,
+      nonce: crypto.randomUUID(),
+    };
     const authorization = authenticated
-      ? await options.ownerSigner.signRequest({
-          aud: origin,
-          method: "GET",
-          uri,
-        })
+      ? budget && options.boundedOwnerSigner
+        ? await options.boundedOwnerSigner(signing, signal)
+        : await options.ownerSigner.signRequest(signing)
       : undefined;
     signal?.throwIfAborted();
     const response = await fetcher(`${origin}${uri}`, {
@@ -118,14 +137,21 @@ export function createVersionInventoryClient(options: {
       signal,
       cache: "no-store",
     });
-    if (!response.ok)
+    if (!response.ok) {
+      await response.body?.cancel();
       throw new Error(`Gateway inventory request failed (${response.status})`);
-    return response.json();
+    }
+    return readBoundedJson(response, budget);
   }
 
   async function page(
     scope: string,
-    paging: { after?: string; limit?: number; signal?: AbortSignal } = {},
+    paging: {
+      after?: string;
+      limit?: number;
+      signal?: AbortSignal;
+      budget?: ByteBudget;
+    } = {},
   ) {
     scopeSchema.parse(scope);
     const after = uint256.parse(paging.after ?? "0");
@@ -137,7 +163,9 @@ export function createVersionInventoryClient(options: {
       .parse(paging.limit ?? 100);
     const id = idFor(scope);
     const uri = `/v1/data/${id}/versions?${new URLSearchParams({ user: owner, scope, after, limit: String(limit) })}`;
-    const result = pageSchema.parse(await read(uri, paging.signal));
+    const result = pageSchema.parse(
+      await read(uri, paging.signal, true, paging.budget),
+    );
     if (
       result.data.dataPointId !== id ||
       result.data.ownerAddress.toLowerCase() !== owner ||
@@ -183,7 +211,11 @@ export function createVersionInventoryClient(options: {
     let head: InventoryHead | null = null;
     const versions: InventoryVersion[] = [];
     for (let count = 0; count < maxPages; count++) {
-      const result = await page(scope, { after, signal: readOptions.signal });
+      const result = await page(scope, {
+        after,
+        signal: readOptions.signal,
+        budget: readOptions.budget,
+      });
       if (
         count > 0 &&
         JSON.stringify(head) !== JSON.stringify(result.data.head)
@@ -220,7 +252,12 @@ export function createVersionInventoryClient(options: {
       });
       if (cursor !== null) query.set("cursor", cursor);
       const result = scopesSchema.parse(
-        await read(`/v1/data?${query}`, readOptions.signal, false),
+        await read(
+          `/v1/data?${query}`,
+          readOptions.signal,
+          false,
+          readOptions.budget,
+        ),
       );
       if (
         result.pagination.limit !== 100 ||
