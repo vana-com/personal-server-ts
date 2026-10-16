@@ -1185,7 +1185,20 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(read.kind).toBe("canonical");
     expect(read.kind === "canonical" && read.envelope.data).toEqual({
       username: "current-user",
+      fullName: "",
+      bio: "",
+      company: "",
+      location: "",
+      website: "",
+      avatarUrl: "",
+      followers: 0,
+      following: 0,
+      repositoryCount: 0,
       profileUrl: "https://github.com/current-user",
+      pinnedRepositories: [],
+      organizations: [],
+      achievements: [],
+      contributionsLastYear: null,
     });
   });
 
