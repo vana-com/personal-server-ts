@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -15,8 +16,10 @@ export interface OfflineDeclarationWitnessOptions {
   dbPath: string;
   /** Existing registry file; defaults to pdpp-declarations.db beside dbPath. */
   declarationsDbPath?: string;
-  /** One connection instance ID, NOT a source declaration URL. */
-  sourceKey: string;
+  /** A live connection instance ID; its binding selects the entire source. */
+  sourceKey?: string;
+  /** Exact declaration source ID, as an alternative to sourceKey. Supply exactly one. */
+  sourceId?: string;
   stream: string;
   nextSchema: Record<string, unknown>;
   /** Positive safe integer. Each internal page is capped at 1,000 rows. */
@@ -28,7 +31,10 @@ export interface OfflineDeclarationWitnessOptions {
 }
 
 export type OfflineDeclarationWitnessResult =
-  Omit<DeclarationWitnessResult, "nextCursor">;
+  Omit<DeclarationWitnessResult, "nextCursor"> & {
+    /** SHA-256 of the failing connection instance ID, only on fail. */
+    connectionHash?: string;
+  };
 
 export type OfflineDeclarationWitnessErrorCode =
   | "invalid_argument"
@@ -113,7 +119,11 @@ function assertRetainedStreamDeclaration(
  * or a snapshot, and this API does not detect other running server processes.
  *
  * Two read-only databases and one read-port own every continuation in this call.
- * No database is created, migrated or pruned. Missing/incompatible databases
+ * Every live connection bound to the selected source is checked, under one
+ * shared deadline; a pass requires all of them to pass.
+ * No main database is created, migrated or pruned. SQLite may create WAL/SHM
+ * sidecars or update SHM reader marks, including during crash recovery; main
+ * database bytes and existing WAL frame contents remain unchanged. Missing/incompatible databases
  * throw typed errors. Only a registered source and a declared stream may pass
  * with checked: 0. Stream authority comes from the current declaration in the
  * separate registry; absent or malformed authority fails closed.
@@ -133,7 +143,9 @@ export async function runDeclarationWitness(
     !options || typeof options.dbPath !== "string" || !options.dbPath ||
     (options.declarationsDbPath !== undefined &&
       (typeof options.declarationsDbPath !== "string" || !options.declarationsDbPath)) ||
-    typeof options.sourceKey !== "string" || !options.sourceKey ||
+    ((options.sourceKey === undefined) === (options.sourceId === undefined)) ||
+    (options.sourceKey !== undefined && (typeof options.sourceKey !== "string" || !options.sourceKey)) ||
+    (options.sourceId !== undefined && (typeof options.sourceId !== "string" || !options.sourceId)) ||
     typeof options.stream !== "string" || !options.stream ||
     typeof pageSize !== "number" || !Number.isSafeInteger(pageSize) || pageSize <= 0 ||
     !Number.isFinite(options.budgetMs) || options.budgetMs < 0
@@ -169,7 +181,10 @@ export async function runDeclarationWitness(
     }
     db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 0 });
     stage = "unverifiable_source";
-    const sourceId = assertRegisteredSource(db, sourceKey);
+    const sourceId = options.sourceId ?? assertRegisteredSource(db, sourceKey!);
+    const connections = db.prepare(
+      "SELECT instance FROM pdpp_instance_binding WHERE source_id = ? AND deleted_at IS NULL ORDER BY instance",
+    ).all(sourceId) as { instance: string }[];
     stage = "unsupported_store";
     const store = createSqliteRecordStore(db);
     stage = "unverifiable_source";
@@ -185,26 +200,47 @@ export async function runDeclarationWitness(
     const readPort = fromSyncRecordStore({ ...store, forInstance: () => undefined });
     stage = "read_failed";
     let checked = 0;
-    let cursor: string | undefined;
-    for (;;) {
-      if (performance.now() - started >= budgetMs) {
-        return { verdict: "partial", checked };
-      }
-      const page = await witnessDeclarationUpgrade({
-        readPort, sourceKey, stream, nextSchema: schema, limit,
-        ...(cursor === undefined ? {} : { cursor }),
+    if (connections.length === 0) {
+      if (performance.now() - started >= budgetMs) return { verdict: "partial", checked };
+      // Still compile/validate nextSchema, but never read orphaned or unrelated
+      // rows merely because an instance happens to share the source ID.
+      const emptyPort = fromSyncRecordStore({
+        ...store, forInstance: () => undefined,
+        listRecords: () => ({ data: [], hasMore: false }),
       });
-      checked += page.checked;
-      if (page.verdict === "fail") {
-        return { verdict: "fail", checked, failure: page.failure };
-      }
-      if (performance.now() - started >= budgetMs) {
-        return { verdict: "partial", checked };
-      }
-      if (page.verdict === "pass") return { verdict: "pass", checked };
-      if (!page.nextCursor) throw new OfflineDeclarationWitnessError("read_failed");
-      cursor = page.nextCursor;
+      await witnessDeclarationUpgrade({
+        readPort: emptyPort, sourceKey: sourceId, stream, nextSchema: schema, limit,
+      });
     }
+    for (const { instance } of connections) {
+      let cursor: string | undefined;
+      for (;;) {
+        if (performance.now() - started >= budgetMs) {
+          return { verdict: "partial", checked };
+        }
+        const page = await witnessDeclarationUpgrade({
+          readPort, sourceKey: instance, stream, nextSchema: schema, limit,
+          ...(cursor === undefined ? {} : { cursor }),
+        });
+        checked += page.checked;
+        if (page.verdict === "fail") {
+          return {
+            verdict: "fail", checked, failure: page.failure,
+            connectionHash: createHash("sha256").update(instance).digest("hex"),
+          };
+        }
+        if (performance.now() - started >= budgetMs) {
+          return { verdict: "partial", checked };
+        }
+        if (page.verdict === "pass") break;
+        if (!page.nextCursor) throw new OfflineDeclarationWitnessError("read_failed");
+        cursor = page.nextCursor;
+      }
+    }
+    // Also enforce the deadline for a declared source with no live bindings.
+    return performance.now() - started >= budgetMs
+      ? { verdict: "partial", checked }
+      : { verdict: "pass", checked };
   } catch (error) {
     if (error instanceof OfflineDeclarationWitnessError) throw error;
     throw new OfflineDeclarationWitnessError(

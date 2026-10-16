@@ -1,4 +1,6 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -129,7 +131,7 @@ describe("offline declaration witness over the real SQLite store", () => {
     expectClosed();
   });
 
-  it("preserves both database files and existing WAL/SHM bytes", async () => {
+  it("preserves both main files and existing WAL frame contents", async () => {
     seed(2);
     const declarationsPath = join(root, "pdpp-declarations.db");
     seedDeclaration();
@@ -148,7 +150,7 @@ describe("offline declaration witness over the real SQLite store", () => {
         reader.exec("BEGIN");
         reader.prepare(`SELECT * FROM ${table}`).all();
       }
-      const paths = [dbPath, declarationsPath].flatMap((path) => [path, path + "-wal", path + "-shm"]);
+      const paths = [dbPath, declarationsPath].flatMap((path) => [path, path + "-wal"]);
       const before = paths.map((path) => readFileSync(path));
       opened.length = 0;
       await expect(run()).resolves.toEqual({ verdict: "pass", checked: 2 });
@@ -159,6 +161,149 @@ describe("offline declaration witness over the real SQLite store", () => {
       for (const db of [...readers, ...keepers]) if (db.open) db.close();
     }
   });
+
+  it("fails for a rejecting sibling connection with only its hashed identity", async () => {
+    seed(7, -1, true);
+    seedDeclaration();
+    const result = await run();
+    expect(result).toMatchObject({
+      verdict: "fail",
+      connectionHash: createHash("sha256").update("conn_other").digest("hex"),
+    });
+    expect(JSON.stringify(result)).not.toMatch(/conn_other|conn_witness|PRIVATE_VALUE|private-key/);
+    expectClosed();
+  });
+
+  it("walks every live connection and excludes deleted and unrelated bindings", async () => {
+    seed(7, -1, true);
+    seedDeclaration();
+    const db = new Database(dbPath);
+    const store = createSqliteRecordStore(db);
+    store.deleteConnection("conn_other");
+    store.registerConnection({ instance: "conn_unrelated", sourceId: "other", method: "test", label: "test" });
+    store.ingestBatch([{ instance: "conn_unrelated", stream, key: "secret",
+      data: { id: "secret", count: "PRIVATE_VALUE" }, emitted_at: "2026-10-15T00:00:00.000Z" }],
+      () => "mutable_state", () => ["id"], { method: "test", generation: 1 });
+    db.close();
+    opened.length = 0;
+    await expect(run()).resolves.toEqual({ verdict: "pass", checked: 7 });
+    expectClosed();
+  });
+
+  it("adds checked rows across all live connections", async () => {
+    seed(7, -1, true);
+    seedDeclaration();
+    await expect(run({ nextSchema: { type: "object" } })).resolves.toEqual({ verdict: "pass", checked: 8 });
+    expectClosed();
+  });
+
+  it("permits a declared source with zero live connections but not an undeclared stream", async () => {
+    seed();
+    seedDeclaration();
+    const db = new Database(dbPath);
+    db.exec("DELETE FROM pdpp_instance_binding");
+    db.close();
+    opened.length = 0;
+    const options = { sourceKey: undefined, sourceId: "https://example.test/source" };
+    await expect(run(options)).resolves.toEqual({ verdict: "pass", checked: 0 });
+    await expect(run({ ...options, nextSchema: { type: "INVALID_TYPE" } }))
+      .rejects.toMatchObject({ code: "invalid_schema" });
+    await expect(run({ ...options, stream: "typo" })).rejects.toMatchObject({ code: "missing_stream" });
+    await expect(run({ ...options, budgetMs: 0 })).resolves.toEqual({ verdict: "partial", checked: 0 });
+    expectClosed();
+  });
+
+  it("returns partial for zero budget before walking any declared rows", async () => {
+    seed(7);
+    seedDeclaration();
+    await expect(run({ budgetMs: 0 })).resolves.toEqual({ verdict: "partial", checked: 0 });
+    expectClosed();
+  });
+
+  it("returns partial when the shared deadline expires mid-walk", async () => {
+    seed(7);
+    seedDeclaration();
+    let tick = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => tick++);
+    const result = await run({ budgetMs: 5, pageSize: 2 });
+    expect(result).toMatchObject({ verdict: "partial" });
+    expect(result.checked).toBeGreaterThan(0);
+    expect(result.checked).toBeLessThan(7);
+    expectClosed();
+  });
+
+  it("returns partial when the terminal page consumes the remaining budget", async () => {
+    seed(1);
+    seedDeclaration();
+    let tick = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => tick++);
+    await expect(run({ budgetMs: 4 })).resolves.toEqual({ verdict: "partial", checked: 1 });
+    expectClosed();
+  });
+
+  it("preserves main files and stored WAL frames from a crash-style snapshot without other handles", async () => {
+    seed(2);
+    seedDeclaration();
+    const paths = [dbPath, join(root, "pdpp-declarations.db")];
+    for (const path of paths) {
+      const db = new Database(path);
+      db.pragma("journal_mode = WAL");
+      db.pragma("wal_checkpoint(TRUNCATE)");
+      const table = path === dbPath ? "pdpp_instance_binding" : "pdpp_current_declarations";
+      db.exec(`UPDATE ${table} SET ${path === dbPath ? "label" : "digest"} = 'crash-snapshot'`);
+      const files = [path, path + "-wal", path + "-shm"];
+      const snapshot = files.map((file) => readFileSync(file));
+      expect(snapshot[1]!.length).toBeGreaterThan(32);
+      db.close();
+      // Restore an internally consistent snapshot captured before checkpoint/
+      // shutdown. This simulates crash leftovers without a writer held open.
+      files.forEach((file, i) => writeFileSync(file, snapshot[i]!));
+    }
+    expect(opened.every((db) => !db.open)).toBe(true);
+    const persistent = paths.flatMap((path) => [path, path + "-wal"]);
+    const before = persistent.map((path) => readFileSync(path));
+    opened.length = 0;
+    await expect(run()).resolves.toEqual({ verdict: "pass", checked: 2 });
+    expectClosed();
+    expect(persistent.map((path) => readFileSync(path))).toEqual(before);
+    // SHM is intentionally not byte-compared: SQLite may initialize reader marks.
+  });
+
+  it("does not reset the deadline between connections", async () => {
+    seed(1, -1, true);
+    seedDeclaration();
+    let tick = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => tick++);
+    await expect(run({ budgetMs: 3, nextSchema: { type: "object" } }))
+      .resolves.toEqual({ verdict: "partial", checked: 1 });
+    expectClosed();
+  });
+
+  it("preserves main files and verdict with no other open handle after clean shutdown", async () => {
+    seed(2);
+    seedDeclaration();
+    const paths = [dbPath, join(root, "pdpp-declarations.db")];
+    for (const path of paths) {
+      const db = new Database(path);
+      db.pragma("journal_mode = WAL");
+      db.close();
+      expect(existsSync(path + "-wal")).toBe(false);
+    }
+    expect(opened.every((db) => !db.open)).toBe(true);
+    const before = paths.map((path) => readFileSync(path));
+    opened.length = 0;
+    await expect(run()).resolves.toEqual({ verdict: "pass", checked: 2 });
+    expectClosed();
+    expect(paths.map((path) => readFileSync(path))).toEqual(before);
+    // Read-only SQLite may create WAL/SHM sidecars. Their existence and SHM
+    // reader marks are not part of the immutable persistent-data guarantee.
+    for (const path of paths) {
+      if (existsSync(path + "-wal")) expect(readFileSync(path + "-wal").length).toBe(0);
+    }
+    await expect(run()).resolves.toEqual({ verdict: "pass", checked: 2 });
+    expectClosed();
+  });
+
   let root: string;
   let dbPath: string;
 
@@ -176,7 +321,7 @@ describe("offline declaration witness over the real SQLite store", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  function seed(count = 0, badIndex = -1): void {
+  function seed(count = 0, badIndex = -1, badOther = false): void {
     const db = new Database(dbPath);
     try {
       const store = createSqliteRecordStore(db);
@@ -184,7 +329,7 @@ describe("offline declaration witness over the real SQLite store", () => {
         store.registerConnection({
           instance, sourceId: "https://example.test/source", method: "test", label: "test",
         });
-        const data = Array.from({ length: instance === sourceKey ? count : 1 }, (_, i) => {
+        const data = Array.from({ length: instance === sourceKey ? count : (badOther ? 1 : 0) }, (_, i) => {
           const id = `private-key-${String(i).padStart(4, "0")}`;
           return {
             instance, stream, key: id,
@@ -357,12 +502,12 @@ describe("offline declaration witness over the real SQLite store", () => {
     },
   );
 
-  it("does not change the database or existing WAL/SHM sidecars", async () => {
+  it("does not change the main database or existing WAL frames on error", async () => {
     seed(2);
     const keeper = new Database(dbPath);
     keeper.pragma("wal_checkpoint(TRUNCATE)");
     keeper.prepare("UPDATE pdpp_instance_binding SET label = 'sidecar-test' WHERE instance = ?").run(sourceKey);
-    const paths = [dbPath, dbPath + "-wal", dbPath + "-shm"];
+    const paths = [dbPath, dbPath + "-wal"];
     for (const path of paths) expect(existsSync(path)).toBe(true);
     // Keep an existing read lock so opening the witness need not initialize
     // reader marks in the shared-memory sidecar.
