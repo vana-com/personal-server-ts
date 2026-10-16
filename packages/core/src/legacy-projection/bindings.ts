@@ -915,14 +915,12 @@ const instagramProfile: LegacyScopeBinding = {
     const payload: Record<string, unknown> = {
       username,
       full_name: fullName,
+      bio: typeof p.bio === "string" ? p.bio : "",
     };
-    if (typeof p.bio === "string") payload.bio = p.bio;
     if (typeof p.profile_pic_url === "string") {
       payload.profile_pic_url = p.profile_pic_url;
     }
-    if (typeof p.external_url === "string") {
-      payload.external_url = p.external_url;
-    }
+    payload.external_url = typeof p.external_url === "string" ? p.external_url : "";
     if (typeof p.follower_count === "number") {
       payload.follower_count = p.follower_count;
     }
