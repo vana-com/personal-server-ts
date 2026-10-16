@@ -86,3 +86,26 @@ it("retains exhaustion after a failed charge", () => {
   expect(() => budget.charge(11)).toThrow();
   expect(() => budget.charge()).toThrow();
 });
+
+it("settles late host receipts after child cancellation without spending the checkpoint reservation", () => {
+  const owner = new AdditionsBudget(1024 * 1024);
+  const controller = new AbortController();
+  const child = new AdditionsBudget(
+    768 * 1024,
+    undefined,
+    controller.signal,
+    owner,
+  );
+  const host = new AdditionsBudget(child.remaining);
+  host.charge(512 * 1024);
+  controller.abort(new Error("source deadline"));
+  child.recordSpent(768 * 1024 - host.remaining);
+  expect(owner.remaining).toBe(512 * 1024);
+  expect(child.remaining).toBe(256 * 1024);
+  expect(() => child.charge()).toThrow("source deadline");
+  // A rejected speculative allocation cannot consume publication capacity.
+  expect(() => child.charge(300 * 1024)).toThrow();
+  expect(owner.remaining).toBe(512 * 1024);
+  owner.charge(256 * 1024);
+  expect(owner.remaining).toBe(256 * 1024);
+});

@@ -113,6 +113,9 @@ export function createPsLiteAdditionsSession(
                 get remaining() {
                   return budget.remaining;
                 },
+                recordSpent(bytes: number) {
+                  budget.recordSpent(bytes);
+                },
                 charge(bytes = 0) {
                   budget.signal?.throwIfAborted();
                   budget.charge(bytes);

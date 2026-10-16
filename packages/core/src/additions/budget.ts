@@ -6,6 +6,8 @@ export interface ByteBudget {
   readonly remaining: number;
   readonly remainingMilliseconds?: number;
   charge(bytes?: number): void;
+  /** Book an already-completed host receipt even when its deadline expired. */
+  recordSpent(bytes: number): void;
 }
 
 export class AdditionsBudget implements ByteBudget {
@@ -17,6 +19,7 @@ export class AdditionsBudget implements ByteBudget {
     private readonly bytes = Infinity,
     milliseconds?: number,
     signal?: AbortSignal,
+    private readonly parent?: AdditionsBudget,
   ) {
     if (bytes < 0 || (!Number.isFinite(bytes) && bytes !== Infinity))
       throw new RangeError("Invalid additions byte budget");
@@ -49,6 +52,24 @@ export class AdditionsBudget implements ByteBudget {
       throw new AdditionsBudgetExceeded("Additions byte budget exhausted");
     }
     this.used += bytes;
+    this.parent?.charge(bytes);
+  }
+  recordSpent(bytes: number) {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      this.exhausted = true;
+      throw new AdditionsBudgetExceeded("Invalid additions spent-byte receipt");
+    }
+    const overflow = bytes > this.remaining;
+    // These bytes were actually consumed remotely. Cancellation must not erase
+    // them, and every ancestor must observe the receipt before deadline checks.
+    this.used += bytes;
+    this.parent?.recordSpent(bytes);
+    if (overflow) {
+      this.exhausted = true;
+      throw new AdditionsBudgetExceeded(
+        "Additions byte receipt exceeds allowance",
+      );
+    }
   }
 }
 

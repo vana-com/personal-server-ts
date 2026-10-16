@@ -130,15 +130,11 @@ class ReadBudget extends AdditionsBudget {
       DurableAdditionsOptions,
       "byteBudget" | "timeBudgetMs" | "signal"
     >,
-    private readonly parent?: ReadBudget,
+    parent?: ReadBudget,
   ) {
-    super(options.byteBudget, options.timeBudgetMs, options.signal);
+    super(options.byteBudget, options.timeBudgetMs, options.signal, parent);
     this.limited =
       options.byteBudget !== undefined || options.timeBudgetMs !== undefined;
-  }
-  override charge(bytes = 0) {
-    super.charge(bytes);
-    this.parent?.charge(bytes);
   }
   /** A failed source unit cannot spend the bytes held for its durable prefix. */
   excluding(reserved: number): ReadBudget {

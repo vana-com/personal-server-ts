@@ -283,7 +283,8 @@ worker.onmessage = (event) => {
     const request = pending.get(message.id);
     pending.delete(message.id);
     try {
-      request?.budget?.charge(message.spent);
+      request?.budget?.recordSpent(message.spent);
+      request?.budget?.charge();
       if (message.error)
         request?.reject(
           message.budgetExceeded
