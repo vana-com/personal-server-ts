@@ -28,6 +28,10 @@
       "types": "./dist/config/index.d.ts",
       "import": "./dist/config/index.js"
     },
+    "./witness": {
+      "types": "./dist/storage/declaration-witness.d.ts",
+      "import": "./dist/storage/declaration-witness.js"
+    },
     "./runtime": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
