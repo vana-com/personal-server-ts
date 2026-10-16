@@ -38,6 +38,127 @@ const nextSchema = {
 };
 
 describe("offline declaration witness over the real SQLite store", () => {
+
+  function seedDeclaration(path = join(root, "pdpp-declarations.db"), names = [stream], current = 1): void {
+    const db = new Database(path);
+    try {
+      db.exec(`CREATE TABLE pdpp_current_declarations (
+        source_id TEXT NOT NULL, version TEXT NOT NULL, digest TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL, document TEXT NOT NULL, accepted_at TEXT NOT NULL,
+        is_current INTEGER NOT NULL, origin TEXT NOT NULL,
+        PRIMARY KEY (source_id, version))`);
+      db.prepare("INSERT INTO pdpp_current_declarations VALUES (?, 'v1', 'digest', ?, '{}', 'now', ?, 'configured')")
+        .run("https://example.test/source", JSON.stringify({
+          source_id: "https://example.test/source",
+          streams: names.map((name) => ({ name, schema: nextSchema })),
+        }), current);
+    } finally { db.close(); }
+    opened.length = 0;
+  }
+
+  it.each([0, 7, 103])("walks a declared stream with %s rows using the exact bound source ID", async (count) => {
+    seed(count);
+    seedDeclaration();
+    await expect(run()).resolves.toEqual({ verdict: "pass", checked: count });
+    expect(opened).toHaveLength(2);
+    expectClosed();
+  });
+
+  it("validates declared rows against nextSchema without disclosing values", async () => {
+    seed(7, 4);
+    seedDeclaration();
+    const result = await run();
+    expect(result.verdict).toBe("fail");
+    expect(JSON.stringify(result)).not.toContain("PRIVATE_VALUE");
+    expectClosed();
+  });
+
+  it("rejects undeclared streams even when they have stored rows", async () => {
+    seed(2);
+    seedDeclaration(undefined, ["other"]);
+    await expect(run()).rejects.toMatchObject({ code: "missing_stream" });
+    expectClosed();
+  });
+
+  it("ignores retained declarations that are not current", async () => {
+    seed();
+    seedDeclaration(undefined, [stream], 0);
+    await expect(run()).rejects.toMatchObject({ code: "unverifiable_source" });
+    expectClosed();
+  });
+
+  it("uses an explicit declarationsDbPath", async () => {
+    seed();
+    const declarationsDbPath = join(root, "custom.db");
+    seedDeclaration(declarationsDbPath);
+    await expect(run({ declarationsDbPath })).resolves.toEqual({ verdict: "pass", checked: 0 });
+    expect(existsSync(join(root, "pdpp-declarations.db"))).toBe(false);
+    expectClosed();
+  });
+
+  it.each(["missing table", "invalid JSON", "wrong source", "invalid streams", "ambiguous current"])(
+    "fails closed and closes both handles for %s", async (kind) => {
+      seed();
+      const path = join(root, "pdpp-declarations.db");
+      seedDeclaration();
+      const db = new Database(path);
+      if (kind === "missing table") db.exec("DROP TABLE pdpp_current_declarations");
+      if (kind === "invalid JSON") db.exec("UPDATE pdpp_current_declarations SET snapshot_json = 'PRIVATE_BAD_JSON'");
+      if (kind === "wrong source") db.prepare("UPDATE pdpp_current_declarations SET snapshot_json = ?")
+        .run(JSON.stringify({ source_id: "other", streams: [{ name: stream }] }));
+      if (kind === "invalid streams") db.prepare("UPDATE pdpp_current_declarations SET snapshot_json = ?")
+        .run(JSON.stringify({ source_id: "https://example.test/source", streams: [null] }));
+      if (kind === "ambiguous current") db.exec(`INSERT INTO pdpp_current_declarations
+        SELECT source_id, 'v2', digest, snapshot_json, document, accepted_at, is_current, origin
+        FROM pdpp_current_declarations`);
+      db.close();
+      opened.length = 0;
+      const error = await run().catch((error: unknown) => error);
+      expect(error).toMatchObject({ code: "unverifiable_source" });
+      expect(String(error)).not.toContain("PRIVATE_BAD_JSON");
+      expect(opened).toHaveLength(2);
+      expectClosed();
+    },
+  );
+
+  it("closes both handles when schema validation throws", async () => {
+    seed(1);
+    seedDeclaration();
+    await expect(run({ nextSchema: { type: "INVALID_PRIVATE_TYPE" } })).rejects.toMatchObject({ code: "invalid_schema" });
+    expect(opened).toHaveLength(2);
+    expectClosed();
+  });
+
+  it("preserves both database files and existing WAL/SHM bytes", async () => {
+    seed(2);
+    const declarationsPath = join(root, "pdpp-declarations.db");
+    seedDeclaration();
+    const keepers: Array<InstanceType<typeof Database>> = [];
+    const readers: Array<InstanceType<typeof Database>> = [];
+    try {
+      for (const path of [dbPath, declarationsPath]) {
+        const keeper = new Database(path);
+        keepers.push(keeper);
+        keeper.pragma("journal_mode = WAL");
+        keeper.pragma("wal_checkpoint(TRUNCATE)");
+        const table = path === dbPath ? "pdpp_instance_binding" : "pdpp_current_declarations";
+        keeper.exec(`UPDATE ${table} SET source_id = source_id`);
+        const reader = new Database(path, { readonly: true });
+        readers.push(reader);
+        reader.exec("BEGIN");
+        reader.prepare(`SELECT * FROM ${table}`).all();
+      }
+      const paths = [dbPath, declarationsPath].flatMap((path) => [path, path + "-wal", path + "-shm"]);
+      const before = paths.map((path) => readFileSync(path));
+      opened.length = 0;
+      await expect(run()).resolves.toEqual({ verdict: "pass", checked: 2 });
+      expect(opened).toHaveLength(2);
+      expectClosed();
+      expect(paths.map((path) => readFileSync(path))).toEqual(before);
+    } finally {
+      for (const db of [...readers, ...keepers]) if (db.open) db.close();
+    }
+  });
   let root: string;
   let dbPath: string;
 

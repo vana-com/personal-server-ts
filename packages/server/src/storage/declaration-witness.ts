@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import Database from "better-sqlite3";
 import {
@@ -12,6 +13,8 @@ import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 export interface OfflineDeclarationWitnessOptions {
   /** Exact existing PDPP records database path used by the caller's server. */
   dbPath: string;
+  /** Existing registry file; defaults to pdpp-declarations.db beside dbPath. */
+  declarationsDbPath?: string;
   /** One connection instance ID, NOT a source declaration URL. */
   sourceKey: string;
   stream: string;
@@ -56,8 +59,8 @@ function isUnreadable(error: unknown): boolean {
   );
 }
 
-/** Current v11 retains connections, but not the declarations authorizing streams. */
-function assertRegisteredSource(db: InstanceType<typeof Database>, sourceKey: string): void {
+/** Binding source_id is the exact key used by declaration-registry.resolve. */
+function assertRegisteredSource(db: InstanceType<typeof Database>, sourceKey: string): string {
   let binding: { source_id: string | null; deleted_at: string | null } | undefined;
   try {
     binding = db.prepare(
@@ -70,35 +73,57 @@ function assertRegisteredSource(db: InstanceType<typeof Database>, sourceKey: st
   if (!binding || !binding.source_id || binding.deleted_at !== null) {
     throw new OfflineDeclarationWitnessError("missing_source");
   }
+  return binding.source_id;
 }
 
-function assertRetainedStreamDeclaration(): void {
-  // Row listings and completion receipts are not retained declarations. Neither
-  // proves that an empty/unknown stream belongs to this registered connection.
-  // Until the store retains that authoritative binding, no walk may pass.
-  throw new OfflineDeclarationWitnessError("unverifiable_source");
+function assertRetainedStreamDeclaration(
+  db: InstanceType<typeof Database>, sourceId: string, stream: string,
+): void {
+  try {
+    // Same key and current predicate as declaration-registry.resolve; never
+    // derive a source from the instance name or from a connector URI suffix.
+    const rows = db.prepare(
+      "SELECT snapshot_json FROM pdpp_current_declarations WHERE source_id = ? AND is_current = 1 LIMIT 2",
+    ).all(sourceId) as { snapshot_json: string }[];
+    if (rows.length !== 1) throw new OfflineDeclarationWitnessError("unverifiable_source");
+    const snapshot: unknown = JSON.parse(rows[0]!.snapshot_json);
+    if (!snapshot || typeof snapshot !== "object" ||
+        !("source_id" in snapshot) || snapshot.source_id !== sourceId ||
+        !("streams" in snapshot) || !Array.isArray(snapshot.streams) ||
+        !snapshot.streams.every((entry: unknown) =>
+          entry !== null && typeof entry === "object" &&
+          "name" in entry && typeof entry.name === "string" && entry.name.length > 0)) {
+      throw new OfflineDeclarationWitnessError("unverifiable_source");
+    }
+    if (!snapshot.streams.some((entry: { name: string }) => entry.name === stream)) {
+      throw new OfflineDeclarationWitnessError("missing_stream");
+    }
+  } catch (error) {
+    if (error instanceof OfflineDeclarationWitnessError) throw error;
+    throw new OfflineDeclarationWitnessError("unverifiable_source");
+  }
 }
 
 /**
  * Validate a declaration offline, before starting the server.
  *
  * The caller supplies the exact bootstrap database path and MUST guarantee
- * exclusive use from the start of this call through the upgrade decision.
+ * exclusive use of BOTH databases from the start of this call through the upgrade decision.
  * No shared bootstrap lock is available here: readonly is NOT a writer fence
  * or a snapshot, and this API does not detect other running server processes.
  *
- * One database and one read-port object own every continuation in this call.
+ * Two read-only databases and one read-port own every continuation in this call.
  * No database is created, migrated or pruned. Missing/incompatible databases
  * throw typed errors. Only a registered source and a declared stream may pass
- * with checked: 0. The current v11 store cannot verify stream declarations,
- * so registered sources currently throw unverifiable_source, even with rows.
+ * with checked: 0. Stream authority comes from the current declaration in the
+ * separate registry; absent or malformed authority fails closed.
  *
  * The deadline is checked before and after every bounded page, including the
  * terminal page. Synchronous SQLite/JSON parsing/schema compilation cannot be
  * interrupted, so budgetMs is not a hard process timeout. A caller requiring
  * hard cancellation must use a supervised process and reap it before boot.
  * A partial result cannot be resumed across calls; rerun the entire walk.
- * The database is closed before this promise resolves or rejects.
+ * Both databases are closed before this promise resolves or rejects.
  */
 export async function runDeclarationWitness(
   options: OfflineDeclarationWitnessOptions,
@@ -106,6 +131,8 @@ export async function runDeclarationWitness(
   const pageSize = options?.pageSize !== undefined ? options.pageSize : options?.limit;
   if (
     !options || typeof options.dbPath !== "string" || !options.dbPath ||
+    (options.declarationsDbPath !== undefined &&
+      (typeof options.declarationsDbPath !== "string" || !options.declarationsDbPath)) ||
     typeof options.sourceKey !== "string" || !options.sourceKey ||
     typeof options.stream !== "string" || !options.stream ||
     typeof pageSize !== "number" || !Number.isSafeInteger(pageSize) || pageSize <= 0 ||
@@ -126,6 +153,7 @@ export async function runDeclarationWitness(
   }
 
   let db: InstanceType<typeof Database> | undefined;
+  let declarationsDb: InstanceType<typeof Database> | undefined;
   let stage: OfflineDeclarationWitnessErrorCode = "open_failed";
   try {
     try {
@@ -141,10 +169,18 @@ export async function runDeclarationWitness(
     }
     db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 0 });
     stage = "unverifiable_source";
-    assertRegisteredSource(db, sourceKey);
+    const sourceId = assertRegisteredSource(db, sourceKey);
     stage = "unsupported_store";
     const store = createSqliteRecordStore(db);
-    assertRetainedStreamDeclaration();
+    stage = "unverifiable_source";
+    try {
+      const path = options.declarationsDbPath ?? join(dirname(dbPath), "pdpp-declarations.db");
+      if (!statSync(path).isFile()) throw new Error("unavailable");
+      declarationsDb = new Database(path, { readonly: true, fileMustExist: true, timeout: 0 });
+    } catch {
+      throw new OfflineDeclarationWitnessError("unverifiable_source");
+    }
+    assertRetainedStreamDeclaration(declarationsDb, sourceId, stream);
     // Witness validation uses nextSchema, never declaration registry lookups.
     const readPort = fromSyncRecordStore({ ...store, forInstance: () => undefined });
     stage = "read_failed";
@@ -176,12 +212,15 @@ export async function runDeclarationWitness(
       error instanceof DeclarationWitnessSchemaError ? "invalid_schema" : stage,
     );
   } finally {
-    if (db?.open) {
+    let closeFailed = false;
+    for (const handle of [declarationsDb, db]) {
+      if (!handle?.open) continue;
       try {
-        db.close();
+        handle.close();
       } catch {
-        throw new OfflineDeclarationWitnessError("close_failed");
+        closeFailed = true;
       }
     }
+    if (closeFailed) throw new OfflineDeclarationWitnessError("close_failed");
   }
 }
