@@ -1,8 +1,4 @@
-import {
-  createDurableAdditions,
-  createVersionInventoryClient,
-  type DurableAdditionsService,
-} from "@opendatalabs/personal-server-ts-core/additions";
+import { type DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
@@ -46,6 +42,14 @@ import type {
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import type { PsLiteStateStore } from "./state.js";
 import { resolvePsLiteOwner } from "./owner-binding.js";
+import {
+  createPsLiteAdditionsSession,
+  type AdditionsWorkerPort,
+} from "./additions-session.js";
+import {
+  createPsLiteAdditionsTransport,
+  type PsLiteBoundedOwnerSigner,
+} from "./additions-transport.js";
 import type { DiagnosticsRecorder } from "./diagnostics.js";
 
 const SYNC_CURSOR_KEY = "sync-cursor-v1";
@@ -67,10 +71,10 @@ interface SyncCursor {
 }
 
 /** Owner-authorized sync capability. Hosts mediate signing; no owner key enters Lite. */
-export interface PsLiteOwnerSyncSigner extends Pick<
-  ServerSigner,
-  "address" | "signAddData" | "signLineageAttestation"
-> {
+export interface PsLiteOwnerSyncSigner
+  extends
+    Partial<PsLiteBoundedOwnerSigner>,
+    Pick<ServerSigner, "address" | "signAddData" | "signLineageAttestation"> {
   signMessage(message: string): Promise<`0x${string}`>;
 }
 
@@ -83,6 +87,7 @@ export interface PsLiteSyncOptions {
   serverAccount: ServerAccount;
   /** Uses owner authority for Storage and AddData, without server registration. */
   ownerSyncSigner?: PsLiteOwnerSyncSigner;
+  additionsWorkerFactory?: () => AdditionsWorkerPort;
   gateway?: GatewayClient;
   /**
    * Deletion-aware gateway feed. Defaults to a REST feed on the configured
@@ -271,38 +276,40 @@ export async function createPsLiteSyncManager(
           }),
       }
     : undefined;
-  const additions = ownerSigner
-    ? createDurableAdditions({
-        deleteSystemScope: async (scope) => {
-          if (!syncManager)
-            throw new Error("Durable system deletion capability unavailable");
-          const result = await syncManager.deleteScope(scope);
-          if (!result.durable || result.steps.gateway.status === "failed") {
-            throw new Error("System scope deletion was not durable");
-          }
-        },
-        ownerAddress: serverOwner,
-        network: `vana:${options.config.gateway.chainId}:${new URL(options.config.gateway.url).origin}`,
-        inventory: createVersionInventoryClient({
-          gatewayUrl: options.config.gateway.url,
-          ownerAddress: serverOwner,
-          ownerSigner: {
-            signRequest: (params) =>
-              buildWeb3SignedHeader({
-                ...params,
-                signMessage: (message: string) =>
-                  ownerSigner.signMessage(message),
-              }),
+  const boundedSigner =
+    ownerSigner?.signMessageBounded && ownerSigner.signAddDataBounded
+      ? {
+          signMessageBounded: ownerSigner.signMessageBounded.bind(ownerSigner),
+          signAddDataBounded: ownerSigner.signAddDataBounded.bind(ownerSigner),
+        }
+      : undefined;
+  const additions =
+    ownerSigner && boundedSigner && options.stateStore.bounded
+      ? createPsLiteAdditionsSession({
+          init: {
+            ownerAddress: serverOwner,
+            network: `vana:${options.config.gateway.chainId}:${new URL(options.config.gateway.url).origin}`,
+            gatewayUrl: options.config.gateway.url,
+            storageEndpoint: resolveVanaStorageEndpoint(options.config),
+            masterKey,
+            byteBudget: 8 * 1024 * 1024,
+            timeBudgetMs: 10_000,
           },
-        }),
-        storageAdapter,
-        masterKey,
-        signer,
-        gateway,
-        byteBudget: 8 * 1024 * 1024,
-        timeBudgetMs: 10_000,
-      })
-    : undefined;
+          transport: createPsLiteAdditionsTransport({
+            config: options.config,
+            ownerAddress: serverOwner,
+            stateStore: options.stateStore,
+            masterKey,
+            ownerSigner: boundedSigner,
+          }),
+          workerFactory: options.additionsWorkerFactory,
+          deleteSystemScope: async (scope) => {
+            const result = await syncManager.deleteScope(scope);
+            if (!result.durable || result.steps.gateway.status === "failed")
+              throw new Error("System scope deletion was not durable");
+          },
+        })
+      : undefined;
   const cursor = createPsLiteSyncCursor(options.stateStore);
   const logger = createBrowserLogger(options.logger);
   const dataPointFeed =

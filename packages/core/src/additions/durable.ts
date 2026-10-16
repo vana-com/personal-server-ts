@@ -84,6 +84,8 @@ export interface DurableAdditionsOptions {
    * No SDK whole-object fallback is allowed under a finite budget.
    */
   boundedWork?: {
+    /** Clear an interrupted-publication intent only after commitment verification. */
+    confirmed?(scope: string, budget: ByteBudget): Promise<void>;
     decrypt(
       encrypted: Uint8Array,
       password: string,
@@ -100,6 +102,8 @@ export interface DurableAdditionsOptions {
     }>;
   };
   timeBudgetMs?: number;
+  /** Session driver cancellation. All bounded operations share this signal. */
+  signal?: AbortSignal;
   /** Existing durable delete pipeline, including exact-key cleanup/retry. */
   deleteSystemScope?: (scope: string) => Promise<void>;
 }
@@ -121,10 +125,33 @@ class InaccessibleLedger extends Error {}
 class BoundedWorkUnavailable extends Error {}
 class ReadBudget extends AdditionsBudget {
   readonly limited: boolean;
-  constructor(options: DurableAdditionsOptions) {
-    super(options.byteBudget, options.timeBudgetMs);
+  constructor(
+    options: Pick<
+      DurableAdditionsOptions,
+      "byteBudget" | "timeBudgetMs" | "signal"
+    >,
+    private readonly parent?: ReadBudget,
+  ) {
+    super(options.byteBudget, options.timeBudgetMs, options.signal);
     this.limited =
       options.byteBudget !== undefined || options.timeBudgetMs !== undefined;
+  }
+  override charge(bytes = 0) {
+    super.charge(bytes);
+    this.parent?.charge(bytes);
+  }
+  /** A failed source unit cannot spend the bytes held for its durable prefix. */
+  excluding(reserved: number): ReadBudget {
+    return new ReadBudget(
+      {
+        byteBudget: Math.max(0, this.remaining - reserved),
+        timeBudgetMs: Number.isFinite(this.remainingMilliseconds)
+          ? Math.max(0, Math.floor(this.remainingMilliseconds - 2000))
+          : undefined,
+        signal: this.signal,
+      },
+      this,
+    );
   }
   check(bytes = 0) {
     this.charge(bytes);
@@ -325,6 +352,7 @@ export function createDurableAdditions(
       if (JSON.stringify(envelope.data) !== JSON.stringify(data))
         throw new Error("Bounded checkpoint content was replaced");
       budget.check();
+      await options.boundedWork.confirmed?.(scope, budget);
       return;
     }
     const snapshot = await inventory.list(scope, budget.readOptions);
@@ -470,9 +498,31 @@ export function createDurableAdditions(
         coverage = "partial";
       expected = BigInt(slot.expectedVersion) + 1n;
     }
+    const checkpointBytes = (
+      candidate: ScopeFirstSeenLedger | null,
+      count: number,
+    ) =>
+      128 * 1024 +
+      128 *
+        new TextEncoder().encode(
+          JSON.stringify({
+            ledger: candidate,
+            slots: relevant.slice(0, count),
+            owner,
+            network: options.network,
+            scope,
+            through,
+            currentTotal,
+          }),
+        ).byteLength;
     for (const slot of relevant.slice(folded.length)) {
       try {
-        budget.check();
+        // Keep publication capacity in the same owner-wide allowance. Exhaustion
+        // of the child leaves the already-folded prefix publishable.
+        const unitBudget = budget.limited
+          ? budget.excluding(checkpointBytes(ledger, folded.length))
+          : budget;
+        unitBudget.check();
         if (BigInt(slot.expectedVersion) !== BigInt(through) + 1n)
           coverage = "partial";
         // Mutable slots are provisional; failed/unknown slots cannot advance the prefix.
@@ -520,13 +570,22 @@ export function createDurableAdditions(
           if (!data) throw new Error("Unsupported source envelope");
           version = { scope, collectedAt: inMemory.data.collectedAt, data };
         } else {
-          const envelope = await readEnvelope(scope, slot, budget);
+          const envelope = await readEnvelope(scope, slot, unitBudget);
           const data = sourceData(envelope.data);
           if (!data) throw new Error("Unsupported source envelope");
           version = { scope, collectedAt: envelope.collectedAt, data };
         }
         const hadBaseline = ledger !== null && ledger.baseline !== null;
-        ledger = await foldVersion(ledger, version);
+        const candidate = await foldVersion(ledger, version);
+        unitBudget.check();
+        if (
+          budget.limited &&
+          checkpointBytes(candidate, folded.length + 1) > budget.remaining
+        )
+          throw new BudgetExceeded(
+            "Checkpoint cannot fit remaining recovery allowance",
+          );
+        ledger = candidate;
         currentTotal =
           (await extractRecordKeys(scope, version.data))?.total ?? 1;
         // Reimport baseline and incomplete starts have unknown arrivals.
@@ -549,7 +608,7 @@ export function createDurableAdditions(
       coverage = "partial";
     if (ledger?.incomplete || ledger?.skipped) coverage = "partial";
     // The pages above are separate snapshots. Never certify against an old view.
-    if (coverage !== "behind") {
+    if (!budget.signal?.aborted) {
       const check = await inventory.list(scope, budget.readOptions);
       if (!sameInventory(snapshot, check))
         return {
@@ -691,6 +750,9 @@ export function createDurableAdditions(
       // Optional optimization only. Correctness always comes from read recovery.
       try {
         const budget = new ReadBudget(options);
+        // Bounded recovery reads committed bytes through the bounded transport;
+        // never parse or serialize an unbounded caller-owned upload hint.
+        if (budget.limited) proof = undefined;
         if (
           budget.limited &&
           (!options.boundedWork || !storageAdapter.downloadBounded)

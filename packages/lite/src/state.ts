@@ -25,9 +25,18 @@ export type PsLiteStateKey =
   | "relay-v1"
   | "sync-cursor-v1"
   | "pending-blob-deletions-v1"
+  | `additions-publication-v1:${string}`
   | "derivative-questions-v1";
 
+/** Implementations must settle on abort and prevent late mutations. */
+export interface PsLiteBoundedStateStore {
+  get<T>(key: PsLiteStateKey, signal?: AbortSignal): Promise<T | null>;
+  set<T>(key: PsLiteStateKey, value: T, signal?: AbortSignal): Promise<void>;
+  delete(key: PsLiteStateKey, signal?: AbortSignal): Promise<void>;
+}
+
 export interface PsLiteStateStore {
+  bounded?: PsLiteBoundedStateStore;
   get<T>(key: PsLiteStateKey): Promise<T | null>;
   set<T>(key: PsLiteStateKey, value: T): Promise<void>;
   delete(key: PsLiteStateKey): Promise<void>;
@@ -221,14 +230,32 @@ function openStateDb(options: {
   stateStoreName?: string;
   tokenStoreName?: string;
   accessLogStoreName?: string;
+  signal?: AbortSignal;
 }): Promise<IDBDatabase> {
   if (typeof indexedDB === "undefined") {
     throw new Error("IndexedDB is not available in this runtime");
   }
 
   return new Promise((resolve, reject) => {
+    options.signal?.throwIfAborted();
+    let abandoned = false;
     const request = indexedDB.open(options.dbName, STATE_DB_VERSION);
+    const cleanup = () => options.signal?.removeEventListener("abort", abort);
+    const fail = (error: unknown) => {
+      abandoned = true;
+      cleanup();
+      reject(error);
+    };
+    const abort = () =>
+      fail(options.signal?.reason ?? new Error("IndexedDB open aborted"));
+    options.signal?.addEventListener("abort", abort, { once: true });
+    request.onblocked = () =>
+      fail(new Error("IndexedDB upgrade is blocked by another connection"));
     request.onupgradeneeded = () => {
+      if (abandoned || options.signal?.aborted) {
+        request.transaction?.abort();
+        return;
+      }
       createPsLiteStateSchema(request.result, request.transaction, {
         stateStoreName: options.stateStoreName ?? DEFAULT_STATE_STORE,
         tokenStoreName: options.tokenStoreName ?? DEFAULT_TOKEN_STORE,
@@ -236,34 +263,78 @@ function openStateDb(options: {
           options.accessLogStoreName ?? DEFAULT_ACCESS_LOG_STORE,
       });
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      cleanup();
+      if (abandoned || options.signal?.aborted) {
+        request.result.close();
+        return;
+      }
+      request.result.onversionchange = () => request.result.close();
+      resolve(request.result);
+    };
+    request.onerror = () => fail(request.error);
   });
 }
 
-function runStateTransaction<T>(
+async function runStateTransaction<T>(
   options: Required<IndexedDbPsLiteStateStoreOptions>,
   mode: IDBTransactionMode,
   callback: (store: IDBObjectStore) => IDBRequest<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  return openStateDb({
+  const db = await openStateDb({
     dbName: options.dbName,
     stateStoreName: options.storeName,
-  }).then(
-    (db) =>
-      new Promise<T>((resolve, reject) => {
-        const transaction = db.transaction(options.storeName, mode);
-        const store = transaction.objectStore(options.storeName);
-        const request = callback(store);
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-        transaction.oncomplete = () => db.close();
-        transaction.onerror = () => {
-          db.close();
-          reject(transaction.error);
-        };
-      }),
-  );
+    signal,
+  });
+  return new Promise<T>((resolve, reject) => {
+    if (signal?.aborted) {
+      db.close();
+      reject(signal.reason);
+      return;
+    }
+    let result: T;
+    let request: IDBRequest<T>;
+    const transaction = db.transaction(options.storeName, mode);
+    const cleanup = () => {
+      signal?.removeEventListener("abort", abort);
+      db.close();
+    };
+    const abort = () => {
+      try {
+        transaction.abort();
+      } catch {
+        /* Already settled; oncomplete reports the receipt. */
+      }
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    transaction.oncomplete = () => {
+      cleanup();
+      if (signal?.aborted) reject(signal.reason);
+      else resolve(result);
+    };
+    transaction.onabort = () => {
+      cleanup();
+      reject(
+        signal?.aborted
+          ? signal.reason
+          : (transaction.error ?? new Error("IndexedDB transaction aborted")),
+      );
+    };
+    transaction.onerror = () => {
+      /* Default IndexedDB error handling aborts the transaction. */
+    };
+    try {
+      request = callback(transaction.objectStore(options.storeName));
+      request.onsuccess = () => {
+        result = request.result;
+      };
+    } catch (error) {
+      transaction.abort();
+      cleanup();
+      reject(error);
+    }
+  });
 }
 
 function runStoreTransaction<T>(
@@ -342,26 +413,34 @@ export function createIndexedDbPsLiteStateStore(
     dbName: options.dbName ?? DEFAULT_STATE_DB_NAME,
     storeName: options.storeName ?? DEFAULT_STATE_STORE,
   };
-  return {
-    async get<T>(key: PsLiteStateKey) {
+  const bounded: PsLiteBoundedStateStore = {
+    async get<T>(key: PsLiteStateKey, signal?: AbortSignal) {
       const value = await runStateTransaction<T | undefined>(
         resolved,
         "readonly",
         (store) => store.get(key),
+        signal,
       );
       return value ?? null;
     },
-    async set<T>(key: PsLiteStateKey, value: T) {
-      await runStateTransaction<IDBValidKey>(resolved, "readwrite", (store) =>
-        store.put(value, key),
+    async set<T>(key: PsLiteStateKey, value: T, signal?: AbortSignal) {
+      await runStateTransaction<IDBValidKey>(
+        resolved,
+        "readwrite",
+        (store) => store.put(value, key),
+        signal,
       );
     },
-    async delete(key: PsLiteStateKey) {
-      await runStateTransaction<undefined>(resolved, "readwrite", (store) =>
-        store.delete(key),
+    async delete(key: PsLiteStateKey, signal?: AbortSignal) {
+      await runStateTransaction<undefined>(
+        resolved,
+        "readwrite",
+        (store) => store.delete(key),
+        signal,
       );
     },
   };
+  return { ...bounded, bounded };
 }
 
 export function createIndexedDbPsLiteTokenStore(

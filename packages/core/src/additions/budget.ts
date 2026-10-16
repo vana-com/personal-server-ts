@@ -4,6 +4,7 @@ export class AdditionsBudgetExceeded extends Error {}
 export interface ByteBudget {
   readonly signal?: AbortSignal;
   readonly remaining: number;
+  readonly remainingMilliseconds?: number;
   charge(bytes?: number): void;
 }
 
@@ -15,14 +16,22 @@ export class AdditionsBudget implements ByteBudget {
   constructor(
     private readonly bytes = Infinity,
     milliseconds?: number,
+    signal?: AbortSignal,
   ) {
     if (bytes < 0 || (!Number.isFinite(bytes) && bytes !== Infinity))
       throw new RangeError("Invalid additions byte budget");
     this.deadline = performance.now() + (milliseconds ?? Infinity);
-    this.signal =
+    const timeout =
       milliseconds === undefined
         ? undefined
         : AbortSignal.timeout(milliseconds);
+    this.signal =
+      signal && timeout
+        ? AbortSignal.any([signal, timeout])
+        : (signal ?? timeout);
+  }
+  get remainingMilliseconds() {
+    return Math.max(0, this.deadline - performance.now());
   }
   get remaining() {
     return Math.max(0, this.bytes - this.used);

@@ -72,6 +72,7 @@ export {
   type PsLiteRelayState,
   type PsLiteStateKey,
   type PsLiteStateStore,
+  type PsLiteBoundedStateStore,
   type PsLiteUnlockedServerIdentity,
 } from "./state.js";
 

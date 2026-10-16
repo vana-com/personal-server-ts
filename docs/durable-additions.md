@@ -1,6 +1,6 @@
 # Durable additions producer
 
-Personal Server producer for BUI-904/VANA-12, based on `main@76c3a2f72a809d26169d675199dcfac9fdae4dcc`. Gateway draft #168 is pinned at `228bbf1cd6893a5b34da248832d8861f245d6d3d`. Both PRs remain unpublished, draft and unmerged. Desktop/Web rendered acceptance belongs to the later consumer issues.
+Personal Server producer for BUI-904/VANA-12, based on `main@76c3a2f72a809d26169d675199dcfac9fdae4dcc`. Gateway draft #168 is pinned at `228bbf1cd6893a5b34da248832d8861f245d6d3d`. Existing remote PRs stay unchanged and unmerged; this continuation is local only. Desktop/Web rendered acceptance belongs to the later consumer issues.
 
 ## Storage and authority
 
@@ -8,7 +8,7 @@ Personal Server producer for BUI-904/VANA-12, based on `main@76c3a2f72a809d26169
 
 Ordinary ledger names are `vana.system.additions.<source>`. When that name exceeds 256 UTF-8 bytes, the selected mapping is `vana.system.additions-hash.<keccak256(exact source)>`. The exact source remains inside the validated encrypted document. The separate namespace cannot collide with a literal source suffix. This fallback is coordinator-approved; it is no longer a pending format decision.
 
-Inventory remains owner-wallet only. Every request includes a fresh signed nonce because Gateway consumes read proofs once. No server key is silently promoted to owner authority. `CreateServerOptions.additionsWriter` accepts an already-authorized storage/AddData/Gateway capability for TEE checkpoints. TEE additions remain unavailable without both owner inventory signing and that injected writer. The ordinary enclave public-read adapter still cannot upload. This injection creates no credential, registration, grant or egress permission.
+This Lite composition uses existing owner-wallet authority. Every inventory request includes a fresh signed nonce because Gateway consumes read proofs once. The coordinator owns the separately approved inventory-only registered-server exception; it does not confer checkpoint write authority. No server key is silently promoted to owner authority. `CreateServerOptions.additionsWriter` accepts an already-authorized storage/AddData/Gateway capability for TEE checkpoints. TEE additions remain unavailable without both owner inventory signing and that injected writer. The ordinary enclave public-read adapter still cannot upload. This injection creates no credential, registration, grant or egress permission.
 
 ## Recovery
 
@@ -38,7 +38,15 @@ One `AdditionsBudget` covers inventory bodies, ciphertext, contiguous copies, de
 
 Vana's signed adapter exposes `downloadBounded`, using the already-public canonical blob GET with namespace validation and redirect rejection. It checks advertised length and actual stream chunks, including missing/false lengths and HTTP decompression expansion. Inventory readers bound JSON before parsing and share the accumulator's budget. They require a cancellation-aware signing capability rather than letting wallet prompts outlive the deadline.
 
-The SDK crypto and checkpoint APIs still do not expose cancellation or a preallocation plaintext/decompression ceiling. Therefore the installed Lite path returns **unavailable** before starting recovery when bounded crypto/publication capability is absent. It no longer claims behind progress after whole-object SDK work or runs checkpoint publication under a fresh unlimited budget. A host may inject `boundedWork` only if it cancels and settles crypto/publication and enforces the plaintext limit. Returned checkpoint proofs are revalidated by the coordinator under the same budget. No production bounded-work implementation is supplied in this PR; incremental Lite progress and checkpoint resume acceptance remain **unproved**. This safe unavailable state is an explicit remaining gate, not completion of browser catch-up.
+The Lite sync composition now creates a real dedicated-worker session when `ownerSyncSigner` supplies `signMessageBounded` and `signAddDataBounded`. Those host methods must cancel and settle the actual signing request when their signal aborts. Missing bounded signing remains unavailable; no race against an unresolved wallet prompt is supplied. Worker creation, traversal, OpenPGP decryption, commitment checking, folding, summary construction and checkpoint encryption use the production path. The driver terminates the worker and awaits all aborted host operations before returning. Binary network/publication buffers transfer across the worker channel instead of being cloned. The master key is copied once to the dedicated worker.
+
+The package builds `dist/additions-worker.bundle.js` separately from TypeScript output, so subsequent type checks cannot overwrite the browser artifact with an unbundled module. Bundlers can supply `additionsWorkerFactory` through the browser-runtime or sync options. Upload notifications trigger inventory-backed recovery without cloning upload data/proof into the worker. Explicit durable deletion stays in the ordinary sync pipeline outside the timed recovery session. An owner/network Web Lock covers the complete session and serializes encrypted publication intents across tabs; its wait is included in the ten-second deadline. Hosts without browser Web Locks cannot execute this bounded lane.
+
+OpenPGP is pinned to installed version 6.3.0. A per-call compressed tag-8 packet override throws from packet `read` before decoder execution; no global prototype or configuration is changed. Compressed historical envelopes remain unsupported on this bounded lane and produce incomplete coverage. Full runtime retains SDK compatibility. Uncompressed ciphertext reserves conservative decryption capacity before decrypting; parse and serialization work are charged separately.
+
+Before another source unit starts, recovery reserves 128 KiB plus 128 times the candidate checkpoint serialization and two seconds within the same owner-wide allowance. The attempted unit receives only the remainder, and its actual HTTP/signing operations receive its remaining deadline. A failed unit cannot consume the prefix publication reservation. Candidate admission checks the enlarged checkpoint before advancing its durable prefix. Oversized histories can remain behind; no per-publication budget reset exists.
+
+The host uses canonical abortable Storage PUT and Gateway AddData POST with existing owner signatures, redirect rejection and bounded response parsing. It seals each candidate version, both hashes and encrypted bytes in Lite persistence before signing or PUT. AES-GCM associated data binds owner, chain/Gateway origin and exact system scope. On restart, the worker reconciles real inventory/blob commitments before retrying the same candidate version. An ambiguous receipt never blindly increments the version. The prior checkpoint stays readable until the candidate verifies. Confirmed journal intents clear after verification; durable deletion also clears its scope's intent. Journal operations require `stateStore.bounded`; the default IndexedDB implementation aborts transactions on cancellation, resolves writes only on commit, fails blocked upgrades and aborts/closes late open results. An injected store without that cancellation contract disables bounded recovery.
 
 ## Reproducible evidence
 
@@ -48,6 +56,7 @@ With dependencies installed in both isolated checkouts:
 npm test -- packages/core/src/additions packages/core/src/storage/adapters/vana-bounded.test.ts packages/core/src/signing
 node --import tsx scripts/verify-additions-gateway.mjs ../data-gateway
 node --import tsx scripts/verify-additions-gateway.mjs ../data-gateway --large
+node --import tsx scripts/verify-additions-browser.mjs ../data-gateway
 npm run validate
 npm run build
 ```
@@ -56,9 +65,8 @@ The runner refuses any Gateway revision other than the pinned commit. It owns a 
 
 Observed full-runtime runs: 102 versions passed the paging proof. The large run replayed 90 versions / **377,509,603 ciphertext bytes**, returned complete/total 2, and recovered identical counts after original pruning. Peak process RSS was **487,292,928 bytes**, including fixture generation and imported Gateway code. This is measured evidence, not a constant-memory guarantee for unbounded identities or versions.
 
-## Remaining acceptance gates
+## Runtime proof and remaining authority
 
-- Registered-server INVENTORY authorization remains pending Callum's confirmation. No Gateway permission change is included. An existing owner signing capability remains the supported alternative.
-- TEE needs an actual authorized owner inventory signer and host-injected writable checkpoint capability. The injection is prepared; no authority was manufactured.
-- Lite needs concrete cancellation-aware bounded signing, crypto and checkpoint adapters with real worker/transport proof, plus resumable interrupted checkpoints. Missing capability returns unavailable. The hard 8-MiB/ten-second incremental catch-up gate is not accepted.
-- Browser/native cross-surface rendered equality is later consumer work. No production data, publishing, deployment or shared-branch writes were used.
+The coordinator-owned `scripts/verify-additions-browser.mjs` exercises the production session, transport, worker and IndexedDB against isolated Gateway handlers, real PostgreSQL and encrypted loopback blobs with disposable owner signing. Its final output records the tested dependency head, capped invocation progress, restarts, interrupted publication, cancellation and malicious transport cases. This is local fixture evidence; chain settlement remains simulated and production Storage is not exercised.
+
+The enclave entry point now composes a dedicated host additions broker through `additionsInventorySigner` and `additionsWriter`. The sandbox account stays public-only. The host derives its existing registered epoch account and fixes owner, chain, Gateway/storage origins, checkpoint scope, method and registry domain. It rechecks sandbox placement after asynchronous work and requires fresh registered-server inventory evidence before checkpoint writes. No general signing operation or owner key enters the sandbox. The Gateway dependency must include the inventory-only registered-server exception; earlier owner-only inventory builds fail closed. Local native proof uses fake dstack key derivation and loopback services, not hardware attestation or production Storage. A noncancelable external wallet cannot provide bounded Lite signing. Missing capabilities preserve unavailable behavior. Browser/native consumer rendering belongs to the later consumer issues. No production data, publishing, deployment or shared-branch writes are part of this local delivery.
