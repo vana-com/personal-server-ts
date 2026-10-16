@@ -97,7 +97,7 @@ describe("initializeDatabase", () => {
       .get("instagram/profile.json") as
       { path: string; scope: string; size_bytes: number } | undefined;
 
-    expect(version).toBe(4);
+    expect(version).toBe(5);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -152,7 +152,7 @@ describe("initializeDatabase", () => {
         }
       | undefined;
 
-    expect(version).toBe(4);
+    expect(version).toBe(5);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
@@ -200,7 +200,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(4);
+    expect(db.pragma("user_version", { simple: true })).toBe(5);
     const row = db
       .prepare(
         "SELECT path, schema_id, version, data_point_id FROM data_files WHERE path = ?",
@@ -258,7 +258,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(4);
+    expect(db.pragma("user_version", { simple: true })).toBe(5);
     const row = db
       .prepare(
         "SELECT path, version, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",

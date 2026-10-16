@@ -6,7 +6,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pino } from "pino";
@@ -14,6 +16,7 @@ import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { buildScopeDir } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
@@ -381,7 +384,6 @@ describe("POST /v1/data/:scope with a write session", () => {
       indexManager: flakyIndex,
       hierarchyOptions,
     });
-    let failures = 1;
     const flakyApp = dataRoutes({
       indexManager: flakyIndex,
       hierarchyOptions,
@@ -391,13 +393,7 @@ describe("POST /v1/data/:scope with a write session", () => {
       gateway,
       accessLogWriter,
       writeSessionStore,
-      dataStorage: {
-        ...realStorage,
-        async writeEnvelope(envelope) {
-          if (failures-- > 0) throw new Error("disk full");
-          return realStorage.writeEnvelope(envelope);
-        },
-      },
+      dataStorage: realStorage,
     });
     const rawBody = JSON.stringify({ note: "retry" });
     const headers: Record<string, string> = {
@@ -419,8 +415,14 @@ describe("POST /v1/data/:scope with a write session", () => {
         body: rawBody,
       });
 
-    const failing = await send();
-    expect(failing.status).toBe(500);
+    await rm(hierarchyOptions.dataDir, { recursive: true });
+    await writeFile(hierarchyOptions.dataDir, "not a directory");
+    try {
+      expect((await send()).status).toBe(500);
+    } finally {
+      await rm(hierarchyOptions.dataDir, { force: true });
+      await mkdir(hierarchyOptions.dataDir);
+    }
     const retry = await send();
     expect(retry.status).toBe(201);
     const auth = await buildWeb3SignedHeader({
@@ -436,64 +438,135 @@ describe("POST /v1/data/:scope with a write session", () => {
     flakyIndex.close();
   });
 
-  it("keeps the proof consumed when the envelope persisted but indexing failed", async () => {
-    // Partial storage failure: the envelope reaches disk, the index insert
-    // throws. The record is persisted (a re-index surfaces it), so the same
-    // proof must NOT be accepted again.
-    const partialIndex = createIndexManager(initializeDatabase(":memory:"));
-    const realStorage = createNodeDataStorage({
-      indexManager: partialIndex,
-      hierarchyOptions,
-    });
-    let indexFailures = 1;
-    const partialApp = dataRoutes({
-      indexManager: partialIndex,
-      hierarchyOptions,
-      logger,
-      serverOrigin: SERVER_ORIGIN,
-      serverOwner: ownerWallet.address,
-      gateway,
-      accessLogWriter,
-      writeSessionStore,
-      dataStorage: {
-        ...realStorage,
-        async insertEntry(entry) {
-          if (indexFailures-- > 0) throw new Error("index locked");
-          return realStorage.insertEntry(entry);
-        },
-      },
-    });
-    const rawBody = JSON.stringify({ note: "partial" });
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${SESSION_TOKEN}`,
-      [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
-        wallet: builderWallet,
-        aud: SERVER_ORIGIN,
-        method: "POST",
-        uri: `/${SCOPE}`,
-        body: new TextEncoder().encode(rawBody),
-        grantId: WRITE_GRANT_ID,
-      }),
-    };
-    const send = () =>
-      partialApp.request(`/${SCOPE}`, {
-        method: "POST",
-        headers,
-        body: rawBody,
+  it.each([
+    "index insertion",
+    ...(process.platform === "win32" ? [] : ["directory sync"]),
+    "temporary cleanup",
+    "transaction commit",
+  ])(
+    "keeps the proof consumed after publication when %s fails",
+    async (failure) => {
+      const db = initializeDatabase(":memory:");
+      const partialIndex = createIndexManager(db);
+      const realStorage = createNodeDataStorage({
+        indexManager: partialIndex,
+        hierarchyOptions,
       });
+      if (failure === "index insertion") {
+        db.exec(
+          "CREATE TRIGGER reject_insert BEFORE INSERT ON data_files BEGIN SELECT RAISE(FAIL, 'index unavailable'); END",
+        );
+      } else if (failure === "transaction commit") {
+        db.exec(`
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE commit_parent (id INTEGER PRIMARY KEY);
+        CREATE TABLE commit_child (
+          parent INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED
+        );
+        CREATE TRIGGER reject_commit AFTER INSERT ON data_files
+          BEGIN INSERT INTO commit_child(parent) VALUES (1); END;
+      `);
+      }
+      const partialApp = dataRoutes({
+        indexManager: partialIndex,
+        hierarchyOptions,
+        logger,
+        serverOrigin: SERVER_ORIGIN,
+        serverOwner: ownerWallet.address,
+        gateway,
+        accessLogWriter,
+        writeSessionStore,
+        dataStorage: realStorage,
+      });
+      const rawBody = JSON.stringify({ note: "partial" });
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${SESSION_TOKEN}`,
+        [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+          wallet: builderWallet,
+          aud: SERVER_ORIGIN,
+          method: "POST",
+          uri: `/${SCOPE}`,
+          body: new TextEncoder().encode(rawBody),
+          grantId: WRITE_GRANT_ID,
+        }),
+      };
+      const send = () =>
+        partialApp.request(`/${SCOPE}`, {
+          method: "POST",
+          headers,
+          body: rawBody,
+        });
 
-    const failing = await send();
-    expect(failing.status).toBe(500);
-    const retry = await send();
-    expect(retry.status).toBe(401);
-    expect((await retry.json()).error.errorCode).toBe(
-      "WRITE_ATTRIBUTION_REPLAY",
-    );
-    // Only the orphaned (unindexed) envelope exists: nothing was indexed.
-    expect(partialIndex.findLatestByScope(SCOPE)).toBeUndefined();
-    partialIndex.close();
-  });
+      const link = fs.linkSync;
+      const sync = fs.fsyncSync;
+      const remove = fs.rmSync;
+      let published = false;
+      let faulted = false;
+      const restore: (() => void)[] = [];
+      if (failure === "directory sync" || failure === "temporary cleanup") {
+        restore.push(
+          vi.spyOn(fs, "linkSync").mockImplementation((...args) => {
+            link(...args);
+            published = true;
+          }).mockRestore,
+        );
+        if (failure === "directory sync") {
+          restore.push(
+            vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+              if (published && !faulted) {
+                faulted = true;
+                throw Object.assign(
+                  new Error("directory sync failed after publication"),
+                  { code: "EIO" },
+                );
+              }
+              sync(fd);
+            }).mockRestore,
+          );
+        } else {
+          restore.push(
+            vi.spyOn(fs, "rmSync").mockImplementation((path, options) => {
+              if (published && !faulted && String(path).includes(".tmp.")) {
+                faulted = true;
+                throw Object.assign(
+                  new Error("temporary cleanup failed after publication"),
+                  { code: "EIO" },
+                );
+              }
+              remove(path, options);
+            }).mockRestore,
+          );
+        }
+        syncBuiltinESMExports();
+      }
+      try {
+        const failing = await send();
+        for (const reset of restore) reset();
+        syncBuiltinESMExports();
+        expect(failing.status).toBe(500);
+        expect(
+          (
+            await readdir(buildScopeDir(hierarchyOptions.dataDir, SCOPE))
+          ).filter((name) => name.endsWith(".json")),
+        ).toHaveLength(1);
+        if (failure === "index insertion")
+          db.exec("DROP TRIGGER reject_insert");
+        if (failure === "transaction commit")
+          db.exec("DROP TRIGGER reject_commit");
+        const retry = await send();
+        expect(retry.status).toBe(401);
+        expect((await retry.json()).error.errorCode).toBe(
+          "WRITE_ATTRIBUTION_REPLAY",
+        );
+        expect(partialIndex.findLatestByScope(SCOPE)).toBeUndefined();
+      } finally {
+        for (const reset of restore) reset();
+        syncBuiltinESMExports();
+        partialIndex.close();
+      }
+    },
+  );
 
   it("rejects a session write without the attribution proof", async () => {
     const res = await sessionWrite(
