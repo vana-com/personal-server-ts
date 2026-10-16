@@ -292,8 +292,11 @@ worker.onmessage = (event) => {
         );
       else request?.resolve(message.result);
     } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
       request?.reject(
-        error instanceof Error ? error : new Error(String(error)),
+        message.budgetExceeded || request?.budget?.signal?.aborted
+          ? new AdditionsBudgetExceeded(failure.message)
+          : failure,
       );
     }
     return;
