@@ -349,6 +349,17 @@ export function compareLegacyCoverage(
         mark("timestamp_format", path);
         return;
       }
+      // Value corrections cannot replace missing slots or waive cardinality.
+      if (canonical.length < legacy.length) {
+        const missing = legacy.length - canonical.length;
+        missingEntityCount += missing;
+        mark("missing_entity", path, true, missing);
+        return;
+      }
+      if (!options.canonicalNewer && canonical.length !== legacy.length) {
+        mark("array_order", path);
+        return;
+      }
       const counts = new Map<string | undefined, number>();
       for (const item of available)
         counts.set(item, (counts.get(item) ?? 0) + 1);
@@ -386,7 +397,15 @@ export function compareLegacyCoverage(
             (entry) =>
               entry.scope === options.scope && entry.path === normalizedPath,
           );
-          if (exception) {
+          const canonicalValue = canonical[index];
+          if (
+            exception &&
+            canonicalValue !== undefined &&
+            canonicalValue !== null &&
+            canonicalValue !== "" &&
+            jsonType(canonicalValue) === jsonType(legacyValue) &&
+            timestampFormat(canonicalValue) === timestampFormat(legacyValue)
+          ) {
             appliedExceptions.set(normalizedPath, {
               path: exception.path,
               reason: exception.reason,
@@ -488,7 +507,12 @@ export function compareLegacyCoverage(
         (entry) =>
           entry.scope === options.scope && entry.path === normalizedPath,
       );
-      if (exception) {
+      if (
+        exception &&
+        canonical !== undefined &&
+        canonical !== null &&
+        canonical !== ""
+      ) {
         appliedExceptions.set(normalizedPath, {
           path: exception.path,
           reason: exception.reason,
