@@ -26,6 +26,10 @@ import {
   verifyWeb3Signed,
 } from "@opendatalabs/vana-sdk/browser";
 
+import { createDurableAdditions } from "../packages/core/src/additions/durable.ts";
+import { createVersionInventoryClient } from "../packages/core/src/additions/version-inventory.ts";
+import { createServerSigner } from "../packages/core/src/signing/signer.ts";
+
 const gatewayRoot = resolve(process.argv[2] ?? "../data-gateway");
 assert.equal(
   execFileSync("git", ["rev-parse", "HEAD"], {
@@ -40,7 +44,9 @@ const { default: EmbeddedPostgres } = await import(
 );
 const root = await mkdtemp(join(tmpdir(), "ps-gateway-additions-"));
 const count = 40;
-const browserSession = `vana12-proof-${process.pid}`;
+let browserSession = `vana12-proof-${process.pid}`;
+let browserRestarts = 0;
+let fullRuntimeEquality = false;
 let browserBundle, workerBundle;
 const lastRegistered = new Map();
 let fixturePost = 0;
@@ -177,7 +183,9 @@ const server = createServer(async (request, response) => {
           stalledActive--;
           stalledClosed++;
         });
-        response.write(bytes.subarray(0, 1));
+        response.write(
+          bytes.subarray(0, Math.min(256 * 1024, bytes.length - 1)),
+        );
         return;
       }
       response.end(bytes);
@@ -233,10 +241,32 @@ const server = createServer(async (request, response) => {
       fixturePost++;
       // Simulated local settlement of the ACTUAL handler-accepted signed row.
       // This proves POST/signing/SQL compatibility, not an on-chain transaction.
-      await register({
-        ...req.body,
-        signature: request.headers.authorization.slice(11),
-      });
+      const id = idFor(req.body.scope);
+      const selector = and(
+        eq(schema.dataPointVersions.id, id),
+        eq(schema.dataPointVersions.expectedVersion, req.body.expectedVersion),
+      );
+      const [created] = await db
+        .select()
+        .from(schema.dataPointVersions)
+        .where(selector);
+      assert.ok(created, "POST returned success without inserting SQL version");
+      assert.equal(created.dataHash, req.body.dataHash);
+      assert.equal(created.metadataHash, req.body.metadataHash);
+      assert.equal(created.signature, request.headers.authorization.slice(11));
+      assert.equal(
+        created.signerAddress.toLowerCase(),
+        account.address.toLowerCase(),
+      );
+      await db
+        .update(schema.dataPointVersions)
+        .set({ status: "confirmed" })
+        .where(selector);
+      await db
+        .update(schema.dataPoints)
+        .set({ status: "confirmed", chainState: "active" })
+        .where(eq(schema.dataPoints.id, id));
+      lastRegistered.set(req.body.scope, req.body);
       if (fault === "verify") verificationArmed = true;
       if (dropRegistration) {
         fault = "";
@@ -283,7 +313,13 @@ const command = (args) =>
   new Promise((resolve, reject) => {
     const child = spawn(
       "agent-browser",
-      ["--session", browserSession, ...args],
+      [
+        "--session",
+        browserSession,
+        "--profile",
+        join(root, "browser-profile"),
+        ...args,
+      ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     let output = "";
@@ -295,6 +331,9 @@ const command = (args) =>
     );
   });
 let db, schema, register;
+const { eq, and } = await import(
+  pathToFileURL(requireGateway.resolve("drizzle-orm"))
+);
 try {
   await pg.initialise();
   await pg.start();
@@ -417,18 +456,19 @@ const ownerSignature=await account.signMessage({message:'vana-master-key-v1'});
 const config=ServerConfigSchema.parse({gateway:{url:origin,chainId:14800,contracts:{dataRegistry:'0x8C8788f98385F6ba1adD4234e551ABba0f82Cb7C'}},storage:{config:{vana:{apiUrl:origin}}}});
 const signer=createServerSigner({address:account.address,publicKey:account.publicKey,signTypedData:p=>account.signTypedData(p),signMessage:m=>account.signMessage({message:m})},config.gateway);
 const stateStore=createIndexedDbPsLiteStateStore({dbName:'local-additions-proof'});
-let active=0,started=0,terminated=0;const errors=[];
+let active=0,started=0,terminated=0,hostBytesCharged=0;const errors=[];
 let failSign=false;
 const ownerSigner={async signMessageBounded(message,signal){signal?.throwIfAborted();const r=await account.signMessage({message});signal?.throwIfAborted();return r},async signAddDataBounded(message,signal){signal?.throwIfAborted();if(failSign){failSign=false;throw Error('injected interrupted owner signing')}const r=await signer.signAddData(message);signal?.throwIfAborted();return r}};
  const storage=await createPersistentPsLiteStorage({kind:"indexeddb"});
- const composition=await createPsLiteSyncManager({config,stateStore,storage,ownerSignature,serverAccount:{address:account.address,publicKey:account.publicKey,signMessage:m=>account.signMessage({message:m}),signTypedData:p=>account.signTypedData(p)},ownerSyncSigner:{...signer,...ownerSigner,signMessage:m=>account.signMessage({message:m})},additionsWorkerFactory:()=>{const w=new Worker('/additions-worker.js',{type:'module'});started++;active++;w.addEventListener('error',e=>errors.push(e.message));w.addEventListener('message',e=>{if(e.data.kind==='error')errors.push(e.data.error)});const terminate=w.terminate.bind(w);w.terminate=()=>{if(!w.stopped){w.stopped=true;active--;terminated++;terminate()}};return w}});
+ const composition=await createPsLiteSyncManager({config,stateStore,storage,ownerSignature,serverAccount:{address:account.address,publicKey:account.publicKey,signMessage:m=>account.signMessage({message:m}),signTypedData:p=>account.signTypedData(p)},ownerSyncSigner:{...signer,...ownerSigner,signMessage:m=>account.signMessage({message:m})},additionsWorkerFactory:()=>{const w=new Worker('/additions-worker.js',{type:'module'});started++;active++;w.addEventListener('error',e=>errors.push(e.message));w.addEventListener('message',e=>{if(e.data.kind==='error')errors.push(e.data.error)});const post=w.postMessage.bind(w);w.postMessage=(message,transfer)=>{if(message.kind==='response')hostBytesCharged+=message.spent??0;return post(message,transfer)};const terminate=w.terminate.bind(w);w.terminate=()=>{if(!w.stopped){w.stopped=true;active--;terminated++;terminate()}};return w}});
  await composition.syncManager.stop();
  const session=composition.additions;if(!session)throw Error("production additions composition unavailable");
 window.proof=async function(signFailure=false){
  failSign=signFailure;
+ hostBytesCharged=0;
  const start=performance.now();
  const result=await session.summarize({timezone:'Asia/Kathmandu',days:7,now:new Date('2026-10-04T00:00:00Z')});
- return {errors,result,elapsedMs:performance.now()-start,active,started,terminated};
+ return {hostBytesCharged,errors,result,elapsedMs:performance.now()-start,active,started,terminated};
 };
 window.uploadNoClone=async()=>{let touched=0;await session.recordUpload({scope:'test.conversations',collectedAt:'2026-10-01T00:00:00Z',get data(){touched++;throw Error('unbounded data cloned')}},{get envelope(){touched++;throw Error('unbounded proof cloned')},encryptedSize:1024*1024*1024});return {touched,active}};
 window.ready=true;
@@ -471,6 +511,14 @@ window.ready=true;
     const parsed = JSON.parse(output);
     const value = parsed.data?.result ?? parsed.result ?? parsed;
     const outcome = typeof value === "string" ? JSON.parse(value) : value;
+    assert.ok(
+      outcome.elapsedMs < 10250,
+      "worker session exceeded ten-second bound",
+    );
+    assert.ok(
+      outcome.hostBytesCharged <= 8 * 1024 * 1024,
+      "host work exceeded aggregate byte bound",
+    );
     attempts.push(outcome);
     console.log(
       JSON.stringify({
@@ -490,17 +538,33 @@ window.ready=true;
   const last = attempts.at(-1);
   assert.equal(last.result.coverage, "complete");
   assert.equal(last.result.total, 2);
-  await command(["reload"]);
+  await command(["close"]);
+  browserSession = `vana12-proof-${process.pid}-${++browserRestarts}`;
+  await command(["open", origin]);
   await command(["wait", "--fn", "window.ready === true"]);
   const restarted = await command([
     "eval",
     "--json",
     "(async () => await window.proof())()",
   ]);
-  console.log(restarted);
+  const initialReload = JSON.parse(restarted).data.result;
+  assert.equal(initialReload.result.coverage, "complete");
+  assert.equal(initialReload.result.total, 2);
+  assert.equal(initialReload.active, 0);
   const decode = (output) => {
     const p = JSON.parse(output);
-    return p.data.result;
+    const result = p.data.result;
+    if (result.elapsedMs !== undefined)
+      assert.ok(
+        result.elapsedMs < 10250,
+        "worker session exceeded ten-second bound",
+      );
+    if (result.hostBytesCharged !== undefined)
+      assert.ok(
+        result.hostBytesCharged <= 8 * 1024 * 1024,
+        "host work exceeded aggregate byte bound",
+      );
+    return result;
   };
   const interrupted = [];
   for (const [index, stage] of [
@@ -546,6 +610,7 @@ window.ready=true;
         Date.UTC(2026, 9, 1, 13, 0, nextVersion),
       ).toISOString();
       const nextData = {
+        padding: randomBytes(256 * 1024).toString("base64"),
         conversations: [...data.conversations, { id: "case-5" }],
       };
       const nextPlain = new TextEncoder().encode(
@@ -590,6 +655,11 @@ window.ready=true;
     );
     assert.equal(failed.active, 0);
     if (stage === "stall") {
+      assert.equal(
+        failed.result.coverage,
+        "behind",
+        "budget exhaustion must not be classified as missing history",
+      );
       assert.equal(failed.result.through[source], String(version));
       const checkpoint = lastRegistered.get(`vana.system.additions.${source}`);
       const bytes = await readFile(
@@ -606,7 +676,9 @@ window.ready=true;
       );
     }
     fault = "";
-    await command(["reload"]);
+    await command(["close"]);
+    browserSession = `vana12-proof-${process.pid}-${++browserRestarts}`;
+    await command(["open", origin]);
     await command(["wait", "--fn", "window.ready === true"]);
     let resumed;
     for (let retry = 0; retry < 4; retry++) {
@@ -625,6 +697,7 @@ window.ready=true;
     interrupted.push({
       stage,
       interruptedCoverage: failed.result.coverage,
+      hostBytesCharged: failed.hostBytesCharged,
       elapsedMs: failed.elapsedMs,
       restartedTotal: resumed.result.total,
       activeWorkers: resumed.active,
@@ -704,6 +777,63 @@ window.ready=true;
       assert.equal(resumed.result.coverage, "complete");
       assert.equal(resumed.result.total, 9 + index);
     }
+    if (stage === "missing-length") {
+      const inventory = createVersionInventoryClient({
+        gatewayUrl: origin,
+        ownerAddress: account.address,
+        ownerSigner: {
+          signRequest: (params) =>
+            buildWeb3SignedHeader({
+              ...params,
+              signMessage: (message) => account.signMessage({ message }),
+            }),
+        },
+      });
+      const full = createDurableAdditions({
+        ownerAddress: account.address,
+        network: `vana:14800:${origin}`,
+        masterKey,
+        inventory,
+        storageAdapter: storage,
+        signer: createServerSigner(
+          {
+            address: account.address,
+            publicKey: account.publicKey,
+            signTypedData: (params) => account.signTypedData(params),
+            signMessage: (message) => account.signMessage({ message }),
+          },
+          {
+            chainId: 14800,
+            contracts: { dataRegistry: process.env.DATA_REGISTRY_CONTRACT },
+          },
+        ),
+        gateway: {
+          async registerDataPoint(params) {
+            const { signature, ...body } = params;
+            const response = await fetch(`${origin}/v1/data`, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                authorization: `Web3Signed ${signature}`,
+              },
+              body: JSON.stringify(body),
+            });
+            assert.ok(response.ok);
+            return response.json();
+          },
+        },
+      });
+      const fullResult = await full.summarize({
+        timezone: "Asia/Kathmandu",
+        days: 7,
+        now: new Date("2026-10-04T00:00:00Z"),
+      });
+      assert.equal(fullResult.coverage, "complete");
+      assert.equal(fullResult.total, outcome.result.total);
+      assert.deepEqual(fullResult.days, outcome.result.days);
+      assert.deepEqual(fullResult.through, outcome.result.through);
+      fullRuntimeEquality = true;
+    }
     transportCases.push({
       stage,
       coverage: outcome.result.coverage,
@@ -722,6 +852,8 @@ window.ready=true;
       result: "PASS",
       actualBrowser: true,
       actualWorkerArtifact: true,
+      browserRestarts,
+      fullRuntimeEquality,
       gatewayHead: "228bbf1cd6893a5b34da248832d8861f245d6d3d",
       versions: count,
       attempts: attempts.length,
@@ -742,5 +874,10 @@ window.ready=true;
   });
   if (db) await db.$client.end();
   await pg.stop();
-  await rm(root, { recursive: true, force: true });
+  await rm(root, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 100,
+  });
 }
