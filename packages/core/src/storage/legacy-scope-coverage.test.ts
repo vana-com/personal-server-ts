@@ -4,6 +4,70 @@ import { compareLegacyCoverage } from "./legacy-scope-coverage.js";
 const keys = { "$.items": ["id"], "$.items[].children": ["id"] };
 
 describe("legacy scope coverage", () => {
+
+  describe.each([false, true])("memory creation coverage (newer=%s)", (canonicalNewer) => {
+    const options = {
+      entityKeys: { "$.memories": ["id"] },
+      scope: "chatgpt.memories",
+      canonicalNewer,
+      allowProvenDeletion: true,
+    };
+    const body = (created_at: unknown) => ({
+      memories: [{ id: "a", created_at }],
+    });
+
+    it.each([
+      { label: "empty", legacy: ["2024-01-01T00:00:00Z"], canonical: [] },
+      { label: "shorter", legacy: ["2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"], canonical: ["2023-01-01T00:00:00Z"] },
+      { label: "duplicate shortage", legacy: ["2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"], canonical: ["2024-01-01T00:00:00Z"] },
+    ])("blocks $label canonical creation arrays", ({ legacy, canonical }) => {
+      const verdict = compareLegacyCoverage(body(legacy), body(canonical), options);
+      expect(verdict.covered).toBe(false);
+      expect(verdict.reasonCounts.missing_entity).toBeGreaterThan(0);
+      expect(verdict.appliedExceptions).toEqual([]);
+    });
+
+    it.each([
+      { label: "absent", memory: { id: "a" }, reason: "missing_field" },
+      { label: "null", memory: { id: "a", created_at: null }, reason: "type_mismatch" },
+      { label: "empty", memory: { id: "a", created_at: "" }, reason: "timestamp_format" },
+    ])("blocks $label canonical creation scalars", ({ memory, reason }) => {
+      const verdict = compareLegacyCoverage(
+        body("2024-01-01T00:00:00Z"), { memories: [memory] }, options,
+      );
+      expect(verdict.covered).toBe(false);
+      expect(verdict.reason).toBe(reason);
+      expect(verdict.appliedExceptions).toEqual([]);
+    });
+
+    it.each([null, "", 123, "2023-01-01"])(
+      "keeps array type and timestamp format guards for %s", (value) => {
+        const verdict = compareLegacyCoverage(
+          body(["2024-01-01T00:00:00Z"]), body([value]), options,
+        );
+        expect(verdict.covered).toBe(false);
+        expect(verdict.appliedExceptions).toEqual([]);
+      },
+    );
+
+    it("requires same-time cardinality even when a creation value differs", () => {
+      const verdict = compareLegacyCoverage(
+        body(["2024-01-01T00:00:00Z"]),
+        body(["2023-01-01T00:00:00Z", "2023-01-02T00:00:00Z"]),
+        options,
+      );
+      expect(verdict.covered).toBe(canonicalNewer);
+      if (!canonicalNewer) expect(verdict.reason).toBe("array_order");
+    });
+
+    it.each([false, true])("does not waive empty non-date strings (array=%s)", (asArray) => {
+      const verdict = compareLegacyCoverage(
+        body(asArray ? ["legacy"] : "legacy"), body(asArray ? [""] : ""), options,
+      );
+      expect(verdict.covered).toBe(false);
+      expect(verdict.appliedExceptions).toEqual([]);
+    });
+  });
   it("covers legacy entities and fields while allowing canonical extras", () => {
     const verdict = compareLegacyCoverage(
       {
@@ -430,23 +494,37 @@ describe("legacy scope coverage", () => {
     expect(verdict.reason).toBe("creation_mismatch");
   });
 
-  it("does not blanket-exempt creation-time differences in scalar arrays", () => {
-    const verdict = compareLegacyCoverage(
-      {
-        memories: [{ id: "a", created_at: ["2024-01-01T00:00:00Z"] }],
-      },
-      {
-        memories: [{ id: "a", created_at: ["2025-01-01T00:00:00Z"] }],
-      },
-      {
-        entityKeys: { "$.memories": ["id"] },
-        scope: "chatgpt.memories",
-        canonicalNewer: true,
-      },
-    );
-    expect(verdict.covered).toBe(false);
-    expect(verdict.reason).toBe("creation_mismatch");
-  });
+  it.each([false, true])(
+    "applies the reviewed memory creation exception to scalar arrays (newer=%s)",
+    (canonicalNewer) => {
+      const verdict = compareLegacyCoverage(
+        {
+          memories: [{ id: "a", created_at: ["2024-01-01T00:00:00Z"] }],
+        },
+        {
+          memories: [{ id: "a", created_at: ["2023-01-01T00:00:00Z"] }],
+        },
+        {
+          entityKeys: { "$.memories": ["id"] },
+          scope: "chatgpt.memories",
+          canonicalNewer,
+        },
+      );
+      expect(verdict.covered).toBe(true);
+      expect(verdict.reason).toBeNull();
+      expect(verdict.reasonCounts.creation_mismatch).toBe(0);
+      expect(verdict.missingEntityCount).toBe(0);
+      expect(verdict.mismatchedFieldPaths).toEqual([]);
+      expect(verdict.appliedExceptions).toEqual([
+        {
+          path: "$.memories[].created_at",
+          reason:
+            "legacy collector wrote collection time; canonical carries source creation time",
+          authority: "canonical",
+        },
+      ]);
+    },
+  );
 
   it("compares immutable creation timestamps as millisecond instants", () => {
     const legacy = { createdAt: "2024-01-01T00:00:00.123456Z" };
@@ -517,33 +595,108 @@ describe("legacy scope coverage", () => {
     expect(changedId.reasonCounts.timestamp_format).toBe(0);
   });
 
-  it("requires canonical creation times to match ChatGPT legacy values", () => {
-    const legacy = {
-      memories: [{ id: "secret-id", created_at: "2024-01-01T00:00:00Z" }],
-    };
-    const canonical = {
-      memories: [{ id: "secret-id", created_at: "2023-01-01T00:00:00Z" }],
-    };
-    const options = {
-      entityKeys: { "$.memories": ["id"] },
-      scope: "chatgpt.memories",
-    };
-    const verdict = compareLegacyCoverage(legacy, canonical, options);
-    expect(verdict.covered).toBe(false);
-    expect(verdict.reason).toBe("creation_mismatch");
-    expect(JSON.stringify(verdict)).not.toContain("secret-id");
-    expect(
-      compareLegacyCoverage(legacy, canonical, {
-        ...options,
-        scope: "other.memories",
-      }).reason,
-    ).toBe("creation_mismatch");
-    expect(
-      compareLegacyCoverage(legacy, canonical, {
-        ...options,
-        scope: undefined,
-      }).covered,
-    ).toBe(false);
+  it.each([false, true])(
+    "trusts canonical ChatGPT memory creation times (newer=%s)",
+    (canonicalNewer) => {
+      const legacy = {
+        memories: [
+          { id: "secret-a", created_at: "2024-01-01T00:00:00Z" },
+          { id: "secret-b", created_at: "2024-01-02T00:00:00Z" },
+        ],
+      };
+      const canonical = {
+        memories: [
+          { id: "secret-a", created_at: "2023-01-01T00:00:00Z" },
+          { id: "secret-b", created_at: "2023-01-02T00:00:00Z" },
+        ],
+      };
+      const verdict = compareLegacyCoverage(legacy, canonical, {
+        entityKeys: { "$.memories": ["id"] },
+        scope: "chatgpt.memories",
+        canonicalNewer,
+      });
+      expect(verdict.covered).toBe(true);
+      expect(verdict.reason).toBeNull();
+      expect(verdict.reasonCounts.creation_mismatch).toBe(0);
+      expect(verdict.mismatchedFieldPaths).toEqual([]);
+      expect(verdict.appliedExceptions).toEqual([
+        {
+          path: "$.memories[].created_at",
+          reason:
+            "legacy collector wrote collection time; canonical carries source creation time",
+          authority: "canonical",
+        },
+      ]);
+      expect(JSON.stringify(verdict)).not.toContain("secret-");
+      expect(JSON.stringify(verdict)).not.toContain("2024-");
+      expect(JSON.stringify(verdict)).not.toContain("2023-");
+    },
+  );
+
+  it.each(["other.memories", "chatgpt.conversations", undefined])(
+    "does not apply the memory creation exception to scope %s",
+    (scope) => {
+      for (const canonicalNewer of [false, true]) {
+        for (const asArray of [false, true]) {
+          const legacyTime = "2024-01-01T00:00:00Z";
+          const canonicalTime = "2023-01-01T00:00:00Z";
+          const verdict = compareLegacyCoverage(
+            {
+              memories: [
+                { id: "a", created_at: asArray ? [legacyTime] : legacyTime },
+              ],
+            },
+            {
+              memories: [
+                { id: "a", created_at: asArray ? [canonicalTime] : canonicalTime },
+              ],
+            },
+            { entityKeys: { "$.memories": ["id"] }, scope, canonicalNewer },
+          );
+          expect(verdict.covered).toBe(false);
+          expect(verdict.reason).toBe("creation_mismatch");
+          expect(verdict.appliedExceptions).toEqual([]);
+        }
+      }
+    },
+  );
+
+  it("does not apply the memory creation exception to other paths", () => {
+    for (const canonicalNewer of [false, true]) {
+      for (const asArray of [false, true]) {
+        const legacyTime = "2024-01-01T00:00:00Z";
+        const canonicalTime = "2023-01-01T00:00:00Z";
+        const body = (time: string) => {
+          const created_at = asArray ? [time] : time;
+          return {
+            created_at,
+            other: [{ id: "a", created_at }],
+            memories: [
+              { id: "a", createdAt: created_at, nested: { created_at } },
+            ],
+          };
+        };
+        const verdict = compareLegacyCoverage(
+          body(legacyTime),
+          body(canonicalTime),
+          {
+            entityKeys: { "$.memories": ["id"], "$.other": ["id"] },
+            scope: "chatgpt.memories",
+            canonicalNewer,
+          },
+        );
+        expect(verdict.covered).toBe(false);
+        expect(verdict.reason).toBe("creation_mismatch");
+        expect(verdict.reasonCounts.creation_mismatch).toBe(4);
+        expect(verdict.mismatchedFieldPaths).toEqual([
+          "$.created_at",
+          "$.other[0].created_at",
+          "$.memories[0].createdAt",
+          "$.memories[0].nested.created_at",
+        ]);
+        expect(verdict.appliedExceptions).toEqual([]);
+      }
+    }
   });
 
   it("keeps format class mandatory for an allowlisted creation field", () => {
