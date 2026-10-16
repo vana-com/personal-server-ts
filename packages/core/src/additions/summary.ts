@@ -1,11 +1,12 @@
 /**
  * Additions summary: how many records each scope's newest version holds and
- * how many of those records were first seen on each of the last N local
+ * how many records arrived on each of the last N local
  * calendar days. Pure: it reads only the ledgers it is handed, never a store,
  * and never mutates them. A scope's records first seen at its `trackedSince`
  * count on that date unless the scope is `partial`.
  */
 
+import { z } from "zod";
 import {
   listAddedTimestamps,
   type ScopeFirstSeenLedger,
@@ -22,9 +23,27 @@ export interface AdditionsSummaryInput {
   /** Number of local calendar days to report, ending with the day containing `now`. 1..31. */
   days: number;
   now: Date;
+  /** Current coordination coverage, independent from unknown historical baseline dates. */
+  coverage?: AdditionsCoverage;
+  /** Stable per-scope source version markers, supplied by the coordinator. */
+  through?: Record<string, string>;
 }
 
+export type AdditionsCoverage =
+  "complete" | "behind" | "partial" | "unavailable";
+export interface AdditionsBucket {
+  /** Inclusive UTC start of a 15-minute interval, ISO 8601. */
+  start: string;
+  added: number;
+}
+export const ADDITIONS_BUCKET_MS = 15 * 60 * 1000;
+
 export interface AdditionsSummary {
+  version: 1;
+  coverage: AdditionsCoverage;
+  through: Record<string, string>;
+  /** Permanent arrivals in UTC buckets; rebucket into local days at display time. */
+  buckets: AdditionsBucket[];
   timezone: string;
   /** Records in each scope's newest version (tracked or not), summed. */
   total: number;
@@ -37,6 +56,8 @@ export interface AdditionsSummary {
   scopes: {
     scope: string;
     total: number;
+    /** Permanent scope arrivals, retaining quarter-hour resolution for every date. */
+    buckets: AdditionsBucket[];
     /**
      * The scope's baseline: records first seen then predate tracking. Null
      * when no version of the scope is trackable yet (binary only, over the
@@ -50,6 +71,73 @@ export interface AdditionsSummary {
      */
     partial: boolean;
   }[];
+}
+
+const countSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const instantSchema = z.string().datetime({ offset: true });
+const daySchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/)
+  .refine((value) => {
+    const date = new Date(`${value}T00:00:00.000Z`);
+    return (
+      Number.isFinite(date.getTime()) &&
+      date.toISOString().slice(0, 10) === value
+    );
+  });
+
+const bucketsSchema = z.array(
+  z.object({
+    start: instantSchema.refine(
+      (value) => Date.parse(value) % ADDITIONS_BUCKET_MS === 0,
+    ),
+    added: countSchema,
+  }),
+);
+
+/** Browser-safe transport contract for the version-1 owner summary. */
+export const AdditionsSummarySchema = z.object({
+  version: z.literal(1),
+  coverage: z.enum(["complete", "behind", "partial", "unavailable"]),
+  through: z.record(z.string(), z.string().regex(/^(0|[1-9]\d*)$/)),
+  buckets: bucketsSchema,
+  timezone: z.string().refine((value) => {
+    try {
+      validateTimezone(value);
+      return true;
+    } catch {
+      return false;
+    }
+  }),
+  total: countSchema,
+  days: z
+    .array(z.object({ date: daySchema, added: countSchema }))
+    .min(1)
+    .max(31),
+  trackedSince: instantSchema.nullable(),
+  partial: z.boolean(),
+  scopes: z.array(
+    z.object({
+      scope: z
+        .string()
+        .min(1)
+        .refine((scope) => !scope.startsWith("vana.system.")),
+      total: countSchema,
+      buckets: bucketsSchema,
+      trackedSince: instantSchema.nullable(),
+      partial: z.boolean(),
+    }),
+  ),
+});
+
+/** Null for unsupported or malformed transport payloads. */
+export function readAdditionsSummary(value: unknown): AdditionsSummary | null {
+  try {
+    const result = AdditionsSummarySchema.safeParse(value);
+    return result.success ? result.data : null;
+  } catch {
+    return null;
+  }
 }
 
 export class InvalidTimezoneError extends Error {}
@@ -116,13 +204,37 @@ export function validateTimezone(timezone: string): void {
   createFormatter(timezone);
 }
 
+/** Rebucket UTC arrivals into local calendar days, including DST and fractional-hour zones. */
+export function bucketAdditionsByLocalDay(
+  buckets: readonly AdditionsBucket[],
+  timezone: string,
+  days: number,
+  now: Date,
+): AdditionsSummary["days"] {
+  const formatter = createFormatter(timezone);
+  const rows = buildDayRows(formatter, now, days);
+  const byDate = new Map(rows.map((row) => [row.date, row]));
+  for (const bucket of buckets) {
+    const row = byDate.get(localDate(formatter, new Date(bucket.start)));
+    if (row) row.added += bucket.added;
+  }
+  return rows;
+}
+
+/** Retain fine resolution for all history so timezone changes can rebucket old days. */
+function sortedBuckets(counts: ReadonlyMap<number, number>): AdditionsBucket[] {
+  return [...counts]
+    .sort(([a], [b]) => a - b)
+    .map(([start, added]) => ({ start: new Date(start).toISOString(), added }));
+}
+
 export async function summarizeAdditions(
   input: AdditionsSummaryInput,
 ): Promise<AdditionsSummary> {
   const { timezone, days, now } = input;
-  const formatter = createFormatter(timezone);
-  const dayRows = buildDayRows(formatter, now, days);
-  const dayIndex = new Map(dayRows.map((row, index) => [row.date, index]));
+  validateTimezone(timezone);
+  const bucketCounts = new Map<number, number>();
+  let incomplete = false;
 
   const scopes: AdditionsSummary["scopes"] = [];
   let total = 0;
@@ -131,10 +243,17 @@ export async function summarizeAdditions(
   let anyPartial = false;
 
   for await (const ledger of input.ledgers) {
+    if (ledger.scope.startsWith("vana.system.")) continue;
+    incomplete ||= Boolean(
+      ledger.skipped || ledger.incomplete || ledger.truncated || ledger.retry,
+    );
+    const scopeBucketCounts = new Map<number, number>();
     for (const firstSeen of listAddedTimestamps(ledger)) {
-      const date = localDate(formatter, new Date(Date.parse(firstSeen)));
-      const index = dayIndex.get(date);
-      if (index !== undefined) dayRows[index].added += 1;
+      const start =
+        Math.floor(Date.parse(firstSeen) / ADDITIONS_BUCKET_MS) *
+        ADDITIONS_BUCKET_MS;
+      bucketCounts.set(start, (bucketCounts.get(start) ?? 0) + 1);
+      scopeBucketCounts.set(start, (scopeBucketCounts.get(start) ?? 0) + 1);
     }
 
     total += ledger.latest.total;
@@ -154,6 +273,7 @@ export async function summarizeAdditions(
     scopes.push({
       scope: ledger.scope,
       total: ledger.latest.total,
+      buckets: sortedBuckets(scopeBucketCounts),
       trackedSince: scopeTrackedSince,
       partial,
     });
@@ -161,10 +281,18 @@ export async function summarizeAdditions(
 
   scopes.sort((a, b) => a.scope.localeCompare(b.scope));
 
+  const buckets = sortedBuckets(bucketCounts);
   return {
+    version: 1,
+    coverage:
+      incomplete && (!input.coverage || input.coverage === "complete")
+        ? "partial"
+        : (input.coverage ?? "complete"),
+    through: { ...input.through },
+    buckets,
     timezone,
     total,
-    days: dayRows,
+    days: bucketAdditionsByLocalDay(buckets, timezone, days, now),
     trackedSince,
     partial: anyPartial,
     scopes,

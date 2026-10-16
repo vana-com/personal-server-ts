@@ -1,3 +1,4 @@
+import { isSystemScope } from "../policy/reserved-scopes.js";
 import type { ReadResourceResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { McpDataReadError, type McpDataReadClient } from "./read-client.js";
@@ -63,6 +64,7 @@ export function resolveGrantForRawScopeResource(
   connection: McpConnectionRecord,
   scope: string,
 ): { grantId: string } | null {
+  if (isSystemScope(scope)) return null;
   for (const grant of connection.grants) {
     for (const granted of grant.scopes) {
       if (granted === scope || granted === "*") {

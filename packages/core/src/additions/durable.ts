@@ -1,0 +1,664 @@
+import { z } from "zod";
+import { getAddress, keccak256, stringToHex } from "viem";
+import {
+  createDataFileEnvelope,
+  DataFileEnvelopeSchema,
+  decryptWithPassword,
+  deriveScopeKey,
+  encryptWithPassword,
+  type GatewayClient,
+} from "@opendatalabs/vana-sdk/browser";
+import type { StorageAdapter } from "../storage/adapters/interface.js";
+import type { ServerSigner } from "../signing/signer.js";
+import {
+  foldVersion,
+  extractRecordKeys,
+  readScopeFirstSeenLedger,
+  type ScopeFirstSeenLedger,
+  type VersionToFold,
+} from "./first-added.js";
+import {
+  summarizeAdditions,
+  type AdditionsCoverage,
+  type AdditionsSummary,
+} from "./summary.js";
+import type {
+  VersionInventory,
+  VersionInventoryClient,
+  InventoryVersion,
+} from "./version-inventory.js";
+import { isSystemScope } from "../policy/reserved-scopes.js";
+
+export const ADDITIONS_SUMMARY_SCOPE = "vana.system.additions";
+const decimal = z.string().regex(/^(0|[1-9]\d*)$/);
+const slotSchema = z.object({
+  expectedVersion: decimal,
+  dataHash: z.string(),
+  metadataHash: z.string(),
+  status: z.string(),
+  addedAt: z.string(),
+  isTombstone: z.boolean(),
+});
+const documentSchema = z.object({
+  version: z.literal(1),
+  owner: z.string(),
+  network: z.string(),
+  scope: z.string(),
+  through: decimal,
+  currentTotal: z.number().int().nonnegative(),
+  slots: z.array(slotSchema),
+  ledger: z.unknown(),
+});
+type LedgerDocument = Omit<z.infer<typeof documentSchema>, "ledger"> & {
+  ledger: ScopeFirstSeenLedger | null;
+  repairHead?: true;
+};
+
+/** The separate hash namespace cannot collide with a literal source suffix. */
+export function additionsLedgerScope(scope: string): string {
+  const literal = `${ADDITIONS_SUMMARY_SCOPE}.${scope}`;
+  return new TextEncoder().encode(literal).byteLength <= 256
+    ? literal
+    : `vana.system.additions-hash.${keccak256(stringToHex(scope)).slice(2)}`;
+}
+
+export interface DurableAdditionsOptions {
+  ownerAddress: string;
+  /** Include chain and Gateway origin. A service instance belongs to one owner/network. */
+  network: string;
+  inventory: VersionInventoryClient;
+  storageAdapter: StorageAdapter;
+  masterKey: Uint8Array;
+  signer: Pick<ServerSigner, "signAddData">;
+  gateway: Pick<GatewayClient, "registerDataPoint">;
+  /** Full PS is unbounded; Lite charges read bytes and checks time between atomic SDK operations. */
+  byteBudget?: number;
+  timeBudgetMs?: number;
+  /** Existing durable delete pipeline, including exact-key cleanup/retry. */
+  deleteSystemScope?: (scope: string) => Promise<void>;
+}
+
+export interface DurableAdditionsService {
+  summarize(input: {
+    timezone: string;
+    days: number;
+    now: Date;
+  }): Promise<AdditionsSummary>;
+  recordUpload(
+    version: VersionToFold,
+    proof?: { envelope: unknown; encryptedSize: number },
+  ): Promise<void>;
+  deleteScope(scope: string): Promise<void>;
+}
+
+class BudgetExceeded extends Error {}
+class InaccessibleLedger extends Error {}
+class ReadBudget {
+  used = 0;
+  readonly signal: AbortSignal | undefined;
+  private readonly start = performance.now();
+  constructor(private readonly options: DurableAdditionsOptions) {
+    this.signal =
+      options.timeBudgetMs === undefined
+        ? undefined
+        : AbortSignal.timeout(options.timeBudgetMs);
+  }
+  check(bytes = 0) {
+    this.used += bytes;
+    if (
+      this.used > (this.options.byteBudget ?? Infinity) ||
+      performance.now() - this.start >= (this.options.timeBudgetMs ?? Infinity)
+    ) {
+      throw new BudgetExceeded();
+    }
+  }
+}
+
+function hex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
+}
+function sameCommitment(a: InventoryVersion, b: InventoryVersion): boolean {
+  return (
+    a.expectedVersion === b.expectedVersion &&
+    a.dataHash.toLowerCase() === b.dataHash.toLowerCase() &&
+    a.metadataHash.toLowerCase() === b.metadataHash.toLowerCase() &&
+    a.isTombstone === b.isTombstone
+  );
+}
+function sameSlot(a: InventoryVersion, b: InventoryVersion): boolean {
+  return sameCommitment(a, b) && a.status === b.status;
+}
+function sameInventory(a: VersionInventory, b: VersionInventory): boolean {
+  return (
+    JSON.stringify(a.head) === JSON.stringify(b.head) &&
+    a.versions.length === b.versions.length &&
+    a.versions.every((slot, i) => sameSlot(slot, b.versions[i]!))
+  );
+}
+function settled(slot: { status: string }): boolean {
+  return slot.status === "confirmed" || slot.status === "finalized";
+}
+function sourceData(data: unknown): Record<string, unknown> | null {
+  if (data === null || typeof data !== "object" || Array.isArray(data))
+    return null;
+  return Object.fromEntries(Object.entries(data));
+}
+
+/**
+ * Revalidates commitments, rather than trusting a numeric watermark or a local
+ * mutex. Persisted lost/lower-prefix writes are repaired from the next inventory.
+ */
+export function createDurableAdditions(
+  options: DurableAdditionsOptions,
+): DurableAdditionsService {
+  const owner = options.ownerAddress.toLowerCase();
+  const { inventory, storageAdapter } = options;
+
+  async function readEnvelope(
+    scope: string,
+    slot: InventoryVersion,
+    budget: ReadBudget,
+  ) {
+    budget.check();
+    const encrypted = await storageAdapter.download(
+      storageAdapter.urlForKey(`${scope}/${slot.expectedVersion}`),
+    );
+    budget.check(encrypted.byteLength);
+    const plaintext = await decryptWithPassword(
+      encrypted,
+      hex(deriveScopeKey(options.masterKey, scope)),
+    );
+    budget.check(plaintext.byteLength);
+    if (keccak256(plaintext).toLowerCase() !== slot.dataHash.toLowerCase())
+      throw new Error("Additions content commitment mismatch");
+    const envelope = DataFileEnvelopeSchema.parse(
+      JSON.parse(new TextDecoder().decode(plaintext)),
+    );
+    const metadataHash = keccak256(
+      stringToHex(
+        JSON.stringify({
+          scope,
+          collectedAt: envelope.collectedAt,
+          sizeBytes: encrypted.byteLength,
+        }),
+      ),
+    );
+    if (
+      envelope.scope !== scope ||
+      !Number.isFinite(Date.parse(envelope.collectedAt)) ||
+      metadataHash.toLowerCase() !== slot.metadataHash.toLowerCase()
+    )
+      throw new Error("Additions metadata commitment mismatch");
+    return envelope;
+  }
+
+  async function current(scope: string, budget: ReadBudget) {
+    budget.check();
+    const snapshot = await inventory.list(scope, { signal: budget.signal });
+    budget.check();
+    const head = snapshot.head;
+    if (!head || head.deletedAt !== null) return null;
+    const slot = snapshot.versions.find(
+      (row) =>
+        row.expectedVersion === head.expectedVersion &&
+        !row.isTombstone &&
+        row.dataHash === head.dataHash &&
+        row.metadataHash === head.metadataHash,
+    );
+    if (!slot) throw new Error("Additions head missing from inventory");
+    return { snapshot, envelope: await readEnvelope(scope, slot, budget) };
+  }
+
+  async function readDocument(
+    scope: string,
+    budget: ReadBudget,
+  ): Promise<LedgerDocument | null> {
+    const systemScope = additionsLedgerScope(scope);
+    const snapshot = await inventory.list(systemScope, {
+      signal: budget.signal,
+    });
+    if (!snapshot.head || snapshot.head.deletedAt !== null) return null;
+    const boundary =
+      snapshot.versions.filter((row) => row.isTombstone).at(-1)
+        ?.expectedVersion ?? "0";
+    let inaccessible = false;
+    for (const slot of [...snapshot.versions].reverse()) {
+      if (
+        BigInt(slot.expectedVersion) <= BigInt(boundary) ||
+        BigInt(slot.expectedVersion) > BigInt(snapshot.head.expectedVersion) ||
+        slot.isTombstone
+      )
+        continue;
+      let envelope;
+      try {
+        envelope = await readEnvelope(systemScope, slot, budget);
+      } catch (error) {
+        if (error instanceof BudgetExceeded || budget.signal?.aborted)
+          throw error;
+        inaccessible = true;
+        continue;
+      }
+      const parsed = documentSchema.safeParse(envelope.data);
+      if (
+        !parsed.success ||
+        parsed.data.owner !== owner ||
+        parsed.data.network !== options.network ||
+        parsed.data.scope !== scope
+      )
+        continue;
+      const ledger =
+        parsed.data.ledger === null
+          ? null
+          : readScopeFirstSeenLedger(parsed.data.ledger);
+      if (parsed.data.ledger !== null && (!ledger || ledger.scope !== scope))
+        continue;
+      return {
+        ...parsed.data,
+        ledger,
+        ...(slot.expectedVersion !== snapshot.head.expectedVersion
+          ? { repairHead: true as const }
+          : {}),
+      };
+    }
+    if (inaccessible)
+      throw new InaccessibleLedger(
+        "No readable committed additions ledger version",
+      );
+    return null;
+  }
+
+  async function publish(scope: string, data: Record<string, unknown>) {
+    const snapshot = await inventory.list(scope);
+    const version =
+      BigInt(snapshot.versions.at(-1)?.expectedVersion ?? "0") + 1n;
+    const envelope = createDataFileEnvelope(
+      scope,
+      new Date().toISOString(),
+      data,
+    );
+    const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
+    const encrypted = await encryptWithPassword(
+      plaintext,
+      hex(deriveScopeKey(options.masterKey, scope)),
+    );
+    const dataHash = keccak256(plaintext);
+    const metadataHash = keccak256(
+      stringToHex(
+        JSON.stringify({
+          scope,
+          collectedAt: envelope.collectedAt,
+          sizeBytes: encrypted.byteLength,
+        }),
+      ),
+    );
+    await storageAdapter.upload(`${scope}/${version}`, encrypted);
+    const signature = await options.signer.signAddData({
+      ownerAddress: getAddress(owner),
+      scope,
+      dataHash,
+      metadataHash,
+      expectedVersion: version,
+    });
+    await options.gateway.registerDataPoint({
+      ownerAddress: owner,
+      scope,
+      dataHash,
+      metadataHash,
+      expectedVersion: String(version),
+      signature,
+    });
+    // A concurrent upload can replace the bytes at this shared version key
+    // independently of registration. Never claim durability without checking.
+    const check = await inventory.list(scope);
+    const registered = check.versions.find(
+      (slot) =>
+        slot.expectedVersion === String(version) &&
+        slot.dataHash === dataHash &&
+        slot.metadataHash === metadataHash,
+    );
+    if (!registered)
+      throw new Error(
+        "Concurrent additions publication replaced the registration",
+      );
+    await readEnvelope(
+      scope,
+      registered,
+      new ReadBudget({
+        ...options,
+        byteBudget: undefined,
+        timeBudgetMs: undefined,
+      }),
+    );
+  }
+
+  async function recover(
+    scope: string,
+    budget: ReadBudget,
+    uploaded?: {
+      version: VersionToFold;
+      proof?: { envelope: unknown; encryptedSize: number };
+    },
+  ): Promise<{
+    ledger: ScopeFirstSeenLedger | null;
+    through: string;
+    currentTotal: number;
+    coverage: AdditionsCoverage;
+  }> {
+    budget.check();
+    const snapshot = await inventory.list(scope, { signal: budget.signal });
+    budget.check();
+    const head = snapshot.head;
+    if (!head || head.deletedAt !== null) {
+      const tombstone = head
+        ? snapshot.versions.find(
+            (slot) =>
+              slot.expectedVersion === head.expectedVersion &&
+              slot.dataHash === head.dataHash &&
+              slot.metadataHash === head.metadataHash &&
+              slot.isTombstone &&
+              settled(slot),
+          )
+        : null;
+      const check = await inventory.list(scope, { signal: budget.signal });
+      return {
+        ledger: null,
+        currentTotal: 0,
+        through: head?.expectedVersion ?? "0",
+        coverage: !sameInventory(snapshot, check)
+          ? "behind"
+          : head
+            ? settled(head) && tombstone
+              ? "complete"
+              : "partial"
+            : snapshot.versions.length
+              ? "partial"
+              : "complete",
+      };
+    }
+    const end = BigInt(head.expectedVersion);
+    const rows = snapshot.versions.filter(
+      (slot) => BigInt(slot.expectedVersion) <= end,
+    );
+    const boundary = rows
+      .filter((slot) => slot.isTombstone && settled(slot))
+      .at(-1);
+    const after = BigInt(boundary?.expectedVersion ?? "0");
+    const relevant = rows.filter(
+      (slot) => BigInt(slot.expectedVersion) > after,
+    );
+    let existing: LedgerDocument | null = null;
+    let inaccessibleExisting = false;
+    try {
+      existing = await readDocument(scope, budget);
+    } catch (error) {
+      if (error instanceof BudgetExceeded || budget.signal?.aborted)
+        throw error;
+      inaccessibleExisting = true;
+    }
+    const prefixValid =
+      existing !== null &&
+      existing.slots.length <= relevant.length &&
+      existing.slots.every((slot, i) => sameCommitment(slot, relevant[i]!)) &&
+      existing.through ===
+        (existing.slots.at(-1)?.expectedVersion ?? String(after));
+    let ledger = prefixValid ? existing!.ledger : null;
+    const folded = prefixValid ? relevant.slice(0, existing!.slots.length) : [];
+    let currentTotal = prefixValid ? existing!.currentTotal : 0;
+    let through = folded.at(-1)?.expectedVersion ?? String(after);
+    let expected = after + 1n;
+    const headSlot = relevant.find(
+      (slot) =>
+        slot.expectedVersion === head.expectedVersion &&
+        slot.dataHash === head.dataHash &&
+        slot.metadataHash === head.metadataHash,
+    );
+    let coverage: AdditionsCoverage =
+      headSlot && settled(head) ? "complete" : "partial";
+    for (const slot of relevant) {
+      if (BigInt(slot.expectedVersion) !== expected || !settled(slot))
+        coverage = "partial";
+      expected = BigInt(slot.expectedVersion) + 1n;
+    }
+    for (const slot of relevant.slice(folded.length)) {
+      try {
+        budget.check();
+        if (BigInt(slot.expectedVersion) !== BigInt(through) + 1n)
+          coverage = "partial";
+        // Mutable slots are provisional; failed/unknown slots cannot advance the prefix.
+        if (
+          slot.status === "failed" ||
+          !["confirmed", "finalized", "pending", "submitting"].includes(
+            slot.status,
+          )
+        ) {
+          coverage = "partial";
+          break;
+        }
+        if (slot.isTombstone) {
+          coverage = "partial";
+          break;
+        }
+        let version: VersionToFold;
+        const proof = uploaded?.proof;
+        const inMemory = proof
+          ? DataFileEnvelopeSchema.safeParse(proof.envelope)
+          : null;
+        const bytes = proof
+          ? new TextEncoder().encode(JSON.stringify(proof.envelope))
+          : null;
+        const metadata =
+          inMemory?.success && proof
+            ? keccak256(
+                stringToHex(
+                  JSON.stringify({
+                    scope,
+                    collectedAt: inMemory.data.collectedAt,
+                    sizeBytes: proof.encryptedSize,
+                  }),
+                ),
+              )
+            : null;
+        if (
+          inMemory?.success &&
+          bytes &&
+          inMemory.data.scope === scope &&
+          keccak256(bytes) === slot.dataHash &&
+          metadata === slot.metadataHash
+        ) {
+          const data = sourceData(inMemory.data.data);
+          if (!data) throw new Error("Unsupported source envelope");
+          version = { scope, collectedAt: inMemory.data.collectedAt, data };
+        } else {
+          const envelope = await readEnvelope(scope, slot, budget);
+          const data = sourceData(envelope.data);
+          if (!data) throw new Error("Unsupported source envelope");
+          version = { scope, collectedAt: envelope.collectedAt, data };
+        }
+        const hadBaseline = ledger !== null && ledger.baseline !== null;
+        ledger = await foldVersion(ledger, version);
+        currentTotal =
+          (await extractRecordKeys(scope, version.data))?.total ?? 1;
+        // Reimport baseline and incomplete starts have unknown arrivals.
+        if (ledger && (after > 0n || relevant[0]?.expectedVersion !== "1")) {
+          ledger.partial = true;
+          if (!hadBaseline && ledger.baseline !== null)
+            ledger.unknownArrivalKeys = Object.keys(ledger.records);
+        }
+        folded.push(slot);
+        through = slot.expectedVersion;
+      } catch (error) {
+        coverage =
+          error instanceof BudgetExceeded || budget.signal?.aborted
+            ? "behind"
+            : "partial";
+        break;
+      }
+    }
+    if (BigInt(through) !== end && coverage === "complete")
+      coverage = "partial";
+    if (ledger?.incomplete || ledger?.skipped) coverage = "partial";
+    // The pages above are separate snapshots. Never certify against an old view.
+    if (coverage !== "behind") {
+      const check = await inventory.list(scope, { signal: budget.signal });
+      if (!sameInventory(snapshot, check))
+        return {
+          ledger: null,
+          through: "0",
+          currentTotal: 0,
+          coverage: "behind",
+        };
+    }
+    const document: LedgerDocument = {
+      version: 1,
+      owner,
+      network: options.network,
+      scope,
+      through,
+      currentTotal,
+      slots: folded,
+      ledger,
+    };
+    // Never replace durable permanent evidence with a failed invalidation replay.
+    if (
+      ((!existing && !inaccessibleExisting) ||
+        prefixValid ||
+        coverage === "complete") &&
+      JSON.stringify(document) !== JSON.stringify(existing)
+    ) {
+      // A write failure affects durability, never hides the verified in-memory result.
+      try {
+        await publish(additionsLedgerScope(scope), { ...document });
+      } catch {
+        coverage = coverage === "complete" ? "behind" : coverage;
+      }
+    }
+    return { ledger, through, currentTotal, coverage };
+  }
+
+  return {
+    async summarize(input) {
+      const budget = new ReadBudget(options);
+      const ledgers: ScopeFirstSeenLedger[] = [];
+      const through: Record<string, string> = {};
+      let coverage: AdditionsCoverage = "complete";
+      let scopes: string[] = [];
+      try {
+        scopes = (await inventory.listScopes({ signal: budget.signal }))
+          .filter((scope) => !isSystemScope(scope))
+          .sort();
+        for (const scope of scopes) {
+          const result = await recover(scope, budget);
+          if (result.ledger)
+            ledgers.push({
+              ...result.ledger,
+              latest: { ...result.ledger.latest, total: result.currentTotal },
+            });
+          through[scope] = result.through;
+          if (
+            result.coverage === "behind" ||
+            (result.coverage === "partial" && coverage === "complete")
+          )
+            coverage = result.coverage;
+        }
+        const check = (await inventory.listScopes({ signal: budget.signal }))
+          .filter((scope) => !isSystemScope(scope))
+          .sort();
+        if (JSON.stringify(scopes) !== JSON.stringify(check))
+          coverage = "behind";
+      } catch (error) {
+        coverage =
+          error instanceof BudgetExceeded || budget.signal?.aborted
+            ? "behind"
+            : "unavailable";
+      }
+      const result = await summarizeAdditions({
+        ...input,
+        ledgers,
+        coverage,
+        through,
+      });
+      // Publish one portable UTC summary on reads, never on every source upload.
+      if (coverage === "complete" || coverage === "partial") {
+        try {
+          const portable = await summarizeAdditions({
+            ...input,
+            timezone: "UTC",
+            ledgers,
+            coverage,
+            through,
+          });
+          let previous: Awaited<ReturnType<typeof current>> = null;
+          try {
+            previous = await current(ADDITIONS_SUMMARY_SCOPE, budget);
+          } catch (error) {
+            if (error instanceof BudgetExceeded || budget.signal?.aborted)
+              throw error;
+          }
+          if (
+            JSON.stringify(previous?.envelope.data) !== JSON.stringify(portable)
+          ) {
+            await new Promise((resolve) =>
+              setTimeout(
+                resolve,
+                Math.floor(crypto.getRandomValues(new Uint8Array(1))[0]! / 8),
+              ),
+            );
+            await publish(ADDITIONS_SUMMARY_SCOPE, { ...portable });
+          }
+        } catch {
+          result.coverage = "behind";
+        }
+      }
+      return result;
+    },
+    async recordUpload(version, proof) {
+      if (isSystemScope(version.scope)) return;
+      // Optional optimization only. Correctness always comes from read recovery.
+      try {
+        const budget = new ReadBudget(options);
+        const snapshot = await inventory.list(version.scope, {
+          signal: budget.signal,
+        });
+        const head = snapshot.head;
+        if (!head || head.deletedAt !== null) return;
+        if (
+          proof &&
+          keccak256(
+            new TextEncoder().encode(JSON.stringify(proof.envelope)),
+          ) !== head.dataHash
+        )
+          return;
+        const previous = await readDocument(version.scope, budget);
+        const boundary =
+          snapshot.versions
+            .filter((slot) => slot.isTombstone && settled(slot))
+            .at(-1)?.expectedVersion ?? "0";
+        const startsFresh =
+          BigInt(head.expectedVersion) === BigInt(boundary) + 1n;
+        if (
+          !startsFresh &&
+          (!previous ||
+            BigInt(previous.through) + 1n !== BigInt(head.expectedVersion))
+        )
+          return;
+        await recover(version.scope, budget, {
+          version,
+          proof,
+        });
+      } catch {
+        /* Next reader retries. */
+      }
+    },
+    async deleteScope(scope) {
+      if (isSystemScope(scope)) return;
+      if (!options.deleteSystemScope)
+        throw new Error("Durable additions deletion is unavailable");
+      await options.deleteSystemScope(additionsLedgerScope(scope));
+      // Invalidate the portable summary immediately. The next reader rebuilds
+      // from authoritative source tombstones and cannot show deleted counts.
+      await options.deleteSystemScope(ADDITIONS_SUMMARY_SCOPE);
+    },
+  };
+}

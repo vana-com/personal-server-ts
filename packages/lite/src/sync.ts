@@ -1,3 +1,8 @@
+import {
+  createDurableAdditions,
+  createVersionInventoryClient,
+  type DurableAdditionsService,
+} from "@opendatalabs/personal-server-ts-core/additions";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
@@ -26,8 +31,10 @@ import {
   createServerSigner,
   type ServerSigner,
 } from "@opendatalabs/personal-server-ts-core/signing";
+import type { RequestSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerAccount } from "@opendatalabs/personal-server-ts-core/keys";
 import {
+  buildWeb3SignedHeader,
   createGatewayClient,
   deriveMasterKey,
   type GatewayClient,
@@ -224,6 +231,7 @@ export async function createPsLiteSyncManager(
   options: PsLiteSyncOptions,
 ): Promise<{
   syncManager: SyncManager;
+  additions?: DurableAdditionsService;
   serverOwner: `0x${string}`;
   dataPointFeed: DataPointFeedPort;
   scopeDeletions: ScopeDeletionTracker;
@@ -253,11 +261,56 @@ export async function createPsLiteSyncManager(
       chainId: options.config.gateway.chainId,
       contracts: options.config.gateway.contracts,
     });
+  const ownerSigner = options.ownerSyncSigner;
+  const ownerRequestSigner: RequestSigner | undefined = ownerSigner
+    ? {
+        signRequest: (params) =>
+          buildWeb3SignedHeader({
+            ...params,
+            signMessage: (message: string) => ownerSigner.signMessage(message),
+          }),
+      }
+    : undefined;
+  const additions = ownerSigner
+    ? createDurableAdditions({
+        deleteSystemScope: async (scope) => {
+          if (!syncManager)
+            throw new Error("Durable system deletion capability unavailable");
+          const result = await syncManager.deleteScope(scope);
+          if (!result.durable || result.steps.gateway.status === "failed") {
+            throw new Error("System scope deletion was not durable");
+          }
+        },
+        ownerAddress: serverOwner,
+        network: `vana:${options.config.gateway.chainId}:${new URL(options.config.gateway.url).origin}`,
+        inventory: createVersionInventoryClient({
+          gatewayUrl: options.config.gateway.url,
+          ownerAddress: serverOwner,
+          ownerSigner: {
+            signRequest: (params) =>
+              buildWeb3SignedHeader({
+                ...params,
+                signMessage: (message: string) =>
+                  ownerSigner.signMessage(message),
+              }),
+          },
+        }),
+        storageAdapter,
+        masterKey,
+        signer,
+        gateway,
+        byteBudget: 8 * 1024 * 1024,
+        timeBudgetMs: 10_000,
+      })
+    : undefined;
   const cursor = createPsLiteSyncCursor(options.stateStore);
   const logger = createBrowserLogger(options.logger);
   const dataPointFeed =
     options.dataPointFeed ??
-    createGatewayDataPointFeed({ gatewayUrl: options.config.gateway.url });
+    createGatewayDataPointFeed({
+      gatewayUrl: options.config.gateway.url,
+      ownerRequestSigner,
+    });
   const scopeDeletions =
     options.scopeDeletions ??
     createScopeDeletionTracker({ feed: dataPointFeed, serverOwner, logger });
@@ -282,6 +335,7 @@ export async function createPsLiteSyncManager(
     : undefined;
   const syncManager = createSyncManager(
     {
+      additions,
       storage: options.storage,
       storageAdapter,
       gateway,
@@ -336,5 +390,5 @@ export async function createPsLiteSyncManager(
     },
   );
   syncManager.start();
-  return { syncManager, serverOwner, dataPointFeed, scopeDeletions };
+  return { syncManager, additions, serverOwner, dataPointFeed, scopeDeletions };
 }

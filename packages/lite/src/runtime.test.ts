@@ -1407,3 +1407,22 @@ describe("createPsLiteRuntime", () => {
     ).not.toThrow();
   });
 });
+
+describe("portable additions capability", () => {
+  it("reports unavailable coverage when the owner inventory signer is absent", async () => {
+    const runtime = createTestRuntime({
+      active: true,
+      auth: createBearerTokenPsLiteAuth({ ownerToken: "owner-token" }),
+    });
+    const response = await runtime.fetch(
+      new Request("https://ps.local/v1/data/additions", {
+        headers: { Authorization: "Bearer owner-token" },
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      coverage: "unavailable",
+      total: 0,
+    });
+  });
+});

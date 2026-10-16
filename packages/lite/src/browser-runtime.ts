@@ -181,6 +181,7 @@ export async function createIndexedDbPsLiteRuntime(
   });
   let syncManager = options.syncManager ?? null;
   let scopeDeletions = options.scopeDeletions;
+  let additions = options.additions;
   let runtimeRef: PsLiteRuntime | null = null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
@@ -239,6 +240,7 @@ export async function createIndexedDbPsLiteRuntime(
           lineageSources: event.lineageSources,
         }),
     });
+    additions = sync.additions ?? additions;
     syncManager = sync.syncManager;
     scopeDeletions = sync.scopeDeletions;
   }
@@ -304,6 +306,7 @@ export async function createIndexedDbPsLiteRuntime(
     serverOwner,
     serverSigner,
     syncManager,
+    additions,
     scopeDeletions,
     diagnostics,
     lineageGateway,

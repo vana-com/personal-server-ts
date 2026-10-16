@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { ScopeFirstSeenLedger } from "./first-added.js";
 import {
   InvalidTimezoneError,
+  bucketAdditionsByLocalDay,
+  readAdditionsSummary,
   summarizeAdditions,
   validateTimezone,
   type AdditionsSummary,
@@ -18,10 +20,11 @@ function ledger(
   overrides: Partial<ScopeFirstSeenLedger> = {},
 ): ScopeFirstSeenLedger {
   return {
-    version: 2,
+    version: 5,
     scope,
     baseline: BASELINE,
     current: NOW,
+    through: NOW,
     latest: { collectedAt: NOW, total: Object.keys(records).length },
     records,
     ...overrides,
@@ -107,7 +110,7 @@ describe("summarizeAdditions", () => {
   });
   const BASELINE_DAY = "2026-09-20";
 
-  it("counts a complete scope's baseline records on the baseline's date, never absent ones", async () => {
+  it("counts permanent arrivals even when records are absent from the newest snapshot", async () => {
     const summary = await summarize(
       [
         ledger("notes.entries", baselineRecords(), {
@@ -121,7 +124,7 @@ describe("summarizeAdditions", () => {
     expect(summary.partial).toBe(false);
     expect(summary.scopes[0]!.partial).toBe(false);
     expect(addedOn(summary, BASELINE_DAY)).toBe(1);
-    expect(addedOn(summary, "2026-10-09")).toBe(1);
+    expect(addedOn(summary, "2026-10-09")).toBe(2);
   });
 
   it("does not count a partial scope's baseline records, and flags it", async () => {
@@ -136,7 +139,7 @@ describe("summarizeAdditions", () => {
       { days: 31 },
     );
     expect(addedOn(summary, BASELINE_DAY)).toBe(0);
-    expect(addedOn(summary, "2026-10-09")).toBe(1);
+    expect(addedOn(summary, "2026-10-09")).toBe(2);
     expect(summary.partial).toBe(true);
     expect(summary.scopes[0]).toMatchObject({
       trackedSince: WINDOW_BASELINE,
@@ -206,7 +209,7 @@ describe("summarizeAdditions", () => {
         "b.huge",
         {},
         {
-          skipped: "too_many_keys",
+          skipped: "too_large",
           latest: { collectedAt: NOW, total: 300_000 },
         },
       ),
@@ -214,9 +217,27 @@ describe("summarizeAdditions", () => {
     ]);
     expect(summary.total).toBe(300_002);
     expect(summary.scopes).toEqual([
-      { scope: "a.binary", total: 1, trackedSince: null, partial: false },
-      { scope: "b.huge", total: 300_000, trackedSince: null, partial: false },
-      { scope: "c.normal", total: 1, trackedSince: BASELINE, partial: false },
+      {
+        scope: "a.binary",
+        total: 1,
+        trackedSince: null,
+        partial: false,
+        buckets: [],
+      },
+      {
+        scope: "b.huge",
+        total: 300_000,
+        trackedSince: null,
+        partial: false,
+        buckets: [],
+      },
+      {
+        scope: "c.normal",
+        total: 1,
+        trackedSince: BASELINE,
+        partial: false,
+        buckets: [{ start: "2026-10-09T01:00:00.000Z", added: 1 }],
+      },
     ]);
     expect(summary.trackedSince).toBe(BASELINE);
     expect(summary.days.at(-1)).toEqual({ date: "2026-10-09", added: 1 });
@@ -240,9 +261,121 @@ describe("summarizeAdditions", () => {
     expect(peak).toBe(1);
   });
 
+  it.each([
+    [
+      "Asia/Kolkata",
+      "2026-10-08T18:15:00.000Z",
+      "2026-10-08T18:30:00.000Z",
+      "2026-10-09",
+    ],
+    [
+      "Asia/Kathmandu",
+      "2026-10-08T18:00:00.000Z",
+      "2026-10-08T18:15:00.000Z",
+      "2026-10-09",
+    ],
+    [
+      "America/New_York",
+      "2026-11-01T05:30:00.000Z",
+      "2026-11-01T06:30:00.000Z",
+      "2026-11-01",
+    ],
+  ])(
+    "rebuckets UTC intervals into %s calendar days",
+    (timezone, first, second, today) => {
+      const rows = bucketAdditionsByLocalDay(
+        [
+          { start: first, added: 2 },
+          { start: second, added: 3 },
+        ],
+        timezone,
+        2,
+        new Date(second),
+      );
+      expect(rows.at(-1)).toEqual({
+        date: today,
+        added: timezone === "America/New_York" ? 5 : 3,
+      });
+      expect(rows[0]!.added).toBe(timezone === "America/New_York" ? 0 : 2);
+    },
+  );
+
+  it("stores quarter-hour UTC buckets and excludes only the literal reserved prefix", async () => {
+    const at = "2026-10-09T01:14:59.999Z";
+    const summary = await summarize(
+      [
+        ledger("vana.system.additions", { a: [at, NOW] }),
+        ledger("vanaXsystem.scope", { b: [at, NOW] }),
+        ledger("notes.entries", { c: ["2026-10-09T01:15:00.000Z", NOW] }),
+      ],
+      { through: { "notes.entries": "3" } },
+    );
+    expect(summary.buckets).toEqual([
+      { start: "2026-10-09T01:00:00.000Z", added: 1 },
+      { start: "2026-10-09T01:15:00.000Z", added: 1 },
+    ]);
+    expect(summary.total).toBe(2);
+    expect(
+      summary.scopes.map(({ scope, buckets }) => ({ scope, buckets })),
+    ).toEqual([
+      {
+        scope: "notes.entries",
+        buckets: [{ start: "2026-10-09T01:15:00.000Z", added: 1 }],
+      },
+      {
+        scope: "vanaXsystem.scope",
+        buckets: [{ start: "2026-10-09T01:00:00.000Z", added: 1 }],
+      },
+    ]);
+    expect(summary.through).toEqual({ "notes.entries": "3" });
+  });
+
+  it("keeps coordination coverage separate from unknown historical dates", async () => {
+    const historical = ledger("notes.entries", baselineRecords(), {
+      partial: true,
+    });
+    expect((await summarize([historical])).coverage).toBe("complete");
+    for (const coverage of [
+      "complete",
+      "behind",
+      "partial",
+      "unavailable",
+    ] as const) {
+      const summary = await summarize([historical], { coverage });
+      expect(summary.coverage).toBe(coverage);
+      expect(summary.partial).toBe(true);
+    }
+    const incomplete = ledger("notes.entries", {}, { incomplete: true });
+    expect((await summarize([incomplete])).coverage).toBe("partial");
+    expect(
+      (await summarize([incomplete], { coverage: "complete" })).coverage,
+    ).toBe("partial");
+  });
+
+  it("reads only versioned valid summaries from an untrusted transport", async () => {
+    const summary = await summarize([
+      ledger("notes.entries", { a: [NOW, NOW] }),
+    ]);
+    expect(readAdditionsSummary(summary)).toEqual(summary);
+    for (const invalid of [
+      { ...summary, version: 0 },
+      { ...summary, total: -1 },
+      { ...summary, coverage: "ready" },
+      { ...summary, through: { "notes.entries": "not-a-version" } },
+      {
+        ...summary,
+        buckets: [{ start: "2026-10-09T12:01:00.000Z", added: 1 }],
+      },
+      { ...summary, buckets: [{ start: NOW, added: -1 }] },
+    ])
+      expect(readAdditionsSummary(invalid)).toBeNull();
+  });
+
   it("throws InvalidTimezoneError for an unknown timezone", async () => {
     await expect(summarize([], { timezone: "Not/AZone" })).rejects.toThrow(
       InvalidTimezoneError,
+      bucketAdditionsByLocalDay,
+      readAdditionsSummary,
     );
     expect(() => validateTimezone("Not/AZone")).toThrow(InvalidTimezoneError);
     expect(() => validateTimezone("America/Toronto")).not.toThrow();

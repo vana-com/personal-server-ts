@@ -1,3 +1,4 @@
+import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   withLegacyProjection,
   type LegacyProjectionIssue,
@@ -163,6 +164,7 @@ export interface PsLiteRuntimeOptions {
    * alongside the sync manager, which keeps it current.
    */
   scopeDeletions?: ScopeDeletionTracker;
+  additions?: DurableAdditionsService;
   accessLogReader?: AccessLogReader;
   accessLogWriter?: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
@@ -1121,6 +1123,7 @@ export function createPsLiteRuntime(
               auth,
               accessLogWriter,
               readFulfillmentReporter: options.readFulfillmentReporter,
+              additions: options.additions,
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
               now,

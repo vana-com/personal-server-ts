@@ -155,7 +155,13 @@ describe("first-seen sidecar on ingest", () => {
     expect(summary.total).toBe(1);
     expect(summary.trackedSince).toBeNull();
     expect(summary.scopes).toEqual([
-      { scope: SCOPE, total: 1, trackedSince: null, partial: false },
+      {
+        scope: SCOPE,
+        total: 1,
+        trackedSince: null,
+        partial: false,
+        buckets: [],
+      },
     ]);
   });
 
@@ -506,12 +512,12 @@ describe("summarizeDataAdditionsContract", () => {
 });
 
 describe("sidecar shape", () => {
-  it("is a version-2 document keyed by the scope", async () => {
+  it("is a version-5 cache document keyed by the scope", async () => {
     const storage = createMemoryDataStorage();
     await ingest(storage, items("a"), T1);
     const ledger: ScopeFirstSeenLedger = await ledgerOf(storage);
     expect(ledger).toEqual({
-      version: 4,
+      version: 5,
       scope: SCOPE,
       baseline: T1,
       current: T1,
@@ -519,5 +525,15 @@ describe("sidecar shape", () => {
       through: T1,
       records: { "items:i:a": [T1, T1] },
     });
+  });
+});
+
+// A local cache is not authoritative owner inventory.
+it("does not certify an empty local cache as complete history", async () => {
+  const result = await summarize(createMemoryDataStorage());
+  expect(result).toMatchObject({
+    version: 1,
+    coverage: "unavailable",
+    total: 0,
   });
 });

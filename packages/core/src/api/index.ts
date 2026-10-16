@@ -1,3 +1,5 @@
+import type { DurableAdditionsService } from "../additions/durable.js";
+import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
   DataDeletedError,
   DeleteTombstoneFailedError,
@@ -282,6 +284,7 @@ export interface PersonalServerIngestSyncManager {
 }
 
 export interface PersonalServerDataApiDeps {
+  additions?: DurableAdditionsService;
   storage: DataStoragePort;
   auth: PersonalServerApiAuthPort;
   accessLogWriter: AccessLogWriter;
@@ -597,7 +600,10 @@ function listAuthCovers(
   listAuth: PersonalServerListAuthResult,
   scope: string,
 ): boolean {
-  return scopeCoveredByGrant(scope, [...listAuth.grantedScopes]);
+  return (
+    !isSystemScope(scope) &&
+    scopeCoveredByGrant(scope, [...listAuth.grantedScopes])
+  );
 }
 
 export interface X402CycleInput {
@@ -1214,9 +1220,9 @@ export async function handlePersonalServerDataRequest(
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
         isVisible: discoveryVisibility(deps),
-        isListable: listAuth
-          ? (scope) => listAuthCovers(listAuth, scope)
-          : undefined,
+        isListable: (scope) =>
+          !isSystemScope(scope) &&
+          (!listAuth || listAuthCovers(listAuth, scope)),
       });
       return jsonResponse(result.response);
     }
@@ -1229,6 +1235,7 @@ export async function handlePersonalServerDataRequest(
       await deps.auth.authorizeOwner(request);
       const daysRaw = url.searchParams.get("days");
       const result = await summarizeDataAdditionsContract({
+        additions: deps.additions,
         storage: deps.storage,
         isVisible: discoveryVisibility(deps),
         timezone: url.searchParams.get("tz") ?? "UTC",

@@ -966,3 +966,24 @@ describe("GET /v1/derivatives/status", () => {
     expect(res.status).toBe(405);
   });
 });
+
+describe("reserved derivative sources", () => {
+  it.each(["*", "vana.*", "vana.system.*", "vana.system.ledger"])(
+    "rejects delegated system sources under %s",
+    async (pattern) => {
+      const { deps, store, scheduler } = createDeps({
+        auth: createAuth({ grantScopes: ["write:coach.*", pattern] }),
+      });
+      const response = await call(deps, "POST", "/questions", {
+        token: BUILDER_TOKEN,
+        body: { ...body, sourceScopes: ["vana.system.ledger"] },
+      });
+      expect(response.status).toBe(403);
+      expect((await response.json()).error).toMatchObject({
+        errorCode: "DERIVATIVE_SOURCE_NOT_GRANTED",
+      });
+      expect(await store.list()).toEqual([]);
+      expect(scheduler.requestRecompute).not.toHaveBeenCalled();
+    },
+  );
+});
