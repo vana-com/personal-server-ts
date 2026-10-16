@@ -110,6 +110,8 @@ export interface ServerContext {
 export interface CreateServerOptions {
   /** Owner-authorized HTTP signing capability supplied by the trusted host. */
   ownerRequestSigner?: RequestSigner;
+  /** Inventory-route-only signer; never used by the owner-only scope feed. */
+  additionsInventorySigner?: RequestSigner;
   /** Host-authorized checkpoint capability. TEE public-read adapters cannot write.
    * The host supplies an existing AddData signer/storage pair; this creates no grant.
    */
@@ -489,9 +491,11 @@ export async function createServer(
     scheduler: derivativeScheduler,
   };
 
+  const additionsInventorySigner =
+    options?.additionsInventorySigner ?? additionsOwnerSigner;
   let additions: DurableAdditionsService | undefined;
   if (
-    additionsOwnerSigner &&
+    additionsInventorySigner &&
     (!isEnclave || options?.additionsWriter) &&
     masterKeySignature &&
     serverOwner &&
@@ -512,7 +516,7 @@ export async function createServer(
       inventory: createVersionInventoryClient({
         gatewayUrl: config.gateway.url,
         ownerAddress: serverOwner,
-        ownerSigner: additionsOwnerSigner,
+        ownerSigner: additionsInventorySigner,
       }),
       storageAdapter:
         options?.additionsWriter?.storageAdapter ??
