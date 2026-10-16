@@ -11,6 +11,152 @@ import {
   OfflineDeclarationWitnessError,
 } from "./declaration-witness.js";
 
+import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
+import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
+import { initializeDatabase } from "./index-schema.js";
+
+// These server-level checks run with server-witness and use real SQLite rows
+// and persisted takeover verdicts, not the portable in-memory store.
+describe("current declarations at the server legacy-read boundary", () => {
+  const source = "https://registry.pdpp.dev/sources/chatgpt";
+  const instance = "conn_opaque";
+  const scope = "chatgpt.conversations";
+  const collectedAt = "2026-09-10T06:30:00.000Z";
+  const encoded = "title\\u0000";
+  const decoded = "title\u0000";
+  let db: InstanceType<typeof Database>;
+  let store: ReturnType<typeof createSqliteRecordStore>;
+  let current: ReturnType<typeof createStreamDeclarationRegistry> | undefined;
+
+  function registry(annotated: boolean) {
+    return createStreamDeclarationRegistry([{
+      name: "conversations",
+      semantics: "mutable_state",
+      primaryKey: ["id"],
+      cursorField: "update_time",
+      requiredFields: ["id"],
+      schema: { properties: { title: {
+        type: "string",
+        ...(annotated ? { x_pdpp_text_encoding: "pdpp-safe-escape-v1" } : {}),
+      } } },
+    }]);
+  }
+
+  const declarations = {
+    forInstance(id: string, stream: string) {
+      // As in the record server, use the registered source, never an ID suffix.
+      const binding = store.getInstanceBinding(id);
+      return binding.sourceId === source && binding.deletedAt === null
+        ? current?.forInstance(id, stream)
+        : undefined;
+    },
+  };
+  const makeView = (readLegacyHead?: Parameters<typeof createLegacyScopeView>[0]["readLegacyHead"]) =>
+    createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      declarations,
+      configuredMethods: (id) => id === source ? ["chatgpt"] : [],
+      readLegacyHead,
+    });
+
+  beforeEach(() => {
+    faults.open = "";
+    faults.read = "";
+    db = initializeDatabase(":memory:");
+    store = createSqliteRecordStore(db);
+    current = undefined;
+    store.registerConnection({ instance, sourceId: source, method: "chatgpt", label: "" });
+    for (const [stream, rows] of [
+      ["conversations", [{
+        id: "cv1", title: encoded, create_time: collectedAt,
+        update_time: collectedAt, current_node: null, message_count_on_current_branch: 0,
+      }]],
+      ["messages", []],
+    ] as const) {
+      store.replaceStream({
+        instance, stream, method: "chatgpt", generation: 1,
+        primaryKey: ["id"], emittedAt: collectedAt, sourceCollectedAt: collectedAt,
+        envelopes: rows.map((data) => ({
+          instance, stream, key: data.id, data, emitted_at: collectedAt,
+        })),
+      });
+    }
+  });
+  afterEach(() => {
+    store.close();
+    opened.length = 0;
+  });
+
+  it.each(["absent", "old", "annotated"] as const)(
+    "serves ChatGPT title under the %s declaration", async (version) => {
+      current = version === "absent" ? undefined : registry(version === "annotated");
+      const result = await makeView().readLatest(scope);
+      expect(result).toMatchObject({
+        kind: "canonical",
+        envelope: { data: { conversations: [{ id: "cv1", title: version === "annotated" ? decoded : encoded }] } },
+      });
+    },
+  );
+
+  it("changes the projection revision when only the declaration changes", async () => {
+    current = registry(false);
+    const view = makeView();
+    const before = await view.readLatest(scope);
+    current = registry(true);
+    const after = await view.readLatest(scope);
+    expect(before.kind).toBe("canonical");
+    expect(after.kind).toBe("canonical");
+    if (before.kind !== "canonical" || after.kind !== "canonical") return;
+    expect(after.revision).not.toBe(before.revision);
+    expect(after.envelope.data).not.toEqual(before.envelope.data);
+    expect(await view.readLatest(scope)).toEqual(after);
+  });
+
+  it("invalidates the covered body and persisted verdict on a declaration upgrade", async () => {
+    current = registry(false);
+    const baseline = await makeView().readLatest(scope);
+    expect(baseline.kind).toBe("canonical");
+    if (baseline.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run("chatgpt/conversations/old.json", scope, collectedAt, 12);
+    const readHead = vi.fn(async () => baseline.envelope);
+    const view = makeView(readHead);
+    const first = await view.readLatest(scope);
+    expect(first.kind).toBe("canonical");
+    const cursor = view.verdictFor(scope)[0]!.canonicalCursor;
+    expect(await view.readLatest(scope)).toEqual(first);
+    expect(readHead).toHaveBeenCalledTimes(1);
+
+    current = registry(true);
+    expect(view.listingFor(scope)).toEqual({ kind: "refused" });
+    // The old file contains encoded text. A decoded body no longer covers it:
+    // recompute parity and refuse rather than return the stale cached body.
+    expect((await view.readLatest(scope)).kind).toBe("refused");
+    expect(readHead).toHaveBeenCalledTimes(2);
+    expect(view.verdictFor(scope)[0]!.canonicalCursor).not.toBe(cursor);
+    expect(view.verdictFor(scope)[0]!.verdict).toBe("not_covered");
+  });
+
+  it("does not apply a declaration from another registered source", () => {
+    current = registry(true);
+    store.registerConnection({
+      instance: "conn_chatgpt_suffix", sourceId: "https://example.test/other",
+      method: "other", label: "",
+    });
+    expect(declarations.forInstance("conn_chatgpt_suffix", "conversations")).toBeUndefined();
+    expect(declarations.forInstance(instance, "conversations")?.schema).toBeDefined();
+    expect(declarations.forInstance(instance, "missing")).toBeUndefined();
+  });
+});
+
+it("wires trusted declarations into the production legacy view", () => {
+  const bootstrap = readFileSync(new URL("../bootstrap.ts", import.meta.url), "utf8");
+  expect(bootstrap).toMatch(/legacyScopeView: createLegacyScopeView\(\{[\s\S]*?declarations: pdppRecords\?\.declarations,/);
+});
+
 const faults = vi.hoisted(() => ({ open: "", read: "" }));
 const opened = vi.hoisted(() => [] as Array<InstanceType<typeof Database>>);
 vi.mock("better-sqlite3", async (importOriginal) => {
