@@ -40,6 +40,12 @@ export type ProjectionError =
   | { kind: "missing_stream"; scope: string; expectedStream: string }
   | { kind: "invalid_value"; scope: string; reason: string }
   | {
+      kind: "invalid_encoded_text" | "message_content_omitted" | "unresolved_blob";
+      scope: string;
+      stream: string;
+      field: string;
+    }
+  | {
       kind: "incomplete_scope";
       scope: string;
       reason: string;
@@ -110,6 +116,8 @@ export type ProjectionResult = ProjectionOk | ProjectionErr;
  */
 export interface ProjectPdppRecordsOptions {
   fetchedStreams: string[];
+  /** Trusted per-stream declarations governing these rows; absent means no decoding. */
+  streamSchemas?: Readonly<Record<string, Record<string, unknown>>>;
   /** Selected signed connector key. Omitted for the original PAT binding. */
   profileKey?: string;
   /**

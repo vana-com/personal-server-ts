@@ -15,6 +15,15 @@ import {
 } from "../legacy-projection/index.js";
 import type { ProjectionOmission } from "../legacy-projection/types.js";
 import {
+  declaredBlobField,
+  declaredBlobReference,
+  decodeDeclaredBlob,
+  decodeDeclaredRecords,
+  DeclaredTextError,
+  type StreamSchemas,
+} from "../legacy-projection/declared-text.js";
+import type { StreamDeclarationRegistry } from "./pdpp-records/stream-declaration.js";
+import {
   claudeBlobReference,
   ClaudeSourceRecordError,
   decodeClaudeSourceRecord,
@@ -42,7 +51,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/5";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/6";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -238,6 +247,8 @@ export type CanonicalLegacyReadResult =
 
 export interface ReadCanonicalLegacyScopeInput {
   store: CanonicalLegacyReadStore;
+  /** Trusted declarations governing this instance, read inside the record snapshot. */
+  declarations?: Pick<StreamDeclarationRegistry, "forInstance">;
   scope: string;
   selection: CanonicalConnectionSelection;
   /**
@@ -361,6 +372,7 @@ export async function readCanonicalLegacyScope(
             : MAX_BLOB_READ_BYTES,
           input.requireCompletionReceipts === true,
           input.allowUnprovenEmptyStreams === true,
+          input.declarations,
         ),
   );
   if (!snapshot.ok) return snapshot.result;
@@ -391,6 +403,7 @@ interface Snapshot {
    */
   completions: Map<string, CanonicalStreamCompletion>;
   blobContents: Map<string, ClaudeBlobContents>;
+  streamSchemas: StreamSchemas;
 }
 
 /** Everything the view needs from the store, read inside one snapshot. */
@@ -403,12 +416,18 @@ function collectSnapshot(
   blobByteBudget: number,
   requireCompletionReceipts: boolean,
   allowUnprovenEmptyStreams: boolean,
+  declarations?: Pick<StreamDeclarationRegistry, "forInstance">,
 ): Snapshot | { ok: false; result: CanonicalLegacyReadResult } {
   const { instance } = selection;
   const binding = store.getInstanceBinding(instance);
   const rejected = checkConnection(binding, selection);
   if (rejected) return { ok: false, result: unavailable(rejected) };
   const listing = store.listStreams([instance]);
+  const streamSchemas: Record<string, Record<string, unknown>> = {};
+  for (const stream of streams) {
+    const schema = declarations?.forInstance(instance, stream)?.schema;
+    if (schema) streamSchemas[stream] = structuredClone(schema);
+  }
 
   const rowsByStream = new Map<string, PdppStoredRecord[]>();
   const orderGaps: string[] = [];
@@ -481,12 +500,15 @@ function collectSnapshot(
   // per-blob size does not bound fan-in; excluded raw fields still cost bytes.
   const blobContents = new Map<string, ClaudeBlobContents>();
   let requiredBytes = 0;
+  const declaredBlobIds = new Set<string>();
   for (const stream of streams) {
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (blobBacked.length === 0) continue;
+    const projectedField = declaredBlobField(streamSchemas[stream]);
     if (
-      selection.sourceId !== CLAUDE_SOURCE_ID ||
-      (stream !== "conversations" && stream !== "projects")
+      !projectedField &&
+      (selection.sourceId !== CLAUDE_SOURCE_ID ||
+        (stream !== "conversations" && stream !== "projects"))
     ) {
       return {
         ok: false,
@@ -502,19 +524,34 @@ function collectSnapshot(
     for (const row of blobBacked) {
       let ref;
       try {
-        ref = claudeBlobReference(row.data);
+        ref = projectedField
+          ? declaredBlobReference(row.data, projectedField)
+          : claudeBlobReference(row.data);
       } catch (error) {
-        if (!(error instanceof ClaudeSourceRecordError)) throw error;
+        if (!projectedField && !(error instanceof ClaudeSourceRecordError))
+          throw error;
         return {
           ok: false,
           result: unavailable({
             reason: "blob_backed_record_invalid",
-            detail: error.message,
+            detail: projectedField
+              ? "invalid_blob_reference"
+              : (error as ClaudeSourceRecordError).message,
           }),
         };
       }
+      if (projectedField) declaredBlobIds.add(ref.blobId);
       const prior = blobContents.get(ref.blobId);
-      const meta = prior?.meta ?? store.getBlobMeta?.(ref.blobId);
+      let meta;
+      try {
+        meta = prior?.meta ?? store.getBlobMeta?.(ref.blobId);
+      } catch (error) {
+        if (!projectedField) throw error;
+        return { ok: false, result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }) };
+      }
+      if (!meta && projectedField) {
+        return { ok: false, result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }) };
+      }
       if (!meta)
         return {
           ok: false,
@@ -564,7 +601,16 @@ function collectSnapshot(
     };
   }
   for (const [blobId, contents] of blobContents) {
-    const bytes = store.getBlobBytes?.(blobId);
+    let bytes;
+    try {
+      bytes = store.getBlobBytes?.(blobId);
+    } catch (error) {
+      if (!declaredBlobIds.has(blobId)) throw error;
+      return { ok: false, result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }) };
+    }
+    if (!bytes && declaredBlobIds.has(blobId)) {
+      return { ok: false, result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }) };
+    }
     if (!bytes)
       return {
         ok: false,
@@ -592,6 +638,7 @@ function collectSnapshot(
     orderGaps,
     completions,
     blobContents,
+    streamSchemas,
   };
 }
 
@@ -659,6 +706,7 @@ async function projectSnapshot(
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (
       canExpandClaude &&
+      !declaredBlobField(input.streamSchemas[stream]) &&
       (stream === "conversations" || stream === "projects")
     ) {
       try {
@@ -683,7 +731,10 @@ async function projectSnapshot(
       }
       continue;
     }
-    if (blobBacked.length > 0) {
+    if (
+      blobBacked.length > 0 &&
+      !declaredBlobField(input.streamSchemas[stream])
+    ) {
       return unavailable({
         reason: "blob_backed_records_unsupported",
         stream,
@@ -705,6 +756,32 @@ async function projectSnapshot(
   let records = streams.flatMap((stream) =>
     (rowsByStream.get(stream) ?? []).map((row) => ({ stream, data: row.data })),
   );
+  // Decode inline fields before inserting raw blob text; a JSON-string blob
+  // is already source text and must never be decoded a second time.
+  try {
+    records = decodeDeclaredRecords(records, input.streamSchemas, true);
+  } catch (error) {
+    if (!(error instanceof DeclaredTextError)) throw error;
+    return rejection(error.projectionError(scope), sourceRowCounts);
+  }
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i]!;
+    const field = declaredBlobField(input.streamSchemas[record.stream]);
+    if (!field || !Object.hasOwn(record.data, "blob_ref")) continue;
+    try {
+      const ref = declaredBlobReference(record.data, field);
+      records[i] = {
+        ...record,
+        data: await decodeDeclaredBlob(record.data, field,
+          input.blobContents.get(ref.blobId) ?? { meta: undefined, bytes: undefined }),
+      };
+    } catch {
+      return unavailable({
+        reason: "blob_backed_record_invalid",
+        detail: "invalid_declared_blob",
+      });
+    }
+  }
   if (expanded.length > 0) {
     try {
       records = mergeClaudeSourceRecords(
@@ -787,6 +864,7 @@ async function projectSnapshot(
     orderGaps,
     completions,
     listing: listingBefore,
+    streamSchemas: input.streamSchemas,
   });
 
   return {
@@ -1009,6 +1087,7 @@ async function viewRevision(input: {
   orderGaps: string[];
   completions: Map<string, CanonicalStreamCompletion>;
   listing: StreamListing[];
+  streamSchemas: StreamSchemas;
 }): Promise<string> {
   const horizons = [];
   for (const stream of input.streams) {
@@ -1032,6 +1111,7 @@ async function viewRevision(input: {
   const digest = await sha256Hex(
     JSON.stringify({
       contract: CANONICAL_LEGACY_VIEW_CONTRACT,
+      streamSchemas: input.streamSchemas,
       scope: input.scope,
       instance: input.selection.instance,
       sourceId: input.selection.sourceId,
