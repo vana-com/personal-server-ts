@@ -17,7 +17,9 @@ export interface OfflineDeclarationWitnessOptions {
   stream: string;
   nextSchema: Record<string, unknown>;
   /** Positive safe integer. Each internal page is capped at 1,000 rows. */
-  limit: number;
+  pageSize?: number;
+  /** @deprecated Use pageSize. Used only when pageSize is omitted. */
+  limit?: number;
   /** Finite nonnegative, cooperative wall-clock budget in milliseconds. */
   budgetMs: number;
 }
@@ -30,6 +32,10 @@ export type OfflineDeclarationWitnessErrorCode =
   | "missing_database"
   | "open_failed"
   | "unsupported_store"
+  | "store_unreadable"
+  | "missing_source"
+  | "missing_stream"
+  | "unverifiable_source"
   | "invalid_schema"
   | "read_failed"
   | "close_failed";
@@ -42,6 +48,37 @@ export class OfflineDeclarationWitnessError extends Error {
   }
 }
 
+function isUnreadable(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && (
+    ["EACCES", "EPERM", "EISDIR", "EROFS", "SQLITE_CANTOPEN", "SQLITE_PERM", "SQLITE_AUTH"].includes(code) ||
+    code.startsWith("SQLITE_READONLY")
+  );
+}
+
+/** Current v11 retains connections, but not the declarations authorizing streams. */
+function assertRegisteredSource(db: InstanceType<typeof Database>, sourceKey: string): void {
+  let binding: { source_id: string | null; deleted_at: string | null } | undefined;
+  try {
+    binding = db.prepare(
+      "SELECT source_id, deleted_at FROM pdpp_instance_binding WHERE instance = ?",
+    ).get(sourceKey) as typeof binding;
+  } catch (error) {
+    if (isUnreadable(error)) throw new OfflineDeclarationWitnessError("store_unreadable");
+    throw new OfflineDeclarationWitnessError("unverifiable_source");
+  }
+  if (!binding || !binding.source_id || binding.deleted_at !== null) {
+    throw new OfflineDeclarationWitnessError("missing_source");
+  }
+}
+
+function assertRetainedStreamDeclaration(): void {
+  // Row listings and completion receipts are not retained declarations. Neither
+  // proves that an empty/unknown stream belongs to this registered connection.
+  // Until the store retains that authoritative binding, no walk may pass.
+  throw new OfflineDeclarationWitnessError("unverifiable_source");
+}
+
 /**
  * Validate a declaration offline, before starting the server.
  *
@@ -52,7 +89,9 @@ export class OfflineDeclarationWitnessError extends Error {
  *
  * One database and one read-port object own every continuation in this call.
  * No database is created, migrated or pruned. Missing/incompatible databases
- * throw typed errors; only an existing valid empty stream passes.
+ * throw typed errors. Only a registered source and a declared stream may pass
+ * with checked: 0. The current v11 store cannot verify stream declarations,
+ * so registered sources currently throw unverifiable_source, even with rows.
  *
  * The deadline is checked before and after every bounded page, including the
  * terminal page. Synchronous SQLite/JSON parsing/schema compilation cannot be
@@ -64,11 +103,12 @@ export class OfflineDeclarationWitnessError extends Error {
 export async function runDeclarationWitness(
   options: OfflineDeclarationWitnessOptions,
 ): Promise<OfflineDeclarationWitnessResult> {
+  const pageSize = options?.pageSize !== undefined ? options.pageSize : options?.limit;
   if (
     !options || typeof options.dbPath !== "string" || !options.dbPath ||
     typeof options.sourceKey !== "string" || !options.sourceKey ||
     typeof options.stream !== "string" || !options.stream ||
-    !Number.isSafeInteger(options.limit) || options.limit <= 0 ||
+    typeof pageSize !== "number" || !Number.isSafeInteger(pageSize) || pageSize <= 0 ||
     !Number.isFinite(options.budgetMs) || options.budgetMs < 0
   ) {
     throw new OfflineDeclarationWitnessError("invalid_argument");
@@ -76,7 +116,7 @@ export async function runDeclarationWitness(
 
   const started = performance.now();
   const { dbPath, sourceKey, stream, budgetMs } = options;
-  const limit = Math.min(options.limit, 1_000);
+  const limit = Math.min(pageSize, 1_000);
   let schema: Record<string, unknown>;
   try {
     // Freeze the walk's schema against caller mutations between async pages.
@@ -90,17 +130,21 @@ export async function runDeclarationWitness(
   try {
     try {
       if (!statSync(dbPath).isFile()) {
-        throw new OfflineDeclarationWitnessError("open_failed");
+        throw new OfflineDeclarationWitnessError("store_unreadable");
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         throw new OfflineDeclarationWitnessError("missing_database");
       }
-      throw new OfflineDeclarationWitnessError("open_failed");
+      if (error instanceof OfflineDeclarationWitnessError) throw error;
+      throw new OfflineDeclarationWitnessError(isUnreadable(error) ? "store_unreadable" : "open_failed");
     }
     db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 0 });
+    stage = "unverifiable_source";
+    assertRegisteredSource(db, sourceKey);
     stage = "unsupported_store";
     const store = createSqliteRecordStore(db);
+    assertRetainedStreamDeclaration();
     // Witness validation uses nextSchema, never declaration registry lookups.
     const readPort = fromSyncRecordStore({ ...store, forInstance: () => undefined });
     stage = "read_failed";
@@ -128,6 +172,7 @@ export async function runDeclarationWitness(
   } catch (error) {
     if (error instanceof OfflineDeclarationWitnessError) throw error;
     throw new OfflineDeclarationWitnessError(
+      isUnreadable(error) ? "store_unreadable" :
       error instanceof DeclarationWitnessSchemaError ? "invalid_schema" : stage,
     );
   } finally {
