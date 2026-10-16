@@ -1,3 +1,4 @@
+import { GITHUB_LEGACY_FIELDS as schemasByStream } from "./github-legacy-fields.js";
 import type {
   LegacyScopeBinding,
   PdppRecord,
@@ -53,6 +54,72 @@ const requiredByStream: Record<string, string[]> = {
 };
 const legacyEventsWindowDescription =
   "Up to 300 most recent public events across all repositories (≈90 days, GitHub API limit)";
+
+type LegacySchema = {
+  properties?: Record<string, LegacySchema>;
+  items?: LegacySchema;
+};
+
+// Follow the schema-pinned field tree: canonical additions must never leak
+// into these closed legacy objects, including nested rows and nullable objects.
+function projectDeclared(value: unknown, schema: LegacySchema): unknown {
+  if (Array.isArray(value) && schema.items) {
+    const items = schema.items;
+    return value.map((item) => projectDeclared(item, items));
+  }
+  if (value !== null && typeof value === "object" && !Array.isArray(value) && schema.properties) {
+    const object = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(schema.properties)
+        .filter(([key]) => Object.hasOwn(object, key))
+        .map(([key, child]) => [key, projectDeclared(object[key], child)]),
+    );
+  }
+  return value;
+}
+
+// Verified github-playwright 1.5.0 collector defaults, supplied with assignment
+// build-ps-legacy-contract-gh-meta-4884292 (profile :268-337,
+// repositories :416-425, starred :568-575). These are compatibility defaults,
+// not new facts in the canonical records. Required identities stay guarded.
+const profileDefaults: Record<string, unknown> = {
+  fullName: "", bio: "", company: "", location: "", website: "", avatarUrl: "",
+  followers: 0, following: 0, repositoryCount: 0,
+  pinnedRepositories: [], organizations: [], achievements: [],
+  contributionsLastYear: null,
+};
+const rowDefaults: Record<string, Record<string, unknown>> = {
+  pinnedRepositories: { url: null, description: "", language: null, stars: 0 },
+  organizations: { avatarUrl: null },
+  achievements: { iconUrl: null },
+  repositories: {
+    description: "", language: "", stars: 0, forks: 0,
+    visibility: "Public", topics: [], updatedAt: null,
+  },
+  starred: { description: "", language: "", stars: 0, updatedAt: null },
+};
+
+function fillAbsent(object: Record<string, unknown>, defaults: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(defaults)) {
+    if (object[key] === undefined) object[key] = Array.isArray(value) ? [...value] : value;
+  }
+}
+
+function fillLegacyDefaults(stream: string, payload: Record<string, unknown>): void {
+  if (stream === "profile") fillAbsent(payload, profileDefaults);
+  const fields = stream === "profile"
+    ? ["pinnedRepositories", "organizations", "achievements"]
+    : stream === "repositories" || stream === "starred" ? [stream] : [];
+  for (const field of fields) {
+    const rows = payload[field];
+    if (!Array.isArray(rows)) continue;
+    for (const row of rows) {
+      if (row !== null && typeof row === "object" && !Array.isArray(row)) {
+        fillAbsent(row as Record<string, unknown>, rowDefaults[field]);
+      }
+    }
+  }
+}
 
 function browserBinding(stream: string): LegacyScopeBinding {
   const scope = `github.${stream}`;
@@ -118,14 +185,16 @@ function browserBinding(stream: string): LegacyScopeBinding {
           };
         }
       }
-      const payload: Record<string, unknown> = {};
-      for (const field of fields) {
-        if (Object.hasOwn(snapshot, field)) payload[field] = snapshot[field];
-      }
+      const payload = projectDeclared(snapshot, schemasByStream[stream]) as Record<string, unknown>;
+      fillLegacyDefaults(stream, payload);
       // github-browser 0.2.1 uses a new description for the same API window.
       // Keep the Vana legacy payload wording from github-playwright 1.5.1.
       if (stream === "events" && Object.hasOwn(payload, "windowDescription")) {
         payload.windowDescription = legacyEventsWindowDescription;
+      }
+      if (stream === "history" && Object.hasOwn(payload, "windowDescription")) {
+        payload.windowDescription =
+          "Full lifetime authored PRs and Issues from /search/issues, up to 1000 per type.";
       }
       return { ok: true, payload };
     },
