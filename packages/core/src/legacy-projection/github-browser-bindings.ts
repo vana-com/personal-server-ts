@@ -115,6 +115,11 @@ function fillLegacyDefaults(stream: string, payload: Record<string, unknown>): v
     if (!Array.isArray(rows)) continue;
     for (const row of rows) {
       if (row !== null && typeof row === "object" && !Array.isArray(row)) {
+        // github-playwright derives missing pinned URLs from the repository identity.
+        // Preserve every supplied canonical URL, including empty strings and null.
+        if (field === "pinnedRepositories" && row.url === undefined) {
+          row.url = row.fullName ? `https://github.com/${row.fullName}` : null;
+        }
         fillAbsent(row as Record<string, unknown>, rowDefaults[field]);
       }
     }

@@ -316,7 +316,7 @@ describe("frozen legacy GitHub and Meta contracts", () => {
   });
 
   const cases: [string, string, Record<string, unknown>, Record<string, unknown>][] = [
-    ["profile", "pinnedRepositories", { fullName: "a/b" }, { url: null, description: "", language: null, stars: 0 }],
+    ["profile", "pinnedRepositories", { fullName: "a/b" }, { url: "https://github.com/a/b", description: "", language: null, stars: 0 }],
     ["profile", "organizations", { login: "org", label: "Org", url: "https://github.com/org" }, { avatarUrl: null }],
     ["profile", "achievements", { name: "Pull Shark" }, { iconUrl: null }],
     ["repositories", "repositories", { name: "repo", url: "https://github.com/a/repo" }, {
@@ -335,6 +335,31 @@ describe("frozen legacy GitHub and Meta contracts", () => {
     ]));
     expect(project(stream, { ...canonical, [field]: [{ ...identity, ...actual }] })[field])
       .toEqual([{ ...identity, ...actual }]);
+  });
+
+  it.each<[Record<string, unknown>, string | null]>([
+    [{ fullName: "a/b" }, "https://github.com/a/b"],
+    [{ fullName: "a/b", url: undefined }, "https://github.com/a/b"],
+    [{ fullName: "" }, null],
+    [{}, null],
+    [{ fullName: "a/b", url: "https://example.com/canonical" }, "https://example.com/canonical"],
+    [{ fullName: "a/b", url: "" }, ""],
+    [{ fullName: "a/b", url: null }, null],
+  ])("derives only absent pinned repository URLs for %j", (row, url) => {
+    const before = { ...row };
+    const canonical = {
+      username: "octocat",
+      profileUrl: "https://github.com/octocat",
+      pinnedRepositories: [row],
+    };
+    expect(project("profile", canonical).pinnedRepositories).toEqual([{
+      ...row,
+      url,
+      description: "",
+      language: null,
+      stars: 0,
+    }]);
+    expect(canonical.pinnedRepositories).toStrictEqual([before]);
   });
 
   it("preserves null contribution totals and does not invent absent history fields", () => {
