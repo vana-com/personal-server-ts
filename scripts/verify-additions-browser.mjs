@@ -44,7 +44,14 @@ const { default: EmbeddedPostgres } = await import(
 );
 const root = await mkdtemp(join(tmpdir(), "ps-gateway-additions-"));
 const count = 40;
-const journalRegression = process.argv.includes("--journal-regression");
+const tombstoneRegression = process.argv.includes("--tombstone-regression");
+const uploadRegression = process.argv.includes("--upload-regression");
+const concurrentRegression = process.argv.includes("--concurrent-regression");
+const journalRegression =
+  process.argv.includes("--journal-regression") ||
+  concurrentRegression ||
+  uploadRegression ||
+  tombstoneRegression;
 const blobPutHistory = [];
 let browserSession = `vana12-proof-${process.pid}`;
 let browserRestarts = 0;
@@ -627,14 +634,20 @@ window.ready=true;
         signature: "local-settled-fixture",
       });
     };
-    const scenarios = [
-      { stage: "put-503", records: 650 },
-      { stage: "register", records: 650 },
-      { stage: "verify", records: 650 },
-      { stage: "put-503", records: 750 },
-      { stage: "put-503", records: 650, scopes: 2 },
-      { stage: "oversized", records: 850 },
-    ];
+    const scenarios = tombstoneRegression
+      ? [{ stage: "put-503", records: 650, concurrent: true, tombstone: true }]
+      : uploadRegression
+        ? [{ stage: "upload", records: 650 }]
+        : concurrentRegression
+          ? [{ stage: "put-503", records: 650, concurrent: true }]
+          : [
+              { stage: "put-503", records: 650 },
+              { stage: "register", records: 650 },
+              { stage: "verify", records: 650 },
+              { stage: "put-503", records: 750 },
+              { stage: "put-503", records: 650, scopes: 2 },
+              { stage: "oversized", records: 850 },
+            ];
     for (const [index, scenario] of scenarios.entries()) {
       await db.delete(schema.dataPointVersions);
       await db.delete(schema.dataPoints);
@@ -664,6 +677,34 @@ window.ready=true;
         continue;
       }
       for (const scope of scopes) await seed(scope, scenario.records);
+      if (scenario.stage === "upload") {
+        const upload = JSON.parse(
+          await command([
+            "eval",
+            "--json",
+            "(async()=>await window.uploadNoClone())()",
+          ]),
+        ).data.result;
+        assert.equal(upload.touched, 0, "upload hints were materialized");
+        assert.equal(upload.active, 0);
+        assert.ok(
+          lastRegistered.has(ledgerScope(source)),
+          "upload did not checkpoint its source",
+        );
+        assert.equal(
+          lastRegistered.has("vana.system.additions"),
+          false,
+          "upload registered a reader-only summary",
+        );
+        const read = await invoke();
+        assert.equal(read.result.coverage, "complete");
+        assert.ok(
+          lastRegistered.has("vana.system.additions"),
+          "read did not publish its stale summary",
+        );
+        await assertFullEquality(read.result);
+        continue;
+      }
       const putsBefore = blobPuts;
       fault = scenario.stage;
       verificationArmed = false;
@@ -694,6 +735,56 @@ window.ready=true;
       );
       fault = "";
       verificationArmed = false;
+      if (scenario.tombstone) {
+        const scope = ledgerScope(source);
+        const { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } =
+          await load("lib/data-points.ts");
+        await register({
+          scope,
+          expectedVersion: "1",
+          dataHash: TOMBSTONE_DATA_HASH,
+          metadataHash: TOMBSTONE_METADATA_HASH,
+          signature: "local-settled-deletion-fixture",
+        });
+        await db
+          .update(schema.dataPoints)
+          .set({ deletedAt: new Date(), chainState: "deleted" })
+          .where(eq(schema.dataPoints.id, idFor(scope)));
+        await rm(blobPath(`${scope}/1`), { force: true });
+      } else if (scenario.concurrent) {
+        // A different device wins the same numeric checkpoint version while
+        // this browser retains its interrupted encrypted publication intent.
+        await assertFullEquality(initial.result);
+        assert.equal((await journal(ledgerScope(source))).exists, true);
+        for (const table of [schema.dataPointVersions, schema.dataPoints])
+          await db
+            .update(table)
+            .set({ status: "pending" })
+            .where(eq(table.id, idFor(ledgerScope(source))));
+        await restart();
+        assert.notEqual((await invoke()).result.coverage, "complete");
+        assert.equal(
+          (await journal(ledgerScope(source))).exists,
+          true,
+          "unsettled winner discarded the intent",
+        );
+        for (const table of [schema.dataPointVersions, schema.dataPoints])
+          await db
+            .update(table)
+            .set({ status: "confirmed" })
+            .where(eq(table.id, idFor(ledgerScope(source))));
+        const winnerKey = `${ledgerScope(source)}/1`;
+        const winnerBytes = await readFile(blobPath(winnerKey));
+        await writeFile(blobPath(winnerKey), new Uint8Array([0]));
+        await restart();
+        assert.notEqual((await invoke()).result.coverage, "complete");
+        assert.equal(
+          (await journal(ledgerScope(source))).exists,
+          true,
+          "unreadable winner discarded the intent",
+        );
+        await writeFile(blobPath(winnerKey), winnerBytes);
+      }
       let resumed;
       for (let retry = 0; retry < 5; retry++) {
         await restart();
@@ -709,7 +800,7 @@ window.ready=true;
         );
         if (resumed.result.coverage === "complete") break;
       }
-      if (scenario.stage === "put-503")
+      if (scenario.stage === "put-503" && !scenario.concurrent)
         assert.ok(
           blobPuts > putsBefore + candidates.length,
           "admitted journal livelocked: restart never retried PUT",
@@ -730,6 +821,11 @@ window.ready=true;
         { date: "2026-10-03", added: 0 },
         { date: "2026-10-04", added: 0 },
       ]);
+      if (scenario.concurrent) {
+        assert.equal((await journal(ledgerScope(source))).exists, false);
+        await assertFullEquality(resumed.result);
+        continue;
+      }
       for (const candidate of candidates) {
         const writes = blobPutHistory.filter(
           (write) =>

@@ -121,14 +121,12 @@ function createService(init: AdditionsWorkerInit) {
     let slot = snapshot.versions.find(
       (row) => row.expectedVersion === prior.expectedVersion,
     );
-    if (
+    const replaced =
       slot &&
       (slot.dataHash !== prior.dataHash ||
-        slot.metadataHash !== prior.metadataHash)
-    )
-      throw new Error(
-        "Pending checkpoint version has a conflicting registration",
-      );
+        slot.metadataHash !== prior.metadataHash);
+    if (slot && replaced && !["confirmed", "finalized"].includes(slot.status))
+      throw new Error("Pending checkpoint replacement is not settled");
     if (!slot) {
       // The exact encrypted candidate is retried; never bump the version
       // on an ambiguous PUT or registration receipt.
@@ -143,42 +141,70 @@ function createService(init: AdditionsWorkerInit) {
     }
     if (
       !slot ||
-      slot.dataHash !== prior.dataHash ||
-      slot.metadataHash !== prior.metadataHash
+      (!replaced &&
+        (slot.dataHash !== prior.dataHash ||
+          slot.metadataHash !== prior.metadataHash))
     )
       throw new Error("Interrupted checkpoint registration remains ambiguous");
-    const ciphertext = await transport(
-      "download",
-      [`${scope}/${prior.expectedVersion}`],
-      budget,
-    );
-    const plaintext = await decryptBoundedAdditions(
-      ciphertext,
-      hex(deriveScopeKey(init.masterKey, scope)),
-      budget,
-    );
-    budget.charge(plaintext.byteLength * 4);
-    const envelope = DataFileEnvelopeSchema.parse(
-      JSON.parse(new TextDecoder().decode(plaintext)),
-    );
-    const metadataHash = keccak256(
-      stringToHex(
-        JSON.stringify({
-          scope,
-          collectedAt: envelope.collectedAt,
-          sizeBytes: ciphertext.byteLength,
-        }),
-      ),
-    );
-    if (
-      envelope.scope !== scope ||
-      keccak256(plaintext) !== prior.dataHash ||
-      metadataHash !== prior.metadataHash
-    )
-      throw new Error("Interrupted checkpoint commitment mismatch");
+    const proof = replaced ? slot : prior;
+    let data: unknown;
+    // The inventory parser verifies canonical tombstone hashes. A settled
+    // deletion has no ciphertext; its second observation below is the proof.
+    if (!replaced || !slot.isTombstone) {
+      const ciphertext = await transport(
+        "download",
+        [`${scope}/${proof.expectedVersion}`],
+        budget,
+      );
+      const plaintext = await decryptBoundedAdditions(
+        ciphertext,
+        hex(deriveScopeKey(init.masterKey, scope)),
+        budget,
+      );
+      budget.charge(plaintext.byteLength * 4);
+      const envelope = DataFileEnvelopeSchema.parse(
+        JSON.parse(new TextDecoder().decode(plaintext)),
+      );
+      const metadataHash = keccak256(
+        stringToHex(
+          JSON.stringify({
+            scope,
+            collectedAt: envelope.collectedAt,
+            sizeBytes: ciphertext.byteLength,
+          }),
+        ),
+      );
+      if (
+        envelope.scope !== scope ||
+        keccak256(plaintext) !== proof.dataHash ||
+        metadataHash !== proof.metadataHash
+      )
+        throw new Error("Interrupted checkpoint commitment mismatch");
+      data = envelope.data;
+    }
+    if (replaced) {
+      // Other devices do not share our Web Lock. Authenticate their settled
+      // winning bytes and recheck the slot before retiring this local intent.
+      const latest = await inventory.list(scope, {
+        budget,
+        signal: budget.signal,
+      });
+      if (
+        !latest.versions.some(
+          (row) =>
+            row.expectedVersion === proof.expectedVersion &&
+            row.dataHash === proof.dataHash &&
+            row.metadataHash === proof.metadataHash &&
+            ["confirmed", "finalized"].includes(row.status),
+        )
+      )
+        throw new Error(
+          "Pending checkpoint replacement changed during verification",
+        );
+    }
     await transport("clearPending", [scope], budget);
     reconciledScopes.add(scope);
-    return { proof: prior, data: envelope.data };
+    return replaced ? null : { proof: prior, data };
   }
   // Budget objects never cross structured clone; each RPC receives the current
   // remaining allowance and the host's session-wide cancellation signal.
@@ -310,6 +336,9 @@ worker.onmessage = (event) => {
       switch (operation.method) {
         case "summarize":
           result = await service.summarize(...operation.args);
+          break;
+        case "recordUpload":
+          result = await service.recordUpload({ scope: operation.scope });
           break;
       }
       worker.postMessage({ kind: "result", result });

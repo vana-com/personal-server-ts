@@ -115,7 +115,7 @@ export interface DurableAdditionsService {
     now: Date;
   }): Promise<AdditionsSummary>;
   recordUpload(
-    version: VersionToFold,
+    version: VersionToFold | Pick<VersionToFold, "scope">,
     proof?: { envelope: unknown; encryptedSize: number },
   ): Promise<void>;
   deleteScope(scope: string): Promise<void>;
@@ -780,10 +780,11 @@ export function createDurableAdditions(
             BigInt(previous.through) + 1n !== BigInt(head.expectedVersion))
         )
           return;
-        await recover(version.scope, budget, {
-          version,
-          proof,
-        });
+        const uploaded =
+          !budget.limited && "collectedAt" in version && "data" in version
+            ? { version, proof }
+            : undefined;
+        await recover(version.scope, budget, uploaded);
       } catch {
         /* Next reader retries. */
       }
