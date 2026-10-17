@@ -1,6 +1,6 @@
 /** Local-only reproducible producer proof. Run:
  * node --import tsx scripts/verify-additions-gateway.mjs ../data-gateway [--large]
- * Gateway checkout must be exactly #168 228bbf1; npm ci in both repos first.
+ * Gateway checkout must be exactly #168 d8ed3c0; npm ci in both repos first.
  * All SQL/HTTP/blob state is disposable. No chain or production calls occur.
  */
 import assert from "node:assert/strict";
@@ -30,7 +30,7 @@ assert.equal(
     cwd: gatewayRoot,
     encoding: "utf8",
   }).trim(),
-  "228bbf1cd6893a5b34da248832d8861f245d6d3d",
+  "d8ed3c09952a4151ab94df30aa905423eca6a29d",
 );
 const requireGateway = createRequire(join(gatewayRoot, "package.json"));
 const { default: EmbeddedPostgres } = await import(
@@ -327,7 +327,7 @@ try {
   console.log(
     JSON.stringify({
       result: "PASS",
-      gatewayHead: "228bbf1cd6893a5b34da248832d8861f245d6d3d",
+      gatewayHead: "d8ed3c09952a4151ab94df30aa905423eca6a29d",
       versions: count,
       ciphertextBytes: blobBytes,
       inventoryCalls,

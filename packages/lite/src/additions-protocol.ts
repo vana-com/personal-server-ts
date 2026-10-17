@@ -10,10 +10,12 @@ export interface AdditionsWorkerInit {
   byteBudget: number;
   timeBudgetMs: number;
 }
-export type AdditionsOperation = {
-  method: "summarize";
-  args: Parameters<DurableAdditionsService["summarize"]>;
-};
+export type AdditionsOperation =
+  | {
+      method: "summarize";
+      args: Parameters<DurableAdditionsService["summarize"]>;
+    }
+  | { method: "recordUpload"; scope: string };
 export type HostMethod = Exclude<keyof PsLiteAdditionsTransport, "openSession">;
 export type WorkerMessage =
   | { kind: "run"; init: AdditionsWorkerInit; operation: AdditionsOperation }

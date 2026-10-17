@@ -222,10 +222,7 @@ export function createPsLiteAdditionsSession(
       // Upload bodies already belong to sync. Recovery reads bounded committed
       // blobs instead of cloning an arbitrarily large upload into the worker.
       try {
-        await run({
-          method: "summarize",
-          args: [{ timezone: "UTC", days: 7, now: new Date() }],
-        });
+        await run({ method: "recordUpload", scope: version.scope });
       } catch {
         /* The next read retries authoritative recovery. */
       }
