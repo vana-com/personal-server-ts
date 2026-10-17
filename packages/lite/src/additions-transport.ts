@@ -60,6 +60,8 @@ export function createPsLiteAdditionsTransport(options: {
   stateStore: PsLiteStateStore;
   masterKey: Uint8Array;
   ownerSigner: PsLiteBoundedOwnerSigner;
+  /** Authentication origin may differ from a preview Storage endpoint. */
+  storageAudience?: string;
   fetch?: typeof globalThis.fetch;
 }) {
   const candidateStore = options.stateStore.bounded;
@@ -279,7 +281,7 @@ export function createPsLiteAdditionsTransport(options: {
       const url = blobUrl(prepared.scope, prepared.expectedVersion);
       const authorization = await signRequest(
         {
-          aud: storage,
+          aud: options.storageAudience ?? storage,
           method: "PUT",
           uri: new URL(url).pathname,
           body: prepared.encrypted,

@@ -5,6 +5,7 @@ import { ServerSigningUnavailableError } from "../../errors/catalog.js";
 import type { ServerConfig } from "../../schemas/server-config.js";
 import type { ServerAccount } from "../../keys/server-account.js";
 import type { StorageAdapter } from "./interface.js";
+import { createAudienceVanaAdapter } from "./vana-audience.js";
 import { createSdkStorageAdapter } from "./sdk.js";
 
 // Default endpoint baked into the SDK's vana-storage provider; mirrored here
@@ -30,6 +31,8 @@ export function createVanaSyncStorageAdapter(params: {
   serverOwner: `0x${string}`;
   serverAccount: Pick<ServerAccount, "address" | "signMessage">;
   reads?: "signed" | "public";
+  /** Authentication origin, independently of a preview routing endpoint. */
+  audience?: string;
 }): StorageAdapter {
   const endpoint = resolveVanaStorageEndpoint(params.config);
   // The SDK's vana-storage provider lowercases the owner before building the
@@ -53,31 +56,40 @@ export function createVanaSyncStorageAdapter(params: {
     return createPublicReadAdapter({ endpoint, chainId, owner });
   }
 
-  const adapter = createSdkStorageAdapter(
-    createVanaStorageProvider({
-      endpoint: params.config.storage.config.vana?.apiUrl,
-      chainId,
-      ownerAddress: owner,
-      signer: {
-        address: params.serverAccount.address,
-        signMessage: (message: string) =>
-          params.serverAccount.signMessage(message),
-      },
-    }),
-    {
-      // Mirror the provider's keying: PUT/GET target
-      // `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${encodeURIComponent-per-segment(key)}`.
-      // The download worker hands us `{scope}/{version}` and we rebuild the
-      // exact URL the provider's pathFromUrl() validator accepts.
-      urlForKey: (key) => {
-        const subpath = key
-          .split("/")
-          .map((segment) => encodeURIComponent(segment))
-          .join("/");
-        return `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${subpath}`;
-      },
-    },
-  );
+  const adapter =
+    params.audience && params.audience !== endpoint
+      ? createAudienceVanaAdapter({
+          endpoint,
+          audience: params.audience,
+          chainId,
+          owner,
+          signer: params.serverAccount,
+        })
+      : createSdkStorageAdapter(
+          createVanaStorageProvider({
+            endpoint: params.config.storage.config.vana?.apiUrl,
+            chainId,
+            ownerAddress: owner,
+            signer: {
+              address: params.serverAccount.address,
+              signMessage: (message: string) =>
+                params.serverAccount.signMessage(message),
+            },
+          }),
+          {
+            // Mirror the provider's keying: PUT/GET target
+            // `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${encodeURIComponent-per-segment(key)}`.
+            // The download worker hands us `{scope}/{version}` and we rebuild the
+            // exact URL the provider's pathFromUrl() validator accepts.
+            urlForKey: (key) => {
+              const subpath = key
+                .split("/")
+                .map((segment) => encodeURIComponent(segment))
+                .join("/");
+              return `${endpoint}/v1/chains/${chainId}/blobs/${owner}/${subpath}`;
+            },
+          },
+        );
   // Blob GET is public by the existing storage contract. Use the supported
   // canonical URL directly so bounded recovery never enters SDK blob buffering.
   return {

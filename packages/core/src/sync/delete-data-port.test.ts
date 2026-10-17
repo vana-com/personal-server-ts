@@ -42,6 +42,7 @@ function jsonResponse(status: number, body: unknown): Response {
 function makePort(
   feedRecord: DataPointFeedRecord | null,
   fetchImpl: typeof fetch,
+  audience?: string,
 ) {
   const dataPointFeed: DataPointFeedPort = {
     getDataPoint: vi.fn(async () => feedRecord),
@@ -55,6 +56,7 @@ function makePort(
     signer: { signAddData },
     storage: {
       endpoint: STORAGE,
+      audience,
       chainId: CHAIN_ID,
       signMessage: (message) => serverAccount.signMessage({ message }),
     },
@@ -274,50 +276,54 @@ describe("createGatewayDeleteDataPort.tombstone", () => {
 });
 
 describe("createGatewayDeleteDataPort.deleteBlobVersions", () => {
-  it("sends one Web3Signed DELETE per exact version key, never the scope prefix", async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse(200, { deleted: true }));
-    const { port } = makePort(
-      liveRecord(),
-      fetchImpl as unknown as typeof fetch,
-    );
+  it.each([undefined, "https://canonical-storage.test"])(
+    "sends exact-key DELETEs to the endpoint using audience %s",
+    async (audience) => {
+      const fetchImpl = vi.fn(async () => jsonResponse(200, { deleted: true }));
+      const { port } = makePort(
+        liveRecord(),
+        fetchImpl as unknown as typeof fetch,
+        audience,
+      );
 
-    const outcome = await port.deleteBlobVersions("chatgpt.conversations", [
-      "1",
-      "2",
-    ]);
+      const outcome = await port.deleteBlobVersions("chatgpt.conversations", [
+        "1",
+        "2",
+      ]);
 
-    expect(outcome).toEqual({ deleted: ["1", "2"], missing: [], failed: [] });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-    const calls = fetchImpl.mock.calls as unknown as [string, RequestInit][];
-    const prefix = `/v1/chains/${CHAIN_ID}/blobs/${OWNER.toLowerCase()}/chatgpt.conversations`;
-    expect(calls.map(([url]) => url)).toEqual([
-      `${STORAGE}${prefix}/1`,
-      `${STORAGE}${prefix}/2`,
-    ]);
-    for (const [, init] of calls) {
-      expect(init.method).toBe("DELETE");
-      expect(init.body).toBeUndefined();
-    }
+      expect(outcome).toEqual({ deleted: ["1", "2"], missing: [], failed: [] });
+      expect(fetchImpl).toHaveBeenCalledTimes(2);
+      const calls = fetchImpl.mock.calls as unknown as [string, RequestInit][];
+      const prefix = `/v1/chains/${CHAIN_ID}/blobs/${OWNER.toLowerCase()}/chatgpt.conversations`;
+      expect(calls.map(([url]) => url)).toEqual([
+        `${STORAGE}${prefix}/1`,
+        `${STORAGE}${prefix}/2`,
+      ]);
+      for (const [, init] of calls) {
+        expect(init.method).toBe("DELETE");
+        expect(init.body).toBeUndefined();
+      }
 
-    // The header is the SDK's Web3Signed shape, signed by the server
-    // account over (aud = storage origin, method DELETE, uri = the exact
-    // blob path, empty-body hash).
-    const header = (calls[0][1].headers as Record<string, string>)
-      .authorization;
-    expect(header.startsWith("Web3Signed ")).toBe(true);
-    const [payloadB64] = header.slice("Web3Signed ".length).split(".");
-    const payload = JSON.parse(
-      Buffer.from(payloadB64, "base64url").toString("utf8"),
-    );
-    expect(payload).toMatchObject({
-      aud: STORAGE,
-      method: "DELETE",
-      uri: `${prefix}/1`,
-      bodyHash:
-        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-    });
-    expect(payload.exp - payload.iat).toBe(300);
-  });
+      // The header is the SDK's Web3Signed shape, signed by the server
+      // account over (aud = storage origin, method DELETE, uri = the exact
+      // blob path, empty-body hash).
+      const header = (calls[0][1].headers as Record<string, string>)
+        .authorization;
+      expect(header.startsWith("Web3Signed ")).toBe(true);
+      const [payloadB64] = header.slice("Web3Signed ".length).split(".");
+      const payload = JSON.parse(
+        Buffer.from(payloadB64, "base64url").toString("utf8"),
+      );
+      expect(payload).toMatchObject({
+        aud: audience ?? STORAGE,
+        method: "DELETE",
+        uri: `${prefix}/1`,
+        bodyHash:
+          "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      });
+      expect(payload.exp - payload.iat).toBe(300);
+    },
+  );
 
   it("URI-encodes the scope and version segments the way the storage provider does", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse(200, { deleted: true }));

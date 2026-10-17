@@ -28,10 +28,11 @@ import {
   type AdditionsCoverage,
   type AdditionsSummary,
 } from "./summary.js";
-import type {
-  VersionInventory,
-  VersionInventoryClient,
-  InventoryVersion,
+import {
+  fingerprintVersionInventory,
+  type VersionInventory,
+  type VersionInventoryClient,
+  type InventoryVersion,
 } from "./version-inventory.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 
@@ -416,6 +417,7 @@ export function createDurableAdditions(
   ): Promise<{
     ledger: ScopeFirstSeenLedger | null;
     through: string;
+    inventory: string;
     currentTotal: number;
     coverage: AdditionsCoverage;
   }> {
@@ -437,6 +439,7 @@ export function createDurableAdditions(
       const check = await inventory.list(scope, budget.readOptions);
       return {
         ledger: null,
+        inventory: fingerprintVersionInventory(snapshot),
         currentTotal: 0,
         through: head?.expectedVersion ?? "0",
         coverage: !sameInventory(snapshot, check)
@@ -609,6 +612,7 @@ export function createDurableAdditions(
       if (!sameInventory(snapshot, check))
         return {
           ledger: null,
+          inventory: fingerprintVersionInventory(snapshot),
           through: "0",
           currentTotal: 0,
           coverage: "behind",
@@ -638,7 +642,13 @@ export function createDurableAdditions(
         coverage = coverage === "complete" ? "behind" : coverage;
       }
     }
-    return { ledger, through, currentTotal, coverage };
+    return {
+      ledger,
+      through,
+      currentTotal,
+      coverage,
+      inventory: fingerprintVersionInventory(snapshot),
+    };
   }
 
   return {
@@ -655,6 +665,7 @@ export function createDurableAdditions(
         });
       const ledgers: ScopeFirstSeenLedger[] = [];
       const through: Record<string, string> = {};
+      const provenance: Record<string, string> = {};
       let coverage: AdditionsCoverage = "complete";
       let scopes: string[] = [];
       try {
@@ -669,6 +680,7 @@ export function createDurableAdditions(
               latest: { ...result.ledger.latest, total: result.currentTotal },
             });
           through[scope] = result.through;
+          provenance[scope] = result.inventory;
           if (
             result.coverage === "behind" ||
             (result.coverage === "partial" && coverage === "complete")
@@ -691,6 +703,7 @@ export function createDurableAdditions(
         ledgers,
         coverage,
         through,
+        inventory: provenance,
       });
       // Publish one portable UTC summary on reads, never on every source upload.
       if (coverage === "complete" || coverage === "partial") {
@@ -701,6 +714,7 @@ export function createDurableAdditions(
             ledgers,
             coverage,
             through,
+            inventory: provenance,
           });
           const serialized = JSON.stringify(portable);
           if (
