@@ -8,6 +8,7 @@ import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
 import { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
 import { classifyAsTestDebris } from "./test-debris.js";
+import { decodeDeclaredRecords, DeclaredTextError } from "./declared-text.js";
 import type {
   LegacyScopeBinding,
   LegacyScopeLookupResult,
@@ -146,6 +147,12 @@ export function projectPdppRecordsToLegacyPayload(
       return { ok: false, error: { kind: "gap", scope, reason: gap.reason } };
     }
     return { ok: false, error: { kind: "unknown_scope", scope } };
+  }
+  try {
+    records = decodeDeclaredRecords(records, options.streamSchemas);
+  } catch (error) {
+    if (!(error instanceof DeclaredTextError)) throw error;
+    return { ok: false, error: error.projectionError(scope) };
   }
   const result = binding.project(
     options.orderByPrimaryKey

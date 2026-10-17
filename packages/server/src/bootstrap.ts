@@ -938,6 +938,10 @@ export async function createServer(
     legacyScopeView: createLegacyScopeView({
       authority: createLegacyScopeAuthority(db),
       records: pdppRecords?.bindingStore,
+      // Reuse the source-scoped declarations selected by the record server.
+      // Declaration schema identity participates in projection revisions and
+      // takeover cache keys; staging an upgrade takes effect on the next boot.
+      declarations: pdppRecords?.declarations,
       configuredMethods: (sourceId) =>
         pdppRecords?.configuredMethods.get(sourceId) ?? [],
       readLegacyHead: async (head) => {

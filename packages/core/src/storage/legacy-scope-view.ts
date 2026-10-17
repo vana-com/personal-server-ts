@@ -20,6 +20,7 @@ import {
   type CanonicalLegacyReadFailure,
   type CanonicalLegacyReadOk,
   type CanonicalLegacyReadStore,
+  type ReadCanonicalLegacyScopeInput,
   CANONICAL_LEGACY_VIEW_CONTRACT,
 } from "./canonical-legacy-projection.js";
 
@@ -227,6 +228,8 @@ export interface CreateLegacyScopeViewInput {
    * are then refused.
    */
   records?: CanonicalLegacyReadStore;
+  /** Current trusted declarations; pass the same registry used by canonical ingest. */
+  declarations?: ReadCanonicalLegacyScopeInput["declarations"];
   /** Methods this boot configures for a store source id. */
   configuredMethods(sourceId: string): readonly string[];
   /** Read the exact latest indexed legacy file; omitted by in-memory adapters. */
@@ -391,7 +394,7 @@ export function createLegacyScopeView(
         }
         if (
           !verdict.canonicalCursor.startsWith(
-            `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(decision)}:`,
+            `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(decision, input.declarations)}:`,
           )
         ) {
           return { kind: "refused" };
@@ -435,7 +438,7 @@ export function createLegacyScopeView(
           writeClock: authority.writeClock(),
           arrivalRevision: authority.arrivalRevision(),
           receiptCursor:
-            decision.kind === "canonical" ? receiptCursor(decision) : "",
+            decision.kind === "canonical" ? receiptCursor(decision, input.declarations) : "",
         };
       });
       const { decision, legacyHead, hasTakeover, canServeLegacy } = initial;
@@ -487,7 +490,7 @@ export function createLegacyScopeView(
           legacyHead,
           () =>
             sameSelection(decide(scope), decision) &&
-            receiptCursor(decision) === initial.receiptCursor,
+            receiptCursor(decision, input.declarations) === initial.receiptCursor,
           {
             instance: decision.selection.instance,
             generation: decision.generation,
@@ -548,7 +551,7 @@ export function createLegacyScopeView(
           legacyHead,
           () =>
             sameSelection(decide(scope), decision) &&
-            receiptCursor(decision) === initial.receiptCursor,
+            receiptCursor(decision, input.declarations) === initial.receiptCursor,
           {
             instance: decision.selection.instance,
             generation: decision.generation,
@@ -584,6 +587,7 @@ export function createLegacyScopeView(
       }
       const read = await readCanonicalLegacyScope({
         store: decision.records,
+        declarations: input.declarations,
         scope,
         selection: decision.selection,
         profileBy: "method",
@@ -630,7 +634,7 @@ export function createLegacyScopeView(
             legacyHead,
             () =>
               sameSelection(decide(scope), decision) &&
-              receiptCursor(decision) === initial.receiptCursor,
+              receiptCursor(decision, input.declarations) === initial.receiptCursor,
             {
               instance: decision.selection.instance,
               generation: decision.generation,
@@ -733,7 +737,7 @@ export function createLegacyScopeView(
           legacyHead,
           () =>
             sameSelection(decide(scope), decision) &&
-            receiptCursor(decision) === initial.receiptCursor,
+            receiptCursor(decision, input.declarations) === initial.receiptCursor,
           {
             instance: decision.selection.instance,
             generation: decision.generation,
@@ -892,8 +896,9 @@ function isProjectionDataFailure(reason: string): boolean {
 
 function receiptCursor(
   decision: Extract<Decision, { kind: "canonical" }>,
+  declarations?: ReadCanonicalLegacyScopeInput["declarations"],
 ): string {
-  return JSON.stringify(
+  const receipts = (
     decision.records
       .listStreamCompletions(decision.selection.instance)
       .filter((receipt) => decision.streams.includes(receipt.stream))
@@ -905,8 +910,14 @@ function receiptCursor(
         receipt.writeSeq,
         receipt.liveCount,
       ])
-      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
   );
+  // A declaration-only change must invalidate covered-body and verdict caches,
+  // including while an asynchronous blob digest or legacy file read is pending.
+  if (!declarations) return JSON.stringify(receipts);
+  return JSON.stringify({ receipts, schemas: decision.streams.map((stream) => [
+    stream, declarations.forInstance(decision.selection.instance, stream)?.schema ?? null,
+  ]) });
 }
 
 function projectionUnavailableCoverage(
