@@ -227,19 +227,31 @@ export function createPsLiteAdditionsSession(
         /* The next read retries authoritative recovery. */
       }
     },
-    async deleteScope(scope) {
+    async deleteScope(scope, deletion) {
       if (scope.startsWith("vana.system.")) return;
       if (typeof navigator === "undefined" || !navigator.locks)
         throw new Error("Durable additions deletion requires browser locks");
       // Explicit durable deletion belongs to the ordinary sync pipeline and
       // has no bounded-recovery deadline or noncancelable worker RPC.
+      const budget = deletion?.durableOnly
+        ? new AdditionsBudget(
+            options.init.byteBudget,
+            options.init.timeBudgetMs,
+            deletion.signal,
+          )
+        : undefined;
       await navigator.locks.request(
         JSON.stringify([
           "ps-lite.additions.v1",
           options.init.ownerAddress.toLowerCase(),
           options.init.network,
         ]),
+        { mode: "exclusive", signal: budget?.signal },
         async () => {
+          if (budget) {
+            await options.transport.deleteScope(scope, budget);
+            return;
+          }
           for (const target of [
             additionsLedgerScope(scope),
             ADDITIONS_SUMMARY_SCOPE,

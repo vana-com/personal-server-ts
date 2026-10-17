@@ -84,3 +84,11 @@ Observed full-runtime runs: 102 versions passed the paging proof. The large run 
 The coordinator-owned `scripts/verify-additions-browser.mjs` exercises the production session, transport, worker and IndexedDB against isolated Gateway handlers, real PostgreSQL and encrypted loopback blobs with disposable owner signing. Its final output records the tested dependency head, capped invocation progress, restarts, interrupted publication, cancellation and malicious transport cases. This is local fixture evidence; chain settlement remains simulated and production Storage is not exercised.
 
 The enclave entry point now composes a dedicated host additions broker through `additionsInventorySigner` and `additionsWriter`. The sandbox account stays public-only. The host derives its existing registered epoch account and fixes owner, chain, Gateway/storage origins, checkpoint scope, method and registry domain. It rechecks sandbox placement after asynchronous work and requires fresh registered-server inventory evidence before checkpoint writes. No general signing operation or owner key enters the sandbox. The Gateway dependency must include the inventory-only registered-server exception; earlier owner-only inventory builds fail closed. Local native proof uses fake dstack key derivation and loopback services, not hardware attestation or production Storage. A noncancelable external wallet cannot provide bounded Lite signing. Missing capabilities preserve unavailable behavior. Browser/native consumer rendering belongs to the later consumer issues. No production data, publishing, deployment or shared-branch writes are part of this local delivery.
+
+Browser hosts may call `deleteScope(scope, { durableOnly: true, signal })` to
+retry the registered ledger and summary tombstones under the bounded publication
+lock. The deadline cancels the actual inventory, owner signing, HTTP and journal
+operations. Interrupted cleanup is retried from authoritative source tombstones.
+This option clears pending publication journals after registry deletion; it does
+not drain physical ciphertext deletion. The ordinary deletion pipeline retains
+its existing blob deletion batches and retry ownership.

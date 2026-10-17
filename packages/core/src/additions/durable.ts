@@ -119,7 +119,12 @@ export interface DurableAdditionsService {
     version: VersionToFold | Pick<VersionToFold, "scope">,
     proof?: { envelope: unknown; encryptedSize: number },
   ): Promise<void>;
-  deleteScope(scope: string): Promise<void>;
+  /** Browser readers may request only bounded registry tombstones/journal clearing.
+   * Physical blob cleanup remains the ordinary durable deletion pipeline. */
+  deleteScope(
+    scope: string,
+    options?: { durableOnly: true; signal?: AbortSignal },
+  ): Promise<void>;
 }
 
 class InaccessibleLedger extends Error {}

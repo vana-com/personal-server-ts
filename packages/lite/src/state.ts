@@ -26,6 +26,7 @@ export type PsLiteStateKey =
   | "sync-cursor-v1"
   | "pending-blob-deletions-v1"
   | `additions-publication-v1:${string}`
+  | `additions-deletion-v1:${string}`
   | "derivative-questions-v1";
 
 /** Implementations must settle on abort and prevent late mutations. */
