@@ -10,3 +10,4 @@ export * from "./connection-api.js";
 export * from "./session.js";
 export * from "./activity.js";
 export * from "./approval-url.js";
+export * from "./oauth-redirect.js";
