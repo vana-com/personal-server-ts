@@ -492,7 +492,7 @@ export async function createServer(
   };
 
   const additionsInventorySigner =
-    options?.additionsInventorySigner ?? additionsOwnerSigner;
+    options?.additionsInventorySigner ?? additionsOwnerSigner ?? requestSigner;
   let additions: DurableAdditionsService | undefined;
   if (
     additionsInventorySigner &&
