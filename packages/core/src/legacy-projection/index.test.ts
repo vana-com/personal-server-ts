@@ -1841,6 +1841,8 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         payload: {
           username: "example",
           full_name: "",
+          bio: "",
+          external_url: "",
         },
       });
       if (result.ok) validateAgainst(instagramProfileSchema, result.payload);
@@ -1872,7 +1874,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     });
   });
 
-  it("omits nullable optional profile fields and keeps provided values schema-valid", () => {
+  it("defaults legacy profile text and omits other nullable optional fields", () => {
     const result = projectPdppRecordsToLegacyPayload(
       "instagram.profile",
       [
@@ -1901,6 +1903,8 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       payload: {
         username: "example",
         full_name: "Example User",
+        bio: "",
+        external_url: "",
         profile_pic_url: "https://example.test/profile.jpg",
         following_count: 12,
         is_verified: true,
@@ -2104,7 +2108,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       ["empty", instagramProfileEmpty],
       ["large", instagramProfileLarge],
     ] as const) {
-      it(`does NOT reproduce the real "${label}" legacy fixture byte-for-byte — is_private/is_business/profile_pic_url/external_url are not provided by this PDPP row (B1, B2: documented gap, not silently passed)`, () => {
+      it(`does NOT reproduce the real "${label}" legacy fixture byte-for-byte — is_private/is_business/profile_pic_url are not provided by this PDPP row (B1, B2: documented gap, not silently passed)`, () => {
         const pdppRecords: PdppRecord[] = [
           {
             stream: "profile",
@@ -2143,11 +2147,12 @@ describe("projectPdppRecordsToLegacyPayload", () => {
                 "media_count",
                 "is_business",
                 "profile_pic_url",
-                "external_url",
               ].filter((k) => oldKeys.has(k)),
             ),
           );
-          const sharedKeys = [...oldKeys].filter((k) => newKeys.has(k));
+          // The omitted canonical external_url gets the legacy empty sentinel.
+          expect(result.payload.external_url).toBe("");
+          const sharedKeys = [...oldKeys].filter((k) => newKeys.has(k) && k !== "external_url");
           for (const key of sharedKeys) {
             expect(
               (result.payload as Record<string, unknown>)[key],
