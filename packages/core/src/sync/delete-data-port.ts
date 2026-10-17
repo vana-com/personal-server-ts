@@ -26,6 +26,8 @@ export interface GatewayDeleteDataPortOptions {
   storage: {
     /** vana-storage base URL, e.g. https://storage.vana.org */
     endpoint: string;
+    /** Authentication origin may differ from the routing endpoint. */
+    audience?: string;
     /** Protocol chain id; blob paths are chain-scoped. */
     chainId: number;
     /**
@@ -217,7 +219,7 @@ export function createGatewayDeleteDataPort(
           const authorization = await buildWeb3SignedHeader({
             signMessage: (message: string) =>
               options.storage.signMessage(message),
-            aud: storageBase,
+            aud: options.storage.audience ?? storageBase,
             method: "DELETE",
             uri: path,
           });

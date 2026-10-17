@@ -4,6 +4,7 @@ import {
   getAddress,
   keccak256,
   stringToBytes,
+  stringToHex,
 } from "viem";
 import { z } from "zod";
 import type { RequestSigner } from "../signing/request-signer.js";
@@ -80,6 +81,37 @@ export interface InventoryReadOptions {
   signal?: AbortSignal;
   maxPages?: number;
   budget?: ByteBudget;
+}
+
+/** Compact provenance for the authoritative history at a head. Failed slots
+ * above a rolled-back head are not source data; confirmation→finality does not
+ * change counts. Earlier same-version replacements do change this digest. */
+export function fingerprintVersionInventory(
+  snapshot: VersionInventory,
+): `0x${string}` {
+  const normalize = (row: InventoryHead | InventoryVersion) => ({
+    expectedVersion: row.expectedVersion,
+    dataHash: row.dataHash,
+    metadataHash: row.metadataHash,
+    status: ["confirmed", "finalized"].includes(row.status)
+      ? "settled"
+      : row.status,
+  });
+  const head = snapshot.head;
+  return keccak256(
+    stringToHex(
+      JSON.stringify({
+        head: head ? { ...normalize(head), deletedAt: head.deletedAt } : null,
+        versions: snapshot.versions
+          .filter(
+            (row) =>
+              head &&
+              BigInt(row.expectedVersion) <= BigInt(head.expectedVersion),
+          )
+          .map((row) => ({ ...normalize(row), isTombstone: row.isTombstone })),
+      }),
+    ),
+  );
 }
 
 /** Inventory reads accept the owner or a currently registered same-owner server. */

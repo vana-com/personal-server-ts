@@ -19,7 +19,7 @@ const prepared = {
   metadataHash: `0x${"cd".repeat(32)}` as `0x${string}`,
   encrypted: new Uint8Array([34, 67, 89]),
 };
-function setup(fetcher: typeof fetch) {
+function setup(fetcher: typeof fetch, storageAudience?: string) {
   vi.stubGlobal("indexedDB", new IDBFactory());
   const stateStore = createIndexedDbPsLiteStateStore({
     dbName: crypto.randomUUID(),
@@ -38,6 +38,7 @@ function setup(fetcher: typeof fetch) {
     masterKey: new Uint8Array(32).fill(4),
     stateStore,
     ownerSigner,
+    storageAudience,
     fetch: fetcher,
   });
   return { transport, stateStore, config, ownerSigner };
@@ -104,6 +105,22 @@ describe("bounded owner checkpoint transport", () => {
     expect(
       await restarted.readPending(prepared.scope, new AdditionsBudget(100_000)),
     ).toBeNull();
+  });
+
+  it("routes preview checkpoint bytes to the endpoint while signing the configured audience", async () => {
+    const requests: { url: string; init: RequestInit }[] = [];
+    const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+      requests.push({ url: String(input), init: init ?? {} });
+      return new Response("{}");
+    });
+    const { transport } = setup(fetcher, "https://storage.vana.org");
+    await transport.publish(prepared, new AdditionsBudget(100_000));
+    expect(new URL(requests[0].url).origin).toBe("https://storage.example");
+    expect(
+      parseWeb3SignedHeader(
+        new Headers(requests[0].init.headers).get("authorization") ?? "",
+      ).payload.aud,
+    ).toBe("https://storage.vana.org");
   });
 
   it("migrates an authenticated legacy numeric journal without changing its candidate", async () => {
