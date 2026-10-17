@@ -27,11 +27,13 @@ export interface PsLiteBoundedOwnerSigner {
 }
 
 const hash = z.string().regex(/^0x[0-9a-fA-F]{64}$/);
-const publicationSchema = z.object({
+const publicationHeaderSchema = z.object({
   scope: z.string().min(1).max(256),
   expectedVersion: z.string().regex(/^[1-9][0-9]*$/),
   dataHash: hash,
   metadataHash: hash,
+});
+const publicationSchema = publicationHeaderSchema.extend({
   encrypted: z.array(z.number().int().min(0).max(255)),
 });
 export interface PsLitePreparedPublication {
@@ -41,9 +43,15 @@ export interface PsLitePreparedPublication {
   metadataHash: `0x${string}`;
   encrypted: Uint8Array;
 }
-const sealedSchema = z.object({
+const legacySealedSchema = z.object({
   iv: z.array(z.number().int().min(0).max(255)).length(12),
   ciphertext: z.array(z.number().int().min(0).max(255)),
+});
+
+const binarySealedSchema = z.object({
+  version: z.literal(2),
+  iv: z.instanceof(Uint8Array).refine((bytes) => bytes.byteLength === 12),
+  ciphertext: z.instanceof(Uint8Array),
 });
 
 export function createPsLiteAdditionsTransport(options: {
@@ -119,75 +127,34 @@ export function createPsLiteAdditionsTransport(options: {
     return result;
   }
 
-  async function readPending(
-    scope: string,
-    budget: ByteBudget,
-  ): Promise<PsLitePreparedPublication | null> {
-    budget.charge();
-    const value: unknown = await stateStore.get(
-      journalKey(scope),
-      budget.signal,
-    );
-    budget.charge();
-    if (value === null) return null;
-    const entry = sealedSchema.parse(value);
-    budget.charge(entry.ciphertext.length * 16);
-    const plaintext = await crypto.subtle.decrypt(
-      {
-        name: "AES-GCM",
-        iv: Uint8Array.from(entry.iv),
-        additionalData: new TextEncoder().encode(binding(scope)),
-      },
-      await key,
-      Uint8Array.from(entry.ciphertext),
-    );
-    budget.charge(plaintext.byteLength * 8);
-    const parsed = publicationSchema.parse(
-      JSON.parse(new TextDecoder().decode(plaintext)),
-    );
-    if (parsed.scope !== scope)
-      throw new Error("Checkpoint journal scope mismatch");
-    return {
-      ...parsed,
-      dataHash: hash.parse(parsed.dataHash) as `0x${string}`,
-      metadataHash: hash.parse(parsed.metadataHash) as `0x${string}`,
-      encrypted: Uint8Array.from(parsed.encrypted),
-    };
-  }
-
-  async function clearPending(scope: string, budget: ByteBudget) {
-    budget.charge();
-    await stateStore.delete(journalKey(scope), budget.signal);
-    budget.charge();
-  }
-
-  async function publish(
-    prepared: PsLitePreparedPublication,
-    budget: ByteBudget,
-  ) {
-    budget.charge(prepared.encrypted.byteLength * 32);
-    const pending = await readPending(prepared.scope, budget);
-    if (
-      pending &&
-      (pending.expectedVersion !== prepared.expectedVersion ||
-        pending.dataHash !== prepared.dataHash ||
-        pending.metadataHash !== prepared.metadataHash ||
-        pending.encrypted.length !== prepared.encrypted.length ||
-        pending.encrypted.some(
-          (byte, index) => byte !== prepared.encrypted[index],
-        ))
-    ) {
-      throw new Error(
-        "Interrupted checkpoint must be reconciled before replacement",
-      );
+  // Each session belongs to one Web Lock and one worker lifetime. Cache only
+  // authenticated fingerprints, since returning candidate buffers transfers ownership.
+  function openSession() {
+    const fingerprints = new Map<string, string | null>();
+    function fingerprint(prepared: PsLitePreparedPublication) {
+      return JSON.stringify([
+        prepared.scope,
+        prepared.expectedVersion,
+        prepared.dataHash,
+        prepared.metadataHash,
+        keccak256(prepared.encrypted),
+      ]);
     }
-    if (!pending) {
-      const plaintext = new TextEncoder().encode(
-        JSON.stringify({
-          ...prepared,
-          encrypted: Array.from(prepared.encrypted),
-        }),
+    async function persistPending(
+      prepared: PsLitePreparedPublication,
+      budget: ByteBudget,
+    ) {
+      const { encrypted, ...metadata } = prepared;
+      const header = new TextEncoder().encode(JSON.stringify(metadata));
+      if (header.byteLength > 4096)
+        throw new Error("Checkpoint journal header too large");
+      budget.charge((header.byteLength + 20) * 8);
+      const plaintext = new Uint8Array(
+        4 + header.byteLength + encrypted.byteLength,
       );
+      new DataView(plaintext.buffer).setUint32(0, header.byteLength);
+      plaintext.set(header, 4);
+      plaintext.set(encrypted, 4 + header.byteLength);
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const ciphertext = await crypto.subtle.encrypt(
         {
@@ -201,74 +168,185 @@ export function createPsLiteAdditionsTransport(options: {
       budget.charge();
       await stateStore.set(
         journalKey(prepared.scope),
-        {
-          iv: Array.from(iv),
-          ciphertext: Array.from(new Uint8Array(ciphertext)),
-        },
+        { version: 2, iv, ciphertext: new Uint8Array(ciphertext) },
         budget.signal,
       );
       budget.charge();
     }
-    const url = blobUrl(prepared.scope, prepared.expectedVersion);
-    const authorization = await signRequest(
-      {
-        aud: storage,
-        method: "PUT",
-        uri: new URL(url).pathname,
-        body: prepared.encrypted,
-      },
-      budget.signal,
-    );
-    const uploaded = await fetchBounded(
-      {
-        url,
-        method: "PUT",
-        headers: [
-          ["authorization", authorization],
-          ["content-type", "application/octet-stream"],
-        ],
-        body: prepared.encrypted,
-      },
-      budget,
-    );
-    if (uploaded.status < 200 || uploaded.status >= 300)
-      throw new Error(`Checkpoint upload failed (${uploaded.status})`);
-    budget.charge();
-    const signature = await options.ownerSigner.signAddDataBounded(
-      {
-        ownerAddress: getAddress(owner),
-        scope: prepared.scope,
-        dataHash: prepared.dataHash,
-        metadataHash: prepared.metadataHash,
-        expectedVersion: BigInt(prepared.expectedVersion),
-      },
-      budget.signal,
-    );
-    budget.charge();
-    const body = new TextEncoder().encode(
-      JSON.stringify({
-        ownerAddress: owner,
-        scope: prepared.scope,
-        dataHash: prepared.dataHash,
-        metadataHash: prepared.metadataHash,
-        expectedVersion: prepared.expectedVersion,
-      }),
-    );
-    const registered = await fetchBounded(
-      {
-        url: `${gateway}/v1/data`,
-        method: "POST",
-        headers: [
-          ["Content-Type", "application/json"],
-          ["Authorization", `Web3Signed ${signature}`],
-        ],
-        body,
-      },
-      budget,
-    );
-    if (registered.status < 200 || registered.status >= 300)
-      throw new Error(`Checkpoint registration failed (${registered.status})`);
-    // Keep the journal until the worker verifies inventory AND decrypted blob commitments.
+    async function readPending(
+      scope: string,
+      budget: ByteBudget,
+    ): Promise<PsLitePreparedPublication | null> {
+      budget.charge();
+      const value: unknown = await stateStore.get(
+        journalKey(scope),
+        budget.signal,
+      );
+      budget.charge();
+      if (value === null) {
+        fingerprints.set(scope, null);
+        return null;
+      }
+      // Bound clone/validation work before a schema can materialize legacy arrays.
+      // Inspect only the container and length here; array validation happens after admission.
+      if (!value || typeof value !== "object" || !("ciphertext" in value))
+        throw new Error("Invalid checkpoint journal");
+      const bytes = value.ciphertext;
+      if (!(bytes instanceof Uint8Array) && !Array.isArray(bytes))
+        throw new Error("Invalid checkpoint journal ciphertext");
+      budget.charge(bytes.length * 16);
+      const binary = binarySealedSchema.safeParse(value);
+      const entry = binary.success
+        ? binary.data
+        : legacySealedSchema.parse(value);
+      const plaintext = await crypto.subtle.decrypt(
+        {
+          name: "AES-GCM",
+          iv: Uint8Array.from(entry.iv),
+          additionalData: new TextEncoder().encode(binding(scope)),
+        },
+        await key,
+        Uint8Array.from(entry.ciphertext),
+      );
+      budget.charge(plaintext.byteLength * 8);
+      let prepared: PsLitePreparedPublication;
+      if (binary.success) {
+        if (plaintext.byteLength < 4)
+          throw new Error("Invalid checkpoint journal header");
+        const headerLength = new DataView(plaintext).getUint32(0);
+        if (headerLength > 4096 || headerLength > plaintext.byteLength - 4)
+          throw new Error("Invalid checkpoint journal header length");
+        const header = publicationHeaderSchema.parse(
+          JSON.parse(
+            new TextDecoder().decode(
+              new Uint8Array(plaintext, 4, headerLength),
+            ),
+          ),
+        );
+        prepared = {
+          ...header,
+          dataHash: hash.parse(header.dataHash) as `0x${string}`,
+          metadataHash: hash.parse(header.metadataHash) as `0x${string}`,
+          encrypted: new Uint8Array(plaintext, 4 + headerLength),
+        };
+      } else {
+        const parsed = publicationSchema.parse(
+          JSON.parse(new TextDecoder().decode(plaintext)),
+        );
+        prepared = {
+          ...parsed,
+          dataHash: hash.parse(parsed.dataHash) as `0x${string}`,
+          metadataHash: hash.parse(parsed.metadataHash) as `0x${string}`,
+          encrypted: Uint8Array.from(parsed.encrypted),
+        };
+      }
+      if (prepared.scope !== scope)
+        throw new Error("Checkpoint journal scope mismatch");
+      if (!binary.success) {
+        // An old admitted intent may need a separate capped migration pass.
+        // Commit the compact representation before attempting network retries.
+        budget.charge(prepared.encrypted.byteLength * 8 + 32 * 1024);
+        await persistPending(prepared, budget);
+      }
+      fingerprints.set(scope, fingerprint(prepared));
+      return prepared;
+    }
+
+    async function clearPending(scope: string, budget: ByteBudget) {
+      budget.charge();
+      await stateStore.delete(journalKey(scope), budget.signal);
+      fingerprints.set(scope, null);
+      budget.charge();
+    }
+
+    async function publish(
+      prepared: PsLitePreparedPublication,
+      budget: ByteBudget,
+    ) {
+      budget.charge(prepared.encrypted.byteLength * 32);
+      if (!fingerprints.has(prepared.scope))
+        await readPending(prepared.scope, budget);
+      const pending = fingerprints.get(prepared.scope);
+      const candidate = fingerprint(prepared);
+      if (pending && pending !== candidate)
+        throw new Error(
+          "Interrupted checkpoint must be reconciled before replacement",
+        );
+      if (!pending) {
+        await persistPending(prepared, budget);
+        fingerprints.set(prepared.scope, candidate);
+      }
+      const url = blobUrl(prepared.scope, prepared.expectedVersion);
+      const authorization = await signRequest(
+        {
+          aud: storage,
+          method: "PUT",
+          uri: new URL(url).pathname,
+          body: prepared.encrypted,
+        },
+        budget.signal,
+      );
+      const uploaded = await fetchBounded(
+        {
+          url,
+          method: "PUT",
+          headers: [
+            ["authorization", authorization],
+            ["content-type", "application/octet-stream"],
+          ],
+          body: prepared.encrypted,
+        },
+        budget,
+      );
+      if (uploaded.status < 200 || uploaded.status >= 300)
+        throw new Error(`Checkpoint upload failed (${uploaded.status})`);
+      budget.charge();
+      const signature = await options.ownerSigner.signAddDataBounded(
+        {
+          ownerAddress: getAddress(owner),
+          scope: prepared.scope,
+          dataHash: prepared.dataHash,
+          metadataHash: prepared.metadataHash,
+          expectedVersion: BigInt(prepared.expectedVersion),
+        },
+        budget.signal,
+      );
+      budget.charge();
+      const body = new TextEncoder().encode(
+        JSON.stringify({
+          ownerAddress: owner,
+          scope: prepared.scope,
+          dataHash: prepared.dataHash,
+          metadataHash: prepared.metadataHash,
+          expectedVersion: prepared.expectedVersion,
+        }),
+      );
+      const registered = await fetchBounded(
+        {
+          url: `${gateway}/v1/data`,
+          method: "POST",
+          headers: [
+            ["Content-Type", "application/json"],
+            ["Authorization", `Web3Signed ${signature}`],
+          ],
+          body,
+        },
+        budget,
+      );
+      if (registered.status < 200 || registered.status >= 300)
+        throw new Error(
+          `Checkpoint registration failed (${registered.status})`,
+        );
+      // Keep the journal until the worker verifies inventory AND decrypted blob commitments.
+    }
+    return {
+      fetch: fetchBounded,
+      signRequest,
+      publish,
+      readPending,
+      clearPending,
+      download,
+    };
   }
   async function download(key: string, budget: ByteBudget) {
     const slash = key.lastIndexOf("/");
@@ -284,14 +362,7 @@ export function createPsLiteAdditionsTransport(options: {
       throw new Error(`Checkpoint download failed (${response.status})`);
     return response.body;
   }
-  return {
-    fetch: fetchBounded,
-    signRequest,
-    publish,
-    readPending,
-    clearPending,
-    download,
-  };
+  return { ...openSession(), openSession };
 }
 
 export type PsLiteAdditionsTransport = ReturnType<

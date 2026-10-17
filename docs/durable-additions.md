@@ -48,6 +48,10 @@ Before another source unit starts, recovery reserves 128 KiB plus 128 times the 
 
 The host uses canonical abortable Storage PUT and Gateway AddData POST with existing owner signatures, redirect rejection and bounded response parsing. It seals each candidate version, both hashes and encrypted bytes in Lite persistence before signing or PUT. AES-GCM associated data binds owner, chain/Gateway origin and exact system scope. On restart, the worker reconciles real inventory/blob commitments before retrying the same candidate version. An ambiguous receipt never blindly increments the version. The prior checkpoint stays readable until the candidate verifies. Confirmed journal intents clear after verification; durable deletion also clears its scope's intent. Journal operations require `stateStore.bounded`; the default IndexedDB implementation aborts transactions on cancellation, resolves writes only on commit, fails blocked upgrades and aborts/closes late open results. An injected store without that cancellation contract disables bounded recovery.
 
+The version-2 local publication journal stores AES-GCM ciphertext and IV as binary IndexedDB values. Its authenticated plaintext is a four-byte header length, at most 4 KiB of JSON metadata, and the original encrypted checkpoint bytes. This avoids expanding each random byte into a JSON number. Header lengths are checked before decoding. Legacy numeric journals authenticate and atomically migrate to binary before retrying, preserving the exact candidate. Migration can occupy one capped invocation; the committed intent remains available to the next one.
+
+Each locked worker session creates a fresh host transport context. After reading a journal, that context keeps only its authenticated metadata/ciphertext fingerprint. Publication compares against that fingerprint instead of reading and decrypting the same journal again. Fingerprints cannot survive the lock or worker lifetime; transferred buffers are never cached. Network registration and downloaded plaintext commitments still require independent verification. Binary journal reading reserves 24 times its payload size, publication reserves another 32 times checkpoint ciphertext plus header work, and subsequent network/decrypt/parse steps charge the same budget. These conservative charges fit the existing 128-times checkpoint admission reserve for the tested near-limit candidates; neither the aggregate 8 MiB limit nor its deadline changes. Arbitrarily slow network or an inventory that itself exceeds the cap can still return behind.
+
 ## Reproducible evidence
 
 With dependencies installed in both isolated checkouts:
@@ -57,6 +61,7 @@ npm test -- packages/core/src/additions packages/core/src/storage/adapters/vana-
 node --import tsx scripts/verify-additions-gateway.mjs ../data-gateway
 node --import tsx scripts/verify-additions-gateway.mjs ../data-gateway --large
 node --import tsx scripts/verify-additions-browser.mjs ../data-gateway
+node --import tsx scripts/verify-additions-browser.mjs ../data-gateway --journal-regression
 npm run validate
 npm run build
 ```

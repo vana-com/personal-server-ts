@@ -1,8 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { IDBFactory } from "fake-indexeddb";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { AdditionsBudget } from "@opendatalabs/personal-server-ts-core/additions";
-import { parseWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
-import { createMemoryPsLiteStateStore } from "./test-support/memory.js";
+import {
+  deriveScopeKey,
+  parseWeb3SignedHeader,
+} from "@opendatalabs/vana-sdk/browser";
+import { keccak256, stringToHex } from "viem";
+import { createIndexedDbPsLiteStateStore } from "./state.js";
+afterEach(() => vi.unstubAllGlobals());
 import { createPsLiteAdditionsTransport } from "./additions-transport.js";
 
 const ownerAddress = "0x1111111111111111111111111111111111111111";
@@ -14,21 +20,10 @@ const prepared = {
   encrypted: new Uint8Array([34, 67, 89]),
 };
 function setup(fetcher: typeof fetch) {
-  const stateStore = createMemoryPsLiteStateStore();
-  stateStore.bounded = {
-    async get(key, signal) {
-      signal?.throwIfAborted();
-      return stateStore.get(key);
-    },
-    async set(key, value, signal) {
-      signal?.throwIfAborted();
-      await stateStore.set(key, value);
-    },
-    async delete(key, signal) {
-      signal?.throwIfAborted();
-      await stateStore.delete(key);
-    },
-  };
+  vi.stubGlobal("indexedDB", new IDBFactory());
+  const stateStore = createIndexedDbPsLiteStateStore({
+    dbName: crypto.randomUUID(),
+  });
   const config = ServerConfigSchema.parse({
     gateway: { url: "https://gateway.example" },
     storage: { config: { vana: { apiUrl: "https://storage.example" } } },
@@ -109,6 +104,83 @@ describe("bounded owner checkpoint transport", () => {
     expect(
       await restarted.readPending(prepared.scope, new AdditionsBudget(100_000)),
     ).toBeNull();
+  });
+
+  it("migrates an authenticated legacy numeric journal without changing its candidate", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response("{}"));
+    const { transport, stateStore, config } = setup(fetcher);
+    const candidate = {
+      ...prepared,
+      encrypted: crypto.getRandomValues(new Uint8Array(60_000)),
+    };
+    const network = `vana:${config.gateway.chainId}:${new URL(config.gateway.url).origin}`;
+    const binding = JSON.stringify([ownerAddress, network, prepared.scope]);
+    const journalKey =
+      `additions-publication-v1:${keccak256(stringToHex(binding))}` as const;
+    const key = await crypto.subtle.importKey(
+      "raw",
+      Uint8Array.from(
+        deriveScopeKey(
+          new Uint8Array(32).fill(4),
+          "ps-lite.additions-journal.v1",
+        ),
+      ),
+      "AES-GCM",
+      false,
+      ["encrypt"],
+    );
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv,
+        additionalData: new TextEncoder().encode(binding),
+      },
+      key,
+      new TextEncoder().encode(
+        JSON.stringify({
+          ...candidate,
+          encrypted: Array.from(candidate.encrypted),
+        }),
+      ),
+    );
+    await stateStore.set(journalKey, {
+      iv: Array.from(iv),
+      ciphertext: Array.from(new Uint8Array(ciphertext)),
+    });
+    const migrationBudget = new AdditionsBudget(8 * 1024 * 1024);
+    expect(
+      await transport
+        .openSession()
+        .readPending(prepared.scope, migrationBudget),
+    ).toEqual(candidate);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(await stateStore.get(journalKey)).toMatchObject({ version: 2 });
+    const restarted = transport.openSession();
+    const retryBudget = new AdditionsBudget(8 * 1024 * 1024);
+    expect(await restarted.readPending(prepared.scope, retryBudget)).toEqual(
+      candidate,
+    );
+    await restarted.publish(candidate, retryBudget);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    // Neither a success receipt nor a retry alone retires the verified intent.
+    expect(await stateStore.get(journalKey)).not.toBeNull();
+    const otherBinding = JSON.stringify([
+      ownerAddress,
+      network,
+      prepared.scope + ".other",
+    ]);
+    const otherKey =
+      `additions-publication-v1:${keccak256(stringToHex(otherBinding))}` as const;
+    await stateStore.set(otherKey, await stateStore.get(journalKey));
+    await expect(
+      transport
+        .openSession()
+        .readPending(
+          prepared.scope + ".other",
+          new AdditionsBudget(8 * 1024 * 1024),
+        ),
+    ).rejects.toThrow();
   });
 
   it("passes cancellation to the actual signing operation before any network write", async () => {

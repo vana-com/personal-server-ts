@@ -64,7 +64,7 @@ function hex(bytes: Uint8Array) {
 function createService(init: AdditionsWorkerInit) {
   // Responses are trusted messages from our own host module; all network JSON is
   // still decoded and schema-validated by the inventory client in this worker.
-  const transport = async <K extends keyof PsLiteAdditionsTransport>(
+  const transport = async <K extends HostMethod>(
     method: K,
     args: unknown[],
     budget?: ByteBudget,

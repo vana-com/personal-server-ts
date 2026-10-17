@@ -1,6 +1,6 @@
 /** Local-only reproducible producer proof. Run:
  * node --import tsx scripts/verify-additions-browser.mjs ../data-gateway
- * Gateway checkout must be exactly #168 228bbf1; npm ci in both repos first.
+ * Gateway checkout must be exactly accepted local d8ed3c0; npm ci in both repos first.
  * All SQL/HTTP/blob state is disposable. No chain or production calls occur.
  */
 import assert from "node:assert/strict";
@@ -36,7 +36,7 @@ assert.equal(
     cwd: gatewayRoot,
     encoding: "utf8",
   }).trim(),
-  "228bbf1cd6893a5b34da248832d8861f245d6d3d",
+  "d8ed3c09952a4151ab94df30aa905423eca6a29d",
 );
 const requireGateway = createRequire(join(gatewayRoot, "package.json"));
 const { default: EmbeddedPostgres } = await import(
@@ -44,8 +44,11 @@ const { default: EmbeddedPostgres } = await import(
 );
 const root = await mkdtemp(join(tmpdir(), "ps-gateway-additions-"));
 const count = 40;
+const journalRegression = process.argv.includes("--journal-regression");
+const blobPutHistory = [];
 let browserSession = `vana12-proof-${process.pid}`;
 let browserRestarts = 0;
+let profileName = "browser-profile";
 let fullRuntimeEquality = false;
 let browserBundle, workerBundle;
 const lastRegistered = new Map();
@@ -134,6 +137,17 @@ const server = createServer(async (request, response) => {
         );
         await writeFile(blobPath(key), bytes);
         blobPuts++;
+        blobPutHistory.push({
+          scope,
+          version,
+          hash: keccak256(bytes),
+          bytes: bytes.length,
+        });
+        if (fault === "put-503") {
+          response.statusCode = 503;
+          response.end("{}");
+          return;
+        }
         if (fault === "put") {
           response.destroy();
           return;
@@ -317,7 +331,7 @@ const command = (args) =>
         "--session",
         browserSession,
         "--profile",
-        join(root, "browser-profile"),
+        join(root, profileName),
         ...args,
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
@@ -411,7 +425,7 @@ try {
       .onConflictDoUpdate({ target: schema.dataPoints.id, set: head });
     return { success: true };
   };
-  for (let version = 1; version <= count; version++) {
+  for (let version = 1; version <= (journalRegression ? 0 : count); version++) {
     const collectedAt = new Date(
       Date.UTC(2026, 9, 1, 12, 0, version),
     ).toISOString();
@@ -445,6 +459,7 @@ try {
   }
   const entry = `
 import { privateKeyToAccount } from 'viem/accounts';
+import { keccak256, stringToHex } from 'viem';
 import { createServerSigner } from './packages/core/src/signing/signer.ts';
 import { ServerConfigSchema } from './packages/core/src/schemas/server-config.ts';
 import { createIndexedDbPsLiteStateStore } from './packages/lite/src/state.ts';
@@ -471,6 +486,7 @@ window.proof=async function(signFailure=false){
  return {hostBytesCharged,errors,result,elapsedMs:performance.now()-start,active,started,terminated};
 };
 window.uploadNoClone=async()=>{let touched=0;await session.recordUpload({scope:'test.conversations',collectedAt:'2026-10-01T00:00:00Z',get data(){touched++;throw Error('unbounded data cloned')}},{get envelope(){touched++;throw Error('unbounded proof cloned')},encryptedSize:1024*1024*1024});return {touched,active}};
+window.journal=async scope=>{const binding=JSON.stringify([account.address.toLowerCase(),'vana:14800:'+origin,scope]);const value=await stateStore.get('additions-publication-v1:'+keccak256(stringToHex(binding)));return value ? {exists:true,version:value.version??1,bytes:value.ciphertext.length} : {exists:false}};
 window.ready=true;
 `;
   workerBundle = (
@@ -499,372 +515,633 @@ window.ready=true;
   ).outputFiles[0].text;
   await command(["open", origin]);
   await command(["wait", "--fn", "window.ready === true"]);
-  const attempts = [];
-  for (let i = 0; i < 8; i++) {
-    const priorBytes = servedBlobBytes;
-    const output = await command([
-      "eval",
-      "--json",
-      "(async () => await window.proof())()",
-    ]);
-
-    const parsed = JSON.parse(output);
-    const value = parsed.data?.result ?? parsed.result ?? parsed;
-    const outcome = typeof value === "string" ? JSON.parse(value) : value;
-    assert.ok(
-      outcome.elapsedMs < 10250,
-      "worker session exceeded ten-second bound",
-    );
-    assert.ok(
-      outcome.hostBytesCharged <= 8 * 1024 * 1024,
-      "host work exceeded aggregate byte bound",
-    );
-    attempts.push(outcome);
-    console.log(
-      JSON.stringify({
-        invocation: i + 1,
-        ciphertextReadBytes: servedBlobBytes - priorBytes,
-        ...outcome,
-        result: {
-          coverage: outcome.result?.coverage,
-          total: outcome.result?.total,
-          through: outcome.result?.through,
+  async function assertFullEquality(expected) {
+    const inventory = createVersionInventoryClient({
+      gatewayUrl: origin,
+      ownerAddress: account.address,
+      ownerSigner: {
+        signRequest: (params) =>
+          buildWeb3SignedHeader({
+            ...params,
+            signMessage: (message) => account.signMessage({ message }),
+          }),
+      },
+    });
+    const full = createDurableAdditions({
+      ownerAddress: account.address,
+      network: `vana:14800:${origin}`,
+      masterKey,
+      inventory,
+      storageAdapter: storage,
+      signer: createServerSigner(
+        {
+          address: account.address,
+          publicKey: account.publicKey,
+          signTypedData: (params) => account.signTypedData(params),
+          signMessage: (message) => account.signMessage({ message }),
         },
-      }),
-    );
-    assert.equal(outcome.active, 0);
-    if (outcome.result?.coverage === "complete") break;
+        {
+          chainId: 14800,
+          contracts: { dataRegistry: process.env.DATA_REGISTRY_CONTRACT },
+        },
+      ),
+      gateway: {
+        async registerDataPoint(params) {
+          const { signature, ...body } = params;
+          const response = await fetch(`${origin}/v1/data`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Web3Signed ${signature}`,
+            },
+            body: JSON.stringify(body),
+          });
+          assert.ok(response.ok);
+          return response.json();
+        },
+      },
+    });
+    const actual = await full.summarize({
+      timezone: "Asia/Kathmandu",
+      days: 7,
+      now: new Date("2026-10-04T00:00:00Z"),
+    });
+    assert.equal(actual.coverage, "complete");
+    assert.equal(actual.total, expected.total);
+    assert.deepEqual(actual.days, expected.days);
+    assert.deepEqual(actual.through, expected.through);
+    fullRuntimeEquality = true;
   }
-  const last = attempts.at(-1);
-  assert.equal(last.result.coverage, "complete");
-  assert.equal(last.result.total, 2);
-  await command(["close"]);
-  browserSession = `vana12-proof-${process.pid}-${++browserRestarts}`;
-  await command(["open", origin]);
-  await command(["wait", "--fn", "window.ready === true"]);
-  const restarted = await command([
-    "eval",
-    "--json",
-    "(async () => await window.proof())()",
-  ]);
-  const initialReload = JSON.parse(restarted).data.result;
-  assert.equal(initialReload.result.coverage, "complete");
-  assert.equal(initialReload.result.total, 2);
-  assert.equal(initialReload.active, 0);
-  const decode = (output) => {
-    const p = JSON.parse(output);
-    const result = p.data.result;
-    if (result.elapsedMs !== undefined)
-      assert.ok(
-        result.elapsedMs < 10250,
-        "worker session exceeded ten-second bound",
-      );
-    if (result.hostBytesCharged !== undefined)
-      assert.ok(
-        result.hostBytesCharged <= 8 * 1024 * 1024,
-        "host work exceeded aggregate byte bound",
-      );
-    return result;
-  };
-  const interrupted = [];
-  for (const [index, stage] of [
-    "sign",
-    "put",
-    "register",
-    "verify",
-    "stall",
-  ].entries()) {
-    const version = count + index + 1;
-    const collectedAt = new Date(
-      Date.UTC(2026, 9, 1, 13, 0, version),
-    ).toISOString();
-    const data = {
-      conversations: [
-        { id: "old" },
-        { id: "new" },
-        ...Array.from({ length: index + 1 }, (_, j) => ({ id: `case-${j}` })),
-      ],
+  if (journalRegression) {
+    const decode = (output) => {
+      const value = JSON.parse(output).data.result;
+      assert.ok(value.elapsedMs < 10250);
+      assert.ok(value.hostBytesCharged <= 8 * 1024 * 1024);
+      assert.equal(value.active, 0);
+      return value;
     };
-    const envelope = createDataFileEnvelope(source, collectedAt, data);
-    const plain = new TextEncoder().encode(JSON.stringify(envelope));
-    const encrypted = await encryptWithPassword(plain, keyPassword(source));
-    await writeFile(blobPath(`${source}/${version}`), encrypted);
-    await register({
-      scope: source,
-      expectedVersion: String(version),
-      dataHash: keccak256(plain),
-      metadataHash: keccak256(
-        stringToHex(
-          JSON.stringify({
-            scope: source,
-            collectedAt,
-            sizeBytes: encrypted.byteLength,
+    const invoke = async () =>
+      decode(
+        await command(["eval", "--json", "(async()=>await window.proof())()"]),
+      );
+    const journal = async (scope) =>
+      JSON.parse(
+        await command([
+          "eval",
+          "--json",
+          `(async()=>await window.journal(${JSON.stringify(scope)}))()`,
+        ]),
+      ).data.result;
+    const restart = async () => {
+      await command(["close"]);
+      browserSession = `vana12-proof-${process.pid}-${++browserRestarts}`;
+      await command(["open", origin]);
+      await command(["wait", "--fn", "window.ready === true"]);
+    };
+    const seed = async (scope, records, version = "1") => {
+      const collectedAt = "2026-10-01T12:00:00.000Z";
+      const plain = new TextEncoder().encode(
+        JSON.stringify(
+          createDataFileEnvelope(scope, collectedAt, {
+            conversations: Array.from({ length: records }, (_, i) => ({
+              id: `id-${i}`,
+            })),
           }),
         ),
-      ),
-      signature: "local-settled-fixture",
-    });
-    if (stage === "stall") {
-      const nextVersion = version + 1;
-      const nextCollectedAt = new Date(
-        Date.UTC(2026, 9, 1, 13, 0, nextVersion),
-      ).toISOString();
-      const nextData = {
-        padding: randomBytes(256 * 1024).toString("base64"),
-        conversations: [...data.conversations, { id: "case-5" }],
-      };
-      const nextPlain = new TextEncoder().encode(
-        JSON.stringify(
-          createDataFileEnvelope(source, nextCollectedAt, nextData),
-        ),
       );
-      const nextEncrypted = await encryptWithPassword(
-        nextPlain,
-        keyPassword(source),
-      );
-      await writeFile(blobPath(`${source}/${nextVersion}`), nextEncrypted);
+      const encrypted = await encryptWithPassword(plain, keyPassword(scope));
+      await storage.upload(`${scope}/${version}`, encrypted);
       await register({
-        scope: source,
-        expectedVersion: String(nextVersion),
-        dataHash: keccak256(nextPlain),
+        scope,
+        expectedVersion: version,
+        dataHash: keccak256(plain),
         metadataHash: keccak256(
           stringToHex(
             JSON.stringify({
-              scope: source,
-              collectedAt: nextCollectedAt,
-              sizeBytes: nextEncrypted.byteLength,
+              scope,
+              collectedAt,
+              sizeBytes: encrypted.byteLength,
             }),
           ),
         ),
         signature: "local-settled-fixture",
       });
-      faultVersion = String(nextVersion);
+    };
+    const scenarios = [
+      { stage: "put-503", records: 650 },
+      { stage: "register", records: 650 },
+      { stage: "verify", records: 650 },
+      { stage: "put-503", records: 750 },
+      { stage: "put-503", records: 650, scopes: 2 },
+      { stage: "oversized", records: 850 },
+    ];
+    for (const [index, scenario] of scenarios.entries()) {
+      await db.delete(schema.dataPointVersions);
+      await db.delete(schema.dataPoints);
+      lastRegistered.clear();
+      blobPutHistory.length = 0;
+      profileName = `journal-profile-${index}`;
+      await restart();
+      const scopes = Array.from({ length: scenario.scopes ?? 1 }, (_, i) =>
+        i === 0 ? source : `test.conversations.${i}`,
+      );
+      const ledgerScope = (scope) => `vana.system.additions.${scope}`;
+      if (scenario.stage === "oversized") {
+        await seed(source, 1);
+        const baseline = await invoke();
+        assert.equal(baseline.result.coverage, "complete");
+        const previous = lastRegistered.get(ledgerScope(source));
+        await seed(source, scenario.records, "2");
+        const tooLarge = await invoke();
+        assert.equal(tooLarge.result.coverage, "behind");
+        assert.equal(tooLarge.result.total, 1);
+        assert.equal(tooLarge.result.through[source], "1");
+        assert.equal((await journal(ledgerScope(source))).exists, false);
+        assert.deepEqual(lastRegistered.get(ledgerScope(source)), previous);
+        console.log(
+          JSON.stringify({ scenario, stage: "not-admitted", ...tooLarge }),
+        );
+        continue;
+      }
+      for (const scope of scopes) await seed(scope, scenario.records);
+      const putsBefore = blobPuts;
+      fault = scenario.stage;
+      verificationArmed = false;
+      const initial = await invoke();
+      assert.equal(initial.result.coverage, "behind");
+      assert.equal(initial.result.through[source], "1");
+      assert.ok(
+        blobPuts > putsBefore,
+        "large candidate was not initially admitted",
+      );
+      const candidates = [...blobPutHistory];
+      assert.ok(
+        candidates[0].bytes > 48000,
+        "regression did not exercise a large journal",
+      );
+      assert.equal(
+        (await journal(ledgerScope(source))).exists,
+        true,
+        "interrupted intent was lost",
+      );
+      console.log(
+        JSON.stringify({
+          scenario,
+          stage: "interrupted",
+          candidates,
+          ...initial,
+        }),
+      );
+      fault = "";
+      verificationArmed = false;
+      let resumed;
+      for (let retry = 0; retry < 5; retry++) {
+        await restart();
+        resumed = await invoke();
+        console.log(
+          JSON.stringify({
+            scenario,
+            stage: "restart",
+            attempt: retry + 1,
+            blobPuts,
+            ...resumed,
+          }),
+        );
+        if (resumed.result.coverage === "complete") break;
+      }
+      if (scenario.stage === "put-503")
+        assert.ok(
+          blobPuts > putsBefore + candidates.length,
+          "admitted journal livelocked: restart never retried PUT",
+        );
+      assert.equal(resumed.result.coverage, "complete");
+      const total = scenario.records * scopes.length;
+      assert.equal(resumed.result.total, total);
+      assert.deepEqual(
+        resumed.result.through,
+        Object.fromEntries(scopes.map((scope) => [scope, "1"])),
+      );
+      assert.deepEqual(resumed.result.days, [
+        { date: "2026-09-28", added: 0 },
+        { date: "2026-09-29", added: 0 },
+        { date: "2026-09-30", added: 0 },
+        { date: "2026-10-01", added: total },
+        { date: "2026-10-02", added: 0 },
+        { date: "2026-10-03", added: 0 },
+        { date: "2026-10-04", added: 0 },
+      ]);
+      for (const candidate of candidates) {
+        const writes = blobPutHistory.filter(
+          (write) =>
+            write.scope === candidate.scope &&
+            write.version === candidate.version,
+        );
+        assert.ok(
+          writes.every(
+            (write) =>
+              write.version === candidate.version &&
+              write.hash === candidate.hash,
+          ),
+          "retry changed original candidate bytes/version",
+        );
+        const registered = lastRegistered.get(candidate.scope);
+        const rows = await db
+          .select()
+          .from(schema.dataPointVersions)
+          .where(eq(schema.dataPointVersions.id, idFor(candidate.scope)));
+        const original = rows.find(
+          (row) => row.expectedVersion === candidate.version,
+        );
+        assert.ok(original, "retry lost original candidate version");
+        assert.equal(original.signature.length, 132);
+        const ciphertext = await readFile(
+          blobPath(`${candidate.scope}/${candidate.version}`),
+        );
+        assert.equal(keccak256(ciphertext), candidate.hash);
+        const plain = await decryptWithPassword(
+          ciphertext,
+          keyPassword(candidate.scope),
+        );
+        const envelope = JSON.parse(new TextDecoder().decode(plain));
+        assert.equal(original.dataHash, keccak256(plain));
+        assert.equal(
+          original.metadataHash,
+          keccak256(
+            stringToHex(
+              JSON.stringify({
+                scope: candidate.scope,
+                collectedAt: envelope.collectedAt,
+                sizeBytes: ciphertext.byteLength,
+              }),
+            ),
+          ),
+        );
+        if (envelope.data.through === "1") {
+          assert.equal(
+            rows.length,
+            1,
+            "retry blindly advanced completed candidate version",
+          );
+          assert.equal(original.dataHash, registered.dataHash);
+          assert.equal(original.metadataHash, registered.metadataHash);
+        } else {
+          assert.equal(envelope.data.through, "0");
+          assert.deepEqual(rows.map((row) => row.expectedVersion).sort(), [
+            "1",
+            "2",
+          ]);
+          const headPlain = await decryptWithPassword(
+            await readFile(blobPath(`${candidate.scope}/2`)),
+            keyPassword(candidate.scope),
+          );
+          assert.equal(
+            JSON.parse(new TextDecoder().decode(headPlain)).data.through,
+            "1",
+          );
+        }
+        assert.equal((await journal(candidate.scope)).exists, false);
+      }
+      await assertFullEquality(resumed.result);
     }
-    fault = stage === "sign" ? "" : stage;
-    const failed = decode(
-      await command([
+    assert.ok(fixturePost > 0);
+    console.log(
+      JSON.stringify({
+        result: "PASS",
+        journalRegression: true,
+        browserRestarts,
+        fixturePost,
+        blobPuts,
+        fullRuntimeEquality,
+        gatewayHead: "d8ed3c09952a4151ab94df30aa905423eca6a29d",
+      }),
+    );
+  } else {
+    const attempts = [];
+    for (let i = 0; i < 8; i++) {
+      const priorBytes = servedBlobBytes;
+      const output = await command([
         "eval",
         "--json",
-        `(async()=>await window.proof(${stage === "sign"}))()`,
-      ]),
-    );
-    assert.notEqual(
-      failed.result.coverage,
-      "complete",
-      `${stage} claimed complete`,
-    );
-    assert.equal(failed.active, 0);
-    if (stage === "stall") {
-      assert.equal(
-        failed.result.coverage,
-        "behind",
-        "budget exhaustion must not be classified as missing history",
+        "(async () => await window.proof())()",
+      ]);
+
+      const parsed = JSON.parse(output);
+      const value = parsed.data?.result ?? parsed.result ?? parsed;
+      const outcome = typeof value === "string" ? JSON.parse(value) : value;
+      assert.ok(
+        outcome.elapsedMs < 10250,
+        "worker session exceeded ten-second bound",
       );
-      assert.equal(failed.result.through[source], String(version));
-      const checkpoint = lastRegistered.get(`vana.system.additions.${source}`);
-      const bytes = await readFile(
-        blobPath(`${checkpoint.scope}/${checkpoint.expectedVersion}`),
+      assert.ok(
+        outcome.hostBytesCharged <= 8 * 1024 * 1024,
+        "host work exceeded aggregate byte bound",
       );
-      const plain = await decryptWithPassword(
-        bytes,
-        keyPassword(checkpoint.scope),
+      attempts.push(outcome);
+      console.log(
+        JSON.stringify({
+          invocation: i + 1,
+          ciphertextReadBytes: servedBlobBytes - priorBytes,
+          ...outcome,
+          result: {
+            coverage: outcome.result?.coverage,
+            total: outcome.result?.total,
+            through: outcome.result?.through,
+          },
+        }),
       );
-      assert.equal(
-        JSON.parse(new TextDecoder().decode(plain)).data.through,
-        String(version),
-        "slow unit lost durable prefix",
-      );
+      assert.equal(outcome.active, 0);
+      if (outcome.result?.coverage === "complete") break;
     }
-    fault = "";
+    const last = attempts.at(-1);
+    assert.equal(last.result.coverage, "complete");
+    assert.equal(last.result.total, 2);
     await command(["close"]);
     browserSession = `vana12-proof-${process.pid}-${++browserRestarts}`;
     await command(["open", origin]);
     await command(["wait", "--fn", "window.ready === true"]);
-    let resumed;
-    for (let retry = 0; retry < 4; retry++) {
-      resumed = decode(
-        await command(["eval", "--json", "(async()=>await window.proof())()"]),
-      );
-      if (resumed.result.coverage === "complete") break;
-    }
-    assert.equal(
-      resumed.result.coverage,
-      "complete",
-      `${stage} did not resume`,
-    );
-    assert.equal(resumed.result.total, 3 + index + (stage === "stall" ? 1 : 0));
-    assert.equal(resumed.active, 0);
-    interrupted.push({
-      stage,
-      interruptedCoverage: failed.result.coverage,
-      hostBytesCharged: failed.hostBytesCharged,
-      elapsedMs: failed.elapsedMs,
-      restartedTotal: resumed.result.total,
-      activeWorkers: resumed.active,
-    });
-  }
-  const noClone = decode(
-    await command([
+    const restarted = await command([
       "eval",
       "--json",
-      "(async()=>await window.uploadNoClone())()",
-    ]),
-  );
-  assert.equal(noClone.touched, 0);
-  assert.equal(noClone.active, 0);
-  const transportCases = [];
-  for (const [index, stage] of [
-    "declared-length",
-    "lying-length",
-    "stream-overflow",
-    "missing-length",
-    "compressed",
-  ].entries()) {
-    const version = count + 7 + index;
-    const collectedAt = new Date(
-      Date.UTC(2026, 9, 1, 14, 0, version),
-    ).toISOString();
-    const data = {
-      conversations: [
-        { id: "old" },
-        { id: "new" },
-        ...Array.from({ length: 7 + index }, (_, j) => ({ id: `case-${j}` })),
-      ],
-      padding: "z".repeat(stage === "compressed" ? 1024 * 1024 : 0),
+      "(async () => await window.proof())()",
+    ]);
+    const initialReload = JSON.parse(restarted).data.result;
+    assert.equal(initialReload.result.coverage, "complete");
+    assert.equal(initialReload.result.total, 2);
+    assert.equal(initialReload.active, 0);
+    const decode = (output) => {
+      const p = JSON.parse(output);
+      const result = p.data.result;
+      if (result.elapsedMs !== undefined)
+        assert.ok(
+          result.elapsedMs < 10250,
+          "worker session exceeded ten-second bound",
+        );
+      if (result.hostBytesCharged !== undefined)
+        assert.ok(
+          result.hostBytesCharged <= 8 * 1024 * 1024,
+          "host work exceeded aggregate byte bound",
+        );
+      return result;
     };
-    const envelope = createDataFileEnvelope(source, collectedAt, data);
-    const plain = new TextEncoder().encode(JSON.stringify(envelope));
-    const encrypted =
-      stage === "compressed"
-        ? await encrypt({
-            message: await createMessage({ binary: plain }),
-            passwords: [keyPassword(source)],
-            format: "binary",
-            config: { preferredCompressionAlgorithm: enums.compression.zlib },
-          })
-        : await encryptWithPassword(plain, keyPassword(source));
-    await writeFile(blobPath(`${source}/${version}`), encrypted);
-    await register({
-      scope: source,
-      expectedVersion: String(version),
-      dataHash: keccak256(plain),
-      metadataHash: keccak256(
-        stringToHex(
-          JSON.stringify({
-            scope: source,
-            collectedAt,
-            sizeBytes: encrypted.byteLength,
-          }),
+    const interrupted = [];
+    for (const [index, stage] of [
+      "sign",
+      "put",
+      "register",
+      "verify",
+      "stall",
+    ].entries()) {
+      const version = count + index + 1;
+      const collectedAt = new Date(
+        Date.UTC(2026, 9, 1, 13, 0, version),
+      ).toISOString();
+      const data = {
+        conversations: [
+          { id: "old" },
+          { id: "new" },
+          ...Array.from({ length: index + 1 }, (_, j) => ({ id: `case-${j}` })),
+        ],
+      };
+      const envelope = createDataFileEnvelope(source, collectedAt, data);
+      const plain = new TextEncoder().encode(JSON.stringify(envelope));
+      const encrypted = await encryptWithPassword(plain, keyPassword(source));
+      await writeFile(blobPath(`${source}/${version}`), encrypted);
+      await register({
+        scope: source,
+        expectedVersion: String(version),
+        dataHash: keccak256(plain),
+        metadataHash: keccak256(
+          stringToHex(
+            JSON.stringify({
+              scope: source,
+              collectedAt,
+              sizeBytes: encrypted.byteLength,
+            }),
+          ),
         ),
-      ),
-      signature: "local-settled-fixture",
-    });
-    faultVersion = String(version);
-    fault = stage;
-    const outcome = decode(
-      await command(["eval", "--json", "(async()=>await window.proof())()"]),
+        signature: "local-settled-fixture",
+      });
+      if (stage === "stall") {
+        const nextVersion = version + 1;
+        const nextCollectedAt = new Date(
+          Date.UTC(2026, 9, 1, 13, 0, nextVersion),
+        ).toISOString();
+        const nextData = {
+          padding: randomBytes(256 * 1024).toString("base64"),
+          conversations: [...data.conversations, { id: "case-5" }],
+        };
+        const nextPlain = new TextEncoder().encode(
+          JSON.stringify(
+            createDataFileEnvelope(source, nextCollectedAt, nextData),
+          ),
+        );
+        const nextEncrypted = await encryptWithPassword(
+          nextPlain,
+          keyPassword(source),
+        );
+        await writeFile(blobPath(`${source}/${nextVersion}`), nextEncrypted);
+        await register({
+          scope: source,
+          expectedVersion: String(nextVersion),
+          dataHash: keccak256(nextPlain),
+          metadataHash: keccak256(
+            stringToHex(
+              JSON.stringify({
+                scope: source,
+                collectedAt: nextCollectedAt,
+                sizeBytes: nextEncrypted.byteLength,
+              }),
+            ),
+          ),
+          signature: "local-settled-fixture",
+        });
+        faultVersion = String(nextVersion);
+      }
+      fault = stage === "sign" ? "" : stage;
+      const failed = decode(
+        await command([
+          "eval",
+          "--json",
+          `(async()=>await window.proof(${stage === "sign"}))()`,
+        ]),
+      );
+      assert.notEqual(
+        failed.result.coverage,
+        "complete",
+        `${stage} claimed complete`,
+      );
+      assert.equal(failed.active, 0);
+      if (stage === "stall") {
+        assert.equal(
+          failed.result.coverage,
+          "behind",
+          "budget exhaustion must not be classified as missing history",
+        );
+        assert.equal(failed.result.through[source], String(version));
+        const checkpoint = lastRegistered.get(
+          `vana.system.additions.${source}`,
+        );
+        const bytes = await readFile(
+          blobPath(`${checkpoint.scope}/${checkpoint.expectedVersion}`),
+        );
+        const plain = await decryptWithPassword(
+          bytes,
+          keyPassword(checkpoint.scope),
+        );
+        assert.equal(
+          JSON.parse(new TextDecoder().decode(plain)).data.through,
+          String(version),
+          "slow unit lost durable prefix",
+        );
+      }
+      fault = "";
+      await command(["close"]);
+      browserSession = `vana12-proof-${process.pid}-${++browserRestarts}`;
+      await command(["open", origin]);
+      await command(["wait", "--fn", "window.ready === true"]);
+      let resumed;
+      for (let retry = 0; retry < 4; retry++) {
+        resumed = decode(
+          await command([
+            "eval",
+            "--json",
+            "(async()=>await window.proof())()",
+          ]),
+        );
+        if (resumed.result.coverage === "complete") break;
+      }
+      assert.equal(
+        resumed.result.coverage,
+        "complete",
+        `${stage} did not resume`,
+      );
+      assert.equal(
+        resumed.result.total,
+        3 + index + (stage === "stall" ? 1 : 0),
+      );
+      assert.equal(resumed.active, 0);
+      interrupted.push({
+        stage,
+        interruptedCoverage: failed.result.coverage,
+        hostBytesCharged: failed.hostBytesCharged,
+        elapsedMs: failed.elapsedMs,
+        restartedTotal: resumed.result.total,
+        activeWorkers: resumed.active,
+      });
+    }
+    const noClone = decode(
+      await command([
+        "eval",
+        "--json",
+        "(async()=>await window.uploadNoClone())()",
+      ]),
     );
-    assert.equal(outcome.active, 0);
-    if (stage === "missing-length") {
-      assert.equal(outcome.result.coverage, "complete");
-      assert.equal(outcome.result.total, 9 + index);
-    } else assert.notEqual(outcome.result.coverage, "complete");
-    fault = "";
-    if (stage !== "compressed") {
-      const resumed = decode(
+    assert.equal(noClone.touched, 0);
+    assert.equal(noClone.active, 0);
+    const transportCases = [];
+    for (const [index, stage] of [
+      "declared-length",
+      "lying-length",
+      "stream-overflow",
+      "missing-length",
+      "compressed",
+    ].entries()) {
+      const version = count + 7 + index;
+      const collectedAt = new Date(
+        Date.UTC(2026, 9, 1, 14, 0, version),
+      ).toISOString();
+      const data = {
+        conversations: [
+          { id: "old" },
+          { id: "new" },
+          ...Array.from({ length: 7 + index }, (_, j) => ({ id: `case-${j}` })),
+        ],
+        padding: "z".repeat(stage === "compressed" ? 1024 * 1024 : 0),
+      };
+      const envelope = createDataFileEnvelope(source, collectedAt, data);
+      const plain = new TextEncoder().encode(JSON.stringify(envelope));
+      const encrypted =
+        stage === "compressed"
+          ? await encrypt({
+              message: await createMessage({ binary: plain }),
+              passwords: [keyPassword(source)],
+              format: "binary",
+              config: { preferredCompressionAlgorithm: enums.compression.zlib },
+            })
+          : await encryptWithPassword(plain, keyPassword(source));
+      await writeFile(blobPath(`${source}/${version}`), encrypted);
+      await register({
+        scope: source,
+        expectedVersion: String(version),
+        dataHash: keccak256(plain),
+        metadataHash: keccak256(
+          stringToHex(
+            JSON.stringify({
+              scope: source,
+              collectedAt,
+              sizeBytes: encrypted.byteLength,
+            }),
+          ),
+        ),
+        signature: "local-settled-fixture",
+      });
+      faultVersion = String(version);
+      fault = stage;
+      const outcome = decode(
         await command(["eval", "--json", "(async()=>await window.proof())()"]),
       );
-      assert.equal(resumed.result.coverage, "complete");
-      assert.equal(resumed.result.total, 9 + index);
+      assert.equal(outcome.active, 0);
+      if (stage === "missing-length") {
+        assert.equal(outcome.result.coverage, "complete");
+        assert.equal(outcome.result.total, 9 + index);
+      } else assert.notEqual(outcome.result.coverage, "complete");
+      fault = "";
+      if (stage !== "compressed") {
+        const resumed = decode(
+          await command([
+            "eval",
+            "--json",
+            "(async()=>await window.proof())()",
+          ]),
+        );
+        assert.equal(resumed.result.coverage, "complete");
+        assert.equal(resumed.result.total, 9 + index);
+      }
+      if (stage === "missing-length") {
+        await assertFullEquality(outcome.result);
+      }
+      transportCases.push({
+        stage,
+        coverage: outcome.result.coverage,
+        elapsedMs: outcome.elapsedMs,
+        activeWorkers: outcome.active,
+      });
     }
-    if (stage === "missing-length") {
-      const inventory = createVersionInventoryClient({
-        gatewayUrl: origin,
-        ownerAddress: account.address,
-        ownerSigner: {
-          signRequest: (params) =>
-            buildWeb3SignedHeader({
-              ...params,
-              signMessage: (message) => account.signMessage({ message }),
-            }),
-        },
-      });
-      const full = createDurableAdditions({
-        ownerAddress: account.address,
-        network: `vana:14800:${origin}`,
-        masterKey,
-        inventory,
-        storageAdapter: storage,
-        signer: createServerSigner(
-          {
-            address: account.address,
-            publicKey: account.publicKey,
-            signTypedData: (params) => account.signTypedData(params),
-            signMessage: (message) => account.signMessage({ message }),
-          },
-          {
-            chainId: 14800,
-            contracts: { dataRegistry: process.env.DATA_REGISTRY_CONTRACT },
-          },
-        ),
-        gateway: {
-          async registerDataPoint(params) {
-            const { signature, ...body } = params;
-            const response = await fetch(`${origin}/v1/data`, {
-              method: "POST",
-              headers: {
-                "content-type": "application/json",
-                authorization: `Web3Signed ${signature}`,
-              },
-              body: JSON.stringify(body),
-            });
-            assert.ok(response.ok);
-            return response.json();
-          },
-        },
-      });
-      const fullResult = await full.summarize({
-        timezone: "Asia/Kathmandu",
-        days: 7,
-        now: new Date("2026-10-04T00:00:00Z"),
-      });
-      assert.equal(fullResult.coverage, "complete");
-      assert.equal(fullResult.total, outcome.result.total);
-      assert.deepEqual(fullResult.days, outcome.result.days);
-      assert.deepEqual(fullResult.through, outcome.result.through);
-      fullRuntimeEquality = true;
-    }
-    transportCases.push({
-      stage,
-      coverage: outcome.result.coverage,
-      elapsedMs: outcome.elapsedMs,
-      activeWorkers: outcome.active,
-    });
+    console.log(JSON.stringify({ transportCases, noClone }));
+    assert.equal(stalledActive, 0);
+    assert.equal(stalledClosed, 1);
+    console.log(JSON.stringify({ interrupted, stalledActive, stalledClosed }));
+    assert.ok(fixturePost > 0);
+    assert.ok(blobPuts > 0);
+    console.log(
+      JSON.stringify({
+        result: "PASS",
+        actualBrowser: true,
+        actualWorkerArtifact: true,
+        browserRestarts,
+        fullRuntimeEquality,
+        gatewayHead: "d8ed3c09952a4151ab94df30aa905423eca6a29d",
+        versions: count,
+        attempts: attempts.length,
+        fixturePost,
+        blobPuts,
+        inventoryCalls,
+        ciphertextBytes: blobBytes,
+        limitations:
+          "Actual Gateway POST with real owner signatures and SQL; local simulated settlement; no production or chain transaction",
+      }),
+    );
   }
-  console.log(JSON.stringify({ transportCases, noClone }));
-  assert.equal(stalledActive, 0);
-  assert.equal(stalledClosed, 1);
-  console.log(JSON.stringify({ interrupted, stalledActive, stalledClosed }));
-  assert.ok(fixturePost > 0);
-  assert.ok(blobPuts > 0);
-  console.log(
-    JSON.stringify({
-      result: "PASS",
-      actualBrowser: true,
-      actualWorkerArtifact: true,
-      browserRestarts,
-      fullRuntimeEquality,
-      gatewayHead: "228bbf1cd6893a5b34da248832d8861f245d6d3d",
-      versions: count,
-      attempts: attempts.length,
-      fixturePost,
-      blobPuts,
-      inventoryCalls,
-      ciphertextBytes: blobBytes,
-      limitations:
-        "Actual Gateway POST with real owner signatures and SQL; local simulated settlement; no production or chain transaction",
-    }),
-  );
   await command(["close"]);
 } finally {
   await command(["close"]).catch(() => {});

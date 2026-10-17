@@ -62,6 +62,7 @@ export function createPsLiteAdditionsSession(
     remainingMs: number,
   ): Promise<unknown> {
     const controller = new AbortController();
+    const transport = options.transport.openSession();
     const worker: AdditionsWorkerPort =
       options.workerFactory?.() ??
       new Worker(new URL("./additions-worker.bundle.js", import.meta.url), {
@@ -124,7 +125,6 @@ export function createPsLiteAdditionsSession(
               // This channel is private to the worker created above. Network
               // responses are validated in that worker, never trusted as JSON.
               const args = message.args;
-              const transport = options.transport;
               let result: unknown;
               switch (message.method) {
                 case "fetch":

@@ -14,7 +14,7 @@ export type AdditionsOperation = {
   method: "summarize";
   args: Parameters<DurableAdditionsService["summarize"]>;
 };
-export type HostMethod = keyof PsLiteAdditionsTransport;
+export type HostMethod = Exclude<keyof PsLiteAdditionsTransport, "openSession">;
 export type WorkerMessage =
   | { kind: "run"; init: AdditionsWorkerInit; operation: AdditionsOperation }
   | {
