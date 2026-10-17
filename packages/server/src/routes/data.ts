@@ -1,3 +1,4 @@
+import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono } from "hono";
 import {
   handlePersonalServerDataRequest,
@@ -36,6 +37,7 @@ import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createServerApiAuth } from "../api-auth.js";
 
 export interface DataRouteDeps {
+  additions?: DurableAdditionsService;
   indexManager: IndexManager;
   hierarchyOptions: HierarchyManagerOptions;
   logger: Logger;
@@ -137,6 +139,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     handlePersonalServerDataRequest(
       c.req.raw,
       {
+        additions: deps.additions,
         storage: dataStorage,
         auth,
         accessLogWriter: deps.accessLogWriter,

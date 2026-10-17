@@ -1,3 +1,4 @@
+import { signAdditions, AdditionsRefused } from "./additions.js";
 import { timingSafeEqual } from "node:crypto";
 import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/node";
 import { ScopeSchema } from "@opendatalabs/vana-sdk/protocol/scopes";
@@ -97,6 +98,7 @@ export interface AgentJobsControl {
   /** The node's configured chain; what an access record is stamped with. */
   chainId: number;
   storageApiUrl: string;
+  additions?: { gatewayUrl: string; dataRegistry: Address };
   activeCount(): number;
   draining(): boolean;
   drain(): Promise<void>;
@@ -134,6 +136,34 @@ async function handleRequest(
   response: ServerResponse,
   path: string,
 ): Promise<void> {
+  if (request.method === POST && path === "/agent/v1/additions/sign") {
+    const token = bearerToken(request);
+    if (!token) {
+      sendError(response, UNAUTHORIZED, "UNAUTHORIZED", UNAUTHORIZED_MESSAGE);
+      return;
+    }
+    try {
+      sendJson(
+        response,
+        OK,
+        await signAdditions(options, token, await readJson(request)),
+      );
+    } catch (error) {
+      if (error instanceof AdditionsRefused)
+        sendError(response, FORBIDDEN, "SIGNING_REFUSED", error.message);
+      else if (error instanceof BadRequest)
+        sendError(response, BAD_REQUEST, "BAD_REQUEST", BAD_REQUEST_MESSAGE);
+      else if (error instanceof BodyTooLarge)
+        sendError(
+          response,
+          BODY_TOO_LARGE,
+          "BODY_TOO_LARGE",
+          BODY_TOO_LARGE_MESSAGE,
+        );
+      else sendError(response, INTERNAL_ERROR, "INTERNAL", INTERNAL_MESSAGE);
+    }
+    return;
+  }
   if (request.method === POST && path === RESULT_SIGNING_ROUTE) {
     await handleResultSigning(options, request, response);
     return;

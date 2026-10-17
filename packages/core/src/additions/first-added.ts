@@ -8,9 +8,9 @@
  * first-seen ledger by folding the scope's stored versions.
  *
  * The ledger is a SIDECAR kept beside the data (see `ledger-store.ts`). It
- * is never stamped into a stored envelope, never synced as data and never
- * served to grantees: it is a cache that can always be rebuilt from the
- * retained versions.
+ * is never stamped into a source envelope or served to grantees. Its permanent
+ * identity union preserves arrivals after source versions are pruned. A rebuild
+ * from retained versions can recover only the history those versions contain.
  *
  * Everything here is pure: it never reads or writes a store and never
  * mutates the objects it is handed. Folding is order independent and
@@ -20,17 +20,13 @@
 
 import { memoryRecordRulesFor, type MemoryRecordRule } from "./record-rules.js";
 
-/**
- * At most this many tracked keys per scope snapshot AND in the ledger (the
- * union over time). A snapshot over it is untrackable; when the union passes
- * it, keys absent from the newest tracked version are dropped, oldest first.
- */
+/** Maximum identities extracted from one snapshot. The permanent union is not capped. */
 export const MAX_TRACKED_KEYS = 200_000;
 /** Ids longer than this are replaced by a hash so keys stay bounded. */
 export const MAX_ID_LENGTH = 64;
 /** Collection names longer than this are replaced by a hash (they can be caller-controlled). */
 export const MAX_COLLECTION_LENGTH = 64;
-/** A record absent from the newest tracked version is dropped after this long. */
+/** Legacy window, retained for source compatibility; v5 never prunes arrivals. */
 export const PRUNE_AFTER_MS = 90 * 24 * 60 * 60 * 1000;
 /** An unreadable version is read again at most this often. */
 export const RETRY_UNREADABLE_MS = 60 * 60 * 1000;
@@ -55,7 +51,7 @@ export type LedgerSkipReason = "too_large" | "unreadable";
 
 /** One document per scope, stored as a sidecar beside the data. */
 export interface ScopeFirstSeenLedger {
-  version: 4;
+  version: 5;
   scope: string;
   /**
    * collectedAt of the EARLIEST TRACKABLE version folded in (one with records
@@ -87,6 +83,8 @@ export interface ScopeFirstSeenLedger {
   retry?: { versions: string[]; attemptedAt: string };
   /** Set when no per-record keys are kept (see `LedgerSkipReason`); `records` is then empty. */
   skipped?: LedgerSkipReason;
+  /** An import exceeded the identity extraction limit; historical arrivals are incomplete. */
+  incomplete?: true;
   /**
    * The rebuild or catch-up folded only the newest retained versions (the
    * count window or the byte budget cut off older ones). A version older than
@@ -95,14 +93,21 @@ export interface ScopeFirstSeenLedger {
    */
   truncated?: true;
   /**
-   * DERIVED, never persisted: set by `ensureScopeLedger` on the ledger it
+   * Historical baseline uncertainty: set by `ensureScopeLedger` on the ledger it
    * returns when the baseline is not known to be the scope's first version.
+   * Persisted once established so a tombstone/re-import cannot erase it.
    * The owner's read decides it from the index (the oldest retained version,
    * its number, whether it follows a deletion) plus `truncated`, so it follows
    * later changes of version numbers and deletions. Records first seen at the
    * baseline then keep an unknown date and are not counted as added.
    */
   partial?: true;
+  /**
+   * Exact identities with unknown arrival dates. When present (including an
+   * empty list), this replaces the legacy partial-baseline date threshold:
+   * later imports may introduce new identities at equal or earlier timestamps.
+   */
+  unknownArrivalKeys?: string[];
   /** record key -> [firstSeen collectedAt, lastSeen collectedAt] */
   records: Record<string, [string, string]>;
 }
@@ -389,10 +394,6 @@ export async function extractRecordKeys(
 
 type Pair = [string, string];
 
-function ms(value: string | null): number {
-  return value === null ? Number.NaN : Date.parse(value);
-}
-
 /**
  * Whether `a` is the newer of two collectedAt strings. Instants decide
  * ("…00Z" and "…00.000Z" are the same instant); a tie is broken by the
@@ -427,10 +428,10 @@ function isTrackable(extraction: RecordKeyExtraction | null): boolean {
 /**
  * Folds stored versions into one ledger, one at a time, so a caller can read a
  * version, `add` it and drop it before reading the next: only one parsed
- * envelope is ever alive. Order independent and idempotent for versions within
- * the 90-day pruning window of each other (pruning is relative to the newest
- * tracked version, so folding versions further apart in a different order can
- * re-date a record that was already pruned).
+ * envelope is ever alive. Permanent identities make folds order independent
+ * and idempotent across chunk boundaries and arbitrarily distant dates.
+ * Storage grows with distinct identities; the snapshot cap bounds extraction,
+ * not the historical union. Over-cap snapshots contribute totals only.
  */
 export class LedgerFold {
   private scope: string | null;
@@ -441,6 +442,9 @@ export class LedgerFold {
   private retry: ScopeFirstSeenLedger["retry"];
   private skipped: LedgerSkipReason | undefined;
   private truncated = false;
+  private incomplete = false;
+  private partial = false;
+  private unknownArrivalKeys: string[] | undefined;
   // A Map keeps arbitrary keys (including "__proto__") out of the prototype
   // chain; Object.fromEntries defines each one as an own property again.
   private records = new Map<string, Pair>();
@@ -460,6 +464,12 @@ export class LedgerFold {
       : undefined;
     this.skipped = ledger.skipped;
     this.truncated = ledger.truncated === true;
+    this.incomplete = ledger.incomplete === true;
+    this.partial = ledger.partial === true;
+    this.unknownArrivalKeys =
+      ledger.unknownArrivalKeys === undefined
+        ? undefined
+        : [...ledger.unknownArrivalKeys];
     // Copied, never shared: the input ledger is not mutated.
     for (const [key, pair] of Object.entries(ledger.records)) {
       this.records.set(key, [pair[0], pair[1]]);
@@ -480,7 +490,13 @@ export class LedgerFold {
       this.latest === null ||
       isNewer(version.collectedAt, this.latest.collectedAt)
     ) {
-      this.latest = { collectedAt: version.collectedAt, total };
+      this.latest = {
+        collectedAt: version.collectedAt,
+        total:
+          this.latest?.collectedAt === version.collectedAt
+            ? Math.max(total, this.latest.total)
+            : total,
+      };
     }
     if (isNewer(version.collectedAt, this.through)) {
       this.through = version.collectedAt;
@@ -488,6 +504,7 @@ export class LedgerFold {
     // A negative-outcome marker keeps no keys; a binary file or a snapshot
     // over the key cap is counted above but contributes none.
     if (this.skipped !== undefined) return;
+    if (extraction?.tooMany) this.incomplete = true;
     if (!isTrackable(extraction)) return;
 
     if (this.baseline === null) {
@@ -526,99 +543,38 @@ export class LedgerFold {
       await this.insertFresh(fresh, keys, version.collectedAt);
   }
 
-  /**
-   * Insert the records this version brings that the ledger does not know.
-   * Capacity is decided ONCE: when they do not fit, absent records are evicted
-   * in a single pass (see `evict`), and whatever still does not fit is left
-   * out, smallest keys first, so the result never depends on the order of the
-   * ids in the version.
-   */
+  /** Keep every admitted identity permanently, so a later return never re-dates it. */
   private async insertFresh(
     fresh: string[],
-    versionKeys: readonly string[],
+    _versionKeys: readonly string[],
     collectedAt: string,
   ): Promise<void> {
-    fresh.sort();
-    let room = MAX_TRACKED_KEYS - this.records.size;
-    if (fresh.length > room) {
-      room += await this.evict(fresh.length - room, new Set(versionKeys));
-    }
-    const take = Math.min(fresh.length, Math.max(0, room));
-    for (let index = 0; index < take; index += 1) {
+    for (let index = 0; index < fresh.length; index += 1) {
       if (index % YIELD_EVERY === YIELD_EVERY - 1) await yieldToEventLoop();
       this.records.set(fresh[index]!, [collectedAt, collectedAt]);
     }
   }
 
   /**
-   * Make room for `need` records by dropping some that are absent: not in the
-   * newest tracked version, not in the version being folded, and not
-   * baseline records (first seen at or before the baseline). Baseline records
-   * are never dropped. Other absent records CAN be dropped (and are
-   * dated as new if they return): that needs a scope near the cap, and
-   * whoever can write the scope can provoke it. Among the evictable ones the
-   * most recently first seen go first. Returns how many were dropped.
-   */
-  private async evict(
-    need: number,
-    inVersion: ReadonlySet<string>,
-  ): Promise<number> {
-    const currentMs = ms(this.current);
-    const baselineMs = ms(this.baseline);
-    const candidates: [number, string][] = [];
-    let seen = 0;
-    for (const [key, pair] of this.records) {
-      seen += 1;
-      if (seen % (YIELD_EVERY * 5) === 0) await yieldToEventLoop();
-      if (inVersion.has(key)) continue;
-      if (Date.parse(pair[1]) === currentMs) continue;
-      const firstMs = Date.parse(pair[0]);
-      if (firstMs <= baselineMs) continue;
-      candidates.push([firstMs, key]);
-    }
-    candidates.sort(
-      (a, b) => b[0] - a[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0),
-    );
-    const count = Math.min(need, candidates.length);
-    for (let index = 0; index < count; index += 1) {
-      this.records.delete(candidates[index]![1]);
-    }
-    return count;
-  }
-
-  /** Drop records that are not present and were last seen over 90 days before `current`. */
-  private async prune(): Promise<void> {
-    if (this.current === null || this.skipped !== undefined) return;
-    const currentMs = ms(this.current);
-    const cutoff = currentMs - PRUNE_AFTER_MS;
-    let seen = 0;
-    for (const [key, pair] of this.records) {
-      seen += 1;
-      if (seen % (YIELD_EVERY * 5) === 0) await yieldToEventLoop();
-      const lastMs = Date.parse(pair[1]);
-      if (lastMs !== currentMs && lastMs < cutoff) this.records.delete(key);
-    }
-  }
-
-  /**
-   * Prune and return the ledger, or null when nothing was ever folded.
+   * Return the permanent ledger, or null when nothing was ever folded.
    * `truncated` marks a ledger rebuilt from only the newest retained versions;
    * `through` overrides the completeness marker (see `ScopeFirstSeenLedger`).
    */
   async finish(
     options: {
       truncated?: boolean;
+      /** Preserve an unknown baseline after deletion or incomplete recovery. */
+      partial?: boolean;
       through?: string;
       /** `null` clears the retry list; undefined keeps it. */
       retry?: ScopeFirstSeenLedger["retry"] | null;
     } = {},
   ): Promise<ScopeFirstSeenLedger | null> {
     if (this.scope === null || this.latest === null) return null;
-    await this.prune();
     const truncated = this.truncated || options.truncated === true;
     const retry = options.retry === undefined ? this.retry : options.retry;
     return {
-      version: 4,
+      version: 5,
       scope: this.scope,
       baseline: this.baseline,
       current: this.current,
@@ -627,6 +583,11 @@ export class LedgerFold {
       ...(retry ? { retry } : {}),
       ...(this.skipped ? { skipped: this.skipped } : {}),
       ...(truncated ? { truncated: true as const } : {}),
+      ...(this.incomplete ? { incomplete: true as const } : {}),
+      ...(this.partial || options.partial ? { partial: true as const } : {}),
+      ...(this.unknownArrivalKeys !== undefined
+        ? { unknownArrivalKeys: [...this.unknownArrivalKeys] }
+        : {}),
       records: Object.fromEntries(this.records),
     };
   }
@@ -634,7 +595,7 @@ export class LedgerFold {
 
 /**
  * Fold several stored versions into a ledger in one pass. Equivalent to
- * calling `foldVersion` for each, but copies the ledger and prunes once.
+ * calling `foldVersion` for each, but copies the ledger once.
  * Returns null only when no version had a parseable `collectedAt` and there
  * was no starting ledger.
  */
@@ -666,51 +627,35 @@ export function isPresent(ledger: ScopeFirstSeenLedger, key: string): boolean {
 
 /**
  * True when the record's first-seen date is unknown: there is no baseline, or
- * the ledger is partial and the record was first seen at or before the
- * baseline. In a complete ledger the baseline's records are dated by it.
+ * it is named in unknownArrivalKeys. Older ledgers without that set use
+ * the partial-baseline timestamp threshold for compatibility.
  */
 export function isPreTracking(
   ledger: ScopeFirstSeenLedger,
   key: string,
 ): boolean {
+  if (ledger.unknownArrivalKeys !== undefined)
+    return ledger.unknownArrivalKeys.includes(key);
   if (ledger.baseline === null) return true;
   if (ledger.partial !== true || !hasOwn(ledger.records, key)) return false;
   return Date.parse(ledger.records[key]![0]) <= Date.parse(ledger.baseline);
 }
 
-/**
- * First-seen timestamps of the records that count as additions: present in
- * the newest tracked version. Records first seen at the baseline count too
- * (they entered the server then) unless the ledger is `partial`, where their
- * date is unknown. One per record. A skipped ledger, one with no baseline yet, and a scope whose newest
- * version is not its newest tracked one (a binary file or an over-cap
- * snapshot, whose `latest.total` does not describe those records) report none,
- * so `added` can never exceed `total`.
- */
+/** Every known arrival, including records absent from the latest snapshot. */
 export function listAddedTimestamps(ledger: ScopeFirstSeenLedger): string[] {
-  if (
-    ledger.skipped !== undefined ||
-    ledger.baseline === null ||
-    ledger.current === null ||
-    Date.parse(ledger.current) !== Date.parse(ledger.latest.collectedAt)
-  ) {
-    return [];
-  }
+  if (ledger.skipped !== undefined || ledger.baseline === null) return [];
   const baselineMs = Date.parse(ledger.baseline);
-  const currentMs = Date.parse(ledger.current);
-  const added: string[] = [];
-  for (const [first, last] of Object.values(ledger.records)) {
-    if (Date.parse(last) !== currentMs) continue;
-    if (ledger.partial === true && Date.parse(first) <= baselineMs) continue;
-    added.push(first);
-  }
-  // Two versions at one instant can both look present; never report more
-  // additions than the newest version has records.
-  if (added.length > ledger.latest.total) {
-    added.sort();
-    added.length = ledger.latest.total;
-  }
-  return added;
+  const unknownKeys =
+    ledger.unknownArrivalKeys === undefined
+      ? undefined
+      : new Set(ledger.unknownArrivalKeys);
+  return Object.entries(ledger.records)
+    .filter(([key, [first]]) =>
+      unknownKeys
+        ? !unknownKeys.has(key)
+        : !(ledger.partial === true && Date.parse(first) <= baselineMs),
+    )
+    .map(([, [first]]) => first);
 }
 
 // ---------------------------------------------------------------------------
@@ -728,14 +673,14 @@ function nullableParseable(value: unknown): value is string | null {
 const SKIP_REASONS: ReadonlySet<unknown> = new Set(["too_large", "unreadable"]);
 
 /**
- * The ledger in `value`, or null unless it is a well-formed version-2
+ * The ledger in `value`, or null unless it is a well-formed version-5
  * document (older versions are rejected and rebuilt). Never throws. The result is a fresh object.
  */
 export function readScopeFirstSeenLedger(
   value: unknown,
 ): ScopeFirstSeenLedger | null {
   try {
-    if (!isRecord(value) || value.version !== 4) return null;
+    if (!isRecord(value) || value.version !== 5) return null;
     const {
       scope,
       baseline,
@@ -784,18 +729,31 @@ export function readScopeFirstSeenLedger(
     }
     if (skipped !== undefined && !SKIP_REASONS.has(skipped)) return null;
     if (truncated !== undefined && truncated !== true) return null;
+    if (value.incomplete !== undefined && value.incomplete !== true)
+      return null;
+    if (value.partial !== undefined && value.partial !== true) return null;
     if (!isRecord(records)) return null;
 
     const entries = Object.entries(records);
-    if (entries.length > MAX_TRACKED_KEYS) return null;
     const copied = new Map<string, Pair>();
     for (const [key, pair] of entries) {
       if (!Array.isArray(pair) || pair.length !== 2) return null;
       if (!parseableString(pair[0]) || !parseableString(pair[1])) return null;
       copied.set(key, [pair[0], pair[1]]);
     }
+    let unknownArrivalKeys: string[] | undefined;
+    if (value.unknownArrivalKeys !== undefined) {
+      if (
+        !Array.isArray(value.unknownArrivalKeys) ||
+        !value.unknownArrivalKeys.every(
+          (key): key is string => typeof key === "string" && copied.has(key),
+        )
+      )
+        return null;
+      unknownArrivalKeys = [...new Set(value.unknownArrivalKeys)];
+    }
     return {
-      version: 4,
+      version: 5,
       scope,
       baseline,
       current,
@@ -804,6 +762,9 @@ export function readScopeFirstSeenLedger(
       ...(retryValue ? { retry: retryValue } : {}),
       ...(skipped ? { skipped: skipped as LedgerSkipReason } : {}),
       ...(truncated ? { truncated: true as const } : {}),
+      ...(value.incomplete ? { incomplete: true as const } : {}),
+      ...(value.partial ? { partial: true as const } : {}),
+      ...(unknownArrivalKeys !== undefined ? { unknownArrivalKeys } : {}),
       records: Object.fromEntries(copied),
     };
   } catch {

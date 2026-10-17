@@ -1,3 +1,4 @@
+import { isSystemScope } from "../policy/reserved-scopes.js";
 /**
  * MCP tool surface. Phase 1 / §4 of 260604-PLAN-vana-mcp-personal-server.md.
  *
@@ -141,7 +142,9 @@ function textResult(value: unknown, isError = false): McpToolResult {
 function uniqueScopes(connection: McpConnectionRecord): string[] {
   const set = new Set<string>();
   for (const grant of connection.grants) {
-    for (const scope of grant.scopes) set.add(scope);
+    for (const scope of grant.scopes) {
+      if (!isSystemScope(scope)) set.add(scope);
+    }
   }
   return Array.from(set).sort();
 }
@@ -149,6 +152,7 @@ function uniqueScopes(connection: McpConnectionRecord): string[] {
 function uniqueSources(connection: McpConnectionRecord): string[] {
   const set = new Set<string>();
   for (const grant of connection.grants) {
+    if (!grant.scopes.some((scope) => !isSystemScope(scope))) continue;
     const sourceId =
       typeof grant.sourceId === "string" ? grant.sourceId.trim() : "";
     if (sourceId) {
@@ -156,6 +160,7 @@ function uniqueSources(connection: McpConnectionRecord): string[] {
       continue;
     }
     for (const scope of grant.scopes) {
+      if (isSystemScope(scope)) continue;
       const [scopeSourceId] = scope.split(".");
       if (scopeSourceId && scopeSourceId !== "*") {
         set.add(scopeSourceId);
@@ -304,6 +309,7 @@ export function resolveGrantForScope(
   connection: McpConnectionRecord,
   scope: string,
 ): { grantId: string; scopes: string[] } | null {
+  if (isSystemScope(scope)) return null;
   for (const grant of connection.grants) {
     for (const granted of grant.scopes) {
       if (granted === scope) {

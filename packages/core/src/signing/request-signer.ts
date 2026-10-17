@@ -13,6 +13,8 @@ export interface RequestSigner {
     body?: Uint8Array;
     /** Signed `grantId` claim (the grant view a lineage read asks for). */
     grantId?: string;
+    /** Unique signed marker for single-use Gateway read proofs. */
+    nonce?: string;
   }): Promise<string>;
 }
 
@@ -30,6 +32,7 @@ export function createRequestSigner(account: ServerAccount): RequestSigner {
         uri: params.uri,
         body: params.body,
         grantId: params.grantId,
+        nonce: params.nonce,
       });
     },
   };
