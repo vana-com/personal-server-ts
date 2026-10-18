@@ -133,6 +133,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
   });
 
   app.use("/:scope", createBodyLimit(DATA_INGEST_MAX_SIZE));
+  app.use("/:scope/imports/:operation", createBodyLimit(DATA_INGEST_MAX_SIZE));
   app.all("*", (c) =>
     handlePersonalServerDataRequest(
       c.req.raw,

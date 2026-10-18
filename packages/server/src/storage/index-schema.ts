@@ -23,7 +23,7 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_data_point_id ON data_files (data_point_id)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 4;
+export const INDEX_SCHEMA_VERSION = 5;
 
 function hasColumn(
   db: Database.Database,
@@ -77,14 +77,56 @@ function ensureSchemaVersion(db: Database.Database): void {
 /** Open/create SQLite database, run CREATE TABLE IF NOT EXISTS, set WAL mode */
 export function initializeDatabase(dbPath: string): Database.Database {
   const db = new Database(dbPath);
+  try {
+    db.pragma("busy_timeout = 5000");
+    const deadline = performance.now() + 5000;
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    for (;;) {
+      try {
+        if (db.pragma("journal_mode", { simple: true }) !== "wal") {
+          db.pragma("journal_mode = WAL");
+        }
+        break;
+      } catch (err) {
+        if (
+          (err as { code?: string }).code !== "SQLITE_BUSY" ||
+          performance.now() >= deadline
+        )
+          throw err;
+        Atomics.wait(pause, 0, 0, Math.min(50, deadline - performance.now()));
+      }
+    }
+    db.pragma("synchronous = FULL");
 
-  db.pragma("journal_mode = WAL");
+    db.exec(CREATE_TABLE_SQL);
+    ensureSchemaVersion(db);
+    db.exec(`CREATE TABLE IF NOT EXISTS owner_import_operations (
+    authority TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('prepared', 'accepted', 'deleted', 'cancelled')),
+    collected_at TEXT NOT NULL,
+    path TEXT NOT NULL,
+    envelope_bytes BLOB,
+    metadata_json TEXT,
+    receipt_json TEXT,
+    PRIMARY KEY(authority, owner, scope, operation)
+  )`);
+    db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_owner_import_operations_path ON owner_import_operations(path)",
+    );
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_owner_import_operations_recovery ON owner_import_operations(operation) WHERE state = 'prepared' OR (state IN ('deleted', 'cancelled') AND metadata_json IS NOT NULL)",
+    );
+    for (const sql of CREATE_INDEXES_SQL) {
+      db.exec(sql);
+    }
 
-  db.exec(CREATE_TABLE_SQL);
-  ensureSchemaVersion(db);
-  for (const sql of CREATE_INDEXES_SQL) {
-    db.exec(sql);
+    return db;
+  } catch (err) {
+    db.close();
+    throw err;
   }
-
-  return db;
 }
