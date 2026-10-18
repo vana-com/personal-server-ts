@@ -28,6 +28,10 @@ import {
   type PdppImporter,
 } from "../sync/pdpp-import.js";
 import {
+  supersedeLegacyVersions,
+  type SupersedeResult,
+} from "../storage/legacy-projection.js";
+import {
   deleteScope as deleteScopeLocally,
   type DeleteScopeResult,
 } from "../sync/workers/delete.js";
@@ -67,11 +71,14 @@ import {
   type LegacyProducerProvenance,
 } from "../contracts/index.js";
 import { canonicalJsonBytes } from "../derivatives/e2ee/jcs.js";
+// Imported directly: the contracts barrel does not re-export this addition.
+import { summarizeDataAdditionsContract } from "../contracts/data.js";
 import type {
   DataFileEnvelope,
   DataPortabilityGatewayConfig,
   GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
+import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
 import {
   WRITER_ATTRIBUTION_KEY,
@@ -111,6 +118,12 @@ export interface PersonalServerReadAuthInput {
    * x402 challenge/settlement to the exact version served, not the latest.
    */
   at?: string;
+  /**
+   * The read serves no block values, only a scope's table of contents (block
+   * ids, paths, sizes). Grant policy still applies; payment-enforcing auth
+   * ports do not charge it, the same way search is free discovery.
+   */
+  metadataOnly?: boolean;
 }
 
 export interface PersonalServerReadAuthResult {
@@ -129,6 +142,8 @@ export interface PersonalServerScopeAuthInput {
   request: Request;
   /** Raw scope path param; auth ports that need scope binding validate it. */
   scope: string;
+  /** The unsigned grant hint a read also takes; see `authorizeBuilderList`. */
+  grantId?: string;
 }
 
 /**
@@ -213,14 +228,42 @@ export interface PersonalServerReadFulfillmentReporter {
   reportDenied?(event: PersonalServerReadFulfillment): Promise<void>;
 }
 
+/**
+ * What a non-owner caller may see in a data listing: the scope patterns of
+ * the grants it holds from this server's owner. Only scopes they cover are
+ * listed, and versions of any other scope are refused.
+ */
+export interface PersonalServerListAuthResult {
+  grantedScopes: readonly string[];
+}
+
 export interface PersonalServerApiAuthPort {
   authorizeOwner(request: Request): Promise<void>;
-  authorizeBuilderList(request: Request): Promise<void>;
+  /**
+   * Authorize `GET /v1/data` and `GET /v1/data/:scope/versions`.
+   *
+   * Returning void means a FULL listing: every scope, and versions of any
+   * scope, exactly as the owner sees them. Return void only for the owner or
+   * an owner-equivalent credential (dev token, control-plane token, owner
+   * session token, PS-Lite's bearer `builderToken`, which is owner-equivalent
+   * by design). Any other caller must get a result naming its granted scopes
+   * (possibly `[]`), or the call must throw.
+   * `grantId` is the unsigned hint a read also takes (`?grantId=` /
+   * `X-PS-Grant-Id`); a signed `grantId` claim takes precedence.
+   */
+  authorizeBuilderList(
+    request: Request,
+    options?: { grantId?: string },
+  ): Promise<PersonalServerListAuthResult | void>;
   /**
    * Authorize listing versions for one legacy scope. Optional so auth ports
-   * without scoped owner-token support keep the existing builder-list gate.
+   * without scoped owner-token support keep the `authorizeBuilderList` gate.
+   * Returns what `authorizeBuilderList` does: void is a full listing, a
+   * result names the scopes a non-owner may see.
    */
-  authorizeScopeVersions?(input: PersonalServerScopeAuthInput): Promise<void>;
+  authorizeScopeVersions?(
+    input: PersonalServerScopeAuthInput,
+  ): Promise<PersonalServerListAuthResult | void>;
   authorizeBuilderRead(
     input: PersonalServerReadAuthInput,
   ): Promise<PersonalServerReadAuthResult | void>;
@@ -481,6 +524,47 @@ function contractResponse(result: ContractResult): Response {
   return jsonResponse(result.body, { status: result.status });
 }
 
+/**
+ * Runs after the write committed, so a failure here must not fail the
+ * write: it is logged and the response lists no superseded versions.
+ */
+async function supersedeAfterCommit(
+  deps: PersonalServerDataApiDeps,
+  scope: string,
+  committedAt: string,
+): Promise<SupersedeResult> {
+  try {
+    const result = await supersedeLegacyVersions(
+      deps.storage,
+      scope,
+      committedAt,
+    );
+    if (result.superseded.length > 0) {
+      deps.logger?.info?.(
+        { scope, committedAt, superseded: result.superseded },
+        "Deleted legacy-form versions superseded by a PDPP write",
+      );
+    }
+    if (result.refused) {
+      deps.logger?.info?.(
+        { scope, committedAt, refused: result.refused },
+        "Kept legacy-form versions; superseding was refused",
+      );
+    }
+    return result;
+  } catch (err) {
+    deps.logger?.warn?.(
+      {
+        scope,
+        committedAt,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      "Superseding legacy-form versions failed; the write is stored",
+    );
+    return { superseded: [], refused: "superseding failed" };
+  }
+}
+
 function contractErrorResponse(err: DataContractError): Response {
   return jsonResponse(err.body, { status: err.status });
 }
@@ -669,6 +753,13 @@ export function selectedGrantId(
     request.headers.get("x-ps-grant-id") ??
     undefined
   );
+}
+
+function listAuthCovers(
+  listAuth: PersonalServerListAuthResult,
+  scope: string,
+): boolean {
+  return scopeCoveredByGrant(scope, [...listAuth.grantedScopes]);
 }
 
 export interface X402CycleInput {
@@ -1563,13 +1654,18 @@ export async function handlePersonalServerDataRequest(
 
     if (pathname === "/" || pathname === "") {
       if (request.method !== "GET") return methodNotAllowed();
-      await deps.auth.authorizeBuilderList(request);
+      const listAuth = await deps.auth.authorizeBuilderList(request, {
+        grantId: selectedGrantId(request, url),
+      });
       const result = await listDataScopesContract({
         storage: deps.storage,
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
         isVisible: listingVisibility(deps),
+        isListable: listAuth
+          ? (scope) => listAuthCovers(listAuth, scope)
+          : undefined,
         extraScopes: canonicalOnlyScopes(deps),
       });
       return jsonResponse({
@@ -1580,16 +1676,56 @@ export async function handlePersonalServerDataRequest(
       });
     }
 
+    // "additions" has no dot, so it can never be a real scope name (scopes are
+    // "source.dataset"); handle it before the single-segment scope path.
+    if (pathname === "/additions") {
+      if (request.method !== "GET") return methodNotAllowed();
+      // The counts span every scope, so only the owner may read them.
+      await deps.auth.authorizeOwner(request);
+      const daysRaw = url.searchParams.get("days");
+      const result = await summarizeDataAdditionsContract({
+        storage: deps.storage,
+        isVisible: discoveryVisibility(deps),
+        timezone: url.searchParams.get("tz") ?? "UTC",
+        // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
+        days:
+          daysRaw === null
+            ? 7
+            : /^\d{1,3}$/.test(daysRaw)
+              ? Number(daysRaw)
+              : Number.NaN,
+        now: (deps.now ?? (() => new Date()))(),
+      });
+      if ("ok" in result) return contractErrorResponse(result);
+      return jsonResponse(result);
+    }
+
     const parts = pathname.split("/").filter(Boolean);
     if (parts.length === 2 && parts[1] === "versions") {
       if (request.method !== "GET") return methodNotAllowed();
-      if (deps.auth.authorizeScopeVersions) {
-        await deps.auth.authorizeScopeVersions({
-          request,
-          scope: decodePathPart(parts[0]),
+      const versionsScopeParam = decodePathPart(parts[0]);
+      const versionsGrantId = selectedGrantId(request, url);
+      const listAuth = deps.auth.authorizeScopeVersions
+        ? await deps.auth.authorizeScopeVersions({
+            request,
+            scope: versionsScopeParam,
+            grantId: versionsGrantId,
+          })
+        : await deps.auth.authorizeBuilderList(request, {
+            grantId: versionsGrantId,
+          });
+      // A scope's version history is as much its data as its content is, so
+      // a non-owner needs a grant covering it, exactly like a read.
+      const scopeResult = parseDataScopeContract(versionsScopeParam);
+      if (
+        scopeResult.ok &&
+        listAuth &&
+        !listAuthCovers(listAuth, scopeResult.scope)
+      ) {
+        throw new GrantRequiredError({
+          reason: "No grant covers this scope",
+          requestedScope: scopeResult.scope,
         });
-      } else {
-        await deps.auth.authorizeBuilderList(request);
       }
       const result = await listDataVersionsContract({
         storage: deps.storage,
@@ -1722,6 +1858,16 @@ export async function handlePersonalServerDataRequest(
       // read, as storage already treats it.
       const fileIdParam = url.searchParams.get("fileId") || undefined;
       const atParam = url.searchParams.get("at") || undefined;
+      // `?view=stored` returns the body as stored, without the read-time
+      // legacy projection. Owner only; checked after auth below.
+      const view = url.searchParams.get("view");
+      if (view !== null && view !== "stored") {
+        return errorResponse(
+          400,
+          "INVALID_VIEW",
+          'view must be "stored" or absent',
+        );
+      }
       const selectedEntry = deps.storage.findEntry({
         scope: scopeResult.scope,
         fileId: fileIdParam,
@@ -1741,8 +1887,10 @@ export async function handlePersonalServerDataRequest(
 
       // Select the body after auth and before deletion or payment. A file's
       // version and re-add marker authorize that file, not canonical rows.
+      // `?view=stored` asks for the stored file's body, so it never reads the
+      // canonical view either.
       const latest =
-        fileIdParam === undefined && atParam === undefined
+        fileIdParam === undefined && atParam === undefined && view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
       const canonicalOwned =
@@ -1758,6 +1906,14 @@ export async function handlePersonalServerDataRequest(
         canonicalOwned ? undefined : selectedEntry,
         canonicalOwned ? "canonical" : "file",
       );
+
+      if (view === "stored" && !isOwnerView(authResult)) {
+        return errorResponse(
+          403,
+          "FORBIDDEN",
+          "Only the owner can read the stored view",
+        );
+      }
 
       // Demand: this authorized read is what pays for a recompute of a
       // derivative whose sources have moved on. It runs after the gates
@@ -1897,6 +2053,7 @@ export async function handlePersonalServerDataRequest(
           scopeParam: scopeResult.scope,
           fileId: fileIdParam,
           at: atParam,
+          ...(view === "stored" ? { view } : {}),
         });
         if (!result.ok) {
           if (result.status === 404) {
@@ -2005,6 +2162,26 @@ export async function handlePersonalServerDataRequest(
       } else {
         await deps.auth.authorizeOwner(request);
       }
+      // `?supersede=legacy`: once this write commits, delete the scope's
+      // older legacy-form versions (see supersedeLegacyVersions). It deletes
+      // data, so only the owner may ask for it.
+      const supersede = url.searchParams.get("supersede");
+      if (supersede !== null && supersede !== "legacy") {
+        await writeAuth?.releaseProof?.();
+        return errorResponse(
+          400,
+          "INVALID_SUPERSEDE",
+          'supersede must be "legacy" or absent',
+        );
+      }
+      if (supersede !== null && writeAuth) {
+        await writeAuth.releaseProof?.();
+        return errorResponse(
+          403,
+          "FORBIDDEN",
+          "Only the owner can supersede stored versions",
+        );
+      }
       // A write that fails before commit hands the proof back (replay guard)
       // so the builder's retry with the same still-valid proof is accepted;
       // after commit the proof stays consumed (a retry would be a duplicate).
@@ -2089,6 +2266,15 @@ export async function handlePersonalServerDataRequest(
                 400,
                 "INVALID_PRODUCER",
                 "Producer attribution requires a JSON body",
+              ),
+            );
+          }
+          if (supersede !== null) {
+            return failWrite(
+              errorResponse(
+                400,
+                "INVALID_SUPERSEDE",
+                "supersede applies to JSON writes only",
               ),
             );
           }
@@ -2184,6 +2370,14 @@ export async function handlePersonalServerDataRequest(
           "Data file ingested",
         );
         await logBuilderWrite();
+        const supersedeResult =
+          supersede === "legacy"
+            ? await supersedeAfterCommit(
+                deps,
+                scopeResult.scope,
+                collectedAtValue,
+              )
+            : undefined;
         notifyNewData(deps.syncManager);
         // The parsed body is the envelope's `data`, which is where a producer
         // stamps `$pdpp`. Offered here rather than inside the ingest contract
@@ -2198,7 +2392,18 @@ export async function handlePersonalServerDataRequest(
           collectedAt: collectedAtValue,
           lineageSources: lineage?.sources,
         });
-        return jsonResponse(result.response, { status: 201 });
+        return jsonResponse(
+          supersedeResult
+            ? {
+                ...result.response,
+                superseded: supersedeResult.superseded,
+                ...(supersedeResult.refused
+                  ? { supersedeRefused: supersedeResult.refused }
+                  : {}),
+              }
+            : result.response,
+          { status: 201 },
+        );
       } catch (err) {
         // An envelope that reached storage before indexing failed is
         // persisted (a re-index surfaces it): keep the proof consumed so a

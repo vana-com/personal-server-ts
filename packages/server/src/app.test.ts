@@ -156,6 +156,7 @@ describe("createApp", () => {
       cloudMode?: boolean;
       accessToken?: string;
       localApprovalOrigin?: string | (() => string | undefined);
+      localApprovalPort?: number;
     },
   ) {
     const logger = pino({ level: "silent" });
@@ -167,6 +168,8 @@ describe("createApp", () => {
       hierarchyOptions: { dataDir: join(tempDir, "data") },
       serverOrigin: SERVER_ORIGIN,
       localApprovalOrigin: options?.localApprovalOrigin,
+      localApprovalPort: options?.localApprovalPort,
+      serverPort: 8080,
       serverOwner: ownerWallet.address,
       gateway: createMockGateway(),
       accessLogWriter: createMockAccessLogWriter(),
@@ -468,6 +471,8 @@ describe("createApp", () => {
 
     const res = await app.request(
       new Request("http://localhost:8080/auth/device", { method: "POST" }),
+      undefined,
+      { incoming: { socket: { remoteAddress: "127.0.0.1" } } },
     );
 
     expect(res.status).toBe(200);
@@ -530,6 +535,112 @@ describe("createApp", () => {
     expect((await approveRes.json()).error.message).toContain(
       "Remote approval requires owner wallet authentication",
     );
+  });
+
+  it("/auth/device/* responses do not carry wildcard CORS", async () => {
+    const app = makeAppWithTokenStore(createMockTokenStore(), {
+      localApprovalOrigin: "http://127.0.0.1:34127",
+    });
+    const crossOrigin = { origin: "https://example.com" };
+
+    const initRes = await app.request(
+      new Request("https://ps.alice.com/auth/device", {
+        method: "POST",
+        headers: crossOrigin,
+      }),
+    );
+    expect(initRes.headers.get("access-control-allow-origin")).toBeNull();
+    const sessionId = new URL((await initRes.json()).login).searchParams.get(
+      "session",
+    )!;
+
+    const pageRes = await app.request(
+      new Request(
+        `https://ps.alice.com/auth/device/approve?session=${sessionId}`,
+        { headers: crossOrigin },
+      ),
+    );
+    expect(pageRes.status).toBe(200);
+    expect(pageRes.headers.get("access-control-allow-origin")).toBeNull();
+
+    const approveRes = await app.request(
+      new Request(
+        `http://127.0.0.1:34127/auth/device/approve?session=${sessionId}`,
+        { method: "POST", headers: crossOrigin },
+      ),
+    );
+    expect(approveRes.headers.get("access-control-allow-origin")).toBeNull();
+
+    const preflightRes = await app.request(
+      new Request("http://127.0.0.1:34127/auth/device/approve?session=x", {
+        method: "OPTIONS",
+        headers: {
+          ...crossOrigin,
+          "access-control-request-method": "POST",
+          "access-control-request-headers": "authorization",
+        },
+      }),
+    );
+    expect(preflightRes.headers.get("access-control-allow-origin")).toBeNull();
+
+    // Other routes keep the permissive CORS browser clients rely on.
+    const healthRes = await app.request(
+      new Request("https://ps.alice.com/health", { headers: crossOrigin }),
+    );
+    expect(healthRes.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
+  it("same-machine CLI login approves in one click on the loopback channel", async () => {
+    const tokenStore = createMockTokenStore();
+    const app = makeAppWithTokenStore(tokenStore, {
+      localApprovalOrigin: "http://127.0.0.1:34127",
+      localApprovalPort: 34127,
+    });
+    // The CLI dials the main port; the browser then opens the login URL on
+    // the loopback approval listener.
+    const viaMainPort = {
+      incoming: {
+        socket: {
+          remoteAddress: "127.0.0.1",
+          localAddress: "127.0.0.1",
+          localPort: 8080,
+        },
+      },
+    };
+    const viaApprovalListener = {
+      incoming: {
+        socket: {
+          remoteAddress: "127.0.0.1",
+          localAddress: "127.0.0.1",
+          localPort: 34127,
+        },
+      },
+    };
+
+    const initRes = await app.request(
+      new Request("http://localhost:8080/auth/device", { method: "POST" }),
+      undefined,
+      viaMainPort,
+    );
+    const login = new URL((await initRes.json()).login);
+    expect(login.origin).toBe("http://127.0.0.1:34127");
+
+    // What the approval page's fetch() sends from its own origin.
+    const approveRes = await app.request(
+      new Request(`${login.origin}/auth/device/approve${login.search}`, {
+        method: "POST",
+        headers: {
+          origin: login.origin,
+          "sec-fetch-site": "same-origin",
+        },
+      }),
+      undefined,
+      viaApprovalListener,
+    );
+
+    expect(approveRes.status).toBe(200);
+    expect(await approveRes.json()).toEqual({ status: "approved" });
+    expect(tokenStore.addToken).toHaveBeenCalledTimes(1);
   });
 
   it("cloud mode disables interactive /auth/device login flow", async () => {
@@ -924,6 +1035,106 @@ describe("createApp", () => {
       expect(
         lowerList(res.headers.get("Access-Control-Expose-Headers")),
       ).toContain("x-vana-metadata");
+    });
+  });
+
+  describe("CORS for Vana Web MCP scope requests", () => {
+    // Vana Web (app.vana.org) loads a pending MCP scope request and posts the
+    // owner's decision straight to this server through its public URL, with
+    // a Web3Signed owner header. No cookies, so `*` is enough; the preflight
+    // must pass before any auth runs, and errors must stay readable.
+    const WEB_ORIGIN = "https://app.vana.org";
+    const DECISION_PATHS = [
+      "/v1/mcp/connections/conn-1/scope-request/approve",
+      "/v1/mcp/connections/conn-1/scope-request/deny",
+    ];
+
+    function lowerList(value: string | null): string[] {
+      return (value ?? "").split(",").map((h) => h.trim().toLowerCase());
+    }
+
+    it.each(DECISION_PATHS)("OPTIONS %s answers 204", async (path) => {
+      const app = makeApp();
+      const res = await app.request(path, {
+        method: "OPTIONS",
+        headers: {
+          Origin: WEB_ORIGIN,
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "authorization, content-type",
+        },
+      });
+      expect(res.status).toBe(204);
+      expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(res.headers.get("Access-Control-Allow-Methods")).toContain("POST");
+      const allowed = lowerList(
+        res.headers.get("Access-Control-Allow-Headers"),
+      );
+      expect(allowed).toContain("authorization");
+      expect(allowed).toContain("content-type");
+    });
+
+    it("serves the owner's signed list and a readable 404 cross-origin", async () => {
+      const app = makeApp();
+      const listPath = "/v1/mcp/connections";
+      const list = await app.request(listPath, {
+        headers: {
+          Origin: WEB_ORIGIN,
+          Authorization: await buildWeb3SignedHeader({
+            wallet: ownerWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: listPath,
+          }),
+        },
+      });
+      expect(list.status).toBe(200);
+      expect(list.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect(await list.json()).toEqual({ connections: [] });
+
+      const deny = await app.request(DECISION_PATHS[1], {
+        method: "POST",
+        headers: {
+          Origin: WEB_ORIGIN,
+          Authorization: await buildWeb3SignedHeader({
+            wallet: ownerWallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: DECISION_PATHS[1],
+          }),
+        },
+      });
+      expect(deny.status).toBe(404);
+      expect(deny.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect((await deny.json()).error.code).toBe(404);
+    });
+    it("lets the page send the scope-request read token cross-origin", async () => {
+      const app = makeApp();
+      const path = "/v1/mcp/connections/conn-1/scope-request";
+      const preflight = await app.request(path, {
+        method: "OPTIONS",
+        headers: {
+          Origin: WEB_ORIGIN,
+          "Access-Control-Request-Method": "GET",
+          "Access-Control-Request-Headers": "x-vana-scope-request-token",
+        },
+      });
+      expect(preflight.status).toBe(204);
+      expect(
+        lowerList(preflight.headers.get("Access-Control-Allow-Headers")),
+      ).toContain("x-vana-scope-request-token");
+
+      // No signature on this read; a wrong token is a readable 404.
+      const read = await app.request(path, {
+        headers: {
+          Origin: WEB_ORIGIN,
+          "X-Vana-Scope-Request-Token": "not-the-token",
+        },
+      });
+      expect(read.status).toBe(404);
+      expect(read.headers.get("Access-Control-Allow-Origin")).toBe("*");
+      expect((await read.json()).error.errorCode).toBe(
+        "MCP_SCOPE_REQUEST_NOT_FOUND",
+      );
     });
   });
 });

@@ -308,6 +308,7 @@ This section elaborates on the API endpoints and authorization model, extracted 
 | `/v1/data`                  | GET    | Web3Signed (builder) | No             | Builder      | List available scopes  |
 | `/v1/data/{scope}`          | GET    | Web3Signed (builder) | **Yes**        | Builder/User | Read data file         |
 | `/v1/data/{scope}/versions` | GET    | Web3Signed (builder) | No             | Builder      | List versions          |
+| `/v1/data/additions`        | GET    | Web3Signed (owner)   | No             | User only    | Additions summary      |
 | `/v1/data/{scope}`          | DELETE | Web3Signed (owner)   | No             | User only    | Delete data            |
 | `/v1/grants`                | GET    | Web3Signed (owner)   | No             | User only    | List grants            |
 | `/v1/grants/verify`         | POST   | None                 | No             | Any          | Verify grant signature |

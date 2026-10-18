@@ -16,6 +16,40 @@ import {
 export type AuthMechanism =
   "web3-signed" | "dev-token" | "control-plane-token" | "cli-session-token";
 
+/**
+ * Longest `exp - iat` window a Web3Signed request may carry. The SDK verifier
+ * only checks `exp` and `iat` against the clock (plus skew), so without this
+ * bound the signer chooses how long a captured request stays replayable.
+ * Mirrors MAX_PROOF_LIFETIME_SEC in ./proof-id.ts, which already bounds the
+ * MCP and write-session proofs.
+ */
+export const MAX_WEB3SIGNED_LIFETIME_SEC = 15 * 60;
+
+/**
+ * The request-auth lifetime-cap rejection. Same errorCode as an expired
+ * token so clients re-sign; the message names the cap because the fix is a
+ * shorter window, not a fresh clock. A distinct class so handshake routes
+ * that carry their own proof-lifetime error code can recognise it.
+ */
+export class TokenLifetimeError extends ProtocolError {
+  constructor(lifetimeSeconds: number) {
+    super(
+      401,
+      "EXPIRED_TOKEN",
+      `Token lifetime (exp - iat) must be between 1 and ${MAX_WEB3SIGNED_LIFETIME_SEC} seconds`,
+      {
+        reason: "Token lifetime exceeds the server cap",
+        maxLifetimeSeconds: MAX_WEB3SIGNED_LIFETIME_SEC,
+        lifetimeSeconds,
+      },
+    );
+  }
+}
+
+export function isWeb3SignedLifetimeError(err: unknown): boolean {
+  return err instanceof TokenLifetimeError;
+}
+
 export interface RequestAuth {
   signer: `0x${string}`;
   payload: Partial<Web3SignedPayload>;
@@ -222,6 +256,16 @@ export async function authenticateRequest(
       bodyBytes: await cacheRequestBodyBytes(input.request),
       now: input.now?.(),
     });
+
+    // The SDK already guarantees finite iat/exp (fractional seconds allowed).
+    const lifetime = (auth.payload.exp ?? 0) - (auth.payload.iat ?? 0);
+    if (
+      !Number.isFinite(lifetime) ||
+      lifetime <= 0 ||
+      lifetime > MAX_WEB3SIGNED_LIFETIME_SEC
+    ) {
+      throw new TokenLifetimeError(lifetime);
+    }
 
     return {
       auth,

@@ -1,0 +1,14 @@
+[
+  {
+    "uuid": "0a9e1f00-0000-4000-8000-0000000000a1",
+    "name": "synthetic.claude@example.invalid's Organization",
+    "capabilities": [
+      "chat",
+      "claude_pro"
+    ],
+    "rate_limit_tier": "default_claude_ai",
+    "billing_type": "stripe_subscription",
+    "raven_type": null,
+    "active_flags": []
+  }
+]

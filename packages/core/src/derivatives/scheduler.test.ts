@@ -59,6 +59,34 @@ async function flush() {
 }
 
 describe("createRecomputeScheduler", () => {
+  it("a change to a stream a projected legacy scope reads marks that scope's questions stale", async () => {
+    const store = createInMemoryQuestionStore({
+      initial: [
+        registration({
+          questionId: "q-1",
+          sourceScopes: ["chatgpt.conversations"],
+        }),
+        registration({
+          questionId: "q-2",
+          derivedScope: "coach.memories",
+          sourceScopes: ["chatgpt.memories"],
+        }),
+      ],
+    });
+    const scheduler = createRecomputeScheduler({
+      store,
+      compute: vi.fn(async () => undefined),
+      debounceMs: 5_000,
+      timers: manualTimers().api,
+    });
+
+    scheduler.markSourceChanged("chatgpt.messages");
+    await scheduler.whenIdle();
+
+    expect((await store.get("q-1"))!.status).toBe("stale");
+    expect((await store.get("q-2"))!.status).toBe("ready");
+  });
+
   it("a source change marks registrations stale and schedules no compute", async () => {
     const store = createInMemoryQuestionStore({
       initial: [

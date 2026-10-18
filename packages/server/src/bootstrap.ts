@@ -35,6 +35,9 @@ import {
   type IndexManager,
 } from "./storage/index-manager.js";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import type { McpScopeRequestApprovalUrlHook } from "@opendatalabs/personal-server-ts-core/mcp";
+import { mcpGrantDefaultExpiry } from "@opendatalabs/personal-server-ts-core/mcp";
+import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import {
   createGatewayClient,
   NodeECIESProvider,
@@ -106,6 +109,7 @@ import {
   type RecomputeScheduler,
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import { executeJob, type JobWorkerDeps } from "./jobs/worker.js";
+import { openLocalMcpState } from "./mcp/local-state.js";
 
 const TRAILING_SLASHES = /\/+$/;
 
@@ -163,6 +167,23 @@ export interface CreateServerOptions {
    * approval surface (e.g. the desktop app) pass it here.
    */
   mcpOAuthApprovalUrl?: string | (() => string);
+  /**
+   * Page where the owner answers an MCP client's `request_scope_access`
+   * (approve/deny via `POST /v1/mcp/connections/:id/scope-request/{approve,deny}`).
+   * Called with the connection id and the server's current public origin; a
+   * returned URL is handed to the agent to show the user. Omit (or return
+   * undefined) to keep telling the agent the request waits for approval in
+   * Vana. `vanaWebMcpScopeRequestApprovalUrl()` from the core mcp entry
+   * builds the Vana Web link (`/mcp/requests/<id>?ps_origin=<origin>`).
+   */
+  mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /**
+   * Lifetime in seconds of grants the server signs itself for MCP
+   * connections: the OAuth approve path and a scope-request approve with no
+   * live grant to inherit an expiry from (a live grant's expiry is always
+   * kept). Unset or 0 signs perpetual grants (the default).
+   */
+  mcpGrantTtlSeconds?: number;
   profile?: "standard" | "enclave";
   serverAccount?: ServerAccount;
 }
@@ -201,6 +222,8 @@ export async function createServer(
   if (isEnclave && process.env.VANA_OWNER_PRIVATE_KEY) {
     throw new Error("VANA_OWNER_PRIVATE_KEY is forbidden in enclave profile");
   }
+  // Fail at startup, not at the first MCP approval, on a bad TTL.
+  mcpGrantDefaultExpiry(options?.mcpGrantTtlSeconds);
 
   const storageRoot = resolveRootPath(
     options?.rootPath ?? options?.serverDir ?? DEFAULT_ROOT_PATH,
@@ -384,7 +407,22 @@ export async function createServer(
     });
     await clearReindexInProgress();
   }
-  const dataStorage = createNodeDataStorage({ indexManager, hierarchyOptions });
+  // Sync moves stored bytes and must see them unchanged (the upload hashes
+  // them). Every reader gets the served port, which projects legacy scope
+  // bodies from stored PDPP records.
+  const rawDataStorage = createNodeDataStorage({
+    indexManager,
+    hierarchyOptions,
+  });
+  const dataStorage = withLegacyProjection(rawDataStorage, {
+    onIssue: (issue) =>
+      issue.kind === "projection_failed"
+        ? logger.warn(
+            issue,
+            "Legacy scope projection failed; serving stored body",
+          )
+        : logger.info(issue, "Legacy scope projection left rows out"),
+  });
 
   const gatewayClient =
     options?.gatewayClient ?? createGatewayClient(config.gateway.url);
@@ -652,7 +690,7 @@ export async function createServer(
     });
 
     const uploadDeps = {
-      storage: dataStorage,
+      storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
       signer: serverSigner,
@@ -665,7 +703,7 @@ export async function createServer(
     };
 
     const downloadDeps = {
-      storage: dataStorage,
+      storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
       cursor,
@@ -882,6 +920,17 @@ export async function createServer(
       logger,
     }) ?? null;
 
+  // Standard mode keeps MCP clients (e.g. a claude.ai connector) signed in
+  // across restarts. Enclaves use the TEE ingress's own sealed state.
+  const mcpState =
+    !isEnclave && masterKeySignature
+      ? await openLocalMcpState({
+          path: join(storageRoot, "mcp-state.json"),
+          masterKey: deriveMasterKey(masterKeySignature),
+          logger,
+        })
+      : undefined;
+
   const app = createApp({
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
@@ -975,6 +1024,10 @@ export async function createServer(
     serverSigner,
     getTunnelStatus: () => tunnelManager?.getStatus() ?? null,
     mcpOAuthApprovalUrl: options?.mcpOAuthApprovalUrl,
+    mcpScopeRequestApprovalUrl: options?.mcpScopeRequestApprovalUrl,
+    mcpGrantTtlSeconds: options?.mcpGrantTtlSeconds,
+    mcpConnectionStore: mcpState?.connections,
+    mcpOAuthAuthorizationStore: mcpState?.authorizations,
     onServerRegistered: (serverId) => notifyServerRegistered(serverId),
     profile: options?.profile,
     jobWorker,

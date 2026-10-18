@@ -16,6 +16,55 @@ function createAccount() {
 }
 
 describe("mcp/read-client", () => {
+  it("signs a scope listing with the grant it is discovering under", async () => {
+    const authorizeBuilderList = vi
+      .fn()
+      .mockResolvedValue({ grantedScopes: ["instagram.*"] });
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          listScopes: () => ({
+            scopes: [
+              {
+                scope: "instagram.profile",
+                latestCollectedAt: "t",
+                versionCount: 1,
+              },
+              {
+                scope: "twitter.posts",
+                latestCollectedAt: "t",
+                versionCount: 1,
+              },
+            ],
+            total: 2,
+          }),
+          findEntry: () => undefined,
+        } as never,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList,
+          authorizeBuilderRead: vi.fn(),
+        },
+        accessLogWriter: { write: vi.fn() },
+      },
+    });
+
+    const listed = await client.listScopes({ grantId: "grant-1" });
+
+    expect(listed.scopes.map((s) => s.scope)).toEqual(["instagram.profile"]);
+    const request = authorizeBuilderList.mock.calls[0][0] as Request;
+    const header = request.headers.get("authorization") ?? "";
+    const payload = JSON.parse(
+      Buffer.from(
+        header.replace("Web3Signed ", "").split(".")[0],
+        "base64url",
+      ).toString(),
+    );
+    expect(payload.grantId).toBe("grant-1");
+  });
+
   it("reports metadata as block-ready only when the manifest exists", async () => {
     const hasScopeBlocks = vi.fn().mockResolvedValue(false);
     const client = createMcpDataReadClient({

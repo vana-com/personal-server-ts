@@ -26,6 +26,10 @@ describe("published portable canonical entry points", () => {
           resolveDir: root,
         },
         bundle: true,
+        // The PDF reader the block builder uses. It runs in browsers, but its
+        // bundled source names `Buffer` in an error message and in a guarded
+        // check, which the scan below would count as Node use.
+        external: ["unpdf"],
         platform: "browser",
         format: "esm",
         target: "es2022",

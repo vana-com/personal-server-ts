@@ -1,0 +1,7 @@
+{
+  "organizationId": "0a9e1f00-0000-4000-8000-0000000000a1",
+  "nonce": "nonce-synthetic-0001",
+  "signedUrl": "https://storage.claude-export.test/export.zip?sig=synthetic",
+  "menuName": "Synthetic Claude User",
+  "menuPlan": "Pro plan"
+}

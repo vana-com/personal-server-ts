@@ -411,13 +411,13 @@ it("keeps imported approved owners paused on partial enrollment and reconciles a
       dstack,
       requestFetch,
     );
-    const admin = (route: string) =>
+    const admin = (route: string, body: unknown = {}) =>
       fetch(`http://127.0.0.1:${env.FLEET_ADMIN_PORT}/fleet/v1/${route}`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${env.FLEET_CONTROLLER_ADMIN_TOKEN}`,
         },
-        body: "{}",
+        body: JSON.stringify(body),
       });
     expect(requestFetch).not.toHaveBeenCalled();
     expect((await admin("activate")).status).toBe(503);
@@ -457,7 +457,42 @@ it("keeps imported approved owners paused on partial enrollment and reconciles a
       enrollments.filter((owner) => owner.userPsId === retryOwnerId),
     ).toHaveLength(2);
 
+    // Directory maintenance must not enumerate approved owners or reconcile a
+    // newly advanced epoch; ordinary migration quiesce below still must.
     firstOwnerEpoch = 2;
+    requestFetch.mockClear();
+    const enrolledBeforeMaintenance = structuredClone(enrollments);
+    const rowsBeforeMaintenance = runtime.controller.snapshot();
+    expect(
+      (
+        await admin("quiesce", {
+          mode: "maintenance",
+          maintenanceId: "directory-roll-1",
+        })
+      ).status,
+    ).toBe(200);
+    expect(runtime.controller.paused()).toBe(true);
+    expect(
+      (
+        await admin("activate", {
+          mode: "maintenance",
+          maintenanceId: "wrong-roll-id",
+        })
+      ).status,
+    ).toBe(503);
+    expect(runtime.controller.paused()).toBe(true);
+    expect(
+      (
+        await admin("activate", {
+          mode: "maintenance",
+          maintenanceId: "directory-roll-1",
+        })
+      ).status,
+    ).toBe(200);
+    expect(runtime.controller.paused()).toBe(false);
+    expect(requestFetch).not.toHaveBeenCalled();
+    expect(enrollments).toEqual(enrolledBeforeMaintenance);
+    expect(runtime.controller.snapshot()).toEqual(rowsBeforeMaintenance);
     let releaseIdentity!: () => void;
     identityGate = new Promise<void>((resolve) => {
       releaseIdentity = resolve;
@@ -476,9 +511,20 @@ it("keeps imported approved owners paused on partial enrollment and reconciles a
     ]);
     const drain = vi.spyOn(runtime.controller, "drain").mockResolvedValue();
     const quiescing = admin("quiesce");
+    let queuedActivation: Promise<Response> | undefined;
+    let queuedActivationSettled = false;
     let quiesceResponse: Response | undefined;
     try {
       await lookupStarted;
+      queuedActivation = admin("activate", {
+        mode: "maintenance",
+        maintenanceId: "directory-roll-1",
+      }).then((response) => {
+        queuedActivationSettled = true;
+        return response;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(queuedActivationSettled).toBe(false);
       expect(runtime.controller.paused()).toBe(true);
       expect(drain).toHaveBeenCalledWith("worker-being-drained");
     } finally {
@@ -488,6 +534,7 @@ it("keeps imported approved owners paused on partial enrollment and reconciles a
       drain.mockRestore();
     }
     expect(quiesceResponse.status).toBe(200);
+    expect((await queuedActivation)?.status).toBe(503);
     expect(runtime.controller.paused()).toBe(true);
     expect(runtime.controller.snapshot()).toHaveLength(3);
     expect(

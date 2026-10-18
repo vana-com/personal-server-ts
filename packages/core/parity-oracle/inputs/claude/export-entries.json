@@ -1,0 +1,401 @@
+[
+  [
+    "users.json",
+    [
+      {
+        "uuid": "0a9e1f00-0000-4000-8000-0000000000b1",
+        "full_name": "Synthetic Claude User",
+        "email_address": "synthetic.claude@example.invalid",
+        "verified_phone_number": ""
+      }
+    ]
+  ],
+  [
+    "conversations.json",
+    [
+      {
+        "uuid": "0a9e1f00-0000-4000-8000-00000000c001",
+        "name": "Debugging a flaky test",
+        "summary": "",
+        "created_at": "2026-09-10T09:00:00.000000Z",
+        "updated_at": "2026-09-10T09:30:00.000000Z",
+        "is_starred": true,
+        "project_uuid": "0a9e1f00-0000-4000-8000-0000000000d1",
+        "account": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000b1"
+        },
+        "chat_messages": [
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-000000000102",
+            "text": "Let me check the test runner.\n```\nThis block is not supported on your current device yet.\n```\n\n```\nThis block is not supported on your current device yet.\n```\nThe test depends on wall-clock time.",
+            "content": [
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "thinking",
+                "thinking": "The user wants the cause.",
+                "summaries": [],
+                "cut_off": false
+              },
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Let me check the test runner.",
+                "citations": []
+              },
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "tool_use",
+                "id": "toolu_synth01",
+                "name": "bash",
+                "input": {
+                  "command": "npm test"
+                },
+                "message": null,
+                "integration_name": null
+              },
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "tool_result",
+                "tool_use_id": "toolu_synth01",
+                "name": "bash",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "1 failed"
+                  }
+                ],
+                "is_error": false
+              },
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "The test depends on wall-clock time.",
+                "citations": []
+              }
+            ],
+            "sender": "assistant",
+            "created_at": "2026-09-10T09:01:00.000000Z",
+            "updated_at": "2026-09-10T09:01:00.000000Z",
+            "attachments": [],
+            "files": [],
+            "parent_message_uuid": "0a9e1f00-0000-4000-8000-000000000101"
+          },
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-000000000101",
+            "text": "Why does this test fail only on CI?",
+            "content": [
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Why does this test fail only on CI?",
+                "citations": []
+              }
+            ],
+            "sender": "human",
+            "created_at": "2026-09-10T09:00:30.000000Z",
+            "updated_at": "2026-09-10T09:00:30.000000Z",
+            "attachments": [
+              {
+                "file_name": "ci.log",
+                "file_size": 18,
+                "file_type": "txt",
+                "extracted_content": "FAIL clock.test.ts"
+              }
+            ],
+            "files": [
+              {
+                "file_uuid": "0a9e1f00-0000-4000-8000-0000000000f1",
+                "file_name": "ci.log"
+              }
+            ],
+            "parent_message_uuid": "00000000-0000-4000-8000-000000000000"
+          },
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-000000000103",
+            "text": "Thanks, that fixed it.",
+            "content": [
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Thanks, that fixed it.",
+                "citations": []
+              }
+            ],
+            "sender": "human",
+            "created_at": "2026-09-10T09:05:00.000000Z",
+            "updated_at": "2026-09-10T09:06:00.000000Z",
+            "attachments": [],
+            "files": [],
+            "parent_message_uuid": "0a9e1f00-0000-4000-8000-000000000102"
+          }
+        ]
+      },
+      {
+        "uuid": "0a9e1f00-0000-4000-8000-00000000c002",
+        "name": "",
+        "summary": "Recipe ideas for a dinner party",
+        "created_at": "2026-09-11T18:00:00.000000Z",
+        "updated_at": "2026-09-11T18:10:00.000000Z",
+        "is_starred": false,
+        "project_uuid": null,
+        "account": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000b1"
+        },
+        "chat_messages": [
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-000000000201",
+            "text": "Ideas for six people?",
+            "content": [
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Ideas for six people?",
+                "citations": []
+              }
+            ],
+            "sender": "human",
+            "created_at": "2026-09-11T18:00:00.000000Z",
+            "updated_at": "2026-09-11T18:00:00.000000Z",
+            "attachments": [],
+            "files": [],
+            "parent_message_uuid": "00000000-0000-4000-8000-000000000000"
+          },
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-000000000202",
+            "text": "Try a paella and a green salad.",
+            "content": [
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Try a paella and a green salad.",
+                "citations": []
+              }
+            ],
+            "sender": "assistant",
+            "created_at": "2026-09-11T18:00:10.000000Z",
+            "updated_at": "2026-09-11T18:00:10.000000Z",
+            "attachments": [],
+            "files": [],
+            "parent_message_uuid": "0a9e1f00-0000-4000-8000-000000000201"
+          }
+        ]
+      },
+      {
+        "uuid": "0a9e1f00-0000-4000-8000-00000000c003",
+        "name": "",
+        "summary": "",
+        "created_at": "2026-09-12T07:00:00.000000Z",
+        "updated_at": "2026-09-12T07:01:00.000000Z",
+        "account": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000b1"
+        },
+        "chat_messages": [
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-000000000301",
+            "text": "",
+            "content": [
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Block-only question?",
+                "citations": []
+              },
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Second block.",
+                "citations": []
+              }
+            ],
+            "sender": "human",
+            "created_at": "2026-09-12T07:00:00.000000Z",
+            "updated_at": "2026-09-12T07:00:00.000000Z",
+            "attachments": [],
+            "files": [],
+            "parent_message_uuid": "00000000-0000-4000-8000-000000000000"
+          },
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-000000000302",
+            "text": "Block-only answer.",
+            "content": [
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Block-only answer.",
+                "citations": []
+              }
+            ],
+            "sender": "assistant",
+            "created_at": "2026-09-12T07:00:05.000000Z",
+            "updated_at": "2026-09-12T07:00:05.000000Z",
+            "attachments": [],
+            "files": [],
+            "parent_message_uuid": "0a9e1f00-0000-4000-8000-000000000301"
+          }
+        ]
+      },
+      {
+        "uuid": "0a9e1f00-0000-4000-8000-00000000c004",
+        "name": "Empty chat",
+        "summary": "",
+        "created_at": "2026-09-13T12:00:00.000000Z",
+        "updated_at": "2026-09-13T12:00:00.000000Z",
+        "is_starred": false,
+        "project_uuid": null,
+        "account": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000b1"
+        },
+        "chat_messages": []
+      },
+      {
+        "uuid": "0a9e1f00-0000-4000-8000-00000000c005",
+        "name": "Old travel notes",
+        "summary": "",
+        "created_at": "2026-06-01T10:00:00.000000Z",
+        "updated_at": "2026-06-01T10:05:00.000000Z",
+        "is_starred": false,
+        "project_uuid": null,
+        "account": {
+          "uuid": "0a9e1f00-0000-4000-8000-0000000000b1"
+        },
+        "chat_messages": [
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-000000000501",
+            "text": "Best time to visit Porto?",
+            "content": [
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Best time to visit Porto?",
+                "citations": []
+              }
+            ],
+            "sender": "human",
+            "created_at": "2026-06-01T10:00:00.000000Z",
+            "updated_at": "2026-06-01T10:00:00.000000Z",
+            "attachments": [],
+            "files": [],
+            "parent_message_uuid": "00000000-0000-4000-8000-000000000000"
+          },
+          {
+            "uuid": "0a9e1f00-0000-4000-8000-000000000502",
+            "text": "Late spring or early autumn.",
+            "content": [
+              {
+                "start_timestamp": null,
+                "stop_timestamp": null,
+                "flags": null,
+                "type": "text",
+                "text": "Late spring or early autumn.",
+                "citations": []
+              }
+            ],
+            "sender": "assistant",
+            "created_at": "2026-06-01T10:00:05.000000Z",
+            "updated_at": "2026-06-01T10:00:05.000000Z",
+            "attachments": [],
+            "files": [],
+            "parent_message_uuid": "0a9e1f00-0000-4000-8000-000000000501"
+          }
+        ]
+      }
+    ]
+  ],
+  [
+    "projects/0a9e1f00-0000-4000-8000-0000000000d1.json",
+    {
+      "uuid": "0a9e1f00-0000-4000-8000-0000000000d1",
+      "name": "Design System",
+      "description": "Tokens and components.",
+      "is_private": true,
+      "is_starter_project": false,
+      "prompt_template": "Answer as a design-system reviewer.",
+      "created_at": "2026-09-01T00:00:00.000000Z",
+      "updated_at": "2026-09-09T00:00:00.000000Z",
+      "creator": {
+        "uuid": "0a9e1f00-0000-4000-8000-0000000000b1",
+        "full_name": "Synthetic Claude User"
+      },
+      "docs": [
+        {
+          "uuid": "0a9e1f00-0000-4000-8000-00000000d011",
+          "filename": "tokens.md",
+          "content": "# Tokens\nspacing-1: 4px",
+          "created_at": "2026-09-02T00:00:00.000000Z"
+        },
+        {
+          "filename": "id-less.md",
+          "content": "A document without a uuid.",
+          "created_at": "2026-09-03T00:00:00.000000Z"
+        }
+      ]
+    }
+  ],
+  [
+    "projects/0a9e1f00-0000-4000-8000-0000000000d2.json",
+    {
+      "uuid": "0a9e1f00-0000-4000-8000-0000000000d2",
+      "name": "Old Research",
+      "description": "",
+      "is_private": true,
+      "is_starter_project": false,
+      "prompt_template": "",
+      "created_at": "2026-03-01T00:00:00.000000Z",
+      "updated_at": "2026-05-01T00:00:00.000000Z",
+      "archived_at": "2026-05-01T00:00:00.000000Z",
+      "creator": {
+        "uuid": "0a9e1f00-0000-4000-8000-0000000000b1",
+        "full_name": "Synthetic Claude User"
+      },
+      "docs": []
+    }
+  ],
+  [
+    "projects/0a9e1f00-0000-4000-8000-0000000000d3.json",
+    {
+      "uuid": "0a9e1f00-0000-4000-8000-0000000000d3",
+      "name": "How to use Claude",
+      "description": "An example project.",
+      "is_private": false,
+      "is_starter_project": true,
+      "prompt_template": "",
+      "created_at": "2026-09-05T00:00:00.000000Z",
+      "updated_at": "2026-09-05T00:00:00.000000Z",
+      "creator": null,
+      "docs": [
+        {
+          "uuid": "0a9e1f00-0000-4000-8000-00000000d031",
+          "filename": "intro.md",
+          "content": "Example content.",
+          "created_at": "2026-09-05T00:00:00.000000Z"
+        }
+      ]
+    }
+  ]
+]

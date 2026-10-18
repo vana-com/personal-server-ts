@@ -615,6 +615,9 @@ describe("TEE MCP ingress", () => {
       scopes: ["chatgpt.history"],
       reason: "Answer from prior chats.",
       requestedAt: expect.any(String),
+      // Only the hash of the approval link's read token is stored.
+      readTokenHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      readTokenExpiresAt: expect.any(String),
     });
     expect(dispatch.mock.calls[1]?.[1]).toMatchObject({
       scopeAccessRequest: { scopes: ["chatgpt.history"] },
@@ -716,6 +719,7 @@ describe("TEE MCP ingress", () => {
           granteeAddress: OWNER,
           status: "approved",
           grants: [{ grantId: "0xabc", scopes: ["spotify.profile"] }],
+          grantedScopes: ["spotify.profile"],
           createdAt: expect.any(String),
         },
       ]);

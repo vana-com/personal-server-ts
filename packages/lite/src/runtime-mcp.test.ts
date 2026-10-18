@@ -29,12 +29,15 @@ import {
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
 import {
+  type McpScopeRequestApprovalUrlHook,
   createInMemoryMcpConnectionStore,
   createMcpConnection,
   createMcpDataReadClient,
   hashConnectionToken,
   loadMcpGranteeAccount,
   MCP_TOOLS,
+  MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  vanaWebMcpScopeRequestApprovalUrl,
   type McpConnectionStore,
   type McpToolContext,
 } from "@opendatalabs/personal-server-ts-core/mcp";
@@ -170,6 +173,7 @@ function buildRuntime(
     grantId?: string;
     scopes?: string[];
     approvalUrl?: string;
+    scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   } = {},
 ): RuntimeBundle {
   const gateway = makeMockGateway({
@@ -199,6 +203,7 @@ function buildRuntime(
     serverOwner: owner.address,
     mcpConnectionStore: store,
     mcpOAuthApprovalUrl: opts.approvalUrl,
+    mcpScopeRequestApprovalUrl: opts.scopeRequestApprovalUrl,
     auth: createWeb3SignedPsLiteAuth({
       origin: SERVER_ORIGIN,
       ownerAddress: owner.address,
@@ -417,6 +422,20 @@ describe("createPsLiteRuntime + /mcp/:token route", () => {
     expect((await res.json()).error.errorCode).toBe("INVALID_TOKEN");
   });
 
+  it("refuses the third-party session handshake with an explicit code", async () => {
+    const { runtime } = buildRuntime();
+    const res = await runtime.fetch(
+      new Request(`${SERVER_ORIGIN}/mcp/session`, {
+        method: "POST",
+        headers: { authorization: "Web3Signed e30.0x00" },
+      }),
+    );
+    expect(res.status).toBe(501);
+    expect((await res.json()).error.errorCode).toBe(
+      "MCP_SESSION_NOT_SUPPORTED",
+    );
+  });
+
   it("rejects pending tokens", async () => {
     const { runtime, store } = buildRuntime();
     const created = await createMcpConnection(
@@ -436,6 +455,162 @@ describe("createPsLiteRuntime + /mcp/:token route", () => {
   });
 });
 
+describe("createPsLiteRuntime + scope-request answers", () => {
+  async function requested(bundle: RuntimeBundle) {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store: bundle.store, publicOrigin: SERVER_ORIGIN },
+    );
+    await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/connections/${created.connectionId}/approve`,
+        { grants: [{ grantId: "grant-mcp-1", scopes: ["instagram.profile"] }] },
+      ),
+    );
+    const res = await bundle.runtime.fetch(
+      new Request(
+        `${SERVER_ORIGIN}/mcp/${encodeURIComponent(created.connectionToken)}`,
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: {
+              name: "request_scope_access",
+              arguments: { scopes: ["chatgpt.history", "spotify.profile"] },
+            },
+          }),
+        },
+      ),
+    );
+    const tool = JSON.parse((await res.json()).result.content[0].text);
+    return { id: created.connectionId, tool };
+  }
+
+  it("hands out the host link and approves the union server-side", async () => {
+    const bundle = buildRuntime({
+      grantId: "grant-mcp-1",
+      scopeRequestApprovalUrl: (id) => `http://127.0.0.1:9/approve/${id}`,
+    });
+    const { id, tool } = await requested(bundle);
+    expect(tool.approvalUrl).toBe(`http://127.0.0.1:9/approve/${id}`);
+
+    const res = await bundle.runtime.fetch(
+      await ownerSigned(
+        "POST",
+        `/v1/mcp/connections/${id}/scope-request/approve`,
+        { scopes: ["chatgpt.history"] },
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      grantedScopes: ["chatgpt.history", "instagram.profile"],
+      deniedScopes: ["spotify.profile"],
+    });
+    expect(bundle.gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopes: ["chatgpt.history", "instagram.profile"],
+        grantVersion: "2",
+      }),
+    );
+  });
+
+  it("denies, then refuses a second answer, and 404s unknown ids", async () => {
+    const bundle = buildRuntime();
+    const { id, tool } = await requested(bundle);
+    expect(tool).not.toHaveProperty("approvalUrl");
+
+    const deny = () =>
+      ownerSigned("POST", `/v1/mcp/connections/${id}/scope-request/deny`);
+    const denied = await bundle.runtime.fetch(await deny());
+    expect(denied.status).toBe(200);
+    expect((await denied.json()).connection.scopeAccessDecision).toMatchObject({
+      decision: "denied",
+    });
+    const again = await bundle.runtime.fetch(await deny());
+    expect(again.status).toBe(409);
+
+    const missing = await bundle.runtime.fetch(
+      await ownerSigned("POST", "/v1/mcp/connections/nope/scope-request/deny"),
+    );
+    expect(missing.status).toBe(404);
+    expect((await missing.json()).error.errorCode).toBe(
+      "MCP_CONNECTION_NOT_FOUND",
+    );
+
+    const one = await bundle.runtime.fetch(
+      await ownerSigned("GET", `/v1/mcp/connections/${id}`),
+    );
+    expect(one.status).toBe(200);
+    expect(await one.json()).toMatchObject({
+      id,
+      scopeAccessDecision: { decision: "denied" },
+    });
+    const unknown = await bundle.runtime.fetch(
+      await ownerSigned("GET", "/v1/mcp/connections/nope"),
+    );
+    expect(unknown.status).toBe(404);
+    expect((await unknown.json()).error.errorCode).toBe(
+      "MCP_CONNECTION_NOT_FOUND",
+    );
+  });
+  it("loads the request with the link token and no signature, until answered", async () => {
+    const bundle = buildRuntime({
+      grantId: "grant-mcp-1",
+      scopeRequestApprovalUrl: vanaWebMcpScopeRequestApprovalUrl(),
+    });
+    const { id, tool } = await requested(bundle);
+    const link = new URL(tool.approvalUrl);
+    expect(link.search).not.toContain("t=");
+    const token = new URLSearchParams(link.hash.slice(1)).get("t") ?? "";
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/u);
+
+    const read = (value?: string, connectionId = id) =>
+      bundle.runtime.fetch(
+        new Request(
+          `${SERVER_ORIGIN}/v1/mcp/connections/${connectionId}/scope-request`,
+          {
+            headers: value ? { [MCP_SCOPE_REQUEST_TOKEN_HEADER]: value } : {},
+          },
+        ),
+      );
+    const ok = await read(token);
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("Cache-Control")).toBe("no-store");
+    expect(await ok.json()).toEqual({
+      id,
+      displayName: "Claude",
+      scopeAccessRequest: {
+        scopes: ["chatgpt.history", "spotify.profile"],
+        requestedAt: expect.any(String),
+      },
+      grantedScopes: ["instagram.profile"],
+    });
+
+    for (const res of [
+      await read(),
+      await read(`${token.slice(0, -1)}x`),
+      await read(token, "nope"),
+    ]) {
+      expect(res.status).toBe(404);
+      expect((await res.json()).error.errorCode).toBe(
+        "MCP_SCOPE_REQUEST_NOT_FOUND",
+      );
+    }
+
+    await bundle.runtime.fetch(
+      await ownerSigned("POST", `/v1/mcp/connections/${id}/scope-request/deny`),
+    );
+    expect((await read(token)).status).toBe(404);
+  });
+});
+
 describe("createPsLiteRuntime + MCP OAuth routes", () => {
   it("returns JSON OAuth error when authorize cannot redirect", async () => {
     const bundle = buildRuntime({
@@ -447,6 +622,73 @@ describe("createPsLiteRuntime + MCP OAuth routes", () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({
       error: "unsupported_response_type",
+    });
+  });
+
+  it("redirects authorize errors only to an allowed redirect_uri", async () => {
+    const bundle = buildRuntime({
+      approvalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+    });
+    const ok = await bundle.runtime.fetch(
+      new Request(
+        `${SERVER_ORIGIN}/mcp/oauth/authorize?${new URLSearchParams({
+          response_type: "token",
+          redirect_uri: CLAUDE_REDIRECT_URI,
+          state: "s1",
+        })}`,
+      ),
+    );
+    expect(ok.status).toBe(302);
+    expect(new URL(ok.headers.get("location")!).searchParams.get("error")).toBe(
+      "unsupported_response_type",
+    );
+
+    for (const redirectUri of [
+      "javascript:alert(1)",
+      "data:text/html,x",
+      "http://example.com/cb",
+    ]) {
+      for (const responseType of ["token", "code"]) {
+        const res = await bundle.runtime.fetch(
+          new Request(
+            `${SERVER_ORIGIN}/mcp/oauth/authorize?${new URLSearchParams({
+              response_type: responseType,
+              client_id: "client",
+              redirect_uri: redirectUri,
+              code_challenge: "challenge",
+              code_challenge_method: "S256",
+            })}`,
+          ),
+        );
+        expect(res.status).toBe(400);
+        expect(res.headers.get("location")).toBeNull();
+        expect((await res.json()).error).toBeTruthy();
+      }
+    }
+  });
+
+  it("validates redirect_uris on dynamic client registration", async () => {
+    const bundle = buildRuntime({
+      approvalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+    });
+    const register = (redirect_uris: unknown[]) =>
+      bundle.runtime.fetch(
+        new Request(`${SERVER_ORIGIN}/mcp/oauth/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ client_name: "Client", redirect_uris }),
+        }),
+      );
+    const accepted = await register([
+      CLAUDE_REDIRECT_URI,
+      "http://localhost:6274/oauth/callback",
+      "cursor://anysphere.cursor-retrieval/oauth/callback",
+    ]);
+    expect(accepted.status).toBe(201);
+    const rejected = await register([CLAUDE_REDIRECT_URI, "javascript:x"]);
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toMatchObject({
+      error: "invalid_redirect_uri",
     });
   });
 

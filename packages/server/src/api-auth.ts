@@ -5,11 +5,15 @@ import {
 } from "@opendatalabs/personal-server-ts-core/auth";
 import type {
   PersonalServerApiAuthPort,
+  PersonalServerListAuthResult,
   PersonalServerReadAuthInput,
   PersonalServerScopeAuthInput,
   PersonalServerWriteAuthInput,
 } from "@opendatalabs/personal-server-ts-core/api";
-import { verifyDataReadPolicy } from "@opendatalabs/personal-server-ts-core/policy";
+import {
+  resolveDataListGrantScopes,
+  verifyDataReadPolicy,
+} from "@opendatalabs/personal-server-ts-core/policy";
 import {
   createInMemoryWriteProofReplayStore,
   createWriteSessionAuthorization,
@@ -19,7 +23,6 @@ import {
 import {
   NotOwnerError,
   ProtocolError,
-  UnregisteredBuilderError,
 } from "@opendatalabs/personal-server-ts-core/errors";
 import type {
   DataStoragePort,
@@ -98,18 +101,6 @@ async function authenticate(
     sessionTokenVerifier: deps.tokenStore,
     serverOwner: deps.serverOwner,
   });
-}
-
-async function assertRegisteredBuilder(
-  gateway: GatewayClient,
-  signer: `0x${string}`,
-): Promise<void> {
-  // vana-sdk 3.14.0's GatewayClient always exposes isRegisteredBuilder, so the
-  // legacy getBuilder feature-detect fallback is now unreachable (its else
-  // branch narrows the client to `never`). Query registration directly, matching
-  // middleware/builder-check.ts.
-  if (await gateway.isRegisteredBuilder(signer)) return;
-  throw new UnregisteredBuilderError();
 }
 
 function bearerToken(request: Request): string | undefined {
@@ -311,6 +302,38 @@ export function createServerApiAuth(
     return writeSessions.recognizeWriteSession(request);
   }
 
+  async function authorizeBuilderList(
+    request: Request,
+    options?: { grantId?: string },
+  ): Promise<PersonalServerListAuthResult | void> {
+    const result = await authenticate(request, deps);
+    if (
+      result.isPolicyBypass ||
+      isOwner(result.auth.signer, deps.serverOwner)
+    ) {
+      return;
+    }
+    // A builder lists only what its grants cover, bound to this server's
+    // owner like a read; fail closed when we can't identify the owner.
+    // resolveDataListGrantScopes does the one builder lookup (and throws
+    // UnregisteredBuilderError), so no separate registration check here.
+    if (!deps.serverOwner) throw serverNotConfigured();
+    const grantedScopes = await resolveDataListGrantScopes(
+      {
+        signer: result.auth.signer,
+        grantId: result.auth.payload.grantId ?? options?.grantId,
+        serverOwner: deps.serverOwner,
+      },
+      {
+        authSessionVerifier: deps.gateway,
+        grantVerifier: deps.gateway,
+        grantLister: deps.gateway,
+        runtimeAvailability: deps.runtimeAvailability,
+      },
+    );
+    return { grantedScopes };
+  }
+
   return {
     authorizeOwner,
     authorizeWrite,
@@ -322,26 +345,12 @@ export function createServerApiAuth(
 
     async authorizeScopeVersions(input) {
       if (await authorizePdppOwnerBearerForScope(input)) return;
-      const result = await authenticate(input.request, deps);
-      if (
-        result.isPolicyBypass ||
-        isOwner(result.auth.signer, deps.serverOwner)
-      ) {
-        return;
-      }
-      await assertRegisteredBuilder(deps.gateway, result.auth.signer);
+      // Any other credential is held to the listing rules: a builder sees the
+      // versions of a scope only when one of its grants covers it.
+      return authorizeBuilderList(input.request, { grantId: input.grantId });
     },
 
-    async authorizeBuilderList(request) {
-      const result = await authenticate(request, deps);
-      if (
-        result.isPolicyBypass ||
-        isOwner(result.auth.signer, deps.serverOwner)
-      ) {
-        return;
-      }
-      await assertRegisteredBuilder(deps.gateway, result.auth.signer);
-    },
+    authorizeBuilderList,
 
     async authorizeBuilderRead(input: PersonalServerReadAuthInput) {
       const result = await authenticate(input.request, deps);

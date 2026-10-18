@@ -1,0 +1,23 @@
+{
+  "memories": [
+    {
+      "id": "mem-synth-0001",
+      "content": "Prefers metric units.",
+      "created_at": "2026-08-01T10:00:00.123456+00:00",
+      "updated_at": "2026-08-02T11:30:00.654321+00:00"
+    },
+    {
+      "id": "mem-synth-0002",
+      "content": "Is learning Portuguese.",
+      "created_at": null,
+      "updated_at": "2026-09-03T09:15:00.000000+00:00"
+    },
+    {
+      "id": "mem-synth-0003",
+      "content": "Has a dog named Pixel.",
+      "created_at": "2026-07-20T08:00:00.000000+00:00"
+    }
+  ],
+  "memory_max_tokens": 10000,
+  "memory_num_tokens": 42
+}

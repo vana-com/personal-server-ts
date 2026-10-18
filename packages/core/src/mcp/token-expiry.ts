@@ -53,6 +53,28 @@ export function isMcpRefreshExpired(
 }
 
 /**
+ * True for a connection issued before the store recorded token lifetimes
+ * (Personal Server < 1.17): no `tokenExpiresAt` and no refresh token. Its
+ * client holds only the access token and has no way to refresh, so failing
+ * it closed forces every such client to re-consent. A store that may hold
+ * these records (PS-Lite, whose web owners ran 1.12) can accept them; owner
+ * revocation still ends them. Every record written since 1.17 carries an
+ * expiry, so this never makes a newly issued token unbounded.
+ */
+export function isPreExpiryMcpRecord(
+  record: Pick<
+    McpConnectionRecord,
+    "tokenExpiresAt" | "refreshTokenHash" | "refreshExpiresAt"
+  >,
+): boolean {
+  return (
+    !record.tokenExpiresAt &&
+    !record.refreshTokenHash &&
+    !record.refreshExpiresAt
+  );
+}
+
+/**
  * True when `hash` is this record's current or rotated-out refresh hash. Every
  * store resolves a refresh token through this one predicate.
  */

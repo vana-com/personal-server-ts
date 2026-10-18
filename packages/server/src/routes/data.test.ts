@@ -612,7 +612,7 @@ describe("GET /v1/data (list scopes)", () => {
   ) {
     const uri = "/";
     const header = await buildWeb3SignedHeader({
-      wallet,
+      wallet: ownerWallet,
       aud: SERVER_ORIGIN,
       method: "GET",
       uri,
@@ -702,17 +702,26 @@ describe("GET /v1/data (list scopes)", () => {
     expect(json.error.errorCode).toBe("MISSING_AUTH");
   });
 
-  it("returns 401 for unregistered builder", async () => {
-    const gateway = createMockGateway({
-      isRegisteredBuilder: vi.fn().mockResolvedValue(false),
-    });
+  it("returns 401 for unregistered builder after a single builder lookup", async () => {
+    const isRegisteredBuilder = vi.fn().mockResolvedValue(false);
+    const getBuilder = vi.fn().mockResolvedValue(null);
+    const gateway = createMockGateway({ isRegisteredBuilder, getBuilder });
     const app = createApp({ gateway });
 
-    const res = await getListWithAuth(app);
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/",
+    });
+    const res = await app.request("/", { headers: { Authorization: header } });
 
     expect(res.status).toBe(401);
     const json = await res.json();
     expect(json.error.errorCode).toBe("UNREGISTERED_BUILDER");
+    // One gateway round-trip decides registration; no duplicate lookup.
+    expect(getBuilder).toHaveBeenCalledTimes(1);
+    expect(isRegisteredBuilder).not.toHaveBeenCalled();
   });
 
   it("allows owner session tokens to list scopes without builder registration", async () => {
@@ -734,6 +743,537 @@ describe("GET /v1/data (list scopes)", () => {
     const json = await res.json();
     expect(json.scopes).toHaveLength(1);
     expect(json.scopes[0].scope).toBe("instagram.profile");
+  });
+});
+
+describe("GET /v1/data listings are scoped to the builder's grants", () => {
+  let dataDir: string;
+  let hierarchyOptions: HierarchyManagerOptions;
+  let indexManager: IndexManager;
+
+  function createApp(
+    gatewayOverrides: Partial<GatewayClient> = {},
+    depsOverrides: Partial<DataRouteDeps> = {},
+  ) {
+    return dataRoutes({
+      indexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(gatewayOverrides),
+      accessLogWriter: createMockAccessLogWriter(),
+      ...depsOverrides,
+    });
+  }
+
+  async function signedGet(
+    app: ReturnType<typeof dataRoutes>,
+    uri: string,
+    options: { signer?: typeof wallet; grantId?: string } = {},
+  ) {
+    const header = await buildWeb3SignedHeader({
+      wallet: options.signer ?? wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri,
+      grantId: options.grantId,
+    });
+    return app.request(uri, { headers: { Authorization: header } });
+  }
+
+  async function listedScopes(res: Response): Promise<string[]> {
+    const json = await res.json();
+    return json.scopes.map((s: { scope: string }) => s.scope);
+  }
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), "data-route-list-grant-test-"));
+    hierarchyOptions = { dataDir };
+    indexManager = createIndexManager(initializeDatabase(":memory:"));
+    const app = createApp();
+    await postWithOwnerAuth(app, "instagram.profile", { username: "test" });
+    await postWithOwnerAuth(app, "twitter.posts", { count: 10 });
+  });
+
+  afterEach(async () => {
+    indexManager.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("lists every scope for the owner", async () => {
+    const res = await signedGet(createApp(), "/", { signer: ownerWallet });
+
+    expect(res.status).toBe(200);
+    expect(await listedScopes(res)).toEqual([
+      "instagram.profile",
+      "twitter.posts",
+    ]);
+  });
+
+  it("lists no scopes for a builder holding no grant", async () => {
+    const res = await signedGet(createApp(), "/");
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.scopes).toEqual([]);
+    expect(json.total).toBe(0);
+  });
+
+  it("lists only the scopes the signed grant covers", async () => {
+    const getGrant = vi
+      .fn()
+      .mockResolvedValue(makeGrant({ scopes: ["instagram.profile"] }));
+    const res = await signedGet(createApp({ getGrant }), "/", {
+      grantId: "grant-123",
+    });
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.scopes.map((s: { scope: string }) => s.scope)).toEqual([
+      "instagram.profile",
+    ]);
+    expect(json.total).toBe(1);
+    expect(getGrant).toHaveBeenCalledWith("grant-123");
+  });
+
+  it("honours the grantId query parameter like a read", async () => {
+    const app = createApp({
+      getGrant: vi
+        .fn()
+        .mockResolvedValue(makeGrant({ scopes: ["twitter.posts"] })),
+    });
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/",
+    });
+    const res = await app.request("/?grantId=grant-123", {
+      headers: { Authorization: header },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await listedScopes(res)).toEqual(["twitter.posts"]);
+  });
+
+  it("without a grantId, lists the scopes of the owner's live grants to this builder", async () => {
+    const listGrantsByUser = vi.fn().mockResolvedValue([
+      makeGrant({ id: "g-ig", scopes: ["instagram.*"] }),
+      makeGrant({ id: "g-other", granteeId: "0xotherbuilder", scopes: ["*"] }),
+      makeGrant({
+        id: "g-revoked",
+        scopes: ["twitter.posts"],
+        revokedAt: "2026-01-22T10:00:00.000Z",
+      }),
+      makeGrant({
+        id: "g-expired",
+        scopes: ["twitter.posts"],
+        expiresAt: String(Math.floor(Date.now() / 1000) - 60),
+      }),
+      makeGrant({
+        id: "g-foreign",
+        grantorAddress: wallet.address,
+        scopes: ["twitter.posts"],
+      }),
+    ]);
+    const res = await signedGet(createApp({ listGrantsByUser }), "/");
+
+    expect(res.status).toBe(200);
+    expect(await listedScopes(res)).toEqual(["instagram.profile"]);
+    expect(listGrantsByUser).toHaveBeenCalledWith(ownerWallet.address);
+  });
+
+  it("does not count a grant issued by a different owner", async () => {
+    const app = createApp({
+      getGrant: vi
+        .fn()
+        .mockResolvedValue(makeGrant({ grantorAddress: wallet.address })),
+    });
+
+    const list = await signedGet(app, "/", { grantId: "grant-123" });
+    expect(list.status).toBe(403);
+    expect((await list.json()).error.errorCode).toBe("GRANT_OWNER_MISMATCH");
+
+    const versions = await signedGet(app, "/instagram.profile/versions", {
+      grantId: "grant-123",
+    });
+    expect(versions.status).toBe(403);
+  });
+
+  it("does not count a revoked or expired grant", async () => {
+    for (const grant of [
+      makeGrant({ revokedAt: "2026-01-22T10:00:00.000Z" }),
+      makeGrant({ expiresAt: String(Math.floor(Date.now() / 1000) - 60) }),
+    ]) {
+      const app = createApp({ getGrant: vi.fn().mockResolvedValue(grant) });
+
+      const list = await signedGet(app, "/", { grantId: "grant-123" });
+      expect(list.status).toBe(403);
+
+      const versions = await signedGet(app, "/instagram.profile/versions", {
+        grantId: "grant-123",
+      });
+      expect(versions.status).toBe(403);
+    }
+  });
+
+  it("refuses versions with 403 GRANT_REQUIRED to a builder holding no grant", async () => {
+    const res = await signedGet(createApp(), "/instagram.profile/versions");
+
+    expect(res.status).toBe(403);
+    expect((await res.json()).error.errorCode).toBe("GRANT_REQUIRED");
+  });
+
+  it("serves versions of a scope the grant covers, and refuses one it does not", async () => {
+    const app = createApp({
+      getGrant: vi
+        .fn()
+        .mockResolvedValue(makeGrant({ scopes: ["instagram.profile"] })),
+    });
+
+    const covered = await signedGet(app, "/instagram.profile/versions", {
+      grantId: "grant-123",
+    });
+    expect(covered.status).toBe(200);
+    expect((await covered.json()).total).toBe(1);
+
+    const uncovered = await signedGet(app, "/twitter.posts/versions", {
+      grantId: "grant-123",
+    });
+    expect(uncovered.status).toBe(403);
+    expect((await uncovered.json()).error.errorCode).toBe("GRANT_REQUIRED");
+  });
+
+  it("serves versions to the owner without a grant", async () => {
+    const res = await signedGet(createApp(), "/twitter.posts/versions", {
+      signer: ownerWallet,
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).total).toBe(1);
+  });
+
+  it("fails closed when the grant lookup fails, never listing an empty page", async () => {
+    const listGrantsByUser = vi
+      .fn()
+      .mockRejectedValue(new Error("Gateway error: 503 Service Unavailable"));
+    const app = createApp({ listGrantsByUser });
+
+    const list = await signedGet(app, "/");
+    expect(list.status).toBe(500);
+    expect((await list.json()).scopes).toBeUndefined();
+
+    const versions = await signedGet(app, "/instagram.profile/versions");
+    expect(versions.status).toBe(500);
+  });
+
+  it("fails closed when a presented grant cannot be fetched", async () => {
+    const getGrant = vi
+      .fn()
+      .mockRejectedValue(new Error("Gateway error: 502 Bad Gateway"));
+    const listGrantsByUser = vi.fn();
+    const res = await signedGet(
+      createApp({ getGrant, listGrantsByUser }),
+      "/",
+      {
+        grantId: "grant-123",
+      },
+    );
+
+    expect(res.status).toBe(500);
+    expect(listGrantsByUser).not.toHaveBeenCalled();
+  });
+
+  it("skips malformed gateway grant rows instead of aborting the listing", async () => {
+    const valid = makeGrant({ id: "g-ig", scopes: ["instagram.profile"] });
+    const { granteeId: _omitted, ...missingGrantee } = makeGrant({
+      id: "g-no-grantee",
+      scopes: ["twitter.posts"],
+    });
+    const listGrantsByUser = vi
+      .fn()
+      .mockResolvedValue([
+        missingGrantee,
+        { ...makeGrant({ id: "g-string-scopes" }), scopes: "twitter.posts" },
+        { ...makeGrant({ id: "g-bad-grantor" }), grantorAddress: 42 },
+        null,
+        valid,
+      ]);
+    const res = await signedGet(createApp({ listGrantsByUser }), "/");
+
+    expect(res.status).toBe(200);
+    expect(await listedScopes(res)).toEqual(["instagram.profile"]);
+  });
+
+  it("applies scopePrefix and pagination to the grant-filtered set", async () => {
+    const owner = createApp();
+    await postWithOwnerAuth(owner, "instagram.likes", { count: 5 });
+    await postWithOwnerAuth(owner, "instagram.stories", { count: 2 });
+    const listGrantsByUser = vi.fn().mockResolvedValue([
+      makeGrant({
+        id: "g-ig",
+        scopes: ["instagram.profile", "instagram.stories", "twitter.posts"],
+      }),
+    ]);
+    const app = createApp({ listGrantsByUser });
+
+    // instagram.likes is stored and matches the prefix, but is not granted.
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/",
+    });
+    const first = await app.request("/?scopePrefix=instagram&limit=1", {
+      headers: { Authorization: header },
+    });
+    expect(first.status).toBe(200);
+    const firstJson = await first.json();
+    expect(firstJson.scopes.map((s: { scope: string }) => s.scope)).toEqual([
+      "instagram.profile",
+    ]);
+    expect(firstJson.total).toBe(2);
+
+    const second = await app.request(
+      "/?scopePrefix=instagram&limit=1&offset=1",
+      { headers: { Authorization: header } },
+    );
+    const secondJson = await second.json();
+    expect(secondJson.scopes.map((s: { scope: string }) => s.scope)).toEqual([
+      "instagram.stories",
+    ]);
+    expect(secondJson.total).toBe(2);
+    expect(secondJson.offset).toBe(1);
+  });
+
+  it("lists every scope for the dev token and the control-plane token without a grant lookup", async () => {
+    for (const [deps, token] of [
+      [{ devToken: "dev-secret" }, "dev-secret"],
+      [{ accessToken: "vana_ps_control_plane" }, "vana_ps_control_plane"],
+    ] as const) {
+      const getBuilder = vi.fn();
+      const listGrantsByUser = vi.fn();
+      const app = createApp({ getBuilder, listGrantsByUser }, deps);
+
+      const res = await app.request("/", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      expect(res.status).toBe(200);
+      expect(await listedScopes(res)).toEqual([
+        "instagram.profile",
+        "twitter.posts",
+      ]);
+      expect(getBuilder).not.toHaveBeenCalled();
+      expect(listGrantsByUser).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe("GET /v1/data/additions", () => {
+  let dataDir: string;
+  let hierarchyOptions: HierarchyManagerOptions;
+  let indexManager: IndexManager;
+  let cleanup: () => void;
+
+  function createApp(overrides: Partial<DataRouteDeps> = {}) {
+    const gateway = createMockGateway({
+      getGrant: vi.fn().mockResolvedValue(makeGrant({ scopes: ["notes.*"] })),
+    });
+    return dataRoutes({
+      indexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway,
+      accessLogWriter: createMockAccessLogWriter(),
+      ...overrides,
+    });
+  }
+
+  async function getAdditions(
+    app: ReturnType<typeof dataRoutes>,
+    query = "",
+    signer: typeof ownerWallet | null = ownerWallet,
+  ) {
+    const headers: Record<string, string> = {};
+    if (signer) {
+      headers.Authorization = await buildWeb3SignedHeader({
+        wallet: signer,
+        aud: SERVER_ORIGIN,
+        method: "GET",
+        uri: "/additions",
+      });
+    }
+    return app.request(`/additions${query}`, { headers });
+  }
+
+  beforeEach(async () => {
+    dataDir = await mkdtemp(join(tmpdir(), "data-route-additions-test-"));
+    hierarchyOptions = { dataDir };
+
+    const db = initializeDatabase(":memory:");
+    indexManager = createIndexManager(db);
+
+    cleanup = () => {
+      indexManager.close();
+    };
+  });
+
+  afterEach(async () => {
+    cleanup();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("counts the first import and the record the second write adds, from the sidecar", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    // collectedAt has one-second resolution.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    await postWithOwnerAuth(app, "notes.entries", {
+      items: [{ id: "a" }, { id: "b" }],
+    });
+
+    const res = await getAdditions(app);
+
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json).toMatchObject({
+      timezone: "UTC",
+      total: 2,
+      trackedSince: expect.any(String),
+      partial: false,
+      scopes: [
+        {
+          scope: "notes.entries",
+          total: 2,
+          trackedSince: json.trackedSince,
+          partial: false,
+        },
+      ],
+    });
+    expect(json.days).toHaveLength(7);
+    // "a" arrived with the first import and "b" with the second: both today.
+    expect(
+      json.days.reduce(
+        (sum: number, day: { added: number }) => sum + day.added,
+        0,
+      ),
+    ).toBe(2);
+  });
+
+  it("reports a brand-new scope's records as added on the day they were imported", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", {
+      items: [{ id: "a" }, { id: "b" }, { id: "c" }],
+    });
+    const json = await (await getAdditions(app)).json();
+    expect(json.total).toBe(3);
+    expect(json.days.at(-1).added).toBe(3);
+    expect(json.partial).toBe(false);
+  });
+
+  it("reports partial when the scope's first version is numbered above 1, and counts nothing at its baseline", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", {
+      items: [{ id: "a" }, { id: "b" }],
+    });
+    // An upload rebase (or a second device) leaves the oldest version at #7.
+    const entry = indexManager.findLatestByScope("notes.entries")!;
+    indexManager.updateVersion(entry.path, 7);
+
+    const json = await (await getAdditions(app)).json();
+    expect(json.partial).toBe(true);
+    expect(json.scopes[0]).toMatchObject({
+      scope: "notes.entries",
+      total: 2,
+      partial: true,
+    });
+    expect(
+      json.days.reduce(
+        (sum: number, day: { added: number }) => sum + day.added,
+        0,
+      ),
+    ).toBe(0);
+  });
+
+  it("honours the tz parameter", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    const res = await getAdditions(app, "?tz=America/Toronto&days=3");
+    const json = await res.json();
+    expect(json.timezone).toBe("America/Toronto");
+    expect(json.days).toHaveLength(3);
+  });
+
+  it("refuses a non-owner or unauthenticated caller", async () => {
+    const app = createApp();
+
+    const unauth = await getAdditions(app, "", null);
+    expect(unauth.status).toBe(401);
+    expect((await unauth.json()).error.errorCode).toBe("MISSING_AUTH");
+
+    const nonOwner = await getAdditions(app, "", wallet);
+    expect(nonOwner.status).toBe(401);
+    expect((await nonOwner.json()).error.errorCode).toBe("NOT_OWNER");
+  });
+
+  it.each([
+    ["days=0"],
+    ["days=32"],
+    ["days="],
+    ["days=1e1"],
+    ["days=0x7"],
+    ["days=%207"],
+    ["days=7.5"],
+    ["days=abc"],
+    ["tz=Not/AZone"],
+  ])("rejects ?%s before any storage access", async (query) => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    const listScopes = vi.spyOn(indexManager, "listDistinctScopes");
+
+    const res = await getAdditions(app, `?${query}`);
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe("INVALID_QUERY");
+    expect(listScopes).not.toHaveBeenCalled();
+  });
+
+  it("never serves ledger content on a grantee read of the scope", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    const header = await buildWeb3SignedHeader({
+      wallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/notes.entries",
+      grantId: "grant-123",
+    });
+    const res = await app.request("/notes.entries", {
+      headers: { Authorization: header },
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual({ items: [{ id: "a" }] });
+  });
+
+  it("does not offer the sidecar as a scope", async () => {
+    const app = createApp();
+    await postWithOwnerAuth(app, "notes.entries", { items: [{ id: "a" }] });
+    const header = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri: "/",
+    });
+    const res = await app.request("/", { headers: { Authorization: header } });
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.scopes.map((s: { scope: string }) => s.scope)).toEqual([
+      "notes.entries",
+    ]);
   });
 });
 
@@ -772,7 +1312,7 @@ describe("GET /v1/data/:scope/versions", () => {
   ) {
     const uri = `/${scope}/versions`;
     const header = await buildWeb3SignedHeader({
-      wallet,
+      wallet: ownerWallet,
       aud: SERVER_ORIGIN,
       method: "GET",
       uri,
@@ -2070,6 +2610,7 @@ describe("DELETE /v1/data/:scope", () => {
         aud: SERVER_ORIGIN,
         method: "GET",
         uri: "/",
+        grantId: "grant-123",
       });
       const list = await app.request("/", {
         headers: { Authorization: listHeader },
@@ -2085,6 +2626,7 @@ describe("DELETE /v1/data/:scope", () => {
         aud: SERVER_ORIGIN,
         method: "GET",
         uri: "/instagram.profile/versions",
+        grantId: "grant-123",
       });
       const versions = await app.request("/instagram.profile/versions", {
         headers: { Authorization: versionsHeader },
@@ -2120,6 +2662,7 @@ describe("DELETE /v1/data/:scope", () => {
         aud: SERVER_ORIGIN,
         method: "GET",
         uri: "/instagram.profile/versions",
+        grantId: "grant-123",
       });
       const versions = await app.request("/instagram.profile/versions", {
         headers: { Authorization: versionsHeader },
@@ -2135,6 +2678,7 @@ describe("DELETE /v1/data/:scope", () => {
         aud: SERVER_ORIGIN,
         method: "GET",
         uri: "/",
+        grantId: "grant-123",
       });
       const list = await app.request("/", {
         headers: { Authorization: listHeader },

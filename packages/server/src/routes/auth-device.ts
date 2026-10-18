@@ -39,11 +39,25 @@ import {
 } from "../middleware/web3-auth.js";
 import { createOwnerCheckMiddleware } from "../middleware/owner-check.js";
 import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
+import {
+  arrivedOnLoopbackListener,
+  isLoopbackIp,
+  isSameOriginLoopbackRequest,
+} from "../middleware/local-listener.js";
+import { escapeHtml, renderAccountPage } from "../ui/account-page.js";
 
 export interface LoginV2Deps {
   logger: Logger;
   serverOrigin: string | (() => string);
   localApprovalOrigin?: string | (() => string | undefined);
+  /**
+   * Port of the loopback approval listener (see `index.ts`). The
+   * signature-free approval shortcut is honored only on connections that
+   * this listener accepted; `undefined` disables the shortcut.
+   */
+  localApprovalPort?: number;
+  /** Main server port; a collision with `localApprovalPort` disables the shortcut. */
+  serverPort?: number;
   serverOwner?: `0x${string}`;
   tokenStore: TokenStore;
   devToken?: string;
@@ -115,58 +129,59 @@ function resolveOrigin(
   return typeof origin === "function" ? origin() : origin;
 }
 
-function isLocalhostRequest(remoteAddr: string | undefined): boolean {
-  if (!remoteAddr) return false;
-  return (
-    remoteAddr === "127.0.0.1" ||
-    remoteAddr === "::1" ||
-    remoteAddr === "localhost" ||
-    remoteAddr.startsWith("127.") ||
-    remoteAddr === "::ffff:127.0.0.1"
-  );
-}
-
-function isLoopbackHost(hostname: string): boolean {
-  return (
-    hostname === "localhost" ||
-    hostname === "::1" ||
-    hostname === "127.0.0.1" ||
-    hostname.startsWith("127.")
-  );
-}
-
-function isLocalhostOrigin(origin: string): boolean {
-  try {
-    return isLoopbackHost(new URL(origin).hostname);
-  } catch {
-    return false;
-  }
-}
-
 function getSocketRemoteAddress(c: Context): string | undefined {
   // Access Node.js socket via Hono's env bindings when running on the real server.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (c.env as any)?.incoming?.socket?.remoteAddress;
 }
 
+/**
+ * The request comes from this machine and not from another site open in the
+ * user's browser: a loopback TCP peer (never X-Forwarded-For / X-Real-IP,
+ * which are trivially spoofable), a loopback Host (DNS rebinding), and no
+ * foreign `Origin` / cross-site `Sec-Fetch-Site`. The tunnel client also
+ * connects from loopback but keeps the public Host, so tunneled requests
+ * never qualify.
+ */
+function isLocalRequest(c: Context, deps: LoginV2Deps): boolean {
+  const remoteAddr = deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
+  return isLoopbackIp(remoteAddr) && isSameOriginLoopbackRequest(c);
+}
+
+/**
+ * The request is on the loopback approval channel: the TCP connection was
+ * accepted by the loopback approval listener (socket port + loopback local
+ * address, the same check that gates the dev UI), and it addressed that
+ * listener by its own origin. `Host` alone proves nothing — a request to the
+ * main port can carry `Host: 127.0.0.1:<approvalPort>`. Fails closed when the
+ * socket is unavailable.
+ */
 function usesLocalApprovalChannel(c: Context, deps: LoginV2Deps): boolean {
   const localApprovalOrigin = resolveOrigin(deps.localApprovalOrigin);
   if (!localApprovalOrigin) {
     return false;
   }
 
-  return getRequestOrigin(c) === localApprovalOrigin;
+  return (
+    arrivedOnLoopbackListener(c, {
+      localApprovalPort: deps.localApprovalPort,
+      serverPort: deps.serverPort,
+    }) && getRequestOrigin(c) === localApprovalOrigin
+  );
 }
 
-function getApprovalOrigin(c: Context, deps: LoginV2Deps): string {
-  const requestOrigin = getRequestOrigin(c);
-  const localApprovalOrigin = resolveOrigin(deps.localApprovalOrigin);
-
-  if (localApprovalOrigin && isLocalhostOrigin(requestOrigin)) {
-    return localApprovalOrigin;
-  }
-
-  return requestOrigin;
+/**
+ * Approval pages must never render inside another site's frame (clickjacking
+ * the Approve button).
+ */
+function noFrameHtml(
+  c: Context,
+  html: string,
+  status: 200 | 400 | 404 = 200,
+): Response {
+  c.header("Content-Security-Policy", "frame-ancestors 'none'");
+  c.header("X-Frame-Options", "DENY");
+  return c.html(html, status);
 }
 
 async function verifyRemoteOwnerApproval(
@@ -252,17 +267,36 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
     app.post("/", (c) => {
       const sessionId = randomBytes(32).toString("hex");
       const pollToken = randomBytes(32).toString("hex");
+      const requestOrigin = getRequestOrigin(c);
+      const localApprovalOrigin = resolveOrigin(deps.localApprovalOrigin);
+      // Bind the session to where it was started: only a login initiated
+      // locally (the CLI on this machine) may later be approved through the
+      // signature-free loopback channel. Anything else, e.g. via the public
+      // tunnel URL, needs the owner wallet.
+      //
+      // Caveat: "local" is judged from the loopback peer plus a loopback
+      // Host. A reverse proxy on this machine that rewrites Host to
+      // localhost would make remote sessions look local here. Such a session
+      // still needs the owner to click Approve on the loopback approval
+      // listener, which only this machine can reach.
+      const localApprovalAllowed =
+        localApprovalOrigin !== undefined && isLocalRequest(c, deps);
       const result = initiateDeviceSessionContract({
         sessionStore: sessions,
         serverOwner: deps.serverOwner,
-        requestOrigin: getRequestOrigin(c),
-        approvalOrigin: getApprovalOrigin(c, deps),
+        requestOrigin,
+        approvalOrigin:
+          (localApprovalAllowed && localApprovalOrigin) || requestOrigin,
+        localApprovalAllowed,
         sessionId,
         pollToken,
         now: Date.now(),
       });
 
-      deps.logger.info({ sessionId }, "Login flow initiated");
+      deps.logger.info(
+        { sessionId, localApprovalAllowed },
+        "Login flow initiated",
+      );
       return c.json(result.body, result.status as 200 | 500);
     });
 
@@ -290,22 +324,25 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 
       const sessionId = c.req.query("session");
       if (!sessionId) {
-        return c.html(errorPage("Missing session parameter"), 400);
+        return noFrameHtml(c, errorPage("Missing session parameter"), 400);
       }
 
       const session = sessions.get(sessionId);
       if (!session) {
-        return c.html(errorPage("Session expired or invalid"), 404);
+        return noFrameHtml(c, errorPage("Session expired or invalid"), 404);
       }
 
       if (session.status === "approved") {
-        return c.html(successPage());
+        return noFrameHtml(c, successPage());
       }
 
       const owner = deps.serverOwner ?? "unknown";
-      const localApprovalShortcutEnabled = usesLocalApprovalChannel(c, deps);
+      const localApprovalShortcutEnabled =
+        session.localApprovalAllowed === true &&
+        usesLocalApprovalChannel(c, deps);
 
-      return c.html(
+      return noFrameHtml(
+        c,
         approvePage(
           session.requestedServerOrigin,
           owner,
@@ -340,13 +377,15 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
       }
 
       // v1: localhost auto-approve — user is physically at the server.
-      // SECURITY: Use the direct TCP peer address, NOT X-Forwarded-For
-      // or X-Real-IP headers which are trivially spoofable by remote attackers.
+      // Only for sessions initiated locally, on the loopback channel, from
+      // the approval page itself (not another site in the same browser).
+      // Anything else falls through to the owner-wallet check.
       const remoteAddr =
         deps.getRemoteAddress?.(c) ?? getSocketRemoteAddress(c);
       const allowLocalShortcut =
+        session.localApprovalAllowed === true &&
         usesLocalApprovalChannel(c, deps) &&
-        isLocalhostRequest(remoteAddr as string | undefined);
+        isLocalRequest(c, deps);
 
       if (!allowLocalShortcut) {
         const approvalAuth = await verifyRemoteOwnerApproval(
@@ -355,7 +394,7 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
         );
         if (approvalAuth instanceof Response) {
           deps.logger.warn(
-            { remoteAddr, sessionId },
+            { remoteAddr, sessionId, origin: c.req.header("origin") },
             "Remote approval rejected",
           );
           return approvalAuth;
@@ -441,6 +480,10 @@ export function authDeviceRoutes(deps: LoginV2Deps): Hono {
 }
 
 // ── HTML pages ──────────────────────────────────────────────────────
+// Presentation lives in ../ui/account-page.ts so every page the Personal
+// Server shows a person shares Vana Account's look.
+
+const PAGE_ACCENT = "Personal Server";
 
 function approvePage(
   origin: string,
@@ -448,56 +491,25 @@ function approvePage(
   sessionId: string,
   localApprovalShortcutEnabled: boolean,
 ): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Authorize CLI — Personal Server</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f5f5f5; color: #1a1a1a;
-      display: flex; justify-content: center; align-items: center;
-      min-height: 100vh; padding: 1rem;
-    }
-    .card {
-      background: #fff; border-radius: 12px; padding: 2rem;
-      max-width: 420px; width: 100%;
-      box-shadow: 0 2px 8px rgba(0,0,0,.08);
-    }
-    h1 { font-size: 1.25rem; margin-bottom: 1.5rem; }
-    .info { background: #f8f9fa; border-radius: 8px; padding: 1rem; margin-bottom: 1.5rem; font-size: 0.875rem; }
-    .info dt { color: #666; margin-bottom: 0.25rem; }
-    .info dd { font-family: monospace; word-break: break-all; margin-bottom: 0.75rem; }
-    .info dd:last-child { margin-bottom: 0; }
-    .btn {
-      display: block; width: 100%; padding: 0.75rem 1.5rem;
-      background: #2563eb; color: #fff; border: none; border-radius: 8px;
-      font-size: 1rem; font-weight: 500; cursor: pointer;
-      transition: background 0.15s;
-    }
-    .btn:hover { background: #1d4ed8; }
-    .btn:disabled { background: #94a3b8; cursor: not-allowed; }
-    #status { text-align: center; margin-top: 1rem; font-size: 0.875rem; color: #666; }
-    .hint { margin-top: 1rem; font-size: 0.875rem; color: #666; line-height: 1.5; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>A CLI tool is requesting access to your Personal Server</h1>
-    <dl class="info">
-      <dt>Server</dt>
-      <dd>${escapeHtml(origin)}</dd>
-      <dt>Owner</dt>
-      <dd>${escapeHtml(owner)}</dd>
-    </dl>
-    <button class="btn" id="approveBtn" onclick="approve()">Approve</button>
-    <div id="status"></div>
-    <p class="hint" id="hint"></p>
-  </div>
-  <script>
+  return renderAccountPage({
+    title: "Authorize CLI — Personal Server",
+    headingAccent: PAGE_ACCENT,
+    heading: "Authorize CLI",
+    description:
+      "A CLI tool is requesting access to your Personal Server. Only approve if you started this sign-in yourself.",
+    bodyHtml: `
+        <dl class="unity-details">
+          <dt>Server</dt>
+          <dd>${escapeHtml(origin)}</dd>
+          <dt>Owner</dt>
+          <dd class="unity-mono">${escapeHtml(owner)}</dd>
+        </dl>
+        <p class="unity-status" id="hint"></p>
+        <p class="unity-status" id="status" role="status" aria-live="polite"></p>
+        <div class="unity-actions">
+          <button class="unity-button" id="approveBtn" type="button" onclick="approve()">Approve</button>
+        </div>`,
+    script: `
     const SESSION_ID = ${JSON.stringify(sessionId)};
     const OWNER_ADDRESS = ${JSON.stringify(owner)};
     const LOCAL_APPROVAL_SHORTCUT_ENABLED = ${JSON.stringify(localApprovalShortcutEnabled)};
@@ -584,10 +596,25 @@ function approvePage(
         "This browser is on the same machine as the Personal Server, so approval stays local.";
     }
 
+    function showStatus(message, isError) {
+      status.textContent = message;
+      status.className = isError ? "unity-error" : "unity-status";
+    }
+
+    function showAuthorized() {
+      document.getElementById("page-heading").innerHTML =
+        '<span class="unity-header-title-accent">${PAGE_ACCENT}</span><br>Device authorized!';
+      document.getElementById("page-description").textContent =
+        "You can close this tab and return to the CLI.";
+      document.querySelector(".unity-content").remove();
+      document.querySelector(".unity-panel").classList.add("unity-panel--slim");
+      document.title = "Authorized — Personal Server";
+    }
+
     async function approve() {
       btn.disabled = true;
       btn.textContent = remoteApproval ? 'Signing...' : 'Authorizing...';
-      status.textContent = "";
+      showStatus("", false);
       try {
         const headers = {};
         if (remoteApproval) {
@@ -600,99 +627,43 @@ function approvePage(
           headers,
         });
         if (res.ok) {
-          document.querySelector('.card').innerHTML =
-            '<h1 style="color:#16a34a">Device authorized!</h1>' +
-            '<p style="margin-top:1rem;color:#666">You can close this tab.</p>';
+          showAuthorized();
         } else {
           const data = await res.json();
-          status.textContent = data.error?.message || 'Authorization failed';
-          status.style.color = '#dc2626';
+          showStatus(data.error?.message || 'Authorization failed', true);
           btn.disabled = false;
           btn.textContent = 'Approve';
         }
       } catch (err) {
-        status.textContent = 'Network error — please try again';
-        status.style.color = '#dc2626';
+        showStatus('Network error — please try again', true);
         btn.disabled = false;
         btn.textContent = 'Approve';
       }
     }
-  </script>
-</body>
-</html>`;
+  `,
+  });
 }
 
 function successPage(): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Authorized — Personal Server</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f5f5f5; color: #1a1a1a;
-      display: flex; justify-content: center; align-items: center;
-      min-height: 100vh;
-    }
-    .card {
-      background: #fff; border-radius: 12px; padding: 2rem;
-      max-width: 420px; text-align: center;
-      box-shadow: 0 2px 8px rgba(0,0,0,.08);
-    }
-    h1 { color: #16a34a; font-size: 1.25rem; }
-    p { margin-top: 1rem; color: #666; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Device authorized!</h1>
-    <p>You can close this tab.</p>
-  </div>
-</body>
-</html>`;
+  return renderAccountPage({
+    title: "Authorized — Personal Server",
+    headingAccent: PAGE_ACCENT,
+    heading: "Device authorized!",
+    description: "You can close this tab and return to the CLI.",
+    slim: true,
+  });
 }
 
 function errorPage(message: string): string {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Error — Personal Server</title>
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f5f5f5; color: #1a1a1a;
-      display: flex; justify-content: center; align-items: center;
-      min-height: 100vh;
-    }
-    .card {
-      background: #fff; border-radius: 12px; padding: 2rem;
-      max-width: 420px; text-align: center;
-      box-shadow: 0 2px 8px rgba(0,0,0,.08);
-    }
-    h1 { color: #dc2626; font-size: 1.25rem; }
-    p { margin-top: 1rem; color: #666; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Error</h1>
-    <p>${escapeHtml(message)}</p>
-  </div>
-</body>
-</html>`;
-}
-
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+  return renderAccountPage({
+    title: "Error — Personal Server",
+    headingAccent: PAGE_ACCENT,
+    heading: "Error",
+    description: message,
+    bodyHtml: `
+        <p class="unity-status">Start the sign-in again from your terminal to get a new link.</p>`,
+    slim: true,
+  });
 }
 
 // Export for testing

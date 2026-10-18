@@ -17,7 +17,12 @@ import {
 } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
+import { toMcpScopeAccessRequestView } from "./connection-api.js";
 import type { McpActivityRecorder } from "./activity.js";
+import type {
+  McpScopeRequestApprovalUrlContext,
+  McpScopeRequestApprovalUrlHook,
+} from "./approval-url.js";
 import { MiniSearchIndex, type SearchDocument } from "./search/index.js";
 import { MAX_SELECTED_BLOCK_IDS } from "../storage/blocks/index.js";
 import {
@@ -33,7 +38,20 @@ export interface McpToolContext {
   requestScopeAccess?(input: { scopes: string[]; reason?: string }): Promise<{
     connection: McpConnectionRecord;
     requestRecorded: boolean;
+    /** Raw read token for the request just written; goes into the link. */
+    readToken?: string;
   }>;
+  /**
+   * Host-provided page where the owner answers this connection's scope
+   * request. When it returns a URL, `request_scope_access` hands it to the
+   * agent to show the user; when absent, the owner is pointed at Vana.
+   */
+  scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /**
+   * This server's current public origin, handed to the approval-URL hook so
+   * the link can name the server that holds the request.
+   */
+  serverOrigin?: string;
 }
 
 export type McpToolResultContent =
@@ -607,6 +625,7 @@ async function resolveSearchScopes({
         readClient.listScopes({
           scopePrefix: prefix,
           limit: LIST_SCOPES_LIMIT,
+          grantId: grant.grantId,
         }),
         discoveryTimeoutMs,
         `list scopes for ${requested}`,
@@ -720,7 +739,21 @@ const listGrantedScopes: McpToolDefinition = {
         };
       }),
     );
-    return textResult({ scopes: scopeEntries });
+    // Lets an agent that asked for more scopes see whether the owner has
+    // answered yet without re-recording the request.
+    return textResult({
+      scopes: scopeEntries,
+      ...(connection.scopeAccessRequest
+        ? {
+            pendingScopeRequest: toMcpScopeAccessRequestView(
+              connection.scopeAccessRequest,
+            ),
+          }
+        : {}),
+      ...(connection.scopeAccessDecision
+        ? { lastScopeDecision: connection.scopeAccessDecision }
+        : {}),
+    });
   },
 };
 
@@ -730,8 +763,14 @@ const requestScopeAccess: McpToolDefinition = {
   description:
     "Record missing scopes on this MCP connection for explicit owner approval in Vana.",
   inputSchema: scopeAccessRequestInputShape,
-  async handler(args, { connection, requestScopeAccess }) {
+  async handler(
+    args,
+    { connection, requestScopeAccess, scopeRequestApprovalUrl, serverOrigin },
+  ) {
     const requestedScopes = normalizeScopeListInput(args.scopes);
+    // Read before recording: a new request must not hide the owner's last
+    // answer from the agent that is checking back.
+    const previousDecision = connection.scopeAccessDecision;
     let effectiveConnection = connection;
     let grantedRequestedScopes = requestedScopes.filter((scope) =>
       Boolean(resolveGrantForScope(effectiveConnection, scope)),
@@ -747,6 +786,7 @@ const requestScopeAccess: McpToolDefinition = {
         connection.scopeAccessRequest?.scopes.includes(scope),
       );
     let requestRecorded = alreadyRecorded;
+    let readToken: string | undefined;
     if (approvalRequired && requestScopeAccess) {
       const outcome = await requestScopeAccess({
         scopes: missingScopes,
@@ -754,6 +794,7 @@ const requestScopeAccess: McpToolDefinition = {
       });
       effectiveConnection = outcome.connection;
       requestRecorded = outcome.requestRecorded;
+      readToken = outcome.readToken;
       grantedRequestedScopes = requestedScopes.filter((scope) =>
         Boolean(resolveGrantForScope(effectiveConnection, scope)),
       );
@@ -762,6 +803,17 @@ const requestScopeAccess: McpToolDefinition = {
       );
     }
     const finalApprovalRequired = missingScopes.length > 0;
+    const recorded = finalApprovalRequired && requestRecorded;
+    const approvalUrl = recorded
+      ? resolveScopeRequestApprovalUrl(scopeRequestApprovalUrl, connection.id, {
+          serverOrigin,
+          ...(readToken ? { readToken } : {}),
+        })
+      : undefined;
+    const declinedScopes =
+      previousDecision?.deniedScopes.filter((scope) =>
+        missingScopes.includes(scope),
+      ) ?? [];
 
     return textResult({
       approvalRequired: finalApprovalRequired,
@@ -775,15 +827,55 @@ const requestScopeAccess: McpToolDefinition = {
       missingScopes,
       grantedScopes: uniqueScopes(effectiveConnection),
       reason: reason || undefined,
-      requestRecorded: finalApprovalRequired && requestRecorded,
-      nextAction: finalApprovalRequired
-        ? requestRecorded
-          ? "The request is waiting for owner approval in Vana. Access remains unchanged until the owner approves it."
-          : "Ask the user to open Vana's Personal Server page and add the missing scopes to this MCP client. This tool cannot grant access by itself."
-        : "No new grant is needed for the requested scopes.",
+      requestRecorded: recorded,
+      approvalUrl,
+      previousDecision,
+      nextAction: scopeRequestNextAction({
+        finalApprovalRequired,
+        recorded,
+        approvalUrl,
+        declinedScopes,
+      }),
     });
   },
 };
+
+function resolveScopeRequestApprovalUrl(
+  hook: McpToolContext["scopeRequestApprovalUrl"],
+  connectionId: string,
+  context: McpScopeRequestApprovalUrlContext,
+): string | undefined {
+  if (!hook) return undefined;
+  try {
+    const url = hook(connectionId, context);
+    return typeof url === "string" && url.trim() ? url.trim() : undefined;
+  } catch {
+    // A broken host hook must not fail the request itself; fall back to Vana.
+    return undefined;
+  }
+}
+
+function scopeRequestNextAction(input: {
+  finalApprovalRequired: boolean;
+  recorded: boolean;
+  approvalUrl?: string;
+  declinedScopes: string[];
+}): string {
+  if (!input.finalApprovalRequired) {
+    return "No new grant is needed for the requested scopes.";
+  }
+  const declined =
+    input.declinedScopes.length > 0
+      ? `The owner previously declined ${input.declinedScopes.join(", ")}; only ask again if the user wants to. `
+      : "";
+  if (!input.recorded) {
+    return `${declined}Ask the user to open Vana's Personal Server page and add the missing scopes to this MCP client. This tool cannot grant access by itself.`;
+  }
+  if (input.approvalUrl) {
+    return `${declined}Show the user this link to review the request: ${input.approvalUrl} . Ask them to approve or decline it there and to tell you when they are done, then call list_granted_scopes to see what was granted. Access remains unchanged until the owner approves.`;
+  }
+  return `${declined}The request is waiting for owner approval in Vana. Access remains unchanged until the owner approves it.`;
+}
 
 const readScope: McpToolDefinition = {
   name: READ_SCOPE_TOOL,

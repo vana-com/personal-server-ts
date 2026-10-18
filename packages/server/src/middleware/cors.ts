@@ -12,6 +12,7 @@
 
 import { cors } from "hono/cors";
 import { WRITE_SIGNATURE_HEADER } from "@opendatalabs/personal-server-ts-core/write";
+import { MCP_SCOPE_REQUEST_TOKEN_HEADER } from "@opendatalabs/personal-server-ts-core/mcp";
 
 /** Request headers the API reads that are not CORS-safelisted. */
 export const CORS_ALLOW_HEADERS: readonly string[] = [
@@ -27,6 +28,8 @@ export const CORS_ALLOW_HEADERS: readonly string[] = [
   // Granted / paid reads.
   "X-PS-Grant-Id",
   "X-PAYMENT",
+  // Vana Web loads an MCP scope request with its approval-link token.
+  MCP_SCOPE_REQUEST_TOKEN_HEADER,
 ];
 
 /** Response headers a browser client must be able to read back. */

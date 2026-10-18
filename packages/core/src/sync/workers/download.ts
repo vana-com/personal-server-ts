@@ -33,6 +33,7 @@ import {
 import { downloadRetryKey, type DownloadRetryMemory } from "../retry-memory.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
 import { isPermanentRejection, type PdppImporter } from "../pdpp-import.js";
+import { recordStoredVersion } from "../../additions/ledger-store.js";
 
 /**
  * Minimal diagnostics hook — keeps core free of lite-specific imports.
@@ -254,7 +255,9 @@ interface RecordContext {
 
 /**
  * Download and process a single DPv2 data point from the storage backend:
- * 1. Check dedup: skip if dataPointId already in local index
+ * 1. Check dedup: skip if this version (or a newer one) of the data point is
+ *    already in the local index. DPv2 ids are per (owner, scope), so the id
+ *    alone would dedup every later version of a scope away.
  * 2. Reconstruct the blob URL from (scope, expectedVersion) — DataPointRecords
  *    carry no URL, so we rebuild the version-keyed `{scope}/{version}` key the
  *    upload worker wrote under and resolve it via storageAdapter.urlForKey
@@ -273,9 +276,12 @@ export async function downloadOne(
   const { storage, storageAdapter, masterKey, logger, diagnostics } = deps;
   const ctx: RecordContext = { dataPointId: record.id, schemaId: null };
 
-  // 1. Check dedup: skip if dataPointId already in local index
+  // 1. Check dedup: skip if this version (or a newer one) is already indexed.
+  // The id is shared by every version of the scope, so an older local
+  // version must not hide a newer registered one.
+  const expectedVersion = Number(record.expectedVersion);
   const existing = storage.findByDataPointId(record.id);
-  if (existing) {
+  if (existing && !(existing.version < expectedVersion)) {
     const repairResult = await repairMissingBlockSidecars(
       storage,
       logger,
@@ -389,6 +395,14 @@ export async function downloadOne(
     if (existingByVersion.dataPointId !== record.id) {
       await storage.updateDataPointId(existingByVersion.path, record.id);
     }
+    // Adopt the registered version, or the dedup above keeps seeing an
+    // older local version and downloads this blob again every cycle.
+    if (
+      existingByVersion.version !== expectedVersion &&
+      Number.isSafeInteger(expectedVersion)
+    ) {
+      await storage.updateEntryVersion(existingByVersion.path, expectedVersion);
+    }
     const repairResult = await repairMissingBlockSidecars(
       storage,
       logger,
@@ -453,7 +467,7 @@ export async function downloadOne(
       scope: envelope.scope,
       collectedAt: envelope.collectedAt,
       sizeBytes,
-      version: Number(record.expectedVersion),
+      version: expectedVersion,
       dataPointId: record.id,
       ...(envelope.producer === "pdpp-projector" ||
       envelope.producer === "pdpp-import-projection"
@@ -470,6 +484,14 @@ export async function downloadOne(
     throw err;
   }
   diagnostics?.onIndexEnd(record.id, envelope.scope);
+
+  // Fold the stored version into the scope's first-seen sidecar. Best-effort
+  // and after indexing: a failure leaves the sidecar to be rebuilt later.
+  await recordStoredVersion(storage, {
+    scope: envelope.scope,
+    collectedAt: envelope.collectedAt,
+    data: envelope.data,
+  });
 
   logger.info(
     { dataPointId: record.id, scope: envelope.scope, path: relativePath },
@@ -492,7 +514,7 @@ export async function downloadOne(
       deps.onDataPointIndexed({
         scope: envelope.scope,
         dataPointId: record.id,
-        version: Number(record.expectedVersion),
+        version: expectedVersion,
         collectedAt: envelope.collectedAt,
         lineageSources,
       });
@@ -744,6 +766,16 @@ export async function reconcileDeletedDataPoint(
   }
   if (orphanKeys.length > 0 && deps.pendingBlobDeletions) {
     await deps.pendingBlobDeletions.add(orphanKeys);
+  }
+  // The first-seen sidecar was derived from versions that no longer exist.
+  // Dropping it lets the next write or additions read rebuild it from what
+  // this replica retains (a re-add above the tombstone included).
+  if (removed > 0 || kept === 0) {
+    try {
+      await storage.deleteFirstSeenLedger?.(record.scope);
+    } catch {
+      // Derived data; a stale sidecar is rebuilt on the next scope delete.
+    }
   }
 
   if (removed > 0 || kept > 0) {

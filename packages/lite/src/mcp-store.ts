@@ -24,6 +24,7 @@
 
 import {
   isMcpTokenExpired,
+  isPreExpiryMcpRecord,
   matchesMcpRefreshHash,
   type McpConnectionRecord,
   type McpConnectionStore,
@@ -256,7 +257,12 @@ export function createIndexedDbMcpConnectionStore(
       );
       if (!record) return null;
       if (record.status !== "approved") return null;
-      if (isMcpTokenExpired(record)) return null;
+      // Web owners' connections from PS-Lite < 1.17 have no stored lifetime
+      // and no refresh token; keep them working rather than force a
+      // re-consent on every one of them.
+      if (!isPreExpiryMcpRecord(record) && isMcpTokenExpired(record)) {
+        return null;
+      }
       return { ...record };
     },
 

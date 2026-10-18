@@ -18,10 +18,13 @@
  * is one implementation of who may open a write session.
  */
 
-import { authenticateRequest } from "../auth/index.js";
+import {
+  authenticateRequest,
+  isWeb3SignedLifetimeError,
+} from "../auth/index.js";
 import type { SessionTokenVerifierPort } from "../auth/index.js";
 import { ProtocolError } from "../errors/catalog.js";
-import { hashConnectionToken } from "../mcp/connection-api.js";
+import { web3SignedProofId, boundedProofExpiry } from "../auth/proof-id.js";
 import type {
   AuthSessionVerifierPort,
   GrantVerifierPort,
@@ -140,6 +143,14 @@ export async function handleWriteSessionRequest(
     if (!(err instanceof ProtocolError)) {
       return internalError(deps.logger, err, "authenticate");
     }
+    // The request-auth lifetime cap fires before boundedProofExpiry below;
+    // keep the handshake's own error code for an over-long proof.
+    if (isWeb3SignedLifetimeError(err)) {
+      return jsonResponse(
+        jsonError(401, "WRITE_SESSION_PROOF_LIFETIME", err.message),
+        401,
+      );
+    }
     return jsonResponse(
       jsonError(401, "WRITE_SESSION_AUTH_FAILED", err.message),
       401,
@@ -171,17 +182,15 @@ export async function handleWriteSessionRequest(
     );
   }
 
-  // Replay guard: bind to a digest of the exact proof header, remembered
-  // until the proof's own expiry (a replay only matters while still valid).
-  const proofHeader = request.headers.get("authorization") ?? "";
-  const proofId = await hashConnectionToken(proofHeader);
-  const expSec = authResult.auth.payload.exp;
-  const expiresAtMs =
-    (typeof expSec === "number"
-      ? expSec
-      : Math.floor(Date.now() / 1000) + 300) * 1000;
-
   try {
+    const expiresAtMs = boundedProofExpiry(
+      authResult.auth.payload,
+      "WRITE_SESSION_PROOF_LIFETIME",
+    );
+    const proofId = await web3SignedProofId(
+      request.headers.get("authorization") ?? "",
+      authResult.auth.signer,
+    );
     const session = await createWriteSession(
       {
         builderAddress: authResult.auth.signer,

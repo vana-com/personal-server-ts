@@ -96,6 +96,18 @@
       "types": "./dist/storage/preview.d.ts",
       "import": "./dist/storage/preview.js"
     },
+    "./legacy-projection": {
+      "types": "./dist/legacy-projection/index.d.ts",
+      "import": "./dist/legacy-projection/index.js"
+    },
+    "./additions": {
+      "types": "./dist/additions/index.d.ts",
+      "import": "./dist/additions/index.js"
+    },
+    "./storage/legacy-projection": {
+      "types": "./dist/storage/legacy-projection.d.ts",
+      "import": "./dist/storage/legacy-projection.js"
+    },
     "./storage/blocks/build": {
       "types": "./dist/storage/blocks/build.d.ts",
       "import": "./dist/storage/blocks/build.js"
@@ -183,14 +195,6 @@
     "./storage/pdpp-records/memory": {
       "types": "./dist/storage/pdpp-records/memory-store.d.ts",
       "import": "./dist/storage/pdpp-records/memory-store.js"
-    },
-    "./legacy-projection": {
-      "types": "./dist/legacy-projection/index.d.ts",
-      "import": "./dist/legacy-projection/index.js"
-    },
-    "./storage/legacy-projection": {
-      "types": "./dist/legacy-projection/index.d.ts",
-      "import": "./dist/legacy-projection/index.js"
     }
   },
   "scripts": {

@@ -9,5 +9,9 @@
     "sourceMap": true
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.test.ts"]
+  "exclude": [
+    "src/**/*.test.ts",
+    "src/legacy-projection/github-browser-parity-fixtures.ts",
+    "src/legacy-projection/__fixtures__/**"
+  ]
 }

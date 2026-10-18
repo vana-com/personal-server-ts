@@ -72,7 +72,7 @@ export interface IndexManager {
    * Update the dataPointId for an index entry (after DPv2 registerDataPoint).
    * @returns true if row was updated, false if path not found
    */
-  updateDataPointId(path: string, dataPointId: string): boolean;
+  updateDataPointId(path: string, dataPointId: string | null): boolean;
   /**
    * Update the DPv2 `version` for an index entry (upload-worker rebase after
    * a stale-expectedVersion conflict).
@@ -333,7 +333,7 @@ export function createIndexManager(
   );
 
   const findByDataPointIdStmt = db.prepare<{ data_point_id: string }>(
-    "SELECT * FROM data_files WHERE data_point_id = @data_point_id",
+    "SELECT * FROM data_files WHERE data_point_id = @data_point_id ORDER BY version DESC, id DESC LIMIT 1",
   );
 
   const findUnsyncedStmt = db.prepare(
@@ -349,7 +349,7 @@ export function createIndexManager(
   );
 
   const updateDataPointIdStmt = db.prepare<{
-    data_point_id: string;
+    data_point_id: string | null;
     path: string;
   }>("UPDATE data_files SET data_point_id = @data_point_id WHERE path = @path");
 

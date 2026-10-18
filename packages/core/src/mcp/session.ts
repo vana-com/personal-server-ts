@@ -17,7 +17,10 @@ import { generateMcpGrantee } from "./grantee.js";
 import { hashConnectionToken } from "./connection-api.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ServerAccount } from "../keys/server-account.js";
-import { verifyDataReadPolicy } from "../policy/data-read.js";
+import {
+  resolveDataListGrantScopes,
+  verifyDataReadPolicy,
+} from "../policy/data-read.js";
 import type {
   AuthSessionVerifierPort,
   GrantVerifierPort,
@@ -92,7 +95,7 @@ export interface McpProofReplayStore {
   /**
    * Atomically record `proofId` (remembered until `expiresAtMs`) and report
    * whether it was ALREADY present and live — i.e. a replay. Returns `true`
-   * on replay, `false` when the proof is fresh (and now recorded).
+   * on replay or expiry, `false` when the proof is fresh (and now recorded).
    */
   consume(proofId: string, expiresAtMs: number): Promise<boolean>;
   /**
@@ -119,6 +122,7 @@ export function createInMemoryMcpProofReplayStore(): McpProofReplayStore {
       for (const [id, exp] of seen) {
         if (exp <= now) seen.delete(id);
       }
+      if (expiresAtMs <= now) return true;
       const existing = seen.get(proofId);
       if (existing !== undefined && existing > now) return true;
       seen.set(proofId, expiresAtMs);
@@ -309,7 +313,20 @@ export function createMcpSessionAuthPort(params: {
       });
     },
     async authorizeBuilderList() {
-      // Allowed: the session builder may list its own granted scopes.
+      // The session builder lists only what the session grant covers.
+      const grantedScopes = await resolveDataListGrantScopes(
+        {
+          signer: params.builderAddress,
+          grantId: params.grantId,
+          serverOwner: params.serverOwner,
+        },
+        {
+          authSessionVerifier: params.authSessionVerifier,
+          grantVerifier: params.grantVerifier,
+          runtimeAvailability: params.runtimeAvailability,
+        },
+      );
+      return { grantedScopes };
     },
     async authorizeBuilderRead(input: PersonalServerReadAuthInput) {
       const grant = await verifyDataReadPolicy(
@@ -329,7 +346,9 @@ export function createMcpSessionAuthPort(params: {
 
       // Paid session: enforce x402 per read (reuses the exact HTTP cycle). The
       // read client forwards the app's `X-PAYMENT` proof on `input.request`.
-      if (params.payment) {
+      // A table-of-contents read carries no values and its tool takes no
+      // `payment` argument, so charging it would make it unreachable.
+      if (params.payment && !input.metadataOnly) {
         // Settlement happens here, ahead of the HTTP handler's own deletion
         // gate, so the gate must run here too: never challenge or settle a
         // read of a scope the owner deleted.

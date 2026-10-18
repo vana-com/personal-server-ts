@@ -37,6 +37,11 @@ export interface GrantVerifierPort {
   getGrant(grantId: string): Promise<GatewayGrantResponse | null>;
 }
 
+export interface GrantListerPort {
+  /** Every grant `grantorAddress` issued, live or not. */
+  listGrantsByUser(grantorAddress: string): Promise<GatewayGrantResponse[]>;
+}
+
 export interface AuthSessionVerifierPort {
   getBuilder(address: string): Promise<Builder | null>;
 }
@@ -87,10 +92,23 @@ export interface DataStoragePort extends RuntimeStoragePort {
   countVersions(scope: string): number;
   findEntry(lookup: DataStorageEntryLookup): IndexEntry | undefined;
   findByFileId(fileId: string): IndexEntry | undefined;
-  /** Dedup lookup for the download worker: find an entry by its DPv2 data-point id. */
+  /**
+   * Dedup lookup for the download worker: the NEWEST local version (highest
+   * `version`) of a DPv2 data point. Data point ids are per (owner, scope),
+   * so every version of a scope shares one id.
+   */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
+  /**
+   * The envelope exactly as stored, bypassing any read-time view. Only a
+   * served port (see `withLegacyProjection`) has it; on a raw port
+   * `readEnvelope` already returns the stored form.
+   */
+  readStoredEnvelope?(
+    scope: string,
+    collectedAt: string,
+  ): Promise<DataFileEnvelope>;
   /** Read the stored JSON envelope without parsing its potentially large data. */
   readEnvelopeBytes?(scope: string, collectedAt: string): Promise<Uint8Array>;
   /** Open a fresh byte stream for the stored JSON envelope. May be called twice. */
@@ -153,14 +171,28 @@ export interface DataStoragePort extends RuntimeStoragePort {
     manifest: DataBlockManifest,
     blocks: DataScopeBlock[],
   ): Promise<void>;
+  /**
+   * The per-scope first-seen ledger (see `additions/first-added.ts`), or null
+   * when none is stored. A sidecar derived from the scope's stored versions:
+   * it is not a version, never appears in the index or a listing, is never
+   * uploaded by sync and is never served by a data, block, MCP, job or
+   * derivative read. Opaque to storage; callers validate it on read.
+   */
+  readFirstSeenLedger?(scope: string): Promise<unknown | null>;
+  writeFirstSeenLedger?(scope: string, ledger: unknown): Promise<void>;
+  /** Idempotent. `deleteScope` also removes the scope's ledger. */
+  deleteFirstSeenLedger?(scope: string): Promise<void>;
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   /** Highest stored DPv2 `version` for a scope; 0 if none. */
   findLatestVersionByScope(scope: string): number | Promise<number>;
-  /** Stamps the DPv2 dataPointId on an entry after registerDataPoint. */
+  /**
+   * Stamps the DPv2 dataPointId on an entry after registerDataPoint; `null`
+   * marks it unsynced again (the gateway lost the registration).
+   */
   updateDataPointId(
     path: string,
-    dataPointId: string,
+    dataPointId: string | null,
   ): boolean | Promise<boolean>;
   /**
    * Rewrites the DPv2 `version` on an entry. Used when the upload worker

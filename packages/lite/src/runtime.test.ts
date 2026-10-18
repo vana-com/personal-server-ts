@@ -1092,6 +1092,58 @@ describe("createPsLiteRuntime", () => {
     await expect(read.json()).resolves.toMatchObject({
       data: { username: "web3_user" },
     });
+
+    // Listings are scoped to the grant exactly like reads.
+    const otherBody = JSON.stringify({ count: 1 });
+    const other = await runtime.fetch(
+      new Request("https://ps.local/v1/data/twitter.posts", {
+        method: "POST",
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: owner,
+            aud: "https://ps.local",
+            method: "POST",
+            uri: "/v1/data/twitter.posts",
+            body: new TextEncoder().encode(otherBody),
+          }),
+          "Content-Type": "application/json",
+        },
+        body: otherBody,
+      }),
+    );
+    expect(other.status).toBe(201);
+    const builderGet = async (uri: string, withGrant: boolean) =>
+      runtime.fetch(
+        new Request(`https://ps.local${uri}`, {
+          headers: {
+            Authorization: await buildWeb3SignedHeader({
+              wallet: builder,
+              aud: "https://ps.local",
+              method: "GET",
+              uri,
+              grantId: withGrant ? grantId : undefined,
+            }),
+          },
+        }),
+      );
+
+    const granted = await builderGet("/v1/data", true);
+    expect(granted.status).toBe(200);
+    await expect(granted.json()).resolves.toMatchObject({
+      scopes: [{ scope: "instagram.profile" }],
+      total: 1,
+    });
+    const ungranted = await builderGet("/v1/data", false);
+    await expect(ungranted.json()).resolves.toMatchObject({
+      scopes: [],
+      total: 0,
+    });
+    expect(
+      (await builderGet("/v1/data/instagram.profile/versions", true)).status,
+    ).toBe(200);
+    expect(
+      (await builderGet("/v1/data/twitter.posts/versions", true)).status,
+    ).toBe(403);
   });
 
   it("returns SERVER_NOT_CONFIGURED when Web3Signed reads lack policy ports", async () => {

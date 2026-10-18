@@ -303,10 +303,19 @@ async function executeJobUnsafe(
   const sealedPath = join(tempDirectory, "sealed.bin");
   try {
     let payloadBytes = 0;
+    let overBudget = false;
     const countedBody = body.pipeThrough(
       new TransformStream<Uint8Array, Uint8Array>({
         transform(chunk, controller) {
           payloadBytes += chunk.byteLength;
+          // The stored size was checked up front, but a served body can be
+          // larger than the stored one (a legacy scope projected from
+          // several stored PDPP streams), so the budget also holds here.
+          if (payloadBytes > resultMaxBytes) {
+            overBudget = true;
+            controller.error(new Error("job result exceeds the byte budget"));
+            return;
+          }
           controller.enqueue(chunk);
         },
       }),
@@ -315,7 +324,16 @@ async function executeJobUnsafe(
       sealedPath,
       sealed.header,
       countedBody.pipeThrough(sealed.transform),
-    );
+    ).catch((error: unknown) => {
+      if (overBudget) {
+        throw new JobFailure(
+          "RESULT_TOO_LARGE",
+          `job result exceeds ${resultMaxBytes} bytes`,
+          false,
+        );
+      }
+      throw error;
+    });
     logExecutionStep(deps, jobId, "read", executionStartedAt, {
       payloadBytes,
     });

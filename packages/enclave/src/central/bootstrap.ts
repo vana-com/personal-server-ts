@@ -367,6 +367,14 @@ export async function startFleetCentral(
     });
     return mcp.importFromMigration(exported);
   };
+  // Serialize the whole lifecycle operation, including reconciliation. A queued
+  // migration pause invalidates any earlier maintenance resume authorization.
+  let lifecycle: Promise<unknown> = Promise.resolve();
+  const runLifecycle = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = lifecycle.then(operation);
+    lifecycle = result.catch(() => undefined);
+    return result;
+  };
   const common = {
     controller,
     admissions: () => Object.fromEntries(admissions),
@@ -378,24 +386,53 @@ export async function startFleetCentral(
       instanceId: identity.instanceId,
     },
     active: async () => !controller.paused() && (await mcp.active()),
-    activate: async () => {
-      if (!(await mcp.active()))
-        throw new Error("Protected state import required");
-      await controller.pause();
-      await reconcileApprovedOwners();
-      await controller.resume();
-      return { success: true, paused: false };
-    },
-    quiesce: async () => {
-      await controller.pause();
-      const outcomes = await Promise.allSettled([
-        ...controller.nodeStatus().map((node) => controller.drain(node.nodeId)),
-        reconcileApprovedOwners(),
-      ]);
-      const failure = outcomes.find((result) => result.status === "rejected");
-      if (failure?.status === "rejected") throw failure.reason;
-      return { success: true, paused: true, placements: controller.snapshot() };
-    },
+    activate: (maintenanceId?: string) =>
+      runLifecycle(async () => {
+        if (!(await mcp.active()))
+          throw new Error("Protected state import required");
+        if (maintenanceId !== undefined) {
+          await controller.resumeFromMaintenance(maintenanceId);
+          return {
+            success: true,
+            paused: false,
+            mode: "maintenance",
+            maintenanceId,
+          };
+        }
+        await controller.pause();
+        await reconcileApprovedOwners();
+        await controller.resume();
+        return { success: true, paused: false };
+      }),
+    quiesce: (maintenanceId?: string) =>
+      runLifecycle(async () => {
+        if (maintenanceId !== undefined) {
+          if (!(await mcp.active()))
+            throw new Error("Protected state import required");
+          await controller.pauseForMaintenance(maintenanceId);
+          return {
+            success: true,
+            paused: true,
+            mode: "maintenance",
+            maintenanceId,
+            drained: drained(),
+          };
+        }
+        await controller.pause();
+        const outcomes = await Promise.allSettled([
+          ...controller
+            .nodeStatus()
+            .map((node) => controller.drain(node.nodeId)),
+          reconcileApprovedOwners(),
+        ]);
+        const failure = outcomes.find((result) => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+        return {
+          success: true,
+          paused: true,
+          placements: controller.snapshot(),
+        };
+      }),
     identity: (body: unknown) => servingPeer().call("worker.identity", body),
     seal: (body: unknown) => servingPeer().call("worker.seal", body),
     admit,

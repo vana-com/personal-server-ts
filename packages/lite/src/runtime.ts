@@ -1,11 +1,14 @@
 import {
+  withLegacyProjection,
+  type LegacyProjectionIssue,
+} from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
+import {
   GrantRequiredError,
   InvalidSignatureError,
   MissingAuthError,
   NotOwnerError,
   ProtocolError,
   PsUnavailableError,
-  UnregisteredBuilderError,
 } from "@opendatalabs/personal-server-ts-core/errors";
 import {
   authenticateRequest,
@@ -40,8 +43,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import {
+  resolveDataListGrantScopes,
   verifyDataReadPolicy,
-  type DataReadPolicyPorts,
+  type DataListPolicyPorts,
   type DataWritePolicyPorts,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import {
@@ -69,19 +73,28 @@ import {
   approveMcpOAuthAuthorization,
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
+  approveMcpScopeAccessRequest,
   buildMcpProtectedResourceMetadataUrl,
   buildStableMcpUrl,
   createInMemoryMcpOAuthAuthorizationStore,
   createMcpConnection,
   createMcpOAuthAuthorization,
   createMcpDataReadClient,
+  denyMcpScopeAccessRequest,
   handleMcpStreamableHttpRequest,
   hashConnectionToken,
   listMcpConnectionViews,
   loadMcpGranteeAccount,
+  MCP_CONNECTION_NOT_FOUND,
+  MCP_SCOPE_REQUEST_NOT_FOUND,
+  MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  readMcpScopeRequestWithToken,
+  getMcpConnectionView,
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpOAuthAuthorizationError,
+  isAllowedOAuthRedirectUri,
+  McpScopeRequestError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
   requestMcpScopeAccess,
@@ -92,6 +105,7 @@ import {
   type McpConnectionGrant,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
+  type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { PsLiteStorageCapabilities } from "./storage.js";
 import {
@@ -201,10 +215,29 @@ export interface PsLiteRuntimeOptions {
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
   mcpOAuthApprovalUrl?: string | (() => string);
   /**
+   * Page where the owner answers an MCP client's `request_scope_access`.
+   * Called with the connection id and this runtime's public origin; a
+   * returned URL is handed to the agent to show the user. Omit to keep
+   * pointing the owner at Vana.
+   */
+  mcpScopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /**
+   * Lifetime in seconds of grants this runtime signs itself for MCP
+   * connections (OAuth approve, scope-request approve with no live grant to
+   * inherit an expiry from). Unset or 0 signs perpetual grants (the default).
+   */
+  mcpGrantTtlSeconds?: number;
+  /**
    * Optional diagnostics recorder. When provided, GET /v1/diagnostics (owner-only)
    * returns a structured snapshot useful for debugging stuck approval pages.
    */
   diagnostics?: DiagnosticsRecorder;
+  /**
+   * Called when a legacy scope cannot be projected from stored PDPP records
+   * (the stored body is then served) or is projected with rows left out.
+   * Defaults to a console warning.
+   */
+  onLegacyProjectionIssue?: (issue: LegacyProjectionIssue) => void;
 }
 
 export interface PsLiteRuntimeStateCapabilities {
@@ -263,6 +296,12 @@ export interface PsLiteWriteSessionAuthOptions {
 
 export interface BearerTokenPsLiteAuthOptions {
   ownerToken: string;
+  /**
+   * Owner-equivalent for listings by design: `authorizeBuilderList` returns
+   * void for it, so it sees every scope. The token names no builder, so there
+   * is no grant to scope a listing by; reads still require a grantId. Hand it
+   * only to a party trusted with the owner's scope inventory.
+   */
   builderToken: string;
   /**
    * Optional delegated-write support. The static builder token never gains
@@ -279,7 +318,8 @@ export interface BearerTokenPsLiteAuthOptions {
 export interface Web3SignedPsLiteAuthOptions {
   origin: string | (() => string);
   ownerAddress: `0x${string}`;
-  dataReadPolicyPorts?: DataReadPolicyPorts;
+  /** `grantLister` lets a builder list without presenting a grantId. */
+  dataReadPolicyPorts?: DataListPolicyPorts;
   accessToken?: string;
   tokenStore?: SessionTokenVerifierPort;
   now?: () => number;
@@ -291,7 +331,7 @@ export interface Web3SignedPsLiteAuthOptions {
 }
 
 type JsonStatus =
-  200 | 201 | 400 | 401 | 403 | 404 | 405 | 409 | 500 | 501 | 503;
+  200 | 201 | 400 | 401 | 403 | 404 | 405 | 409 | 500 | 501 | 502 | 503;
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
   headers.set("Content-Type", "application/json");
@@ -391,22 +431,22 @@ function redirectWithOAuthError(
   description: string,
   state: string | null,
 ): Response {
-  try {
+  // RFC 6749 4.1.2.1: never redirect to an invalid or unvalidated URI.
+  if (isAllowedOAuthRedirectUri(redirectUri)) {
     const url = new URL(redirectUri);
     url.searchParams.set("error", error);
     url.searchParams.set("error_description", description);
     if (state) url.searchParams.set("state", state);
     return Response.redirect(url.toString(), 302);
-  } catch {
-    return jsonResponse(
-      {
-        error,
-        error_description: description,
-        ...(state ? { state } : {}),
-      },
-      { status: 400 },
-    );
   }
+  return jsonResponse(
+    {
+      error,
+      error_description: description,
+      ...(state ? { state } : {}),
+    },
+    { status: 400 },
+  );
 }
 
 async function parseFormBody(request: Request): Promise<URLSearchParams> {
@@ -504,6 +544,7 @@ export function createBearerTokenPsLiteAuth(
       : {}),
     async authorizeBuilderList(request) {
       if (parseBearerToken(request) === options.ownerToken) return;
+      // Owner-equivalent listing by design; see `builderToken`.
       assertBearerToken(request, options.builderToken);
     },
     async authorizeBuilderRead(input) {
@@ -586,7 +627,7 @@ export function createWeb3SignedPsLiteAuth(
           authorizeOwner,
         )
       : {}),
-    async authorizeBuilderList(request) {
+    async authorizeBuilderList(request, listOptions) {
       const auth = await authenticatePsLiteRequest(request, options);
       if (auth.isPolicyBypass || isOwnerSigner(auth, options.ownerAddress)) {
         return;
@@ -594,13 +635,16 @@ export function createWeb3SignedPsLiteAuth(
       if (!options.dataReadPolicyPorts) {
         throw dataReadPolicyPortsRequired();
       }
-      const builder =
-        await options.dataReadPolicyPorts.authSessionVerifier.getBuilder(
-          auth.auth.signer,
-        );
-      if (!builder) {
-        throw new UnregisteredBuilderError();
-      }
+      // A builder lists only what its grants from this PS's owner cover.
+      const grantedScopes = await resolveDataListGrantScopes(
+        {
+          signer: auth.auth.signer,
+          grantId: auth.auth.payload.grantId ?? listOptions?.grantId,
+          serverOwner: options.ownerAddress,
+        },
+        options.dataReadPolicyPorts,
+      );
+      return { grantedScopes };
     },
     async authorizeBuilderRead(input) {
       const auth = await authenticatePsLiteRequest(input.request, options);
@@ -712,13 +756,26 @@ function resolveX402Settings(
   };
 }
 
+function warnLegacyProjectionIssue(issue: LegacyProjectionIssue): void {
+  console.warn(
+    issue.kind === "projection_failed"
+      ? "[legacy-projection] projection failed; serving stored body"
+      : "[legacy-projection] projection left rows out",
+    issue,
+  );
+}
+
 export function createPsLiteRuntime(
   options: PsLiteRuntimeOptions,
 ): PsLiteRuntime {
   let active = options.active ?? false;
   const now = options.now ?? (() => new Date());
   const auth = options.auth ?? createMissingAuthAdapter();
-  const dataStorage = toDataStoragePort(options.storage);
+  // Readers get legacy bodies projected from stored PDPP records; writes and
+  // listings pass through. Sync is built outside with the raw port.
+  const dataStorage = withLegacyProjection(toDataStoragePort(options.storage), {
+    onIssue: options.onLegacyProjectionIssue ?? warnLegacyProjectionIssue,
+  });
   // Wire diagnostics by default so GET /v1/diagnostics is always available.
   const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
   options = { ...options, diagnostics };
@@ -1265,6 +1322,7 @@ export function createPsLiteRuntime(
             store: options.mcpConnectionStore,
             authorizationStore: mcpOAuthAuthorizationStore,
             approvalUrl: options.mcpOAuthApprovalUrl,
+            scopeRequestApprovalUrl: options.mcpScopeRequestApprovalUrl,
             auth,
             dataStorage,
             accessLogWriter,
@@ -1279,6 +1337,7 @@ export function createPsLiteRuntime(
               (DataPortabilityGatewayConfig & { url?: string }) | undefined,
             serverOwner: options.serverOwner ?? options.identity?.address,
             serverSigner: options.serverSigner,
+            grantTtlSeconds: options.mcpGrantTtlSeconds,
             activityRecorder,
           });
           if (mcpResponse) return mcpResponse;
@@ -1305,6 +1364,7 @@ async function handleMcpRoute(input: {
   store: McpConnectionStore;
   authorizationStore: McpOAuthAuthorizationStore;
   approvalUrl?: string | (() => string);
+  scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
   auth: PsLiteAuthAdapter;
   dataStorage: DataStoragePort;
   accessLogWriter: AccessLogWriter;
@@ -1316,6 +1376,7 @@ async function handleMcpRoute(input: {
   gatewayConfig?: (DataPortabilityGatewayConfig & { url?: string }) | null;
   serverOwner?: `0x${string}`;
   serverSigner?: Pick<ServerSigner, "signGrantRegistration">;
+  grantTtlSeconds?: number;
   activityRecorder?: McpActivityRecorder;
 }): Promise<Response | null> {
   const pathname = input.url.pathname;
@@ -1360,6 +1421,18 @@ async function handleMcpRoute(input: {
       body = (await input.request.json()) as typeof body;
     } catch {
       body = {};
+    }
+    if (
+      Array.isArray(body.redirect_uris) &&
+      !body.redirect_uris.every(isAllowedOAuthRedirectUri)
+    ) {
+      return jsonResponse(
+        {
+          error: "invalid_redirect_uri",
+          error_description: "One or more redirect_uris are not allowed",
+        },
+        { status: 400 },
+      );
     }
     return jsonResponse(
       {
@@ -1575,6 +1648,7 @@ async function handleMcpRoute(input: {
               serverOwner: input.serverOwner,
               serverSigner: input.serverSigner,
               now: input.now,
+              grantTtlSeconds: input.grantTtlSeconds,
             },
           );
           return jsonResponse({ redirectTo: approved.redirectTo });
@@ -1612,6 +1686,38 @@ async function handleMcpRoute(input: {
     return errorResponse(404, "NOT_FOUND", "Not found");
   }
 
+  // GET /v1/mcp/connections/:id/scope-request: the pending request, read
+  // with the token from its approval link instead of an owner signature, so
+  // the owner signs only to answer. Every failure is the same 404, so the
+  // route does not reveal which requests exist.
+  const scopeRequestRead =
+    /^\/v1\/mcp\/connections\/([^/]+)\/scope-request$/u.exec(pathname);
+  if (scopeRequestRead && input.request.method === "GET") {
+    let connectionId = "";
+    try {
+      connectionId = decodeURIComponent(scopeRequestRead[1] ?? "");
+    } catch {
+      connectionId = "";
+    }
+    const view = await readMcpScopeRequestWithToken(
+      {
+        connectionId,
+        token: input.request.headers.get(MCP_SCOPE_REQUEST_TOKEN_HEADER),
+      },
+      { store: input.store, now: input.now },
+    );
+    if (!view) {
+      const notFound = errorResponse(
+        404,
+        MCP_SCOPE_REQUEST_NOT_FOUND,
+        "Scope request not found",
+      );
+      notFound.headers.set("Cache-Control", "no-store");
+      return notFound;
+    }
+    return jsonResponse(view, { headers: { "Cache-Control": "no-store" } });
+  }
+
   // Owner management endpoints
   if (pathname === ownerPrefix || pathname.startsWith(`${ownerPrefix}/`)) {
     try {
@@ -1647,11 +1753,24 @@ async function handleMcpRoute(input: {
       }
       return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
     }
-    // /v1/mcp/connections/:id[/approve]
+    // /v1/mcp/connections/:id[/approve | /scope-request/(approve|deny)]
+    // GET /:id reads one connection; DELETE /:id revokes it.
     const tail = pathname.slice(ownerPrefix.length + 1);
-    const [id, action] = tail.split("/");
+    const [id, action, subAction, ...rest] = tail.split("/");
     if (!id) {
       return errorResponse(404, "NOT_FOUND", "Not found");
+    }
+    if (action === "scope-request") {
+      if (
+        rest.length > 0 ||
+        (subAction !== "approve" && subAction !== "deny")
+      ) {
+        return errorResponse(404, "NOT_FOUND", "Not found");
+      }
+      if (input.request.method !== "POST") {
+        return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
+      }
+      return handleScopeRequestAnswer(id, subAction);
     }
     if (action === "approve") {
       if (input.request.method !== "POST") {
@@ -1689,6 +1808,16 @@ async function handleMcpRoute(input: {
       }
     }
     if (!action) {
+      if (input.request.method === "GET") {
+        try {
+          return jsonResponse(await getMcpConnectionView(id, input.store));
+        } catch (err) {
+          if (err instanceof McpConnectionNotFoundError) {
+            return errorResponse(404, MCP_CONNECTION_NOT_FOUND, err.message);
+          }
+          throw err;
+        }
+      }
       if (input.request.method === "DELETE") {
         try {
           const updated = await revokeMcpConnection(id, {
@@ -1706,6 +1835,90 @@ async function handleMcpRoute(input: {
       return errorResponse(405, "METHOD_NOT_ALLOWED", "Method not allowed");
     }
     return errorResponse(404, "NOT_FOUND", "Not found");
+  }
+
+  async function handleScopeRequestAnswer(
+    id: string,
+    answer: "approve" | "deny",
+  ): Promise<Response> {
+    let scopes: unknown;
+    if (answer === "approve") {
+      try {
+        scopes = ((await input.request.json()) as { scopes?: unknown }).scopes;
+      } catch {
+        return errorResponse(400, "INVALID_BODY", "Body must be JSON");
+      }
+    }
+    const gateway = input.gateway;
+    if (answer === "approve" && !gateway) {
+      return errorResponse(
+        500,
+        "SERVER_NOT_CONFIGURED",
+        "Gateway is not configured",
+      );
+    }
+    const activityId = input.activityRecorder?.start({
+      tool: `owner.scope_request.${answer}`,
+      ...(Array.isArray(scopes)
+        ? {
+            scopes: scopes.filter(
+              (scope): scope is string => typeof scope === "string",
+            ),
+          }
+        : {}),
+    });
+    const finish = (status: "succeeded" | "failed", errorCode?: string) => {
+      if (activityId) {
+        input.activityRecorder?.finish(activityId, {
+          status,
+          ...(errorCode ? { errorCode } : {}),
+        });
+      }
+    };
+    try {
+      if (answer === "deny" || !gateway) {
+        const denied = await denyMcpScopeAccessRequest(
+          { connectionId: id },
+          { store: input.store, now: input.now },
+        );
+        finish("succeeded");
+        return jsonResponse({ connection: toMcpConnectionView(denied) });
+      }
+      const approved = await approveMcpScopeAccessRequest(
+        { connectionId: id, scopes },
+        {
+          store: input.store,
+          gateway,
+          serverOwner: input.serverOwner,
+          serverSigner: input.serverSigner,
+          now: input.now,
+          grantTtlSeconds: input.grantTtlSeconds,
+        },
+      );
+      finish("succeeded");
+      return jsonResponse({
+        connection: toMcpConnectionView(approved.connection),
+        grantId: approved.grantId,
+        grantedScopes: approved.grantedScopes,
+        approvedScopes: approved.approvedScopes,
+        deniedScopes: approved.deniedScopes,
+      });
+    } catch (err) {
+      if (err instanceof McpConnectionNotFoundError) {
+        finish("failed", MCP_CONNECTION_NOT_FOUND);
+        return errorResponse(404, MCP_CONNECTION_NOT_FOUND, err.message);
+      }
+      if (err instanceof McpConnectionStateError) {
+        finish("failed", "INVALID_STATE");
+        return errorResponse(409, "INVALID_STATE", err.message);
+      }
+      if (err instanceof McpScopeRequestError) {
+        finish("failed", err.code);
+        return errorResponse(err.status, err.code, err.message);
+      }
+      finish("failed", "INTERNAL");
+      throw err;
+    }
   }
 
   async function handleMcpToken(
@@ -1765,6 +1978,8 @@ async function handleMcpRoute(input: {
           { store: input.store, now: input.now },
         );
       },
+      scopeRequestApprovalUrl: input.scopeRequestApprovalUrl,
+      serverOrigin: input.serverOrigin,
     });
     void input.store
       .update(record.id, {
@@ -1800,6 +2015,17 @@ async function handleMcpRoute(input: {
     return handleMcpToken(bearerToken(input.request), {
       oauthChallenge: Boolean(resolveMcpApprovalUrl(input.approvalUrl)),
     });
+  }
+
+  // The self-signing app handshake (Node server only). Without this it falls
+  // into the legacy /mcp/:token route below, which reads "session" as a
+  // connection token and answers "Unknown or revoked MCP connection".
+  if (pathname === "/mcp/session") {
+    return errorResponse(
+      501,
+      "MCP_SESSION_NOT_SUPPORTED",
+      "Third-party MCP sessions are not available on this Personal Server. The user needs Vana Desktop.",
+    );
   }
 
   // Legacy Claude-facing endpoint: /mcp/:token

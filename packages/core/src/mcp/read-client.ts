@@ -323,12 +323,14 @@ export interface McpDataReadClient {
   /**
    * Perform `GET /v1/data?scopePrefix=…` as the connection grantee. This is
    * used only for discovery/expanding wildcard grants before a grant-gated
-   * read; it does not return scope contents.
+   * read; it does not return scope contents. The listing only shows scopes
+   * the signed `grantId` covers (absent: the owner's grants to the grantee).
    */
   listScopes(params?: {
     scopePrefix?: string;
     limit?: number;
     offset?: number;
+    grantId?: string;
   }): Promise<McpDataListResult>;
 
   /**
@@ -529,6 +531,8 @@ export function createMcpDataReadClient(
      * The owner/OAuth path never sets this.
      */
     payment?: string;
+    /** A block manifest read: no values, so never charged. */
+    metadataOnly?: boolean;
   }): Promise<{ request: Request; authResult?: BuilderReadAuthorization }> {
     const safeScope = encodeURIComponent(params.scope);
     const signingUri = `${basePath}/${safeScope}`;
@@ -555,6 +559,7 @@ export function createMcpDataReadClient(
         grantId: params.grantId,
         fileId: params.fileId,
         ...(params.at ? { at: params.at } : {}),
+        ...(params.metadataOnly ? { metadataOnly: true } : {}),
       });
       return { request, authResult };
     } catch (err) {
@@ -602,7 +607,7 @@ export function createMcpDataReadClient(
 
   return {
     enforcesPayment: options.enforcesPayment ?? false,
-    async listScopes({ scopePrefix, limit, offset } = {}) {
+    async listScopes({ scopePrefix, limit, offset, grantId } = {}) {
       const params = new URLSearchParams();
       if (scopePrefix) params.set("scopePrefix", scopePrefix);
       if (limit !== undefined) params.set("limit", String(limit));
@@ -615,7 +620,7 @@ export function createMcpDataReadClient(
         aud: options.serverOrigin,
         method: "GET",
         uri: basePath,
-        grantId: "mcp-list",
+        grantId,
       });
 
       const url = new URL(pathWithQuery, options.serverOrigin).toString();
@@ -796,6 +801,7 @@ export function createMcpDataReadClient(
         scope,
         grantId,
         fileId: selectedEntry.fileId ?? undefined,
+        metadataOnly: true,
       });
       const manifest = await storage.readBlockManifest(
         scope,

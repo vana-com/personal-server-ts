@@ -17,7 +17,7 @@
  * "encrypt grantee private keys at rest" applies there).
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { Hono } from "hono";
 import type { Context } from "hono";
 import type { Logger } from "pino";
@@ -29,6 +29,7 @@ import {
   approveMcpOAuthAuthorization,
   approveMcpOAuthAuthorizationWithScopes,
   approveMcpConnection,
+  approveMcpScopeAccessRequest,
   buildMcpProtectedResourceMetadataUrl,
   buildMcpUrl,
   buildStableMcpUrl,
@@ -44,13 +45,21 @@ import {
   type McpSessionPaymentConfig,
   type McpProofReplayStore,
   createMcpDataReadClient,
+  denyMcpScopeAccessRequest,
+  getMcpConnectionView,
   handleMcpStreamableHttpRequest,
   hashConnectionToken,
   listMcpConnectionViews,
   loadMcpGranteeAccount,
+  MCP_CONNECTION_NOT_FOUND,
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpOAuthAuthorizationError,
+  isAllowedOAuthRedirectUri,
+  McpScopeRequestError,
+  MCP_SCOPE_REQUEST_NOT_FOUND,
+  MCP_SCOPE_REQUEST_TOKEN_HEADER,
+  readMcpScopeRequestWithToken,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
   requestMcpScopeAccess,
@@ -63,6 +72,7 @@ import {
   type McpSessionStore,
   type McpOAuthAuthorizationStore,
   type McpActivityRecorder,
+  type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type {
   PersonalServerDataApiDeps,
@@ -72,7 +82,12 @@ import type {
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
 import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
-import { authenticateRequest } from "@opendatalabs/personal-server-ts-core/auth";
+import {
+  authenticateRequest,
+  isWeb3SignedLifetimeError,
+  web3SignedProofId,
+  boundedProofExpiry,
+} from "@opendatalabs/personal-server-ts-core/auth";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -82,6 +97,7 @@ import type {
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "../token-store.js";
+import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 
 export interface McpRouteDeps {
@@ -107,6 +123,12 @@ export interface McpRouteDeps {
    * The owner/OAuth connection path is always free regardless of this flag.
    */
   paymentEnabled?: boolean;
+  /**
+   * Lifetime in seconds of grants this server signs itself for MCP
+   * connections when there is no live grant expiry to keep. Unset or 0
+   * signs perpetual grants (the default).
+   */
+  mcpGrantTtlSeconds?: number;
   devToken?: string;
   accessToken?: string;
   tokenStore?: TokenStore;
@@ -141,6 +163,12 @@ export interface McpRouteDeps {
    * with `mcp_authorization` and `ps_origin` query params.
    */
   oauthApprovalUrl?: string | (() => string);
+  /**
+   * Host page where the owner answers an MCP client's scope request. When it
+   * returns a URL, `request_scope_access` gives it to the agent to show the
+   * user. Absent: the agent is told to wait for approval in Vana.
+   */
+  scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
 }
 
 function resolveOrigin(origin: string | (() => string)): string {
@@ -228,25 +256,25 @@ function redirectWithOAuthError(
   description: string,
   state: string | null,
 ): Response {
-  try {
+  // RFC 6749 4.1.2.1: never redirect to an invalid or unvalidated URI.
+  if (isAllowedOAuthRedirectUri(redirectUri)) {
     const url = new URL(redirectUri);
     url.searchParams.set("error", error);
     url.searchParams.set("error_description", description);
     if (state) url.searchParams.set("state", state);
     return Response.redirect(url.toString(), 302);
-  } catch {
-    return new Response(
-      JSON.stringify({
-        error,
-        error_description: description,
-        ...(state ? { state } : {}),
-      }),
-      {
-        status: 400,
-        headers: { "content-type": "application/json" },
-      },
-    );
   }
+  return new Response(
+    JSON.stringify({
+      error,
+      error_description: description,
+      ...(state ? { state } : {}),
+    }),
+    {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    },
+  );
 }
 
 async function parseFormBody(request: Request): Promise<URLSearchParams> {
@@ -258,10 +286,12 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
   const dataStorage =
     deps.dataStorage ??
     (deps.indexManager && deps.hierarchyOptions
-      ? createNodeDataStorage({
-          indexManager: deps.indexManager,
-          hierarchyOptions: deps.hierarchyOptions,
-        })
+      ? withLegacyProjection(
+          createNodeDataStorage({
+            indexManager: deps.indexManager,
+            hierarchyOptions: deps.hierarchyOptions,
+          }),
+        )
       : undefined);
   if (!dataStorage) {
     throw new Error(
@@ -317,6 +347,31 @@ export function executeMcpConnectionRequest(
   });
 }
 
+/** Activity-log tool names for owner answers to a client's scope request. */
+const SCOPE_REQUEST_APPROVE_ACTIVITY = "owner.scope_request.approve";
+const SCOPE_REQUEST_DENY_ACTIVITY = "owner.scope_request.deny";
+
+function scopeRequestErrorCode(err: unknown): string {
+  if (err instanceof McpScopeRequestError) return err.code;
+  if (err instanceof McpConnectionNotFoundError)
+    return MCP_CONNECTION_NOT_FOUND;
+  if (err instanceof McpConnectionStateError) return "INVALID_STATE";
+  return "INTERNAL";
+}
+
+function scopeRequestErrorResponse(c: Context, err: unknown): Response | null {
+  if (err instanceof McpConnectionNotFoundError) {
+    return c.json(jsonError(404, MCP_CONNECTION_NOT_FOUND, err.message), 404);
+  }
+  if (err instanceof McpConnectionStateError) {
+    return c.json(jsonError(409, "INVALID_STATE", err.message), 409);
+  }
+  if (err instanceof McpScopeRequestError) {
+    return c.json(jsonError(err.status, err.code, err.message), err.status);
+  }
+  return null;
+}
+
 /**
  * Hono sub-app for the owner-only `/v1/mcp/connections` endpoints.
  * Mount under `/v1/mcp/connections` in `app.ts`.
@@ -370,6 +425,42 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
     return c.json({ connections: records });
   });
 
+  // One connection, e.g. the pending scope request Vana Web renders. An
+  // unknown id answers MCP_CONNECTION_NOT_FOUND, never the generic NOT_FOUND
+  // a server without this route returns.
+  app.get("/:id", async (c) => {
+    const err = await requireOwner(c);
+    if (err) return err;
+    try {
+      return c.json(await getMcpConnectionView(c.req.param("id"), store));
+    } catch (caught) {
+      const response = scopeRequestErrorResponse(c, caught);
+      if (response) return response;
+      throw caught;
+    }
+  });
+
+  // The pending request, read with the token from its approval link instead
+  // of an owner signature, so the owner signs only to answer. Every failure
+  // is the same 404, so the route does not reveal which requests exist.
+  app.get("/:id/scope-request", async (c) => {
+    const view = await readMcpScopeRequestWithToken(
+      {
+        connectionId: c.req.param("id"),
+        token: c.req.header(MCP_SCOPE_REQUEST_TOKEN_HEADER),
+      },
+      { store },
+    );
+    c.header("Cache-Control", "no-store");
+    if (!view) {
+      return c.json(
+        jsonError(404, MCP_SCOPE_REQUEST_NOT_FOUND, "Scope request not found"),
+        404,
+      );
+    }
+    return c.json(view);
+  });
+
   app.post("/:id/approve", async (c) => {
     const err = await requireOwner(c);
     if (err) return err;
@@ -403,6 +494,97 @@ export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
       if (caught instanceof McpConnectionStateError) {
         return c.json(jsonError(409, "INVALID_STATE", caught.message), 409);
       }
+      throw caught;
+    }
+  });
+
+  // Owner answers the client's `request_scope_access` here; the server signs
+  // the replacement grant itself, so no Desktop/web signer is needed.
+  app.post("/:id/scope-request/approve", async (c) => {
+    const err = await requireOwner(c);
+    if (err) return err;
+    const id = c.req.param("id");
+    let body: { scopes?: unknown } = {};
+    try {
+      body = (await c.req.json()) as { scopes?: unknown };
+    } catch {
+      return c.json(jsonError(400, "INVALID_BODY", "Body must be JSON"), 400);
+    }
+    if (!deps.gatewayConfig?.url) {
+      return c.json(
+        jsonError(
+          500,
+          "SERVER_NOT_CONFIGURED",
+          "Gateway config is not configured",
+        ),
+        500,
+      );
+    }
+    const activityId = deps.activityRecorder?.start({
+      tool: SCOPE_REQUEST_APPROVE_ACTIVITY,
+      scopes: Array.isArray(body.scopes)
+        ? body.scopes.filter((s): s is string => typeof s === "string")
+        : undefined,
+    });
+    try {
+      const approved = await approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: body.scopes },
+        {
+          store,
+          gateway: deps.gateway,
+          serverOwner: deps.serverOwner,
+          serverSigner: deps.serverSigner,
+          grantTtlSeconds: deps.mcpGrantTtlSeconds,
+        },
+      );
+      if (activityId) {
+        deps.activityRecorder?.finish(activityId, { status: "succeeded" });
+      }
+      return c.json({
+        connection: toMcpConnectionView(approved.connection),
+        grantId: approved.grantId,
+        grantedScopes: approved.grantedScopes,
+        approvedScopes: approved.approvedScopes,
+        deniedScopes: approved.deniedScopes,
+      });
+    } catch (caught) {
+      const response = scopeRequestErrorResponse(c, caught);
+      if (activityId) {
+        deps.activityRecorder?.finish(activityId, {
+          status: "failed",
+          errorCode: response ? scopeRequestErrorCode(caught) : "INTERNAL",
+        });
+      }
+      if (response) return response;
+      throw caught;
+    }
+  });
+
+  app.post("/:id/scope-request/deny", async (c) => {
+    const err = await requireOwner(c);
+    if (err) return err;
+    const id = c.req.param("id");
+    const activityId = deps.activityRecorder?.start({
+      tool: SCOPE_REQUEST_DENY_ACTIVITY,
+    });
+    try {
+      const denied = await denyMcpScopeAccessRequest(
+        { connectionId: id },
+        { store },
+      );
+      if (activityId) {
+        deps.activityRecorder?.finish(activityId, { status: "succeeded" });
+      }
+      return c.json({ connection: toMcpConnectionView(denied) });
+    } catch (caught) {
+      const response = scopeRequestErrorResponse(c, caught);
+      if (activityId) {
+        deps.activityRecorder?.finish(activityId, {
+          status: "failed",
+          errorCode: response ? scopeRequestErrorCode(caught) : "INTERNAL",
+        });
+      }
+      if (response) return response;
       throw caught;
     }
   });
@@ -444,6 +626,7 @@ export type McpOAuthRouteDeps = Pick<
   | "tokenStore"
   | "gatewayConfig"
   | "serverSigner"
+  | "mcpGrantTtlSeconds"
 >;
 
 export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
@@ -517,6 +700,18 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
       body = (await c.req.json()) as typeof body;
     } catch {
       body = {};
+    }
+    if (
+      Array.isArray(body.redirect_uris) &&
+      !body.redirect_uris.every(isAllowedOAuthRedirectUri)
+    ) {
+      return c.json(
+        {
+          error: "invalid_redirect_uri",
+          error_description: "One or more redirect_uris are not allowed",
+        },
+        400,
+      );
     }
     return c.json(
       {
@@ -724,6 +919,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
             gatewayUrl: deps.gatewayConfig.url,
             serverOwner: deps.serverOwner,
             serverSigner: deps.serverSigner,
+            grantTtlSeconds: deps.mcpGrantTtlSeconds,
           },
         );
         return c.json({ redirectTo: approved.redirectTo });
@@ -825,6 +1021,8 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
           { store },
         );
       },
+      scopeRequestApprovalUrl: deps.scopeRequestApprovalUrl,
+      serverOrigin: resolveOrigin(deps.serverOrigin),
     });
     void store
       .update(record.id, { lastUsedAt: new Date().toISOString() })
@@ -864,6 +1062,21 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
           "x402 payment is enabled but the gateway URL is not configured",
         ),
         500,
+      );
+    }
+
+    // Revocation is checked on every session request, not only on data reads:
+    // the listing tools (list_granted_scopes, list_granted_sources,
+    // request_scope_access) answer from the session record and would keep
+    // describing a revoked grant's scopes until the token expired. A failed
+    // lookup is left to the per-read checks, which fail closed on their own.
+    const liveGrant = await deps.gateway
+      .getGrant(session.grantId)
+      .catch(() => undefined);
+    if (liveGrant === null || liveGrant?.revokedAt || liveGrant?.expired) {
+      return c.json(
+        jsonError(403, "GRANT_REVOKED", "Grant has been revoked or expired"),
+        403,
       );
     }
 
@@ -975,10 +1188,15 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         serverOwner: deps.serverOwner,
       });
     } catch (err) {
+      // The request-auth lifetime cap fires before boundedProofExpiry below;
+      // keep the handshake's own error code for an over-long proof.
+      const errorCode = isWeb3SignedLifetimeError(err)
+        ? "MCP_SESSION_PROOF_LIFETIME"
+        : "MCP_SESSION_AUTH_FAILED";
       return c.json(
         jsonError(
           401,
-          "MCP_SESSION_AUTH_FAILED",
+          errorCode,
           err instanceof Error ? err.message : String(err),
         ),
         401,
@@ -1005,16 +1223,15 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
         400,
       );
     }
-    // Replay guard: bind to a digest of the exact proof header, remembered
-    // until the proof's own expiry (a replay only matters while still valid).
-    const proofHeader = c.req.raw.headers.get("authorization") ?? "";
-    const proofId = createHash("sha256").update(proofHeader).digest("hex");
-    const expSec = authResult.auth.payload.exp;
-    const expiresAtMs =
-      (typeof expSec === "number"
-        ? expSec
-        : Math.floor(Date.now() / 1000) + 300) * 1000;
     try {
+      const expiresAtMs = boundedProofExpiry(
+        authResult.auth.payload,
+        "MCP_SESSION_PROOF_LIFETIME",
+      );
+      const proofId = await web3SignedProofId(
+        c.req.raw.headers.get("authorization") ?? "",
+        authResult.auth.signer,
+      );
       const session = await createMcpSession(
         {
           builderAddress: authResult.auth.signer,

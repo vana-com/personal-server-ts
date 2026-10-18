@@ -239,4 +239,237 @@ describe("Write API (e2e)", () => {
     const body = await res.json();
     expect(body.error.errorCode).toBe("SCOPE_MISMATCH");
   });
+
+  function variants(proof: string): string[] {
+    const dot = proof.indexOf(".");
+    const head = proof.slice(0, dot + 1);
+    const sig = proof.slice(dot + 1);
+    const parity = Number.parseInt(sig.slice(-2), 16) - 27;
+    const order = BigInt(
+      "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+    );
+    const highS = (order - BigInt(`0x${sig.slice(66, 130)}`))
+      .toString(16)
+      .padStart(64, "0");
+    return [
+      proof,
+      head + sig.slice(0, -2) + parity.toString(16).padStart(2, "0"),
+      head + "0x" + sig.slice(2).toUpperCase(),
+      head + sig.slice(0, 66) + highS + (27 + (parity ^ 1)).toString(16),
+    ];
+  }
+
+  it.each([
+    ["/mcp/session", READ_GRANT_ID, "MCP_SESSION_PROOF_REPLAY"],
+    ["/v1/write/session", WRITE_GRANT_ID, "WRITE_SESSION_PROOF_REPLAY"],
+  ])(
+    "%s rejects captured proof encodings and accepts fresh proofs",
+    async (uri, grantId, errorCode) => {
+      const proof = await buildWeb3SignedHeader({
+        wallet: builderWallet,
+        aud: server.url,
+        method: "POST",
+        uri,
+        grantId,
+        nonce: crypto.randomUUID(),
+      });
+      const send = (auth: string) =>
+        fetch(`${server.url}${uri}`, {
+          method: "POST",
+          headers: { Authorization: auth },
+        });
+      const first = await send(proof);
+      expect(first.status).toBe(200);
+      const session = await first.json();
+      for (const replay of variants(proof)) {
+        const res = await send(replay);
+        expect(res.status).toBe(401);
+        expect((await res.json()).error.errorCode).toBe(errorCode);
+      }
+      const fresh = await buildWeb3SignedHeader({
+        wallet: builderWallet,
+        aud: server.url,
+        method: "POST",
+        uri,
+        grantId,
+        nonce: crypto.randomUUID(),
+      });
+      expect((await send(fresh)).status).toBe(200);
+      if (uri === "/mcp/session") {
+        const init = await fetch(`${server.url}/mcp`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {
+              protocolVersion: "2025-03-26",
+              capabilities: {},
+              clientInfo: { name: "replay-e2e", version: "1" },
+            },
+          }),
+        });
+        expect(init.status).toBe(200);
+        expect(await init.text()).toContain("serverInfo");
+        const read = await fetch(`${server.url}/mcp`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session.access_token}`,
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: { name: "read_scope", arguments: { scope: SCOPE } },
+          }),
+        });
+        expect(read.status).toBe(200);
+        const result = await read.text();
+        expect(result).toContain("hello from the builder");
+        expect(result).not.toContain('"isError":true');
+      }
+    },
+  );
+
+  it("rejects re-encoded delegated writes and accepts a fresh legitimate write", async () => {
+    const rawBody = JSON.stringify({ note: "replay-fenced" });
+    const uri = `/v1/data/${SCOPE}`;
+    const proof = await buildWeb3SignedHeader({
+      wallet: builderWallet,
+      aud: server.url,
+      method: "POST",
+      uri,
+      grantId: WRITE_GRANT_ID,
+      body: new TextEncoder().encode(rawBody),
+    });
+    const send = (signature: string) =>
+      fetch(`${server.url}${uri}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${sessionToken}`,
+          "Content-Type": "application/json",
+          "X-Vana-Write-Signature": signature,
+        },
+        body: rawBody,
+      });
+    const written = await send(proof);
+    expect(written.status, await written.text()).toBe(201);
+    for (const replay of variants(proof)) {
+      const res = await send(replay);
+      expect(res.status).toBe(401);
+      expect((await res.json()).error.errorCode).toBe(
+        "WRITE_ATTRIBUTION_REPLAY",
+      );
+    }
+    const fresh = await buildWeb3SignedHeader({
+      wallet: builderWallet,
+      aud: server.url,
+      method: "POST",
+      uri,
+      grantId: WRITE_GRANT_ID,
+      body: new TextEncoder().encode(rawBody),
+      nonce: crypto.randomUUID(),
+    });
+    expect((await send(fresh)).status).toBe(201);
+  });
+
+  it.each(["/mcp/session", "/v1/write/session", `/v1/data/${SCOPE}`])(
+    "%s bounds proof lifetime and refuses expired proofs inside SDK skew",
+    async (uri) => {
+      const now = Math.floor(Date.now() / 1000);
+      for (const [iat, exp] of [
+        [now, now + 86400],
+        [now - 300, now - 1],
+      ]) {
+        const write = uri.startsWith("/v1/data/");
+        const body = write
+          ? JSON.stringify({ note: "invalid-lifetime" })
+          : undefined;
+        const proof = await buildWeb3SignedHeader({
+          wallet: builderWallet,
+          aud: server.url,
+          method: "POST",
+          uri,
+          grantId: uri === "/mcp/session" ? READ_GRANT_ID : WRITE_GRANT_ID,
+          iat,
+          exp,
+          ...(body ? { body: new TextEncoder().encode(body) } : {}),
+        });
+        const res = await fetch(`${server.url}${uri}`, {
+          method: "POST",
+          headers: write
+            ? {
+                Authorization: `Bearer ${sessionToken}`,
+                "X-Vana-Write-Signature": proof,
+                "Content-Type": "application/json",
+              }
+            : { Authorization: proof },
+          body,
+        });
+        expect(res.status).toBe(401);
+        const code =
+          uri === "/mcp/session"
+            ? "MCP_SESSION_PROOF_LIFETIME"
+            : write
+              ? "WRITE_ATTRIBUTION_LIFETIME"
+              : "WRITE_SESSION_PROOF_LIFETIME";
+        expect((await res.json()).error.errorCode).toBe(code);
+      }
+    },
+  );
+  it("preserves concurrent fresh writes to the same scope", async () => {
+    const results = await Promise.all(
+      [1, 2, 3].map(async (sequence) => {
+        const rawBody = JSON.stringify({ sequence });
+        const uri = `/v1/data/${SCOPE}`;
+        const signature = await buildWeb3SignedHeader({
+          wallet: builderWallet,
+          aud: server.url,
+          method: "POST",
+          uri,
+          grantId: WRITE_GRANT_ID,
+          body: new TextEncoder().encode(rawBody),
+          nonce: crypto.randomUUID(),
+        });
+        const res = await fetch(`${server.url}${uri}`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${sessionToken}`,
+            "X-Vana-Write-Signature": signature,
+            "Content-Type": "application/json",
+          },
+          body: rawBody,
+        });
+        expect(res.status).toBe(201);
+        return {
+          sequence,
+          collectedAt: (await res.json()).collectedAt as string,
+        };
+      }),
+    );
+    expect(new Set(results.map((r) => r.collectedAt)).size).toBe(3);
+    for (const result of results) {
+      const uri = `/v1/data/${SCOPE}`;
+      const auth = await buildWeb3SignedHeader({
+        wallet: builderWallet,
+        aud: server.url,
+        method: "GET",
+        uri,
+        grantId: READ_GRANT_ID,
+      });
+      const res = await fetch(
+        `${server.url}${uri}?at=${encodeURIComponent(result.collectedAt)}`,
+        { headers: { Authorization: auth } },
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).data.sequence).toBe(result.sequence);
+    }
+  });
 });

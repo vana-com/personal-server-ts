@@ -206,6 +206,11 @@ describe("createMcpSession", () => {
     });
   });
 
+  it("refuses proofs that expire while grant validation is pending", async () => {
+    const replayStore = createInMemoryMcpProofReplayStore();
+    expect(await replayStore.consume("expired", Date.now() - 1)).toBe(true);
+  });
+
   it("allows a fresh proof id after a prior one was consumed", async () => {
     const gw = fakeGateway(grant());
     const replayStore = createInMemoryMcpProofReplayStore();
@@ -321,6 +326,30 @@ describe("createMcpSessionAuthPort", () => {
     ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
   });
 
+  it("scopes a data listing to the session grant", async () => {
+    const port = createMcpSessionAuthPort({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      authSessionVerifier: fakeGateway(grant()),
+      grantVerifier: fakeGateway(grant()),
+      serverOwner: OWNER,
+    });
+    await expect(
+      port.authorizeBuilderList(new Request("http://ps.local/")),
+    ).resolves.toEqual({ grantedScopes: ["instagram.profile"] });
+
+    const foreign = fakeGateway(grant({ grantorAddress: OTHER }));
+    await expect(
+      createMcpSessionAuthPort({
+        builderAddress: BUILDER,
+        grantId: "grant_1",
+        authSessionVerifier: foreign,
+        grantVerifier: foreign,
+        serverOwner: OWNER,
+      }).authorizeBuilderList(new Request("http://ps.local/")),
+    ).rejects.toMatchObject({ errorCode: "GRANT_OWNER_MISMATCH" });
+  });
+
   it("refuses owner operations", async () => {
     const gw = fakeGateway(grant());
     const port = createMcpSessionAuthPort({
@@ -403,6 +432,73 @@ describe("createMcpSessionAuthPort", () => {
     expect(signRecordDataAccess).toHaveBeenCalledWith(
       expect.objectContaining({ version: 3n }),
     );
+  });
+
+  it("does not charge a table-of-contents read, but still charges a data read", async () => {
+    const gw = fakeGateway(
+      grant({
+        paymentStatus: "pending",
+        fee: {
+          totalDue: "100",
+          asset: "0x0000000000000000000000000000000000000fee",
+        },
+      }),
+    );
+    const findEntry = vi.fn(() => ({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-06T00:00:00Z",
+      fileId: "file-latest",
+      sizeBytes: 10,
+      dataPointId: "0x00000000000000000000000000000000000000dp",
+      version: 7,
+    }));
+    const signRecordDataAccess = vi.fn().mockResolvedValue("0xsig");
+    const port = createMcpSessionAuthPort({
+      builderAddress: BUILDER,
+      grantId: "grant_1",
+      authSessionVerifier: gw,
+      grantVerifier: gw,
+      serverOwner: OWNER,
+      payment: {
+        dataApiDeps: {
+          storage: { findEntry } as never,
+          auth: {} as never,
+          accessLogWriter: { write: vi.fn() },
+          serverSigner: { signRecordDataAccess },
+          serverOwner: OWNER,
+          serverAddress: "0x0000000000000000000000000000000000000ccc",
+        },
+        gateway: gw as never,
+        gatewayConfig: {
+          chainId: 14800,
+          contracts: {
+            dataRegistry: "0x0000000000000000000000000000000000000001",
+            dataPortabilityPermissions:
+              "0x0000000000000000000000000000000000000002",
+            dataPortabilityServer: "0x0000000000000000000000000000000000000003",
+            dataPortabilityGrantees:
+              "0x0000000000000000000000000000000000000004",
+          },
+        } as never,
+        gatewayUrl: "https://gateway.test",
+      },
+    });
+
+    await expect(
+      port.authorizeBuilderRead({
+        request: new Request("http://ps.local/"),
+        scope: "instagram.profile",
+        metadataOnly: true,
+      }),
+    ).resolves.toMatchObject({ builder: BUILDER });
+    expect(signRecordDataAccess).not.toHaveBeenCalled();
+
+    await expect(
+      port.authorizeBuilderRead({
+        request: new Request("http://ps.local/"),
+        scope: "instagram.profile",
+      }),
+    ).rejects.toMatchObject({ code: 402, errorCode: "PAYMENT_REQUIRED" });
   });
 
   it("refuses a deleted scope with 410 before any payment challenge or settlement", async () => {
