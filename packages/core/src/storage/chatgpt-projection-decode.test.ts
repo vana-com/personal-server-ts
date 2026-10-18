@@ -176,6 +176,20 @@ describe("declared lossless text projection", () => {
     "preserves literal and valid text %s",
     (text) => expect(payloadContent(project(text))).toBe(text),
   );
+  it.each([
+    "  leading and trailing  ",
+    "\n\n\tindented\n",
+    "\u00A0nbsp edges\u00A0",
+    "\n  \t",
+  ])("keeps edge whitespace exactly in %j", (text) => {
+    expect(payloadContent(project(text))).toBe(text);
+    expect(payloadContent(project(text, false))).toBe(text);
+  });
+  it("keeps edge whitespace around a decoded control character", () => {
+    expect(payloadContent(project("\n  a\\u0000b \t\n"))).toBe(
+      "\n  a\u0000b \t\n",
+    );
+  });
   it("does not decode undeclared old data", () => {
     expect(payloadContent(project("\\u0000", false))).toBe("\\u0000");
   });
