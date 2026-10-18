@@ -15,6 +15,7 @@ import type {
   DataStoragePort,
   PendingBlobDeletion,
   PendingBlobDeletionStore,
+  VersionCommit,
 } from "../../ports/index.js";
 import { feedFromGatewayClient } from "../data-point-feed.js";
 import {
@@ -389,6 +390,7 @@ export async function downloadOne(
     at: envelope.collectedAt,
   });
   if (
+    !storage.commitVersion &&
     existingByVersion !== undefined &&
     existingByVersion.collectedAt === envelope.collectedAt
   ) {
@@ -442,8 +444,35 @@ export async function downloadOne(
   diagnostics?.onIndexStart(record.id, envelope.scope);
   let relativePath: string;
   let sizeBytes: number;
+  const replicaMetadata: Extract<VersionCommit, { kind: "replica" }>["metadata"] = {
+    schemaId: ctx.schemaId,
+    dataPointId: record.id,
+    version: expectedVersion,
+    ...(envelope.producer === "pdpp-projector" ||
+    envelope.producer === "pdpp-import-projection"
+      ? { producer: envelope.producer }
+      : {}),
+    ...(envelope.producer_provenance &&
+    typeof envelope.producer_provenance === "object"
+      ? { producerProvenance: JSON.stringify(envelope.producer_provenance) }
+      : {}),
+  };
   try {
-    ({ relativePath, sizeBytes } = await storage.writeEnvelope(envelope));
+    if (storage.commitVersion) {
+      // Publication, collision-byte validation and metadata adoption share the
+      // writer gate with owner imports. A timestamp lookup is not a reservation.
+      const committed = await storage.commitVersion({
+        kind: "replica",
+        envelope,
+        metadata: replicaMetadata,
+      });
+      if (committed.kind !== "stored") {
+        throw new Error("Replica commit unexpectedly returned an import receipt");
+      }
+      ({ relativePath, sizeBytes } = committed.writeResult);
+    } else {
+      ({ relativePath, sizeBytes } = await storage.writeEnvelope(envelope));
+    }
     await writeBlockSidecars(
       storage,
       envelope,
@@ -460,30 +489,31 @@ export async function downloadOne(
 
   // 8. Insert into local index (with dataPointId + version)
   try {
-    await storage.insertEntry({
-      fileId: null,
-      schemaId: ctx.schemaId,
-      path: relativePath,
-      scope: envelope.scope,
-      collectedAt: envelope.collectedAt,
-      sizeBytes,
-      version: expectedVersion,
-      dataPointId: record.id,
-      ...(envelope.producer === "pdpp-projector" ||
-      envelope.producer === "pdpp-import-projection"
-        ? { producer: envelope.producer }
-        : {}),
-      ...(envelope.producer_provenance &&
-      typeof envelope.producer_provenance === "object"
-        ? { producerProvenance: JSON.stringify(envelope.producer_provenance) }
-        : {}),
-    });
+    if (!storage.commitVersion) {
+      await storage.insertEntry({
+        fileId: null,
+        path: relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes,
+        ...replicaMetadata,
+      });
+    }
   } catch (err) {
     const detail = (err as Error).message;
     diagnostics?.onIndexError(record.id, envelope.scope, detail);
     throw err;
   }
   diagnostics?.onIndexEnd(record.id, envelope.scope);
+  if (
+    storage.commitVersion &&
+    existingByVersion?.collectedAt === envelope.collectedAt
+  ) {
+    // Preserve the existing-version skip contract after the atomic port has
+    // verified the bytes and safely adopted the registered metadata.
+    importIntoPdpp(deps, envelope, record.id);
+    return null;
+  }
 
   // Fold the stored version into the scope's first-seen sidecar. Best-effort
   // and after indexing: a failure leaves the sidecar to be rebuilt later.

@@ -211,18 +211,55 @@ describe("first-seen sidecar on the Node storage", () => {
     expect(await ledger()).toEqual(rebuilt);
   });
 
-  it("is removed with the scope and a reimport starts a fresh baseline", async () => {
-    await ingest(items("a"), T1);
-    await ingest(items("a", "b"), T2);
-    await stat(sidecarPath());
-
-    await deleteDataScopeContract({ storage, scopeParam: SCOPE });
-    await expect(stat(sidecarPath())).rejects.toThrow();
-    expect(await ledger()).toBeNull();
-
-    await ingest(items("a", "b", "c"), T3);
-    expect((await ledger())?.baseline).toBe(T3);
-  });
+  it.each(["post", "import"])(
+    "starts a complete baseline after deletion and %s",
+    async (writeKind) => {
+      await ingest(items("a"), T1);
+      await ingest(items("a", "b"), T2);
+      const oldRevision = storage.findEntry({ scope: SCOPE })!.casRevision!;
+      await stat(sidecarPath());
+  
+      await deleteDataScopeContract({ storage, scopeParam: SCOPE });
+      await expect(stat(sidecarPath())).rejects.toThrow();
+      expect(await ledger()).toBeNull();
+  
+      if (writeKind === "post") {
+        await ingest(items("a", "b", "c"), T3);
+      } else {
+        await storage.commitVersion!({
+          kind: "append",
+          envelope: createDataFileEnvelope(SCOPE, T3, items("a", "b", "c")),
+          metadata: {},
+          import: {
+            authority: "local",
+            owner: "owner",
+            operation: "a".repeat(64),
+            bodySha256: "b".repeat(64),
+          },
+        });
+      }
+      const fresh = storage.findEntry({ scope: SCOPE })!;
+      expect(fresh.version).toBe(1);
+      expect(fresh.casRevision).toBeGreaterThan(oldRevision);
+      const rebuilt = await ensureScopeLedger(storage, SCOPE);
+      expect(rebuilt?.baseline).toBe(T3);
+      expect(rebuilt?.partial).toBeUndefined();
+      expect(listAddedTimestamps(rebuilt!)).toEqual([T3, T3, T3]);
+  
+      const rejected = await storage.commitEnvelope!(
+        createDataFileEnvelope(SCOPE, "2026-10-10T08:00:00Z", items("stale")),
+        {
+          fileId: null,
+          scope: SCOPE,
+          collectedAt: "2026-10-10T08:00:00Z",
+        },
+        { kind: "match", version: oldRevision },
+      );
+      expect(rejected).toMatchObject({ ok: false });
+      expect(storage.findEntry({ scope: SCOPE })).toEqual(fresh);
+      expect(storage.countVersions(SCOPE)).toBe(1);
+    },
+  );
 
   it("deleting an absent sidecar is a no-op, and a scope can never escape the folder", async () => {
     await expect(

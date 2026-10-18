@@ -709,9 +709,9 @@ describe("IndexManager", () => {
       sizeBytes: 100,
     });
 
-    expect(recreated.version).toBe(2);
+    expect(recreated.version).toBe(1);
     expect(recreated.casRevision).toBe(2);
-    expect(manager.findLatestVersionByScope("instagram.profile")).toBe(2);
+    expect(manager.findLatestVersionByScope("instagram.profile")).toBe(1);
   });
 
   it("insert respects an explicit version", () => {
