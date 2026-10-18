@@ -496,7 +496,7 @@ export interface PersonalServerApiDispatchOptions {
   basePath?: string;
 }
 
-type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 405 | 500 | 502 | 503;
+type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 405 | 429 | 500 | 502 | 503;
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
@@ -967,25 +967,40 @@ export async function handleX402Cycle(
   return { kind: "gateway-error", status: gatewayRes.status, body: errorBody };
 }
 
-const lastCollectedAtByStorage = new WeakMap<DataStoragePort, number>();
-function collectedAt(
+const pendingIngestStamps = new WeakMap<DataStoragePort, Map<string, Set<number>>>();
+
+function reserveIngestStamp(
   now: () => Date,
   storage: DataStoragePort,
   scope: string,
-): string {
-  // Further writes in the same second need distinct paths so no version is
-  // overwritten. Use one timestamp format so lexical ordering remains valid.
-  const second = Math.floor(now().getTime() / 1000) * 1000;
-  // The process-local clock resets on restart. Consult the durable head so a
-  // same-second restart cannot reuse a committed envelope path.
+): { collectedAt: string; release(): void } | undefined {
+  // Bound allocation to 60 millisecond slots per scope, anchored to wall time.
+  // Failed requests release their slot; neither failures nor other scopes
+  // advance this scope's clock. The durable head protects restart/clock rollback.
+  const wall = now().getTime();
   const latest = Date.parse(storage.findEntry({ scope })?.collectedAt ?? "");
-  const current = Math.max(
-    second,
-    (lastCollectedAtByStorage.get(storage) ?? 0) + 1,
-    Number.isFinite(latest) ? latest + 1 : 0,
-  );
-  lastCollectedAtByStorage.set(storage, current);
-  return new Date(current).toISOString();
+  let scopes = pendingIngestStamps.get(storage);
+  const pending = scopes?.get(scope) ?? new Set<number>();
+  for (let stamp = wall; stamp < wall + 60; stamp += 1) {
+    if ((Number.isFinite(latest) && stamp <= latest) || pending.has(stamp)) {
+      continue;
+    }
+    if (!scopes) {
+      scopes = new Map();
+      pendingIngestStamps.set(storage, scopes);
+    }
+    scopes.set(scope, pending);
+    pending.add(stamp);
+    const reservations = scopes;
+    return {
+      collectedAt: new Date(stamp).toISOString(),
+      release() {
+        pending.delete(stamp);
+        if (pending.size === 0) reservations.delete(scope);
+      },
+    };
+  }
+  return undefined;
 }
 
 function parseLegacyPrecondition(
@@ -2186,6 +2201,7 @@ export async function handlePersonalServerDataRequest(
       // so the builder's retry with the same still-valid proof is accepted;
       // after commit the proof stays consumed (a retry would be a duplicate).
       let committed = false;
+      let ingestStamp: ReturnType<typeof reserveIngestStamp>;
       const failWrite = async <T>(response: T): Promise<T> => {
         await writeAuth?.releaseProof?.();
         return response;
@@ -2209,11 +2225,21 @@ export async function handlePersonalServerDataRequest(
             ),
           );
         }
-        const collectedAtValue = collectedAt(
+        ingestStamp = reserveIngestStamp(
           deps.now ?? (() => new Date()),
           deps.storage,
           scopeResult.scope,
         );
+        if (!ingestStamp) {
+          return failWrite(
+            errorResponse(
+              429,
+              "INGEST_CAPACITY",
+              "Too many writes for this scope; retry when the clock advances",
+            ),
+          );
+        }
+        const collectedAtValue = ingestStamp.collectedAt;
         const status = deps.syncManager ? "syncing" : "stored";
         const afterTombstoneVersion = await ingestTombstoneMarker(
           deps,
@@ -2424,6 +2450,8 @@ export async function handlePersonalServerDataRequest(
           await writeAuth?.releaseProof?.();
         }
         throw err;
+      } finally {
+        ingestStamp?.release();
       }
     }
 

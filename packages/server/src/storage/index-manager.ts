@@ -322,7 +322,7 @@ export function createIndexManager(
   );
 
   const findClosestByScopeStmt = db.prepare<{ scope: string; at: string }>(
-    "SELECT * FROM data_files WHERE scope = @scope AND collected_at <= @at ORDER BY collected_at DESC LIMIT 1",
+    "SELECT * FROM data_files WHERE scope = @scope AND julianday(collected_at) <= julianday(@at) ORDER BY julianday(collected_at) DESC, id DESC LIMIT 1",
   );
   const listIndexedScopesStmt = db.prepare(
     "SELECT DISTINCT scope FROM data_files ORDER BY scope ASC",

@@ -301,6 +301,28 @@ describe("IndexManager", () => {
 
   // --- findClosestByScope ---
 
+  it("findClosestByScope compares mixed timestamp formats as instants", () => {
+    const insert = (scope: string, collectedAt: string) =>
+      manager.insert({
+        fileId: null,
+        path: scope + "/" + collectedAt + ".json",
+        scope,
+        collectedAt,
+        sizeBytes: 100,
+      });
+    const whole = "2026-10-18T00:00:00Z";
+    const fractional = "2026-10-18T00:00:00.500Z";
+    const older = insert("old.scope", whole);
+    expect(manager.findClosestByScope("old.scope", fractional)?.id).toBe(older.id);
+    insert("future.scope", fractional);
+    expect(manager.findClosestByScope("future.scope", whole)).toBeUndefined();
+    const newer = insert("old.scope", fractional);
+    expect(manager.findClosestByScope("old.scope", whole)?.id).toBe(older.id);
+    expect(manager.findClosestByScope("old.scope", fractional)?.id).toBe(newer.id);
+    const tied = insert("old.scope", "2026-10-18T00:00:00.000Z");
+    expect(manager.findClosestByScope("old.scope", whole)?.id).toBe(tied.id);
+  });
+
   it("findClosestByScope returns entry at or before given time", () => {
     manager.insert({
       fileId: null,
