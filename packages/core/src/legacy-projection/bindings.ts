@@ -395,6 +395,7 @@ const youtubeSubscriptions: LegacyScopeBinding = {
       "handle",
       "avatar_url",
       "subscriber_count",
+      "subscriber_count_text",
       "description",
       "is_verified",
       "notifications",
@@ -403,6 +404,7 @@ const youtubeSubscriptions: LegacyScopeBinding = {
   primaryKey: { subscriptions: ["id"] },
   lossy: [
     "Rows without legacy-required channelTitle/channelUrl or required notification booleans are skipped and reported.",
+    "subscriberCountText is null when the page rendered no count text; the connector omits subscriber_count_text then, and legacy's own default is null.",
   ],
   provenance: youtubeProvenance,
   project(records, options): ProjectionResult {
@@ -437,7 +439,8 @@ const youtubeSubscriptions: LegacyScopeBinding = {
           handle: youtubeStringOrNull(row.handle),
           channelId: youtubeStringOrNull(row.channel_id),
           avatarUrl: youtubeStringOrNull(row.avatar_url),
-          subscriberCountText: null,
+          subscriberCountText:
+            youtubeRequiredString(row.subscriber_count_text) ?? null,
           subscriberCount:
             typeof row.subscriber_count === "number"
               ? row.subscriber_count
@@ -920,7 +923,8 @@ const instagramProfile: LegacyScopeBinding = {
     if (typeof p.profile_pic_url === "string") {
       payload.profile_pic_url = p.profile_pic_url;
     }
-    payload.external_url = typeof p.external_url === "string" ? p.external_url : "";
+    payload.external_url =
+      typeof p.external_url === "string" ? p.external_url : "";
     if (typeof p.follower_count === "number") {
       payload.follower_count = p.follower_count;
     }
@@ -4524,10 +4528,18 @@ const icloudNoteFolders: LegacyScopeBinding = {
   },
 };
 
+const ICLOUD_NOTES_PROFILE_PROVENANCE: LegacyScopeBindingProvenance = {
+  kind: "collection-profile",
+  ref: "https://github.com/PDP-Connect/data-connectors/tree/9ebc547382d2a8883fc1eac5a2a42bebe88f0944/connectors/icloud_notes",
+  digest:
+    "sha256:ad6d28dac69a84019be2c81ac5f1f2ae8fa9c6602eb179370f0bb9d9022e33b2",
+  path: "declarations/icloud-notes-0.1.24.collection-profile.json#streams[name=profile,notes,folders]",
+};
+
 const icloudNotes: LegacyScopeBinding = {
   scope: "icloud_notes.notes",
   pdppSource: "https://registry.pdpp.dev/connectors/icloud-notes",
-  pdppStreams: ["notes", "folders"],
+  pdppStreams: ["notes", "folders", "profile"],
   legacySchemaPath: "icloud_notes.notes.json",
   fieldsRead: {
     notes: [
@@ -4542,27 +4554,31 @@ const icloudNotes: LegacyScopeBinding = {
       "text_content",
     ],
     folders: ["id", "name"],
+    profile: ["id", "user_name"],
   },
-  primaryKey: { notes: ["id"], folders: ["id"] },
+  primaryKey: { notes: ["id"], folders: ["id"], profile: ["id"] },
   lossy: [
-    "userName is always null because the declaration has no account/profile stream for the legacy fullName source.",
+    "userName is null when the profile stream has no readable user_name (legacy's fullName default); it is never inferred from an Apple ID or the account id.",
     "folder uses the legacy display-name shape; unresolved folder references fall back to folder_id.",
   ],
-  provenance: [
-    {
-      kind: "oci",
-      ref: "ghcr.io/pdp-connect/connector/icloud-notes:0.1.0",
-      digest:
-        "sha256:fe5497bb79b0d567c30790cc71b1e591b955fe474725679b996441bd70c09944",
-      path: "declarations/icloud-notes.collection-profile.json#streams[name=notes,folders]",
-    },
-  ],
+  provenance: [ICLOUD_NOTES_PROFILE_PROVENANCE],
   project(records, options): ProjectionResult {
     const guard = requireStreams("icloud_notes.notes", options, [
       "notes",
       "folders",
+      "profile",
     ]);
     if (guard) return guard;
+
+    // The profile stream is a singleton: legacy's fullName maps to exactly one
+    // account. No row, several rows, or an unreadable name leave userName null.
+    const profiles = byStream(records, "profile");
+    const profileName =
+      profiles.length === 1 ? profiles[0]?.user_name : undefined;
+    const userName =
+      typeof profileName === "string" && profileName.trim().length > 0
+        ? profileName
+        : null;
 
     const folders = new Map<string, string>();
     for (const folder of byStream(records, "folders")) {
@@ -4633,7 +4649,7 @@ const icloudNotes: LegacyScopeBinding = {
     }
     return {
       ok: true,
-      payload: { notes, total: notes.length, userName: null },
+      payload: { notes, total: notes.length, userName },
     };
   },
 };
