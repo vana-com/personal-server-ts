@@ -118,7 +118,9 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
       "ALTER TABLE data_files ADD COLUMN after_tombstone_version INTEGER",
     );
   }
-  if (currentVersion < 5) {
+  // `< 6`, not `< 5`: owner-import builds stamped version 5 without these
+  // columns, so a version-5 database cannot be trusted to have them.
+  if (currentVersion < 6) {
     if (!hasColumn(db, "data_files", "producer")) {
       db.exec("ALTER TABLE data_files ADD COLUMN producer TEXT");
     }
@@ -250,18 +252,60 @@ function ensureSchemaVersion(db: Database.Database): void {
 /** Open/create SQLite database, run CREATE TABLE IF NOT EXISTS, set WAL mode */
 export function initializeDatabase(dbPath: string): Database.Database {
   const db = new Database(dbPath);
+  try {
+    db.pragma("busy_timeout = 5000");
+    const deadline = performance.now() + 5000;
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    for (;;) {
+      try {
+        if (db.pragma("journal_mode", { simple: true }) !== "wal") {
+          db.pragma("journal_mode = WAL");
+        }
+        break;
+      } catch (err) {
+        if (
+          (err as { code?: string }).code !== "SQLITE_BUSY" ||
+          performance.now() >= deadline
+        )
+          throw err;
+        Atomics.wait(pause, 0, 0, Math.min(50, deadline - performance.now()));
+      }
+    }
+    db.pragma("synchronous = FULL");
 
-  db.pragma("journal_mode = WAL");
+    db.exec(CREATE_TABLE_SQL);
+    db.exec(CREATE_SCOPE_REVISIONS_SQL);
+    db.exec(CREATE_LEGACY_SCOPE_TAKEOVERS_SQL);
+    db.exec(CREATE_LEGACY_SCOPE_VERDICTS_SQL);
+    db.exec(CREATE_LEGACY_SCOPE_RESETS_SQL);
+    ensureSchemaVersion(db);
+    db.exec(`CREATE TABLE IF NOT EXISTS owner_import_operations (
+    authority TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('prepared', 'accepted', 'deleted', 'cancelled')),
+    collected_at TEXT NOT NULL,
+    path TEXT NOT NULL,
+    envelope_bytes BLOB,
+    metadata_json TEXT,
+    receipt_json TEXT,
+    PRIMARY KEY(authority, owner, scope, operation)
+  )`);
+    db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_owner_import_operations_path ON owner_import_operations(path)",
+    );
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_owner_import_operations_recovery ON owner_import_operations(operation) WHERE state = 'prepared' OR (state IN ('deleted', 'cancelled') AND metadata_json IS NOT NULL)",
+    );
+    for (const sql of CREATE_INDEXES_SQL) {
+      db.exec(sql);
+    }
 
-  db.exec(CREATE_TABLE_SQL);
-  db.exec(CREATE_SCOPE_REVISIONS_SQL);
-  db.exec(CREATE_LEGACY_SCOPE_TAKEOVERS_SQL);
-  db.exec(CREATE_LEGACY_SCOPE_VERDICTS_SQL);
-  db.exec(CREATE_LEGACY_SCOPE_RESETS_SQL);
-  ensureSchemaVersion(db);
-  for (const sql of CREATE_INDEXES_SQL) {
-    db.exec(sql);
+    return db;
+  } catch (err) {
+    db.close();
+    throw err;
   }
-
-  return db;
 }

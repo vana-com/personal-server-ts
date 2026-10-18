@@ -65,6 +65,61 @@ function createV14TakeoverTables(db: Database.Database) {
 }
 
 describe("initializeDatabase", () => {
+  it("upgrades an owner-import canary index stamped version 5 without producer columns", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ps-index-owner-import-v5-"));
+    try {
+      const path = join(dir, "index.db");
+      const canary = new Database(path);
+      canary.exec(`
+        CREATE TABLE data_files (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, file_id TEXT, schema_id TEXT,
+          path TEXT NOT NULL UNIQUE, scope TEXT NOT NULL, collected_at TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+          size_bytes INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 1,
+          data_point_id TEXT, after_tombstone_version INTEGER
+        );
+        INSERT INTO data_files (path, scope, collected_at, size_bytes, version)
+          VALUES ('instagram/profile/a.json', 'instagram.profile', '2026-01-01T00:00:00Z', 7, 3);
+        CREATE TABLE owner_import_operations (
+          authority TEXT NOT NULL, owner TEXT NOT NULL, scope TEXT NOT NULL,
+          operation TEXT NOT NULL, body_sha256 TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('prepared', 'accepted', 'deleted', 'cancelled')),
+          collected_at TEXT NOT NULL, path TEXT NOT NULL, envelope_bytes BLOB,
+          metadata_json TEXT, receipt_json TEXT,
+          PRIMARY KEY(authority, owner, scope, operation)
+        );
+        INSERT INTO owner_import_operations
+          VALUES ('local', '0xowner', 'instagram.profile', 'op', 'hash', 'accepted',
+                  '2026-01-01T00:00:00Z', 'instagram/profile/a.json', NULL, NULL, '{}');
+      `);
+      canary.pragma("user_version = 5");
+      canary.close();
+
+      const db = initializeDatabase(path);
+      expect(db.pragma("user_version", { simple: true })).toBe(14);
+      expect(
+        db
+          .prepare(
+            "SELECT version, cas_revision, producer, producer_provenance FROM data_files",
+          )
+          .get(),
+      ).toEqual({
+        version: 3,
+        cas_revision: 3,
+        producer: null,
+        producer_provenance: null,
+      });
+      expect(
+        db
+          .prepare("SELECT operation, state FROM owner_import_operations")
+          .get(),
+      ).toEqual({ operation: "op", state: "accepted" });
+      db.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("returns a Database instance", () => {
     const db = initializeDatabase(":memory:");
     expect(db).toBeDefined();

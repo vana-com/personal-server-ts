@@ -31,6 +31,8 @@ import type {
   DataStorageScopeListOptions,
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/node";
+import { indexDatabase } from "./index-manager.js";
+import { createImportOperations } from "./import-operations.js";
 
 export interface NodeDataStorageDeps {
   indexManager: IndexManager;
@@ -151,6 +153,10 @@ export async function reindexLegacyDataFiles(
 export function createNodeDataStorage(
   deps: NodeDataStorageDeps,
 ): DataStoragePort {
+  const db = indexDatabase(deps.indexManager);
+  const operations = db
+    ? createImportOperations(db, deps.indexManager, deps.hierarchyOptions)
+    : undefined;
   async function dropLedgerIfEmpty(scope: string): Promise<void> {
     if (deps.indexManager.countByScope(scope) === 0) {
       await deleteFirstSeenLedger(deps.hierarchyOptions, scope);
@@ -159,6 +165,7 @@ export function createNodeDataStorage(
 
   return {
     kind: "node-fs-sqlite",
+    ...(operations ? { commitVersion: operations.commitVersion } : {}),
     listScopes(options: DataStorageScopeListOptions) {
       return deps.indexManager.listDistinctScopes(options);
     },
@@ -291,6 +298,7 @@ export function createNodeDataStorage(
     // version, so no delete path can leave a stale ledger behind.
     deleteScope(scope: string) {
       return withScopeLock(scope, async () => {
+        if (operations) return operations.deleteScope(scope);
         // The sidecar first: it holds record ids, so it must not survive a
         // data delete that fails half way. A sidecar that cannot be removed
         // never blocks the data delete; it is tried once more afterwards, and
@@ -317,6 +325,15 @@ export function createNodeDataStorage(
       const entry = deps.indexManager.findByFileId(fileId);
       if (!entry) return false;
       return withScopeLock(entry.scope, async () => {
+        if (operations) {
+          const removed = operations.deleteVersion(
+            entry.scope,
+            entry.collectedAt,
+            entry.path,
+          );
+          await dropLedgerIfEmpty(entry.scope);
+          return removed;
+        }
         // Delete the blob FIRST; only drop the index row once it's gone (deleteDataFile is
         // ENOENT-tolerant). If blob deletion fails for a real reason, the row is preserved so the next
         // sync retry re-attempts — rather than the row vanishing and the cursor advancing past an
@@ -333,6 +350,17 @@ export function createNodeDataStorage(
     },
     async deleteVersion(scope: string, collectedAt: string) {
       const entry = deps.indexManager.findClosestByScope(scope, collectedAt);
+      if (operations) {
+        return withScopeLock(scope, async () => {
+          const removed = operations.deleteVersion(
+            scope,
+            collectedAt,
+            entry?.collectedAt === collectedAt ? entry.path : undefined,
+          );
+          await dropLedgerIfEmpty(scope);
+          return removed;
+        });
+      }
       if (!entry || entry.collectedAt !== collectedAt) return false;
       return withScopeLock(scope, async () => {
         // Same ordering as deleteByFileId: blob first (ENOENT-tolerant), then
@@ -350,7 +378,9 @@ export function createNodeDataStorage(
       // and this returns false, so the caller surfaces the real error instead
       // of silently discarding registered data.
       const entry = deps.indexManager.findByPath(path);
-      const removed = deps.indexManager.deleteUnsyncedByPath(path);
+      const removed = operations
+        ? operations.dropUnsyncedEntry(path)
+        : deps.indexManager.deleteUnsyncedByPath(path);
       if (removed && entry) {
         await withScopeLock(entry.scope, () => dropLedgerIfEmpty(entry.scope));
       }

@@ -1,4 +1,8 @@
-import { type DataStoragePort } from "../ports/index.js";
+import {
+  type DataStoragePort,
+  type ImportIntent,
+  type ImportReceipt,
+} from "../ports/index.js";
 import type {
   IndexEntry,
   NewIndexEntry,
@@ -33,6 +37,7 @@ import {
   type AdditionsSummary,
 } from "../additions/summary.js";
 import type { ScopeFirstSeenLedger } from "../additions/first-added.js";
+import { ProtocolError } from "../errors/catalog.js";
 
 export type DataContractErrorCode =
   | "INVALID_SCOPE"
@@ -250,6 +255,7 @@ export interface IngestDataContractInput {
   precondition?: LegacyPrecondition;
   producer?: LegacyProducer;
   producerProvenance?: LegacyProducerProvenance;
+  import?: ImportIntent;
 }
 
 export interface IngestDataContractResult {
@@ -262,9 +268,16 @@ export interface IngestDataContractResult {
     status: "stored" | "syncing";
     /** Echoed for a derivative write: the accepted, normalized sources. */
     lineage?: { sources: `0x${string}`[] };
+    importReceipt?: ImportReceipt;
   };
   writeResult: WriteResult;
+  replay?: false;
 }
+
+export type IngestImportReplayResult = Omit<
+  IngestDataContractResult,
+  "writeResult" | "replay"
+> & { replay: true };
 
 export interface IngestBinaryDataContractInput {
   storage: DataStoragePort;
@@ -634,7 +647,9 @@ function isMissingFileError(err: unknown): boolean {
 
 export async function ingestDataContract(
   input: IngestDataContractInput,
-): Promise<IngestDataContractResult | DataContractError> {
+): Promise<
+  IngestDataContractResult | IngestImportReplayResult | DataContractError
+> {
   const scopeResult = parseDataScopeContract(input.scopeParam);
   if (!scopeResult.ok) return scopeResult;
 
@@ -676,7 +691,7 @@ export async function ingestDataContract(
     };
   }
 
-  const envelope = {
+  let envelope: DataFileEnvelope = {
     ...createDataFileEnvelope(
       scopeResult.scope,
       input.collectedAt,
@@ -687,24 +702,63 @@ export async function ingestDataContract(
       ? { producer_provenance: input.producerProvenance }
       : {}),
   };
-  const committed = await commitWrittenEnvelope(
-    input.storage,
-    envelope,
-    {
-      fileId: null,
-      schemaId: null,
-      scope: scopeResult.scope,
-      collectedAt: input.collectedAt,
-      afterTombstoneVersion: input.afterTombstoneVersion ?? null,
-      producer: input.producer ?? null,
-      producerProvenance: input.producerProvenance
-        ? JSON.stringify(input.producerProvenance)
-        : null,
-    },
-    input.precondition,
-  );
-  if (!committed.ok) return committed;
-  const { writeResult } = committed;
+  let writeResult: WriteResult;
+  let importReceipt: ImportReceipt | undefined;
+  if (input.import) {
+    // A durable owner import is its own commit protocol (operation row,
+    // receipt, replay). It never carries a legacy precondition or producer.
+    if (!input.storage.commitVersion) {
+      throw new ProtocolError(
+        501,
+        "IMPORT_UNSUPPORTED",
+        "This storage backend does not support durable owner imports",
+      );
+    }
+    const imported = await input.storage.commitVersion({
+      kind: "append",
+      envelope,
+      metadata: {
+        afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+      },
+      import: input.import,
+    });
+    if (imported.kind === "replay") {
+      return {
+        ok: true,
+        scope: imported.receipt.scope,
+        collectedAt: imported.receipt.collectedAt,
+        response: {
+          scope: imported.receipt.scope,
+          collectedAt: imported.receipt.collectedAt,
+          status: input.status,
+          importReceipt: imported.receipt,
+        },
+        replay: true,
+      };
+    }
+    envelope = imported.envelope;
+    writeResult = imported.writeResult;
+    importReceipt = imported.receipt;
+  } else {
+    const committed = await commitWrittenEnvelope(
+      input.storage,
+      envelope,
+      {
+        fileId: null,
+        schemaId: null,
+        scope: scopeResult.scope,
+        collectedAt: input.collectedAt,
+        afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+        producer: input.producer ?? null,
+        producerProvenance: input.producerProvenance
+          ? JSON.stringify(input.producerProvenance)
+          : null,
+      },
+      input.precondition,
+    );
+    if (!committed.ok) return committed;
+    writeResult = committed.writeResult;
+  }
   try {
     await writeBlockSidecars(input.storage, envelope);
   } catch {
@@ -712,15 +766,21 @@ export async function ingestDataContract(
   }
   await recordStoredVersion(input.storage, {
     scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
+    collectedAt: envelope.collectedAt,
     data: envelope.data,
   });
 
   return {
     ok: true,
     scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    response: ingestResponse(scopeResult.scope, input),
+    collectedAt: envelope.collectedAt,
+    response: {
+      ...ingestResponse(scopeResult.scope, {
+        ...input,
+        collectedAt: envelope.collectedAt,
+      }),
+      ...(importReceipt ? { importReceipt } : {}),
+    },
     writeResult,
   };
 }

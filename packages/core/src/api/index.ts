@@ -496,7 +496,8 @@ export interface PersonalServerApiDispatchOptions {
   basePath?: string;
 }
 
-type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 405 | 429 | 500 | 502 | 503;
+type JsonStatus =
+  200 | 201 | 400 | 401 | 403 | 404 | 405 | 429 | 500 | 502 | 503;
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
@@ -967,7 +968,10 @@ export async function handleX402Cycle(
   return { kind: "gateway-error", status: gatewayRes.status, body: errorBody };
 }
 
-const pendingIngestStamps = new WeakMap<DataStoragePort, Map<string, Set<number>>>();
+const pendingIngestStamps = new WeakMap<
+  DataStoragePort,
+  Map<string, Set<number>>
+>();
 
 function reserveIngestStamp(
   now: () => Date,
@@ -1716,6 +1720,81 @@ export async function handlePersonalServerDataRequest(
     }
 
     const parts = pathname.split("/").filter(Boolean);
+    if (parts.length === 3 && parts[1] === "imports") {
+      if (request.method !== "PUT") return methodNotAllowed();
+      await deps.auth.authorizeOwner(request);
+      const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+      if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+      const operation = decodePathPart(parts[2]);
+      if (!/^[a-f0-9]{64}$/.test(operation)) {
+        return errorResponse(
+          400,
+          "INVALID_IMPORT_OPERATION",
+          "operation must be 64 lowercase hexadecimal characters",
+        );
+      }
+      if (!deps.storage.commitVersion) {
+        throw new ProtocolError(
+          501,
+          "IMPORT_UNSUPPORTED",
+          "This storage backend does not support durable owner imports",
+        );
+      }
+      if (!deps.serverOwner)
+        throw new ServerNotConfiguredError({
+          reason: "serverOwner is required for durable owner imports",
+        });
+      if (!isJsonContentType(request) || url.search.length > 0) {
+        return errorResponse(
+          400,
+          "INVALID_IMPORT",
+          "Owner imports accept JSON root writes without query parameters",
+        );
+      }
+      const parsed = await parseJsonObjectBody(
+        request,
+        "Request body must be valid JSON",
+      );
+      if (!parsed.ok) return contractResponse(parsed.result);
+      if ("lineage" in parsed.body || "$binary" in parsed.body) {
+        return errorResponse(
+          400,
+          "INVALID_IMPORT",
+          "Owner imports do not accept binary or lineage writes",
+        );
+      }
+      const bodySha256 = await sha256Hex(canonicalJsonBytes(parsed.body));
+      const authority = deps.gatewayConfig
+        ? `${deps.gatewayConfig.chainId}:${deps.gatewayConfig.contracts.dataRegistry.toLowerCase()}`
+        : "local";
+      const result = await ingestDataContract({
+        storage: deps.storage,
+        scopeParam: scopeResult.scope,
+        body: parsed.body,
+        collectedAt: (deps.now ?? (() => new Date()))().toISOString(),
+        status: deps.syncManager ? "syncing" : "stored",
+        afterTombstoneVersion: await ingestTombstoneMarker(
+          deps,
+          scopeResult.scope,
+        ),
+        import: {
+          operation,
+          bodySha256,
+          owner: deps.serverOwner.toLowerCase(),
+          authority,
+        },
+      });
+      if (!result.ok) return contractErrorResponse(result);
+      notifyNewData(deps.syncManager);
+      if (!result.replay)
+        notifyDataWritten(deps, {
+          scope: result.scope,
+          collectedAt: result.collectedAt,
+        });
+      return jsonResponse(result.response, {
+        status: result.replay ? 200 : 201,
+      });
+    }
     if (parts.length === 2 && parts[1] === "versions") {
       if (request.method !== "GET") return methodNotAllowed();
       const versionsScopeParam = decodePathPart(parts[0]);
@@ -2385,6 +2464,8 @@ export async function handlePersonalServerDataRequest(
           producerProvenance: provenance,
         });
         if (!result.ok) return failWrite(contractErrorResponse(result));
+        if (result.replay)
+          throw new Error("Ordinary POST cannot replay an import");
         committed = true;
         deps.logger?.info?.(
           {

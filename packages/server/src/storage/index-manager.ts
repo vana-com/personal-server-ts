@@ -101,6 +101,14 @@ interface RawRow {
   producer_provenance: string | null;
 }
 
+const databases = new WeakMap<IndexManager, Database.Database>();
+
+export function indexDatabase(
+  index: IndexManager,
+): Database.Database | undefined {
+  return databases.get(index);
+}
+
 function rowToEntry(row: RawRow): IndexEntry {
   return {
     id: row.id,
@@ -465,7 +473,7 @@ export function createIndexManager(
     },
   );
 
-  return {
+  const manager: IndexManager = {
     insert(entry) {
       const result = insertIfCurrent(entry);
       if (!result.ok) throw new Error("Unconditional insert was rejected");
@@ -660,4 +668,6 @@ export function createIndexManager(
       db.close();
     },
   };
+  databases.set(manager, db);
+  return manager;
 }

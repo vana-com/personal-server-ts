@@ -349,6 +349,10 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     if (c.req.path.split("/").includes("imports")) return next();
     return legacyWriteBodyLimit(c, next);
   });
+  // Durable owner imports are root JSON writes: same bound as a plain ingest.
+  app.use("/:scope/imports/:operation", (c, next) =>
+    c.req.method === "PUT" ? legacyWriteBodyLimit(c, next) : next(),
+  );
   app.all("*", (c) =>
     handlePersonalServerDataRequest(
       c.req.raw,
