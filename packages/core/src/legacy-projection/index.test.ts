@@ -720,6 +720,50 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     });
   });
 
+  it("maps youtube subscriptions' subscriber_count_text and defaults to legacy's null when it is absent", () => {
+    const row = (id: string, extra: Record<string, unknown>) => ({
+      stream: "subscriptions",
+      data: {
+        id,
+        channel_title: `Channel ${id}`,
+        channel_url: `https://youtube.com/@${id}`,
+        subscriber_count: null,
+        is_verified: false,
+        notifications: false,
+        ...extra,
+      },
+    });
+    const result = projectPdppRecordsToLegacyPayload(
+      "youtube.subscriptions",
+      [
+        row("shown", { subscriber_count_text: "1.2M subscribers" }),
+        row("absent", {}),
+        row("null", { subscriber_count_text: null }),
+        row("blank", { subscriber_count_text: "   " }),
+        row("wrong-type", { subscriber_count_text: 12 }),
+      ],
+      { fetchedStreams: ["subscriptions"] },
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const texts = Object.fromEntries(
+      (
+        result.payload.subscriptions as {
+          channelTitle: string;
+          subscriberCountText: string | null;
+        }[]
+      ).map((item) => [item.channelTitle, item.subscriberCountText]),
+    );
+    expect(texts).toEqual({
+      "Channel shown": "1.2M subscribers",
+      "Channel absent": null,
+      "Channel null": null,
+      "Channel blank": null,
+      "Channel wrong-type": null,
+    });
+    validateAgainst(youtubeSubscriptionsSchema, result.payload);
+  });
+
   it("skips YouTube rows that cannot satisfy legacy required fields", () => {
     const cases = [
       [
@@ -1577,8 +1621,12 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             },
           },
           { stream: "folders", data: { id: "folder-1", name: "Ideas" } },
+          {
+            stream: "profile",
+            data: { id: "account-1", user_name: "Test User" },
+          },
         ],
-        { fetchedStreams: ["notes", "folders"] },
+        { fetchedStreams: ["notes", "folders", "profile"] },
       );
 
       expect(result).toEqual({
@@ -1609,10 +1657,40 @@ describe("projectPdppRecordsToLegacyPayload", () => {
             },
           ],
           total: 2,
-          userName: null,
+          userName: "Test User",
         },
       });
       validateAgainst(icloudNotesSchema, result.ok ? result.payload : result);
+    });
+
+    it("projects userName as null only when the profile has no readable name", () => {
+      const project = (profiles: Record<string, unknown>[]) =>
+        projectPdppRecordsToLegacyPayload(
+          "icloud_notes.notes",
+          profiles.map((data) => ({ stream: "profile", data })),
+          { fetchedStreams: ["notes", "folders", "profile"] },
+        );
+      const userName = (profiles: Record<string, unknown>[]) => {
+        const result = project(profiles);
+        expect(result.ok).toBe(true);
+        return result.ok ? result.payload.userName : undefined;
+      };
+      expect(userName([{ id: "account-1", user_name: "Zoë 李" }])).toBe(
+        "Zoë 李",
+      );
+      // The profile row is absent, has no name, or the name is unreadable.
+      expect(userName([])).toBeNull();
+      expect(userName([{ id: "account-1" }])).toBeNull();
+      expect(userName([{ id: "account-1", user_name: null }])).toBeNull();
+      expect(userName([{ id: "account-1", user_name: "  " }])).toBeNull();
+      expect(userName([{ id: "account-1", user_name: 7 }])).toBeNull();
+      // A singleton stream with several rows names no single account.
+      expect(
+        userName([
+          { id: "account-1", user_name: "First" },
+          { id: "account-2", user_name: "Second" },
+        ]),
+      ).toBeNull();
     });
 
     it("rejects records that violate required manifest fields and distinguishes an unfetched stream", () => {
@@ -1620,7 +1698,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         projectPdppRecordsToLegacyPayload(
           "icloud_notes.notes",
           [{ stream: "notes", data: { id: "note-1", is_pinned: false } }],
-          { fetchedStreams: ["notes", "folders"] },
+          { fetchedStreams: ["notes", "folders", "profile"] },
         ),
       ).toMatchObject({
         ok: false,
@@ -1636,6 +1714,18 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           kind: "missing_stream",
           scope: "icloud_notes.notes",
           expectedStream: "folders",
+        },
+      });
+      expect(
+        projectPdppRecordsToLegacyPayload("icloud_notes.notes", [], {
+          fetchedStreams: ["notes", "folders"],
+        }),
+      ).toEqual({
+        ok: false,
+        error: {
+          kind: "missing_stream",
+          scope: "icloud_notes.notes",
+          expectedStream: "profile",
         },
       });
     });
@@ -2152,7 +2242,9 @@ describe("projectPdppRecordsToLegacyPayload", () => {
           );
           // The omitted canonical external_url gets the legacy empty sentinel.
           expect(result.payload.external_url).toBe("");
-          const sharedKeys = [...oldKeys].filter((k) => newKeys.has(k) && k !== "external_url");
+          const sharedKeys = [...oldKeys].filter(
+            (k) => newKeys.has(k) && k !== "external_url",
+          );
           for (const key of sharedKeys) {
             expect(
               (result.payload as Record<string, unknown>)[key],

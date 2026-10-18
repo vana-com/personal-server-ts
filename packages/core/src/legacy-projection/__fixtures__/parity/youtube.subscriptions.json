@@ -5,8 +5,8 @@
     "legacyConnector": "current binding output, not captured legacy-connector output; youtube.subscriptions from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
     "pdppBundle": "synthetic youtube.subscriptions records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
     "expectedSideNote": "current binding output, not captured legacy-connector output",
-    "outputKeysAndTypes": "{subscriptions:Array<{channelTitle:string, channelUrl:string, handle:string|null, channelId:string|null, avatarUrl:string|null, subscriberCountText:null, subscriberCount:number|null, description:string|null, isVerified:boolean, isBellNotification:boolean}>}.",
-    "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. subscriber_count_text supplied in the normal input is dropped: subscriberCountText is always null. id is used for ordering but not emitted. Dirty missing title rejects the public projection as incomplete_scope."
+    "outputKeysAndTypes": "{subscriptions:Array<{channelTitle:string, channelUrl:string, handle:string|null, channelId:string|null, avatarUrl:string|null, subscriberCountText:string|null, subscriberCount:number|null, description:string|null, isVerified:boolean, isBellNotification:boolean}>}.",
+    "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. subscriber_count_text maps to subscriberCountText; a missing or blank value gives null, legacy's own default. id is used for ordering but not emitted. Dirty missing title rejects the public projection as incomplete_scope."
   },
   "fetchedStreams": [
     "subscriptions"
@@ -36,7 +36,7 @@
         "handle": "@channel-a",
         "channelId": "UC-a",
         "avatarUrl": "https://example.com/a.png",
-        "subscriberCountText": null,
+        "subscriberCountText": "1.2K subscribers",
         "subscriberCount": 1200,
         "description": "Channel A description",
         "isVerified": true,
@@ -53,8 +53,8 @@
         "legacyConnector": "current binding output, not captured legacy-connector output; youtube.subscriptions from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
         "pdppBundle": "synthetic youtube.subscriptions records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
-        "outputKeysAndTypes": "{subscriptions:Array<{channelTitle:string, channelUrl:string, handle:string|null, channelId:string|null, avatarUrl:string|null, subscriberCountText:null, subscriberCount:number|null, description:string|null, isVerified:boolean, isBellNotification:boolean}>}.",
-        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. subscriber_count_text supplied in the normal input is dropped: subscriberCountText is always null. id is used for ordering but not emitted. Dirty missing title rejects the public projection as incomplete_scope."
+        "outputKeysAndTypes": "{subscriptions:Array<{channelTitle:string, channelUrl:string, handle:string|null, channelId:string|null, avatarUrl:string|null, subscriberCountText:string|null, subscriberCount:number|null, description:string|null, isVerified:boolean, isBellNotification:boolean}>}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. subscriber_count_text maps to subscriberCountText; a missing or blank value gives null, legacy's own default. id is used for ordering but not emitted. Dirty missing title rejects the public projection as incomplete_scope."
       },
       "fetchedStreams": [
         "subscriptions"
@@ -74,8 +74,8 @@
         "legacyConnector": "current binding output, not captured legacy-connector output; youtube.subscriptions from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
         "pdppBundle": "synthetic youtube.subscriptions records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
-        "outputKeysAndTypes": "{subscriptions:Array<{channelTitle:string, channelUrl:string, handle:string|null, channelId:string|null, avatarUrl:string|null, subscriberCountText:null, subscriberCount:number|null, description:string|null, isVerified:boolean, isBellNotification:boolean}>}.",
-        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. subscriber_count_text supplied in the normal input is dropped: subscriberCountText is always null. id is used for ordering but not emitted. Dirty missing title rejects the public projection as incomplete_scope."
+        "outputKeysAndTypes": "{subscriptions:Array<{channelTitle:string, channelUrl:string, handle:string|null, channelId:string|null, avatarUrl:string|null, subscriberCountText:string|null, subscriberCount:number|null, description:string|null, isVerified:boolean, isBellNotification:boolean}>}.",
+        "profileCaveat": "Exact traced output keys/types for owner comparison with the frozen LEGACY schema. Frozen schema comparison and test execution were not performed here. subscriber_count_text maps to subscriberCountText; a missing or blank value gives null, legacy's own default. id is used for ordering but not emitted. Dirty missing title rejects the public projection as incomplete_scope."
       },
       "fetchedStreams": [
         "subscriptions"

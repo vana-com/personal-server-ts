@@ -11,6 +11,8 @@ import githubProvenance from "./declarations/github.provenance.json";
 import hebDeclaration from "./declarations/heb.collection-profile.json";
 import hebProvenance from "./declarations/heb.provenance.json";
 import icloudNotesDeclaration from "./declarations/icloud-notes.collection-profile.json";
+import icloudNotes0124Declaration from "./declarations/icloud-notes-0.1.24.collection-profile.json";
+import icloudNotes0124Provenance from "./declarations/icloud-notes-0.1.24.provenance.json";
 import linkedinDeclaration from "./declarations/linkedin.collection-profile.json";
 import metaDeclaration from "./declarations/meta.collection-profile.json";
 import ouraDeclaration from "./declarations/oura.collection-profile.json";
@@ -90,6 +92,7 @@ const DECLARATIONS: Record<string, CollectionProfile> = {
   github: githubDeclaration as CollectionProfile,
   heb: hebDeclaration as CollectionProfile,
   "icloud-notes": icloudNotesDeclaration as CollectionProfile,
+  "icloud-notes-0.1.24": icloudNotes0124Declaration as CollectionProfile,
   linkedin: linkedinDeclaration as CollectionProfile,
   meta: metaDeclaration as CollectionProfile,
   oura: ouraDeclaration as CollectionProfile,
@@ -173,7 +176,7 @@ function collectionProfileDigest(fileName: string): string {
  */
 const SOURCE_ID_TO_KEY: Record<string, string> = Object.fromEntries(
   Object.entries(DECLARATIONS)
-    .filter(([key]) => key !== "chatgpt-0.2.0")
+    .filter(([key]) => key !== "chatgpt-0.2.0" && key !== "icloud-notes-0.1.24")
     .map(([key, decl]) => [decl.connector_id, key]),
 );
 
@@ -328,8 +331,8 @@ describe("legacy scope binding self-check", () => {
     });
   });
 
-  it("icloud_notes.notes cites the signed iCloud Notes 0.1.0 profile", () => {
-    const binding = LEGACY_SCOPE_BINDINGS.get("icloud_notes.notes");
+  it("icloud_notes.folders still cites the signed iCloud Notes 0.1.0 profile", () => {
+    const binding = LEGACY_SCOPE_BINDINGS.get("icloud_notes.folders");
     expect(icloudNotesDeclaration.version).toBe("0.1.0");
     expect(binding?.provenance).toEqual([
       {
@@ -337,7 +340,30 @@ describe("legacy scope binding self-check", () => {
         ref: "ghcr.io/pdp-connect/connector/icloud-notes:0.1.0",
         digest:
           "sha256:fe5497bb79b0d567c30790cc71b1e591b955fe474725679b996441bd70c09944",
-        path: "declarations/icloud-notes.collection-profile.json#streams[name=notes,folders]",
+        path: "declarations/icloud-notes.collection-profile.json#streams[name=folders]",
+      },
+    ]);
+  });
+
+  it("icloud_notes.notes cites the iCloud Notes 0.1.24 source declaration that adds the profile stream", () => {
+    const binding = LEGACY_SCOPE_BINDINGS.get("icloud_notes.notes");
+    expect(icloudNotes0124Declaration.version).toBe("0.1.24");
+    expect(icloudNotes0124Declaration.connector_id).toBe(
+      "https://registry.pdpp.dev/connectors/icloud-notes",
+    );
+    expect(icloudNotes0124Declaration.streams.map((s) => s.name)).toContain(
+      "profile",
+    );
+    const digest = collectionProfileDigest("icloud-notes-0.1.24");
+    expect(digest).toBe(
+      icloudNotes0124Provenance.outputs["collection-profile.json"],
+    );
+    expect(binding?.provenance).toEqual([
+      {
+        kind: "collection-profile",
+        ref: `https://github.com/PDP-Connect/data-connectors/tree/${icloudNotes0124Provenance.source.revision}/connectors/icloud_notes`,
+        digest,
+        path: "declarations/icloud-notes-0.1.24.collection-profile.json#streams[name=profile,notes,folders]",
       },
     ]);
   });
@@ -489,7 +515,9 @@ describe("legacy scope binding self-check", () => {
                     has_attachments: false,
                     text_content: null,
                   }
-                : { id: "folder-1", name: "Folder" },
+                : streamName === "profile"
+                  ? { id: "account-1" }
+                  : { id: "folder-1", name: "Folder" },
           };
         }
         const nullFilled: Record<string, unknown> = {};

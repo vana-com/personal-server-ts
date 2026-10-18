@@ -5,13 +5,14 @@
     "legacyConnector": "current binding output, not captured legacy-connector output; icloud_notes.notes from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
     "pdppBundle": "synthetic icloud_notes.notes records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
     "expectedSideNote": "current binding output, not captured legacy-connector output",
-    "outputKeysAndTypes": "{notes:Array<{recordName:string,title:string|null,snippet:string|null,folder:string|null,isPinned:boolean,createdDate:string|null,modifiedDate:string|null,hasAttachments:boolean,textContent:string|null}>,total:number,userName:null}",
+    "outputKeysAndTypes": "{notes:Array<{recordName:string,title:string|null,snippet:string|null,folder:string|null,isPinned:boolean,createdDate:string|null,modifiedDate:string|null,hasAttachments:boolean,textContent:string|null}>,total:number,userName:string|null}",
     "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
-    "inputHandling": "Dirty-row uses absent/null optional strings and unresolved folder fallback while preserving required booleans."
+    "inputHandling": "Dirty-row uses absent/null optional strings and unresolved folder fallback while preserving required booleans. Profile user_name maps to userName; no profile row, or a profile without user_name, gives null."
   },
   "fetchedStreams": [
     "notes",
-    "folders"
+    "folders",
+    "profile"
   ],
   "streams": {
     "notes": [
@@ -32,6 +33,12 @@
         "id": "folder-a",
         "name": "Work"
       }
+    ],
+    "profile": [
+      {
+        "id": "account-a",
+        "user_name": "Test User"
+      }
     ]
   },
   "legacyBody": {
@@ -49,7 +56,7 @@
       }
     ],
     "total": 1,
-    "userName": null
+    "userName": "Test User"
   },
   "reviewedDifferences": [],
   "cases": [
@@ -60,17 +67,19 @@
         "legacyConnector": "current binding output, not captured legacy-connector output; icloud_notes.notes from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
         "pdppBundle": "synthetic icloud_notes.notes records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
-        "outputKeysAndTypes": "{notes:Array<{recordName:string,title:string|null,snippet:string|null,folder:string|null,isPinned:boolean,createdDate:string|null,modifiedDate:string|null,hasAttachments:boolean,textContent:string|null}>,total:number,userName:null}",
+        "outputKeysAndTypes": "{notes:Array<{recordName:string,title:string|null,snippet:string|null,folder:string|null,isPinned:boolean,createdDate:string|null,modifiedDate:string|null,hasAttachments:boolean,textContent:string|null}>,total:number,userName:string|null}",
         "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
-        "inputHandling": "Dirty-row uses absent/null optional strings and unresolved folder fallback while preserving required booleans."
+        "inputHandling": "Dirty-row uses absent/null optional strings and unresolved folder fallback while preserving required booleans. Profile user_name maps to userName; no profile row, or a profile without user_name, gives null."
       },
       "fetchedStreams": [
         "notes",
-        "folders"
+        "folders",
+        "profile"
       ],
       "streams": {
         "notes": [],
-        "folders": []
+        "folders": [],
+        "profile": []
       },
       "legacyBody": {
         "notes": [],
@@ -86,13 +95,14 @@
         "legacyConnector": "current binding output, not captured legacy-connector output; icloud_notes.notes from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
         "pdppBundle": "synthetic icloud_notes.notes records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
         "expectedSideNote": "current binding output, not captured legacy-connector output",
-        "outputKeysAndTypes": "{notes:Array<{recordName:string,title:string|null,snippet:string|null,folder:string|null,isPinned:boolean,createdDate:string|null,modifiedDate:string|null,hasAttachments:boolean,textContent:string|null}>,total:number,userName:null}",
+        "outputKeysAndTypes": "{notes:Array<{recordName:string,title:string|null,snippet:string|null,folder:string|null,isPinned:boolean,createdDate:string|null,modifiedDate:string|null,hasAttachments:boolean,textContent:string|null}>,total:number,userName:string|null}",
         "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
-        "inputHandling": "Dirty-row uses absent/null optional strings and unresolved folder fallback while preserving required booleans."
+        "inputHandling": "Dirty-row uses absent/null optional strings and unresolved folder fallback while preserving required booleans. Profile user_name maps to userName; no profile row, or a profile without user_name, gives null."
       },
       "fetchedStreams": [
         "notes",
-        "folders"
+        "folders",
+        "profile"
       ],
       "streams": {
         "notes": [
@@ -104,7 +114,12 @@
             "has_attachments": true
           }
         ],
-        "folders": []
+        "folders": [],
+        "profile": [
+          {
+            "id": "account-a"
+          }
+        ]
       },
       "legacyBody": {
         "notes": [

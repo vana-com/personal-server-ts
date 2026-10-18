@@ -13,12 +13,15 @@ import {
   type LegacyScopeLookupError,
   type ProjectionError,
 } from "../legacy-projection/index.js";
-import type { ProjectionOmission } from "../legacy-projection/types.js";
+import type {
+  ProjectionDiagnostic,
+  ProjectionOmission,
+} from "../legacy-projection/types.js";
 import {
   declaredBlobField,
   declaredBlobReference,
   decodeDeclaredBlob,
-  decodeDeclaredRecords,
+  decodeDeclaredRecordsForProjection,
   DeclaredTextError,
   type StreamSchemas,
 } from "../legacy-projection/declared-text.js";
@@ -51,7 +54,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/6";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/7";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -547,10 +550,16 @@ function collectSnapshot(
         meta = prior?.meta ?? store.getBlobMeta?.(ref.blobId);
       } catch (error) {
         if (!projectedField) throw error;
-        return { ok: false, result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }) };
+        return {
+          ok: false,
+          result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }),
+        };
       }
       if (!meta && projectedField) {
-        return { ok: false, result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }) };
+        return {
+          ok: false,
+          result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }),
+        };
       }
       if (!meta)
         return {
@@ -606,10 +615,16 @@ function collectSnapshot(
       bytes = store.getBlobBytes?.(blobId);
     } catch (error) {
       if (!declaredBlobIds.has(blobId)) throw error;
-      return { ok: false, result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }) };
+      return {
+        ok: false,
+        result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }),
+      };
     }
     if (!bytes && declaredBlobIds.has(blobId)) {
-      return { ok: false, result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }) };
+      return {
+        ok: false,
+        result: unavailable({ reason: "missing_raw_blob", recordCount: 1 }),
+      };
     }
     if (!bytes)
       return {
@@ -758,8 +773,16 @@ async function projectSnapshot(
   );
   // Decode inline fields before inserting raw blob text; a JSON-string blob
   // is already source text and must never be decoded a second time.
+  let decodeDiagnostics: ProjectionDiagnostic[] = [];
   try {
-    records = decodeDeclaredRecords(records, input.streamSchemas, true);
+    const decoded = decodeDeclaredRecordsForProjection(
+      records,
+      input.streamSchemas,
+      scope,
+      true,
+    );
+    records = decoded.records;
+    decodeDiagnostics = decoded.diagnostics;
   } catch (error) {
     if (!(error instanceof DeclaredTextError)) throw error;
     return rejection(error.projectionError(scope), sourceRowCounts);
@@ -772,8 +795,14 @@ async function projectSnapshot(
       const ref = declaredBlobReference(record.data, field);
       records[i] = {
         ...record,
-        data: await decodeDeclaredBlob(record.data, field,
-          input.blobContents.get(ref.blobId) ?? { meta: undefined, bytes: undefined }),
+        data: await decodeDeclaredBlob(
+          record.data,
+          field,
+          input.blobContents.get(ref.blobId) ?? {
+            meta: undefined,
+            bytes: undefined,
+          },
+        ),
       };
     } catch {
       return unavailable({
@@ -817,7 +846,10 @@ async function projectSnapshot(
       reason:
         "some rows were stored before the store kept arrival order; they are served in primary-key order",
     }));
-  for (const diagnostic of projected.diagnostics ?? []) {
+  for (const diagnostic of [
+    ...decodeDiagnostics,
+    ...(projected.diagnostics ?? []),
+  ]) {
     if (
       diagnostic.kind === "records_dropped" ||
       diagnostic.kind === "records_partial"

@@ -8,7 +8,10 @@ import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
 import { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
 import { classifyAsTestDebris } from "./test-debris.js";
-import { decodeDeclaredRecords, DeclaredTextError } from "./declared-text.js";
+import {
+  decodeDeclaredRecordsForProjection,
+  DeclaredTextError,
+} from "./declared-text.js";
 import type {
   LegacyScopeBinding,
   LegacyScopeLookupResult,
@@ -148,8 +151,15 @@ export function projectPdppRecordsToLegacyPayload(
     }
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }
+  let decodeDiagnostics: ProjectionDiagnostic[] = [];
   try {
-    records = decodeDeclaredRecords(records, options.streamSchemas);
+    const decoded = decodeDeclaredRecordsForProjection(
+      records,
+      options.streamSchemas,
+      scope,
+    );
+    records = decoded.records;
+    decodeDiagnostics = decoded.diagnostics;
   } catch (error) {
     if (!(error instanceof DeclaredTextError)) throw error;
     return { ok: false, error: error.projectionError(scope) };
@@ -161,6 +171,9 @@ export function projectPdppRecordsToLegacyPayload(
     options,
   );
   if (!result.ok) return result;
+  if (decodeDiagnostics.length > 0) {
+    result.diagnostics = [...decodeDiagnostics, ...(result.diagnostics ?? [])];
+  }
   if (scope.startsWith("oura.")) {
     assertOuraLegacyScoresAreIntegers(scope, result.payload);
   }
