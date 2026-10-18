@@ -879,6 +879,41 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(asOwner.etag).toMatch(/^"v1:[0-9a-f]{64}"$/);
   });
 
+  it("gives the owner the stored file with ?view=stored, not the canonical view, and refuses it to a grantee", async () => {
+    await legacyWrite("oura.activity", COVERED_A1);
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a2", "2026-09-02"), day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+    const canonical = await ownerGet("/v1/data/oura.activity");
+    expect(canonical.dataSource).toBe("canonical");
+    expect(ids(canonical.text)).toEqual(["a1", "a2"]);
+
+    const stored = await ownerGet("/v1/data/oura.activity?view=stored");
+    expect(stored.status).toBe(200);
+    expect(stored.dataSource).toBe("legacy");
+    expect(ids(stored.text)).toEqual(["a1"]);
+
+    const asBuilder = await ctx!.app.request(
+      "/v1/data/oura.activity?view=stored",
+      {
+        headers: {
+          authorization: await buildWeb3SignedHeader({
+            wallet: builder,
+            aud: ctx!.config.server.origin,
+            method: "GET",
+            uri: "/v1/data/oura.activity",
+            grantId: GRANT_ID,
+          }),
+        },
+      },
+    );
+    expect(asBuilder.status).toBe(403);
+  });
+
   it("reflects a later repair and keeps the revision stable while nothing changes", async () => {
     await legacyWrite("oura.activity", { days: [day("a1", "2026-09-01", 10)] });
     const token = await ownerPdppToken();
@@ -1354,6 +1389,39 @@ describe("GET /v1/data listing", () => {
     });
     // The listing still creates no legacy entry.
     expect(ctx!.indexManager.listDistinctScopes().scopes).toEqual([]);
+  });
+
+  it("lists to a grantee only the scopes its grant covers, canonical-only ones included", async () => {
+    await legacyWrite("notes.manual", { text: "kept" });
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01")],
+      "2026-09-10T06:00:00Z",
+    );
+    const signedGet = async (uri: string) =>
+      ctx!.app.request(uri, {
+        headers: {
+          authorization: await buildWeb3SignedHeader({
+            wallet: builder,
+            aud: ctx!.config.server.origin,
+            method: "GET",
+            uri,
+            grantId: GRANT_ID,
+          }),
+        },
+      });
+
+    const listing = await signedGet("/v1/data");
+    expect(listing.status).toBe(200);
+    const body = (await listing.json()) as { scopes: { scope: string }[] };
+    expect(body.scopes.map((entry) => entry.scope)).toEqual(["oura.activity"]);
+
+    // The grant covers oura.*, so another scope's version history is refused.
+    expect((await signedGet("/v1/data/notes.manual/versions")).status).toBe(
+      403,
+    );
   });
 
   it("merges canonical-only and stored scopes in one ordered, paged listing", async () => {
