@@ -678,6 +678,7 @@ const youtubeHistory: LegacyScopeBinding = {
     watch_history: [
       "position",
       "watched_date",
+      "watched_date_label",
       "video_id",
       "video_url",
       "video_title",
@@ -689,7 +690,7 @@ const youtubeHistory: LegacyScopeBinding = {
   },
   primaryKey: { watch_history: ["id"] },
   lossy: [
-    "Preserves page order by position and caps output at 50 entries. watchedAt and watchedAtText both carry watched_date (YYYY-MM-DD, null unchanged) at day precision only; no timestamp is inferred. Integer view_count is rendered as '<count> views'; absent view_count remains null. Rows without required videoUrl are skipped and reported. Missing positions fail because page order cannot be preserved.",
+    "Preserves page order by position and caps output at 50 entries. watchedAt carries watched_date (YYYY-MM-DD, null unchanged) at day precision only; no timestamp is inferred. watchedAtText carries watched_date_label (the browser section header as shown, as legacy emitted it); it falls back to watched_date only when the label is absent or empty. Integer view_count is rendered as '<count> views'; absent view_count remains null. Rows without required videoUrl are skipped and reported. Missing positions fail because page order cannot be preserved.",
   ],
   provenance: youtubeProvenance,
   project(records, options): ProjectionResult {
@@ -725,7 +726,9 @@ const youtubeHistory: LegacyScopeBinding = {
         return [
           {
             watchedAt: youtubeStringOrNull(row.watched_date),
-            watchedAtText: youtubeStringOrNull(row.watched_date),
+            watchedAtText:
+              youtubeRequiredString(row.watched_date_label) ??
+              youtubeStringOrNull(row.watched_date),
             videoId: youtubeStringOrNull(row.video_id),
             videoUrl,
             videoTitle: youtubeStringOrNull(row.video_title),
