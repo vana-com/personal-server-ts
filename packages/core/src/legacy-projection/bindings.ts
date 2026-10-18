@@ -4530,7 +4530,7 @@ const icloudNoteFolders: LegacyScopeBinding = {
 
 const ICLOUD_NOTES_PROFILE_PROVENANCE: LegacyScopeBindingProvenance = {
   kind: "collection-profile",
-  ref: "https://github.com/PDP-Connect/data-connectors/tree/9ebc547382d2a8883fc1eac5a2a42bebe88f0944/connectors/icloud_notes",
+  ref: "https://github.com/PDP-Connect/data-connectors/tree/3ac4dd636938fbff9168eb662d2300eb85554801/connectors/icloud_notes",
   digest:
     "sha256:ad6d28dac69a84019be2c81ac5f1f2ae8fa9c6602eb179370f0bb9d9022e33b2",
   path: "declarations/icloud-notes-0.1.24.collection-profile.json#streams[name=profile,notes,folders]",

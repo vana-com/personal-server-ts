@@ -7,12 +7,12 @@
   "protocol_version": "0.1.0",
   "source": {
     "repository": "https://github.com/PDP-Connect/data-connectors",
-    "revision": "9ebc547382d2a8883fc1eac5a2a42bebe88f0944",
+    "revision": "3ac4dd636938fbff9168eb662d2300eb85554801",
     "package": "connectors/icloud_notes"
   },
   "source_inventory": [],
   "outputs": {
     "collection-profile.json": "sha256:ad6d28dac69a84019be2c81ac5f1f2ae8fa9c6602eb179370f0bb9d9022e33b2"
   },
-  "note": "Source declaration copied from connectors/icloud_notes/manifest.json at the recorded revision, the head of the data-connectors pull request that adds the profile stream. The legacy icloud_notes.notes binding reads profile.user_name from it. No signed OCI artifact digest was available for 0.1.24; icloud_notes.folders still cites the signed 0.1.0 artifact."
+  "note": "Source declaration copied from connectors/icloud_notes/manifest.json at the recorded revision, the data-connectors main commit that merged the profile stream. The legacy icloud_notes.notes binding reads profile.user_name from it. No signed OCI artifact digest was available for 0.1.24; icloud_notes.folders still cites the signed 0.1.0 artifact."
 }
