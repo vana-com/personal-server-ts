@@ -1810,6 +1810,7 @@ const chatgptConversations: LegacyScopeBinding = {
     "A conversation without complete current-branch message evidence, a valid id, or valid timestamps is dropped and counted in a records_dropped diagnostic; nested full threads are not invented. Messages whose conversation is absent are dropped and counted the same way.",
     "Only user/assistant text or multimodal_text messages with nonempty string content are retained, matching the legacy connector's walkMessages filter; message_count is the retained count.",
     "A missing title becomes 'Untitled', matching the legacy connector's toConversationRecord fallback; model_slug is renamed to model.",
+    "Legacy message ids are source node ids. ChatGPT 0.3.0 stores a message under '<conversation_id>:<node_id>' (and links parent_id the same way); the projection strips that prefix, reads a bare pre-0.3.0 id as it is, and counts a node stored under both forms once, preferring the 0.3.0 row.",
   ],
   provenance: [
     {
@@ -1907,24 +1908,33 @@ const chatgptConversations: LegacyScopeBinding = {
         continue;
       }
 
-      const branch = (messagesByConversation.get(id) ?? []).filter(
+      // Legacy names a message by its source node id. Messages are stored
+      // under their record id: the bare node id before ChatGPT 0.3.0,
+      // `<conversation_id>:<node_id>` since. An instance that holds both
+      // forms of one node uses the current one.
+      const { byNode, unkeyed } = chatgptMessagesByNode(
+        id,
+        messagesByConversation.get(id),
+      );
+      const branch = [...byNode.values(), ...unkeyed].filter(
         (m) => m.on_current_branch === true,
       );
       if (branch.length !== message_count_on_current_branch) {
         drop("Current branch message count does not match conversation");
         continue;
       }
-      const byId = new Map(
-        branch.filter((m) => typeof m.id === "string").map((m) => [m.id, m]),
-      );
       const ordered: Record<string, unknown>[] = [];
       const seen = new Set<string>();
       let node = typeof current_node === "string" ? current_node : null;
-      while (node && byId.has(node) && !seen.has(node)) {
+      while (node && !seen.has(node)) {
+        const message = byNode.get(node);
+        if (!message || message.on_current_branch !== true) break;
         seen.add(node);
-        const message = byId.get(node)!;
         ordered.push(message);
-        node = typeof message.parent_id === "string" ? message.parent_id : null;
+        node =
+          typeof message.parent_id === "string"
+            ? chatgptNodeId(id, message.parent_id)
+            : null;
       }
       if (ordered.length !== branch.length) {
         drop("Current branch message chain is incomplete");
@@ -1941,7 +1951,7 @@ const chatgptConversations: LegacyScopeBinding = {
             m.content.length > 0,
         )
         .map((m) => ({
-          id: m.id,
+          id: chatgptNodeId(id, m.id as string),
           role: m.role,
           content: m.content,
           content_type: m.content_type,
@@ -1997,6 +2007,47 @@ const chatgptConversations: LegacyScopeBinding = {
     };
   },
 };
+
+/**
+ * The source node id of a ChatGPT message record id. ChatGPT 0.3.0 and later
+ * name a message `<conversation_id>:<node_id>`, because a node id can recur in
+ * a forked conversation; earlier versions stored the bare node id. A
+ * conversation id is a UUID and never contains ":", so the prefix is
+ * unambiguous. Applies to `parent_id` too, which names a record the same way.
+ */
+function chatgptNodeId(conversationId: string, recordId: string): string {
+  const prefix = `${conversationId}:`;
+  return recordId.startsWith(prefix) ? recordId.slice(prefix.length) : recordId;
+}
+
+/**
+ * One conversation's stored messages by source node id. When an instance holds
+ * a node under both the pre-0.3.0 key and the 0.3.0 key, the 0.3.0 row wins:
+ * it was written later, from the full source body.
+ */
+function chatgptMessagesByNode(
+  conversationId: string,
+  messages: Record<string, unknown>[] | undefined,
+): {
+  byNode: Map<string, Record<string, unknown>>;
+  unkeyed: Record<string, unknown>[];
+} {
+  const byNode = new Map<string, Record<string, unknown>>();
+  const unkeyed: Record<string, unknown>[] = [];
+  const current = new Set<string>();
+  for (const message of messages ?? []) {
+    if (typeof message.id !== "string") {
+      unkeyed.push(message);
+      continue;
+    }
+    const node = chatgptNodeId(conversationId, message.id);
+    const isCurrent = node !== message.id;
+    if (byNode.has(node) && (current.has(node) || !isCurrent)) continue;
+    byNode.set(node, message);
+    if (isCurrent) current.add(node);
+  }
+  return { byNode, unkeyed };
+}
 
 /**
  * Newest `update_time` first; a missing or unparseable time sorts last.
