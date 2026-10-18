@@ -2563,14 +2563,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
     });
 
     describe("message record ids (ChatGPT 0.3.0 names a message <conversation_id>:<node_id>)", () => {
-      const conversation = (id: string, count: number) => ({
+      const conversation = (id: string, count: number, tip = "n2") => ({
         stream: "conversations",
         data: {
           id,
           title: id,
           create_time: "2026-09-22T10:00:00Z",
           update_time: "2026-09-22T10:05:00Z",
-          current_node: "n2",
+          current_node: tip,
           message_count_on_current_branch: count,
         },
       });
@@ -2600,7 +2600,8 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       const project = (records: PdppRecord[]) =>
         projectPdppRecordsToLegacyPayload("chatgpt.conversations", records, {
           fetchedStreams: ["conversations", "messages"],
-          orderByPrimaryKey: true,
+          // Preserve raw record order so permutations exercise duplicate precedence.
+          orderByPrimaryKey: false,
         });
       const projected = (result: ReturnType<typeof project>) => {
         expect(result.ok).toBe(true);
@@ -2628,34 +2629,49 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         ]);
       });
 
-      it("projects both conversations that share node ids, which a bare-id key could not store", () => {
-        const result = projected(
-          project([
+      it.each(["forward", "reverse"])(
+        "isolates shared node ids across conversations in raw %s order",
+        (order) => {
+          const records = [
             conversation("c1", 2),
             conversation("c2", 2),
             message("c1", "n1", null, "first in one"),
             message("c1", "n2", "n1", "second in one"),
             message("c2", "n1", null, "first in two"),
             message("c2", "n2", "n1", "second in two"),
-          ]),
-        );
-        expect(result.diagnostics).toBeUndefined();
-        const payload = result.payload as {
-          conversations: {
-            id: string;
-            messages: { id: string; content: string }[];
-          }[];
-        };
-        expect(
-          payload.conversations.map((c) => [
-            c.id,
-            c.messages.map((m) => m.content),
-          ]),
-        ).toEqual([
-          ["c1", ["first in one", "second in one"]],
-          ["c2", ["first in two", "second in two"]],
-        ]);
-      });
+          ];
+          const result = projected(
+            project(order === "forward" ? records : [...records].reverse()),
+          );
+          expect(result.diagnostics).toBeUndefined();
+          const payload = result.payload as {
+            conversations: {
+              id: string;
+              messages: { id: string; content: string }[];
+            }[];
+          };
+          expect(
+            [...payload.conversations]
+              .sort((a, b) => a.id.localeCompare(b.id))
+              .map((c) => [c.id, c.messages.map((m) => [m.id, m.content])]),
+          ).toEqual([
+            [
+              "c1",
+              [
+                ["n1", "first in one"],
+                ["n2", "second in one"],
+              ],
+            ],
+            [
+              "c2",
+              [
+                ["n1", "first in two"],
+                ["n2", "second in two"],
+              ],
+            ],
+          ]);
+        },
+      );
 
       it("counts a node stored under both the old and the new key once, and prefers the new row", () => {
         const result = projected(
@@ -2683,28 +2699,48 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         ]);
       });
 
-      it("takes the current row's branch flag over a stale old row for the same node", () => {
-        const result = projected(
-          project([
-            conversation("c1", 2),
-            message("c1", "n1", null, "first", { scoped: false }),
-            message("c1", "n2", "n1", "stale", { scoped: false }),
-            message("c1", "n3", "n1", "stale alt", {
+      it.each(["old-first", "new-first"])(
+        "takes scoped branch flags over opposing stale flags after a branch change (%s)",
+        (order) => {
+          const oldRows = [
+            message("c1", "n2", "n1", "stale old branch", { scoped: false }),
+            message("c1", "n3", "n1", "stale alternate", {
               scoped: false,
               onBranch: false,
             }),
-            message("c1", "n1", null, "first"),
-            message("c1", "n2", "n1", "fresh"),
-            message("c1", "n3", "n1", "alt", { onBranch: false }),
-          ]),
-        );
-        const payload = result.payload as {
-          conversations: { messages: { content: string }[] }[];
-        };
-        expect(
-          payload.conversations[0]?.messages.map((m) => m.content),
-        ).toEqual(["first", "fresh"]);
-      });
+          ];
+          const newRows = [
+            message("c1", "n2", "n1", "retired branch", { onBranch: false }),
+            message("c1", "n3", "n1", "fresh branch"),
+          ];
+          const result = projected(
+            project([
+              conversation("c1", 2, "n3"),
+              message("c1", "n1", null, "first"),
+              ...(order === "old-first"
+                ? [...oldRows, ...newRows]
+                : [...newRows, ...oldRows]),
+            ]),
+          );
+          expect(result.diagnostics).toBeUndefined();
+          const payload = result.payload as {
+            conversations: {
+              message_count: number;
+              messages: { id: string; content: string }[];
+            }[];
+            total: number;
+          };
+          expect(payload.total).toBe(1);
+          expect(payload.conversations).toHaveLength(1);
+          expect(payload.conversations[0]?.message_count).toBe(2);
+          expect(
+            payload.conversations[0]?.messages.map((m) => [m.id, m.content]),
+          ).toEqual([
+            ["n1", "first"],
+            ["n3", "fresh branch"],
+          ]);
+        },
+      );
 
       it("still projects a conversation that holds only old bare-id rows", () => {
         const result = projected(
@@ -2724,13 +2760,62 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         ]);
       });
 
-      it("drops a conversation whose branch chain is incomplete, as before", () => {
-        const result = projected(
-          project([conversation("c1", 2), message("c1", "n2", "n1", "orphan")]),
+      describe.each(["forward", "reverse"])("raw %s record order", (order) => {
+        it.each([
+          { layout: "scoped", scoped: true },
+          { layout: "mixed", scoped: false },
+        ])(
+          "drops an equal-count disconnected $layout branch with the chain diagnostic",
+          ({ scoped }) => {
+            // Both rows are on-branch: count 2 passes, but n2 cannot reach n1.
+            const records = [
+              conversation("c1", 2),
+              message("c1", "n1", null, "disconnected root", { scoped }),
+              message("c1", "n2", "missing", "orphan tip"),
+            ];
+            const result = projected(
+              project(order === "forward" ? records : [...records].reverse()),
+            );
+            expect(result).toEqual({
+              ok: true,
+              payload: { conversations: [], total: 0 },
+              diagnostics: [
+                {
+                  kind: "records_dropped",
+                  scope: "chatgpt.conversations",
+                  stream: "conversations",
+                  count: 1,
+                  // copy-assertion-ok: identifies the chain guard rather than the earlier count guard.
+                  reasons: ["Current branch message chain is incomplete"],
+                },
+              ],
+            });
+          },
         );
-        expect(result.diagnostics).toMatchObject([
-          { kind: "records_dropped", stream: "conversations", count: 1 },
-        ]);
+
+        it("drops an equal-count branch whose current tip is missing", () => {
+          const records = [
+            conversation("c1", 1),
+            message("c1", "n1", null, "present root"),
+          ];
+          const result = projected(
+            project(order === "forward" ? records : [...records].reverse()),
+          );
+          expect(result).toEqual({
+            ok: true,
+            payload: { conversations: [], total: 0 },
+            diagnostics: [
+              {
+                kind: "records_dropped",
+                scope: "chatgpt.conversations",
+                stream: "conversations",
+                count: 1,
+                // copy-assertion-ok: identifies the chain guard rather than the earlier count guard.
+                reasons: ["Current branch message chain is incomplete"],
+              },
+            ],
+          });
+        });
       });
     });
 
