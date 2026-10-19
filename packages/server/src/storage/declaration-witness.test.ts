@@ -160,7 +160,7 @@ it("wires trusted declarations into the production legacy view", () => {
 const faults = vi.hoisted(() => ({ open: "", read: "" }));
 const opened = vi.hoisted(() => [] as Array<InstanceType<typeof Database>>);
 vi.mock("better-sqlite3", async (importOriginal) => {
-  const { default: Actual } = await importOriginal<typeof import("better-sqlite3")>();
+  const { default: Actual } = await importOriginal<{ default: typeof Database }>();
   return {
     default: function TrackedDatabase(...args: ConstructorParameters<typeof Actual>) {
       if (faults.open) throw Object.assign(new Error("PRIVATE_NATIVE"), { code: faults.open });
