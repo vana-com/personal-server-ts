@@ -90,7 +90,8 @@ const CASES: IntegerCase[] = [
     outputPath: [collection!, "0", ...output!.split(".")],
     scope: "oura.sleep" as const,
     stream: "sleep" as const,
-    profiles: [undefined, "oura-browser"],
+    profiles:
+      input === "average_hrv" ? [undefined] : [undefined, "oura-browser"],
   })),
   {
     inputPath: ["awake_time"],
@@ -177,6 +178,13 @@ function expectSchemaValid(
 }
 
 describe("Oura legacy projection policy", () => {
+  it("keeps fractional Oura Browser HRV without integer coercion", () => {
+    const hrv = CASES.find(({ inputPath }) => inputPath[0] === "average_hrv")!;
+    const { payload } = project(hrv, 45.75, "oura-browser");
+    expect(getPath(payload, hrv.outputPath)).toBe(45.75);
+    expectSchemaValid("oura.sleep", payload);
+  });
+
   it.each(CASES)("rounds integer field $scope $outputPath", (testCase) => {
     for (const profileKey of testCase.profiles) {
       const samples: [number, number][] =
@@ -312,30 +320,32 @@ describe("Oura legacy projection policy", () => {
         if (!result.ok) throw new Error("Oura projection failed unexpectedly");
 
         const entries = result.payload[testCase.collection];
-        expect(entries).toEqual(testCase.expected);
-        expect(JSON.stringify(entries)).toBe(JSON.stringify(testCase.expected));
+        const expected = testCase.expected.map((entry) =>
+          profileKey === "oura-browser"
+            ? {
+                ...entry,
+                ...(testCase.scope === "oura.sleep" && entry.id === "null"
+                  ? { timestamp: null }
+                  : {}),
+                contributors: {},
+              }
+            : entry,
+        );
+        expect(entries).toEqual(expected);
+        expect(JSON.stringify(entries)).toBe(JSON.stringify(expected));
         expect(
           (entries as { score: number | null }[]).every(
             ({ score }) => score === null || Number.isInteger(score),
           ),
         ).toBe(true);
         expectSchemaValid(testCase.scope, result.payload);
-        if (testCase.scope === "oura.sleep" && profileKey === "oura-browser") {
-          expect(
-            result.projectionOmissions?.some(
-              (omission) =>
-                omission.entityKey === "null" &&
-                omission.entityPath === "$.dailyScores[]" &&
-                omission.fieldPath === "timestamp" &&
-                omission.reason === "null_timestamp",
-            ),
-          ).toBe(true);
-        }
+        if (testCase.scope === "oura.sleep" && profileKey === "oura-browser")
+          expect(result.projectionOmissions).toBeUndefined();
       }
     },
   );
 
-  it("omits sleep type values outside the frozen enum and null types", () => {
+  it("preserves Oura Browser sleep types while retaining the older profile's omissions", () => {
     for (const profileKey of [undefined, "oura-browser"]) {
       for (const type of ["awake", null]) {
         const result = projectPdppRecordsToLegacyPayload(
@@ -364,13 +374,18 @@ describe("Oura legacy projection policy", () => {
           },
         });
         if (result.ok) {
-          expect(result.payload.sleepPeriods).not.toHaveProperty("0.type");
-          expect(result.projectionOmissions).toContainEqual({
-            entityPath: "$.sleepPeriods[]",
-            entityKey: "session-1",
-            fieldPath: "type",
-            reason: type === null ? "null_type" : "off_enum_type",
-          });
+          if (profileKey === "oura-browser") {
+            expect(result.payload.sleepPeriods).toHaveProperty("0.type", type);
+            expect(result.projectionOmissions).toBeUndefined();
+          } else {
+            expect(result.payload.sleepPeriods).not.toHaveProperty("0.type");
+            expect(result.projectionOmissions).toContainEqual({
+              entityPath: "$.sleepPeriods[]",
+              entityKey: "session-1",
+              fieldPath: "type",
+              reason: type === null ? "null_type" : "off_enum_type",
+            });
+          }
           expectSchemaValid("oura.sleep", result.payload);
         }
       }
@@ -378,7 +393,7 @@ describe("Oura legacy projection policy", () => {
   });
 
   it.each([undefined, "oura-browser"] as const)(
-    "omits null sleep timestamps for profile %s",
+    "handles null sleep timestamps for profile %s",
     (profileKey) => {
       const result = projectPdppRecordsToLegacyPayload(
         "oura.sleep",
@@ -417,26 +432,30 @@ describe("Oura legacy projection policy", () => {
       const period = result.payload.sleepPeriods as Record<string, unknown>[];
       const session = period.find(({ id }) => id === "session-1");
       expect(session).toBeDefined();
-      expect(session).not.toHaveProperty("bedtimeStart");
-      expect(session).not.toHaveProperty("bedtimeEnd");
-      expect(result.projectionOmissions).toEqual(
-        expect.arrayContaining([
-          {
-            entityPath: "$.sleepPeriods[]",
-            entityKey: "session-1",
-            fieldPath: "bedtimeStart",
-            reason: "null_timestamp",
-          },
-          {
-            entityPath: "$.sleepPeriods[]",
-            entityKey: "session-1",
-            fieldPath: "bedtimeEnd",
-            reason: "null_timestamp",
-          },
-        ]),
-      );
       if (profileKey) {
-        expect(result.payload.dailyScores).not.toHaveProperty("0.timestamp");
+        expect(session).toHaveProperty("bedtimeStart", null);
+        expect(session).toHaveProperty("bedtimeEnd", null);
+        expect(result.payload.dailyScores).toHaveProperty("0.timestamp", null);
+        expect(result.projectionOmissions).toBeUndefined();
+      } else {
+        expect(session).not.toHaveProperty("bedtimeStart");
+        expect(session).not.toHaveProperty("bedtimeEnd");
+        expect(result.projectionOmissions).toEqual(
+          expect.arrayContaining([
+            {
+              entityPath: "$.sleepPeriods[]",
+              entityKey: "session-1",
+              fieldPath: "bedtimeStart",
+              reason: "null_timestamp",
+            },
+            {
+              entityPath: "$.sleepPeriods[]",
+              entityKey: "session-1",
+              fieldPath: "bedtimeEnd",
+              reason: "null_timestamp",
+            },
+          ]),
+        );
       }
       expectSchemaValid("oura.sleep", result.payload);
     },
@@ -658,7 +677,7 @@ describe("Oura legacy projection policy", () => {
     expect(verdict.reason).toBe("missing_field");
   });
 
-  it("takes over with only per-entity omissions emitted from canonical values", () => {
+  it("refuses coverage when stored legacy values differ from Oura Browser nulls and unknown types", () => {
     const result = projectPdppRecordsToLegacyPayload(
       "oura.sleep",
       [
@@ -719,11 +738,11 @@ describe("Oura legacy projection policy", () => {
         projectionOmissions: result.projectionOmissions,
       },
     );
-    expect(verdict.covered).toBe(true);
-    expect(verdict.appliedExceptions).toHaveLength(4);
+    expect(verdict.covered).toBe(false);
+    expect(verdict.appliedExceptions).toHaveLength(0);
   });
 
-  it("excuses only the exact omitted field path, not a same-named nested field", () => {
+  it("does not excuse a legacy timestamp when Oura Browser returned null", () => {
     const result = projectPdppRecordsToLegacyPayload(
       "oura.sleep",
       [
@@ -744,7 +763,13 @@ describe("Oura legacy projection policy", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.payload.dailyScores).toEqual([
-      { id: "s", day: "2026-10-01", score: 80, contributors: {} },
+      {
+        id: "s",
+        day: "2026-10-01",
+        score: 80,
+        timestamp: null,
+        contributors: {},
+      },
     ]);
     const options = {
       scope: "oura.sleep",
@@ -771,24 +796,15 @@ describe("Oura legacy projection policy", () => {
       options,
     );
     expect(nested.covered).toBe(false);
-    expect(nested.reason).toBe("missing_field");
-    expect(nested.mismatchedFieldPaths).toEqual([
-      "$.dailyScores[0].contributors.timestamp",
-    ]);
+    expect(nested.appliedExceptions).toEqual([]);
 
     const topLevel = compareLegacyCoverage(
       { dailyScores: [{ ...legacyScore, contributors: {} }] },
       result.payload,
       options,
     );
-    expect(topLevel.covered).toBe(true);
-    expect(topLevel.appliedExceptions).toEqual([
-      {
-        path: "$.dailyScores[].timestamp",
-        reason: "null_timestamp",
-        authority: "canonical",
-      },
-    ]);
+    expect(topLevel.covered).toBe(false);
+    expect(topLevel.appliedExceptions).toEqual([]);
   });
 
   it("rejects daily score rows whose score is absent or undefined", () => {

@@ -31,15 +31,15 @@ import type { DataBlockManifest, DataScopeBlock } from "./blocks/types.js";
 import { previewEnvelopeValue } from "./preview.js";
 
 /**
- * Sources whose `{records}` bodies have complete, tested legacy bindings.
- * Other sources either emit legacy wrappers themselves (GitHub, Strava) or
- * lack real-shape parity evidence (Oura), so their stored bodies are served
- * as stored.
+ * Sources whose `{records}` bodies have tested legacy bindings. Other sources
+ * either emit legacy wrappers themselves (GitHub, Strava) or have no proven
+ * legacy projection.
  */
 const PROJECTED_SOURCES: ReadonlySet<string> = new Set([
   "chatgpt",
   "claude",
   "youtube",
+  "oura",
 ]);
 
 /** Keys the server stamps into `data`; they are not part of the body. */
@@ -181,7 +181,9 @@ export function withLegacyProjection(
         collectedAt: storedScope === scope ? collectedAt : entry?.collectedAt,
         // The index row id changes when a version is deleted and written
         // again under the same collectedAt, so it identifies the content.
-        version: entry ? `${entry.id}@${entry.collectedAt}` : null,
+        version: entry
+          ? `${storedScope}:${entry.id}@${entry.collectedAt}`
+          : null,
       };
     });
     const ownVersion = inputs.find(
@@ -257,6 +259,7 @@ export function withLegacyProjection(
       now,
       orderByPrimaryKey: true,
       allowMissingJoinStreams: true,
+      ...(scope.startsWith("oura.") ? { profileKey: "oura-browser" } : {}),
     });
     if (!result.ok) {
       options.onIssue?.({
@@ -563,6 +566,11 @@ export async function supersedeLegacyVersions(
     return refuse(
       "YouTube legacy versions are retained for read-time projection",
     );
+  }
+  // Oura Browser may cover only a time window; item-level identity coverage
+  // against every stored legacy version has not been proven.
+  if (scope.startsWith("oura.")) {
+    return refuse("Oura projection is read-time only");
   }
   const readStored = (storage.readStoredEnvelope ?? storage.readEnvelope).bind(
     storage,

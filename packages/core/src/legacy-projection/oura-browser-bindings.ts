@@ -3,13 +3,13 @@ import {
   OURA_SLEEP_CONTRIBUTOR_INTEGERS,
   ouraInteger,
   ouraSleepPeriod,
-  ouraSleepPeriodOmissions,
   withOuraContributors,
   partitionOuraRows,
 } from "./bindings.js";
 import type { LegacyScopeBinding, ProjectionResult } from "./types.js";
 
-// Map signed Oura Browser 0.1.2 records into the retained legacy scopes.
+// API v2 field parity follows data-connectors PR #504 at e04efd50c.
+// The checked-in OCI provenance still pins the earlier signed 0.1.2 profile.
 const source = "https://registry.pdpp.dev/connectors/oura-browser";
 const digest =
   "sha256:ddc901015996e4ae67030bcd9ec809aa368b1b69d94b8ed5515d1be0a886975d";
@@ -56,15 +56,24 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                       "restless_periods",
                     ],
                   }
-                : original.fieldsRead,
+                : {
+                    [stream]: [
+                      ...(original.fieldsRead[stream] ?? []),
+                      "timestamp",
+                    ],
+                  },
             lossy:
               stream === "sleep"
                 ? original.lossy.filter(
                     (item) =>
                       !item.startsWith("awakeTime:") &&
-                      !item.startsWith("dailyScores.timestamp:"),
+                      !item.startsWith("dailyScores.timestamp:") &&
+                      !item.startsWith("sleepPeriods.averageHrv:") &&
+                      !item.startsWith("sleepPeriods.type:"),
                   )
-                : original.lossy,
+                : original.lossy.filter(
+                    (item) => !item.startsWith("timestamp:"),
+                  ),
             provenance: [
               {
                 kind: "oci" as const,
@@ -107,7 +116,30 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
               }
               // Day and score rules are the base profile's: an impossible day
               // or a missing/malformed score drops and counts the row.
-              if (stream !== "sleep") return original.project(records, options);
+              if (stream !== "sleep") {
+                const projected = original.project(records, options);
+                if (!projected.ok) return projected;
+                const days = projected.payload.days as Record<
+                  string,
+                  unknown
+                >[];
+                const sourceById = new Map(
+                  streamRecords.map(({ data }) => [data.id, data]),
+                );
+                return {
+                  ...projected,
+                  payload: {
+                    ...projected.payload,
+                    days: days.map((day) => ({
+                      ...day,
+                      ...(sourceById.get(day.id)?.timestamp === undefined
+                        ? {}
+                        : { timestamp: sourceById.get(day.id)?.timestamp }),
+                      contributors: day.contributors ?? {},
+                    })),
+                  },
+                };
+              }
 
               // A session row produces no daily score here, so only its day
               // is checked; each daily_score row must carry the legacy score.
@@ -126,6 +158,16 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
               );
               const sleepPeriods = sessions.map((session) => ({
                 ...ouraSleepPeriod(session),
+                ...(session.type === undefined ? {} : { type: session.type }),
+                ...(session.bedtime_start === undefined
+                  ? {}
+                  : { bedtimeStart: session.bedtime_start }),
+                ...(session.bedtime_end === undefined
+                  ? {}
+                  : { bedtimeEnd: session.bedtime_end }),
+                ...(session.average_hrv === undefined
+                  ? {}
+                  : { averageHrv: session.average_hrv }),
                 ...(typeof session.awake_time === "number" ||
                 session.awake_time === null
                   ? { awakeTime: ouraInteger(session.awake_time) }
@@ -138,37 +180,19 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                     : data.id,
                 day: data.day,
                 score: ouraInteger(data.sleep_score),
-                ...(data.daily_sleep_timestamp === null
+                ...(data.daily_sleep_timestamp === undefined
                   ? {}
-                  : typeof data.daily_sleep_timestamp === "string"
-                    ? { timestamp: data.daily_sleep_timestamp }
-                    : {}),
+                  : { timestamp: data.daily_sleep_timestamp }),
                 ...withOuraContributors(
                   data.contributors,
                   OURA_SLEEP_CONTRIBUTOR_INTEGERS,
                 ),
+                ...(!data.contributors || typeof data.contributors !== "object"
+                  ? { contributors: {} }
+                  : {}),
               }));
-              const projectionOmissions = sessions.flatMap(
-                ouraSleepPeriodOmissions,
-              );
-              for (const data of scores) {
-                if (data.daily_sleep_timestamp !== null) continue;
-                const entityKey =
-                  typeof data.daily_sleep_id === "string"
-                    ? data.daily_sleep_id
-                    : data.id;
-                projectionOmissions.push({
-                  entityPath: "$.dailyScores[]",
-                  entityKey: String(entityKey),
-                  fieldPath: "timestamp",
-                  reason: "null_timestamp",
-                });
-              }
               return {
                 ok: true,
-                ...(projectionOmissions.length > 0
-                  ? { projectionOmissions }
-                  : {}),
                 payload: { dailyScores, sleepPeriods },
                 ...(diagnostics.length > 0 ? { diagnostics } : {}),
               };

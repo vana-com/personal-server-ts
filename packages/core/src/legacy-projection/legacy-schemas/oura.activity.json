@@ -15,7 +15,7 @@
             "id": { "type": "string" },
             "day": { "type": "string", "format": "date", "description": "Date in YYYY-MM-DD format" },
             "score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100, "description": "Overall activity score (0-100)" },
-            "timestamp": { "type": "string", "format": "date-time" },
+            "timestamp": { "type": ["string", "null"], "format": "date-time" },
             "activeCalories": { "type": ["integer", "null"], "description": "Calories burned through activity" },
             "totalCalories": { "type": ["integer", "null"], "description": "Total calories burned including BMR" },
             "steps": { "type": ["integer", "null"], "description": "Total step count" },

@@ -445,7 +445,7 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
       legacySchemaValid("oura.sleep", result.envelope.data);
     });
 
-    it("carries Oura omission provenance beside the projected payload", async () => {
+    it("preserves Oura Browser nulls and unknown type in the projected payload", async () => {
       const a = connect("conn_a", "oura-browser");
       put(a, "sleep", [
         {
@@ -466,32 +466,13 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
         },
       ]);
       const result = okBody(await read(a, "oura.sleep"));
-      expect(result.projectionOmissions).toEqual([
-        {
-          entityPath: "$.sleepPeriods[]",
-          entityKey: "s1",
-          fieldPath: "type",
-          reason: "off_enum_type",
-        },
-        {
-          entityPath: "$.sleepPeriods[]",
-          entityKey: "s1",
-          fieldPath: "bedtimeStart",
-          reason: "null_timestamp",
-        },
-        {
-          entityPath: "$.sleepPeriods[]",
-          entityKey: "s1",
-          fieldPath: "bedtimeEnd",
-          reason: "null_timestamp",
-        },
-        {
-          entityPath: "$.dailyScores[]",
-          entityKey: "d1",
-          fieldPath: "timestamp",
-          reason: "null_timestamp",
-        },
-      ]);
+      expect(result.projectionOmissions).toBeUndefined();
+      expect(result.envelope.data).toMatchObject({
+        dailyScores: [{ id: "d1", timestamp: null }],
+        sleepPeriods: [
+          { id: "s1", type: "awake", bedtimeStart: null, bedtimeEnd: null },
+        ],
+      });
       legacySchemaValid("oura.sleep", result.envelope.data);
     });
 
@@ -519,8 +500,8 @@ describe("canonical legacy reader: rows the projector cannot carry", () => {
         expect(result.complete).toBe(true);
         expect(result.envelope.data).toEqual({
           dailyScores: [
-            { id: "d1", day: "2026-02-01", score: 70 },
-            { id: "d2", day: "2026-02-02", score: null },
+            { id: "d1", day: "2026-02-01", score: 70, contributors: {} },
+            { id: "d2", day: "2026-02-02", score: null, contributors: {} },
           ],
           sleepPeriods: [],
         });

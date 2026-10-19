@@ -15,7 +15,7 @@
             "id": { "type": "string" },
             "day": { "type": "string", "format": "date", "description": "Date in YYYY-MM-DD format" },
             "score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100, "description": "Overall readiness score (0-100)" },
-            "timestamp": { "type": "string", "format": "date-time" },
+            "timestamp": { "type": ["string", "null"], "format": "date-time" },
             "temperatureDeviation": { "type": ["number", "null"], "description": "Body temperature deviation from baseline in degrees Celsius" },
             "temperatureTrendDeviation": { "type": ["number", "null"], "description": "Temperature trend deviation from baseline" },
             "contributors": {

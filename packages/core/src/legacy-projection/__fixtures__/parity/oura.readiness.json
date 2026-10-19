@@ -52,6 +52,10 @@
       }
     ]
   },
-  "reviewedDifferences": [],
+  "reviewedDifferences": [
+    { "path": "days[id=readiness-0].contributors", "legacy": "<absent>", "projected": {}, "reason": "Oura API v2 legacy mapper supplies an empty contributor object when absent" },
+    { "path": "days[id=readiness-1].contributors", "legacy": "<absent>", "projected": {}, "reason": "Oura API v2 legacy mapper supplies an empty contributor object when absent" },
+    { "path": "days[id=readiness-2].contributors", "legacy": "<absent>", "projected": {}, "reason": "Oura API v2 legacy mapper supplies an empty contributor object when absent" }
+  ],
   "profileKey": "oura-browser"
 }

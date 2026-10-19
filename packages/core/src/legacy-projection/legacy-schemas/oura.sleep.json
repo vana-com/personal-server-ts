@@ -16,7 +16,7 @@
             "id": { "type": "string" },
             "day": { "type": "string", "format": "date", "description": "Date in YYYY-MM-DD format" },
             "score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100, "description": "Overall sleep score (0-100)" },
-            "timestamp": { "type": "string", "format": "date-time" },
+            "timestamp": { "type": ["string", "null"], "format": "date-time" },
             "contributors": {
               "type": "object",
               "properties": {
@@ -42,7 +42,7 @@
           "properties": {
             "id": { "type": "string" },
             "day": { "type": "string", "format": "date", "description": "Date in YYYY-MM-DD format" },
-            "type": { "type": "string", "enum": ["long_sleep", "short_sleep", "rest"], "description": "Type of sleep period" },
+            "type": { "type": ["string", "null"], "description": "Type of sleep period as returned by Oura API v2" },
             "bedtimeStart": { "type": ["string", "null"], "format": "date-time", "description": "Bedtime start in ISO 8601" },
             "bedtimeEnd": { "type": ["string", "null"], "format": "date-time", "description": "Bedtime end in ISO 8601" },
             "totalSleepDuration": { "type": ["integer", "null"], "description": "Total sleep duration in seconds" },
@@ -54,7 +54,7 @@
             "efficiency": { "type": ["integer", "null"], "description": "Sleep efficiency percentage" },
             "latency": { "type": ["integer", "null"], "description": "Sleep onset latency in seconds" },
             "averageHeartRate": { "type": ["number", "null"], "description": "Average heart rate during sleep in BPM" },
-            "averageHrv": { "type": ["integer", "null"], "description": "Average heart rate variability during sleep in ms" },
+            "averageHrv": { "type": ["number", "null"], "description": "Average heart rate variability during sleep in ms" },
             "lowestHeartRate": { "type": ["integer", "null"], "description": "Lowest heart rate during sleep in BPM" },
             "averageBreath": { "type": ["number", "null"], "description": "Average breathing rate during sleep in breaths/min" },
             "restlessPeriods": { "type": ["integer", "null"], "description": "Number of restless periods during sleep" }

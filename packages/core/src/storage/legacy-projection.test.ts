@@ -72,7 +72,7 @@ describe("classifyStoredBody", () => {
     ["chatgpt.conversations", { records: [] }, "pdpp-projected"],
     ["claude.projects", { records: [{ id: "p" }] }, "pdpp-projected"],
     ["chatgpt.messages", { records: [] }, "pdpp-unprojected"],
-    ["oura.sleep", { records: [] }, "pdpp-unprojected"],
+    ["oura.sleep", { records: [] }, "pdpp-projected"],
     ["github.repositories", { records: [] }, "pdpp-unprojected"],
     ["chatgpt.conversations", { conversations: [], total: 0 }, "legacy"],
     ["chatgpt.conversations", { records: [], total: 0 }, "legacy"],
@@ -112,18 +112,303 @@ describe("legacyScopesProjectedFrom", () => {
 });
 
 describe("withLegacyProjection", () => {
+  it("emits the legacy empty contributors object when an Oura API row omits it", async () => {
+    const raw = createMemoryDataStorage();
+    const at = "2026-10-01T00:00:00Z";
+    await store(raw, "oura.activity", at, {
+      records: [
+        {
+          id: "a",
+          day: "2026-09-01",
+          score: 80,
+        },
+      ],
+    });
+    await store(raw, "oura.sleep", at, {
+      records: [
+        {
+          id: "s",
+          day: "2026-09-01",
+          record_type: "daily_score",
+          sleep_score: 82,
+        },
+      ],
+    });
+    const served = withLegacyProjection(raw);
+    expect((await served.readEnvelope("oura.activity", at)).data).toEqual({
+      days: [{ id: "a", day: "2026-09-01", score: 80, contributors: {} }],
+    });
+    expect((await served.readEnvelope("oura.sleep", at)).data).toEqual({
+      dailyScores: [
+        { id: "s", day: "2026-09-01", score: 82, contributors: {} },
+      ],
+      sleepPeriods: [],
+    });
+  });
+
+  it("projects the data-connectors API v2 replay fixture through the served port", async () => {
+    const fixture = JSON.parse(
+      readFileSync(
+        new URL("./__fixtures__/oura-api-v2-replay.json", import.meta.url),
+        "utf8",
+      ),
+    ) as Record<string, Record<string, unknown>[]>;
+    const raw = createMemoryDataStorage();
+    const at = "2026-10-01T00:00:00Z";
+    await store(raw, "oura.readiness", at, {
+      records: fixture.daily_readiness,
+    });
+    await store(raw, "oura.activity", at, { records: fixture.daily_activity });
+    await store(raw, "oura.sleep", at, {
+      records: [
+        ...fixture.sleep.map((session) => ({
+          ...session,
+          record_type: "sleep_session",
+        })),
+        ...fixture.daily_sleep.map((score) => ({
+          record_type: "daily_score",
+          id: score.id,
+          day: score.day,
+          daily_sleep_id: score.id,
+          sleep_score: score.score,
+          daily_sleep_timestamp: score.timestamp,
+          contributors: score.contributors,
+        })),
+      ],
+    });
+    const served = withLegacyProjection(raw);
+    expect(
+      (await served.readEnvelope("oura.readiness", at)).data,
+    ).toMatchObject({
+      days: [
+        {
+          id: fixture.daily_readiness[0].id,
+          timestamp: "2026-09-23T08:15:00+00:00",
+          temperatureDeviation: 0.2,
+          temperatureTrendDeviation: 0.1,
+        },
+      ],
+    });
+    expect((await served.readEnvelope("oura.activity", at)).data).toMatchObject(
+      {
+        days: [
+          {
+            id: fixture.daily_activity[0].id,
+            timestamp: "2026-09-23T08:15:00+00:00",
+            activeCalories: 250,
+            equivalentWalkingDistance: 3800,
+          },
+        ],
+      },
+    );
+    expect((await served.readEnvelope("oura.sleep", at)).data).toEqual({
+      dailyScores: [
+        {
+          id: fixture.daily_sleep[0].id,
+          day: "2026-09-23",
+          score: 88,
+          timestamp: "2026-09-23T08:15:00+00:00",
+          contributors: { efficiency: 91 },
+        },
+      ],
+      sleepPeriods: [
+        {
+          id: fixture.sleep[0].id,
+          day: "2026-09-23",
+          type: "long_sleep",
+          bedtimeStart: "2026-09-22T22:00:00+00:00",
+          bedtimeEnd: "2026-09-23T06:00:00+00:00",
+          totalSleepDuration: 28000,
+          timeInBed: 29000,
+          deepSleepDuration: 7200,
+          lightSleepDuration: 12300,
+          remSleepDuration: 8500,
+          awakeTime: 1200,
+          efficiency: 96,
+          latency: 500,
+          averageHeartRate: 58,
+          averageHrv: 42,
+          lowestHeartRate: 51,
+          averageBreath: 14,
+          restlessPeriods: 3,
+        },
+      ],
+    });
+  });
+
+  it("serves every Oura API v2 field in the legacy shapes without changing stored records", async () => {
+    const raw = createMemoryDataStorage();
+    const at = "2026-10-01T00:00:00Z";
+    const readiness = {
+      id: "readiness-1",
+      day: "2026-09-01",
+      score: 85,
+      timestamp: "2026-09-01T07:00:00Z",
+      temperature_deviation: 0.2,
+      temperature_trend_deviation: -0.1,
+      contributors: { hrv_balance: 81 },
+    };
+    const activity = {
+      id: "activity-1",
+      day: "2026-09-01",
+      score: 82,
+      timestamp: "2026-09-01T23:59:00Z",
+      active_calories: 420,
+      total_calories: 2100,
+      steps: 8500,
+      equivalent_walking_distance: 6200,
+      high_activity_time: 900,
+      medium_activity_time: 1800,
+      low_activity_time: 2700,
+      sedentary_time: 3600,
+      resting_time: 1800,
+      inactivity_alerts: 1,
+      contributors: { stay_active: 79 },
+    };
+    const score = {
+      record_type: "daily_score",
+      id: "score-1",
+      daily_sleep_id: "score-1",
+      day: "2026-09-01",
+      sleep_score: 83,
+      daily_sleep_timestamp: "2026-09-01T07:15:00Z",
+      contributors: { deep_sleep: 75 },
+    };
+    const period = {
+      record_type: "sleep_session",
+      id: "period-1",
+      day: "2026-09-01",
+      type: "new_sleep_type",
+      bedtime_start: "2026-08-31T23:00:00Z",
+      bedtime_end: "2026-09-01T07:00:00Z",
+      total_sleep_duration: 26000,
+      time_in_bed: 28800,
+      deep_sleep_duration: 5000,
+      light_sleep_duration: 12000,
+      rem_sleep_duration: 9000,
+      awake_time: 1200,
+      efficiency: 90,
+      latency: 600,
+      average_heart_rate: 52.5,
+      average_hrv: 45.75,
+      lowest_heart_rate: 42,
+      average_breath: 14.2,
+      restless_periods: 2,
+    };
+    await store(raw, "oura.readiness", at, { records: [readiness] });
+    await store(raw, "oura.activity", at, { records: [activity] });
+    await store(raw, "oura.sleep", at, { records: [score, period] });
+    const served = withLegacyProjection(raw);
+
+    expect((await served.readEnvelope("oura.readiness", at)).data).toEqual({
+      days: [
+        {
+          id: "readiness-1",
+          day: "2026-09-01",
+          score: 85,
+          timestamp: "2026-09-01T07:00:00Z",
+          temperatureDeviation: 0.2,
+          temperatureTrendDeviation: -0.1,
+          contributors: { hrv_balance: 81 },
+        },
+      ],
+    });
+    expect((await served.readEnvelope("oura.activity", at)).data).toEqual({
+      days: [
+        {
+          id: "activity-1",
+          day: "2026-09-01",
+          score: 82,
+          timestamp: "2026-09-01T23:59:00Z",
+          activeCalories: 420,
+          totalCalories: 2100,
+          steps: 8500,
+          equivalentWalkingDistance: 6200,
+          highActivityTime: 900,
+          mediumActivityTime: 1800,
+          lowActivityTime: 2700,
+          sedentaryTime: 3600,
+          restingTime: 1800,
+          inactivityAlerts: 1,
+          contributors: { stay_active: 79 },
+        },
+      ],
+    });
+    expect((await served.readEnvelope("oura.sleep", at)).data).toEqual({
+      dailyScores: [
+        {
+          id: "score-1",
+          day: "2026-09-01",
+          score: 83,
+          timestamp: "2026-09-01T07:15:00Z",
+          contributors: { deep_sleep: 75 },
+        },
+      ],
+      sleepPeriods: [
+        {
+          id: "period-1",
+          day: "2026-09-01",
+          type: "new_sleep_type",
+          bedtimeStart: "2026-08-31T23:00:00Z",
+          bedtimeEnd: "2026-09-01T07:00:00Z",
+          totalSleepDuration: 26000,
+          timeInBed: 28800,
+          deepSleepDuration: 5000,
+          lightSleepDuration: 12000,
+          remSleepDuration: 9000,
+          awakeTime: 1200,
+          efficiency: 90,
+          latency: 600,
+          averageHeartRate: 52.5,
+          averageHrv: 45.75,
+          lowestHeartRate: 42,
+          averageBreath: 14.2,
+          restlessPeriods: 2,
+        },
+      ],
+    });
+    expect((await raw.readEnvelope("oura.sleep", at)).data).toEqual({
+      records: [score, period],
+    });
+    expect((await served.readStoredEnvelope!("oura.sleep", at)).data).toEqual({
+      records: [score, period],
+    });
+    const nextAt = "2026-10-02T00:00:00Z";
+    await store(raw, "oura.readiness", nextAt, {
+      records: [{ ...readiness, score: 91 }],
+    });
+    expect(
+      (await served.readEnvelope("oura.readiness", nextAt)).data,
+    ).toMatchObject({
+      days: [{ score: 91 }],
+    });
+    expect(
+      (await served.readEnvelope("oura.readiness", at)).data,
+    ).toMatchObject({
+      days: [{ score: 85 }],
+    });
+  });
+
   it.each([
     ["2026-10-01T00:00:00Z", "2026-10-01T00:00:00.500Z"],
     ["2026-10-01T00:00:00.500Z", "2026-10-01T00:00:00Z"],
-  ])("uses the newest input instant for mixed formats (%s, %s)", async (own, sibling) => {
-    const raw = createMemoryDataStorage();
-    await store(raw, "chatgpt.conversations", own, { records: [conversation] });
-    await store(raw, "chatgpt.messages", sibling, { records: messages });
-    const envelope = await withLegacyProjection(raw).readEnvelope("chatgpt.conversations", own);
-    expect(envelope.data).toMatchObject({
-      conversations: [{ fetched_at: "2026-10-01T00:00:00.500Z" }],
-    });
-  });
+  ])(
+    "uses the newest input instant for mixed formats (%s, %s)",
+    async (own, sibling) => {
+      const raw = createMemoryDataStorage();
+      await store(raw, "chatgpt.conversations", own, {
+        records: [conversation],
+      });
+      await store(raw, "chatgpt.messages", sibling, { records: messages });
+      const envelope = await withLegacyProjection(raw).readEnvelope(
+        "chatgpt.conversations",
+        own,
+      );
+      expect(envelope.data).toMatchObject({
+        conversations: [{ fetched_at: "2026-10-01T00:00:00.500Z" }],
+      });
+    },
+  );
 
   it("serves chatgpt.conversations projected from the stored conversations and messages streams", async () => {
     const raw = createMemoryDataStorage();
@@ -586,6 +871,36 @@ describe("withLegacyProjection parity goldens", () => {
 });
 
 describe("supersedeLegacyVersions", () => {
+  it("never supersedes stored Oura legacy versions, even for matching item counts", async () => {
+    const raw = createMemoryDataStorage();
+    const oldAt = "2026-09-01T00:00:00Z";
+    const newAt = "2026-10-01T00:00:00Z";
+    await store(raw, "oura.sleep", oldAt, {
+      dailyScores: [{ id: "score-1", day: "2026-09-01", score: 80 }],
+      sleepPeriods: [{ id: "period-1", day: "2026-09-01" }],
+    });
+    await store(raw, "oura.sleep", newAt, {
+      records: [
+        {
+          record_type: "daily_score",
+          id: "score-1",
+          day: "2026-09-01",
+          sleep_score: 80,
+        },
+      ],
+    });
+    expect(
+      await supersedeLegacyVersions(
+        withLegacyProjection(raw),
+        "oura.sleep",
+        newAt,
+      ),
+    ).toEqual({ superseded: [], refused: "Oura projection is read-time only" });
+    expect((await raw.readEnvelope("oura.sleep", oldAt)).data).toMatchObject({
+      dailyScores: [{ id: "score-1" }],
+    });
+  });
+
   it("deletes only older legacy-form versions of the scope", async () => {
     const raw = createMemoryDataStorage();
     const legacy = { conversations: [], total: 0 };
