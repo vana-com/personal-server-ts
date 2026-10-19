@@ -31,11 +31,16 @@ import type { DataBlockManifest, DataScopeBlock } from "./blocks/types.js";
 import { previewEnvelopeValue } from "./preview.js";
 
 /**
- * Sources whose `{records}` bodies are projected. Other sources either emit
- * legacy wrappers themselves (GitHub, Strava) or have no real-shape parity
- * evidence yet (Oura), so their stored bodies are served as stored.
+ * Sources whose `{records}` bodies have complete, tested legacy bindings.
+ * Other sources either emit legacy wrappers themselves (GitHub, Strava) or
+ * lack real-shape parity evidence (Oura), so their stored bodies are served
+ * as stored.
  */
-const PROJECTED_SOURCES: ReadonlySet<string> = new Set(["chatgpt", "claude"]);
+const PROJECTED_SOURCES: ReadonlySet<string> = new Set([
+  "chatgpt",
+  "claude",
+  "youtube",
+]);
 
 /** Keys the server stamps into `data`; they are not part of the body. */
 const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
@@ -149,13 +154,21 @@ export function withLegacyProjection(
     // in time: the one its own run wrote, before or after it.
     const supersededAt = nextVersionTime(raw, scope, collectedAt);
     const inputs = binding.pdppStreams.map((stream) => {
-      const storedScope = `${source}.${stream}`;
-      const entry =
+      let storedScope = `${source}.${stream}`;
+      let entry =
         storedScope === scope
           ? raw.findEntry({ scope, at: collectedAt })
           : supersededAt === undefined
             ? raw.findEntry({ scope: storedScope })
             : nearestBefore(raw, storedScope, collectedAt, supersededAt);
+      // Some PDPP streams have a legacy scope alias (for example,
+      // youtube.history -> youtube.watch_history). Lite stores the stream
+      // envelope under that alias, so use it as the single stream input when
+      // no canonical stream-scope entry exists.
+      if (!entry && binding.pdppStreams.length === 1 && storedScope !== scope) {
+        storedScope = scope;
+        entry = raw.findEntry({ scope, at: collectedAt });
+      }
       return {
         stream,
         storedScope,
