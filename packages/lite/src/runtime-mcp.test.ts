@@ -625,6 +625,73 @@ describe("createPsLiteRuntime + MCP OAuth routes", () => {
     });
   });
 
+  it("redirects authorize errors only to an allowed redirect_uri", async () => {
+    const bundle = buildRuntime({
+      approvalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+    });
+    const ok = await bundle.runtime.fetch(
+      new Request(
+        `${SERVER_ORIGIN}/mcp/oauth/authorize?${new URLSearchParams({
+          response_type: "token",
+          redirect_uri: CLAUDE_REDIRECT_URI,
+          state: "s1",
+        })}`,
+      ),
+    );
+    expect(ok.status).toBe(302);
+    expect(new URL(ok.headers.get("location")!).searchParams.get("error")).toBe(
+      "unsupported_response_type",
+    );
+
+    for (const redirectUri of [
+      "javascript:alert(1)",
+      "data:text/html,x",
+      "http://example.com/cb",
+    ]) {
+      for (const responseType of ["token", "code"]) {
+        const res = await bundle.runtime.fetch(
+          new Request(
+            `${SERVER_ORIGIN}/mcp/oauth/authorize?${new URLSearchParams({
+              response_type: responseType,
+              client_id: "client",
+              redirect_uri: redirectUri,
+              code_challenge: "challenge",
+              code_challenge_method: "S256",
+            })}`,
+          ),
+        );
+        expect(res.status).toBe(400);
+        expect(res.headers.get("location")).toBeNull();
+        expect((await res.json()).error).toBeTruthy();
+      }
+    }
+  });
+
+  it("validates redirect_uris on dynamic client registration", async () => {
+    const bundle = buildRuntime({
+      approvalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+    });
+    const register = (redirect_uris: unknown[]) =>
+      bundle.runtime.fetch(
+        new Request(`${SERVER_ORIGIN}/mcp/oauth/register`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ client_name: "Client", redirect_uris }),
+        }),
+      );
+    const accepted = await register([
+      CLAUDE_REDIRECT_URI,
+      "http://localhost:6274/oauth/callback",
+      "cursor://anysphere.cursor-retrieval/oauth/callback",
+    ]);
+    expect(accepted.status).toBe(201);
+    const rejected = await register([CLAUDE_REDIRECT_URI, "javascript:x"]);
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toMatchObject({
+      error: "invalid_redirect_uri",
+    });
+  });
+
   it("creates an authorization from Claude OAuth and redeems it after owner approval", async () => {
     const bundle = buildRuntime({
       approvalUrl: "https://app-dev.vana.org/mcp/connect/claude",

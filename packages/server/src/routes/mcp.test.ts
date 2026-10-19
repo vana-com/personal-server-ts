@@ -1273,6 +1273,63 @@ describe("MCP OAuth routes", () => {
     });
   });
 
+  it("redirects authorize errors only to an allowed redirect_uri", async () => {
+    const ok = await app.request(
+      `/mcp/oauth/authorize?${new URLSearchParams({
+        response_type: "token",
+        redirect_uri: CLAUDE_REDIRECT_URI,
+        state: "s1",
+      })}`,
+    );
+    expect(ok.status).toBe(302);
+    const location = new URL(ok.headers.get("location")!);
+    expect(location.searchParams.get("error")).toBe(
+      "unsupported_response_type",
+    );
+    expect(location.searchParams.get("state")).toBe("s1");
+
+    for (const redirectUri of [
+      "javascript:alert(1)",
+      "data:text/html,x",
+      "http://example.com/cb",
+    ]) {
+      for (const responseType of ["token", "code"]) {
+        const res = await app.request(
+          `/mcp/oauth/authorize?${new URLSearchParams({
+            response_type: responseType,
+            client_id: "client",
+            redirect_uri: redirectUri,
+            code_challenge: "challenge",
+            code_challenge_method: "S256",
+          })}`,
+        );
+        expect(res.status).toBe(400);
+        expect(res.headers.get("location")).toBeNull();
+        expect((await res.json()).error).toBeTruthy();
+      }
+    }
+  });
+
+  it("validates redirect_uris on dynamic client registration", async () => {
+    const register = (redirect_uris: unknown[]) =>
+      app.request("/mcp/oauth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_name: "Client", redirect_uris }),
+      });
+    const accepted = await register([
+      CLAUDE_REDIRECT_URI,
+      "http://127.0.0.1:33418/callback",
+      "cursor://anysphere.cursor-retrieval/oauth/callback",
+    ]);
+    expect(accepted.status).toBe(201);
+    const rejected = await register([CLAUDE_REDIRECT_URI, "javascript:x"]);
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toMatchObject({
+      error: "invalid_redirect_uri",
+    });
+  });
+
   it("creates an authorization from Claude OAuth and redeems it after owner approval", async () => {
     const register = await app.request("/mcp/oauth/register", {
       method: "POST",

@@ -94,6 +94,7 @@ import {
   McpConnectionNotFoundError,
   McpConnectionStateError,
   McpOAuthAuthorizationError,
+  isAllowedOAuthRedirectUri,
   McpScopeRequestError,
   redeemMcpOAuthAuthorizationCode,
   refreshMcpOAuthToken,
@@ -432,22 +433,22 @@ function redirectWithOAuthError(
   description: string,
   state: string | null,
 ): Response {
-  try {
+  // RFC 6749 4.1.2.1: never redirect to an invalid or unvalidated URI.
+  if (isAllowedOAuthRedirectUri(redirectUri)) {
     const url = new URL(redirectUri);
     url.searchParams.set("error", error);
     url.searchParams.set("error_description", description);
     if (state) url.searchParams.set("state", state);
     return Response.redirect(url.toString(), 302);
-  } catch {
-    return jsonResponse(
-      {
-        error,
-        error_description: description,
-        ...(state ? { state } : {}),
-      },
-      { status: 400 },
-    );
   }
+  return jsonResponse(
+    {
+      error,
+      error_description: description,
+      ...(state ? { state } : {}),
+    },
+    { status: 400 },
+  );
 }
 
 async function parseFormBody(request: Request): Promise<URLSearchParams> {
@@ -1423,6 +1424,18 @@ async function handleMcpRoute(input: {
       body = (await input.request.json()) as typeof body;
     } catch {
       body = {};
+    }
+    if (
+      Array.isArray(body.redirect_uris) &&
+      !body.redirect_uris.every(isAllowedOAuthRedirectUri)
+    ) {
+      return jsonResponse(
+        {
+          error: "invalid_redirect_uri",
+          error_description: "One or more redirect_uris are not allowed",
+        },
+        { status: 400 },
+      );
     }
     return jsonResponse(
       {

@@ -47,6 +47,7 @@ import type {
   McpOAuthAuthorizationStore,
 } from "./types.js";
 import { MCP_SCOPE_ACCESS_REQUEST_LIMIT } from "./types.js";
+import { isAllowedOAuthRedirectUri } from "./oauth-redirect.js";
 import {
   isMcpRefreshExpired,
   MCP_TOKEN_TTL_MS,
@@ -914,6 +915,12 @@ export async function createMcpOAuthAuthorization(
     throw new McpOAuthAuthorizationError(
       "invalid_request",
       "redirect_uri is required",
+    );
+  }
+  if (!isAllowedOAuthRedirectUri(input.redirectUri)) {
+    throw new McpOAuthAuthorizationError(
+      "invalid_request",
+      "redirect_uri is not an allowed redirect URI",
     );
   }
   if (!input.codeChallenge.trim()) {
