@@ -3,7 +3,7 @@
 	"connector_id": "https://registry.pdpp.dev/connectors/wholefoods",
 	"connector_key": "wholefoods",
 	"manifest_uri": "https://registry.pdpp.dev/connectors/wholefoods",
-	"version": "0.3.0",
+	"version": "0.3.34",
 	"display_name": "Whole Foods",
 	"runtime_requirements": {
 		"bindings": {
@@ -224,6 +224,8 @@
 					"source": {
 						"type": "string",
 						"enum": [
+							"wholefoods_structured_data",
+							"amazon_product_page",
 							"wholefoods_product_page",
 							"usda_fdc",
 							"not_found",
@@ -261,7 +263,28 @@
 					},
 					"servings_per_container": {
 						"type": ["number", "null"]
-					}
+					},
+					"saturated_fat_g": { "type": ["number", "null"] },
+					"trans_fat_g": { "type": ["number", "null"] },
+					"cholesterol_mg": { "type": ["number", "null"] },
+					"added_sugar_g": { "type": ["number", "null"] },
+					"potassium_mg": { "type": ["number", "null"] },
+					"calcium_mg": { "type": ["number", "null"] },
+					"iron_mg": { "type": ["number", "null"] },
+					"vitamin_d_mcg": { "type": ["number", "null"] },
+					"ingredients": { "type": ["string", "null"] },
+					"allergens": { "type": ["string", "null"] },
+					"highlights": { "type": "array" },
+					"category": { "type": "array" },
+					"upc": { "type": ["string", "null"] },
+					"raw_nutrition_text": { "type": ["string", "null"] },
+					"usda_fdc_id": { "type": ["integer", "null"] },
+					"usda_match_method": { "type": ["string", "null"] },
+					"usda_description": { "type": ["string", "null"] },
+					"usda_brand": { "type": ["string", "null"] },
+					"error": { "type": ["string", "null"] },
+					"page_title": { "type": ["string", "null"] },
+					"type": { "type": ["string", "null"] }
 				},
 				"required": ["product_id", "source", "confidence"]
 			},

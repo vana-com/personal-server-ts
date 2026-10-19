@@ -260,7 +260,7 @@ describe("legacy scope binding self-check", () => {
     const wholeFoodsStreamNames = wholefoodsDeclaration.streams.map(
       (stream) => stream.name,
     );
-    expect(wholefoodsDeclaration.version).toBe("0.3.0");
+    expect(wholefoodsDeclaration.version).toBe("0.3.34");
     expect(wholeFoodsStreamNames).toEqual([
       "profile",
       "orders",

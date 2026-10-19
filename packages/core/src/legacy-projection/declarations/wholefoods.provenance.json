@@ -2,7 +2,7 @@
   "generated_file_notice": "GENERATED FILE — DO NOT HAND-EDIT. Rebuild with scripts/build-connector-oci-artifact.mjs.",
   "connector_key": "wholefoods",
   "connector_id": "https://registry.pdpp.dev/connectors/wholefoods",
-  "version": "0.3.0",
+  "version": "0.3.34",
   "protocol_version": "0.1.0",
   "source": {
     "repository": "https://github.com/PDP-Connect/data-connectors",
@@ -149,7 +149,7 @@
     "zod"
   ],
   "outputs": {
-    "collection-profile.json": "sha256:b61408fd381da52e9d395696d875282ffb763837381b598e855c7c250c08e4e0",
+    "collection-profile.json": "sha256:2240249fc49d663798465d2ea42273402bd31a135cd0d262110098ee72e019de",
     "code.tar.gz": "sha256:759dd8cd05efe581bb27b4ec2dd1fda408224cf724f3cd8929eb104b3f225a3f",
     "assets.tar.gz": null,
     "licenses.tar.gz": "sha256:8d502bb8a83e63101397c7a57af52da4a456d5bfe382c4731920594d485c3398"

@@ -9,6 +9,7 @@ import profileFixtures from "./__fixtures__/grocery-profiles.compatibility.json"
 import pendingOutcomes from "./__fixtures__/grocery-pending-source-outcomes.json";
 import { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
 import type { PdppRecord } from "./types.js";
+import { createMemoryRecordStore } from "../storage/pdpp-records/memory-store.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false });
 
@@ -517,7 +518,7 @@ describe("grocery legacy scope projections", () => {
     validates(wholefoodsOrdersSchema, payload);
   });
 
-  it("maps Whole Foods nutrition values under the declared Amazon product id", () => {
+  it("maps Whole Foods nutrition values to the frozen legacy script shape", () => {
     const payload = project(
       "wholefoods.nutrition",
       [
@@ -553,7 +554,10 @@ describe("grocery legacy scope projections", () => {
           name: "Apples",
           source: "usda_fdc",
           productUrl: "https://amazon.test/dp/B000000001",
-          images: "https://img.test/apple.jpg",
+          images: {
+            thumbnail: "https://img.test/apple.jpg",
+            full: "",
+          },
           calories: 52,
           carbs_g: 14,
           servingSize: "100 g",
@@ -563,6 +567,231 @@ describe("grocery legacy scope projections", () => {
       coverage: { total: 1, found: 0, foundUSDA: 1, percentCovered: 100 },
     });
     validates(wholefoodsNutritionSchema, payload);
+  });
+
+  it("keeps cancelled orders with no item rows and preserves nullable legacy fields", () => {
+    const payload = project(
+      "wholefoods.orders",
+      [
+        {
+          stream: "orders",
+          data: {
+            id: "cancelled-order",
+            status: "Cancelled",
+            order_date: null,
+            order_url: "https://amazon.test/order/cancelled",
+            total_cents: null,
+            item_count: null,
+          },
+        },
+      ],
+      ["orders", "order_items"],
+    );
+    expect(payload).toEqual({
+      orders: [
+        {
+          orderId: "cancelled-order",
+          orderUrl: "https://amazon.test/order/cancelled",
+          orderDate: null,
+          total: null,
+          itemCount: null,
+          status: "Cancelled",
+          items: [],
+        },
+      ],
+      totalOrders: 1,
+      totalItems: 0,
+    });
+    validates(wholefoodsOrdersSchema, payload);
+  });
+
+  it("differentially projects good, failed, and recovered offline refreshes through ingest", () => {
+    const store = createMemoryRecordStore();
+    const streamSemantics = () => "mutable_state" as const;
+    const primaryKeyFields = (stream: string) =>
+      stream === "orders"
+        ? ["id"]
+        : stream === "order_items"
+          ? ["id"]
+          : ["product_id"];
+    const ingest = (
+      emittedAt: string,
+      records: Array<{
+        stream: string;
+        key: string;
+        data: Record<string, unknown>;
+      }>,
+    ) =>
+      store.ingestBatch(
+        records.map((record) => ({
+          instance: "amazon-account",
+          stream: record.stream,
+          key: record.key,
+          data: record.data,
+          emitted_at: emittedAt,
+        })),
+        streamSemantics,
+        primaryKeyFields,
+      );
+    const projectStored = (scope: string, streams: string[]) => {
+      const records: PdppRecord[] = streams.flatMap((stream) =>
+        store
+          .listRecords(stream, {
+            instanceIds: ["amazon-account"],
+            limit: 100,
+            order: "asc",
+          })
+          .data.map((row) => ({ stream, data: row.data })),
+      );
+      const result = LEGACY_SCOPE_BINDINGS.get(scope)?.project(records, {
+        fetchedStreams: streams,
+      });
+      expect(result?.ok, JSON.stringify(result)).toBe(true);
+      if (!result?.ok) throw new Error(`Projection failed for ${scope}`);
+      return result.payload;
+    };
+    const nutrition = (calories: number) => ({
+      product_id: "B000000001",
+      name: "Apples",
+      source: "wholefoods_structured_data",
+      confidence: "high",
+      calories,
+      protein_g: 0.3,
+      carbs_g: 14,
+      fat_g: 0.2,
+      saturated_fat_g: 0,
+      trans_fat_g: 0,
+      cholesterol_mg: 0,
+      added_sugar_g: null,
+      sodium_mg: 1,
+      potassium_mg: 107,
+      calcium_mg: 6,
+      iron_mg: 0.1,
+      vitamin_d_mcg: 0,
+      fiber_g: 2.4,
+      sugar_g: 10,
+      ingredients: "Apples",
+      allergens: null,
+      highlights: [],
+      category: ["Produce"],
+      upc: "012345678905",
+      raw_nutrition_text: null,
+      usda_fdc_id: null,
+      usda_match_method: null,
+      usda_description: null,
+      usda_brand: null,
+      type: "https://schema.org/NutritionInformation",
+      serving_size: "1 medium",
+      servings_per_container: null,
+    });
+    const order = (id: string, status = "Completed") => ({
+      id,
+      order_date: "2026-10-01",
+      order_url: `https://amazon.test/order/${id}`,
+      status,
+      total_cents: null,
+      item_count: status === "Cancelled" ? 0 : 1,
+    });
+    const item = (id: string, orderId: string) => ({
+      id,
+      order_id: orderId,
+      name: "Apples",
+      product_id: "B000000001",
+      product_url: "https://amazon.test/dp/B000000001",
+      image_url: "https://img.test/apples.jpg",
+      quantity: 1,
+      unit_price_cents: null,
+    });
+
+    const good = ingest("2026-10-01T00:00:00.000Z", [
+      { stream: "orders", key: "order-1", data: order("order-1") },
+      {
+        stream: "orders",
+        key: "cancelled-1",
+        data: order("cancelled-1", "Cancelled"),
+      },
+      {
+        stream: "order_items",
+        key: "order-1#B000000001",
+        data: item("order-1#B000000001", "order-1"),
+      },
+      { stream: "nutrition", key: "B000000001", data: nutrition(52) },
+    ]);
+    expect(good.rejected).toEqual([]);
+    expect(
+      projectStored("wholefoods.nutrition", ["nutrition", "order_items"]),
+    ).toMatchObject({
+      items: {
+        B000000001: {
+          images: { thumbnail: "https://img.test/apples.jpg", full: "" },
+          calories: 52,
+          ingredients: "Apples",
+          upc: "012345678905",
+          "@type": "https://schema.org/NutritionInformation",
+        },
+      },
+    });
+
+    // This is a failed refresh: a new order and item arrived, one detail was
+    // unreadable, and nutrition lookup failed. The data connector withholds
+    // both failed same-key rows; absence is not a delete in mutable-state ingest.
+    const failed = ingest("2026-10-02T00:00:00.000Z", [
+      { stream: "orders", key: "order-2", data: order("order-2") },
+      {
+        stream: "order_items",
+        key: "order-2#B000000001",
+        data: item("order-2#B000000001", "order-2"),
+      },
+    ]);
+    expect(failed.rejected).toEqual([]);
+    expect(
+      store.getRecord("amazon-account", "nutrition", "B000000001")?.data
+        .calories,
+    ).toBe(52);
+    expect(
+      store.getRecord("amazon-account", "orders", "order-1")?.data.order_date,
+    ).toBe("2026-10-01");
+    expect(
+      projectStored("wholefoods.orders", ["orders", "order_items"]),
+    ).toMatchObject({
+      totalOrders: 3,
+      orders: [
+        {
+          orderId: "cancelled-1",
+          status: "Cancelled",
+          items: [],
+          itemCount: null,
+          total: null,
+        },
+        {
+          orderId: "order-1",
+          items: [{ productId: "B000000001", quantity: "1" }],
+        },
+        {
+          orderId: "order-2",
+          items: [{ productId: "B000000001", quantity: "1" }],
+        },
+      ],
+    });
+
+    const recovered = ingest("2026-10-03T00:00:00.000Z", [
+      { stream: "orders", key: "order-3", data: order("order-3") },
+      {
+        stream: "order_items",
+        key: "order-3#B000000001",
+        data: item("order-3#B000000001", "order-3"),
+      },
+      { stream: "nutrition", key: "B000000001", data: nutrition(53) },
+    ]);
+    expect(recovered.rejected).toEqual([]);
+    expect(
+      projectStored("wholefoods.nutrition", ["nutrition", "order_items"]),
+    ).toMatchObject({
+      items: {
+        B000000001: { calories: 53, source: "wholefoods_structured_data" },
+      },
+      coverage: { total: 1, found: 1 },
+    });
   });
 
   it("projects every Whole Foods nutrition outcome and counts blocked lookups", () => {

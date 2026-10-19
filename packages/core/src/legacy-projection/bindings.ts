@@ -967,7 +967,7 @@ const instagramPosts: LegacyScopeBinding = {
   },
   primaryKey: { posts: ["id"], post_likes: ["post_id", "liker_ordinal"] },
   lossy: [
-    "nullable media_url, caption, and like_count use the retained collector's empty-string and zero sentinels; every source post is retained",
+    "nullable media_url, caption, and like_count use the retained legacy data connector's empty-string and zero sentinels; every source post is retained",
     "media_url is only available for images and the first image in a carousel; video posts and later carousel images are absent from the artifact's parser output",
     "who_liked.profile_pic_url is omitted because the post_likes stream does not declare it",
     "who_liked.pk and who_liked.id both use post_likes.user_id because the source exposes one liker identity field",
@@ -3059,8 +3059,8 @@ const spotifyPlaylists: LegacyScopeBinding = {
     playlist_items: ["id"],
   },
   lossy: [
-    "tracks[].uri: raw playlist item URIs are retained when available; older pinned records fall back to a canonical Spotify track ID, and a null ID uses the retained collector's empty-string sentinel.",
-    "tracks_total counts joined fetched tracks, as in the retained collector; catalog track_count is not a fetched-row count.",
+    "tracks[].uri: raw playlist item URIs are retained when available; older pinned records fall back to a canonical Spotify track ID, and a null ID uses the retained legacy data connector's empty-string sentinel.",
+    "tracks_total counts joined fetched tracks, as in the retained legacy data connector; catalog track_count is not a fetched-row count.",
     "images: legacy stores string URLs. String entries are retained, and structured PDPP image entries project their string url field.",
   ],
   provenance: [
@@ -4010,7 +4010,7 @@ const hebOrders: LegacyScopeBinding = {
     "orderUrl and address: the signed profile has no equivalent fields; fulfillment_location is not treated as an address.",
     "status_code, store_name, timeslot_start/end, unfulfilled_count, fulfillment_method, and fetched_at are not represented by the legacy schema.",
     "total and item price: derived from declared integer cents when present; omitted when absent. No currency or decimal text is guessed.",
-    "the retained collector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
+    "the retained legacy data connector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
     "An order without a usable id, or with no usable line and an item_count that is not a known zero, is left out and counted; valid peers are still delivered.",
     "item_count counts quantity units; an order whose summed line quantities differ is delivered and reported partial.",
     "quantity: a declared numeric quantity is converted to its decimal string form to match the legacy connector output type.",
@@ -4244,7 +4244,7 @@ const wholefoodsOrders: LegacyScopeBinding = {
   },
   primaryKey: { orders: ["id"], order_items: ["id"] },
   lossy: [
-    "The retained collector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
+    "The retained legacy data connector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
     "An order with no usable line and an item_count that is not a known zero is left out and counted; an order whose line count differs from item_count, or whose item_count is unknown, is delivered and reported partial. A missing or duplicate order id still fails the scope.",
     "Product identity is the source Amazon ASIN in product_id.",
   ],
@@ -4329,7 +4329,13 @@ const wholefoodsOrders: LegacyScopeBinding = {
         typeof itemCount === "number" &&
         Number.isSafeInteger(itemCount) &&
         itemCount >= 0;
-      if (items.length === 0 && !(knownCount && itemCount === 0)) {
+      const cancelled =
+        typeof o.status === "string" && /cancelled/i.test(o.status);
+      if (
+        items.length === 0 &&
+        !(knownCount && itemCount === 0) &&
+        !cancelled
+      ) {
         dropped.add("orders", GROCERY_ORDER_ITEMS_GAP);
         return [];
       }
@@ -4342,19 +4348,15 @@ const wholefoodsOrders: LegacyScopeBinding = {
           ...(typeof o.order_date === "string" || o.order_date === null
             ? { orderDate: o.order_date }
             : {}),
-          // The legacy Whole Foods collector labeled every observed order Completed;
+          // The legacy data connector labeled every observed order Completed;
           // source 0.3.0 correctly reports status as unknown (null).
           ...(o.status === null
             ? { status: "Completed" }
             : typeof o.status === "string"
               ? { status: o.status }
               : {}),
-          ...(typeof o.total_cents === "number"
-            ? { total: o.total_cents / 100 }
-            : {}),
-          ...(typeof o.item_count === "number"
-            ? { itemCount: o.item_count }
-            : {}),
+          total: typeof o.total_cents === "number" ? o.total_cents / 100 : null,
+          itemCount: items.length > 0 && knownCount ? itemCount : null,
         },
       ];
     });
@@ -4396,6 +4398,27 @@ const wholefoodsNutritionFields = [
   "sugar_g",
   "serving_size",
   "servings_per_container",
+  "saturated_fat_g",
+  "trans_fat_g",
+  "cholesterol_mg",
+  "added_sugar_g",
+  "potassium_mg",
+  "calcium_mg",
+  "iron_mg",
+  "vitamin_d_mcg",
+  "ingredients",
+  "allergens",
+  "highlights",
+  "category",
+  "upc",
+  "raw_nutrition_text",
+  "usda_fdc_id",
+  "usda_match_method",
+  "usda_description",
+  "usda_brand",
+  "error",
+  "page_title",
+  "type",
 ];
 const wholefoodsNutrition: LegacyScopeBinding = {
   scope: "wholefoods.nutrition",
@@ -4408,7 +4431,6 @@ const wholefoodsNutrition: LegacyScopeBinding = {
   },
   primaryKey: { nutrition: ["product_id"], order_items: ["id"] },
   lossy: [
-    "ingredients and allergens are not collected by the current nutrition stream.",
     "servingsPerContainer is converted from the declared number to the legacy string field.",
   ],
   provenance: [
@@ -4458,6 +4480,8 @@ const wholefoodsNutrition: LegacyScopeBinding = {
         typeof n.source !== "string" ||
         ![
           "wholefoods_product_page",
+          "wholefoods_structured_data",
+          "amazon_product_page",
           "usda_fdc",
           "not_found",
           "error",
@@ -4490,7 +4514,10 @@ const wholefoodsNutrition: LegacyScopeBinding = {
       const item: Record<string, unknown> = { name, source: n.source };
       if (ordered?.productUrl !== undefined)
         item.productUrl = ordered.productUrl;
-      if (ordered?.imageUrl !== undefined) item.images = ordered.imageUrl;
+      item.images = {
+        thumbnail: ordered?.imageUrl ?? "",
+        full: "",
+      };
       if (["high", "medium", "low"].includes(String(n.confidence))) {
         item.confidence = n.confidence;
       }
@@ -4507,6 +4534,61 @@ const wholefoodsNutrition: LegacyScopeBinding = {
           item[field] = n[field];
         }
       }
+      for (const field of [
+        "saturated_fat_g",
+        "trans_fat_g",
+        "cholesterol_mg",
+        "added_sugar_g",
+        "potassium_mg",
+        "calcium_mg",
+        "iron_mg",
+        "vitamin_d_mcg",
+      ]) {
+        if (n[field] === null || typeof n[field] === "number") {
+          item[field] = n[field];
+        }
+      }
+      for (const field of [
+        "ingredients",
+        "allergens",
+        "upc",
+        "raw_nutrition_text",
+        "usda_fdc_id",
+        "usda_match_method",
+        "usda_description",
+        "usda_brand",
+        "error",
+        "page_title",
+      ]) {
+        if (
+          n[field] === null ||
+          typeof n[field] === "string" ||
+          typeof n[field] === "number"
+        ) {
+          const legacyField =
+            {
+              raw_nutrition_text: "rawNutritionText",
+              usda_fdc_id: "usdaFdcId",
+              usda_match_method: "usdaMatchMethod",
+              usda_description: "usdaDescription",
+              usda_brand: "usdaBrand",
+              page_title: "pageTitle",
+            }[field] ?? field;
+          item[legacyField] = n[field];
+        }
+      }
+      for (const field of ["highlights", "category"]) {
+        if (
+          Array.isArray(n[field]) &&
+          n[field].every((value) => typeof value === "string")
+        ) {
+          item[field] = n[field];
+        }
+      }
+      item["@type"] =
+        typeof n.type === "string"
+          ? n.type
+          : "https://schema.org/NutritionInformation";
       if (n.serving_size === null || typeof n.serving_size === "string")
         item.servingSize = n.serving_size;
       if (typeof n.servings_per_container === "number")
@@ -4514,7 +4596,12 @@ const wholefoodsNutrition: LegacyScopeBinding = {
       else if (n.servings_per_container === null)
         item.servingsPerContainer = null;
       items[n.product_id] = item;
-      if (n.source === "wholefoods_product_page") found++;
+      if (
+        n.source === "wholefoods_product_page" ||
+        n.source === "wholefoods_structured_data" ||
+        n.source === "amazon_product_page"
+      )
+        found++;
       if (n.source === "usda_fdc") foundUSDA++;
       if (n.source === "blocked") blocked++;
     }
