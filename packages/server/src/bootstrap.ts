@@ -5,14 +5,33 @@ import {
   type DurableAdditionsService,
 } from "@opendatalabs/personal-server-ts-core/additions";
 import type { RequestSigner } from "@opendatalabs/personal-server-ts-core/signing";
-import { mkdir } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
-import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
+import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { privateKeyToAccount } from "viem/accounts";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version: string };
+
+function takeoverLimit(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative finite number`);
+  }
+  return value;
+}
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { DEFAULT_ROOT_PATH, resolveRootPath } from "./config/index.js";
@@ -56,6 +75,7 @@ import {
   createGatewayDeleteDataPort,
   createScopeDeletionTracker,
   createSyncManager,
+  type PdppImporter,
   type SyncManager,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataPointFeedPort } from "@opendatalabs/personal-server-ts-core/ports";
@@ -66,11 +86,27 @@ import {
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
+import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
+import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
+import {
+  createPdppRecordsDeps,
+  coLocatedAuthorizationService,
+  createPdppSyncImporter,
+  registerLegacyDataConnections,
+} from "./pdpp/records-bootstrap.js";
+import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
+import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
+import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
+import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { generateDevToken } from "./dev-token.js";
 import { migrateLocalState } from "./migrations/local-state.js";
 import { createTokenStore, type TokenStore } from "./token-store.js";
 import { TunnelManager, ensureFrpcBinary } from "./tunnel/index.js";
-import { createNodeDataStorage } from "./storage/node-data-storage.js";
+import {
+  createNodeDataStorage,
+  recoverStagedDataFiles,
+  reindexLegacyDataFiles,
+} from "./storage/node-data-storage.js";
 import { createSqliteQuestionStore } from "./storage/question-store.js";
 import {
   computeQuestion,
@@ -220,9 +256,112 @@ export async function createServer(
     "pending-blob-deletions.json",
   );
   const tokensPath = join(storageRoot, "tokens.json");
+  const revisionJournalDir = join(storageRoot, "cas-revisions");
+  const metadataSentinelPath = join(storageRoot, "cas-metadata-initialized");
+  const historyUnknownPath = join(storageRoot, "cas-history-unknown");
+  const pathExists = async (path: string): Promise<boolean> => {
+    try {
+      await access(path);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
+  const hadIndex = await pathExists(indexPath);
+  const hadMetadataSentinel = await pathExists(metadataSentinelPath);
+  let hadLocalData = false;
+  try {
+    hadLocalData = (await readdir(dataDir)).length > 0;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 
+  const fsyncDirectory = async (path: string): Promise<void> => {
+    const handle = await open(path, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  };
+  const newDirectoryParents = new Set<string>();
+  for (const requested of [storageRoot, dataDir]) {
+    let current = requested;
+    while (!(await pathExists(current))) {
+      const parent = dirname(current);
+      if (parent === current) break;
+      newDirectoryParents.add(parent);
+      current = parent;
+    }
+  }
   await mkdir(storageRoot, { recursive: true });
   await mkdir(dataDir, { recursive: true });
+  for (const parent of [...newDirectoryParents].sort(
+    (a, b) => a.length - b.length,
+  )) {
+    await fsyncDirectory(parent);
+  }
+
+  const reindexInProgressPath = join(storageRoot, "reindex-in-progress");
+  const hasReindexInProgress = async (): Promise<boolean> => {
+    return pathExists(reindexInProgressPath);
+  };
+  const writeDurableRootFile = async (
+    path: string,
+    content: string,
+  ): Promise<void> => {
+    await writeFile(path, content);
+    const handle = await open(path, "r");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fsyncDirectory(storageRoot);
+  };
+  const markHistoryUnknown = async (): Promise<void> => {
+    await writeDurableRootFile(historyUnknownPath, "unknown\n");
+    await writeDurableRootFile(metadataSentinelPath, "unknown\n");
+  };
+  if ((hadMetadataSentinel || hadLocalData) && !hadIndex) {
+    await markHistoryUnknown();
+  } else if (
+    (hadMetadataSentinel &&
+      (await readFile(metadataSentinelPath, "utf8")) !== "initialized\n") ||
+    (await pathExists(historyUnknownPath))
+  ) {
+    await markHistoryUnknown();
+  } else if (!hadMetadataSentinel) {
+    await writeDurableRootFile(metadataSentinelPath, "initialized\n");
+  }
+  const markReindexInProgress = async (): Promise<void> => {
+    await writeFile(reindexInProgressPath, `${new Date().toISOString()}\n`);
+    const marker = await open(reindexInProgressPath, "r");
+    try {
+      await marker.sync();
+    } finally {
+      await marker.close();
+    }
+    await fsyncDirectory(storageRoot);
+  };
+  const clearReindexInProgress = async (): Promise<void> => {
+    await rm(reindexInProgressPath, { force: true });
+    await fsyncDirectory(storageRoot);
+  };
+  const hasScopeClosedMarker = async (scope: string): Promise<boolean> => {
+    const journalPath = join(
+      revisionJournalDir,
+      `${createHash("sha256").update(scope).digest("hex")}.revision.closed`,
+    );
+    try {
+      await access(journalPath);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  };
 
   const db = initializeDatabase(indexPath);
   await migrateLocalState({
@@ -234,8 +373,59 @@ export async function createServer(
     db,
     logger,
   });
-  const indexManager = createIndexManager(db);
+  // This database-held bit distinguishes an old index that needs open-marker
+  // migration from a migrated index whose root sentinel was later lost.
+  const openMarkerProtocolInitialized =
+    db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cas_open_marker_protocol'",
+      )
+      .get() !== undefined;
+  const indexManager = createIndexManager(db, {
+    revisionJournalDir,
+    historyUnknownPath,
+    // Existing databases predate open proofs. Later boots treat a missing
+    // proof as an interrupted close or metadata loss, never as open.
+    allowOpenMarkerMigration:
+      hadIndex && !hadMetadataSentinel && !openMarkerProtocolInitialized,
+  });
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS cas_open_marker_protocol (id INTEGER PRIMARY KEY)",
+  );
   const hierarchyOptions: HierarchyManagerOptions = { dataDir };
+  await cleanupExpiredScopeImports(
+    { hierarchyOptions, indexManager },
+    Date.now(),
+    true,
+  );
+  await recoverStagedDataFiles({ indexManager, hierarchyOptions });
+  const resumeReindex = await hasReindexInProgress();
+  let needsRecoveryScan = false;
+  for (const scope of indexManager.listIndexedScopes()) {
+    const closed = await hasScopeClosedMarker(scope);
+    if (resumeReindex || closed) {
+      indexManager.closeScopeForWrites(scope);
+    }
+    if (!closed && !indexManager.hasTrustedRevisionJournal(scope)) {
+      needsRecoveryScan = true;
+      indexManager.closeScopeForWrites(scope);
+    }
+  }
+  const indexedCount = db
+    .prepare("SELECT COUNT(*) AS count FROM data_files")
+    .get() as { count: number };
+  if (indexedCount.count === 0 || resumeReindex || needsRecoveryScan) {
+    await markReindexInProgress();
+    await reindexLegacyDataFiles({
+      indexManager,
+      hierarchyOptions,
+      closeRecoveredScopeForWrites: async (scope) =>
+        resumeReindex ||
+        (await hasScopeClosedMarker(scope)) ||
+        !indexManager.hasTrustedRevisionJournal(scope),
+    });
+    await clearReindexInProgress();
+  }
   // Sync moves stored bytes and must see them unchanged (the upload hashes
   // them). Every reader gets the served port, which projects legacy scope
   // bodies from stored PDPP records.
@@ -402,6 +592,28 @@ export async function createServer(
 
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
+  /**
+   * Late-bound PDPP importer.
+   *
+   * The sync engine is wired here, but the PDPP servers mount much further
+   * down: they need the index (to derive the connector inventory), the
+   * declarations and the auth store, none of which exist yet. Rather than
+   * reorder boot around the newer subsystem, the download worker holds this
+   * stable delegate and it starts importing the moment PDPP mounts. While
+   * PDPP is disabled or fails to mount, `importer` stays null and the
+   * delegate reports every envelope as skipped — sync behaves exactly as it
+   * did before this existed.
+   */
+  let pdppImporterImpl: PdppImporter | null = null;
+  const pdppImporter: PdppImporter = {
+    importEnvelope: (envelope) =>
+      pdppImporterImpl?.importEnvelope(envelope) ?? { status: "skipped" },
+    // Before PDPP mounts, nothing is settled: an entry indexed during that
+    // window must still be retried once the real importer attaches, which is
+    // the "enable PDPP after an earlier sync" case.
+    needsRetry: (scope, collectedAt) =>
+      pdppImporterImpl?.needsRetry(scope, collectedAt) ?? true,
+  };
   // Deletion-aware registry view. Independent of sync: the data route uses
   // it to answer 410 for scopes the owner deleted even when sync is off.
   const dataPointFeed =
@@ -416,6 +628,9 @@ export async function createServer(
     feed: dataPointFeed,
     serverOwner,
     logger,
+    deletionHistory: serverOwner
+      ? createScopeDeletionHistory(db, serverOwner)
+      : undefined,
   });
 
   // --- Derivative compute (question -> derivative) ---
@@ -583,6 +798,7 @@ export async function createServer(
         derivativeScheduler.markSourceChanged(event.scope, {
           lineageSources: event.lineageSources,
         }),
+      pdppImporter,
     };
 
     // Durable deletion: gateway tombstone signed with the same server
@@ -707,6 +923,82 @@ export async function createServer(
           })
       : undefined;
 
+  // PDPP Authorization Server. Opt-in, and returns undefined unless the
+  // deployment has an owner, retained declarations, and readable auth state —
+  // so `/pdpp/v1` is mounted only when it can actually issue grants.
+  const pdppAuth = await createPdppAuthDeps({
+    config,
+    storageRoot,
+    logger,
+    indexManager,
+    serverOrigin: () => effectiveOrigin,
+    serverOwner,
+    devToken,
+    accessToken,
+    tokenStore,
+  });
+
+  if (pdppAuth) {
+    registerLegacyDataConnections({
+      db,
+      serverOwner,
+      connectionMethods: pdppAuth.connectionMethods,
+      legacyScopes: indexManager
+        .listDistinctScopes()
+        .scopes.map(({ scope }) => scope),
+      logger,
+    });
+  }
+
+  // PDPP Resource Server. Mounts only alongside a mounted AS, so a real boot
+  // yields both halves over ONE token authority — the AS's own
+  // PdppTokenService, resolved in-process (Core §8 co-located). Without this
+  // a real server can issue a valid grant-bound token that has nothing to
+  // read, and cannot publish the RFC 9728 metadata a client needs to discover
+  // where to authorize.
+  const pdppRecords = createPdppRecordsDeps({
+    pdppAuth,
+    declarations: pdppAuth?.retainedDeclarations ?? [],
+    db,
+    serverOwner,
+    resource: effectiveOrigin,
+    logger,
+    configuredMethods: pdppAuth?.configuredMethods,
+  });
+
+  const pdppConnections = pdppAuth
+    ? {
+        store: createSqliteRecordStore(db),
+        auth: pdppRecords?.auth ?? coLocatedAuthorizationService(pdppAuth),
+        ownerSubjectId: serverOwner!,
+        connectionMethods: new Map(pdppAuth.connectionMethods),
+        configuredMethods:
+          pdppRecords?.configuredMethods ?? new Map<string, string[]>(),
+        canonicalSourceIds: new Set(
+          pdppAuth.configuredMethods.map((method) => method.sourceId),
+        ),
+        sourceIds: new Set([
+          ...pdppAuth.connectionMethods.keys(),
+          ...pdppAuth.retainedDeclarations.map(
+            (declaration) => declaration.source_id,
+          ),
+        ]),
+      }
+    : undefined;
+
+  // Close the sync→PDPP loop. Until this runs the download worker holds an
+  // inert delegate; from here a synced envelope carrying verified `$pdpp`
+  // metadata reaches the store the RS serves reads from, which refuses it
+  // until the metadata carries a method and binding generation (P8a).
+  pdppImporterImpl =
+    createPdppSyncImporter({
+      records: pdppRecords,
+      declarations: pdppAuth?.retainedDeclarations ?? [],
+      documents: pdppAuth?.retainedDocuments ?? new Map(),
+      serverOwner,
+      logger,
+    }) ?? null;
+
   // Standard mode keeps MCP clients (e.g. a claude.ai connector) signed in
   // across restarts. Enclaves use the TEE ingress's own sealed state.
   const mcpState =
@@ -719,6 +1011,27 @@ export async function createServer(
       : undefined;
 
   const app = createApp({
+    pdppAuth,
+    // Declaration submission, gated on the control-plane credential the
+    // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).
+    // Deliberately NOT a new config field: `loadConfig()` rewrites
+    // `config.json` with defaults on every boot, so a secret living there is
+    // a secret at rest in a file the server edits. Without the credential the
+    // route is not mounted and the declaration set stays exactly what config
+    // made it.
+    pdppDeclarations: pdppAuth
+      ? {
+          registry: pdppAuth.declarationRegistry,
+          supportedConnectors: pdppAuth.supportedConnectors,
+          operatorToken: accessToken,
+        }
+      : undefined,
+    pdpp: pdppRecords,
+    pdppConnections,
+    // The SAME stable delegate the download worker was given above, not a
+    // second importer: both arrival routes must resolve to one importer over
+    // one store, and this one is already late-bound to `pdppImporterImpl`.
+    pdppImporter,
     mcpHydrateScopes:
       isEnclave && jobSyncManager
         ? (scopes) => jobSyncManager.hydrateScopes(scopes)
@@ -746,6 +1059,39 @@ export async function createServer(
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
     additions,
+    // Latest legacy reads of connector scopes the owner collects into the
+    // record store come from its rows: the same store and the same
+    // configured methods the RS enforces. Composed with or without the RS,
+    // so a scope whose data moved there is refused, not read from its stale
+    // file, on a boot that does not mount the RS.
+    legacyScopeView: createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: pdppRecords?.bindingStore,
+      // Reuse the source-scoped declarations selected by the record server.
+      // Declaration schema identity participates in projection revisions and
+      // takeover cache keys; staging an upgrade takes effect on the next boot.
+      declarations: pdppRecords?.declarations,
+      configuredMethods: (sourceId) =>
+        pdppRecords?.configuredMethods.get(sourceId) ?? [],
+      readLegacyHead: async (head) => {
+        if (
+          head.path.startsWith("/") ||
+          head.path.split(/[\\/]/).includes("..")
+        ) {
+          throw new Error("Unsafe indexed legacy path");
+        }
+        return DataFileEnvelopeSchema.passthrough().parse(
+          JSON.parse(await readFile(join(dataDir, head.path), "utf8")),
+        );
+      },
+      coverageThresholds: {
+        maxPayloadRatio: takeoverLimit("PDPP_TAKEOVER_MAX_PAYLOAD_RATIO", 1.5),
+        maxExtraBytes: takeoverLimit(
+          "PDPP_TAKEOVER_MAX_EXTRA_BYTES",
+          256 * 1024,
+        ),
+      },
+    }),
     scopeDeletions,
     cloudMode,
     devToken,

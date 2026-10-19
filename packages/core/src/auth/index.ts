@@ -1,5 +1,6 @@
 export {
   authenticateRequest,
+  cacheRequestBodyBytes,
   mapSdkAuthError,
   type AuthenticatedRequest,
   type AuthenticateRequestInput,

@@ -1,10 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pino } from "pino";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
+import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import { createLegacyScopeAuthority } from "../storage/legacy-scope-authority.js";
+import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
+import Database from "better-sqlite3";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import {
@@ -138,12 +143,14 @@ async function postWithOwnerAuth(
     contentType?: string;
     rawBody?: string;
     wallet?: typeof ownerWallet;
+    headers?: Record<string, string>;
   } = {},
 ) {
   const {
     contentType = "application/json",
     rawBody,
     wallet: signingWallet = ownerWallet,
+    headers = {},
   } = options;
   const requestBody =
     rawBody !== undefined
@@ -166,6 +173,7 @@ async function postWithOwnerAuth(
     headers: {
       "Content-Type": contentType,
       Authorization: auth,
+      ...headers,
     },
   };
   if (requestBody !== undefined) init.body = requestBody;
@@ -262,6 +270,34 @@ describe("POST /v1/data/:scope", () => {
     });
 
     expect(res.status).toBe(201);
+    localIndexManager.close();
+  });
+
+  it("rejects a PDPP owner token on legacy scope ingest without writing", async () => {
+    const localIndexManager = createIndexManager(
+      initializeDatabase(":memory:"),
+    );
+    const localApp = dataRoutes({
+      indexManager: localIndexManager,
+      hierarchyOptions,
+      logger,
+      serverOrigin: SERVER_ORIGIN,
+      serverOwner: ownerWallet.address,
+      gateway: createMockGateway(),
+      accessLogWriter: createMockAccessLogWriter(),
+    });
+
+    const res = await localApp.request("/instagram.profile", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer pdpp_owner_token",
+      },
+      body: JSON.stringify({ username: "pdpp-owner" }),
+    });
+
+    expect(res.status).toBe(401);
+    expect(localIndexManager.countByScope("instagram.profile")).toBe(0);
     localIndexManager.close();
   });
 
@@ -1466,6 +1502,117 @@ describe("GET /v1/data/:scope", () => {
     vi.unstubAllGlobals();
   });
 
+  it("serves persisted missing raw blob diagnostics in a signed owner takeover GET", async () => {
+    const path = join(dataDir, "parity-index.db");
+    const db = initializeDatabase(path);
+    const store = createSqliteRecordStore(db);
+    store.registerConnection({
+      instance: "conn_claude",
+      sourceId: "https://registry.pdpp.dev/sources/claude",
+      method: "anthropic",
+      label: "Claude",
+    });
+    const collectedAt = "2026-09-10T07:00:00.000Z";
+    for (const [stream, rows] of [
+      ["account_profile", [{ id: "org", organization_id: "org" }]],
+      [
+        "conversations",
+        [
+          { id: "conversation-1", title: "First", message_count: 0 },
+          { id: "conversation-2", title: "Second", message_count: 0 },
+        ],
+      ],
+    ] as const) {
+      store.replaceStream({
+        instance: "conn_claude",
+        stream,
+        method: "anthropic",
+        generation: 1,
+        primaryKey: ["id"],
+        emittedAt: collectedAt,
+        sourceCollectedAt: collectedAt,
+        envelopes: rows.map((data) => ({
+          instance: "conn_claude",
+          stream,
+          key: data.id,
+          data,
+          emitted_at: collectedAt,
+        })),
+      });
+    }
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "claude/conversations/old.json",
+      "claude.conversations",
+      "2026-09-01T00:00:00.000Z",
+      100,
+    );
+    const readLegacyHead = async () => ({
+      version: "1.0",
+      scope: "claude.conversations",
+      collectedAt: "2026-09-01T00:00:00.000Z",
+      data: { conversations: [{ id: "conversation-1", messages: [] }] },
+    });
+    let legacyScopeView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) =>
+        sourceId === "https://registry.pdpp.dev/sources/claude"
+          ? ["anthropic"]
+          : [],
+      readLegacyHead,
+    });
+    expect(await legacyScopeView.readLatest("claude.conversations")).toEqual({
+      kind: "file",
+    });
+    expect(legacyScopeView.verdictFor("claude.conversations")[0]).toMatchObject(
+      {
+        verdict: "not_covered",
+        reason: { reason: "missing_raw_blob" },
+        reasonCounts: { missing_raw_blob: 2 },
+      },
+    );
+    store.close();
+
+    const reopenedDb = new Database(path);
+    const reopenedStore = createSqliteRecordStore(reopenedDb);
+    legacyScopeView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(reopenedDb),
+      records: reopenedStore,
+      configuredMethods: (sourceId) =>
+        sourceId === "https://registry.pdpp.dev/sources/claude"
+          ? ["anthropic"]
+          : [],
+      readLegacyHead,
+    });
+    const app = createApp({ legacyScopeView });
+    const uri = "/claude.conversations/takeover";
+    const header = await buildWeb3SignedHeader({
+      wallet: ownerWallet,
+      aud: SERVER_ORIGIN,
+      method: "GET",
+      uri,
+    });
+
+    const response = await app.request(uri, {
+      headers: { Authorization: header },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      scope: "claude.conversations",
+      verdicts: [
+        {
+          verdict: "not_covered",
+          reason: { reason: "missing_raw_blob" },
+          reasonCounts: { missing_raw_blob: 2 },
+        },
+      ],
+    });
+    reopenedStore.close();
+  });
+
   it("returns 200 with DataFileEnvelope for valid auth + grant", async () => {
     const app = createApp();
 
@@ -1480,6 +1627,35 @@ describe("GET /v1/data/:scope", () => {
     expect(json.scope).toBe("instagram.profile");
     expect(json.collectedAt).toBeDefined();
     expect(json.data).toEqual({ username: "test_user" });
+  });
+
+  it("serves an attributed projection to a grantee without changing data bytes", async () => {
+    const app = createApp();
+    const data = { username: "test_user" };
+    const provenance = {
+      projector_version: "1",
+      declaration_digest: "sha256:fixture",
+      inputs: [{ stream: "profile", changes_since_token: "opaque" }],
+      payload_sha256: createHash("sha256")
+        .update(JSON.stringify(data))
+        .digest("hex"),
+    };
+    const ingest = await postWithOwnerAuth(app, "instagram.profile", data, {
+      headers: {
+        "Vana-Producer": "pdpp-projector",
+        "Vana-Producer-Provenance": Buffer.from(
+          JSON.stringify(provenance),
+        ).toString("base64url"),
+      },
+    });
+    expect(ingest.status).toBe(201);
+
+    const response = await getWithAuth(app, "instagram.profile");
+    expect(response.status).toBe(200);
+    const envelope = await response.json();
+    expect(JSON.stringify(envelope.data)).toBe(JSON.stringify(data));
+    expect(envelope.producer).toBe("pdpp-projector");
+    expect(envelope.producer_provenance).toEqual(provenance);
   });
 
   it("reports read fulfillment for successful grant-backed reads", async () => {
@@ -1635,6 +1811,124 @@ describe("GET /v1/data/:scope", () => {
     const json = await res.json();
     expect(json.error).toBe("NOT_BINARY_SCOPE");
     expect(readFulfillmentReporter.report).not.toHaveBeenCalled();
+  });
+
+  // A dangling index row — the row survived, the file behind it did not.
+  // Batch 17 spent most of a diagnosis on this because it answered a bare
+  // INTERNAL_ERROR 500 and logged nothing anywhere.
+  async function orphanTheBackingFile(scope: string) {
+    const entry = indexManager.findLatestByScope(scope);
+    expect(entry).toBeDefined();
+    await rm(buildDataFilePath(dataDir, scope, entry!.collectedAt), {
+      force: true,
+    });
+    return entry!;
+  }
+
+  it("returns 404 DATA_FILE_MISSING when the indexed file is gone", async () => {
+    const app = createApp();
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+    await orphanTheBackingFile("instagram.profile");
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(404);
+    const json = await res.json();
+    expect(json.error).toBe("DATA_FILE_MISSING");
+  });
+
+  it("logs the missing-file read with route and request id", async () => {
+    const records: Record<string, unknown>[] = [];
+    const app = createApp({
+      logger: {
+        ...logger,
+        error: ((obj: Record<string, unknown>) => {
+          records.push(obj);
+        }) as never,
+      } as never,
+    });
+    await ingestData("instagram.profile", { username: "test_user" }, app);
+    await orphanTheBackingFile("instagram.profile");
+
+    let finishBodyRead!: () => void;
+    let bodyReadStarted!: () => void;
+    const bodyReadGate = new Promise<void>((resolve) => {
+      finishBodyRead = resolve;
+    });
+    const bodyReadStartedPromise = new Promise<void>((resolve) => {
+      bodyReadStarted = resolve;
+    });
+    const clone = Response.prototype.clone;
+    const cloneSpy = vi
+      .spyOn(Response.prototype, "clone")
+      .mockImplementation(function (this: Response) {
+        const cloned = clone.call(this);
+        if (this.status !== 404) return cloned;
+        return {
+          json: async () => {
+            bodyReadStarted();
+            await bodyReadGate;
+            return cloned.json();
+          },
+        } as Response;
+      });
+
+    try {
+      let requestSettled = false;
+      const responsePromise = getWithAuth(app, "instagram.profile").then(
+        (response) => {
+          requestSettled = true;
+          return response;
+        },
+      );
+      await bodyReadStartedPromise;
+      expect(requestSettled).toBe(false);
+
+      finishBodyRead();
+      await responsePromise;
+
+      const logged = records.find((r) => r.errorCode === "DATA_FILE_MISSING");
+      expect(logged).toMatchObject({
+        route: "GET /v1/data/:scope",
+        scope: "instagram.profile",
+        errorCode: "DATA_FILE_MISSING",
+        requestId: expect.any(String),
+      });
+    } finally {
+      finishBodyRead();
+      cloneSpy.mockRestore();
+    }
+  });
+
+  it("logs unexpected 500s on the data route with route and request id", async () => {
+    const records: Record<string, unknown>[] = [];
+    const app = createApp({
+      logger: {
+        ...logger,
+        error: ((obj: Record<string, unknown>) => {
+          records.push(obj);
+        }) as never,
+      } as never,
+      // A storage fault that is not a missing file: the read must still
+      // answer 500, but it must no longer do so silently.
+      dataStorage: {
+        findEntry: () => {
+          throw new Error("index exploded");
+        },
+      } as never,
+    });
+
+    const res = await getWithAuth(app, "instagram.profile");
+
+    expect(res.status).toBe(500);
+    const logged = records.find((r) => r.errorCode === "INTERNAL_ERROR");
+    expect(logged).toMatchObject({
+      route: "GET /v1/data/:scope",
+      errorCode: "INTERNAL_ERROR",
+      requestId: expect.any(String),
+    });
+    // Structured, and the message must survive for diagnosis.
+    expect(JSON.stringify(logged)).toContain("index exploded");
   });
 
   it("returns 401 MISSING_AUTH without authorization header", async () => {

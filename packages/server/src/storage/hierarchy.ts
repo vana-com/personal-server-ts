@@ -7,12 +7,25 @@ import {
   readdir,
   unlink,
   rename,
-  stat,
   rm,
 } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import {
+  createReadStream,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  rmdirSync,
+  writeFileSync,
+} from "node:fs";
 import { Readable } from "node:stream";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   DataFileEnvelopeSchema,
@@ -41,33 +54,250 @@ const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-/** Atomic write: mkdir -p, write temp file, rename */
-export async function writeDataFile(
+function syncDirectory(path: string): void {
+  if (process.platform === "win32") return;
+  const fd = openSync(path, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export class PublishedDataFileError extends Error {
+  constructor(
+    public readonly relativePath: string,
+    cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+  }
+}
+
+/** Synchronous, no-replace publication inside the SQLite writer gate. */
+export function publishDataFile(
   options: HierarchyManagerOptions,
   envelope: DataFileEnvelope,
-): Promise<WriteResult> {
-  const filePath = buildDataFilePath(
+  bytes: Uint8Array,
+  operation?: string,
+): WriteResult {
+  const path = buildDataFilePath(
     options.dataDir,
     envelope.scope,
     envelope.collectedAt,
   );
-  const dir = dirname(filePath);
-
-  await mkdir(dir, { recursive: true });
-
-  const content = JSON.stringify(envelope, null, 2);
-  const tempPath = filePath + ".tmp." + randomUUID();
-
-  await writeFile(tempPath, content, "utf-8");
-  await rename(tempPath, filePath);
-
-  const stats = await stat(filePath);
-
+  const dir = dirname(path);
+  const missing: string[] = [];
+  for (let parent = dir; !existsSync(parent); parent = dirname(parent)) {
+    missing.push(parent);
+  }
+  mkdirSync(dir, { recursive: true });
+  for (const created of missing.reverse()) syncDirectory(dirname(created));
+  const temp = `${path}.tmp.${operation ?? randomUUID()}`;
+  rmSync(temp, { force: true });
+  let published = false;
+  try {
+    try {
+      const fd = openSync(temp, "wx", 0o600);
+      try {
+        writeFileSync(fd, bytes);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      try {
+        linkSync(temp, path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        if (!readFileSync(path).equals(Buffer.from(bytes))) {
+          throw new Error(
+            `Stored envelope conflicts with publication at ${path}`,
+          );
+        }
+      }
+      published = true;
+      syncDirectory(dir);
+    } finally {
+      rmSync(temp, { force: true });
+      syncDirectory(dir);
+    }
+  } catch (err) {
+    if (published) {
+      throw new PublishedDataFileError(relative(options.dataDir, path), err);
+    }
+    throw err;
+  }
   return {
-    path: filePath,
-    relativePath: relative(options.dataDir, filePath),
-    sizeBytes: stats.size,
+    path,
+    relativePath: relative(options.dataDir, path),
+    sizeBytes: bytes.byteLength,
   };
+}
+
+export function deleteDataFileSync(
+  options: HierarchyManagerOptions,
+  scope: string,
+  collectedAt: string,
+  operation?: string,
+): void {
+  const path = buildDataFilePath(options.dataDir, scope, collectedAt);
+  rmSync(path, { force: true });
+  if (operation) rmSync(`${path}.tmp.${operation}`, { force: true });
+  if (existsSync(dirname(path))) syncDirectory(dirname(path));
+  rmSync(buildBlockDir(options.dataDir, scope, collectedAt), {
+    recursive: true,
+    force: true,
+  });
+}
+
+export function deleteFirstSeenLedgerSync(
+  options: HierarchyManagerOptions,
+  scope: string,
+): void {
+  try {
+    rmSync(buildFirstSeenLedgerPath(options.dataDir, scope), { force: true });
+  } catch {
+    /* Derived sidecar cleanup must not block data deletion. */
+  }
+}
+
+export function snapshotScopeFiles(
+  options: HierarchyManagerOptions,
+  scope: string,
+): { files: string[]; directories: string[] } {
+  const files: string[] = [];
+  const directories: string[] = [];
+  function visit(path: string): void {
+    let info;
+    try {
+      info = lstatSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
+    }
+    if (!info.isDirectory()) {
+      files.push(path);
+      return;
+    }
+    for (const name of readdirSync(path)) visit(join(path, name));
+    directories.push(path);
+  }
+  for (const path of [
+    buildScopeDir(resolve(options.dataDir), scope),
+    buildScopeDir(join(resolve(options.dataDir), "blocks"), scope),
+  ]) {
+    for (
+      let parent = dirname(path);
+      parent !== resolve(options.dataDir);
+      parent = dirname(parent)
+    ) {
+      if (existsSync(parent) && lstatSync(parent).isSymbolicLink()) {
+        throw new Error(`Scope parent is a symbolic link: ${parent}`);
+      }
+    }
+    visit(path);
+  }
+  return { files, directories };
+}
+
+export function deleteScopeFilesSync(
+  snapshot: ReturnType<typeof snapshotScopeFiles>,
+): void {
+  for (const path of snapshot.files) rmSync(path, { force: true });
+  for (const dir of new Set(snapshot.files.map(dirname))) {
+    if (existsSync(dir)) syncDirectory(dir);
+  }
+  for (const path of snapshot.directories) {
+    try {
+      rmdirSync(path);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTEMPTY") throw err;
+    }
+    if (existsSync(dirname(path))) syncDirectory(dirname(path));
+  }
+}
+
+/** Publish a durable envelope before callers make it visible in the index. */
+export async function writeDataFile(
+  options: HierarchyManagerOptions,
+  envelope: DataFileEnvelope,
+): Promise<WriteResult> {
+  const staged = await stageDataFile(options, envelope);
+  await publishStagedDataFile(staged.stagePath, staged.finalPath);
+  return {
+    path: staged.finalPath,
+    relativePath: staged.relativePath,
+    sizeBytes: staged.sizeBytes,
+  };
+}
+
+/** Stage and fsync an envelope before an index transaction makes it visible. */
+export async function stageDataFile(
+  options: HierarchyManagerOptions,
+  envelope: DataFileEnvelope,
+  deps: { openFile?: typeof open } = {},
+): Promise<{
+  finalPath: string;
+  stagePath: string;
+  relativePath: string;
+  sizeBytes: number;
+}> {
+  const openFile = deps.openFile ?? open;
+  const finalPath = buildDataFilePath(
+    options.dataDir,
+    envelope.scope,
+    envelope.collectedAt,
+  );
+  const finalDir = dirname(finalPath);
+  const directorySyncPaths = collectDirectorySyncPaths(finalDir);
+  await mkdir(finalDir, { recursive: true });
+  const stagePath = `${finalPath}.pending.${randomUUID()}`;
+  const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
+  const handle = await openFile(stagePath, "wx");
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  for (const directoryPath of directorySyncPaths) {
+    const directory = await openFile(directoryPath, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  }
+  return {
+    finalPath,
+    stagePath,
+    relativePath: relative(options.dataDir, finalPath),
+    sizeBytes: bytes.length,
+  };
+}
+
+function collectDirectorySyncPaths(finalDir: string): string[] {
+  const paths: string[] = [];
+  let current = finalDir;
+  while (true) {
+    paths.unshift(current);
+    const parent = dirname(current);
+    if (parent === current) return paths;
+    current = parent;
+  }
+}
+
+export async function publishStagedDataFile(
+  stagePath: string,
+  finalPath: string,
+): Promise<void> {
+  await rename(stagePath, finalPath);
+  const directory = await open(dirname(finalPath), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
 }
 
 /** Read and parse a data file */
@@ -78,7 +308,7 @@ export async function readDataFile(
 ): Promise<DataFileEnvelope> {
   const filePath = buildDataFilePath(options.dataDir, scope, collectedAt);
   const content = await readFile(filePath, "utf-8");
-  return DataFileEnvelopeSchema.parse(JSON.parse(content));
+  return DataFileEnvelopeSchema.passthrough().parse(JSON.parse(content));
 }
 
 /** Read a data file without decoding or parsing its potentially large body. */

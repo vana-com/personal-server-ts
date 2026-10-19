@@ -1,0 +1,1101 @@
+{
+  "protocol_version": "0.1.0",
+  "source": {
+    "kind": "connector",
+    "id": "https://registry.pdpp.dev/connectors/github"
+  },
+  "declaration_version": "0.5.1",
+  "publisher": {
+    "id": "https://registry.pdpp.dev/publishers/pdp-connect"
+  },
+  "display": {
+    "name": "GitHub"
+  },
+  "streams": [
+    {
+      "name": "user",
+      "description": "GitHub user profile",
+      "display": {
+        "label": "GitHub profile",
+        "detail": "GitHub account id, login, profile details, and profile timestamps."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "login": {
+            "type": "string"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bio": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "company": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "blog": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "twitter_username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "avatar_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "login"
+        ]
+      },
+      "primary_key": [
+        "id"
+      ],
+      "cursor_field": "updated_at",
+      "consent_time_field": "created_at",
+      "selection": {
+        "fields": true,
+        "resources": false
+      },
+      "query": {
+        "range_filters": {
+          "updated_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ]
+        }
+      }
+    },
+    {
+      "name": "repositories",
+      "description": "Repositories owned or contributed to by the user.",
+      "display": {
+        "label": "Your repositories",
+        "detail": "Full repo metadata: name, description, languages, topics, stars, forks, open issues, default branch, visibility, fork/archive status, created/updated/pushed timestamps."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "full_name": {
+            "type": "string"
+          },
+          "owner_login": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "private": {
+            "type": "boolean"
+          },
+          "fork": {
+            "type": "boolean"
+          },
+          "archived": {
+            "type": "boolean"
+          },
+          "disabled": {
+            "type": "boolean"
+          },
+          "default_branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "topics": {
+            "type": "array"
+          },
+          "stargazers_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "forks_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "open_issues_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "watchers_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "size_kb": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "license_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "html_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "homepage": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "pushed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "full_name"
+        ]
+      },
+      "primary_key": [
+        "id"
+      ],
+      "cursor_field": "pushed_at",
+      "consent_time_field": "created_at",
+      "selection": {
+        "fields": true,
+        "resources": true
+      },
+      "query": {
+        "search": {
+          "lexical_fields": [
+            "name",
+            "full_name",
+            "owner_login",
+            "description",
+            "default_branch",
+            "language",
+            "license_key",
+            "homepage"
+          ],
+          "semantic_fields": [
+            "description"
+          ]
+        },
+        "range_filters": {
+          "created_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "updated_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "pushed_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "stargazers_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "forks_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "open_issues_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "watchers_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "size_kb": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ]
+        },
+        "aggregations": {
+          "count": true,
+          "group_by_time": [
+            "pushed_at",
+            "created_at"
+          ]
+        }
+      }
+    },
+    {
+      "name": "starred",
+      "description": "Repositories the user has starred, with starred_at timestamp.",
+      "display": {
+        "label": "Your starred repositories",
+        "detail": "Full repo metadata for every star you've given, plus the time you starred it."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "full_name": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stargazers_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "html_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "starred_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "full_name"
+        ]
+      },
+      "primary_key": [
+        "id"
+      ],
+      "cursor_field": "starred_at",
+      "consent_time_field": "starred_at",
+      "selection": {
+        "fields": true,
+        "resources": true
+      },
+      "query": {
+        "search": {
+          "lexical_fields": [
+            "full_name",
+            "description",
+            "language"
+          ],
+          "semantic_fields": [
+            "description"
+          ]
+        },
+        "range_filters": {
+          "starred_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "stargazers_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ]
+        },
+        "aggregations": {
+          "count": true,
+          "group_by_time": [
+            "starred_at"
+          ]
+        }
+      }
+    },
+    {
+      "name": "issues",
+      "description": "Issues and pull requests across all repos the user has access to, authored by or assigned to them. GitHub's /issues endpoint returns both issues and PRs; the is_pull_request flag lets downstream consumers split them.",
+      "display": {
+        "label": "Your issues and PRs",
+        "detail": "Issue/PR number, title, body (capped at 20000 chars), labels, assignees, milestone, reactions, comment count, repository, state, timestamps, and a flag indicating which are pull requests."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "number": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_login": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "assignees": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "milestone_title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_full_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "html_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "comments": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reactions_total_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "closed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "is_pull_request": {
+            "type": "boolean"
+          },
+          "pull_request_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "draft": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "primary_key": [
+        "id"
+      ],
+      "cursor_field": "updated_at",
+      "consent_time_field": "created_at",
+      "selection": {
+        "fields": true,
+        "resources": true
+      },
+      "query": {
+        "search": {
+          "lexical_fields": [
+            "title",
+            "body",
+            "state_reason",
+            "user_login",
+            "milestone_title",
+            "repository_full_name"
+          ],
+          "semantic_fields": [
+            "title",
+            "body"
+          ]
+        },
+        "range_filters": {
+          "created_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "updated_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "closed_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "comments": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "reactions_total_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ]
+        },
+        "aggregations": {
+          "count": true,
+          "group_by_time": [
+            "updated_at",
+            "created_at"
+          ]
+        }
+      }
+    },
+    {
+      "name": "pull_requests",
+      "description": "Pull requests authored by the user, with PR-specific detail (merge state, diff stats, base/head refs, reviewers). Sourced via the GitHub search API (type:pr author:<you>); PRs the user only reviewed are NOT included — that requires a follow-up reviewer: query.",
+      "display": {
+        "label": "Your pull requests",
+        "detail": "PRs you authored, including merge timestamp and committer, additions/deletions, changed files count, base and head refs, requested reviewers, and review-comment counts."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "number": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_login": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "assignees": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "labels": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "milestone_title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_full_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "html_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "comments": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reactions_total_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "closed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "draft": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "merged_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "merged_by_login": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commits_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "additions": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "deletions": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "changed_files": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "base_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "head_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requested_reviewers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "review_comments_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "primary_key": [
+        "id"
+      ],
+      "cursor_field": "updated_at",
+      "consent_time_field": "created_at",
+      "selection": {
+        "fields": true,
+        "resources": true
+      },
+      "query": {
+        "search": {
+          "lexical_fields": [
+            "title",
+            "body",
+            "state_reason",
+            "user_login",
+            "milestone_title",
+            "repository_full_name",
+            "base_ref",
+            "head_ref",
+            "merged_by_login"
+          ],
+          "semantic_fields": [
+            "title",
+            "body"
+          ]
+        },
+        "range_filters": {
+          "created_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "updated_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "closed_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "merged_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "comments": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "reactions_total_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "commits_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "additions": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "deletions": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "changed_files": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "review_comments_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ]
+        },
+        "aggregations": {
+          "count": true,
+          "group_by_time": [
+            "updated_at",
+            "created_at"
+          ]
+        }
+      }
+    },
+    {
+      "name": "gists",
+      "description": "Gists the user has created (public and secret).",
+      "display": {
+        "label": "Your gists",
+        "detail": "Gist description, visibility, URL, up to 10 files per gist with filename/language/size/raw URL, comment count, created/updated timestamps."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "public": {
+            "type": "boolean"
+          },
+          "html_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "filename": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "language": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "size": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "raw_url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          },
+          "files_truncated": {
+            "type": "boolean"
+          },
+          "files_total_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "comments_count": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "primary_key": [
+        "id"
+      ],
+      "cursor_field": "updated_at",
+      "consent_time_field": "created_at",
+      "selection": {
+        "fields": true,
+        "resources": true
+      },
+      "query": {
+        "search": {
+          "lexical_fields": [
+            "description"
+          ],
+          "semantic_fields": [
+            "description"
+          ]
+        },
+        "range_filters": {
+          "created_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "updated_at": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "files_total_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ],
+          "comments_count": [
+            "gte",
+            "gt",
+            "lte",
+            "lt"
+          ]
+        },
+        "aggregations": {
+          "count": true,
+          "group_by_time": [
+            "updated_at",
+            "created_at"
+          ]
+        }
+      }
+    }
+  ],
+  "extensions": {}
+}

@@ -2,6 +2,23 @@ import forge from "node-forge";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRustlsPsLiteRelayTlsFactory } from "./relay-tls.js";
 
+const rustlsCalls = vi.hoisted(() => ({
+  process: vi.fn(() => ({
+    plaintext: new Uint8Array(),
+    tls: new Uint8Array(),
+  })),
+  write: vi.fn(() => ({ plaintext: new Uint8Array(), tls: new Uint8Array() })),
+  free: vi.fn(),
+}));
+vi.mock("./browser-tls-rustls/browser_tls_rustls.js", () => ({
+  default: vi.fn(async () => {}),
+  TlsServer: class {
+    process_tls = rustlsCalls.process;
+    write_plaintext = rustlsCalls.write;
+    free = rustlsCalls.free;
+  },
+}));
+
 const CONTROL_URL = "wss://control.psrelay.test:8443";
 const SESSION_ID = "abc123session";
 
@@ -78,6 +95,26 @@ describe("createRustlsPsLiteRelayTlsFactory identity resolution", () => {
       logger: (line) => logs.push(line),
     });
   }
+
+  it("closes Rustls once and rejects direct use after close before touching WASM", async () => {
+    const stream = await createFactory().createStream({
+      sessionId: SESSION_ID,
+      streamId: 1,
+      issueToken: "tok",
+    });
+    rustlsCalls.process.mockClear();
+    rustlsCalls.write.mockClear();
+    rustlsCalls.free.mockClear();
+    stream.close?.();
+    stream.close?.();
+    expect(rustlsCalls.free).toHaveBeenCalledTimes(1);
+    expect(() => stream.processTls(new Uint8Array())).toThrow(/closed/i);
+    expect(() => stream.writePlaintext(new Uint8Array(), true)).toThrow(
+      /closed/i,
+    );
+    expect(rustlsCalls.process).not.toHaveBeenCalled();
+    expect(rustlsCalls.write).not.toHaveBeenCalled();
+  });
 
   it("does not memoize a self-signed fallback: a later tokened attempt mints a trusted cert (BUI-664)", async () => {
     const factory = createFactory();

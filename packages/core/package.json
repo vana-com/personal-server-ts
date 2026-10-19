@@ -48,6 +48,22 @@
       "types": "./dist/errors/catalog.d.ts",
       "import": "./dist/errors/catalog.js"
     },
+    "./errors/pdpp": {
+      "types": "./dist/errors/pdpp-catalog.d.ts",
+      "import": "./dist/errors/pdpp-catalog.js"
+    },
+    "./pdpp-version": {
+      "types": "./dist/pdpp-version.d.ts",
+      "import": "./dist/pdpp-version.js"
+    },
+    "./ports/pdpp-auth": {
+      "types": "./dist/ports/pdpp-auth.d.ts",
+      "import": "./dist/ports/pdpp-auth.js"
+    },
+    "./ports/pdpp-auth.test-utils": {
+      "types": "./dist/ports/pdpp-auth.test-utils.d.ts",
+      "import": "./dist/ports/pdpp-auth.test-utils.js"
+    },
     "./schemas": {
       "types": "./dist/schemas/server-config.d.ts",
       "import": "./dist/schemas/server-config.js"
@@ -59,6 +75,18 @@
     "./storage/index": {
       "types": "./dist/storage/index/index.d.ts",
       "import": "./dist/storage/index/index.js"
+    },
+    "./storage/canonical-legacy-projection": {
+      "types": "./dist/storage/canonical-legacy-projection.d.ts",
+      "import": "./dist/storage/canonical-legacy-projection.js"
+    },
+    "./storage/legacy-scope-view": {
+      "types": "./dist/storage/legacy-scope-view.d.ts",
+      "import": "./dist/storage/legacy-scope-view.js"
+    },
+    "./storage/pdpp-records": {
+      "types": "./dist/storage/pdpp-records/index.d.ts",
+      "import": "./dist/storage/pdpp-records/index.js"
     },
     "./storage/blocks": {
       "types": "./dist/storage/blocks/index.d.ts",
@@ -91,6 +119,10 @@
     "./grants": {
       "types": "./dist/grants/index.d.ts",
       "import": "./dist/grants/index.js"
+    },
+    "./pdpp": {
+      "types": "./dist/pdpp/index.d.ts",
+      "import": "./dist/pdpp/index.js"
     },
     "./policy": {
       "types": "./dist/policy/index.d.ts",
@@ -151,6 +183,22 @@
     "./write": {
       "types": "./dist/write/index.d.ts",
       "import": "./dist/write/index.js"
+    },
+    "./storage/pdpp-records/portable": {
+      "types": "./dist/storage/pdpp-records/portable.d.ts",
+      "import": "./dist/storage/pdpp-records/portable.js"
+    },
+    "./storage/pdpp-records/completion": {
+      "types": "./dist/storage/pdpp-records/completion.d.ts",
+      "import": "./dist/storage/pdpp-records/completion.js"
+    },
+    "./storage/pdpp-records/schema": {
+      "types": "./dist/storage/pdpp-records/schema.d.ts",
+      "import": "./dist/storage/pdpp-records/schema.js"
+    },
+    "./storage/pdpp-records/memory": {
+      "types": "./dist/storage/pdpp-records/memory-store.d.ts",
+      "import": "./dist/storage/pdpp-records/memory-store.js"
     }
   },
   "scripts": {
@@ -159,12 +207,10 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@opendatalabs/vana-sdk": "3.23.0-pr.211.36da1d8",
+    "ajv2020": "npm:ajv@^8.20.0",
     "minisearch": "^7.2.0",
     "unpdf": "^1.6.2",
     "viem": "^2.54.2",
     "zod": "^4.4.3"
-  },
-  "devDependencies": {
-    "ajv": "^8.20.0"
   }
 }

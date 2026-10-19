@@ -1,0 +1,111 @@
+{
+  "protocol_version": "0.1.0",
+  "source": {
+    "kind": "connector",
+    "id": "https://registry.pdpp.dev/connectors/youtube"
+  },
+  "declaration_version": "0.1.0-local",
+  "publisher": {
+    "id": "https://vana.org/unity-surfaces"
+  },
+  "display": {
+    "name": "YouTube"
+  },
+  "streams": [
+    {
+      "name": "profile",
+      "description": "YouTube channel profile snapshot",
+      "display": {
+        "label": "YouTube channel profile",
+        "detail": "YouTube channel id, handle, description, country, joined date, and channel counters."
+      },
+      "semantics": "mutable_state",
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "channelId": {
+            "type": "string"
+          },
+          "channelTitle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "channelUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "handle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "avatarUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "joinedDate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subscriberCount": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "videoCount": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "viewCount": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "channelId"
+        ]
+      },
+      "primary_key": [
+        "channelId"
+      ],
+      "selection": {
+        "fields": true,
+        "resources": false
+      }
+    }
+  ],
+  "extensions": {}
+}

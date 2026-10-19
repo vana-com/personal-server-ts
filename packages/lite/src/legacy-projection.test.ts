@@ -43,6 +43,22 @@ const messages = {
   ],
 };
 
+function youtubeHistoryRecord(videoId: string, position: number) {
+  return {
+    id: `history-${videoId}`,
+    position,
+    watched_date: "2026-10-18",
+    watched_date_label: "Today",
+    video_id: videoId,
+    video_url: `https://www.youtube.com/watch?v=${videoId}`,
+    video_title: `${videoId} title`,
+    channel_title: "Channel",
+    view_count: 1,
+    views_text: "1 view",
+    description: null,
+  };
+}
+
 function createRuntime(
   options: Partial<Parameters<typeof createPsLiteRuntime>[0]> = {},
 ) {
@@ -108,6 +124,128 @@ function get(
 }
 
 describe("PS-Lite legacy projection", () => {
+  it("serves youtube.history from stored PDPP watch_history records", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "youtube.history", {
+      records: [
+        {
+          id: "history-2",
+          position: 1,
+          watched_date: "2026-10-17",
+          watched_date_label: "Oct 17, 2026",
+          video_id: "video-2",
+          video_url: "https://www.youtube.com/watch?v=video-2",
+          video_title: "Second video",
+          channel_title: "Second channel",
+          view_count: 42,
+          views_text: null,
+          description: "Second description",
+        },
+        {
+          id: "history-1",
+          position: 0,
+          watched_date: "2026-10-18",
+          watched_date_label: "Today",
+          video_id: "video-1",
+          video_url: "https://www.youtube.com/watch?v=video-1",
+          video_title: "First video",
+          channel_title: "First channel",
+          view_count: 1234,
+          views_text: "1.2K views",
+          description: "First description",
+        },
+      ],
+    });
+
+    const res = await get(runtime, "/v1/data/youtube.history");
+
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { data: unknown }).data).toEqual({
+      timeWindow: "top 50 most recent items",
+      history: [
+        {
+          watchedAt: "2026-10-18",
+          watchedAtText: "Today",
+          videoId: "video-1",
+          videoUrl: "https://www.youtube.com/watch?v=video-1",
+          videoTitle: "First video",
+          channelTitle: "First channel",
+          views: "1.2K views",
+          description: "First description",
+        },
+        {
+          watchedAt: "2026-10-17",
+          watchedAtText: "Oct 17, 2026",
+          videoId: "video-2",
+          videoUrl: "https://www.youtube.com/watch?v=video-2",
+          videoTitle: "Second video",
+          channelTitle: "Second channel",
+          views: "42 views",
+          description: "Second description",
+        },
+      ],
+    });
+
+    const entry = storage.findEntry({ scope: "youtube.history" })!;
+    expect(
+      (await storage.readEnvelope("youtube.history", entry.collectedAt)).data,
+    ).toMatchObject({ records: expect.any(Array) });
+  });
+
+  it("uses the requested YouTube alias envelope when canonical and alias versions coexist", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "youtube.watch_history", {
+      records: [youtubeHistoryRecord("canonical-video", 0)],
+    });
+    await post(runtime, "youtube.history", {
+      records: [youtubeHistoryRecord("alias-video", 0)],
+    });
+    const alias = storage.findEntry({ scope: "youtube.history" })!;
+
+    const res = await get(runtime, "/v1/data/youtube.history");
+
+    expect(
+      ((await res.json()) as { data: { history: { videoId: string }[] } }).data
+        .history,
+    ).toMatchObject([{ videoId: "alias-video" }]);
+    expect(alias).toBeDefined();
+  });
+
+  it("does not reuse a projection across alias version or body-form transitions", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "youtube.watch_history", {
+      records: [youtubeHistoryRecord("canonical-video", 0)],
+    });
+    await post(runtime, "youtube.history", {
+      records: [youtubeHistoryRecord("first-video", 0)],
+    });
+    const first = storage.findEntry({ scope: "youtube.history" })!;
+    const firstRead = await get(runtime, "/v1/data/youtube.history");
+    const firstData = (await firstRead.json()) as {
+      data: { history: { videoId: string }[] };
+    };
+    expect(firstData.data.history[0]?.videoId).toBe("first-video");
+
+    await post(runtime, "youtube.history", {
+      records: [youtubeHistoryRecord("second-video", 0)],
+    });
+    const second = storage.findEntry({ scope: "youtube.history" })!;
+    expect(second.collectedAt).not.toBe(first.collectedAt);
+    const secondRead = await get(runtime, "/v1/data/youtube.history");
+    const secondData = (await secondRead.json()) as {
+      data: { history: { videoId: string }[] };
+    };
+    expect(secondData.data.history[0]?.videoId).toBe("second-video");
+
+    await post(runtime, "youtube.history", {
+      history: [{ videoId: "legacy-video" }],
+    });
+    const legacyRead = await get(runtime, "/v1/data/youtube.history");
+    expect(((await legacyRead.json()) as { data: unknown }).data).toEqual({
+      history: [{ videoId: "legacy-video" }],
+    });
+  });
+
   it("reports a projection that left rows out", async () => {
     const onLegacyProjectionIssue = vi.fn();
     const { runtime } = createRuntime({ onLegacyProjectionIssue });
@@ -383,6 +521,194 @@ describe("POST ?supersede=legacy", () => {
       total: 1,
     });
   });
+
+  it.each([
+    {
+      scope: "youtube.profile",
+      legacy: { channelId: "channel-1", channelTitle: "Old channel" },
+      records: [{ id: "channel-1", title: "New channel" }],
+      projected: { channelId: "channel-1" },
+    },
+    {
+      scope: "youtube.history",
+      legacy: {
+        history: [
+          {
+            videoId: "video-1",
+            videoUrl: "https://youtube.com/watch?v=video-1",
+            videoTitle: "Old title",
+          },
+        ],
+      },
+      records: [youtubeHistoryRecord("video-1", 0)],
+      projected: {
+        history: [{ videoId: "video-1", videoTitle: "video-1 title" }],
+      },
+    },
+    {
+      scope: "youtube.subscriptions",
+      legacy: {
+        subscriptions: [
+          {
+            channelId: "channel-1",
+            channelUrl: "https://youtube.com/@channel-1",
+            channelTitle: "Old title",
+          },
+        ],
+      },
+      records: [
+        {
+          id: "subscription-1",
+          channel_id: "channel-1",
+          channel_title: "New title",
+          channel_url: "https://youtube.com/@channel-1",
+          is_verified: false,
+          notifications: false,
+        },
+      ],
+      projected: {
+        subscriptions: [{ channelId: "channel-1", channelTitle: "New title" }],
+      },
+    },
+    {
+      scope: "youtube.playlists",
+      legacy: {
+        playlists: [
+          {
+            playlistId: "playlist-1",
+            url: "https://youtube.com/playlist?list=playlist-1",
+            title: "Old title",
+          },
+        ],
+      },
+      records: [
+        {
+          id: "playlist-1",
+          url: "https://youtube.com/playlist?list=playlist-1",
+          title: "New title",
+        },
+      ],
+      projected: {
+        playlists: [{ playlistId: "playlist-1", title: "New title" }],
+      },
+    },
+    {
+      scope: "youtube.playlistItems",
+      legacy: {
+        playlists: [
+          {
+            playlistId: "playlist-1",
+            items: [
+              {
+                videoId: "old-video",
+                videoUrl: "https://youtube.com/watch?v=old-video",
+                videoTitle: "Old video",
+              },
+            ],
+          },
+        ],
+      },
+      records: [
+        {
+          id: "playlist-item-1",
+          playlist_id: "playlist-1",
+          video_id: "new-video",
+          video_url: "https://youtube.com/watch?v=new-video",
+          video_title: "New video",
+        },
+      ],
+      projected: {
+        playlists: [
+          { playlistId: "playlist-1", items: [{ videoId: "new-video" }] },
+        ],
+      },
+    },
+    {
+      scope: "youtube.likes",
+      legacy: {
+        likedVideos: [
+          {
+            videoId: "video-1",
+            videoUrl: "https://youtube.com/watch?v=video-1",
+            videoTitle: "Old title",
+          },
+        ],
+      },
+      records: [
+        {
+          id: "like-1",
+          video_id: "video-1",
+          video_url: "https://youtube.com/watch?v=video-1",
+          video_title: "New title",
+        },
+      ],
+      projected: {
+        likedVideos: [{ videoId: "video-1", videoTitle: "New title" }],
+      },
+    },
+    {
+      scope: "youtube.watchLater",
+      legacy: {
+        watchLater: [
+          {
+            videoId: "video-1",
+            videoUrl: "https://youtube.com/watch?v=video-1",
+            videoTitle: "Old title",
+          },
+        ],
+      },
+      records: [
+        {
+          id: "watch-later-1",
+          video_id: "video-1",
+          video_url: "https://youtube.com/watch?v=video-1",
+          video_title: "New title",
+        },
+      ],
+      projected: {
+        watchLater: [{ videoId: "video-1", videoTitle: "New title" }],
+      },
+    },
+  ])(
+    "$scope keeps legacy versions and serves the read-time projection",
+    async ({ scope, legacy, records, projected }) => {
+      const { runtime, storage } = createRuntime();
+      await post(runtime, scope, legacy);
+      await post(runtime, scope, legacy);
+      const legacyVersions = storage
+        .listVersions(scope, { limit: 50 })
+        .map((entry) => entry.collectedAt);
+
+      const write = await postRaw(
+        runtime,
+        `/v1/data/${scope}?supersede=legacy`,
+        { records },
+      );
+
+      expect(write.status).toBe(201);
+      expect(await write.json()).toMatchObject({
+        superseded: [],
+        supersedeRefused:
+          "YouTube legacy versions are retained for read-time projection",
+      });
+      expect(storage.countVersions(scope)).toBe(legacyVersions.length + 1);
+
+      for (const collectedAt of legacyVersions) {
+        const oldRead = await get(
+          runtime,
+          `/v1/data/${scope}?at=${encodeURIComponent(collectedAt)}`,
+        );
+        expect(((await oldRead.json()) as { data: unknown }).data).toEqual(
+          legacy,
+        );
+      }
+
+      const latestRead = await get(runtime, `/v1/data/${scope}`);
+      expect(
+        ((await latestRead.json()) as { data: unknown }).data,
+      ).toMatchObject(projected);
+    },
+  );
 
   it("keeps older PDPP versions", async () => {
     const { runtime, storage } = createRuntime();

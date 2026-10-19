@@ -1,9 +1,17 @@
 // biome-ignore lint/performance/noBarrelFile: re-exported through @vana-unity/app-runtime/sources
-import { LEGACY_SCOPE_BINDINGS, LEGACY_SCOPE_GAPS } from "./bindings.js";
+import {
+  GROCERY_INVALID_ORDER,
+  LEGACY_SCOPE_BINDINGS,
+  LEGACY_SCOPE_GAPS,
+} from "./bindings.js";
 import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
 import { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
 import { classifyAsTestDebris } from "./test-debris.js";
+import {
+  decodeDeclaredRecordsForProjection,
+  DeclaredTextError,
+} from "./declared-text.js";
 import type {
   LegacyScopeBinding,
   LegacyScopeLookupResult,
@@ -27,6 +35,7 @@ export type {
   PdppRecord,
   PdppSelection,
   ProjectionDiagnostic,
+  ProjectionOmission,
   ProjectionError,
   ProjectionResult,
   ProjectPdppRecordsOptions,
@@ -142,6 +151,19 @@ export function projectPdppRecordsToLegacyPayload(
     }
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }
+  let decodeDiagnostics: ProjectionDiagnostic[] = [];
+  try {
+    const decoded = decodeDeclaredRecordsForProjection(
+      records,
+      options.streamSchemas,
+      scope,
+    );
+    records = decoded.records;
+    decodeDiagnostics = decoded.diagnostics;
+  } catch (error) {
+    if (!(error instanceof DeclaredTextError)) throw error;
+    return { ok: false, error: error.projectionError(scope) };
+  }
   const result = binding.project(
     options.orderByPrimaryKey
       ? inPrimaryKeyOrder(records, binding.primaryKey)
@@ -149,11 +171,28 @@ export function projectPdppRecordsToLegacyPayload(
     options,
   );
   if (!result.ok) return result;
+  if (decodeDiagnostics.length > 0) {
+    result.diagnostics = [...decodeDiagnostics, ...(result.diagnostics ?? [])];
+  }
+  if (scope.startsWith("oura.")) {
+    assertOuraLegacyScoresAreIntegers(scope, result.payload);
+  }
 
   // These bindings drop and count malformed rows themselves (see their
   // records_dropped diagnostics) instead of failing the whole scope.
   if (DROP_AND_COUNT_SCOPES.has(scope)) return result;
 
+  // An order dropped and counted for its unusable id may pass the key check;
+  // every other malformed key stays fatal.
+  let reportedInvalidOrders = (result.diagnostics ?? []).reduce(
+    (total, diagnostic) =>
+      diagnostic.kind === "records_dropped" &&
+      diagnostic.stream === "orders" &&
+      diagnostic.reasons.includes(GROCERY_INVALID_ORDER)
+        ? total + diagnostic.count
+        : total,
+    0,
+  );
   for (const record of records) {
     if (!binding.pdppStreams.includes(record.stream)) continue;
     if (
@@ -177,6 +216,10 @@ export function projectPdppRecordsToLegacyPayload(
         value === undefined ||
         (typeof value === "string" && !value.trim())
       ) {
+        if (record.stream === "orders" && reportedInvalidOrders > 0) {
+          reportedInvalidOrders -= 1;
+          break;
+        }
         return {
           ok: false,
           error: {
@@ -216,6 +259,31 @@ export function projectPdppRecordsToLegacyPayload(
 const DROP_AND_COUNT_SCOPES: ReadonlySet<string> = new Set([
   "chatgpt.conversations",
 ]);
+
+/** Keep OpenPet's Go `*int` score decoding safe for every Oura projection. */
+export function assertOuraLegacyScoresAreIntegers(
+  scope: string,
+  payload: Record<string, unknown>,
+): void {
+  for (const collection of ["days", "dailyScores"] as const) {
+    const rows = payload[collection];
+    if (!Array.isArray(rows)) continue;
+    for (const [index, row] of rows.entries()) {
+      if (row === null || typeof row !== "object") continue;
+      // `score` is required on every daily score row: absent and undefined
+      // (dropped by JSON serialization) are both rejected.
+      const score = (row as Record<string, unknown>).score;
+      if (
+        score === null ||
+        (typeof score === "number" && Number.isInteger(score))
+      )
+        continue;
+      throw new Error(
+        `${scope}.${collection}[${index}].score must be an integer or null`,
+      );
+    }
+  }
+}
 
 type RecordsSkipped = Extract<
   ProjectionDiagnostic,

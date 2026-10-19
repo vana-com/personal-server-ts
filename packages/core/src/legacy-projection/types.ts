@@ -39,19 +39,46 @@ export type ProjectionError =
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
   | { kind: "missing_stream"; scope: string; expectedStream: string }
   | { kind: "invalid_value"; scope: string; reason: string }
-  | { kind: "incomplete_scope"; scope: string; reason: string }
+  | {
+      kind:
+        "invalid_encoded_text" | "message_content_omitted" | "unresolved_blob";
+      scope: string;
+      stream: string;
+      field: string;
+    }
+  | {
+      kind: "incomplete_scope";
+      scope: string;
+      reason: string;
+      /**
+       * Rows behind a rejection in which source rows existed but none could
+       * be projected. Absent for other incomplete scopes.
+       */
+      diagnostics?: ProjectionDiagnostic[];
+    }
   | { kind: "gap"; scope: string; reason: string }
   | { kind: "empty_singleton"; scope: string };
 
 export interface ProjectionOk {
   diagnostics?: ProjectionDiagnostic[];
+  projectionOmissions?: ProjectionOmission[];
   ok: true;
   payload: Record<string, unknown>;
 }
+/** A field omitted by policy because of the raw canonical value on this entity. */
+export interface ProjectionOmission {
+  entityKey: string | number | boolean;
+  entityPath: string;
+  /** Dot path relative to the entity, e.g. `timestamp` or `contributors.timestamp`. */
+  fieldPath: string;
+  reason: "off_enum_type" | "null_type" | "null_timestamp";
+}
 /**
  * `records_skipped` makes the whole projection `incomplete_scope`.
- * `records_dropped` and `stream_missing` do not: the payload is served
- * without the named rows, and the diagnostic says how many were left out.
+ * `records_dropped`, `records_partial` and `stream_missing` do not: the
+ * payload is served without the named rows (`records_dropped`, `count` is
+ * distinct source rows of `stream`), or with rows the source says are short
+ * of detail (`records_partial`), and the diagnostic says how many.
  */
 export type ProjectionDiagnostic =
   | {
@@ -63,6 +90,13 @@ export type ProjectionDiagnostic =
   | {
       count: number;
       kind: "records_dropped";
+      reasons: string[];
+      scope: string;
+      stream: string;
+    }
+  | {
+      count: number;
+      kind: "records_partial";
       reasons: string[];
       scope: string;
       stream: string;
@@ -83,6 +117,8 @@ export type ProjectionResult = ProjectionOk | ProjectionErr;
  */
 export interface ProjectPdppRecordsOptions {
   fetchedStreams: string[];
+  /** Trusted per-stream declarations governing these rows; absent means no decoding. */
+  streamSchemas?: Readonly<Record<string, Record<string, unknown>>>;
   /** Selected signed connector key. Omitted for the original PAT binding. */
   profileKey?: string;
   /**
@@ -147,5 +183,12 @@ export interface LegacyScopeBinding {
     options: ProjectPdppRecordsOptions,
   ) => ProjectionResult;
   provenance: LegacyScopeBindingProvenance[];
+  /**
+   * `"arrival"`: the legacy body listed each stream in the order its live
+   * keys last arrived, an unchanged re-delivery moving a key to the end. A
+   * reader then feeds rows to `project()` in that order, and reports when it
+   * cannot prove it. Absent: rows go in primary-key order.
+   */
+  rowOrder?: "arrival";
   scope: string;
 }

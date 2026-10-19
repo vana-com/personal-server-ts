@@ -5,7 +5,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/auth";
 import type {
   PersonalServerApiAuthPort,
+  PersonalServerListAuthResult,
   PersonalServerReadAuthInput,
+  PersonalServerScopeAuthInput,
   PersonalServerWriteAuthInput,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
@@ -26,6 +28,10 @@ import type {
   DataStoragePort,
   RuntimeAvailabilityPort,
 } from "@opendatalabs/personal-server-ts-core/ports";
+import type {
+  PdppAuthorizationService,
+  PdppTokenContext,
+} from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 
 export interface ServerApiAuthDeps {
@@ -51,6 +57,19 @@ export interface ServerApiAuthDeps {
    * are enabled; hosts may supply a shared store.
    */
   writeProofReplayStore?: WriteProofReplayStore;
+  /**
+   * PDPP owner bearer bridge for the legacy reconciler path. When supplied,
+   * POST /v1/data/:scope and GET /v1/data/:scope/versions may accept a PDPP
+   * owner token, but only when the token's live instance scope maps to the
+   * legacy source namespace. It never authorizes DELETE or broad owner reads.
+   */
+  pdppOwnerBearer?: {
+    auth: PdppAuthorizationService;
+    configuredMethods: Map<string, string[]>;
+    ownerSubjectId?: string;
+    instancesForSubject?: (subjectId: string) => string[];
+    instancesForSource?: (subjectId: string, sourceId: string) => string[];
+  };
 }
 
 function serverNotConfigured(): ProtocolError {
@@ -84,9 +103,30 @@ async function authenticate(
   });
 }
 
+function bearerToken(request: Request): string | undefined {
+  const header = request.headers.get("authorization");
+  if (!header) return undefined;
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match?.[1]?.trim();
+}
+
+function legacyNamespace(scope: string): string {
+  return scope.split(".", 1)[0] ?? "";
+}
+
+function pdppBridgeError(
+  errorCode: string,
+  message: string,
+  details?: Record<string, unknown>,
+): ProtocolError {
+  return new ProtocolError(403, errorCode, message, details);
+}
+
 export function createServerApiAuth(
   deps: ServerApiAuthDeps,
-): PersonalServerApiAuthPort {
+): PersonalServerApiAuthPort & {
+  authorizeOwnerScope(input: PersonalServerScopeAuthInput): Promise<void>;
+} {
   const writeProofReplayStore =
     deps.writeProofReplayStore ?? createInMemoryWriteProofReplayStore();
   // The write-session half of this port is protocol, not runtime: the browser
@@ -118,6 +158,122 @@ export function createServerApiAuth(
     }
   }
 
+  async function authorizePdppOwnerBearerForScope(
+    input: PersonalServerScopeAuthInput,
+  ): Promise<boolean> {
+    if (!deps.pdppOwnerBearer) return false;
+    const token = bearerToken(input.request);
+    if (!token) return false;
+
+    const context = await deps.pdppOwnerBearer.auth.resolveToken(token);
+    if (!context.active) return false;
+    assertPdppOwnerBearerForScope(context, input.scope, deps);
+    return true;
+  }
+
+  function assertPdppOwnerBearerForScope(
+    context: PdppTokenContext,
+    scope: string,
+    authDeps: ServerApiAuthDeps,
+  ): void {
+    const bridge = authDeps.pdppOwnerBearer;
+    if (!bridge) return;
+
+    if (context.tokenKind !== "owner") {
+      throw pdppBridgeError(
+        "PDPP_CLIENT_BEARER_NOT_OWNER",
+        "PDPP client bearer tokens cannot authorize legacy data owner writes",
+      );
+    }
+
+    if (
+      !context.subjectId ||
+      !bridge.ownerSubjectId ||
+      context.subjectId.toLowerCase() !== bridge.ownerSubjectId.toLowerCase()
+    ) {
+      throw pdppBridgeError(
+        "PDPP_OWNER_BEARER_FOREIGN",
+        "PDPP owner bearer token belongs to a different subject",
+        {
+          subjectId: context.subjectId,
+          expectedSubjectId: bridge.ownerSubjectId,
+        },
+      );
+    }
+
+    if (context.sourceId) {
+      const namespace = legacyNamespace(scope);
+      const configured = bridge.configuredMethods.get(context.sourceId) ?? [];
+      const sourceNamespace =
+        context.sourceId.split("/").filter(Boolean).at(-1) ?? context.sourceId;
+      if (namespace !== sourceNamespace || configured.length !== 1) {
+        throw pdppBridgeError(
+          "PDPP_OWNER_BEARER_SCOPE_MISMATCH",
+          "PDPP owner bearer token is not scoped to the requested legacy source namespace",
+          { scope, sourceId: context.sourceId },
+        );
+      }
+      if (context.instanceIds) {
+        const liveInstances = new Set(
+          bridge.instancesForSource?.(context.subjectId, context.sourceId) ??
+            [],
+        );
+        if (
+          context.instanceIds.length === 0 ||
+          context.instanceIds.some((instance) => !liveInstances.has(instance))
+        ) {
+          throw pdppBridgeError(
+            "PDPP_OWNER_BEARER_FOREIGN",
+            "PDPP owner bearer token is not scoped to currently available source instances",
+            { sourceId: context.sourceId, instanceIds: context.instanceIds },
+          );
+        }
+      }
+      return;
+    }
+
+    if (!context.instanceIds || context.instanceIds.length !== 1) {
+      throw pdppBridgeError(
+        "PDPP_OWNER_BEARER_UNSCOPED_INSTANCE",
+        "PDPP owner bearer token must be scoped to exactly one legacy source instance",
+      );
+    }
+
+    const currentInstances = bridge.instancesForSubject?.(context.subjectId);
+    if (!currentInstances || currentInstances.length === 0) {
+      throw pdppBridgeError(
+        "PDPP_OWNER_BEARER_FOREIGN",
+        "PDPP owner bearer token is not scoped to a currently owned instance",
+        { subjectId: context.subjectId },
+      );
+    }
+
+    const current = new Set(currentInstances);
+    const liveInstanceIds = context.instanceIds.filter((instance) =>
+      current.has(instance),
+    );
+    if (liveInstanceIds.length === 0) {
+      throw pdppBridgeError(
+        "PDPP_OWNER_BEARER_FOREIGN",
+        "PDPP owner bearer token is not scoped to a currently owned instance",
+        { subjectId: context.subjectId },
+      );
+    }
+    const namespace = legacyNamespace(scope);
+    const [liveInstance] = liveInstanceIds;
+    const matchesScope =
+      liveInstance.split(":", 1)[0] === namespace &&
+      bridge.configuredMethods.has(liveInstance);
+
+    if (!matchesScope) {
+      throw pdppBridgeError(
+        "PDPP_OWNER_BEARER_SCOPE_MISMATCH",
+        "PDPP owner bearer token is not scoped to the requested legacy source namespace",
+        { scope, instanceIds: liveInstanceIds },
+      );
+    }
+  }
+
   /**
    * Delegated ingest. A bearer token that resolves to a live write session
    * authorizes as the session builder: the write policy re-runs against the
@@ -130,6 +286,7 @@ export function createServerApiAuth(
   async function authorizeWrite(input: PersonalServerWriteAuthInput) {
     const delegated = await writeSessions.authorizeSessionWrite(input);
     if (delegated) return delegated;
+    if (await authorizePdppOwnerBearerForScope(input)) return;
     await authorizeOwner(input.request);
   }
 
@@ -145,39 +302,55 @@ export function createServerApiAuth(
     return writeSessions.recognizeWriteSession(request);
   }
 
+  async function authorizeBuilderList(
+    request: Request,
+    options?: { grantId?: string },
+  ): Promise<PersonalServerListAuthResult | void> {
+    const result = await authenticate(request, deps);
+    if (
+      result.isPolicyBypass ||
+      isOwner(result.auth.signer, deps.serverOwner)
+    ) {
+      return;
+    }
+    // A builder lists only what its grants cover, bound to this server's
+    // owner like a read; fail closed when we can't identify the owner.
+    // resolveDataListGrantScopes does the one builder lookup (and throws
+    // UnregisteredBuilderError), so no separate registration check here.
+    if (!deps.serverOwner) throw serverNotConfigured();
+    const grantedScopes = await resolveDataListGrantScopes(
+      {
+        signer: result.auth.signer,
+        grantId: result.auth.payload.grantId ?? options?.grantId,
+        serverOwner: deps.serverOwner,
+      },
+      {
+        authSessionVerifier: deps.gateway,
+        grantVerifier: deps.gateway,
+        grantLister: deps.gateway,
+        runtimeAvailability: deps.runtimeAvailability,
+      },
+    );
+    return { grantedScopes };
+  }
+
   return {
     authorizeOwner,
     authorizeWrite,
     authorizeWriteSession,
-
-    async authorizeBuilderList(request, options) {
-      const result = await authenticate(request, deps);
-      if (
-        result.isPolicyBypass ||
-        isOwner(result.auth.signer, deps.serverOwner)
-      ) {
-        return;
-      }
-      // A builder lists only what its grants cover, bound to this server's
-      // owner like a read; fail closed when we can't identify the owner.
-      // resolveDataListGrantScopes does the one builder lookup (and throws
-      // UnregisteredBuilderError), so no separate registration check here.
-      if (!deps.serverOwner) throw serverNotConfigured();
-      const grantedScopes = await resolveDataListGrantScopes(
-        {
-          signer: result.auth.signer,
-          grantId: result.auth.payload.grantId ?? options?.grantId,
-          serverOwner: deps.serverOwner,
-        },
-        {
-          authSessionVerifier: deps.gateway,
-          grantVerifier: deps.gateway,
-          grantLister: deps.gateway,
-          runtimeAvailability: deps.runtimeAvailability,
-        },
-      );
-      return { grantedScopes };
+    async authorizeOwnerScope(input: PersonalServerScopeAuthInput) {
+      if (await authorizePdppOwnerBearerForScope(input)) return;
+      await authorizeOwner(input.request);
     },
+
+    async authorizeScopeVersions(input) {
+      if (await authorizePdppOwnerBearerForScope(input)) return;
+      // Any other credential is held to the listing rules: a builder sees the
+      // versions of a scope only when one of its grants covers it.
+      return authorizeBuilderList(input.request, { grantId: input.grantId });
+    },
+
+    authorizeBuilderList,
 
     async authorizeBuilderRead(input: PersonalServerReadAuthInput) {
       const result = await authenticate(input.request, deps);

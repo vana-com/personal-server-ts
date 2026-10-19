@@ -1,0 +1,27 @@
+{
+  "source": "apps/desktop/src-tauri/src/commands/pdpp_export_projection.rs at unity-surfaces e970213f7977cf6756cd0670d6f063a5bbf21987, function project_export_scopes",
+  "contract": "each selected stream becomes the scope `<connector>.<stream>` with body { <stream>: [record.data in snapshot_by_stream order] }; a selected stream with no records is { <stream>: [] }",
+  "rustUnitTest": {
+    "note": "strava_projects_activities_and_coverage_diagnostics_as_object_scopes. Fixes the envelope only: its diagnostic has no id, which the pinned producer always sets.",
+    "snapshot": {
+      "activities": [{ "id": 1 }],
+      "coverage_diagnostics": [{ "stream": "activities", "status": "complete" }]
+    },
+    "scopes": {
+      "strava.activities": { "activities": [{ "id": 1 }] },
+      "strava.coverage_diagnostics": {
+        "coverage_diagnostics": [{ "stream": "activities", "status": "complete" }]
+      }
+    }
+  },
+  "snapshotOrder": {
+    "note": "Synthetic. Desktop's stage_succeeded_run_with_replacements appends in emit order, so a CSV not sorted by id gives a snapshot not sorted by id. Ids here are numeric strings of different lengths.",
+    "activities": [
+      { "id": "100", "start_time": "2026-08-01T07:00:00" },
+      { "id": "9", "start_time": "2026-08-02T07:00:00" },
+      { "id": "2000000000", "start_time": "2026-08-03T07:00:00" },
+      { "id": "21", "start_time": "2026-08-04T07:00:00" },
+      { "id": "3", "start_time": "2026-08-05T07:00:00" }
+    ]
+  }
+}

@@ -24,7 +24,11 @@ import {
   isEntryCoveredByTombstone,
   type ScopeDeletionTracker,
 } from "../sync/scope-deletions.js";
-import type { IndexEntry } from "../storage/index/types.js";
+import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
+import {
+  isPermanentRejection,
+  type PdppImporter,
+} from "../sync/pdpp-import.js";
 import {
   supersedeLegacyVersions,
   type SupersedeResult,
@@ -63,7 +67,12 @@ import {
   parseMetadataHeader,
   stringifyMetadataHeader,
   IngestPersistedError,
+  sha256Hex,
+  type LegacyPrecondition,
+  type LegacyProducer,
+  type LegacyProducerProvenance,
 } from "../contracts/index.js";
+import { canonicalJsonBytes } from "../derivatives/e2ee/jcs.js";
 // Imported directly: the contracts barrel does not re-export this addition.
 import { summarizeDataAdditionsContract } from "../contracts/data.js";
 import type {
@@ -84,6 +93,10 @@ import {
   type StoredLineage,
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
+import type {
+  LegacyScopeRefusal,
+  LegacyScopeViewPort,
+} from "../storage/legacy-scope-view.js";
 import {
   binaryFilename,
   binaryMimeType,
@@ -125,6 +138,14 @@ export interface PersonalServerWriteAuthInput {
   /** Raw scope path param (validated by parseDataScopeContract after auth,
    * same precedence as the owner write path). */
   scope: string;
+}
+
+export interface PersonalServerScopeAuthInput {
+  request: Request;
+  /** Raw scope path param; auth ports that need scope binding validate it. */
+  scope: string;
+  /** The unsigned grant hint a read also takes; see `authorizeBuilderList`. */
+  grantId?: string;
 }
 
 /**
@@ -236,6 +257,15 @@ export interface PersonalServerApiAuthPort {
     request: Request,
     options?: { grantId?: string },
   ): Promise<PersonalServerListAuthResult | void>;
+  /**
+   * Authorize listing versions for one legacy scope. Optional so auth ports
+   * without scoped owner-token support keep the `authorizeBuilderList` gate.
+   * Returns what `authorizeBuilderList` does: void is a full listing, a
+   * result names the scopes a non-owner may see.
+   */
+  authorizeScopeVersions?(
+    input: PersonalServerScopeAuthInput,
+  ): Promise<PersonalServerListAuthResult | void>;
   authorizeBuilderRead(
     input: PersonalServerReadAuthInput,
   ): Promise<PersonalServerReadAuthResult | void>;
@@ -286,6 +316,12 @@ export interface PersonalServerIngestSyncManager {
 export interface PersonalServerDataApiDeps {
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
+  /**
+   * Latest bodies of connector scopes the owner collects into the canonical
+   * record store. Absent = every scope is read from `storage`, as before.
+   * Explicit versions (`fileId`, `at`) always read from `storage`.
+   */
+  legacyScopeView?: LegacyScopeViewPort;
   auth: PersonalServerApiAuthPort;
   accessLogWriter: AccessLogWriter;
   syncManager?: PersonalServerIngestSyncManager | null;
@@ -382,6 +418,25 @@ export interface PersonalServerDataApiDeps {
     lineageSources?: string[];
   }) => void;
   /**
+   * Import a locally-ingested envelope into the PDPP record store, when the
+   * deployment mounted one.
+   *
+   * The same importer, the same envelope shape and the same best-effort
+   * contract as the download worker's (`sync/workers/download.ts`). It is
+   * here because a `$pdpp`-annotated envelope can reach this server two ways
+   * — pulled from the gateway by sync, or POSTed to `/v1/data/:scope` by a
+   * local owner-authenticated producer — and only the first offered it to the
+   * importer. A record that arrived by the second route was stored and
+   * indexed but never became readable over the PDPP resource surface, which
+   * made a local producer's write silently half-land.
+   *
+   * Runs AFTER the legacy write and index, never in place of them, and a
+   * failure is logged and swallowed: the record is already durable by the
+   * time this runs, so throwing would turn a committed write into a 500 and
+   * invite a duplicate on retry.
+   */
+  pdppImporter?: PdppImporter;
+  /**
    * Called on GET /v1/data/:scope once the read is authorized (a live grant
    * covering the scope, or the owner) and the scope is not tombstoned, and
    * before anything is served. The derivative compute layer uses it to run
@@ -444,7 +499,8 @@ export interface PersonalServerApiDispatchOptions {
   basePath?: string;
 }
 
-type JsonStatus = 200 | 201 | 400 | 401 | 403 | 404 | 405 | 500 | 502 | 503;
+type JsonStatus =
+  200 | 201 | 400 | 401 | 403 | 404 | 405 | 429 | 500 | 502 | 503;
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
@@ -546,17 +602,124 @@ function notFound(): Response {
   return errorResponse(404, "NOT_FOUND", "Not found");
 }
 
+/**
+ * What a 500 out of this layer must leave behind.
+ *
+ * These handlers run INSIDE the Hono app, so an error they catch never
+ * reaches the framework's `onError` — which is the one place that used to
+ * log. The result was that any unexpected fault on `/v1/data` answered a
+ * bare `INTERNAL_ERROR` and left nothing in stdout, nothing in the access
+ * log, and nothing for an operator to work from. Diagnosing one meant
+ * patching the server.
+ *
+ * Deliberately no request body, no headers, no query string and no
+ * authorization material: the route and method are the diagnostic value, and
+ * a grant id or signed header in a log file is a credential at rest. The
+ * request id is minted here when the caller did not supply one so the log
+ * line and the response can always be correlated.
+ */
+export interface ApiErrorLogContext {
+  logger?: PersonalServerApiLogger;
+  /** Stable route label, e.g. `GET /v1/data/:scope`. Never the raw path. */
+  route: string;
+  /** Correlates the log line with the response. Minted if absent. */
+  requestId?: string;
+  /** Non-secret route parameters worth having in the line (e.g. scope). */
+  detail?: Record<string, string | undefined>;
+}
+
 async function withApiErrors(
   handler: () => Promise<Response> | Response,
+  context?: ApiErrorLogContext,
 ): Promise<Response> {
   try {
-    return await handler();
+    const response = await handler();
+    // A handled 4xx that means "the index and the disk disagree" is an
+    // operator-facing fault even though it is not a 500 — log it once, here,
+    // rather than at the contract that cannot see the route.
+    if (response.status === 404 && context) {
+      await logMissingDataFile(response, context);
+    }
+    return response;
   } catch (err) {
     if (err instanceof ProtocolError) {
       return protocolErrorResponse(err);
     }
+    if (context) {
+      context.logger?.error?.(
+        {
+          route: context.route,
+          requestId: context.requestId ?? crypto.randomUUID(),
+          errorCode: "INTERNAL_ERROR",
+          ...stripUndefined(context.detail),
+          err: describeError(err),
+        },
+        "Unhandled error in personal server API",
+      );
+    }
     return errorResponse(500, "INTERNAL_ERROR", "Internal server error");
   }
+}
+
+/**
+ * The `DATA_FILE_MISSING` 404 the read contract produces, logged at the one
+ * layer that knows which route served it. Peeks at a clone so the response
+ * body stays readable by the caller.
+ */
+async function logMissingDataFile(
+  response: Response,
+  context: ApiErrorLogContext,
+): Promise<void> {
+  if (!context.logger?.error) return;
+  try {
+    const body: unknown = await response.clone().json();
+    if (
+      typeof body !== "object" ||
+      body === null ||
+      (body as { error?: unknown }).error !== "DATA_FILE_MISSING"
+    ) {
+      return;
+    }
+    context.logger.error(
+      {
+        route: context.route,
+        requestId: context.requestId ?? crypto.randomUUID(),
+        errorCode: "DATA_FILE_MISSING",
+        ...stripUndefined(context.detail),
+      },
+      "Indexed data file is missing on disk",
+    );
+  } catch {
+    // A diagnostic log must not change the response sent to the caller.
+  }
+}
+
+/**
+ * An error rendered for a log line — name, message and stack only. Never the
+ * whole object: a thrown error can carry a request, a config or a token on an
+ * arbitrary property, and a structured logger would serialize all of it.
+ */
+function describeError(err: unknown): Record<string, unknown> {
+  if (err instanceof Error) {
+    return {
+      name: err.name,
+      message: err.message,
+      ...("code" in err && { code: (err as { code?: unknown }).code }),
+      stack: err.stack,
+    };
+  }
+  return { message: String(err) };
+}
+
+function stripUndefined(
+  detail: Record<string, string | undefined> | undefined,
+): Record<string, string> {
+  if (!detail) return {};
+  return Object.fromEntries(
+    Object.entries(detail).filter(
+      (pair): pair is [string, string] => pair[1] !== undefined,
+    ),
+  );
 }
 
 function normalizeLimit(value: string | null, fallback: number): number {
@@ -811,44 +974,159 @@ export async function handleX402Cycle(
   return { kind: "gateway-error", status: gatewayRes.status, body: errorBody };
 }
 
-const MAX_INGEST_STAMP_ADVANCE_SEC = 60;
-const pendingIngestStamps = new WeakMap<DataStoragePort, Set<string>>();
+const pendingIngestStamps = new WeakMap<
+  DataStoragePort,
+  Map<string, Set<number>>
+>();
 
-/** Reserve before awaiting ingestion; keep the existing second-precision paths. */
 function reserveIngestStamp(
+  now: () => Date,
   storage: DataStoragePort,
   scope: string,
-  now: () => Date,
-): { value: string; release: () => void } {
-  let pending = pendingIngestStamps.get(storage);
-  if (!pending) {
-    pending = new Set();
-    pendingIngestStamps.set(storage, pending);
-  }
-  const base = Math.floor(now().getTime() / 1000) * 1000;
-  for (let bump = 0; bump < MAX_INGEST_STAMP_ADVANCE_SEC; bump += 1) {
-    const value = new Date(base + bump * 1000)
-      .toISOString()
-      .replace(/\.\d{3}Z$/, "Z");
-    const key = `${scope}:${value}`;
-    if (
-      pending.has(key) ||
-      storage.findEntry({ scope, at: value })?.collectedAt === value
-    )
+): { collectedAt: string; release(): void } | undefined {
+  // Bound allocation to 60 millisecond slots per scope, anchored to wall time.
+  // Failed requests release their slot; neither failures nor other scopes
+  // advance this scope's clock. The durable head protects restart/clock rollback.
+  const wall = now().getTime();
+  const latest = Date.parse(storage.findEntry({ scope })?.collectedAt ?? "");
+  let scopes = pendingIngestStamps.get(storage);
+  const pending = scopes?.get(scope) ?? new Set<number>();
+  for (let stamp = wall; stamp < wall + 60; stamp += 1) {
+    if ((Number.isFinite(latest) && stamp <= latest) || pending.has(stamp)) {
       continue;
-    pending.add(key);
+    }
+    if (!scopes) {
+      scopes = new Map();
+      pendingIngestStamps.set(storage, scopes);
+    }
+    scopes.set(scope, pending);
+    pending.add(stamp);
+    const reservations = scopes;
     return {
-      value,
-      release: () => {
-        pending.delete(key);
+      collectedAt: new Date(stamp).toISOString(),
+      release() {
+        pending.delete(stamp);
+        if (pending.size === 0) reservations.delete(scope);
       },
     };
   }
-  throw new ProtocolError(
-    429,
-    "INGEST_CAPACITY",
-    "Too many writes to this scope; retry after a minute",
-  );
+  return undefined;
+}
+
+function parseLegacyPrecondition(
+  request: Request,
+): LegacyPrecondition | Response | undefined {
+  const none = request.headers.get("if-none-match");
+  const match = request.headers.get("if-match");
+  if (none !== null && match !== null) {
+    return errorResponse(
+      400,
+      "INVALID_PRECONDITION",
+      "Supply only one precondition",
+    );
+  }
+  if (none !== null) {
+    return none === "*"
+      ? { kind: "none" }
+      : errorResponse(400, "INVALID_PRECONDITION", "If-None-Match must be *");
+  }
+  if (match !== null) {
+    const parsed = /^"([1-9]\d*)"$/.exec(match);
+    const version = parsed ? Number(parsed[1]) : NaN;
+    return Number.isSafeInteger(version)
+      ? { kind: "match", version }
+      : errorResponse(
+          400,
+          "INVALID_PRECONDITION",
+          "If-Match must be a quoted positive version",
+        );
+  }
+  return undefined;
+}
+
+function parseProducerHeader(
+  request: Request,
+): { producer?: LegacyProducer; encodedProvenance?: string } | Response {
+  const producer = request.headers.get("vana-producer");
+  const encodedProvenance =
+    request.headers.get("vana-producer-provenance") ?? undefined;
+  if (producer === null && !encodedProvenance) return {};
+  if (producer !== "pdpp-projector" && producer !== "pdpp-import-projection") {
+    return errorResponse(
+      400,
+      "INVALID_PRODUCER",
+      "Vana-Producer is unrecognized or missing",
+    );
+  }
+  if (
+    encodedProvenance &&
+    (encodedProvenance.length > 8192 ||
+      !/^[A-Za-z0-9_-]+$/.test(encodedProvenance))
+  ) {
+    return errorResponse(
+      400,
+      "INVALID_PROVENANCE",
+      "Vana-Producer-Provenance is malformed",
+    );
+  }
+  return { producer, encodedProvenance };
+}
+
+async function parseProducerProvenance(
+  encoded: string | undefined,
+  body: Record<string, unknown>,
+): Promise<LegacyProducerProvenance | Response | undefined> {
+  if (!encoded) return undefined;
+  try {
+    const value = JSON.parse(
+      new TextDecoder().decode(
+        Uint8Array.from(
+          atob(encoded.replace(/-/g, "+").replace(/_/g, "/")),
+          (char) => char.charCodeAt(0),
+        ),
+      ),
+    ) as LegacyProducerProvenance;
+    if (
+      !value ||
+      typeof value !== "object" ||
+      typeof value.projector_version !== "string" ||
+      !value.projector_version ||
+      typeof value.declaration_digest !== "string" ||
+      !value.declaration_digest ||
+      !Array.isArray(value.inputs) ||
+      !value.inputs.every(
+        (input) =>
+          input &&
+          typeof input.stream === "string" &&
+          input.stream &&
+          typeof input.changes_since_token === "string" &&
+          input.changes_since_token,
+      ) ||
+      typeof value.payload_sha256 !== "string" ||
+      !/^(?:0x)?[0-9a-fA-F]{64}$/.test(value.payload_sha256)
+    ) {
+      return errorResponse(
+        400,
+        "INVALID_PROVENANCE",
+        "Producer provenance has invalid fields",
+      );
+    }
+    const actual = (await sha256Hex(canonicalJsonBytes(body))).slice(2);
+    if (actual !== value.payload_sha256.replace(/^0x/, "").toLowerCase()) {
+      return errorResponse(
+        400,
+        "PAYLOAD_HASH_MISMATCH",
+        "Provenance payload_sha256 does not match the JSON body",
+      );
+    }
+    return value;
+  } catch {
+    return errorResponse(
+      400,
+      "INVALID_PROVENANCE",
+      "Vana-Producer-Provenance is not base64url JSON",
+    );
+  }
 }
 
 /**
@@ -869,6 +1147,7 @@ export async function resolveReadDeletion(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
+  body: "file" | "canonical" = "file",
 ): Promise<{
   scope: string;
   dataPointId: string | null;
@@ -878,8 +1157,21 @@ export async function resolveReadDeletion(
   const verdict = await deps.scopeDeletions.resolve(scope, {
     consultGateway: entry ? "if-stale" : "always",
   });
-  if (!verdict.deleted) return null;
-  if (entry && !isEntryCoveredByTombstone(entry, verdict)) {
+  // A live DPv2 file cannot establish that a different canonical body was
+  // re-added. Keep this refusal until a genuine canonical re-add seam exists.
+  const tombstone =
+    body === "canonical"
+      ? (deps.scopeDeletions.deletionHistory?.get(scope) ??
+        (verdict.deleted ? verdict : null))
+      : verdict.deleted
+        ? verdict
+        : null;
+  if (!tombstone) return null;
+  if (
+    body === "file" &&
+    entry &&
+    !isEntryCoveredByTombstone(entry, tombstone)
+  ) {
     return null;
   }
   return {
@@ -887,7 +1179,7 @@ export async function resolveReadDeletion(
     dataPointId: deps.serverOwner
       ? computeDataPointId(deps.serverOwner, scope)
       : null,
-    deletedAt: verdict.deletedAt,
+    deletedAt: tombstone.deletedAt,
   };
 }
 
@@ -900,8 +1192,9 @@ export async function assertScopeNotDeleted(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
+  body: "file" | "canonical" = "file",
 ): Promise<void> {
-  const deletion = await resolveReadDeletion(deps, scope, entry);
+  const deletion = await resolveReadDeletion(deps, scope, entry, body);
   if (deletion) throw new DataDeletedError(deletion);
 }
 
@@ -916,6 +1209,127 @@ function discoveryVisibility(
   if (!deps.scopeDeletions) return undefined;
   return async (scope, entry) =>
     (await resolveReadDeletion(deps, scope, entry)) === null;
+}
+
+/**
+ * Discovery filter for the scope listing: the deletion filter, and a
+ * canonical scope is listed only when the view could serve it.
+ */
+function listingVisibility(
+  deps: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner" | "legacyScopeView"
+  >,
+): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
+  const deletion = discoveryVisibility(deps);
+  const view = deps.legacyScopeView;
+  if (!view) return deletion;
+  return async (scope, entry) => {
+    const listing = view.listingFor(scope);
+    if (listing.kind === "refused") return false;
+    const canonicalOwned = view.ownsScope(scope);
+    // A file's re-add marker cannot revive the canonical body this row
+    // describes. Canonical re-adds have no registered version yet.
+    return (
+      (await resolveReadDeletion(
+        deps,
+        scope,
+        canonicalOwned ? undefined : entry,
+        canonicalOwned ? "canonical" : "file",
+      )) === null
+    );
+  };
+}
+
+/**
+ * Bound scopes served only from canonical records, for the listing: no
+ * legacy write is needed to discover them. A gateway deletion hides them
+ * the way it hides a stored scope.
+ */
+function canonicalOnlyScopes(
+  deps: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner" | "legacyScopeView"
+  >,
+):
+  | ((
+      scopePrefix: string | undefined,
+      stored: ReadonlySet<string>,
+    ) => Promise<ScopeSummary[]>)
+  | undefined {
+  const view = deps.legacyScopeView;
+  if (!view) return undefined;
+  return async (scopePrefix, stored) => {
+    const listed: ScopeSummary[] = [];
+    for (const { scope, collectedAt } of view.listCanonicalScopes(
+      scopePrefix,
+    )) {
+      if (stored.has(scope)) continue;
+      if (
+        (await resolveReadDeletion(deps, scope, undefined, "canonical")) !==
+        null
+      ) {
+        continue;
+      }
+      // No legacy version exists to count or to ask `/versions` for.
+      listed.push({ scope, latestCollectedAt: collectedAt, versionCount: 0 });
+    }
+    return listed;
+  };
+}
+
+/**
+ * A canonical scope's listing row carries the canonical freshness. The
+ * legacy head's size and block readiness describe a file the latest read
+ * does not serve, so they are dropped.
+ */
+function withCanonicalListing(
+  deps: Pick<PersonalServerDataApiDeps, "legacyScopeView">,
+  summary: ScopeSummary,
+): ScopeSummary {
+  const listing = deps.legacyScopeView?.listingFor(summary.scope);
+  if (listing?.kind !== "canonical") return summary;
+  return {
+    scope: summary.scope,
+    latestCollectedAt: listing.collectedAt,
+    versionCount: summary.versionCount,
+  };
+}
+
+/**
+ * X402 binds a payment to a registered data point version
+ * (`RecordDataAccess`). A canonical body has none, and the legacy entry's
+ * would attest a different body, so a charged canonical read is refused
+ * before any challenge until a real binding exists.
+ */
+type PaidCanonicalReadRefusal = {
+  status: "unavailable";
+  reason: "paid_read_unsupported";
+};
+
+/**
+ * 409 when the owner must choose between connections, 503 otherwise. The
+ * body names the reason and stream names only: no instance id, no row data,
+ * no legacy content.
+ */
+function legacyViewRefusalResponse(
+  scope: string,
+  refusal: LegacyScopeRefusal | PaidCanonicalReadRefusal,
+): Response {
+  const status = refusal.reason === "ambiguous_connection" ? 409 : 503;
+  return jsonResponse(
+    {
+      error: "CANONICAL_VIEW_UNAVAILABLE",
+      message: `The latest data for scope "${scope}" cannot be served from the owner's connector records (${refusal.reason}).`,
+      status: refusal.status,
+      reason: refusal.reason,
+      ...("detail" in refusal ? { detail: refusal.detail } : {}),
+      ...("streams" in refusal ? { streams: refusal.streams } : {}),
+      ...("stream" in refusal ? { stream: refusal.stream } : {}),
+      ...("candidates" in refusal ? { candidates: refusal.candidates } : {}),
+    },
+    { status },
+  );
 }
 
 /** The index fields the deletion gate needs from the entry a read would serve. */
@@ -945,22 +1359,15 @@ async function ingestTombstoneMarker(
 
 // The delete worker wants a full Logger; the API logger is all-optional.
 function apiLoggerAsLogger(logger: PersonalServerApiLogger | undefined) {
-  const noop = () => undefined;
   return {
     debug: (payload: unknown, message?: string) =>
-      (logger?.debug ?? noop)(
-        payload as Record<string, unknown>,
-        message ?? "",
-      ),
+      logger?.debug?.(payload as Record<string, unknown>, message ?? ""),
     info: (payload: unknown, message?: string) =>
-      (logger?.info ?? noop)(payload as Record<string, unknown>, message ?? ""),
+      logger?.info?.(payload as Record<string, unknown>, message ?? ""),
     warn: (payload: unknown, message?: string) =>
-      (logger?.warn ?? noop)(payload as Record<string, unknown>, message ?? ""),
+      logger?.warn?.(payload as Record<string, unknown>, message ?? ""),
     error: (payload: unknown, message?: string) =>
-      (logger?.error ?? noop)(
-        payload as Record<string, unknown>,
-        message ?? "",
-      ),
+      logger?.error?.(payload as Record<string, unknown>, message ?? ""),
   };
 }
 
@@ -978,6 +1385,58 @@ function notifyDataWritten(
         error: err instanceof Error ? err.message : String(err),
       },
       "onDataWritten hook failed; record already stored",
+    );
+  }
+}
+
+/**
+ * Offer a just-ingested envelope to the PDPP importer.
+ *
+ * The local-ingest twin of the download worker's `importIntoPdpp`, and
+ * deliberately the same shape: same `ImportableEnvelope`, same total handling
+ * of every outcome, same permanent-vs-transient logging split. Keeping the
+ * two symmetric is the point — a `$pdpp` envelope must mean the same thing
+ * and reach the same store whether the gateway handed it over or a local
+ * producer POSTed it, otherwise "imported" would depend on which door the
+ * bytes came through.
+ *
+ * `skipped` is the ordinary legacy case (no `$pdpp` block) and stays silent.
+ * A rejection is a WARNING, not an error: it means the producer sent
+ * something this deployment could not verify — actionable, but not a failure
+ * of the write, which has already committed.
+ */
+function importIngestedIntoPdpp(
+  deps: Pick<PersonalServerDataApiDeps, "pdppImporter" | "logger">,
+  envelope: { scope: string; collectedAt: string; data: unknown },
+): void {
+  if (!deps.pdppImporter) return;
+  try {
+    const outcome = deps.pdppImporter.importEnvelope(envelope);
+    if (outcome.status === "rejected") {
+      const permanent = isPermanentRejection(outcome.rejection);
+      deps.logger?.warn?.(
+        {
+          scope: envelope.scope,
+          collectedAt: envelope.collectedAt,
+          code: outcome.rejection.code,
+          message: outcome.rejection.message,
+          permanent,
+        },
+        permanent
+          ? "Ingested data point was refused by the PDPP importer and will not be retried"
+          : "PDPP import unavailable for this ingested data point",
+      );
+    }
+  } catch (err) {
+    // A throwing importer is infrastructure failing, not the envelope being
+    // wrong. The record is stored and indexed already, so this must never
+    // turn a committed write into a 500.
+    deps.logger?.warn?.(
+      {
+        scope: envelope.scope,
+        error: err instanceof Error ? err.message : String(err),
+      },
+      "PDPP import threw on ingest; record already stored and indexed",
     );
   }
 }
@@ -1205,6 +1664,15 @@ export async function handlePersonalServerDataRequest(
   deps: PersonalServerDataApiDeps,
   options: PersonalServerApiDispatchOptions = {},
 ): Promise<Response> {
+  // Filled in as the dispatch narrows, so a 500 thrown deep in a read is
+  // logged against the route that served it rather than a generic label. It
+  // is mutable for exactly that reason: the route is not known until the path
+  // has been parsed, and by then we are already inside the try.
+  const logContext: ApiErrorLogContext = {
+    logger: deps.logger,
+    route: `${request.method} ${options.basePath ?? "/v1/data"}`,
+    requestId: crypto.randomUUID(),
+  };
   return withApiErrors(async () => {
     const url = new URL(request.url);
     const pathname = stripBasePath(url.pathname, options.basePath);
@@ -1219,12 +1687,18 @@ export async function handlePersonalServerDataRequest(
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
-        isVisible: discoveryVisibility(deps),
+        isVisible: listingVisibility(deps),
         isListable: (scope) =>
           !isSystemScope(scope) &&
           (!listAuth || listAuthCovers(listAuth, scope)),
+        extraScopes: canonicalOnlyScopes(deps),
       });
-      return jsonResponse(result.response);
+      return jsonResponse({
+        ...result.response,
+        scopes: result.response.scopes.map((summary) =>
+          withCanonicalListing(deps, summary),
+        ),
+      });
     }
 
     // "additions" has no dot, so it can never be a real scope name (scopes are
@@ -1253,14 +1727,97 @@ export async function handlePersonalServerDataRequest(
     }
 
     const parts = pathname.split("/").filter(Boolean);
+    if (parts.length === 3 && parts[1] === "imports") {
+      if (request.method !== "PUT") return methodNotAllowed();
+      await deps.auth.authorizeOwner(request);
+      const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+      if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+      const operation = decodePathPart(parts[2]);
+      if (!/^[a-f0-9]{64}$/.test(operation)) {
+        return errorResponse(
+          400,
+          "INVALID_IMPORT_OPERATION",
+          "operation must be 64 lowercase hexadecimal characters",
+        );
+      }
+      if (!deps.storage.commitVersion) {
+        throw new ProtocolError(
+          501,
+          "IMPORT_UNSUPPORTED",
+          "This storage backend does not support durable owner imports",
+        );
+      }
+      if (!deps.serverOwner)
+        throw new ServerNotConfiguredError({
+          reason: "serverOwner is required for durable owner imports",
+        });
+      if (!isJsonContentType(request) || url.search.length > 0) {
+        return errorResponse(
+          400,
+          "INVALID_IMPORT",
+          "Owner imports accept JSON root writes without query parameters",
+        );
+      }
+      const parsed = await parseJsonObjectBody(
+        request,
+        "Request body must be valid JSON",
+      );
+      if (!parsed.ok) return contractResponse(parsed.result);
+      if ("lineage" in parsed.body || "$binary" in parsed.body) {
+        return errorResponse(
+          400,
+          "INVALID_IMPORT",
+          "Owner imports do not accept binary or lineage writes",
+        );
+      }
+      const bodySha256 = await sha256Hex(canonicalJsonBytes(parsed.body));
+      const authority = deps.gatewayConfig
+        ? `${deps.gatewayConfig.chainId}:${deps.gatewayConfig.contracts.dataRegistry.toLowerCase()}`
+        : "local";
+      const result = await ingestDataContract({
+        storage: deps.storage,
+        scopeParam: scopeResult.scope,
+        body: parsed.body,
+        collectedAt: (deps.now ?? (() => new Date()))().toISOString(),
+        status: deps.syncManager ? "syncing" : "stored",
+        afterTombstoneVersion: await ingestTombstoneMarker(
+          deps,
+          scopeResult.scope,
+        ),
+        import: {
+          operation,
+          bodySha256,
+          owner: deps.serverOwner.toLowerCase(),
+          authority,
+        },
+      });
+      if (!result.ok) return contractErrorResponse(result);
+      notifyNewData(deps.syncManager);
+      if (!result.replay)
+        notifyDataWritten(deps, {
+          scope: result.scope,
+          collectedAt: result.collectedAt,
+        });
+      return jsonResponse(result.response, {
+        status: result.replay ? 200 : 201,
+      });
+    }
     if (parts.length === 2 && parts[1] === "versions") {
       if (request.method !== "GET") return methodNotAllowed();
-      const listAuth = await deps.auth.authorizeBuilderList(request, {
-        grantId: selectedGrantId(request, url),
-      });
+      const versionsScopeParam = decodePathPart(parts[0]);
+      const versionsGrantId = selectedGrantId(request, url);
+      const listAuth = deps.auth.authorizeScopeVersions
+        ? await deps.auth.authorizeScopeVersions({
+            request,
+            scope: versionsScopeParam,
+            grantId: versionsGrantId,
+          })
+        : await deps.auth.authorizeBuilderList(request, {
+            grantId: versionsGrantId,
+          });
       // A scope's version history is as much its data as its content is, so
       // a non-owner needs a grant covering it, exactly like a read.
-      const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+      const scopeResult = parseDataScopeContract(versionsScopeParam);
       if (
         scopeResult.ok &&
         listAuth &&
@@ -1392,10 +1949,16 @@ export async function handlePersonalServerDataRequest(
 
     if (parts.length !== 1) return notFound();
     const scopeParam = decodePathPart(parts[0]);
+    logContext.route = `${request.method} ${options.basePath ?? "/v1/data"}/:scope`;
 
     if (request.method === "GET") {
       const scopeResult = parseDataScopeContract(scopeParam);
       if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+      logContext.detail = { scope: scopeResult.scope };
+      // An empty `fileId=` or `at=` selects no version: it is the latest
+      // read, as storage already treats it.
+      const fileIdParam = url.searchParams.get("fileId") || undefined;
+      const atParam = url.searchParams.get("at") || undefined;
       // `?view=stored` returns the body as stored, without the read-time
       // legacy projection. Owner only; checked after auth below.
       const view = url.searchParams.get("view");
@@ -1408,8 +1971,8 @@ export async function handlePersonalServerDataRequest(
       }
       const selectedEntry = deps.storage.findEntry({
         scope: scopeResult.scope,
-        fileId: url.searchParams.get("fileId") ?? undefined,
-        at: url.searchParams.get("at") ?? undefined,
+        fileId: fileIdParam,
+        at: atParam,
       });
       // Holds the base64-encoded gateway payForOperation response body when
       // X402 succeeds — emitted on the final read response as X-PAYMENT-RESPONSE.
@@ -1419,15 +1982,31 @@ export async function handlePersonalServerDataRequest(
         request,
         scope: scopeResult.scope,
         grantId,
-        fileId:
-          url.searchParams.get("fileId") ?? selectedEntry?.fileId ?? undefined,
-        at: url.searchParams.get("at") ?? undefined,
+        fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
+        at: atParam,
       });
+
+      // Select the body after auth and before deletion or payment. A file's
+      // version and re-add marker authorize that file, not canonical rows.
+      // `?view=stored` asks for the stored file's body, so it never reads the
+      // canonical view either.
+      const latest =
+        fileIdParam === undefined && atParam === undefined && view === null
+          ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
+          : undefined;
+      const canonicalOwned =
+        latest !== undefined &&
+        deps.legacyScopeView?.ownsScope(scopeResult.scope);
 
       // Deletion gate, after auth (so unauthenticated callers learn nothing)
       // and before payment (so nobody is charged for deleted data). Covers
       // both a stale local copy of a tombstoned scope and a local miss.
-      await assertScopeNotDeleted(deps, scopeResult.scope, selectedEntry);
+      await assertScopeNotDeleted(
+        deps,
+        scopeResult.scope,
+        canonicalOwned ? undefined : selectedEntry,
+        canonicalOwned ? "canonical" : "file",
+      );
 
       if (view === "stored" && !isOwnerView(authResult)) {
         return errorResponse(
@@ -1446,6 +2025,14 @@ export async function handlePersonalServerDataRequest(
       // answer unreachable through this route. Nothing here blocks: a
       // previous version is served now, the fresh one lands in a later read.
       notifyDataRead(deps, { scope: scopeResult.scope });
+
+      // A canonical scope's latest body is the canonical view, and only it:
+      // a refusal is answered, never replaced by the legacy file. Explicit
+      // versions stay legacy history. Read before payment, so a builder is
+      // never challenged or charged for a read that is then refused.
+      if (latest?.kind === "refused") {
+        return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
+      }
 
       // X402 payment dance for builder reads. Owner-exempt reads (the
       // grantId sentinels "owner" / "policy-bypass") skip payment entirely
@@ -1506,6 +2093,12 @@ export async function handlePersonalServerDataRequest(
           willCharge,
         });
       }
+      if (willCharge && latest?.kind === "canonical") {
+        return legacyViewRefusalResponse(scopeResult.scope, {
+          status: "unavailable",
+          reason: "paid_read_unsupported",
+        });
+      }
       // Keep the full condition inline (not `if (willCharge)`) so TS narrows
       // deps.gateway/gatewayConfig/gatewayUrl to non-undefined in the block.
       if (
@@ -1522,8 +2115,8 @@ export async function handlePersonalServerDataRequest(
           deps,
           request,
           scope: scopeResult.scope,
-          fileIdParam: url.searchParams.get("fileId") ?? undefined,
-          atParam: url.searchParams.get("at") ?? undefined,
+          fileIdParam,
+          atParam,
           grantId: resolvedGrantId,
           builder: builder as `0x${string}`,
           gateway: deps.gateway,
@@ -1547,26 +2140,38 @@ export async function handlePersonalServerDataRequest(
         );
       }
 
-      const result = await readDataContract({
-        storage: deps.storage,
-        scopeParam: scopeResult.scope,
-        fileId: url.searchParams.get("fileId") ?? undefined,
-        at: url.searchParams.get("at") ?? undefined,
-        ...(view === "stored" ? { view } : {}),
-      });
-      if (!result.ok) {
-        if (result.status === 404) {
-          // The entry selected above can vanish before the read (a sync
-          // reconcile applying a tombstone concurrently); answer 410, not
-          // 404, when that is why.
-          await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
+      const headers: Record<string, string> = {};
+      headers["X-Vana-Data-Source"] =
+        latest?.kind === "canonical" ? "canonical" : "legacy";
+      let envelope: DataFileEnvelope;
+      let servedFileId: string | undefined;
+      if (latest?.kind === "canonical") {
+        envelope = latest.envelope;
+        headers.ETag = `"${latest.revision}"`;
+      } else {
+        const result = await readDataContract({
+          storage: deps.storage,
+          scopeParam: scopeResult.scope,
+          fileId: fileIdParam,
+          at: atParam,
+          ...(view === "stored" ? { view } : {}),
+        });
+        if (!result.ok) {
+          if (result.status === 404) {
+            // The entry selected above can vanish before the read (a sync
+            // reconcile applying a tombstone concurrently); answer 410, not
+            // 404, when that is why.
+            await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
+          }
+          return contractErrorResponse(result);
         }
-        return contractErrorResponse(result);
+        envelope = result.envelope;
+        servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
       }
 
       const servedEnvelope = isOwnerView(authResult)
-        ? result.envelope
-        : redactEnvelopeForGrantee(result.envelope);
+        ? envelope
+        : redactEnvelopeForGrantee(envelope);
 
       const logId = deps.createLogId?.() ?? crypto.randomUUID();
       const timestamp = (deps.now ?? (() => new Date()))().toISOString();
@@ -1591,10 +2196,7 @@ export async function handlePersonalServerDataRequest(
         if (!authResult?.grantId || !authResult.builder) return;
         reportPersonalServerReadFulfillment(deps, {
           builder: authResult.builder,
-          fileId:
-            url.searchParams.get("fileId") ??
-            selectedEntry?.fileId ??
-            undefined,
+          fileId: servedFileId,
           grantId: authResult.grantId,
           ipAddress,
           logId,
@@ -1606,7 +2208,6 @@ export async function handlePersonalServerDataRequest(
         });
       };
 
-      const headers: Record<string, string> = {};
       if (paymentResponseHeader) {
         headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
       }
@@ -1686,7 +2287,7 @@ export async function handlePersonalServerDataRequest(
       // so the builder's retry with the same still-valid proof is accepted;
       // after commit the proof stays consumed (a retry would be a duplicate).
       let committed = false;
-      let releaseStamp: (() => void) | undefined;
+      let ingestStamp: ReturnType<typeof reserveIngestStamp>;
       const failWrite = async <T>(response: T): Promise<T> => {
         await writeAuth?.releaseProof?.();
         return response;
@@ -1695,13 +2296,36 @@ export async function handlePersonalServerDataRequest(
         const scopeResult = parseDataScopeContract(scopeParam);
         if (!scopeResult.ok)
           return failWrite(contractErrorResponse(scopeResult));
-        const stamp = reserveIngestStamp(
+        const parsedPrecondition = parseLegacyPrecondition(request);
+        if (parsedPrecondition instanceof Response)
+          return failWrite(parsedPrecondition);
+        const producerHeader = parseProducerHeader(request);
+        if (producerHeader instanceof Response)
+          return failWrite(producerHeader);
+        if (writeAuth && producerHeader.producer) {
+          return failWrite(
+            errorResponse(
+              403,
+              "NOT_OWNER",
+              "Only the owner may assert a producer",
+            ),
+          );
+        }
+        ingestStamp = reserveIngestStamp(
+          deps.now ?? (() => new Date()),
           deps.storage,
           scopeResult.scope,
-          deps.now ?? (() => new Date()),
         );
-        releaseStamp = stamp.release;
-        const collectedAtValue = stamp.value;
+        if (!ingestStamp) {
+          return failWrite(
+            errorResponse(
+              429,
+              "INGEST_CAPACITY",
+              "Too many writes for this scope; retry when the clock advances",
+            ),
+          );
+        }
+        const collectedAtValue = ingestStamp.collectedAt;
         const status = deps.syncManager ? "syncing" : "stored";
         const afterTombstoneVersion = await ingestTombstoneMarker(
           deps,
@@ -1748,6 +2372,15 @@ export async function handlePersonalServerDataRequest(
         // data needs no schema at all — we ingest it schemaless. (Structured JSON
         // below still resolves a schema for validation/metadata.)
         if (!isJsonContentType(request)) {
+          if (producerHeader.producer) {
+            return failWrite(
+              errorResponse(
+                400,
+                "INVALID_PRODUCER",
+                "Producer attribution requires a JSON body",
+              ),
+            );
+          }
           if (supersede !== null) {
             return failWrite(
               errorResponse(
@@ -1780,6 +2413,7 @@ export async function handlePersonalServerDataRequest(
             attribution: writeAuth?.attribution,
             lineage,
             afterTombstoneVersion,
+            precondition: parsedPrecondition,
           });
           if (!result.ok) return failWrite(contractErrorResponse(result));
           committed = true;
@@ -1809,6 +2443,11 @@ export async function handlePersonalServerDataRequest(
           "Request body must be valid JSON",
         );
         if (!parsed.ok) return failWrite(contractResponse(parsed.result));
+        const provenance = await parseProducerProvenance(
+          producerHeader.encodedProvenance,
+          parsed.body,
+        );
+        if (provenance instanceof Response) return failWrite(provenance);
         // Derivative writes: validate the caller's `lineage` before anything
         // is stored (a failure here throws, releasing the builder's proof).
         const lineage = await prepareWriteLineage(
@@ -1827,8 +2466,13 @@ export async function handlePersonalServerDataRequest(
           attribution: writeAuth?.attribution,
           lineage,
           afterTombstoneVersion,
+          precondition: parsedPrecondition,
+          producer: producerHeader.producer,
+          producerProvenance: provenance,
         });
         if (!result.ok) return failWrite(contractErrorResponse(result));
+        if (result.replay)
+          throw new Error("Ordinary POST cannot replay an import");
         committed = true;
         deps.logger?.info?.(
           {
@@ -1849,6 +2493,14 @@ export async function handlePersonalServerDataRequest(
               )
             : undefined;
         notifyNewData(deps.syncManager);
+        // The parsed body is the envelope's `data`, which is where a producer
+        // stamps `$pdpp`. Offered here rather than inside the ingest contract
+        // so the import stays strictly after the record is durable.
+        importIngestedIntoPdpp(deps, {
+          scope: scopeResult.scope,
+          collectedAt: collectedAtValue,
+          data: parsed.body,
+        });
         notifyDataWritten(deps, {
           scope: scopeResult.scope,
           collectedAt: collectedAtValue,
@@ -1880,14 +2532,14 @@ export async function handlePersonalServerDataRequest(
                   ? err.cause.message
                   : String(err.cause),
             },
-            "Envelope written but indexing failed; record persisted unindexed",
+            "Envelope write incomplete after durable commit; boot recovery may finish it",
           );
         } else if (!committed) {
           await writeAuth?.releaseProof?.();
         }
         throw err;
       } finally {
-        releaseStamp?.();
+        ingestStamp?.release();
       }
     }
 
@@ -1909,6 +2561,22 @@ export async function handlePersonalServerDataRequest(
         // truncation and cross-owner handling, all-or-nothing before the
         // first tombstone). Until that lands the only honest answer is 501.
         throw new LineageCascadeUnavailableError({ scope: parsed.scope });
+      }
+
+      // A canonical-owned scope's latest body is its connection's rows. No
+      // store seam deletes one legacy scope's rows (streams can be shared,
+      // and the account and its generation are the unit of erasure), so a
+      // 200 here would leave the data readable. Refuse before any gateway or
+      // file change; the connection's own delete erases its rows.
+      if (deps.legacyScopeView?.ownsScope(parsed.scope)) {
+        return jsonResponse(
+          {
+            error: "CANONICAL_DELETE_UNSUPPORTED",
+            message: `Scope "${parsed.scope}" is served from the owner's connector records, which this route cannot delete. Nothing was deleted; delete the connection to erase its records.`,
+            scope: parsed.scope,
+          },
+          { status: 409 },
+        );
       }
 
       // Durable order: gateway tombstone -> storage blobs -> local copy. The
@@ -1978,7 +2646,7 @@ export async function handlePersonalServerDataRequest(
     }
 
     return methodNotAllowed();
-  });
+  }, logContext);
 }
 
 export async function handlePersonalServerAccessLogsRequest(
@@ -2007,40 +2675,46 @@ export async function handlePersonalServerSyncRequest(
   deps: PersonalServerSyncApiDeps,
   options: PersonalServerApiDispatchOptions = {},
 ): Promise<Response> {
-  return withApiErrors(async () => {
-    const url = new URL(request.url);
-    const pathname = stripBasePath(url.pathname, options.basePath);
+  return withApiErrors(
+    async () => {
+      const url = new URL(request.url);
+      const pathname = stripBasePath(url.pathname, options.basePath);
 
-    if (pathname === "/trigger") {
-      if (request.method !== "POST") return methodNotAllowed();
-      await deps.auth.authorizeOwner(request);
-      return contractResponse(await triggerSyncContract(deps.syncManager));
-    }
+      if (pathname === "/trigger") {
+        if (request.method !== "POST") return methodNotAllowed();
+        await deps.auth.authorizeOwner(request);
+        return contractResponse(await triggerSyncContract(deps.syncManager));
+      }
 
-    if (pathname === "/status") {
-      if (request.method !== "GET") return methodNotAllowed();
-      await deps.auth.authorizeOwner(request);
-      return contractResponse(getSyncStatusContract(deps.syncManager));
-    }
+      if (pathname === "/status") {
+        if (request.method !== "GET") return methodNotAllowed();
+        await deps.auth.authorizeOwner(request);
+        return contractResponse(getSyncStatusContract(deps.syncManager));
+      }
 
-    if (pathname.startsWith("/file/")) {
-      if (request.method !== "POST") return methodNotAllowed();
-      await deps.auth.authorizeOwner(request);
-      const fileId = decodeURIComponent(pathname.slice("/file/".length));
-      deps.logger?.info?.(
-        { fileId },
-        "File sync requested, triggering full sync",
-      );
-      return contractResponse(
-        await syncFileContract({
-          fileId,
-          syncManager: deps.syncManager,
-        }),
-      );
-    }
+      if (pathname.startsWith("/file/")) {
+        if (request.method !== "POST") return methodNotAllowed();
+        await deps.auth.authorizeOwner(request);
+        const fileId = decodeURIComponent(pathname.slice("/file/".length));
+        deps.logger?.info?.(
+          { fileId },
+          "File sync requested, triggering full sync",
+        );
+        return contractResponse(
+          await syncFileContract({
+            fileId,
+            syncManager: deps.syncManager,
+          }),
+        );
+      }
 
-    return notFound();
-  });
+      return notFound();
+    },
+    {
+      logger: deps.logger,
+      route: `${request.method} ${options.basePath ?? "/v1/sync"}`,
+    },
+  );
 }
 
 export async function handlePersonalServerGrantsRequest(

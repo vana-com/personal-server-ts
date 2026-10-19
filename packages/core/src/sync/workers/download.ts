@@ -3,6 +3,7 @@ import {
   DataFileEnvelopeSchema,
   decryptWithPassword,
   deriveScopeKey,
+  type DataFileEnvelope,
   type DataPointRecord,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
@@ -14,6 +15,7 @@ import type {
   DataStoragePort,
   PendingBlobDeletion,
   PendingBlobDeletionStore,
+  VersionCommit,
 } from "../../ports/index.js";
 import { feedFromGatewayClient } from "../data-point-feed.js";
 import {
@@ -31,6 +33,7 @@ import {
 } from "../issues.js";
 import { downloadRetryKey, type DownloadRetryMemory } from "../retry-memory.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
+import { isPermanentRejection, type PdppImporter } from "../pdpp-import.js";
 import { recordStoredVersion } from "../../additions/ledger-store.js";
 
 /**
@@ -100,6 +103,19 @@ export interface DownloadWorkerDeps {
     /** The record's stamped `$lineage.sources`, when it is a derivative. */
     lineageSources?: string[];
   }) => void;
+  /**
+   * Import a decrypted envelope into the PDPP record store, when the
+   * deployment mounted one.
+   *
+   * Runs AFTER the legacy write and index above, and never in place of them:
+   * PDPP is an additional read surface over the same synced data, not a
+   * replacement for the storage every existing reader depends on. A failing
+   * import is logged and swallowed for the same reason — the data point is
+   * already durably stored and indexed by the time this runs, so throwing
+   * would block the sync cursor and stall the legacy path over a defect in
+   * the newer one.
+   */
+  pdppImporter?: PdppImporter;
 }
 
 export interface DeletionReconcileResult {
@@ -284,6 +300,13 @@ export async function downloadOne(
         "Local index entry was missing its envelope; re-downloading data point",
       );
     } else {
+      // Already indexed by a previous cycle. The legacy path is done, but the
+      // PDPP import may not be: it runs after indexing, so it can have failed,
+      // or PDPP may not have been mounted yet when this point first arrived.
+      // Because the local index is itself the dedup key, returning here
+      // without retrying is what strands such an envelope permanently — no
+      // later sync would ever look at it again.
+      await retryPdppImportFromLocal(deps, existing);
       logger.debug(
         { dataPointId: record.id },
         "Data point already in index, skipping",
@@ -347,10 +370,13 @@ export async function downloadOne(
   }
 
   // 6. Parse as DataFileEnvelope (validate)
-  let envelope: ReturnType<typeof DataFileEnvelopeSchema.parse>;
+  let envelope: DataFileEnvelope & {
+    producer?: unknown;
+    producer_provenance?: unknown;
+  };
   try {
     const raw = JSON.parse(new TextDecoder().decode(plaintext));
-    envelope = DataFileEnvelopeSchema.parse(raw);
+    envelope = DataFileEnvelopeSchema.passthrough().parse(raw);
   } catch (err) {
     const detail = (err as Error).message;
     diagnostics?.onDecryptError(record.id, record.scope, detail);
@@ -364,6 +390,7 @@ export async function downloadOne(
     at: envelope.collectedAt,
   });
   if (
+    !storage.commitVersion &&
     existingByVersion !== undefined &&
     existingByVersion.collectedAt === envelope.collectedAt
   ) {
@@ -389,6 +416,10 @@ export async function downloadOne(
       diagnostics,
     );
     if (repairResult !== "missing-envelope") {
+      // Same version already stored locally. The envelope is decrypted and in
+      // hand, so offer it to the importer directly — no local re-read needed.
+      // Same stranding risk as the dataPointId dedup above.
+      importIntoPdpp(deps, envelope, record.id);
       logger.debug(
         {
           dataPointId: record.id,
@@ -413,8 +444,40 @@ export async function downloadOne(
   diagnostics?.onIndexStart(record.id, envelope.scope);
   let relativePath: string;
   let sizeBytes: number;
+  const replicaMetadata: Extract<
+    VersionCommit,
+    { kind: "replica" }
+  >["metadata"] = {
+    schemaId: ctx.schemaId,
+    dataPointId: record.id,
+    version: expectedVersion,
+    ...(envelope.producer === "pdpp-projector" ||
+    envelope.producer === "pdpp-import-projection"
+      ? { producer: envelope.producer }
+      : {}),
+    ...(envelope.producer_provenance &&
+    typeof envelope.producer_provenance === "object"
+      ? { producerProvenance: JSON.stringify(envelope.producer_provenance) }
+      : {}),
+  };
   try {
-    ({ relativePath, sizeBytes } = await storage.writeEnvelope(envelope));
+    if (storage.commitVersion) {
+      // Publication, collision-byte validation and metadata adoption share the
+      // writer gate with owner imports. A timestamp lookup is not a reservation.
+      const committed = await storage.commitVersion({
+        kind: "replica",
+        envelope,
+        metadata: replicaMetadata,
+      });
+      if (committed.kind !== "stored") {
+        throw new Error(
+          "Replica commit unexpectedly returned an import receipt",
+        );
+      }
+      ({ relativePath, sizeBytes } = committed.writeResult);
+    } else {
+      ({ relativePath, sizeBytes } = await storage.writeEnvelope(envelope));
+    }
     await writeBlockSidecars(
       storage,
       envelope,
@@ -431,22 +494,31 @@ export async function downloadOne(
 
   // 8. Insert into local index (with dataPointId + version)
   try {
-    await storage.insertEntry({
-      fileId: null,
-      schemaId: ctx.schemaId,
-      path: relativePath,
-      scope: envelope.scope,
-      collectedAt: envelope.collectedAt,
-      sizeBytes,
-      version: expectedVersion,
-      dataPointId: record.id,
-    });
+    if (!storage.commitVersion) {
+      await storage.insertEntry({
+        fileId: null,
+        path: relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes,
+        ...replicaMetadata,
+      });
+    }
   } catch (err) {
     const detail = (err as Error).message;
     diagnostics?.onIndexError(record.id, envelope.scope, detail);
     throw err;
   }
   diagnostics?.onIndexEnd(record.id, envelope.scope);
+  if (
+    storage.commitVersion &&
+    existingByVersion?.collectedAt === envelope.collectedAt
+  ) {
+    // Preserve the existing-version skip contract after the atomic port has
+    // verified the bytes and safely adopted the registered metadata.
+    importIntoPdpp(deps, envelope, record.id);
+    return null;
+  }
 
   // Fold the stored version into the scope's first-seen sidecar. Best-effort
   // and after indexing: a failure leaves the sidecar to be rebuilt later.
@@ -460,6 +532,8 @@ export async function downloadOne(
     { dataPointId: record.id, scope: envelope.scope, path: relativePath },
     "Downloaded and indexed data point",
   );
+
+  importIntoPdpp(deps, envelope, record.id);
 
   if (deps.onDataPointIndexed) {
     try {
@@ -807,6 +881,108 @@ export async function repairLocalMissingBlockSidecars(
     );
   }
   return { repaired, missingEnvelopeEntries };
+}
+
+/**
+ * Offer a freshly indexed envelope to the PDPP importer.
+ *
+ * Deliberately total: every outcome is handled and none escapes. A rejection
+ * is a WARNING rather than an error because it means the producer sent
+ * something this deployment could not verify — actionable, but not a fault of
+ * this sync cycle, and not a reason to re-download a blob that arrived
+ * intact. `skipped` is the ordinary legacy case and stays silent.
+ */
+function importIntoPdpp(
+  deps: Pick<DownloadWorkerDeps, "pdppImporter" | "logger">,
+  envelope: { scope: string; collectedAt: string; data: unknown },
+  dataPointId: string,
+): void {
+  if (!deps.pdppImporter) return;
+  try {
+    const outcome = deps.pdppImporter.importEnvelope({
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      data: envelope.data,
+    });
+    if (outcome.status === "rejected") {
+      // Both are visible, but they mean different things and an operator
+      // needs to tell them apart: a permanent verdict is about the producer's
+      // bytes and will never change, while a transient one is about this
+      // deployment and clears on a later cycle.
+      const permanent = isPermanentRejection(outcome.rejection);
+      deps.logger.warn(
+        {
+          dataPointId,
+          scope: envelope.scope,
+          code: outcome.rejection.code,
+          message: outcome.rejection.message,
+          permanent,
+        },
+        permanent
+          ? "Synced data point was refused by the PDPP importer and will not be retried"
+          : "PDPP import unavailable for this data point; a later sync will retry it",
+      );
+    }
+  } catch (err) {
+    // A throwing importer is infrastructure failing, not the envelope being
+    // wrong, so this is retryable by construction — and the retry path above
+    // is what makes that statement true rather than aspirational.
+    deps.logger.warn(
+      { dataPointId, scope: envelope.scope, error: (err as Error).message },
+      "PDPP import threw; data point stays indexed and a later sync will retry it",
+    );
+  }
+}
+
+/**
+ * Re-offer an already-indexed data point to the PDPP importer, reading the
+ * envelope back from local storage.
+ *
+ * This exists because legacy indexing and PDPP import are two separate
+ * writes with no shared transaction. Anything that interrupts between them —
+ * a throwing importer, an unmounted PDPP, a store that is briefly unhealthy
+ * — leaves an envelope that is indexed but not imported, and the index entry
+ * then suppresses every future attempt.
+ *
+ * Reads the cached local envelope rather than re-downloading: the plaintext
+ * is already on disk, so re-fetching and re-decrypting the blob would burn
+ * network and CPU on every cycle for no new information. The importer's own
+ * idempotency (compare-before-write) is what keeps a repeated offer from
+ * producing a duplicate revision, so this cannot inflate `changes_since`.
+ *
+ * Best-effort throughout. The data point is durably stored and indexed
+ * already; a failure here must never fail the sync cycle or block its cursor.
+ */
+async function retryPdppImportFromLocal(
+  deps: Pick<DownloadWorkerDeps, "pdppImporter" | "logger" | "storage">,
+  entry: { scope: string; collectedAt: string },
+): Promise<void> {
+  if (!deps.pdppImporter) return;
+  // Nothing a re-read could change: already imported, verified unchanged,
+  // permanently refused, or carrying no `$pdpp` at all. Without this gate the
+  // retry would re-read and re-verify every legacy data point on every cycle,
+  // forever, to reach the same answer.
+  if (!deps.pdppImporter.needsRetry(entry.scope, entry.collectedAt)) return;
+
+  let envelope: Awaited<ReturnType<DataStoragePort["readEnvelope"]>>;
+  try {
+    envelope = await deps.storage.readEnvelope(entry.scope, entry.collectedAt);
+  } catch (err) {
+    // No local payload to retry from. The sidecar repair path above already
+    // handles a missing envelope by re-downloading, so this is not the place
+    // to fix it — just don't pretend an import was attempted.
+    deps.logger.debug(
+      {
+        scope: entry.scope,
+        collectedAt: entry.collectedAt,
+        error: (err as Error).message,
+      },
+      "Skipped PDPP import retry: no local envelope to read",
+    );
+    return;
+  }
+
+  importIntoPdpp(deps, envelope, `${entry.scope}@${entry.collectedAt}`);
 }
 
 function createSyncRunId(): string {

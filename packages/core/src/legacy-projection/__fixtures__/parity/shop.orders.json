@@ -1,0 +1,117 @@
+{
+  "scope": "shop.orders",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; shop.orders from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553",
+    "pdppBundle": "synthetic shop.orders records against vendored declarations at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output"
+  },
+  "fetchedStreams": [
+    "orders"
+  ],
+  "streams": {
+    "orders": [
+      {
+        "id": "order-a",
+        "order_number": "merchant-999",
+        "order_date": "2026-10-01T12:00:00.000Z",
+        "merchant_name": "Example Shop",
+        "total_cents": 2599,
+        "currency": "USD",
+        "status": "delivered",
+        "item_count": 2,
+        "line_item_titles": [
+          "Toy car",
+          "Track"
+        ],
+        "detail_url": "https://example.com/orders/a"
+      }
+    ]
+  },
+  "legacyBody": {
+    "orders": [
+      {
+        "id": "order-a",
+        "orderNumber": "order-a",
+        "placedAt": "2026-10-01T12:00:00.000Z",
+        "merchantName": "Example Shop",
+        "total": 25.99,
+        "currency": "USD",
+        "status": "delivered",
+        "itemCount": 2,
+        "lineItemTitles": [
+          "Toy car",
+          "Track"
+        ],
+        "detailUrl": "https://example.com/orders/a"
+      }
+    ],
+    "total": 1
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "shop.orders",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; shop.orders from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553",
+        "pdppBundle": "synthetic shop.orders records against vendored declarations at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output"
+      },
+      "fetchedStreams": [
+        "orders"
+      ],
+      "streams": {
+        "orders": []
+      },
+      "legacyBody": {
+        "orders": [],
+        "total": 0
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "shop.orders",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; shop.orders from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553",
+        "pdppBundle": "synthetic shop.orders records against vendored declarations at personal-server-ts commit 81e63d84c38dd45c47073daf790b8905c834c553; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output"
+      },
+      "fetchedStreams": [
+        "orders"
+      ],
+      "streams": {
+        "orders": [
+          {
+            "id": "order-dirty",
+            "order_date": "not-a-date",
+            "merchant_name": null,
+            "total_cents": "2599",
+            "currency": null,
+            "status": 7,
+            "item_count": null,
+            "line_item_titles": [
+              "Toy",
+              7
+            ],
+            "detail_url": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "orders": [
+          {
+            "id": "order-dirty",
+            "orderNumber": "order-dirty",
+            "merchantName": "",
+            "currency": "",
+            "status": ""
+          }
+        ],
+        "total": 1
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}
