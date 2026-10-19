@@ -685,12 +685,13 @@ const youtubeHistory: LegacyScopeBinding = {
       "channel_title",
       "channel_url",
       "view_count",
+      "views_text",
       "description",
     ],
   },
   primaryKey: { watch_history: ["id"] },
   lossy: [
-    "Preserves page order by position and caps output at 50 entries. watchedAt carries watched_date (YYYY-MM-DD, null unchanged) at day precision only; no timestamp is inferred. watchedAtText carries watched_date_label (the browser section header as shown, as legacy emitted it); it falls back to watched_date only when the label is absent or empty. Integer view_count is rendered as '<count> views'; absent view_count remains null. Rows without required videoUrl are skipped and reported. Missing positions fail because page order cannot be preserved.",
+    "Preserves page order by position and caps output at 50 entries. watchedAt carries watched_date (YYYY-MM-DD, null unchanged) at day precision only; no timestamp is inferred. watchedAtText carries watched_date_label (the browser section header as shown, as legacy emitted it); it falls back to watched_date only when the label is absent or empty. views_text is preserved when present; otherwise integer view_count is rendered as '<count> views'. Rows without required videoUrl are skipped and reported. Missing positions fail because page order cannot be preserved.",
   ],
   provenance: youtubeProvenance,
   project(records, options): ProjectionResult {
@@ -723,6 +724,7 @@ const youtubeHistory: LegacyScopeBinding = {
         }
         const viewCount =
           typeof row.view_count === "number" ? row.view_count : null;
+        const viewsText = youtubeRequiredString(row.views_text);
         return [
           {
             watchedAt: youtubeStringOrNull(row.watched_date),
@@ -733,7 +735,8 @@ const youtubeHistory: LegacyScopeBinding = {
             videoUrl,
             videoTitle: youtubeStringOrNull(row.video_title),
             channelTitle: youtubeStringOrNull(row.channel_title),
-            views: viewCount === null ? null : `${viewCount} views`,
+            views:
+              viewsText ?? (viewCount === null ? null : `${viewCount} views`),
             description: youtubeStringOrNull(row.description),
             _position: row.position as number,
           },

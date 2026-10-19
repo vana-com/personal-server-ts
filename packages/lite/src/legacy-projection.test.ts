@@ -108,6 +108,74 @@ function get(
 }
 
 describe("PS-Lite legacy projection", () => {
+  it("serves youtube.history from stored PDPP watch_history records", async () => {
+    const { runtime, storage } = createRuntime();
+    await post(runtime, "youtube.history", {
+      records: [
+        {
+          id: "history-2",
+          position: 1,
+          watched_date: "2026-10-17",
+          watched_date_label: "Oct 17, 2026",
+          video_id: "video-2",
+          video_url: "https://www.youtube.com/watch?v=video-2",
+          video_title: "Second video",
+          channel_title: "Second channel",
+          view_count: 42,
+          views_text: null,
+          description: "Second description",
+        },
+        {
+          id: "history-1",
+          position: 0,
+          watched_date: "2026-10-18",
+          watched_date_label: "Today",
+          video_id: "video-1",
+          video_url: "https://www.youtube.com/watch?v=video-1",
+          video_title: "First video",
+          channel_title: "First channel",
+          view_count: 1234,
+          views_text: "1.2K views",
+          description: "First description",
+        },
+      ],
+    });
+
+    const res = await get(runtime, "/v1/data/youtube.history");
+
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { data: unknown }).data).toEqual({
+      timeWindow: "top 50 most recent items",
+      history: [
+        {
+          watchedAt: "2026-10-18",
+          watchedAtText: "Today",
+          videoId: "video-1",
+          videoUrl: "https://www.youtube.com/watch?v=video-1",
+          videoTitle: "First video",
+          channelTitle: "First channel",
+          views: "1.2K views",
+          description: "First description",
+        },
+        {
+          watchedAt: "2026-10-17",
+          watchedAtText: "Oct 17, 2026",
+          videoId: "video-2",
+          videoUrl: "https://www.youtube.com/watch?v=video-2",
+          videoTitle: "Second video",
+          channelTitle: "Second channel",
+          views: "42 views",
+          description: "Second description",
+        },
+      ],
+    });
+
+    const entry = storage.findEntry({ scope: "youtube.history" })!;
+    expect(
+      (await storage.readEnvelope("youtube.history", entry.collectedAt)).data,
+    ).toMatchObject({ records: expect.any(Array) });
+  });
+
   it("reports a projection that left rows out", async () => {
     const onLegacyProjectionIssue = vi.fn();
     const { runtime } = createRuntime({ onLegacyProjectionIssue });
