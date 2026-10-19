@@ -6,8 +6,12 @@ import {
 } from "@opendatalabs/vana-sdk/browser";
 import {
   readBoundedResponse,
+  createVersionInventoryClient,
+  additionsLedgerScope,
+  ADDITIONS_SUMMARY_SCOPE,
   type ByteBudget,
 } from "@opendatalabs/personal-server-ts-core/additions";
+import { createGatewayDeleteDataPort } from "@opendatalabs/personal-server-ts-core/sync";
 import { resolveVanaStorageEndpoint } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { RequestSigner } from "@opendatalabs/personal-server-ts-core/signing";
@@ -60,6 +64,8 @@ export function createPsLiteAdditionsTransport(options: {
   stateStore: PsLiteStateStore;
   masterKey: Uint8Array;
   ownerSigner: PsLiteBoundedOwnerSigner;
+  /** Authentication origin may differ from a preview Storage endpoint. */
+  storageAudience?: string;
   fetch?: typeof globalThis.fetch;
 }) {
   const candidateStore = options.stateStore.bounded;
@@ -279,7 +285,7 @@ export function createPsLiteAdditionsTransport(options: {
       const url = blobUrl(prepared.scope, prepared.expectedVersion);
       const authorization = await signRequest(
         {
-          aud: storage,
+          aud: options.storageAudience ?? storage,
           method: "PUT",
           uri: new URL(url).pathname,
           body: prepared.encrypted,
@@ -362,7 +368,102 @@ export function createPsLiteAdditionsTransport(options: {
       throw new Error(`Checkpoint download failed (${response.status})`);
     return response.body;
   }
-  return { ...openSession(), openSession };
+  async function tombstone(scope: string, budget: ByteBudget) {
+    budget.charge();
+    if (
+      scope !== "vana.system.additions" &&
+      !scope.startsWith("vana.system.additions.") &&
+      !/^vana\.system\.additions-hash\.[0-9a-f]{64}$/.test(scope)
+    )
+      throw new Error("Bounded deletion is limited to additions scopes");
+    const inventory = createVersionInventoryClient({
+      gatewayUrl: gateway,
+      ownerAddress: options.ownerAddress,
+      ownerSigner: { signRequest },
+      boundedOwnerSigner: signRequest,
+      fetch: fetcher,
+    });
+    const port = createGatewayDeleteDataPort({
+      gatewayUrl: gateway,
+      serverOwner: getAddress(options.ownerAddress),
+      dataPointFeed: {
+        async getDataPoint({ ownerAddress, scope }) {
+          if (ownerAddress.toLowerCase() !== owner)
+            throw new Error("Deletion owner changed");
+          const page = await inventory.page(scope, {
+            limit: 1,
+            budget,
+            signal: budget.signal,
+          });
+          const head = page.data.head;
+          return head
+            ? {
+                ...head,
+                id: page.data.dataPointId,
+                ownerAddress,
+                scope,
+                addedAt: page.data.versions[0]?.addedAt ?? "",
+              }
+            : null;
+        },
+        listDataPointsByOwner: async () => {
+          throw new Error("Deletion cannot enumerate data");
+        },
+      },
+      signer: {
+        signAddData: (message) =>
+          options.ownerSigner.signAddDataBounded(message, budget.signal),
+      },
+      storage: {
+        endpoint: storage,
+        audience: options.storageAudience,
+        chainId: options.config.gateway.chainId,
+        signMessage: (message) =>
+          options.ownerSigner.signMessageBounded(message, budget.signal),
+      },
+      fetch: async (url, init) => {
+        const result = await fetchBounded(
+          {
+            url: String(url),
+            method: init?.method,
+            headers: Array.from(new Headers(init?.headers).entries()),
+            body:
+              typeof init?.body === "string"
+                ? new TextEncoder().encode(init.body)
+                : undefined,
+          },
+          budget,
+        );
+        return new Response(
+          result.body.length ? Uint8Array.from(result.body) : null,
+          { status: result.status, headers: result.headers },
+        );
+      },
+    });
+    const outcome = await port.tombstone(scope);
+    budget.charge();
+    return outcome;
+  }
+  async function deleteScope(scope: string, budget: ByteBudget) {
+    if (scope.startsWith("vana.system.")) return;
+    const intent: `additions-deletion-v1:${string}` = `additions-deletion-v1:${keccak256(stringToHex(binding(scope)))}`;
+    const pending = await stateStore.get<boolean>(intent, budget.signal);
+    budget.charge();
+    const ledger = additionsLedgerScope(scope);
+    // Write intent before touching the registry: a crash after the ledger
+    // tombstone must still retry summary invalidation and journal clearing.
+    await stateStore.set(intent, true, budget.signal);
+    const outcome = await tombstone(ledger, budget);
+    await openSession().clearPending(ledger, budget);
+    if (pending || outcome.status === "tombstoned") {
+      await tombstone(ADDITIONS_SUMMARY_SCOPE, budget);
+      await openSession().clearPending(ADDITIONS_SUMMARY_SCOPE, budget);
+    }
+    // Repeated polls must not invalidate a subsequently rebuilt summary.
+    await stateStore.delete(intent, budget.signal);
+    budget.charge();
+  }
+  return { ...openSession(), openSession, tombstone, deleteScope };
 }
 
 export type PsLiteAdditionsTransport = ReturnType<

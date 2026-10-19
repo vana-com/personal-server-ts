@@ -27,6 +27,8 @@ export interface AdditionsSummaryInput {
   coverage?: AdditionsCoverage;
   /** Stable per-scope source version markers, supplied by the coordinator. */
   through?: Record<string, string>;
+  /** Inventory fingerprints corresponding to these folded counts. */
+  inventory?: Record<string, string>;
 }
 
 export type AdditionsCoverage =
@@ -50,6 +52,8 @@ export interface AdditionsSummary {
   version: 1;
   coverage: AdditionsCoverage;
   through: Record<string, string>;
+  /** Absent on older producers; cannot certify portable freshness after a reorg. */
+  inventory?: Record<string, string>;
   /** UTC midnight cutoff. Older daily counts cannot prove exact local days. */
   fineSince: string;
   daily: AdditionsDailyCount[];
@@ -112,6 +116,9 @@ export const AdditionsSummarySchema = z.object({
   version: z.literal(1),
   coverage: z.enum(["complete", "behind", "partial", "unavailable"]),
   through: z.record(z.string(), z.string().regex(/^(0|[1-9]\d*)$/)),
+  inventory: z
+    .record(z.string(), z.string().regex(/^0x[0-9a-f]{64}$/))
+    .optional(),
   fineSince: instantSchema,
   daily: z.array(z.object({ date: daySchema, added: countSchema })),
   buckets: bucketsSchema,
@@ -330,6 +337,7 @@ export async function summarizeAdditions(
         ? "partial"
         : (input.coverage ?? "complete"),
     through: { ...input.through },
+    ...(input.inventory ? { inventory: { ...input.inventory } } : {}),
     buckets,
     fineSince: new Date(fineSinceAt).toISOString(),
     daily: sortedDays(dailyCounts),

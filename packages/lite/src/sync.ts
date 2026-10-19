@@ -88,6 +88,8 @@ export interface PsLiteSyncOptions {
   /** Uses owner authority for Storage and AddData, without server registration. */
   ownerSyncSigner?: PsLiteOwnerSyncSigner;
   additionsWorkerFactory?: () => AdditionsWorkerPort;
+  /** Storage authentication origin, independent of its routing endpoint. */
+  storageAudience?: string;
   gateway?: GatewayClient;
   /**
    * Deletion-aware gateway feed. Defaults to a REST feed on the configured
@@ -259,6 +261,7 @@ export async function createPsLiteSyncManager(
     config: options.config,
     serverOwner,
     serverAccount: syncAccount,
+    audience: options.storageAudience,
   });
   const signer =
     options.ownerSyncSigner ??
@@ -301,6 +304,7 @@ export async function createPsLiteSyncManager(
             stateStore: options.stateStore,
             masterKey,
             ownerSigner: boundedSigner,
+            storageAudience: options.storageAudience,
           }),
           workerFactory: options.additionsWorkerFactory,
           deleteSystemScope: async (scope) => {
@@ -330,6 +334,7 @@ export async function createPsLiteSyncManager(
     signer,
     storage: {
       endpoint: resolveVanaStorageEndpoint(options.config),
+      audience: options.storageAudience,
       chainId: options.config.gateway.chainId,
       signMessage: (message) => syncAccount.signMessage(message),
     },

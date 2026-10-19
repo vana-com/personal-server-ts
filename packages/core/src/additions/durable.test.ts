@@ -253,6 +253,26 @@ async function fixture() {
 }
 
 describe("durable owner additions recovery", () => {
+  it("binds portable counts to historical commitments when the head version is unchanged", async () => {
+    const f = await fixture();
+    await f.source("1", T1, ["a"]);
+    await f.source("2", T2, ["a", "b"]);
+    const first = await f.actor().summarize(QUERY);
+    expect(first.inventory?.[SOURCE]).toMatch(/^0x[0-9a-f]{64}$/);
+    const head = (await f.readRegistry())[SOURCE].versions[1];
+    // A reorg permits an older confirmed slot to be replaced and settled again;
+    // the later head can retain its exact content and version.
+    await f.source("1", T1, ["a", "b"]);
+    await f.setSlot(SOURCE, head);
+    const next = await f.actor().summarize(QUERY);
+    expect(next.through).toEqual(first.through);
+    expect(next.inventory?.[SOURCE]).not.toBe(first.inventory?.[SOURCE]);
+    expect(next.days.map((day) => day.added)).toEqual([2, 0, 0, 0]);
+    expect(await f.document("vana.system.additions")).toMatchObject({
+      inventory: next.inventory,
+    });
+  });
+
   it("restarts from encrypted remote ledgers with no local sidecar or original source blobs", async () => {
     const f = await fixture();
     await f.source("1", T1, ["a"]);

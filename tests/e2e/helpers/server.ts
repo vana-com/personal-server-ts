@@ -60,6 +60,8 @@ export async function startTestServer(options?: {
   const configInput: Record<string, unknown> = {
     server: { port, origin: `http://localhost:${port}` },
     gateway,
+    // API E2E does not exercise tunnels; avoid downloading frpc during setup.
+    tunnel: { enabled: false },
     logging: { level: "fatal" },
   };
 
