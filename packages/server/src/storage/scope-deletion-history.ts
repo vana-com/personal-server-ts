@@ -40,8 +40,7 @@ export function createScopeDeletionHistory(
     },
     get(scope): ScopeTombstone | null {
       const row = get.get(owner, scope) as
-        | { deleted_at: string; tombstone_version: string | null }
-        | undefined;
+        { deleted_at: string; tombstone_version: string | null } | undefined;
       return row
         ? { deletedAt: row.deleted_at, version: row.tombstone_version }
         : null;

@@ -593,7 +593,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
       .get() as { version: number } | undefined;
     if (current?.version !== MIGRATIONS.length) {
-      throw new Error("Readonly PDPP store requires the current schema version");
+      throw new Error(
+        "Readonly PDPP store requires the current schema version",
+      );
     }
   } else {
     db.pragma("journal_mode = WAL");

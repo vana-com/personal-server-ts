@@ -1,4 +1,10 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { tmpdir } from "node:os";
@@ -30,17 +36,25 @@ describe("current declarations at the server legacy-read boundary", () => {
   let current: ReturnType<typeof createStreamDeclarationRegistry> | undefined;
 
   function registry(annotated: boolean) {
-    return createStreamDeclarationRegistry([{
-      name: "conversations",
-      semantics: "mutable_state",
-      primaryKey: ["id"],
-      cursorField: "update_time",
-      requiredFields: ["id"],
-      schema: { properties: { title: {
-        type: "string",
-        ...(annotated ? { x_pdpp_text_encoding: "pdpp-safe-escape-v1" } : {}),
-      } } },
-    }]);
+    return createStreamDeclarationRegistry([
+      {
+        name: "conversations",
+        semantics: "mutable_state",
+        primaryKey: ["id"],
+        cursorField: "update_time",
+        requiredFields: ["id"],
+        schema: {
+          properties: {
+            title: {
+              type: "string",
+              ...(annotated
+                ? { x_pdpp_text_encoding: "pdpp-safe-escape-v1" }
+                : {}),
+            },
+          },
+        },
+      },
+    ]);
   }
 
   const declarations = {
@@ -52,12 +66,16 @@ describe("current declarations at the server legacy-read boundary", () => {
         : undefined;
     },
   };
-  const makeView = (readLegacyHead?: Parameters<typeof createLegacyScopeView>[0]["readLegacyHead"]) =>
+  const makeView = (
+    readLegacyHead?: Parameters<
+      typeof createLegacyScopeView
+    >[0]["readLegacyHead"],
+  ) =>
     createLegacyScopeView({
       authority: createLegacyScopeAuthority(db),
       records: store,
       declarations,
-      configuredMethods: (id) => id === source ? ["chatgpt"] : [],
+      configuredMethods: (id) => (id === source ? ["chatgpt"] : []),
       readLegacyHead,
     });
 
@@ -67,19 +85,42 @@ describe("current declarations at the server legacy-read boundary", () => {
     db = initializeDatabase(":memory:");
     store = createSqliteRecordStore(db);
     current = undefined;
-    store.registerConnection({ instance, sourceId: source, method: "chatgpt", label: "" });
+    store.registerConnection({
+      instance,
+      sourceId: source,
+      method: "chatgpt",
+      label: "",
+    });
     for (const [stream, rows] of [
-      ["conversations", [{
-        id: "cv1", title: encoded, create_time: collectedAt,
-        update_time: collectedAt, current_node: null, message_count_on_current_branch: 0,
-      }]],
+      [
+        "conversations",
+        [
+          {
+            id: "cv1",
+            title: encoded,
+            create_time: collectedAt,
+            update_time: collectedAt,
+            current_node: null,
+            message_count_on_current_branch: 0,
+          },
+        ],
+      ],
       ["messages", []],
     ] as const) {
       store.replaceStream({
-        instance, stream, method: "chatgpt", generation: 1,
-        primaryKey: ["id"], emittedAt: collectedAt, sourceCollectedAt: collectedAt,
+        instance,
+        stream,
+        method: "chatgpt",
+        generation: 1,
+        primaryKey: ["id"],
+        emittedAt: collectedAt,
+        sourceCollectedAt: collectedAt,
         envelopes: rows.map((data) => ({
-          instance, stream, key: data.id, data, emitted_at: collectedAt,
+          instance,
+          stream,
+          key: data.id,
+          data,
+          emitted_at: collectedAt,
         })),
       });
     }
@@ -90,12 +131,20 @@ describe("current declarations at the server legacy-read boundary", () => {
   });
 
   it.each(["absent", "old", "annotated"] as const)(
-    "serves ChatGPT title under the %s declaration", async (version) => {
-      current = version === "absent" ? undefined : registry(version === "annotated");
+    "serves ChatGPT title under the %s declaration",
+    async (version) => {
+      current =
+        version === "absent" ? undefined : registry(version === "annotated");
       const result = await makeView().readLatest(scope);
       expect(result).toMatchObject({
         kind: "canonical",
-        envelope: { data: { conversations: [{ id: "cv1", title: version === "annotated" ? decoded : encoded }] } },
+        envelope: {
+          data: {
+            conversations: [
+              { id: "cv1", title: version === "annotated" ? decoded : encoded },
+            ],
+          },
+        },
       });
     },
   );
@@ -143,31 +192,49 @@ describe("current declarations at the server legacy-read boundary", () => {
   it("does not apply a declaration from another registered source", () => {
     current = registry(true);
     store.registerConnection({
-      instance: "conn_chatgpt_suffix", sourceId: "https://example.test/other",
-      method: "other", label: "",
+      instance: "conn_chatgpt_suffix",
+      sourceId: "https://example.test/other",
+      method: "other",
+      label: "",
     });
-    expect(declarations.forInstance("conn_chatgpt_suffix", "conversations")).toBeUndefined();
-    expect(declarations.forInstance(instance, "conversations")?.schema).toBeDefined();
+    expect(
+      declarations.forInstance("conn_chatgpt_suffix", "conversations"),
+    ).toBeUndefined();
+    expect(
+      declarations.forInstance(instance, "conversations")?.schema,
+    ).toBeDefined();
     expect(declarations.forInstance(instance, "missing")).toBeUndefined();
   });
 });
 
 it("wires trusted declarations into the production legacy view", () => {
-  const bootstrap = readFileSync(new URL("../bootstrap.ts", import.meta.url), "utf8");
-  expect(bootstrap).toMatch(/legacyScopeView: createLegacyScopeView\(\{[\s\S]*?declarations: pdppRecords\?\.declarations,/);
+  const bootstrap = readFileSync(
+    new URL("../bootstrap.ts", import.meta.url),
+    "utf8",
+  );
+  expect(bootstrap).toMatch(
+    /legacyScopeView: createLegacyScopeView\(\{[\s\S]*?declarations: pdppRecords\?\.declarations,/,
+  );
 });
 
 const faults = vi.hoisted(() => ({ open: "", read: "" }));
 const opened = vi.hoisted(() => [] as Array<InstanceType<typeof Database>>);
 vi.mock("better-sqlite3", async (importOriginal) => {
-  const { default: Actual } = await importOriginal<{ default: typeof Database }>();
+  const { default: Actual } = await importOriginal<{
+    default: typeof Database;
+  }>();
   return {
-    default: function TrackedDatabase(...args: ConstructorParameters<typeof Actual>) {
-      if (faults.open) throw Object.assign(new Error("PRIVATE_NATIVE"), { code: faults.open });
+    default: function TrackedDatabase(
+      ...args: ConstructorParameters<typeof Actual>
+    ) {
+      if (faults.open)
+        throw Object.assign(new Error("PRIVATE_NATIVE"), { code: faults.open });
       const db = new Actual(...args);
       if (faults.read && db.readonly) {
         vi.spyOn(db, "prepare").mockImplementation(() => {
-          throw Object.assign(new Error("PRIVATE_NATIVE"), { code: faults.read });
+          throw Object.assign(new Error("PRIVATE_NATIVE"), {
+            code: faults.read,
+          });
         });
       }
       opened.push(db);
@@ -186,8 +253,11 @@ const nextSchema = {
 };
 
 describe("offline declaration witness over the real SQLite store", () => {
-
-  function seedDeclaration(path = join(root, "pdpp-declarations.db"), names = [stream], current = 1): void {
+  function seedDeclaration(
+    path = join(root, "pdpp-declarations.db"),
+    names = [stream],
+    current = 1,
+  ): void {
     const db = new Database(path);
     try {
       db.exec(`CREATE TABLE pdpp_current_declarations (
@@ -195,22 +265,32 @@ describe("offline declaration witness over the real SQLite store", () => {
         snapshot_json TEXT NOT NULL, document TEXT NOT NULL, accepted_at TEXT NOT NULL,
         is_current INTEGER NOT NULL, origin TEXT NOT NULL,
         PRIMARY KEY (source_id, version))`);
-      db.prepare("INSERT INTO pdpp_current_declarations VALUES (?, 'v1', 'digest', ?, '{}', 'now', ?, 'configured')")
-        .run("https://example.test/source", JSON.stringify({
+      db.prepare(
+        "INSERT INTO pdpp_current_declarations VALUES (?, 'v1', 'digest', ?, '{}', 'now', ?, 'configured')",
+      ).run(
+        "https://example.test/source",
+        JSON.stringify({
           source_id: "https://example.test/source",
           streams: names.map((name) => ({ name, schema: nextSchema })),
-        }), current);
-    } finally { db.close(); }
+        }),
+        current,
+      );
+    } finally {
+      db.close();
+    }
     opened.length = 0;
   }
 
-  it.each([0, 7, 103])("walks a declared stream with %s rows using the exact bound source ID", async (count) => {
-    seed(count);
-    seedDeclaration();
-    await expect(run()).resolves.toEqual({ verdict: "pass", checked: count });
-    expect(opened).toHaveLength(2);
-    expectClosed();
-  });
+  it.each([0, 7, 103])(
+    "walks a declared stream with %s rows using the exact bound source ID",
+    async (count) => {
+      seed(count);
+      seedDeclaration();
+      await expect(run()).resolves.toEqual({ verdict: "pass", checked: count });
+      expect(opened).toHaveLength(2);
+      expectClosed();
+    },
+  );
 
   it("validates declared rows against nextSchema without disclosing values", async () => {
     seed(7, 4);
@@ -239,40 +319,61 @@ describe("offline declaration witness over the real SQLite store", () => {
     seed();
     const declarationsDbPath = join(root, "custom.db");
     seedDeclaration(declarationsDbPath);
-    await expect(run({ declarationsDbPath })).resolves.toEqual({ verdict: "pass", checked: 0 });
+    await expect(run({ declarationsDbPath })).resolves.toEqual({
+      verdict: "pass",
+      checked: 0,
+    });
     expect(existsSync(join(root, "pdpp-declarations.db"))).toBe(false);
     expectClosed();
   });
 
-  it.each(["missing table", "invalid JSON", "wrong source", "invalid streams", "ambiguous current"])(
-    "fails closed and closes both handles for %s", async (kind) => {
-      seed();
-      const path = join(root, "pdpp-declarations.db");
-      seedDeclaration();
-      const db = new Database(path);
-      if (kind === "missing table") db.exec("DROP TABLE pdpp_current_declarations");
-      if (kind === "invalid JSON") db.exec("UPDATE pdpp_current_declarations SET snapshot_json = 'PRIVATE_BAD_JSON'");
-      if (kind === "wrong source") db.prepare("UPDATE pdpp_current_declarations SET snapshot_json = ?")
-        .run(JSON.stringify({ source_id: "other", streams: [{ name: stream }] }));
-      if (kind === "invalid streams") db.prepare("UPDATE pdpp_current_declarations SET snapshot_json = ?")
-        .run(JSON.stringify({ source_id: "https://example.test/source", streams: [null] }));
-      if (kind === "ambiguous current") db.exec(`INSERT INTO pdpp_current_declarations
+  it.each([
+    "missing table",
+    "invalid JSON",
+    "wrong source",
+    "invalid streams",
+    "ambiguous current",
+  ])("fails closed and closes both handles for %s", async (kind) => {
+    seed();
+    const path = join(root, "pdpp-declarations.db");
+    seedDeclaration();
+    const db = new Database(path);
+    if (kind === "missing table")
+      db.exec("DROP TABLE pdpp_current_declarations");
+    if (kind === "invalid JSON")
+      db.exec(
+        "UPDATE pdpp_current_declarations SET snapshot_json = 'PRIVATE_BAD_JSON'",
+      );
+    if (kind === "wrong source")
+      db.prepare("UPDATE pdpp_current_declarations SET snapshot_json = ?").run(
+        JSON.stringify({ source_id: "other", streams: [{ name: stream }] }),
+      );
+    if (kind === "invalid streams")
+      db.prepare("UPDATE pdpp_current_declarations SET snapshot_json = ?").run(
+        JSON.stringify({
+          source_id: "https://example.test/source",
+          streams: [null],
+        }),
+      );
+    if (kind === "ambiguous current")
+      db.exec(`INSERT INTO pdpp_current_declarations
         SELECT source_id, 'v2', digest, snapshot_json, document, accepted_at, is_current, origin
         FROM pdpp_current_declarations`);
-      db.close();
-      opened.length = 0;
-      const error = await run().catch((error: unknown) => error);
-      expect(error).toMatchObject({ code: "unverifiable_source" });
-      expect(String(error)).not.toContain("PRIVATE_BAD_JSON");
-      expect(opened).toHaveLength(2);
-      expectClosed();
-    },
-  );
+    db.close();
+    opened.length = 0;
+    const error = await run().catch((error: unknown) => error);
+    expect(error).toMatchObject({ code: "unverifiable_source" });
+    expect(String(error)).not.toContain("PRIVATE_BAD_JSON");
+    expect(opened).toHaveLength(2);
+    expectClosed();
+  });
 
   it("closes both handles when schema validation throws", async () => {
     seed(1);
     seedDeclaration();
-    await expect(run({ nextSchema: { type: "INVALID_PRIVATE_TYPE" } })).rejects.toMatchObject({ code: "invalid_schema" });
+    await expect(
+      run({ nextSchema: { type: "INVALID_PRIVATE_TYPE" } }),
+    ).rejects.toMatchObject({ code: "invalid_schema" });
     expect(opened).toHaveLength(2);
     expectClosed();
   });
@@ -289,14 +390,20 @@ describe("offline declaration witness over the real SQLite store", () => {
         keepers.push(keeper);
         keeper.pragma("journal_mode = WAL");
         keeper.pragma("wal_checkpoint(TRUNCATE)");
-        const table = path === dbPath ? "pdpp_instance_binding" : "pdpp_current_declarations";
+        const table =
+          path === dbPath
+            ? "pdpp_instance_binding"
+            : "pdpp_current_declarations";
         keeper.exec(`UPDATE ${table} SET source_id = source_id`);
         const reader = new Database(path, { readonly: true });
         readers.push(reader);
         reader.exec("BEGIN");
         reader.prepare(`SELECT * FROM ${table}`).all();
       }
-      const paths = [dbPath, declarationsPath].flatMap((path) => [path, path + "-wal"]);
+      const paths = [dbPath, declarationsPath].flatMap((path) => [
+        path,
+        path + "-wal",
+      ]);
       const before = paths.map((path) => readFileSync(path));
       opened.length = 0;
       await expect(run()).resolves.toEqual({ verdict: "pass", checked: 2 });
@@ -316,7 +423,9 @@ describe("offline declaration witness over the real SQLite store", () => {
       verdict: "fail",
       connectionHash: createHash("sha256").update("conn_other").digest("hex"),
     });
-    expect(JSON.stringify(result)).not.toMatch(/conn_other|conn_witness|PRIVATE_VALUE|private-key/);
+    expect(JSON.stringify(result)).not.toMatch(
+      /conn_other|conn_witness|PRIVATE_VALUE|private-key/,
+    );
     expectClosed();
   });
 
@@ -326,10 +435,26 @@ describe("offline declaration witness over the real SQLite store", () => {
     const db = new Database(dbPath);
     const store = createSqliteRecordStore(db);
     store.deleteConnection("conn_other");
-    store.registerConnection({ instance: "conn_unrelated", sourceId: "other", method: "test", label: "test" });
-    store.ingestBatch([{ instance: "conn_unrelated", stream, key: "secret",
-      data: { id: "secret", count: "PRIVATE_VALUE" }, emitted_at: "2026-10-15T00:00:00.000Z" }],
-      () => "mutable_state", () => ["id"], { method: "test", generation: 1 });
+    store.registerConnection({
+      instance: "conn_unrelated",
+      sourceId: "other",
+      method: "test",
+      label: "test",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "conn_unrelated",
+          stream,
+          key: "secret",
+          data: { id: "secret", count: "PRIVATE_VALUE" },
+          emitted_at: "2026-10-15T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "test", generation: 1 },
+    );
     db.close();
     opened.length = 0;
     await expect(run()).resolves.toEqual({ verdict: "pass", checked: 7 });
@@ -339,7 +464,10 @@ describe("offline declaration witness over the real SQLite store", () => {
   it("adds checked rows across all live connections", async () => {
     seed(7, -1, true);
     seedDeclaration();
-    await expect(run({ nextSchema: { type: "object" } })).resolves.toEqual({ verdict: "pass", checked: 8 });
+    await expect(run({ nextSchema: { type: "object" } })).resolves.toEqual({
+      verdict: "pass",
+      checked: 8,
+    });
     expectClosed();
   });
 
@@ -350,19 +478,34 @@ describe("offline declaration witness over the real SQLite store", () => {
     db.exec("DELETE FROM pdpp_instance_binding");
     db.close();
     opened.length = 0;
-    const options = { sourceKey: undefined, sourceId: "https://example.test/source" };
-    await expect(run(options)).resolves.toEqual({ verdict: "pass", checked: 0 });
-    await expect(run({ ...options, nextSchema: { type: "INVALID_TYPE" } }))
-      .rejects.toMatchObject({ code: "invalid_schema" });
-    await expect(run({ ...options, stream: "typo" })).rejects.toMatchObject({ code: "missing_stream" });
-    await expect(run({ ...options, budgetMs: 0 })).resolves.toEqual({ verdict: "partial", checked: 0 });
+    const options = {
+      sourceKey: undefined,
+      sourceId: "https://example.test/source",
+    };
+    await expect(run(options)).resolves.toEqual({
+      verdict: "pass",
+      checked: 0,
+    });
+    await expect(
+      run({ ...options, nextSchema: { type: "INVALID_TYPE" } }),
+    ).rejects.toMatchObject({ code: "invalid_schema" });
+    await expect(run({ ...options, stream: "typo" })).rejects.toMatchObject({
+      code: "missing_stream",
+    });
+    await expect(run({ ...options, budgetMs: 0 })).resolves.toEqual({
+      verdict: "partial",
+      checked: 0,
+    });
     expectClosed();
   });
 
   it("returns partial for zero budget before walking any declared rows", async () => {
     seed(7);
     seedDeclaration();
-    await expect(run({ budgetMs: 0 })).resolves.toEqual({ verdict: "partial", checked: 0 });
+    await expect(run({ budgetMs: 0 })).resolves.toEqual({
+      verdict: "partial",
+      checked: 0,
+    });
     expectClosed();
   });
 
@@ -383,7 +526,10 @@ describe("offline declaration witness over the real SQLite store", () => {
     seedDeclaration();
     let tick = 0;
     vi.spyOn(performance, "now").mockImplementation(() => tick++);
-    await expect(run({ budgetMs: 4 })).resolves.toEqual({ verdict: "partial", checked: 1 });
+    await expect(run({ budgetMs: 4 })).resolves.toEqual({
+      verdict: "partial",
+      checked: 1,
+    });
     expectClosed();
   });
 
@@ -395,8 +541,11 @@ describe("offline declaration witness over the real SQLite store", () => {
       const db = new Database(path);
       db.pragma("journal_mode = WAL");
       db.pragma("wal_checkpoint(TRUNCATE)");
-      const table = path === dbPath ? "pdpp_instance_binding" : "pdpp_current_declarations";
-      db.exec(`UPDATE ${table} SET ${path === dbPath ? "label" : "digest"} = 'crash-snapshot'`);
+      const table =
+        path === dbPath ? "pdpp_instance_binding" : "pdpp_current_declarations";
+      db.exec(
+        `UPDATE ${table} SET ${path === dbPath ? "label" : "digest"} = 'crash-snapshot'`,
+      );
       const files = [path, path + "-wal", path + "-shm"];
       const snapshot = files.map((file) => readFileSync(file));
       expect(snapshot[1]!.length).toBeGreaterThan(32);
@@ -420,8 +569,9 @@ describe("offline declaration witness over the real SQLite store", () => {
     seedDeclaration();
     let tick = 0;
     vi.spyOn(performance, "now").mockImplementation(() => tick++);
-    await expect(run({ budgetMs: 3, nextSchema: { type: "object" } }))
-      .resolves.toEqual({ verdict: "partial", checked: 1 });
+    await expect(
+      run({ budgetMs: 3, nextSchema: { type: "object" } }),
+    ).resolves.toEqual({ verdict: "partial", checked: 1 });
     expectClosed();
   });
 
@@ -444,7 +594,8 @@ describe("offline declaration witness over the real SQLite store", () => {
     // Read-only SQLite may create WAL/SHM sidecars. Their existence and SHM
     // reader marks are not part of the immutable persistent-data guarantee.
     for (const path of paths) {
-      if (existsSync(path + "-wal")) expect(readFileSync(path + "-wal").length).toBe(0);
+      if (existsSync(path + "-wal"))
+        expect(readFileSync(path + "-wal").length).toBe(0);
     }
     await expect(run()).resolves.toEqual({ verdict: "pass", checked: 2 });
     expectClosed();
@@ -473,23 +624,48 @@ describe("offline declaration witness over the real SQLite store", () => {
       const store = createSqliteRecordStore(db);
       for (const instance of [sourceKey, "conn_other"]) {
         store.registerConnection({
-          instance, sourceId: "https://example.test/source", method: "test", label: "test",
+          instance,
+          sourceId: "https://example.test/source",
+          method: "test",
+          label: "test",
         });
-        const data = Array.from({ length: instance === sourceKey ? count : (badOther ? 1 : 0) }, (_, i) => {
-          const id = `private-key-${String(i).padStart(4, "0")}`;
-          return {
-            instance, stream, key: id,
-            data: { id, count: instance === sourceKey && i !== badIndex ? i : "PRIVATE_VALUE" },
-            emitted_at: "2026-10-15T00:00:00.000Z",
-          };
-        });
-        expect(store.ingestBatch(data, () => "mutable_state", () => ["id"], {
-          method: "test", generation: 1,
-        }).accepted).toBe(data.length);
+        const data = Array.from(
+          { length: instance === sourceKey ? count : badOther ? 1 : 0 },
+          (_, i) => {
+            const id = `private-key-${String(i).padStart(4, "0")}`;
+            return {
+              instance,
+              stream,
+              key: id,
+              data: {
+                id,
+                count:
+                  instance === sourceKey && i !== badIndex
+                    ? i
+                    : "PRIVATE_VALUE",
+              },
+              emitted_at: "2026-10-15T00:00:00.000Z",
+            };
+          },
+        );
+        expect(
+          store.ingestBatch(
+            data,
+            () => "mutable_state",
+            () => ["id"],
+            {
+              method: "test",
+              generation: 1,
+            },
+          ).accepted,
+        ).toBe(data.length);
       }
       // A read-only open must not sweep this unclaimed metadata.
       store.putBlobMeta({
-        blobId: "orphan", mimeType: "text/plain", sizeBytes: 0, sha256: "test",
+        blobId: "orphan",
+        mimeType: "text/plain",
+        sizeBytes: 0,
+        sha256: "test",
       });
     } finally {
       db.close();
@@ -497,11 +673,22 @@ describe("offline declaration witness over the real SQLite store", () => {
     opened.length = 0;
   }
 
-  const run = (overrides: Partial<Parameters<typeof runDeclarationWitness>[0]> = {}) =>
-    runDeclarationWitness({ dbPath, sourceKey, stream, nextSchema, limit: 3, budgetMs: 30_000, ...overrides });
+  const run = (
+    overrides: Partial<Parameters<typeof runDeclarationWitness>[0]> = {},
+  ) =>
+    runDeclarationWitness({
+      dbPath,
+      sourceKey,
+      stream,
+      nextSchema,
+      limit: 3,
+      budgetMs: 30_000,
+      ...overrides,
+    });
 
   it.each(["conn_missing", "https://example.test/source"])(
-    "rejects an unregistered source identity: %s", async (unknownSource) => {
+    "rejects an unregistered source identity: %s",
+    async (unknownSource) => {
       seed();
       await expect(run({ sourceKey: unknownSource })).rejects.toMatchObject({
         code: "missing_source",
@@ -544,7 +731,8 @@ describe("offline declaration witness over the real SQLite store", () => {
   it("never turns a missing database into an empty-stream pass, even with zero budget", async () => {
     for (const budgetMs of [30_000, 0]) {
       await expect(run({ budgetMs })).rejects.toMatchObject({
-        name: "OfflineDeclarationWitnessError", code: "missing_database",
+        name: "OfflineDeclarationWitnessError",
+        code: "missing_database",
       });
     }
     expect(existsSync(dbPath)).toBe(false);
@@ -567,36 +755,54 @@ describe("offline declaration witness over the real SQLite store", () => {
     writeFileSync(dbPath, "PRIVATE_DATABASE_BYTES");
     const error = await run().catch((e: unknown) => e);
     expect(error).toBeInstanceOf(OfflineDeclarationWitnessError);
-    expect(String(error)).not.toMatch(/PRIVATE_DATABASE_BYTES|records.sqlite|pdpp-offline/);
+    expect(String(error)).not.toMatch(
+      /PRIVATE_DATABASE_BYTES|records.sqlite|pdpp-offline/,
+    );
     expectClosed();
   });
 
   it.each([
-    { pageSize: 0 }, { pageSize: -1 }, { pageSize: 1.5 }, { pageSize: Infinity },
-    { limit: 0 }, { limit: -1 }, { limit: 1.5 }, { limit: Infinity },
-    { budgetMs: -1 }, { budgetMs: NaN }, { budgetMs: Infinity },
-    { dbPath: "" }, { sourceKey: "" }, { stream: "" },
+    { pageSize: 0 },
+    { pageSize: -1 },
+    { pageSize: 1.5 },
+    { pageSize: Infinity },
+    { limit: 0 },
+    { limit: -1 },
+    { limit: 1.5 },
+    { limit: Infinity },
+    { budgetMs: -1 },
+    { budgetMs: NaN },
+    { budgetMs: Infinity },
+    { dbPath: "" },
+    { sourceKey: "" },
+    { stream: "" },
   ])("rejects invalid options without opening storage: %j", async (options) => {
-    await expect(run(options)).rejects.toMatchObject({ code: "invalid_argument" });
+    await expect(run(options)).rejects.toMatchObject({
+      code: "invalid_argument",
+    });
     expect(opened).toHaveLength(0);
   });
 
   it("never logs record values on a failed witness", async () => {
     seed(1, 0);
-    const logs = (["log", "info", "warn", "error"] as const)
-      .map((method) => vi.spyOn(console, method).mockImplementation(() => {}));
+    const logs = (["log", "info", "warn", "error"] as const).map((method) =>
+      vi.spyOn(console, method).mockImplementation(() => {}),
+    );
     await expect(run()).rejects.toMatchObject({ code: "unverifiable_source" });
     for (const log of logs) expect(log).not.toHaveBeenCalled();
     expectClosed();
   });
 
   it("treats a directory path as store_unreadable", async () => {
-    await expect(run({ dbPath: root })).rejects.toMatchObject({ code: "store_unreadable" });
+    await expect(run({ dbPath: root })).rejects.toMatchObject({
+      code: "store_unreadable",
+    });
     expect(opened).toHaveLength(0);
   });
 
   it.each(["EACCES", "EPERM", "SQLITE_CANTOPEN", "SQLITE_READONLY_DIRECTORY"])(
-    "redacts opening/permission errors as store_unreadable: %s", async (code) => {
+    "redacts opening/permission errors as store_unreadable: %s",
+    async (code) => {
       seed();
       faults.open = code;
       const error = await run().catch((error: unknown) => error);
@@ -615,33 +821,53 @@ describe("offline declaration witness over the real SQLite store", () => {
     expectClosed();
   });
 
-  it.each([0, 30_000])("verifies identities before the budget check (%s)", async (budgetMs) => {
-    seed();
-    await expect(run({ budgetMs })).rejects.toMatchObject({ code: "unverifiable_source" });
-    await expect(run({ budgetMs, sourceKey: "missing" })).rejects.toMatchObject({ code: "missing_source" });
-    expectClosed();
-  });
-
-  it.each([{ pageSize: 2, limit: undefined }, { pageSize: 2, limit: 0 }, { limit: 2 }])(
-    "accepts pageSize and the legacy limit alias: %j", async (options) => {
+  it.each([0, 30_000])(
+    "verifies identities before the budget check (%s)",
+    async (budgetMs) => {
       seed();
-      await expect(run(options)).rejects.toMatchObject({ code: "unverifiable_source" });
+      await expect(run({ budgetMs })).rejects.toMatchObject({
+        code: "unverifiable_source",
+      });
+      await expect(
+        run({ budgetMs, sourceKey: "missing" }),
+      ).rejects.toMatchObject({ code: "missing_source" });
       expectClosed();
     },
   );
 
+  it.each([
+    { pageSize: 2, limit: undefined },
+    { pageSize: 2, limit: 0 },
+    { limit: 2 },
+  ])("accepts pageSize and the legacy limit alias: %j", async (options) => {
+    seed();
+    await expect(run(options)).rejects.toMatchObject({
+      code: "unverifiable_source",
+    });
+    expectClosed();
+  });
+
   it.each(["deleted", "unregistered", "missing_registry"])(
-    "fails closed for %s connection metadata", async (kind) => {
+    "fails closed for %s connection metadata",
+    async (kind) => {
       seed();
       const db = new Database(dbPath);
-      if (kind === "deleted") createSqliteRecordStore(db).deleteConnection(sourceKey);
-      if (kind === "unregistered") db.prepare("UPDATE pdpp_instance_binding SET source_id = NULL WHERE instance = ?").run(sourceKey);
-      if (kind === "missing_registry") db.exec("DROP TABLE pdpp_instance_binding");
+      if (kind === "deleted")
+        createSqliteRecordStore(db).deleteConnection(sourceKey);
+      if (kind === "unregistered")
+        db.prepare(
+          "UPDATE pdpp_instance_binding SET source_id = NULL WHERE instance = ?",
+        ).run(sourceKey);
+      if (kind === "missing_registry")
+        db.exec("DROP TABLE pdpp_instance_binding");
       db.close();
       opened.length = 0;
       const before = readFileSync(dbPath);
       await expect(run()).rejects.toMatchObject({
-        code: kind === "missing_registry" ? "unverifiable_source" : "missing_source",
+        code:
+          kind === "missing_registry"
+            ? "unverifiable_source"
+            : "missing_source",
       });
       expectClosed();
       expect(readFileSync(dbPath)).toEqual(before);
@@ -652,7 +878,11 @@ describe("offline declaration witness over the real SQLite store", () => {
     seed(2);
     const keeper = new Database(dbPath);
     keeper.pragma("wal_checkpoint(TRUNCATE)");
-    keeper.prepare("UPDATE pdpp_instance_binding SET label = 'sidecar-test' WHERE instance = ?").run(sourceKey);
+    keeper
+      .prepare(
+        "UPDATE pdpp_instance_binding SET label = 'sidecar-test' WHERE instance = ?",
+      )
+      .run(sourceKey);
     const paths = [dbPath, dbPath + "-wal"];
     for (const path of paths) expect(existsSync(path)).toBe(true);
     // Keep an existing read lock so opening the witness need not initialize
@@ -663,7 +893,9 @@ describe("offline declaration witness over the real SQLite store", () => {
     const before = paths.map((path) => readFileSync(path));
     opened.length = 0;
     try {
-      await expect(run()).rejects.toMatchObject({ code: "unverifiable_source" });
+      await expect(run()).rejects.toMatchObject({
+        code: "unverifiable_source",
+      });
       expectClosed();
       expect(paths.map((path) => readFileSync(path))).toEqual(before);
     } finally {
@@ -673,7 +905,9 @@ describe("offline declaration witness over the real SQLite store", () => {
   });
 
   it("publishes the witness subpath alongside the other tsc-built entries", () => {
-    const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+    const pkg = JSON.parse(
+      readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+    );
     expect(pkg.exports["./witness"]).toEqual({
       types: "./dist/storage/declaration-witness.d.ts",
       import: "./dist/storage/declaration-witness.js",

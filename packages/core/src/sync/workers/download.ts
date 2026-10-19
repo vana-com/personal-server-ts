@@ -444,7 +444,10 @@ export async function downloadOne(
   diagnostics?.onIndexStart(record.id, envelope.scope);
   let relativePath: string;
   let sizeBytes: number;
-  const replicaMetadata: Extract<VersionCommit, { kind: "replica" }>["metadata"] = {
+  const replicaMetadata: Extract<
+    VersionCommit,
+    { kind: "replica" }
+  >["metadata"] = {
     schemaId: ctx.schemaId,
     dataPointId: record.id,
     version: expectedVersion,
@@ -467,7 +470,9 @@ export async function downloadOne(
         metadata: replicaMetadata,
       });
       if (committed.kind !== "stored") {
-        throw new Error("Replica commit unexpectedly returned an import receipt");
+        throw new Error(
+          "Replica commit unexpectedly returned an import receipt",
+        );
       }
       ({ relativePath, sizeBytes } = committed.writeResult);
     } else {

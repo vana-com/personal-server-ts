@@ -44,12 +44,24 @@ function fixture() {
       data: { id: key, ...data },
       emitted_at: "2026-04-01T00:00:00.000Z",
     };
-    expect(store.ingestBatch([input], () => "mutable_state", () => ["id"]).accepted)
-      .toBe(1);
+    expect(
+      store.ingestBatch(
+        [input],
+        () => "mutable_state",
+        () => ["id"],
+      ).accepted,
+    ).toBe(1);
   }
-  const run = (overrides: Partial<Parameters<typeof witnessDeclarationUpgrade>[0]> = {}) =>
+  const run = (
+    overrides: Partial<Parameters<typeof witnessDeclarationUpgrade>[0]> = {},
+  ) =>
     witnessDeclarationUpgrade({
-      readPort, sourceKey, stream, nextSchema, limit: 2, ...overrides,
+      readPort,
+      sourceKey,
+      stream,
+      nextSchema,
+      limit: 2,
+      ...overrides,
     });
   return { store, readPort, list, insert, run };
 }
@@ -63,20 +75,37 @@ describe("witnessDeclarationUpgrade", () => {
     insert("d");
     insert("e");
     const first = await run();
-    expect(first).toEqual({ verdict: "partial", checked: 2, nextCursor: expect.any(String) });
+    expect(first).toEqual({
+      verdict: "partial",
+      checked: 2,
+      nextCursor: expect.any(String),
+    });
     const second = await run({ cursor: first.nextCursor! });
-    expect(second).toEqual({ verdict: "partial", checked: 2, nextCursor: expect.any(String) });
+    expect(second).toEqual({
+      verdict: "partial",
+      checked: 2,
+      nextCursor: expect.any(String),
+    });
     const third = await run({ cursor: second.nextCursor! });
     expect(third).toEqual({ verdict: "pass", checked: 1, nextCursor: null });
     expect(list).toHaveBeenCalledTimes(3);
     for (const [requestedStream, options] of list.mock.calls) {
       expect(requestedStream).toBe(stream);
-      expect(options).toMatchObject({ instanceIds: [sourceKey], order: "asc", limit: 2 });
+      expect(options).toMatchObject({
+        instanceIds: [sourceKey],
+        order: "asc",
+        limit: 2,
+      });
       expect(options.fields).toBeUndefined();
     }
-    const seen = await Promise.all(list.mock.results.map((result) => result.value));
-    expect(seen.flatMap((page) => page.data.map((row: { recordKey: string }) => row.recordKey)))
-      .toEqual(["a", "b", "c", "d", "e"]);
+    const seen = await Promise.all(
+      list.mock.results.map((result) => result.value),
+    );
+    expect(
+      seen.flatMap((page) =>
+        page.data.map((row: { recordKey: string }) => row.recordKey),
+      ),
+    ).toEqual(["a", "b", "c", "d", "e"]);
   });
 
   it("resumes a partial page at the next row and permits a different positive limit", async () => {
@@ -88,10 +117,13 @@ describe("witnessDeclarationUpgrade", () => {
     expect(first.verdict).toBe("partial");
     const resumed = await run({ cursor: first.nextCursor!, limit: 2 });
     expect(resumed).toEqual({
-      verdict: "fail", checked: 2, nextCursor: null,
+      verdict: "fail",
+      checked: 2,
+      nextCursor: null,
       failure: {
         recordKeyDigest: createHash("sha256").update("c").digest("hex"),
-        instancePath: "/model_source", keyword: "type",
+        instancePath: "/model_source",
+        keyword: "type",
       },
     });
   });
@@ -107,10 +139,15 @@ describe("witnessDeclarationUpgrade", () => {
     try {
       const result = await run({ limit: 3 });
       expect(result).toEqual({
-        verdict: "fail", checked: 2, nextCursor: null,
+        verdict: "fail",
+        checked: 2,
+        nextCursor: null,
         failure: {
-          recordKeyDigest: createHash("sha256").update("private-record-key").digest("hex"),
-          instancePath: "/model_source", keyword: "type",
+          recordKeyDigest: createHash("sha256")
+            .update("private-record-key")
+            .digest("hex"),
+          instancePath: "/model_source",
+          keyword: "type",
         },
       });
       expect(JSON.stringify(result)).not.toContain("private-record-key");
@@ -129,9 +166,15 @@ describe("witnessDeclarationUpgrade", () => {
     const { insert, run } = fixture();
     insert("a", { contacts: { "private@example.com": 42 } });
     const result = await run({
-      nextSchema: { type: "object", properties: {
-        contacts: { type: "object", additionalProperties: { type: "string" } },
-      } },
+      nextSchema: {
+        type: "object",
+        properties: {
+          contacts: {
+            type: "object",
+            additionalProperties: { type: "string" },
+          },
+        },
+      },
     });
     expect(result.failure?.instancePath).toBe("/contacts/*");
     expect(JSON.stringify(result)).not.toContain("private@example.com");
@@ -141,21 +184,38 @@ describe("witnessDeclarationUpgrade", () => {
 
   it("passes an empty stream", async () => {
     const { run } = fixture();
-    expect(await run()).toEqual({ verdict: "pass", checked: 0, nextCursor: null });
+    expect(await run()).toEqual({
+      verdict: "pass",
+      checked: 0,
+      nextCursor: null,
+    });
   });
 
   it("skips tombstones and deleted rows and never requests other streams or sources", async () => {
     const { store, insert, run, list } = fixture();
     insert("a");
     insert("bad-deleted", { model_source: 42 });
-    expect(store.deleteRecord(sourceKey, stream, "bad-deleted",
-      "2026-04-02T00:00:00.000Z", "mutable_state")).toBe(true);
+    expect(
+      store.deleteRecord(
+        sourceKey,
+        stream,
+        "bad-deleted",
+        "2026-04-02T00:00:00.000Z",
+        "mutable_state",
+      ),
+    ).toBe(true);
     insert("bad-other-source", { model_source: 42 }, "other-source");
     insert("bad-other-stream", { model_source: 42 }, sourceKey, "other-stream");
-    expect(await run()).toEqual({ verdict: "pass", checked: 1, nextCursor: null });
+    expect(await run()).toEqual({
+      verdict: "pass",
+      checked: 1,
+      nextCursor: null,
+    });
     expect(list).toHaveBeenCalledOnce();
     expect(list).toHaveBeenCalledWith(stream, {
-      instanceIds: [sourceKey], limit: 2, order: "asc",
+      instanceIds: [sourceKey],
+      limit: 2,
+      order: "asc",
     });
   });
 
@@ -165,13 +225,21 @@ describe("witnessDeclarationUpgrade", () => {
     { $ref: "https://example.invalid/remote-schema" },
   ]) {
     it(`rejects a schema rejected by the write validator: ${JSON.stringify(schema)}`, async () => {
-      const registry = createStreamDeclarationRegistry([{
-        name: stream, semantics: "mutable_state", primaryKey: ["id"],
-        cursorField: "emitted_at", requiredFields: ["id"], schema,
-      }]);
+      const registry = createStreamDeclarationRegistry([
+        {
+          name: stream,
+          semantics: "mutable_state",
+          primaryKey: ["id"],
+          cursorField: "emitted_at",
+          requiredFields: ["id"],
+          schema,
+        },
+      ]);
       expect(() => createRecordDataValidator(registry)).toThrow();
       const { run, list } = fixture();
-      await expect(run({ nextSchema: schema })).rejects.toBeInstanceOf(DeclarationWitnessSchemaError);
+      await expect(run({ nextSchema: schema })).rejects.toBeInstanceOf(
+        DeclarationWitnessSchemaError,
+      );
       expect(list).not.toHaveBeenCalled();
     });
   }
@@ -182,18 +250,25 @@ describe("witnessDeclarationUpgrade", () => {
     const schema = {
       type: "object",
       properties: {
-        tuple: { type: "array", prefixItems: [{ type: "string" }, { type: "null" }], items: false },
+        tuple: {
+          type: "array",
+          prefixItems: [{ type: "string" }, { type: "null" }],
+          items: false,
+        },
         model_source: { $ref: "#/$defs/model" },
       },
-      $defs: { model: { type: "string", format: "email", customAnnotation: true } },
+      $defs: {
+        model: { type: "string", format: "email", customAnnotation: true },
+      },
     };
     expect((await run({ nextSchema: schema })).verdict).toBe("pass");
   });
 
   it("rejects asynchronous schemas rather than treating a promise as a pass", async () => {
     const { run, list } = fixture();
-    await expect(run({ nextSchema: { $async: true, type: "object" } }))
-      .rejects.toBeInstanceOf(DeclarationWitnessSchemaError);
+    await expect(
+      run({ nextSchema: { $async: true, type: "object" } }),
+    ).rejects.toBeInstanceOf(DeclarationWitnessSchemaError);
     expect(list).not.toHaveBeenCalled();
   });
 
@@ -203,11 +278,18 @@ describe("witnessDeclarationUpgrade", () => {
     insert("b");
     const first = await run({ limit: 1 });
     const token = first.nextCursor!;
-    const raw = store.listRecords(stream, { instanceIds: [sourceKey], limit: 1, order: "asc" }).nextCursor!;
-    const changed = token.slice(0, -2) + (token.at(-2) === "A" ? "B" : "A") + token.slice(-1);
+    const raw = store.listRecords(stream, {
+      instanceIds: [sourceKey],
+      limit: 1,
+      order: "asc",
+    }).nextCursor!;
+    const changed =
+      token.slice(0, -2) + (token.at(-2) === "A" ? "B" : "A") + token.slice(-1);
     list.mockClear();
     for (const cursor of ["", "unknown", token.slice(0, -1), changed, raw]) {
-      await expect(run({ cursor })).rejects.toBeInstanceOf(DeclarationWitnessCursorError);
+      await expect(run({ cursor })).rejects.toBeInstanceOf(
+        DeclarationWitnessCursorError,
+      );
     }
     expect(list).not.toHaveBeenCalled();
   });
@@ -224,16 +306,26 @@ describe("witnessDeclarationUpgrade", () => {
       { nextSchema: { type: "object" } },
       { readPort: fixture().readPort },
     ]) {
-      await expect(run({ cursor: nextCursor!, ...changed }))
-        .rejects.toBeInstanceOf(DeclarationWitnessCursorError);
+      await expect(
+        run({ cursor: nextCursor!, ...changed }),
+      ).rejects.toBeInstanceOf(DeclarationWitnessCursorError);
     }
     expect(list).not.toHaveBeenCalled();
   });
 
-  for (const limit of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+  for (const limit of [
+    0,
+    -1,
+    1.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
     it(`rejects invalid limit ${limit} before reading`, async () => {
       const { run, list } = fixture();
-      await expect(run({ limit })).rejects.toBeInstanceOf(DeclarationWitnessInputError);
+      await expect(run({ limit })).rejects.toBeInstanceOf(
+        DeclarationWitnessInputError,
+      );
       expect(list).not.toHaveBeenCalled();
     });
   }
@@ -243,13 +335,28 @@ describe("witnessDeclarationUpgrade", () => {
     insert("a");
     list.mockResolvedValueOnce({ data: [], hasMore: true });
     await expect(run()).rejects.toBeInstanceOf(DeclarationWitnessReadError);
-    list.mockResolvedValueOnce({ data: [], hasMore: undefined as unknown as boolean });
+    list.mockResolvedValueOnce({
+      data: [],
+      hasMore: undefined as unknown as boolean,
+    });
     await expect(run()).rejects.toBeInstanceOf(DeclarationWitnessReadError);
-    const row = { instance: sourceKey, stream, recordKey: "a", data: { id: "a" },
-      version: 1, emittedAt: "2026-04-01T00:00:00.000Z", deleted: false as const };
+    const row = {
+      instance: sourceKey,
+      stream,
+      recordKey: "a",
+      data: { id: "a" },
+      version: 1,
+      emittedAt: "2026-04-01T00:00:00.000Z",
+      deleted: false as const,
+    };
     list.mockResolvedValueOnce({ data: [row, row], hasMore: false });
-    await expect(run({ limit: 1 })).rejects.toBeInstanceOf(DeclarationWitnessReadError);
-    list.mockResolvedValueOnce({ data: [{ ...row, instance: "wrong-source" }], hasMore: false });
+    await expect(run({ limit: 1 })).rejects.toBeInstanceOf(
+      DeclarationWitnessReadError,
+    );
+    list.mockResolvedValueOnce({
+      data: [{ ...row, instance: "wrong-source" }],
+      hasMore: false,
+    });
     await expect(run()).rejects.toBeInstanceOf(DeclarationWitnessReadError);
   });
 });

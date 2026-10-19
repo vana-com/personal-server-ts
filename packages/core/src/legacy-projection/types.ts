@@ -40,7 +40,8 @@ export type ProjectionError =
   | { kind: "missing_stream"; scope: string; expectedStream: string }
   | { kind: "invalid_value"; scope: string; reason: string }
   | {
-      kind: "invalid_encoded_text" | "message_content_omitted" | "unresolved_blob";
+      kind:
+        "invalid_encoded_text" | "message_content_omitted" | "unresolved_blob";
       scope: string;
       stream: string;
       field: string;

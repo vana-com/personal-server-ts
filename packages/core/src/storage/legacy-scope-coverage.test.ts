@@ -4,70 +4,102 @@ import { compareLegacyCoverage } from "./legacy-scope-coverage.js";
 const keys = { "$.items": ["id"], "$.items[].children": ["id"] };
 
 describe("legacy scope coverage", () => {
+  describe.each([false, true])(
+    "memory creation coverage (newer=%s)",
+    (canonicalNewer) => {
+      const options = {
+        entityKeys: { "$.memories": ["id"] },
+        scope: "chatgpt.memories",
+        canonicalNewer,
+        allowProvenDeletion: true,
+      };
+      const body = (created_at: unknown) => ({
+        memories: [{ id: "a", created_at }],
+      });
 
-  describe.each([false, true])("memory creation coverage (newer=%s)", (canonicalNewer) => {
-    const options = {
-      entityKeys: { "$.memories": ["id"] },
-      scope: "chatgpt.memories",
-      canonicalNewer,
-      allowProvenDeletion: true,
-    };
-    const body = (created_at: unknown) => ({
-      memories: [{ id: "a", created_at }],
-    });
-
-    it.each([
-      { label: "empty", legacy: ["2024-01-01T00:00:00Z"], canonical: [] },
-      { label: "shorter", legacy: ["2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"], canonical: ["2023-01-01T00:00:00Z"] },
-      { label: "duplicate shortage", legacy: ["2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"], canonical: ["2024-01-01T00:00:00Z"] },
-    ])("blocks $label canonical creation arrays", ({ legacy, canonical }) => {
-      const verdict = compareLegacyCoverage(body(legacy), body(canonical), options);
-      expect(verdict.covered).toBe(false);
-      expect(verdict.reasonCounts.missing_entity).toBeGreaterThan(0);
-      expect(verdict.appliedExceptions).toEqual([]);
-    });
-
-    it.each([
-      { label: "absent", memory: { id: "a" }, reason: "missing_field" },
-      { label: "null", memory: { id: "a", created_at: null }, reason: "type_mismatch" },
-      { label: "empty", memory: { id: "a", created_at: "" }, reason: "timestamp_format" },
-    ])("blocks $label canonical creation scalars", ({ memory, reason }) => {
-      const verdict = compareLegacyCoverage(
-        body("2024-01-01T00:00:00Z"), { memories: [memory] }, options,
-      );
-      expect(verdict.covered).toBe(false);
-      expect(verdict.reason).toBe(reason);
-      expect(verdict.appliedExceptions).toEqual([]);
-    });
-
-    it.each([null, "", 123, "2023-01-01"])(
-      "keeps array type and timestamp format guards for %s", (value) => {
+      it.each([
+        { label: "empty", legacy: ["2024-01-01T00:00:00Z"], canonical: [] },
+        {
+          label: "shorter",
+          legacy: ["2024-01-01T00:00:00Z", "2024-01-02T00:00:00Z"],
+          canonical: ["2023-01-01T00:00:00Z"],
+        },
+        {
+          label: "duplicate shortage",
+          legacy: ["2024-01-01T00:00:00Z", "2024-01-01T00:00:00Z"],
+          canonical: ["2024-01-01T00:00:00Z"],
+        },
+      ])("blocks $label canonical creation arrays", ({ legacy, canonical }) => {
         const verdict = compareLegacyCoverage(
-          body(["2024-01-01T00:00:00Z"]), body([value]), options,
+          body(legacy),
+          body(canonical),
+          options,
         );
         expect(verdict.covered).toBe(false);
+        expect(verdict.reasonCounts.missing_entity).toBeGreaterThan(0);
         expect(verdict.appliedExceptions).toEqual([]);
-      },
-    );
+      });
 
-    it("requires same-time cardinality even when a creation value differs", () => {
-      const verdict = compareLegacyCoverage(
-        body(["2024-01-01T00:00:00Z"]),
-        body(["2023-01-01T00:00:00Z", "2023-01-02T00:00:00Z"]),
-        options,
-      );
-      expect(verdict.covered).toBe(canonicalNewer);
-      if (!canonicalNewer) expect(verdict.reason).toBe("array_order");
-    });
+      it.each([
+        { label: "absent", memory: { id: "a" }, reason: "missing_field" },
+        {
+          label: "null",
+          memory: { id: "a", created_at: null },
+          reason: "type_mismatch",
+        },
+        {
+          label: "empty",
+          memory: { id: "a", created_at: "" },
+          reason: "timestamp_format",
+        },
+      ])("blocks $label canonical creation scalars", ({ memory, reason }) => {
+        const verdict = compareLegacyCoverage(
+          body("2024-01-01T00:00:00Z"),
+          { memories: [memory] },
+          options,
+        );
+        expect(verdict.covered).toBe(false);
+        expect(verdict.reason).toBe(reason);
+        expect(verdict.appliedExceptions).toEqual([]);
+      });
 
-    it.each([false, true])("does not waive empty non-date strings (array=%s)", (asArray) => {
-      const verdict = compareLegacyCoverage(
-        body(asArray ? ["legacy"] : "legacy"), body(asArray ? [""] : ""), options,
+      it.each([null, "", 123, "2023-01-01"])(
+        "keeps array type and timestamp format guards for %s",
+        (value) => {
+          const verdict = compareLegacyCoverage(
+            body(["2024-01-01T00:00:00Z"]),
+            body([value]),
+            options,
+          );
+          expect(verdict.covered).toBe(false);
+          expect(verdict.appliedExceptions).toEqual([]);
+        },
       );
-      expect(verdict.covered).toBe(false);
-      expect(verdict.appliedExceptions).toEqual([]);
-    });
-  });
+
+      it("requires same-time cardinality even when a creation value differs", () => {
+        const verdict = compareLegacyCoverage(
+          body(["2024-01-01T00:00:00Z"]),
+          body(["2023-01-01T00:00:00Z", "2023-01-02T00:00:00Z"]),
+          options,
+        );
+        expect(verdict.covered).toBe(canonicalNewer);
+        if (!canonicalNewer) expect(verdict.reason).toBe("array_order");
+      });
+
+      it.each([false, true])(
+        "does not waive empty non-date strings (array=%s)",
+        (asArray) => {
+          const verdict = compareLegacyCoverage(
+            body(asArray ? ["legacy"] : "legacy"),
+            body(asArray ? [""] : ""),
+            options,
+          );
+          expect(verdict.covered).toBe(false);
+          expect(verdict.appliedExceptions).toEqual([]);
+        },
+      );
+    },
+  );
   it("covers legacy entities and fields while allowing canonical extras", () => {
     const verdict = compareLegacyCoverage(
       {
@@ -648,7 +680,10 @@ describe("legacy scope coverage", () => {
             },
             {
               memories: [
-                { id: "a", created_at: asArray ? [canonicalTime] : canonicalTime },
+                {
+                  id: "a",
+                  created_at: asArray ? [canonicalTime] : canonicalTime,
+                },
               ],
             },
             { entityKeys: { "$.memories": ["id"] }, scope, canonicalNewer },

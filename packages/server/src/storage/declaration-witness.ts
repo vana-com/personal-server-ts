@@ -30,11 +30,13 @@ export interface OfflineDeclarationWitnessOptions {
   budgetMs: number;
 }
 
-export type OfflineDeclarationWitnessResult =
-  Omit<DeclarationWitnessResult, "nextCursor"> & {
-    /** SHA-256 of the failing connection instance ID, only on fail. */
-    connectionHash?: string;
-  };
+export type OfflineDeclarationWitnessResult = Omit<
+  DeclarationWitnessResult,
+  "nextCursor"
+> & {
+  /** SHA-256 of the failing connection instance ID, only on fail. */
+  connectionHash?: string;
+};
 
 export type OfflineDeclarationWitnessErrorCode =
   | "invalid_argument"
@@ -59,21 +61,37 @@ export class OfflineDeclarationWitnessError extends Error {
 
 function isUnreadable(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
-  return typeof code === "string" && (
-    ["EACCES", "EPERM", "EISDIR", "EROFS", "SQLITE_CANTOPEN", "SQLITE_PERM", "SQLITE_AUTH"].includes(code) ||
-    code.startsWith("SQLITE_READONLY")
+  return (
+    typeof code === "string" &&
+    ([
+      "EACCES",
+      "EPERM",
+      "EISDIR",
+      "EROFS",
+      "SQLITE_CANTOPEN",
+      "SQLITE_PERM",
+      "SQLITE_AUTH",
+    ].includes(code) ||
+      code.startsWith("SQLITE_READONLY"))
   );
 }
 
 /** Binding source_id is the exact key used by declaration-registry.resolve. */
-function assertRegisteredSource(db: InstanceType<typeof Database>, sourceKey: string): string {
-  let binding: { source_id: string | null; deleted_at: string | null } | undefined;
+function assertRegisteredSource(
+  db: InstanceType<typeof Database>,
+  sourceKey: string,
+): string {
+  let binding:
+    { source_id: string | null; deleted_at: string | null } | undefined;
   try {
-    binding = db.prepare(
-      "SELECT source_id, deleted_at FROM pdpp_instance_binding WHERE instance = ?",
-    ).get(sourceKey) as typeof binding;
+    binding = db
+      .prepare(
+        "SELECT source_id, deleted_at FROM pdpp_instance_binding WHERE instance = ?",
+      )
+      .get(sourceKey) as typeof binding;
   } catch (error) {
-    if (isUnreadable(error)) throw new OfflineDeclarationWitnessError("store_unreadable");
+    if (isUnreadable(error))
+      throw new OfflineDeclarationWitnessError("store_unreadable");
     throw new OfflineDeclarationWitnessError("unverifiable_source");
   }
   if (!binding || !binding.source_id || binding.deleted_at !== null) {
@@ -83,25 +101,42 @@ function assertRegisteredSource(db: InstanceType<typeof Database>, sourceKey: st
 }
 
 function assertRetainedStreamDeclaration(
-  db: InstanceType<typeof Database>, sourceId: string, stream: string,
+  db: InstanceType<typeof Database>,
+  sourceId: string,
+  stream: string,
 ): void {
   try {
     // Same key and current predicate as declaration-registry.resolve; never
     // derive a source from the instance name or from a connector URI suffix.
-    const rows = db.prepare(
-      "SELECT snapshot_json FROM pdpp_current_declarations WHERE source_id = ? AND is_current = 1 LIMIT 2",
-    ).all(sourceId) as { snapshot_json: string }[];
-    if (rows.length !== 1) throw new OfflineDeclarationWitnessError("unverifiable_source");
+    const rows = db
+      .prepare(
+        "SELECT snapshot_json FROM pdpp_current_declarations WHERE source_id = ? AND is_current = 1 LIMIT 2",
+      )
+      .all(sourceId) as { snapshot_json: string }[];
+    if (rows.length !== 1)
+      throw new OfflineDeclarationWitnessError("unverifiable_source");
     const snapshot: unknown = JSON.parse(rows[0]!.snapshot_json);
-    if (!snapshot || typeof snapshot !== "object" ||
-        !("source_id" in snapshot) || snapshot.source_id !== sourceId ||
-        !("streams" in snapshot) || !Array.isArray(snapshot.streams) ||
-        !snapshot.streams.every((entry: unknown) =>
-          entry !== null && typeof entry === "object" &&
-          "name" in entry && typeof entry.name === "string" && entry.name.length > 0)) {
+    if (
+      !snapshot ||
+      typeof snapshot !== "object" ||
+      !("source_id" in snapshot) ||
+      snapshot.source_id !== sourceId ||
+      !("streams" in snapshot) ||
+      !Array.isArray(snapshot.streams) ||
+      !snapshot.streams.every(
+        (entry: unknown) =>
+          entry !== null &&
+          typeof entry === "object" &&
+          "name" in entry &&
+          typeof entry.name === "string" &&
+          entry.name.length > 0,
+      )
+    ) {
       throw new OfflineDeclarationWitnessError("unverifiable_source");
     }
-    if (!snapshot.streams.some((entry: { name: string }) => entry.name === stream)) {
+    if (
+      !snapshot.streams.some((entry: { name: string }) => entry.name === stream)
+    ) {
       throw new OfflineDeclarationWitnessError("missing_stream");
     }
   } catch (error) {
@@ -138,17 +173,27 @@ function assertRetainedStreamDeclaration(
 export async function runDeclarationWitness(
   options: OfflineDeclarationWitnessOptions,
 ): Promise<OfflineDeclarationWitnessResult> {
-  const pageSize = options?.pageSize !== undefined ? options.pageSize : options?.limit;
+  const pageSize =
+    options?.pageSize !== undefined ? options.pageSize : options?.limit;
   if (
-    !options || typeof options.dbPath !== "string" || !options.dbPath ||
+    !options ||
+    typeof options.dbPath !== "string" ||
+    !options.dbPath ||
     (options.declarationsDbPath !== undefined &&
-      (typeof options.declarationsDbPath !== "string" || !options.declarationsDbPath)) ||
-    ((options.sourceKey === undefined) === (options.sourceId === undefined)) ||
-    (options.sourceKey !== undefined && (typeof options.sourceKey !== "string" || !options.sourceKey)) ||
-    (options.sourceId !== undefined && (typeof options.sourceId !== "string" || !options.sourceId)) ||
-    typeof options.stream !== "string" || !options.stream ||
-    typeof pageSize !== "number" || !Number.isSafeInteger(pageSize) || pageSize <= 0 ||
-    !Number.isFinite(options.budgetMs) || options.budgetMs < 0
+      (typeof options.declarationsDbPath !== "string" ||
+        !options.declarationsDbPath)) ||
+    (options.sourceKey === undefined) === (options.sourceId === undefined) ||
+    (options.sourceKey !== undefined &&
+      (typeof options.sourceKey !== "string" || !options.sourceKey)) ||
+    (options.sourceId !== undefined &&
+      (typeof options.sourceId !== "string" || !options.sourceId)) ||
+    typeof options.stream !== "string" ||
+    !options.stream ||
+    typeof pageSize !== "number" ||
+    !Number.isSafeInteger(pageSize) ||
+    pageSize <= 0 ||
+    !Number.isFinite(options.budgetMs) ||
+    options.budgetMs < 0
   ) {
     throw new OfflineDeclarationWitnessError("invalid_argument");
   }
@@ -177,39 +222,62 @@ export async function runDeclarationWitness(
         throw new OfflineDeclarationWitnessError("missing_database");
       }
       if (error instanceof OfflineDeclarationWitnessError) throw error;
-      throw new OfflineDeclarationWitnessError(isUnreadable(error) ? "store_unreadable" : "open_failed");
+      throw new OfflineDeclarationWitnessError(
+        isUnreadable(error) ? "store_unreadable" : "open_failed",
+      );
     }
-    db = new Database(dbPath, { readonly: true, fileMustExist: true, timeout: 0 });
+    db = new Database(dbPath, {
+      readonly: true,
+      fileMustExist: true,
+      timeout: 0,
+    });
     stage = "unverifiable_source";
     const sourceId = options.sourceId ?? assertRegisteredSource(db, sourceKey!);
-    const connections = db.prepare(
-      "SELECT instance FROM pdpp_instance_binding WHERE source_id = ? AND deleted_at IS NULL ORDER BY instance",
-    ).all(sourceId) as { instance: string }[];
+    const connections = db
+      .prepare(
+        "SELECT instance FROM pdpp_instance_binding WHERE source_id = ? AND deleted_at IS NULL ORDER BY instance",
+      )
+      .all(sourceId) as { instance: string }[];
     stage = "unsupported_store";
     const store = createSqliteRecordStore(db);
     stage = "unverifiable_source";
     try {
-      const path = options.declarationsDbPath ?? join(dirname(dbPath), "pdpp-declarations.db");
+      const path =
+        options.declarationsDbPath ??
+        join(dirname(dbPath), "pdpp-declarations.db");
       if (!statSync(path).isFile()) throw new Error("unavailable");
-      declarationsDb = new Database(path, { readonly: true, fileMustExist: true, timeout: 0 });
+      declarationsDb = new Database(path, {
+        readonly: true,
+        fileMustExist: true,
+        timeout: 0,
+      });
     } catch {
       throw new OfflineDeclarationWitnessError("unverifiable_source");
     }
     assertRetainedStreamDeclaration(declarationsDb, sourceId, stream);
     // Witness validation uses nextSchema, never declaration registry lookups.
-    const readPort = fromSyncRecordStore({ ...store, forInstance: () => undefined });
+    const readPort = fromSyncRecordStore({
+      ...store,
+      forInstance: () => undefined,
+    });
     stage = "read_failed";
     let checked = 0;
     if (connections.length === 0) {
-      if (performance.now() - started >= budgetMs) return { verdict: "partial", checked };
+      if (performance.now() - started >= budgetMs)
+        return { verdict: "partial", checked };
       // Still compile/validate nextSchema, but never read orphaned or unrelated
       // rows merely because an instance happens to share the source ID.
       const emptyPort = fromSyncRecordStore({
-        ...store, forInstance: () => undefined,
+        ...store,
+        forInstance: () => undefined,
         listRecords: () => ({ data: [], hasMore: false }),
       });
       await witnessDeclarationUpgrade({
-        readPort: emptyPort, sourceKey: sourceId, stream, nextSchema: schema, limit,
+        readPort: emptyPort,
+        sourceKey: sourceId,
+        stream,
+        nextSchema: schema,
+        limit,
       });
     }
     for (const { instance } of connections) {
@@ -219,13 +287,19 @@ export async function runDeclarationWitness(
           return { verdict: "partial", checked };
         }
         const page = await witnessDeclarationUpgrade({
-          readPort, sourceKey: instance, stream, nextSchema: schema, limit,
+          readPort,
+          sourceKey: instance,
+          stream,
+          nextSchema: schema,
+          limit,
           ...(cursor === undefined ? {} : { cursor }),
         });
         checked += page.checked;
         if (page.verdict === "fail") {
           return {
-            verdict: "fail", checked, failure: page.failure,
+            verdict: "fail",
+            checked,
+            failure: page.failure,
             connectionHash: createHash("sha256").update(instance).digest("hex"),
           };
         }
@@ -233,7 +307,8 @@ export async function runDeclarationWitness(
           return { verdict: "partial", checked };
         }
         if (page.verdict === "pass") break;
-        if (!page.nextCursor) throw new OfflineDeclarationWitnessError("read_failed");
+        if (!page.nextCursor)
+          throw new OfflineDeclarationWitnessError("read_failed");
         cursor = page.nextCursor;
       }
     }
@@ -244,8 +319,11 @@ export async function runDeclarationWitness(
   } catch (error) {
     if (error instanceof OfflineDeclarationWitnessError) throw error;
     throw new OfflineDeclarationWitnessError(
-      isUnreadable(error) ? "store_unreadable" :
-      error instanceof DeclarationWitnessSchemaError ? "invalid_schema" : stage,
+      isUnreadable(error)
+        ? "store_unreadable"
+        : error instanceof DeclarationWitnessSchemaError
+          ? "invalid_schema"
+          : stage,
     );
   } finally {
     let closeFailed = false;

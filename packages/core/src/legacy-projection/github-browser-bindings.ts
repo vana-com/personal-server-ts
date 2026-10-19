@@ -67,7 +67,12 @@ function projectDeclared(value: unknown, schema: LegacySchema): unknown {
     const items = schema.items;
     return value.map((item) => projectDeclared(item, items));
   }
-  if (value !== null && typeof value === "object" && !Array.isArray(value) && schema.properties) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    schema.properties
+  ) {
     const object = value as Record<string, unknown>;
     return Object.fromEntries(
       Object.entries(schema.properties)
@@ -83,9 +88,18 @@ function projectDeclared(value: unknown, schema: LegacySchema): unknown {
 // repositories :416-425, starred :568-575). These are compatibility defaults,
 // not new facts in the canonical records. Required identities stay guarded.
 const profileDefaults: Record<string, unknown> = {
-  fullName: "", bio: "", company: "", location: "", website: "", avatarUrl: "",
-  followers: 0, following: 0, repositoryCount: 0,
-  pinnedRepositories: [], organizations: [], achievements: [],
+  fullName: "",
+  bio: "",
+  company: "",
+  location: "",
+  website: "",
+  avatarUrl: "",
+  followers: 0,
+  following: 0,
+  repositoryCount: 0,
+  pinnedRepositories: [],
+  organizations: [],
+  achievements: [],
   contributionsLastYear: null,
 };
 const rowDefaults: Record<string, Record<string, unknown>> = {
@@ -93,23 +107,38 @@ const rowDefaults: Record<string, Record<string, unknown>> = {
   organizations: { avatarUrl: null },
   achievements: { iconUrl: null },
   repositories: {
-    description: "", language: "", stars: 0, forks: 0,
-    visibility: "Public", topics: [], updatedAt: null,
+    description: "",
+    language: "",
+    stars: 0,
+    forks: 0,
+    visibility: "Public",
+    topics: [],
+    updatedAt: null,
   },
   starred: { description: "", language: "", stars: 0, updatedAt: null },
 };
 
-function fillAbsent(object: Record<string, unknown>, defaults: Record<string, unknown>): void {
+function fillAbsent(
+  object: Record<string, unknown>,
+  defaults: Record<string, unknown>,
+): void {
   for (const [key, value] of Object.entries(defaults)) {
-    if (object[key] === undefined) object[key] = Array.isArray(value) ? [...value] : value;
+    if (object[key] === undefined)
+      object[key] = Array.isArray(value) ? [...value] : value;
   }
 }
 
-function fillLegacyDefaults(stream: string, payload: Record<string, unknown>): void {
+function fillLegacyDefaults(
+  stream: string,
+  payload: Record<string, unknown>,
+): void {
   if (stream === "profile") fillAbsent(payload, profileDefaults);
-  const fields = stream === "profile"
-    ? ["pinnedRepositories", "organizations", "achievements"]
-    : stream === "repositories" || stream === "starred" ? [stream] : [];
+  const fields =
+    stream === "profile"
+      ? ["pinnedRepositories", "organizations", "achievements"]
+      : stream === "repositories" || stream === "starred"
+        ? [stream]
+        : [];
   for (const field of fields) {
     const rows = payload[field];
     if (!Array.isArray(rows)) continue;
@@ -190,7 +219,10 @@ function browserBinding(stream: string): LegacyScopeBinding {
           };
         }
       }
-      const payload = projectDeclared(snapshot, schemasByStream[stream]) as Record<string, unknown>;
+      const payload = projectDeclared(
+        snapshot,
+        schemasByStream[stream],
+      ) as Record<string, unknown>;
       fillLegacyDefaults(stream, payload);
       // github-browser 0.2.1 uses a new description for the same API window.
       // Keep the Vana legacy payload wording from github-playwright 1.5.1.

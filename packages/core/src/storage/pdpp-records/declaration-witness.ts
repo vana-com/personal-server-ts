@@ -40,7 +40,9 @@ export interface DeclarationWitnessResult {
 
 export class DeclarationWitnessInputError extends Error {
   constructor() {
-    super("Declaration witness requires a source, stream and positive safe-integer limit");
+    super(
+      "Declaration witness requires a source, stream and positive safe-integer limit",
+    );
     this.name = "DeclarationWitnessInputError";
   }
 }
@@ -55,7 +57,9 @@ export class DeclarationWitnessSchemaError extends Error {
 
 export class DeclarationWitnessCursorError extends InvalidCursorError {
   constructor() {
-    super("Declaration witness cursor is invalid, expired or belongs to another walk");
+    super(
+      "Declaration witness cursor is invalid, expired or belongs to another walk",
+    );
     this.name = "DeclarationWitnessCursorError";
   }
 }
@@ -74,7 +78,11 @@ export class DeclarationWitnessReadError extends Error {
 const cursorKeys = new WeakMap<PdppRecordReadPort, Buffer>();
 const prefix = "dw1.";
 
-function sealCursor(port: PdppRecordReadPort, cursor: string, context: string): string {
+function sealCursor(
+  port: PdppRecordReadPort,
+  cursor: string,
+  context: string,
+): string {
   let key = cursorKeys.get(port);
   if (!key) {
     key = randomBytes(32);
@@ -83,24 +91,43 @@ function sealCursor(port: PdppRecordReadPort, cursor: string, context: string): 
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   cipher.setAAD(Buffer.from(context, "utf8"));
-  const encrypted = Buffer.concat([cipher.update(cursor, "utf8"), cipher.final()]);
-  return prefix + Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString("base64url");
+  const encrypted = Buffer.concat([
+    cipher.update(cursor, "utf8"),
+    cipher.final(),
+  ]);
+  return (
+    prefix +
+    Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString("base64url")
+  );
 }
 
-function openCursor(port: PdppRecordReadPort, token: string, context: string): string {
+function openCursor(
+  port: PdppRecordReadPort,
+  token: string,
+  context: string,
+): string {
   try {
     const key = cursorKeys.get(port);
-    if (!key || !token.startsWith(prefix)) throw new DeclarationWitnessCursorError();
+    if (!key || !token.startsWith(prefix))
+      throw new DeclarationWitnessCursorError();
     const encoded = token.slice(prefix.length);
-    if (!/^[A-Za-z0-9_-]+$/.test(encoded)) throw new DeclarationWitnessCursorError();
+    if (!/^[A-Za-z0-9_-]+$/.test(encoded))
+      throw new DeclarationWitnessCursorError();
     const bytes = Buffer.from(encoded, "base64url");
     if (bytes.length <= 28 || bytes.toString("base64url") !== encoded) {
       throw new DeclarationWitnessCursorError();
     }
-    const decipher = createDecipheriv("aes-256-gcm", key, bytes.subarray(0, 12));
+    const decipher = createDecipheriv(
+      "aes-256-gcm",
+      key,
+      bytes.subarray(0, 12),
+    );
     decipher.setAAD(Buffer.from(context, "utf8"));
     decipher.setAuthTag(bytes.subarray(12, 28));
-    return Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString("utf8");
+    return Buffer.concat([
+      decipher.update(bytes.subarray(28)),
+      decipher.final(),
+    ]).toString("utf8");
   } catch {
     throw new DeclarationWitnessCursorError();
   }
@@ -143,12 +170,20 @@ function storePosition(cursor: string, stream: string) {
  * in the redacted failure pointer.
  */
 export async function witnessDeclarationUpgrade({
-  readPort, sourceKey, stream, nextSchema, cursor, limit,
+  readPort,
+  sourceKey,
+  stream,
+  nextSchema,
+  cursor,
+  limit,
 }: DeclarationWitnessOptions): Promise<DeclarationWitnessResult> {
   if (
-    !Number.isSafeInteger(limit) || limit <= 0 ||
-    typeof sourceKey !== "string" || sourceKey.length === 0 ||
-    typeof stream !== "string" || stream.length === 0
+    !Number.isSafeInteger(limit) ||
+    limit <= 0 ||
+    typeof sourceKey !== "string" ||
+    sourceKey.length === 0 ||
+    typeof stream !== "string" ||
+    stream.length === 0
   ) {
     throw new DeclarationWitnessInputError();
   }
@@ -161,8 +196,11 @@ export async function witnessDeclarationUpgrade({
     // object even if the caller mutates its schema while listRecords awaits.
     schema = structuredClone(nextSchema);
     validate = compileRecordSchema(schema);
-    if ("$async" in validate && validate.$async) throw new DeclarationWitnessSchemaError();
-    schemaDigest = createHash("sha256").update(JSON.stringify(schema)).digest("hex");
+    if ("$async" in validate && validate.$async)
+      throw new DeclarationWitnessSchemaError();
+    schemaDigest = createHash("sha256")
+      .update(JSON.stringify(schema))
+      .digest("hex");
   } catch {
     throw new DeclarationWitnessSchemaError();
   }
@@ -199,7 +237,9 @@ export async function witnessDeclarationUpgrade({
   }
 
   if (
-    !page || !Array.isArray(page.data) || page.data.length > limit ||
+    !page ||
+    !Array.isArray(page.data) ||
+    page.data.length > limit ||
     typeof page.hasMore !== "boolean" ||
     (!page.hasMore && page.nextCursor !== undefined)
   ) {
@@ -207,12 +247,20 @@ export async function witnessDeclarationUpgrade({
   }
   if (page.hasMore) {
     try {
-      if (!page.nextCursor || page.nextCursor === storeCursor || page.data.length === 0) {
+      if (
+        !page.nextCursor ||
+        page.nextCursor === storeCursor ||
+        page.data.length === 0
+      ) {
         throw new DeclarationWitnessReadError();
       }
       const position = storePosition(page.nextCursor, stream);
       const last = page.data[page.data.length - 1];
-      if (!last || position.recordKey !== last.recordKey || position.sortValue !== last.emittedAt) {
+      if (
+        !last ||
+        position.recordKey !== last.recordKey ||
+        position.sortValue !== last.emittedAt
+      ) {
         throw new DeclarationWitnessReadError();
       }
     } catch {
@@ -223,7 +271,9 @@ export async function witnessDeclarationUpgrade({
   let checked = 0;
   for (const row of page.data as PdppRecordRow[]) {
     if (
-      !row || row.instance !== sourceKey || row.stream !== stream ||
+      !row ||
+      row.instance !== sourceKey ||
+      row.stream !== stream ||
       typeof row.recordKey !== "string" ||
       (row.deleted !== true && row.deleted !== false)
     ) {
@@ -240,7 +290,9 @@ export async function witnessDeclarationUpgrade({
         checked,
         nextCursor: null,
         failure: {
-          recordKeyDigest: createHash("sha256").update(row.recordKey).digest("hex"),
+          recordKeyDigest: createHash("sha256")
+            .update(row.recordKey)
+            .digest("hex"),
           instancePath: error?.instancePath
             ? redactedPath(schema, error.instancePath, row.data)
             : "",

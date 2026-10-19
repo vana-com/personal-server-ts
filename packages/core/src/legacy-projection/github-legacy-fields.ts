@@ -6,203 +6,203 @@ export type LegacyGithubFields = {
 };
 
 export const GITHUB_LEGACY_FIELDS: Record<string, LegacyGithubFields> = {
-  "profile": {
-    "properties": {
-      "username": {},
-      "fullName": {},
-      "bio": {},
-      "company": {},
-      "location": {},
-      "website": {},
-      "avatarUrl": {},
-      "followers": {},
-      "following": {},
-      "repositoryCount": {},
-      "profileUrl": {},
-      "pinnedRepositories": {
-        "items": {
-          "properties": {
-            "fullName": {},
-            "url": {},
-            "description": {},
-            "language": {},
-            "stars": {}
-          }
-        }
+  profile: {
+    properties: {
+      username: {},
+      fullName: {},
+      bio: {},
+      company: {},
+      location: {},
+      website: {},
+      avatarUrl: {},
+      followers: {},
+      following: {},
+      repositoryCount: {},
+      profileUrl: {},
+      pinnedRepositories: {
+        items: {
+          properties: {
+            fullName: {},
+            url: {},
+            description: {},
+            language: {},
+            stars: {},
+          },
+        },
       },
-      "organizations": {
-        "items": {
-          "properties": {
-            "login": {},
-            "label": {},
-            "url": {},
-            "avatarUrl": {}
-          }
-        }
+      organizations: {
+        items: {
+          properties: {
+            login: {},
+            label: {},
+            url: {},
+            avatarUrl: {},
+          },
+        },
       },
-      "achievements": {
-        "items": {
-          "properties": {
-            "name": {},
-            "iconUrl": {}
-          }
-        }
+      achievements: {
+        items: {
+          properties: {
+            name: {},
+            iconUrl: {},
+          },
+        },
       },
-      "contributionsLastYear": {}
-    }
+      contributionsLastYear: {},
+    },
   },
-  "repositories": {
-    "properties": {
-      "repositories": {
-        "items": {
-          "properties": {
-            "name": {},
-            "url": {},
-            "description": {},
-            "language": {},
-            "stars": {},
-            "forks": {},
-            "visibility": {},
-            "topics": {
-              "items": {}
+  repositories: {
+    properties: {
+      repositories: {
+        items: {
+          properties: {
+            name: {},
+            url: {},
+            description: {},
+            language: {},
+            stars: {},
+            forks: {},
+            visibility: {},
+            topics: {
+              items: {},
             },
-            "updatedAt": {}
-          }
-        }
-      }
-    }
+            updatedAt: {},
+          },
+        },
+      },
+    },
   },
-  "starred": {
-    "properties": {
-      "starred": {
-        "items": {
-          "properties": {
-            "fullName": {},
-            "url": {},
-            "description": {},
-            "language": {},
-            "stars": {},
-            "updatedAt": {}
-          }
-        }
-      }
-    }
+  starred: {
+    properties: {
+      starred: {
+        items: {
+          properties: {
+            fullName: {},
+            url: {},
+            description: {},
+            language: {},
+            stars: {},
+            updatedAt: {},
+          },
+        },
+      },
+    },
   },
-  "events": {
-    "properties": {
-      "events": {
-        "items": {
-          "properties": {
-            "id": {},
-            "type": {},
-            "createdAt": {},
-            "repo": {},
-            "repoUrl": {},
-            "action": {},
-            "title": {},
-            "body": {},
-            "url": {},
-            "branch": {},
-            "commits": {},
-            "isPublic": {}
-          }
-        }
+  events: {
+    properties: {
+      events: {
+        items: {
+          properties: {
+            id: {},
+            type: {},
+            createdAt: {},
+            repo: {},
+            repoUrl: {},
+            action: {},
+            title: {},
+            body: {},
+            url: {},
+            branch: {},
+            commits: {},
+            isPublic: {},
+          },
+        },
       },
-      "fetchedAt": {},
-      "windowDescription": {}
-    }
+      fetchedAt: {},
+      windowDescription: {},
+    },
   },
-  "contributions": {
-    "properties": {
-      "totalContributionsLastYear": {},
-      "yearTotals": {
-        "items": {
-          "properties": {
-            "year": {},
-            "total": {}
-          }
-        }
+  contributions: {
+    properties: {
+      totalContributionsLastYear: {},
+      yearTotals: {
+        items: {
+          properties: {
+            year: {},
+            total: {},
+          },
+        },
       },
-      "days": {
-        "items": {
-          "properties": {
-            "date": {},
-            "count": {},
-            "level": {}
-          }
-        }
+      days: {
+        items: {
+          properties: {
+            date: {},
+            count: {},
+            level: {},
+          },
+        },
       },
-      "monthlyTotals": {
-        "items": {
-          "properties": {
-            "month": {},
-            "count": {}
-          }
-        }
+      monthlyTotals: {
+        items: {
+          properties: {
+            month: {},
+            count: {},
+          },
+        },
       },
-      "topDay": {
-        "properties": {
-          "date": {},
-          "count": {}
-        }
+      topDay: {
+        properties: {
+          date: {},
+          count: {},
+        },
       },
-      "fetchedAt": {}
-    }
+      fetchedAt: {},
+    },
   },
-  "history": {
-    "properties": {
-      "pullRequests": {
-        "items": {
-          "properties": {
-            "id": {},
-            "type": {},
-            "number": {},
-            "title": {},
-            "body": {},
-            "state": {},
-            "createdAt": {},
-            "updatedAt": {},
-            "closedAt": {},
-            "mergedAt": {},
-            "url": {},
-            "repo": {},
-            "repoUrl": {},
-            "labels": {
-              "items": {}
+  history: {
+    properties: {
+      pullRequests: {
+        items: {
+          properties: {
+            id: {},
+            type: {},
+            number: {},
+            title: {},
+            body: {},
+            state: {},
+            createdAt: {},
+            updatedAt: {},
+            closedAt: {},
+            mergedAt: {},
+            url: {},
+            repo: {},
+            repoUrl: {},
+            labels: {
+              items: {},
             },
-            "comments": {},
-            "reactionsTotal": {},
-            "isDraft": {}
-          }
-        }
+            comments: {},
+            reactionsTotal: {},
+            isDraft: {},
+          },
+        },
       },
-      "issues": {
-        "items": {
-          "properties": {
-            "id": {},
-            "type": {},
-            "number": {},
-            "title": {},
-            "body": {},
-            "state": {},
-            "createdAt": {},
-            "updatedAt": {},
-            "closedAt": {},
-            "mergedAt": {},
-            "url": {},
-            "repo": {},
-            "repoUrl": {},
-            "labels": {
-              "items": {}
+      issues: {
+        items: {
+          properties: {
+            id: {},
+            type: {},
+            number: {},
+            title: {},
+            body: {},
+            state: {},
+            createdAt: {},
+            updatedAt: {},
+            closedAt: {},
+            mergedAt: {},
+            url: {},
+            repo: {},
+            repoUrl: {},
+            labels: {
+              items: {},
             },
-            "comments": {},
-            "reactionsTotal": {},
-            "isDraft": {}
-          }
-        }
+            comments: {},
+            reactionsTotal: {},
+            isDraft: {},
+          },
+        },
       },
-      "fetchedAt": {},
-      "windowDescription": {}
-    }
-  }
+      fetchedAt: {},
+      windowDescription: {},
+    },
+  },
 };

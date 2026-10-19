@@ -438,7 +438,9 @@ export function createLegacyScopeView(
           writeClock: authority.writeClock(),
           arrivalRevision: authority.arrivalRevision(),
           receiptCursor:
-            decision.kind === "canonical" ? receiptCursor(decision, input.declarations) : "",
+            decision.kind === "canonical"
+              ? receiptCursor(decision, input.declarations)
+              : "",
         };
       });
       const { decision, legacyHead, hasTakeover, canServeLegacy } = initial;
@@ -490,7 +492,8 @@ export function createLegacyScopeView(
           legacyHead,
           () =>
             sameSelection(decide(scope), decision) &&
-            receiptCursor(decision, input.declarations) === initial.receiptCursor,
+            receiptCursor(decision, input.declarations) ===
+              initial.receiptCursor,
           {
             instance: decision.selection.instance,
             generation: decision.generation,
@@ -551,7 +554,8 @@ export function createLegacyScopeView(
           legacyHead,
           () =>
             sameSelection(decide(scope), decision) &&
-            receiptCursor(decision, input.declarations) === initial.receiptCursor,
+            receiptCursor(decision, input.declarations) ===
+              initial.receiptCursor,
           {
             instance: decision.selection.instance,
             generation: decision.generation,
@@ -634,7 +638,8 @@ export function createLegacyScopeView(
             legacyHead,
             () =>
               sameSelection(decide(scope), decision) &&
-              receiptCursor(decision, input.declarations) === initial.receiptCursor,
+              receiptCursor(decision, input.declarations) ===
+                initial.receiptCursor,
             {
               instance: decision.selection.instance,
               generation: decision.generation,
@@ -737,7 +742,8 @@ export function createLegacyScopeView(
           legacyHead,
           () =>
             sameSelection(decide(scope), decision) &&
-            receiptCursor(decision, input.declarations) === initial.receiptCursor,
+            receiptCursor(decision, input.declarations) ===
+              initial.receiptCursor,
           {
             instance: decision.selection.instance,
             generation: decision.generation,
@@ -898,26 +904,29 @@ function receiptCursor(
   decision: Extract<Decision, { kind: "canonical" }>,
   declarations?: ReadCanonicalLegacyScopeInput["declarations"],
 ): string {
-  const receipts = (
-    decision.records
-      .listStreamCompletions(decision.selection.instance)
-      .filter((receipt) => decision.streams.includes(receipt.stream))
-      .map((receipt) => [
-        receipt.stream,
-        receipt.method,
-        receipt.generation,
-        receipt.sourceCollectedAt,
-        receipt.writeSeq,
-        receipt.liveCount,
-      ])
-      .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
-  );
+  const receipts = decision.records
+    .listStreamCompletions(decision.selection.instance)
+    .filter((receipt) => decision.streams.includes(receipt.stream))
+    .map((receipt) => [
+      receipt.stream,
+      receipt.method,
+      receipt.generation,
+      receipt.sourceCollectedAt,
+      receipt.writeSeq,
+      receipt.liveCount,
+    ])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
   // A declaration-only change must invalidate covered-body and verdict caches,
   // including while an asynchronous blob digest or legacy file read is pending.
   if (!declarations) return JSON.stringify(receipts);
-  return JSON.stringify({ receipts, schemas: decision.streams.map((stream) => [
-    stream, declarations.forInstance(decision.selection.instance, stream)?.schema ?? null,
-  ]) });
+  return JSON.stringify({
+    receipts,
+    schemas: decision.streams.map((stream) => [
+      stream,
+      declarations.forInstance(decision.selection.instance, stream)?.schema ??
+        null,
+    ]),
+  });
 }
 
 function projectionUnavailableCoverage(

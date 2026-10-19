@@ -218,11 +218,11 @@ describe("first-seen sidecar on the Node storage", () => {
       await ingest(items("a", "b"), T2);
       const oldRevision = storage.findEntry({ scope: SCOPE })!.casRevision!;
       await stat(sidecarPath());
-  
+
       await deleteDataScopeContract({ storage, scopeParam: SCOPE });
       await expect(stat(sidecarPath())).rejects.toThrow();
       expect(await ledger()).toBeNull();
-  
+
       if (writeKind === "post") {
         await ingest(items("a", "b", "c"), T3);
       } else {
@@ -245,7 +245,7 @@ describe("first-seen sidecar on the Node storage", () => {
       expect(rebuilt?.baseline).toBe(T3);
       expect(rebuilt?.partial).toBeUndefined();
       expect(listAddedTimestamps(rebuilt!)).toEqual([T3, T3, T3]);
-  
+
       const rejected = await storage.commitEnvelope!(
         createDataFileEnvelope(SCOPE, "2026-10-10T08:00:00Z", items("stale")),
         {

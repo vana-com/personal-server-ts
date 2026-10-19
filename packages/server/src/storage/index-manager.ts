@@ -401,9 +401,11 @@ export function createIndexManager(
     // Sync history counts retained versions; CAS revisions never rewind.
     const version =
       entry.version ??
-      (maxVersionByScopeStmt.get({ scope: entry.scope }) as {
-        max_version: number;
-      }).max_version + 1;
+      (
+        maxVersionByScopeStmt.get({ scope: entry.scope }) as {
+          max_version: number;
+        }
+      ).max_version + 1;
     // Reserve before the SQLite commit. A crash may leave a gap, but never
     // lets an old If-Match value name a different row after index recovery.
     reserveJournal(entry.scope, casRevision);
