@@ -410,8 +410,8 @@ export function createSyncManager(
       scheduleNotifiedCycle();
     },
 
-    deleteScope(scope: string) {
-      return exclusive(() =>
+    async deleteScope(scope: string) {
+      const result = await exclusive(() =>
         deleteScope(
           {
             storage: uploadDeps.storage,
@@ -425,6 +425,9 @@ export function createSyncManager(
           scope,
         ),
       );
+      if (result.durable && uploadDeps.additions)
+        await uploadDeps.additions.deleteScope(scope);
+      return result;
     },
   };
 

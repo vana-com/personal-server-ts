@@ -1,3 +1,4 @@
+import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono, type Context } from "hono";
 import {
   handlePersonalServerDataRequest,
@@ -54,6 +55,7 @@ import {
 } from "./chunked-scope-import.js";
 
 export interface DataRouteDeps {
+  additions?: DurableAdditionsService;
   indexManager: IndexManager;
   hierarchyOptions: HierarchyManagerOptions;
   logger: Logger;
@@ -357,6 +359,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
     handlePersonalServerDataRequest(
       c.req.raw,
       {
+        additions: deps.additions,
         storage: dataStorage,
         legacyScopeView: deps.legacyScopeView,
         auth,

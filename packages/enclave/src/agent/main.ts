@@ -1,3 +1,4 @@
+import { getAddress } from "viem";
 import { startFleetWorker } from "../fleet/worker-runtime.js";
 import { currentFleetSandbox, fleetSandboxKey } from "../fleet/worker-key.js";
 import {
@@ -206,6 +207,10 @@ async function startJobs(
       ? { nodeIncarnation: fleet.identity.nodeIncarnation, fleetEnabled: true }
       : {}),
     storageApiUrl: config.storageApiUrl,
+    additions: {
+      gatewayUrl: config.gatewayUrl,
+      dataRegistry: getAddress(config.contracts.dataRegistry),
+    },
     activeCount: () => registry.activeCount(),
     draining: () => claimLoop.draining(),
     sandboxDebug: config.sandboxDebug,

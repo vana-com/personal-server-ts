@@ -1,3 +1,4 @@
+import { isSystemScope } from "./reserved-scopes.js";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/browser";
 import { scopeMatchesPattern } from "@opendatalabs/vana-sdk/browser";
 import {
@@ -56,6 +57,7 @@ export function scopeCoveredByWriteGrant(
   requestedScope: string,
   grantScopes: readonly string[],
 ): boolean {
+  if (isSystemScope(requestedScope)) return false;
   return writeScopePatterns(grantScopes).some((pattern) =>
     scopeMatchesPattern(requestedScope, pattern),
   );

@@ -100,6 +100,10 @@
       "types": "./dist/legacy-projection/index.d.ts",
       "import": "./dist/legacy-projection/index.js"
     },
+    "./additions/summary": {
+      "types": "./dist/additions/summary.d.ts",
+      "import": "./dist/additions/summary.js"
+    },
     "./additions": {
       "types": "./dist/additions/index.d.ts",
       "import": "./dist/additions/index.js"

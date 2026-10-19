@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -101,6 +102,7 @@ export interface IdentityInfo {
 }
 
 export interface AppDeps {
+  additions?: DurableAdditionsService;
   logger: Logger;
   version: string;
   startedAt: Date;
@@ -414,6 +416,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route(
     "/v1/data",
     dataRoutes({
+      additions: deps.additions,
       indexManager: deps.indexManager,
       hierarchyOptions: deps.hierarchyOptions,
       logger: deps.logger,

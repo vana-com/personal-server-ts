@@ -238,6 +238,7 @@ export const MEMORY_RECORD_RULES: Readonly<
 export function memoryRecordRulesFor(
   scope: string,
 ): readonly MemoryRecordRule[] | null {
+  if (scope.startsWith("vana.system.")) return [];
   if (!Object.prototype.hasOwnProperty.call(MEMORY_RECORD_RULES, scope)) {
     return null;
   }

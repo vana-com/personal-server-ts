@@ -1252,7 +1252,7 @@ describe("download worker", () => {
         await storage.readFirstSeenLedger!(REPOS),
       );
       expect(ledger).toEqual({
-        version: 4,
+        version: 5,
         scope: REPOS,
         baseline: V1,
         current: V2,

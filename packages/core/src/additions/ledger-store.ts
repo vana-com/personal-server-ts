@@ -313,7 +313,7 @@ async function rebuild(
   if (folded === 0) {
     // Persisted so the next request does not repeat the failed work.
     return {
-      version: 4,
+      version: 5,
       scope,
       baseline: null,
       current: null,

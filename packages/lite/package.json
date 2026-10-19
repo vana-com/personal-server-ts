@@ -19,7 +19,8 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    }
+    },
+    "./additions-worker": "./dist/additions-worker.bundle.js"
   },
   "publishConfig": {
     "access": "public"
@@ -29,12 +30,14 @@
   ],
   "scripts": {
     "copy-tls": "mkdir -p dist/browser-tls-rustls && cp src/browser-tls-rustls/* dist/browser-tls-rustls/",
-    "build": "tsc --build && npm run copy-tls"
+    "build": "tsc --build && npm run copy-tls && npm run build-worker",
+    "build-worker": "esbuild src/additions-worker.ts --bundle --platform=browser --format=esm --target=es2022 --outfile=dist/additions-worker.bundle.js"
   },
   "dependencies": {
     "@opendatalabs/personal-server-ts-core": "*",
     "@opendatalabs/vana-sdk": "3.23.0-pr.211.36da1d8",
     "node-forge": "^1.4.0",
-    "viem": "^2.54.2"
+    "viem": "^2.54.2",
+    "openpgp": "6.3.0"
   }
 }

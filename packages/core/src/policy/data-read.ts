@@ -1,3 +1,4 @@
+import { isSystemScope } from "./reserved-scopes.js";
 import type {
   Builder,
   GatewayGrantResponse,
@@ -96,6 +97,13 @@ export async function verifyDataReadPolicy(
   input: DataReadPolicyInput,
   ports: DataReadPolicyPorts,
 ): Promise<GatewayGrantResponse> {
+  if (isSystemScope(input.requestedScope)) {
+    throw new ScopeMismatchError({
+      requestedScope: input.requestedScope,
+      reason: "System scopes are private",
+    });
+  }
+
   const available = await ports.runtimeAvailability?.isAvailable();
   if (available === false) {
     throw new PsUnavailableError();
@@ -368,7 +376,7 @@ export async function resolveDataListGrantScopes(
       });
     }
     assertGrantAuthorizesBuilder(grant, builder, input);
-    return [...grant.scopes];
+    return grant.scopes.filter((scope) => !isSystemScope(scope));
   }
 
   if (!ports.grantLister) return [];
@@ -387,7 +395,9 @@ export async function resolveDataListGrantScopes(
       if (err instanceof ProtocolError) continue;
       throw err;
     }
-    for (const scope of grant.scopes) scopes.add(scope);
+    for (const scope of grant.scopes) {
+      if (!isSystemScope(scope)) scopes.add(scope);
+    }
   }
   return [...scopes];
 }

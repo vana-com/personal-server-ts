@@ -140,3 +140,48 @@ describe("feedFromGatewayClient", () => {
     expect(single?.deletedAt).toBe(null);
   });
 });
+
+describe("reserved point owner authorization", () => {
+  it("signs the canonical exact URI for a system lookup without exposing the capability to public reads", async () => {
+    const signRequest = vi.fn(async () => "Web3Signed owner-proof");
+    const requests: { url: string; authorization: string | null }[] = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = String(input);
+      const authorization = new Headers(init?.headers).get("authorization");
+      requests.push({ url, authorization });
+      return new Response(null, {
+        status:
+          authorization || url.includes(computeDataPointId(OWNER, SCOPE))
+            ? 404
+            : 401,
+      });
+    };
+    const feed = createGatewayDataPointFeed({
+      gatewayUrl: GATEWAY,
+      fetch: fetchImpl,
+      ownerRequestSigner: { signRequest },
+    });
+    await expect(
+      feed.getDataPoint({ ownerAddress: OWNER, scope: "vana.system.ledger" }),
+    ).resolves.toBeNull();
+    await expect(
+      feed.getDataPoint({ ownerAddress: OWNER, scope: SCOPE }),
+    ).resolves.toBeNull();
+    const id = computeDataPointId(OWNER, "vana.system.ledger");
+    expect(signRequest).toHaveBeenCalledExactlyOnceWith({
+      aud: GATEWAY,
+      method: "GET",
+      uri: `/v1/data/${id}`,
+    });
+    expect(requests).toEqual([
+      {
+        url: `${GATEWAY}/v1/data/${id}?includeDeleted=true`,
+        authorization: "Web3Signed owner-proof",
+      },
+      {
+        url: `${GATEWAY}/v1/data/${computeDataPointId(OWNER, SCOPE)}?includeDeleted=true`,
+        authorization: null,
+      },
+    ]);
+  });
+});
