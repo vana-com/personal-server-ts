@@ -533,7 +533,8 @@ export interface SupersedeResult {
 /**
  * After a `{records}` version of a projected scope is committed, delete the
  * scope's older owner-written legacy versions: the new version serves the
- * same legacy view, so they are a second copy.
+ * same legacy view, so they are a second copy. YouTube legacy versions are
+ * retained and replaced only in the read view.
  *
  * It deletes nothing unless `storage` is a served port (see
  * `withLegacyProjection`) whose projection of the new version is complete:
@@ -558,6 +559,11 @@ export async function supersedeLegacyVersions(
     superseded: [],
     refused,
   });
+  if (scope.startsWith("youtube.")) {
+    return refuse(
+      "YouTube legacy versions are retained for read-time projection",
+    );
+  }
   const readStored = (storage.readStoredEnvelope ?? storage.readEnvelope).bind(
     storage,
   );
