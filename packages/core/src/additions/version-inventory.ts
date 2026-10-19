@@ -82,7 +82,7 @@ export interface InventoryReadOptions {
   budget?: ByteBudget;
 }
 
-/** Owner-wallet reads only. Registered Personal Server signatures do not authorize this API. */
+/** Inventory reads accept the owner or a currently registered same-owner server. */
 export function createVersionInventoryClient(options: {
   gatewayUrl: string;
   ownerAddress: string;
