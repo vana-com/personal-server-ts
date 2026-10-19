@@ -523,199 +523,192 @@ describe("POST ?supersede=legacy", () => {
   });
 
   it.each([
-    [
-      "youtube.history",
-      "history",
-      [youtubeHistoryRecord("new-video", 0)] as unknown[],
-      {
-        videoId: "old-video",
-        videoUrl: "https://www.youtube.com/watch?v=old-video",
+    {
+      scope: "youtube.profile",
+      legacy: { channelId: "channel-1", channelTitle: "Old channel" },
+      records: [{ id: "channel-1", title: "New channel" }],
+      projected: { channelId: "channel-1" },
+    },
+    {
+      scope: "youtube.history",
+      legacy: {
+        history: [
+          {
+            videoId: "video-1",
+            videoUrl: "https://youtube.com/watch?v=video-1",
+            videoTitle: "Old title",
+          },
+        ],
       },
-    ],
-    [
-      "youtube.subscriptions",
-      "subscriptions",
-      [
+      records: [youtubeHistoryRecord("video-1", 0)],
+      projected: {
+        history: [{ videoId: "video-1", videoTitle: "video-1 title" }],
+      },
+    },
+    {
+      scope: "youtube.subscriptions",
+      legacy: {
+        subscriptions: [
+          {
+            channelId: "channel-1",
+            channelUrl: "https://youtube.com/@channel-1",
+            channelTitle: "Old title",
+          },
+        ],
+      },
+      records: [
         {
-          channel_id: "new-channel",
-          channel_title: "New",
-          channel_url: "https://youtube.com/@new",
+          id: "subscription-1",
+          channel_id: "channel-1",
+          channel_title: "New title",
+          channel_url: "https://youtube.com/@channel-1",
           is_verified: false,
           notifications: false,
         },
-      ] as unknown[],
-      {
-        channelId: "old-channel",
-        channelUrl: "https://youtube.com/@old",
-        channelTitle: "Old",
-        isVerified: false,
-        isBellNotification: false,
+      ],
+      projected: {
+        subscriptions: [{ channelId: "channel-1", channelTitle: "New title" }],
       },
-    ],
-    [
-      "youtube.playlists",
-      "playlists",
-      [
-        {
-          id: "new-playlist",
-          url: "https://youtube.com/playlist?list=new-playlist",
-        },
-      ] as unknown[],
-      {
-        playlistId: "old-playlist",
-        url: "https://youtube.com/playlist?list=old-playlist",
-      },
-    ],
-    [
-      "youtube.playlistItems",
-      "playlists",
-      [
-        {
-          id: "new-item",
-          playlist_id: "new-playlist",
-          video_id: "new-video",
-          video_url: "https://youtube.com/watch?v=new-video",
-          video_title: "New video",
-        },
-      ] as unknown[],
-      {
-        playlistId: "old-playlist",
-        items: [
+    },
+    {
+      scope: "youtube.playlists",
+      legacy: {
+        playlists: [
           {
-            videoId: "old-video",
-            videoUrl: "https://youtube.com/watch?v=old-video",
-            videoTitle: "Old video",
+            playlistId: "playlist-1",
+            url: "https://youtube.com/playlist?list=playlist-1",
+            title: "Old title",
           },
         ],
       },
-    ],
-    [
-      "youtube.watchLater",
-      "watchLater",
-      [
+      records: [
         {
+          id: "playlist-1",
+          url: "https://youtube.com/playlist?list=playlist-1",
+          title: "New title",
+        },
+      ],
+      projected: {
+        playlists: [{ playlistId: "playlist-1", title: "New title" }],
+      },
+    },
+    {
+      scope: "youtube.playlistItems",
+      legacy: {
+        playlists: [
+          {
+            playlistId: "playlist-1",
+            items: [
+              {
+                videoId: "old-video",
+                videoUrl: "https://youtube.com/watch?v=old-video",
+                videoTitle: "Old video",
+              },
+            ],
+          },
+        ],
+      },
+      records: [
+        {
+          id: "playlist-item-1",
+          playlist_id: "playlist-1",
           video_id: "new-video",
           video_url: "https://youtube.com/watch?v=new-video",
           video_title: "New video",
         },
-      ] as unknown[],
-      {
-        videoId: "old-video",
-        videoUrl: "https://youtube.com/watch?v=old-video",
-        videoTitle: "Old video",
+      ],
+      projected: {
+        playlists: [
+          { playlistId: "playlist-1", items: [{ videoId: "new-video" }] },
+        ],
       },
-    ],
-    [
-      "youtube.likes",
-      "likedVideos",
-      [
+    },
+    {
+      scope: "youtube.likes",
+      legacy: {
+        likedVideos: [
+          {
+            videoId: "video-1",
+            videoUrl: "https://youtube.com/watch?v=video-1",
+            videoTitle: "Old title",
+          },
+        ],
+      },
+      records: [
         {
-          video_id: "new-video",
-          video_url: "https://youtube.com/watch?v=new-video",
-          video_title: "New video",
+          id: "like-1",
+          video_id: "video-1",
+          video_url: "https://youtube.com/watch?v=video-1",
+          video_title: "New title",
         },
-      ] as unknown[],
-      {
-        videoId: "old-video",
-        videoUrl: "https://youtube.com/watch?v=old-video",
-        videoTitle: "Old video",
+      ],
+      projected: {
+        likedVideos: [{ videoId: "video-1", videoTitle: "New title" }],
       },
-    ],
+    },
+    {
+      scope: "youtube.watchLater",
+      legacy: {
+        watchLater: [
+          {
+            videoId: "video-1",
+            videoUrl: "https://youtube.com/watch?v=video-1",
+            videoTitle: "Old title",
+          },
+        ],
+      },
+      records: [
+        {
+          id: "watch-later-1",
+          video_id: "video-1",
+          video_url: "https://youtube.com/watch?v=video-1",
+          video_title: "New title",
+        },
+      ],
+      projected: {
+        watchLater: [{ videoId: "video-1", videoTitle: "New title" }],
+      },
+    },
   ])(
-    "keeps disjoint equal-size legacy %s items",
-    async (scope, collection, records, oldItem) => {
+    "$scope keeps legacy versions and serves the read-time projection",
+    async ({ scope, legacy, records, projected }) => {
       const { runtime, storage } = createRuntime();
-      await post(runtime, scope, { [collection]: [oldItem], total: 1 });
+      await post(runtime, scope, legacy);
+      await post(runtime, scope, legacy);
+      const legacyVersions = storage
+        .listVersions(scope, { limit: 50 })
+        .map((entry) => entry.collectedAt);
 
-      const res = await postRaw(runtime, `/v1/data/${scope}?supersede=legacy`, {
-        records,
+      const write = await postRaw(
+        runtime,
+        `/v1/data/${scope}?supersede=legacy`,
+        { records },
+      );
+
+      expect(write.status).toBe(201);
+      expect(await write.json()).toMatchObject({
+        superseded: [],
+        supersedeRefused:
+          "YouTube legacy versions are retained for read-time projection",
       });
+      expect(storage.countVersions(scope)).toBe(legacyVersions.length + 1);
 
-      expect(res.status).toBe(201);
-      expect(await res.json()).toMatchObject({ superseded: [] });
-      expect(storage.countVersions(scope)).toBe(2);
+      for (const collectedAt of legacyVersions) {
+        const oldRead = await get(
+          runtime,
+          `/v1/data/${scope}?at=${encodeURIComponent(collectedAt)}`,
+        );
+        expect(((await oldRead.json()) as { data: unknown }).data).toEqual(
+          legacy,
+        );
+      }
+
+      const latestRead = await get(runtime, `/v1/data/${scope}`);
+      expect(
+        ((await latestRead.json()) as { data: unknown }).data,
+      ).toMatchObject(projected);
     },
   );
-
-  it("refuses to supersede YouTube's singleton profile shape safely", async () => {
-    const { runtime, storage } = createRuntime();
-
-    const res = await postRaw(
-      runtime,
-      "/v1/data/youtube.profile?supersede=legacy",
-      { records: [{ id: "channel-1", title: "Channel" }] },
-    );
-
-    expect(res.status).toBe(201);
-    expect(await res.json()).toMatchObject({
-      superseded: [],
-      supersedeRefused:
-        "the legacy collection for youtube.profile is unsupported",
-    });
-    expect(storage.countVersions("youtube.profile")).toBe(1);
-  });
-
-  it("requires each repeated legacy YouTube identity occurrence to survive", async () => {
-    const { runtime, storage } = createRuntime();
-    const duplicate = {
-      videoId: "same-video",
-      videoUrl: "https://www.youtube.com/watch?v=same-video",
-      videoTitle: "Same video",
-    };
-    await post(runtime, "youtube.likes", {
-      likedVideos: [duplicate, duplicate],
-      total: 2,
-    });
-
-    const res = await postRaw(
-      runtime,
-      "/v1/data/youtube.likes?supersede=legacy",
-      {
-        records: [
-          {
-            video_id: "same-video",
-            video_url: duplicate.videoUrl,
-            video_title: "Same video",
-          },
-          {
-            video_id: "other-video",
-            video_url: "https://www.youtube.com/watch?v=other-video",
-            video_title: "Other video",
-          },
-        ],
-      },
-    );
-
-    expect(res.status).toBe(201);
-    expect(await res.json()).toMatchObject({ superseded: [] });
-    expect(storage.countVersions("youtube.likes")).toBe(2);
-  });
-
-  it("keeps YouTube legacy items whose identity cannot be proven", async () => {
-    const { runtime, storage } = createRuntime();
-    await post(runtime, "youtube.watchLater", {
-      watchLater: [{ videoTitle: "Missing URL and ID" }],
-      total: 1,
-    });
-
-    const res = await postRaw(
-      runtime,
-      "/v1/data/youtube.watchLater?supersede=legacy",
-      {
-        records: [
-          {
-            video_id: "new-video",
-            video_url: "https://youtube.com/watch?v=new-video",
-            video_title: "New video",
-          },
-        ],
-      },
-    );
-
-    expect(res.status).toBe(201);
-    expect(await res.json()).toMatchObject({ superseded: [] });
-    expect(storage.countVersions("youtube.watchLater")).toBe(2);
-  });
 
   it("keeps older PDPP versions", async () => {
     const { runtime, storage } = createRuntime();
