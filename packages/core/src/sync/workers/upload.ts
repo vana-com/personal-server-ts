@@ -1,3 +1,4 @@
+import type { DurableAdditionsService } from "../../additions/durable.js";
 import { keccak256, stringToHex } from "viem";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
@@ -28,6 +29,7 @@ export { computeDataPointId } from "../data-point-id.js";
 export { isEntryCoveredByTombstone } from "../scope-deletions.js";
 
 export interface UploadWorkerDeps {
+  additions?: DurableAdditionsService;
   storage: DataStoragePort;
   storageAdapter: StorageAdapter;
   gateway: GatewayClient;
@@ -473,6 +475,17 @@ export async function uploadOne(
     // The registry now holds a live row for the scope (fresh registration or
     // an adopted one): reads must stop treating it as deleted.
     deps.scopeDeletions?.markLive(entry.scope);
+  }
+
+  if (deps.additions) {
+    await deps.additions.recordUpload(
+      {
+        scope: entry.scope,
+        collectedAt: envelope.collectedAt,
+        data: envelope.data as Record<string, unknown>,
+      },
+      { envelope, encryptedSize: encrypted.byteLength },
+    );
   }
 
   logger.info(

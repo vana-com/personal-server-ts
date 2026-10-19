@@ -1,3 +1,5 @@
+import { privateKeyToAccount } from "viem/accounts";
+import { MASTER_KEY_MESSAGE } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readEnclaveEnv, runEnclaveMain } from "./enclave-main.js";
@@ -18,7 +20,9 @@ vi.mock("./listen.js", () => ({
   listenHttpServer: serviceMocks.listenHttpServer,
 }));
 
-const MASTER_SIGNATURE = `0x${"11".repeat(65)}`;
+const MASTER_SIGNATURE = await privateKeyToAccount(
+  `0x${"11".repeat(32)}`,
+).signMessage({ message: MASTER_KEY_MESSAGE });
 const SERVER_ADDRESS = "0x2222222222222222222222222222222222222222";
 const SERVER_PUBLIC_KEY = `0x04${"33".repeat(64)}`;
 const AGENT_URL = "http://agent:8787";

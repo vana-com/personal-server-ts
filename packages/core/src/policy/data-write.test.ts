@@ -393,3 +393,55 @@ describe("derivative write grants never leak across a lineage edge", () => {
     );
   });
 });
+
+describe("reserved system writes", () => {
+  it.each(["write:*", "write:vana.*", "write:vana.system.profile"])(
+    "rejects %s",
+    async (pattern) => {
+      const grant = makeGrant({ scopes: [pattern] });
+      await expect(
+        verifyDataWritePolicy(
+          {
+            signer: BUILDER_ADDRESS,
+            grantId: grant.id,
+            requestedScope: "vana.system.profile",
+            serverOwner: SERVER_OWNER,
+          },
+          makePorts(grant),
+        ),
+      ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
+    },
+  );
+});
+
+describe("ordinary Vana scopes", () => {
+  it.each(["vana.profile", "vana.system", "vana.systematic.profile"])(
+    "keeps delegated access to %s",
+    async (requestedScope) => {
+      const readGrant = makeGrant({ scopes: ["vana.*"] });
+      await expect(
+        verifyDataReadPolicy(
+          {
+            signer: BUILDER_ADDRESS,
+            grantId: readGrant.id,
+            requestedScope,
+            serverOwner: SERVER_OWNER,
+          },
+          makePorts(readGrant),
+        ),
+      ).resolves.toBe(readGrant);
+      const writeGrant = makeGrant({ scopes: ["write:vana.*"] });
+      await expect(
+        verifyDataWritePolicy(
+          {
+            signer: BUILDER_ADDRESS,
+            grantId: writeGrant.id,
+            requestedScope,
+            serverOwner: SERVER_OWNER,
+          },
+          makePorts(writeGrant),
+        ),
+      ).resolves.toBe(writeGrant);
+    },
+  );
+});

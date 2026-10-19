@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   LedgerFold,
@@ -29,6 +29,14 @@ async function keysOf(scope: string, data: Record<string, unknown>) {
 const rows = (...ids: string[]) => ids.map((id) => ({ id }));
 
 describe("extractRecordKeys", () => {
+  it("excludes only the literal vana.system. reserved namespace", async () => {
+    expect(
+      await extractRecordKeys("vana.system.additions", { records: rows("a") }),
+    ).toEqual({ keys: [], total: 0 });
+    expect(
+      await extractRecordKeys("vanaXsystem.items", { records: rows("a") }),
+    ).toEqual({ keys: ["items:i:a"], total: 1 });
+  });
   it("keys a generic legacy collection by its name and the record id", async () => {
     expect(
       await keysOf("test.scope", { conversations: rows("a", "b"), total: 2 }),
@@ -420,10 +428,21 @@ const iso = (days: number) =>
   new Date(Date.parse(T1) + days * DAY).toISOString();
 
 describe("foldVersion", () => {
+  it("keeps an arrival after its record disappears and returns beyond the old pruning window", async () => {
+    const first = await fold([version(T1, ["a"]), version(T2, ["a", "b"])]);
+    const absent = (await foldVersion(first, version(iso(200), ["a"])))!;
+    expect(listAddedTimestamps(absent).sort()).toEqual([T1, T2].sort());
+    const returned = (await foldVersion(
+      absent,
+      version(iso(210), ["a", "b"]),
+    ))!;
+    expect(returned.records["items:i:b"]![0]).toBe(T2);
+  });
+
   it("starts a ledger at the first version, dating its records at that version", async () => {
     const ledger = await fold([version(T1, ["a", "b"])]);
     expect(ledger).toEqual({
-      version: 4,
+      version: 5,
       scope: "notes.entries",
       baseline: T1,
       current: T1,
@@ -494,12 +513,7 @@ describe("foldVersion", () => {
     expect(expected.records["items:i:c"]).toEqual([T2, T3]);
   });
 
-  it("is order independent only within the 90-day pruning window", async () => {
-    // Four versions spanning 210 days (the reviewer's case). Pruning is
-    // relative to the newest version folded so far, so a record already
-    // pruned can return with a later first date in another fold order. The
-    // documented guarantee stops at the window: chronological order is the
-    // reference, and it is deterministic.
+  it("converges across chunk boundaries and arbitrary time spans", async () => {
     const spread = [
       version(iso(0), ["a", "b"]),
       version(iso(150), ["a"]),
@@ -507,15 +521,13 @@ describe("foldVersion", () => {
       version(iso(210), ["a", "b"]),
     ];
     const chronological = await fold(spread);
-    expect(await fold(spread)).toEqual(chronological);
-    // One pass prunes once at the end, so it keeps b's original date: the
-    // pruning point, not the fold order alone, decides these edge cases.
-    expect((await foldVersions(null, spread))!.records["items:i:b"]).toEqual([
-      iso(0),
-      iso(210),
-    ]);
-    // b was pruned between day 0 and 200, so it re-dates from day 200.
-    expect(chronological.records["items:i:b"]).toEqual([iso(200), iso(210)]);
+    expect(await foldVersions(null, spread)).toEqual(chronological);
+    expect(chronological.records["items:i:b"]).toEqual([iso(0), iso(210)]);
+    for (const rotation of [1, 2, 3]) {
+      expect(
+        await fold([...spread.slice(rotation), ...spread.slice(0, rotation)]),
+      ).toEqual(chronological);
+    }
 
     // Within the window every permutation agrees.
     const close = [
@@ -559,11 +571,52 @@ describe("foldVersion", () => {
     const one = await fold([base, first, second]);
     const two = await fold([base, second, first]);
     expect(one).toEqual(two);
-    // The greater string names the newest version; additions fit its total.
+    // The greater string names the newest version deterministically.
     expect(one.latest.collectedAt).toBe(plain);
-    expect(listAddedTimestamps(one).length).toBeLessThanOrEqual(
-      one.latest.total,
-    );
+    expect(listAddedTimestamps(one)).toHaveLength(3);
+  });
+
+  it("breaks equal-timestamp content ties deterministically", async () => {
+    const small = version(T2, ["a"]);
+    const large = version(T2, ["a", "b"]);
+    const left = await fold([small, large]);
+    const right = await fold([large, small]);
+    expect(left).toEqual(right);
+    expect(left.latest.total).toBe(2);
+  });
+
+  it("suppresses unknown identities without hiding new arrivals at equal or earlier timestamps", async () => {
+    const initial = await fold([version(T2, ["unknown"])]);
+    const baseline = {
+      ...initial,
+      partial: true as const,
+      unknownArrivalKeys: ["items:i:unknown"],
+    };
+    const parsed = readScopeFirstSeenLedger(baseline)!;
+    const sameTime = (await foldVersion(
+      parsed,
+      version(T2, ["unknown", "same-time-new"]),
+    ))!;
+    expect(listAddedTimestamps(sameTime)).toEqual([T2]);
+    expect(isPreTracking(sameTime, "items:i:unknown")).toBe(true);
+    expect(isPreTracking(sameTime, "items:i:same-time-new")).toBe(false);
+    const older = (await foldVersion(sameTime, version(T1, ["older-new"])))!;
+    expect(listAddedTimestamps(older).sort()).toEqual([T1, T2].sort());
+    expect(isPreTracking(older, "items:i:unknown")).toBe(true);
+    expect(isPreTracking(older, "items:i:older-new")).toBe(false);
+    expect(older.unknownArrivalKeys).toEqual(["items:i:unknown"]);
+    expect(readScopeFirstSeenLedger(older)).toEqual(older);
+    expect(
+      listAddedTimestamps({ ...older, unknownArrivalKeys: [] }).sort(),
+    ).toEqual([T1, T2, T2].sort());
+  });
+
+  it("persists baseline uncertainty through serialization and future folds", async () => {
+    const initial = await fold([version(T1, ["unknown"])]);
+    const parsed = readScopeFirstSeenLedger({ ...initial, partial: true })!;
+    const later = (await foldVersion(parsed, version(T2, ["unknown", "new"])))!;
+    expect(later.partial).toBe(true);
+    expect(listAddedTimestamps(later)).toEqual([T2]);
   });
 
   it("ignores a version whose collectedAt does not parse", async () => {
@@ -580,9 +633,8 @@ describe("foldVersion", () => {
     expect(afterBinary.baseline).toBe(T1);
     expect(afterBinary.current).toBe(T2);
     expect(afterBinary.records).toEqual(base.records);
-    // While the newest version is the binary file the scope reports its
-    // total and no additions, so `added` can never exceed `total`.
-    expect(listAddedTimestamps(afterBinary)).toEqual([]);
+    // A later binary snapshot cannot erase earlier arrivals.
+    expect(listAddedTimestamps(afterBinary)).toEqual([T1, T2]);
 
     const t4 = "2026-01-04T00:00:00.000Z";
     const after = (await foldVersion(
@@ -638,14 +690,13 @@ describe("foldVersion", () => {
     expect(base).toEqual(snapshot);
   });
 
-  it("prunes records absent for more than 90 days and keeps others", async () => {
+  it("keeps permanent identities even after 90 days of absence", async () => {
     const ledger = await fold([
       version(iso(0), ["old", "kept", "back"]),
       version(iso(60), ["kept", "back"]),
       version(iso(100), ["kept"]),
     ]);
-    // `old` was last seen 100 days before the newest version: pruned.
-    expect(ledger.records["items:i:old"]).toBeUndefined();
+    expect(ledger.records["items:i:old"]).toEqual([iso(0), iso(0)]);
     // `back` was last seen 40 days before: kept, though absent.
     expect(ledger.records["items:i:back"]).toEqual([iso(0), iso(60)]);
     expect(isPresent(ledger, "items:i:back")).toBe(false);
@@ -672,7 +723,8 @@ describe("foldVersion", () => {
       total: MAX_TRACKED_KEYS + 1,
     });
     expect(capped.current).toBe(T1);
-    expect(listAddedTimestamps(capped)).toEqual([]);
+    expect(listAddedTimestamps(capped)).toEqual([T1]);
+    expect(capped.incomplete).toBe(true);
     expect(readScopeFirstSeenLedger(capped)).toEqual(capped);
 
     // Normal imports then resume tracking and date genuinely new records.
@@ -717,46 +769,28 @@ describe("foldVersion", () => {
       const newFirst = (await foldVersion(base, v(3, [...news, ...olds])))!;
       const oldFirst = (await foldVersion(base, v(3, [...olds, ...news])))!;
 
-      // 50,000 absent A records make room; the 100,000 present ones keep v2.
+      // Absent A records remain permanently recorded alongside new arrivals.
       expect(newFirst).toEqual(oldFirst);
       const keys = Object.keys(newFirst.records);
-      expect(keys.length).toBe(200_000);
+      expect(keys.length).toBe(250_000);
       const redated = Object.entries(newFirst.records).filter(
         ([key, pair]) => key.startsWith("items:i:A") && pair[0] !== at(2),
       );
       expect(redated).toHaveLength(0);
       const added = listAddedTimestamps(newFirst);
       expect(added.filter((when) => when === at(3))).toHaveLength(100_000);
-      expect(added.filter((when) => when === at(2))).toHaveLength(100_000);
+      expect(added.filter((when) => when === at(2))).toHaveLength(150_000);
     }, 120_000);
 
-    it("folding an older version into a full ledger evicts and sorts at most once (F2)", async () => {
+    it("admits older identities beyond the snapshot cap without evicting history", async () => {
       const full = (await fold([v(5, ids("K", 200_000))]))!;
-      expect(Object.keys(full.records)).toHaveLength(200_000);
-      const sort = vi.spyOn(Array.prototype, "sort");
-      let ticks = 0;
-      const timer = setInterval(() => {
-        ticks += 1;
-      }, 0);
-      let older: ScopeFirstSeenLedger | null;
-      let sorts = 0;
-      try {
-        older = await foldVersion(full, v(3, ids("unknown", 4_000)));
-        sorts = sort.mock.calls.length;
-      } finally {
-        clearInterval(timer);
-        sort.mockRestore();
-      }
-      // One sort for the new ids and at most one for the eviction candidates.
-      expect(sorts).toBeGreaterThan(0);
-      expect(sorts).toBeLessThanOrEqual(3);
-      expect(ticks).toBeGreaterThan(0);
-      // Nothing was evictable (every record is in the newest version), so the
-      // unknown ids are left out rather than evicting each other.
-      expect(Object.keys(older!.records)).toHaveLength(200_000);
+      const older = (await foldVersion(full, v(3, ids("unknown", 4_000))))!;
+      expect(Object.keys(older.records)).toHaveLength(204_000);
+      expect(older.records["items:i:unknown0"]).toEqual([at(3), at(3)]);
+      expect(readScopeFirstSeenLedger(older)).toEqual(older);
       expect(
-        Object.keys(older!.records).some((key) => key.includes("unknown")),
-      ).toBe(false);
+        await fold([v(3, ids("unknown", 4_000)), v(5, ids("K", 200_000))]),
+      ).toEqual(older);
     }, 120_000);
 
     it("gives the same ledger whatever the order of the ids in a version", async () => {
@@ -773,7 +807,7 @@ describe("foldVersion", () => {
       expect(shuffled).toEqual(forward);
     }, 120_000);
 
-    it("never evicts established (pre-tracking) records: a flood displaces itself (F3)", async () => {
+    it("keeps established records and every admitted arrival after a disjoint snapshot", async () => {
       const owner = ids("owner", 5_001);
       const base = await fold([v(1, owner)]);
       const flooded = (await foldVersion(base, v(2, ids("junk", 200_000))))!;
@@ -781,9 +815,7 @@ describe("foldVersion", () => {
         key.startsWith("items:i:owner"),
       );
       expect(ownerKept).toHaveLength(5_001);
-      expect(Object.keys(flooded.records).length).toBeLessThanOrEqual(
-        MAX_TRACKED_KEYS,
-      );
+      expect(Object.keys(flooded.records)).toHaveLength(205_001);
       // The owner imports the same records again: none is dated by the new
       // import, they keep the day they first arrived.
       const again = (await foldVersion(flooded, v(3, owner)))!;
@@ -795,9 +827,7 @@ describe("foldVersion", () => {
     it("keeps returning baseline records dated at the baseline after a disjoint version (F1b)", async () => {
       const x = ids("x", KEEP);
       const ledger = await fold([v(1, x), v(2, ids("y", KEEP))]);
-      expect(Object.keys(ledger.records).length).toBeLessThanOrEqual(
-        MAX_TRACKED_KEYS,
-      );
+      expect(Object.keys(ledger.records)).toHaveLength(300_000);
       const back = (await foldVersion(ledger, v(3, x)))!;
       // All of x is still known at the baseline: none of it is dated by v3.
       const added = listAddedTimestamps(back);
@@ -805,11 +835,7 @@ describe("foldVersion", () => {
       expect(added.filter((when) => when === at(1))).toHaveLength(KEEP);
     }, 120_000);
 
-    it("KNOWN LIMITATION, not a guarantee: dated (not pre-tracking) records can be evicted and re-dated near the cap", async () => {
-      // Day 1: a one-record baseline. Day 2: the owner's 5,001 records, which
-      // are dated, so NOT pre-tracking. Day 3: a version of 199,000 other ids
-      // brings the ledger to the cap; the owner's records are absent from it
-      // and can be evicted. Day 4: the owner imports the same 5,001 again.
+    it("does not re-date returning records after the union passes the snapshot cap", async () => {
       const owner = ids("owner", 5_001);
       const ledger = (await fold([
         v(1, ids("seed", 1)),
@@ -819,15 +845,14 @@ describe("foldVersion", () => {
       const kept = Object.keys(ledger.records).filter((key) =>
         key.startsWith("items:i:owner"),
       ).length;
-      expect(kept).toBe(999);
+      expect(kept).toBe(5_001);
       const again = (await foldVersion(ledger, v(4, owner)))!;
       const added = listAddedTimestamps(again);
-      // 999 kept their day-2 date; 4,002 were forgotten and are dated as new.
-      expect(added.filter((when) => when === at(2))).toHaveLength(999);
-      expect(added.filter((when) => when === at(4))).toHaveLength(4_002);
+      expect(added.filter((when) => when === at(2))).toHaveLength(5_001);
+      expect(added.filter((when) => when === at(4))).toHaveLength(0);
     }, 120_000);
 
-    it("evicts the most recently first-seen absent records first", async () => {
+    it("keeps each generation of absent records permanently", async () => {
       const ledger = (await fold([
         v(1, []),
         v(2, ids("old", 100_000)),
@@ -839,10 +864,9 @@ describe("foldVersion", () => {
         Object.keys(ledger.records).filter((key) =>
           key.startsWith(`items:i:${prefix}`),
         ).length;
-      // 20,000 had to go: the newest-first-seen absent ones.
       expect(count("old")).toBe(100_000);
       expect(count("mid")).toBe(50_000);
-      expect(count("new")).toBe(20_000);
+      expect(count("new")).toBe(40_000);
       expect(count("fresh")).toBe(30_000);
     }, 120_000);
   });
@@ -947,7 +971,7 @@ describe("foldVersions", () => {
 
 describe("readScopeFirstSeenLedger", () => {
   const valid: ScopeFirstSeenLedger = {
-    version: 4,
+    version: 5,
     scope: "notes.entries",
     baseline: T1,
     current: T2,
@@ -980,6 +1004,7 @@ describe("readScopeFirstSeenLedger", () => {
     ["an array", []],
     ["a wrong version", { ...valid, version: 1 }],
     ["a version-2 sidecar (old key encoding)", { ...valid, version: 2 }],
+    ["a version-4 present-only sidecar", { ...valid, version: 4 }],
     ["a missing through marker", { ...valid, through: undefined }],
     ["the retired too_many_keys state", { ...valid, skipped: "too_many_keys" }],
     ["a missing scope", { ...valid, scope: undefined }],
@@ -993,6 +1018,18 @@ describe("readScopeFirstSeenLedger", () => {
     ["a bad skipped reason", { ...valid, skipped: "x" }],
     ["a bad truncated flag", { ...valid, truncated: false }],
     ["a version-3 sidecar (partial meant truncated)", { ...valid, version: 3 }],
+    [
+      "unknown arrivals as a string",
+      { ...valid, unknownArrivalKeys: "items:i:a" },
+    ],
+    [
+      "an unknown arrival that is not a record key",
+      { ...valid, unknownArrivalKeys: ["missing"] },
+    ],
+    [
+      "an unknown arrival key that is not a string",
+      { ...valid, unknownArrivalKeys: [1] },
+    ],
     ["records as an array", { ...valid, records: [] }],
     ["a record that is not a pair", { ...valid, records: { a: [T1] } }],
     [

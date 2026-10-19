@@ -24,3 +24,5 @@ export {
   type DataWritePolicyPorts,
   type WriteFeeVerifierPort,
 } from "./data-write.js";
+
+export { isSystemScope } from "./reserved-scopes.js";

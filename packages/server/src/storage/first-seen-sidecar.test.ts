@@ -80,7 +80,7 @@ describe("first-seen sidecar on the Node storage", () => {
     await ingest(items("a", "b"), T2);
 
     const onDisk = JSON.parse(await readFile(sidecarPath(), "utf-8"));
-    expect(onDisk.version).toBe(4);
+    expect(onDisk.version).toBe(5);
     expect(onDisk.records["items:i:b"]).toEqual([T2, T2]);
     // The scope's own directory holds only the two version files.
     expect(await readdir(join(dataDir, "notes", "entries"))).toEqual([

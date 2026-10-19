@@ -1,3 +1,5 @@
+import { isSystemScope } from "../policy/reserved-scopes.js";
+import type { RequestSigner } from "../signing/request-signer.js";
 import type {
   DataPointFeedListOptions,
   DataPointFeedListResult,
@@ -10,6 +12,8 @@ import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "./tombstone.js";
 export interface GatewayDataPointFeedOptions {
   /** Gateway base URL, e.g. https://dp-rpc.vana.org */
   gatewayUrl: string;
+  /** Owner capability for private system point lookups; never substituted by a server signer. */
+  ownerRequestSigner?: RequestSigner;
   /** Test seam; defaults to the global fetch. */
   fetch?: typeof fetch;
   /** Test seam for the fallback `deletedAt` when a 410 body carries none. */
@@ -69,9 +73,22 @@ export function createGatewayDataPointFeed(
 
     async getDataPoint(input) {
       const dataPointId = computeDataPointId(input.ownerAddress, input.scope);
-      const res = await fetchImpl(
-        `${base}/v1/data/${dataPointId}?includeDeleted=true`,
-      );
+      const uri = `/v1/data/${dataPointId}`;
+      const url = `${base}${uri}?includeDeleted=true`;
+      const ownerSigner = isSystemScope(input.scope)
+        ? options.ownerRequestSigner
+        : undefined;
+      const res = ownerSigner
+        ? await fetchImpl(url, {
+            headers: {
+              Authorization: await ownerSigner.signRequest({
+                aud: new URL(base).origin,
+                method: "GET",
+                uri,
+              }),
+            },
+          })
+        : await fetchImpl(url);
       if (res.status === 404) return null;
       if (res.status === 410) {
         // Tombstoned. Prefer the row the gateway echoes in the 410 body;

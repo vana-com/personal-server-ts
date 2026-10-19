@@ -1,5 +1,20 @@
+import { createHash } from "node:crypto";
+import {
+  recoverServerOwner,
+  createGatewayClient,
+} from "@opendatalabs/vana-sdk/node";
+import { createVanaSyncStorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import type { CreateServerOptions } from "./bootstrap.js";
+import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createPublicOnlyAccount } from "@opendatalabs/personal-server-ts-core/keys";
-import { isAddress, isHex, type Address, type Hex } from "viem";
+import {
+  isAddress,
+  isHex,
+  keccak256,
+  stringToHex,
+  type Address,
+  type Hex,
+} from "viem";
 import { createServer } from "./bootstrap.js";
 import { createAccessReporter } from "./jobs/access-reporter.js";
 import { loadConfig } from "./config/index.js";
@@ -136,6 +151,7 @@ export async function runEnclaveMain(): Promise<void> {
     rootPath,
     hydrateScopes: readHydrateScopes(process.env.PS_HYDRATE_SCOPES),
     ownerSignature: enclaveEnv.ownerSignature,
+    ...(await createEnclaveAdditionsPorts(config, enclaveEnv)),
     serverAccount,
     profile: "enclave",
     readFulfillmentReporter: accessReporter,
@@ -217,5 +233,179 @@ function installGatewayBypass(gatewayUrl: string, secret: string): void {
     headers.set("x-vercel-protection-bypass", secret);
 
     return requestFetch(input, { ...init, headers });
+  };
+}
+
+/** Sandbox adapter: all signing stays behind the node's closed additions RPC. */
+export async function createEnclaveAdditionsPorts(
+  config: ServerConfig,
+  env: EnclaveEnv,
+): Promise<
+  Pick<CreateServerOptions, "additionsInventorySigner" | "additionsWriter">
+> {
+  const ownerAddress = await recoverServerOwner(env.ownerSignature);
+  const sources = new Map<string, string>();
+  const sourceFor = (scope: string) =>
+    scope.startsWith("vana.system.additions.")
+      ? scope.slice("vana.system.additions.".length)
+      : sources.get(scope);
+  async function rpc(body: Record<string, unknown>) {
+    const response = await fetch(
+      `${env.agentUrl.replace(/\/+$/, "")}/agent/v1/additions/sign`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          ...body,
+          owner: ownerAddress,
+          chainId: config.gateway.chainId,
+        }),
+        redirect: "error",
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(`Additions signing refused (${response.status})`);
+    }
+    const result: unknown = await response.json();
+    if (typeof result !== "object" || result === null)
+      throw new Error("Invalid additions signing result");
+    return result;
+  }
+  const additionsInventorySigner: NonNullable<
+    CreateServerOptions["additionsInventorySigner"]
+  > = {
+    async signRequest(params) {
+      if (
+        params.aud !== new URL(config.gateway.url).origin ||
+        params.method !== "GET" ||
+        params.body ||
+        params.grantId !== undefined
+      )
+        throw new Error("Only inventory signing is supported");
+      const uri = new URL(params.uri, params.aud);
+      if (
+        uri.origin !== params.aud ||
+        !/^\/v1\/data\/0x[0-9a-f]{64}\/versions$/.test(uri.pathname) ||
+        uri.hash ||
+        uri.searchParams.get("user") !== ownerAddress.toLowerCase() ||
+        [...uri.searchParams.keys()].join(",") !== "user,scope,after,limit"
+      )
+        throw new Error("Only canonical inventory signing is supported");
+      const source = uri.searchParams.get("scope");
+      if (source && !source.startsWith("vana.system."))
+        sources.set(
+          `vana.system.additions-hash.${keccak256(stringToHex(source)).slice(2)}`,
+          source,
+        );
+      const result = await rpc({
+        kind: "inventory",
+        scope: uri.searchParams.get("scope"),
+        after: uri.searchParams.get("after"),
+        limit: uri.searchParams.get("limit"),
+      });
+      if (
+        !("authorization" in result) ||
+        typeof result.authorization !== "string"
+      )
+        throw new Error("Invalid inventory authorization");
+      return result.authorization;
+    },
+  };
+  // This account only resolves public storage URLs. Its signing functions stay
+  // unavailable; upload authorization uses the dedicated RPC below.
+  const publicStorage = createVanaSyncStorageAdapter({
+    config,
+    serverOwner: ownerAddress,
+    serverAccount: createPublicOnlyAccount({
+      address: env.serverAddress,
+      publicKey: env.serverPublicKey,
+    }),
+    reads: "public",
+  });
+  const storageEndpoint = (
+    config.storage.config.vana?.apiUrl ?? "https://storage.vana.org"
+  ).replace(/\/+$/, "");
+  const keyUrl = (address: string, key: string) =>
+    `${storageEndpoint}/v1/chains/${config.gateway.chainId}/blobs/${address.toLowerCase()}/${key.split("/").map(encodeURIComponent).join("/")}`;
+  const storageAdapter: NonNullable<
+    CreateServerOptions["additionsWriter"]
+  >["storageAdapter"] = {
+    urlForKey(key) {
+      return keyUrl(ownerAddress, key);
+    },
+    async upload(key, data) {
+      const parts = key.split("/");
+      if (parts.length !== 2) throw new Error("Invalid checkpoint key");
+      const result = await rpc({
+        kind: "upload",
+        sourceScope: sourceFor(parts[0] ?? ""),
+        scope: parts[0],
+        version: parts[1],
+        bodyHash: `sha256:${createHash("sha256").update(data).digest("hex")}`,
+      });
+      if (
+        !("authorization" in result) ||
+        typeof result.authorization !== "string"
+      )
+        throw new Error("Invalid upload authorization");
+      const url = keyUrl(ownerAddress, key);
+      const response = await fetch(url, {
+        method: "PUT",
+        headers: {
+          Authorization: result.authorization,
+          "Content-Type": "application/octet-stream",
+        },
+        body: new Uint8Array(data),
+        redirect: "error",
+        signal: AbortSignal.timeout(15_000),
+      });
+      await response.body?.cancel();
+      if (!response.ok)
+        throw new Error(`Checkpoint upload failed (${response.status})`);
+      return url;
+    },
+    async download(url) {
+      return publicStorage.download(url);
+    },
+    async downloadBounded(url, budget) {
+      if (!publicStorage.downloadBounded)
+        throw new Error("Bounded download unavailable");
+      return publicStorage.downloadBounded(url, budget);
+    },
+    async exists(url) {
+      return publicStorage.exists(url);
+    },
+    async delete() {
+      throw new Error("Checkpoint deletion is not authorized");
+    },
+  };
+  return {
+    additionsInventorySigner,
+    additionsWriter: {
+      storageAdapter,
+      gateway: createGatewayClient(config.gateway.url),
+      signer: {
+        async signAddData(message) {
+          if (message.ownerAddress.toLowerCase() !== ownerAddress.toLowerCase())
+            throw new Error("Checkpoint owner mismatch");
+          const result = await rpc({
+            kind: "register",
+            sourceScope: sourceFor(message.scope),
+            scope: message.scope,
+            version: String(message.expectedVersion),
+            dataHash: message.dataHash,
+            metadataHash: message.metadataHash,
+          });
+          if (!("signature" in result) || !isHex(result.signature))
+            throw new Error("Invalid checkpoint signature");
+          return result.signature;
+        },
+      },
+    },
   };
 }

@@ -223,7 +223,7 @@ describe("negative outcomes are persisted", () => {
     expect(readEnvelope).not.toHaveBeenCalled();
   }, 60_000);
 
-  it("two disjoint versions beyond the cap stay readable, bounded and tracking", async () => {
+  it("two disjoint snapshots retain their complete permanent identity union", async () => {
     const storage = createMemoryDataStorage();
     const part = Math.floor(MAX_TRACKED_KEYS * 0.75);
     const batch = (prefix: string) => ({
@@ -242,9 +242,7 @@ describe("negative outcomes are persisted", () => {
 
     const ledger = await stored(storage);
     expect(ledger).not.toBeNull();
-    expect(Object.keys(ledger!.records).length).toBeLessThanOrEqual(
-      MAX_TRACKED_KEYS,
-    );
+    expect(Object.keys(ledger!.records)).toHaveLength(part * 2);
     expect(ledger?.skipped).toBeUndefined();
     expect(ledger?.latest.total).toBe(part);
 
@@ -466,8 +464,8 @@ describe("a sidecar far behind is not mistaken for a deleted one (B4)", () => {
   });
 });
 
-describe("added never exceeds total (B10)", () => {
-  it("reports no additions while the newest version is a binary file", async () => {
+describe("permanent arrivals can exceed the current total", () => {
+  it("retains earlier arrivals while the newest version is a binary file", async () => {
     const storage = createMemoryDataStorage();
     const ingest = (body: Record<string, unknown>, collectedAt: string) =>
       ingestDataContract({
@@ -491,15 +489,13 @@ describe("added never exceeds total (B10)", () => {
     });
     const ledger = (await stored(storage))!;
     expect(ledger.latest.total).toBe(1);
-    expect(listAddedTimestamps(ledger)).toEqual([]);
+    expect(listAddedTimestamps(ledger)).toEqual([at(0), at(1), at(1)]);
 
     // The next JSON version brings the numbers back in step.
     await ingest(items("a", "b", "c", "d"), at(3));
     const after = (await stored(storage))!;
     expect(after.latest.total).toBe(4);
-    expect(listAddedTimestamps(after).length).toBeLessThanOrEqual(
-      after.latest.total,
-    );
+    expect(listAddedTimestamps(after)).toEqual([at(0), at(1), at(1), at(3)]);
     expect(listAddedTimestamps(after)).toHaveLength(4);
   });
 
@@ -843,41 +839,6 @@ describe("when the baseline's records count as added (first-import rule)", () =>
     expect(ledger.partial).toBe(true);
     expect(listAddedTimestamps(ledger)).toEqual([at(5)]);
   });
-
-  it("added never exceeds total over random sequences of writes, binaries and deletes", async () => {
-    let seed = 7;
-    const random = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
-    for (let run = 0; run < 25; run += 1) {
-      const storage = createMemoryDataStorage();
-      let slot = 0;
-      for (let step = 0; step < 8; step += 1) {
-        const roll = random();
-        slot += 1;
-        if (roll < 0.15) {
-          await ingestBinaryDataContract({
-            storage,
-            scopeParam: SCOPE,
-            bytes: new TextEncoder().encode("%PDF"),
-            mimeType: "application/pdf",
-            collectedAt: at(slot),
-            status: "stored",
-          });
-        } else if (roll < 0.25 && storage.entries.length > 1) {
-          const entry =
-            storage.entries[Math.floor(random() * storage.entries.length)]!;
-          await storage.deleteVersion(SCOPE, entry.collectedAt);
-        } else {
-          const count = 1 + Math.floor(random() * 6);
-          await ingest(storage, items(...upTo(count)), at(slot));
-        }
-        const ledger = await ensureScopeLedger(storage, SCOPE);
-        if (!ledger) continue;
-        expect(listAddedTimestamps(ledger).length).toBeLessThanOrEqual(
-          ledger.latest.total,
-        );
-      }
-    }
-  });
 });
 
 describe("partial is decided from the index on every owner read (follow-up review)", () => {
@@ -924,7 +885,7 @@ describe("partial is decided from the index on every owner read (follow-up revie
     expect(
       ((await storage.readFirstSeenLedger!(SCOPE)) as { version: number })
         .version,
-    ).toBe(4);
+    ).toBe(5);
   });
 
   it("1. a second device that synced only version #12 reports 0, partial", async () => {

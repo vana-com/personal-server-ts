@@ -1,3 +1,5 @@
+import { isSystemScope } from "../policy/reserved-scopes.js";
+import type { DurableAdditionsService } from "../additions/durable.js";
 import { type DataStoragePort } from "../ports/index.js";
 import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
 import {
@@ -402,6 +404,7 @@ export async function listDataVersionsContract(
 }
 
 export interface SummarizeDataAdditionsContractInput {
+  additions?: DurableAdditionsService;
   storage: DataStoragePort;
   isVisible?: DataVisibilityFilter;
   /** IANA timezone, e.g. "America/Toronto". */
@@ -441,7 +444,10 @@ export async function summarizeDataAdditionsContract(
     throw err;
   }
 
-  const scopes = await collectScopes(input.storage, undefined, input.isVisible);
+  if (input.additions) return input.additions.summarize(input);
+  const scopes = (
+    await collectScopes(input.storage, undefined, input.isVisible)
+  ).filter((row) => !isSystemScope(row.scope));
   // One scope at a time: only one ledger is in memory at once.
   async function* ledgers(): AsyncGenerator<ScopeFirstSeenLedger> {
     for (const summary of scopes) {
@@ -454,6 +460,7 @@ export async function summarizeDataAdditionsContract(
 
   return summarizeAdditions({
     ledgers: ledgers(),
+    coverage: "unavailable",
     timezone: input.timezone,
     days: input.days,
     now: input.now,

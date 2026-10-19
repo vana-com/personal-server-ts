@@ -1,3 +1,4 @@
+import { readBoundedResponse } from "../../additions/budget.js";
 import { createVanaStorageProvider } from "@opendatalabs/vana-sdk/browser";
 import { StorageError } from "@opendatalabs/vana-sdk/storage/index";
 import { ServerSigningUnavailableError } from "../../errors/catalog.js";
@@ -52,7 +53,7 @@ export function createVanaSyncStorageAdapter(params: {
     return createPublicReadAdapter({ endpoint, chainId, owner });
   }
 
-  return createSdkStorageAdapter(
+  const adapter = createSdkStorageAdapter(
     createVanaStorageProvider({
       endpoint: params.config.storage.config.vana?.apiUrl,
       chainId,
@@ -77,6 +78,31 @@ export function createVanaSyncStorageAdapter(params: {
       },
     },
   );
+  // Blob GET is public by the existing storage contract. Use the supported
+  // canonical URL directly so bounded recovery never enters SDK blob buffering.
+  return {
+    ...adapter,
+    async downloadBounded(url, budget) {
+      const prefix = `${endpoint}/v1/chains/${chainId}/blobs/${owner}/`;
+      const parsed = new URL(url);
+      if (
+        !parsed.href.startsWith(prefix) ||
+        ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)
+      )
+        throw new Error("Blob URL does not match configured namespace");
+      budget.charge();
+      const response = await fetch(parsed.href, {
+        signal: budget.signal,
+        cache: "no-store",
+        redirect: "error",
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new Error(`Blob download failed (${response.status})`);
+      }
+      return readBoundedResponse(response, budget);
+    },
+  };
 }
 
 function createPublicReadAdapter(options: {

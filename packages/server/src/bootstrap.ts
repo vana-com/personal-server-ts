@@ -1,3 +1,10 @@
+import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
+import {
+  createDurableAdditions,
+  createVersionInventoryClient,
+  type DurableAdditionsService,
+} from "@opendatalabs/personal-server-ts-core/additions";
+import type { RequestSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import { mkdir } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
@@ -28,6 +35,7 @@ import { createAccessLogWriter } from "./logging/access-log.js";
 import { createAccessLogReader } from "./logging/access-reader.js";
 import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logging/access-reader";
 import {
+  buildWeb3SignedHeader,
   deriveMasterKey,
   recoverServerOwner,
 } from "@opendatalabs/vana-sdk/node";
@@ -100,6 +108,17 @@ export interface ServerContext {
 }
 
 export interface CreateServerOptions {
+  /** Owner-authorized HTTP signing capability supplied by the trusted host. */
+  ownerRequestSigner?: RequestSigner;
+  /** Inventory-route-only signer; never used by the owner-only scope feed. */
+  additionsInventorySigner?: RequestSigner;
+  /** Host-authorized checkpoint capability. TEE public-read adapters cannot write.
+   * The host supplies an existing AddData signer/storage pair; this creates no grant.
+   */
+  additionsWriter?: Pick<
+    DurableAdditionsOptions,
+    "storageAdapter" | "signer" | "gateway"
+  >;
   rootPath?: string;
   /** Exact owner scopes to hydrate before the first full sync pass. */
   hydrateScopes?: string[];
@@ -366,13 +385,31 @@ export async function createServer(
       })
     : undefined;
 
+  const additionsOwnerSigner =
+    options?.ownerRequestSigner ??
+    (ownerTunnelSigner &&
+    serverOwner &&
+    ownerTunnelSigner.address.toLowerCase() === serverOwner.toLowerCase()
+      ? {
+          signRequest: (params: Parameters<RequestSigner["signRequest"]>[0]) =>
+            buildWeb3SignedHeader({
+              ...params,
+              signMessage: (message: string) =>
+                ownerTunnelSigner.signMessage({ message }),
+            }),
+        }
+      : undefined);
+
   // --- Sync engine setup ---
   let syncManager: SyncManager | null = null;
   // Deletion-aware registry view. Independent of sync: the data route uses
   // it to answer 410 for scopes the owner deleted even when sync is off.
   const dataPointFeed =
     options?.dataPointFeed ??
-    createGatewayDataPointFeed({ gatewayUrl: config.gateway.url });
+    createGatewayDataPointFeed({
+      gatewayUrl: config.gateway.url,
+      ownerRequestSigner: additionsOwnerSigner,
+    });
   // Read-side memory of tombstones, shared by the sync workers (which feed
   // it) and the data route (which consults it on every read).
   const scopeDeletions = createScopeDeletionTracker({
@@ -454,6 +491,47 @@ export async function createServer(
     scheduler: derivativeScheduler,
   };
 
+  const additionsInventorySigner =
+    options?.additionsInventorySigner ?? additionsOwnerSigner;
+  let additions: DurableAdditionsService | undefined;
+  if (
+    additionsInventorySigner &&
+    (!isEnclave || options?.additionsWriter) &&
+    masterKeySignature &&
+    serverOwner &&
+    serverAccount &&
+    serverSigner
+  ) {
+    additions = createDurableAdditions({
+      deleteSystemScope: async (scope) => {
+        if (!syncManager)
+          throw new Error("Durable system deletion capability unavailable");
+        const result = await syncManager.deleteScope(scope);
+        if (!result.durable || result.steps.gateway.status === "failed") {
+          throw new Error("System scope deletion was not durable");
+        }
+      },
+      ownerAddress: serverOwner,
+      network: `vana:${config.gateway.chainId}:${new URL(config.gateway.url).origin}`,
+      inventory: createVersionInventoryClient({
+        gatewayUrl: config.gateway.url,
+        ownerAddress: serverOwner,
+        ownerSigner: additionsInventorySigner,
+      }),
+      storageAdapter:
+        options?.additionsWriter?.storageAdapter ??
+        createVanaSyncStorageAdapter({
+          config,
+          serverOwner,
+          serverAccount,
+          reads: isEnclave ? "public" : "signed",
+        }),
+      masterKey: deriveMasterKey(masterKeySignature),
+      signer: options?.additionsWriter?.signer ?? serverSigner,
+      gateway: options?.additionsWriter?.gateway ?? gatewayClient,
+    });
+  }
+
   if (
     config.sync.enabled &&
     masterKeySignature &&
@@ -475,6 +553,7 @@ export async function createServer(
     });
 
     const uploadDeps = {
+      additions,
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -666,6 +745,7 @@ export async function createServer(
     accessLogReader,
     readFulfillmentReporter: options?.readFulfillmentReporter,
     dataStorage,
+    additions,
     scopeDeletions,
     cloudMode,
     devToken,

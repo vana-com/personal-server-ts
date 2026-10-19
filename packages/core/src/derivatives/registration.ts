@@ -1,3 +1,4 @@
+import { isSystemScope } from "../policy/reserved-scopes.js";
 /**
  * Question registration: input validation, the naming rule (shared with the
  * lineage write path) and the cycle guard that keeps a chain of recomputes
@@ -261,6 +262,6 @@ export function uncoveredSourceScopes(
     (entry) => !isWriteScopeEntry(entry),
   );
   return sourceScopes.filter(
-    (scope) => !scopeCoveredByGrant(scope, readEntries),
+    (scope) => isSystemScope(scope) || !scopeCoveredByGrant(scope, readEntries),
   );
 }

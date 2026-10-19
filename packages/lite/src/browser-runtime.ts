@@ -39,7 +39,11 @@ import {
   type PsLiteRuntime,
   type PsLiteRuntimeOptions,
 } from "./runtime.js";
-import { createPsLiteSyncManager, type PsLiteOwnerSyncSigner } from "./sync.js";
+import {
+  createPsLiteSyncManager,
+  type PsLiteOwnerSyncSigner,
+  type PsLiteSyncOptions,
+} from "./sync.js";
 import {
   createPsLiteDerivativeCompute,
   createPsLiteQuestionStore,
@@ -72,6 +76,7 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   inferenceProvider?: InferenceProvider;
   ownerSignature: `0x${string}`;
   ownerSyncSigner?: PsLiteOwnerSyncSigner;
+  additionsWorkerFactory?: PsLiteSyncOptions["additionsWorkerFactory"];
   dbName?: string;
   stateStoreName?: string;
   storageDbName?: string;
@@ -181,6 +186,7 @@ export async function createIndexedDbPsLiteRuntime(
   });
   let syncManager = options.syncManager ?? null;
   let scopeDeletions = options.scopeDeletions;
+  let additions = options.additions;
   let runtimeRef: PsLiteRuntime | null = null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
@@ -227,6 +233,7 @@ export async function createIndexedDbPsLiteRuntime(
       ownerSignature: options.ownerSignature,
       ownerAddress: options.ownerAddress,
       ownerSyncSigner: options.ownerSyncSigner,
+      additionsWorkerFactory: options.additionsWorkerFactory,
       serverAccount: identity.account,
       gateway,
       dataPointFeed: options.dataPointFeed,
@@ -239,6 +246,7 @@ export async function createIndexedDbPsLiteRuntime(
           lineageSources: event.lineageSources,
         }),
     });
+    additions = sync.additions ?? additions;
     syncManager = sync.syncManager;
     scopeDeletions = sync.scopeDeletions;
   }
@@ -304,6 +312,7 @@ export async function createIndexedDbPsLiteRuntime(
     serverOwner,
     serverSigner,
     syncManager,
+    additions,
     scopeDeletions,
     diagnostics,
     lineageGateway,

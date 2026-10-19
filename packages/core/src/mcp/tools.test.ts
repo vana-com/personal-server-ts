@@ -1,6 +1,11 @@
+import { resolveGrantForRawScopeResource } from "./resources.js";
 import { describe, expect, it, vi } from "vitest";
 import { McpActivityRecorder } from "./activity.js";
-import { MAX_MCP_TOOL_TIMEOUT_MS, MCP_TOOLS } from "./tools.js";
+import {
+  MAX_MCP_TOOL_TIMEOUT_MS,
+  MCP_TOOLS,
+  resolveGrantForScope,
+} from "./tools.js";
 import { handleMcpStreamableHttpRequest } from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
@@ -1976,4 +1981,20 @@ describe("mcp/tools", () => {
       }),
     ]);
   });
+});
+
+describe("reserved MCP scopes", () => {
+  it.each(["*", "vana.*", "vana.system.profile"])(
+    "never resolves reserved scope via %s",
+    (pattern) => {
+      const connection = createConnection();
+      connection.grants = [{ grantId: "owner", scopes: [pattern] }];
+      expect(
+        resolveGrantForScope(connection, "vana.system.profile"),
+      ).toBeNull();
+      expect(
+        resolveGrantForRawScopeResource(connection, "vana.system.profile"),
+      ).toBeNull();
+    },
+  );
 });

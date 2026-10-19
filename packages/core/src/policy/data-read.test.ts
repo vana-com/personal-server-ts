@@ -525,3 +525,29 @@ describe("derivative grants never leak across a lineage edge", () => {
     ).resolves.toBe(grant);
   });
 });
+
+describe("reserved system scopes", () => {
+  it.each(["*", "vana.*", "vana.system.*", "vana.system.profile"])(
+    "rejects delegated system read under %s",
+    async (pattern) => {
+      const requestedScope = "vana.system.profile";
+      const grant = makeGrant({ scopes: [pattern] });
+      await expect(
+        verifyDataReadPolicy(
+          {
+            signer: BUILDER_ADDRESS,
+            grantId: grant.id,
+            requestedScope,
+            serverOwner: "0xOwner",
+          },
+          {
+            authSessionVerifier: {
+              getBuilder: vi.fn().mockResolvedValue(builder),
+            },
+            grantVerifier: { getGrant: vi.fn().mockResolvedValue(grant) },
+          },
+        ),
+      ).rejects.toMatchObject({ errorCode: "SCOPE_MISMATCH" });
+    },
+  );
+});
