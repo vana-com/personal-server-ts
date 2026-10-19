@@ -8,6 +8,8 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createServer as createHttpServer } from "node:http";
+import { privateKeyToAccount } from "viem/accounts";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer } from "./bootstrap.js";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
@@ -28,6 +30,73 @@ describe("createServer", () => {
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true });
     vi.unstubAllEnvs();
+  });
+
+  it("starts durable Node recovery without an owner private key and fails closed on missing publication", async () => {
+    vi.stubEnv("VANA_OWNER_PRIVATE_KEY", "");
+    const gateway = createHttpServer((request, response) => {
+      const url = new URL(request.url ?? "/", "http://localhost");
+      response.setHeader("Content-Type", "application/json");
+      response.end(
+        JSON.stringify(
+          url.pathname.endsWith("/versions")
+            ? {
+                data: {
+                  dataPointId: url.pathname.split("/")[3],
+                  ownerAddress: url.searchParams.get("user"),
+                  scope: url.searchParams.get("scope"),
+                  head: null,
+                  versions: [],
+                },
+                pagination: { limit: 100, hasMore: false, nextAfter: null },
+              }
+            : {
+                data: { dataPoints: [] },
+                pagination: { limit: 100, hasMore: false, nextCursor: null },
+              },
+        ),
+      );
+    });
+    await new Promise<void>((resolve) =>
+      gateway.listen(0, "127.0.0.1", resolve),
+    );
+    const address = gateway.address();
+    if (!address || typeof address === "string")
+      throw new Error("Missing fixture port");
+    const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
+    const ownerSignature = await owner.signMessage({
+      message: "Disposably authorize Node",
+    });
+    const config = ServerConfigSchema.parse({
+      gateway: { url: `http://127.0.0.1:${address.port}` },
+      storage: {
+        backend: "vana",
+        config: { vana: { apiUrl: `http://127.0.0.1:${address.port}` } },
+      },
+      tunnel: { enabled: false },
+      sync: { enabled: false },
+      logging: { level: "fatal", pretty: false },
+    });
+    let ctx;
+    try {
+      ctx = await createServer(config, { rootPath: tempDir, ownerSignature });
+      const response = await ctx.app.request(
+        "/v1/data/additions?tz=UTC&days=7",
+        {
+          headers: { Authorization: `Bearer ${ctx.devToken}` },
+        },
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        version: 1,
+        coverage: "behind",
+        total: 0,
+      });
+    } finally {
+      await ctx?.cleanup();
+      gateway.closeAllConnections();
+      await new Promise<void>((resolve) => gateway.close(() => resolve()));
+    }
   });
 
   it("returns object with app, logger, config, startedAt", async () => {
