@@ -274,9 +274,9 @@ describe("legacy scope binding self-check", () => {
       LEGACY_SCOPE_BINDINGS.get("wholefoods.profile")?.provenance[0],
     ).toEqual({
       kind: "oci",
-      ref: "ghcr.io/pdp-connect/connector/wholefoods:0.3.0",
+      ref: "ghcr.io/pdp-connect/connector/wholefoods:0.3.34",
       digest:
-        "sha256:873e287a153673bb9b96cae87dfe64e36730e18b30ea2e5c1731bdcff8d4432c",
+        "sha256:2240249fc49d663798465d2ea42273402bd31a135cd0d262110098ee72e019de",
       path: "declarations/wholefoods.collection-profile.json#streams[name=profile]",
     });
     expect(collectionProfileDigest("wholefoods")).toBe(
@@ -593,7 +593,7 @@ describe("legacy scope binding self-check", () => {
         return;
       }
       // These bindings require evidence that a null-filled declaration row
-      // cannot provide. Whole Foods 0.3.0 can project its declared item row;
+      // cannot provide. Whole Foods 0.3.34 can project its declared item row;
       // the production gate still rejects unproven collection completeness.
       if (
         [

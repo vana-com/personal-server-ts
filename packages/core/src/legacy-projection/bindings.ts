@@ -4150,13 +4150,13 @@ const hebOrders: LegacyScopeBinding = {
   },
 };
 
-// Whole Foods 0.3.0 is the published, signature-verified OCI artifact.
+// Whole Foods declaration and provenance are pinned to data connector 0.3.34.
 const wholefoodsSource = "https://registry.pdpp.dev/connectors/wholefoods";
 const wholefoodsEvidence: LegacyScopeBindingProvenance = {
   kind: "oci",
-  ref: "ghcr.io/pdp-connect/connector/wholefoods:0.3.0",
+  ref: "ghcr.io/pdp-connect/connector/wholefoods:0.3.34",
   digest:
-    "sha256:873e287a153673bb9b96cae87dfe64e36730e18b30ea2e5c1731bdcff8d4432c",
+    "sha256:2240249fc49d663798465d2ea42273402bd31a135cd0d262110098ee72e019de",
   path: "declarations/wholefoods.collection-profile.json",
 };
 
@@ -4349,7 +4349,7 @@ const wholefoodsOrders: LegacyScopeBinding = {
             ? { orderDate: o.order_date }
             : {}),
           // The legacy data connector labeled every observed order Completed;
-          // source 0.3.0 correctly reports status as unknown (null).
+          // source 0.3.34 correctly reports status as unknown (null).
           ...(o.status === null
             ? { status: "Completed" }
             : typeof o.status === "string"
