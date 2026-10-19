@@ -1,0 +1,90 @@
+{
+  "scope": "linkedin.languages",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.languages from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic linkedin.languages records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{languages:Array<{name:string,proficiency:string}>}",
+    "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+    "inputHandling": "Input id is omitted; mapped strings normalize malformed values to empty strings."
+  },
+  "fetchedStreams": [
+    "languages"
+  ],
+  "streams": {
+    "languages": [
+      {
+        "id": "language-a",
+        "name": "English",
+        "proficiency": "Native"
+      }
+    ]
+  },
+  "legacyBody": {
+    "languages": [
+      {
+        "name": "English",
+        "proficiency": "Native"
+      }
+    ]
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "linkedin.languages",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.languages from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic linkedin.languages records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{languages:Array<{name:string,proficiency:string}>}",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Input id is omitted; mapped strings normalize malformed values to empty strings."
+      },
+      "fetchedStreams": [
+        "languages"
+      ],
+      "streams": {
+        "languages": []
+      },
+      "legacyBody": {
+        "languages": []
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "linkedin.languages",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.languages from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic linkedin.languages records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{languages:Array<{name:string,proficiency:string}>}",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Input id is omitted; mapped strings normalize malformed values to empty strings."
+      },
+      "fetchedStreams": [
+        "languages"
+      ],
+      "streams": {
+        "languages": [
+          {
+            "id": "language-dirty",
+            "name": 42,
+            "proficiency": null
+          }
+        ]
+      },
+      "legacyBody": {
+        "languages": [
+          {
+            "name": "",
+            "proficiency": ""
+          }
+        ]
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

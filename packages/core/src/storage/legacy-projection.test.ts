@@ -112,6 +112,19 @@ describe("legacyScopesProjectedFrom", () => {
 });
 
 describe("withLegacyProjection", () => {
+  it.each([
+    ["2026-10-01T00:00:00Z", "2026-10-01T00:00:00.500Z"],
+    ["2026-10-01T00:00:00.500Z", "2026-10-01T00:00:00Z"],
+  ])("uses the newest input instant for mixed formats (%s, %s)", async (own, sibling) => {
+    const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.conversations", own, { records: [conversation] });
+    await store(raw, "chatgpt.messages", sibling, { records: messages });
+    const envelope = await withLegacyProjection(raw).readEnvelope("chatgpt.conversations", own);
+    expect(envelope.data).toMatchObject({
+      conversations: [{ fetched_at: "2026-10-01T00:00:00.500Z" }],
+    });
+  });
+
   it("serves chatgpt.conversations projected from the stored conversations and messages streams", async () => {
     const raw = createMemoryDataStorage();
     await store(raw, "chatgpt.messages", "2026-10-01T00:00:02.000Z", {

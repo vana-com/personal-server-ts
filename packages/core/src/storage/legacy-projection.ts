@@ -220,7 +220,9 @@ export function withLegacyProjection(
         .records;
       if (rows.some(isTaggedRecord)) continue;
       fetchedStreams.push(input.stream);
-      if (input.collectedAt > now) now = input.collectedAt;
+      if (Date.parse(input.collectedAt) > Date.parse(now)) {
+        now = input.collectedAt;
+      }
       for (const row of rows) {
         records.push({ stream: input.stream, data: row });
       }

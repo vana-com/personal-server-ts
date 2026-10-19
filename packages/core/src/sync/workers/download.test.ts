@@ -24,6 +24,10 @@ import type { SyncCursor } from "../cursor.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
+import {
+  createScopeDeletionTracker,
+  type ScopeTombstone,
+} from "../scope-deletions.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
 import { computeQuestion } from "../../derivatives/compute.js";
 import { createFakeInferenceProvider } from "../../derivatives/inference.js";
@@ -310,6 +314,34 @@ describe("download worker", () => {
         collectedAt: COLLECTED_AT,
         path: RELATIVE_PATH,
       });
+    });
+
+    it("preserves envelope producer attribution and indexes it after a sync download", async () => {
+      const deps = makeMockDeps();
+      const source = {
+        projector_version: "1",
+        declaration_digest: "sha256:declaration",
+        inputs: [{ stream: "profile", changes_since_token: "opaque" }],
+        payload_sha256: "a".repeat(64),
+      };
+      const envelope = {
+        ...makeEnvelope(),
+        producer: "pdpp-projector",
+        producer_provenance: source,
+      };
+      (decryptWithPassword as ReturnType<typeof vi.fn>).mockResolvedValue(
+        new TextEncoder().encode(JSON.stringify(envelope)),
+      );
+
+      await downloadOne(deps, makeDataPointRecord());
+
+      expect(deps.storage.writeEnvelope).toHaveBeenCalledWith(envelope);
+      expect(deps.storage.insertEntry).toHaveBeenCalledWith(
+        expect.objectContaining({
+          producer: "pdpp-projector",
+          producerProvenance: JSON.stringify(source),
+        }),
+      );
     });
 
     it("clears the encrypted download after decryption completes", async () => {
@@ -928,6 +960,33 @@ describe("download worker", () => {
       expect(pendingBlobDeletions.add).toHaveBeenCalledWith([
         { scope: SCOPE, version: "9" },
       ]);
+    });
+
+    it("retries a failed deletion observation on an empty feed after the file became live", async () => {
+      const deps = makeMockDeps();
+      const facts = new Map<string, ScopeTombstone>();
+      const failure = new Error("metadata unavailable");
+      let unavailable = true;
+      const tracker = createScopeDeletionTracker({
+        deletionHistory: {
+          get: (scope) => facts.get(scope) ?? null,
+          remember: (scope, tombstone) => {
+            if (unavailable) throw failure;
+            facts.set(scope, tombstone);
+          },
+        },
+      });
+      const tombstone = { deletedAt: "2026-09-11T00:00:00Z", version: "1" };
+      expect(() => tracker.markDeleted(SCOPE, tombstone)).toThrow(failure);
+      tracker.markLive(SCOPE);
+      deps.scopeDeletions = tracker;
+      await expect(downloadAll(deps)).rejects.toBe(failure);
+      expect(tracker.deletionHistory?.get(SCOPE)).toEqual(tombstone);
+      expect(facts.size).toBe(0);
+      unavailable = false;
+      await expect(downloadAll(deps)).resolves.toEqual([]);
+      expect(facts.get(SCOPE)).toEqual(tombstone);
+      expect(tracker.knownDeletion(SCOPE)).toBeNull();
     });
 
     it("feeds the read-side deletion memory from every listed row and marks a complete pass", async () => {

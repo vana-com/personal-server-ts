@@ -1,6 +1,6 @@
 {
   "name": "YouTube Watch History (Recent)",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "scope": "youtube.history",
   "dialect": "json",
   "description": "Most recent watch history entries (top 50) collected from the YouTube History page.",
@@ -13,6 +13,7 @@
         "items": {
           "type": "object",
           "properties": {
+            "watchedAt":     { "type": ["string", "null"], "description": "ISO date (YYYY-MM-DD) resolved from the section date header at scrape time; null when the header was missing or unrecognized" },
             "watchedAtText": { "type": ["string", "null"], "description": "Section date header e.g. Today, Yesterday, Jan 23 2026" },
             "videoId":       { "type": ["string", "null"] },
             "videoUrl":      { "type": "string" },

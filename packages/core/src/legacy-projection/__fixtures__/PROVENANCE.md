@@ -37,7 +37,8 @@ data-connectors source commits `0bba63811c99e6a3d4c8932d126d0eafc529c7aa`
 (H-E-B) and `05c2bc61c84c5591415f168354eaa7427645908e` (Whole Foods).
 It is a mapping test fixture, not a captured legacy output or a signed artifact.
 
-`desktop-schemas/` holds byte-identical copies of the H-E-B and Whole Foods
-Desktop connector schemas from unity-surfaces `origin/dev` b227e8ce1
-(`apps/desktop/connectors/{heb,wholefoods}/schemas/*.json`). The self-check
-and grocery tests validate projections against them.
+`desktop-schemas/` contains byte-identical copies of the nine frozen Desktop schemas needed where the active Personal Server schemas differ or are absent. The six H-E-B and Whole Foods schemas are also vendored under `../legacy-schemas/`. Source paths, commit, and SHA-256 values are recorded in `desktop-schemas/PROVENANCE.md`.
+
+`desktop-schemas/youtube.history.json` is the frozen Desktop schema from unity-surfaces commit `9155456f7a90a10b7af902c7ae5ea68ee8cef12d` (`apps/desktop/connectors/google/schemas/youtube.history.json`, version 1.0.0). The active Personal Server copy remains at version 1.1.0 and adds `watchedAt`; the parity suite checks projection output against the frozen 1.0.0 app contract.
+
+`../legacy-schemas/youtube.history.json` is also a byte-identical copy of the published schema at PDP-Connect/data-connectors commit `d750663` (`connectors/google/schemas/youtube.history.json`, version 1.1.0). It adds `watchedAt` (ISO date `YYYY-MM-DD` or null) that the earlier 1.0.0 copy lacked. The projection sets `watchedAt` and `watchedAtText` from `watched_date`, preserving null without inventing timestamp precision.

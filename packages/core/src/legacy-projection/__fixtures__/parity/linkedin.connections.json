@@ -1,0 +1,98 @@
+{
+  "scope": "linkedin.connections",
+  "case": "normal",
+  "provenance": {
+    "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.connections from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+    "pdppBundle": "synthetic linkedin.connections records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+    "expectedSideNote": "current binding output, not captured legacy-connector output",
+    "outputKeysAndTypes": "{connections:Array<{fullName:string,headline:string,profileUrl:string,dateConnected:string}>}",
+    "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+    "inputHandling": "Input id is omitted; mapped strings normalize malformed values to empty strings."
+  },
+  "fetchedStreams": [
+    "connections"
+  ],
+  "streams": {
+    "connections": [
+      {
+        "id": "connection-a",
+        "full_name": "Example Person",
+        "headline": "Engineer",
+        "profile_url": "https://www.linkedin.com/in/example",
+        "connected_at": "2026-09-01T23:30:00-07:00"
+      }
+    ]
+  },
+  "legacyBody": {
+    "connections": [
+      {
+        "fullName": "Example Person",
+        "headline": "Engineer",
+        "profileUrl": "https://www.linkedin.com/in/example",
+        "dateConnected": "2026-09-02"
+      }
+    ]
+  },
+  "reviewedDifferences": [],
+  "cases": [
+    {
+      "scope": "linkedin.connections",
+      "case": "empty",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.connections from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic linkedin.connections records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{connections:Array<{fullName:string,headline:string,profileUrl:string,dateConnected:string}>}",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Input id is omitted; mapped strings normalize malformed values to empty strings."
+      },
+      "fetchedStreams": [
+        "connections"
+      ],
+      "streams": {
+        "connections": []
+      },
+      "legacyBody": {
+        "connections": []
+      },
+      "reviewedDifferences": []
+    },
+    {
+      "scope": "linkedin.connections",
+      "case": "dirty-row",
+      "provenance": {
+        "legacyConnector": "current binding output, not captured legacy-connector output; linkedin.connections from packages/core/src/legacy-projection/bindings.ts at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665",
+        "pdppBundle": "synthetic linkedin.connections records against vendored declarations at personal-server-ts commit 71a43bce98f0dde2ec1ddc3d7ad03d701cc0f665; no bundle executed",
+        "expectedSideNote": "current binding output, not captured legacy-connector output",
+        "outputKeysAndTypes": "{connections:Array<{fullName:string,headline:string,profileUrl:string,dateConnected:string}>}",
+        "legacySchemaComparison": "Frozen Desktop schema is checked by parity-goldens.test.ts. These expectations establish current-binding regression coverage only.",
+        "inputHandling": "Input id is omitted; mapped strings normalize malformed values to empty strings."
+      },
+      "fetchedStreams": [
+        "connections"
+      ],
+      "streams": {
+        "connections": [
+          {
+            "id": "connection-dirty",
+            "full_name": null,
+            "headline": 42,
+            "profile_url": false,
+            "connected_at": "invalid"
+          }
+        ]
+      },
+      "legacyBody": {
+        "connections": [
+          {
+            "fullName": "",
+            "headline": "",
+            "profileUrl": "",
+            "dateConnected": ""
+          }
+        ]
+      },
+      "reviewedDifferences": []
+    }
+  ]
+}

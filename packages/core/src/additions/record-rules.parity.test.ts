@@ -116,6 +116,7 @@ const FIXTURES: Record<string, { own: string; streams: Rows }> = {
     own: "notes",
     streams: {
       folders: [{ id: "f1", name: "Folder" }],
+      profile: [{ id: "account-1", user_name: "Test User" }],
       notes: [
         {
           id: "n1",
@@ -221,19 +222,30 @@ const FIXTURES: Record<string, { own: string; streams: Rows }> = {
     own: "activity",
     streams: {
       activity: [
-        { id: "a1", day: "2026-09-01" },
-        { id: "a2", day: "2026-09-02" },
+        { id: "a1", day: "2026-09-01", score: 83 },
+        { id: "a2", day: "2026-09-02", score: null },
       ],
     },
   },
   "oura.readiness": {
     own: "readiness",
-    streams: { readiness: [{ id: "r1", day: "2026-09-01" }] },
+    streams: {
+      readiness: [{ id: "r1", day: "2026-09-01", score: 83 }],
+    },
   },
   // One stream feeds two legacy arrays: untracked.
   "oura.sleep": {
     own: "sleep",
-    streams: { sleep: [{ id: "s1", day: "2026-09-01", type: "long_sleep" }] },
+    streams: {
+      sleep: [
+        {
+          id: "s1",
+          day: "2026-09-01",
+          record_type: "daily_score",
+          sleep_score: 83,
+        },
+      ],
+    },
   },
   "youtube.playlists": {
     own: "playlists",

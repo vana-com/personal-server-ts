@@ -73,13 +73,25 @@ describe("Oura browser source bindings", () => {
     ).toMatchObject({ ok: false, error: { kind: "missing_stream" } });
     expect(
       projectPdppRecordsToLegacyPayload(
+        "oura.sleep",
+        [{ stream: "sleep", data: { id: "s-1", day: "2026-08-01" } }],
+        { fetchedStreams: ["sleep"], profileKey: "oura-browser" },
+      ),
+    ).toMatchObject({
+      ok: false,
+      error: { kind: "incomplete_scope", scope: "oura.sleep" },
+    });
+    // A row without a day is the base profile's drop-and-count case.
+    expect(
+      projectPdppRecordsToLegacyPayload(
         "oura.activity",
         [{ stream: "activity", data: { id: "day-1" } }],
         { fetchedStreams: ["activity"], profileKey: "oura-browser" },
       ),
     ).toMatchObject({
-      ok: false,
-      error: { kind: "incomplete_scope", scope: "oura.activity" },
+      ok: true,
+      payload: { days: [] },
+      diagnostics: [{ kind: "records_dropped", stream: "activity", count: 1 }],
     });
   });
 });

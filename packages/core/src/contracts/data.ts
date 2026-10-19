@@ -1,7 +1,15 @@
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
-import { type DataStoragePort } from "../ports/index.js";
-import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
+import {
+  type DataStoragePort,
+  type ImportIntent,
+  type ImportReceipt,
+} from "../ports/index.js";
+import type {
+  IndexEntry,
+  NewIndexEntry,
+  ScopeSummary,
+} from "../storage/index/types.js";
 import {
   createDataFileEnvelope,
   ScopeSchema,
@@ -31,18 +39,42 @@ import {
   type AdditionsSummary,
 } from "../additions/summary.js";
 import type { ScopeFirstSeenLedger } from "../additions/first-added.js";
+import { ProtocolError } from "../errors/catalog.js";
 
 export type DataContractErrorCode =
-  "INVALID_SCOPE" | "INVALID_BODY" | "INVALID_QUERY" | "NOT_FOUND";
+  | "INVALID_SCOPE"
+  | "INVALID_BODY"
+  | "INVALID_QUERY"
+  | "NOT_FOUND"
+  /**
+   * The scope IS indexed, but the file the index row names is not on disk.
+   * Distinct from `NOT_FOUND` (nothing indexed at all) on purpose: the two
+   * need different operator responses — one is "no data yet", the other is
+   * an index/storage divergence that wants repairing.
+   */
+  | "DATA_FILE_MISSING"
+  | "PRECONDITION_FAILED";
+
+export type LegacyProducer = "pdpp-projector" | "pdpp-import-projection";
+export interface LegacyProducerProvenance {
+  projector_version: string;
+  declaration_digest: string;
+  inputs: Array<{ stream: string; changes_since_token: string }>;
+  payload_sha256: string;
+}
+export type LegacyPrecondition =
+  { kind: "none" } | { kind: "match"; version: number };
 
 export interface DataContractErrorBody {
   error: DataContractErrorCode;
   message: string;
+  current_version?: number | null;
+  current_producer?: string | null;
 }
 
 export interface DataContractError {
   ok: false;
-  status: 400 | 404;
+  status: 400 | 404 | 412;
   body: DataContractErrorBody;
 }
 
@@ -64,6 +96,15 @@ export interface ListDataScopesContractInput {
   limit?: number;
   offset?: number;
   isVisible?: DataVisibilityFilter;
+  /**
+   * Scopes to list that have no stored entry, such as a scope served only
+   * from canonical records. A scope that storage holds is never added here,
+   * visible or not. Merged into the visible set in scope order.
+   */
+  extraScopes?: (
+    scopePrefix: string | undefined,
+    stored: ReadonlySet<string>,
+  ) => Promise<ScopeSummary[]>;
   /**
    * Which scopes the caller may see at all (a non-owner's grant coverage).
    * Applied before `isVisible`, and before the page and total are taken.
@@ -98,6 +139,9 @@ export interface ListDataVersionsContractResult {
       fileId: string | null;
       schemaId: string | null;
       collectedAt: string;
+      version: number;
+      producer: LegacyProducer | null;
+      producer_provenance: LegacyProducerProvenance | null;
     }>;
     total: number;
     limit: number;
@@ -124,9 +168,9 @@ export interface ReadDataContractResult {
 }
 
 /**
- * Thrown by the ingest contracts when the envelope was already written to
- * storage but a later step (indexing) failed. The record is on disk and a
- * re-index can surface it, so callers must treat the write as persisted:
+ * Thrown when an ingest has crossed the durable-write boundary but a later
+ * step failed. Boot recovery or re-index can finish it, so callers must
+ * treat the write as persisted:
  * never retry it under the same proof, never release a replay reservation.
  */
 export class IngestPersistedError extends Error {
@@ -135,7 +179,7 @@ export class IngestPersistedError extends Error {
     public readonly cause: unknown,
   ) {
     super(
-      `Envelope written to ${relativePath} but indexing failed: ${
+      `Envelope persisted at ${relativePath} but write did not complete: ${
         cause instanceof Error ? cause.message : String(cause)
       }`,
     );
@@ -152,6 +196,40 @@ async function indexWrittenEnvelope(
   } catch (err) {
     throw new IngestPersistedError(entry.path, err);
   }
+}
+
+async function commitWrittenEnvelope(
+  storage: DataStoragePort,
+  envelope: DataFileEnvelope,
+  entry: Omit<NewIndexEntry, "path" | "sizeBytes"> & { sizeBytes?: number },
+  precondition?: LegacyPrecondition,
+): Promise<{ ok: true; writeResult: WriteResult } | DataContractError> {
+  if (storage.commitEnvelope) {
+    const result = await storage.commitEnvelope(envelope, entry, precondition);
+    if (!result.ok) {
+      return {
+        ok: false,
+        status: 412,
+        body: {
+          error: "PRECONDITION_FAILED",
+          message: "Scope version precondition failed",
+          current_version: result.currentVersion,
+          current_producer: result.currentProducer,
+        },
+      };
+    }
+    return result;
+  }
+  if (precondition) {
+    throw new Error("Conditional legacy writes require atomic storage support");
+  }
+  const writeResult = await storage.writeEnvelope(envelope);
+  await indexWrittenEnvelope(storage, {
+    ...entry,
+    path: writeResult.relativePath,
+    sizeBytes: entry.sizeBytes ?? writeResult.sizeBytes,
+  });
+  return { ok: true, writeResult };
 }
 
 export interface IngestDataContractInput {
@@ -176,6 +254,10 @@ export interface IngestDataContractInput {
   lineage?: StoredLineage;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
+  precondition?: LegacyPrecondition;
+  producer?: LegacyProducer;
+  producerProvenance?: LegacyProducerProvenance;
+  import?: ImportIntent;
 }
 
 export interface IngestDataContractResult {
@@ -188,9 +270,16 @@ export interface IngestDataContractResult {
     status: "stored" | "syncing";
     /** Echoed for a derivative write: the accepted, normalized sources. */
     lineage?: { sources: `0x${string}`[] };
+    importReceipt?: ImportReceipt;
   };
   writeResult: WriteResult;
+  replay?: false;
 }
+
+export type IngestImportReplayResult = Omit<
+  IngestDataContractResult,
+  "writeResult" | "replay"
+> & { replay: true };
 
 export interface IngestBinaryDataContractInput {
   storage: DataStoragePort;
@@ -208,6 +297,7 @@ export interface IngestBinaryDataContractInput {
   lineage?: StoredLineage;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
+  precondition?: LegacyPrecondition;
 }
 
 export interface DeleteDataScopeContractInput {
@@ -268,6 +358,8 @@ async function collectScopes(
   scopePrefix: string | undefined,
   isVisible: DataVisibilityFilter | undefined,
   isListable?: (scope: string) => boolean,
+  /** Receives every scope storage holds, listable and visible or not. */
+  stored?: Set<string>,
 ): Promise<ScopeSummary[]> {
   const scopes: ScopeSummary[] = [];
   for (let scan = 0; ; scan += VISIBILITY_PAGE_SIZE) {
@@ -277,6 +369,7 @@ async function collectScopes(
       offset: scan,
     });
     for (const summary of batch.scopes) {
+      stored?.add(summary.scope);
       if (isListable && !isListable(summary.scope)) continue;
       if (!isVisible) {
         scopes.push(summary);
@@ -302,15 +395,29 @@ export async function listDataScopesContract(
   const offset = normalizeOffset(input.offset);
   let page: ScopeSummary[];
   let total: number;
-  if (input.isVisible || input.isListable) {
+  if (input.isVisible || input.isListable || input.extraScopes) {
     // Filtered listing: walk every scope so the page and the total both
     // describe the visible set (the index cannot filter by tombstone).
+    const stored = new Set<string>();
     const visible = await collectScopes(
       input.storage,
       input.scopePrefix,
       input.isVisible,
       input.isListable,
+      stored,
     );
+    if (input.extraScopes) {
+      const extras = await input.extraScopes(input.scopePrefix, stored);
+      for (const extra of extras) {
+        if (stored.has(extra.scope)) continue;
+        if (input.isListable && !input.isListable(extra.scope)) continue;
+        visible.push(extra);
+      }
+      // The index lists in SQLite binary order; `<` compares the same way.
+      visible.sort((a, b) =>
+        a.scope < b.scope ? -1 : a.scope > b.scope ? 1 : 0,
+      );
+    }
     total = visible.length;
     page = visible.slice(offset, offset + limit);
   } else {
@@ -395,6 +502,11 @@ export async function listDataVersionsContract(
         fileId: entry.fileId,
         schemaId: entry.schemaId,
         collectedAt: entry.collectedAt,
+        version: entry.casRevision ?? entry.version,
+        producer: entry.producer ?? null,
+        producer_provenance: entry.producerProvenance
+          ? (JSON.parse(entry.producerProvenance) as LegacyProducerProvenance)
+          : null,
       })),
       total,
       limit,
@@ -490,10 +602,15 @@ export async function readDataContract(
     };
   }
 
-  return {
-    ok: true,
-    scope: scopeResult.scope,
-    envelope:
+  // An index row whose backing file is gone is a 404, not a 500. The row
+  // says the version exists — `/versions` lists it and a client may name it
+  // explicitly — so the honest answer is "that version is not retrievable",
+  // with a code distinct from `NOT_FOUND` (nothing indexed) so an operator
+  // can tell a dangling row from an empty scope without reading a stack
+  // trace. Before this it escaped as a bare INTERNAL_ERROR 500.
+  let envelope;
+  try {
+    envelope =
       input.view === "stored" && input.storage.readStoredEnvelope
         ? await input.storage.readStoredEnvelope(
             scopeResult.scope,
@@ -502,13 +619,44 @@ export async function readDataContract(
         : await input.storage.readEnvelope(
             scopeResult.scope,
             entry.collectedAt,
-          ),
+          );
+  } catch (err) {
+    if (!isMissingFileError(err)) throw err;
+    return {
+      ok: false,
+      status: 404,
+      body: {
+        error: "DATA_FILE_MISSING",
+        message: `Indexed data for scope "${scopeResult.scope}" is no longer on disk`,
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    scope: scopeResult.scope,
+    envelope,
   };
+}
+
+/**
+ * A read that failed because the bytes are not there — as opposed to any
+ * other storage fault, which stays a 500 because it is genuinely our bug.
+ * Matched on the Node error code rather than the message so it survives
+ * locale and wording changes; `ENOTDIR` is the same condition reached
+ * through a removed scope directory.
+ */
+function isMissingFileError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
 
 export async function ingestDataContract(
   input: IngestDataContractInput,
-): Promise<IngestDataContractResult | DataContractError> {
+): Promise<
+  IngestDataContractResult | IngestImportReplayResult | DataContractError
+> {
   const scopeResult = parseDataScopeContract(input.scopeParam);
   if (!scopeResult.ok) return scopeResult;
 
@@ -550,37 +698,96 @@ export async function ingestDataContract(
     };
   }
 
-  const envelope = createDataFileEnvelope(
-    scopeResult.scope,
-    input.collectedAt,
-    stampServerKeys(input.body, input),
-  );
-  const writeResult = await input.storage.writeEnvelope(envelope);
+  let envelope: DataFileEnvelope = {
+    ...createDataFileEnvelope(
+      scopeResult.scope,
+      input.collectedAt,
+      stampServerKeys(input.body, input),
+    ),
+    ...(input.producer ? { producer: input.producer } : {}),
+    ...(input.producerProvenance
+      ? { producer_provenance: input.producerProvenance }
+      : {}),
+  };
+  let writeResult: WriteResult;
+  let importReceipt: ImportReceipt | undefined;
+  if (input.import) {
+    // A durable owner import is its own commit protocol (operation row,
+    // receipt, replay). It never carries a legacy precondition or producer.
+    if (!input.storage.commitVersion) {
+      throw new ProtocolError(
+        501,
+        "IMPORT_UNSUPPORTED",
+        "This storage backend does not support durable owner imports",
+      );
+    }
+    const imported = await input.storage.commitVersion({
+      kind: "append",
+      envelope,
+      metadata: {
+        afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+      },
+      import: input.import,
+    });
+    if (imported.kind === "replay") {
+      return {
+        ok: true,
+        scope: imported.receipt.scope,
+        collectedAt: imported.receipt.collectedAt,
+        response: {
+          scope: imported.receipt.scope,
+          collectedAt: imported.receipt.collectedAt,
+          status: input.status,
+          importReceipt: imported.receipt,
+        },
+        replay: true,
+      };
+    }
+    envelope = imported.envelope;
+    writeResult = imported.writeResult;
+    importReceipt = imported.receipt;
+  } else {
+    const committed = await commitWrittenEnvelope(
+      input.storage,
+      envelope,
+      {
+        fileId: null,
+        schemaId: null,
+        scope: scopeResult.scope,
+        collectedAt: input.collectedAt,
+        afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+        producer: input.producer ?? null,
+        producerProvenance: input.producerProvenance
+          ? JSON.stringify(input.producerProvenance)
+          : null,
+      },
+      input.precondition,
+    );
+    if (!committed.ok) return committed;
+    writeResult = committed.writeResult;
+  }
   try {
     await writeBlockSidecars(input.storage, envelope);
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await indexWrittenEnvelope(input.storage, {
-    fileId: null,
-    schemaId: null,
-    path: writeResult.relativePath,
-    scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    sizeBytes: writeResult.sizeBytes,
-    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
-  });
   await recordStoredVersion(input.storage, {
     scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
+    collectedAt: envelope.collectedAt,
     data: envelope.data,
   });
 
   return {
     ok: true,
     scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    response: ingestResponse(scopeResult.scope, input),
+    collectedAt: envelope.collectedAt,
+    response: {
+      ...ingestResponse(scopeResult.scope, {
+        ...input,
+        collectedAt: envelope.collectedAt,
+      }),
+      ...(importReceipt ? { importReceipt } : {}),
+    },
     writeResult,
   };
 }
@@ -672,21 +879,26 @@ export async function ingestBinaryDataContract(
     input.collectedAt,
     stampServerKeys(data, input),
   );
-  const writeResult = await input.storage.writeEnvelope(envelope);
+  const committed = await commitWrittenEnvelope(
+    input.storage,
+    envelope,
+    {
+      fileId: null,
+      schemaId: null,
+      scope: scopeResult.scope,
+      collectedAt: input.collectedAt,
+      sizeBytes: input.bytes.length,
+      afterTombstoneVersion: input.afterTombstoneVersion ?? null,
+    },
+    input.precondition,
+  );
+  if (!committed.ok) return committed;
+  const { writeResult } = committed;
   try {
     await writeBlockSidecars(input.storage, envelope);
   } catch {
     // Best-effort bounded sidecars: raw envelope storage remains the source of truth.
   }
-  await indexWrittenEnvelope(input.storage, {
-    fileId: null,
-    schemaId: null,
-    path: writeResult.relativePath,
-    scope: scopeResult.scope,
-    collectedAt: input.collectedAt,
-    sizeBytes: input.bytes.length,
-    afterTombstoneVersion: input.afterTombstoneVersion ?? null,
-  });
   await recordStoredVersion(input.storage, {
     scope: scopeResult.scope,
     collectedAt: input.collectedAt,

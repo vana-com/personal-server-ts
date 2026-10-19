@@ -81,6 +81,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/api";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
+import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
 import {
   authenticateRequest,
   isWeb3SignedLifetimeError,
@@ -377,6 +378,7 @@ function scopeRequestErrorResponse(c: Context, err: unknown): Response | null {
  */
 export function mcpConnectionsRoutes(deps: McpRouteDeps): Hono {
   const app = new Hono();
+  app.use("*", createBodyLimit(DEFAULT_MAX_SIZE));
   const store = deps.connectionStore ?? createInMemoryMcpConnectionStore();
 
   const ownerAuth: PersonalServerApiAuthPort = createServerApiAuth({
@@ -629,6 +631,7 @@ export type McpOAuthRouteDeps = Pick<
 
 export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
   const app = new Hono();
+  app.use("*", createBodyLimit(DEFAULT_MAX_SIZE));
   const connectionStore =
     deps.connectionStore ?? createInMemoryMcpConnectionStore();
   const authorizationStore =
