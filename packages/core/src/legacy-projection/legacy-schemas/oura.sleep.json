@@ -15,18 +15,18 @@
           "properties": {
             "id": { "type": "string" },
             "day": { "type": "string", "format": "date", "description": "Date in YYYY-MM-DD format" },
-            "score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100, "description": "Overall sleep score (0-100)" },
+            "score": { "type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "Overall sleep score (0-100)" },
             "timestamp": { "type": ["string", "null"], "format": "date-time" },
             "contributors": {
               "type": "object",
               "properties": {
-                "deep_sleep": { "type": ["integer", "null"], "description": "Deep sleep contributor score (0-100)" },
-                "efficiency": { "type": ["integer", "null"], "description": "Sleep efficiency contributor score (0-100)" },
-                "latency": { "type": ["integer", "null"], "description": "Sleep latency contributor score (0-100)" },
-                "rem_sleep": { "type": ["integer", "null"], "description": "REM sleep contributor score (0-100)" },
-                "restfulness": { "type": ["integer", "null"], "description": "Restfulness contributor score (0-100)" },
-                "timing": { "type": ["integer", "null"], "description": "Sleep timing contributor score (0-100)" },
-                "total_sleep": { "type": ["integer", "null"], "description": "Total sleep contributor score (0-100)" }
+                "deep_sleep": { "type": ["number", "null"], "description": "Deep sleep contributor score (0-100)" },
+                "efficiency": { "type": ["number", "null"], "description": "Sleep efficiency contributor score (0-100)" },
+                "latency": { "type": ["number", "null"], "description": "Sleep latency contributor score (0-100)" },
+                "rem_sleep": { "type": ["number", "null"], "description": "REM sleep contributor score (0-100)" },
+                "restfulness": { "type": ["number", "null"], "description": "Restfulness contributor score (0-100)" },
+                "timing": { "type": ["number", "null"], "description": "Sleep timing contributor score (0-100)" },
+                "total_sleep": { "type": ["number", "null"], "description": "Total sleep contributor score (0-100)" }
               },
               "additionalProperties": true
             }
@@ -45,19 +45,19 @@
             "type": { "type": ["string", "null"], "description": "Type of sleep period as returned by Oura API v2" },
             "bedtimeStart": { "type": ["string", "null"], "format": "date-time", "description": "Bedtime start in ISO 8601" },
             "bedtimeEnd": { "type": ["string", "null"], "format": "date-time", "description": "Bedtime end in ISO 8601" },
-            "totalSleepDuration": { "type": ["integer", "null"], "description": "Total sleep duration in seconds" },
-            "timeInBed": { "type": ["integer", "null"], "description": "Total time in bed in seconds" },
-            "deepSleepDuration": { "type": ["integer", "null"], "description": "Deep sleep duration in seconds" },
-            "lightSleepDuration": { "type": ["integer", "null"], "description": "Light sleep duration in seconds" },
-            "remSleepDuration": { "type": ["integer", "null"], "description": "REM sleep duration in seconds" },
-            "awakeTime": { "type": ["integer", "null"], "description": "Awake time during sleep in seconds" },
-            "efficiency": { "type": ["integer", "null"], "description": "Sleep efficiency percentage" },
-            "latency": { "type": ["integer", "null"], "description": "Sleep onset latency in seconds" },
+            "totalSleepDuration": { "type": ["number", "null"], "description": "Total sleep duration in seconds" },
+            "timeInBed": { "type": ["number", "null"], "description": "Total time in bed in seconds" },
+            "deepSleepDuration": { "type": ["number", "null"], "description": "Deep sleep duration in seconds" },
+            "lightSleepDuration": { "type": ["number", "null"], "description": "Light sleep duration in seconds" },
+            "remSleepDuration": { "type": ["number", "null"], "description": "REM sleep duration in seconds" },
+            "awakeTime": { "type": ["number", "null"], "description": "Awake time during sleep in seconds" },
+            "efficiency": { "type": ["number", "null"], "description": "Sleep efficiency percentage" },
+            "latency": { "type": ["number", "null"], "description": "Sleep onset latency in seconds" },
             "averageHeartRate": { "type": ["number", "null"], "description": "Average heart rate during sleep in BPM" },
             "averageHrv": { "type": ["number", "null"], "description": "Average heart rate variability during sleep in ms" },
-            "lowestHeartRate": { "type": ["integer", "null"], "description": "Lowest heart rate during sleep in BPM" },
+            "lowestHeartRate": { "type": ["number", "null"], "description": "Lowest heart rate during sleep in BPM" },
             "averageBreath": { "type": ["number", "null"], "description": "Average breathing rate during sleep in breaths/min" },
-            "restlessPeriods": { "type": ["integer", "null"], "description": "Number of restless periods during sleep" }
+            "restlessPeriods": { "type": ["number", "null"], "description": "Number of restless periods during sleep" }
           },
           "required": ["day"]
         }

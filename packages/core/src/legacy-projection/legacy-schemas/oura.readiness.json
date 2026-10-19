@@ -14,21 +14,21 @@
           "properties": {
             "id": { "type": "string" },
             "day": { "type": "string", "format": "date", "description": "Date in YYYY-MM-DD format" },
-            "score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100, "description": "Overall readiness score (0-100)" },
+            "score": { "type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "Overall readiness score (0-100)" },
             "timestamp": { "type": ["string", "null"], "format": "date-time" },
             "temperatureDeviation": { "type": ["number", "null"], "description": "Body temperature deviation from baseline in degrees Celsius" },
             "temperatureTrendDeviation": { "type": ["number", "null"], "description": "Temperature trend deviation from baseline" },
             "contributors": {
               "type": "object",
               "properties": {
-                "activity_balance": { "type": ["integer", "null"], "description": "Activity balance contributor score (0-100)" },
-                "body_temperature": { "type": ["integer", "null"], "description": "Body temperature contributor score (0-100)" },
-                "hrv_balance": { "type": ["integer", "null"], "description": "HRV balance contributor score (0-100)" },
-                "previous_day_activity": { "type": ["integer", "null"], "description": "Previous day activity contributor score (0-100)" },
-                "previous_night": { "type": ["integer", "null"], "description": "Previous night sleep contributor score (0-100)" },
-                "recovery_index": { "type": ["integer", "null"], "description": "Recovery index contributor score (0-100)" },
-                "resting_heart_rate": { "type": ["integer", "null"], "description": "Resting heart rate contributor score (0-100)" },
-                "sleep_balance": { "type": ["integer", "null"], "description": "Sleep balance contributor score (0-100)" }
+                "activity_balance": { "type": ["number", "null"], "description": "Activity balance contributor score (0-100)" },
+                "body_temperature": { "type": ["number", "null"], "description": "Body temperature contributor score (0-100)" },
+                "hrv_balance": { "type": ["number", "null"], "description": "HRV balance contributor score (0-100)" },
+                "previous_day_activity": { "type": ["number", "null"], "description": "Previous day activity contributor score (0-100)" },
+                "previous_night": { "type": ["number", "null"], "description": "Previous night sleep contributor score (0-100)" },
+                "recovery_index": { "type": ["number", "null"], "description": "Recovery index contributor score (0-100)" },
+                "resting_heart_rate": { "type": ["number", "null"], "description": "Resting heart rate contributor score (0-100)" },
+                "sleep_balance": { "type": ["number", "null"], "description": "Sleep balance contributor score (0-100)" }
               },
               "additionalProperties": true
             }

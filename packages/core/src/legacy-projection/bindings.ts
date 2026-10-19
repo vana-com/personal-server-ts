@@ -230,12 +230,13 @@ export function partitionOuraRows(
   stream: string,
   rows: Record<string, unknown>[],
   scoreField: (row: Record<string, unknown>) => string | undefined,
+  isValidScore: (value: unknown) => boolean = isOuraScore,
 ): { rows: Record<string, unknown>[]; diagnostics: ProjectionDiagnostic[] } {
   const dropped = new DroppedRows(scope);
   const valid = rows.filter((row) => {
     const field = scoreField(row);
     if (!isCalendarDay(row.day)) dropped.add(stream, OURA_BAD_DAY);
-    else if (field !== undefined && !isOuraScore(row[field]))
+    else if (field !== undefined && !isValidScore(row[field]))
       dropped.add(stream, OURA_BAD_SCORE);
     else return true;
     return false;

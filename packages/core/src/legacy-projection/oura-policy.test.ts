@@ -178,6 +178,105 @@ function expectSchemaValid(
 }
 
 describe("Oura legacy projection policy", () => {
+  it("passes fractional Oura Browser numbers through every legacy collection", () => {
+    const activity = projectPdppRecordsToLegacyPayload(
+      "oura.activity",
+      [
+        {
+          stream: "activity",
+          data: {
+            id: "a",
+            day: "2026-10-01",
+            score: 80.5,
+            equivalent_walking_distance: 3800.75,
+            contributors: { stay_active: 80.25 },
+          },
+        },
+      ],
+      { fetchedStreams: ["activity"], profileKey: "oura-browser" },
+    );
+    expect(activity).toMatchObject({
+      ok: true,
+      payload: {
+        days: [
+          {
+            score: 80.5,
+            equivalentWalkingDistance: 3800.75,
+            contributors: { stay_active: 80.25 },
+          },
+        ],
+      },
+    });
+
+    const readiness = projectPdppRecordsToLegacyPayload(
+      "oura.readiness",
+      [
+        {
+          stream: "readiness",
+          data: {
+            id: "r",
+            day: "2026-10-01",
+            score: 81.25,
+            contributors: { hrv_balance: 79.5 },
+          },
+        },
+      ],
+      { fetchedStreams: ["readiness"], profileKey: "oura-browser" },
+    );
+    expect(readiness).toMatchObject({
+      ok: true,
+      payload: {
+        days: [
+          {
+            score: 81.25,
+            contributors: { hrv_balance: 79.5 },
+          },
+        ],
+      },
+    });
+
+    const sleep = projectPdppRecordsToLegacyPayload(
+      "oura.sleep",
+      [
+        {
+          stream: "sleep",
+          data: {
+            record_type: "daily_score",
+            id: "d",
+            day: "2026-10-01",
+            sleep_score: 82.5,
+            contributors: { efficiency: 80.25 },
+          },
+        },
+        {
+          stream: "sleep",
+          data: {
+            record_type: "sleep_session",
+            id: "s",
+            day: "2026-10-01",
+            efficiency: 95.75,
+            total_sleep_duration: 27000.5,
+            awake_time: 1200.25,
+          },
+        },
+      ],
+      { fetchedStreams: ["sleep"], profileKey: "oura-browser" },
+    );
+    expect(sleep).toMatchObject({
+      ok: true,
+      payload: {
+        dailyScores: [{ score: 82.5, contributors: { efficiency: 80.25 } }],
+        sleepPeriods: [
+          {
+            efficiency: 95.75,
+            totalSleepDuration: 27000.5,
+            awakeTime: 1200.25,
+          },
+        ],
+      },
+    });
+  });
+
   it("keeps fractional Oura Browser HRV without integer coercion", () => {
     const hrv = CASES.find(({ inputPath }) => inputPath[0] === "average_hrv")!;
     const { payload } = project(hrv, 45.75, "oura-browser");
@@ -185,33 +284,38 @@ describe("Oura legacy projection policy", () => {
     expectSchemaValid("oura.sleep", payload);
   });
 
-  it.each(CASES)("rounds integer field $scope $outputPath", (testCase) => {
-    for (const profileKey of testCase.profiles) {
-      const samples: [number, number][] =
-        testCase.outputPath.at(-1) === "score"
-          ? [
-              [1.5, 2],
-              [1.49, 1],
-            ]
-          : [
-              [1.5, 2],
-              [1.49, 1],
-              [-1.5, -1],
-            ];
-      for (const [input, expected] of samples) {
-        const { payload } = project(testCase, input as number, profileKey);
-        const value = getPath(payload, testCase.outputPath);
-        expect(value).toBe(expected);
-        expectSchemaValid(testCase.scope, payload);
+  it.each(CASES)(
+    "preserves the $scope $outputPath number policy",
+    (testCase) => {
+      for (const profileKey of testCase.profiles) {
+        const samples: [number, number][] =
+          testCase.outputPath.at(-1) === "score"
+            ? [
+                [1.5, 2],
+                [1.49, 1],
+              ]
+            : [
+                [1.5, 2],
+                [1.49, 1],
+                [-1.5, -1],
+              ];
+        for (const [input, expected] of samples) {
+          const { payload } = project(testCase, input as number, profileKey);
+          const value = getPath(payload, testCase.outputPath);
+          expect(value).toBe(profileKey === "oura-browser" ? input : expected);
+          expectSchemaValid(testCase.scope, payload);
+        }
       }
-    }
-  });
+    },
+  );
 
   it("checks score bounds after Math.round, including negative zero", () => {
     for (const testCase of CASES.filter(
       ({ outputPath }) => outputPath.at(-1) === "score",
     )) {
-      for (const profileKey of testCase.profiles) {
+      for (const profileKey of testCase.profiles.filter(
+        (key) => key !== "oura-browser",
+      )) {
         const nearZero = project(testCase, -0.49, profileKey).payload;
         expect(Object.is(getPath(nearZero, testCase.outputPath), -0)).toBe(
           true,
@@ -225,6 +329,18 @@ describe("Oura legacy projection policy", () => {
         const aboveMaximum = project(testCase, 100.5, profileKey).payload;
         expect(getPath(aboveMaximum, testCase.outputPath)).toBeUndefined();
         expectSchemaValid(testCase.scope, aboveMaximum);
+      }
+    }
+  });
+
+  it("checks Oura Browser score bounds without rounding them into range", () => {
+    for (const testCase of CASES.filter(
+      ({ outputPath }) => outputPath.at(-1) === "score",
+    )) {
+      for (const score of [-0.49, 100.49]) {
+        const { payload } = project(testCase, score, "oura-browser");
+        expect(getPath(payload, testCase.outputPath)).toBeUndefined();
+        expectSchemaValid(testCase.scope, payload);
       }
     }
   });
@@ -324,6 +440,12 @@ describe("Oura legacy projection policy", () => {
           profileKey === "oura-browser"
             ? {
                 ...entry,
+                score:
+                  entry.id === "half"
+                    ? 79.5
+                    : entry.id === "fraction"
+                      ? 80.49
+                      : entry.score,
                 ...(testCase.scope === "oura.sleep" && entry.id === "null"
                   ? { timestamp: null }
                   : {}),
@@ -333,11 +455,12 @@ describe("Oura legacy projection policy", () => {
         );
         expect(entries).toEqual(expected);
         expect(JSON.stringify(entries)).toBe(JSON.stringify(expected));
-        expect(
-          (entries as { score: number | null }[]).every(
-            ({ score }) => score === null || Number.isInteger(score),
-          ),
-        ).toBe(true);
+        if (profileKey !== "oura-browser")
+          expect(
+            (entries as { score: number | null }[]).every(
+              ({ score }) => score === null || Number.isInteger(score),
+            ),
+          ).toBe(true);
         expectSchemaValid(testCase.scope, result.payload);
         if (testCase.scope === "oura.sleep" && profileKey === "oura-browser")
           expect(result.projectionOmissions).toBeUndefined();

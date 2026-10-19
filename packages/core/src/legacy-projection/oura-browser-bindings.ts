@@ -1,11 +1,4 @@
-import {
-  LEGACY_SCOPE_BINDINGS,
-  OURA_SLEEP_CONTRIBUTOR_INTEGERS,
-  ouraInteger,
-  ouraSleepPeriod,
-  withOuraContributors,
-  partitionOuraRows,
-} from "./bindings.js";
+import { LEGACY_SCOPE_BINDINGS, partitionOuraRows } from "./bindings.js";
 import type { LegacyScopeBinding, ProjectionResult } from "./types.js";
 
 // API v2 field parity follows data-connectors PR #504 at e04efd50c.
@@ -13,6 +6,70 @@ import type { LegacyScopeBinding, ProjectionResult } from "./types.js";
 const source = "https://registry.pdpp.dev/connectors/oura-browser";
 const digest =
   "sha256:ddc901015996e4ae67030bcd9ec809aa368b1b69d94b8ed5515d1be0a886975d";
+
+function isBrowserScore(value: unknown): boolean {
+  return (
+    value === null ||
+    (typeof value === "number" &&
+      Number.isFinite(value) &&
+      value >= 0 &&
+      value <= 100)
+  );
+}
+
+function legacyFields(
+  row: Record<string, unknown>,
+  fields: ReadonlyArray<readonly [string, string]>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    fields
+      .filter(([source]) => row[source] !== undefined)
+      .map(([source, target]) => [target, row[source]]),
+  );
+}
+
+function legacyContributors(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+const activityFields = [
+  ["active_calories", "activeCalories"],
+  ["total_calories", "totalCalories"],
+  ["steps", "steps"],
+  ["equivalent_walking_distance", "equivalentWalkingDistance"],
+  ["high_activity_time", "highActivityTime"],
+  ["medium_activity_time", "mediumActivityTime"],
+  ["low_activity_time", "lowActivityTime"],
+  ["sedentary_time", "sedentaryTime"],
+  ["resting_time", "restingTime"],
+  ["inactivity_alerts", "inactivityAlerts"],
+] as const;
+
+const readinessFields = [
+  ["temperature_deviation", "temperatureDeviation"],
+  ["temperature_trend_deviation", "temperatureTrendDeviation"],
+] as const;
+
+const sleepPeriodFields = [
+  ["type", "type"],
+  ["bedtime_start", "bedtimeStart"],
+  ["bedtime_end", "bedtimeEnd"],
+  ["total_sleep_duration", "totalSleepDuration"],
+  ["time_in_bed", "timeInBed"],
+  ["awake_time", "awakeTime"],
+  ["deep_sleep_duration", "deepSleepDuration"],
+  ["light_sleep_duration", "lightSleepDuration"],
+  ["rem_sleep_duration", "remSleepDuration"],
+  ["efficiency", "efficiency"],
+  ["latency", "latency"],
+  ["average_heart_rate", "averageHeartRate"],
+  ["average_hrv", "averageHrv"],
+  ["lowest_heart_rate", "lowestHeartRate"],
+  ["average_breath", "averageBreath"],
+  ["restless_periods", "restlessPeriods"],
+] as const;
 
 export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
   new Map(
@@ -69,10 +126,13 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                       !item.startsWith("awakeTime:") &&
                       !item.startsWith("dailyScores.timestamp:") &&
                       !item.startsWith("sleepPeriods.averageHrv:") &&
-                      !item.startsWith("sleepPeriods.type:"),
+                      !item.startsWith("sleepPeriods.type:") &&
+                      !item.startsWith("Legacy integer fields:"),
                   )
                 : original.lossy.filter(
-                    (item) => !item.startsWith("timestamp:"),
+                    (item) =>
+                      !item.startsWith("timestamp:") &&
+                      !item.startsWith("Legacy integer fields:"),
                   ),
             provenance: [
               {
@@ -114,28 +174,32 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                   };
                 }
               }
-              // Day and score rules are the base profile's: an impossible day
-              // or a missing/malformed score drops and counts the row.
+              // Keep valid calendar days and scores in the legacy 0–100 range,
+              // then copy source numbers unchanged as the browser script does.
               if (stream !== "sleep") {
-                const projected = original.project(records, options);
-                if (!projected.ok) return projected;
-                const days = projected.payload.days as Record<
-                  string,
-                  unknown
-                >[];
-                const sourceById = new Map(
-                  streamRecords.map(({ data }) => [data.id, data]),
+                const { rows, diagnostics } = partitionOuraRows(
+                  scope,
+                  stream,
+                  streamRecords.map(({ data }) => data),
+                  () => "score",
+                  isBrowserScore,
                 );
                 return {
-                  ...projected,
+                  ok: true,
+                  ...(diagnostics.length > 0 ? { diagnostics } : {}),
                   payload: {
-                    ...projected.payload,
-                    days: days.map((day) => ({
-                      ...day,
-                      ...(sourceById.get(day.id)?.timestamp === undefined
-                        ? {}
-                        : { timestamp: sourceById.get(day.id)?.timestamp }),
-                      contributors: day.contributors ?? {},
+                    days: rows.map((row) => ({
+                      id: row.id,
+                      day: row.day,
+                      score: row.score,
+                      ...legacyFields(
+                        row,
+                        stream === "activity"
+                          ? activityFields
+                          : readinessFields,
+                      ),
+                      ...legacyFields(row, [["timestamp", "timestamp"]]),
+                      contributors: legacyContributors(row.contributors),
                     })),
                   },
                 };
@@ -149,6 +213,7 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                 streamRecords.map(({ data }) => data),
                 (row) =>
                   row.record_type === "daily_score" ? "sleep_score" : undefined,
+                isBrowserScore,
               );
               const sessions = rows.filter(
                 (row) => row.record_type === "sleep_session",
@@ -157,21 +222,9 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                 (row) => row.record_type === "daily_score",
               );
               const sleepPeriods = sessions.map((session) => ({
-                ...ouraSleepPeriod(session),
-                ...(session.type === undefined ? {} : { type: session.type }),
-                ...(session.bedtime_start === undefined
-                  ? {}
-                  : { bedtimeStart: session.bedtime_start }),
-                ...(session.bedtime_end === undefined
-                  ? {}
-                  : { bedtimeEnd: session.bedtime_end }),
-                ...(session.average_hrv === undefined
-                  ? {}
-                  : { averageHrv: session.average_hrv }),
-                ...(typeof session.awake_time === "number" ||
-                session.awake_time === null
-                  ? { awakeTime: ouraInteger(session.awake_time) }
-                  : {}),
+                id: session.id,
+                day: session.day,
+                ...legacyFields(session, sleepPeriodFields),
               }));
               const dailyScores = scores.map((data) => ({
                 id:
@@ -179,17 +232,11 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
                     ? data.daily_sleep_id
                     : data.id,
                 day: data.day,
-                score: ouraInteger(data.sleep_score),
+                score: data.sleep_score,
                 ...(data.daily_sleep_timestamp === undefined
                   ? {}
                   : { timestamp: data.daily_sleep_timestamp }),
-                ...withOuraContributors(
-                  data.contributors,
-                  OURA_SLEEP_CONTRIBUTOR_INTEGERS,
-                ),
-                ...(!data.contributors || typeof data.contributors !== "object"
-                  ? { contributors: {} }
-                  : {}),
+                contributors: legacyContributors(data.contributors),
               }));
               return {
                 ok: true,

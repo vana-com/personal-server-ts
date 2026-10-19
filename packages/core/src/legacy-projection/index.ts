@@ -174,7 +174,7 @@ export function projectPdppRecordsToLegacyPayload(
   if (decodeDiagnostics.length > 0) {
     result.diagnostics = [...decodeDiagnostics, ...(result.diagnostics ?? [])];
   }
-  if (scope.startsWith("oura.")) {
+  if (scope.startsWith("oura.") && options.profileKey !== "oura-browser") {
     assertOuraLegacyScoresAreIntegers(scope, result.payload);
   }
 

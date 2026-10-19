@@ -815,7 +815,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
       )
       .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/7");
+    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/8");
     const callsAfterFirstRead = listRecords.mock.calls.length;
     expect(callsAfterFirstRead).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
@@ -988,6 +988,53 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(callsAfterEvaluation).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe("file");
     expect(listRecords).toHaveBeenCalledTimes(callsAfterEvaluation);
+  });
+
+  it("rechecks a negative verdict stored under the previous projection contract", async () => {
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    const projected = await view.readLatest("oura.activity");
+    expect(projected.kind).toBe("canonical");
+    if (projected.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-10-01T00:00:00.000Z",
+      1,
+    );
+    let legacyData = {
+      values: ["legacy-only"],
+    } as typeof projected.envelope.data;
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => ({ ...projected.envelope, data: legacyData }),
+    });
+    expect((await parityView.readLatest("oura.activity")).kind).toBe("file");
+    expect(parityView.verdictFor("oura.activity")[0]?.verdict).toBe(
+      "not_covered",
+    );
+
+    // Model an upgrade with a verdict written by the previous contract.
+    db.prepare(
+      "UPDATE legacy_scope_takeover_verdicts SET canonical_cursor = replace(canonical_cursor, 'canonical-legacy-view/8', 'canonical-legacy-view/7') WHERE scope = ?",
+    ).run("oura.activity");
+    legacyData = projected.envelope.data;
+    const upgradedView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => ({ ...projected.envelope, data: legacyData }),
+    });
+    expect((await upgradedView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    expect(upgradedView.verdictFor("oura.activity")[0]).toMatchObject({
+      verdict: "covered",
+    });
   });
 
   it("does not treat one newer unproven upsert as a newer full stream", async () => {
