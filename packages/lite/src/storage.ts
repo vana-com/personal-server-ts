@@ -946,6 +946,17 @@ export async function createPersistentPsLiteStorage(
     deleteScope(scope) {
       return withScopeLock(scope, async () => {
         await dropLedger(scope);
+        let readinessChanged = false;
+        for (const entry of entriesForScope(scope)) {
+          if (
+            readyBlockManifests.delete(
+              blockManifestPath(scope, entry.collectedAt),
+            )
+          ) {
+            readinessChanged = true;
+          }
+        }
+        if (readinessChanged) await persist();
         let deleted = 0;
         const deletedPaths: string[] = [];
         const deletedBlockTrees: string[] = [];
@@ -953,9 +964,6 @@ export async function createPersistentPsLiteStorage(
           ...state,
           entries: state.entries.filter((entry) => {
             if (entry.scope !== scope) return true;
-            readyBlockManifests.delete(
-              blockManifestPath(entry.scope, entry.collectedAt),
-            );
             deleted += 1;
             deletedPaths.push(envelopePath(entry.scope, entry.collectedAt));
             deletedBlockTrees.push(
