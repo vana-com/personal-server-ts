@@ -169,3 +169,62 @@ it.each(["version", "scope"])(
     expect(await reloaded.hasScopeBlocks!(scope, collectedAt)).toBe(false);
   },
 );
+
+it.each(["version", "scope"])(
+  "retries the readiness persistence barrier before %s deletion after a failed metadata write",
+  async (kind) => {
+    const files = createMemoryPsLiteDataFileStore();
+    const persistence = createMemoryPsLitePersistence();
+    const create = () =>
+      createPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
+    const storage = await create();
+    const scope = "notes.documents";
+    const collectedAt = "2026-10-20T00:00:00.000Z";
+    const envelope = createDataFileEnvelope(scope, collectedAt, {
+      text: "hello",
+    });
+    const write = await storage.writeEnvelope(envelope);
+    await storage.insertEntry({
+      fileId: "file",
+      scope,
+      collectedAt,
+      path: write.relativePath,
+      sizeBytes: write.sizeBytes,
+    });
+    const built = await buildDataBlocksAsync({
+      scope,
+      collectedAt,
+      content: envelope,
+    });
+    await storage.writeBlockManifest!(
+      scope,
+      collectedAt,
+      built.manifest,
+      built.blocks,
+    );
+    const deleteEnvelope = vi
+      .spyOn(files, "deleteEnvelope")
+      .mockRejectedValue(new Error("delete failed"));
+    const deleteTree = vi.spyOn(files, "deleteBlockTree");
+    vi.spyOn(persistence, "write").mockRejectedValueOnce(
+      new Error("metadata failed"),
+    );
+    const remove = () =>
+      kind === "version"
+        ? storage.deleteVersion!(scope, collectedAt)
+        : storage.deleteScope(scope);
+    await expect(remove()).rejects.toThrow("metadata failed");
+    expect(deleteEnvelope).not.toHaveBeenCalled();
+    expect(deleteTree).not.toHaveBeenCalled();
+    await expect(remove()).rejects.toThrow("delete failed");
+    expect(deleteTree).toHaveBeenCalled();
+    expect(
+      await files.readBlockManifest!(
+        `blocks/${scope}/${collectedAt}/manifest.json`,
+      ),
+    ).toBeNull();
+    const reloaded = await create();
+    expect(reloaded.findEntry({ scope })).toBeDefined();
+    expect(await reloaded.hasScopeBlocks!(scope, collectedAt)).toBe(false);
+  },
+);

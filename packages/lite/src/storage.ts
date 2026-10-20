@@ -788,9 +788,8 @@ export async function createPersistentPsLiteStorage(
 
     async writeBlockManifest(scope, collectedAt, manifest, blocks) {
       // Invalidate before replacing a tree; a failed build is not ready.
-      if (readyBlockManifests.delete(blockManifestPath(scope, collectedAt))) {
-        await persist();
-      }
+      readyBlockManifests.delete(blockManifestPath(scope, collectedAt));
+      await persist();
       const writeTree = async (store: PsLiteDataFileStore) => {
         if (!store.writeBlockManifest || !store.writeBlockPayload) {
           throw new Error("Block sidecar storage is not available");
@@ -946,17 +945,13 @@ export async function createPersistentPsLiteStorage(
     deleteScope(scope) {
       return withScopeLock(scope, async () => {
         await dropLedger(scope);
-        let readinessChanged = false;
         for (const entry of entriesForScope(scope)) {
-          if (
-            readyBlockManifests.delete(
-              blockManifestPath(scope, entry.collectedAt),
-            )
-          ) {
-            readinessChanged = true;
-          }
+          readyBlockManifests.delete(
+            blockManifestPath(scope, entry.collectedAt),
+          );
         }
-        if (readinessChanged) await persist();
+        // Repeat the barrier on retry, even if a failed write cleared the set.
+        await persist();
         let deleted = 0;
         const deletedPaths: string[] = [];
         const deletedBlockTrees: string[] = [];
@@ -1045,13 +1040,10 @@ export async function createPersistentPsLiteStorage(
     // next sync retry re-attempts instead of orphaning the local blob.
     // A partial delete can remove the tree while leaving the index row.
     // Persist the conservative hint before any destructive file operation.
-    if (
-      readyBlockManifests.delete(
-        blockManifestPath(entry.scope, entry.collectedAt),
-      )
-    ) {
-      await persist();
-    }
+    readyBlockManifests.delete(
+      blockManifestPath(entry.scope, entry.collectedAt),
+    );
+    await persist();
     await Promise.all([
       fileStore.deleteEnvelope(blobPath),
       fallbackStore.deleteEnvelope(blobPath),
