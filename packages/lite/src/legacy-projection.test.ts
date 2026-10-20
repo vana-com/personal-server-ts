@@ -170,6 +170,72 @@ function fixtureRecords(
 }
 
 describe("PS-Lite legacy projection", () => {
+  it.each([
+    ["claude.conversations", "anthropic"],
+    ["claude.conversations", "claude"],
+    ["claude.projects", "anthropic"],
+    ["claude.projects", "claude"],
+  ])(
+    "reads existing source-stamped %s and %s-stamped siblings",
+    async (scope, siblingIdentity) => {
+      const { runtime } = createRuntime();
+      const fixture = parityFixture(scope);
+      expect(alternateLegacyBindingsForScope(scope).size).toBe(0);
+      for (const [stream, rows] of Object.entries(fixture.streams)) {
+        await post(runtime, `claude.${stream}`, {
+          records: markedRecords(
+            rows,
+            `claude.${stream}` === scope ? "claude" : siblingIdentity,
+          ),
+        });
+      }
+      const response = await get(runtime, `/v1/data/${scope}`);
+      const body = await response.json();
+      expect(response.status, JSON.stringify(body)).toBe(200);
+      const projected = projectPdppRecordsToLegacyPayload(
+        scope,
+        Object.entries(fixture.streams).flatMap(([stream, rows]) =>
+          rows.map((data) => ({ stream, data })),
+        ),
+        {
+          fetchedStreams: Object.keys(fixture.streams),
+          now: "2026-10-01T00:00:00Z",
+          orderByPrimaryKey: true,
+        },
+      );
+      expect(projected.ok).toBe(true);
+      if (projected.ok)
+        expect((body as { data: unknown }).data).toEqual(projected.payload);
+    },
+  );
+
+  it.each([
+    null,
+    {},
+    { sourceId: null },
+    { sourceId: "https://registry.pdpp.dev/sources/foreign" },
+  ])(
+    "still rejects invalid or conflicting Claude row identity %j",
+    async (metadata) => {
+      const { runtime } = createRuntime();
+      const fixture = parityFixture("claude.conversations");
+      for (const [stream, rows] of Object.entries(fixture.streams)) {
+        const records = markedRecords(rows, "claude");
+        if (stream === "conversations")
+          records[0] = { ...records[0], $pdpp: metadata };
+        await post(runtime, `claude.${stream}`, { records });
+      }
+      const response = await get(runtime, "/v1/data/claude.conversations");
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        error: {
+          errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+          details: { projectionError: "incomplete_scope" },
+        },
+      });
+    },
+  );
+
   it("rejects unmarked raw records for a multi-profile source and allows the stored view", async () => {
     const { runtime, storage } = createRuntime();
     const raw = { records: [{ id: "repo-1", repositories: [] }] };

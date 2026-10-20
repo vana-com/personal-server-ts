@@ -517,10 +517,10 @@ function selectProjectionBinding(
   const sourceId = [...sources][0];
   const connectorKey = sourceId.slice(sourceId.lastIndexOf("/") + 1);
   const alternate = alternates.get(connectorKey);
-  if (alternate && sourceIdForBinding(alternate) === sourceId) {
+  if (alternate && bindingAcceptsSourceId(alternate, sourceId)) {
     return { binding: alternate, profileKey: connectorKey };
   }
-  return sourceIdForBinding(original) === sourceId
+  return bindingAcceptsSourceId(original, sourceId)
     ? { binding: original }
     : null;
 }
@@ -542,15 +542,27 @@ function sourceIdForBinding(binding: LegacyScopeBinding): string {
   return binding.pdppSource.replace("/connectors/", "/sources/");
 }
 
+function bindingAcceptsSourceId(
+  binding: LegacyScopeBinding,
+  sourceId: string,
+): boolean {
+  return (
+    sourceIdForBinding(binding) === sourceId ||
+    binding.recordSourceIds?.includes(sourceId) === true
+  );
+}
+
 function recordsMatchBindingSource(
   records: PdppRecord[],
   binding: LegacyScopeBinding,
   requireIdentity: boolean,
 ): boolean {
-  const expected = sourceIdForBinding(binding);
   return records.every(({ data }) => {
     const actual = recordSourceId(data);
-    return actual === expected || (!requireIdentity && actual === undefined);
+    return (
+      (typeof actual === "string" && bindingAcceptsSourceId(binding, actual)) ||
+      (!requireIdentity && actual === undefined)
+    );
   });
 }
 
