@@ -170,6 +170,12 @@ export interface LegacyScopeBinding {
   lossy: string[];
   /** The PDPP source id (`connector_id`), e.g. "https://registry.pdpp.dev/connectors/meta" — never the short connector key. */
   pdppSource: string;
+  /**
+   * Additional stored $pdpp.sourceId values for this same connector profile.
+   * Public source and producing method can differ. The normalized pdppSource
+   * remains accepted for exports stamped with the producing method identity.
+   */
+  recordSourceIds?: readonly string[];
   pdppStreams: string[];
   /**
    * Per bound stream, the exact primary-key field list `project()` relies on

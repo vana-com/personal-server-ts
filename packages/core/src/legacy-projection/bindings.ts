@@ -2147,6 +2147,7 @@ function claudeConversationsBinding(): LegacyScopeBinding {
   return {
     scope,
     pdppSource: ANTHROPIC_CONNECTOR_ID,
+    recordSourceIds: [CLAUDE_SOURCE_ID],
     pdppStreams: ["account_profile", "conversations", "messages"],
     legacySchemaPath: "claude.conversations.json",
     fieldsRead: {
@@ -2333,6 +2334,7 @@ const claudeConversations = claudeConversationsBinding();
 const claudeProjects: LegacyScopeBinding = {
   scope: "claude.projects",
   pdppSource: ANTHROPIC_CONNECTOR_ID,
+  recordSourceIds: [CLAUDE_SOURCE_ID],
   pdppStreams: ["account_profile", "projects", "project_documents"],
   legacySchemaPath: "claude.projects.json",
   fieldsRead: {
