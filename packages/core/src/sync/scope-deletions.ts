@@ -42,6 +42,8 @@ export interface ScopeDeletionResolveOptions {
    * same to the local index and a fresh feed pass cannot tell them apart.
    */
   consultGateway?: "if-stale" | "always";
+  /** Maximum wait for gateway state. Zero uses cached state only. */
+  gatewayTimeoutMs?: number;
 }
 
 /**
@@ -158,6 +160,33 @@ interface KnownTombstone extends ScopeTombstone {
   verifiedAtMs: number;
 }
 
+class DeletionLookupTimeout extends Error {}
+
+/** A timed-out response is never applied to the tracker cache. */
+async function beforeDeadline<T>(
+  request: Promise<T>,
+  timeoutMs?: number,
+  onTimeout?: () => void,
+): Promise<T> {
+  if (timeoutMs === undefined) return request;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      request,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new DeletionLookupTimeout("Deletion lookup deadline exceeded"),
+          );
+          onTimeout?.();
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export function createScopeDeletionTracker(
   options: ScopeDeletionTrackerOptions = {},
 ): ScopeDeletionTracker {
@@ -264,10 +293,14 @@ export function createScopeDeletionTracker(
    * owner wired, inside the failure back-off, or the request failed): the
    * caller falls back to its last known state.
    */
-  async function lookup(scope: string): Promise<ScopeDeletionVerdict | null> {
+  async function lookup(
+    scope: string,
+    timeoutMs?: number,
+  ): Promise<ScopeDeletionVerdict | null> {
     const feed = options.feed;
     const owner = options.serverOwner;
-    if (!feed || !owner) return null;
+    if (!feed || !owner || (timeoutMs !== undefined && timeoutMs <= 0))
+      return null;
     if (
       lastGatewayFailureMs !== null &&
       nowMs() - lastGatewayFailureMs < gatewayRetryMs
@@ -275,14 +308,28 @@ export function createScopeDeletionTracker(
       return null;
     }
     const pending = inflight.get(scope);
-    if (pending) return pending;
+    if (pending) {
+      // A read may already own an unbounded lookup. Inventory still has its
+      // own deadline and must not wait for that request.
+      return beforeDeadline(pending, timeoutMs).catch((error) => {
+        if (error instanceof DeletionLookupTimeout) return null;
+        throw error;
+      });
+    }
     const request = (async () => {
       let record: DataPointFeedRecord | null;
+      const controller =
+        timeoutMs === undefined ? undefined : new AbortController();
       try {
-        record = await feed.getDataPoint({
-          ownerAddress: owner,
-          scope,
-        });
+        record = await beforeDeadline(
+          feed.getDataPoint({
+            ownerAddress: owner,
+            scope,
+            ...(controller ? { signal: controller.signal } : {}),
+          }),
+          timeoutMs,
+          () => controller?.abort(),
+        );
         lastGatewayFailureMs = null;
       } catch (err) {
         lastGatewayFailureMs = nowMs();
@@ -302,6 +349,20 @@ export function createScopeDeletionTracker(
     })().finally(() => inflight.delete(scope));
     inflight.set(scope, request);
     return request;
+  }
+
+  function lastKnownVerdict(scope: string): ScopeDeletionVerdict {
+    // Sync or a local delete can teach us a tombstone during the lookup.
+    const known = deleted.get(scope);
+    return known
+      ? {
+          deleted: true,
+          deletedAt: known.deletedAt,
+          version: known.version,
+          source: known.source,
+          verified: false,
+        }
+      : { deleted: false, source: "assumed-live", verified: false };
   }
 
   return {
@@ -359,15 +420,9 @@ export function createScopeDeletionTracker(
         // Stale tombstone: the scope may have been re-added elsewhere. Ask;
         // if the registry cannot be reached, keep refusing (never resurrect
         // on a guess) and say the verdict is unverified.
-        const rechecked = await lookup(scope);
+        const rechecked = await lookup(scope, resolveOptions?.gatewayTimeoutMs);
         if (rechecked !== null) return rechecked;
-        return {
-          deleted: true,
-          deletedAt: known.deletedAt,
-          version: known.version,
-          source: known.source,
-          verified: false,
-        };
+        return lastKnownVerdict(scope);
       }
       if (isFresh(live.get(scope) ?? null)) {
         return { deleted: false, source: "gateway", verified: true };
@@ -377,11 +432,8 @@ export function createScopeDeletionTracker(
         return { deleted: false, source: "feed", verified: true };
       }
       return (
-        (await lookup(scope)) ?? {
-          deleted: false,
-          source: "assumed-live",
-          verified: false,
-        }
+        (await lookup(scope, resolveOptions?.gatewayTimeoutMs)) ??
+        lastKnownVerdict(scope)
       );
     },
   };

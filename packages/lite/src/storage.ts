@@ -26,6 +26,8 @@ export interface PsLitePersistedStorageState {
   nextId: number;
   entries: IndexEntry[];
   envelopes: DataFileEnvelope[];
+  /** Paths of committed sidecars; inventory never reads file bodies. */
+  readyBlockManifests?: string[];
   blockManifests?: Array<{
     path: string;
     manifest: DataBlockManifest;
@@ -147,6 +149,7 @@ function normalizeState(
       schemaId: entry.schemaId ?? null,
     })),
     envelopes: state.envelopes,
+    readyBlockManifests: state.readyBlockManifests ?? [],
     blockManifests: state.blockManifests ?? [],
     blockPayloads: state.blockPayloads ?? [],
     ...(state.pendingLedgerDeletes?.length
@@ -482,6 +485,10 @@ export async function createPersistentPsLiteStorage(
   const fallbackBlockManifests = new Map(
     (state.blockManifests ?? []).map(({ path, manifest }) => [path, manifest]),
   );
+  const readyBlockManifests = new Set([
+    ...(state.readyBlockManifests ?? []),
+    ...fallbackBlockManifests.keys(),
+  ]);
   const fallbackBlockPayloads = new Map(
     (state.blockPayloads ?? []).map(({ path, block }) => [path, block]),
   );
@@ -514,6 +521,7 @@ export async function createPersistentPsLiteStorage(
   async function persist(): Promise<void> {
     const snapshot = {
       ...state,
+      readyBlockManifests: Array.from(readyBlockManifests),
       envelopes:
         fileStore.kind === "indexeddb"
           ? Array.from(fallbackEnvelopes.values())
@@ -756,7 +764,7 @@ export async function createPersistentPsLiteStorage(
     },
 
     async hasScopeBlocks(scope, collectedAt) {
-      return Boolean(await storagePort.readBlockManifest?.(scope, collectedAt));
+      return readyBlockManifests.has(blockManifestPath(scope, collectedAt));
     },
 
     async canReadScopeBlocks(scope, collectedAt) {
@@ -779,6 +787,10 @@ export async function createPersistentPsLiteStorage(
     },
 
     async writeBlockManifest(scope, collectedAt, manifest, blocks) {
+      // Invalidate before replacing a tree; a failed build is not ready.
+      if (readyBlockManifests.delete(blockManifestPath(scope, collectedAt))) {
+        await persist();
+      }
       const writeTree = async (store: PsLiteDataFileStore) => {
         if (!store.writeBlockManifest || !store.writeBlockPayload) {
           throw new Error("Block sidecar storage is not available");
@@ -822,6 +834,7 @@ export async function createPersistentPsLiteStorage(
           blockTreePath(scope, collectedAt),
         );
       }
+      readyBlockManifests.add(blockManifestPath(scope, collectedAt));
       await persist();
     },
 
@@ -940,6 +953,9 @@ export async function createPersistentPsLiteStorage(
           ...state,
           entries: state.entries.filter((entry) => {
             if (entry.scope !== scope) return true;
+            readyBlockManifests.delete(
+              blockManifestPath(entry.scope, entry.collectedAt),
+            );
             deleted += 1;
             deletedPaths.push(envelopePath(entry.scope, entry.collectedAt));
             deletedBlockTrees.push(
@@ -1029,6 +1045,9 @@ export async function createPersistentPsLiteStorage(
         blockTreePath(entry.scope, entry.collectedAt),
       ) ?? Promise.resolve(),
     ]);
+    readyBlockManifests.delete(
+      blockManifestPath(entry.scope, entry.collectedAt),
+    );
     state = {
       ...state,
       entries: state.entries.filter((e) => e !== entry),
