@@ -16,7 +16,7 @@
 
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
-  GITHUB_BROWSER_BINDINGS,
+  alternateLegacyBindingsForScope,
   LEGACY_SCOPE_BINDINGS,
   projectPdppRecordsToLegacyPayload,
   type LegacyScopeBinding,
@@ -51,7 +51,7 @@ export type StoredBodyForm = "legacy" | "pdpp-projected" | "pdpp-unprojected";
 
 interface CachedForm {
   form: StoredBodyForm;
-  profileKey?: "github-browser";
+  selected?: { binding: LegacyScopeBinding; profileKey?: string } | null;
 }
 
 export function classifyStoredBody(
@@ -149,33 +149,36 @@ export function withLegacyProjection(
     if (!cached) {
       own = await raw.readEnvelope(scope, collectedAt);
       const form = classifyStoredBody(scope, own.data);
-      const browserBinding = GITHUB_BROWSER_BINDINGS.get(scope);
-      const browserStream = browserBinding?.pdppStreams[0];
-      let profileKey: "github-browser" | undefined;
-      if (form === "pdpp-projected" && browserStream) {
-        // The browser connector stores one snapshot under the same github.*
-        // scope without a profile marker. Its binding validates that shape.
-        const rows = (own.data as { records: Record<string, unknown>[] })
-          .records;
-        const browserView = projectPdppRecordsToLegacyPayload(
-          scope,
-          rows.map((data) => ({ stream: browserStream, data })),
-          {
-            fetchedStreams: [browserStream],
-            now: collectedAt,
-            profileKey: "github-browser",
-          },
-        );
-        if (browserView.ok) profileKey = "github-browser";
-      }
-      cached = { form, ...(profileKey ? { profileKey } : {}) };
+      cached = {
+        form,
+        ...(form === "pdpp-projected"
+          ? {
+              selected: selectProjectionBinding(
+                scope,
+                (own.data as { records: Record<string, unknown>[] }).records,
+              ),
+            }
+          : {}),
+      };
       rememberForm(formKey, cached);
     }
     if (cached.form !== "pdpp-projected") return { view: null, own };
+    if (!cached.selected) {
+      options.onIssue?.({
+        kind: "projection_failed",
+        scope,
+        collectedAt,
+        error: {
+          kind: "incomplete_scope",
+          scope,
+          reason:
+            "Stored records do not identify one compatible connector profile",
+        },
+      });
+      return { view: null, own };
+    }
 
-    const binding = cached.profileKey
-      ? GITHUB_BROWSER_BINDINGS.get(scope)!
-      : LEGACY_SCOPE_BINDINGS.get(scope)!;
+    const { binding, profileKey } = cached.selected;
     const source = scope.slice(0, scope.indexOf("."));
     // The latest version joins the latest siblings, whatever order one run
     // wrote its streams in. A historical version joins, of the sibling
@@ -217,7 +220,7 @@ export function withLegacyProjection(
     const key = JSON.stringify([
       scope,
       ownVersion,
-      cached.profileKey,
+      profileKey,
       inputs.map(({ storedScope, version }) => [storedScope, version]),
     ]);
     if (memo?.key === key) return { view: memo.value, own };
@@ -230,7 +233,7 @@ export function withLegacyProjection(
       own,
       inputs,
       binding,
-      cached.profileKey,
+      profileKey,
     );
     if (value) value.view = key;
     memo = { key, value };
@@ -250,7 +253,7 @@ export function withLegacyProjection(
     own: DataFileEnvelope,
     inputs: { stream: string; storedScope: string; collectedAt?: string }[],
     binding: LegacyScopeBinding,
-    profileKey?: "github-browser",
+    profileKey?: string,
   ): Promise<Projected | null> {
     const records: PdppRecord[] = [];
     const fetchedStreams: string[] = [];
@@ -276,6 +279,20 @@ export function withLegacyProjection(
       for (const row of rows) {
         records.push({ stream: input.stream, data: row });
       }
+    }
+
+    if (!recordsMatchBindingSource(records, binding)) {
+      options.onIssue?.({
+        kind: "projection_failed",
+        scope,
+        collectedAt,
+        error: {
+          kind: "incomplete_scope",
+          scope,
+          reason: "Joined streams have conflicting connector identities",
+        },
+      });
+      return null;
     }
 
     const result = projectPdppRecordsToLegacyPayload(scope, records, {
@@ -450,6 +467,93 @@ export function legacyScopesProjectedFrom(scope: string): string[] {
 
 function isProjectedScope(scope: string): boolean {
   return LEGACY_SCOPE_BINDINGS.has(scope);
+}
+
+function selectProjectionBinding(
+  scope: string,
+  rows: Record<string, unknown>[],
+): { binding: LegacyScopeBinding; profileKey?: string } | null {
+  const original = LEGACY_SCOPE_BINDINGS.get(scope)!;
+  const alternates = alternateLegacyBindingsForScope(scope);
+  if (alternates.size === 0) return { binding: original };
+  if (
+    rows.some((row) => !row || typeof row !== "object" || Array.isArray(row))
+  ) {
+    return null;
+  }
+
+  // Annotated records identify their declaration source. A partial or mixed
+  // identity must not join records from different connector profiles.
+  const identities = rows.map(recordSourceId);
+  if (identities.some((identity) => identity !== undefined)) {
+    if (
+      identities.some(
+        (identity) => typeof identity !== "string" || !identity,
+      ) ||
+      new Set(identities).size !== 1
+    ) {
+      return null;
+    }
+    const sourceId = identities[0] as string;
+    const connectorKey = sourceId.slice(sourceId.lastIndexOf("/") + 1);
+    const alternate = alternates.get(connectorKey);
+    if (alternate && sourceIdForBinding(alternate) === sourceId) {
+      return { binding: alternate, profileKey: connectorKey };
+    }
+    return sourceIdForBinding(original) === sourceId
+      ? { binding: original }
+      : null;
+  }
+
+  // Older stream files have no annotation. Prefer a profile whose declared
+  // fields distinguish its rows from the base binding. An alternate of the
+  // same connector supersedes the base declaration, as in canonical reads.
+  const candidates = [...alternates].map(([profileKey, binding]) => {
+    let evidence = binding.pdppSource === original.pdppSource ? 1 : 0;
+    for (const row of rows) {
+      for (const stream of binding.pdppStreams) {
+        const baseFields = new Set(original.fieldsRead[stream] ?? []);
+        for (const field of binding.fieldsRead[stream] ?? []) {
+          if (!baseFields.has(field) && Object.hasOwn(row, field))
+            evidence += 1;
+        }
+      }
+    }
+    return { binding, profileKey, evidence };
+  });
+  const strongest = Math.max(0, ...candidates.map(({ evidence }) => evidence));
+  if (strongest === 0) return { binding: original };
+  const matches = candidates.filter(({ evidence }) => evidence === strongest);
+  if (matches.length !== 1) return null;
+  return { binding: matches[0].binding, profileKey: matches[0].profileKey };
+}
+
+function recordSourceId(data: unknown): string | null | undefined {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return null;
+  }
+  if (!("$pdpp" in data)) return undefined;
+  const metadata = data.$pdpp;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return null;
+  }
+  const sourceId = (metadata as { sourceId?: unknown }).sourceId;
+  return typeof sourceId === "string" && sourceId ? sourceId : null;
+}
+
+function sourceIdForBinding(binding: LegacyScopeBinding): string {
+  return binding.pdppSource.replace("/connectors/", "/sources/");
+}
+
+function recordsMatchBindingSource(
+  records: PdppRecord[],
+  binding: LegacyScopeBinding,
+): boolean {
+  const identities = records.map(({ data }) => recordSourceId(data));
+  return (
+    identities.every((identity) => identity === undefined) ||
+    identities.every((identity) => identity === sourceIdForBinding(binding))
+  );
 }
 
 const VERSION_PAGE_SIZE = 100;

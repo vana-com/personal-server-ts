@@ -7,6 +7,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { projectPdppRecordsToLegacyPayload } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
@@ -127,6 +128,7 @@ function get(
 function parityFixture(scope: string): {
   streams: Record<string, Record<string, unknown>[]>;
   legacyBody: Record<string, unknown>;
+  profileKey?: string;
 } {
   return JSON.parse(
     readFileSync(
@@ -140,6 +142,93 @@ function parityFixture(scope: string): {
 }
 
 describe("PS-Lite legacy projection", () => {
+  it.each(["oura.sleep", "instagram.posts"])(
+    "matches the canonical %s profile projection for raw stream writes",
+    async (scope) => {
+      const { runtime } = createRuntime();
+      const fixture = parityFixture(scope);
+      const source = scope.slice(0, scope.indexOf("."));
+      const records = Object.entries(fixture.streams).flatMap(
+        ([stream, rows]) => rows.map((data) => ({ stream, data })),
+      );
+      for (const [stream, rows] of Object.entries(fixture.streams)) {
+        await post(runtime, `${source}.${stream}`, { records: rows });
+      }
+      const canonical = projectPdppRecordsToLegacyPayload(scope, records, {
+        fetchedStreams: Object.keys(fixture.streams),
+        profileKey: fixture.profileKey,
+      });
+      expect(canonical.ok).toBe(true);
+      if (!canonical.ok) return;
+
+      const res = await get(runtime, `/v1/data/${scope}`);
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { data: unknown }).data).toEqual(
+        canonical.payload,
+      );
+      expect(canonical.payload).toEqual(fixture.legacyBody);
+    },
+  );
+
+  it("does not project records with conflicting connector identities", async () => {
+    const { runtime } = createRuntime();
+    const raw = {
+      records: [
+        {
+          id: "browser-day",
+          day: "2026-09-01",
+          record_type: "daily_score",
+          sleep_score: 83,
+          $pdpp: {
+            sourceId: "https://registry.pdpp.dev/sources/oura-browser",
+          },
+        },
+        {
+          id: "other-day",
+          day: "2026-09-02",
+          sleep_score: 82,
+          $pdpp: { sourceId: "https://registry.pdpp.dev/sources/oura" },
+        },
+      ],
+    };
+    await post(runtime, "oura.sleep", raw);
+
+    const res = await get(runtime, "/v1/data/oura.sleep");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { data: unknown }).data).toEqual(raw);
+  });
+
+  it("uses annotated connector identity before an ambiguous row shape", async () => {
+    const { runtime } = createRuntime();
+    const raw = {
+      records: [
+        {
+          id: "incomplete-browser-row",
+          day: "2026-09-01",
+          sleep_score: 83,
+          $pdpp: {
+            sourceId: "https://registry.pdpp.dev/sources/oura-browser",
+          },
+        },
+      ],
+    };
+    await post(runtime, "oura.sleep", raw);
+
+    const res = await get(runtime, "/v1/data/oura.sleep");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { data: unknown }).data).toEqual(raw);
+  });
+
+  it("serves malformed raw rows as stored instead of throwing", async () => {
+    const { runtime } = createRuntime();
+    const raw = { records: [null] };
+    await post(runtime, "oura.sleep", raw);
+
+    const res = await get(runtime, "/v1/data/oura.sleep");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { data: unknown }).data).toEqual(raw);
+  });
+
   it("serves a GitHub stream write in the legacy repositories shape", async () => {
     const { runtime, storage } = createRuntime();
     const raw = {
