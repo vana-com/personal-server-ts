@@ -7,7 +7,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
-import { projectPdppRecordsToLegacyPayload } from "@opendatalabs/personal-server-ts-core/legacy-projection";
+import {
+  alternateLegacyBindingsForScope,
+  LEGACY_SCOPE_BINDINGS,
+  legacyBindingsForProfile,
+  projectPdppRecordsToLegacyPayload,
+} from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createBearerTokenPsLiteAuth, createPsLiteRuntime } from "./runtime.js";
 import {
@@ -141,7 +146,110 @@ function parityFixture(scope: string): {
   ) as ReturnType<typeof parityFixture>;
 }
 
+function markedRecords(
+  records: Record<string, unknown>[],
+  connectorId: string,
+): Record<string, unknown>[] {
+  return records.map((record) => ({
+    ...record,
+    $pdpp: { sourceId: `https://registry.pdpp.dev/sources/${connectorId}` },
+  }));
+}
+
+function fixtureRecords(
+  scope: string,
+  fixture: ReturnType<typeof parityFixture>,
+  records: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  if (alternateLegacyBindingsForScope(scope).size === 0) return records;
+  const binding = fixture.profileKey
+    ? legacyBindingsForProfile(fixture.profileKey).get(scope)
+    : LEGACY_SCOPE_BINDINGS.get(scope);
+  if (!binding) throw new Error(`Missing test binding for ${scope}`);
+  return markedRecords(records, binding.pdppSource.split("/").at(-1)!);
+}
+
 describe("PS-Lite legacy projection", () => {
+  it("rejects unmarked raw records for a multi-profile source and allows the stored view", async () => {
+    const { runtime, storage } = createRuntime();
+    const raw = { records: [{ id: "repo-1", repositories: [] }] };
+    await post(runtime, "github.repositories", raw);
+    const at = storage.findEntry({ scope: "github.repositories" })!.collectedAt;
+
+    const served = await get(runtime, "/v1/data/github.repositories");
+    expect(served.status).toBe(409);
+    expect(await served.json()).toMatchObject({
+      error: { errorCode: "LEGACY_PROJECTION_UNAVAILABLE" },
+    });
+    const historical = await get(
+      runtime,
+      `/v1/data/github.repositories?at=${encodeURIComponent(at)}`,
+    );
+    expect(historical.status).toBe(409);
+    expect(await historical.json()).toMatchObject({
+      error: { errorCode: "LEGACY_PROJECTION_UNAVAILABLE" },
+    });
+    const stored = await get(
+      runtime,
+      "/v1/data/github.repositories?view=stored",
+    );
+    expect(stored.status).toBe(200);
+    expect(((await stored.json()) as { data: unknown }).data).toEqual(raw);
+  });
+
+  it("does not guess the default Oura binding from a row without record_type", async () => {
+    const { runtime } = createRuntime();
+    await post(runtime, "oura.sleep", {
+      records: [{ id: "day-1", day: "2026-09-01", sleep_score: 82 }],
+    });
+
+    const res = await get(runtime, "/v1/data/oura.sleep");
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: { errorCode: "LEGACY_PROJECTION_UNAVAILABLE" },
+    });
+  });
+
+  it("rejects a sibling stream from another connector", async () => {
+    const { runtime } = createRuntime();
+    const fixture = parityFixture("instagram.posts");
+    await post(runtime, "instagram.posts", {
+      records: markedRecords(fixture.streams.posts, "meta"),
+    });
+    await post(runtime, "instagram.post_likes", {
+      records: markedRecords(fixture.streams.post_likes, "github"),
+    });
+
+    const res = await get(runtime, "/v1/data/instagram.posts");
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: { errorCode: "LEGACY_PROJECTION_UNAVAILABLE" },
+    });
+  });
+
+  it("uses connector identity even when a PAT row has browser-looking extra fields", async () => {
+    const { runtime } = createRuntime();
+    const raw = {
+      records: [
+        {
+          id: "repo-1",
+          name: "PAT repo",
+          html_url: "https://github.com/example/pat-repo",
+          repositories: [],
+          $pdpp: { sourceId: "https://registry.pdpp.dev/sources/github" },
+        },
+      ],
+    };
+    await post(runtime, "github.repositories", raw);
+
+    const served = await get(runtime, "/v1/data/github.repositories");
+    expect(served.status).toBe(200);
+    expect(
+      ((await served.json()) as { data: { repositories: { name: string }[] } })
+        .data.repositories,
+    ).toMatchObject([{ name: "PAT repo" }]);
+  });
+
   it.each(["oura.sleep", "instagram.posts"])(
     "matches the canonical %s profile projection for raw stream writes",
     async (scope) => {
@@ -152,7 +260,9 @@ describe("PS-Lite legacy projection", () => {
         ([stream, rows]) => rows.map((data) => ({ stream, data })),
       );
       for (const [stream, rows] of Object.entries(fixture.streams)) {
-        await post(runtime, `${source}.${stream}`, { records: rows });
+        await post(runtime, `${source}.${stream}`, {
+          records: fixtureRecords(scope, fixture, rows),
+        });
       }
       const canonical = projectPdppRecordsToLegacyPayload(scope, records, {
         fetchedStreams: Object.keys(fixture.streams),
@@ -194,11 +304,13 @@ describe("PS-Lite legacy projection", () => {
     await post(runtime, "oura.sleep", raw);
 
     const res = await get(runtime, "/v1/data/oura.sleep");
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as { data: unknown }).data).toEqual(raw);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: { errorCode: "LEGACY_PROJECTION_UNAVAILABLE" },
+    });
   });
 
-  it("uses annotated connector identity before an ambiguous row shape", async () => {
+  it("rejects an incomplete row even when its connector identity is known", async () => {
     const { runtime } = createRuntime();
     const raw = {
       records: [
@@ -215,37 +327,44 @@ describe("PS-Lite legacy projection", () => {
     await post(runtime, "oura.sleep", raw);
 
     const res = await get(runtime, "/v1/data/oura.sleep");
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as { data: unknown }).data).toEqual(raw);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: { errorCode: "LEGACY_PROJECTION_UNAVAILABLE" },
+    });
   });
 
-  it("serves malformed raw rows as stored instead of throwing", async () => {
+  it("rejects malformed raw rows without serving them to the app", async () => {
     const { runtime } = createRuntime();
     const raw = { records: [null] };
     await post(runtime, "oura.sleep", raw);
 
     const res = await get(runtime, "/v1/data/oura.sleep");
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as { data: unknown }).data).toEqual(raw);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: { errorCode: "LEGACY_PROJECTION_UNAVAILABLE" },
+    });
   });
 
   it("serves a GitHub stream write in the legacy repositories shape", async () => {
     const { runtime, storage } = createRuntime();
     const raw = {
-      records: [
-        {
-          id: "repo-a",
-          name: "sample",
-          html_url: "https://github.com/example/sample",
-          description: "Example",
-          language: "TypeScript",
-          stargazers_count: 12,
-          forks_count: 2,
-          private: true,
-          topics: ["tools"],
-          updated_at: "2026-09-01T00:00:00Z",
-        },
-      ],
+      records: markedRecords(
+        [
+          {
+            id: "repo-a",
+            name: "sample",
+            html_url: "https://github.com/example/sample",
+            description: "Example",
+            language: "TypeScript",
+            stargazers_count: 12,
+            forks_count: 2,
+            private: true,
+            topics: ["tools"],
+            updated_at: "2026-09-01T00:00:00Z",
+          },
+        ],
+        "github",
+      ),
     };
     await post(runtime, "github.repositories", raw);
 
@@ -295,7 +414,9 @@ describe("PS-Lite legacy projection", () => {
     const fixture = parityFixture(scope);
     const source = scope.slice(0, scope.indexOf("."));
     for (const [stream, records] of Object.entries(fixture.streams)) {
-      await post(runtime, `${source}.${stream}`, { records });
+      await post(runtime, `${source}.${stream}`, {
+        records: fixtureRecords(scope, fixture, records),
+      });
     }
 
     const res = await get(runtime, `/v1/data/${scope}`);
@@ -306,7 +427,13 @@ describe("PS-Lite legacy projection", () => {
     );
     const entry = storage.findEntry({ scope })!;
     expect((await storage.readEnvelope(scope, entry.collectedAt)).data).toEqual(
-      { records: fixture.streams[scope.slice(scope.indexOf(".") + 1)] },
+      {
+        records: fixtureRecords(
+          scope,
+          fixture,
+          fixture.streams[scope.slice(scope.indexOf(".") + 1)],
+        ),
+      },
     );
   });
 
@@ -350,7 +477,8 @@ describe("PS-Lite legacy projection", () => {
     "serves a $scope browser snapshot through its legacy binding",
     async ({ scope, snapshot, expected }) => {
       const { runtime, storage } = createRuntime();
-      await post(runtime, scope, { records: [snapshot] });
+      const records = markedRecords([snapshot], "github-browser");
+      await post(runtime, scope, { records });
 
       const res = await get(runtime, `/v1/data/${scope}`);
 
@@ -361,7 +489,7 @@ describe("PS-Lite legacy projection", () => {
       const entry = storage.findEntry({ scope })!;
       expect(
         (await storage.readEnvelope(scope, entry.collectedAt)).data,
-      ).toEqual({ records: [snapshot] });
+      ).toEqual({ records });
     },
   );
 
@@ -436,6 +564,20 @@ describe("PS-Lite legacy projection", () => {
       });
     },
   );
+
+  it("uses a single-binding connector marker without exposing it in the legacy body", async () => {
+    const { runtime } = createRuntime();
+    const activity = { id: "ride-1", activity_type: "Ride" };
+    await post(runtime, "strava.activities", {
+      records: markedRecords([activity], "strava"),
+    });
+
+    const res = await get(runtime, "/v1/data/strava.activities");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { data: unknown }).data).toEqual({
+      activities: [activity],
+    });
+  });
 
   it("serves the freshest same-name body without mixing legacy and PDPP versions", async () => {
     const { runtime, storage } = createRuntime();
@@ -816,7 +958,9 @@ describe("PS-Lite legacy projection", () => {
     const { runtime, storage } = createRuntime();
     const scope = "github.repositories";
     const fixture = parityFixture(scope);
-    await post(runtime, scope, { records: fixture.streams.repositories });
+    await post(runtime, scope, {
+      records: fixtureRecords(scope, fixture, fixture.streams.repositories),
+    });
     await post(runtime, "linkedin.skills", {
       records: parityFixture("linkedin.skills").streams.skills,
     });
@@ -838,7 +982,9 @@ describe("PS-Lite legacy projection", () => {
     ).rejects.toMatchObject({ code: "cursor_invalid" });
 
     await post(runtime, scope, {
-      records: [{ ...fixture.streams.repositories[0], name: "new-repo" }],
+      records: fixtureRecords(scope, fixture, [
+        { ...fixture.streams.repositories[0], name: "new-repo" },
+      ]),
     });
     const secondAt = storage.findEntry({ scope })!.collectedAt;
     await expect(
@@ -851,11 +997,10 @@ describe("PS-Lite legacy projection", () => {
 
   it("keys a sibling-only projection by its requested legacy version", async () => {
     const { runtime, storage } = createRuntime();
-    const scope = "github.history";
-    const fixture = parityFixture(scope);
-    for (const [stream, records] of Object.entries(fixture.streams)) {
-      await post(runtime, `github.${stream}`, { records });
-    }
+    const scope = "amazon.orders";
+    await post(runtime, "amazon.order_items", {
+      records: [],
+    });
     await post(runtime, scope, { records: [] });
     const firstAt = storage.findEntry({ scope })!.collectedAt;
     await post(runtime, scope, { records: [] });
@@ -868,7 +1013,7 @@ describe("PS-Lite legacy projection", () => {
 
     expect(first.collectedAt).toBe(firstAt);
     expect(second.collectedAt).toBe(secondAt);
-    expect(second.data).toMatchObject({ fetchedAt: secondAt });
+    expect(second.data).toEqual({ orders: [], total: 0 });
   });
 });
 

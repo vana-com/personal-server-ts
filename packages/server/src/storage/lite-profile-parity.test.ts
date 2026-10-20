@@ -190,7 +190,12 @@ describe("Lite and Desktop legacy profile parity", () => {
                 Authorization: "Bearer owner-token",
                 "Content-Type": "application/json",
               },
-              body: JSON.stringify({ records: rows }),
+              body: JSON.stringify({
+                records: rows.map((data) => ({
+                  ...data,
+                  $pdpp: { sourceId },
+                })),
+              }),
             }),
           );
           expect(response.status).toBe(201);

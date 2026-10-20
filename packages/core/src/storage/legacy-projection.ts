@@ -6,8 +6,9 @@
  * as `chatgpt.conversations` = `{conversations, total}`. `withLegacyProjection`
  * wraps the raw storage port: when the latest stored body of a projected
  * scope is `{records}`, reads return the legacy body projected from that
- * stream and its sibling streams. Every other body is served exactly as
- * stored. Writes, listings and the sync-facing methods pass through.
+ * stream and its sibling streams. Legacy-shaped bodies are served as stored;
+ * raw bodies that cannot be projected fail the served read. Writes, listings
+ * and the sync-facing methods pass through.
  *
  * Give the wrapped ("served") port to every reader of data: the HTTP data
  * route, MCP, derivatives and the job worker. Give the raw port to sync
@@ -25,6 +26,7 @@ import {
   type ProjectionError,
 } from "../legacy-projection/index.js";
 import type { DataStoragePort } from "../ports/index.js";
+import { ProtocolError } from "../errors/catalog.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import type { IndexEntry } from "./index/types.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
@@ -44,8 +46,8 @@ const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
  *   binding. Served as the projected legacy body.
  * - `pdpp-unprojected`: `{records}` under any other scope (for example
  *   `chatgpt.messages`, which has no legacy form), or `{records}` holding a
- *   tagged `{stream, data}` row, which is not one stream's rows. Served as
- *   stored.
+ *   tagged `{stream, data}` row, which is not one stream's rows. A bound
+ *   scope rejects this form; an unbound scope is served as stored.
  */
 export type StoredBodyForm = "legacy" | "pdpp-projected" | "pdpp-unprojected";
 
@@ -80,8 +82,8 @@ export type LegacyProjectionIssue =
 
 export interface LegacyProjectionOptions {
   /**
-   * Called when a projection fails (the stored body is then served as
-   * stored) or succeeds with dropped rows or a missing join stream.
+   * Called when a projection fails or succeeds with dropped rows or a missing
+   * join stream.
    */
   onIssue?: (issue: LegacyProjectionIssue) => void;
 }
@@ -130,6 +132,24 @@ export function withLegacyProjection(
       forms.delete(forms.keys().next().value!);
     }
   };
+  function failProjection(
+    scope: string,
+    collectedAt: string,
+    error: ProjectionError,
+  ): never {
+    options.onIssue?.({ kind: "projection_failed", scope, collectedAt, error });
+    throw new ProtocolError(
+      409,
+      "LEGACY_PROJECTION_UNAVAILABLE",
+      `Cannot serve the legacy view for scope "${scope}"`,
+      {
+        scope,
+        collectedAt,
+        reason: "reason" in error ? error.reason : error.kind,
+        projectionError: error.kind,
+      },
+    );
+  }
   /**
    * The projected view of a stored version, or null when it is served as
    * stored. `own` is the stored envelope when it had to be read to decide.
@@ -162,20 +182,21 @@ export function withLegacyProjection(
       };
       rememberForm(formKey, cached);
     }
-    if (cached.form !== "pdpp-projected") return { view: null, own };
-    if (!cached.selected) {
-      options.onIssue?.({
-        kind: "projection_failed",
+    if (cached.form === "legacy") return { view: null, own };
+    if (cached.form === "pdpp-unprojected") {
+      failProjection(scope, collectedAt, {
+        kind: "incomplete_scope",
         scope,
-        collectedAt,
-        error: {
-          kind: "incomplete_scope",
-          scope,
-          reason:
-            "Stored records do not identify one compatible connector profile",
-        },
+        reason: "Stored records are not rows of one stream",
       });
-      return { view: null, own };
+    }
+    if (!cached.selected) {
+      failProjection(scope, collectedAt, {
+        kind: "incomplete_scope",
+        scope,
+        reason:
+          "Stored records do not identify one compatible connector profile",
+      });
     }
 
     const { binding, profileKey } = cached.selected;
@@ -247,6 +268,23 @@ export function withLegacyProjection(
     return (await resolve(scope, collectedAt)).view;
   }
 
+  async function projectedForSupersede(
+    scope: string,
+    collectedAt: string,
+  ): Promise<Projected | null> {
+    try {
+      return await projected(scope, collectedAt);
+    } catch (error) {
+      if (
+        error instanceof ProtocolError &&
+        error.errorCode === "LEGACY_PROJECTION_UNAVAILABLE"
+      ) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
   async function project(
     scope: string,
     collectedAt: string,
@@ -281,21 +319,27 @@ export function withLegacyProjection(
       }
     }
 
-    if (!recordsMatchBindingSource(records, binding)) {
-      options.onIssue?.({
-        kind: "projection_failed",
+    if (
+      !recordsMatchBindingSource(
+        records,
+        binding,
+        alternateLegacyBindingsForScope(scope).size > 0,
+      )
+    ) {
+      failProjection(scope, collectedAt, {
+        kind: "incomplete_scope",
         scope,
-        collectedAt,
-        error: {
-          kind: "incomplete_scope",
-          scope,
-          reason: "Joined streams have conflicting connector identities",
-        },
+        reason: "Joined streams have conflicting connector identities",
       });
-      return null;
     }
 
-    const result = projectPdppRecordsToLegacyPayload(scope, records, {
+    // Connector identity is storage metadata, not part of an app's legacy row.
+    const projectionRecords = records.map((record) => {
+      const data = { ...record.data };
+      delete data.$pdpp;
+      return { ...record, data };
+    });
+    const result = projectPdppRecordsToLegacyPayload(scope, projectionRecords, {
       fetchedStreams,
       now,
       ...(profileKey ? { profileKey } : {}),
@@ -303,13 +347,7 @@ export function withLegacyProjection(
       allowMissingJoinStreams: true,
     });
     if (!result.ok) {
-      options.onIssue?.({
-        kind: "projection_failed",
-        scope,
-        collectedAt,
-        error: result.error,
-      });
-      return null;
+      failProjection(scope, collectedAt, result.error);
     }
     if (result.diagnostics?.length) {
       options.onIssue?.({
@@ -351,7 +389,7 @@ export function withLegacyProjection(
     [PROJECTED_VIEW]: typeof projected;
   } = {
     [SERVED]: true,
-    [PROJECTED_VIEW]: projected,
+    [PROJECTED_VIEW]: projectedForSupersede,
     async readEnvelope(scope, collectedAt) {
       const { view, own } = await resolve(scope, collectedAt);
       return view?.envelope ?? own ?? raw.readEnvelope(scope, collectedAt);
@@ -475,57 +513,24 @@ function selectProjectionBinding(
 ): { binding: LegacyScopeBinding; profileKey?: string } | null {
   const original = LEGACY_SCOPE_BINDINGS.get(scope)!;
   const alternates = alternateLegacyBindingsForScope(scope);
-  if (alternates.size === 0) return { binding: original };
-  if (
-    rows.some((row) => !row || typeof row !== "object" || Array.isArray(row))
-  ) {
-    return null;
-  }
-
-  // Annotated records identify their declaration source. A partial or mixed
-  // identity must not join records from different connector profiles.
   const identities = rows.map(recordSourceId);
-  if (identities.some((identity) => identity !== undefined)) {
-    if (
-      identities.some(
-        (identity) => typeof identity !== "string" || !identity,
-      ) ||
-      new Set(identities).size !== 1
-    ) {
-      return null;
-    }
-    const sourceId = identities[0] as string;
-    const connectorKey = sourceId.slice(sourceId.lastIndexOf("/") + 1);
-    const alternate = alternates.get(connectorKey);
-    if (alternate && sourceIdForBinding(alternate) === sourceId) {
-      return { binding: alternate, profileKey: connectorKey };
-    }
-    return sourceIdForBinding(original) === sourceId
-      ? { binding: original }
-      : null;
+  if (identities.includes(null)) return null;
+  if (alternates.size > 0 && identities.includes(undefined)) return null;
+  const sources = new Set(identities.filter((id): id is string => !!id));
+  if (sources.size > 1) return null;
+  if (sources.size === 0) {
+    return alternates.size === 0 ? { binding: original } : null;
   }
 
-  // Older stream files have no annotation. Prefer a profile whose declared
-  // fields distinguish its rows from the base binding. An alternate of the
-  // same connector supersedes the base declaration, as in canonical reads.
-  const candidates = [...alternates].map(([profileKey, binding]) => {
-    let evidence = binding.pdppSource === original.pdppSource ? 1 : 0;
-    for (const row of rows) {
-      for (const stream of binding.pdppStreams) {
-        const baseFields = new Set(original.fieldsRead[stream] ?? []);
-        for (const field of binding.fieldsRead[stream] ?? []) {
-          if (!baseFields.has(field) && Object.hasOwn(row, field))
-            evidence += 1;
-        }
-      }
-    }
-    return { binding, profileKey, evidence };
-  });
-  const strongest = Math.max(0, ...candidates.map(({ evidence }) => evidence));
-  if (strongest === 0) return { binding: original };
-  const matches = candidates.filter(({ evidence }) => evidence === strongest);
-  if (matches.length !== 1) return null;
-  return { binding: matches[0].binding, profileKey: matches[0].profileKey };
+  const sourceId = [...sources][0];
+  const connectorKey = sourceId.slice(sourceId.lastIndexOf("/") + 1);
+  const alternate = alternates.get(connectorKey);
+  if (alternate && sourceIdForBinding(alternate) === sourceId) {
+    return { binding: alternate, profileKey: connectorKey };
+  }
+  return sourceIdForBinding(original) === sourceId
+    ? { binding: original }
+    : null;
 }
 
 function recordSourceId(data: unknown): string | null | undefined {
@@ -548,12 +553,13 @@ function sourceIdForBinding(binding: LegacyScopeBinding): string {
 function recordsMatchBindingSource(
   records: PdppRecord[],
   binding: LegacyScopeBinding,
+  requireIdentity: boolean,
 ): boolean {
-  const identities = records.map(({ data }) => recordSourceId(data));
-  return (
-    identities.every((identity) => identity === undefined) ||
-    identities.every((identity) => identity === sourceIdForBinding(binding))
-  );
+  const expected = sourceIdForBinding(binding);
+  return records.every(({ data }) => {
+    const actual = recordSourceId(data);
+    return actual === expected || (!requireIdentity && actual === undefined);
+  });
 }
 
 const VERSION_PAGE_SIZE = 100;

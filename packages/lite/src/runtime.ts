@@ -761,7 +761,7 @@ function resolveX402Settings(
 function warnLegacyProjectionIssue(issue: LegacyProjectionIssue): void {
   console.warn(
     issue.kind === "projection_failed"
-      ? "[legacy-projection] projection failed; serving stored body"
+      ? "[legacy-projection] served read refused"
       : "[legacy-projection] projection left rows out",
     issue,
   );
