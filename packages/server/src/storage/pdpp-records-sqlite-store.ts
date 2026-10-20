@@ -26,6 +26,10 @@ import {
   InvalidCursorError,
   BlobConflictError,
   type PdppRecordStore,
+  type CanonicalMutation,
+  type MutationJournalReader,
+  type MutationJournalPageOptions,
+  type MutationJournalPage,
   type ChangesSinceOptions,
   type ChangesSincePage,
   type IngestOutcome,
@@ -325,6 +329,31 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
     snapshots_json TEXT NOT NULL,
     conversations_covered INTEGER NOT NULL DEFAULT 0
   );`,
+  // v15: inert canonical mutation evidence, independent of query history.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_installation_writer (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  writer_id TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS pdpp_mutation_journal (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  operation_id TEXT NOT NULL UNIQUE,
+  writer_id TEXT NOT NULL,
+  source_id TEXT,
+  connection_id TEXT NOT NULL,
+  method TEXT,
+  generation INTEGER NOT NULL CHECK (generation > 0),
+  stream TEXT NOT NULL,
+  record_key TEXT NOT NULL,
+  operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+  value_json TEXT NOT NULL,
+  blob_ids_json TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_update BEFORE UPDATE ON pdpp_mutation_journal
+BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_delete BEFORE DELETE ON pdpp_mutation_journal
+BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
+`,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -410,6 +439,11 @@ function migrate(db: Database): void {
         ).run(randomUUID());
       }
       if (v === 12) migrateToV13(db);
+      if (v === 15) {
+        db.prepare(
+          "INSERT OR IGNORE INTO pdpp_installation_writer (id, writer_id) VALUES (1, ?)",
+        ).run(randomUUID());
+      }
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -574,7 +608,7 @@ function toRow(db: RecordRowDb): PdppRecordRow {
  * A readonly database must already have the current schema; no migration,
  * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
-export function createSqliteRecordStore(db: Database): PdppRecordStore & {
+export function createSqliteRecordStore(db: Database): PdppRecordStore & MutationJournalReader & {
   transitionClaudeToLive(input: ClaudeTransitionInput): PdppInstanceBinding;
   claudeTransition(instance: string): ClaudeTransition | null;
   listClaudeTransitions(): ClaudeTransition[];
@@ -662,6 +696,58 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     db.pragma("journal_mode = WAL");
     migrate(db);
     sweepStaleBlobClaims(db);
+  }
+
+  const writerId = (
+    db.prepare("SELECT writer_id FROM pdpp_installation_writer WHERE id = 1").get() as {
+      writer_id: string;
+    }
+  ).writer_id;
+  const insertMutationStmt = db.prepare(`
+    INSERT INTO pdpp_mutation_journal
+      (operation_id, writer_id, source_id, connection_id, method, generation,
+       stream, record_key, operation, value_json, blob_ids_json)
+    VALUES (@operation_id, @writer_id, @source_id, @connection_id, @method, @generation,
+            @stream, @record_key, @operation, @value_json, @blob_ids_json)
+  `);
+
+  function journalMutation(instance: string, stream: string, recordKey: string): void {
+    const binding = getInstanceBinding(instance);
+    const record = toRow(getCurrentStmt.get(instance, stream, recordKey) as RecordRowDb);
+    const blobId = record.deleted ? null : extractBlobId(record.data);
+    insertMutationStmt.run({
+      operation_id: randomUUID(),
+      writer_id: writerId,
+      source_id: binding.sourceId,
+      connection_id: instance,
+      method: binding.method,
+      generation: binding.generation,
+      stream,
+      record_key: recordKey,
+      operation: record.deleted ? "delete" : "upsert",
+      value_json: JSON.stringify(record),
+      blob_ids_json: JSON.stringify(blobId ? [blobId] : []),
+    });
+  }
+
+  function readMutationJournalPage(options: MutationJournalPageOptions): MutationJournalPage {
+    const afterSequence = options.afterSequence ?? 0;
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0 || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 1000) {
+      throw new RangeError("Invalid mutation journal offset or limit");
+    }
+    const rows = db.prepare("SELECT * FROM pdpp_mutation_journal WHERE sequence > ? ORDER BY sequence LIMIT ?")
+      .all(afterSequence, options.limit + 1) as Array<{
+        sequence: number; operation_id: string; writer_id: string; source_id: string | null;
+        connection_id: string; method: string | null; generation: number; stream: string;
+        record_key: string; operation: CanonicalMutation["operation"]; value_json: string; blob_ids_json: string;
+      }>;
+    const mutations = rows.slice(0, options.limit).map((row): CanonicalMutation => ({
+      sequence: row.sequence, operationId: row.operation_id, writerId: row.writer_id,
+      sourceId: row.source_id, connectionId: row.connection_id, method: row.method,
+      generation: row.generation, stream: row.stream, recordKey: row.record_key,
+      operation: row.operation, value: JSON.parse(row.value_json), blobIds: JSON.parse(row.blob_ids_json),
+    }));
+    return { mutations, hasMore: rows.length > options.limit, nextAfterSequence: mutations.at(-1)?.sequence ?? afterSequence };
   }
 
   const nextWriteSeq = db.prepare(
@@ -849,6 +935,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           data,
           envelope.emitted_at,
         );
+        journalMutation(envelope.instance, envelope.stream, recordKey);
         if (data === null) {
           forgetArrivalStmt.run(envelope.instance, envelope.stream, recordKey);
         } else {
@@ -1903,6 +1990,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         deleted_at: deletedAt,
         written_at: writtenAt.value,
       });
+      journalMutation(instance, stream, recordKey);
       forgetArrivalStmt.run(instance, stream, recordKey);
       result = true;
     });
@@ -2199,6 +2287,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   }
 
   return {
+    getInstallationWriterId: () => writerId,
+    readMutationJournalPage,
     transitionClaudeToLive,
     claudeTransition,
     listClaudeTransitions,
