@@ -16,8 +16,10 @@
 
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
+  GITHUB_BROWSER_BINDINGS,
   LEGACY_SCOPE_BINDINGS,
   projectPdppRecordsToLegacyPayload,
+  type LegacyScopeBinding,
   type PdppRecord,
   type ProjectionDiagnostic,
   type ProjectionError,
@@ -30,18 +32,6 @@ import { readBuiltScopeBlocks } from "./blocks/page.js";
 import type { DataBlockManifest, DataScopeBlock } from "./blocks/types.js";
 import { previewEnvelopeValue } from "./preview.js";
 
-/**
- * Sources whose `{records}` bodies have complete, tested legacy bindings.
- * Other sources either emit legacy wrappers themselves (GitHub, Strava) or
- * lack real-shape parity evidence (Oura), so their stored bodies are served
- * as stored.
- */
-const PROJECTED_SOURCES: ReadonlySet<string> = new Set([
-  "chatgpt",
-  "claude",
-  "youtube",
-]);
-
 /** Keys the server stamps into `data`; they are not part of the body. */
 const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
   "$writtenBy",
@@ -51,13 +41,18 @@ const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
 /**
  * - `legacy`: anything that is not exactly `{records: [...]}`. Served as stored.
  * - `pdpp-projected`: `{records}` of plain rows under a scope with a legacy
- *   binding of a projected source. Served as the projected legacy body.
+ *   binding. Served as the projected legacy body.
  * - `pdpp-unprojected`: `{records}` under any other scope (for example
  *   `chatgpt.messages`, which has no legacy form), or `{records}` holding a
  *   tagged `{stream, data}` row, which is not one stream's rows. Served as
  *   stored.
  */
 export type StoredBodyForm = "legacy" | "pdpp-projected" | "pdpp-unprojected";
+
+interface CachedForm {
+  form: StoredBodyForm;
+  profileKey?: "github-browser";
+}
 
 export function classifyStoredBody(
   scope: string,
@@ -128,9 +123,9 @@ export function withLegacyProjection(
   let memo: { key: string; value: Projected | null } | null = null;
   // Classification is safe to reuse only for the same immutable stored
   // version. The requested version is classified before the projection cache.
-  const forms = new Map<string, StoredBodyForm>();
-  const rememberForm = (version: string, form: StoredBodyForm) => {
-    forms.set(version, form);
+  const forms = new Map<string, CachedForm>();
+  const rememberForm = (key: string, value: CachedForm) => {
+    forms.set(key, value);
     if (forms.size > FORM_CACHE_SIZE) {
       forms.delete(forms.keys().next().value!);
     }
@@ -144,7 +139,43 @@ export function withLegacyProjection(
     collectedAt: string,
   ): Promise<{ view: Projected | null; own?: DataFileEnvelope }> {
     if (!isProjectedScope(scope)) return { view: null };
-    const binding = LEGACY_SCOPE_BINDINGS.get(scope)!;
+    const requestedEntry = raw.findEntry({ scope, at: collectedAt });
+    const ownVersion = requestedEntry
+      ? `${requestedEntry.id}@${requestedEntry.collectedAt}`
+      : `unindexed@${collectedAt}`;
+    const formKey = JSON.stringify([scope, ownVersion]);
+    let cached = forms.get(formKey);
+    let own: DataFileEnvelope | undefined;
+    if (!cached) {
+      own = await raw.readEnvelope(scope, collectedAt);
+      const form = classifyStoredBody(scope, own.data);
+      const browserBinding = GITHUB_BROWSER_BINDINGS.get(scope);
+      const browserStream = browserBinding?.pdppStreams[0];
+      let profileKey: "github-browser" | undefined;
+      if (form === "pdpp-projected" && browserStream) {
+        // The browser connector stores one snapshot under the same github.*
+        // scope without a profile marker. Its binding validates that shape.
+        const rows = (own.data as { records: Record<string, unknown>[] })
+          .records;
+        const browserView = projectPdppRecordsToLegacyPayload(
+          scope,
+          rows.map((data) => ({ stream: browserStream, data })),
+          {
+            fetchedStreams: [browserStream],
+            now: collectedAt,
+            profileKey: "github-browser",
+          },
+        );
+        if (browserView.ok) profileKey = "github-browser";
+      }
+      cached = { form, ...(profileKey ? { profileKey } : {}) };
+      rememberForm(formKey, cached);
+    }
+    if (cached.form !== "pdpp-projected") return { view: null, own };
+
+    const binding = cached.profileKey
+      ? GITHUB_BROWSER_BINDINGS.get(scope)!
+      : LEGACY_SCOPE_BINDINGS.get(scope)!;
     const source = scope.slice(0, scope.indexOf("."));
     // The latest version joins the latest siblings, whatever order one run
     // wrote its streams in. A historical version joins, of the sibling
@@ -153,7 +184,6 @@ export function withLegacyProjection(
     const supersededAt = nextVersionTime(raw, scope, collectedAt);
     const inputs = binding.pdppStreams.map((stream) => {
       const canonicalScope = `${source}.${stream}`;
-      const requestedEntry = raw.findEntry({ scope, at: collectedAt });
       // For a single-stream alias, prefer the exact requested version when
       // it exists. This keeps alias writes, body classification and cursors
       // tied to the version the caller asked to read.
@@ -184,31 +214,25 @@ export function withLegacyProjection(
         version: entry ? `${entry.id}@${entry.collectedAt}` : null,
       };
     });
-    const ownVersion = inputs.find(
-      (input) => input.storedScope === scope,
-    )?.version;
-    let own: DataFileEnvelope | undefined;
-    let form = ownVersion ? forms.get(ownVersion) : undefined;
-    if (form === undefined) {
-      own = await raw.readEnvelope(scope, collectedAt);
-      form = classifyStoredBody(scope, own.data);
-      if (ownVersion) rememberForm(ownVersion, form);
-    }
-    if (form !== "pdpp-projected") return { view: null, own };
     const key = JSON.stringify([
       scope,
       ownVersion,
+      cached.profileKey,
       inputs.map(({ storedScope, version }) => [storedScope, version]),
     ]);
     if (memo?.key === key) return { view: memo.value, own };
 
     own ??= await raw.readEnvelope(scope, collectedAt);
 
-    let value: Projected | null = null;
-    if (form === "pdpp-projected") {
-      value = await project(scope, collectedAt, own, inputs);
-      if (value) value.view = key;
-    }
+    const value = await project(
+      scope,
+      collectedAt,
+      own,
+      inputs,
+      binding,
+      cached.profileKey,
+    );
+    if (value) value.view = key;
     memo = { key, value };
     return { view: value, own };
   }
@@ -225,6 +249,8 @@ export function withLegacyProjection(
     collectedAt: string,
     own: DataFileEnvelope,
     inputs: { stream: string; storedScope: string; collectedAt?: string }[],
+    binding: LegacyScopeBinding,
+    profileKey?: "github-browser",
   ): Promise<Projected | null> {
     const records: PdppRecord[] = [];
     const fetchedStreams: string[] = [];
@@ -255,7 +281,8 @@ export function withLegacyProjection(
     const result = projectPdppRecordsToLegacyPayload(scope, records, {
       fetchedStreams,
       now,
-      orderByPrimaryKey: true,
+      ...(profileKey ? { profileKey } : {}),
+      orderByPrimaryKey: binding.rowOrder !== "arrival",
       allowMissingJoinStreams: true,
     });
     if (!result.ok) {
@@ -422,12 +449,7 @@ export function legacyScopesProjectedFrom(scope: string): string[] {
 }
 
 function isProjectedScope(scope: string): boolean {
-  const dot = scope.indexOf(".");
-  return (
-    dot > 0 &&
-    PROJECTED_SOURCES.has(scope.slice(0, dot)) &&
-    LEGACY_SCOPE_BINDINGS.has(scope)
-  );
+  return LEGACY_SCOPE_BINDINGS.has(scope);
 }
 
 const VERSION_PAGE_SIZE = 100;
@@ -533,8 +555,9 @@ export interface SupersedeResult {
 /**
  * After a `{records}` version of a projected scope is committed, delete the
  * scope's older owner-written legacy versions: the new version serves the
- * same legacy view, so they are a second copy. YouTube legacy versions are
- * retained and replaced only in the read view.
+ * same legacy view, so they are a second copy. This explicit supersede path
+ * remains available only for the original ChatGPT and Claude sources. Other
+ * bound sources retain legacy versions and replace them only in the read view.
  *
  * It deletes nothing unless `storage` is a served port (see
  * `withLegacyProjection`) whose projection of the new version is complete:
@@ -563,6 +586,13 @@ export async function supersedeLegacyVersions(
     return refuse(
       "YouTube legacy versions are retained for read-time projection",
     );
+  }
+  if (
+    isProjectedScope(scope) &&
+    !scope.startsWith("chatgpt.") &&
+    !scope.startsWith("claude.")
+  ) {
+    return refuse("Legacy versions are retained for read-time projection");
   }
   const readStored = (storage.readStoredEnvelope ?? storage.readEnvelope).bind(
     storage,

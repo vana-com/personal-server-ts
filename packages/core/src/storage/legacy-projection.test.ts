@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { diffBodies } from "../legacy-projection/__fixtures__/parity/diff.js";
+import { LEGACY_SCOPE_BINDINGS } from "../legacy-projection/index.js";
 import {
   ingestBinaryDataContract,
   ingestDataContract,
@@ -72,8 +73,8 @@ describe("classifyStoredBody", () => {
     ["chatgpt.conversations", { records: [] }, "pdpp-projected"],
     ["claude.projects", { records: [{ id: "p" }] }, "pdpp-projected"],
     ["chatgpt.messages", { records: [] }, "pdpp-unprojected"],
-    ["oura.sleep", { records: [] }, "pdpp-unprojected"],
-    ["github.repositories", { records: [] }, "pdpp-unprojected"],
+    ["oura.sleep", { records: [] }, "pdpp-projected"],
+    ["github.repositories", { records: [] }, "pdpp-projected"],
     ["chatgpt.conversations", { conversations: [], total: 0 }, "legacy"],
     ["chatgpt.conversations", { records: [], total: 0 }, "legacy"],
     ["chatgpt.conversations", { records: {} }, "legacy"],
@@ -96,6 +97,15 @@ describe("classifyStoredBody", () => {
   ])("%s %j is %s", (scope, data, form) => {
     expect(classifyStoredBody(scope, data)).toBe(form);
   });
+
+  it("classifies every bound legacy scope for projection", () => {
+    for (const scope of LEGACY_SCOPE_BINDINGS.keys()) {
+      expect(classifyStoredBody(scope, { records: [] })).toBe("pdpp-projected");
+    }
+    expect(classifyStoredBody("spotify.saved_tracks", { records: [] })).toBe(
+      "pdpp-unprojected",
+    );
+  });
 });
 
 describe("legacyScopesProjectedFrom", () => {
@@ -104,6 +114,7 @@ describe("legacyScopesProjectedFrom", () => {
     ["chatgpt.conversations", []],
     ["claude.account_profile", ["claude.conversations", "claude.projects"]],
     ["claude.project_documents", ["claude.projects"]],
+    ["spotify.playlist_items", ["spotify.playlists"]],
     ["oura.sleep", []],
     ["notes", []],
   ])("%s → %j", (scope, expected) => {
