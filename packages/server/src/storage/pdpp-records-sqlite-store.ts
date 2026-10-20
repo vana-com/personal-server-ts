@@ -1092,6 +1092,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
     }
     return db.transaction((): ReplaceStreamResult => {
       checkInstanceBinding(input.instance, input.method, input.generation);
+      checkStreamQuarantine(input.instance, input.stream, input.generation);
 
       const seen = new Set<string>();
       /** Live keys of the snapshot, in the order it delivered them. */
@@ -1318,15 +1319,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
     if (typeof method !== "string" || method.length === 0) {
       throw new PdppBindingError("method_required");
     }
-    if (
-      db
-        .prepare(
-          "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ?",
-        )
-        .get(instance)
-    ) {
-      throw new PdppBindingError("replica_integrity_quarantine");
-    }
+    checkConnectionQuarantine(instance);
     const current = ensureBinding(db, instance);
     if (current.deleted_at !== null) {
       throw new PdppBindingError("connection_deleted");
@@ -1339,6 +1332,34 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
     }
     if (current.method !== method) {
       throw new PdppBindingError("instance_bound_to_other_method");
+    }
+  }
+
+  function checkConnectionQuarantine(instance: string): void {
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ?",
+        )
+        .get(instance)
+    ) {
+      throw new PdppBindingError("replica_integrity_quarantine");
+    }
+  }
+
+  function checkStreamQuarantine(
+    instance: string,
+    stream: string,
+    generation: number,
+  ): void {
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND stream = ? AND generation = ? LIMIT 1",
+        )
+        .get(instance, stream, generation)
+    ) {
+      throw new PdppBindingError("replica_integrity_quarantine");
     }
   }
 
@@ -1743,12 +1764,18 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
           throw new PdppBindingError("instance_bound_to_other_method");
         }
 
+        checkConnectionQuarantine(request.instance);
         const clock = readWriteClock();
         const requestedAt = Date.parse(request.sourceCollectedAt);
         // Validate every stream before the first receipt is written.
         const writes: { stream: string; kind: "insert" | "update" | "keep" }[] =
           [];
         for (const proof of request.streams) {
+          checkStreamQuarantine(
+            request.instance,
+            proof.stream,
+            request.generation,
+          );
           const primaryKey = declarations(request.sourceId, proof.stream);
           if (primaryKey === undefined) {
             throw new StreamCompletionError("unknown_stream");
