@@ -448,15 +448,7 @@ export function withLegacyProjection(
         : rawManifest(scope, collectedAt);
     };
   }
-  // A stored sidecar answers "yes" for either form (a projected view can
-  // always be split into blocks), so the stored body is only read when the
-  // raw port has no sidecar yet.
-  if (raw.hasScopeBlocks) {
-    const rawHas = raw.hasScopeBlocks.bind(raw);
-    overrides.hasScopeBlocks = async (scope, collectedAt) =>
-      (await rawHas(scope, collectedAt)) ||
-      (await projected(scope, collectedAt)) !== null;
-  }
+  // Inventory inherits raw metadata readiness. Projection belongs to reads.
   if (raw.canReadScopeBlocks) {
     const rawCan = raw.canReadScopeBlocks.bind(raw);
     overrides.canReadScopeBlocks = async (scope, collectedAt) =>
