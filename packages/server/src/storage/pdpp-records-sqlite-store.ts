@@ -1,3 +1,4 @@
+import { RECEIVER_MIGRATION } from "./pdpp-replication-receiver.js";
 import {
   createReplicationJournal,
   REPLICATION_MIGRATION,
@@ -339,6 +340,7 @@ CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_delete BEFORE DELETE ON pd
 BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
 `,
   REPLICATION_MIGRATION,
+  RECEIVER_MIGRATION,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -989,6 +991,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     data: Record<string, unknown> | null,
     emittedAt: string,
   ): void {
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_quarantined_keys q JOIN pdpp_instance_binding b ON q.instance = b.instance AND q.generation = b.generation WHERE q.instance = ? AND q.stream = ? AND q.record_key = ?",
+        )
+        .get(instance, stream, recordKey)
+    ) {
+      throw new PdppBindingError("replica_integrity_quarantine");
+    }
     const deleted = data === null;
     const version = latestVersion(instance, stream, recordKey) + 1;
     const writtenAt = nextWriteSeq.get() as { value: number };
@@ -1058,6 +1069,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     }
     return db.transaction((): ReplaceStreamResult => {
       checkInstanceBinding(input.instance, input.method, input.generation);
+      checkStreamQuarantine(input.instance, input.stream, input.generation);
 
       const seen = new Set<string>();
       /** Live keys of the snapshot, in the order it delivered them. */
@@ -1284,6 +1296,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     if (typeof method !== "string" || method.length === 0) {
       throw new PdppBindingError("method_required");
     }
+    checkConnectionQuarantine(instance);
     const current = ensureBinding(db, instance);
     if (current.deleted_at !== null) {
       throw new PdppBindingError("connection_deleted");
@@ -1296,6 +1309,34 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     }
     if (current.method !== method) {
       throw new PdppBindingError("instance_bound_to_other_method");
+    }
+  }
+
+  function checkConnectionQuarantine(instance: string): void {
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ?",
+        )
+        .get(instance)
+    ) {
+      throw new PdppBindingError("replica_integrity_quarantine");
+    }
+  }
+
+  function checkStreamQuarantine(
+    instance: string,
+    stream: string,
+    generation: number,
+  ): void {
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND stream = ? AND generation = ? LIMIT 1",
+        )
+        .get(instance, stream, generation)
+    ) {
+      throw new PdppBindingError("replica_integrity_quarantine");
     }
   }
 
@@ -1549,12 +1590,18 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           throw new PdppBindingError("instance_bound_to_other_method");
         }
 
+        checkConnectionQuarantine(request.instance);
         const clock = readWriteClock();
         const requestedAt = Date.parse(request.sourceCollectedAt);
         // Validate every stream before the first receipt is written.
         const writes: { stream: string; kind: "insert" | "update" | "keep" }[] =
           [];
         for (const proof of request.streams) {
+          checkStreamQuarantine(
+            request.instance,
+            proof.stream,
+            request.generation,
+          );
           const primaryKey = declarations(request.sourceId, proof.stream);
           if (primaryKey === undefined) {
             throw new StreamCompletionError("unknown_stream");
