@@ -2,7 +2,7 @@
 
 This is an internal Vana implementation profile, not a normative PDPP addition.
 It defines pure operation decisions. It has no storage, receiver, publisher,
-cryptography, byte transfer, or authorization-state replication.
+transport encryption, byte transfer, or authorization-state replication.
 
 ## Provisional decisions
 
@@ -61,8 +61,13 @@ only those exact canonical bytes, rejecting duplicate-member ambiguity, unknown
 versions, unknown fields, and changed authenticated-owner/declaration binding.
 Authentication, decryption and verification precede decode; the expected owner
 must come from that authenticated context. This codec is not a signature check.
-Transport sequences, predecessors, completion dependencies and fragmentation
-belong to later framing work; this operation envelope cannot yet be published.
+Transport sequences, predecessors and fragmentation belong to later framing
+work; this operation envelope cannot yet be published. `blob-claim` pins a verified
+content descriptor to a connection generation. `stream-complete` lists exact
+operation identities and SHA-256 digests. `hasCompletionDependencies` checks that
+coverage; receivers must additionally validate merged snapshot and byte integrity
+before claiming availability. The SQLite implementation and fence contract are
+documented in `packages/server/src/storage/pdpp-replication.md`.
 
 `planReplicaMerge` takes the complete retained operation set. Preserve that set
 across calls, including lifecycle evidence, losers, pending evidence, conflicts

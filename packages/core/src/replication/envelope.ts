@@ -55,6 +55,18 @@ export const replicaOperationSchema = z.discriminatedUnion("kind", [
     previousGeneration: integer.min(1),
   }),
   z.strictObject({ ...base, kind: z.literal("connection-delete") }),
+  z.strictObject({ ...base, kind: z.literal("blob-claim"), blob }),
+  z.strictObject({
+    ...base,
+    kind: z.literal("stream-complete"),
+    stream: token,
+    sourceCollectedAt: token,
+    liveCount: integer,
+    snapshotSha256: digest,
+    dependencies: z.array(
+      z.strictObject({ writerId: token, operationId: token, digest }),
+    ),
+  }),
 ]);
 export type ReplicaOperation = z.infer<typeof replicaOperationSchema>;
 export type RecordOperation = Extract<
