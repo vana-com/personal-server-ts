@@ -43,7 +43,13 @@ function device(registered = true, entries = declarations) {
       method: "collector",
       label: "A",
     });
-  store.replication.beginBaseline(config);
+  store.replication.beginBaseline({
+    ...config,
+    declarations: entries.map(({ sourceId, binding }) => ({
+      sourceId,
+      binding,
+    })),
+  });
   let known = entries;
   const receiver = () =>
     createReplicaReceiver({
@@ -510,6 +516,12 @@ it("detects operation-ID equivocation instead of silently replacing evidence", (
       (issue) => issue.reason === "operation_id_equivocation",
     ),
   ).toBe(true);
+  const outbound = all(d);
+  expect(() => put(d, "collector-cannot-repair")).toThrow(
+    "replica_integrity_quarantine",
+  );
+  expect(value(d)).toBeUndefined();
+  expect(all(d)).toEqual(outbound);
 });
 
 it("advances the local Lamport clock beyond observed imported revisions", () => {
@@ -692,4 +704,146 @@ it("requires an established baseline for the same verified owner", () => {
     }),
   ).toThrow("baseline");
   expect(value(d)).toBeUndefined();
+});
+
+it("does not let a local collector restore an append-only quarantined record, including after restart", () => {
+  const appendBinding = { ...binding, semantics: "append_only" as const };
+  const d = device(true, [
+    { sourceId, binding: appendBinding, validateData: () => true },
+  ]);
+  send(d, [
+    { ...upsert(20), declaration: appendBinding },
+    { ...upsert(21), declaration: appendBinding },
+  ]);
+  expect(value(d)).toBeUndefined();
+  const before = d.db.prepare("SELECT * FROM pdpp_mutation_journal").all();
+  const outbound = d.store.replication.readTailPage({ limit: 100 }).operations;
+  for (const restart of [false, true]) {
+    if (restart) d.reopen();
+    try {
+      d.store.ingestBatch(
+        [
+          {
+            instance: "conn_a",
+            stream: "messages",
+            key: "a",
+            data: { id: "a", text: "collector-repair" },
+            emitted_at: at,
+          },
+        ],
+        () => "append_only",
+        () => ["id"],
+        { method: "collector", generation: 1 },
+      );
+    } catch {
+      // Refusing a local write is an acceptable enforcement of quarantine.
+    }
+    expect(value(d)).toBeUndefined();
+    expect(d.db.prepare("SELECT * FROM pdpp_mutation_journal").all()).toEqual(
+      before,
+    );
+    expect(d.store.replication.readTailPage({ limit: 100 }).operations).toEqual(
+      outbound,
+    );
+  }
+});
+
+it("keeps a committed completion receipt unchanged when replay follows unrelated local writes", () => {
+  const source = device(),
+    target = device();
+  source.store.replaceStream({
+    instance: "conn_a",
+    stream: "messages",
+    method: "collector",
+    generation: 1,
+    emittedAt: at,
+    envelopes: [
+      {
+        instance: "conn_a",
+        stream: "messages",
+        key: "a",
+        data: { id: "a", text: "snapshot" },
+        emitted_at: at,
+      },
+    ],
+    primaryKey: ["id"],
+    sourceCollectedAt: at,
+  });
+  const operations = all(source);
+  send(target, operations);
+  const before = target.store.listStreamCompletions("conn_a");
+  expect(before).toHaveLength(1);
+  target.store.registerConnection({
+    instance: "conn_unrelated",
+    sourceId,
+    method: "collector",
+    label: "Unrelated",
+  });
+  target.store.ingestBatch(
+    [
+      {
+        instance: "conn_unrelated",
+        stream: "messages",
+        key: "other",
+        data: { id: "other", text: "unrelated" },
+        emitted_at: at,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  send(target, operations);
+  expect(target.store.listStreamCompletions("conn_a")).toEqual(before);
+  target.reopen();
+  send(target, operations);
+  expect(target.store.listStreamCompletions("conn_a")).toEqual(before);
+});
+
+it("does not expose a pending record when persisted received blob bytes are corrupt after restart", () => {
+  const source = device(),
+    target = device();
+  const bytes = new Uint8Array([8, 9]);
+  const blob = source.store.storeBlobBytesForInstance({
+    instance: "conn_a",
+    method: "collector",
+    generation: 1,
+    bytes,
+    mimeType: "application/octet-stream",
+  });
+  source.store.ingestBatch(
+    [
+      {
+        instance: "conn_a",
+        stream: "messages",
+        key: "a",
+        data: {
+          id: "a",
+          blob_ref: {
+            blob_id: blob.blobId,
+            mime_type: blob.mimeType,
+            size_bytes: 2,
+          },
+        },
+        emitted_at: at,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  send(target, all(source));
+  target.db
+    .prepare(
+      "INSERT INTO pdpp_replica_received_bytes (blob_id, bytes) VALUES (?, ?)",
+    )
+    .run(blob.blobId, new Uint8Array([1, 2]));
+  target.reopen();
+  const plan = target.receiver.retry({ credential: "replica-secret" });
+  expect(plan.pending.length).toBeGreaterThan(0);
+  expect(value(target)).toBeUndefined();
+  expect(target.store.getBlobBytes(blob.blobId)).toBeUndefined();
+  expect(
+    target.store.replication.readTailPage({ limit: 100 }).operations,
+  ).toEqual([]);
 });

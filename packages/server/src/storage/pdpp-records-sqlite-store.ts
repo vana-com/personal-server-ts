@@ -991,6 +991,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     data: Record<string, unknown> | null,
     emittedAt: string,
   ): void {
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_quarantined_keys q JOIN pdpp_instance_binding b ON q.instance = b.instance AND q.generation = b.generation WHERE q.instance = ? AND q.stream = ? AND q.record_key = ?",
+        )
+        .get(instance, stream, recordKey)
+    ) {
+      throw new PdppBindingError("replica_integrity_quarantine");
+    }
     const deleted = data === null;
     const version = latestVersion(instance, stream, recordKey) + 1;
     const writtenAt = nextWriteSeq.get() as { value: number };
@@ -1285,6 +1294,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     // Only a named method may write.
     if (typeof method !== "string" || method.length === 0) {
       throw new PdppBindingError("method_required");
+    }
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ?",
+        )
+        .get(instance)
+    ) {
+      throw new PdppBindingError("replica_integrity_quarantine");
     }
     const current = ensureBinding(db, instance);
     if (current.deleted_at !== null) {
