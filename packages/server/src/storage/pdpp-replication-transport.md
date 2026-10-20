@@ -66,6 +66,8 @@ order, with persisted exponential backoff (1 second through 1 hour). One failed
 address cannot monopolize the oldest 50. Preparation has its own durable retry
 state; impossible framing is quarantined. A missing predecessor intentionally
 blocks descendants on that writer's chain, while other writers can advance.
+Each cycle attempts every phase even if an earlier phase fails, then reports
+collected errors so retained imports can advance during a feed outage.
 All payloads, fragments, failures and receipts remain retained; no compaction,
 retirement or sole-history deletion is implemented.
 
