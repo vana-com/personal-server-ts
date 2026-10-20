@@ -81,7 +81,14 @@ function network(realCrypto = false, cap = 8192) {
     gateway: {
       async registerDataPoint(input) {
         registrations.push(input.scope);
-        const max = Number(history.get(input.scope)?.version ?? 0);
+        const max = Math.max(
+          Number(history.get(input.scope)?.version ?? 0),
+          Number(chain.get(input.scope)?.version ?? 0),
+        );
+        if (Number(input.expectedVersion) <= max)
+          throw new Error(
+            `Gateway error: 409 Stale expectedVersion; stored value ${max}`,
+          );
         if (Number(input.expectedVersion) !== max + 1)
           throw new Error(
             `Gateway error: 409 Gap in version sequence; next valid version is ${max + 1}`,
@@ -743,4 +750,27 @@ it("does not acknowledge or apply a different batch reusing an imported writer s
   expect(inbox(b).find((r) => r.scope === cloneScope)?.error).toContain(
     "UNIQUE",
   );
+});
+
+it("the gateway oracle enforces chain-backed continuity even when history is missing", async () => {
+  const net = network();
+  const scope = "pdpp_replica_v1.test.0";
+  net.chain.set(scope, {
+    owner,
+    scope,
+    version: "1",
+    dataHash: "0xaa",
+    metadataHash: "0xbb",
+    deleted: false,
+  });
+  await expect(
+    net.port.register({
+      scope,
+      plaintext: new Uint8Array(),
+      encrypted: new Uint8Array(),
+      dataHash: "0xaa",
+      metadataHash: "0xbb",
+    }),
+  ).rejects.toThrow();
+  expect(net.head.has(scope)).toBe(false);
 });
