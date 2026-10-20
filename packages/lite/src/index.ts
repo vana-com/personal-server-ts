@@ -185,3 +185,16 @@ export {
   type PsLitePersistenceBundle,
   type PsLitePersistenceRuntimeOptions,
 } from "./persistence.js";
+
+export {
+  createLiteCanonicalStore,
+  type LiteCommitReceipt,
+  type LiteOperationDraft,
+} from "./canonical-store.js";
+export type {
+  LiteCanonicalPersistence,
+  LiteCanonicalTransaction,
+  LiteBlobDescriptor,
+  LiteStorageEntry,
+  LiteStoragePage,
+} from "./canonical-persistence.js";
