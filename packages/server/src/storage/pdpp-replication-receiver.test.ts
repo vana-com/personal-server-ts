@@ -12,6 +12,7 @@ import { createFixtureAuthorizationService } from "@opendatalabs/personal-server
 import type { Grant } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { pdppRecordsRoutes } from "../routes/pdpp-records.js";
 import { pdppBlobsRoutes } from "../routes/pdpp-blobs.js";
+import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
 const sourceId = "https://source.invalid/declaration";
@@ -1036,4 +1037,184 @@ it("allocates imported arrival order after repeated unchanged local collector ob
   expect(d.db.prepare("SELECT * FROM pdpp_record_arrival").all()).toEqual(
     before,
   );
+});
+
+function certifyEmpty(d: ReturnType<typeof device>, stream = "messages") {
+  return d.store.completeStreams(
+    {
+      instance: "conn_a",
+      sourceId,
+      method: "collector",
+      generation: 1,
+      sourceCollectedAt: at,
+      collectionTimeBasis: "host_run_finished",
+      streams: [
+        {
+          stream,
+          coverage: "full_stream",
+          liveCount: 0,
+          snapshotSha256: liveSnapshotDigest(
+            {
+              sourceId,
+              instance: "conn_a",
+              method: "collector",
+              generation: 1,
+              stream,
+            },
+            ["id"],
+            [],
+          ),
+        },
+      ],
+    },
+    () => ["id"],
+  );
+}
+function appendQuarantineDevice() {
+  const appendBinding = { ...binding, semantics: "append_only" as const };
+  const d = device(true, [
+    { sourceId, binding: appendBinding, validateData: () => true },
+    {
+      sourceId,
+      binding: { ...binding, stream: "profiles" },
+      validateData: () => true,
+    },
+  ]);
+  send(d, [
+    { ...upsert(20), declaration: appendBinding },
+    { ...upsert(21), declaration: appendBinding },
+  ]);
+  expect(value(d)).toBeUndefined();
+  return d;
+}
+it("refuses native empty completion certification for an append-only quarantined stream", () => {
+  const d = appendQuarantineDevice();
+  const before = all(d);
+  try {
+    certifyEmpty(d);
+  } catch {
+    /* Refusal may throw. */
+  }
+  expect(d.store.listStreamCompletions("conn_a")).toEqual([]);
+  d.reopen();
+  try {
+    certifyEmpty(d);
+  } catch {
+    /* The durable fence must survive restart. */
+  }
+  expect(d.store.listStreamCompletions("conn_a")).toEqual([]);
+  expect(all(d)).toEqual(before);
+  certifyEmpty(d, "profiles");
+  expect(
+    d.store.listStreamCompletions("conn_a").map((receipt) => receipt.stream),
+  ).toEqual(["profiles"]);
+});
+it("refuses replace-stream empty snapshot certification for an append-only quarantined stream", () => {
+  const d = appendQuarantineDevice();
+  const before = all(d);
+  try {
+    d.store.replaceStream({
+      instance: "conn_a",
+      stream: "messages",
+      method: "collector",
+      generation: 1,
+      emittedAt: at,
+      envelopes: [],
+      primaryKey: ["id"],
+      sourceCollectedAt: at,
+    });
+  } catch {
+    /* Refusal may throw. */
+  }
+  expect(d.store.listStreamCompletions("conn_a")).toEqual([]);
+  expect(value(d)).toBeUndefined();
+  expect(all(d)).toEqual(before);
+});
+it("refuses native empty completion certification for an operation-ID quarantined connection", () => {
+  const d = device();
+  const record = upsert();
+  send(d, [record]);
+  send(d, [
+    { ...registration(), kind: "connection-delete", revision: record.revision },
+  ]);
+  expect(d.store.getInstanceBinding("conn_a").deletedAt).toBeNull();
+  const before = all(d);
+  try {
+    certifyEmpty(d);
+  } catch {
+    /* Refusal may throw. */
+  }
+  expect(d.store.listStreamCompletions("conn_a")).toEqual([]);
+  expect(all(d)).toEqual(before);
+});
+
+it("does not reveal quarantined append-only content through a pre-conflict pagination horizon", () => {
+  const appendBinding = { ...binding, semantics: "append_only" as const };
+  const d = device(true, [
+    { sourceId, binding: appendBinding, validateData: () => true },
+  ]);
+  d.store.ingestBatch(
+    ["a", "b"].map((id) => ({
+      instance: "conn_a",
+      stream: "messages",
+      key: id,
+      data: { id, text: `original-${id}` },
+      emitted_at: at,
+    })),
+    () => "append_only",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  const options = { instanceIds: ["conn_a"], limit: 1, order: "asc" as const };
+  const first = d.store.listRecords("messages", options);
+  expect(first.data.map((row) => row.recordKey)).toEqual(["a"]);
+  expect(first.nextCursor).toBeDefined();
+  const conflict: ReplicaOperation = {
+    ...upsert(100),
+    declaration: appendBinding,
+    recordKey: "b",
+    data: { id: "b", text: "conflicting-b" },
+  };
+  send(d, [conflict]);
+  expect(d.store.getRecord("conn_a", "messages", "b")).toBeUndefined();
+  let continued;
+  try {
+    continued = d.store.listRecords("messages", {
+      ...options,
+      cursor: first.nextCursor,
+    });
+  } catch (error) {
+    expect((error as Error).name).toContain("CursorExpired");
+  }
+  expect(continued?.data.some((row) => row.recordKey === "b") ?? false).toBe(
+    false,
+  );
+  expect(
+    d.store
+      .listRecords("messages", { ...options, limit: 100 })
+      .data.map((row) => row.recordKey),
+  ).toEqual(["a"]);
+  const fence = d.store.getInstanceBinding("conn_a").resetClock;
+  d.store.registerConnection({
+    instance: "other",
+    sourceId,
+    method: "collector",
+    label: "Other",
+  });
+  d.store.ingestBatch(
+    [
+      {
+        instance: "other",
+        stream: "messages",
+        key: "c",
+        data: { id: "c" },
+        emitted_at: at,
+      },
+    ],
+    () => "append_only",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  send(d, [conflict]);
+  expect(d.store.getInstanceBinding("conn_a").resetClock).toBe(fence);
 });
