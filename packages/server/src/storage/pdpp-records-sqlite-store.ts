@@ -1,3 +1,4 @@
+import { RECEIVER_MIGRATION } from "./pdpp-replication-receiver.js";
 import {
   parseTime,
   timeSortKey,
@@ -366,6 +367,7 @@ CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_delete BEFORE DELETE ON pd
 BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
 `,
   REPLICATION_MIGRATION,
+  RECEIVER_MIGRATION,
 ];
 
 function addCompletionProofColumns(db: Database): void {
