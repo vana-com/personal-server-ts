@@ -20,6 +20,7 @@ import {
   previewEnvelopeValue,
   previewJsonEnvelopePrefix,
 } from "@opendatalabs/personal-server-ts-core/storage/preview";
+import { recordEnvelopeChunks } from "./record-stream.js";
 
 export interface PsLitePersistedStorageState {
   version: 1;
@@ -53,6 +54,10 @@ export interface PsLiteDataFileStore {
     options: { maxBytes: number },
   ): Promise<{ text: string; truncated: boolean } | null>;
   writeEnvelope(path: string, envelope: DataFileEnvelope): Promise<number>;
+  writeEnvelopeChunks?(
+    path: string,
+    chunks: AsyncIterable<Uint8Array>,
+  ): Promise<number>;
   deleteEnvelope(path: string): Promise<void>;
   readBlockManifest?(path: string): Promise<DataBlockManifest | null>;
   writeBlockManifest?(path: string, manifest: DataBlockManifest): Promise<void>;
@@ -70,6 +75,13 @@ export interface PsLiteStorageCapabilities {
 /** Persistent Lite storage with its public backend capability report. */
 export interface PsLiteStoragePort extends DataStoragePort {
   readonly capabilities: PsLiteStorageCapabilities;
+  writeRecordStream?(
+    scope: string,
+    collectedAt: string,
+    connectorId: string,
+    chunks: AsyncIterable<string>,
+    onRecord?: (count: number) => void,
+  ): Promise<{ sizeBytes: number; records: number }>;
 }
 
 export interface PsLitePersistenceAdapter {
@@ -292,6 +304,22 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
       await writable.write(encoded);
       await writable.close();
       return new TextEncoder().encode(encoded).length;
+    },
+    async writeEnvelopeChunks(path, chunks) {
+      const handle = await getOpfsFileHandle(root, path, { create: true });
+      const writable = await handle.createWritable();
+      let sizeBytes = 0;
+      try {
+        for await (const chunk of chunks) {
+          await writable.write(new Uint8Array(chunk));
+          sizeBytes += chunk.byteLength;
+        }
+        await writable.close();
+        return sizeBytes;
+      } catch (error) {
+        await writable.abort().catch(() => undefined);
+        throw error;
+      }
     },
     async deleteEnvelope(path) {
       const parts = path.split("/").filter(Boolean);
@@ -590,6 +618,47 @@ export async function createPersistentPsLiteStorage(
       };
     },
 
+    ...(fileStore.writeEnvelopeChunks
+      ? {
+          async writeRecordStream(
+            scope: string,
+            collectedAt: string,
+            connectorId: string,
+            chunks: AsyncIterable<string>,
+            onRecord?: (count: number) => void,
+          ) {
+            const path = envelopePath(scope, collectedAt);
+            let records = 0;
+            try {
+              const sizeBytes = await fileStore.writeEnvelopeChunks!(
+                path,
+                recordEnvelopeChunks(
+                  scope,
+                  collectedAt,
+                  connectorId,
+                  chunks,
+                  (count) => {
+                    records = count;
+                    onRecord?.(count);
+                  },
+                ),
+              );
+              await storagePort.insertEntry({
+                path,
+                scope,
+                collectedAt,
+                sizeBytes,
+                fileId: null,
+              });
+              return { sizeBytes, records };
+            } catch (error) {
+              await fileStore.deleteEnvelope(path).catch(() => undefined);
+              throw error;
+            }
+          },
+        }
+      : {}),
+
     async readScopeBlocks(scope, collectedAt, options) {
       const manifestPath = blockManifestPath(scope, collectedAt);
       let manifest =
@@ -842,6 +911,7 @@ export async function createPersistentPsLiteStorage(
         id: state.nextId,
         createdAt: new Date().toISOString(),
       };
+      const previousState = state;
       state = {
         ...state,
         nextId: state.nextId + 1,
@@ -850,7 +920,12 @@ export async function createPersistentPsLiteStorage(
           indexed,
         ],
       };
-      await persist();
+      try {
+        await persist();
+      } catch (error) {
+        state = previousState;
+        throw error;
+      }
       return indexed;
     },
 

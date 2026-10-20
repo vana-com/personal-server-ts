@@ -16,6 +16,80 @@ import {
 import { previewEnvelopeValue } from "./storage-utils.js";
 
 describe("createPersistentPsLiteStorage", () => {
+  it("indexes a streamed record envelope only after the final chunk", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const files = new Map<string, string>();
+    const dataFileStore: PsLiteDataFileStore = {
+      kind: "custom",
+      async readEnvelope(path) {
+        const text = files.get(path);
+        return text ? JSON.parse(text) : null;
+      },
+      async writeEnvelope() {
+        throw new Error("whole-object write must not run");
+      },
+      async writeEnvelopeChunks(path, chunks) {
+        let text = "";
+        for await (const chunk of chunks)
+          text += new TextDecoder().decode(chunk);
+        files.set(path, text);
+        return new TextEncoder().encode(text).length;
+      },
+      async deleteEnvelope(path) {
+        files.delete(path);
+      },
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      dataFileStore,
+    );
+    const time = "2026-10-19T00:00:00.000Z";
+    async function* rows() {
+      yield '{"id":"m1","$pdpp":{"run":"r1"}}\n';
+      expect(storage.countVersions("chatgpt.messages")).toBe(0);
+      yield '{"id":"m2"}\n';
+    }
+
+    const result = await storage.writeRecordStream!(
+      "chatgpt.messages",
+      time,
+      "chatgpt",
+      rows(),
+    );
+
+    expect(result.records).toBe(2);
+    expect(storage.countVersions("chatgpt.messages")).toBe(1);
+    expect(
+      (await storage.readEnvelope("chatgpt.messages", time)).data.records,
+    ).toEqual([
+      {
+        id: "m1",
+        $pdpp: {
+          run: "r1",
+          sourceId: "https://registry.pdpp.dev/sources/chatgpt",
+        },
+      },
+      {
+        id: "m2",
+        $pdpp: { sourceId: "https://registry.pdpp.dev/sources/chatgpt" },
+      },
+    ]);
+
+    await expect(
+      storage.writeRecordStream!(
+        "chatgpt.messages",
+        "2026-10-20T00:00:00.000Z",
+        "chatgpt",
+        (async function* () {
+          yield '{"id":"bad","$pdpp":{"sourceId":"wrong"}}\n';
+        })(),
+      ),
+    ).rejects.toThrow("Conflicting $pdpp.sourceId");
+    expect(storage.countVersions("chatgpt.messages")).toBe(1);
+    expect(files.size).toBe(1);
+  });
+
   it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {
     const envelope = createDataFileEnvelope(
       "chatgpt.conversations",

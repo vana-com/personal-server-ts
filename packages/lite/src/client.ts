@@ -72,6 +72,23 @@ export interface StartPersonalServerLiteRelayOptions extends Omit<
   onStatus?: PsLiteRelayClientOptions["onStatus"];
 }
 
+/** Lite-only local ingest for a disk-backed stream of newline-delimited rows. */
+export interface PsLiteRecordStreamHandle extends PersonalServerHandle {
+  readonly supportsRecordStream: boolean;
+  postDataRecords(
+    scope: string,
+    connectorId: string,
+    chunks: AsyncIterable<string>,
+    options: { bearerToken: string; onRecord?: (count: number) => void },
+  ): Promise<{
+    scope: string;
+    collectedAt: string;
+    status: "stored";
+    records: number;
+    plaintextBytes: number;
+  }>;
+}
+
 export interface StartPersonalServerLiteOptions extends Omit<
   IndexedDbPsLiteRuntimeOptions,
   "ownerSignature" | "active"
@@ -88,7 +105,7 @@ export interface StartPersonalServerLiteOptions extends Omit<
 
 export async function startPersonalServer(
   options: StartPersonalServerLiteOptions,
-): Promise<PersonalServerHandle> {
+): Promise<PsLiteRecordStreamHandle> {
   if (options.persistence && options.runtime) {
     throw new Error(
       "runtime cannot be supplied with a complete persistence bundle",
@@ -155,6 +172,11 @@ export async function startPersonalServer(
         ),
       });
   const runtime = options.runtime ?? runtimeBundle!.runtime;
+  const supportsRecordStream = Boolean(
+    runtime.postDataRecords &&
+    "writeRecordStream" in runtime.storage &&
+    typeof runtime.storage.writeRecordStream === "function",
+  );
 
   if (options.active ?? true) {
     runtime.activate();
@@ -283,6 +305,24 @@ export async function startPersonalServer(
     return parsePersonalServerJsonResponse(
       await callFetch(request),
       "data write",
+    );
+  }
+
+  async function postDataRecords(
+    scope: string,
+    connectorId: string,
+    chunks: AsyncIterable<string>,
+    streamOptions: { bearerToken: string; onRecord?: (count: number) => void },
+  ) {
+    if (!supportsRecordStream || !runtime.postDataRecords) {
+      throw new Error("PS-Lite streamed record ingest is unavailable");
+    }
+    return runtime.postDataRecords(
+      scope,
+      connectorId,
+      chunks,
+      streamOptions.bearerToken,
+      streamOptions.onRecord,
     );
   }
 
@@ -507,12 +547,14 @@ export async function startPersonalServer(
 
   return {
     kind: "lite",
+    supportsRecordStream,
     ready: (_options?: PersonalServerReadyOptions) => info(),
     info,
     prepareRegistration,
     submitRegistration,
     fetch: callFetch,
     postData,
+    postDataRecords,
     listData,
     listAccessLogs,
     listVersions,

@@ -24,6 +24,7 @@ import {
   provisionDeviceTokenContract,
   revokeDeviceTokenContract,
   type DeviceSessionStore,
+  parseDataScopeContract,
 } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
   handlePersonalServerAccessLogsRequest,
@@ -108,7 +109,10 @@ import {
   type McpOAuthAuthorizationStore,
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
-import type { PsLiteStorageCapabilities } from "./storage.js";
+import type {
+  PsLiteStorageCapabilities,
+  PsLiteStoragePort,
+} from "./storage.js";
 import {
   createDefaultPsLiteAccessLogStore,
   createDefaultPsLiteSaveConfig,
@@ -268,6 +272,19 @@ export interface PsLiteRuntime extends RuntimeAvailabilityPort {
   activate(): void;
   deactivate(): void;
   fetch(request: Request): Promise<Response>;
+  postDataRecords?(
+    scope: string,
+    connectorId: string,
+    chunks: AsyncIterable<string>,
+    bearerToken: string,
+    onRecord?: (count: number) => void,
+  ): Promise<{
+    scope: string;
+    collectedAt: string;
+    status: "stored";
+    records: number;
+    plaintextBytes: number;
+  }>;
 }
 
 /**
@@ -991,6 +1008,44 @@ export function createPsLiteRuntime(
   return {
     kind: "ps-lite",
     storage: options.storage,
+    async postDataRecords(scope, connectorId, chunks, bearerToken, onRecord) {
+      if (!active) {
+        throw new PsUnavailableError({
+          runtime: "ps-lite",
+          reason: "Browser runtime is inactive",
+        });
+      }
+      const parsed = parseDataScopeContract(scope);
+      if (!parsed.ok) throw new Error("Invalid scope for streamed records");
+      const storage = options.storage as PsLiteStoragePort;
+      if (!storage.writeRecordStream) {
+        throw new Error("PS-Lite streamed record storage is unavailable");
+      }
+      await auth.authorizeOwner(
+        new Request(
+          `https://ps-lite.local/v1/data/${encodeURIComponent(scope)}`,
+          {
+            method: "POST",
+            headers: { authorization: `Bearer ${bearerToken}` },
+          },
+        ),
+      );
+      const collectedAt = now().toISOString();
+      const written = await storage.writeRecordStream(
+        parsed.scope,
+        collectedAt,
+        connectorId,
+        chunks,
+        onRecord,
+      );
+      return {
+        scope: parsed.scope,
+        collectedAt,
+        status: "stored",
+        records: written.records,
+        plaintextBytes: written.sizeBytes,
+      };
+    },
     activate() {
       active = true;
       options.syncManager?.start?.();

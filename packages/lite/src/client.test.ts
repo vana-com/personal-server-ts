@@ -11,7 +11,11 @@ import {
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
-import { createPsLiteRuntime, createWeb3SignedPsLiteAuth } from "./runtime.js";
+import {
+  createBearerTokenPsLiteAuth,
+  createPsLiteRuntime,
+  createWeb3SignedPsLiteAuth,
+} from "./runtime.js";
 import { startPersonalServer } from "./client.js";
 
 const ORIGIN = "https://ps-lite.local";
@@ -89,6 +93,56 @@ function createRuntime(gateway: GatewayClient) {
 }
 
 describe("startPersonalServer lite handle", () => {
+  it("checks owner auth before consuming a streamed write", async () => {
+    const writeRecordStream = vi.fn(async () => ({
+      records: 1,
+      sizeBytes: 100,
+    }));
+    const accessLogs = createMemoryPsLiteAccessLogStore();
+    const runtime = createPsLiteRuntime({
+      active: true,
+      accessLogReader: accessLogs,
+      accessLogWriter: accessLogs,
+      tokenStore: createMemoryPsLiteTokenStore(),
+      saveConfig: async () => {},
+      storage: Object.assign(createMemoryPsLiteStorage(), {
+        writeRecordStream,
+      }),
+      auth: createBearerTokenPsLiteAuth({
+        ownerToken: "owner-token",
+        builderToken: "builder-token",
+      }),
+    });
+    const handle = await startPersonalServer({ runtime, relay: false });
+    expect(handle.supportsRecordStream).toBe(true);
+    const rows = () =>
+      (async function* () {
+        yield '{"id":"m1"}\n';
+      })();
+
+    await expect(
+      handle.postDataRecords("chatgpt.messages", "chatgpt", rows(), {
+        bearerToken: "wrong-token",
+      }),
+    ).rejects.toThrow();
+    expect(writeRecordStream).not.toHaveBeenCalled();
+
+    const written = await handle.postDataRecords(
+      "chatgpt.messages",
+      "chatgpt",
+      rows(),
+      { bearerToken: "owner-token" },
+    );
+    expect(written).toMatchObject({
+      scope: "chatgpt.messages",
+      status: "stored",
+      records: 1,
+      plaintextBytes: 100,
+    });
+    expect(writeRecordStream).toHaveBeenCalledOnce();
+    await handle.stop();
+  });
+
   it("exposes info and registration through the unified handle", async () => {
     const gateway = createGateway();
     const ps = await startPersonalServer({
