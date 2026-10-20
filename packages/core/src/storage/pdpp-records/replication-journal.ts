@@ -9,7 +9,8 @@ export interface CanonicalMutation {
   readonly sourceId: string | null;
   readonly connectionId: string;
   readonly method: string | null;
-  readonly generation: number;
+  /** Null if no binding row exists for a legacy owner deletion. */
+  readonly generation: number | null;
   readonly stream: string;
   readonly recordKey: string;
   readonly operation: "upsert" | "delete";
