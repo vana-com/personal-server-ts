@@ -48,7 +48,7 @@ describe("replica merge vectors", () => {
   it("retains losing mutable values and permits later resurrection in every order", () => {
     const result = assertPermutations([registration, ...mutableVectors]);
     expect(result.records[0].winner?.revision.operationId).toBe("resurrect");
-    expect(result.records[0].losers).toHaveLength(3);
+    expect(result.records[0].losers).toEqual(mutableVectors.slice(0, 3));
     const deleted = assertPermutations([
       registration,
       ...mutableVectors.slice(0, 3),
@@ -90,6 +90,11 @@ it("quarantines append-only conflicts in all orders; ordinary later writes canno
     quarantined: true,
   });
   expect(expected.conflicts[0].reason).toBe("append_only_content_conflict");
+  expect(expected.records[0].losers).toEqual([a, b, repairAttempt]);
+  expect(expected.conflicts[0].operations).toHaveLength(3);
+  expect(expected.conflicts[0].operations).toEqual(
+    expect.arrayContaining([a, b, repairAttempt]),
+  );
   const same = {
     ...a,
     emittedAt: "later",
@@ -172,10 +177,22 @@ it("deleted connections dominate even later generations and high-counter writes"
       operationId: "connection-delete",
     },
   };
+  const reset: ReplicaOperation = {
+    ...identity,
+    kind: "connection-reset",
+    generation: 2,
+    previousGeneration: 1,
+    revision: {
+      counter: 3,
+      writerId: "device-a",
+      operationId: "reset-after-delete",
+    },
+  };
   const result = assertPermutations([
     registration,
     deletion,
-    upsert("late", 999),
+    reset,
+    { ...upsert("late", 999), generation: 2 },
   ]);
   expect(result.records).toEqual([]);
   expect(result.suppressed[0].reason).toBe("connection_deleted");
