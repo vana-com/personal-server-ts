@@ -847,3 +847,193 @@ it("does not expose a pending record when persisted received blob bytes are corr
     target.store.replication.readTailPage({ limit: 100 }).operations,
   ).toEqual([]);
 });
+
+function completedReplica() {
+  const source = device();
+  source.store.replaceStream({
+    instance: "conn_a",
+    stream: "messages",
+    method: "collector",
+    generation: 1,
+    emittedAt: at,
+    envelopes: [
+      {
+        instance: "conn_a",
+        stream: "messages",
+        key: "a",
+        data: { id: "a", text: "snapshot" },
+        emitted_at: at,
+      },
+    ],
+    primaryKey: ["id"],
+    sourceCollectedAt: at,
+  });
+  return all(source);
+}
+
+it("keeps unknown-declaration invalidation pending without erasing a trusted completion", () => {
+  const d = device();
+  send(d, completedReplica());
+  const receipt = d.store.listStreamCompletions("conn_a");
+  expect(receipt).toHaveLength(1);
+  const invalidation: ReplicaOperation = {
+    ...registration(),
+    kind: "stream-invalidate",
+    revision: { counter: 100, writerId: "unknown", operationId: "invalidate" },
+    declaration: { ...binding, digest: `sha256:${"c".repeat(64)}` },
+  };
+  const plan = send(d, [invalidation]);
+  expect(
+    plan.pending.some((issue) => issue.reason === "missing_declaration"),
+  ).toBe(true);
+  expect(d.store.listStreamCompletions("conn_a")).toEqual(receipt);
+  d.reopen();
+  d.receiver.retry({ credential: "replica-secret" });
+  expect(d.store.listStreamCompletions("conn_a")).toEqual(receipt);
+});
+
+it("makes competing known declaration completions unavailable instead of overwriting one by iteration order", () => {
+  const operations = completedReplica();
+  const d = device();
+  send(d, operations);
+  const competing = { ...binding, digest: `sha256:${"c".repeat(64)}` };
+  d.declare([
+    ...declarations,
+    { sourceId, binding: competing, validateData: () => true },
+  ]);
+  const second = operations
+    .filter((op) => op.kind === "upsert" || op.kind === "stream-complete")
+    .map((op) => ({
+      ...op,
+      declaration: competing,
+      revision: {
+        ...op.revision,
+        writerId: "competing",
+        operationId: `competing-${op.revision.operationId}`,
+      },
+    }));
+  send(d, second);
+  expect(value(d)).toBeUndefined();
+  expect(d.store.listStreamCompletions("conn_a")).toEqual([]);
+});
+
+it.each([false, true])(
+  "does not permanently delete a binding on cross-kind operation equivocation (deleteFirst=%s)",
+  (deleteFirst) => {
+    const d = device();
+    const record = upsert();
+    const deletion: ReplicaOperation = {
+      ...registration(),
+      kind: "connection-delete",
+      revision: record.revision,
+    };
+    send(d, [deleteFirst ? deletion : record]);
+    const plan = send(d, [deleteFirst ? record : deletion]);
+    expect(
+      plan.conflicts.some(
+        (issue) => issue.reason === "operation_id_equivocation",
+      ),
+    ).toBe(true);
+    expect(value(d)).toBeUndefined();
+    expect(d.store.getInstanceBinding("conn_a").deletedAt).toBeNull();
+    const before = d.db.prepare("SELECT * FROM pdpp_mutation_journal").all();
+    try {
+      put(d, "local");
+    } catch {
+      /* Quarantine may explicitly refuse the write. */
+    }
+    expect(value(d)).toBeUndefined();
+    expect(d.db.prepare("SELECT * FROM pdpp_mutation_journal").all()).toEqual(
+      before,
+    );
+    d.reopen();
+    expect(d.store.getInstanceBinding("conn_a").deletedAt).toBeNull();
+  },
+);
+
+it.each(["empty", "tombstone-only"])(
+  "allocates a fresh reset fence for an imported reset of a %s connection",
+  (mode) => {
+    const d = device();
+    if (mode === "tombstone-only") {
+      put(d, "old");
+      d.store.deleteRecord("conn_a", "messages", "a", at, "mutable_state");
+    }
+    const options = { instanceIds: ["conn_a"], limit: 100 };
+    const before = d.store.changesSince("messages", options);
+    const clock = (
+      d.db.prepare("SELECT value FROM pdpp_write_clock").get() as {
+        value: number;
+      }
+    ).value;
+    const reset: ReplicaOperation = {
+      ...registration(),
+      kind: "connection-reset",
+      generation: 2,
+      previousGeneration: 1,
+      revision: { counter: 100, writerId: "remote", operationId: "reset" },
+    };
+    send(d, [reset]);
+    expect(d.store.getInstanceBinding("conn_a").resetClock).toBeGreaterThan(
+      clock,
+    );
+    expect(() =>
+      d.store.changesSince("messages", {
+        ...options,
+        changesSince: before.nextChangesSince,
+      }),
+    ).toThrow();
+  },
+);
+
+it("keeps a committed connection deletion fence unchanged on duplicate replay after unrelated writes", () => {
+  const d = device();
+  put(d, "a");
+  const deletion: ReplicaOperation = {
+    ...registration(),
+    kind: "connection-delete",
+    revision: { counter: 100, writerId: "remote", operationId: "delete" },
+  };
+  send(d, [deletion]);
+  const before = d.store.getInstanceBinding("conn_a");
+  d.store.registerConnection({
+    instance: "other",
+    sourceId,
+    method: "collector",
+    label: "Other",
+  });
+  d.store.ingestBatch(
+    [
+      {
+        instance: "other",
+        stream: "messages",
+        key: "b",
+        data: { id: "b" },
+        emitted_at: at,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  send(d, [deletion]);
+  expect(d.store.getInstanceBinding("conn_a")).toEqual(before);
+});
+
+it("allocates imported arrival order after repeated unchanged local collector observations", () => {
+  const d = device();
+  for (let i = 0; i < 5; i++) put(d, "unchanged");
+  expect(d.store.listArrivalOrder("conn_a", "messages")).toEqual(["a"]);
+  const record: ReplicaOperation = {
+    ...upsert(100),
+    recordKey: "b",
+    data: { id: "b", text: "imported" },
+  };
+  send(d, [record]);
+  expect(d.store.listArrivalOrder("conn_a", "messages")).toEqual(["a", "b"]);
+  const before = d.db.prepare("SELECT * FROM pdpp_record_arrival").all();
+  send(d, [record]);
+  expect(d.db.prepare("SELECT * FROM pdpp_record_arrival").all()).toEqual(
+    before,
+  );
+});

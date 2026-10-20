@@ -246,8 +246,8 @@ export function createReplicaReceiver(deps: {
       ).run(instance, stream, key);
     else
       db.prepare(
-        "INSERT INTO pdpp_record_arrival VALUES (?, ?, ?, ?, ?) ON CONFLICT(instance,stream,record_key) DO UPDATE SET generation=excluded.generation,arrival=excluded.arrival",
-      ).run(instance, stream, key, operation!.generation, seq);
+        "INSERT INTO pdpp_record_arrival VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(arrival), 0) + 1 FROM pdpp_record_arrival WHERE instance = ?)) ON CONFLICT(instance,stream,record_key) DO UPDATE SET generation=excluded.generation,arrival=excluded.arrival",
+      ).run(instance, stream, key, operation!.generation, instance);
     db.prepare(
       "UPDATE pdpp_record_arrival_clock SET value = value + 1 WHERE id = 1",
     ).run();
@@ -281,7 +281,11 @@ export function createReplicaReceiver(deps: {
           issue.reason !== "incompatible_record_declaration" &&
           issue.operations.some((op) => op.connectionId === id),
       );
-      const deleted = entries.some((op) => op.kind === "connection-delete");
+      const deleted = plan.suppressed.some(
+        (issue) =>
+          issue.reason === "connection_deleted" &&
+          issue.operations.some((op) => op.connectionId === id),
+      );
       const missingLifecycle = plan.pending.some(
         (issue) =>
           issue.operations.some((op) => op.connectionId === id) &&
@@ -301,15 +305,20 @@ export function createReplicaReceiver(deps: {
           .filter((op) => op.kind === "connection-reset")
           .map((op) => op.generation),
       );
-      if (blocked)
-        db.prepare(
-          "INSERT OR IGNORE INTO pdpp_replica_quarantined_connections VALUES (?)",
-        ).run(id);
-      if (
-        deleted ||
-        blocked ||
-        (!missingLifecycle && generation > local.generation)
-      ) {
+      const newlyBlocked =
+        blocked &&
+        db
+          .prepare(
+            "INSERT OR IGNORE INTO pdpp_replica_quarantined_connections VALUES (?)",
+          )
+          .run(id).changes > 0;
+      const reset =
+        !blocked && !missingLifecycle && generation > local.generation;
+      // A receiver-derived deletion can become equivocated later. Retract only
+      // that derived marker; an actual local deletion remains in the merge set.
+      const retractDeletion =
+        !deleted && local.deleted_at === "replica-deleted";
+      if (deleted || blocked || reset) {
         for (const row of db
           .prepare(
             "SELECT stream,record_key FROM pdpp_records WHERE instance = ? AND deleted = 0",
@@ -320,14 +329,31 @@ export function createReplicaReceiver(deps: {
           id,
         );
         db.prepare("DELETE FROM pdpp_blob_claims WHERE instance = ?").run(id);
-        if (deleted)
-          db.prepare(
-            "UPDATE pdpp_instance_binding SET deleted_at = COALESCE(deleted_at, 'replica-deleted'), reset_clock = (SELECT value FROM pdpp_write_clock) WHERE instance = ?",
-          ).run(id);
-        else if (!blocked)
-          db.prepare(
-            "UPDATE pdpp_instance_binding SET generation = ?, reset_clock = (SELECT value FROM pdpp_write_clock) WHERE instance = ?",
-          ).run(generation, id);
+      }
+      if (
+        (deleted && local.deleted_at === null) ||
+        reset ||
+        newlyBlocked ||
+        retractDeletion
+      ) {
+        // Even an empty reset must expire a token at the old write horizon.
+        const { value: fence } = db
+          .prepare(
+            "UPDATE pdpp_write_clock SET value = value + 1 WHERE id = 1 RETURNING value",
+          )
+          .get() as { value: number };
+        db.prepare(
+          "UPDATE pdpp_instance_binding SET generation = ?, deleted_at = ?, reset_clock = ? WHERE instance = ?",
+        ).run(
+          reset ? generation : local.generation,
+          deleted
+            ? (local.deleted_at ?? "replica-deleted")
+            : retractDeletion
+              ? null
+              : local.deleted_at,
+          fence,
+          id,
+        );
       }
     }
     for (const record of plan.records) {
@@ -361,30 +387,56 @@ export function createReplicaReceiver(deps: {
         { kind: "stream-complete" | "stream-invalidate" }
       >[]
     >();
-    for (const op of operations)
-      if (op.kind === "stream-complete" || op.kind === "stream-invalidate") {
-        const key = canonicalJson([
-          op.connectionId,
-          op.generation,
-          op.declaration,
-        ]);
-        grouped.set(key, [...(grouped.get(key) ?? []), op]);
+    const declarations = deps.declarations();
+    for (const op of operations) {
+      if (op.kind !== "stream-complete" && op.kind !== "stream-invalidate")
+        continue;
+      if (
+        !declarations.some(
+          (d) =>
+            d.sourceId === op.sourceId &&
+            canonicalJson(d.binding) === canonicalJson(op.declaration),
+        )
+      ) {
+        plan.pending.push({ reason: "missing_declaration", operations: [op] });
+        continue;
       }
+      const key = canonicalJson([
+        op.connectionId,
+        op.generation,
+        op.declaration.stream,
+      ]);
+      grouped.set(key, [...(grouped.get(key) ?? []), op]);
+    }
     for (const entries of grouped.values()) {
       const first = entries[0];
       const local = binding(first.connectionId)!;
       if (local.deleted_at || local.generation !== first.generation) continue;
       const stream = first.declaration.stream;
+      if (
+        new Set(entries.map((op) => canonicalJson(op.declaration))).size > 1
+      ) {
+        plan.conflicts.push({
+          reason: "incompatible_completion_declaration",
+          operations: entries,
+        });
+        db.prepare(
+          "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+        ).run(first.connectionId, stream);
+        continue;
+      }
       const relevantIssue = [
         ...plan.pending,
         ...plan.conflicts,
         ...plan.rejected,
-      ].some((issue) =>
-        issue.operations.some(
-          (op) =>
-            op.connectionId === first.connectionId &&
-            (!("declaration" in op) || op.declaration.stream === stream),
-        ),
+      ].some(
+        (issue) =>
+          issue.reason !== "missing_declaration" &&
+          issue.operations.some(
+            (op) =>
+              op.connectionId === first.connectionId &&
+              (!("declaration" in op) || op.declaration.stream === stream),
+          ),
       );
       const declaration = deps
         .declarations()
