@@ -774,3 +774,22 @@ it("the gateway oracle enforces chain-backed continuity even when history is mis
   ).rejects.toThrow();
   expect(net.head.has(scope)).toBe(false);
 });
+
+it("retries durable imports while owner discovery is unavailable", async () => {
+  const net = network();
+  const a = device(net, { preexisting: "retained record" });
+  await cycles([a], 2);
+  const b = device(net);
+  b.db.exec(
+    "CREATE TRIGGER pause_import BEFORE INSERT ON pdpp_transport_imported BEGIN SELECT RAISE(ABORT,'pause'); END;",
+  );
+  await b.cycle();
+  expect(b.get()).toBeUndefined();
+  b.db.exec("DROP TRIGGER pause_import");
+  b.reopen();
+  net.port.list = async () => {
+    throw new Error("gateway listing offline");
+  };
+  await b.cycle().catch(() => undefined);
+  expect(b.get()).toEqual(a.get());
+});

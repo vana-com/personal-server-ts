@@ -505,13 +505,28 @@ export function createReplicaTransportWorker(deps: {
       if (!enabled() || running) return;
       running = true;
       try {
-        retainPage();
-        await prepare();
-        await publish();
-        await discover();
-        await download();
-        importReady();
-        deps.receiver.retry({ credential: deps.credential });
+        const failures: unknown[] = [];
+        // A failed network phase must not prevent progress on work already retained locally.
+        for (const phase of [
+          retainPage,
+          prepare,
+          publish,
+          discover,
+          download,
+          importReady,
+          () => deps.receiver.retry({ credential: deps.credential }),
+        ]) {
+          try {
+            await phase();
+          } catch (error) {
+            failures.push(error);
+          }
+        }
+        if (failures.length)
+          throw new AggregateError(
+            failures,
+            "Replica transport cycle incomplete",
+          );
       } finally {
         running = false;
       }
