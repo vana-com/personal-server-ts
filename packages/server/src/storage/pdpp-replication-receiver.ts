@@ -1,0 +1,511 @@
+import type { Database } from "better-sqlite3";
+import { createHash } from "node:crypto";
+import {
+  canonicalJson,
+  replicaEnvelopeSchema,
+  type ReplicaOperation,
+  type RecordOperation,
+} from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import {
+  planReplicaMerge,
+  type MergeContext,
+  type ReplicaMergePlan,
+} from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
+import { selectStreamCompletion } from "@opendatalabs/personal-server-ts-core/replication/completion";
+import { replicaOperationDigest } from "./pdpp-replication-sqlite.js";
+import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
+import type { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+
+export const RECEIVER_MIGRATION = `
+CREATE TABLE pdpp_replica_received (operation_json TEXT PRIMARY KEY, digest TEXT NOT NULL);
+CREATE TRIGGER pdpp_received_no_update BEFORE UPDATE ON pdpp_replica_received BEGIN SELECT RAISE(ABORT, 'received operations are append-only'); END;
+CREATE TRIGGER pdpp_received_no_delete BEFORE DELETE ON pdpp_replica_received BEGIN SELECT RAISE(ABORT, 'received operations are append-only'); END;
+CREATE TABLE pdpp_replica_received_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
+`;
+
+type Store = ReturnType<typeof createSqliteRecordStore>;
+type Binding = {
+  instance: string;
+  source_id: string | null;
+  method: string | null;
+  generation: number;
+  deleted_at: string | null;
+};
+type BlobDescriptor = Extract<ReplicaOperation, { kind: "blob-claim" }>["blob"];
+interface StoredRow {
+  data: string | null;
+  version: number;
+  emitted_at: string;
+  deleted: number;
+  deleted_at: string | null;
+  blob_id: string | null;
+}
+
+/**
+ * Internal port, deliberately absent from bootstrap and connector routes. The host
+ * must verify a replica-specific credential before returning its owner. A payload,
+ * a collector credential, and a source declaration are never authentication.
+ * Connection ids are the registered canonical instance ids (the export profile).
+ */
+export function createReplicaReceiver(deps: {
+  db: Database;
+  store: Store;
+  owner: string;
+  authenticate: (credential: unknown) => string | undefined;
+  declarations: () => MergeContext["declarations"];
+}) {
+  const { db, store, owner } = deps;
+  function authorize(credential: unknown) {
+    if (!owner || deps.authenticate(credential) !== owner)
+      throw new Error("replica authority required for owner");
+    const settings = db
+      .prepare("SELECT config_json FROM pdpp_replica_settings WHERE id = 1")
+      .get() as { config_json: string } | undefined;
+    if (!settings || JSON.parse(settings.config_json).owner !== owner)
+      throw new Error("same-owner replication baseline required");
+  }
+  const binding = (id: string) =>
+    db
+      .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
+      .get(id) as Binding | undefined;
+  function validateMapping(operation: ReplicaOperation) {
+    const local = binding(operation.connectionId);
+    if (
+      local?.source_id &&
+      (local.source_id !== operation.sourceId ||
+        local.method !== operation.methodId)
+    )
+      throw new Error("replica connection source or method mismatch");
+  }
+  function retained(): ReplicaOperation[] {
+    return (
+      db
+        .prepare(
+          "SELECT operation_json FROM pdpp_replica_operations UNION SELECT operation_json FROM pdpp_replica_received",
+        )
+        .all() as { operation_json: string }[]
+    ).map((row) => JSON.parse(row.operation_json));
+  }
+  const hash = (bytes: Uint8Array) =>
+    `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  function verifiedBytes(blob: BlobDescriptor): Uint8Array | undefined {
+    const row = db
+      .prepare(
+        "SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id = ?",
+      )
+      .get(blob.blobId) as { bytes: Buffer } | undefined;
+    const bytes = row?.bytes ?? store.getBlobBytes(blob.blobId);
+    return bytes &&
+      bytes.byteLength === blob.sizeBytes &&
+      hash(bytes) === blob.sha256 &&
+      blob.blobId === blob.sha256
+      ? bytes
+      : undefined;
+  }
+  function materializeBlob(
+    operation: Extract<ReplicaOperation, { kind: "upsert" }>,
+    operations: ReplicaOperation[],
+  ): boolean {
+    const ref = operation.data.blob_ref as
+      | {
+          blob_id?: unknown;
+          sha256?: unknown;
+          size_bytes?: unknown;
+          mime_type?: unknown;
+        }
+      | undefined;
+    if (operation.blobs.length !== (ref ? 1 : 0)) return false;
+    for (const blob of operation.blobs) {
+      if (
+        ref?.blob_id !== blob.blobId ||
+        (ref.sha256 !== undefined &&
+          ref.sha256 !== blob.sha256.replace("sha256:", "")) ||
+        (ref.size_bytes !== undefined && ref.size_bytes !== blob.sizeBytes) ||
+        (ref.mime_type !== undefined && ref.mime_type !== blob.mimeType)
+      )
+        return false;
+      const claimed = operations.some(
+        (op) =>
+          op.kind === "blob-claim" &&
+          op.owner === owner &&
+          op.connectionId === operation.connectionId &&
+          op.sourceId === operation.sourceId &&
+          op.methodId === operation.methodId &&
+          op.generation === operation.generation &&
+          canonicalJson(op.blob) === canonicalJson(blob),
+      );
+      const bytes = verifiedBytes(blob);
+      if (!claimed || !bytes) return false;
+      const meta = store.getBlobMeta(blob.blobId);
+      if (
+        meta &&
+        (meta.sha256 !== blob.sha256.slice(7) ||
+          meta.mimeType !== blob.mimeType ||
+          meta.sizeBytes !== blob.sizeBytes)
+      )
+        throw new Error("replica blob metadata conflict");
+      db.prepare("INSERT OR IGNORE INTO pdpp_blobs VALUES (?, ?, ?, ?)").run(
+        blob.blobId,
+        blob.mimeType,
+        blob.sizeBytes,
+        blob.sha256.slice(7),
+      );
+      const existing = db
+        .prepare("SELECT bytes FROM pdpp_blob_bytes WHERE blob_id = ?")
+        .get(blob.blobId) as { bytes: Buffer } | undefined;
+      if (
+        existing &&
+        (hash(existing.bytes) !== blob.sha256 ||
+          existing.bytes.length !== blob.sizeBytes)
+      )
+        throw new Error("corrupt canonical blob bytes");
+      db.prepare("INSERT OR IGNORE INTO pdpp_blob_bytes VALUES (?, ?)").run(
+        blob.blobId,
+        bytes,
+      );
+      db.prepare(
+        "INSERT INTO pdpp_blob_claims VALUES (?, ?, ?) ON CONFLICT(blob_id, instance) DO UPDATE SET generation = excluded.generation",
+      ).run(blob.blobId, operation.connectionId, operation.generation);
+    }
+    return true;
+  }
+  function write(
+    instance: string,
+    stream: string,
+    key: string,
+    operation: RecordOperation | null,
+  ) {
+    const current = db
+      .prepare(
+        "SELECT * FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
+      )
+      .get(instance, stream, key) as StoredRow | undefined;
+    const data =
+      operation?.kind === "upsert" ? canonicalJson(operation.data) : null;
+    const emittedAt = operation?.emittedAt ?? current?.emitted_at;
+    if (!emittedAt) return;
+    const deletedAt =
+      operation?.kind === "delete"
+        ? operation.deletedAt
+        : data === null
+          ? emittedAt
+          : null;
+    if (
+      current &&
+      (current.data === null
+        ? null
+        : canonicalJson(JSON.parse(current.data))) === data &&
+      current.emitted_at === emittedAt &&
+      current.deleted_at === deletedAt
+    )
+      return;
+    const version = (current?.version ?? 0) + 1;
+    const { value: seq } = db
+      .prepare(
+        "UPDATE pdpp_write_clock SET value = value + 1 WHERE id = 1 RETURNING value",
+      )
+      .get() as { value: number };
+    const blobId =
+      operation?.kind === "upsert"
+        ? (operation.blobs[0]?.blobId ?? null)
+        : null;
+    db.prepare(
+      "INSERT INTO pdpp_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance,stream,record_key) DO UPDATE SET data=excluded.data, version=excluded.version, emitted_at=excluded.emitted_at, deleted=excluded.deleted, deleted_at=excluded.deleted_at, blob_id=excluded.blob_id",
+    ).run(
+      instance,
+      stream,
+      key,
+      data,
+      version,
+      emittedAt,
+      data === null ? 1 : 0,
+      deletedAt,
+      blobId,
+    );
+    db.prepare(
+      "INSERT INTO pdpp_record_changes (instance,stream,record_key,version,data,emitted_at,deleted,deleted_at,written_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(
+      instance,
+      stream,
+      key,
+      version,
+      data,
+      emittedAt,
+      data === null ? 1 : 0,
+      deletedAt,
+      seq,
+    );
+    db.prepare(
+      "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+    ).run(instance, stream);
+    if (data === null)
+      db.prepare(
+        "DELETE FROM pdpp_record_arrival WHERE instance = ? AND stream = ? AND record_key = ?",
+      ).run(instance, stream, key);
+    else
+      db.prepare(
+        "INSERT INTO pdpp_record_arrival VALUES (?, ?, ?, ?, ?) ON CONFLICT(instance,stream,record_key) DO UPDATE SET generation=excluded.generation,arrival=excluded.arrival",
+      ).run(instance, stream, key, operation!.generation, seq);
+    db.prepare(
+      "UPDATE pdpp_record_arrival_clock SET value = value + 1 WHERE id = 1",
+    ).run();
+  }
+  function reconcile(): ReplicaMergePlan {
+    const all = retained();
+    const context = { owner, declarations: deps.declarations() };
+    const unavailable: ReplicaOperation[] = [];
+    const eligible = all.filter((op) => {
+      validateMapping(op);
+      if (!binding(op.connectionId)?.source_id) {
+        unavailable.push(op);
+        return false;
+      }
+      return true;
+    });
+    const plan = planReplicaMerge(context, eligible);
+    if (unavailable.length)
+      plan.pending.push({
+        reason: "missing_local_connection",
+        operations: unavailable,
+      });
+    // Lifecycle evidence gates canonical state, but never creates a connection or
+    // changes its acquisition method. Only the local authority provisions that.
+    for (const id of new Set(eligible.map((op) => op.connectionId))) {
+      const local = binding(id)!;
+      const entries = eligible.filter((op) => op.connectionId === id);
+      const blocked = plan.conflicts.some(
+        (issue) =>
+          issue.reason !== "append_only_content_conflict" &&
+          issue.reason !== "incompatible_record_declaration" &&
+          issue.operations.some((op) => op.connectionId === id),
+      );
+      const deleted = entries.some((op) => op.kind === "connection-delete");
+      const missingLifecycle = plan.pending.some(
+        (issue) =>
+          issue.operations.some((op) => op.connectionId === id) &&
+          [
+            "missing_connection_registration",
+            "missing_generation_reset",
+          ].includes(issue.reason) &&
+          issue.operations.some(
+            (op) =>
+              op.kind === "connection-register" ||
+              op.kind === "connection-reset",
+          ),
+      );
+      const generation = Math.max(
+        1,
+        ...entries
+          .filter((op) => op.kind === "connection-reset")
+          .map((op) => op.generation),
+      );
+      if (
+        deleted ||
+        blocked ||
+        (!missingLifecycle && generation > local.generation)
+      ) {
+        for (const row of db
+          .prepare(
+            "SELECT stream,record_key FROM pdpp_records WHERE instance = ? AND deleted = 0",
+          )
+          .all(id) as { stream: string; record_key: string }[])
+          write(id, row.stream, row.record_key, null);
+        db.prepare("DELETE FROM pdpp_stream_completion WHERE instance = ?").run(
+          id,
+        );
+        db.prepare("DELETE FROM pdpp_blob_claims WHERE instance = ?").run(id);
+        if (deleted)
+          db.prepare(
+            "UPDATE pdpp_instance_binding SET deleted_at = COALESCE(deleted_at, 'replica-deleted'), reset_clock = (SELECT value FROM pdpp_write_clock) WHERE instance = ?",
+          ).run(id);
+        else if (!blocked)
+          db.prepare(
+            "UPDATE pdpp_instance_binding SET generation = ?, reset_clock = (SELECT value FROM pdpp_write_clock) WHERE instance = ?",
+          ).run(generation, id);
+      }
+    }
+    for (const record of plan.records) {
+      const { connectionId, stream, recordKey, generation } = record.identity;
+      const local = binding(connectionId)!;
+      if (local.deleted_at || generation !== local.generation) continue;
+      const winner = record.winner;
+      if (winner?.kind === "upsert" && !materializeBlob(winner, eligible)) {
+        plan.pending.push({
+          reason: "missing_or_invalid_blob",
+          operations: [winner],
+        });
+        write(connectionId, stream, recordKey, null);
+      } else write(connectionId, stream, recordKey, winner);
+    }
+    reconcileCompletions(eligible, plan);
+    return plan;
+  }
+  function reconcileCompletions(
+    operations: ReplicaOperation[],
+    plan: ReplicaMergePlan,
+  ) {
+    const grouped = new Map<
+      string,
+      Extract<
+        ReplicaOperation,
+        { kind: "stream-complete" | "stream-invalidate" }
+      >[]
+    >();
+    for (const op of operations)
+      if (op.kind === "stream-complete" || op.kind === "stream-invalidate") {
+        const key = canonicalJson([
+          op.connectionId,
+          op.generation,
+          op.declaration,
+        ]);
+        grouped.set(key, [...(grouped.get(key) ?? []), op]);
+      }
+    for (const entries of grouped.values()) {
+      const first = entries[0];
+      const local = binding(first.connectionId)!;
+      if (local.deleted_at || local.generation !== first.generation) continue;
+      const stream = first.declaration.stream;
+      const relevantIssue = [
+        ...plan.pending,
+        ...plan.conflicts,
+        ...plan.rejected,
+      ].some((issue) =>
+        issue.operations.some(
+          (op) =>
+            op.connectionId === first.connectionId &&
+            (!("declaration" in op) || op.declaration.stream === stream),
+        ),
+      );
+      const declaration = deps
+        .declarations()
+        .find(
+          (d) =>
+            d.sourceId === first.sourceId &&
+            canonicalJson(d.binding) === canonicalJson(first.declaration),
+        );
+      const completion = selectStreamCompletion(entries);
+      const dependencies =
+        completion?.dependencies.every((dep) => {
+          const matches = operations.filter(
+            (op) =>
+              op.revision.writerId === dep.writerId &&
+              op.revision.operationId === dep.operationId,
+          );
+          return (
+            matches.length === 1 &&
+            replicaOperationDigest(matches[0]) === dep.digest
+          );
+        }) && completion.dependencies.length > 0;
+      const rows = db
+        .prepare(
+          "SELECT record_key AS recordKey, data AS dataJson FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+        )
+        .all(first.connectionId, stream) as {
+        recordKey: string;
+        dataJson: string;
+      }[];
+      const digest = declaration
+        ? liveSnapshotDigest(
+            {
+              sourceId: first.sourceId,
+              instance: first.connectionId,
+              method: first.methodId,
+              generation: first.generation,
+              stream,
+            },
+            declaration.binding.primaryKey,
+            rows,
+          )
+        : undefined;
+      if (
+        completion &&
+        declaration &&
+        dependencies &&
+        !relevantIssue &&
+        rows.length === completion.liveCount &&
+        `sha256:${digest}` === completion.snapshotSha256 &&
+        (completion.proof.kind !== "native" ||
+          completion.proof.snapshotSha256 === completion.snapshotSha256)
+      ) {
+        const seq = (
+          db.prepare("SELECT value FROM pdpp_write_clock").get() as {
+            value: number;
+          }
+        ).value;
+        db.prepare(
+          "INSERT INTO pdpp_stream_completion (instance,stream,method,generation,source_collected_at,write_seq,live_count,snapshot_sha256,collection_time_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance,stream) DO UPDATE SET method=excluded.method,generation=excluded.generation,source_collected_at=excluded.source_collected_at,write_seq=excluded.write_seq,live_count=excluded.live_count,snapshot_sha256=excluded.snapshot_sha256,collection_time_basis=excluded.collection_time_basis",
+        ).run(
+          first.connectionId,
+          stream,
+          first.methodId,
+          first.generation,
+          completion.sourceCollectedAt,
+          seq,
+          completion.liveCount,
+          completion.proof.kind === "native" ? digest! : null,
+          completion.proof.kind === "native" ? "host_run_finished" : null,
+        );
+      } else {
+        db.prepare(
+          "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+        ).run(first.connectionId, stream);
+        if (completion)
+          plan.pending.push({
+            reason: "unverified_completion",
+            operations: [completion],
+          });
+      }
+    }
+  }
+  return {
+    import(input: {
+      credential: unknown;
+      envelope: unknown;
+      blobs?: { blobId: string; bytes: Uint8Array }[];
+    }): ReplicaMergePlan {
+      authorize(input.credential);
+      const envelope = replicaEnvelopeSchema.parse(input.envelope);
+      if (
+        envelope.owner !== owner ||
+        envelope.operations.some((op) => op.owner !== owner)
+      )
+        throw new Error("wrong replica owner");
+      return db
+        .transaction(() => {
+          for (const op of envelope.operations) validateMapping(op);
+          for (const blob of input.blobs ?? []) {
+            if (hash(blob.bytes) !== blob.blobId)
+              throw new Error("corrupt replica blob bytes");
+            const previous = db
+              .prepare(
+                "SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id = ?",
+              )
+              .get(blob.blobId) as { bytes: Buffer } | undefined;
+            if (
+              previous &&
+              (hash(previous.bytes) !== blob.blobId ||
+                !Buffer.from(blob.bytes).equals(previous.bytes))
+            )
+              throw new Error("corrupt retained replica bytes");
+            db.prepare(
+              "INSERT OR IGNORE INTO pdpp_replica_received_bytes VALUES (?, ?)",
+            ).run(blob.blobId, blob.bytes);
+          }
+          for (const op of envelope.operations) {
+            db.prepare(
+              "INSERT OR IGNORE INTO pdpp_replica_received VALUES (?, ?)",
+            ).run(canonicalJson(op), replicaOperationDigest(op));
+            db.prepare(
+              "UPDATE pdpp_replica_clock SET counter = MAX(counter, ?) WHERE id = 1",
+            ).run(op.revision.counter);
+          }
+          return reconcile();
+        })
+        .immediate();
+    },
+    retry(input: { credential: unknown }): ReplicaMergePlan {
+      authorize(input.credential);
+      return db.transaction(reconcile).immediate();
+    },
+  };
+}
