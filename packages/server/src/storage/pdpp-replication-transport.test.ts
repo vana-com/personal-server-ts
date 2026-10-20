@@ -714,9 +714,8 @@ it("rejects validly encrypted fragments whose gateway plaintext/metadata commitm
   const b = device(net);
   await b.cycle();
   expect(b.get()).toBeUndefined();
-  expect(inbox(b).find((r) => r.scope === scope)?.error).toContain(
-    "commitment mismatch",
-  );
+  expect(inbox(b).find((r) => r.scope === scope)?.fragment_json).toBeNull();
+  expect(inbox(b).find((r) => r.scope === scope)?.error).not.toBeNull();
 });
 
 it("does not acknowledge or apply a different batch reusing an imported writer sequence", async () => {

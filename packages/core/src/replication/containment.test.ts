@@ -128,3 +128,28 @@ it("omits internal transport addresses from the actual inventory API even with w
   ]);
   expect(body.total).toBe(1);
 });
+
+it("rejects ordinary owner writes into a reserved replica address before indexing or sync", async () => {
+  const { handlePersonalServerDataRequest } = await import("../api/index.js");
+  const { createMemoryDataStorage } =
+    await import("../test-utils/memory-storage.js");
+  const storage = createMemoryDataStorage();
+  const response = await handlePersonalServerDataRequest(
+    new Request(`http://ps/${scope}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ poison: true }),
+    }),
+    {
+      storage,
+      auth: {
+        authorizeOwner: vi.fn(),
+        authorizeBuilderRead: vi.fn(),
+        authorizeBuilderList: vi.fn(),
+      },
+      accessLogWriter: { write: vi.fn() },
+    } as never,
+  );
+  expect(response.status).toBe(400);
+  expect(storage.entries).toHaveLength(0);
+});
