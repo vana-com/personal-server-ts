@@ -171,3 +171,13 @@ adoption; silently transforming them into blobs would change the declaration.
 Lifecycle evidence currently has a 4 MiB fail-closed merge-window bound; pathological
 reset histories need a bounded lifecycle reducer before promotion. No compaction,
 loser deletion, ordering-policy change or issuer-topology change is authorized.
+
+## Phone adoption read port (slice 7c)
+
+`readConnectionPage(connectionId, after?)` returns `{rows, after}` from current
+canonical rows for exactly that connection, including tombstones. It uses the
+persistence port's bounded keyset scan and rejects a cursor from another
+connection. Continue until `after` is absent; a page boundary is not stream
+completion. The caller filters streams/tombstones and owns its read budget.
+This is an internal trusted-host API, not a grant-relative PDPP list route,
+public query cursor or completion proof. It makes no identity/issuer decisions.
