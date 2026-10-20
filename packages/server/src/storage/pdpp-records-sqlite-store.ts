@@ -1,3 +1,8 @@
+import {
+  createReplicationJournal,
+  REPLICATION_MIGRATION,
+  type ReplicationExport,
+} from "./pdpp-replication-sqlite.js";
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
@@ -333,6 +338,7 @@ BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_delete BEFORE DELETE ON pdpp_mutation_journal
 BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
 `,
+  REPLICATION_MIGRATION,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -563,6 +569,7 @@ function projectFields(
  * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
 export function createSqliteRecordStore(db: Database): PdppRecordStore & {
+  replication: ReplicationExport;
   listConnections(sourceId: string): PdppInstanceBinding[];
   registerConnection(input: {
     instance: string;
@@ -648,6 +655,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       .prepare("SELECT writer_id FROM pdpp_installation_writer WHERE id = 1")
       .get() as { writer_id: string }
   ).writer_id;
+  const replica = createReplicationJournal(db, writerId);
   const insertMutationStmt = db.prepare(`
     INSERT INTO pdpp_mutation_journal
       (operation_id, writer_id, source_id, connection_id, method, generation,
@@ -661,6 +669,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     instance: string,
     stream: string,
     recordKey: string,
+    semantics?: StreamSemantics,
+    primaryKey?: string[],
   ): void {
     // Do not use getInstanceBinding's synthetic defaults for a missing legacy row.
     const binding = db
@@ -686,6 +696,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       value_json: JSON.stringify(record),
       blob_ids_json: JSON.stringify(blobId ? [blobId] : []),
     });
+    replica.captureRecord(instance, stream, recordKey, semantics, primaryKey);
   }
 
   function readMutationJournalPage(
@@ -791,6 +802,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   const dropCompletionStmt = db.prepare(
     "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
   );
+  function dropCompletion(instance: string, stream: string): void {
+    if (dropCompletionStmt.run(instance, stream).changes > 0)
+      replica.captureInvalidation(instance, stream);
+  }
+
   const noteArrivalStmt = db.prepare(`
     INSERT INTO pdpp_record_arrival (instance, stream, record_key, generation, arrival)
     VALUES (@instance, @stream, @record_key, @generation, (
@@ -868,11 +884,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         checkBinding(binding.method, generation, envelopes);
       }
       envelopes.forEach((envelope, index) => {
+        const semantics = streamSemantics(envelope.stream, envelope.instance);
+        const primaryKey = primaryKeyFields(envelope.stream, envelope.instance);
         const plan = planIngest(
           index,
           envelope,
-          streamSemantics(envelope.stream, envelope.instance),
-          primaryKeyFields(envelope.stream, envelope.instance),
+          semantics,
+          primaryKey,
           (recordKey) => {
             const row = getCurrentStmt.get(
               envelope.instance,
@@ -928,7 +946,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           data,
           envelope.emitted_at,
         );
-        journalMutation(envelope.instance, envelope.stream, recordKey);
+        journalMutation(
+          envelope.instance,
+          envelope.stream,
+          recordKey,
+          semantics,
+          primaryKey,
+        );
         if (data === null) {
           forgetArrivalStmt.run(envelope.instance, envelope.stream, recordKey);
         } else {
@@ -970,7 +994,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     const writtenAt = nextWriteSeq.get() as { value: number };
     // The stream no longer holds what a replace delivered. `replaceStream`
     // writes its own receipt after its writes.
-    dropCompletionStmt.run(instance, stream);
+    dropCompletion(instance, stream);
     const dataJson = deleted ? null : JSON.stringify(data);
     const deletedAt = deleted ? emittedAt : null;
     upsertCurrentStmt.run({
@@ -1111,6 +1135,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           write.data,
           write.emittedAt,
         );
+        journalMutation(
+          input.instance,
+          input.stream,
+          write.recordKey,
+          "mutable_state",
+          input.primaryKey,
+        );
       }
       const missing = (
         db
@@ -1127,6 +1158,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           null,
           input.emittedAt,
         );
+        journalMutation(
+          input.instance,
+          input.stream,
+          record_key,
+          "mutable_state",
+          input.primaryKey,
+        );
       }
       // Desktop rebuilt a fully refreshed stream in emit order, unchanged
       // keys included.
@@ -1136,7 +1174,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       for (const recordKey of snapshotOrder) {
         noteArrival(input.instance, input.stream, recordKey, input.generation);
       }
-      if (!preserved) dropCompletionStmt.run(input.instance, input.stream);
+      if (!preserved) dropCompletion(input.instance, input.stream);
       if (input.sourceCollectedAt !== undefined) {
         db.prepare(
           `INSERT INTO pdpp_stream_completion
@@ -1158,6 +1196,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           ).n,
         );
       }
+      if (input.sourceCollectedAt !== undefined)
+        replica.captureCompletion(input.instance, input.stream);
       return { ...summary, applied: true, deleted: missing.length };
     })();
   }
@@ -1323,6 +1363,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         resetClock,
         input.instance,
       );
+      replica.captureLifecycle(input.instance, "connection-reset");
       return {
         binding: toBinding(ensureBinding(db, input.instance)),
         alreadyReset: false,
@@ -1363,6 +1404,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       db.prepare(
         "UPDATE pdpp_instance_binding SET source_id = ?, method = ?, label = ? WHERE instance = ?",
       ).run(input.sourceId, input.method, input.label, input.instance);
+      if (current.source_id === null)
+        replica.captureLifecycle(input.instance, "connection-register");
       return getInstanceBinding(input.instance);
     })();
   }
@@ -1377,6 +1420,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       db.prepare(
         "UPDATE pdpp_instance_binding SET deleted_at = ?, generation = generation + 1, reset_clock = ? WHERE instance = ?",
       ).run(deletedAt, resetClock, instance);
+      replica.captureLifecycle(instance, "connection-delete");
       return getInstanceBinding(instance);
     })();
   }
@@ -1616,6 +1660,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           }
         }
 
+        for (const write of writes) {
+          if (write.kind !== "keep")
+            replica.captureCompletion(request.instance, write.stream);
+        }
         return {
           receipts: request.streams.map((proof) => {
             const row = db
@@ -1788,7 +1836,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
 
       const version = existing.version + 1;
       const writtenAt = nextWriteSeq.get() as { value: number };
-      dropCompletionStmt.run(instance, stream);
+      dropCompletion(instance, stream);
       upsertCurrentStmt.run({
         instance,
         stream,
@@ -1811,7 +1859,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         deleted_at: deletedAt,
         written_at: writtenAt.value,
       });
-      journalMutation(instance, stream, recordKey);
+      journalMutation(instance, stream, recordKey, streamSemantics);
       forgetArrivalStmt.run(instance, stream, recordKey);
       result = true;
     });
@@ -2129,6 +2177,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
          VALUES (?, ?, ?)
          ON CONFLICT (blob_id, instance) DO UPDATE SET generation = excluded.generation`,
       ).run(meta.blobId, input.instance, input.generation);
+      replica.captureBlob(input.instance, meta.blobId);
       return meta;
     })();
   }
@@ -2146,6 +2195,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   }
 
   return {
+    replication: replica.exporter,
     getInstallationWriterId: () => writerId,
     readMutationJournalPage,
     listConnections,

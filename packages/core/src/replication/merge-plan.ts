@@ -142,7 +142,7 @@ export function planReplicaMerge(
     }
     const records = new Map<string, RecordOperation[]>();
     for (const operation of entries) {
-      if (!("declaration" in operation)) continue;
+      if (operation.kind !== "upsert" && operation.kind !== "delete") continue;
       if (operation.generation < generation) {
         issue(result.suppressed, "old_generation", [operation]);
         continue;

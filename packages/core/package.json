@@ -199,6 +199,10 @@
     "./storage/pdpp-records/memory": {
       "types": "./dist/storage/pdpp-records/memory-store.d.ts",
       "import": "./dist/storage/pdpp-records/memory-store.js"
+    },
+    "./replication/*": {
+      "types": "./dist/replication/*.d.ts",
+      "import": "./dist/replication/*.js"
     }
   },
   "scripts": {
