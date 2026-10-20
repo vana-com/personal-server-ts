@@ -436,10 +436,7 @@ export async function createServer(
   const dataStorage = withLegacyProjection(rawDataStorage, {
     onIssue: (issue) =>
       issue.kind === "projection_failed"
-        ? logger.warn(
-            issue,
-            "Legacy scope projection failed; serving stored body",
-          )
+        ? logger.warn(issue, "Legacy scope served read refused")
         : logger.info(issue, "Legacy scope projection left rows out"),
   });
 

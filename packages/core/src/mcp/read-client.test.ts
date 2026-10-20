@@ -3,6 +3,7 @@ import { createMcpDataReadClient, McpDataReadError } from "./read-client.js";
 import { encodeDataBlockCursor } from "../storage/blocks/index.js";
 import { buildBinaryEnvelopeData } from "../contracts/binary.js";
 import { createScopeDeletionTracker } from "../sync/scope-deletions.js";
+import { ProtocolError } from "../errors/catalog.js";
 
 const SERVER_ORIGIN = "https://personal-server.test";
 
@@ -16,6 +17,46 @@ function createAccount() {
 }
 
 describe("mcp/read-client", () => {
+  it("preserves a projection refusal from the block manifest read", async () => {
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          findEntry: () => ({
+            scope: "oura.sleep",
+            collectedAt: "2026-10-01T00:00:00Z",
+            fileId: "file-1",
+          }),
+          readBlockManifest: vi
+            .fn()
+            .mockRejectedValue(
+              new ProtocolError(
+                409,
+                "LEGACY_PROJECTION_UNAVAILABLE",
+                "Cannot serve the legacy view",
+              ),
+            ),
+        } as never,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi
+            .fn()
+            .mockResolvedValue({ grantId: "grant-1" }),
+        },
+        accessLogWriter: { write: vi.fn() },
+      },
+    });
+
+    await expect(
+      client.readBlockManifest({ scope: "oura.sleep", grantId: "grant-1" }),
+    ).rejects.toMatchObject({
+      status: 409,
+      body: { error: { errorCode: "LEGACY_PROJECTION_UNAVAILABLE" } },
+    });
+  });
+
   it("signs a scope listing with the grant it is discovering under", async () => {
     const authorizeBuilderList = vi
       .fn()

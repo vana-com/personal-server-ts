@@ -54,6 +54,17 @@ export function hasAlternateLegacyProfile(profileKey: string): boolean {
   return ALTERNATE_PROFILE_BINDINGS.has(profileKey);
 }
 
+/** Alternate bindings available for one retained legacy scope. */
+export function alternateLegacyBindingsForScope(
+  scope: string,
+): ReadonlyMap<string, LegacyScopeBinding> {
+  return new Map(
+    [...ALTERNATE_PROFILE_BINDINGS]
+      .filter(([, bindings]) => bindings.has(scope))
+      .map(([profileKey, bindings]) => [profileKey, bindings.get(scope)!]),
+  );
+}
+
 /** Only declaration-reviewed profile keys may project into retained scopes. */
 export function legacyBindingsForProfile(
   profileKey: string,

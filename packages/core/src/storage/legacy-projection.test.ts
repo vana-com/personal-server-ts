@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { diffBodies } from "../legacy-projection/__fixtures__/parity/diff.js";
+import { LEGACY_SCOPE_BINDINGS } from "../legacy-projection/index.js";
 import {
   ingestBinaryDataContract,
   ingestDataContract,
@@ -72,8 +73,8 @@ describe("classifyStoredBody", () => {
     ["chatgpt.conversations", { records: [] }, "pdpp-projected"],
     ["claude.projects", { records: [{ id: "p" }] }, "pdpp-projected"],
     ["chatgpt.messages", { records: [] }, "pdpp-unprojected"],
-    ["oura.sleep", { records: [] }, "pdpp-unprojected"],
-    ["github.repositories", { records: [] }, "pdpp-unprojected"],
+    ["oura.sleep", { records: [] }, "pdpp-projected"],
+    ["github.repositories", { records: [] }, "pdpp-projected"],
     ["chatgpt.conversations", { conversations: [], total: 0 }, "legacy"],
     ["chatgpt.conversations", { records: [], total: 0 }, "legacy"],
     ["chatgpt.conversations", { records: {} }, "legacy"],
@@ -96,6 +97,15 @@ describe("classifyStoredBody", () => {
   ])("%s %j is %s", (scope, data, form) => {
     expect(classifyStoredBody(scope, data)).toBe(form);
   });
+
+  it("classifies every bound legacy scope for projection", () => {
+    for (const scope of LEGACY_SCOPE_BINDINGS.keys()) {
+      expect(classifyStoredBody(scope, { records: [] })).toBe("pdpp-projected");
+    }
+    expect(classifyStoredBody("spotify.saved_tracks", { records: [] })).toBe(
+      "pdpp-unprojected",
+    );
+  });
 });
 
 describe("legacyScopesProjectedFrom", () => {
@@ -104,6 +114,7 @@ describe("legacyScopesProjectedFrom", () => {
     ["chatgpt.conversations", []],
     ["claude.account_profile", ["claude.conversations", "claude.projects"]],
     ["claude.project_documents", ["claude.projects"]],
+    ["spotify.playlist_items", ["spotify.playlists"]],
     ["oura.sleep", []],
     ["notes", []],
   ])("%s → %j", (scope, expected) => {
@@ -224,7 +235,6 @@ describe("withLegacyProjection", () => {
   it.each([
     ["a legacy body", "chatgpt.conversations", { conversations: [], total: 0 }],
     ["an unbound records stream", "chatgpt.messages", { records: messages }],
-    ["records of an unprojected source", "oura.sleep", { records: [{}] }],
     ["an unrelated scope", "notes.entries", { text: "hello" }],
   ])("passes %s through unchanged", async (_label, scope, body) => {
     const raw = createMemoryDataStorage();
@@ -297,7 +307,7 @@ describe("withLegacyProjection", () => {
     });
   });
 
-  it("serves the stored body and reports the error when projection fails", async () => {
+  it("rejects the served read and reports the error when projection fails", async () => {
     const raw = createMemoryDataStorage();
     const onIssue = vi.fn();
     // A claude scope with no account_profile stream cannot be projected.
@@ -306,12 +316,20 @@ describe("withLegacyProjection", () => {
     });
     const served = withLegacyProjection(raw, { onIssue });
 
-    const envelope = await served.readEnvelope(
-      "claude.projects",
-      "2026-10-01T00:00:01.000Z",
-    );
-
-    expect(envelope.data).toEqual({
+    await expect(
+      served.readEnvelope("claude.projects", "2026-10-01T00:00:01.000Z"),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+    });
+    expect(
+      (
+        await served.readStoredEnvelope!(
+          "claude.projects",
+          "2026-10-01T00:00:01.000Z",
+        )
+      ).data,
+    ).toEqual({
       records: [{ id: "p1", name: "Research" }],
     });
     expect(onIssue).toHaveBeenCalledWith(
@@ -320,6 +338,50 @@ describe("withLegacyProjection", () => {
         scope: "claude.projects",
         error: expect.objectContaining({ kind: "missing_stream" }),
       }),
+    );
+  });
+
+  it("rejects every served read path for unidentified multi-profile rows while preserving stored and legacy bodies", async () => {
+    const raw = createMemoryDataStorage();
+    const scope = "oura.sleep";
+    const rawAt = "2026-10-01T00:00:01.000Z";
+    const legacyAt = "2026-10-02T00:00:01.000Z";
+    const rawBody = { records: [{ id: "sleep-1" }] };
+    const legacyBody = { sleepPeriods: [], total: 0 };
+    await store(raw, scope, rawAt, rawBody);
+    await store(raw, scope, legacyAt, legacyBody);
+
+    const rawFallback = vi.fn(async () => {
+      throw new Error("The served read used the raw fallback");
+    });
+    raw.readEnvelopeBytes = rawFallback;
+    raw.readEnvelopeStream = rawFallback;
+    raw.readEnvelopePreview = rawFallback;
+    raw.readScopeBlocks = rawFallback;
+    raw.readBlockManifest = rawFallback;
+    const served = withLegacyProjection(raw);
+
+    const reads: Array<() => Promise<unknown>> = [
+      () => served.readEnvelope(scope, rawAt),
+      () => served.readEnvelopeBytes!(scope, rawAt),
+      () => served.readEnvelopeStream!(scope, rawAt),
+      () => served.readEnvelopePreview!(scope, rawAt, { maxBytes: 1024 }),
+      () => served.readScopeBlocks!(scope, rawAt, { maxBytes: 1024 }),
+      () => served.readBlockManifest!(scope, rawAt),
+    ];
+    for (const read of reads) {
+      await expect(read()).rejects.toMatchObject({
+        code: 409,
+        errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+      });
+    }
+
+    expect(rawFallback).not.toHaveBeenCalled();
+    expect((await served.readStoredEnvelope!(scope, rawAt)).data).toEqual(
+      rawBody,
+    );
+    expect(await served.readEnvelope(scope, legacyAt)).toEqual(
+      await raw.readEnvelope(scope, legacyAt),
     );
   });
 
@@ -474,7 +536,7 @@ describe("withLegacyProjection", () => {
     expect(readEnvelope).toHaveBeenCalledOnce();
   });
 
-  it("serves a body of tagged {stream, data} rows as stored", async () => {
+  it("rejects tagged {stream, data} rows in a bound legacy scope", async () => {
     const raw = createMemoryDataStorage();
     await store(raw, "chatgpt.messages", "2026-10-01T00:00:00.000Z", {
       records: messages,
@@ -484,12 +546,21 @@ describe("withLegacyProjection", () => {
     };
     await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", body);
 
-    const { data } = await withLegacyProjection(raw).readEnvelope(
-      "chatgpt.conversations",
-      "2026-10-01T00:00:01.000Z",
-    );
-
-    expect(data).toEqual(body);
+    const served = withLegacyProjection(raw);
+    await expect(
+      served.readEnvelope("chatgpt.conversations", "2026-10-01T00:00:01.000Z"),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+    });
+    expect(
+      (
+        await served.readStoredEnvelope!(
+          "chatgpt.conversations",
+          "2026-10-01T00:00:01.000Z",
+        )
+      ).data,
+    ).toEqual(body);
   });
 
   it.each([
