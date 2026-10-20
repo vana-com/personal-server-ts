@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS pdpp_blob_bytes (
 CREATE TABLE IF NOT EXISTS pdpp_instance_binding (
   instance TEXT PRIMARY KEY,
   method TEXT,
-  generation INTEGER NOT NULL CHECK (generation > 0),
+  generation INTEGER CHECK (generation > 0),
   reset_clock INTEGER NOT NULL DEFAULT 0
 );
 
@@ -712,16 +712,22 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
   `);
 
   function journalMutation(instance: string, stream: string, recordKey: string): void {
-    const binding = getInstanceBinding(instance);
+    const binding = db
+      .prepare(
+        "SELECT source_id, method, generation FROM pdpp_instance_binding WHERE instance = ?",
+      )
+      .get(instance) as
+      | Pick<BindingRowDb, "source_id" | "method" | "generation">
+      | undefined;
     const record = toRow(getCurrentStmt.get(instance, stream, recordKey) as RecordRowDb);
     const blobId = record.deleted ? null : extractBlobId(record.data);
     insertMutationStmt.run({
       operation_id: randomUUID(),
       writer_id: writerId,
-      source_id: binding.sourceId,
+      source_id: binding?.source_id ?? null,
       connection_id: instance,
-      method: binding.method,
-      generation: binding.generation,
+      method: binding?.method ?? null,
+      generation: binding?.generation ?? null,
       stream,
       record_key: recordKey,
       operation: record.deleted ? "delete" : "upsert",
@@ -738,7 +744,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
     const rows = db.prepare("SELECT * FROM pdpp_mutation_journal WHERE sequence > ? ORDER BY sequence LIMIT ?")
       .all(afterSequence, options.limit + 1) as Array<{
         sequence: number; operation_id: string; writer_id: string; source_id: string | null;
-        connection_id: string; method: string | null; generation: number; stream: string;
+        connection_id: string; method: string | null; generation: number | null; stream: string;
         record_key: string; operation: CanonicalMutation["operation"]; value_json: string; blob_ids_json: string;
       }>;
     const mutations = rows.slice(0, options.limit).map((row): CanonicalMutation => ({

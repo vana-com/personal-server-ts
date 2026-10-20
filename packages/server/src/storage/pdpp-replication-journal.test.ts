@@ -435,7 +435,7 @@ describe("canonical mutation journal", () => {
     ).toMatchObject({
       sourceId: null,
       method: null,
-      generation: 1,
+      generation: null,
       connectionId: "legacy",
     });
   });
