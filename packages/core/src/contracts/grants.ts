@@ -1,3 +1,4 @@
+import { isReplicaScope } from "../replication/namespace.js";
 import type {
   CreateGrantParams,
   DataPortabilityGatewayConfig,
@@ -168,6 +169,16 @@ export async function createGrantContract(
   }
 
   const { granteeAddress, scopes, expiresAt, grantVersion } = input.body;
+  if (
+    scopes.some((scope) =>
+      isReplicaScope(scope.startsWith("write:") ? scope.slice(6) : scope),
+    )
+  )
+    return contractError(
+      400,
+      "RESERVED_SCOPE",
+      "Replica transport scopes are private",
+    );
   const builder = await input.gateway.getBuilder(granteeAddress);
   if (!builder) {
     return contractProtocolError(
