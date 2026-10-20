@@ -417,6 +417,32 @@ describe("canonical mutation journal", () => {
     expect(store.readMutationJournalPage({ limit: 10 })).toEqual(before);
   });
 
+  it.each(["sequence", "operation_id"])(
+    "rejects REPLACE by %s even with recursive triggers disabled",
+    (conflict) => {
+      store.ingestBatch([envelope()], semantics, primaryKey, binding);
+      const before = store.readMutationJournalPage({ limit: 10 });
+      db.pragma("recursive_triggers = OFF");
+      const columns =
+        conflict === "sequence"
+          ? "sequence, operation_id, writer_id, source_id, connection_id, method, generation, stream, record_key, operation, value_json, blob_ids_json"
+          : "operation_id, writer_id, source_id, connection_id, method, generation, stream, record_key, operation, value_json, blob_ids_json";
+      const values =
+        conflict === "sequence"
+          ? columns.replace(
+              "sequence, operation_id,",
+              "sequence, 'replacement-operation',",
+            )
+          : columns;
+      expect(() =>
+        db.exec(
+          `INSERT OR REPLACE INTO pdpp_mutation_journal (${columns}) SELECT ${values} FROM pdpp_mutation_journal`,
+        ),
+      ).toThrow("append-only");
+      expect(store.readMutationJournalPage({ limit: 10 })).toEqual(before);
+    },
+  );
+
   it("retains null legacy binding metadata on owner delete without inferring source from stream", () => {
     db.prepare(
       `INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at) VALUES ('legacy', 'source.scope', 'key', '{}', 1, ?)`,
@@ -438,6 +464,117 @@ describe("canonical mutation journal", () => {
       generation: null,
       connectionId: "legacy",
     });
+  });
+
+  it("upgrades a populated v11 database without fabricating mutations or replacing identity on reopen", () => {
+    const directory = mkdtempSync(join(tmpdir(), "pdpp-journal-v11-"));
+    const path = join(directory, "records.sqlite");
+    let historical = new Database(path);
+    let upgraded: ReturnType<typeof createSqliteRecordStore> | undefined;
+    try {
+      // Literal pre-journal v11 schema: no use of the current migration output.
+      historical.exec(`
+        CREATE TABLE pdpp_records (
+          instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL,
+          data TEXT, version INTEGER NOT NULL, emitted_at TEXT NOT NULL,
+          deleted INTEGER NOT NULL DEFAULT 0, deleted_at TEXT, blob_id TEXT,
+          PRIMARY KEY (instance, stream, record_key)
+        );
+        CREATE TABLE pdpp_record_changes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, instance TEXT NOT NULL,
+          stream TEXT NOT NULL, record_key TEXT NOT NULL, version INTEGER NOT NULL,
+          data TEXT, emitted_at TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+          deleted_at TEXT, written_at INTEGER NOT NULL
+        );
+        CREATE TABLE pdpp_blobs (
+          blob_id TEXT PRIMARY KEY, mime_type TEXT NOT NULL,
+          size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL
+        );
+        CREATE TABLE pdpp_blob_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
+        CREATE TABLE pdpp_write_clock (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
+        CREATE TABLE pdpp_instance_binding (
+          instance TEXT PRIMARY KEY, method TEXT, generation INTEGER NOT NULL,
+          reset_clock INTEGER NOT NULL DEFAULT 0, source_id TEXT,
+          label TEXT NOT NULL DEFAULT '', deleted_at TEXT
+        );
+        CREATE TABLE pdpp_blob_claims (
+          blob_id TEXT NOT NULL, instance TEXT NOT NULL, generation INTEGER NOT NULL,
+          PRIMARY KEY (blob_id, instance)
+        );
+        CREATE TABLE pdpp_store_metadata (id INTEGER PRIMARY KEY CHECK (id = 1), epoch TEXT NOT NULL);
+        CREATE TABLE pdpp_stream_completion (
+          instance TEXT NOT NULL, stream TEXT NOT NULL, method TEXT NOT NULL,
+          generation INTEGER NOT NULL, source_collected_at TEXT NOT NULL,
+          write_seq INTEGER NOT NULL, live_count INTEGER NOT NULL,
+          snapshot_sha256 TEXT, collection_time_basis TEXT,
+          PRIMARY KEY (instance, stream)
+        );
+        CREATE TABLE pdpp_record_arrival (
+          instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL,
+          generation INTEGER NOT NULL, arrival INTEGER NOT NULL,
+          PRIMARY KEY (instance, stream, record_key)
+        );
+        CREATE TABLE pdpp_record_arrival_clock (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
+        CREATE TABLE pdpp_schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+        INSERT INTO pdpp_schema_version VALUES (1, 11);
+        INSERT INTO pdpp_write_clock VALUES (1, 1);
+        INSERT INTO pdpp_record_arrival_clock VALUES (1, 1);
+        INSERT INTO pdpp_instance_binding VALUES ('account-a', 'collector', 1, 0, 'https://source.invalid/declaration', 'A', NULL);
+        INSERT INTO pdpp_store_metadata VALUES (1, 'v11-epoch');
+        INSERT INTO pdpp_records VALUES ('account-a', 'messages', 'same-key', '{"id":"same-key","content":"old"}', 1, '2026-10-20T10:00:00.000Z', 0, NULL, NULL);
+        INSERT INTO pdpp_record_changes (instance, stream, record_key, version, data, emitted_at, written_at)
+          VALUES ('account-a', 'messages', 'same-key', 1, '{"id":"same-key","content":"old"}', '2026-10-20T10:00:00.000Z', 1);
+        INSERT INTO pdpp_record_arrival VALUES ('account-a', 'messages', 'same-key', 1, 1);
+      `);
+      const retained = [
+        "pdpp_records",
+        "pdpp_record_changes",
+        "pdpp_instance_binding",
+        "pdpp_store_metadata",
+        "pdpp_write_clock",
+        "pdpp_record_arrival",
+        "pdpp_record_arrival_clock",
+      ];
+      const before = retained.map((table) =>
+        historical.prepare(`SELECT * FROM ${table}`).all(),
+      );
+      historical.close();
+      historical = new Database(path);
+      upgraded = createSqliteRecordStore(historical);
+      expect(
+        retained.map((table) =>
+          historical.prepare(`SELECT * FROM ${table}`).all(),
+        ),
+      ).toEqual(before);
+      expect(
+        upgraded.getRecord("account-a", "messages", "same-key"),
+      ).toMatchObject({ version: 1, data: { id: "same-key", content: "old" } });
+      expect(upgraded.readMutationJournalPage({ limit: 10 }).mutations).toEqual(
+        [],
+      );
+      const writer = upgraded.getInstallationWriterId();
+      expect(writer.length).toBeGreaterThan(0);
+      upgraded.close();
+      historical = new Database(path);
+      upgraded = createSqliteRecordStore(historical);
+      expect(upgraded.getInstallationWriterId()).toBe(writer);
+      expect(
+        upgraded.ingestBatch([envelope()], semantics, primaryKey, binding)
+          .accepted,
+      ).toBe(1);
+      expect(
+        upgraded.readMutationJournalPage({ limit: 10 }).mutations,
+      ).toMatchObject([
+        {
+          sequence: 1,
+          writerId: writer,
+          value: { version: 2, data: { id: "same-key", content: "hello" } },
+        },
+      ]);
+    } finally {
+      if (historical.open) historical.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("reopens with identical IDs and values, shares identity across DB handles, and retries once", () => {

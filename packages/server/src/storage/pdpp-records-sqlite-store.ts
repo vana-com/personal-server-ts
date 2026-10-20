@@ -322,6 +322,12 @@ CREATE TABLE IF NOT EXISTS pdpp_mutation_journal (
   value_json TEXT NOT NULL,
   blob_ids_json TEXT NOT NULL
 );
+-- REPLACE's implicit delete need not fire DELETE triggers. Guard both identities
+-- before insertion as well, independent of recursive_triggers configuration.
+CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_replace BEFORE INSERT ON pdpp_mutation_journal
+WHEN EXISTS (SELECT 1 FROM pdpp_mutation_journal
+             WHERE sequence = NEW.sequence OR operation_id = NEW.operation_id)
+BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_update BEFORE UPDATE ON pdpp_mutation_journal
 BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_delete BEFORE DELETE ON pdpp_mutation_journal
