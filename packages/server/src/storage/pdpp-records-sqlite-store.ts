@@ -315,7 +315,7 @@ CREATE TABLE IF NOT EXISTS pdpp_mutation_journal (
   source_id TEXT,
   connection_id TEXT NOT NULL,
   method TEXT,
-  generation INTEGER NOT NULL CHECK (generation > 0),
+  generation INTEGER CHECK (generation > 0),
   stream TEXT NOT NULL,
   record_key TEXT NOT NULL,
   operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
@@ -656,7 +656,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     stream: string,
     recordKey: string,
   ): void {
-    const binding = getInstanceBinding(instance);
+    // Do not use getInstanceBinding's synthetic defaults for a missing legacy row.
+    const binding = db
+      .prepare(
+        "SELECT source_id, method, generation FROM pdpp_instance_binding WHERE instance = ?",
+      )
+      .get(instance) as
+      Pick<BindingRowDb, "source_id" | "method" | "generation"> | undefined;
     const record = toRow(
       getCurrentStmt.get(instance, stream, recordKey) as RecordRowDb,
     );
@@ -664,10 +670,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     insertMutationStmt.run({
       operation_id: randomUUID(),
       writer_id: writerId,
-      source_id: binding.sourceId,
+      source_id: binding?.source_id ?? null,
       connection_id: instance,
-      method: binding.method,
-      generation: binding.generation,
+      method: binding?.method ?? null,
+      generation: binding?.generation ?? null,
       stream,
       record_key: recordKey,
       operation: record.deleted ? "delete" : "upsert",
@@ -702,7 +708,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       source_id: string | null;
       connection_id: string;
       method: string | null;
-      generation: number;
+      generation: number | null;
       stream: string;
       record_key: string;
       operation: CanonicalMutation["operation"];
