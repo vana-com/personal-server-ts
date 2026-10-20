@@ -61,6 +61,7 @@ type Row = {
   emitted_at: string;
   deleted: number;
   deleted_at: string | null;
+  blob_id: string | null;
 };
 type WithoutRevision<T> = T extends ReplicaOperation
   ? Omit<T, "revision">
@@ -215,7 +216,7 @@ export function createReplicationJournal(db: Database, writerId: string) {
         recordKey
       )
         throw new Error("replication record key mismatch");
-      const blobId = data.blob_ref?.blob_id as string | undefined;
+      const blobId = row.blob_id;
       if (blobId) captureBlob(instance, blobId);
       append({
         ...identity,
@@ -265,9 +266,28 @@ export function createReplicationJournal(db: Database, writerId: string) {
           source_collected_at: string;
           live_count: number;
           snapshot_sha256: string | null;
+          collection_time_basis: string | null;
         }
       | undefined;
     if (!row) return;
+    if (
+      (row.snapshot_sha256 === null && row.collection_time_basis !== null) ||
+      (row.snapshot_sha256 !== null &&
+        row.collection_time_basis !== "host_run_finished")
+    )
+      throw new Error("invalid completion proof provenance");
+    const proof =
+      row.snapshot_sha256 === null
+        ? {
+            kind: "producer-asserted" as const,
+            snapshotSha256: null,
+            collectionTimeBasis: null,
+          }
+        : {
+            kind: "native" as const,
+            snapshotSha256: `sha256:${row.snapshot_sha256}`,
+            collectionTimeBasis: "host_run_finished" as const,
+          };
     const rows = db
       .prepare(
         "SELECT record_key AS recordKey, data AS dataJson FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
@@ -305,11 +325,20 @@ export function createReplicationJournal(db: Database, writerId: string) {
     append({
       ...binding,
       kind: "stream-complete",
-      stream,
+      declaration: retained,
       sourceCollectedAt: row.source_collected_at,
       liveCount: row.live_count,
       snapshotSha256: `sha256:${digest}`,
+      proof,
       dependencies,
+    });
+  }
+  function captureInvalidation(instance: string, stream: string) {
+    if (!settings()) return;
+    append({
+      ...base(instance),
+      kind: "stream-invalidate",
+      declaration: declaration(instance, stream),
     });
   }
   function beginBaseline(input: BaselineConfiguration) {
@@ -464,5 +493,6 @@ export function createReplicationJournal(db: Database, writerId: string) {
     captureLifecycle,
     captureBlob,
     captureCompletion,
+    captureInvalidation,
   };
 }
