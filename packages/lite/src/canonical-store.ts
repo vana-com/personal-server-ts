@@ -665,6 +665,24 @@ export function createLiteCanonicalStore(deps: {
         return get<PdppRecordRow>(tx, rowKey(connection, stream, key));
       });
     },
+    /** Host-only current-row page. Includes tombstones; not a public query cursor. */
+    async readConnectionPage(connection: string, after?: string) {
+      enabled();
+      if (!connection) throw new Error("connection required");
+      const prefix = `rows/${keyDigest(connection)}/`;
+      if (after !== undefined && !after.startsWith(prefix))
+        throw new Error("invalid canonical connection cursor");
+      return persistence.transaction(async (tx) => {
+        await clock(tx);
+        const page = await tx.scan(prefix, after);
+        return {
+          rows: page.entries.map(
+            (entry) => JSON.parse(entry.value) as PdppRecordRow,
+          ),
+          after: page.after,
+        };
+      });
+    },
     /** Internal bounded keyset pages; never a public PDPP cursor or grant-relative read. */
     async readPage(kind: "journal" | "mutations" | "outbox", after?: string) {
       enabled();

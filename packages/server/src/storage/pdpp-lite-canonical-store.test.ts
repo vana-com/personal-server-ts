@@ -1053,3 +1053,22 @@ for (const [name, factory] of Object.entries(factories))
       expect(await device.read()).toMatchObject({ version: 1 });
     });
   });
+
+it("pages canonical connection rows without mixing accounts, streams or tombstones", async () => {
+  const { store } = await liteDevice(sqlitePort);
+  await store.commitLocal("write", [
+    draft(registration),
+    draft(upsert("one", 2)),
+  ]);
+  const page = await store.readConnectionPage(identity.connectionId);
+  expect(page.rows).toHaveLength(1);
+  expect(page.rows[0]).toMatchObject({
+    instance: identity.connectionId,
+    stream: binding.stream,
+    recordKey: "same-key",
+  });
+  expect((await store.readConnectionPage("other")).rows).toEqual([]);
+  await expect(
+    store.readConnectionPage(identity.connectionId, "rows/foreign"),
+  ).rejects.toThrow("cursor");
+});
