@@ -1,3 +1,4 @@
+import { isReplicaScope } from "../../replication/namespace.js";
 import type { DurableAdditionsService } from "../../additions/durable.js";
 import { keccak256, stringToHex } from "viem";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
@@ -194,6 +195,8 @@ export async function uploadOne(
   deps: UploadWorkerDeps,
   entry: IndexEntry,
 ): Promise<UploadResult> {
+  if (isReplicaScope(entry.scope))
+    throw new Error("replica scopes require immutable transport");
   const {
     storage,
     storageAdapter,
