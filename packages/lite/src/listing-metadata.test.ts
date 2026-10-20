@@ -121,3 +121,46 @@ it("persists block readiness metadata across reload and removes it with deleted 
     false,
   );
 });
+
+it("invalidates readiness durably when version deletion removes blocks but the envelope delete fails", async () => {
+  const files = createMemoryPsLiteDataFileStore();
+  const persistence = createMemoryPsLitePersistence();
+  const create = () =>
+    createPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
+  const storage = await create();
+  const scope = "notes.documents";
+  const collectedAt = "2026-10-20T00:00:00.000Z";
+  const envelope = createDataFileEnvelope(scope, collectedAt, {
+    text: "hello",
+  });
+  const write = await storage.writeEnvelope(envelope);
+  await storage.insertEntry({
+    fileId: "file",
+    scope,
+    collectedAt,
+    path: write.relativePath,
+    sizeBytes: write.sizeBytes,
+  });
+  const built = await buildDataBlocksAsync({
+    scope,
+    collectedAt,
+    content: envelope,
+  });
+  await storage.writeBlockManifest!(
+    scope,
+    collectedAt,
+    built.manifest,
+    built.blocks,
+  );
+  vi.spyOn(files, "deleteEnvelope").mockRejectedValue(
+    new Error("delete failed"),
+  );
+  await expect(storage.deleteVersion!(scope, collectedAt)).rejects.toThrow(
+    "delete failed",
+  );
+  expect(storage.findEntry({ scope })).toBeDefined();
+  expect(await storage.hasScopeBlocks!(scope, collectedAt)).toBe(false);
+  const reloaded = await create();
+  expect(reloaded.findEntry({ scope })).toBeDefined();
+  expect(await reloaded.hasScopeBlocks!(scope, collectedAt)).toBe(false);
+});

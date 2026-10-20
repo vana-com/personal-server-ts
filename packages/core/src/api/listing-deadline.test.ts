@@ -132,3 +132,28 @@ it("honors a tombstone learned while a discovery lookup is timing out", async ()
   await vi.advanceTimersByTimeAsync(25);
   await expect(result).resolves.toMatchObject({ deleted: true, version: "2" });
 });
+
+it("does not let an older successful lookup erase a newer local tombstone", async () => {
+  let finish!: (record: null) => void;
+  const tracker = createScopeDeletionTracker({
+    serverOwner: "0x1111111111111111111111111111111111111111",
+    feed: {
+      getDataPoint: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      listDataPointsByOwner: vi.fn(),
+    },
+  });
+  const result = tracker.resolve("notes.documents", { gatewayTimeoutMs: 250 });
+  tracker.markDeleted(
+    "notes.documents",
+    { deletedAt: "2026-10-20T01:00:00.000Z", version: "2" },
+    "local-delete",
+  );
+  finish(null);
+  await expect(result).resolves.toMatchObject({ deleted: true, version: "2" });
+  expect(tracker.knownDeletion("notes.documents")).toMatchObject({
+    version: "2",
+  });
+});

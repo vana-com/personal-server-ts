@@ -316,6 +316,7 @@ export function createScopeDeletionTracker(
         throw error;
       });
     }
+    const deletionAtStart = deleted.get(scope);
     const request = (async () => {
       let record: DataPointFeedRecord | null;
       const controller =
@@ -343,6 +344,10 @@ export function createScopeDeletionTracker(
         );
         return null;
       }
+      // Every deletion observation replaces this object. A response started
+      // before a newer tombstone (or its re-add) cannot overwrite that state.
+      if (deleted.get(scope) !== deletionAtStart)
+        return lastKnownVerdict(scope);
       // Persistence failures must propagate. Treating them as a network
       // outage could answer assumed-live before the deletion is recorded.
       return verdictFromRecord(scope, record);

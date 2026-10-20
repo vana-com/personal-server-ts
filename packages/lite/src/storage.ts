@@ -1035,6 +1035,15 @@ export async function createPersistentPsLiteStorage(
     // Delete the blob FIRST (both stores tolerate a missing blob); only drop the index row once
     // the blob is gone. If blob deletion throws for a real reason, the row is preserved so the
     // next sync retry re-attempts instead of orphaning the local blob.
+    // A partial delete can remove the tree while leaving the index row.
+    // Persist the conservative hint before any destructive file operation.
+    if (
+      readyBlockManifests.delete(
+        blockManifestPath(entry.scope, entry.collectedAt),
+      )
+    ) {
+      await persist();
+    }
     await Promise.all([
       fileStore.deleteEnvelope(blobPath),
       fallbackStore.deleteEnvelope(blobPath),
@@ -1045,9 +1054,6 @@ export async function createPersistentPsLiteStorage(
         blockTreePath(entry.scope, entry.collectedAt),
       ) ?? Promise.resolve(),
     ]);
-    readyBlockManifests.delete(
-      blockManifestPath(entry.scope, entry.collectedAt),
-    );
     state = {
       ...state,
       entries: state.entries.filter((e) => e !== entry),
