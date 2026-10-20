@@ -17,10 +17,12 @@ import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 import type { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 
 export const RECEIVER_MIGRATION = `
-CREATE TABLE pdpp_replica_received (operation_json TEXT PRIMARY KEY, digest TEXT NOT NULL);
-CREATE TRIGGER pdpp_received_no_update BEFORE UPDATE ON pdpp_replica_received BEGIN SELECT RAISE(ABORT, 'received operations are append-only'); END;
-CREATE TRIGGER pdpp_received_no_delete BEFORE DELETE ON pdpp_replica_received BEGIN SELECT RAISE(ABORT, 'received operations are append-only'); END;
-CREATE TABLE pdpp_replica_received_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS pdpp_replica_received (operation_json TEXT PRIMARY KEY, digest TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS pdpp_received_no_update BEFORE UPDATE ON pdpp_replica_received BEGIN SELECT RAISE(ABORT, 'received operations are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS pdpp_received_no_delete BEFORE DELETE ON pdpp_replica_received BEGIN SELECT RAISE(ABORT, 'received operations are append-only'); END;
+CREATE TABLE IF NOT EXISTS pdpp_replica_quarantined_keys (instance TEXT NOT NULL, generation INTEGER NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL, PRIMARY KEY(instance,generation,stream,record_key));
+CREATE TABLE IF NOT EXISTS pdpp_replica_quarantined_connections (instance TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS pdpp_replica_received_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
 `;
 
 type Store = ReturnType<typeof createSqliteRecordStore>;
@@ -299,6 +301,10 @@ export function createReplicaReceiver(deps: {
           .filter((op) => op.kind === "connection-reset")
           .map((op) => op.generation),
       );
+      if (blocked)
+        db.prepare(
+          "INSERT OR IGNORE INTO pdpp_replica_quarantined_connections VALUES (?)",
+        ).run(id);
       if (
         deleted ||
         blocked ||
@@ -328,6 +334,10 @@ export function createReplicaReceiver(deps: {
       const { connectionId, stream, recordKey, generation } = record.identity;
       const local = binding(connectionId)!;
       if (local.deleted_at || generation !== local.generation) continue;
+      if (record.quarantined)
+        db.prepare(
+          "INSERT OR IGNORE INTO pdpp_replica_quarantined_keys VALUES (?, ?, ?, ?)",
+        ).run(connectionId, generation, stream, recordKey);
       const winner = record.winner;
       if (winner?.kind === "upsert" && !materializeBlob(winner, eligible)) {
         plan.pending.push({
@@ -433,7 +443,7 @@ export function createReplicaReceiver(deps: {
           }
         ).value;
         db.prepare(
-          "INSERT INTO pdpp_stream_completion (instance,stream,method,generation,source_collected_at,write_seq,live_count,snapshot_sha256,collection_time_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance,stream) DO UPDATE SET method=excluded.method,generation=excluded.generation,source_collected_at=excluded.source_collected_at,write_seq=excluded.write_seq,live_count=excluded.live_count,snapshot_sha256=excluded.snapshot_sha256,collection_time_basis=excluded.collection_time_basis",
+          "INSERT INTO pdpp_stream_completion (instance,stream,method,generation,source_collected_at,write_seq,live_count,snapshot_sha256,collection_time_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance,stream) DO UPDATE SET method=excluded.method,generation=excluded.generation,source_collected_at=excluded.source_collected_at,write_seq=excluded.write_seq,live_count=excluded.live_count,snapshot_sha256=excluded.snapshot_sha256,collection_time_basis=excluded.collection_time_basis WHERE method IS NOT excluded.method OR generation IS NOT excluded.generation OR source_collected_at IS NOT excluded.source_collected_at OR live_count IS NOT excluded.live_count OR snapshot_sha256 IS NOT excluded.snapshot_sha256 OR collection_time_basis IS NOT excluded.collection_time_basis",
         ).run(
           first.connectionId,
           stream,
