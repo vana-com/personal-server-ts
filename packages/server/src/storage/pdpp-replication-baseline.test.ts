@@ -10,7 +10,10 @@ import {
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { planReplicaMerge } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
-import { hasCompletionDependencies } from "@opendatalabs/personal-server-ts-core/replication/completion";
+import {
+  hasCompletionDependencies,
+  selectStreamCompletion,
+} from "@opendatalabs/personal-server-ts-core/replication/completion";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import {
   replicaOperationDigest,
@@ -788,7 +791,7 @@ it("rolls back every stream receipt and dependency cut when the second completio
     ],
   });
   db.exec(
-    "CREATE TRIGGER second_completion BEFORE INSERT ON pdpp_replica_operations WHEN json_extract(NEW.operation_json, '$.kind') = 'stream-complete' AND json_extract(NEW.operation_json, '$.stream') = 'profiles' BEGIN SELECT RAISE(ABORT, 'second completion failed'); END;",
+    "CREATE TRIGGER second_completion BEFORE INSERT ON pdpp_replica_operations WHEN json_extract(NEW.operation_json, '$.kind') = 'stream-complete' AND json_extract(NEW.operation_json, '$.declaration.stream') = 'profiles' BEGIN SELECT RAISE(ABORT, 'second completion failed'); END;",
   );
   const proofs = [
     ["messages", "a"],
@@ -882,4 +885,193 @@ it("captures full referenced blob descriptors and requires the claim in completi
     ),
   ).toBe(false);
   expect(store.replication.readPinnedBlobBytes(blob.blobId)).toEqual(bytes);
+});
+
+it("binds even empty-stream completion to the retained declaration during envelope decode", () => {
+  store.replaceStream({
+    instance: "conn_a",
+    stream: "messages",
+    method: "collector",
+    generation: 1,
+    emittedAt: at,
+    envelopes: [],
+    primaryKey: ["id"],
+    sourceCollectedAt: at,
+  });
+  store.replication.beginBaseline(config);
+  const encoded = canonicalJson({
+    format: "vana-pdpp-replica",
+    version: 1,
+    owner: "owner",
+    batchId: "empty",
+    operations: drain(store.replication.readBaselinePage),
+  });
+  expect(() =>
+    decodeReplicaEnvelope(encoded, { owner: "owner", declarations: [] }),
+  ).toThrow("declaration binding mismatch");
+  expect(decodeReplicaEnvelope(encoded, config).operations).toHaveLength(2);
+});
+
+it("exports a durable completion invalidation when unchanged replace drops the local receipt", () => {
+  ingest("a");
+  complete();
+  store.replication.beginBaseline(config);
+  store.replaceStream({
+    instance: "conn_a",
+    stream: "messages",
+    method: "collector",
+    generation: 1,
+    emittedAt: at,
+    envelopes: [envelope("a")],
+    primaryKey: ["id"],
+  });
+  expect(store.listStreamCompletions("conn_a")).toEqual([]);
+  const invalidation = drain(store.replication.readTailPage);
+  expect(invalidation).toMatchObject([
+    { kind: "stream-invalidate", declaration },
+  ]);
+  const before = drain(store.replication.readBaselinePage);
+  const events = [...before, ...invalidation].filter(
+    (op) => op.kind === "stream-complete" || op.kind === "stream-invalidate",
+  );
+  expect(selectStreamCompletion(events)).toBeNull();
+  expect(selectStreamCompletion([...events].reverse())).toBeNull();
+  expect(selectStreamCompletion([...events, ...events].reverse())).toBeNull();
+  store.close();
+  db = new Database(path);
+  store = createSqliteRecordStore(db);
+  expect(drain(store.replication.readTailPage)).toEqual(invalidation);
+});
+
+it("preserves native versus producer-asserted completion proof provenance", () => {
+  ingest("a");
+  complete();
+  store.replication.beginBaseline(config);
+  const native = drain(store.replication.readBaselinePage).find(
+    (op) => op.kind === "stream-complete",
+  )!;
+  store.replaceStream({
+    instance: "conn_a",
+    stream: "messages",
+    method: "collector",
+    generation: 1,
+    emittedAt: at,
+    envelopes: [envelope("a")],
+    primaryKey: ["id"],
+    sourceCollectedAt: at,
+  });
+  const legacy = drain(store.replication.readTailPage).find(
+    (op) => op.kind === "stream-complete",
+  )!;
+  expect(native).toMatchObject({
+    proof: {
+      kind: "native",
+      collectionTimeBasis: "host_run_finished",
+      snapshotSha256: native.snapshotSha256,
+    },
+  });
+  expect(legacy).toMatchObject({
+    proof: {
+      kind: "producer-asserted",
+      collectionTimeBasis: null,
+      snapshotSha256: null,
+    },
+  });
+  const merged = planReplicaMerge(mergeContext, [
+    ...drain(store.replication.readBaselinePage),
+    ...drain(store.replication.readTailPage),
+  ]);
+  expect(merged.records).toHaveLength(1);
+  expect(merged.records[0].winner).toMatchObject({
+    kind: "upsert",
+    recordKey: "a",
+    data: { id: "a", text: "old" },
+  });
+});
+
+it("keeps canonical blob reference decisions unchanged during baseline and tail capture", () => {
+  const refs = [
+    undefined,
+    null,
+    0,
+    false,
+    "literal",
+    [],
+    {},
+    { blob_id: null },
+    { blob_id: 123 },
+    { blob_id: "" },
+  ];
+  for (const [i, blob_ref] of refs.entries()) {
+    const value = { ...envelope(String(i)), data: { id: String(i), blob_ref } };
+    expect(
+      store.ingestBatch(
+        [value],
+        () => "mutable_state",
+        () => ["id"],
+        { method: "collector", generation: 1 },
+      ).accepted,
+    ).toBe(1);
+  }
+  expect(() => store.replication.beginBaseline(config)).not.toThrow();
+  for (const [i, blob_ref] of refs.entries()) {
+    const value = {
+      ...envelope(String(i)),
+      data: { id: String(i), blob_ref, text: "new" },
+    };
+    expect(
+      store.ingestBatch(
+        [value],
+        () => "mutable_state",
+        () => ["id"],
+        { method: "collector", generation: 1 },
+      ).accepted,
+    ).toBe(1);
+    expect(store.getRecord("conn_a", "messages", String(i))).toMatchObject({
+      data: JSON.parse(JSON.stringify(value.data)),
+    });
+  }
+  const tail = drain(store.replication.readTailPage);
+  expect(tail).toHaveLength(refs.length);
+  expect(
+    tail.every((op) => op.kind === "upsert" && op.blobs.length === 0),
+  ).toBe(true);
+  const unclaimed = {
+    ...envelope("unclaimed"),
+    data: { id: "unclaimed", blob_ref: { blob_id: "sha256:unclaimed" } },
+  };
+  expect(
+    store.ingestBatch(
+      [unclaimed],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    ).rejected,
+  ).toHaveLength(1);
+  expect(drain(store.replication.readTailPage)).toEqual(tail);
+});
+
+it("does not revive a matching old completion after changed-then-reverted data", () => {
+  ingest("a");
+  complete();
+  store.replication.beginBaseline(config);
+  const original = drain(store.replication.readBaselinePage).find(
+    (op) => op.kind === "stream-complete",
+  )!;
+  ingest("a", "changed");
+  ingest("a", "old");
+  const events = () =>
+    [
+      ...drain(store.replication.readBaselinePage),
+      ...drain(store.replication.readTailPage),
+    ].filter(
+      (op) => op.kind === "stream-complete" || op.kind === "stream-invalidate",
+    );
+  expect(selectStreamCompletion(events())).toBeNull();
+  expect(selectStreamCompletion(events().reverse())).toBeNull();
+  complete();
+  const latest = selectStreamCompletion(events())!;
+  expect(latest.snapshotSha256).toBe(original.snapshotSha256);
+  expect(latest.revision.counter).toBeGreaterThan(original.revision.counter);
+  expect(selectStreamCompletion(events().reverse())).toEqual(latest);
 });

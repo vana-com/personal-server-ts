@@ -45,7 +45,8 @@ captures changed values and explicit deletions of every removed live key; absent
 keys in a partial page never imply deletion. Registration, reset, deletion and
 new generation-bound blob claims capture their own operations. Exact local retries
 are inert, except a replace with source collection time can issue a new completion
-assertion. All capture runs inside the existing canonical transaction, so a failed
+assertion. Receipt removal emits `stream-invalidate`, including unchanged replaces
+that drop their receipt. All capture runs inside the existing canonical transaction, so a failed
 capture rolls back local rows, history, receipts, claims and revision allocation.
 
 Pinned operation values, lifecycle evidence and verified blob bytes survive
@@ -56,13 +57,18 @@ does not prove bytes were received or authorize a remote local claim.
 
 ## Completion dependencies
 
-`stream-complete` carries source collection time, live count, snapshot digest and
-an exact list of `(writerId, operationId, digest)` dependencies. The dependency set
+`stream-complete` carries the retained declaration binding, source collection time,
+live count, snapshot digest and an exact list of `(writerId, operationId, digest)` dependencies. The dependency set
 includes connection lifecycle evidence plus every captured record mutation for the
 stream and blob claim in the current generation. Historical superseded mutations
 remain dependencies so a partial delivery cannot masquerade as the completed run.
 Native `completeStreams`, replace receipts and pre-existing baseline receipts use
-this representation. Empty streams still depend on connection registration.
+this representation. `proof` preserves native snapshot proof and host-run time
+basis, or the producer-asserted receipt's original null proof and time basis.
+The top-level snapshot digest is exporter-computed integrity evidence and does
+not promote a producer assertion to native proof. `selectStreamCompletion` uses
+revision order over one stream/generation's completion and invalidation events;
+reversed delivery cannot revive a removed receipt. Empty streams still depend on connection registration.
 
 `hasCompletionDependencies` verifies the exact canonical operation hashes and
 refuses missing or equivocated dependencies. It proves dependency coverage only.

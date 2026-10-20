@@ -825,6 +825,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
   const dropCompletionStmt = db.prepare(
     "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
   );
+  function dropCompletion(instance: string, stream: string): void {
+    if (dropCompletionStmt.run(instance, stream).changes > 0)
+      replica.captureInvalidation(instance, stream);
+  }
+
   const noteArrivalStmt = db.prepare(`
     INSERT INTO pdpp_record_arrival (instance, stream, record_key, generation, arrival)
     VALUES (@instance, @stream, @record_key, @generation, (
@@ -1012,7 +1017,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
     const writtenAt = nextWriteSeq.get() as { value: number };
     // The stream no longer holds what a replace delivered. `replaceStream`
     // writes its own receipt after its writes.
-    dropCompletionStmt.run(instance, stream);
+    dropCompletion(instance, stream);
     const dataJson = deleted ? null : JSON.stringify(data);
     const deletedAt = deleted ? emittedAt : null;
     upsertCurrentStmt.run({
@@ -1192,7 +1197,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
       for (const recordKey of snapshotOrder) {
         noteArrival(input.instance, input.stream, recordKey, input.generation);
       }
-      if (!preserved) dropCompletionStmt.run(input.instance, input.stream);
+      if (!preserved) dropCompletion(input.instance, input.stream);
       if (input.sourceCollectedAt !== undefined) {
         db.prepare(
           `INSERT INTO pdpp_stream_completion
@@ -2026,7 +2031,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
 
       const version = existing.version + 1;
       const writtenAt = nextWriteSeq.get() as { value: number };
-      dropCompletionStmt.run(instance, stream);
+      dropCompletion(instance, stream);
       upsertCurrentStmt.run({
         instance,
         stream,
