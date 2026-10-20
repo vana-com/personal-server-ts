@@ -79,7 +79,13 @@ than `getDataPoint`: the host must fetch authoritative version history and
 finalized chain evidence, including absence, and distinguish pending settlement
 from contradictions. The current SDK's head-only lookup cannot supply that
 proof. There is no fabricated production implementation or head-only fallback.
-The evidence adapter and production scheduling remain promotion work.
+The evidence adapter and production scheduling remain promotion work. During
+history/chain propagation lag, the adapter must return `pending: true` or throw;
+a partial evidence set with `pending: false` is a permanent conflict. Live
+acceptance must verify repeated PUT of identical ciphertext at an existing key
+after registration failure. Preparation currently quarantines any `RangeError`,
+including a possible allocation failure; distinguish retryable runtime errors
+from impossible framing before production promotion.
 
 The in-process oracle uses two file-backed SQLite stores and real receiver
 imports, an encrypted storage fake with a size cap, and independent fake
