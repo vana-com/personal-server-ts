@@ -1,3 +1,5 @@
+import type { BlockRedactionContext } from "./redaction.js";
+
 export type ContentKind =
   "vana-envelope" | "json" | "zip" | "text" | "binary" | "unsupported";
 
@@ -26,7 +28,7 @@ export interface DataBlockManifest {
    */
   envelopeDigest?: string;
   /** Redaction evidence from the envelope that generated this sidecar. */
-  redaction?: { dropTopLevelLineage: boolean; dropMetadataLineage: boolean };
+  redaction?: BlockRedactionContext;
   /** Ordered layout and serialization identity, separate from envelopeDigest. */
   representationId?: string;
   /** Continuation namespace of a read-time projection; not stored envelope identity. */
@@ -77,7 +79,7 @@ export interface ReadScopeBlocksResponse {
   schemaId?: string;
   contentKind: ContentKind;
   representationId?: string;
-  redaction?: { dropTopLevelLineage: boolean; dropMetadataLineage: boolean };
+  redaction?: BlockRedactionContext;
   blocks: DataScopeBlock[];
   nextCursor?: string;
   warnings: DataBlockWarning[];

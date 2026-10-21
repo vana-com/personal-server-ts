@@ -29,6 +29,8 @@ import { reindexLegacyDataFiles } from "./storage/node-data-storage.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { computeDataPointId } from "@opendatalabs/personal-server-ts-core/sync";
 import { dataRoutes } from "./routes/data.js";
+import { storageForReader } from "../../core/src/storage/disclosure-policy.js";
+import { redactJsonEnvelopeBytesForGrantee } from "@opendatalabs/personal-server-ts-core/api";
 
 const logger = pino({ level: "silent" });
 const ORIGIN = "http://localhost:8080";
@@ -242,6 +244,157 @@ describe("derivative output carries the origin of its sources", () => {
     const chain = await signedGet(builder, `/${DERIVED}`);
     expect(chain.status, await chain.text()).toBe(403);
   });
+
+  it("generated source coordinates are private to the owner of a real computed answer", async () => {
+    const hidden = "bank.transactions";
+    await put(sourceEnvelope(hidden, false));
+    await computeOwnerDerivative([hidden]);
+    const owned = await signedGet(owner, `/${DERIVED}`);
+    const ownerBody = await owned.json();
+    expect(owned.status).toBe(200);
+    expect(ownerBody.data.sources).toEqual([
+      { scope: hidden, version: 1, collectedAt: AT },
+    ]);
+    const chain = await signedGet(builder, `/${DERIVED}`);
+    const text = await chain.text();
+    console.log(
+      JSON.stringify({
+        probe: "generated-source-disclosure",
+        status: chain.status,
+        text,
+      }),
+    );
+    expect(chain.status).toBe(200);
+    expect(text).not.toContain(hidden);
+    expect(text).not.toContain(AT);
+    expect(text).not.toContain(computeDataPointId(owner.address, hidden));
+    expect(JSON.parse(text).data).not.toHaveProperty("sources");
+  });
+
+  it.each([
+    "blocks",
+    "manifest",
+    "old-policy-blocks",
+    "old-policy-manifest",
+    "bytes",
+  ])(
+    "generated source metadata uses the common redaction policy: %s",
+    async (mode) => {
+      await put(sourceEnvelope("bank.transactions", false));
+      await computeOwnerDerivative(["bank.transactions"]);
+      const entry = storage.findEntry({ scope: DERIVED })!;
+      const envelope = await storage.readEnvelope(DERIVED, entry.collectedAt);
+      let text: string;
+      if (mode === "bytes") {
+        text = new TextDecoder().decode(
+          redactJsonEnvelopeBytesForGrantee(
+            new TextEncoder().encode(JSON.stringify(envelope)),
+          ),
+        );
+      } else {
+        if (mode.startsWith("old-policy")) {
+          const built = await buildDataBlocksAsync({
+            scope: DERIVED,
+            collectedAt: entry.collectedAt,
+            content: envelope,
+          });
+          built.manifest.redaction = {
+            dropTopLevelLineage: true,
+            dropMetadataLineage: false,
+          };
+          await storage.writeBlockManifest!(
+            DERIVED,
+            entry.collectedAt,
+            built.manifest,
+            built.blocks,
+          );
+        }
+        const guarded = storageForReader(storage, "grantee");
+        text = JSON.stringify(
+          mode.endsWith("manifest")
+            ? await guarded.readBlockManifest!(DERIVED, entry.collectedAt, {
+                generation: entry.generation,
+              })
+            : await guarded.readScopeBlocks!(DERIVED, entry.collectedAt, {
+                generation: entry.generation,
+                maxBytes: 100000,
+                maxBlocks: 100,
+              }),
+        );
+      }
+      console.log(
+        JSON.stringify({ probe: "generated-common-redaction", mode, text }),
+      );
+      expect(text).not.toContain("bank.transactions");
+      expect(text).not.toContain(AT);
+      expect(text).not.toContain("$.data.sources");
+      expect(JSON.stringify(envelope.data)).toContain("bank.transactions");
+    },
+  );
+
+  it("an ordinary user-authored sources field remains readable", async () => {
+    const sources = [
+      { scope: "user-authored.scope", version: 31, collectedAt: AT },
+    ];
+    await put({
+      version: "1.0",
+      scope: DERIVED,
+      collectedAt: AT,
+      data: { sources, answer: "ordinary content" },
+    });
+    const chain = await signedGet(builder, `/${DERIVED}`);
+    expect(chain.status).toBe(200);
+    expect((await chain.json()).data.sources).toEqual(sources);
+  });
+
+  it.each(["pre-marker-computed", "user-authored-lookalike"])(
+    "historical release gate: %s has no trusted compute discriminator",
+    async (fixture) => {
+      // Pre-marker output fixture: the exact shape previously written by
+      // owner compute is also a valid owner-authored record. Latest mutable
+      // registrations and this payload cannot attest which write occurred.
+      const sources = [
+        { scope: "bank.transactions", version: 1, collectedAt: AT },
+      ];
+      const ids = [computeDataPointId(owner.address, "bank.transactions")];
+      const data = {
+        questionId: "q-1",
+        question: "Weekly summary",
+        answer: "ordinary answer",
+        evidence: null,
+        model: "fake-model",
+        computedAt: "2026-09-02T00:00:00.000Z",
+        sources,
+        lineage: ids,
+        $lineage: {
+          sources: ids,
+          writtenAt: "2026-09-02T00:00:00.000Z",
+          origin: "legacy",
+        },
+      };
+      await put({
+        version: "1.0",
+        scope: DERIVED,
+        collectedAt: "2026-09-02T00:00:00Z",
+        data,
+      });
+      const chain = await signedGet(builder, `/${DERIVED}`);
+      const body = await chain.json();
+      console.log(
+        JSON.stringify({
+          probe: "historical-compute-ambiguity",
+          fixture,
+          status: chain.status,
+          sources: body.data?.sources,
+        }),
+      );
+      expect(chain.status).toBe(200);
+      expect(data.$lineage).not.toHaveProperty("kind");
+      expect(body.data.sources).toEqual(sources);
+      // This is a documented unresolved historical F1 gate, not a privacy
+      // closure: arbitrary content cannot be quarantined from shape alone.
+    },
+  );
 
   it("a derivative over legacy-only sources stays readable by the chain grant", async () => {
     await put(sourceEnvelope("oura.legacy", false));

@@ -31,6 +31,7 @@ import { isBinaryEnvelope } from "../contracts/binary.js";
 import type { LegacyReader } from "../policy/legacy-disclosure.js";
 import { inputHasPdppOrigin, isPdppProducer } from "../sync/pdpp-import.js";
 import type { IndexEntry } from "./index/types.js";
+import { readEvidence, retainReadEvidence } from "./read-evidence.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
 import { blockRepresentationMetadata } from "./blocks/representation.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
@@ -330,6 +331,7 @@ export function withLegacyProjection(
     // the requested version alone: a PDPP sibling joined into an unmarked
     // scope makes the view PDPP-origin.
     let viewPdppOrigin = inputHasPdppOrigin(requestedEntry, own);
+    const inputEvidence = [readEvidence(own, requestedEntry)];
     for (const input of inputs) {
       if (!input.collectedAt) continue;
       const envelope =
@@ -346,6 +348,8 @@ export function withLegacyProjection(
       const rows = (envelope.data as { records: Record<string, unknown>[] })
         .records;
       if (rows.some(isTaggedRecord)) continue;
+      if (input.storedScope !== scope)
+        inputEvidence.push(readEvidence(envelope, input));
       fetchedStreams.push(input.stream);
       if (Date.parse(input.collectedAt) > Date.parse(now)) {
         now = input.collectedAt;
@@ -403,6 +407,7 @@ export function withLegacyProjection(
         ? { producer: "pdpp-projector" as const }
         : {}),
     } as DataFileEnvelope;
+    retainReadEvidence(envelope, inputEvidence);
     return {
       envelope,
       bytes: textEncoder.encode(JSON.stringify(envelope)),

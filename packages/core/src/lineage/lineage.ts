@@ -53,6 +53,8 @@ export interface StoredLineage {
    * existed fail closed.
    */
   origin?: "legacy";
+  /** Server-computed answer metadata, distinct from user-authored fields. */
+  kind?: "computed-question";
 }
 
 /** A source as the resolver saw it (local index or gateway). */
@@ -140,6 +142,9 @@ export function readStoredLineage(
     sources: sources.map((id) => id.toLowerCase() as `0x${string}`),
     writtenAt: value.writtenAt,
     ...(value.origin === "legacy" ? { origin: "legacy" as const } : {}),
+    ...(value.kind === "computed-question"
+      ? { kind: "computed-question" as const }
+      : {}),
   };
 }
 

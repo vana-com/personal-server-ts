@@ -5,6 +5,7 @@ import { buildBinaryEnvelopeData } from "../contracts/binary.js";
 import { createScopeDeletionTracker } from "../sync/scope-deletions.js";
 import { ProtocolError } from "../errors/catalog.js";
 import { PDPP_CLASSIFIER_VERSION } from "../sync/pdpp-import.js";
+import { BLOCK_REDACTION_POLICY_VERSION } from "../storage/blocks/redaction.js";
 
 const SERVER_ORIGIN = "https://personal-server.test";
 
@@ -310,7 +311,11 @@ describe("mcp/read-client", () => {
       // A sidecar bound to the selected version.
       pdppOrigin: false,
       envelopeDigest: "gen-1",
-      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [
         {
           id: "block-42",
@@ -397,7 +402,11 @@ describe("mcp/read-client", () => {
       pdppOrigin: false,
       pdppClassifier: PDPP_CLASSIFIER_VERSION,
       envelopeDigest: "gen-1",
-      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [
         {
           id: "block-1",
@@ -479,7 +488,11 @@ describe("mcp/read-client", () => {
       // A sidecar bound to the selected version.
       pdppOrigin: false,
       envelopeDigest: "gen-1",
-      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [
         {
           id: "block-1",
@@ -597,7 +610,11 @@ describe("mcp/read-client", () => {
       // A sidecar bound to the selected version.
       pdppOrigin: false,
       envelopeDigest: "gen-1",
-      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [],
       nextCursor,
       warnings: [],
@@ -680,7 +697,11 @@ describe("mcp/read-client", () => {
       // A sidecar bound to the selected version.
       pdppOrigin: false,
       envelopeDigest: "gen-1",
-      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [],
       warnings: [],
     });
@@ -768,7 +789,11 @@ describe("mcp/read-client", () => {
       // version's generation is the one pinned.
       pdppOrigin: false,
       envelopeDigest: "gen-old",
-      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [],
       warnings: [],
     });
@@ -855,7 +880,11 @@ describe("mcp/read-client", () => {
         contentKind: "json",
         pdppOrigin: false,
         envelopeDigest: "gen-republished",
-        redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
+        redaction: {
+          policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+          dropTopLevelLineage: false,
+          dropMetadataLineage: false,
+        },
         blocks: [
           {
             id: "block-1",
@@ -874,7 +903,11 @@ describe("mcp/read-client", () => {
         contentKind: "json" as const,
         pdppOrigin: false,
         envelopeDigest: "gen-republished",
-        redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
+        redaction: {
+          policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+          dropTopLevelLineage: false,
+          dropMetadataLineage: false,
+        },
         blocks: [
           {
             id: "block-1",
@@ -1222,6 +1255,7 @@ describe("mcp/read-client deletion gate", () => {
               pdppOrigin: false,
               envelopeDigest: "gen-1",
               redaction: {
+                policyVersion: BLOCK_REDACTION_POLICY_VERSION,
                 dropTopLevelLineage: false,
                 dropMetadataLineage: false,
               },
@@ -1235,6 +1269,7 @@ describe("mcp/read-client deletion gate", () => {
               pdppClassifier: PDPP_CLASSIFIER_VERSION,
               envelopeDigest: "gen-1",
               redaction: {
+                policyVersion: BLOCK_REDACTION_POLICY_VERSION,
                 dropTopLevelLineage: false,
                 dropMetadataLineage: false,
               },
