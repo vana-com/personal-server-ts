@@ -759,7 +759,17 @@ describe("/v1/derivatives/questions (composed app)", () => {
       }
     });
 
+    it("an app with unknown PDPP configuration fails closed for direct writes", async () => {
+      const direct = await builderRequest("POST", "/v1/data/coach.direct", {
+        value: MARKER,
+      });
+      expect(direct.status).toBe(201);
+      const read = await thirdPartyRead("coach.direct");
+      expect(read.status).toBe(403);
+    });
+
     it("positive control: a PDPP-disabled server keeps legacy behaviour for builder compute and writes", async () => {
+      app = createApp({ ...baseDeps, pdppEnabled: false });
       expect((await ownerIngest("oura.sleep", { score: 7 })).status).toBe(201);
       expect(
         (

@@ -395,3 +395,16 @@ async function readDeclarations(
   }
   return out;
 }
+
+/**
+ * Whether PDPP is configured on this server, for the publication policy
+ * (`nonOwnerPublicationIsPdpp`). It follows configuration, not whether the
+ * PDPP routes mounted: a service that is enabled but failed to mount (no
+ * retained declarations, no owner) still counts, since PDPP data may exist.
+ */
+export function pdppIsConfigured(
+  config: { pdpp: { enabled: boolean } },
+  mounted: unknown,
+): boolean {
+  return config.pdpp.enabled || mounted !== undefined;
+}

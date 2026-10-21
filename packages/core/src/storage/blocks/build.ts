@@ -10,7 +10,10 @@ import {
   BINARY_MARKER,
   type BinaryEnvelopeData,
 } from "../../contracts/binary.js";
-import { hasPdppOrigin } from "../../sync/pdpp-import.js";
+import {
+  hasPdppOrigin,
+  PDPP_CLASSIFIER_VERSION,
+} from "../../sync/pdpp-import.js";
 import { envelopeGeneration } from "../hierarchy/generation.js";
 import { blockRedactionContext } from "./redaction.js";
 import { blockDigest } from "./digest.js";
@@ -142,6 +145,7 @@ function buildDataBlocksInternal(
           pdppOrigin: hasPdppOrigin(
             classified.value as { data: unknown; producer?: unknown },
           ),
+          pdppClassifier: PDPP_CLASSIFIER_VERSION,
           envelopeDigest: envelopeGeneration(classified.value),
         }
       : {}),

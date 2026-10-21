@@ -1615,5 +1615,107 @@ describe("derivative data routes", () => {
       expect(read.status, text).toBe(403);
       expect(text).not.toContain(MARKER);
     });
+    it("refuses an own conversation projection that would join another writer legacy messages", async () => {
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      const sibling = {
+        version: "1.0",
+        scope: "chatgpt.messages",
+        collectedAt: "2026-09-01T00:00:00Z",
+        data: {
+          records: [
+            {
+              id: "m1",
+              conversation_id: "conv-1",
+              parent_id: null,
+              role: "user",
+              content: "other-writer-message-marker",
+              content_type: "text",
+              model_slug: null,
+              create_time: "2026-09-01T00:00:00Z",
+              on_current_branch: true,
+            },
+          ],
+        },
+      };
+      const written = await raw.writeEnvelope(sibling as never);
+      await raw.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: sibling.scope,
+        collectedAt: sibling.collectedAt,
+        sizeBytes: written.sizeBytes,
+      });
+      expect(
+        (
+          await writeAs(builderWallet, SESSION_TOKEN, SOURCE_SCOPE, {
+            records: [
+              {
+                id: "conv-1",
+                title: "Trip",
+                create_time: "2026-09-01T00:00:00Z",
+                update_time: "2026-09-01T00:00:00Z",
+                current_node: "m1",
+                message_count_on_current_branch: 1,
+              },
+            ],
+          })
+        ).status,
+      ).toBe(201);
+      const read = await readAs(
+        builderWallet,
+        `/${SOURCE_SCOPE}`,
+        CHAT_READ_GRANT_ID,
+      );
+      const text = await read.text();
+      console.log(
+        JSON.stringify({
+          probe: "own-write-legacy-join",
+          status: read.status,
+          otherWriterBytes: text.includes("other-writer-message-marker"),
+          body: text,
+        }),
+      );
+      expect(read.status).toBe(403);
+    });
+    it("reader cache eviction never shares an authorized writer view", async () => {
+      const { withLegacyProjection } =
+        await import("@opendatalabs/personal-server-ts-core/storage/legacy-projection");
+      deps.dataStorage = withLegacyProjection(
+        reviewNodeStorage({
+          indexManager: deps.indexManager,
+          hierarchyOptions,
+        }),
+      );
+      expect(
+        (
+          await writeAs(builderWallet, SESSION_TOKEN, DERIVED_SCOPE, {
+            value: MARKER,
+          })
+        ).status,
+      ).toBe(201);
+      expect((await readAs(builderWallet, `/${DERIVED_SCOPE}`)).status).toBe(
+        200,
+      );
+      for (let i = 3; i < 23; i++) {
+        if (i === 9) continue;
+        const other = createTestWallet(i);
+        const res = await readAs(other, `/${DERIVED_SCOPE}`);
+        expect(res.status, await res.clone().text()).toBe(403);
+      }
+      expect((await readAs(builderWallet, `/${DERIVED_SCOPE}`)).status).toBe(
+        200,
+      );
+      console.log(
+        JSON.stringify({
+          probe: "cache-eviction",
+          writerBefore: 200,
+          otherReadersDenied: 19,
+          writerAfter: 200,
+        }),
+      );
+    });
   });
 });

@@ -24,6 +24,7 @@ import {
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import { derivativesRoutes } from "./routes/derivatives.js";
+import type { PdppEnabled } from "@opendatalabs/personal-server-ts-core/policy";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
@@ -233,6 +234,8 @@ export interface AppDeps {
   writeProofReplayStore?: WriteProofReplayStore;
   profile?: "standard" | "enclave";
   jobWorker?: (envelope: JobRequestEnvelope) => Promise<JobExecuteResponse>;
+  /** PDPP publication state; omitted and unknown fails closed. */
+  pdppEnabled?: PdppEnabled;
   /**
    * PDPP §4/§8 record model + Resource Server query surface. Absent = the
    * PDPP routes are not mounted; existing deployments are unaffected. When
@@ -454,8 +457,14 @@ export function createApp(deps: AppDeps): Hono {
         deps.gatewayUrl ?? deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       paymentEnabled: deps.paymentEnabled,
       lineageGateway: deps.lineageGateway,
-      // Every non-owner write is PDPP-origin when a PDPP surface exists.
-      pdppEnabled: deps.pdpp !== undefined,
+      // The composition root shares this signal with compute. A caller
+      // without configuration or a mounted authority has unknown state.
+      pdppEnabled:
+        deps.pdppEnabled ??
+        deps.config?.pdpp.enabled ??
+        (deps.pdpp !== undefined || deps.pdppAuth !== undefined
+          ? true
+          : undefined),
       writeSessionStore,
       writeProofReplayStore,
       pdppOwnerBearer: deps.pdpp
