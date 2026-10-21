@@ -13,7 +13,8 @@ import { BINARY_NAMESPACE_ROLE } from "./pdpp-binary-chunks.js";
  * (1) removing a quarantine fact raises the connection's integrity epoch in
  *     the same transaction;
  * (2) the one quarantine predicate, given a row's generation, hides a key
- *     quarantined in the generation a pending reset introduces;
+ *     fact's rows of exactly that generation, including the generation a
+ *     pending reset introduces;
  * (3) every blob namespace whose bytes a reader can be served has a
  *     manifest trigger in the visibility view.
  */
@@ -85,7 +86,7 @@ it("(1) removing a key or connection quarantine fact raises the integrity epoch 
   expect(store.replicaIntegrityEpoch("conn_a")).toBe(before + 2);
 });
 
-it("(2) with the row's generation, a key fact hides rows of its generation and later; without it, canonical rows keep the current-generation rule", () => {
+it("(2) with the row's generation, a key fact hides rows of exactly its generation, as the canonical current-generation rule does", () => {
   const { db, store } = device();
   store.ingestBatch(
     [
@@ -105,11 +106,23 @@ it("(2) with the row's generation, a key fact hides rows of its generation and l
   db.exec(
     "CREATE TEMP TABLE preview_rows (instance TEXT, stream TEXT, record_key TEXT, generation INTEGER); INSERT INTO preview_rows VALUES ('conn_a','messages','a',2)",
   );
+  // An owner overlay or local row of the current generation.
+  db.exec(
+    "CREATE TEMP TABLE current_rows (instance TEXT, stream TEXT, record_key TEXT, generation INTEGER); INSERT INTO current_rows VALUES ('conn_a','messages','a',1)",
+  );
   const preview = () =>
     (
       db
         .prepare(
           `SELECT count(*) AS n FROM preview_rows r WHERE ${store.unquarantinedRecordSql("r", "r.generation")}`,
+        )
+        .get() as { n: number }
+    ).n;
+  const current = () =>
+    (
+      db
+        .prepare(
+          `SELECT count(*) AS n FROM current_rows r WHERE ${store.unquarantinedRecordSql("r", "r.generation")}`,
         )
         .get() as { n: number }
     ).n;
@@ -121,7 +134,7 @@ it("(2) with the row's generation, a key fact hides rows of its generation and l
         )
         .get() as { n: number }
     ).n;
-  expect([preview(), canonical()]).toEqual([1, 1]);
+  expect([preview(), current(), canonical()]).toEqual([1, 1, 1]);
   const quarantine = (generation: number) =>
     db.transaction(() => {
       db.prepare(
@@ -130,11 +143,19 @@ it("(2) with the row's generation, a key fact hides rows of its generation and l
       store.fenceReplicaConnection("conn_a");
     })();
   // The binding is at generation 1; the fact is for generation 2.
+  // A generation-2 fact hides the generation-2 row only: the current
+  // generation's overlay row and canonical row agree and stay visible.
   quarantine(2);
-  expect([preview(), canonical()]).toEqual([0, 1]);
-  // A generation-1 fact hides the canonical row, as before.
+  expect([preview(), current(), canonical()]).toEqual([0, 1, 1]);
+  // A generation-1 fact hides both generation-1 rows, as before.
   quarantine(1);
-  expect([preview(), canonical()]).toEqual([0, 0]);
+  expect([preview(), current(), canonical()]).toEqual([0, 0, 0]);
+});
+
+it("(2) the predicate declares generationSql as a plain optional parameter: adapters detect support through Function.length", () => {
+  const { store } = device();
+  // A default value would drop length to 1 and silently disable the generation.
+  expect(store.unquarantinedRecordSql.length).toBe(2);
 });
 
 it("(3) every reader-visible blob namespace has manifest insert and delete triggers in the visibility view", () => {

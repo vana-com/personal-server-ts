@@ -592,17 +592,20 @@ function projectFields(
  * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
 // Shared read predicate for canonical, replica-preview, and known-local projections.
-// `generationSql` is the row's own generation, for rows that can belong to a
-// generation a pending reset introduces: a key fact then applies from its
-// generation on (fail closed). Without it the fact applies to the binding's
-// current generation only, so canonical rows behave as before.
+// A key fact hides rows of exactly its generation. Without `generationSql`
+// that is the binding's current generation (canonical rows). With it, it is
+// the row's own generation, for overlay and local rows that can belong to a
+// generation a pending reset introduces. Both halves use equality, so an
+// overlay row and the canonical row of one generation always agree.
+// Keep `generationSql` a plain optional parameter, never a default value:
+// the receiver adapter detects support through Function.length >= 2.
 function unquarantinedRecordSql(alias: string, generationSql?: string): string {
   const connection = `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_connections q WHERE q.instance = ${alias}.instance)`;
   const key = (scope: string) =>
     `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_keys q ${scope} q.instance=${alias}.instance AND q.stream=${alias}.stream AND q.record_key=${alias}.record_key`;
   return generationSql === undefined
     ? `${connection} AND ${key("JOIN pdpp_instance_binding b ON b.instance=q.instance AND b.generation=q.generation WHERE")})`
-    : `${connection} AND ${key("WHERE")} AND q.generation >= (${generationSql}))`;
+    : `${connection} AND ${key("WHERE")} AND q.generation = (${generationSql}))`;
 }
 
 export function createSqliteRecordStore(db: Database): PdppRecordStore & {
