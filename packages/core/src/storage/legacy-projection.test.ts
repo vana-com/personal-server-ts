@@ -623,6 +623,43 @@ describe("withLegacyProjection parity goldens", () => {
   // so the projection time equals legacy's stamped fetched_at.
   const COLLECTED_AT = "2026-10-01T00:00:00.000Z";
 
+  it("does not join identified live messages into historical untagged Claude export rows", async () => {
+    const golden = JSON.parse(
+      readFileSync(
+        new URL(
+          "../legacy-projection/__fixtures__/parity/claude.conversations.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as { streams: Record<string, Record<string, unknown>[]> };
+    const raw = createMemoryDataStorage();
+    for (const [stream, rows] of Object.entries(golden.streams)) {
+      await store(raw, `claude.${stream}`, COLLECTED_AT, {
+        records:
+          stream === "messages"
+            ? rows.map((row) => ({
+                ...row,
+                $pdpp: {
+                  sourceId: "https://registry.pdpp.dev/sources/anthropic-live",
+                },
+              }))
+            : rows,
+      });
+    }
+    await expect(
+      withLegacyProjection(raw).readEnvelope(
+        "claude.conversations",
+        COLLECTED_AT,
+      ),
+    ).rejects.toMatchObject({
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+      details: {
+        reason: "Joined streams have conflicting connector identities",
+      },
+    });
+  });
+
   it.each([
     "chatgpt.conversations",
     "chatgpt.memories",
