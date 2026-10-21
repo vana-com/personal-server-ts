@@ -77,18 +77,26 @@ describe("sqlite record store", () => {
   }, 30_000);
 
   it("uses a covering index for per-instance stream summaries", () => {
+    // Plan the exact SELECT `listStreams` prepares, not a copy of it.
+    const prepared: string[] = [];
+    const prepare = db.prepare.bind(db);
+    db.prepare = ((sql: string) => {
+      prepared.push(sql);
+      return prepare(sql);
+    }) as typeof db.prepare;
+    try {
+      store.listStreams(["inst_1"]);
+    } finally {
+      db.prepare = prepare as typeof db.prepare;
+    }
+    const summary = prepared.find((sql) => /GROUP BY stream/.test(sql));
+    expect(summary).toBeDefined();
     const plan = db
-      .prepare(
-        `EXPLAIN QUERY PLAN
-         SELECT stream, COUNT(*) as count, MAX(emitted_at) as last_updated
-         FROM pdpp_records
-         WHERE deleted = 0 AND instance IN (?)
-         GROUP BY stream`,
-      )
+      .prepare(`EXPLAIN QUERY PLAN ${summary}`)
       .all("inst_1") as Array<{ detail: string }>;
 
-    expect(plan.map((row) => row.detail).join("\n")).toContain(
-      "idx_pdpp_records_live_instance_stream_emitted_at",
+    expect(plan.map((row) => row.detail).join("\n")).toMatch(
+      /USING COVERING INDEX idx_pdpp_records_live_instance_stream_emitted_key/,
     );
   });
 

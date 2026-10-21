@@ -399,3 +399,51 @@ it.each([false, true])(
       }
   },
 );
+
+it("expires a list cursor minted under timestamp-text order instead of resuming it by instant", async () => {
+  const { encodeCursor, CursorExpiredError } =
+    await import("@opendatalabs/personal-server-ts-core/storage/pdpp-records");
+  for (const store of stores()) {
+    try {
+      // Text order put A (09:00Z) before B ("10:00+02:00", 08:00Z): a
+      // pre-v13 build served A first and left B unread.
+      put(store, "a", "2026-01-01T09:00:00Z");
+      put(store, "b", "2026-01-01T10:00:00+02:00");
+      const options = {
+        instanceIds: ["inst_1"],
+        limit: 1,
+        order: "asc" as const,
+      };
+      const fresh = store.listRecords("events", options);
+      const { decodeCursor } =
+        await import("@opendatalabs/personal-server-ts-core/storage/pdpp-records");
+      const minted = decodeCursor(fresh.nextCursor!);
+      if (minted.kind !== "list") throw Error("expected list cursor");
+      // The same position as an older build minted it: no order revision.
+      const legacy = {
+        kind: "list" as const,
+        stream: minted.stream,
+        epoch: minted.epoch,
+        horizon: minted.horizon,
+        order: "asc" as const,
+        sortValue: "2026-01-01T09:00:00Z",
+        recordKey: "a",
+        instance: "inst_1",
+      };
+      expect(() =>
+        store.listRecords("events", {
+          ...options,
+          cursor: encodeCursor(legacy),
+        }),
+      ).toThrow(CursorExpiredError);
+      // A cursor this build mints still resumes.
+      expect(
+        store
+          .listRecords("events", { ...options, cursor: fresh.nextCursor })
+          .data.map((r) => r.recordKey),
+      ).toEqual(["a"]);
+    } finally {
+      store.close();
+    }
+  }
+});
