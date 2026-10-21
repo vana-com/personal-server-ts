@@ -163,11 +163,13 @@ export function withDisclosurePolicy(raw: DataStoragePort): DataStoragePort {
   ): Promise<{ manifest: DataBlockManifest; blocks: DataScopeBlock[] }> {
     // The generation is computed on the stored JSON as storage computed it
     // when it indexed the row, not on a schema-parsed copy.
+    // Object adapters may lend a retained value. Own it before checking it:
+    // the async builder must consume the same value those checks authorized.
     const envelope = raw.readEnvelopeBytes
       ? (JSON.parse(
           textDecoder.decode(await raw.readEnvelopeBytes(scope, collectedAt)),
         ) as DataFileEnvelope)
-      : await raw.readEnvelope(scope, collectedAt);
+      : structuredClone(await raw.readEnvelope(scope, collectedAt));
     if (
       generation !== undefined &&
       envelopeGeneration(envelope) !== generation

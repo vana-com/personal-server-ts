@@ -96,8 +96,9 @@ export interface McpDataReadClient {
    * reads when the bounded storage path is unavailable.
    *
    * `blockIds` switches the read to block-addressed mode: only those blocks are
-   * returned, `cursor` is ignored, and no `nextCursor` is produced. `maxBytes`
-   * still bounds the response.
+   * returned, cursor positions are ignored but version/layout binding is
+   * checked, and no `nextCursor` is produced. `maxBytes` is a UTF-8 content
+   * budget; a 1–3 byte budget may emit one whole code point (up to 4 bytes).
    */
   readScopeBlocks(params: {
     scope: string;
