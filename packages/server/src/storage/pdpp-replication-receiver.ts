@@ -647,6 +647,7 @@ export function createReplicaReceiver(deps: {
     );
     for (const record of plan.records) {
       if (
+        record.identity.connectionId !== input.connectionId ||
         record.identity.stream !== input.stream ||
         record.identity.generation !== generation
       )
@@ -763,6 +764,14 @@ export function createReplicaReceiver(deps: {
         const previous = db
           .prepare("SELECT * FROM pdpp_replica_pending_batches WHERE id=?")
           .get(input.id) as PendingBatch | undefined;
+        if (previous?.state === "confirmed") {
+          if (
+            previous.envelope_json !== encoded ||
+            previous.blobs_json !== blobs
+          )
+            throw new Error("confirmed replica batch is immutable");
+          return;
+        }
         if (
           previous &&
           (previous.envelope_json !== encoded || previous.blobs_json !== blobs)

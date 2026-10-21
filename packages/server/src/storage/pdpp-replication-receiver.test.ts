@@ -1624,13 +1624,11 @@ it("applies foreign pending identity conflicts to confirmed owner rows without c
   expect(preview(receiver)).toEqual([]);
   expect(preview(receiver, "grant")).toHaveLength(1);
   expect(
-    receiver
-      .readStore({ reader: "owner" })
-      .listRecords("messages", {
-        instanceIds: ["conn_a"],
-        order: "asc",
-        limit: 10,
-      }).data,
+    receiver.readStore({ reader: "owner" }).listRecords("messages", {
+      instanceIds: ["conn_a"],
+      order: "asc",
+      limit: 10,
+    }).data,
   ).toEqual([]);
   expect(
     receiver.readStore({ reader: "owner" }).listStreams(["conn_a"]),
@@ -1650,4 +1648,79 @@ it("does not let an unrelated pending connection conflict withdraw owner rows", 
   const receiver = stagePending(d, [foreign, collision]);
   expect(preview(receiver)).toHaveLength(1);
   expect(preview(receiver)[0].data.text).toBe("remote-200");
+});
+
+for (const owner of ["confirmed-only", "include-pending"] as const)
+  for (const grant of ["confirmed-only", "include-pending"] as const)
+    it(`keeps two-connection record identities scoped in ${owner}/${grant} mode`, () => {
+      const d = device();
+      d.store.registerConnection({
+        instance: "conn_b",
+        sourceId,
+        method: "collector",
+        label: "B",
+      });
+      const regB = {
+        ...registration(),
+        connectionId: "conn_b",
+        revision: { counter: 1, writerId: "B", operationId: "register-b" },
+      } as ReplicaOperation;
+      const bRow = {
+        ...upsert(100),
+        connectionId: "conn_b",
+        recordKey: "b",
+        data: { id: "b", text: "B" },
+      } as ReplicaOperation;
+      send(d, [registration(), regB, upsert(), bRow]);
+      const aPending = {
+        ...upsert(201),
+        recordKey: "p",
+        data: { id: "p", text: "A pending" },
+      } as ReplicaOperation;
+      const bPending = {
+        ...upsert(202),
+        connectionId: "conn_b",
+        recordKey: "foreign",
+        data: { id: "foreign", text: "B pending" },
+      } as ReplicaOperation;
+      const receiver = pendingReceiver(d, true, { owner, grant });
+      receiver.stage({
+        credential: "replica-secret",
+        id: "two-connections",
+        envelope: batch([aPending, bPending]),
+      });
+      for (const reader of ["owner", "grant"] as const) {
+        const view = receiver.readStore({ reader });
+        const rows = view.listRecords("messages", {
+          instanceIds: ["conn_a"],
+          limit: 100,
+          order: "asc",
+        }).data;
+        expect(rows.map((row) => row.recordKey)).toEqual(
+          { owner, grant }[reader] === "include-pending" ? ["a", "p"] : ["a"],
+        );
+        expect(rows.every((row) => row.instance === "conn_a")).toBe(true);
+        expect(view.getRecord("conn_a", "messages", "foreign")).toBeUndefined();
+      }
+    });
+
+it("refuses a changed stage attempt without rewriting a confirmed batch state", () => {
+  const d = device();
+  const receiver = stagePending(d);
+  receiver.promote({ credential: "replica-secret", id: "pending" });
+  expect(() =>
+    receiver.stage({
+      credential: "replica-secret",
+      id: "pending",
+      envelope: batch([registration(), upsert(999)]),
+    }),
+  ).toThrow();
+  expect(
+    d.db
+      .prepare(
+        "SELECT state FROM pdpp_replica_pending_batches WHERE id='pending'",
+      )
+      .get(),
+  ).toEqual({ state: "confirmed" });
+  expect(preview(receiver)).toHaveLength(1);
 });
