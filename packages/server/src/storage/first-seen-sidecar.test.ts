@@ -133,7 +133,10 @@ describe("first-seen sidecar on the Node storage", () => {
 
     // Served read (grantee-visible shape).
     const served = withLegacyProjection(storage);
-    const read = await readDataContract({ storage: served, scopeParam: SCOPE });
+    const read = await readDataContract({
+      source: { reader: "owner", storage: served },
+      scopeParam: SCOPE,
+    });
     expect(JSON.stringify(read)).not.toContain(marker);
     expect(JSON.stringify(read)).not.toContain("baseline");
 

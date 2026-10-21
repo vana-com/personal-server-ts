@@ -211,10 +211,13 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * computes it from the bytes published at the row's path, reads them a
    * second time, and records it on that row only if both reads agree and
    * the row still has none; otherwise undefined. A row that has a
-   * generation returns it unchanged. Never takes a caller's value.
+   * generation returns it unchanged. Never takes a caller's value. Storage
+   * that records a content digest backfills it in the same two reads, also
+   * for a row that has a generation but no digest, and only when the bytes
+   * are of the row's generation.
    */
   backfillGeneration?(
-    entry: Pick<IndexEntry, "id" | "path" | "generation">,
+    entry: Pick<IndexEntry, "id" | "path" | "generation" | "contentDigest">,
   ): Promise<string | undefined>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
   /** Atomic local legacy write, including a version compare when requested. */

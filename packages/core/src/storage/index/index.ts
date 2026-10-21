@@ -4,4 +4,4 @@ export type {
   NewIndexEntry,
   ScopeSummary,
 } from "./types.js";
-export type { IndexManager } from "./manager.js";
+export type { IndexManager, StoredIdentity } from "./manager.js";

@@ -1,4 +1,3 @@
-import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import { existsSync } from "node:fs";
 import type Database from "better-sqlite3";
 import type {
@@ -10,7 +9,6 @@ import type {
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
   buildDataFilePath,
-  envelopeGeneration,
   type HierarchyManagerOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
@@ -23,6 +21,7 @@ import {
   publishDataFile,
   PublishedDataFileError,
   snapshotScopeFiles,
+  versionIdentity,
 } from "./hierarchy.js";
 import { relative } from "node:path";
 
@@ -133,12 +132,12 @@ export function createImportOperations(
           fileId: null,
           schemaId: null,
           path: row.path,
-          pdppOrigin: hasPdppOrigin(envelope),
-          generation: envelopeGeneration(envelope),
           scope: row.scope,
           collectedAt: row.collected_at,
           sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
           afterTombstoneVersion: metadata.afterTombstoneVersion ?? null,
+          // Storage's own values, from the journaled bytes it published.
+          ...versionIdentity(envelope, bytes),
         });
         if (!inserted.ok) {
           // The index closed this scope for writes (history unknown). Fail
@@ -287,10 +286,7 @@ export function createImportOperations(
             : command.envelope;
         const bytes = Buffer.from(JSON.stringify(envelope, null, 2));
         // Synchronous with the serialization above: these describe the bytes.
-        const identity = {
-          pdppOrigin: hasPdppOrigin(envelope),
-          generation: envelopeGeneration(envelope),
-        };
+        const identity = versionIdentity(envelope, bytes);
         let writeResult;
         try {
           writeResult = publishDataFile(options, envelope, bytes);
