@@ -22,6 +22,15 @@ The separate sender-crash probe is:
   "$HOME/.tmp/replica-put-retry.json" --put-retry-only
 ```
 
+The pending visibility probe is:
+
+```sh
+./node_modules/.bin/tsx scripts/pdpp-replica-live-journey.ts \
+  "$HOME/.tmp/replica-visibility.json" --visibility-only
+```
+
+It measures each receiving reader independently from the source write in both directions. The owner must first read the record with `confirmation: "not yet confirmed"`, while grant reads, canonical rows and received operations still exclude it. The receiver is killed and restarted during that interval; its owner preview must survive without exposing the record to the grant reader. Finalized evidence then allows promotion, after which the grant reader sees exactly one imported operation and the owner marker disappears. The receipt reports `ownerVisibleMs` and `appVisibleMs`; polling adds two seconds plus one worker cycle of observation uncertainty. This probe exercises the Node reader API, not an HTTP token or consent flow.
+
 Both commands create a new random owner in memory. They never load `.env`, personal configuration, wallet files or existing accounts. Owner and server keys travel only through private process IPC. The two worker hosts use independent SQLite databases, distinct registered server signers and one shared owner master key. Connection and declaration authority are provisioned explicitly in each host. They drive the canonical store, receiver and transport directly; they do not start the application bootstrap or prove HTTP/authentication routes.
 
 Network destinations are fixed to dev Gateway `dp-rpc-dev.vana.org`, dev storage `storage-dev.vana.org` and Moksha RPC `rpc.moksha.vana.org`, chain 14800. Other fetch origins and redirects are rejected. Replication is enabled only in these hosts. No Lite host or scheduler is started.

@@ -102,6 +102,8 @@ type HostRequest = {
   args?: Record<string, unknown>;
 };
 type Snapshot = {
+  ownerRows: import("../packages/core/src/storage/pdpp-records/types.js").PdppStoredRecord[];
+  appRows: import("../packages/core/src/storage/pdpp-records/types.js").PdppStoredRecord[];
   records: Record<string, unknown>;
   blobs: Record<string, { sha256: string; bytes: number }>;
   published: number;
@@ -166,6 +168,7 @@ async function host() {
   const expected = { owner: init.owner, declarations: [{ sourceId, binding }] };
   store.replication.beginBaseline(expected);
   const receiver = createReplicaReceiver({
+    enabled: true,
     db,
     store,
     owner: init.owner,
@@ -343,6 +346,16 @@ async function host() {
       }
     }
     return {
+      ownerRows: receiver.readVisibleRecords({
+        reader: "owner",
+        connectionId: "conn",
+        stream: "messages",
+      }),
+      appRows: receiver.readVisibleRecords({
+        reader: "grant",
+        connectionId: "conn",
+        stream: "messages",
+      }),
       pid: process.pid,
       importedScopes: (
         db
@@ -637,6 +650,19 @@ async function main() {
     head: execFileSync("git", ["rev-parse", "HEAD"], {
       encoding: "utf8",
     }).trim(),
+    sourceSha256: digest(
+      execFileSync(
+        "git",
+        [
+          "diff",
+          "HEAD",
+          "--",
+          "packages",
+          "scripts/pdpp-replica-live-journey.ts",
+        ],
+        { encoding: "utf8" },
+      ),
+    ),
     harnessSha256: digest(readFileSync(fileURLToPath(import.meta.url))),
     node: process.version,
     dirtyTree: execFileSync(
@@ -763,6 +789,109 @@ async function main() {
     }
     await a.start();
     await b.start();
+    if (process.argv.includes("--visibility-only")) {
+      for (const [sender, recipient, direction] of [
+        [a, b, "A to B"],
+        [b, a, "B to A"],
+      ] as const) {
+        const id = `visibility-${cases.length}`;
+        const started = Date.now();
+        await sender.call("put", { id, text: direction });
+        let ownerVisibleMs: number | undefined;
+        let appVisibleMs: number | undefined;
+        let restartedPending = false;
+        let pendingReceipt: Snapshot | undefined;
+        let confirmedReceipt: Snapshot | undefined;
+        while (Date.now() - started < 12 * 60_000) {
+          await Promise.all(devices.map((device) => device.call("cycle")));
+          let snapshot = await recipient.call("snapshot");
+          const ownerRow = snapshot.ownerRows.find(
+            (row) => row.recordKey === id,
+          );
+          const appRow = snapshot.appRows.find((row) => row.recordKey === id);
+          if (ownerVisibleMs === undefined && ownerRow) {
+            ownerVisibleMs = Date.now() - started;
+            assert.equal(ownerRow.confirmation, "not yet confirmed");
+            assert.equal(
+              appRow,
+              undefined,
+              "Grant reader exposed unconfirmed data",
+            );
+            assert.equal(
+              snapshot.records[id],
+              undefined,
+              "Pending data entered canonical rows",
+            );
+            assert(
+              !snapshot.receivedOperations.some(
+                (op) => op.kind === "upsert" && op.recordKey === id,
+              ),
+              "Pending data advanced received operations",
+            );
+            pendingReceipt = snapshot;
+            const killedPid = snapshot.pid;
+            await recipient.kill();
+            await recipient.start();
+            snapshot = await recipient.call("snapshot");
+            assert.notEqual(snapshot.pid, killedPid);
+            assert.equal(
+              snapshot.ownerRows.find((row) => row.recordKey === id)
+                ?.confirmation,
+              "not yet confirmed",
+            );
+            assert(!snapshot.appRows.some((row) => row.recordKey === id));
+            restartedPending = true;
+          }
+          if (appRow) {
+            appVisibleMs = Date.now() - started;
+            assert(
+              ownerVisibleMs !== undefined && ownerVisibleMs < appVisibleMs,
+            );
+            assert.equal(appRow.confirmation, undefined);
+            assert.deepEqual(snapshot.records[id], { id, text: direction });
+            assert.equal(
+              snapshot.ownerRows.find((row) => row.recordKey === id)
+                ?.confirmation,
+              undefined,
+            );
+            const matching = snapshot.receivedOperations.filter(
+              (op) => op.kind === "upsert" && op.recordKey === id,
+            );
+            assert.equal(matching.length, 1);
+            confirmedReceipt = snapshot;
+            break;
+          }
+          console.log(
+            JSON.stringify({
+              stage: "visibility",
+              direction,
+              elapsedMs: Date.now() - started,
+              ownerVisibleMs,
+              appVisible: !!appRow,
+            }),
+          );
+          await pause(2000);
+        }
+        assert(
+          ownerVisibleMs !== undefined &&
+            appVisibleMs !== undefined &&
+            restartedPending,
+          "Visibility journey timed out",
+        );
+        cases.push({
+          case: "reader-visibility",
+          direction,
+          ownerVisibleMs,
+          appVisibleMs,
+          restartedPending,
+          pendingReceipt,
+          confirmedReceipt,
+        });
+        save();
+      }
+      report.status = "passed";
+      return;
+    }
     if (process.argv.includes("--put-retry-only")) {
       await a.call("put", {
         id: "retry",

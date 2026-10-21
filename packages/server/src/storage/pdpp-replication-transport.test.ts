@@ -896,3 +896,120 @@ it("quarantines a finalized version-1 commitment mismatch including a tombstone 
     expect(net.registrations.filter((s) => s === scope)).toHaveLength(1);
   }
 });
+
+function visibility(d: ReturnType<typeof device>, reader: "owner" | "grant") {
+  const receiver = createReplicaReceiver({
+    db: d.db,
+    store: d.store,
+    owner,
+    enabled: true,
+    authenticate: (c) => (c === "replica-secret" ? owner : undefined),
+    declarations: () =>
+      expected.declarations.map((d) => ({ ...d, validateData: () => true })),
+  });
+  return receiver.readVisibleRecords({
+    reader,
+    connectionId: "conn",
+    stream: "messages",
+  });
+}
+
+it("cheap-validates pending fragments, restores preview on reopen, and promotes once only after every fragment finalizes", async () => {
+  const net = network();
+  net.beforePut((scope) => net.pending.add(scope));
+  const a = device(net),
+    b = device(net);
+  a.put("pending-preview");
+  await cycles([a, b], 3);
+  expect(visibility(b, "owner")).toMatchObject([
+    { data: { text: "pending-preview" }, confirmation: "not yet confirmed" },
+  ]);
+  expect(visibility(b, "grant")).toEqual([]);
+  expect(b.get()).toBeUndefined();
+  const retainedGets = net.gets.length;
+  b.reopen();
+  expect(visibility(b, "owner")[0].confirmation).toBe("not yet confirmed"); // copy-assertion-ok: User-required data-model confirmation value.
+  await cycles([b], 2);
+  expect(net.gets.length).toBe(retainedGets);
+  for (const [scope, head] of net.head)
+    net.chain.set(scope, net.chainRow(scope, head));
+  // One unfinalized fragment still gates the whole batch.
+  const withheld = [...net.pending][0];
+  net.pending.clear();
+  net.pending.add(withheld);
+  await cycles([a, b], 2);
+  expect(b.get()).toBeUndefined();
+  net.pending.clear();
+  await cycles([a, b], 4);
+  expect(visibility(b, "grant")).toMatchObject([
+    { data: { text: "pending-preview" } },
+  ]);
+  expect(visibility(b, "owner")[0].confirmation).toBeUndefined();
+  const history = b.db.prepare("SELECT * FROM pdpp_record_changes").all();
+  await cycles([a, b], 3);
+  expect(b.db.prepare("SELECT * FROM pdpp_record_changes").all()).toEqual(
+    history,
+  );
+});
+
+for (const divergence of ["commitment", "later-version"] as const)
+  it(`quarantines already staged pending on finalized ${divergence}`, async () => {
+    const net = network();
+    net.beforePut((scope) => net.pending.add(scope));
+    const a = device(net),
+      b = device(net);
+    a.put("will-diverge");
+    await cycles([a, b], 3);
+    expect(visibility(b, "owner")).toHaveLength(1);
+    for (const [scope, head] of net.head) {
+      const row = net.chainRow(scope, head);
+      if (divergence === "commitment") row.commitment = `0x${"f".repeat(64)}`;
+      else row.currentVersion = "2";
+      net.chain.set(scope, row);
+    }
+    net.pending.clear();
+    await cycles([b], 3);
+    expect(visibility(b, "owner")).toEqual([]);
+    expect(visibility(b, "grant")).toEqual([]);
+    expect(b.get()).toBeUndefined();
+    b.reopen();
+    expect(visibility(b, "owner")).toEqual([]);
+  });
+
+it("recovers pre-upgrade retained fragments by re-downloading and validating before import", async () => {
+  const net = network();
+  net.beforePut((scope) => net.pending.add(scope));
+  const a = device(net),
+    b = device(net);
+  a.put("upgrade-retained");
+  await cycles([a, b], 3);
+  expect(b.get()).toBeUndefined();
+  const retained = inbox(b).filter((row) => row.fragment_json !== null);
+  expect(retained.length).toBeGreaterThan(0);
+  // Simulate the old durable inbox schema: retained fragments had no hash columns
+  // and may have a future retry deadline after an interrupted receive cycle.
+  b.db
+    .prepare(
+      "UPDATE pdpp_transport_inbox SET next_attempt=?,error='old retry' WHERE state='ready'",
+    )
+    .run(time + 86400000);
+  b.db.exec("ALTER TABLE pdpp_transport_inbox DROP COLUMN data_hash");
+  b.db.exec("ALTER TABLE pdpp_transport_inbox DROP COLUMN metadata_hash");
+  b.db.exec("ALTER TABLE pdpp_transport_inbox DROP COLUMN finalized");
+  const beforeGets = net.gets.length;
+  for (const [scope, head] of net.head)
+    net.chain.set(scope, net.chainRow(scope, head));
+  net.pending.clear();
+  b.reopen();
+  await cycles([b], 3);
+  expect(b.get()?.text).toBe("upgrade-retained");
+  expect(net.gets.slice(beforeGets).sort()).toEqual(
+    retained.map((row) => row.scope).sort(),
+  );
+  const history = b.db.prepare("SELECT * FROM pdpp_record_changes").all();
+  b.reopen();
+  await cycles([b], 2);
+  expect(b.db.prepare("SELECT * FROM pdpp_record_changes").all()).toEqual(
+    history,
+  );
+});

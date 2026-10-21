@@ -25,3 +25,32 @@ Completion receipts require exact dependency IDs and operation digests, a valid 
 `packages/core/src/sync/pdpp-import.ts` is unchanged. Its `$pdpp` metadata path still lacks method authority and cannot acquire replica authority by adding fields. Its transient/permanent compatibility decisions remain in place.
 
 The tests use fresh on-disk SQLite databases, existing HTTP grant reads, and process termination around transaction commit. They do not establish real DPv2 delivery, credential issuance, mobile or lite persistence, retention bounds, or production readiness. Publication/download belongs to Slice 6. The provisional core conflict policy remains unchanged.
+
+## Provisional visibility
+
+`enabled: true` opts this internal receiver into staging and preview. The transport worker explicitly sets this switch from its own existing `enabled` flag; an omitted receiver switch alone does not enable staging. A disabled worker never downloads, stages, promotes, or acknowledges a batch. The original trusted `import` API retains its existing confirmed-import semantics.
+
+`stage({credential,id,envelope,blobs})` persists an immutable pending batch in `pdpp_replica_pending_batches` with binary bytes in separate BLOB rows. It checks envelope structure, owner/mapping and supplied content hashes. The transport caller must first decrypt, validate fragment/payload bindings and validate blob descriptors. No pending operation enters the received operation set, canonical tables, export journals, history or convergence/Lamport clocks.
+
+`readVisibleRecords({reader,connectionId,stream})` returns live stored-record models. `reader` defaults to `grant`. One core `ReplicaVisibilityPolicy` governs record, page, stream-summary and blob reads via `readStore({reader})`. The default owner mode includes pending; the default grant mode is confirmed-only. Change either policy member to `include-pending` or `confirmed-only` without changing the merge engine. Quarantined batches are never visible. The authenticated host chooses reader identity; request parameters must not choose it.
+
+Owner preview calls the same core `planReplicaMerge` over canonical and pending operations, combines its decisions with current canonical rows, and validates binary availability. It does not clone the database or write scratch canonical/convergence state. Pending winners carry `confirmation: "not yet confirmed"` and `visibility: "pending"`; canonical responses omit those fields. Preview-only rows have version zero until canonical history allocates their first version. Local lifecycle evidence, concurrent edits, and #426 ordering remain inputs to that merge. Preview pagination uses the existing tuple cursor format and validates canonical epoch/order/reset fences. Hidden-pending and disabled page reads return the original store page exactly.
+
+`promote({credential,id})` is a **trusted host finality hook**, not a standalone proof verifier. The transport host must recheck every retained fragment against pinned finalized #433 evidence before calling it. Promotion imports the stored batch, updates clocks/history/canonical state, marks it confirmed and removes redundant pending binary rows in one SQLite transaction. The transport wraps promotion and its durable acknowledgement in the same transaction. A failed commit leaves the pending preview available; repeated promotion does not allocate more history. `quarantine({credential,id,reason})` removes provisional visibility without importing. Finalized divergent commitments and later finalized versions use this hook.
+
+Canonical store reads, export APIs, legacy projections, authorization selection and change feeds continue to read canonical state. Hosts that explicitly want policy-driven resource reads supply the receiver's read adapter. This change does not enable production bootstrap scheduling or expose an endpoint to call the trusted hooks. Pending backlog latency and large-device memory limits have not been measured by these focused tests.
+
+The Node record and blob route factories accept the same optional adapter:
+
+```ts
+const replicaReads = (reader: ReplicaReader) => receiver.readStore({ reader });
+pdppRecordsRoutes({ ...recordDeps, replicaReads });
+pdppBlobsRoutes({ ...blobDeps, replicaReads });
+```
+
+Each factory derives the reader class from the authenticated token. Query parameters cannot select owner visibility. The adapter preserves the route's existing instance, field, resource and time restrictions. List and single-record JSON responses expose `confirmation: "not yet confirmed"` on provisional rows. Blob authorization and bytes use that same reader view. With no adapter, the factories retain their existing canonical reads. Change feeds continue to report confirmed durable history; owner previews allocate no history positions. The separate consent acceptance lane must inject these adapters into its test host before claiming RS pending-visibility coverage.
+
+Preview tuple ordering and cursor comparisons use SQLite-compatible UTF-8 BINARY
+comparison, including case, non-ASCII and supplementary-plane keys. They do not
+apply locale collation or normalize timestamp text; this matches canonical SQL
+ordering even for equivalent timestamps with different permitted encodings.

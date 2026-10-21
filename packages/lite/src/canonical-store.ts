@@ -3,6 +3,7 @@ import {
   replicaEnvelopeSchema,
   replicaOperationSchema,
   type ReplicaOperation,
+  type ReplicaEnvelope,
   type RecordOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
@@ -16,6 +17,11 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records/portable";
 import { sha256, toBytes } from "viem";
 import { createReplicaRecordReducer } from "@opendatalabs/personal-server-ts-core/replication/record-reducer";
+import {
+  replicaStateVisible,
+  type ReplicaReader,
+  type ReplicaVisibilityPolicy,
+} from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import type {
   LiteCanonicalPersistence,
   LiteCanonicalTransaction,
@@ -40,6 +46,21 @@ export interface LiteCommitReceipt {
   sequence: number;
   operationCount: number;
 }
+export interface LiteReplicaReadOptions {
+  reader?: ReplicaReader;
+}
+export type LiteVisibleRecord = PdppRecordRow & {
+  confirmation?: "not yet confirmed";
+};
+interface PendingBatch {
+  id: string;
+  fingerprint: string;
+  envelope: ReplicaEnvelope;
+  state: "pending" | "quarantined" | "confirmed";
+  reason?: string;
+  blobs: LiteBlobDescriptor[];
+}
+const pendingKey = (id: string) => `pending-batches/${keyDigest(id)}`;
 const digest = (value: unknown) =>
   `sha256:${sha256(toBytes(canonicalJson(value))).slice(2)}`;
 // Fixed-size internal keys fit the existing native 512-character key bound.
@@ -103,6 +124,7 @@ export function createLiteCanonicalStore(deps: {
   context: () => MergeContext;
   authenticateReplica: (credential: unknown) => string | undefined;
   enabled?: boolean;
+  visibilityPolicy?: ReplicaVisibilityPolicy;
   newId?: () => string;
 }) {
   const persistence = deps.persistence;
@@ -362,6 +384,7 @@ export function createLiteCanonicalStore(deps: {
     envelope?: unknown;
     credential?: unknown;
     blobs?: { stagingId: string; descriptor: LiteBlobDescriptor }[];
+    promotion?: { id: string; fingerprint: string };
   }): Promise<LiteCommitReceipt> {
     enabled();
     if (
@@ -392,6 +415,18 @@ export function createLiteCanonicalStore(deps: {
       throw new Error("canonical batch exceeds 192 KiB; split before commit");
     const fingerprint = `sha256:${sha256(toBytes(encoded)).slice(2)}`;
     return persistence.transaction(async (tx) => {
+      if (input.promotion) {
+        const batch = await get<PendingBatch>(
+          tx,
+          pendingKey(input.promotion.id),
+        );
+        if (
+          !batch ||
+          batch.state === "quarantined" ||
+          batch.fingerprint !== input.promotion.fingerprint
+        )
+          throw new Error("pending promotion conflict");
+      }
       const current = await clock(tx, context);
       const receiptKey = `${local ? "local" : "import"}/${keyDigest(input.id)}`;
       const prior = await get<{
@@ -405,8 +440,14 @@ export function createLiteCanonicalStore(deps: {
         // Retry imports can supply formerly absent bytes/declarations. Retaining
         // exact operations again is idempotent; canonical writes compare content.
       }
-      for (const blob of input.blobs ?? [])
+      for (const blob of input.blobs ?? []) {
         await tx.attachBlob(blob.stagingId, blob.descriptor);
+        await put(
+          tx,
+          `confirmed-blobs/${keyDigest(blob.descriptor.blobId)}`,
+          true,
+        );
+      }
       const dirty = new Set<string>();
       const changed = new Map<
         string,
@@ -501,6 +542,15 @@ export function createLiteCanonicalStore(deps: {
           if (op.kind === "upsert" && !(await blobReady(tx, op)))
             throw new Error("missing_or_invalid_blob");
         }
+        const confirmedBlobs =
+          op.kind === "blob-claim"
+            ? [op.blob]
+            : op.kind === "upsert"
+              ? op.blobs
+              : [];
+        for (const blob of confirmedBlobs)
+          if (await tx.blob(blob.blobId))
+            await put(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`, true);
         current.counter = Math.max(current.counter, op.revision.counter);
         const { collision, opKey } = await retain(tx, op, dirty);
         const address =
@@ -601,10 +651,255 @@ export function createLiteCanonicalStore(deps: {
         operationCount: accepted.length,
       };
       await put(tx, receiptKey, { fingerprint, receipt });
+      if (input.promotion) {
+        const path = pendingKey(input.promotion.id);
+        const batch = (await get<PendingBatch>(tx, path))!;
+        await put(tx, path, { ...batch, state: "confirmed" });
+        for (const blob of batch.blobs)
+          await put(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`, true);
+      }
       return receipt;
     });
   }
+  function authenticate(credential: unknown) {
+    const context = deps.context();
+    if (
+      !context.owner ||
+      deps.authenticateReplica(credential) !== context.owner
+    )
+      throw new Error("replica authority required for owner");
+    return context;
+  }
+  async function pendingBatches(tx: LiteCanonicalTransaction) {
+    const batches: PendingBatch[] = [];
+    for await (const entry of scan(tx, "pending-batches/")) {
+      const batch = JSON.parse(entry.value) as PendingBatch;
+      if (batch.state === "pending") batches.push(batch);
+    }
+    return batches;
+  }
+  // The ordinary materializer runs over an ephemeral transaction overlay. Even
+  // conflict indexes and lifecycle withdrawals follow the canonical path, while
+  // every derived write is discarded and no clock is advanced.
+  async function preview(
+    tx: LiteCanonicalTransaction,
+    connection: string,
+    options: LiteReplicaReadOptions,
+  ) {
+    if (!replicaStateVisible("pending", options.reader, deps.visibilityPolicy))
+      return tx;
+    const batches = await pendingBatches(tx);
+    if (!batches.length) return tx;
+    const writes = new Map<string, string>();
+    const removed = new Set<string>();
+    const overlay: LiteCanonicalTransaction = {
+      get: async (key) =>
+        removed.has(key) ? undefined : (writes.get(key) ?? tx.get(key)),
+      put: async (key, value) => {
+        writes.set(key, value);
+        removed.delete(key);
+      },
+      delete: async (key) => {
+        writes.delete(key);
+        removed.add(key);
+      },
+      scan: async (prefix, after) => {
+        const base = await tx.scan(prefix, after);
+        const entries = new Map(
+          base.entries
+            .filter((entry) => !removed.has(entry.key))
+            .map((entry) => [entry.key, entry.value]),
+        );
+        const boundary = base.after;
+        for (const [key, value] of writes)
+          if (
+            key.startsWith(prefix) &&
+            (after === undefined || key > after) &&
+            (boundary === undefined || key <= boundary)
+          )
+            entries.set(key, value);
+        const sorted = [...entries].sort(([a], [b]) =>
+          a < b ? -1 : a > b ? 1 : 0,
+        );
+        const page: { key: string; value: string }[] = [];
+        let bytes = 0;
+        for (const [key, value] of sorted) {
+          const size = encoder.encode(value).length;
+          if (page.length && (page.length === 100 || bytes + size > 512 * 1024))
+            break;
+          page.push({ key, value });
+          bytes += size;
+        }
+        const more = boundary !== undefined || page.length < sorted.length;
+        return {
+          entries: page,
+          ...(more ? { after: page.at(-1)?.key ?? boundary } : {}),
+        };
+      },
+      blob: (id) => tx.blob(id),
+      attachBlob: async () => {
+        throw new Error("preview cannot attach blobs");
+      },
+    };
+    const dirty = new Set<string>();
+    for (const batch of batches)
+      for (const op of batch.envelope.operations)
+        await retain(overlay, op, dirty);
+    if (dirty.has(connection))
+      await reconcile(overlay, connection, deps.context());
+    return overlay;
+  }
+  async function visibleRow(
+    tx: LiteCanonicalTransaction,
+    view: LiteCanonicalTransaction,
+    path: string,
+  ): Promise<LiteVisibleRecord | undefined> {
+    const row = await get<PdppRecordRow>(view, path);
+    if (!row || view === tx || (await tx.get(path)) === (await view.get(path)))
+      return row;
+    return { ...row, confirmation: "not yet confirmed" };
+  }
   return {
+    /** Host hook: caller authenticates/decrypts transport and verifies its hash before staging. */
+    async stagePending(input: {
+      id: string;
+      envelope: unknown;
+      credential: unknown;
+      blobs?: { stagingId: string; descriptor: LiteBlobDescriptor }[];
+    }) {
+      enabled();
+      const context = authenticate(input.credential);
+      if (!input.id || input.id.length > 256)
+        throw new Error("invalid pending batch id");
+      const envelope = replicaEnvelopeSchema.parse(input.envelope);
+      if (
+        envelope.owner !== context.owner ||
+        envelope.operations.some((op) => op.owner !== context.owner)
+      )
+        throw new Error("wrong replica owner");
+      if (encoder.encode(canonicalJson(envelope)).length > 192 * 1024)
+        throw new Error("canonical batch exceeds 192 KiB; split before commit");
+      if (planReplicaMerge(context, envelope.operations).rejected.length)
+        throw new Error("invalid pending replica operations");
+      const fingerprint = digest(envelope);
+      return persistence.transaction(async (tx) => {
+        await clock(tx, context);
+        const path = pendingKey(input.id);
+        const prior = await get<PendingBatch>(tx, path);
+        if (prior && prior.fingerprint !== fingerprint)
+          throw new Error("pending id reused with different content");
+        if (prior && prior.state !== "pending")
+          return { fingerprint, state: prior.state };
+        for (const op of envelope.operations) await mapping(tx, op);
+        for (const blob of input.blobs ?? []) {
+          if (
+            !envelope.operations.some(
+              (op) =>
+                op.kind === "blob-claim" &&
+                canonicalJson(op.blob) === canonicalJson(blob.descriptor),
+            )
+          )
+            throw new Error("pending blob requires matching claim");
+          if (
+            (await tx.blob(blob.descriptor.blobId)) &&
+            !(await get(
+              tx,
+              `pending-blobs/${keyDigest(blob.descriptor.blobId)}`,
+            ))
+          )
+            await put(
+              tx,
+              `confirmed-blobs/${keyDigest(blob.descriptor.blobId)}`,
+              true,
+            );
+          await tx.attachBlob(blob.stagingId, blob.descriptor);
+          await put(
+            tx,
+            `pending-blobs/${keyDigest(blob.descriptor.blobId)}`,
+            true,
+          );
+        }
+        const blobs = [
+          ...new Map(
+            [
+              ...(prior?.blobs ?? []),
+              ...(input.blobs ?? []).map((blob) => blob.descriptor),
+            ].map((blob) => [blob.blobId, blob]),
+          ).values(),
+        ];
+        await put(tx, path, {
+          id: input.id,
+          envelope,
+          fingerprint,
+          state: "pending",
+          blobs,
+        } satisfies PendingBatch);
+        return { fingerprint, state: "pending" as const };
+      });
+    },
+    /** Trusted finality hook; fingerprint must come from independently verified finalized evidence. */
+    async promotePending(input: {
+      id: string;
+      credential: unknown;
+      fingerprint: string;
+    }) {
+      enabled();
+      authenticate(input.credential);
+      const batch = await persistence.transaction(async (tx) => {
+        await clock(tx);
+        const path = pendingKey(input.id);
+        const value = await get<PendingBatch>(tx, path);
+        if (!value) throw new Error("unknown pending batch");
+        if (
+          value.state === "confirmed" &&
+          value.fingerprint !== input.fingerprint
+        )
+          throw new Error(
+            "cannot quarantine confirmed batch through pending hook",
+          );
+        if (value.fingerprint !== input.fingerprint) {
+          await put(tx, path, {
+            ...value,
+            state: "quarantined",
+            reason: "divergent finalized commitment",
+          });
+          return undefined;
+        }
+        if (value.state === "quarantined")
+          throw new Error("pending batch quarantined");
+        return value;
+      });
+      if (!batch) throw new Error("divergent finalized commitment");
+      return commit({
+        id: input.id,
+        envelope: batch.envelope,
+        credential: input.credential,
+        promotion: input,
+      });
+    },
+    async quarantinePending(input: {
+      id: string;
+      credential: unknown;
+      reason: string;
+    }) {
+      enabled();
+      authenticate(input.credential);
+      await persistence.transaction(async (tx) => {
+        await clock(tx);
+        const path = pendingKey(input.id);
+        const value = await get<PendingBatch>(tx, path);
+        if (!value) throw new Error("unknown pending batch");
+        if (value.state === "confirmed")
+          throw new Error(
+            "cannot quarantine confirmed batch through pending hook",
+          );
+        await put(tx, path, {
+          ...value,
+          state: "quarantined",
+          reason: input.reason,
+        });
+      });
+    },
     /** Trusted host provisioning only; never called by replica or collector input. */
     async provisionConnection(id: string, connection: Connection) {
       enabled();
@@ -658,15 +953,25 @@ export function createLiteCanonicalStore(deps: {
         return { after: page.after };
       });
     },
-    async readRecord(connection: string, stream: string, key: string) {
+    async readRecord(
+      connection: string,
+      stream: string,
+      key: string,
+      options: LiteReplicaReadOptions = {},
+    ) {
       enabled();
       return persistence.transaction(async (tx) => {
         await clock(tx);
-        return get<PdppRecordRow>(tx, rowKey(connection, stream, key));
+        const view = await preview(tx, connection, options);
+        return visibleRow(tx, view, rowKey(connection, stream, key));
       });
     },
     /** Host-only current-row page. Includes tombstones; not a public query cursor. */
-    async readConnectionPage(connection: string, after?: string) {
+    async readConnectionPage(
+      connection: string,
+      after?: string,
+      options: LiteReplicaReadOptions = {},
+    ) {
       enabled();
       if (!connection) throw new Error("connection required");
       const prefix = `rows/${keyDigest(connection)}/`;
@@ -674,10 +979,14 @@ export function createLiteCanonicalStore(deps: {
         throw new Error("invalid canonical connection cursor");
       return persistence.transaction(async (tx) => {
         await clock(tx);
-        const page = await tx.scan(prefix, after);
+        const view = await preview(tx, connection, options);
+        const page = await view.scan(prefix, after);
         return {
-          rows: page.entries.map(
-            (entry) => JSON.parse(entry.value) as PdppRecordRow,
+          rows: await Promise.all(
+            page.entries.map(
+              (entry) =>
+                visibleRow(tx, view, entry.key) as Promise<LiteVisibleRecord>,
+            ),
           ),
           after: page.after,
         };
@@ -763,11 +1072,26 @@ export function createLiteCanonicalStore(deps: {
       });
       return persistence.stageBlob(descriptor, chunks);
     },
-    async *readBlob(blobId: string) {
+    async *readBlob(blobId: string, options: LiteReplicaReadOptions = {}) {
       enabled();
       await persistence.transaction(async (tx) => {
         await clock(tx);
       });
+      const visible = await persistence.transaction(async (tx) => {
+        if (
+          !(await get(tx, `pending-blobs/${keyDigest(blobId)}`)) ||
+          (await get(tx, `confirmed-blobs/${keyDigest(blobId)}`))
+        )
+          return true;
+        if (
+          !replicaStateVisible("pending", options.reader, deps.visibilityPolicy)
+        )
+          return false;
+        return (await pendingBatches(tx)).some((batch) =>
+          batch.blobs.some((blob) => blob.blobId === blobId),
+        );
+      });
+      if (!visible) throw new Error("missing committed blob");
       yield* persistence.readBlob(blobId);
     },
   };

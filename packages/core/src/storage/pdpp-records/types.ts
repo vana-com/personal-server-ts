@@ -22,6 +22,9 @@ export interface PdppRecordEnvelopeInput {
 }
 
 export interface PdppStoredRecord {
+  /** Present only on an explicitly permitted provisional replica read. */
+  confirmation?: "not yet confirmed";
+  visibility?: "pending";
   instance: string;
   stream: string;
   recordKey: string;

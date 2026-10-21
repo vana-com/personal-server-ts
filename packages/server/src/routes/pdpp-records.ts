@@ -1,3 +1,4 @@
+import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import {
@@ -211,6 +212,10 @@ function parseIngestBody(bytes: Uint8Array): unknown {
 
 export interface PdppRecordsRouteDeps {
   store: PdppRecordStore;
+  /** Trusted reader classification; the receiver owns visibility and provisional markers. */
+  replicaReads?: (
+    reader: ReplicaReader,
+  ) => Pick<PdppRecordStore, "getRecord" | "listRecords" | "listStreams">;
   bindingStore?: {
     getInstanceBinding(instance: string): {
       sourceId: string | null;
@@ -649,6 +654,12 @@ function projectSchemaToFields(
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
   const validateData = createRecordDataValidator(deps.declarations);
+  function reads(context: PdppTokenContext) {
+    return (
+      deps.replicaReads?.(context.tokenKind === "owner" ? "owner" : "grant") ??
+      deps.store
+    );
+  }
 
   /**
    * Append one PDPP read to the owner access feed.
@@ -896,7 +907,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
     }
 
-    const streams = deps.store.listStreams(instanceIds);
+    const streams = reads(context).listStreams(instanceIds);
 
     // A client token gets a closed projection: only the streams its grant
     // names, and counts/recency computed over only the records the grant
@@ -922,7 +933,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
               return {
                 name: s.stream,
                 ...summarizeGrantVisible(
-                  deps.store,
+                  reads(context),
                   s.stream,
                   streamGrant?.instance_ids ?? [],
                   streamGrant,
@@ -1161,7 +1172,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       let cursorTemplate: string | undefined;
       do {
         const requestCursor = pageCursor;
-        const page = deps.store.listRecords(stream, {
+        const page = reads(context!).listRecords(stream, {
           instanceIds: effectiveInstanceIds,
           // Fetch at most one client page from the store at a time. The route
           // may need several store pages to collect enough grant-visible rows,
@@ -1271,7 +1282,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
       let found;
       for (const instance of effectiveInstanceIds) {
-        const record = deps.store.getRecord(instance, stream, recordKey);
+        const record = reads(context!).getRecord(instance, stream, recordKey);
         if (record) {
           found = record;
           break;
@@ -1312,6 +1323,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           stream,
           data,
           emitted_at: found.emittedAt,
+          ...(found.confirmation && { confirmation: found.confirmation }),
         },
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
@@ -2123,7 +2135,7 @@ interface GrantVisibleSummary {
  * against the record's real value, not a projected one.
  */
 function summarizeGrantVisible(
-  store: PdppRecordStore,
+  store: Pick<PdppRecordStore, "listRecords">,
   stream: string,
   instanceIds: string[],
   streamGrant: StreamGrant | undefined,
@@ -2224,5 +2236,6 @@ function toRecordJson(
     stream,
     data: projectFields(row.data, fields),
     emitted_at: row.emittedAt,
+    ...(row.confirmation && { confirmation: row.confirmation }),
   };
 }

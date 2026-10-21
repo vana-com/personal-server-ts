@@ -181,3 +181,43 @@ connection. Continue until `after` is absent; a page boundary is not stream
 completion. The caller filters streams/tombstones and owns its read budget.
 This is an internal trusted-host API, not a grant-relative PDPP list route,
 public query cursor or completion proof. It makes no identity/issuer decisions.
+
+## Pending replica visibility hooks
+
+`stagePending({id, envelope, credential, blobs?})` retains an authenticated,
+structure-checked batch under `pending-batches/`, separate from canonical operation
+indexes, rows, convergence counters, journals and outbox. It returns the canonical
+JSON SHA-256 `fingerprint`. The transport host must decrypt and verify incoming
+transport hashes before this call. Blob attachment verifies staged bytes through
+the persistence port; a separate pending visibility gate hides those immutable
+bytes from grant reads. Pending batch retries preserve the original fingerprint.
+
+After independently checking finalized commitment evidence, the trusted host calls
+`promotePending({id, credential, fingerprint})` with the fingerprint of the exact
+finalized envelope. Canonical import, blob visibility and pending-to-confirmed
+state change share one transaction. A mismatching fingerprint persists quarantine
+and throws. `quarantinePending({id, credential, reason})` handles a later finalized
+version or an independently detected divergence. These hooks do not fetch or verify
+chain evidence themselves; the Lite publisher/receiver host is not wired here.
+
+`readRecord(connection, stream, key, {reader?})`,
+`readConnectionPage(connection, after?, {reader?})` and
+`readBlob(blobId, {reader?})` default to `grant`. Trusted owner hosts explicitly pass
+`reader: "owner"`. Store-level `visibilityPolicy` uses the shared core policy:
+owner includes pending and grant sees confirmed only by default. Both classes can
+be changed to either mode through that one policy. Quarantined batches are hidden
+in every mode. Preview-derived rows carry `confirmation: "not yet confirmed"`.
+
+Owner preview runs the existing retained-operation materializer through a sparse
+transaction overlay, discards derived writes and never advances the canonical
+clock. It uses canonical lifecycle evidence together with active pending
+operations, so local resets/deletes and concurrent edits retain #426 ordering.
+It does not clone the database or copy blob bytes. It does scan active pending
+batch metadata and can reconcile all keys for an affected connection; native
+latency and large pending backlogs remain unmeasured. Journal, mutation and outbox
+export methods read canonical state only.
+
+The pending tests exercise the public store API with the crash fake, including
+reopen, interrupted promotion rollback, all four reader policy combinations,
+local edits/reset/delete, quarantine, blob visibility and disabled operation.
+They do not prove native mobile persistence or actual process-kill durability.
