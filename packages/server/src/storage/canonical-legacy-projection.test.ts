@@ -68,6 +68,59 @@ describe("canonical legacy projection over the real SQLite record store", () => 
   const writes = () =>
     db.prepare("SELECT total_changes() AS n").get() as { n: number };
 
+  it("reads live Claude inline records through the server's method binding without requiring export blobs", async () => {
+    const selected = connect("conn_live", "claude", "anthropic-live");
+    put(
+      "conn_live",
+      "account_plan",
+      [{ id: "account_plan", account_id: "org", plan_display_name: "Team" }],
+      undefined,
+      "anthropic-live",
+    );
+    put(
+      "conn_live",
+      "conversations",
+      [{ id: "existing", title: "Existing chat", message_count: 1 }],
+      undefined,
+      "anthropic-live",
+    );
+    put(
+      "conn_live",
+      "messages",
+      [
+        {
+          id: "message",
+          conversation_id: "existing",
+          role: "human",
+          content: "Actual message",
+          attachments: [],
+        },
+      ],
+      undefined,
+      "anthropic-live",
+    );
+    const before = writes();
+    const result = await readCanonicalLegacyScope({
+      store,
+      scope: "claude.conversations",
+      selection: selected,
+      profileBy: "method",
+      requireClaudeRawBlobs: true,
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      envelope: {
+        data: {
+          source: "live-session",
+          conversations: [
+            { id: "existing", messages: [{ content: "Actual message" }] },
+          ],
+        },
+      },
+    });
+    expect(writes()).toEqual(before);
+  });
+
   describe("connection selection", () => {
     it("reads only the selected connection when two accounts share a source", async () => {
       const a = connect("conn_a", "oura");

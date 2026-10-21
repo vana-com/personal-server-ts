@@ -307,6 +307,104 @@ describe("legacy scope view over the real SQLite record store", () => {
     });
   });
 
+  it("keeps known same-organization profile metadata while delivering newer live Claude messages", async () => {
+    connect(store, "live", "anthropic-live", CLAUDE);
+    for (const [stream, data] of [
+      [
+        "account_plan",
+        { id: "account_plan", account_id: "org", plan_display_name: null },
+      ],
+      [
+        "conversations",
+        { id: "existing", title: "Existing chat", message_count: 1 },
+      ],
+      [
+        "messages",
+        {
+          id: "message",
+          conversation_id: "existing",
+          role: "human",
+          content: "Actual message",
+          attachments: [],
+        },
+      ],
+    ] as const) {
+      store.ingestBatch(
+        [
+          {
+            instance: "live",
+            stream,
+            key: data.id,
+            data,
+            emitted_at: CLAUDE_COLLECTED,
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+        { method: "anthropic-live", generation: 1 },
+      );
+    }
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "claude/conversations/old.json",
+      "claude.conversations",
+      "2026-09-01T00:00:00.000Z",
+      1,
+    );
+    let organizationId = "org";
+    const makeView = () =>
+      createLegacyScopeView({
+        authority: createLegacyScopeAuthority(db),
+        records: store,
+        configuredMethods: (sourceId) =>
+          sourceId === CLAUDE ? ["anthropic-live"] : [],
+        readLegacyHead: async () => ({
+          version: "1.0",
+          scope: "claude.conversations",
+          collectedAt: "2026-09-01T00:00:00.000Z",
+          data: {
+            organizationId,
+            profile: { name: "Known reader", plan: "Known team" },
+            source: "official-export",
+            total: 0,
+            messageTotal: 0,
+            conversations: [],
+          },
+        }),
+      });
+    const liveView = makeView();
+    for (const current of [liveView, liveView, makeView()]) {
+      expect(await current.readLatest("claude.conversations")).toMatchObject({
+        kind: "canonical",
+        envelope: {
+          data: {
+            organizationId: "org",
+            profile: { name: "Known reader", plan: "Known team" },
+            source: "live-session",
+            total: 1,
+            conversations: [
+              { id: "existing", messages: [{ content: "Actual message" }] },
+            ],
+          },
+        },
+      });
+    }
+    // A new file from another organization cannot lend its metadata or take over.
+    organizationId = "other-org";
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "claude/conversations/other.json",
+      "claude.conversations",
+      "2026-09-02T00:00:00.000Z",
+      1,
+    );
+    expect(await makeView().readLatest("claude.conversations")).toEqual({
+      kind: "file",
+    });
+  });
+
   it("compares the projected Claude conversation joined from three streams", async () => {
     connect(store, "conn_claude", "anthropic", CLAUDE);
     const rows = [
@@ -815,7 +913,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
       )
       .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/7");
+    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/8");
     const callsAfterFirstRead = listRecords.mock.calls.length;
     expect(callsAfterFirstRead).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe(

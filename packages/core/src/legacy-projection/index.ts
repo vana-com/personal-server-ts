@@ -1,5 +1,6 @@
 // biome-ignore lint/performance/noBarrelFile: re-exported through @vana-unity/app-runtime/sources
 import {
+  ANTHROPIC_LIVE_BINDINGS,
   GROCERY_INVALID_ORDER,
   LEGACY_SCOPE_BINDINGS,
   LEGACY_SCOPE_GAPS,
@@ -21,6 +22,7 @@ import type {
   ProjectionResult,
 } from "./types.js";
 
+export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_GAPS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
@@ -45,6 +47,7 @@ const ALTERNATE_PROFILE_BINDINGS: ReadonlyMap<
   string,
   ReadonlyMap<string, LegacyScopeBinding>
 > = new Map([
+  ["anthropic-live", ANTHROPIC_LIVE_BINDINGS],
   ["github-browser", GITHUB_BROWSER_BINDINGS],
   ["meta", META_040_BINDINGS],
   ["oura-browser", OURA_BROWSER_BINDINGS],

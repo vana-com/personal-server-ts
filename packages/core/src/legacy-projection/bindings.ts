@@ -2142,22 +2142,66 @@ function claudeMetadata(
   };
 }
 
-function claudeConversationsBinding(): LegacyScopeBinding {
+function claudeLiveMetadata(
+  scope: string,
+  records: PdppRecord[],
+): ReturnType<typeof claudeMetadata> {
+  const plans = byStream(records, "account_plan");
+  const plan = plans[0];
+  if (
+    plans.length !== 1 ||
+    !plan ||
+    typeof plan.id !== "string" ||
+    !plan.id.trim() ||
+    typeof plan.account_id !== "string" ||
+    !plan.account_id.trim() ||
+    !(
+      typeof plan.plan_display_name === "string" ||
+      plan.plan_display_name === null
+    )
+  ) {
+    return {
+      ok: false,
+      error: {
+        kind: "incomplete_scope",
+        scope,
+        reason: "A single verified organization account_plan is required",
+      },
+    };
+  }
+  return {
+    ok: true,
+    organizationId: plan.account_id,
+    profile: { name: null, plan: plan.plan_display_name },
+  };
+}
+
+function claudeConversationsBinding(live = false): LegacyScopeBinding {
   const scope = "claude.conversations";
   return {
     scope,
-    pdppSource: ANTHROPIC_CONNECTOR_ID,
-    pdppStreams: ["account_profile", "conversations", "messages"],
+    pdppSource: live
+      ? "https://registry.pdpp.dev/connectors/anthropic-live"
+      : ANTHROPIC_CONNECTOR_ID,
+    pdppStreams: [
+      live ? "account_plan" : "account_profile",
+      "conversations",
+      "messages",
+    ],
     legacySchemaPath: "claude.conversations.json",
     fieldsRead: {
-      account_profile: [
-        "id",
-        "organization_id",
-        "full_name",
-        "plan",
-        "name_source",
-        "metadata_status",
-      ],
+      ...(live
+        ? { account_plan: ["id", "account_id", "plan_display_name"] }
+        : {
+            account_profile: [
+              "id",
+              "organization_id",
+              "full_name",
+              "plan",
+              "name_source",
+              "metadata_status",
+            ],
+          }),
       conversations: [
         "id",
         "title",
@@ -2179,22 +2223,34 @@ function claudeConversationsBinding(): LegacyScopeBinding {
       ],
     },
     primaryKey: {
-      account_profile: ["id"],
+      [live ? "account_plan" : "account_profile"]: ["id"],
       conversations: ["id"],
       messages: ["id"],
     },
     lossy: [
       "href is reconstructed from the retained Claude route convention; rawContent and unavailable fetchError are omitted.",
     ],
-    provenance: anthropicProjectionProvenance,
+    provenance: live
+      ? [
+          {
+            kind: "oci",
+            ref: "ghcr.io/pdp-connect/connector/anthropic-live:0.3.6",
+            digest:
+              "sha256:817716e8c732c9c991be507049147a0cc887b154363428bc4509cc91ed5d17a6",
+            path: "declarations/anthropic-live-0.3.6.collection-profile.json",
+          },
+        ]
+      : anthropicProjectionProvenance,
     project(records, options): ProjectionResult {
       const guard = requireStreams(scope, options, [
-        "account_profile",
+        live ? "account_plan" : "account_profile",
         "conversations",
         "messages",
       ]);
       if (guard) return guard;
-      const metadata = claudeMetadata(scope, records);
+      const metadata = live
+        ? claudeLiveMetadata(scope, records)
+        : claudeMetadata(scope, records);
       if (!metadata.ok) return metadata;
       const conversations = byStream(records, "conversations");
       const messagesByConversation = new Map<
@@ -2321,12 +2377,15 @@ function claudeConversationsBinding(): LegacyScopeBinding {
               total + (conversation.messageCount as number),
             0,
           ),
-          source: "official-export",
+          source: live ? "live-session" : "official-export",
         },
       };
     },
   };
 }
+
+export const ANTHROPIC_LIVE_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
+  new Map([["claude.conversations", claudeConversationsBinding(true)]]);
 
 const claudeConversations = claudeConversationsBinding();
 
