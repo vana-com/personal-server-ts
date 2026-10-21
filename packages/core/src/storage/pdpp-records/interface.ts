@@ -90,9 +90,11 @@ export interface PdppRecordStore {
   syncStates(): SyncStateStore;
 
   /**
-   * Adds the next bounded chunk of the keys written in (low, high] to a
-   * session's candidate set. Throws `CursorExpiredError` when the
-   * preparation expired or the owner's row cap is exceeded.
+   * Adds the next budgeted part of the keys written in (low, high], or held
+   * at high for a first sync, to a session's candidate set. Only the request's
+   * instances are read. Progress is stored with the candidates in one
+   * transaction. Throws `CursorExpiredError` when the preparation expired or
+   * the owner's row cap is exceeded.
    */
   prepareSyncWindow(
     stream: string,

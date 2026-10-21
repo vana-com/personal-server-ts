@@ -67,6 +67,8 @@ interface MemoryPreparation {
   done: boolean;
   expiresAt: number;
   seq: number;
+  /** Next history position to read; kept with the candidates. */
+  next?: number;
   /** In `compareRecordIdentity` order. */
   candidates: RecordIdentity[];
 }
@@ -136,50 +138,25 @@ export function createMemoryRecordStore(): PdppRecordStore {
   const syncTokenKey = new Uint8Array(randomBytes(32));
   const syncStates = createMemorySyncStateStore();
   // Indexes kept on write so a sync request only seeks: versions per key in
-  // write order, deletion times per key, identities per stream in
-  // `compareRecordIdentity` order, and versions per stream and instance in
-  // write order.
+  // write order and deletion times per key.
   const versionsByKey = new Map<RowKey, HistoryEntry[]>();
   const deletionsByKey = new Map<RowKey, string[]>();
-  const identitiesByStream = new Map<string, RecordIdentity[]>();
-  const newIdentities = new Map<string, RecordIdentity[]>();
-  /** The stream's identities in order, merging keys first written since. */
-  function streamIdentities(stream: string): RecordIdentity[] {
-    const pending = newIdentities.get(stream);
-    const ids = identitiesByStream.get(stream) ?? [];
-    if (!pending) return ids;
-    newIdentities.delete(stream);
-    pending.sort(compareRecordIdentity);
-    // Both lists are sorted: merge them in one pass.
-    const merged: RecordIdentity[] = [];
-    let a = 0,
-      b = 0;
-    while (a < ids.length || b < pending.length) {
-      if (
-        b >= pending.length ||
-        (a < ids.length && compareRecordIdentity(ids[a]!, pending[b]!) <= 0)
-      )
-        merged.push(ids[a++]!);
-      else merged.push(pending[b++]!);
-    }
-    identitiesByStream.set(stream, merged);
-    return merged;
-  }
   const preparations = new Map<string, MemoryPreparation>();
+  /** Candidate rows each owner's live preparations hold. */
+  const ownerRows = new Map<string, number>();
   let preparationSeq = 0;
+  function dropPreparation(id: string): void {
+    const p = preparations.get(id);
+    if (!p) return;
+    preparations.delete(id);
+    ownerRows.set(p.owner, (ownerRows.get(p.owner) ?? 0) - p.rows);
+  }
   function record(entry: HistoryEntry): void {
     history.push(entry);
     const key = rowKey(entry.instance, entry.stream, entry.recordKey);
     const versions = versionsByKey.get(key);
     if (versions) versions.push(entry);
-    else {
-      versionsByKey.set(key, [entry]);
-      // Merged into the sorted index on the next sync read, so a large write
-      // costs one sort rather than one insertion per new key.
-      const pending = newIdentities.get(entry.stream) ?? [];
-      pending.push({ recordKey: entry.recordKey, instance: entry.instance });
-      newIdentities.set(entry.stream, pending);
-    }
+    else versionsByKey.set(key, [entry]);
     if (entry.row.deleted) {
       const deletions = deletionsByKey.get(key) ?? [];
       deletions.push(entry.writtenAt);
@@ -462,18 +439,10 @@ export function createMemoryRecordStore(): PdppRecordStore {
     if (high > clock || (low !== null && low > high)) {
       throw new CursorExpiredError();
     }
-    const preparation =
-      request.preparation === undefined
-        ? undefined
-        : preparations.get(request.preparation);
-    if (request.preparation !== undefined && !preparation?.done) {
+    const preparation = preparations.get(request.preparation);
+    if (!preparation?.done || preparation.expiresAt <= request.now) {
       throw new CursorExpiredError();
     }
-    // An incremental window walks only its prepared keys.
-    if (low !== null && !preparation) {
-      throw new RangeError("an incremental sync window needs a preparation");
-    }
-    const instances = new Set(request.instanceIds);
     const versionAt = (
       instance: string,
       recordKey: string,
@@ -490,23 +459,15 @@ export function createMemoryRecordStore(): PdppRecordStore {
       after: RecordIdentity | undefined,
       budget: SyncBudget,
     ): RecordIdentity | undefined | null {
-      const ids = preparation
-        ? preparation.candidates
-        : streamIdentities(stream);
-      let i =
+      if (!budget.spend()) return null;
+      const ids = preparation!.candidates;
+      const i =
         direction === "asc"
           ? after
             ? upperBound(ids, after)
             : 0
           : (after ? lowerBound(ids, after) : ids.length) - 1;
-      const step = direction === "asc" ? 1 : -1;
-      // One seek per identity examined, granted or not, and one to find the
-      // end, as in the SQLite store.
-      for (; ; i += step) {
-        if (!budget.spend()) return null;
-        if (i < 0 || i >= ids.length) return undefined;
-        if (instances.has(ids[i]!.instance)) return ids[i]!;
-      }
+      return i >= 0 && i < ids.length ? ids[i]! : undefined;
     }
 
     function change({
@@ -543,7 +504,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
   /** Drops expired preparations; the memory store frees them at once. */
   function sweepPreparations(now: number): void {
     for (const [id, p] of preparations)
-      if (p.expiresAt <= now) preparations.delete(id);
+      if (p.expiresAt <= now) dropPreparation(id);
   }
 
   function prepareSyncWindow(
@@ -553,11 +514,12 @@ export function createMemoryRecordStore(): PdppRecordStore {
     sweepPreparations(request.now);
     let preparation = preparations.get(request.id);
     if (!preparation) {
-      // Gone after it started: expired or evicted.
-      if (request.progress) throw new CursorExpiredError();
+      // A session that already started has lost its preparation: expired,
+      // evicted or swept.
+      if (request.high !== undefined) throw new CursorExpiredError();
       preparation = {
         owner: request.owner,
-        high: request.high ?? new Date(writeClock).toISOString(),
+        high: new Date(writeClock).toISOString(),
         rows: 0,
         done: false,
         expiresAt: request.expiresAt,
@@ -568,47 +530,44 @@ export function createMemoryRecordStore(): PdppRecordStore {
       const own = [...preparations.entries()]
         .filter(([, p]) => p.owner === request.owner)
         .sort(([, a], [, b]) => b.seq - a.seq);
-      for (const [id] of own.slice(request.maxPerOwner))
-        preparations.delete(id);
+      for (const [id] of own.slice(request.maxPerOwner)) dropPreparation(id);
     }
     preparation.expiresAt = request.expiresAt;
     const high = preparation.high;
-    const low = parseHorizon(request.low);
-    const instanceIds = [...new Set(request.instanceIds)].sort();
-    const instances = new Set(instanceIds);
-    // History is in write order, so the window (low, high] is one slice of
-    // it. Every entry read is paid from the budget, whatever its stream.
+    const instances = new Set(request.instanceIds);
+    // History is in write order, so the window is one slice of it. Every
+    // entry read is paid from the budget, whatever its stream.
     let n =
-      request.progress?.n === undefined
-        ? upperBoundBy(history, low, (e) => e.writtenAt)
-        : Number(request.progress.n);
-    const ownerRows = () =>
-      [...preparations.values()]
-        .filter((p) => p.owner === request.owner)
-        .reduce((sum, p) => sum + p.rows, 0);
-    if (!preparation.done) {
-      for (; n < history.length; n++) {
-        const entry = history[n]!;
-        if (entry.writtenAt > high) break;
-        if (!request.budget.spend()) {
-          return { high, progress: { n }, done: false };
-        }
-        if (entry.stream !== stream || !instances.has(entry.instance)) continue;
+      preparation.next ??
+      (request.low === null
+        ? 0
+        : upperBoundBy(history, parseHorizon(request.low), (e) => e.writtenAt));
+    for (; !preparation.done; n++) {
+      const entry = history[n];
+      if (!entry || entry.writtenAt > high) {
+        preparation.done = true;
+        break;
+      }
+      if (!request.budget.spend()) break;
+      if (entry.stream === stream && instances.has(entry.instance)) {
         const id = { recordKey: entry.recordKey, instance: entry.instance };
         const at = lowerBound(preparation.candidates, id);
         const existing = preparation.candidates[at];
         if (!existing || compareRecordIdentity(existing, id) !== 0) {
           preparation.candidates.splice(at, 0, id);
           preparation.rows += 1;
-          if (ownerRows() > request.maxRowsPerOwner) {
-            preparations.delete(request.id);
+          const rows = (ownerRows.get(request.owner) ?? 0) + 1;
+          ownerRows.set(request.owner, rows);
+          if (rows > request.maxRowsPerOwner) {
+            dropPreparation(request.id);
             throw new CursorExpiredError();
           }
         }
       }
-      preparation.done = true;
+      request.budget.progressed();
     }
-    return { high, progress: { n }, done: true };
+    preparation.next = n;
+    return { high, done: preparation.done };
   }
 
   function touchSyncPreparation(
@@ -619,7 +578,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
     sweepPreparations(now);
     const preparation = preparations.get(id);
     if (!preparation) return;
-    if (expiresAt <= now) preparations.delete(id);
+    if (expiresAt <= now) dropPreparation(id);
     else preparation.expiresAt = expiresAt;
   }
 
@@ -769,9 +728,8 @@ export function createMemoryRecordStore(): PdppRecordStore {
       history.length = 0;
       versionsByKey.clear();
       deletionsByKey.clear();
-      identitiesByStream.clear();
-      newIdentities.clear();
       preparations.clear();
+      ownerRows.clear();
       blobs.clear();
       blobBytes.clear();
     },

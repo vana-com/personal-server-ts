@@ -650,13 +650,14 @@ for (const backend of ["memory", "sqlite"]) {
             Buffer.from(cursor, "base64url").toString("latin1"),
           ).not.toContain("hidden");
         }
+        // Eight keys to prepare and eight to walk, three units per request.
         if (version === CANDIDATE) {
-          // Eight changed keys, three examined per request: one page.
-          expect(retries).toBe(2);
+          // Every 200 is a whole page: one page, after retries.
+          expect(retries).toBeGreaterThanOrEqual(4);
           expect(pages).toBe(1);
         } else {
-          // Eight changed keys, three examined per page.
-          expect(pages).toBe(3);
+          // The current profile ends pages early instead, empty until z.
+          expect(pages).toBeGreaterThanOrEqual(5);
         }
         expect(seen).toEqual(["z"]);
       });

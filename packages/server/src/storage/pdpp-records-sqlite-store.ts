@@ -371,6 +371,11 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_deleted
   ON pdpp_record_changes (instance, stream, record_key, written_at)
   WHERE deleted = 1;
 `,
+  // v17: a preparation keeps its own progress, written with its candidates.
+  // Every sync session walks its candidate set, so the v14 identity index
+  // has no reader left and is dropped.
+  // `migrateToV17` applies it.
+  "",
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -510,6 +515,23 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_expires
 `);
 }
 
+function migrateToV17(db: Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(pdpp_sync_preparation)")
+    .all() as { name: string }[];
+  if (!columns.some((c) => c.name === "cursor_instance")) {
+    db.exec(
+      "ALTER TABLE pdpp_sync_preparation ADD COLUMN cursor_instance INTEGER NOT NULL DEFAULT 0",
+    );
+  }
+  if (!columns.some((c) => c.name === "cursor_written")) {
+    db.exec(
+      "ALTER TABLE pdpp_sync_preparation ADD COLUMN cursor_written INTEGER",
+    );
+  }
+  db.exec("DROP INDEX IF EXISTS idx_pdpp_record_changes_sync_identity");
+}
+
 function migrate(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS pdpp_schema_version (
@@ -533,6 +555,7 @@ function migrate(db: Database): void {
       }
       if (v === 12) migrateToV13(db);
       if (v === 13) migrateToV14(db);
+      if (v === 16) migrateToV17(db);
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -2040,26 +2063,17 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     lazy(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_deleted
       WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
 
-  // One seek per identity. A first sync walks the identity index; an
-  // incremental session walks its prepared candidates. Neither groups or
-  // sorts: each statement returns at most one row.
+  // The candidate set's primary key is unique, so each seek visits one
+  // index entry: no group, sort or skip over versions.
   const seekStmts = new Map<string, { get(...params: unknown[]): unknown }>();
-  function seek(
-    source: "history" | "candidates",
-    direction: "asc" | "desc",
-    hasAfter: boolean,
-  ) {
-    const key = `${source}:${direction}:${hasAfter}`;
+  function seek(direction: "asc" | "desc", hasAfter: boolean) {
+    const key = `${direction}:${hasAfter}`;
     let stmt = seekStmts.get(key);
     if (!stmt) {
       const dir = direction === "desc" ? "DESC" : "ASC";
       const cmp = direction === "desc" ? "<" : ">";
-      const table =
-        source === "history"
-          ? "pdpp_record_changes INDEXED BY idx_pdpp_record_changes_sync_identity WHERE stream = ?"
-          : "pdpp_sync_candidate WHERE preparation = ?";
       stmt = db.prepare(
-        `SELECT record_key, instance FROM ${table}` +
+        "SELECT record_key, instance FROM pdpp_sync_candidate WHERE preparation = ?" +
           (hasAfter ? ` AND (record_key, instance) ${cmp} (?, ?)` : "") +
           ` ORDER BY record_key ${dir}, instance ${dir} LIMIT 1`,
       );
@@ -2085,58 +2099,39 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         throw new CursorExpiredError();
       }
       assertNotResetSince(request.instanceIds, [high, low ?? high]);
-      const instanceIds = request.instanceIds;
       const versionAt = (instance: string, recordKey: string, at: number) => {
         const row = versionAtStmt.get(instance, stream, recordKey, at) as
           RecordRowDb | undefined;
         return row ? toRow(row) : undefined;
       };
 
-      const preparation =
-        request.preparation === undefined
-          ? undefined
-          : (preparationRow.get(request.preparation) as
-              { done: number; expires_at: number } | undefined);
-      // A released or evicted preparation is expired before it is swept.
-      if (
-        request.preparation !== undefined &&
-        (!preparation?.done || preparation.expires_at === 0)
-      ) {
+      const preparation = preparationRow.get(request.preparation) as
+        { done: number; expires_at: number } | undefined;
+      // Unfinished, released, evicted or expired: not walkable.
+      if (!preparation?.done || preparation.expires_at <= request.now) {
         throw new CursorExpiredError();
       }
-      // An incremental window walks only its prepared keys.
-      if (low !== null && request.preparation === undefined) {
-        throw new RangeError("an incremental sync window needs a preparation");
-      }
-      const granted = new Set(instanceIds);
-      const scope =
-        request.preparation === undefined ? stream : request.preparation;
-      const source =
-        request.preparation === undefined ? "history" : "candidates";
 
-      // Identities in record-key then instance order; SQLite's BINARY text
-      // order is `compareRecordIdentity`'s code-point order.
+      // One seek on the candidate set's primary key per call. SQLite's
+      // BINARY text order is `compareRecordIdentity`'s code-point order.
       function next(
         direction: "asc" | "desc",
         after: RecordIdentity | undefined,
         budget: SyncBudget,
       ): RecordIdentity | undefined | null {
-        let at = after;
-        for (;;) {
-          if (!budget.spend()) return null;
-          const row = (
-            at
-              ? seek(source, direction, true).get(
-                  scope,
-                  at.recordKey,
-                  at.instance,
-                )
-              : seek(source, direction, false).get(scope)
-          ) as { record_key: string; instance: string } | undefined;
-          if (!row) return undefined;
-          at = { recordKey: row.record_key, instance: row.instance };
-          if (granted.has(row.instance)) return at;
-        }
+        if (!budget.spend()) return null;
+        const row = (
+          after
+            ? seek(direction, true).get(
+                request.preparation,
+                after.recordKey,
+                after.instance,
+              )
+            : seek(direction, false).get(request.preparation)
+        ) as { record_key: string; instance: string } | undefined;
+        return row
+          ? { recordKey: row.record_key, instance: row.instance }
+          : undefined;
       }
 
       function change({
@@ -2183,7 +2178,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   const insertPreparation = lazy(`INSERT INTO pdpp_sync_preparation
     (id, owner, high, rows, done, expires_at) VALUES (?, ?, ?, 0, 0, ?)`);
   const updatePreparation = lazy(
-    "UPDATE pdpp_sync_preparation SET rows = ?, done = ?, expires_at = ? WHERE id = ?",
+    "UPDATE pdpp_sync_preparation SET rows = ?, done = ?, expires_at = ?, cursor_instance = ?, cursor_written = ? WHERE id = ?",
   );
   const expirePreparation = lazy(
     "UPDATE pdpp_sync_preparation SET expires_at = 0 WHERE id = ?",
@@ -2233,19 +2228,24 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     ): SyncPreparationResult => {
       sweepPreparations(request.now);
       let row = preparationRow.get(request.id) as
-        | { high: number; rows: number; done: number; expires_at: number }
+        | {
+            high: number;
+            rows: number;
+            done: number;
+            expires_at: number;
+            cursor_instance: number;
+            cursor_written: number | null;
+          }
         | undefined;
       if (row && row.expires_at <= request.now) {
         expirePreparation.run(request.id);
         throw new CursorExpiredError();
       }
       if (!row) {
-        // Gone after it started: expired, evicted or swept.
-        if (request.progress) throw new CursorExpiredError();
-        const high =
-          request.high === undefined
-            ? readWriteClock()
-            : parseHorizon(request.high);
+        // A session that already started has lost its preparation:
+        // expired, evicted or swept.
+        if (request.high !== undefined) throw new CursorExpiredError();
+        const high = readWriteClock();
         insertPreparation.run(
           request.id,
           request.owner,
@@ -2253,28 +2253,36 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           request.expiresAt,
         );
         evictPreparations.run(request.owner, request.now, request.maxPerOwner);
-        row = { high, rows: 0, done: 0, expires_at: request.expiresAt };
+        row = {
+          high,
+          rows: 0,
+          done: 0,
+          expires_at: request.expiresAt,
+          cursor_instance: 0,
+          cursor_written: null,
+        };
       }
-      const low = parseHorizon(request.low);
+      const low = request.low === null ? null : parseHorizon(request.low);
       const high = row.high;
-      assertNotResetSince(request.instanceIds, [high, low]);
+      assertNotResetSince(request.instanceIds, [high, low ?? high]);
       const instanceIds = [...new Set(request.instanceIds)].sort();
       let rows = row.rows;
-      let i = Number(request.progress?.i ?? 0);
-      let after = Number(request.progress?.w ?? low);
+      let i = row.cursor_instance;
+      // write sequence numbers start at 1, so 0 reads a first sync from the start
+      let after = row.cursor_written ?? low ?? 0;
       let done = row.done === 1;
       const owner = ownerPreparations.get(request.owner, request.now) as {
         rows: number;
       };
       let ownerRows = owner.rows;
-      chunks: while (!done) {
+      while (!done) {
         if (i >= instanceIds.length) {
           done = true;
           break;
         }
-        // Read one row at a time from the horizon index, so a spent budget
-        // stops the scan at once and the next request resumes after it.
-        if (!request.budget.spend()) break chunks;
+        // One row at a time from the horizon index (each written_at is
+        // unique), so a spent budget stops the scan at once.
+        if (!request.budget.spend()) break;
         const write = preparationWrites.get(
           stream,
           instanceIds[i],
@@ -2284,7 +2292,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         ) as { id: number; record_key: string; written_at: number } | undefined;
         if (!write) {
           i += 1;
-          after = low;
+          after = low ?? 0;
+          request.budget.progressed();
           continue;
         }
         after = write.written_at;
@@ -2299,13 +2308,18 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             throw new CursorExpiredError();
           }
         }
+        request.budget.progressed();
       }
-      updatePreparation.run(rows, done ? 1 : 0, request.expiresAt, request.id);
-      return {
-        high: String(high),
-        progress: { i, w: after },
-        done,
-      };
+      // Progress and candidates commit together.
+      updatePreparation.run(
+        rows,
+        done ? 1 : 0,
+        request.expiresAt,
+        i,
+        after,
+        request.id,
+      );
+      return { high: String(high), done };
     },
   );
 

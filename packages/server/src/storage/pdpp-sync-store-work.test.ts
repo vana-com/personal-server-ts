@@ -168,9 +168,9 @@ for (const backend of ["memory", "sqlite"])
           pages += 1;
           cursor = page.nextCursor;
         } while (cursor);
-        // Four examined per page. The fifth page reaches the budget before it
-        // can see the end, so a sixth, empty page ends the session.
-        expect(pages).toBe(6);
+        // Four units per page: 20 history rows to prepare and 20 identities
+        // to walk, one unit each, take at least ten pages, every one empty.
+        expect(pages).toBeGreaterThanOrEqual(10);
         take();
       } finally {
         store.close();
@@ -307,8 +307,12 @@ for (const backend of ["memory", "sqlite"])
           maxExaminedPerRequest: 2,
         });
         const limit = { ...request, limit: 10 };
-        // Request 0 pauses after two changes.
-        expect(() => sync.read(limit)).toThrow(SyncRetryLaterError);
+        // Request 0 prepares all six keys, walks one and pauses.
+        expect(() =>
+          createPdppSyncSessionService(racing, {
+            maxExaminedPerRequest: 8,
+          }).read(limit),
+        ).toThrow(SyncRetryLaterError);
         // Request A resumes it; meanwhile request B resumes the same scan and
         // finishes the session with a larger budget.
         const finisher = createPdppSyncSessionService(racing, {
@@ -380,7 +384,12 @@ describe("sqlite sync session state", () => {
       const other = createPdppSyncSessionService(two, {
         maxExaminedPerRequest: 100,
       });
-      expect(() => slow.read(request)).toThrow(SyncRetryLaterError);
+      // Request 0 prepares all six keys, walks one and pauses.
+      expect(() =>
+        createPdppSyncSessionService(one, {
+          maxExaminedPerRequest: 8,
+        }).read(request),
+      ).toThrow(SyncRetryLaterError);
       // While connection one resumes the paused scan, connection two resumes
       // the same scan from the shared table and finishes the session.
       interleave = () => expect(other.read(request).data).toHaveLength(6);

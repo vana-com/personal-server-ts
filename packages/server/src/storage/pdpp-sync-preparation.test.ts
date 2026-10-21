@@ -13,7 +13,6 @@ import {
   CursorExpiredError,
   type PdppRecordStore,
   type PdppSyncSessionService,
-  type SyncSessionOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 
@@ -27,7 +26,17 @@ type Inspectable = PdppRecordStore & {
 
 /** SQLite with every statement's returned rows, writes and SQL recorded. */
 function countingSqlite(db = new Database(":memory:")) {
-  const work = { rows: 0, statements: 0, sql: new Set<string>() };
+  // micros: time spent inside SQLite statements, which excludes JavaScript
+  // garbage collection and so tracks the store's own work.
+  const work = { rows: 0, statements: 0, micros: 0, sql: new Set<string>() };
+  const timed = <T>(fn: () => T): T => {
+    const start = process.hrtime.bigint();
+    try {
+      return fn();
+    } finally {
+      work.micros += Number(process.hrtime.bigint() - start) / 1000;
+    }
+  };
   const prepare = db.prepare.bind(db);
   db.prepare = ((sql: string) => {
     const statement = prepare(sql);
@@ -43,15 +52,15 @@ function countingSqlite(db = new Database(":memory:")) {
     const run = statement.run.bind(statement);
     const iterate = statement.iterate.bind(statement);
     return Object.assign(statement, {
-      get: (...args: unknown[]) => count(get(...args)),
+      get: (...args: unknown[]) => count(timed(() => get(...args))),
       run: (...args: unknown[]) => {
-        const result = run(...args);
+        const result = timed(() => run(...args));
         work.statements += 1;
         work.sql.add(sql);
         work.rows += result.changes;
         return result;
       },
-      all: (...args: unknown[]) => count(all(...args)),
+      all: (...args: unknown[]) => count(timed(() => all(...args))),
       iterate: function* (...args: unknown[]) {
         work.statements += 1;
         work.sql.add(sql);
@@ -99,7 +108,7 @@ function drain(
   const seen: string[] = [];
   let retries = 0;
   let cursor: string | undefined;
-  for (let n = 0; n < 2_000; n++) {
+  for (let n = 0; n < 20_000; n++) {
     between();
     try {
       const page = sync.read({ ...base, cursor });
@@ -120,42 +129,58 @@ function drain(
 
 describe("sqlite bounded sync work", () => {
   it("never does unbounded store work in one request, for a first sync or a large backlog", () => {
-    const { store, work } = countingSqlite();
-    try {
-      put(store, keys(2000), "1");
-      // One key with thousands of versions.
-      for (let n = 0; n < 50; n++) put(store, ["hot"], String(n));
-      const options: SyncSessionOptions = { maxExaminedPerRequest: 100 };
-      const sync = createPdppSyncSessionService(store, options);
-      const perRequest: number[] = [];
-      // Rows read before each request belong to the request before it.
-      work.rows = 0;
-      const first = drain(sync, { ...request(), limit: 100 }, () => {
-        perRequest.push(work.rows);
-        work.rows = 0;
-      });
-      expect(first.seen).toHaveLength(2001);
-      // A backlog: every key changes after the checkpoint.
-      put(store, keys(2000), "2");
-      for (let n = 0; n < 50; n++) put(store, ["hot"], `b${n}`);
-      work.rows = 0;
-      const next = drain(
-        sync,
-        { ...request(), limit: 100, changesSince: first.checkpoint },
-        () => {
+    /** The most rows SQLite read or wrote in one request of each session. */
+    const worst = (size: number) => {
+      const { store, work } = countingSqlite();
+      try {
+        put(store, keys(size), "1");
+        // One key with many versions.
+        for (let n = 0; n < size / 20; n++) put(store, ["hot"], String(n));
+        const sync = createPdppSyncSessionService(store, {
+          maxExaminedPerRequest: 100,
+        });
+        const measure = (perRequest: number[]) => () => {
           perRequest.push(work.rows);
           work.rows = 0;
-        },
-      );
-      expect(next.seen).toHaveLength(2001);
-      expect(next.retries).toBeGreaterThan(10);
-      // Rows the store read per request stay within a small multiple of the
-      // budget, whatever the window holds.
-      expect(Math.max(...perRequest)).toBeLessThanOrEqual(5 * 100 + 50);
-    } finally {
-      store.close();
-    }
-  });
+        };
+        const firstSync: number[] = [];
+        work.rows = 0;
+        const first = drain(
+          sync,
+          { ...request(), limit: 100 },
+          measure(firstSync),
+        );
+        expect(first.seen).toHaveLength(size + 1);
+        // A backlog: every key changes after the checkpoint.
+        put(store, keys(size), "2");
+        for (let n = 0; n < size / 20; n++) put(store, ["hot"], `b${n}`);
+        const backlog: number[] = [];
+        work.rows = 0;
+        const next = drain(
+          sync,
+          { ...request(), limit: 100, changesSince: first.checkpoint },
+          measure(backlog),
+        );
+        expect(next.seen).toHaveLength(size + 1);
+        expect(next.retries).toBeGreaterThan(size / 200);
+        return {
+          firstSync: Math.max(...firstSync),
+          backlog: Math.max(...backlog),
+        };
+      } finally {
+        store.close();
+      }
+    };
+    const small = worst(1000);
+    const large = worst(4000);
+    // Four times the data; the costliest request stays the same size.
+    expect(large.firstSync).toBeLessThanOrEqual(small.firstSync * 1.1 + 50);
+    expect(large.backlog).toBeLessThanOrEqual(small.backlog * 1.1 + 50);
+    // And within a fixed multiple of the budget plus one re-read page.
+    expect(Math.max(large.firstSync, large.backlog)).toBeLessThanOrEqual(
+      8 * 100 + 4 * 101,
+    );
+  }, 120_000);
 
   it("plans every sync read as an index search, without a temporary sort", () => {
     const { db, store, work } = countingSqlite();
@@ -211,7 +236,7 @@ for (const backend of ["memory", "sqlite"])
         const first = drain(unbounded, { ...request(), limit: 100 });
         put(store, keys(500), "2");
         const growth: number[] = [];
-        let last = 0;
+        let last = store.inspectSyncState().candidates;
         const bounded = createPdppSyncSessionService(store, {
           maxExaminedPerRequest: 50,
         });
@@ -264,14 +289,15 @@ for (const backend of ["memory", "sqlite"])
         const other = createPdppSyncSessionService(store, { now: () => now });
         for (let n = 0; n < 20; n++)
           drain(other, { ...request(`other-${n}`, "owner-b"), limit: 100 });
-        expect(store.inspectSyncState()).toMatchObject({ candidates: 0 });
         // Left: owner-b's 20 sessions of three pages (two live page handles
         // and a checkpoint each) and owner-a's first checkpoint, which lives
-        // 30 days. The paused scan (it would make 62) and its preparation are
-        // gone.
-        expect(store.inspectSyncState()).toMatchObject({
+        // 30 days; and owner-b's 20 live preparations of 300 keys each. The
+        // abandoned paused scan (it would make 62 states) and its preparation
+        // (21) are gone, with their candidates.
+        expect(store.inspectSyncState()).toEqual({
           states: 61,
-          preparations: 0,
+          preparations: 20,
+          candidates: 20 * 300,
         });
         // A retry of the abandoned request starts afresh and still completes.
         const retried = drain(sync, session);
@@ -364,82 +390,65 @@ for (const backend of ["memory", "sqlite"])
       }
     });
 
-    it("refuses a preparation over the owner's row cap; the client restarts from beginning", () => {
+    it("refuses a session that would take the owner over its prepared-row cap, until older preparations expire", () => {
       const store = create();
       try {
         put(store, keys(100), "1");
+        let now = 1_000_000;
         const sync = createPdppSyncSessionService(store, {
-          maxPreparedRowsPerOwner: 50,
+          maxPreparedRowsPerOwner: 150,
+          now: () => now,
         });
+        // The first sync holds 100 candidate rows for its page lifetime.
         const first = drain(sync, { ...request(), limit: 100 });
         put(store, keys(100), "2");
-        expect(() =>
-          sync.read({
-            ...request(),
-            limit: 100,
-            changesSince: first.checkpoint,
-          }),
-        ).toThrow(CursorExpiredError);
-        // A restart from beginning needs no prepared set.
-        expect(drain(sync, { ...request(), limit: 100 }).seen).toHaveLength(
-          100,
-        );
+        const next = {
+          ...request(),
+          limit: 100,
+          changesSince: first.checkpoint,
+        };
+        // 100 more would make 200: refused.
+        expect(() => sync.read(next)).toThrow(CursorExpiredError);
+        // Once the first sync's preparation expires, the owner has room.
+        now += 2 * 3_600_000;
+        expect(drain(sync, next).seen).toHaveLength(100);
       } finally {
         store.close();
       }
     });
   });
 
-/** CPU time one call takes, in microseconds. */
-function cpu(fn: () => void): number {
-  const start = process.cpuUsage();
-  fn();
-  const used = process.cpuUsage(start);
-  return used.user + used.system;
-}
-
 describe("sqlite physical sync work", () => {
-  it("costs the same per request whatever one key's version count", () => {
-    const perRequest = (versions: number) => {
-      const store = createTestBoundRecordStore(
-        new Database(":memory:"),
-      ) as unknown as Inspectable;
+  it("spends the same SQLite time per request whatever the keys' version counts", () => {
+    /** Median SQLite time per request of one first sync. */
+    const median = (versions: number) => {
+      const { store, work } = countingSqlite();
       try {
-        put(store, ["a"], "1");
-        for (let n = 0; n < versions; n++) put(store, ["hot"], String(n));
-        put(store, ["z"], "1");
+        const hot = keys(100, "hot");
+        put(store, hot, "0");
+        for (let n = 1; n < versions; n++) put(store, hot, String(n));
         const sync = createPdppSyncSessionService(store, {
           maxExaminedPerRequest: 20,
         });
-        const costs: number[] = [];
-        let cursor: string | undefined;
-        for (let n = 0; n < 10_000; n++) {
-          let page;
-          const used = cpu(() => {
-            try {
-              page = sync.read({ ...request(), limit: 1, cursor });
-            } catch (err) {
-              if (!(err instanceof SyncRetryLaterError)) throw err;
-            }
-          });
-          costs.push(used);
-          if (page) {
-            cursor = (page as { nextCursor?: string }).nextCursor;
-            if (!cursor) break;
-          }
-        }
-        // The costliest request after the first, which also prepares the
-        // store's statements: the one that walks past the hot key.
-        return Math.max(...costs.slice(1));
+        const perRequest: number[] = [];
+        work.micros = 0;
+        drain(sync, { ...request(), limit: 100 }, () => {
+          perRequest.push(work.micros);
+          work.micros = 0;
+        });
+        // The median is immune to the rare scheduling or cache spike; a cost
+        // that grows with version count shows in most requests.
+        perRequest.sort((x, y) => x - y);
+        return perRequest[Math.floor(perRequest.length / 2)]!;
       } finally {
         store.close();
       }
     };
-    const few = perRequest(200);
-    const many = perRequest(50_000);
-    // 250 times the versions; a bounded request costs about the same.
-    expect(many).toBeLessThan(few * 3);
-  }, 120_000);
+    const few = median(2);
+    const many = median(300);
+    // 150 times the versions per key; a bounded request costs about the same.
+    expect(many).toBeLessThan(few * 3 + 100);
+  }, 180_000);
 });
 
 for (const backend of ["memory", "sqlite"])

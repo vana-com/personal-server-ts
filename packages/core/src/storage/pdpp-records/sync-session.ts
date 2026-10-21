@@ -16,7 +16,6 @@ import {
   type PdppStoredRecord,
   type RecordIdentity,
   type SyncBudget,
-  type SyncPreparationProgress,
   type SyncStateStore,
   type SyncTokenScope,
   type SyncWindow,
@@ -104,7 +103,7 @@ export const DEFAULT_SYNC_CHECKPOINT_TTL_MS = 30 * 24 * HOUR;
 export const DEFAULT_SYNC_SCAN_TTL_MS = 10 * 60_000;
 export const DEFAULT_SYNC_STATES_PER_OWNER = 1_000;
 export const DEFAULT_SYNC_STATE_BYTES = 256 * 1024;
-export const DEFAULT_SYNC_PREPARED_ROWS_PER_OWNER = 1_000_000;
+export const DEFAULT_SYNC_PREPARED_ROWS_PER_OWNER = 10_000_000;
 /** The largest page one sync request serves. */
 export const MAX_SYNC_PAGE_LIMIT = 100;
 
@@ -173,8 +172,8 @@ export function createPdppSyncSessionService(
 
   function read(request: SyncRequest): ChangesSincePage {
     // The HTTP route clamps `limit` to the same maximum. It also bounds the
-    // rows a resumed request reads again (`found`), which the budget does not
-    // charge.
+    // rows a resumed request reads again (`found`), which the budget charges
+    // but never cuts short.
     if (
       !Number.isSafeInteger(request.limit) ||
       request.limit < 1 ||
@@ -213,9 +212,10 @@ export function createPdppSyncSessionService(
       return result;
     };
 
-    // An incremental session first prepares the keys written in its window,
-    // in bounded chunks, possibly over several requests.
-    if (position.low !== null && !preparation?.done) {
+    // Every session first prepares its candidate set, in budgeted steps and
+    // possibly over several requests: the keys written in its window, or for
+    // a first sync every key held at its horizon.
+    if (!preparation?.done) {
       preparation ??= {
         id: `prep:${randomBytes(16).toString("base64url")}`,
         done: false,
@@ -226,7 +226,6 @@ export function createPdppSyncSessionService(
         instanceIds: request.instanceIds,
         low: position.low,
         ...(high !== undefined && { high }),
-        ...(preparation.progress && { progress: preparation.progress }),
         budget,
         now,
         expiresAt: now + policy.ttl.page,
@@ -234,11 +233,7 @@ export function createPdppSyncSessionService(
         maxRowsPerOwner: preparedRows,
       });
       high = prepared.high;
-      preparation = {
-        id: preparation.id,
-        progress: prepared.progress,
-        done: prepared.done,
-      };
+      preparation = { id: preparation.id, done: prepared.done };
       if (!prepared.done) {
         const scan: PausedScan = {
           high,
@@ -275,7 +270,8 @@ export function createPdppSyncSessionService(
         instanceIds: request.instanceIds,
         low: position.low,
         ...(high !== undefined && { high }),
-        ...(preparation && { preparation: preparation.id }),
+        preparation: preparation.id,
+        now: policy.now(),
       },
       (window): ChangesSincePage | { paused: PausedScan } => {
         const direction = request.candidate?.order === "desc" ? "desc" : "asc";
@@ -301,12 +297,18 @@ export function createPdppSyncSessionService(
           return true;
         };
         // Changes an earlier request already disclosed, read again at the
-        // same horizon so a deletion since then still withholds them. At most
-        // one page plus one, so not charged to the budget.
+        // same horizon so a deletion since then still withholds them. Charged,
+        // but never cut short: there are at most one page plus one, and a
+        // resumed request that stopped among them would read them again.
         for (const id of paused?.found ?? position.found) {
+          budget.spend(
+            1 + (request.oneRecordPerKey ? request.instanceIds.length - 1 : 0),
+          );
           const change = window.change(id);
           if (change) take(change);
         }
+        // Re-reading is not progress: the first new identity below is always
+        // granted, so a session whose found rows exceed the budget still moves.
         const need = request.limit + 1;
         let scanned: RecordIdentity | undefined =
           paused?.after ?? position.after;
@@ -319,9 +321,19 @@ export function createPdppSyncSessionService(
             break;
           }
           if (id === undefined) break;
+          // The other instances this row's key is checked against, paid
+          // before the row is read so a spent budget stops here.
+          if (
+            request.oneRecordPerKey &&
+            !budget.spend(request.instanceIds.length - 1)
+          ) {
+            exhausted = true;
+            break;
+          }
           scanned = id;
           const change = window.change(id);
           if (change) take(change);
+          budget.progressed();
         }
         if (exhausted && request.candidate) {
           return {
@@ -330,7 +342,7 @@ export function createPdppSyncSessionService(
               ...(scanned && { after: scanned }),
               found: rows.map(identity),
               withheld,
-              ...(preparation && { preparation }),
+              preparation: preparation!,
             },
           };
         }
@@ -347,7 +359,7 @@ export function createPdppSyncSessionService(
               found: rows.slice(request.limit).map(identity),
               carried: position.carried,
               withheld,
-              ...(preparation && { preparation }),
+              preparation: preparation!,
             }),
           };
         }
@@ -360,23 +372,20 @@ export function createPdppSyncSessionService(
     );
     if ("paused" in result) {
       tokens.pauseScan(result.paused);
-      if (preparation) {
-        store.touchSyncPreparation(
-          preparation.id,
-          policy.now() + policy.ttl.page,
-          policy.now(),
-        );
-      }
-      throw new SyncRetryLaterError();
-    }
-    if (preparation) {
-      // A finished session frees its candidates; a paged one keeps them.
       store.touchSyncPreparation(
         preparation.id,
-        result.hasMore ? policy.now() + policy.ttl.page : 0,
+        policy.now() + policy.ttl.page,
         policy.now(),
       );
+      throw new SyncRetryLaterError();
     }
+    // The preparation lives as long as a page cursor that can replay it,
+    // including a retry of the session's last page.
+    store.touchSyncPreparation(
+      preparation.id,
+      policy.now() + policy.ttl.page,
+      policy.now(),
+    );
     return finish(result);
   }
 
@@ -398,18 +407,21 @@ function requestBudget(
   now: () => number,
 ): SyncBudget {
   let left = units;
-  let spent = 0;
+  let progress = false;
   return {
     spend(n = 1) {
+      // Until one unit of work is done, spend always grants.
       if (
-        spent > 0 &&
+        progress &&
         (left < n || (deadline !== undefined && now() >= deadline))
       ) {
         return false;
       }
       left -= n;
-      spent += n;
       return true;
+    },
+    progressed() {
+      progress = true;
     },
   };
 }
@@ -516,10 +528,9 @@ function sameProjection(
   );
 }
 
-/** A session's prepared candidate set and how far its preparation got. */
+/** A session's prepared candidate set; the store keeps its progress. */
 interface Preparation {
   id: string;
-  progress?: SyncPreparationProgress;
   done: boolean;
 }
 
@@ -574,12 +585,10 @@ interface SessionTokens {
 
 const toStored = (p: Preparation): NonNullable<StoredState["p"]> => ({
   i: p.id,
-  ...(p.progress && { g: p.progress }),
   d: p.done,
 });
 const fromStored = (p: NonNullable<StoredState["p"]>): Preparation => ({
   id: p.i,
-  ...(p.g && { progress: p.g }),
   done: p.d,
 });
 
@@ -607,8 +616,8 @@ interface StoredState {
   f?: Pair[];
   c?: Pair[];
   w?: Pair[];
-  /** Incremental sessions: preparation id, progress and whether it is done. */
-  p?: { i: string; g?: SyncPreparationProgress; d: boolean };
+  /** The session's preparation id and whether it is done. */
+  p?: { i: string; d: boolean };
 }
 
 const HANDLE_VERSION = 2;

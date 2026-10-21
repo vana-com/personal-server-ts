@@ -107,11 +107,11 @@ export interface SyncWindowRequest {
   /** Fixed horizon of an anchored session. Absent captures the current one. */
   high?: string;
   /**
-   * Incremental windows: the prepared candidate set to walk
-   * (`prepareSyncWindow`). A preparation that has expired is
-   * `CursorExpiredError`.
+   * The session's prepared candidate set to walk (`prepareSyncWindow`). One
+   * that is unfinished, released or expired at `now` is `CursorExpiredError`.
    */
-  preparation?: string;
+  preparation: string;
+  now: number;
 }
 
 /**
@@ -121,20 +121,22 @@ export interface SyncWindowRequest {
  */
 export interface SyncBudget {
   spend(units?: number): boolean;
+  /**
+   * One unit of work finished (a history row stored, an identity read).
+   * Until the first, `spend` always grants, so every request progresses.
+   */
+  progressed(): void;
 }
-
-/** Where a preparation stopped; opaque to everyone but the store. */
-export type SyncPreparationProgress = Record<string, unknown>;
 
 export interface SyncPreparationRequest {
   /** The session's preparation id; the store creates it on first use. */
   id: string;
   owner: string;
   instanceIds: string[];
-  low: string;
+  /** The previous session's horizon; null for a first sync. */
+  low: string | null;
   /** Absent on the first call: the store fixes the horizon then. */
   high?: string;
-  progress?: SyncPreparationProgress;
   budget: SyncBudget;
   now: number;
   expiresAt: number;
@@ -144,9 +146,9 @@ export interface SyncPreparationRequest {
   maxRowsPerOwner: number;
 }
 
+/** The store keeps the preparation's progress, written with its candidates. */
 export interface SyncPreparationResult {
   high: string;
-  progress: SyncPreparationProgress;
   done: boolean;
 }
 
@@ -168,11 +170,10 @@ export interface SyncWindowChange {
 export interface SyncWindow {
   high: string;
   /**
-   * The next candidate identity strictly after `after`, in
-   * `compareRecordIdentity` order: one indexed seek, paid from `budget`. A
-   * first sync walks every identity the stream holds; an incremental window
-   * walks its prepared candidate set. `undefined` at the end, `null` when the
-   * budget is spent. A candidate need not exist at the high horizon.
+   * The next identity of the prepared candidate set strictly after `after`,
+   * in `compareRecordIdentity` order: one seek on a unique key, paid from
+   * `budget`. `undefined` at the end, `null` when the budget is spent. A
+   * candidate need not exist at the high horizon.
    */
   next(
     direction: "asc" | "desc",
