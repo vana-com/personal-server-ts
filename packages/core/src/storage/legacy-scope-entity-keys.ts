@@ -1,5 +1,18 @@
 /** Stable legacy entity keys reviewed against the vendored scope schemas.
- * A missing path has no proven key and cannot qualify for takeover. */
+ * A missing object-array path has no proven key and cannot qualify for takeover.
+ * Singleton profiles belong to the selected connection; they need no array key.
+ * Grocery nutrition already uses source product IDs as object-map keys.
+ *
+ * LinkedIn experience/education/skills/languages, Instagram ads, H-E-B delivery
+ * addresses, GitHub achievements and Spotify artists retain no upstream ID in
+ * the legacy body. Keep those lists unkeyed: names/content are not identities.
+ * GitHub repository URLs/qualified names, organization logins and LinkedIn
+ * profile URLs are reusable aliases, not stable IDs. Their source IDs are
+ * omitted from the legacy body, so those lists must also stay unkeyed.
+ * Spotify track URIs may identify local files by tags/duration rather than an
+ * opaque source ID. The collector does not enforce catalog-only URIs, so keep
+ * both playlist track arrays and saved-track arrays unkeyed.
+ */
 export const LEGACY_SCOPE_ENTITY_KEYS: Readonly<
   Record<string, Readonly<Record<string, readonly string[]>>>
 > = {
@@ -60,6 +73,10 @@ export const LEGACY_SCOPE_ENTITY_KEYS: Readonly<
   },
   "shop.orders": {
     "$.orders": ["id"],
+  },
+  "spotify.playlists": {
+    // Only the opaque playlist ID is stable across upstream metadata edits.
+    "$.playlists": ["uri"],
   },
   "strava.activities": {
     "$.activities": ["id"],

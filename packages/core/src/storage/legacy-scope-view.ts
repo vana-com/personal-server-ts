@@ -58,7 +58,7 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 6;
+const COVERAGE_RULE_VERSION = 7;
 
 /** Live Claude omits some account metadata. Preserve known fields from the
  * same organization's saved head; never borrow entities or another identity. */
