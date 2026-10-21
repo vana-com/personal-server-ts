@@ -13,12 +13,13 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 it.each([
-  { deadline: undefined, delay: 11_000, coverage: "behind" },
-  { deadline: 120_000, delay: 11_000, coverage: "complete" },
-  { deadline: 120_000, delay: 121_000, coverage: "behind" },
+  { deadline: undefined, delay: 11_000, coverage: "behind", upload: false },
+  { deadline: 120_000, delay: 11_000, coverage: "complete", upload: false },
+  { deadline: 120_000, delay: 121_000, coverage: "behind", upload: false },
+  { deadline: 120_000, delay: 11_000, coverage: null, upload: true },
 ])(
-  "keeps recovery bounded with deadline $deadline and work $delay",
-  async ({ deadline, delay, coverage }) => {
+  "keeps recovery bounded with deadline $deadline and work $delay (upload=$upload)",
+  async ({ deadline, delay, coverage, upload }) => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     vi.stubGlobal("navigator", {
       locks: {
@@ -81,11 +82,26 @@ it.each([
     });
     await syncManager.stop();
     expect(additions).toBeDefined();
-    vi.useFakeTimers();
-    const pending = additions!.summarize(query);
-    await vi.advanceTimersByTimeAsync(Math.min(delay, deadline ?? 10_000));
-    expect((await pending).coverage).toBe(coverage);
+    vi.useFakeTimers({
+      toFake: [
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "performance",
+      ],
+    });
+    const pending = upload
+      ? additions!.recordUpload({ scope: "test.records" })
+      : additions!.summarize(query);
+    await vi.advanceTimersByTimeAsync(
+      Math.min(
+        delay,
+        upload ? Math.min(deadline ?? 10_000, 10_000) : (deadline ?? 10_000),
+      ),
+    );
     expect(terminated).toHaveBeenCalled();
+    expect((await pending)?.coverage ?? null).toBe(coverage);
   },
 );
 
@@ -107,5 +123,59 @@ it.each([0, -1, 1.5, 120_001, Infinity, NaN])(
         additionsTimeBudgetMs: deadline,
       }),
     ).rejects.toThrow(RangeError);
+  },
+);
+
+it.each([undefined, false])(
+  "allows metrics without starting sync (autoStartSync=%s)",
+  async (autoStartSync) => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const owner = privateKeyToAccount(`0x${"12".repeat(32)}`);
+    const signature = await owner.signMessage({
+      message: "vana-master-key-v1",
+    });
+    const feed = vi.fn(async () => ({ dataPoints: [], cursor: null }));
+    vi.useFakeTimers({
+      toFake: [
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "performance",
+      ],
+    });
+    const { syncManager, additions } = await createPsLiteSyncManager({
+      config: ServerConfigSchema.parse({}),
+      storage: createMemoryPsLiteStorage(),
+      stateStore: createIndexedDbPsLiteStateStore({
+        dbName: crypto.randomUUID(),
+      }),
+      ownerSignature: signature,
+      serverAccount: owner,
+      ownerSyncSigner: {
+        address: owner.address,
+        signMessage: async () => signature,
+        signMessageBounded: async () => signature,
+        signAddData: async () => signature,
+        signAddDataBounded: async () => signature,
+        signLineageAttestation: async () => signature,
+      },
+      dataPointFeed: {
+        getDataPoint: async () => null,
+        listDataPointsByOwner: feed,
+      },
+      ...{ autoStartSync },
+    });
+    try {
+      expect(additions).toBeDefined();
+      await vi.advanceTimersByTimeAsync(120_000);
+      const running = syncManager.running;
+      await syncManager.stop();
+      expect(running).toBe(autoStartSync !== false);
+      if (autoStartSync === false) expect(feed).not.toHaveBeenCalled();
+      else expect(feed).toHaveBeenCalled();
+    } finally {
+      await syncManager.stop();
+    }
   },
 );

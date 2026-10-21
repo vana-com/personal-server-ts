@@ -34,11 +34,17 @@ export function createPsLiteAdditionsSession(
 ): DurableAdditionsService {
   async function run(operation: AdditionsOperation): Promise<unknown> {
     const started = performance.now();
+    // The longer window is for background summary reconstruction only.
+    // Optional upload hints must not delay a registered source for minutes.
+    const timeBudgetMs =
+      operation.method === "summarize"
+        ? options.init.timeBudgetMs
+        : Math.min(10_000, options.init.timeBudgetMs);
     if (typeof navigator === "undefined" || !navigator.locks)
       throw new Error(
         "Bounded additions requires browser locks for persisted publication",
       );
-    const signal = AbortSignal.timeout(options.init.timeBudgetMs);
+    const signal = AbortSignal.timeout(timeBudgetMs);
     // Web Locks span tabs and survive worker restarts without a stale lease.
     return navigator.locks.request(
       JSON.stringify([
@@ -51,7 +57,7 @@ export function createPsLiteAdditionsSession(
         signal.throwIfAborted();
         const remainingMs = Math.max(
           1,
-          Math.floor(options.init.timeBudgetMs - (performance.now() - started)),
+          Math.floor(timeBudgetMs - (performance.now() - started)),
         );
         return runLocked(operation, remainingMs);
       },

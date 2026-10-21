@@ -91,6 +91,8 @@ export interface PsLiteSyncOptions {
   /** Background recovery deadline, including lock wait. Defaults to 10 seconds;
    * hosted owner signing may use up to two minutes. The byte cap is unchanged. */
   additionsTimeBudgetMs?: number;
+  /** Metrics-only hosts can use the bounded coordinator without starting sync. */
+  autoStartSync?: boolean;
   /** Storage authentication origin, independent of its routing endpoint. */
   storageAudience?: string;
   gateway?: GatewayClient;
@@ -412,6 +414,6 @@ export async function createPsLiteSyncManager(
       },
     },
   );
-  syncManager.start();
+  if (options.autoStartSync !== false) syncManager.start();
   return { syncManager, additions, serverOwner, dataPointFeed, scopeDeletions };
 }
