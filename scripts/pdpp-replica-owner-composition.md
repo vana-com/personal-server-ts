@@ -1,6 +1,6 @@
 # External-owner replica composition
 
-Run from this checkout with Node 22. This host uses the real production AS route factory, one isolated `auth.sqlite`, and the existing A/B replica worker processes. C1 owns the Account browser, isolated dev Neon database, local CG API, and real PKCE requester. This script does not launch a browser or configure those services.
+Run from this checkout with Node 22 and a dedicated disposable dev owner. This host receives the owner's master-key signature and derives its shared data-encryption master key, which is sent to both worker processes. The wallet private key is not exported, but the master-key signature is sensitive and leaves the Account SDK. This host uses the real production AS route factory, one isolated `auth.sqlite`, and the existing A/B replica worker processes. C1 owns the Account browser, isolated dev Neon database, local CG API, and real PKCE requester. This script does not launch a browser or configure those services.
 
 ```sh
 PATH=/home/tnunamak/.local/lib/qwen-code/node/bin:$PATH TMPDIR=$HOME/.tmp \
@@ -24,7 +24,7 @@ The fixture source is `https://replica-journey.invalid/declaration`, stream `mes
 
 The normal production owner token lasts 15 minutes. If C1 obtains another genuine owner token, the host refreshes B's in-memory introspection credential by restarting B against its same durable record store. The public origin stays stable. Grant lifetime follows the actual consent; the host does not autonomously revoke or impose a short expiry on that approval.
 
-SIGINT/SIGTERM closes this host and its owned workers without revoking consent. Local run data lives under an isolated `~/.tmp/replica-owner-composition-*` directory. Keep it while C1 needs the session. No owner key is exported; server keys, raw signatures, and host credentials stay in process/IPC memory. The normal AS persists its own authority in the single auth store. Dev server registrations and encrypted test objects are real; this wrapper does not invent unsupported remote deletion calls. Do not claim remote cleanup until an owning API confirms it.
+SIGINT/SIGTERM closes this host and its owned workers without revoking consent. Local run data lives under an isolated `~/.tmp/replica-owner-composition-*` directory. Keep it while C1 needs the session. Server keys, raw signatures, derived data keys and host credentials stay in process/IPC memory; they must not be printed or exported. The normal AS persists its own authority in the single auth store. Dev server registrations and encrypted test objects are real; this wrapper does not invent unsupported remote deletion calls. Do not claim remote cleanup until an owning API confirms it.
 
 Focused checks:
 
