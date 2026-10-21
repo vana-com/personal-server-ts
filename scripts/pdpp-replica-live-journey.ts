@@ -179,6 +179,29 @@ async function host() {
     ],
   });
   const account = serverAccount(init.serverKey);
+  // The SDK captures global fetch at construction, so install before creating storage.
+  let bodyBarrier: { url: string; scope: string } | undefined;
+  const hostFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const response = await hostFetch(input, init);
+    const url = input instanceof Request ? input.url : String(input);
+    if (
+      bodyBarrier &&
+      url === bodyBarrier.url &&
+      (init?.method ?? "GET") === "GET"
+    ) {
+      assert(response.ok && response.body);
+      const first = await response.body.getReader().read();
+      assert(!first.done && first.value.length > 0);
+      process.send?.({
+        checkpoint: "download",
+        scope: bodyBarrier.scope,
+        bytesStarted: first.value.length,
+      });
+      await new Promise(() => {});
+    }
+    return response;
+  };
   const storage = createVanaSyncStorageAdapter({
     config,
     serverOwner: init.owner,
@@ -247,28 +270,6 @@ async function host() {
     )
       process.kill(process.pid, "SIGKILL");
     return result;
-  };
-  let bodyBarrier: { url: string; scope: string } | undefined;
-  const hostFetch = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    const response = await hostFetch(input, init);
-    const url = input instanceof Request ? input.url : String(input);
-    if (
-      bodyBarrier &&
-      url === bodyBarrier.url &&
-      (init?.method ?? "GET") === "GET"
-    ) {
-      assert(response.ok && response.body);
-      const first = await response.body.getReader().read();
-      assert(!first.done && first.value.length > 0);
-      process.send?.({
-        checkpoint: "download",
-        scope: bodyBarrier.scope,
-        bytesStarted: first.value.length,
-      });
-      await new Promise(() => {});
-    }
-    return response;
   };
   let killScopes = new Set<string>();
   let stopAtDownload = 0,
