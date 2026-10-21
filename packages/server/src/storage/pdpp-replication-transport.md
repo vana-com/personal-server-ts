@@ -26,8 +26,8 @@ that its wildcard grants gain the upgraded runtime's private-scope policy.
 
 Each fragment binds owner, writer, batch, sequence, predecessor batch/digest,
 collection time, total payload digest/length, fragment count/index/offset,
-chunk digest and base64 bytes. Reassembly checks actual retained length before
-allocating the advertised total. The canonical payload contains the existing
+chunk digest and base64 bytes. Reassembly verifies each chunk and the cumulative
+length/digest while streaming. It does not allocate the advertised total. The canonical payload contains the existing
 replica envelope plus content-addressed binary bytes. Existing retained
 source/declaration bindings validate operations before receiver import. Binary
 digest/length, MIME and generation-bound claims remain receiver requirements.
@@ -37,9 +37,10 @@ digest/length, MIME and generation-bound claims remain receiver requirements.
 A single canonical SQLite database owns transport state, outbox, inbox and
 imported batch identities. One worker per database is the host contract.
 
-1. In one immediate transaction, export a pinned baseline or journal tail page,
-   retain its complete payload and binary bytes, allocate its immutable batch
-   identity/sequence/predecessor, and advance the independent export cursor.
+1. Stream a pinned baseline or journal tail page into hidden 64 KiB payload
+   chunks. After the encoder verifies the complete source digests, one immediate
+   transaction retains the batch identity/sequence/predecessor and advances the
+   independent export cursor.
    Baseline acknowledgment transfers responsibility to the durable local queue;
    it does not claim publication. No source history is removed.
 2. Encrypt fragments and atomically retain **all exact ciphertext bytes and
@@ -57,19 +58,36 @@ imported batch identities. One worker per database is the host contract.
 4. Repeated paginated owner scans retain discovered addresses before advancing
    their scan cursor. End-of-scan restarts at page one. Independently retry due
    downloads, verify settled commitments and decryption, then persist fragments.
-5. A complete batch waits for its exact predecessor. Import and the batch receipt
-   commit together on the receiver's database. Missing local authority remains
+5. A complete batch waits for its exact predecessor. Complete groups run in
+   sequence order. A canonical parser writes decoded binary chunks into hidden
+   staging and verifies the complete payload before import. Operations, received
+   bytes, canonical bytes and the batch receipt commit together on the receiver's database. Missing local authority remains
    durably retained by the receiver, whose retry method runs each cycle. Imported
    operations never enter the local journal or become fresh outbound operations.
 
-Due outbox/inbox entries are selected by lowest attempt count, then insertion
-order, with persisted exponential backoff (1 second through 1 hour). One failed
+Due outbox/inbox entries are selected by retry deadline, then insertion order.
+Expected finality waits have a separate durable state and do not increment the
+error counter. The optional `finality.head()` hint polls the finalized height at
+most once per two seconds. Parked waits are filtered before the 50-row budget;
+a new finalized height makes them eligible for the full independent evidence
+check. The verified checked height never moves backwards. A hint supplies no
+commitment authority. A hint ahead of verified evidence uses a 30-second
+non-error cooldown, and waits older than ten minutes use that slow cadence.
+Without hints, waiting rows use a two-second cadence. Actual errors and Gateway
+head disagreements retain exponential backoff (1 second through 1 hour).
+Successful waiting or confirmed evidence clears the error streak. One failed
 address cannot monopolize the oldest 50. Preparation has its own durable retry
 state; impossible framing is quarantined. A missing predecessor intentionally
 blocks descendants on that writer's chain, while other writers can advance.
 Each cycle attempts every phase even if an earlier phase fails, then reports
 collected errors so retained imports can advance during a feed outage.
-All payloads, fragments, failures and receipts remain retained; no compaction,
+New large canonical, pinned and received bytes use the same 64 KiB chunk store.
+Receiver reconciliation re-hashes actual chunks on every retry. Existing
+single-BLOB rows remain readable; their native SQLite memory use is not bounded
+by the JavaScript chunk reader. Explicit whole-value read APIs still assemble
+bytes for their callers. Hidden abandoned stages are reclaimed by the next
+worker cycle under the single-process database-writer contract.
+All verified payloads, fragments, failures and receipts remain retained; no compaction,
 retirement or sole-history deletion is implemented.
 
 ## Host integration and remaining promotion gates

@@ -1,3 +1,5 @@
+import type { ReplicaFinalityHints } from "./finality.js";
+export { createReplicaFinalityHints } from "./finality.js";
 import {
   decryptWithPassword,
   deriveScopeKey,
@@ -60,6 +62,7 @@ export function replicaChainCommitment(dataHash: Hex, metadataHash: Hex): Hex {
   );
 }
 export interface ReplicaTransportPort {
+  finality?: ReplicaFinalityHints;
   encrypt(scope: string, plaintext: Uint8Array): Promise<Uint8Array>;
   decrypt(scope: string, encrypted: Uint8Array): Promise<Uint8Array>;
   evidence(scope: string): Promise<ReplicaRegistrationEvidence>;
@@ -73,6 +76,7 @@ export interface ReplicaTransportPort {
 
 /** Uses existing DPv2 crypto, storage keying, AddData signing and owner feed. No file-head rebase. */
 export function createDpv2ReplicaTransport(deps: {
+  finality?: ReplicaFinalityHints;
   owner: `0x${string}`;
   masterKey: Uint8Array;
   storage: StorageAdapter;
@@ -86,6 +90,7 @@ export function createDpv2ReplicaTransport(deps: {
   const password = (scope: string) =>
     bytesToHex(deriveScopeKey(deps.masterKey, scope)).slice(2);
   return {
+    finality: deps.finality,
     encrypt: (scope, bytes) => encryptWithPassword(bytes, password(scope)),
     decrypt: (scope, bytes) => decryptWithPassword(bytes, password(scope)),
     evidence: deps.evidence,
@@ -181,4 +186,42 @@ export function replicaRegistrationState(
   ).toLowerCase() === chain.commitment.toLowerCase()
     ? "confirmed"
     : "pending";
+}
+
+/** Expected optimistic version-one registration, distinct from disagreements/errors. */
+export function replicaAwaitingFinality(
+  evidence: ReplicaRegistrationEvidence,
+  expected: {
+    owner: string;
+    scope: string;
+    dataHash?: string;
+    metadataHash?: string;
+  },
+): boolean {
+  const { head, chain } = evidence;
+  return (
+    replicaRegistrationState(evidence, expected) === "pending" &&
+    chain !== null &&
+    chain.owner.toLowerCase() === expected.owner.toLowerCase() &&
+    chain.scope === expected.scope &&
+    chain.version === "1" &&
+    chain.currentVersion === "0" &&
+    chain.status === "None" &&
+    /^0x0{64}$/i.test(chain.commitment) &&
+    head !== null &&
+    head.owner.toLowerCase() === expected.owner.toLowerCase() &&
+    head.scope === expected.scope &&
+    head.version === "1" &&
+    !head.deleted &&
+    !(
+      head.dataHash.toLowerCase() === tombstoneDataHash &&
+      head.metadataHash.toLowerCase() === tombstoneMetadataHash
+    ) &&
+    /^0x[0-9a-f]{64}$/i.test(head.dataHash) &&
+    /^0x[0-9a-f]{64}$/i.test(head.metadataHash) &&
+    (expected.dataHash === undefined ||
+      head.dataHash.toLowerCase() === expected.dataHash.toLowerCase()) &&
+    (expected.metadataHash === undefined ||
+      head.metadataHash.toLowerCase() === expected.metadataHash.toLowerCase())
+  );
 }

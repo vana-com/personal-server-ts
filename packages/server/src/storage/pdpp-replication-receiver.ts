@@ -1,4 +1,13 @@
 import { createReplicaVisibilityView } from "./pdpp-replica-visibility-view.js";
+import {
+  binaryLength,
+  binaryWriter,
+  verifyBinary,
+  copyBinary,
+  deleteBinary,
+  readBinary,
+  type BinaryNamespace,
+} from "./pdpp-binary-chunks.js";
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import {
@@ -94,6 +103,14 @@ export function createReplicaReceiver(deps: {
     blobs_json: string;
     state: string;
   };
+  const pendingBlobKey = (batchId: string, blobId: string) =>
+    canonicalJson([batchId, blobId]);
+  const pendingBatches = () =>
+    db
+      .prepare(
+        "SELECT * FROM pdpp_replica_pending_batches WHERE state='pending' ORDER BY id",
+      )
+      .all() as PendingBatch[];
   function authorize(credential: unknown) {
     if (!owner || deps.authenticate(credential) !== owner)
       throw new Error("replica authority required for owner");
@@ -127,21 +144,14 @@ export function createReplicaReceiver(deps: {
   }
   const hash = (bytes: Uint8Array) =>
     `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
-  function verifiedBytes(
-    blob: BlobDescriptor,
-    supplied?: Uint8Array,
-  ): Uint8Array | undefined {
-    const row = db
-      .prepare(
-        "SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id = ?",
-      )
-      .get(blob.blobId) as { bytes: Buffer } | undefined;
-    const bytes = supplied ?? row?.bytes ?? store.getBlobBytes(blob.blobId);
-    return bytes &&
-      bytes.byteLength === blob.sizeBytes &&
-      hash(bytes) === blob.sha256 &&
-      blob.blobId === blob.sha256
-      ? bytes
+  function verifiedBytes(blob: BlobDescriptor): BinaryNamespace | undefined {
+    const namespace =
+      binaryLength(db, "received", blob.blobId) === undefined
+        ? "canonical"
+        : "received";
+    return blob.blobId === blob.sha256 &&
+      verifyBinary(db, namespace, blob.blobId, blob.sha256, blob.sizeBytes)
+      ? namespace
       : undefined;
   }
   function materializeBlob(
@@ -192,19 +202,18 @@ export function createReplicaReceiver(deps: {
         blob.sizeBytes,
         blob.sha256.slice(7),
       );
-      const existing = db
-        .prepare("SELECT bytes FROM pdpp_blob_bytes WHERE blob_id = ?")
-        .get(blob.blobId) as { bytes: Buffer } | undefined;
-      if (
-        existing &&
-        (hash(existing.bytes) !== blob.sha256 ||
-          existing.bytes.length !== blob.sizeBytes)
-      )
-        throw new Error("corrupt canonical blob bytes");
-      db.prepare("INSERT OR IGNORE INTO pdpp_blob_bytes VALUES (?, ?)").run(
-        blob.blobId,
-        bytes,
-      );
+      if (binaryLength(db, "canonical", blob.blobId) !== undefined) {
+        if (
+          !verifyBinary(
+            db,
+            "canonical",
+            blob.blobId,
+            blob.sha256,
+            blob.sizeBytes,
+          )
+        )
+          throw new Error("corrupt canonical blob bytes");
+      } else copyBinary(db, bytes, blob.blobId, "canonical");
       db.prepare(
         "INSERT INTO pdpp_blob_claims VALUES (?, ?, ?) ON CONFLICT(blob_id, instance) DO UPDATE SET generation = excluded.generation",
       ).run(blob.blobId, operation.connectionId, operation.generation);
@@ -703,29 +712,53 @@ export function createReplicaReceiver(deps: {
         "SELECT b.bytes FROM pdpp_replica_pending_bytes b JOIN pdpp_replica_pending_batches p ON p.id=b.batch_id WHERE b.blob_id=? AND p.state='pending' LIMIT 1",
       )
       .get(blobId) as { bytes: Buffer } | undefined;
-    return row?.bytes;
+    if (row) return row.bytes;
+    for (const batch of pendingBatches()) {
+      const bytes = readBinary(db, "pending", pendingBlobKey(batch.id, blobId));
+      if (bytes) return bytes;
+    }
+    return undefined;
   }
-  function rawVisibleBlob(id: string): Uint8Array | undefined {
-    const row = db
+  /** Streams chunked pending custody; only legacy whole-row pending bytes are hashed in memory. */
+  function pendingBlobVerified(blob: BlobDescriptor): boolean {
+    const legacy = db
       .prepare(
-        "SELECT bytes FROM pdpp_blob_bytes WHERE blob_id=? UNION ALL SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id=? LIMIT 1",
+        "SELECT b.bytes FROM pdpp_replica_pending_bytes b JOIN pdpp_replica_pending_batches p ON p.id=b.batch_id WHERE b.blob_id=? AND p.state='pending' LIMIT 1",
       )
-      .get(id, id) as { bytes: Buffer } | undefined;
-    return row?.bytes ?? pendingBlob(id);
+      .get(blob.blobId) as { bytes: Buffer } | undefined;
+    if (legacy)
+      return (
+        legacy.bytes.length === blob.sizeBytes &&
+        hash(legacy.bytes) === blob.sha256
+      );
+    return pendingBatches().some((batch) =>
+      verifyBinary(
+        db,
+        "pending",
+        pendingBlobKey(batch.id, blob.blobId),
+        blob.sha256,
+        blob.sizeBytes,
+      ),
+    );
+  }
+  /** Canonical, received or pending bytes, legacy rows or chunks (#439). */
+  function rawVisibleBlob(id: string): Uint8Array | undefined {
+    return (
+      readBinary(db, "canonical", id) ??
+      readBinary(db, "received", id) ??
+      pendingBlob(id)
+    );
   }
   function verifiedVisibleBlob(id: string): Uint8Array | undefined {
     const meta = store.getBlobMeta(id) ?? view.getBlobMeta(id);
     const bytes = rawVisibleBlob(id);
     if (!meta || !bytes) return undefined;
-    return verifiedBytes(
-      {
-        blobId: id,
-        sha256: `sha256:${meta.sha256}`,
-        sizeBytes: meta.sizeBytes,
-        mimeType: meta.mimeType,
-      },
-      bytes,
-    );
+    const digest = `sha256:${meta.sha256}`;
+    return id === digest &&
+      bytes.byteLength === meta.sizeBytes &&
+      hash(bytes) === digest
+      ? bytes
+      : undefined;
   }
   function readSnapshot<T>(read: () => T): T {
     return db.transaction(read).deferred();
@@ -759,14 +792,13 @@ export function createReplicaReceiver(deps: {
           meta.sizeBytes !== blob.sizeBytes)
       )
         return false;
-      const canonicalBytes = db
-        .prepare("SELECT 1 FROM pdpp_blob_bytes WHERE blob_id=?")
-        .get(blob.blobId);
-      if (canonicalBytes && !store.getBlobBytes(blob.blobId)) return false;
-      const bytes = verifiedBytes(blob) ?? pendingBlob(blob.blobId);
+      if (
+        binaryLength(db, "canonical", blob.blobId) !== undefined &&
+        !store.getBlobBytes(blob.blobId)
+      )
+        return false;
       return (
-        bytes?.length === blob.sizeBytes &&
-        hash(bytes) === blob.sha256 &&
+        (verifiedBytes(blob) !== undefined || pendingBlobVerified(blob)) &&
         operations.some(
           (claim) =>
             claim.kind === "blob-claim" &&
@@ -786,6 +818,8 @@ export function createReplicaReceiver(deps: {
       id: string;
       envelope: unknown;
       blobs?: { blobId: string; bytes: Uint8Array }[];
+      /** Verified transport staging. Copied into durable chunked pending custody. */
+      stagedBlobs?: { blobId: string; key: string; sizeBytes: number }[];
     }) {
       authorize(input.credential);
       if (!pendingEnabled) return;
@@ -800,12 +834,21 @@ export function createReplicaReceiver(deps: {
         if (hash(blob.bytes) !== blob.blobId)
           throw new Error("corrupt replica blob bytes");
       const encoded = canonicalJson(envelope);
-      const blobs = canonicalJson(
-        (input.blobs ?? []).map((b) => ({
+      for (const blob of input.stagedBlobs ?? [])
+        if (
+          !verifyBinary(db, "staging", blob.key, blob.blobId, blob.sizeBytes)
+        )
+          throw new Error("corrupt replica blob bytes");
+      const blobs = canonicalJson([
+        ...(input.blobs ?? []).map((b) => ({
           blobId: b.blobId,
           size: b.bytes.length,
         })),
-      );
+        ...(input.stagedBlobs ?? []).map((b) => ({
+          blobId: b.blobId,
+          size: b.sizeBytes,
+        })),
+      ]);
       db.transaction(() => {
         const previous = db
           .prepare("SELECT * FROM pdpp_replica_pending_batches WHERE id=?")
@@ -832,11 +875,20 @@ export function createReplicaReceiver(deps: {
         db.prepare(
           "INSERT OR IGNORE INTO pdpp_replica_pending_batches VALUES (?,?,?,'pending',NULL)",
         ).run(input.id, encoded, blobs);
-        if (!previous)
+        if (!previous) {
           for (const blob of input.blobs ?? [])
             db.prepare(
               "INSERT INTO pdpp_replica_pending_bytes VALUES (?,?,?)",
             ).run(input.id, blob.blobId, blob.bytes);
+          for (const blob of input.stagedBlobs ?? [])
+            copyBinary(
+              db,
+              "staging",
+              blob.key,
+              "pending",
+              pendingBlobKey(input.id, blob.blobId),
+            );
+        }
         if (!previous) view.addPending(input.id, envelope.operations);
         view.flush();
       }).immediate();
@@ -863,16 +915,31 @@ export function createReplicaReceiver(deps: {
           if (row.state === "quarantined")
             throw new Error("pending replica batch quarantined");
           if (row.state === "confirmed") return;
+          const legacy = (
+            db
+              .prepare(
+                "SELECT blob_id,bytes FROM pdpp_replica_pending_bytes WHERE batch_id=?",
+              )
+              .all(input.id) as { blob_id: string; bytes: Buffer }[]
+          ).map((b) => ({ blobId: b.blob_id, bytes: b.bytes }));
+          const chunked = (
+            JSON.parse(row.blobs_json) as { blobId: string; size: number }[]
+          ).filter(
+            (b) =>
+              !legacy.some((l) => l.blobId === b.blobId) &&
+              binaryLength(db, "pending", pendingBlobKey(input.id, b.blobId)) !==
+                undefined,
+          );
           const result = api.import({
             credential: input.credential,
             envelope: JSON.parse(row.envelope_json),
-            blobs: (
-              db
-                .prepare(
-                  "SELECT blob_id,bytes FROM pdpp_replica_pending_bytes WHERE batch_id=?",
-                )
-                .all(input.id) as { blob_id: string; bytes: Buffer }[]
-            ).map((b) => ({ blobId: b.blob_id, bytes: b.bytes })),
+            blobs: legacy,
+            stagedBlobs: chunked.map((b) => ({
+              blobId: b.blobId,
+              key: pendingBlobKey(input.id, b.blobId),
+              sizeBytes: b.size,
+              namespace: "pending" as const,
+            })),
           });
           db.prepare(
             "UPDATE pdpp_replica_pending_batches SET state='confirmed' WHERE id=?",
@@ -880,6 +947,8 @@ export function createReplicaReceiver(deps: {
           db.prepare(
             "DELETE FROM pdpp_replica_pending_bytes WHERE batch_id=?",
           ).run(input.id);
+          for (const b of chunked)
+            deleteBinary(db, "pending", pendingBlobKey(input.id, b.blobId));
           view.removePending(input.id);
           view.flush();
           return result;
@@ -1067,6 +1136,12 @@ export function createReplicaReceiver(deps: {
       credential: unknown;
       envelope: unknown;
       blobs?: { blobId: string; bytes: Uint8Array }[];
+      stagedBlobs?: {
+        blobId: string;
+        key: string;
+        sizeBytes: number;
+        namespace?: "staging" | "pending";
+      }[];
     }): ReplicaMergePlan {
       authorize(input.credential);
       const envelope = replicaEnvelopeSchema.parse(input.envelope);
@@ -1081,20 +1156,51 @@ export function createReplicaReceiver(deps: {
           for (const blob of input.blobs ?? []) {
             if (hash(blob.bytes) !== blob.blobId)
               throw new Error("corrupt replica blob bytes");
-            const previous = db
-              .prepare(
-                "SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id = ?",
+            if (binaryLength(db, "received", blob.blobId) !== undefined) {
+              if (
+                !verifyBinary(
+                  db,
+                  "received",
+                  blob.blobId,
+                  blob.blobId,
+                  blob.bytes.length,
+                )
               )
-              .get(blob.blobId) as { bytes: Buffer } | undefined;
+                throw new Error("corrupt retained replica bytes");
+            } else if (blob.bytes.length <= 1024 * 1024) {
+              db.prepare(
+                "INSERT INTO pdpp_replica_received_bytes VALUES (?, ?)",
+              ).run(blob.blobId, blob.bytes);
+            } else {
+              const writer = binaryWriter(db, "received", blob.blobId);
+              writer.write(blob.bytes);
+              writer.finish();
+            }
+          }
+          for (const blob of input.stagedBlobs ?? []) {
+            const from = blob.namespace ?? "staging";
             if (
-              previous &&
-              (hash(previous.bytes) !== blob.blobId ||
-                !Buffer.from(blob.bytes).equals(previous.bytes))
+              !verifyBinary(
+                db,
+                from,
+                blob.key,
+                blob.blobId,
+                blob.sizeBytes,
+              )
             )
-              throw new Error("corrupt retained replica bytes");
-            db.prepare(
-              "INSERT OR IGNORE INTO pdpp_replica_received_bytes VALUES (?, ?)",
-            ).run(blob.blobId, blob.bytes);
+              throw new Error("corrupt replica blob bytes");
+            if (binaryLength(db, "received", blob.blobId) !== undefined) {
+              if (
+                !verifyBinary(
+                  db,
+                  "received",
+                  blob.blobId,
+                  blob.blobId,
+                  blob.sizeBytes,
+                )
+              )
+                throw new Error("corrupt retained replica bytes");
+            } else copyBinary(db, from, blob.key, "received", blob.blobId);
           }
           for (const op of envelope.operations) {
             db.prepare(
