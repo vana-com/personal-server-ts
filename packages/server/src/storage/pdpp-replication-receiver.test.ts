@@ -3359,92 +3359,6 @@ it("canonical change feeds validate original scope, exclude all conflicted histo
   ).toEqual([]);
 });
 
-it.each([
-  ["canonical", "owner"],
-  ["canonical", "grant"],
-  ["received", "owner"],
-  ["received", "grant"],
-  ["pending", "owner"],
-] as const)(
-  "preserves byte integrity for %s blobs read by %s after materialization",
-  (origin, reader) => {
-    const source = device();
-    const target = origin === "canonical" ? source : device();
-    installBindingConflictFixture(target);
-    const bytes = new Uint8Array([4, 5, 6]);
-    const blob = source.store.storeBlobBytesForInstance({
-      instance: "conn_a",
-      method: "collector",
-      generation: 1,
-      bytes,
-      mimeType: "application/octet-stream",
-    });
-    source.store.ingestBatch(
-      [
-        {
-          instance: "conn_a",
-          stream: "messages",
-          key: "a",
-          emitted_at: at,
-          data: {
-            id: "a",
-            blob_ref: {
-              blob_id: blob.blobId,
-              sha256: blob.sha256,
-              size_bytes: blob.sizeBytes,
-              mime_type: blob.mimeType,
-            },
-          },
-        },
-      ],
-      () => "mutable_state",
-      () => ["id"],
-      { method: "collector", generation: 1 },
-    );
-    const receiver = pendingReceiver(target);
-    if (origin === "pending")
-      receiver.stage({
-        credential: "replica-secret",
-        id: "integrity",
-        envelope: batch(all(source)),
-        blobs: [{ blobId: blob.blobId, bytes }],
-      });
-    if (origin === "received")
-      receiver.import({
-        credential: "replica-secret",
-        envelope: batch(all(source)),
-        blobs: [{ blobId: blob.blobId, bytes }],
-      });
-    const read = receiver.readStore({ reader });
-    expect(Array.from(read.getBlobBytes(blob.blobId)!)).toEqual(
-      Array.from(bytes),
-    );
-    // Since #439 materialized canonical bytes may live in the chunked binary
-    // store; a store write or small pending bytes keep a legacy row.
-    const overwrite = (value: Uint8Array) =>
-      origin === "pending"
-        ? target.db
-            .prepare(
-              "UPDATE pdpp_replica_pending_bytes SET bytes=? WHERE blob_id=?",
-            )
-            .run(value, blob.blobId).changes
-        : target.db
-            .prepare("UPDATE pdpp_blob_bytes SET bytes=? WHERE blob_id=?")
-            .run(value, blob.blobId).changes ||
-          target.db
-            .prepare(
-              "UPDATE pdpp_binary_chunks SET bytes=? WHERE namespace='canonical' AND blob_id=? AND position=0",
-            )
-            .run(value, blob.blobId).changes;
-    expect(overwrite(new Uint8Array([7, 8, 9]))).toBe(1);
-    expect(read.getBlobBytes(blob.blobId)).toBeUndefined();
-    overwrite(bytes);
-    expect(Array.from(read.getBlobBytes(blob.blobId)!)).toEqual(
-      Array.from(bytes),
-    );
-  },
-);
-
 /** conn_a's "a" and conn_b's "b" reference one blob; legacy rows hold up to 1 MiB. */
 function sharedBlob(form: "legacy" | "chunks") {
   const source = device(),
@@ -3563,6 +3477,148 @@ function tamper(
   expect(d.db.prepare(update).run(changed, ...args).changes).toBe(1);
   return () => d.db.prepare(update).run(bytes, ...args);
 }
+
+it.each([
+  ["canonical", "legacy", "owner"],
+  ["canonical", "legacy", "grant"],
+  ["canonical", "chunks", "owner"],
+  ["canonical", "chunks", "grant"],
+  ["materialized", "chunks", "owner"],
+  ["materialized", "chunks", "grant"],
+] as const)(
+  "preserves byte integrity for %s blobs stored as %s read by %s",
+  (origin, form, reader) => {
+    const source = device();
+    const target = origin === "canonical" ? source : device();
+    installBindingConflictFixture(target);
+    // Store writes keep a legacy row up to 1 MiB; materialization always chunks.
+    const bytes = new Uint8Array(
+      form === "legacy" ? 3 : 1024 * 1024 + 4096,
+    ).map((_, i) => (i + 4) % 251);
+    const blob = source.store.storeBlobBytesForInstance({
+      instance: "conn_a",
+      method: "collector",
+      generation: 1,
+      bytes,
+      mimeType: "application/octet-stream",
+    });
+    source.store.ingestBatch(
+      [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          emitted_at: at,
+          data: {
+            id: "a",
+            blob_ref: {
+              blob_id: blob.blobId,
+              sha256: blob.sha256,
+              size_bytes: blob.sizeBytes,
+              mime_type: blob.mimeType,
+            },
+          },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const receiver = pendingReceiver(target);
+    if (origin === "materialized")
+      receiver.import({
+        credential: "replica-secret",
+        envelope: batch(all(source)),
+        blobs: [{ blobId: blob.blobId, bytes }],
+      });
+    const read = receiver.readStore({ reader });
+    expect(Array.from(read.getBlobBytes(blob.blobId)!)).toEqual(
+      Array.from(bytes),
+    );
+    const restore =
+      form === "legacy"
+        ? (() => {
+            const before = target.db
+              .prepare("SELECT bytes FROM pdpp_blob_bytes WHERE blob_id=?")
+              .get(blob.blobId) as { bytes: Buffer };
+            const changed = Buffer.from(before.bytes);
+            changed[0] ^= 0xff;
+            expect(
+              target.db
+                .prepare("UPDATE pdpp_blob_bytes SET bytes=? WHERE blob_id=?")
+                .run(changed, blob.blobId).changes,
+            ).toBe(1);
+            return () =>
+              target.db
+                .prepare("UPDATE pdpp_blob_bytes SET bytes=? WHERE blob_id=?")
+                .run(before.bytes, blob.blobId);
+          })()
+        : tamper(target, {
+            table: "pdpp_binary_chunks",
+            namespace: "canonical",
+            id: blob.blobId,
+          });
+    expect(read.getBlobBytes(blob.blobId)).toBeUndefined();
+    restore();
+    expect(Array.from(read.getBlobBytes(blob.blobId)!)).toEqual(
+      Array.from(bytes),
+    );
+  },
+);
+
+it.each([
+  ["received", "legacy"],
+  ["received", "chunks"],
+  ["pending", "legacy"],
+  ["pending", "chunks"],
+] as const)(
+  "preserves byte integrity for owner-visible %s bytes stored as %s",
+  (origin, form) => {
+    const f = sharedBlob(form);
+    if (origin === "received") {
+      f.receiver.import({
+        credential: "replica-secret",
+        envelope: batch(f.a.filter((op) => op.kind !== "upsert")),
+        blobs: [{ blobId: f.blob.blobId, bytes: f.bytes }],
+      });
+      f.receiver.stage({
+        credential: "replica-secret",
+        id: "dependent",
+        envelope: batch(f.a.filter((op) => op.kind === "upsert")),
+      });
+    } else f.carry("carrier");
+    expect(Array.from(f.owner.getBlobBytes(f.blob.blobId)!)).toEqual(
+      Array.from(f.bytes),
+    );
+    const restore = tamper(
+      f.target,
+      origin === "received"
+        ? form === "legacy"
+          ? { table: "pdpp_replica_received_bytes", blobId: f.blob.blobId }
+          : {
+              table: "pdpp_binary_chunks",
+              namespace: "received",
+              id: f.blob.blobId,
+            }
+        : form === "legacy"
+          ? {
+              table: "pdpp_replica_pending_bytes",
+              blobId: f.blob.blobId,
+              batchId: "carrier",
+            }
+          : {
+              table: "pdpp_binary_chunks",
+              namespace: "pending",
+              id: JSON.stringify(["carrier", f.blob.blobId]),
+            },
+    );
+    expect(f.owner.getBlobBytes(f.blob.blobId)).toBeUndefined();
+    restore();
+    expect(Array.from(f.owner.getBlobBytes(f.blob.blobId)!)).toEqual(
+      Array.from(f.bytes),
+    );
+  },
+);
 
 it.each(["legacy", "chunks"] as const)(
   "hides a pending blob record and its bytes when its retained received copy is corrupt, as promotion would (%s)",
