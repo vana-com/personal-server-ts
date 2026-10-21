@@ -243,6 +243,9 @@ describe("replica policy v3 vectors", () => {
       operationId: "a",
       contentHash: expect.stringMatching(/^sha256:/),
     });
+    expect(erased.suppressionMarker?.removals).toEqual([
+      { operationId: "owner-delete", deletedAt: T0, finalizedAt: T0 },
+    ]);
     const restore = {
       ...hide,
       kind: "owner-restore" as const,
@@ -301,10 +304,16 @@ describe("replica policy v3 vectors", () => {
       kind: "owner-resolve" as const,
       candidates: ["a", "b"],
       choice: "a",
+      resolvedValue: {
+        kind: "upsert" as const,
+        data: a.data,
+        blobs: a.blobs,
+        contentHash: a.contentHash,
+      },
       revision: { ...a.revision, operationId: "resolve-a" },
     };
     const chosen = plan([a, b, resolution]);
-    expect(chosen.records[0].current?.revision.operationId).toBe("a");
+    expect(chosen.records[0].current?.revision.operationId).toBe("resolve-a");
     const pending = plan([a, { ...resolution, candidates: ["a", "missing"] }]);
     expect(pending.pending[0].reason).toBe("resolution_dependency_missing");
     expect(pending.records[0].current?.revision.operationId).toBe("a");
@@ -315,6 +324,12 @@ describe("replica policy v3 vectors", () => {
       {
         ...resolution,
         choice: "b",
+        resolvedValue: {
+          kind: "upsert" as const,
+          data: b.data,
+          blobs: b.blobs,
+          contentHash: b.contentHash,
+        },
         revision: {
           ...resolution.revision,
           operationId: "resolve-b",
@@ -323,6 +338,32 @@ describe("replica policy v3 vectors", () => {
       },
     ]);
     expect(competing.records[0].state).toBe("conflict");
+    const samePayloadChoice = {
+      ...resolution,
+      candidates: ["a", "b", "same-x"],
+      resolvedValue: {
+        kind: "upsert" as const,
+        data: a.data,
+        blobs: a.blobs,
+        contentHash: a.contentHash,
+      },
+    };
+    const equivalent = plan([
+      a,
+      b,
+      observed("same-x", "device-c", "X"),
+      samePayloadChoice,
+      {
+        ...samePayloadChoice,
+        choice: "same-x",
+        revision: {
+          ...samePayloadChoice.revision,
+          operationId: "resolve-same-x",
+          writerId: "device-d",
+        },
+      },
+    ]);
+    expect(equivalent.records[0].state).toBe("settled");
   });
   it("N17-N19: partial absence is no event and stable account ids ignore login changes", () => {
     expect(plan([observed("a", "A", "X")]).records[0].current?.kind).toBe(

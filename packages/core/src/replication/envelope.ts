@@ -62,6 +62,15 @@ const ownerRecord = {
   declaration: declarationBindingSchema,
   recordKey: z.string(),
 };
+const resolvedValue = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("upsert"),
+    data: z.record(z.string(), z.json()),
+    blobs: z.array(blob),
+    contentHash: digest,
+  }),
+  z.strictObject({ kind: z.literal("source-delete"), contentHash: digest }),
+]);
 export const replicaOperationSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     ...record,
@@ -98,6 +107,7 @@ export const replicaOperationSchema = z.discriminatedUnion("kind", [
     candidates: z.array(token),
     choice: token,
     version: sourceVersion.optional(),
+    resolvedValue,
   }),
   z.strictObject({
     ...base,

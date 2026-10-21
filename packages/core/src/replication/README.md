@@ -22,8 +22,9 @@ current value.
 Differing candidates within the five-minute policy window are `unsettled` and
 request a source re-observation. A non-reobservable stream promotes that
 disagreement to owner review. Equal comparable source versions with different
-content are also owner review. Append-only content conflicts remain quarantined.
-An unsettled disagreement involving a source deletion is hidden from apps.
+content and conflicting concurrent owner resolutions also need owner review.
+Append-only content conflicts remain quarantined. An unsettled disagreement
+involving a source deletion is hidden from apps.
 
 ## Owner removals and deletion erasure
 
@@ -31,7 +32,9 @@ Source deletions are ordinary observations and may be superseded by later
 source observations. Owner hide and delete are separate remove-wins decisions.
 Only an explicit restore that names a removal operation clears that removal;
 concurrent removals remain active. Source observations never clear owner
-removals.
+removals. An owner resolution names the alternatives it settles and carries the
+value it selects; a later scrape cannot inherit that resolution unless its
+frontier shows it received the resolution.
 
 `OWNER_DELETE_GRACE_PERIOD_MS` is the single delete-retention contract constant
 (30 days by default). The period starts at the delete batch's finality time. Once
@@ -70,10 +73,12 @@ quarantine evidence, and suppression markers.
 
 ## Verification vectors
 
-`merge-plan.test.ts` covers the N01–N29 policy cases, including the explicit
-fixture 18 reversal, source-version order, clock capping, removal/restore,
-account quarantine, app projection, and complete-scan handling. Each logical
-vector is evaluated from the same retained set so arrival order does not change
-the result. `revision.test.ts` covers HLC creation and the receive guard.
+`merge-plan.test.ts` covers the N01–N29 policy cases. The three-device suite
+ports fixtures 01–56, including the explicit fixture 18 reversal and causal
+resolution timelines. Both suites cover source-version order, clock capping,
+removal/restore, account quarantine, app projection, and complete-scan handling.
+Each logical vector is replayed across delivery permutations so arrival order
+does not change the result. `revision.test.ts` covers HLC creation and the
+receive guard.
 `envelope.test.ts` covers canonical encoding, exact declaration and owner binding,
 the stable upstream principal, HLC shape, and lifecycle operation roundtrips.

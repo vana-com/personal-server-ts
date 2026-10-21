@@ -64,6 +64,11 @@ export interface MergedRecord {
       observedAt: string;
       finalizedAt: number | null;
     }[];
+    removals: {
+      operationId: string;
+      deletedAt: number;
+      finalizedAt: number;
+    }[];
   } | null;
 }
 export interface ReplicaMergePlan {
@@ -337,7 +342,7 @@ export function appView(record: MergedRecord): RecordOperation | null {
     return null;
   if (!record.current || record.current.kind !== "upsert") return null;
   if (
-    record.state === "unsettled" &&
+    (record.state === "unsettled" || record.state === "conflict") &&
     record.candidates.some((candidate) => candidate.kind === "source-delete")
   )
     return null;
@@ -392,10 +397,27 @@ function mergeRecord(
   const declaration = all[0].declaration;
   const incompatibleDeclaration =
     new Set(all.map((op) => canonicalJson(op.declaration))).size > 1;
-  const dominance = sourceDominance(
-    observations,
-    declaration.sourceVersionOrder,
-  );
+  const resolutions = ownerOps.filter((op) => op.kind === "owner-resolve");
+  const byOperationId = new Map(all.map((op) => [op.revision.operationId, op]));
+  const resolvedIds = new Set<string>();
+  const markResolved = (id: string): void => {
+    if (resolvedIds.has(id)) return;
+    resolvedIds.add(id);
+    const nested = byOperationId.get(id);
+    if (nested?.kind === "owner-resolve")
+      nested.candidates.forEach(markResolved);
+  };
+  resolutions.forEach((op) => {
+    if (op.kind === "owner-resolve") op.candidates.forEach(markResolved);
+  });
+  let candidates: SourceObservation[] = [
+    ...observations.filter((op) => !resolvedIds.has(op.revision.operationId)),
+    ...resolutions
+      .filter((op) => !resolvedIds.has(op.revision.operationId))
+      .map((op) => materializeResolution(op, byOperationId))
+      .filter((op): op is SourceObservation => op !== null),
+  ];
+  const dominance = sourceDominance(candidates, declaration.sourceVersionOrder);
   const unconfirmedScans = observations.filter(
     (op) =>
       op.kind === "source-delete" &&
@@ -412,33 +434,20 @@ function mergeRecord(
             prior.revision.wallMs < op.revision.wallMs,
         )),
   );
-  let candidates = observations.filter(
+  candidates = candidates.filter(
     (op) => !dominance.dominated.has(op) && !unconfirmedScans.includes(op),
   );
-  const resolutions = ownerOps.filter((op) => op.kind === "owner-resolve");
   const ownerResolutionConflict = resolutions.some((left, index) =>
     resolutions
       .slice(index + 1)
       .some(
         (right) =>
-          left.choice !== right.choice &&
+          resolutionPayload(left, byOperationId) !==
+            resolutionPayload(right, byOperationId) &&
+          !knownBefore(left, right) &&
+          !knownBefore(right, left) &&
           left.candidates.some((id) => right.candidates.includes(id)),
       ),
-  );
-  const resolved = new Set(
-    resolutions.flatMap((op) =>
-      op.kind === "owner-resolve" ? op.candidates : [],
-    ),
-  );
-  const chosen = new Set(
-    resolutions.flatMap((op) =>
-      op.kind === "owner-resolve" ? [op.choice] : [],
-    ),
-  );
-  candidates = candidates.filter(
-    (op) =>
-      !resolved.has(op.revision.operationId) ||
-      chosen.has(op.revision.operationId),
   );
   if (purgedRestoreTimes.length)
     candidates = candidates.filter((op) =>
@@ -503,6 +512,11 @@ function mergeRecord(
           contentHash: op.contentHash,
           observedAt: op.emittedAt,
           finalizedAt: finalizedAt(op) ?? null,
+        })),
+        removals: purgedDeletes.map((op) => ({
+          operationId: op.revision.operationId,
+          deletedAt: op.revision.wallMs,
+          finalizedAt: finalizedAt(op)!,
         })),
       }
     : null;
@@ -589,6 +603,80 @@ function payloadIdentity(op: RecordOperation): string {
   return canonicalJson(
     op.kind === "upsert" ? { data: op.data, blobs: op.blobs } : null,
   );
+}
+function materializeResolution(
+  resolution: Extract<RecordOperation, { kind: "owner-resolve" }>,
+  byOperationId: Map<string, RecordOperation>,
+  path = new Set<string>(),
+): SourceObservation | null {
+  if (path.has(resolution.revision.operationId)) return null;
+  const nextPath = new Set(path).add(resolution.revision.operationId);
+  const selected = byOperationId.get(resolution.choice);
+  const selectedObservation =
+    selected?.kind === "owner-resolve"
+      ? materializeResolution(selected, byOperationId, nextPath)
+      : selected?.kind === "upsert" || selected?.kind === "source-delete"
+        ? selected
+        : null;
+  const evidence = resolution.candidates
+    .map((id) => byOperationId.get(id))
+    .flatMap((candidate): SourceObservation[] => {
+      if (!candidate) return [];
+      if (candidate.kind === "owner-resolve") {
+        const nested = materializeResolution(
+          candidate,
+          byOperationId,
+          nextPath,
+        );
+        return nested ? [nested] : [];
+      }
+      return candidate.kind === "upsert" || candidate.kind === "source-delete"
+        ? [candidate]
+        : [];
+    });
+  const template = selectedObservation ?? evidence[0];
+  if (!template) return null;
+  const emittedAt =
+    evidence
+      .map((op) => op.emittedAt)
+      .sort()
+      .at(-1) ?? template.emittedAt;
+  const version = resolution.version ?? selectedObservation?.sourceVersion;
+  const common = {
+    ...template,
+    batchId: resolution.batchId,
+    frontier: resolution.frontier,
+    revision: resolution.revision,
+    emittedAt,
+    contentHash: resolution.resolvedValue?.contentHash ?? template.contentHash,
+    ...(version ? { sourceVersion: version } : { sourceVersion: undefined }),
+  };
+  if (resolution.resolvedValue?.kind === "source-delete")
+    return {
+      ...common,
+      kind: "source-delete",
+      origin: "source-event",
+      confirmationOf: undefined,
+    };
+  if (resolution.resolvedValue?.kind === "upsert")
+    return {
+      ...common,
+      kind: "upsert",
+      data: resolution.resolvedValue.data,
+      blobs: resolution.resolvedValue.blobs,
+    };
+  if (selectedObservation)
+    return { ...common, ...selectedObservation, ...common };
+  return null;
+}
+function resolutionPayload(
+  resolution: Extract<RecordOperation, { kind: "owner-resolve" }>,
+  byOperationId: Map<string, RecordOperation>,
+): string {
+  const value = materializeResolution(resolution, byOperationId);
+  return value
+    ? payloadIdentity(value)
+    : canonicalJson(resolution.resolvedValue);
 }
 function knownBefore(a: RecordOperation, b: RecordOperation): boolean {
   return (
