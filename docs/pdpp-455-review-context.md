@@ -41,11 +41,41 @@ A later boundary probe also reproduced generated source metadata in builder
 compute's inference prompt. Compute now uses the same object renderer as HTTP,
 after retaining its internal dependency facts. No compute own-write exception.
 
-The parent owns historical preparation and any further existing-receipt evidence
-investigation. Mutable latest registration state, payload shape, questionId,
+The parent owns historical preparation. Its one bounded existing-receipt
+investigation is complete with only a partial anchor; no further investigation
+or historical machinery is authorized. Mutable latest registration state, payload shape, questionId,
 lineage plus sources and producer strings are not historical compute identity.
 Any future historical policy requires separately judged exact-version evidence;
 no such interface or execution is approved by this repair.
+
+## R10 current response: actual joined dependency identities
+
+The R9 Astra review rejected complete cycle closure at e6190260. On unchanged
+production, memory and real Node/SQLite probes each returned ready, inference=1,
+and output versions=2 when a generated intermediate depended on a projection
+whose joined scope was the next output. Both unrelated-output controls passed.
+The durable real two-compute regression independently reproduced the same bypass;
+the direct namespace control is already blocked by the existing naming rule.
+Its corrected RED is one cycle failure and three passing controls, not two bugs.
+
+R10 supplies one graph-facing dependency operation in read-evidence: inherited
+lineage IDs UNION owner-derived dataPointIDs for ALL actual retained inputVersion
+scopes. Both loadSource and every subsequent graph read use it. Already loaded
+roots are seeded into the visited set because their captured edges are already
+scheduled, avoiding a second acquisition of the same root. Actual joined inputs
+are included even without explicit lineage. Unused legacy siblings stay excluded;
+frozen detached version facts, grantee rendering and origin union are unchanged.
+The traversal keeps current latest-local semantics; this does not claim immutable
+historical graph traversal or solve historical F1.
+
+The exact reviewer probes now pass all four cases. The durable regression checks
+zero inference and no publication on the indirect cycle; namespace refusal,
+unrelated output and unused sibling controls pass. Full compute/origin tests pass
+67 cases. R9's earlier 495 + 3 + 19 remain evidence of e619, not an R10 count.
+Current raw commands/results accompany the new exact-head assignment. Shared
+disclosure policy, pager, B interfaces and the historical preparation artifact
+were not edited for R10. Fresh dot-first and known Astra-high acceptance remain
+required. Historical F1 and retained excluded-read limitations remain release gates.
 
 ## Original review brief (complete)
 
@@ -414,3 +444,120 @@ Would a different, simpler design make several of these findings disappear? <yes
 When the same kind of finding repeats across rounds, name the owning component and recommend the structural fix, not another patch (memory: `feedback-system-design-before-patch-rounds`).
 
 ````
+
+## R9 exact e619 dot (unknown model; complete report)
+
+```text
+Exact e6190260a7329e36419732e8e93911e3b1565b86. Scoped repair verdict: MERGE within inspected future-output/cycle/prompt delta, not whole-stack acceptance. Overall release verdict: DON'T MERGE while historical F1 remains unresolved. Actual serving model unavailable; cannot certify different-model independence.
+Packet: read entire committed docs/pdpp-455-review-context.md in consecutive chunks, including final integrated brief. Verified decoded UTF8 size63074bytes (63024JS characters); supplied SHA256 not independently recomputed. All SIX report sections read: R6 exact c57 dot; R7 integrated eab7 dot; R7 integrated eab7 Astra F3RED; R8 exact996d dot incomplete gate; R8 exact996d Astra historically scoped acceptance; Broader old-eab dot report absent earlier briefs. Also read original full brief, current frontmatter/contracts and complete integrated R1–R8 responses. Historical excerpts did not authorize excluded reads.
+1 goal: correct separation of future generated privacy/cycle repairs from unsolved historical classification. Passing future fixtures is not historical F1 closure.
+2 concerns: ReadEvidence separates dependency/origin semantics from projected JSON presentation; one privateProvenanceFields policy separates server-generated sources metadata from arbitrary user sources fields. Better structural owner than per-consumer key heuristics.
+3 owners: read-evidence.ts20–72 owns detached/frozen dependency IDs/input-version facts; legacy-projection.ts334/351–352/410 collects actual requested and consumed joined evidence, skips unused legacy/tagged siblings; ownReadEnvelope76–80 explicitly transfers evidence across clones. compute loadSource463–488 captures facts before grantee rendering and cycle walk408 consumes them. Reserved lineage.kind computed-question is stamped by compute616, not guessed from questionId/latest registry.
+4 effects/information: object renderer read-evidence108–152 preserves ordinary content and strips generated sources only for trusted marker; shared function reexported at api/index1661 and called2207. Builder prompt uses same renderer465 before trim, no own-write exception. Bytes renderer delegates private-field classification; blocks use policyVersion2/privateDataFields at redaction20/291 and strip paths/keys. disclosure-policy117–121 still clones at acquisition before authorization; owned evidence retained. Sidecar trust now requires current policy239/267, old policy falls back through checked envelope before shared pager; grantee representation forced227 and manifest refs redacted90–96.
+5 convergence: projected requested/joined/intermediate graph edges no longer disappear because presentation removed $lineage. Initial malformed evidence propagates to compute failure; traversal unreadable/malformed throws source_missing409–413 instead of treating as root. Existing visited-set graph bound retained. Historical missing local graph nodes still follow pre-existing behavior; no broader graph guarantee.
+6 real data: evidence copies small metadata arrays, deduplicates version tuples and lineage IDs, does not serialize private evidence. Existing whole-envelope clone/build costs remain; no B streaming/budget claim. inputVersions are retained evidence, not a claim that current graph traversal pins every transitive historical version.
+Concrete new P0-P2 in inspected delta: NONE confirmed. Historical F1 remains P1/release-blocking: read-evidence84–92 deliberately recognizes only computed-question; pre-marker stored shapes have no discriminator. derivative-origin.test350–396 explicitly asserts current200 plus source coordinates for pre-marker and user-lookalike fixtures. This documents unresolved leakage, not successful privacy tests. No migration/quarantine/recompute/blanket-strip proposal or action made.
+Closure/test-quality inspection: derivative-origin248–272 performs real owner compute and signed derived-only builderHTTP with owner-visible source metadata and nonowner no scope/time/id/sources.274–332 covers object-adjacent byte/block/TOC and oldpolicy fallback, arbitrarysources335–347 positive control. compute.test573–755 covers requested/joined/intermediate/joined-intermediate cycle failures, malformed/unreadable failure, acyclic/unused-sibling positives, zero providercalls and unchangedoutputversions.758–795 runs owner-produced source through buildercompute and asserts prompt hides underlying coordinates. These are meaningful protected-boundary fixtures, not solely helper-shape assertions. They were inspected, NOT executed.
+Preservation: exact endpoint comparisons996d→HEAD and ffecd→HEAD (no mergebase) show page.ts, representation.ts, mcp/read-client.ts and Lite storage.ts byte-identical at both. Digest identical to996d; againstffecd adds classifier trust while preserving redaction evidence. API delta from996d moves renderer/reexports it without reordering retained body/payment; selectedEntry2176 still passed to helper829–841 snapshot before grant await846. Shared pager retains structuredClone33/36, full-block verification before representation, representation/cursor identity and UTF8 policy. Comparison covered these specific integration files plus latest compute/projection changes, not exhaustive whole-repository diff. Prior configured-state F1 and contract-selected-entry F2 are historical verified closures, not fresh excluded-internal certification. Prior F3 acquisition ownership retained structurally. Original originunion/historyclassifier and exact-ownwrite boundaries inspected selectively, not every composition.
+Checks: zero tests/builds/lint/install/model calls; maker495+3/19 counts attributed only, not adopted. workspace_result exacthead/base and diff_bytes0, empty SHA256e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855. No source/Git edits, publication, release or live services. Excluded contracts/data.ts, tokens and jobs paths remained unread; original e536 refusal/r8 contract denial remain limits. No fresh whole payment-contract/token/job/boot certification, no liveOAuth/Gateway/inference/replica/browser or B48MiB gate; B unintegrated. Current cancellation/authority/notes clear before finish.
+```
+
+## R9 exact e619 Astra (joined-input identity RED; complete report)
+
+```text
+Scoped repair verdict: **DON'T MERGE / not accepted in full**. Future generated-output privacy and builder-prompt redaction pass the reviewed boundaries, but a newly reproduced P2 leaves projected-cycle protection incomplete. Historical F1 remains a separate, reproduced P1 release blocker. This is no whole-stack merge or release certificate.
+
+Exact HEAD: `e6190260a7329e36419732e8e93911e3b1565b86`. Checkout: `/home/tnunamak/.tmp/pdpp-conf-derivative-origin-1021`. Verified at entry and completion; clean throughout the checks. Empty `patch.diff` (0 bytes). Latest comparison: `996d4944b3583e1cff8660f26d60f2e72787c2e6` → HEAD. Integrated D comparison: **two endpoints** `ffecd0ab75780101ad9b1b0f9d462053409e11c8` → HEAD, without merge-base. Saved diffs contain only the 25 authorized paths.
+
+Reviewer: **gpt-6-astra, high reasoning effort**, from injected T3 runtime_info. Maker: gpt-6.1-sol/high per brief. Different-model independence is established at the harness-reported level, without an independently retrieved provider receipt. Parent had already submitted the dot review; I launched no agents or models. Unknown-model dot work is not treated as a different-model acceptance certificate.
+
+Packet completeness: read the entire committed `docs/pdpp-455-review-context.md`, 416 lines / **63,074 UTF-8 bytes**, SHA-256 **ff17f71edfebb031887a9f828e9c5de981734741d741c8781c4e1a3fc7400c4f**. Read pages 1–230 and 231–460; a further page confirmed EOF. Neither packet page was truncated. Read the frontmatter/current contracts, complete original brief, complete preceding integrated brief/R1–R8 responses, and all six full report sections:
+
+1. `R6 exact c57 dot (unknown model)`
+2. `R7 integrated eab7 dot (unknown model)`
+3. `R7 integrated eab7 Astra (F3 RED)`
+4. `R8 exact996d dot (incomplete gate)`
+5. `R8 exact996d Astra (historically scoped acceptance)`
+6. `Broader old-eab dot report; concerns absent earlier briefs` — the complete report identified in the assignment as `report_8457f2a7-eea5-485f-9426-cd563961f095`.
+
+Completeness applies to this verified packet. I did not independently retrieve the historical reports' original raw artifacts, certify those reviewers' entire scope, or reinterpret historical denied paths as permission. Current frontmatter and this assignment control over quoted stale statuses. A is integrated; B is not.
+
+Design-first review:
+
+1. **Goal.** Correctly targets disclosure of server-generated source metadata and preservation of dependency meaning through projection. Passing the original four cycle fixtures is insufficient: the actual joined input can itself be the prospective output scope, even when that input has no explicit lineage statement. That case still publishes.
+2. **Decomplecting.** Mutable storage state is separated from approved values by `ownReadEnvelope`; retained evidence is detached/frozen. Presentation and meaning are separated by the WeakMap evidence plus common grantee renderer. Policy is separated from object/byte/block mechanics through `privateProvenanceFields`. Time and identity remain incomplete in the graph consumer: input version identities are retained but ignored when determining graph edges. No additional parsing/execution or waiting/error problem was established.
+3. **Invariant owners.** Read-evidence ownership → `read-evidence.ts`; projection input union → `legacy-projection.ts`; generated-field policy → `privateProvenanceFields`; approved object acquisition → `withDisclosurePolicy.readAuthorized`; classifier freshness → `trustedPdppOrigin`/`manifestBinding`; block snapshot, verification, representation and paging → shared pager; selected payment identity → API's retained entry and primitive snapshot. **Dependency completeness remains incomplete at the read-evidence-to-cycle-walker handoff**: it forwards inherited lineage statements but omits actual joined scope identities.
+4. **State/effects/information flow.** Evidence survives guard clones without serialization and resists mutation of the original input arrays and nested version objects. Actual different joined timestamps survive a real Node projection even though presentation retains the requested timestamp. Builder compute captures evidence before redacting its prompt. The graph consumer then reads only `lineageSources`; the recorded `inputVersions` cannot stop the reproduced cycle. F3/payment snapshot checks remain green.
+5. **Feedback convergence.** The walker has a visited set, and malformed/unreadable extraction now stops compute. The missing joined edge nevertheless allows a scope feedback cycle to publish. One-byte paging converged in 263 pages for each of current-policy and old-policy-fallback generated outputs; representation identity matched their TOCs. No new cursor loop was observed.
+6. **Real data and costs.** Real Node files/SQLite, actual Lite borrowed-object behavior, signed HTTP and MCP boundaries were exercised. Whole-envelope cloning and whole-byte fallback remain proportional to payload size. Evidence copies/deduplicates the consumed versions and dependency lists. This is no bounded-stream or production-load claim; B's 48 MiB gate was not run.
+7. **Local reasoning.** The shared evidence and field-policy interfaces make the invariants clearer. Their presence alone does not prove that a consumer uses every necessary fact. The cycle guard's description of actual dependencies overstates what its `lineageSources`-only traversal proves.
+8. **Lines/tests and preservation.** Details follow. No source changes were made to obtain either failure. Original cycle fixtures, malformed/unreadable controls, future privacy, prompt, payment, classifier and A preservation tests ran on the exact HEAD.
+
+**R9-F2 — P2, reproduced: the cycle walker omits the joined input scope itself.**
+
+Primary location: `packages/core/src/derivatives/compute.ts:408` selects only `readEvidence(envelope).lineageSources`. The same narrowing occurs in `loadSource` at `:486`, and the initial map is populated at `:575`. Related owner: `packages/core/src/storage/read-evidence.ts:51` unions the inputs' existing lineage statements, while `:55` separately retains their actual scope/time identities; `packages/core/src/storage/legacy-projection.ts:352` supplies the joined evidence.
+
+Concrete real-storage scenario:
+
+- Seed ordinary projectable `chatgpt.conversations` and `chatgpt.messages`; the conversation includes message `m1`, whose content is `joined-input`. Neither input needs a lineage statement.
+- Run real owner compute for `spine.summary` from served `chatgpt.conversations`. It succeeds, and the captured inference request contains `joined-input`. Its legitimate generated lineage names `chatgpt.conversations`.
+- Run owner compute targeting **`chatgpt.messages`** from `spine.summary`. Direct source/output namespaces differ, so the naming check permits this. The graph should identify `chatgpt.messages → spine.summary → projected chatgpt.conversations → joined chatgpt.messages` and refuse before inference/publication.
+- Actual exact-head result: **ready, inferenceCalls=1, previousVersions=1, versions=2, error=null**. The joined message scope is present in `ReadEvidence.inputVersions`, but no lineage statement names it, so the walker drops that edge.
+
+The first probe used the existing memory adapter and an explicit valid intermediate lineage statement. A second probe used **real Node storage/SQLite and two actual owner computes**, without fabricating the intermediate's generated lineage. Both reproduce the same failure. Controls target unrelated `coach.weekly` and succeed. The first prompt's consumption of the joined content is asserted in the Node probe.
+
+Raw proof: [node-joined-identity.log](node-joined-identity.log), [node-joined-identity.jsonl](node-joined-identity.jsonl), [joined-identity.log](joined-identity.log), [joined-identity.jsonl](joined-identity.jsonl). Reproduction sources are preserved as [node-joined-identity.test.ts.txt](node-joined-identity.test.ts.txt) and [joined-identity.test.ts.txt](joined-identity.test.ts.txt). Each run has **1 failing cycle assertion / 1 passing control**.
+
+Owning repair requirement: make the internal dependency evidence/graph handoff account for actual consumed input identities as well as inherited lineage statements, including projection joins at every traversal depth. Retain exclusion of unused legacy siblings and immutable version evidence. This needs one complete graph invariant, not another scope-name-specific consumer patch. No implementation is proposed for historical F1, and no patch was produced here.
+
+This is a current-head failure of the scoped cycle closure. I did not execute a full historical baseline or establish the commit that introduced this precise variant. The packet's blame evidence attributes the older mechanisms to base commits; that does not dismiss the remaining defect or prove historical runtime behavior.
+
+**Historical F1 — P1, reproduced, still release-blocking.**
+
+`packages/core/src/storage/read-evidence.ts:84` recognizes `sources` as generated metadata only for valid reserved lineage with `kind: "computed-question"`. The object renderer applies that result at `:119`; HTTP serves it at `packages/core/src/api/index.ts:2205`.
+
+Both committed historical fixtures return **HTTP 200 with `sources: [{scope:"bank.transactions", version:1, collectedAt:"2026-09-01T00:00:00.000Z"}]`** to the derived-only reader. The pre-marker computed fixture and user-authored lookalike intentionally have identical stored shapes. These passing tests explicitly document the unresolved disclosure; they are not privacy-success evidence. See `historical-compute-ambiguity` records in [boundaries.jsonl](boundaries.jsonl).
+
+No payload shape, questionId, producer, latest registration, automatic recompute, blanket strip/deny, migration, quarantine, receipt scheme or live operation is authorized by this review. Parent retains historical preparation/investigation ownership. Future marker acceptance does not close historical F1.
+
+Original findings, responses and remaining objections:
+
+| Contract / prior finding | Current review result |
+| --- | --- |
+| Broader F1, future generated outputs | Accepted within tested scope. Real owner compute → signed derived-only HTTP hides source scope/ID/time; owner retains them. Object/raw-byte/current-block/old-policy fallback/TOC checks pass. Two extra 263-page one-byte probes and block-ID selection hide coordinates even when requesting `representation: "stored"` through the guard. Ordinary answer wording and user-authored `sources` remain content. |
+| Builder-compute prompt | Independently rerun: ready, `hiddenCoordinates=false`; source data-point ID also absent. Compute captures internal evidence first and then uses the same object renderer. No compute own-write exception. |
+| Broader F2, four reported projected cases | All four now fail with `DERIVATIVE_CYCLE`, zero inference, one original output version. Acyclic/unused-legacy-sibling controls succeed; malformed/unreadable cases fail without inference/publication. **Overall closure rejected because R9-F2 remains.** |
+| Evidence detachment/version identity | Extra reviewer probes pass: modifying original lineage/version inputs cannot alter retained facts; nested version objects are frozen; guard cloning retains them; JSON contains no internal facts. Actual requested and joined timestamps remain distinct. This verifies retention, not graph use. |
+| R1/R2 origin union and conservative historical lineage | Owner joined-PDPP and mixed-origin boundary checks pass; observed origin remains OR-of-index/bytes and joins. Classifier source still treats malformed or non-explicit-legacy historical lineage conservatively. |
+| R3/R4 publication/citation history | Inspected API publication call and compute publication gate preserve configured non-owner policy and owner observed union. Builder enabled/unknown/explicit-off and owner legacy controls rerun. Excluded publication-contract implementation and all direct write/session variants were not freshly re-audited. |
+| R5 configured state, c57 F1 mounted/config-false | Composition sources are outside this assignment. No fresh composition-source certificate or real-boot run here. Maker's final 3 boot passes are attributed evidence only; prior packet closure is not silently promoted to full current acceptance. |
+| R5 own-write and projections | Inspected reader-specific views and separate plain-grantee projection input guard remain; cache identity separation remains. Compute passes plain grantee. Full direct own-write/write-session matrix and jobs internals were not rerun/inspected. |
+| R5 refusal-before-payment | Both indexed-origin false/true signed HTTP cases return 403 before payment, zero settlements. |
+| Original F2 payment selection | Challenge remains version 1 when latest becomes 2. Paid response remains response-A with one settlement; committed regression also asserts attested version 1. API snapshots identity before grant refresh. Excluded contract internals remain uninspected. |
+| F3 borrowed approved HTTP body | All six actual Lite + signed HTTP cases pass across payment-refresh and guard-return windows: 200, one settlement, authorized-original only. `ownReadEnvelope` at acquisition preserves both detachment and internal evidence. |
+| A preservation | 72 inherited tests pass: Lite fallback ownership 18, generation/classifier/representation 26, MCP client 25, raw-envelope 3. Full-block verification, snapshot-before-use, redaction-before-paging, layout/policy/view identity, TOC cursorView, stale cursor refusal and UTF-8 checks remain. Page, representation, MCP client, Lite storage and the two unchanged test files have empty two-endpoint diffs against ffecd. |
+| B | Separately owned and unintegrated. Existing port pin/options/budget interfaces inspected; no B brand/stream/48 MiB acceptance. |
+
+Would a different, simpler design make several findings disappear? The shared evidence owner is the correct structural direction. Completing its graph-facing contract so every consumer sees actual consumed input edges addresses the remaining projected-cycle defect without another per-consumer exception. It does not solve historical identity ambiguity, which remains separately owned.
+
+Reviewer-run evidence, **Node v22.23.3 / Vitest v4.1.11**, one worker:
+
+| Raw log | Result | Boundary |
+| --- | --- | --- |
+| [boundaries.log](boundaries.log) | 22 passed / 41 intentionally skipped | Future privacy, historical ambiguity, four cycles, malformed/unreadable/unused controls, builder prompt, origin/publication controls |
+| [payment.log](payment.log) | 10 passed / 108 intentionally skipped | F3 ownership, retained payment identity, refusal before settlement |
+| [inherited.log](inherited.log) | 72 passed | A fallback/representation/classifier/MCP plus raw-envelope regression |
+| [joined-identity.log](joined-identity.log) | 1 failed / 1 passed | Reviewer memory-adapter cycle and unrelated-output control |
+| [node-joined-identity.log](node-joined-identity.log) | 1 failed / 1 passed | Reviewer two-real-compute Node/SQLite reproduction and control |
+| [privacy-evidence-final.log](privacy-evidence-final.log) | 4 passed | Extra tiny-page/privacy, deep evidence detachment, actual distinct joined timestamps |
+
+Unique final cases: **110 passed, 2 failed**, with 149 deliberately skipped cases in filtered files. The failures reproduce one new defect on two adapters. Historical ambiguity cases pass by asserting the known leak. The initial three-case `privacy-evidence.log` is retained for chronology and not counted again. No negative source transform was used: the failures are on unchanged reviewed production HEAD. Commands/configs and JSONL observations are retained beside the report.
+
+Maker evidence remains attributed: read final logs showing **17 files / 495 tests**, **3 real boot cases**, and **19 targeted cases** after detachment tightening. The earlier 494 count preceded the prompt change and is not the final total. Types/ESLint/Prettier results were supplied by maker, not rerun here. Current fixture policy-version edits only add version 2 to current-manifest mocks; the explicit old-policy fallback tests remain active and were exercised.
+
+Scope and limits: source inspection stayed within the exact allow-list, plus permitted instruction/config metadata and maker evidence. Large unchanged files were inspected selectively; this is not a line-by-line audit of every allowed file or a full integration diff outside that list. Executed defensive test ports import their normal implementation dependencies, but excluded `contracts/data.ts`, token internals and server job worker/tests were not source-inspected. No denial retries, alternative source access, new agents/models, source/Git mutations, installs, full suite, browser, merge, release or PS459. No live OAuth/Gateway/inference, remote replica, OPFS/IndexedDB browser runtime, production load or B 48 MiB stream gate. The original e536 provider refusal and R8 contract-read denial remain limitations, not acceptance or renewed read authority.
+
+High confidence in both cycle reproductions and in the explicitly tested future privacy/F3/A boundaries. No exhaustive correctness guarantee and no historical-coverage claim.
+
+Cleanup: all test processes exited; no dev server was started. Review-created temporary data/cache were removed. Active temporary test fixtures were removed by retaining their exact source as `.test.ts.txt` evidence; restore the suffix only to reproduce. Logs, JSONL, configs, scoped comparison diffs, commands, allow-list, `verification.json`, this report and empty `patch.diff` are retained under `/home/tnunamak/.tmp/ps455-r6-sol-evidence/astra-r9`. PR #455 is linked to this thread; no watcher was started.
+```

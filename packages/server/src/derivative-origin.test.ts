@@ -740,3 +740,119 @@ describe("independent stamp persistence probe", () => {
     }
   });
 });
+
+it.each(["namespace-control", "intermediate", "control", "unused-sibling"])(
+  "compute tracks actual joined input identities through %s dependencies",
+  async (kind) => {
+    await put({
+      version: "1.0",
+      scope: "chatgpt.conversations",
+      collectedAt: AT,
+      data: {
+        records: [
+          {
+            id: "conv-1",
+            title: "Trip",
+            create_time: AT,
+            update_time: AT,
+            current_node: "m1",
+            message_count_on_current_branch: 1,
+          },
+        ],
+      },
+    });
+    await put({
+      version: "1.0",
+      scope: "chatgpt.messages",
+      collectedAt: AT,
+      data:
+        kind === "unused-sibling"
+          ? { items: ["unused legacy sibling"] }
+          : {
+              records: [
+                {
+                  id: "m1",
+                  conversation_id: "conv-1",
+                  parent_id: null,
+                  role: "user",
+                  content: "joined-input",
+                  content_type: "text",
+                  model_slug: null,
+                  create_time: AT,
+                  on_current_branch: true,
+                },
+              ],
+            },
+    });
+    const served = withLegacyProjection(storage);
+    const firstProvider = createFakeInferenceProvider();
+    const first = await computeQuestion("q-1", {
+      storage: served,
+      store: createInMemoryQuestionStore({
+        initial: [
+          {
+            ...registration(["chatgpt.conversations"]),
+            derivedScope: "spine.summary",
+          },
+        ],
+      }),
+      provider: firstProvider,
+      serverOwner: owner.address,
+      now: () => new Date("2026-09-02T00:00:00.000Z"),
+      retryDelaysMs: [0, 0],
+    });
+    expect(first.status).toBe("ready");
+    expect(JSON.stringify(firstProvider.calls).includes("joined-input")).toBe(
+      kind !== "unused-sibling",
+    );
+    const derivedScope =
+      kind === "control" ? "coach.weekly" : "chatgpt.messages";
+    const previousVersions = storage.countVersions(derivedScope);
+    const provider = createFakeInferenceProvider();
+    const store = createInMemoryQuestionStore({
+      initial: [
+        {
+          ...registration([
+            kind === "namespace-control"
+              ? "chatgpt.conversations"
+              : "spine.summary",
+          ]),
+          derivedScope,
+        },
+      ],
+    });
+    const outcome = await computeQuestion("q-1", {
+      storage: served,
+      store,
+      provider,
+      serverOwner: owner.address,
+      now: () => new Date("2026-09-03T00:00:00.000Z"),
+      retryDelaysMs: [0, 0],
+    });
+    console.log(
+      JSON.stringify({
+        probe: "joined-input-cycle",
+        kind,
+        status: outcome.status,
+        inferenceCalls: provider.calls.length,
+        previousVersions,
+        versions: storage.countVersions(derivedScope),
+        error: (await store.get("q-1"))?.error,
+      }),
+    );
+    if (kind === "control" || kind === "unused-sibling") {
+      expect(outcome.status).toBe("ready");
+      expect(provider.calls).toHaveLength(1);
+      expect(storage.countVersions(derivedScope)).toBe(previousVersions + 1);
+    } else {
+      expect(outcome.status).toBe("failed");
+      expect((await store.get("q-1"))?.error).toMatch(
+        kind === "namespace-control"
+          ? /^LINEAGE_SCOPE_UNDER_SOURCE_PREFIX/
+          : /^DERIVATIVE_CYCLE/,
+      );
+      expect(provider.calls).toHaveLength(0);
+      expect(storage.countVersions(derivedScope)).toBe(previousVersions);
+    }
+  },
+);

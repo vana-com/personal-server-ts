@@ -3,6 +3,7 @@ import { readStoredLineage, LINEAGE_KEY } from "../lineage/lineage.js";
 import { WRITER_ATTRIBUTION_KEY } from "../write/attribution-key.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import { inputHasPdppOrigin } from "../sync/pdpp-import.js";
+import { computeDataPointId } from "../sync/data-point-id.js";
 
 /** Internal facts about the inputs to a value, independent of its JSON view. */
 export interface ReadEvidence {
@@ -38,6 +39,21 @@ export function readEvidence(
     pdppOrigin:
       retained?.pdppOrigin === true || inputHasPdppOrigin(entry, envelope),
   });
+}
+
+/** Graph edges include inherited statements and every input actually consumed. */
+export function dependencyDataPointIds(
+  facts: ReadEvidence,
+  serverOwner: string,
+): readonly string[] {
+  return Object.freeze([
+    ...new Set([
+      ...facts.lineageSources,
+      ...facts.inputVersions.map(({ scope }) =>
+        computeDataPointId(serverOwner, scope),
+      ),
+    ]),
+  ]);
 }
 
 /** A presentation value depends on all actual inputs, including joined ones. */
