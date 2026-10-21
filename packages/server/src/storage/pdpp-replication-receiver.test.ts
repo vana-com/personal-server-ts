@@ -18,6 +18,7 @@ import { pdppRecordsRoutes } from "../routes/pdpp-records.js";
 import { pdppBlobsRoutes } from "../routes/pdpp-blobs.js";
 import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
+import { binaryWriter, deleteBinary } from "./pdpp-binary-chunks.js";
 
 const sourceId = "https://source.invalid/declaration";
 const at = "2026-10-20T00:00:00.000Z";
@@ -1776,6 +1777,168 @@ it("hides a pending blob record again when the only batch carrying its bytes is 
   expect(owner.getRecord("conn_a", "messages", "conn_a")).toBeUndefined();
   expect(owner.getBlobBytes(blobId)).toBeUndefined();
 });
+
+// Received bytes above 1 MiB and every staged transport blob are chunked (#439).
+for (const delivery of [
+  "replayed claim",
+  "unrelated connection",
+  "pending carrier",
+] as const)
+  it(`re-derives a pending blob record when chunked bytes arrive or leave (${delivery})`, () => {
+    const source = device(),
+      target = device();
+    for (const d of [source, target])
+      d.store.registerConnection({
+        instance: "conn_b",
+        sourceId,
+        method: "collector",
+        label: "B",
+      });
+    const bytes = new Uint8Array(1024 * 1024 + 4096).map((_, i) => i % 251);
+    const store = (instance: string) =>
+      source.store.storeBlobBytesForInstance({
+        instance,
+        method: "collector",
+        generation: 1,
+        bytes,
+        mimeType: "application/octet-stream",
+      });
+    const blob = store("conn_a");
+    expect(store("conn_b")).toEqual(blob);
+    const ref = {
+      blob_id: blob.blobId,
+      sha256: blob.sha256,
+      size_bytes: blob.sizeBytes,
+      mime_type: blob.mimeType,
+    };
+    const ingest = (instance: string, rows: Record<string, unknown>[]) =>
+      source.store.ingestBatch(
+        rows.map((data) => ({
+          instance,
+          stream: "messages",
+          key: data.id as string,
+          emitted_at: at,
+          data,
+        })),
+        () => "mutable_state",
+        () => ["id"],
+        { method: "collector", generation: 1 },
+      );
+    ingest("conn_a", [
+      { id: "a", text: "binary", blob_ref: ref },
+      { id: "c1", text: "plain" },
+      { id: "c2", text: "plain" },
+    ]);
+    ingest("conn_b", [{ id: "b", text: "other", blob_ref: ref }]);
+    const ops = all(source);
+    const a = ops.filter((op) => op.connectionId === "conn_a");
+    const b = ops.filter((op) => op.connectionId === "conn_b");
+    const claimA = a.filter((op) => op.kind === "blob-claim");
+    const receiver = pendingReceiver(target);
+    if (delivery === "replayed claim") {
+      receiver.import({
+        credential: "replica-secret",
+        envelope: batch(a.filter((op) => op.kind !== "upsert")),
+      });
+      receiver.stage({
+        credential: "replica-secret",
+        id: "late-bytes",
+        envelope: batch(a.filter((op) => op.kind === "upsert")),
+      });
+    } else
+      receiver.stage({
+        credential: "replica-secret",
+        id: "late-bytes",
+        envelope: batch(a),
+      });
+    const owner = receiver.readStore({ reader: "owner" });
+    const page = (cursor?: string) =>
+      receiver.readRecords({
+        reader: "owner",
+        stream: "messages",
+        instanceIds: ["conn_a"],
+        limit: 1,
+        order: "asc",
+        cursor,
+      });
+    expect(owner.getRecord("conn_a", "messages", "a")).toBeUndefined();
+    expect(preview(receiver).map((row) => row.recordKey)).toEqual(["c1", "c2"]);
+    const before = page();
+    expect(before.data.map((row) => row.recordKey)).toEqual(["c1"]);
+
+    if (delivery === "pending carrier") {
+      const writer = binaryWriter(target.db, "staging", "carrier-stage");
+      writer.write(bytes);
+      writer.finish();
+      receiver.stage({
+        credential: "replica-secret",
+        id: "carrier",
+        envelope: batch(b),
+        stagedBlobs: [
+          {
+            blobId: blob.blobId,
+            key: "carrier-stage",
+            sizeBytes: blob.sizeBytes,
+          },
+        ],
+      });
+    } else
+      receiver.import({
+        credential: "replica-secret",
+        envelope: batch(delivery === "replayed claim" ? claimA : b),
+        blobs: [{ blobId: blob.blobId, bytes }],
+      });
+    receiver.retry({ credential: "replica-secret" });
+    // The bytes that arrived are chunks, not legacy rows.
+    const namespace = delivery === "pending carrier" ? "pending" : "received";
+    expect(
+      target.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace=?",
+        )
+        .get(namespace),
+    ).toEqual({ n: 1 });
+    expect(
+      target.db
+        .prepare(
+          "SELECT (SELECT count(*) FROM pdpp_replica_received_bytes)+(SELECT count(*) FROM pdpp_replica_pending_bytes) AS n",
+        )
+        .get(),
+    ).toEqual({ n: 0 });
+
+    // copy-assertion-ok: User-required data-model confirmation value.
+    expect(owner.getRecord("conn_a", "messages", "a")).toMatchObject({
+      data: { id: "a", text: "binary" },
+      visibility: "pending",
+      confirmation: "not yet confirmed",
+    });
+    expect(preview(receiver).map((row) => row.recordKey)).toEqual([
+      "a",
+      "c1",
+      "c2",
+    ]);
+    expect(owner.getBlobBytes(blob.blobId)?.byteLength).toBe(bytes.length);
+    expect(() => page(before.nextCursor)).toThrow(/expired/);
+
+    if (delivery === "unrelated connection") return;
+    // The chunks leave: the carrier batch is quarantined, or the received
+    // chunks are lost.
+    if (delivery === "pending carrier")
+      receiver.quarantine({
+        credential: "replica-secret",
+        id: "carrier",
+        reason: "finalized commitment conflict",
+      });
+    else {
+      target.db.transaction(() =>
+        deleteBinary(target.db, "received", blob.blobId),
+      )();
+      receiver.retry({ credential: "replica-secret" });
+    }
+    expect(owner.getRecord("conn_a", "messages", "a")).toBeUndefined();
+    expect(preview(receiver).map((row) => row.recordKey)).toEqual(["c1", "c2"]);
+    expect(owner.getBlobBytes(blob.blobId)).toBeUndefined();
+  });
 
 it("quarantine removes owner binary access and malformed stage bytes never enter pending storage", () => {
   const source = device(),

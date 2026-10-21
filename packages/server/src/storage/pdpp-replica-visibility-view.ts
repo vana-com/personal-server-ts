@@ -51,7 +51,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 7;
+const VIEW_SCHEMA = 8;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -134,6 +134,9 @@ export function createReplicaVisibilityView(deps: {
   // restricted to keys that can have an overlay row.
   const markBlobDependents = (blobIds: string) =>
     `INSERT INTO pdpp_replica_view_dirty_keys SELECT DISTINCT o.instance,o.stream,o.record_key FROM pdpp_replica_view_operations o WHERE o.blob_id IN (${blobIds}) AND o.kind='upsert' AND o.record_key IS NOT NULL AND ${touches("o.instance", "o.stream", "o.record_key")} AND ${notDirtyKey("o")};`;
+  // The blob id of a chunk manifest; pending custody keys are JSON [batch, blob].
+  const chunkedBlobId = (alias: string) =>
+    `SELECT CASE WHEN ${alias}.namespace<>'pending' THEN ${alias}.blob_id WHEN json_valid(${alias}.blob_id) THEN json_extract(${alias}.blob_id,'$[1]') END`;
   const markLatest = (alias: string) =>
     // NOT EXISTS, not OR IGNORE: an outer statement's conflict clause
     // overrides one inside a trigger.
@@ -236,9 +239,14 @@ export function createReplicaVisibilityView(deps: {
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_canonical_delete AFTER DELETE ON pdpp_blob_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_pending AFTER INSERT ON pdpp_replica_pending_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_pending_delete AFTER DELETE ON pdpp_replica_pending_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
-      -- Pending bytes count only while their batch is pending.
+      -- Chunked bytes (#439) exist once their manifest is published after EOF,
+      -- and are gone once it is deleted. Pending chunks are keyed [batch, blob].
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_chunked AFTER INSERT ON pdpp_binary_manifests WHEN NEW.namespace IN ('canonical','received','pending') BEGIN ${markBlobDependents(chunkedBlobId("NEW"))} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_chunked_delete AFTER DELETE ON pdpp_binary_manifests WHEN OLD.namespace IN ('canonical','received','pending') BEGIN ${markBlobDependents(chunkedBlobId("OLD"))} END;
+      -- Pending bytes, legacy rows or chunks, count only while their batch is
+      -- pending. blobs_json lists both.
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_batch AFTER UPDATE OF state ON pdpp_replica_pending_batches WHEN NEW.state IS NOT OLD.state BEGIN
-        ${markBlobDependents("SELECT blob_id FROM pdpp_replica_pending_bytes WHERE batch_id=NEW.id")}
+        ${markBlobDependents("SELECT blob_id FROM pdpp_replica_pending_bytes WHERE batch_id=NEW.id UNION SELECT json_extract(value,'$.blobId') FROM json_each(CASE WHEN json_valid(NEW.blobs_json) THEN NEW.blobs_json ELSE '[]' END)")}
       END;
       -- Mode 1's last_updated is the owner preview's latest row, derived at
       -- write time: overlay rows can mask any number of newer canonical rows.
