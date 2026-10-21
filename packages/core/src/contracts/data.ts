@@ -16,6 +16,7 @@ import {
   type DataFileEnvelope,
 } from "@opendatalabs/vana-sdk/browser";
 import { type WriteResult } from "../storage/hierarchy/index.js";
+import type { ReaderSource } from "../storage/disclosure-policy.js";
 import { buildBinaryEnvelopeData, sha256Hex } from "./binary.js";
 import { buildDataBlocksAsync } from "../storage/blocks/build.js";
 import {
@@ -156,7 +157,11 @@ export interface ListDataVersionsContractResult {
 }
 
 export interface ReadDataContractInput {
-  storage: DataStoragePort;
+  /**
+   * Who the read serves and its storage: the owner's port, or for a
+   * non-owner only a `GranteeReadPort` (see `readerSource`).
+   */
+  source: ReaderSource;
   scopeParam: string;
   fileId?: string;
   at?: string;
@@ -592,7 +597,8 @@ export async function readDataContract(
   const scopeResult = parseDataScopeContract(input.scopeParam);
   if (!scopeResult.ok) return scopeResult;
 
-  const entry = input.storage.findEntry({
+  const storage = input.source.storage;
+  const entry = storage.findEntry({
     scope: scopeResult.scope,
     fileId: input.fileId,
     at: input.at,
@@ -620,15 +626,9 @@ export async function readDataContract(
   let envelope;
   try {
     envelope =
-      input.view === "stored" && input.storage.readStoredEnvelope
-        ? await input.storage.readStoredEnvelope(
-            scopeResult.scope,
-            entry.collectedAt,
-          )
-        : await input.storage.readEnvelope(
-            scopeResult.scope,
-            entry.collectedAt,
-          );
+      input.view === "stored" && storage.readStoredEnvelope
+        ? await storage.readStoredEnvelope(scopeResult.scope, entry.collectedAt)
+        : await storage.readEnvelope(scopeResult.scope, entry.collectedAt);
   } catch (err) {
     if (!isMissingFileError(err)) throw err;
     return {

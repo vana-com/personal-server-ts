@@ -5,6 +5,13 @@ import type {
   ScopeSummary,
 } from "./types.js";
 
+/** A row's version identity as stored; null where the row records none. */
+export interface StoredIdentity {
+  pdppOrigin: boolean | null;
+  generation: string | null;
+  contentDigest: string | null;
+}
+
 export interface IndexManager {
   insert(entry: NewIndexEntry): IndexEntry;
   /** Check a legacy write and allocate its CAS revision in one SQLite transaction. */
@@ -82,15 +89,17 @@ export interface IndexManager {
    */
   updateVersion(path: string, version: number): boolean;
   /**
-   * Compare-and-set a row's generation: set `next` on row `id` only while it
-   * still holds `expected` (null for a row from before generations). Only
-   * storage calls it, with a value it computed from the published bytes.
+   * Compare-and-set a row's whole version identity: set `next` on row `id`
+   * only while the row still holds exactly `expected` (null for a field the
+   * row does not record). One statement, so provenance, generation and
+   * content digest always change together. Only storage calls it, with
+   * values it computed from one read of the published bytes.
    * @returns true if the row was updated
    */
-  swapGeneration(
+  swapIdentity(
     id: number,
-    expected: string | null,
-    next: string | null,
+    expected: StoredIdentity,
+    next: StoredIdentity,
   ): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;

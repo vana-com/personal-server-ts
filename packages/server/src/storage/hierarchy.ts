@@ -27,7 +27,7 @@ import {
 } from "node:fs";
 import { Readable } from "node:stream";
 import { dirname, join, relative, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   DataFileEnvelopeSchema,
   scopeToPathSegments,
@@ -229,6 +229,34 @@ export async function writeDataFile(
   };
 }
 
+/** SHA-256 (lowercase hex) of stored bytes: an index row's `contentDigest`. */
+export function contentDigest(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+/** What storage records about the bytes of one published version. */
+export interface VersionIdentity {
+  pdppOrigin: boolean;
+  generation: string;
+  contentDigest: string;
+}
+
+/**
+ * The identity of `bytes`, the serialization of `envelope`: provenance and
+ * generation from the envelope, the digest from the exact bytes. One owner
+ * and one step for all three, so they always describe the same bytes.
+ */
+export function versionIdentity(
+  envelope: { data: unknown; producer?: unknown },
+  bytes: Uint8Array,
+): VersionIdentity {
+  return {
+    pdppOrigin: hasPdppOrigin(envelope),
+    generation: envelopeGeneration(envelope),
+    contentDigest: contentDigest(bytes),
+  };
+}
+
 /** Stage and fsync an envelope before an index transaction makes it visible. */
 export async function stageDataFile(
   options: HierarchyManagerOptions,
@@ -240,18 +268,15 @@ export async function stageDataFile(
   relativePath: string;
   sizeBytes: number;
   /**
-   * Provenance and generation of the bytes staged, taken with the same
-   * snapshot of `envelope` as the bytes, before any await: a caller that
-   * changes its object later cannot change what is recorded.
+   * Provenance, generation and content digest of the bytes staged, taken
+   * with the same snapshot of `envelope` as the bytes, before any await: a
+   * caller that changes its object later cannot change what is recorded.
    */
-  identity: { pdppOrigin: boolean; generation: string };
+  identity: VersionIdentity;
 }> {
   const openFile = deps.openFile ?? open;
   const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
-  const identity = {
-    pdppOrigin: hasPdppOrigin(envelope),
-    generation: envelopeGeneration(envelope),
-  };
+  const identity = versionIdentity(envelope, bytes);
   const finalPath = buildDataFilePath(
     options.dataDir,
     envelope.scope,
@@ -320,6 +345,16 @@ function sameEnvelope(a: Buffer, b: Buffer): boolean {
 export async function publishStagedDataFile(
   stagePath: string,
   finalPath: string,
+  hooks: {
+    /**
+     * The bytes at the path are not the staged ones: the same envelope was
+     * already published in another key order, and its bytes stay. Called
+     * with their digest while the stage still exists, so a caller can
+     * record it before the stage is gone and boot recovery can still find
+     * and repair the row if the process dies first.
+     */
+    onKept?: (keptDigest: string) => void | Promise<void>;
+  } = {},
 ): Promise<void> {
   try {
     await link(stagePath, finalPath);
@@ -333,6 +368,9 @@ export async function publishStagedDataFile(
       throw new Error(
         `Stored envelope conflicts with publication at ${finalPath}`,
       );
+    }
+    if (!published.equals(staged)) {
+      await hooks.onKept?.(contentDigest(published));
     }
   }
   await unlink(stagePath);

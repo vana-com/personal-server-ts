@@ -1,5 +1,6 @@
 import { hasPdppOrigin } from "../sync/pdpp-import.js";
 import { envelopeGeneration } from "../storage/hierarchy/generation.js";
+import { boundedJsonByteLength } from "../storage/verified-stream.js";
 /**
  * In-memory DataStoragePort for unit tests: envelopes in a Map, index rows
  * in an array, CAS revisions assigned max+1 per scope like the real index.
@@ -114,6 +115,13 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       if (!envelope)
         throw new Error(`missing envelope ${scope}@${collectedAt}`);
       return envelope;
+    },
+    async readEnvelopeBounded(scope, collectedAt, { maxBytes }) {
+      const envelope = envelopes.get(key(scope, collectedAt));
+      if (!envelope)
+        throw new Error(`missing envelope ${scope}@${collectedAt}`);
+      const byteLength = boundedJsonByteLength(envelope, maxBytes);
+      return { envelope: structuredClone(envelope), byteLength };
     },
     async writeEnvelope(envelope) {
       envelopes.set(key(envelope.scope, envelope.collectedAt), envelope);

@@ -28,9 +28,11 @@ export interface IndexEntry {
    * Whether this version's bytes came from PDPP: they carry native `$pdpp`
    * import metadata, or a PDPP producer stamped them as a canonical cache.
    * Storage derives it from the published bytes when it indexes them. It is
-   * only an early refusal, so a read that will be refused fails before
-   * payment; the authority is the disclosure view, which decides on the bytes
-   * a non-owner read returns. Undefined (rows from before this field) means
+   * an early refusal, so a read that will be refused fails before payment.
+   * The authority is the grantee read port, which decides on the bytes a
+   * non-owner read returns: for a stream, on this value together with
+   * `contentDigest`, which storage derives from the same bytes and the
+   * stream is checked against. Undefined (rows from before this field) means
    * no early refusal.
    */
   pdppOrigin?: boolean;
@@ -42,6 +44,16 @@ export interface IndexEntry {
    * bytes) means a non-owner read decides on one full read of the envelope.
    */
   generation?: string;
+  /**
+   * SHA-256 (lowercase hex) of the exact published envelope bytes, which
+   * storage computes with `pdppOrigin` from the same bytes and never takes
+   * from the caller. A non-owner stream decides on `pdppOrigin` and checks
+   * the bytes against this digest while they stream, so it never parses the
+   * envelope. Undefined (rows from before this field, or storage that does
+   * not stream) means a non-owner stream decides on one bounded read of the
+   * bytes instead.
+   */
+  contentDigest?: string;
   /** Server-stamped origin of a legacy cache version. Null for older/manual writes. */
   producer?: "pdpp-projector" | "pdpp-import-projection" | null;
   /** JSON provenance stored outside the grantee-visible data object. */

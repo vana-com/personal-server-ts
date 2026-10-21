@@ -17,8 +17,11 @@ import {
 import { uncoveredSourceScopes } from "./registration.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
-import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
-import { storageForReader } from "../storage/disclosure-policy.js";
+import { authorizeLegacyRead } from "../policy/data-read.js";
+import {
+  readerSource,
+  type ReaderSource,
+} from "../storage/disclosure-policy.js";
 import { assertDerivedScopeNaming } from "../lineage/lineage.js";
 import type { StoredLineage } from "../lineage/lineage.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
@@ -402,12 +405,21 @@ async function assertNoLineageCycle(
   }
 }
 
-async function loadSource(
-  deps: QuestionComputeDeps,
+/**
+ * One source of a question, read for whoever registered it. Index metadata
+ * and body come only from `read`:
+ * the owner's port for an owner, a `GranteeReadPort` for anyone else.
+ */
+export async function loadSource(
+  deps: Pick<
+    QuestionComputeDeps,
+    "scopeDeletions" | "serverOwner" | "maxSourceItems" | "maxSourceChars"
+  >,
   scope: string,
-  reader: LegacyReader,
+  read: ReaderSource,
 ): Promise<{ source: PromptSource; lineageSources: string[] }> {
-  const entry = deps.storage.findEntry({ scope });
+  const reader = read.reader;
+  const entry = read.storage.findEntry({ scope });
   // The same deletion gate a read applies: a tombstoned scope is refused
   // (410 on the read path) whether or not a stale local copy remains.
   const deletion = await resolveReadDeletion(
@@ -433,10 +445,7 @@ async function loadSource(
   authorizeLegacyRead(reader, { kind: "indexed-version", entry });
   let envelope;
   try {
-    envelope = await storageForReader(deps.storage, reader).readEnvelope(
-      scope,
-      entry.collectedAt,
-    );
+    envelope = await read.storage.readEnvelope(scope, entry.collectedAt);
   } catch (err) {
     if (err instanceof ProtocolError) throw err;
     throw new ComputeFailure(`source scope ${scope} could not be read`);
@@ -550,7 +559,10 @@ export async function computeQuestion(
       const loaded = await loadSource(
         deps,
         scope,
-        registration.registeredBy.kind === "owner" ? "owner" : "grantee",
+        readerSource(
+          registration.registeredBy.kind === "owner" ? "owner" : "grantee",
+          deps.storage,
+        ),
       );
       sources.push(loaded.source);
       sourceLineage.set(scope, loaded.lineageSources);

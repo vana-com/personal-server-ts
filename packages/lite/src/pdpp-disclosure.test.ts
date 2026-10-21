@@ -21,10 +21,7 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import {
-  buildDataBlocksAsync,
-  encodeDataBlockCursor,
-} from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
@@ -309,8 +306,19 @@ describe("PS Lite MCP connection with a live chain grant", () => {
   }
 
   it("read_scope refuses the PDPP version and still reads the legacy file", async () => {
-    const { runtime, storage, call } = await connection();
-    const { legacyAt } = await seed(runtime, storage);
+    const { runtime, call } = await connection();
+    await ownerWrite(runtime, "instagram.profile", { rows: [{ id: LEGACY }] });
+    const first = JSON.parse(
+      await call("read_scope", { scope: "instagram.profile", maxBytes: 1 }),
+    );
+    const legacyCursor = first.result?.structuredContent?.nextCursor as string;
+    expect(legacyCursor).toBeTypeOf("string");
+    await ownerWrite(
+      runtime,
+      "instagram.profile",
+      { rows: [{ id: LEGACY, score: SECRET }] },
+      "pdpp-projector",
+    );
 
     const latest = await call("read_scope", { scope: "instagram.profile" });
     expect(latest).not.toContain(SECRET);
@@ -318,11 +326,7 @@ describe("PS Lite MCP connection with a live chain grant", () => {
 
     const legacy = await call("read_scope", {
       scope: "instagram.profile",
-      cursor: encodeDataBlockCursor({
-        scope: "instagram.profile",
-        collectedAt: legacyAt,
-        blockIndex: 0,
-      }),
+      cursor: legacyCursor,
     });
     expect(legacy).toContain(LEGACY);
     expect(legacy).not.toContain(SECRET);

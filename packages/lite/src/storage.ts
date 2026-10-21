@@ -3,7 +3,14 @@ import {
   canonicalJson,
   envelopeGeneration,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type {
+  DataStoragePort,
+  BoundedEnvelopeRead,
+} from "@opendatalabs/personal-server-ts-core/ports";
+import {
+  boundedJsonByteLength,
+  StoredEnvelopeReadError,
+} from "@opendatalabs/personal-server-ts-core/storage/disclosure-policy";
 import type {
   DataBlockManifest,
   DataScopeBlock,
@@ -53,6 +60,11 @@ export type PsLiteFileStorageKind = "opfs" | "indexeddb" | "custom";
 export interface PsLiteDataFileStore {
   readonly kind: PsLiteFileStorageKind;
   readEnvelope(path: string): Promise<DataFileEnvelope | null>;
+  /** Enforce the byte bound before parsing or cloning a stored input. */
+  readEnvelopeBounded?(
+    path: string,
+    options: { maxBytes: number },
+  ): Promise<BoundedEnvelopeRead | null>;
   readEnvelopePreview?(
     path: string,
     options: { maxBytes: number },
@@ -168,6 +180,12 @@ export function createIndexedDbFallbackDataFileStore(
     async readEnvelope(path) {
       return envelopes.get(path) ?? null;
     },
+    async readEnvelopeBounded(path, { maxBytes }) {
+      const envelope = envelopes.get(path);
+      if (!envelope) return null;
+      const byteLength = boundedJsonByteLength(envelope, maxBytes);
+      return { envelope: structuredClone(envelope), byteLength };
+    },
     async readEnvelopePreview(path, { maxBytes }) {
       const envelope = envelopes.get(path);
       if (!envelope) return null;
@@ -268,6 +286,25 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
           return null;
         }
         throw err;
+      }
+    },
+    async readEnvelopeBounded(path, { maxBytes }) {
+      try {
+        const file = await (await getOpfsFileHandle(root, path)).getFile();
+        if (file.size > maxBytes) {
+          throw new StoredEnvelopeReadError(
+            "too_large",
+            "The stored input exceeds this read's byte allowance",
+          );
+        }
+        return {
+          envelope: JSON.parse(await file.text()) as DataFileEnvelope,
+          byteLength: file.size,
+        };
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "NotFoundError")
+          return null;
+        throw error;
       }
     },
     async readEnvelopePreview(path, { maxBytes }) {
@@ -647,6 +684,22 @@ export async function createPersistentPsLiteStorage(
       }
       return envelope;
     },
+    async readEnvelopeBounded(scope, collectedAt, limits) {
+      const path = envelopePath(scope, collectedAt);
+      if (!fileStore.readEnvelopeBounded) {
+        throw new StoredEnvelopeReadError(
+          "bounded_read_unavailable",
+          "The custom Lite file store has no bounded stored-input read",
+        );
+      }
+      const read =
+        (await fileStore.readEnvelopeBounded(path, limits)) ??
+        (fileStore === fallbackStore
+          ? null
+          : await fallbackStore.readEnvelopeBounded!(path, limits));
+      if (!read) throw new Error("Envelope not found");
+      return read;
+    },
 
     /**
      * Publish a version without replacing one. A version path names
@@ -837,12 +890,14 @@ export async function createPersistentPsLiteStorage(
 
     async insertEntry(entry) {
       // Storage derives provenance and generation from the bytes it
-      // published; a caller's values are never trusted. The row is indexed
+      // published; a caller's values are never trusted. Lite has no stream
+      // read, so it records no content digest and drops a caller's. The row is indexed
       // first, synchronously, so index writes keep their order; its identity
       // follows from the read.
       const {
         pdppOrigin: _callerOrigin,
         generation: _callerGeneration,
+        contentDigest: _callerDigest,
         ...callerEntry
       } = entry;
       const version =
@@ -887,41 +942,84 @@ export async function createPersistentPsLiteStorage(
     },
 
     async backfillGeneration(entry) {
-      if (entry.generation) return entry.generation;
-      const swap = (expected: string | null, next: string | null) => {
+      // The row as the index holds it, never the caller's copy.
+      const row = state.entries.find(
+        (item) => item.id === entry.id && item.path === entry.path,
+      );
+      if (!row) return undefined;
+      if (row.generation) return row.generation;
+      type Identity = { pdppOrigin?: boolean; generation?: string };
+      // Provenance and generation change together, only while the row still
+      // holds exactly `expected`.
+      const swap = (expected: Identity, next: Identity) => {
         let swapped = false;
         state = {
           ...state,
           entries: state.entries.map((item) => {
             if (
-              item.id !== entry.id ||
-              (item.generation ?? null) !== expected
+              item.id !== row.id ||
+              item.pdppOrigin !== expected.pdppOrigin ||
+              item.generation !== expected.generation
             ) {
               return item;
             }
             swapped = true;
-            const { generation: _previous, ...rest } = item;
-            return next === null ? rest : { ...rest, generation: next };
+            const {
+              pdppOrigin: _origin,
+              generation: _generation,
+              ...rest
+            } = item;
+            return {
+              ...rest,
+              ...(next.pdppOrigin === undefined
+                ? {}
+                : { pdppOrigin: next.pdppOrigin }),
+              ...(next.generation === undefined
+                ? {}
+                : { generation: next.generation }),
+            };
           }),
         };
         return swapped;
       };
-      const first = (await identityOfPublishedBytes(entry.path)).generation;
-      if (!first) return undefined;
-      if (!swap(null, first)) {
-        const current = state.entries.find((item) => item.id === entry.id);
+      const first = await identityOfPublishedBytes(row.path);
+      if (!first.generation || first.pdppOrigin === undefined) {
+        return undefined;
+      }
+      // Provenance is taken from the bytes with the generation. It may only
+      // become stricter: a row recorded as PDPP never becomes legacy.
+      if (row.pdppOrigin === true && !first.pdppOrigin) return undefined;
+      const before: Identity = { pdppOrigin: row.pdppOrigin };
+      const after: Identity = {
+        pdppOrigin: first.pdppOrigin,
+        generation: first.generation,
+      };
+      if (!swap(before, after)) {
+        const current = state.entries.find((item) => item.id === row.id);
         return current?.generation;
       }
       // The bytes are read again: a version replaced between the two reads
       // is not recorded.
-      const second = (await identityOfPublishedBytes(entry.path)).generation;
-      if (second !== first) {
-        swap(first, null);
+      const second = await identityOfPublishedBytes(row.path);
+      if (
+        second.generation !== first.generation ||
+        second.pdppOrigin !== first.pdppOrigin
+      ) {
+        // Roll back the disputed generation, never the provenance to a
+        // looser value: if either read saw PDPP bytes, the row stays PDPP.
+        swap(after, {
+          pdppOrigin:
+            before.pdppOrigin === true ||
+            first.pdppOrigin === true ||
+            second.pdppOrigin === true
+              ? true
+              : before.pdppOrigin,
+        });
         await persist();
         return undefined;
       }
       await persist();
-      return first;
+      return first.generation;
     },
 
     async updateFileId(path, fileId) {

@@ -127,6 +127,27 @@ export type VersionCommitResult =
     }
   | { kind: "replay"; receipt: ImportReceipt };
 
+/**
+ * Limits a non-owner view applies to a stored envelope stream. A raw port
+ * ignores them.
+ */
+export interface EnvelopeStreamOptions {
+  /**
+   * The index row the read was authorized for, as storage holds it. A
+   * non-owner view streams only bytes of this version and fails the stream
+   * when they are not.
+   */
+  pin?: IndexEntry;
+  /** The most stored bytes the read may take; the stream fails past it. */
+  maxBytes?: number;
+}
+
+/** A stored input whose adapter enforced maxBytes before parsing or cloning. */
+export interface BoundedEnvelopeRead {
+  envelope: DataFileEnvelope;
+  byteLength: number;
+}
+
 export interface DataStoragePort extends RuntimeStoragePort {
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
@@ -145,6 +166,16 @@ export interface DataStoragePort extends RuntimeStoragePort {
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   /**
+   * Read stored JSON under maxBytes, before parsing, hashing or cloning it.
+   * Resident object stores count JSON bytes before making a read snapshot.
+   * This is a resource bound, not provenance/authorization evidence.
+   */
+  readEnvelopeBounded?(
+    scope: string,
+    collectedAt: string,
+    options: { maxBytes: number },
+  ): Promise<BoundedEnvelopeRead>;
+  /**
    * The envelope exactly as stored, bypassing any read-time view. Only a
    * served port (see `withLegacyProjection`) has it; on a raw port
    * `readEnvelope` already returns the stored form.
@@ -159,6 +190,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
   readEnvelopeStream?(
     scope: string,
     collectedAt: string,
+    options?: EnvelopeStreamOptions,
   ): Promise<ReadableStream<Uint8Array>>;
   readEnvelopePreview?(
     scope: string,
@@ -212,10 +244,13 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * computes it from the bytes published at the row's path, reads them a
    * second time, and records it on that row only if both reads agree and
    * the row still has none; otherwise undefined. A row that has a
-   * generation returns it unchanged. Never takes a caller's value.
+   * generation returns it unchanged. Never takes a caller's value. Storage
+   * that records a content digest backfills it in the same two reads, also
+   * for a row that has a generation but no digest, and only when the bytes
+   * are of the row's generation.
    */
   backfillGeneration?(
-    entry: Pick<IndexEntry, "id" | "path" | "generation">,
+    entry: Pick<IndexEntry, "id" | "path" | "generation" | "contentDigest">,
   ): Promise<string | undefined>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
   /** Atomic local legacy write, including a version compare when requested. */

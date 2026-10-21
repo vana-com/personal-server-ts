@@ -12,7 +12,9 @@
  *
  * Give the wrapped ("served") port to every reader of data: the HTTP data
  * route, MCP, derivatives and the job worker. Give the raw port to sync
- * upload/download, so canonical bytes (and their hashes) never change.
+ * upload/download, so canonical bytes (and their hashes) never change. A
+ * non-owner reads through `granteeReadPort`, which builds the same
+ * projection over a source whose every body passed the disclosure policy.
  */
 
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
@@ -35,10 +37,10 @@ import { readBuiltScopeBlocks } from "./blocks/page.js";
 import type { DataBlockManifest, DataScopeBlock } from "./blocks/types.js";
 import { previewEnvelopeValue } from "./preview.js";
 import {
-  GRANTEE_VIEW,
-  isGuarded,
-  withDisclosurePolicy,
-} from "./disclosure-policy.js";
+  boundedJsonBytes,
+  generationMismatch,
+  StoredEnvelopeReadError,
+} from "./verified-stream.js";
 
 /** Keys the server stamps into `data`; they are not part of the body. */
 const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
@@ -95,6 +97,10 @@ export interface LegacyProjectionOptions {
 }
 
 const SERVED = Symbol.for("personal-server-ts.legacy-projection.served");
+/** What a served port projects from, so a non-owner view can rebuild it. */
+const PROJECTION_INPUT = Symbol.for(
+  "personal-server-ts.legacy-projection.input",
+);
 /** A served port's own projected view of one stored version, for supersede. */
 const PROJECTED_VIEW = Symbol.for(
   "personal-server-ts.legacy-projection.projected-view",
@@ -109,12 +115,95 @@ interface Projected {
   view?: string;
   envelope: DataFileEnvelope;
   bytes: Uint8Array;
+  /** Cost of the verified stored inputs, independent of any caller's allowance. */
+  inputBytes?: number;
   built?: { manifest: DataBlockManifest; blocks: DataScopeBlock[] };
   /** Rows left out or join streams missing; absent for a complete view. */
   diagnostics?: ProjectionDiagnostic[];
 }
 
 const textEncoder = new TextEncoder();
+
+/** Stored bytes a read may still take; shared by every input it reads. */
+export interface ReadBudget {
+  remaining: number;
+}
+
+/**
+ * How a projection reads one stored input for a non-owner read: the
+ * input's index row, as storage holds it, and the read's shared budget. A
+ * raw port ignores them.
+ */
+export interface ProjectionReadOptions {
+  pin?: IndexEntry;
+  budget?: ReadBudget;
+}
+
+/**
+ * The one read contract of a non-owner projected read, for streams, blocks
+ * and tables of contents alike: which version (identity) and how much it
+ * may allocate (limits).
+ */
+interface ProjectionRead {
+  /** The requested version's index row; otherwise storage's current row. */
+  pin?: IndexEntry;
+  /** The generation the read authorized; another row's is refused. */
+  generation?: string;
+  /** Stored bytes all inputs together may take. */
+  budget: ReadBudget;
+  /** The most bytes the projected envelope may serialize to. */
+  maxOutputBytes: number;
+}
+
+/**
+ * A cache key for an input that a non-owner read verified: its row and the
+ * identity its bytes were checked against. Undefined for a row with no
+ * identity, whose bytes were decided on alone and are never cached.
+ */
+function verifiedVersion(entry: IndexEntry): string | undefined {
+  if (entry.generation === undefined && entry.contentDigest === undefined) {
+    return undefined;
+  }
+  return `${entry.id}@${entry.collectedAt}#${entry.generation ?? ""}#${entry.contentDigest ?? ""}`;
+}
+
+/** What a projection reads: index lookups and stored bodies. */
+export type ProjectionSource = Pick<
+  DataStoragePort,
+  "findEntry" | "listVersions"
+> & {
+  readEnvelope(
+    scope: string,
+    collectedAt: string,
+    options?: ProjectionReadOptions,
+  ): Promise<DataFileEnvelope>;
+} & Partial<
+    Pick<
+      DataStoragePort,
+      | "readEnvelopeBytes"
+      | "readEnvelopeStream"
+      | "readEnvelopePreview"
+      | "readScopeBlocks"
+      | "readBlockManifest"
+      | "canReadScopeBlocks"
+    >
+  >;
+
+/** The body reads of a served port; a source's capabilities carry over. */
+export type ProjectedReads = Pick<
+  DataStoragePort,
+  "readEnvelope" | "readEnvelopeBytes" | "readEnvelopeStream"
+> &
+  Required<Pick<DataStoragePort, "readStoredEnvelope">> &
+  Partial<
+    Pick<
+      DataStoragePort,
+      | "readEnvelopePreview"
+      | "readScopeBlocks"
+      | "readBlockManifest"
+      | "canReadScopeBlocks"
+    >
+  >;
 
 /**
  * Wrap a raw storage port so reads of projected scopes return legacy bodies.
@@ -125,7 +214,69 @@ export function withLegacyProjection(
   options: LegacyProjectionOptions = {},
 ): DataStoragePort {
   if ((raw as { [SERVED]?: true })[SERVED]) return raw;
+  const overrides: Record<PropertyKey, unknown> = {
+    ...projectedReads(raw, options),
+    [SERVED]: true,
+    [PROJECTION_INPUT]: { raw, options },
+  };
+  return new Proxy(raw, {
+    get(target, property) {
+      if (Object.prototype.hasOwnProperty.call(overrides, property)) {
+        return overrides[property];
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+    has(target, property) {
+      return (
+        Object.prototype.hasOwnProperty.call(overrides, property) ||
+        Reflect.has(target, property)
+      );
+    },
+  });
+}
 
+/**
+ * The raw port and options a served port projects from, or undefined for a
+ * port that `withLegacyProjection` did not build.
+ */
+export function projectionInput(
+  storage: DataStoragePort,
+): { raw: DataStoragePort; options: LegacyProjectionOptions } | undefined {
+  return (
+    storage as {
+      [PROJECTION_INPUT]?: {
+        raw: DataStoragePort;
+        options: LegacyProjectionOptions;
+      };
+    }
+  )[PROJECTION_INPUT];
+}
+
+/**
+ * The projected body reads over `raw`. Each call has its own projection
+ * caches. Bodies of scopes that are not projected are `raw`'s own.
+ */
+export function projectedReads(
+  raw: ProjectionSource,
+  options: LegacyProjectionOptions = {},
+  /**
+   * Set for a non-owner's reads: every projected read is then a
+   * `ProjectionRead` with these default limits (a stream passes its own).
+   */
+  nonOwner?: { maxBytes: number },
+): ProjectedReads {
+  const defaultRead = (
+    identity: { pin?: IndexEntry; generation?: string } = {},
+    maxBytes = nonOwner?.maxBytes,
+  ): ProjectionRead | undefined =>
+    maxBytes !== undefined || identity.pin !== undefined
+      ? {
+          ...identity,
+          budget: { remaining: maxBytes ?? Number.POSITIVE_INFINITY },
+          maxOutputBytes: maxBytes ?? Number.POSITIVE_INFINITY,
+        }
+      : undefined;
   // One entry, keyed by the versions of every input. It saves re-projecting
   // on repeated reads of the same data; it is not a persistent cache.
   let memo: { key: string; value: Projected | null } | null = null;
@@ -159,21 +310,55 @@ export function withLegacyProjection(
   /**
    * The projected view of a stored version, or null when it is served as
    * stored. `own` is the stored envelope when it had to be read to decide.
+   *
+   * A non-owner read (`read`) reads every input through the source under
+   * one input budget, each pinned to its index row as storage holds it, and
+   * builds the output under the output cap. Its caches are keyed by the
+   * identity each input was verified against, so a hit is a view of exactly
+   * those bytes; an input without an identity is never cached.
    */
-  async function resolve(
+  async function resolveValue(
     scope: string,
     collectedAt: string,
+    read?: ProjectionRead,
   ): Promise<{ view: Projected | null; own?: DataFileEnvelope }> {
+    const inputAllowance = read?.budget.remaining;
     if (!isProjectedScope(scope)) return { view: null };
-    const requestedEntry = raw.findEntry({ scope, at: collectedAt });
-    const ownVersion = requestedEntry
-      ? `${requestedEntry.id}@${requestedEntry.collectedAt}`
+    const requestedEntry =
+      read?.pin ?? raw.findEntry({ scope, at: collectedAt });
+    if (
+      read?.generation !== undefined &&
+      requestedEntry?.generation !== read.generation
+    ) {
+      throw generationMismatch();
+    }
+    const readInput = (
+      inputScope: string,
+      inputAt: string,
+      entry: IndexEntry | undefined,
+    ) =>
+      read
+        ? raw.readEnvelope(inputScope, inputAt, {
+            ...(entry ? { pin: entry } : {}),
+            budget: read.budget,
+          })
+        : raw.readEnvelope(inputScope, inputAt);
+    const versionOf = (entry: IndexEntry | undefined) =>
+      entry === undefined
+        ? null
+        : read
+          ? verifiedVersion(entry)
+          : `${entry.id}@${entry.collectedAt}`;
+    const ownKey = requestedEntry
+      ? versionOf(requestedEntry)
       : `unindexed@${collectedAt}`;
+    let cacheable = ownKey !== undefined && !(read && !requestedEntry);
+    const ownVersion = ownKey ?? "unverified";
     const formKey = JSON.stringify([scope, ownVersion]);
-    let cached = forms.get(formKey);
+    let cached = cacheable ? forms.get(formKey) : undefined;
     let own: DataFileEnvelope | undefined;
     if (!cached) {
-      own = await raw.readEnvelope(scope, collectedAt);
+      own = await readInput(scope, collectedAt, requestedEntry);
       const form = classifyStoredBody(scope, own.data);
       cached = {
         form,
@@ -186,7 +371,7 @@ export function withLegacyProjection(
             }
           : {}),
       };
-      rememberForm(formKey, cached);
+      if (cacheable) rememberForm(formKey, cached);
     }
     if (cached.form === "legacy") return { view: null, own };
     if (cached.form === "pdpp-unprojected") {
@@ -238,21 +423,26 @@ export function withLegacyProjection(
       return {
         stream,
         storedScope,
+        entry,
         collectedAt: storedScope === scope ? collectedAt : entry?.collectedAt,
         // The index row id changes when a version is deleted and written
         // again under the same collectedAt, so it identifies the content.
-        version: entry ? `${entry.id}@${entry.collectedAt}` : null,
+        version: versionOf(entry),
       };
     });
+    // A non-owner view is cached only when every input has an identity.
+    if (inputs.some((input) => input.version === undefined)) {
+      cacheable = false;
+    }
     const key = JSON.stringify([
       scope,
       ownVersion,
       profileKey,
       inputs.map(({ storedScope, version }) => [storedScope, version]),
     ]);
-    if (memo?.key === key) return { view: memo.value, own };
+    if (cacheable && memo?.key === key) return { view: memo.value, own };
 
-    own ??= await raw.readEnvelope(scope, collectedAt);
+    own ??= await readInput(scope, collectedAt, requestedEntry);
 
     const value = await project(
       scope,
@@ -260,18 +450,50 @@ export function withLegacyProjection(
       own,
       inputs,
       binding,
+      readInput,
+      read?.maxOutputBytes,
       profileKey,
     );
-    if (value) value.view = key;
-    memo = { key, value };
+    if (value) {
+      value.view = key;
+      if (read && inputAllowance !== undefined) {
+        value.inputBytes = inputAllowance - read.budget.remaining;
+      }
+    }
+    if (cacheable) memo = { key, value };
     return { view: value, own };
+  }
+
+  /** Every result, including a cache hit, spends this call's allowance. */
+  async function resolve(
+    scope: string,
+    collectedAt: string,
+    read?: ProjectionRead,
+  ): Promise<{ view: Projected | null; own?: DataFileEnvelope }> {
+    const inputAllowance = read?.budget.remaining;
+    const result = await resolveValue(scope, collectedAt, read);
+    if (read && result.view && inputAllowance !== undefined) {
+      const inputBytes = result.view.inputBytes ?? 0;
+      if (
+        inputBytes > inputAllowance ||
+        result.view.bytes.byteLength > read.maxOutputBytes
+      ) {
+        throw new StoredEnvelopeReadError(
+          "too_large",
+          "The projection exceeds this read's input or output byte limit",
+        );
+      }
+      read.budget.remaining = inputAllowance - inputBytes;
+    }
+    return result;
   }
 
   async function projected(
     scope: string,
     collectedAt: string,
+    read: ProjectionRead | undefined = defaultRead(),
   ): Promise<Projected | null> {
-    return (await resolve(scope, collectedAt)).view;
+    return (await resolve(scope, collectedAt, read)).view;
   }
 
   async function projectedForSupersede(
@@ -295,8 +517,19 @@ export function withLegacyProjection(
     scope: string,
     collectedAt: string,
     own: DataFileEnvelope,
-    inputs: { stream: string; storedScope: string; collectedAt?: string }[],
+    inputs: {
+      stream: string;
+      storedScope: string;
+      entry?: IndexEntry;
+      collectedAt?: string;
+    }[],
     binding: LegacyScopeBinding,
+    readInput: (
+      scope: string,
+      collectedAt: string,
+      entry: IndexEntry | undefined,
+    ) => Promise<DataFileEnvelope>,
+    maxOutputBytes: number | undefined,
     profileKey?: string,
   ): Promise<Projected | null> {
     const records: PdppRecord[] = [];
@@ -309,7 +542,7 @@ export function withLegacyProjection(
       const envelope =
         input.storedScope === scope
           ? own
-          : await raw.readEnvelope(input.storedScope, input.collectedAt);
+          : await readInput(input.storedScope, input.collectedAt, input.entry);
       if (classifyStoredBody(input.storedScope, envelope.data) === "legacy") {
         continue;
       }
@@ -368,7 +601,12 @@ export function withLegacyProjection(
     const envelope = { ...own, data: result.payload } as DataFileEnvelope;
     return {
       envelope,
-      bytes: textEncoder.encode(JSON.stringify(envelope)),
+      // A non-owner read serializes under its output cap: a view that joins
+      // one input many times is refused before it grows past the cap.
+      bytes:
+        maxOutputBytes === undefined
+          ? textEncoder.encode(JSON.stringify(envelope))
+          : boundedJsonBytes(envelope, maxOutputBytes),
       ...(result.diagnostics?.length
         ? { diagnostics: result.diagnostics }
         : {}),
@@ -390,14 +628,12 @@ export function withLegacyProjection(
     return view.built;
   }
 
-  const overrides: Partial<DataStoragePort> & {
-    [SERVED]: true;
+  const overrides: ProjectedReads & {
     [PROJECTED_VIEW]: typeof projected;
   } = {
-    [SERVED]: true,
     [PROJECTED_VIEW]: projectedForSupersede,
     async readEnvelope(scope, collectedAt) {
-      const { view, own } = await resolve(scope, collectedAt);
+      const { view, own } = await resolve(scope, collectedAt, defaultRead());
       return view?.envelope ?? own ?? raw.readEnvelope(scope, collectedAt);
     },
     readStoredEnvelope(scope, collectedAt) {
@@ -412,10 +648,29 @@ export function withLegacyProjection(
   }
   if (raw.readEnvelopeStream) {
     const rawStream = raw.readEnvelopeStream.bind(raw);
-    overrides.readEnvelopeStream = async (scope, collectedAt) => {
-      const view = await projected(scope, collectedAt);
-      if (!view) return rawStream(scope, collectedAt);
+    overrides.readEnvelopeStream = async (
+      scope,
+      collectedAt,
+      streamOptions,
+    ) => {
+      // A non-owner stream's own pin and byte budget are its read contract.
+      const view = await projected(
+        scope,
+        collectedAt,
+        defaultRead(
+          streamOptions?.pin ? { pin: streamOptions.pin } : {},
+          streamOptions?.maxBytes ?? nonOwner?.maxBytes,
+        ),
+      );
+      if (!view) return rawStream(scope, collectedAt, streamOptions);
       const bytes = view.bytes;
+      const maxBytes = streamOptions?.maxBytes;
+      if (maxBytes !== undefined && bytes.byteLength > maxBytes) {
+        throw new StoredEnvelopeReadError(
+          "too_large",
+          `The served envelope is larger than ${maxBytes} bytes`,
+        );
+      }
       return new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(bytes);
@@ -436,10 +691,19 @@ export function withLegacyProjection(
   if (raw.readScopeBlocks) {
     const rawBlocks = raw.readScopeBlocks.bind(raw);
     overrides.readScopeBlocks = async (scope, collectedAt, blockOpts) => {
-      const view = await projected(scope, collectedAt);
+      const view = await projected(
+        scope,
+        collectedAt,
+        defaultRead(
+          blockOpts.generation !== undefined
+            ? { generation: blockOpts.generation }
+            : {},
+        ),
+      );
       return view
         ? readBuiltScopeBlocks(await builtBlocks(scope, view), {
             ...blockOpts,
+            ...(nonOwner ? { representation: "grantee" as const } : {}),
             cursorView: view.view,
           })
         : rawBlocks(scope, collectedAt, blockOpts);
@@ -448,14 +712,22 @@ export function withLegacyProjection(
   if (raw.readBlockManifest) {
     const rawManifest = raw.readBlockManifest.bind(raw);
     overrides.readBlockManifest = async (scope, collectedAt, options) => {
-      const view = await projected(scope, collectedAt);
+      const view = await projected(
+        scope,
+        collectedAt,
+        defaultRead(
+          options?.generation !== undefined
+            ? { generation: options.generation }
+            : {},
+        ),
+      );
       if (!view) return rawManifest(scope, collectedAt, options);
       const manifest = (await builtBlocks(scope, view)).manifest;
       return {
         ...manifest,
         ...blockRepresentationMetadata(
           manifest,
-          isGuarded(raw) ? "grantee" : "stored",
+          nonOwner ? "grantee" : "stored",
           view.view,
         ),
       };
@@ -469,33 +741,7 @@ export function withLegacyProjection(
       (await projected(scope, collectedAt)) !== null;
   }
 
-  const served: DataStoragePort = new Proxy(raw, {
-    get(target, property) {
-      if (Object.prototype.hasOwnProperty.call(overrides, property)) {
-        return overrides[property as keyof typeof overrides];
-      }
-      const value = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-    has(target, property) {
-      return (
-        Object.prototype.hasOwnProperty.call(overrides, property) ||
-        Reflect.has(target, property)
-      );
-    },
-  });
-  // A non-owner's view projects from the guarded raw port, so the requested
-  // version and every joined sibling version are authorized on their bytes.
-  // Built once per served port, so it keeps its own projection caches.
-  let granteeView: DataStoragePort | undefined;
-  (overrides as Record<symbol, unknown>)[GRANTEE_VIEW] = isGuarded(raw)
-    ? () => served
-    : () =>
-        (granteeView ??= withLegacyProjection(
-          withDisclosurePolicy(raw),
-          options,
-        ));
-  return served;
+  return overrides;
 }
 
 /**
@@ -583,7 +829,7 @@ const VERSION_PAGE_SIZE = 100;
 
 /** Versions of `scope`, newest first, until `stop` returns true. */
 function walkVersions(
-  raw: DataStoragePort,
+  raw: ProjectionSource,
   scope: string,
   stop: (entry: IndexEntry) => boolean,
 ): IndexEntry | undefined {
@@ -599,7 +845,7 @@ function walkVersions(
  * or undefined when that version is the latest (or not indexed).
  */
 function nextVersionTime(
-  raw: DataStoragePort,
+  raw: ProjectionSource,
   scope: string,
   collectedAt: string,
 ): number | undefined {
@@ -620,7 +866,7 @@ function nextVersionTime(
  * collected before `bound` (epoch ms).
  */
 function nearestBefore(
-  raw: DataStoragePort,
+  raw: ProjectionSource,
   scope: string,
   collectedAt: string,
   bound: number,

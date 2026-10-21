@@ -1,17 +1,23 @@
 import { createHash } from "node:crypto";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { tmpdir } from "node:os";
 import type Database from "better-sqlite3";
 import { initializeDatabase } from "./index-schema.js";
 import { createIndexManager } from "./index-manager.js";
-import { createNodeDataStorage } from "./node-data-storage.js";
+import {
+  createNodeDataStorage,
+  recoverStagedDataFiles,
+} from "./node-data-storage.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataBlocks } from "@opendatalabs/personal-server-ts-core/storage/blocks/build";
+
+vi.mock("node:fs/promises", { spy: true });
 
 /**
  * An oracle for a generation that does not use the code under test:
@@ -525,6 +531,80 @@ describe("immutable PDPP version provenance", () => {
     data: { id: "native", $pdpp: { version: 1 } },
   };
 
+  it.each(["read error", "parse error"])(
+    "retains the recovery trigger after a transient %s following stat",
+    async (fault) => {
+      const { dataDir, index, close } = await openStorage();
+      const finalPath = buildDataFilePath(
+        dataDir,
+        legacy.scope,
+        legacy.collectedAt,
+      );
+      const stagePath = `${finalPath}.pending.read-retry`;
+      try {
+        await mkdir(dirname(finalPath), { recursive: true });
+        const kept = Buffer.from(
+          JSON.stringify({
+            data: legacy.data,
+            collectedAt: legacy.collectedAt,
+            scope: legacy.scope,
+            version: legacy.version,
+          }),
+        );
+        const staged = Buffer.from(JSON.stringify(legacy, null, 2));
+        const sha = (value: Buffer) =>
+          createHash("sha256").update(value).digest("hex");
+        await writeFile(finalPath, kept);
+        await writeFile(stagePath, staged);
+        index.insert({
+          fileId: null,
+          path: relative(dataDir, finalPath),
+          scope: legacy.scope,
+          collectedAt: legacy.collectedAt,
+          sizeBytes: staged.byteLength,
+          pdppOrigin: false,
+          generation: oracleGeneration(legacy),
+          contentDigest: sha(staged),
+        });
+        const read = vi.spyOn(fs, "readFile");
+        if (fault === "read error")
+          read.mockRejectedValueOnce(
+            Object.assign(new Error("transient EIO"), { code: "EIO" }),
+          );
+        else read.mockResolvedValueOnce(Buffer.from("{invalid json"));
+        const stat = vi.spyOn(fs, "stat");
+        const attempt = recoverStagedDataFiles({
+          indexManager: index,
+          hierarchyOptions: { dataDir },
+        }).then(
+          () => "resolved",
+          () => "retry",
+        );
+        expect(await attempt).toBe("retry");
+        expect(stat).toHaveBeenCalledWith(finalPath);
+        read.mockRestore();
+        stat.mockRestore();
+        expect(await readFile(stagePath)).toEqual(staged);
+        expect(
+          index.findByPath(relative(dataDir, finalPath))?.contentDigest,
+        ).toBe(sha(staged));
+        await recoverStagedDataFiles({
+          indexManager: index,
+          hierarchyOptions: { dataDir },
+        });
+        expect(
+          index.findByPath(relative(dataDir, finalPath))?.contentDigest,
+        ).toBe(sha(kept));
+        await expect(readFile(stagePath)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        vi.restoreAllMocks();
+        await close();
+      }
+    },
+  );
+
   it("refuses to replace a published version with different bytes", async () => {
     const { storage, dataDir, close } = await openStorage();
     try {
@@ -647,6 +727,303 @@ describe("immutable PDPP version provenance", () => {
       expect(storage.findEntry({ scope: committed.scope })?.generation).toBe(
         oracleGeneration(committed),
       );
+    } finally {
+      await close();
+    }
+  });
+
+  it("derives the content digest from the published bytes, not the caller", async () => {
+    const { storage, dataDir, index, close } = await openStorage();
+    const sha256 = (bytes: Buffer) =>
+      createHash("sha256").update(bytes).digest("hex");
+    try {
+      const written = await storage.writeEnvelope(legacy);
+      const inserted = await storage.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        sizeBytes: written.sizeBytes,
+        contentDigest: "caller-value",
+      });
+      expect(inserted.contentDigest).toBe(
+        sha256(await readFile(join(dataDir, written.relativePath))),
+      );
+      expect(index.findByPath(written.relativePath)?.contentDigest).toBe(
+        inserted.contentDigest,
+      );
+
+      // commitEnvelope records the digest of the bytes it publishes.
+      const committed = { ...legacy, collectedAt: "2026-10-04T00:00:00Z" };
+      const result = await storage.commitEnvelope!(committed, {
+        fileId: null,
+        scope: committed.scope,
+        collectedAt: committed.collectedAt,
+        contentDigest: "caller-value",
+      });
+      expect(result.ok).toBe(true);
+      expect(storage.findEntry({ scope: committed.scope })?.contentDigest).toBe(
+        sha256(await readFile(result.ok ? result.writeResult.path : "")),
+      );
+    } finally {
+      await close();
+    }
+  });
+
+  it("records the digest of the bytes kept when an equal envelope is already published", async () => {
+    const { storage, dataDir, close } = await openStorage();
+    const sha256 = (bytes: Buffer) =>
+      createHash("sha256").update(bytes).digest("hex");
+    try {
+      // The same envelope, published earlier in another key order, with no
+      // index row (an orphan a crash left behind).
+      const finalPath = buildDataFilePath(
+        dataDir,
+        legacy.scope,
+        legacy.collectedAt,
+      );
+      await mkdir(dirname(finalPath), { recursive: true });
+      const kept = Buffer.from(
+        JSON.stringify({
+          data: legacy.data,
+          collectedAt: legacy.collectedAt,
+          scope: legacy.scope,
+          version: legacy.version,
+        }),
+      );
+      await writeFile(finalPath, kept);
+
+      const result = await storage.commitEnvelope!(legacy, {
+        fileId: null,
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+      });
+
+      expect(result.ok).toBe(true);
+      expect(await readFile(finalPath)).toEqual(kept);
+      expect(storage.findEntry({ scope: legacy.scope })?.contentDigest).toBe(
+        sha256(kept),
+      );
+    } finally {
+      await close();
+    }
+  });
+
+  it("backfills a missing content digest only for bytes of the row's generation", async () => {
+    const { storage, dataDir, index, close } = await openStorage();
+    const sha256 = (bytes: Buffer) =>
+      createHash("sha256").update(bytes).digest("hex");
+    try {
+      const written = await storage.writeEnvelope(legacy);
+      // A row from before digests: storage's generation, no digest.
+      const generation = oracleGeneration(legacy);
+      const row = index.insert({
+        fileId: null,
+        path: written.relativePath,
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        sizeBytes: written.sizeBytes,
+        pdppOrigin: false,
+        generation,
+      });
+      expect(row.contentDigest).toBeUndefined();
+
+      await expect(storage.backfillGeneration!(row)).resolves.toBe(generation);
+      expect(index.findByPath(written.relativePath)?.contentDigest).toBe(
+        sha256(await readFile(join(dataDir, written.relativePath))),
+      );
+
+      // A row whose generation is not its bytes' gets no digest.
+      const other = { ...legacy, collectedAt: "2026-10-05T00:00:00Z" };
+      const otherWritten = await storage.writeEnvelope(other);
+      const stale = index.insert({
+        fileId: null,
+        path: otherWritten.relativePath,
+        scope: other.scope,
+        collectedAt: other.collectedAt,
+        sizeBytes: otherWritten.sizeBytes,
+        pdppOrigin: false,
+        generation: "not-these-bytes",
+      });
+      await expect(storage.backfillGeneration!(stale)).resolves.toBe(
+        "not-these-bytes",
+      );
+      expect(
+        index.findByPath(otherWritten.relativePath)?.contentDigest,
+      ).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("repairs the kept bytes' digest at recovery after a crash before the index swap", async () => {
+    const { dataDir, index, close } = await openStorage();
+    const sha256 = (bytes: Buffer) =>
+      createHash("sha256").update(bytes).digest("hex");
+    try {
+      // An equal envelope already published in another key order.
+      const finalPath = buildDataFilePath(
+        dataDir,
+        legacy.scope,
+        legacy.collectedAt,
+      );
+      await mkdir(dirname(finalPath), { recursive: true });
+      const kept = Buffer.from(
+        JSON.stringify({
+          data: legacy.data,
+          collectedAt: legacy.collectedAt,
+          scope: legacy.scope,
+          version: legacy.version,
+        }),
+      );
+      await writeFile(finalPath, kept);
+      // The process dies at the first identity repair of the index row.
+      let crashed = false;
+      const dying = new Proxy(index, {
+        get(target, property) {
+          const value = Reflect.get(target, property, target);
+          if (
+            !crashed &&
+            typeof property === "string" &&
+            property.startsWith("swap")
+          ) {
+            return () => {
+              crashed = true;
+              throw new Error("process died");
+            };
+          }
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const storage = createNodeDataStorage({
+        indexManager: dying,
+        hierarchyOptions: { dataDir },
+      });
+
+      await expect(
+        storage.commitEnvelope!(legacy, {
+          fileId: null,
+          scope: legacy.scope,
+          collectedAt: legacy.collectedAt,
+        }),
+      ).rejects.toThrow();
+      expect(crashed).toBe(true);
+
+      // Boot recovery runs on the restarted index.
+      await recoverStagedDataFiles({
+        indexManager: index,
+        hierarchyOptions: { dataDir },
+      });
+
+      const row = index.findByPath(relative(dataDir, finalPath));
+      expect(await readFile(finalPath)).toEqual(kept);
+      expect(row?.contentDigest).toBe(sha256(kept));
+      expect(row?.generation).toBe(oracleGeneration(legacy));
+    } finally {
+      await close();
+    }
+  });
+
+  it("keeps the stricter provenance when a backfill is rolled back", async () => {
+    const { storage, index, close } = await openStorage();
+    try {
+      const written = await storage.writeEnvelope(legacy);
+      const row = index.insert({
+        fileId: null,
+        path: written.relativePath,
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        sizeBytes: written.sizeBytes,
+        pdppOrigin: false,
+      });
+      // The first read sees PDPP bytes; they become legacy again before the
+      // second read, so the backfill is rolled back.
+      await writeFile(written.path, JSON.stringify(nativeBytes, null, 2));
+      const swap = index.swapIdentity.bind(index);
+      let swaps = 0;
+      index.swapIdentity = (id, expected, next) => {
+        const swapped = swap(id, expected, next);
+        if (++swaps === 1) {
+          expect(next.pdppOrigin).toBe(true);
+          writeFileSync(written.path, JSON.stringify(legacy, null, 2));
+        }
+        return swapped;
+      };
+
+      await storage.backfillGeneration!(row);
+
+      expect(swaps).toBe(2);
+      expect(index.findByPath(written.relativePath)).toMatchObject({
+        pdppOrigin: true,
+      });
+      expect(
+        index.findByPath(written.relativePath)?.generation,
+      ).toBeUndefined();
+      expect(
+        index.findByPath(written.relativePath)?.contentDigest,
+      ).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("keeps the stage until recovery has repaired the row, across a crash in recovery", async () => {
+    const { dataDir, index, close } = await openStorage();
+    const sha256 = (bytes: Buffer) =>
+      createHash("sha256").update(bytes).digest("hex");
+    try {
+      const finalPath = buildDataFilePath(
+        dataDir,
+        legacy.scope,
+        legacy.collectedAt,
+      );
+      await mkdir(dirname(finalPath), { recursive: true });
+      // The equal envelope kept at the path, in another key order; the row
+      // records the staged bytes' digest, as a commit that died does.
+      const kept = Buffer.from(
+        JSON.stringify({
+          data: legacy.data,
+          collectedAt: legacy.collectedAt,
+          scope: legacy.scope,
+          version: legacy.version,
+        }),
+      );
+      await writeFile(finalPath, kept);
+      const staged = Buffer.from(JSON.stringify(legacy, null, 2));
+      index.insert({
+        fileId: null,
+        path: relative(dataDir, finalPath),
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        sizeBytes: staged.byteLength,
+        pdppOrigin: false,
+        generation: oracleGeneration(legacy),
+        contentDigest: sha256(staged),
+      });
+      await writeFile(`${finalPath}.pending.crash`, staged);
+      const swap = index.swapIdentity.bind(index);
+      index.swapIdentity = () => {
+        throw new Error("process died in recovery");
+      };
+
+      await expect(
+        recoverStagedDataFiles({
+          indexManager: index,
+          hierarchyOptions: { dataDir },
+        }),
+      ).rejects.toThrow("process died in recovery");
+      index.swapIdentity = swap;
+      await recoverStagedDataFiles({
+        indexManager: index,
+        hierarchyOptions: { dataDir },
+      });
+
+      expect(
+        index.findByPath(relative(dataDir, finalPath))?.contentDigest,
+      ).toBe(sha256(kept));
+      await expect(
+        readFile(`${finalPath}.pending.crash`),
+      ).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await close();
     }

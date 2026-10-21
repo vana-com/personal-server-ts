@@ -16,6 +16,7 @@ import type {
   IndexListOptions,
   NewIndexEntry,
   ScopeSummary,
+  StoredIdentity,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
 
 export interface IndexManager {
@@ -80,13 +81,13 @@ export interface IndexManager {
    */
   updateVersion(path: string, version: number): boolean;
   /**
-   * Compare-and-set a row's generation (see the core `IndexManager`). Only
-   * storage calls it, with a value it computed from the published bytes.
+   * Compare-and-set a row's whole version identity (see the core
+   * `IndexManager`).
    */
-  swapGeneration(
+  swapIdentity(
     id: number,
-    expected: string | null,
-    next: string | null,
+    expected: StoredIdentity,
+    next: StoredIdentity,
   ): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
@@ -110,6 +111,7 @@ interface RawRow {
   producer_provenance: string | null;
   pdpp_origin: number | null;
   generation: string | null;
+  content_digest: string | null;
 }
 
 const databases = new WeakMap<IndexManager, Database.Database>();
@@ -138,6 +140,9 @@ function rowToEntry(row: RawRow): IndexEntry {
     producerProvenance: row.producer_provenance,
     pdppOrigin: row.pdpp_origin === null ? undefined : row.pdpp_origin !== 0,
     ...(row.generation === null ? {} : { generation: row.generation }),
+    ...(row.content_digest === null
+      ? {}
+      : { contentDigest: row.content_digest }),
   };
 }
 
@@ -301,9 +306,16 @@ export function createIndexManager(
     producer_provenance: string | null;
     pdpp_origin: number | null;
     generation: string | null;
+    content_digest: string | null;
   }>(
-    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes, version, cas_revision, data_point_id, after_tombstone_version, producer, producer_provenance, pdpp_origin, generation)
-     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes, @version, @cas_revision, @data_point_id, @after_tombstone_version, @producer, @producer_provenance, @pdpp_origin, @generation)`,
+    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes, version, cas_revision, data_point_id, after_tombstone_version, producer, producer_provenance, pdpp_origin, generation, content_digest)
+     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes, @version, @cas_revision, @data_point_id, @after_tombstone_version, @producer, @producer_provenance, @pdpp_origin, @generation, @content_digest)`,
+  );
+
+  const swapIdentityStmt = db.prepare(
+    `UPDATE data_files
+     SET pdpp_origin = @nextOrigin, generation = @nextGeneration, content_digest = @nextDigest
+     WHERE id = @id AND pdpp_origin IS @expectedOrigin AND generation IS @expectedGeneration AND content_digest IS @expectedDigest`,
   );
 
   const maxVersionByScopeStmt = db.prepare<{ scope: string }>(
@@ -444,6 +456,7 @@ export function createIndexManager(
       pdpp_origin:
         entry.pdppOrigin === undefined ? null : Number(entry.pdppOrigin),
       generation: entry.generation ?? null,
+      content_digest: entry.contentDigest ?? null,
     });
     const row = db
       .prepare("SELECT * FROM data_files WHERE id = ?")
@@ -563,12 +576,18 @@ export function createIndexManager(
       return row.cnt;
     },
 
-    swapGeneration(id, expected, next) {
-      const result = db
-        .prepare(
-          "UPDATE data_files SET generation = @next WHERE id = @id AND generation IS @expected",
-        )
-        .run({ id, expected, next });
+    swapIdentity(id, expected, next) {
+      const stored = (origin: boolean | null) =>
+        origin === null ? null : Number(origin);
+      const result = swapIdentityStmt.run({
+        id,
+        expectedOrigin: stored(expected.pdppOrigin),
+        expectedGeneration: expected.generation,
+        expectedDigest: expected.contentDigest,
+        nextOrigin: stored(next.pdppOrigin),
+        nextGeneration: next.generation,
+        nextDigest: next.contentDigest,
+      });
       return result.changes > 0;
     },
 

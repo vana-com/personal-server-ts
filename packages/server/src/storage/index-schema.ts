@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS data_files (
   producer TEXT,
   producer_provenance TEXT,
   pdpp_origin INTEGER,
-  generation TEXT
+  generation TEXT,
+  content_digest TEXT
 )`;
 
 const CREATE_SCOPE_REVISIONS_SQL = `
@@ -102,6 +103,13 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
   // decides on a full read of its bytes instead.
   if (!hasColumn(db, "data_files", "generation")) {
     db.exec("ALTER TABLE data_files ADD COLUMN generation TEXT");
+  }
+  // The SHA-256 of each version's published bytes, computed by storage with
+  // its provenance. Additive and nullable, like the generation; rows from
+  // before stay NULL and a non-owner stream of one decides on a bounded
+  // read of its bytes instead.
+  if (!hasColumn(db, "data_files", "content_digest")) {
+    db.exec("ALTER TABLE data_files ADD COLUMN content_digest TEXT");
   }
   if (currentVersion < 2 && !hasColumn(db, "data_files", "schema_id")) {
     db.exec("ALTER TABLE data_files ADD COLUMN schema_id TEXT");

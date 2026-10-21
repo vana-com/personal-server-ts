@@ -1,7 +1,7 @@
 /**
  * The legacy-surface disclosure decision. Kept apart from the chain grant
- * policy in `data-read.ts` so browser-safe storage code (the disclosure view
- * under the legacy projection) can use it without the grant machinery.
+ * policy in `data-read.ts` so browser-safe storage code (the grantee read
+ * port) can use it without the grant machinery.
  */
 import { GrantRequiredError } from "../errors/catalog.js";
 import type { IndexEntry } from "../storage/index/types.js";
@@ -21,8 +21,8 @@ export type LegacyReadBody =
   | { kind: "canonical-view" }
   /**
    * The stored envelope actually read, the bytes about to be served. This is
-   * the authority: `withDisclosurePolicy` decides on it for every body a
-   * non-owner storage view returns.
+   * the authority: `granteeReadPort` decides on it for every body a
+   * non-owner read returns.
    */
   | { kind: "stored-envelope"; envelope: { data: unknown; producer?: unknown } }
   /**
@@ -30,6 +30,13 @@ export type LegacyReadBody =
    * envelope it was built from, read in the same call as the blocks.
    */
   | { kind: "stored-blocks"; pdppOrigin: boolean }
+  /**
+   * Bytes streamed from a version whose index row records the provenance
+   * and the SHA-256 storage derived from the same published bytes. The
+   * stream is checked against that digest and fails, before it completes,
+   * on any other bytes.
+   */
+  | { kind: "digest-pinned-bytes"; pdppOrigin: boolean }
   /**
    * The index row selected before any body is read. Only an early refusal,
    * so a read that will be refused is not charged: a row known to be PDPP is
@@ -56,7 +63,8 @@ export function authorizeLegacyRead(
   const pdpp =
     body.kind === "canonical-view" ||
     (body.kind === "stored-envelope" && hasPdppOrigin(body.envelope)) ||
-    (body.kind === "stored-blocks" && body.pdppOrigin) ||
+    ((body.kind === "stored-blocks" || body.kind === "digest-pinned-bytes") &&
+      body.pdppOrigin) ||
     (body.kind === "indexed-version" && body.entry.pdppOrigin === true);
   if (!pdpp) return;
   throw new GrantRequiredError({

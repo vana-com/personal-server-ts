@@ -1,4 +1,4 @@
-import type { DataStoragePort } from "../../ports/index.js";
+import type { GranteeReadPort } from "../disclosure-policy.js";
 import { isBinaryEnvelope } from "../../contracts/binary.js";
 import { LINEAGE_KEY } from "../../lineage/lineage.js";
 
@@ -108,7 +108,7 @@ function visibleStampEvidence(
  * envelope redacts both locations rather than serving them.
  */
 export async function resolveBlockRedactionContext(
-  storage: Pick<DataStoragePort, "readEnvelope">,
+  storage: GranteeReadPort,
   scope: string,
   collectedAt: string,
   blocks: readonly { path: string; value?: unknown }[],

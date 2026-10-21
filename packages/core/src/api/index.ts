@@ -1,7 +1,7 @@
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import { authorizeLegacyRead } from "../policy/data-read.js";
-import { storageForReader } from "../storage/disclosure-policy.js";
+import { readerSource } from "../storage/disclosure-policy.js";
 import {
   DataDeletedError,
   DeleteTombstoneFailedError,
@@ -2190,9 +2190,9 @@ export async function handlePersonalServerDataRequest(
         headers.ETag = `"${latest.revision}"`;
       } else {
         const result = await readDataContract({
-          // A non-owner reads through the disclosure policy, which decides
+          // A non-owner reads through the grantee read port, which decides
           // on the bytes actually read, not on the row selected above.
-          storage: storageForReader(deps.storage, reader),
+          source: readerSource(reader, deps.storage),
           scopeParam: scopeResult.scope,
           fileId: fileIdParam,
           at: atParam ?? selectedEntry?.collectedAt,

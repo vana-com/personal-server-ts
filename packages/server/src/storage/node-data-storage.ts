@@ -16,18 +16,21 @@ import {
   writeDataFile,
   stageDataFile,
   publishStagedDataFile,
+  versionIdentity,
+  type VersionIdentity,
 } from "./hierarchy.js";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
-import {
-  buildDataFilePath,
-  envelopeGeneration,
-} from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type {
+  IndexEntry,
+  IndexManager,
+  StoredIdentity,
+} from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
   DataStorageEntryLookup,
   DataStorageListOptions,
@@ -69,12 +72,29 @@ export async function recoverStagedDataFiles(
         // A leftover stage can share the final path of a prior committed
         // write after a restart. The existing final file wins: this stage
         // cannot be identified as the one that created the older index row.
+        // A commit that died before recording the kept bytes' digest left
+        // this stage too. The stage is the durable trigger for that repair,
+        // so it is removed only after the row is repaired and checked: a
+        // crash in between leaves it for the next boot.
+        let published = true;
         try {
           await stat(finalPath);
-          await unlink(path);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          await publishStagedDataFile(path, finalPath);
+          published = false;
+        }
+        if (published) {
+          requireCompletedRepair(
+            await repairKeptDigest(deps, indexed, finalPath),
+          );
+          await unlink(path);
+        } else {
+          await publishStagedDataFile(path, finalPath, {
+            onKept: async () =>
+              requireCompletedRepair(
+                await repairKeptDigest(deps, indexed, finalPath),
+              ),
+          });
         }
       }
     }
@@ -107,8 +127,10 @@ export async function reindexLegacyDataFiles(
       const relativePath = relative(dataDir, path);
       if (deps.indexManager.findByPath(relativePath)) continue;
       let raw: unknown;
+      let stored: Buffer;
       try {
-        raw = JSON.parse(await readFile(path, "utf8"));
+        stored = await readFile(path);
+        raw = JSON.parse(stored.toString("utf8"));
       } catch {
         continue;
       }
@@ -137,8 +159,7 @@ export async function reindexLegacyDataFiles(
           envelope.producer === "pdpp-import-projection"
             ? envelope.producer
             : null,
-        pdppOrigin: hasPdppOrigin(envelope),
-        generation: envelopeGeneration(raw),
+        ...versionIdentity(envelope, stored),
         producerProvenance:
           envelope.producer_provenance &&
           typeof envelope.producer_provenance === "object"
@@ -156,28 +177,144 @@ export async function reindexLegacyDataFiles(
   return recovered;
 }
 
+/** A row's identity as the index stores it; null where it records none. */
+function storedIdentity(
+  identity: Pick<IndexEntry, "pdppOrigin" | "generation" | "contentDigest">,
+): StoredIdentity {
+  return {
+    pdppOrigin: identity.pdppOrigin ?? null,
+    generation: identity.generation ?? null,
+    contentDigest: identity.contentDigest ?? null,
+  };
+}
+
+function isComplete(
+  identity: Partial<VersionIdentity>,
+): identity is VersionIdentity {
+  return (
+    identity.pdppOrigin !== undefined &&
+    identity.generation !== undefined &&
+    identity.contentDigest !== undefined
+  );
+}
+
+function sameIdentity(a: VersionIdentity, b: VersionIdentity): boolean {
+  return (
+    a.pdppOrigin === b.pdppOrigin &&
+    a.generation === b.generation &&
+    a.contentDigest === b.contentDigest
+  );
+}
+
+/**
+ * Whether storage may record the identity of bytes on `row`: the row's
+ * generation and digest, where it records them, agree, and provenance only
+ * becomes stricter. The whole identity is then taken from the bytes, so a
+ * legacy row whose bytes are PDPP becomes a PDPP row, never a legacy row
+ * with a PDPP generation and digest. A row recorded as PDPP never becomes
+ * legacy.
+ */
+function describesRow(
+  identity: VersionIdentity,
+  row: Pick<IndexEntry, "pdppOrigin" | "generation" | "contentDigest">,
+): boolean {
+  return (
+    (row.pdppOrigin === undefined ||
+      row.pdppOrigin === identity.pdppOrigin ||
+      identity.pdppOrigin) &&
+    (row.generation === undefined || row.generation === identity.generation) &&
+    (row.contentDigest === undefined ||
+      row.contentDigest === identity.contentDigest)
+  );
+}
+
+/**
+ * After a stage is published or found already published, make the row's
+ * identity the identity of the bytes at the path, when they are the same
+ * version (same provenance and generation) and only the digest differs: an
+ * equal envelope kept in another key order.
+ */
+type KeptDigestRepair =
+  | { kind: "verified" }
+  | { kind: "obsolete" }
+  | { kind: "retry"; cause: unknown };
+
+function requireCompletedRepair(result: KeptDigestRepair): void {
+  if (result.kind === "retry") {
+    throw new Error("Stored identity repair must be retried", {
+      cause: result.cause,
+    });
+  }
+}
+
+async function repairKeptDigest(
+  deps: NodeDataStorageDeps,
+  row: IndexEntry,
+  finalPath: string,
+): Promise<KeptDigestRepair> {
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(finalPath);
+  } catch (cause) {
+    return { kind: "retry", cause };
+  }
+  let published: VersionIdentity;
+  try {
+    published = versionIdentity(JSON.parse(bytes.toString("utf8")), bytes);
+  } catch (cause) {
+    return { kind: "retry", cause };
+  }
+  if (row.contentDigest === published.contentDigest)
+    return { kind: "verified" };
+  if (
+    row.pdppOrigin !== published.pdppOrigin ||
+    row.generation !== published.generation
+  ) {
+    return { kind: "obsolete" };
+  }
+  const recorded = storedIdentity(row);
+  if (
+    !deps.indexManager.swapIdentity(row.id, recorded, {
+      ...recorded,
+      contentDigest: published.contentDigest,
+    }) &&
+    deps.indexManager.findByPath(row.path)?.contentDigest !==
+      published.contentDigest
+  ) {
+    // The row changed under the repair: keep the trigger for a later run.
+    return {
+      kind: "retry",
+      cause: new Error(`Could not repair the content digest of ${row.path}`),
+    };
+  }
+  return { kind: "verified" };
+}
+
 export function createNodeDataStorage(
   deps: NodeDataStorageDeps,
 ): DataStoragePort {
   const db = indexDatabase(deps.indexManager);
   /**
-   * PDPP provenance and generation of the bytes at a version path, both from
-   * one read, or undefined when they cannot be read. Read at insert, never on
-   * a read path. Provenance only lets a read that will be refused fail before
-   * payment; the generation is what a non-owner read pins, so it serves only
-   * these bytes.
+   * PDPP provenance, generation and content digest of the bytes at a version
+   * path, all from one read, or undefined when they cannot be read. Read at
+   * insert, never on a read path. The generation is what a non-owner block
+   * read pins; provenance and digest together are what a non-owner stream
+   * decides on and checks, so it serves only these bytes.
    */
-  async function identityOfPublishedBytes(
-    path: string,
-  ): Promise<{ pdppOrigin?: boolean; generation?: string }> {
+  async function identityOfPublishedBytes(path: string): Promise<{
+    pdppOrigin?: boolean;
+    generation?: string;
+    contentDigest?: string;
+  }> {
     try {
-      const envelope = JSON.parse(
-        await readFile(join(deps.hierarchyOptions.dataDir, path), "utf8"),
-      ) as { data: unknown; producer?: unknown };
-      return {
-        pdppOrigin: hasPdppOrigin(envelope),
-        generation: envelopeGeneration(envelope),
-      };
+      const stored = await readFile(join(deps.hierarchyOptions.dataDir, path));
+      return versionIdentity(
+        JSON.parse(stored.toString("utf8")) as {
+          data: unknown;
+          producer?: unknown;
+        },
+        stored,
+      );
     } catch {
       return {};
     }
@@ -297,7 +434,19 @@ export function createNodeDataStorage(
           return result;
         }
         indexed = true;
-        await publishStagedDataFile(staged.stagePath, staged.finalPath);
+        // Record the digest of the bytes actually at the path: an equal
+        // envelope already published in another key order keeps its bytes.
+        // Recorded before the stage is removed, so if the process dies
+        // first, boot recovery repairs the row from the bytes at the path.
+        await publishStagedDataFile(staged.stagePath, staged.finalPath, {
+          onKept: (keptDigest) => {
+            const recorded = storedIdentity(staged.identity);
+            deps.indexManager.swapIdentity(result.entry.id, recorded, {
+              ...recorded,
+              contentDigest: keptDigest,
+            });
+          },
+        });
         return {
           ok: true as const,
           writeResult: {
@@ -324,11 +473,12 @@ export function createNodeDataStorage(
       );
     },
     async insertEntry(entry) {
-      // Storage derives provenance and generation from the bytes it
-      // published; a caller's values are never trusted.
+      // Storage derives provenance, generation and content digest from the
+      // bytes it published; a caller's values are never trusted.
       const {
         pdppOrigin: _callerOrigin,
         generation: _callerGeneration,
+        contentDigest: _callerDigest,
         ...callerEntry
       } = entry;
       return deps.indexManager.insert({
@@ -337,21 +487,37 @@ export function createNodeDataStorage(
       });
     },
     async backfillGeneration(entry) {
-      if (entry.generation) return entry.generation;
-      const first = (await identityOfPublishedBytes(entry.path)).generation;
-      if (!first) return undefined;
-      if (!deps.indexManager.swapGeneration(entry.id, null, first)) {
-        const current = deps.indexManager.findByPath(entry.path);
-        return current?.id === entry.id ? current.generation : undefined;
+      // The row as the index holds it, never the caller's copy.
+      const row = deps.indexManager.findByPath(entry.path);
+      if (!row || row.id !== entry.id) return undefined;
+      if (row.generation && row.contentDigest) return row.generation;
+      const first = await identityOfPublishedBytes(row.path);
+      if (!isComplete(first) || !describesRow(first, row)) {
+        return row.generation;
+      }
+      const before = storedIdentity(row);
+      const after = storedIdentity(first);
+      if (!deps.indexManager.swapIdentity(row.id, before, after)) {
+        const current = deps.indexManager.findByPath(row.path);
+        return current?.id === row.id ? current.generation : undefined;
       }
       // The bytes are read again: a version replaced between the two reads
       // is not recorded.
-      const second = (await identityOfPublishedBytes(entry.path)).generation;
-      if (second !== first) {
-        deps.indexManager.swapGeneration(entry.id, first, null);
-        return undefined;
+      const second = await identityOfPublishedBytes(row.path);
+      if (!isComplete(second) || !sameIdentity(first, second)) {
+        // Roll back the disputed generation and digest, but never the
+        // provenance to a looser value: if either read saw PDPP bytes, the
+        // row stays PDPP.
+        deps.indexManager.swapIdentity(row.id, after, {
+          ...before,
+          pdppOrigin:
+            before.pdppOrigin === true || first.pdppOrigin || second.pdppOrigin
+              ? true
+              : before.pdppOrigin,
+        });
+        return row.generation;
       }
-      return first;
+      return first.generation;
     },
     updateFileId(path: string, fileId: string) {
       return deps.indexManager.updateFileId(path, fileId);
