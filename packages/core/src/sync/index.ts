@@ -85,11 +85,15 @@ export {
   TOMBSTONE_METADATA_HASH,
   isTombstoneRecord,
 } from "./tombstone.js";
-
 export {
   NeedsFencedPublicationError,
   type FencedPublicationPort,
   type PublicationFence,
   type PublicationRecord,
 } from "../publication/publish.js";
-export { hasPdppOrigin } from "./pdpp-import.js";
+export {
+  hasPdppOrigin,
+  isPdppProducer,
+  PDPP_PRODUCERS,
+  type PdppProducer,
+} from "./pdpp-import.js";

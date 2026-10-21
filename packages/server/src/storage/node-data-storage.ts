@@ -1,4 +1,7 @@
-import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  hasPdppOrigin,
+  isPdppProducer,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import {
   deleteAllForScope,
   deleteDataFile,
@@ -132,11 +135,7 @@ export async function reindexLegacyDataFiles(
         scope: envelope.scope,
         collectedAt: envelope.collectedAt,
         sizeBytes: bytes,
-        producer:
-          envelope.producer === "pdpp-projector" ||
-          envelope.producer === "pdpp-import-projection"
-            ? envelope.producer
-            : null,
+        producer: isPdppProducer(envelope.producer) ? envelope.producer : null,
         pdppOrigin: hasPdppOrigin(envelope),
         generation: envelopeGeneration(raw),
         producerProvenance:

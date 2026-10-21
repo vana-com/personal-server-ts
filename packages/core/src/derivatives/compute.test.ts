@@ -326,6 +326,26 @@ describe("computeQuestion", () => {
     );
   });
 
+  it("stamps the derived record pdpp-derivative only when a source has PDPP origin", async () => {
+    const pdpp = deps();
+    await seed(pdpp.storage, "oura.sleep", { score: 80 });
+    await seed(pdpp.storage, "chatgpt.conversations", { items: [] });
+    pdpp.storage.findEntry({ scope: "oura.sleep" })!.pdppOrigin = true;
+    expect((await computeQuestion("q-1", pdpp)).status).toBe("ready");
+    expect(pdpp.storage.findEntry({ scope: "coach.weekly" })).toMatchObject({
+      producer: "pdpp-derivative",
+      pdppOrigin: true,
+    });
+
+    const legacy = deps();
+    await seed(legacy.storage, "oura.sleep", { score: 80 });
+    await seed(legacy.storage, "chatgpt.conversations", { items: [] });
+    expect((await computeQuestion("q-1", legacy)).status).toBe("ready");
+    const entry = legacy.storage.findEntry({ scope: "coach.weekly" });
+    expect(entry?.producer ?? null).toBeNull();
+    expect(entry?.pdppOrigin).toBeFalsy();
+  });
+
   it("fails closed for a builder question when no grant verifier is wired", async () => {
     const d = deps({
       store: createInMemoryQuestionStore({ initial: [builderRegistration()] }),

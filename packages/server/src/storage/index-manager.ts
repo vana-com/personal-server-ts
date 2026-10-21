@@ -1,3 +1,4 @@
+import type { PdppProducer } from "@opendatalabs/personal-server-ts-core/sync";
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -106,7 +107,7 @@ interface RawRow {
   cas_revision: number;
   data_point_id: string | null;
   after_tombstone_version: number | null;
-  producer: "pdpp-projector" | "pdpp-import-projection" | null;
+  producer: PdppProducer | null;
   producer_provenance: string | null;
   pdpp_origin: number | null;
   generation: string | null;

@@ -15,6 +15,7 @@ import {
   readStoredLineage,
 } from "../lineage/lineage.js";
 import { uncoveredSourceScopes } from "./registration.js";
+import { hasPdppOrigin } from "../sync/pdpp-import.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
@@ -406,7 +407,11 @@ async function loadSource(
   deps: QuestionComputeDeps,
   scope: string,
   reader: LegacyReader,
-): Promise<{ source: PromptSource; lineageSources: string[] }> {
+): Promise<{
+  source: PromptSource;
+  lineageSources: string[];
+  pdppOrigin: boolean;
+}> {
   const entry = deps.storage.findEntry({ scope });
   // The same deletion gate a read applies: a tombstoned scope is refused
   // (410 on the read path) whether or not a stale local copy remains.
@@ -468,6 +473,8 @@ async function loadSource(
       truncated: trimmed.truncated,
     },
     lineageSources,
+    // Decided like a read: the index row and the bytes just read.
+    pdppOrigin: entry.pdppOrigin === true || hasPdppOrigin(envelope),
   };
 }
 
@@ -546,6 +553,7 @@ export async function computeQuestion(
 
     const sources: PromptSource[] = [];
     const sourceLineage = new Map<string, readonly string[]>();
+    let sourcesHavePdppOrigin = false;
     for (const scope of registration.sourceScopes) {
       const loaded = await loadSource(
         deps,
@@ -554,6 +562,7 @@ export async function computeQuestion(
       );
       sources.push(loaded.source);
       sourceLineage.set(scope, loaded.lineageSources);
+      sourcesHavePdppOrigin ||= loaded.pdppOrigin;
     }
     await assertNoLineageCycle(deps, registration, serverOwner, sourceLineage);
     const messages = buildQuestionMessages({
@@ -612,6 +621,12 @@ export async function computeQuestion(
       collectedAt,
       status: deps.syncManager ? "syncing" : "stored",
       lineage,
+      // The answer is computed from PDPP data read as the owner, so it is
+      // PDPP-origin: a legacy chain grant that covers the derived scope must
+      // not read it. Server-only stamp; the HTTP producer header refuses it.
+      ...(sourcesHavePdppOrigin
+        ? { producer: "pdpp-derivative" as const }
+        : {}),
       afterTombstoneVersion: await tombstoneMarker(
         deps.scopeDeletions,
         registration.derivedScope,
