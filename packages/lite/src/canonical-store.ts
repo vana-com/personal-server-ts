@@ -1081,6 +1081,32 @@ export function createLiteCanonicalStore(deps: {
       );
     return previewRows(tx);
   }
+  /**
+   * True when connections claim the blob and every one of them is
+   * quarantined. A quarantined connection's confirmed bytes are not served,
+   * as on Node; bytes another live connection claims still are. The facts are
+   * the durable ones `reconcile` treats as blocking the whole connection.
+   */
+  async function claimedOnlyByQuarantined(
+    tx: LiteCanonicalTransaction,
+    blobId: string,
+  ) {
+    let claimed = false;
+    for await (const entry of scan(tx, "retained-connections/")) {
+      const id = JSON.parse(entry.value) as string;
+      if (
+        !(await any(tx, `${connectionPrefix(id)}claims/${keyDigest(blobId)}/`))
+      )
+        continue;
+      if (
+        !(await get(tx, `binding-conflicts/${keyDigest(id)}`)) &&
+        !(await any(tx, `equivocations/${keyDigest(id)}/`))
+      )
+        return false;
+      claimed = true;
+    }
+    return claimed;
+  }
   async function visibleRow(
     tx: LiteCanonicalTransaction,
     view: LiteCanonicalTransaction,
@@ -1462,7 +1488,7 @@ export function createLiteCanonicalStore(deps: {
           !(await get(tx, `pending-blobs/${keyDigest(blobId)}`)) ||
           (await get(tx, `confirmed-blobs/${keyDigest(blobId)}`))
         )
-          return true;
+          return !(await claimedOnlyByQuarantined(tx, blobId));
         if (
           !replicaStateVisible("pending", options.reader, deps.visibilityPolicy)
         )

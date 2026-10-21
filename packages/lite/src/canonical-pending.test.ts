@@ -1774,3 +1774,204 @@ it.each([undefined, 1])(
     });
   },
 );
+
+// Copy contract v3 A/H/I: a terminal batch quarantines every connection it
+// touched. Lite has no epoch; it blocks a connection when durable evidence
+// says so (a binding conflict, or an operation-ID equivocation, which
+// suppresses the whole connection as on Node). Every read must withdraw the
+// connection, open page cursors must expire, and confirmed blob bytes are not
+// an exception.
+it("withdraws a quarantined connection from records, pages, cursors and confirmed blob bytes", async () => {
+  const { sha256 } = await import("viem");
+  const { make } = device();
+  const store = make();
+  await provision(store);
+  const bytes = new TextEncoder().encode("confirmed bytes");
+  const hash = `sha256:${sha256(bytes).slice(2)}`;
+  const blob = {
+    blobId: hash,
+    sha256: hash,
+    mimeType: "text/plain",
+    sizeBytes: bytes.length,
+  };
+  const stagingId = await store.stageBlob(
+    blob,
+    (async function* () {
+      yield bytes;
+    })(),
+  );
+  const record = upsert("blob", 3);
+  record.blobs = [blob];
+  record.data.blob_ref = { blob_id: hash };
+  const rows = Array.from({ length: 101 }, (_, index) => ({
+    ...upsert(`row-${index}`, index + 4),
+    recordKey: `key-${index}`,
+    data: { id: `key-${index}`, text: `row-${index}` },
+  }));
+  await store.import({
+    ...pending(),
+    id: "confirmed",
+    envelope: {
+      ...pending().envelope,
+      batchId: "confirmed",
+      operations: [
+        registration,
+        {
+          ...identity,
+          kind: "blob-claim",
+          revision: { counter: 2, writerId: "device-a", operationId: "claim" },
+          blob,
+        },
+        record,
+        ...rows,
+      ],
+    },
+    blobs: [{ stagingId, descriptor: blob }],
+  });
+  const collect = async (reader: "owner" | "grant") => {
+    const parts: Uint8Array[] = [];
+    for await (const part of make().readBlob(hash, { reader }))
+      parts.push(part);
+    return parts;
+  };
+  const readers = ["owner", "grant"] as const;
+  const open = new Map<string, string>();
+  for (const reader of readers) {
+    // Control: the confirmed data is served before the quarantine.
+    expect(await read(store, reader)).toMatchObject({
+      data: { blob_ref: { blob_id: hash } },
+    });
+    expect(await collect(reader)).toEqual([bytes]);
+    const page = await store.readConnectionPage(
+      identity.connectionId,
+      undefined,
+      { reader },
+    );
+    expect(page.after).toBeDefined();
+    open.set(reader, page.after!);
+  }
+
+  // The existing quarantine write for a provisioned connection: a second
+  // payload under a retained operation ID blocks the whole connection.
+  await store.import({
+    ...pending(),
+    id: "conflict",
+    envelope: {
+      ...pending().envelope,
+      batchId: "conflict",
+      operations: [{ ...rows[0], data: { id: "key-0", text: "equivocated" } }],
+    },
+  });
+
+  const served: string[] = [];
+  for (const reader of readers) {
+    const fresh = make();
+    const row = await read(fresh, reader);
+    if (row && !row.deleted) served.push(`${reader} record`);
+    let after: string | undefined;
+    do {
+      const page = await fresh.readConnectionPage(
+        identity.connectionId,
+        after,
+        { reader },
+      );
+      if (page.rows.some((row) => !row.deleted)) served.push(`${reader} page`);
+      after = page.after;
+    } while (after);
+    await fresh
+      .readConnectionPage(identity.connectionId, open.get(reader), { reader })
+      .then(
+        () => served.push(`${reader} open cursor`),
+        (error: Error) => {
+          if (!/expired/.test(error.message)) throw error;
+        },
+      );
+    await collect(reader).then(
+      () => served.push(`${reader} confirmed blob bytes`),
+      (error: Error) => {
+        if (!/missing committed blob/.test(error.message)) throw error;
+      },
+    );
+  }
+  expect(served).toEqual([]);
+
+  // Content-addressed bytes another live connection claims are still served.
+  const other = { ...identity, connectionId: "connection-b" };
+  await store.provisionConnection(other.connectionId, {
+    sourceId: other.sourceId,
+    methodId: other.methodId,
+  });
+  await store.import({
+    ...pending(),
+    id: "other",
+    envelope: {
+      ...pending().envelope,
+      batchId: "other",
+      operations: [
+        {
+          ...registration,
+          ...other,
+          revision: { counter: 299, writerId: "device-b", operationId: "r" },
+        },
+        {
+          ...other,
+          kind: "blob-claim",
+          revision: { counter: 300, writerId: "device-b", operationId: "c" },
+          blob,
+        },
+      ],
+    },
+  });
+  for (const reader of readers) expect(await collect(reader)).toEqual([bytes]);
+});
+
+it("does not serve confirmed blob bytes claimed only under a binding conflict", async () => {
+  const { sha256 } = await import("viem");
+  const { make } = device();
+  const store = make();
+  const bytes = new TextEncoder().encode("conflicted bytes");
+  const hash = `sha256:${sha256(bytes).slice(2)}`;
+  const blob = {
+    blobId: hash,
+    sha256: hash,
+    mimeType: "text/plain",
+    sizeBytes: bytes.length,
+  };
+  const stagingId = await store.stageBlob(
+    blob,
+    (async function* () {
+      yield bytes;
+    })(),
+  );
+  // Evidence retained before provisioning disagrees on the method: the
+  // existing binding-conflict fact.
+  await store.import({
+    ...pending(),
+    id: "conflicted",
+    envelope: {
+      ...pending().envelope,
+      batchId: "conflicted",
+      operations: [
+        registration,
+        {
+          ...identity,
+          kind: "blob-claim",
+          revision: { counter: 2, writerId: "device-a", operationId: "claim" },
+          blob,
+        },
+        {
+          ...registration,
+          methodId: "other-method",
+          revision: { counter: 3, writerId: "device-b", operationId: "x" },
+        },
+      ],
+    },
+    blobs: [{ stagingId, descriptor: blob }],
+  });
+  for (const reader of ["owner", "grant"] as const)
+    await expect(
+      (async () => {
+        for await (const _ of make().readBlob(hash, { reader })) void _;
+      })(),
+    ).rejects.toThrow("missing committed blob");
+});

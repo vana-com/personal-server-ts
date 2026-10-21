@@ -255,7 +255,9 @@ marks the blob confirmed. `readBlob` authorizes against that index and then
 requires any active carrier in the per-blob active-batch index; one batch can
 stage the record and another the bytes. A pending deletion, an operation-ID
 variant or quarantine removes the reference or the carrier, and the bytes with
-it. Both checks are prefix lookups. Pending index version 3 adds the reference
+it. Both checks are prefix lookups. Confirmed bytes are refused when every
+connection that claims the blob is quarantined, that is, has a binding-conflict
+fact or an equivocation marker. Bytes another live connection claims still serve. Pending index version 3 adds the reference
 index; `retry` builds it from existing preview rows of a version-two database,
 and preview reads refuse until then. Ordinary record writes reconcile affected keys; lifecycle, blob-claim,
 equivocation and provisioning writes may fan out across a connection's keys.
