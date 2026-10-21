@@ -19,8 +19,11 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { pdppAuthRoutes } from "./pdpp-auth.js";
-import { pdppRecordsRoutes } from "./pdpp-records.js";
-import { pdppBlobsRoutes } from "./pdpp-blobs.js";
+import {
+  pdppRecordsRoutes,
+  type PdppRecordsRouteDeps,
+} from "./pdpp-records.js";
+import { pdppBlobsRoutes, type PdppBlobsRouteDeps } from "./pdpp-blobs.js";
 import type { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
 
 const sourceId = "https://replica-journey.invalid/declaration";
@@ -120,7 +123,13 @@ export type ConsentIssuer = Awaited<ReturnType<typeof openConsentIssuer>>;
 
 export async function openReplicaResourceServer(
   store: ReturnType<typeof createSqliteRecordStore>,
-  options: { owner: string; tokens: PdppTokenService },
+  options: {
+    owner: string;
+    tokens: PdppTokenService;
+    /** The host reader capability (`AppDeps.pdpp.reads`). */
+    reads: NonNullable<PdppRecordsRouteDeps["reads"]> &
+      NonNullable<PdppBlobsRouteDeps["reads"]>;
+  },
 ) {
   // Co-located AS/RS seam: consult the one live issuer token service per read.
   // Replica SQLite contains only data; no auth state is copied or synthesized.
@@ -153,6 +162,11 @@ export async function openReplicaResourceServer(
       auth,
       declarations,
       ownerSubjectId: options.owner,
+      reads: options.reads,
+      instancesForSource: (subject, source) =>
+        subject === options.owner && source === sourceId
+          ? ["conn", "conn-other"]
+          : [],
     }),
   );
   app.route(
@@ -161,6 +175,11 @@ export async function openReplicaResourceServer(
       store,
       auth,
       declarations,
+      reads: options.reads,
+      instancesForSource: (subject, source) =>
+        subject === options.owner && source === sourceId
+          ? ["conn", "conn-other"]
+          : [],
       readBlobBytes: async (id) => {
         const bytes = store.getBlobBytes(id);
         return bytes ? new Uint8Array(bytes) : undefined;

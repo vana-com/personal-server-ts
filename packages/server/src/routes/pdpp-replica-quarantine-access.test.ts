@@ -194,6 +194,8 @@ async function fixture() {
           validateData: (data) => typeof data.id === "string",
         })),
     });
+  // The resource server reads through the receiver the worker uses (#438).
+  let activeReceiver: ReturnType<typeof createReplicaReceiver>;
   const worker = () =>
     createReplicaTransportWorker({
       db,
@@ -206,7 +208,7 @@ async function fixture() {
         })),
       }),
       exporter: store.replication,
-      receiver: receiver(),
+      receiver: (activeReceiver = receiver()),
       credential,
       transport: network.port,
       now: () => Date.parse(at),
@@ -290,6 +292,7 @@ async function fixture() {
     resource = await openReplicaResourceServer(store, {
       owner,
       tokens: issuer.tokens,
+      reads: (reader) => activeReceiver.readStore({ reader }),
     });
   };
   await start();
