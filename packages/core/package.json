@@ -210,6 +210,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@noble/hashes": "^1.8.0",
     "@opendatalabs/vana-sdk": "3.23.0-pr.211.36da1d8",
     "ajv2020": "npm:ajv@^8.20.0",
     "minisearch": "^7.2.0",

@@ -52,7 +52,11 @@ import { isAddressEqual, type Address, type Hex } from "viem";
 import { publicKeyToAddress } from "viem/accounts";
 import type { JobExecuteResponse, JobFailureCode } from "./types.js";
 import { openRedactedEnvelopeStream } from "./raw-envelope-stream.js";
-import { storageForReader } from "@opendatalabs/personal-server-ts-core/storage/disclosure-policy";
+import {
+  granteeReadPort,
+  StoredEnvelopeReadError,
+  type GranteeReadPort,
+} from "@opendatalabs/personal-server-ts-core/storage/disclosure-policy";
 
 const RAW_READ = "raw_read";
 const EXECUTE_PATH = "/v1/jobs/execute";
@@ -289,17 +293,17 @@ async function executeJobUnsafe(
     contentType: JSON_CONTENT_TYPE,
   };
   // A job result goes to the builder: its body is read through the
-  // disclosure policy, which decides on the bytes actually read.
+  // grantee read port, which streams only the version authorized above and
+  // takes at most the byte budget of stored bytes.
   let body: ReadableStream<Uint8Array>;
   try {
     body = await openRawReadBodyStream(
-      storageForReader(deps.storage, "grantee"),
-      request.scope,
+      granteeReadPort(deps.storage),
       selected.entry,
+      resultMaxBytes,
     );
   } catch (error) {
-    if (error instanceof ProtocolError) throw mapPolicyFailure(error);
-    throw error;
+    throw mapStoredReadFailure(error, resultMaxBytes);
   }
   const sealed = await sealJobResultStream(
     result,
@@ -342,8 +346,18 @@ async function executeJobUnsafe(
           false,
         );
       }
-      throw error;
+      // The read stopped (over the cap, or not the authorized version)
+      // before the sealed result was complete: nothing is uploaded.
+      throw mapStoredReadFailure(error, resultMaxBytes);
     });
+    // A row from before content digests was read on the bounded fallback.
+    // Its bytes fit the budget, so let storage record its digest now (two
+    // reads, recorded only if they agree): the next read streams unparsed.
+    if (!selected.entry.contentDigest && deps.storage.backfillGeneration) {
+      await deps.storage
+        .backfillGeneration(selected.entry)
+        .catch(() => undefined);
+    }
     logExecutionStep(deps, jobId, "read", executionStartedAt, {
       payloadBytes,
     });
@@ -457,14 +471,36 @@ export function readJobResultMaxBytes(value: string | undefined): number {
   return parsed;
 }
 
+/**
+ * A failed body read as the job failure it means. A read over the byte
+ * budget is `RESULT_TOO_LARGE`; bytes that are not the authorized version
+ * are a retryable `VERSION_MISMATCH`; a disclosure refusal is a policy
+ * failure.
+ */
+function mapStoredReadFailure(error: unknown, resultMaxBytes: number): unknown {
+  if (error instanceof StoredEnvelopeReadError) {
+    return error.code === "too_large"
+      ? new JobFailure(
+          "RESULT_TOO_LARGE",
+          `job result exceeds ${resultMaxBytes} bytes`,
+          false,
+        )
+      : new JobFailure("VERSION_MISMATCH", "scope version mismatch", true);
+  }
+  if (error instanceof ProtocolError) return mapPolicyFailure(error);
+  return error;
+}
+
 async function openRawReadBodyStream(
-  storage: DataStoragePort,
-  scope: string,
-  entry: { collectedAt: string },
+  storage: GranteeReadPort,
+  entry: IndexEntry,
+  maxBytes: number,
 ): Promise<ReadableStream<Uint8Array>> {
+  const scope = entry.scope;
   if (storage.readEnvelopeStream) {
+    const version = storage.pinVersion(entry);
     return openRedactedEnvelopeStream(() =>
-      storage.readEnvelopeStream!(scope, entry.collectedAt),
+      storage.readEnvelopeStream!(version, { maxBytes }),
     );
   }
   if (storage.readEnvelopeBytes) {
@@ -474,7 +510,7 @@ async function openRawReadBodyStream(
     return oneChunkStream(bytes);
   }
   const read = await readDataContract({
-    storage,
+    source: { reader: "grantee", storage },
     scopeParam: scope,
     at: entry.collectedAt,
   });

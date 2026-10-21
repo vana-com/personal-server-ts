@@ -18,7 +18,7 @@ import { uncoveredSourceScopes } from "./registration.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
-import { storageForReader } from "../storage/disclosure-policy.js";
+import { readerSource } from "../storage/disclosure-policy.js";
 import { assertDerivedScopeNaming } from "../lineage/lineage.js";
 import type { StoredLineage } from "../lineage/lineage.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
@@ -433,7 +433,7 @@ async function loadSource(
   authorizeLegacyRead(reader, { kind: "indexed-version", entry });
   let envelope;
   try {
-    envelope = await storageForReader(deps.storage, reader).readEnvelope(
+    envelope = await readerSource(reader, deps.storage).storage.readEnvelope(
       scope,
       entry.collectedAt,
     );

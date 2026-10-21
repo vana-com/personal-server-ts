@@ -88,13 +88,15 @@ PDPP origin (native `$pdpp` import metadata, or a `pdpp-projector` /
 PDPP resource server with a PDPP access token. This applies to `/v1/data`
 (Node and Lite), MCP, derivative questions and TEE jobs. The owner keeps full
 access. The decision is made on the bytes a non-owner read returns: such
-reads go through a storage view that checks every body (envelope, blocks,
-and each sibling scope a legacy projection joins). A version path never
+reads go through a grantee read port that checks every body (envelope,
+blocks, streams, and each sibling scope a legacy projection joins). A version path never
 changes its content once published, and non-owner version listings omit PDPP
 producer provenance. Each version has an immutable generation (a digest of its
 published envelope). A non-owner block read serves only blocks bound to the
 generation it was authorized for, and refuses rather than serve a version
-published later at the same path.
+published later at the same path. A non-owner stream (a TEE job result) is
+checked against the SHA-256 of the version's published bytes as it streams,
+and stops at the job's byte budget.
 
 ### Server Registration
 

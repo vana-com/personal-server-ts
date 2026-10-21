@@ -101,7 +101,10 @@ describe("first-seen sidecar on ingest", () => {
     const storage = createMemoryDataStorage();
     const body = { items: [{ id: "a" }], note: "hello" };
     await ingest(storage, body, T1);
-    const read = await readDataContract({ storage, scopeParam: SCOPE });
+    const read = await readDataContract({
+      source: { reader: "owner", storage },
+      scopeParam: SCOPE,
+    });
     if (!read.ok) throw new Error("expected a read");
     expect(JSON.stringify(read.envelope)).toBe(
       JSON.stringify(createDataFileEnvelope(SCOPE, T1, body)),

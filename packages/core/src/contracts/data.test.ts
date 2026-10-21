@@ -185,7 +185,7 @@ describe("data contract helpers", () => {
 
     await expect(
       readDataContract({
-        storage,
+        source: { reader: "owner", storage },
         scopeParam: "instagram.profile",
       }),
     ).resolves.toMatchObject({
@@ -363,7 +363,7 @@ describe("data contract helpers", () => {
     });
 
     const read = await readDataContract({
-      storage,
+      source: { reader: "owner", storage },
       scopeParam: "documents.pdf",
     });
     expect(read.ok).toBe(true);
@@ -393,7 +393,7 @@ describe("data contract helpers", () => {
     });
 
     const read = await readDataContract({
-      storage,
+      source: { reader: "owner", storage },
       scopeParam: "documents.pdf",
     });
     if (!read.ok) throw new Error("expected ok");
@@ -416,7 +416,7 @@ describe("data contract helpers", () => {
       status: "stored",
     });
     const read = await readDataContract({
-      storage,
+      source: { reader: "owner", storage },
       scopeParam: "documents.pdf",
     });
     if (!read.ok) throw new Error("expected ok");
@@ -499,7 +499,7 @@ describe("lineage on ingest", () => {
     if (!result.ok) return;
     expect(result.response.lineage).toEqual({ sources: [SOURCE_ID] });
     const read = await readDataContract({
-      storage,
+      source: { reader: "owner", storage },
       scopeParam: "spine.health.summary",
     });
     expect(read.ok && read.envelope.data).toEqual({
@@ -523,7 +523,7 @@ describe("lineage on ingest", () => {
     });
     expect(result.ok).toBe(true);
     const read = await readDataContract({
-      storage,
+      source: { reader: "owner", storage },
       scopeParam: "spine.health.report",
     });
     expect(read.ok && read.envelope.data.$lineage).toEqual(lineage);
@@ -579,7 +579,7 @@ describe("lineage on ingest", () => {
       status: "stored",
     });
     const read = await readDataContract({
-      storage,
+      source: { reader: "owner", storage },
       scopeParam: "notes.entries",
     });
     expect(read.ok && read.envelope.data).toEqual({ note: "x" });

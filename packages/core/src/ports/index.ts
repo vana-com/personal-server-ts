@@ -127,6 +127,21 @@ export type VersionCommitResult =
     }
   | { kind: "replay"; receipt: ImportReceipt };
 
+/**
+ * Limits a non-owner view applies to a stored envelope stream. A raw port
+ * ignores them.
+ */
+export interface EnvelopeStreamOptions {
+  /**
+   * The index row the read was authorized for, as storage holds it. A
+   * non-owner view streams only bytes of this version and fails the stream
+   * when they are not.
+   */
+  pin?: IndexEntry;
+  /** The most stored bytes the read may take; the stream fails past it. */
+  maxBytes?: number;
+}
+
 export interface DataStoragePort extends RuntimeStoragePort {
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
@@ -159,6 +174,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
   readEnvelopeStream?(
     scope: string,
     collectedAt: string,
+    options?: EnvelopeStreamOptions,
   ): Promise<ReadableStream<Uint8Array>>;
   readEnvelopePreview?(
     scope: string,

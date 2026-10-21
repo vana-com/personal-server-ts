@@ -42,7 +42,7 @@ import {
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
 import { authorizeLegacyRead } from "../policy/data-read.js";
-import { storageForReader } from "../storage/disclosure-policy.js";
+import { granteeReadPort } from "../storage/disclosure-policy.js";
 import type { IndexEntry } from "../storage/index/types.js";
 
 import {
@@ -248,10 +248,7 @@ export function createMcpDataReadClient(
 ): McpDataReadClient {
   const basePath = options.basePath ?? "/v1/data";
   // Every body this client returns goes to a grantee.
-  const granteeStorage = storageForReader(
-    options.dataApiDeps.storage,
-    "grantee",
-  );
+  const granteeStorage = granteeReadPort(options.dataApiDeps.storage);
 
   /**
    * Same deletion gate as GET /v1/data/:scope, surfaced as the MCP error
@@ -487,9 +484,10 @@ export function createMcpDataReadClient(
       }
 
       try {
+        // Backfill is a storage write: the owner's port does it.
         const pinned = pinnedVersion(
           scope,
-          await establishVersion(storage, selectedEntry),
+          await establishVersion(options.dataApiDeps.storage, selectedEntry),
         );
         const generation = pinned.generation;
         assertSameVersion(scope, cursorGeneration, generation);
@@ -638,7 +636,7 @@ export function createMcpDataReadClient(
       try {
         pinned = pinnedVersion(
           scope,
-          await establishVersion(storage, selectedEntry),
+          await establishVersion(options.dataApiDeps.storage, selectedEntry),
         );
         admission = await authorizeScopeRead({
           scope,
@@ -847,7 +845,8 @@ type VersionIdentity =
  * example when the row was replaced while it was being backfilled.
  */
 async function establishVersion(
-  storage: PersonalServerDataApiDeps["storage"],
+  // Only storage's own backfill: never a body read.
+  storage: Pick<PersonalServerDataApiDeps["storage"], "backfillGeneration">,
   entry: IndexEntry,
 ): Promise<VersionIdentity> {
   const generation =
