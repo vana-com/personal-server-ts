@@ -359,6 +359,7 @@ function viewFixture(
     writeClock: () => 1,
     arrivalRevision: () => 1,
     hasTakeover: () => covered,
+    hasMethodTakeover: () => covered,
     hasCoveredHead: () => covered,
     isReset: () => false,
     cachedVerdict: (_scope, _instance, _generation, _head, cursor) =>
@@ -374,7 +375,7 @@ function viewFixture(
       casRevision: 1,
       collectedAt: now,
     }),
-    confirmRead: (_scope, _head, current, verdict) => {
+    confirmRead: (_scope, _head, current, _method, verdict) => {
       if (!current()) return false;
       if (verdict) {
         verdicts.push(verdict.coverage);

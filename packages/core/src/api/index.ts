@@ -93,9 +93,10 @@ import {
   type StoredLineage,
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
-import type {
-  LegacyScopeRefusal,
-  LegacyScopeViewPort,
+import {
+  deletionHistoryOf,
+  type LegacyScopeRefusal,
+  type LegacyScopeViewPort,
 } from "../storage/legacy-scope-view.js";
 import {
   binaryFilename,
@@ -1239,7 +1240,7 @@ function listingVisibility(
   return async (scope, entry) => {
     const listing = view.listingFor(scope);
     if (listing.kind === "refused") return false;
-    const canonicalOwned = view.ownsScope(scope);
+    const canonicalOwned = deletionHistoryOf(listing) === "canonical";
     // A file's re-add marker cannot revive the canonical body this row
     // describes. Canonical re-adds have no registered version yet.
     return (
@@ -2015,9 +2016,10 @@ export async function handlePersonalServerDataRequest(
         fileIdParam === undefined && atParam === undefined && view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
+      // The deletion history comes with the body the view chose, never from
+      // a later ownership query a concurrent write could change.
       const canonicalOwned =
-        latest !== undefined &&
-        deps.legacyScopeView?.ownsScope(scopeResult.scope);
+        latest !== undefined && deletionHistoryOf(latest) === "canonical";
 
       // Deletion gate, after auth (so unauthenticated callers learn nothing)
       // and before payment (so nobody is charged for deleted data). Covers
@@ -2593,7 +2595,7 @@ export async function handlePersonalServerDataRequest(
         return jsonResponse(
           {
             error: "CANONICAL_DELETE_UNSUPPORTED",
-            message: `Scope "${parsed.scope}" is served from the owner's connector records, which this route cannot delete. Nothing was deleted; delete the connection to erase its records.`,
+            message: `Scope "${parsed.scope}" has connector records that this route cannot delete. Nothing was deleted; delete the connection to erase its records.`,
             scope: parsed.scope,
           },
           { status: 409 },

@@ -139,6 +139,11 @@ export interface LegacyScopeAuthority {
   arrivalRevision(): number;
   /** Whether a complete canonical read has already superseded the legacy head. */
   hasTakeover(scope: string, instance?: string, generation?: number): boolean;
+  /**
+   * Whether a takeover of `scope` is recorded as earned by `method`. Records
+   * that do not name their method (written before takeovers did) never match.
+   */
+  hasMethodTakeover(scope: string, method: string): boolean;
   hasCoveredHead(
     scope: string,
     head: LegacyScopeHead,
@@ -158,13 +163,16 @@ export interface LegacyScopeAuthority {
   eligibleLegacyHead(scope: string): LegacyScopeHead | null;
   /**
    * Revalidates the head and connection selection under a write lock, then
-   * records the eligible legacy versions. A null head confirms a read that
-   * did not observe legacy data and records no takeover.
+   * records the eligible legacy versions as taken over by `method`, the
+   * selected connection's method. A takeover already recorded for the same
+   * key without a method gains it from this proof. A null head confirms a
+   * read that did not observe legacy data and records no takeover.
    */
   confirmRead(
     scope: string,
     expectedHead: LegacyScopeHead | null,
     selectionIsCurrent: () => boolean,
+    method: string,
     verdict?: {
       instance: string;
       generation: number;
@@ -229,9 +237,18 @@ export type LegacyScopeRefusal =
       }[];
     };
 
+/**
+ * Which deletion history judges a served body. `file`: the file's own
+ * version and re-add marker. `canonical`: the scope's retained canonical
+ * history, which a live file cannot clear. A canonical or refused body is
+ * always `canonical`; a file is `canonical` when the decision that chose it
+ * found connection rows that serve the scope.
+ */
+export type LegacyScopeDeletion = "file" | "canonical";
+
 export type LegacyScopeLatest =
   /** Not canonical: the existing storage answers, exactly as before. */
-  | { kind: "file" }
+  | { kind: "file"; deletion: LegacyScopeDeletion }
   | {
       kind: "canonical";
       envelope: DataFileEnvelope;
@@ -241,9 +258,23 @@ export type LegacyScopeLatest =
   | { kind: "refused"; refusal: LegacyScopeRefusal };
 
 export type LegacyScopeListing =
-  | { kind: "file" }
+  | { kind: "file"; deletion: LegacyScopeDeletion }
   | { kind: "canonical"; collectedAt: string }
   | { kind: "refused" };
+
+/**
+ * The deletion history of a body, decided with the body. Callers never
+ * recompute it from later ownership state.
+ */
+export function deletionHistoryOf(
+  body: LegacyScopeLatest | LegacyScopeListing,
+): LegacyScopeDeletion {
+  return body.kind === "file" ? body.deletion : "canonical";
+}
+
+/** Before the deletion history is attached. */
+type ChosenBody =
+  { kind: "file" } | Exclude<LegacyScopeLatest, { kind: "file" }>;
 
 export interface LegacyScopeViewPort {
   /** The latest body of a scope. Never used for an explicit version. */
@@ -258,7 +289,11 @@ export interface LegacyScopeViewPort {
   listCanonicalScopes(
     scopePrefix: string | undefined,
   ): { scope: string; collectedAt: string }[];
-  /** True when canonical history makes a legacy-only deletion unsafe. */
+  /**
+   * True when connection rows make a legacy-only deletion unsafe: deleting
+   * the file would let them appear. Not the deletion history of a read; see
+   * `deletionHistoryOf`.
+   */
   ownsScope(scope: string): boolean;
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
   resetTakeover(scope: string): void;
@@ -277,10 +312,21 @@ export interface CreateLegacyScopeViewInput {
   declarations?: ReadCanonicalLegacyScopeInput["declarations"];
   /** Methods this boot configures for a store source id. */
   configuredMethods(sourceId: string): readonly string[];
+  /**
+   * Methods this boot runs only at the owner's explicit opt-in, beside the
+   * source's legacy collector (Desktop's stable opt-in tier). While a scope
+   * has an eligible legacy head, such a method does not take the scope over
+   * unless a takeover recorded for that same method exists. Absent: none.
+   */
+  optInMethods?: ReadonlySet<string>;
   /** Read the exact latest indexed legacy file; omitted by in-memory adapters. */
   readLegacyHead?(head: LegacyScopeHead): Promise<DataFileEnvelope>;
   /** Optional payload growth limits for the takeover check. */
   coverageThresholds?: { maxPayloadRatio?: number; maxExtraBytes?: number };
+  /** Reports when the legacy file is kept over a method that holds synced rows. */
+  logger?: {
+    info(payload: Record<string, unknown>, message: string): void;
+  };
 }
 
 type Decision =
@@ -303,8 +349,109 @@ export function createLegacyScopeView(
     { key: string; envelope: DataFileEnvelope; revision: string }
   >();
 
-  function decide(scope: string): Decision {
-    const streamsByMethod = scopeMethods(scope);
+  /**
+   * The scope's methods, minus each opt-in method (`input.optInMethods`)
+   * while the legacy file is still the owner's latest body: an eligible
+   * legacy head and no takeover recorded for that method. Such a method never
+   * served this scope, so its deleted, reset or replaced connections are not
+   * ownership evidence: the file was the served body all along. A takeover
+   * another method earned (the PAT `oura` connection, say), or one that does
+   * not name its method, leaves it excluded. Once it has earned one, it
+   * serves, and deletion refuses, as for any other method.
+   */
+  function withoutOptedOutMethods(
+    scope: string,
+  ): Map<string, readonly string[]> {
+    const methods = scopeMethods(scope);
+    const head = authority.eligibleLegacyHead(scope);
+    if (head === null) return methods;
+    const gated = new Set(
+      [...optedOutMethods(scope)].filter(
+        (method) => !earnedTakeover(scope, method),
+      ),
+    );
+    if (gated.size === 0) return methods;
+    reportKeptLegacyFile(scope, head, gated);
+    return new Map([...methods].filter(([method]) => !gated.has(method)));
+  }
+
+  function optedOutMethods(scope: string): string[] {
+    const optIn = input.optInMethods;
+    if (!optIn || optIn.size === 0) return [];
+    return [...scopeMethods(scope).keys()].filter((method) =>
+      optIn.has(method),
+    );
+  }
+
+  function earnedTakeover(scope: string, method: string): boolean {
+    return authority.hasMethodTakeover(scope, method);
+  }
+
+  /**
+   * Deletion safety asks the ungated question: do connection rows exist that
+   * a legacy-only deletion would let appear? Where the gate keeps the file
+   * over an opted-out method, only live rows of that method count: a deleted,
+   * reset or replaced connection erased its rows, and a connection that never
+   * held data has none.
+   */
+  function ownsScope(scope: string): boolean {
+    if (decide(scope, false).kind === "file") return false;
+    if (decide(scope).kind !== "file") return true;
+    return authority
+      .listMethodConnections([...optedOutMethods(scope)])
+      .some(
+        (connection) =>
+          connection.deletedAt === null &&
+          authority.hasHeldData(connection.instance, null),
+      );
+  }
+
+  /** Decided with the body: connection rows serve the scope, or they do not. */
+  function deletionFor(decision: Decision): LegacyScopeDeletion {
+    return decision.kind === "file" ? "file" : "canonical";
+  }
+
+  /**
+   * One line per (scope, legacy head, number of connections holding rows), so
+   * an operator can see a stalled collector keeping a fresh projection gated.
+   */
+  const reportedKept = new Set<string>();
+  function reportKeptLegacyFile(
+    scope: string,
+    head: LegacyScopeHead,
+    optedOut: ReadonlySet<string>,
+  ): void {
+    if (!input.logger) return;
+    const held = authority
+      .listMethodConnections([...optedOut])
+      .filter(
+        (connection) =>
+          connection.deletedAt === null &&
+          authority.hasHeldData(connection.instance, null),
+      ).length;
+    if (held === 0) return;
+    const key = `${scope}:${head.id}:${held}`;
+    if (reportedKept.has(key)) return;
+    reportedKept.add(key);
+    input.logger.info(
+      {
+        scope,
+        legacyHeadCollectedAt: head.collectedAt,
+        heldConnections: held,
+      },
+      "Legacy file kept as the latest body; a method that opts out of takeover holds synced rows",
+    );
+  }
+
+  /**
+   * `legacyFirst` (the default) lets the legacy file stay authoritative over
+   * methods whose binding opts out of takeover. Deletion safety asks the
+   * ungated question: do any connection rows exist for this scope?
+   */
+  function decide(scope: string, legacyFirst = true): Decision {
+    const streamsByMethod = legacyFirst
+      ? withoutOptedOutMethods(scope)
+      : scopeMethods(scope);
     if (streamsByMethod.size === 0) {
       return authority.hasTakeover(scope)
         ? refused({
@@ -406,132 +553,295 @@ export function createLegacyScopeView(
 
   function listingFor(scope: string): LegacyScopeListing {
     return authority.readSnapshot((): LegacyScopeListing => {
-      if (authority.isReset(scope)) return { kind: "file" };
       const decision = decide(scope);
-      const legacyHead = authority.eligibleLegacyHead(scope);
-      const hasTakeover = authority.hasTakeover(
-        scope,
-        decision.kind === "canonical" ? decision.selection.instance : undefined,
-        decision.kind === "canonical" ? decision.generation : undefined,
-      );
-      if (
-        decision.kind === "refused" &&
-        decision.refusal.status === "unavailable" &&
-        decision.refusal.reason === "no_connection" &&
-        canServeLegacyBeforeTakeover(scope)
-      ) {
-        return { kind: "file" };
-      }
-      if (decision.kind !== "canonical") return { kind: decision.kind };
-      const hasLegacyHead = legacyHead !== null;
-      if (hasLegacyHead && input.readLegacyHead) {
-        const verdict = authority
-          .verdictFor(scope)
-          .find(
-            (row) =>
-              row.instance === decision.selection.instance &&
-              row.generation === decision.generation &&
-              row.legacyVersionId === legacyHead.id,
-          );
-        const coveredHead = authority.hasCoveredHead(scope, legacyHead);
-        if (verdict?.verdict !== "covered") {
-          return { kind: coveredHead ? "refused" : "file" };
-        }
-        if (
-          !verdict.canonicalCursor.startsWith(
-            `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(decision, input.declarations)}:`,
-          )
-        ) {
-          return { kind: "refused" };
-        }
-      } else if (hasLegacyHead && !hasTakeover) return { kind: "file" };
-      if (
-        !input.readLegacyHead &&
-        hasLegacyHead &&
-        hasTakeover &&
-        missingCompletionReceipts(decision).length > 0
-      ) {
-        return { kind: "refused" };
-      }
-      const collectedAt = listedCollectedAt(
-        decision.records,
-        decision.selection.instance,
-        decision.streams,
-      );
-      return collectedAt === null
-        ? { kind: "refused" }
-        : { kind: "canonical", collectedAt };
+      const listed = chooseListing(scope, decision);
+      return listed.kind === "file"
+        ? { kind: "file", deletion: deletionFor(decision) }
+        : listed;
     });
   }
 
-  return {
-    async readLatest(scope) {
-      if (authority.isReset(scope)) return { kind: "file" };
-      const initial = authority.readSnapshot(() => {
-        const decision = decide(scope);
-        return {
-          decision,
-          legacyHead: authority.eligibleLegacyHead(scope),
-          hasTakeover: authority.hasTakeover(
-            scope,
-            decision.kind === "canonical"
-              ? decision.selection.instance
-              : undefined,
-            decision.kind === "canonical" ? decision.generation : undefined,
-          ),
-          canServeLegacy: canServeLegacyBeforeTakeover(scope),
-          writeClock: authority.writeClock(),
-          arrivalRevision: authority.arrivalRevision(),
-          receiptCursor:
-            decision.kind === "canonical"
-              ? receiptCursor(decision, input.declarations)
-              : "",
-        };
-      });
-      const { decision, legacyHead, hasTakeover, canServeLegacy } = initial;
-      if (
-        decision.kind === "refused" &&
-        decision.refusal.status === "unavailable" &&
-        decision.refusal.reason === "no_connection" &&
-        canServeLegacy
-      ) {
-        return { kind: "file" };
+  function chooseListing(
+    scope: string,
+    decision: Decision,
+  ): { kind: "file" } | Exclude<LegacyScopeListing, { kind: "file" }> {
+    if (authority.isReset(scope)) return { kind: "file" };
+    const legacyHead = authority.eligibleLegacyHead(scope);
+    const hasTakeover = authority.hasTakeover(
+      scope,
+      decision.kind === "canonical" ? decision.selection.instance : undefined,
+      decision.kind === "canonical" ? decision.generation : undefined,
+    );
+    if (
+      decision.kind === "refused" &&
+      decision.refusal.status === "unavailable" &&
+      decision.refusal.reason === "no_connection" &&
+      canServeLegacyBeforeTakeover(scope)
+    ) {
+      return { kind: "file" };
+    }
+    if (decision.kind !== "canonical") return { kind: decision.kind };
+    const hasLegacyHead = legacyHead !== null;
+    if (hasLegacyHead && input.readLegacyHead) {
+      const verdict = authority
+        .verdictFor(scope)
+        .find(
+          (row) =>
+            row.instance === decision.selection.instance &&
+            row.generation === decision.generation &&
+            row.legacyVersionId === legacyHead.id,
+        );
+      const coveredHead = authority.hasCoveredHead(scope, legacyHead);
+      if (verdict?.verdict !== "covered") {
+        return { kind: coveredHead ? "refused" : "file" };
       }
-      if (decision.kind !== "canonical") return decision;
-      const canonicalCursor = legacyHead
-        ? [
-            initial.writeClock,
-            initial.arrivalRevision,
-            initial.receiptCursor,
-            decision.generation,
-            CANONICAL_LEGACY_VIEW_CONTRACT,
-            scopeDeclarationCursor(scope),
-            COVERAGE_RULE_VERSION,
-            input.coverageThresholds?.maxPayloadRatio ?? 1.5,
-            input.coverageThresholds?.maxExtraBytes ?? 256 * 1024,
-          ].join(":")
-        : "";
-      const projectionKey = legacyHead
-        ? JSON.stringify([
+      if (
+        !verdict.canonicalCursor.startsWith(
+          `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(decision, input.declarations)}:`,
+        )
+      ) {
+        return { kind: "refused" };
+      }
+    } else if (hasLegacyHead && !hasTakeover) return { kind: "file" };
+    if (
+      !input.readLegacyHead &&
+      hasLegacyHead &&
+      hasTakeover &&
+      missingCompletionReceipts(decision).length > 0
+    ) {
+      return { kind: "refused" };
+    }
+    const collectedAt = listedCollectedAt(
+      decision.records,
+      decision.selection.instance,
+      decision.streams,
+    );
+    return collectedAt === null
+      ? { kind: "refused" }
+      : { kind: "canonical", collectedAt };
+  }
+
+  /** One snapshot: the decision and the evidence the read is judged by. */
+  function readDecision(scope: string) {
+    return authority.readSnapshot(() => {
+      const decision = decide(scope);
+      return {
+        reset: authority.isReset(scope),
+        decision,
+        legacyHead: authority.eligibleLegacyHead(scope),
+        hasTakeover: authority.hasTakeover(
+          scope,
+          decision.kind === "canonical"
+            ? decision.selection.instance
+            : undefined,
+          decision.kind === "canonical" ? decision.generation : undefined,
+        ),
+        canServeLegacy: canServeLegacyBeforeTakeover(scope),
+        writeClock: authority.writeClock(),
+        arrivalRevision: authority.arrivalRevision(),
+        receiptCursor:
+          decision.kind === "canonical"
+            ? receiptCursor(decision, input.declarations)
+            : "",
+      };
+    });
+  }
+
+  /** The body `decision` serves; the caller attaches its deletion history. */
+  async function chooseBody(
+    scope: string,
+    initial: ReturnType<typeof readDecision>,
+  ): Promise<ChosenBody> {
+    if (initial.reset) return { kind: "file" };
+    const { decision, legacyHead, hasTakeover, canServeLegacy } = initial;
+    if (
+      decision.kind === "refused" &&
+      decision.refusal.status === "unavailable" &&
+      decision.refusal.reason === "no_connection" &&
+      canServeLegacy
+    ) {
+      return { kind: "file" };
+    }
+    if (decision.kind !== "canonical") return decision;
+    const canonicalCursor = legacyHead
+      ? [
+          initial.writeClock,
+          initial.arrivalRevision,
+          initial.receiptCursor,
+          decision.generation,
+          CANONICAL_LEGACY_VIEW_CONTRACT,
+          scopeDeclarationCursor(scope),
+          COVERAGE_RULE_VERSION,
+          input.coverageThresholds?.maxPayloadRatio ?? 1.5,
+          input.coverageThresholds?.maxExtraBytes ?? 256 * 1024,
+        ].join(":")
+      : "";
+    const projectionKey = legacyHead
+      ? JSON.stringify([
+          decision.selection.instance,
+          decision.generation,
+          legacyHead.id,
+          canonicalCursor,
+        ])
+      : "";
+    const projectionOwner = scope;
+    const cachedCoverage =
+      legacyHead !== null && input.readLegacyHead
+        ? authority.cachedVerdict(
+            scope,
             decision.selection.instance,
             decision.generation,
             legacyHead.id,
             canonicalCursor,
-          ])
-        : "";
-      const projectionOwner = scope;
-      const cachedCoverage =
-        legacyHead !== null && input.readLegacyHead
-          ? authority.cachedVerdict(
-              scope,
-              decision.selection.instance,
-              decision.generation,
-              legacyHead.id,
-              canonicalCursor,
-            )
-          : null;
-      const cachedProjection = coveredProjection.get(projectionOwner);
-      if (cachedCoverage?.covered && cachedProjection?.key === projectionKey) {
+          )
+        : null;
+    const cachedProjection = coveredProjection.get(projectionOwner);
+    if (cachedCoverage?.covered && cachedProjection?.key === projectionKey) {
+      const confirmed = authority.confirmRead(
+        scope,
+        legacyHead,
+        () =>
+          sameSelection(decide(scope), decision) &&
+          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
+        {
+          instance: decision.selection.instance,
+          generation: decision.generation,
+          writeClock: initial.writeClock,
+          arrivalRevision: initial.arrivalRevision,
+          canonicalCursor,
+          coverage: cachedCoverage,
+          cached: true,
+        },
+      );
+      if (!confirmed) {
+        if (authority.isReset(scope)) return { kind: "file" };
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail:
+              "legacy head or canonical cursor changed during parity evaluation",
+          },
+        };
+      }
+      return {
+        kind: "canonical",
+        envelope: cachedProjection.envelope,
+        revision: cachedProjection.revision,
+      };
+    }
+    if (cachedCoverage && !cachedCoverage.covered && legacyHead) {
+      let legacy: DataFileEnvelope;
+      try {
+        legacy = await input.readLegacyHead!(legacyHead);
+      } catch {
+        return hasTakeover
+          ? {
+              kind: "refused",
+              refusal: {
+                status: "unavailable",
+                reason: "store_inconsistent_read",
+                detail: "indexed legacy head could not be read",
+              },
+            }
+          : { kind: "file" };
+      }
+      if (legacy.scope !== scope) {
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail: "indexed legacy head has another scope",
+          },
+        };
+      }
+      const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
+      const confirmed = authority.confirmRead(
+        scope,
+        legacyHead,
+        () =>
+          sameSelection(decide(scope), decision) &&
+          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
+        {
+          instance: decision.selection.instance,
+          generation: decision.generation,
+          writeClock: initial.writeClock,
+          arrivalRevision: initial.arrivalRevision,
+          canonicalCursor,
+          coverage: cachedCoverage,
+          cached: true,
+        },
+      );
+      if (!confirmed) {
+        if (authority.isReset(scope)) return { kind: "file" };
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail:
+              "legacy head or canonical cursor changed during parity evaluation",
+          },
+        };
+      }
+      return alreadyCovered
+        ? {
+            kind: "refused",
+            refusal: {
+              status: "incomplete",
+              reason: "canonical_view_incomplete",
+              diagnostics: [],
+            },
+          }
+        : { kind: "file" };
+    }
+    const read = await readCanonicalLegacyScope({
+      store: decision.records,
+      declarations: input.declarations,
+      scope,
+      selection: decision.selection,
+      profileBy: "method",
+      requireCompletionReceipts: legacyHead !== null && !input.readLegacyHead,
+      allowUnprovenEmptyStreams: legacyHead !== null && !!input.readLegacyHead,
+      includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
+      requireClaudeRawBlobs: legacyHead !== null && !!input.readLegacyHead,
+      // The rows must come from a state in which this is still the one
+      // connection: a second account appearing between the decision and
+      // the rows refuses instead of serving a body chosen while ambiguous.
+      confirmSelection: () => sameSelection(decide(scope), decision),
+    });
+    if (!read.ok) {
+      if (
+        legacyHead !== null &&
+        input.readLegacyHead &&
+        isProjectionDataFailure(read.reason)
+      ) {
+        let legacy: DataFileEnvelope;
+        try {
+          legacy = await input.readLegacyHead(legacyHead);
+        } catch {
+          const { ok: _ok, ...refusal } = read;
+          return { kind: "refused", refusal };
+        }
+        if (legacy.scope !== scope) {
+          return {
+            kind: "refused",
+            refusal: {
+              status: "unavailable",
+              reason: "store_inconsistent_read",
+              detail: "indexed legacy head has another scope",
+            },
+          };
+        }
+        const coveredHead = authority.hasCoveredHead(scope, legacyHead);
+        const coverage = projectionUnavailableCoverage(
+          legacy.data,
+          read.reason === "missing_raw_blob" ? read.recordCount : 0,
+        );
         const confirmed = authority.confirmRead(
           scope,
           legacyHead,
@@ -539,14 +849,15 @@ export function createLegacyScopeView(
             sameSelection(decide(scope), decision) &&
             receiptCursor(decision, input.declarations) ===
               initial.receiptCursor,
+          decision.selection.method,
           {
             instance: decision.selection.instance,
             generation: decision.generation,
             writeClock: initial.writeClock,
             arrivalRevision: initial.arrivalRevision,
-            canonicalCursor,
-            coverage: cachedCoverage,
-            cached: true,
+            canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
+            coverage,
+            cached: false,
           },
         );
         if (!confirmed) {
@@ -561,16 +872,39 @@ export function createLegacyScopeView(
             },
           };
         }
-        return {
-          kind: "canonical",
-          envelope: cachedProjection.envelope,
-          revision: cachedProjection.revision,
-        };
+        if (coveredHead) {
+          const { ok: _ok, ...refusal } = read;
+          return { kind: "refused", refusal };
+        }
+        return { kind: "file" };
       }
-      if (cachedCoverage && !cachedCoverage.covered && legacyHead) {
+      if (
+        legacyHead !== null &&
+        !hasTakeover &&
+        (read.reason === "projection_rejected" ||
+          read.reason === "all_rows_rejected" ||
+          read.reason === "no_synced_data" ||
+          read.reason === "stream_completion_unknown" ||
+          read.reason === "blob_read_budget_exceeded" ||
+          read.reason === "blob_backed_record_invalid" ||
+          read.reason === "missing_raw_blob" ||
+          read.reason === "blob_backed_records_unsupported")
+      ) {
+        const stillLegacyOwned = authority.readSnapshot(() =>
+          canServeLegacyBeforeTakeover(scope),
+        );
+        if (stillLegacyOwned) return { kind: "file" };
+      }
+      const { ok: _ok, ...refusal } = read;
+      return { kind: "refused", refusal };
+    }
+    if (legacyHead !== null && input.readLegacyHead) {
+      let coverage = cachedCoverage;
+      const cached = coverage !== null;
+      if (!coverage || decision.selection.method === "anthropic-live") {
         let legacy: DataFileEnvelope;
         try {
-          legacy = await input.readLegacyHead!(legacyHead);
+          legacy = await input.readLegacyHead(legacyHead);
         } catch {
           return hasTakeover
             ? {
@@ -593,36 +927,64 @@ export function createLegacyScopeView(
             },
           };
         }
-        const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
-        const confirmed = authority.confirmRead(
-          scope,
-          legacyHead,
-          () =>
-            sameSelection(decide(scope), decision) &&
-            receiptCursor(decision, input.declarations) ===
-              initial.receiptCursor,
-          {
-            instance: decision.selection.instance,
-            generation: decision.generation,
-            writeClock: initial.writeClock,
-            arrivalRevision: initial.arrivalRevision,
-            canonicalCursor,
-            coverage: cachedCoverage,
-            cached: true,
-          },
-        );
-        if (!confirmed) {
-          if (authority.isReset(scope)) return { kind: "file" };
-          return {
-            kind: "refused",
-            refusal: {
-              status: "unavailable",
-              reason: "store_inconsistent_read",
-              detail:
-                "legacy head or canonical cursor changed during parity evaluation",
-            },
-          };
+        if (
+          scope === "claude.conversations" &&
+          decision.selection.method === "anthropic-live"
+        ) {
+          await retainClaudeProfile(read, legacy);
         }
+        coverage = compareLegacyCoverage(legacy.data, read.envelope.data, {
+          scope,
+          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          projectionOmissions: read.projectionOmissions,
+          canonicalNewer: allStreamsNewerThan(
+            read,
+            decision.streams,
+            legacyHead.collectedAt,
+          ),
+          allowProvenDeletion:
+            read.complete &&
+            allStreamsProvenAfter(
+              read,
+              decision.streams,
+              legacyHead.collectedAt,
+            ),
+          ...input.coverageThresholds,
+        });
+      }
+      const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
+      const confirmed = authority.confirmRead(
+        scope,
+        legacyHead,
+        () =>
+          sameSelection(decide(scope), decision) &&
+          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
+        {
+          instance: decision.selection.instance,
+          generation: decision.generation,
+          writeClock: initial.writeClock,
+          arrivalRevision: initial.arrivalRevision,
+          canonicalCursor,
+          coverage,
+          cached,
+        },
+      );
+      if (!confirmed) {
+        if (authority.isReset(scope)) return { kind: "file" };
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail:
+              "legacy head or canonical cursor changed during parity evaluation",
+          },
+        };
+      }
+      if (!coverage.covered) {
+        // A newer file is an explicit, recorded rollback. A canonical
+        // regression against the same file must still refuse after takeover.
         return alreadyCovered
           ? {
               kind: "refused",
@@ -634,259 +996,74 @@ export function createLegacyScopeView(
             }
           : { kind: "file" };
       }
-      const read = await readCanonicalLegacyScope({
-        store: decision.records,
-        declarations: input.declarations,
-        scope,
-        selection: decision.selection,
-        profileBy: "method",
-        requireCompletionReceipts: legacyHead !== null && !input.readLegacyHead,
-        allowUnprovenEmptyStreams:
-          legacyHead !== null && !!input.readLegacyHead,
-        includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
-        requireClaudeRawBlobs: legacyHead !== null && !!input.readLegacyHead,
-        // The rows must come from a state in which this is still the one
-        // connection: a second account appearing between the decision and
-        // the rows refuses instead of serving a body chosen while ambiguous.
-        confirmSelection: () => sameSelection(decide(scope), decision),
+      coveredProjection.set(projectionOwner, {
+        key: projectionKey,
+        envelope: read.envelope,
+        revision: read.revision,
       });
-      if (!read.ok) {
-        if (
-          legacyHead !== null &&
-          input.readLegacyHead &&
-          isProjectionDataFailure(read.reason)
-        ) {
-          let legacy: DataFileEnvelope;
-          try {
-            legacy = await input.readLegacyHead(legacyHead);
-          } catch {
-            const { ok: _ok, ...refusal } = read;
-            return { kind: "refused", refusal };
-          }
-          if (legacy.scope !== scope) {
-            return {
-              kind: "refused",
-              refusal: {
-                status: "unavailable",
-                reason: "store_inconsistent_read",
-                detail: "indexed legacy head has another scope",
-              },
-            };
-          }
-          const coveredHead = authority.hasCoveredHead(scope, legacyHead);
-          const coverage = projectionUnavailableCoverage(
-            legacy.data,
-            read.reason === "missing_raw_blob" ? read.recordCount : 0,
-          );
-          const confirmed = authority.confirmRead(
-            scope,
-            legacyHead,
-            () =>
-              sameSelection(decide(scope), decision) &&
-              receiptCursor(decision, input.declarations) ===
-                initial.receiptCursor,
-            {
-              instance: decision.selection.instance,
-              generation: decision.generation,
-              writeClock: initial.writeClock,
-              arrivalRevision: initial.arrivalRevision,
-              canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
-              coverage,
-              cached: false,
-            },
-          );
-          if (!confirmed) {
-            if (authority.isReset(scope)) return { kind: "file" };
-            return {
-              kind: "refused",
-              refusal: {
-                status: "unavailable",
-                reason: "store_inconsistent_read",
-                detail:
-                  "legacy head or canonical cursor changed during parity evaluation",
-              },
-            };
-          }
-          if (coveredHead) {
-            const { ok: _ok, ...refusal } = read;
-            return { kind: "refused", refusal };
-          }
-          return { kind: "file" };
-        }
-        if (
-          legacyHead !== null &&
-          !hasTakeover &&
-          (read.reason === "projection_rejected" ||
-            read.reason === "all_rows_rejected" ||
-            read.reason === "no_synced_data" ||
-            read.reason === "stream_completion_unknown" ||
-            read.reason === "blob_read_budget_exceeded" ||
-            read.reason === "blob_backed_record_invalid" ||
-            read.reason === "missing_raw_blob" ||
-            read.reason === "blob_backed_records_unsupported")
-        ) {
-          const stillLegacyOwned = authority.readSnapshot(() =>
-            canServeLegacyBeforeTakeover(scope),
-          );
-          if (stillLegacyOwned) return { kind: "file" };
-        }
-        const { ok: _ok, ...refusal } = read;
-        return { kind: "refused", refusal };
-      }
-      if (legacyHead !== null && input.readLegacyHead) {
-        let coverage = cachedCoverage;
-        const cached = coverage !== null;
-        if (!coverage || decision.selection.method === "anthropic-live") {
-          let legacy: DataFileEnvelope;
-          try {
-            legacy = await input.readLegacyHead(legacyHead);
-          } catch {
-            return hasTakeover
-              ? {
-                  kind: "refused",
-                  refusal: {
-                    status: "unavailable",
-                    reason: "store_inconsistent_read",
-                    detail: "indexed legacy head could not be read",
-                  },
-                }
-              : { kind: "file" };
-          }
-          if (legacy.scope !== scope) {
-            return {
-              kind: "refused",
-              refusal: {
-                status: "unavailable",
-                reason: "store_inconsistent_read",
-                detail: "indexed legacy head has another scope",
-              },
-            };
-          }
-          if (
-            scope === "claude.conversations" &&
-            decision.selection.method === "anthropic-live"
-          ) {
-            await retainClaudeProfile(read, legacy);
-          }
-          coverage = compareLegacyCoverage(legacy.data, read.envelope.data, {
-            scope,
-            entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
-            projectionOmissions: read.projectionOmissions,
-            canonicalNewer: allStreamsNewerThan(
-              read,
-              decision.streams,
-              legacyHead.collectedAt,
-            ),
-            allowProvenDeletion:
-              read.complete &&
-              allStreamsProvenAfter(
-                read,
-                decision.streams,
-                legacyHead.collectedAt,
-              ),
-            ...input.coverageThresholds,
-          });
-        }
-        const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
-        const confirmed = authority.confirmRead(
-          scope,
-          legacyHead,
-          () =>
-            sameSelection(decide(scope), decision) &&
-            receiptCursor(decision, input.declarations) ===
-              initial.receiptCursor,
-          {
-            instance: decision.selection.instance,
-            generation: decision.generation,
-            writeClock: initial.writeClock,
-            arrivalRevision: initial.arrivalRevision,
-            canonicalCursor,
-            coverage,
-            cached,
-          },
-        );
-        if (!confirmed) {
-          if (authority.isReset(scope)) return { kind: "file" };
-          return {
-            kind: "refused",
-            refusal: {
-              status: "unavailable",
-              reason: "store_inconsistent_read",
-              detail:
-                "legacy head or canonical cursor changed during parity evaluation",
-            },
-          };
-        }
-        if (!coverage.covered) {
-          // A newer file is an explicit, recorded rollback. A canonical
-          // regression against the same file must still refuse after takeover.
-          return alreadyCovered
-            ? {
-                kind: "refused",
-                refusal: {
-                  status: "incomplete",
-                  reason: "canonical_view_incomplete",
-                  diagnostics: [],
-                },
-              }
-            : { kind: "file" };
-        }
-        coveredProjection.set(projectionOwner, {
-          key: projectionKey,
-          envelope: read.envelope,
-          revision: read.revision,
-        });
-        return {
-          kind: "canonical",
-          envelope: read.envelope,
-          revision: read.revision,
-        };
-      }
-      if (!read.complete) {
-        if (legacyHead !== null && !hasTakeover) {
-          const stillLegacyOwned = authority.readSnapshot(() =>
-            canServeLegacyBeforeTakeover(scope),
-          );
-          if (stillLegacyOwned) return { kind: "file" };
-        }
-        return {
-          kind: "refused",
-          refusal: {
-            status: "incomplete",
-            reason: "canonical_view_incomplete",
-            diagnostics: incompleteness(read),
-          },
-        };
-      }
-      const confirmed = authority.confirmRead(scope, legacyHead, () =>
-        sameSelection(decide(scope), decision),
-      );
-      if (!confirmed) {
-        const current = authority.readSnapshot(() => ({
-          canServeLegacy: canServeLegacyBeforeTakeover(scope),
-          hasTakeover: authority.hasTakeover(
-            scope,
-            decision.selection.instance,
-            decision.generation,
-          ),
-        }));
-        if (current.canServeLegacy && !current.hasTakeover)
-          return { kind: "file" };
-        return {
-          kind: "refused",
-          refusal: {
-            status: "unavailable",
-            reason: "store_inconsistent_read",
-            detail:
-              "legacy head or connection selection changed during canonical projection",
-          },
-        };
-      }
       return {
         kind: "canonical",
         envelope: read.envelope,
         revision: read.revision,
       };
+    }
+    if (!read.complete) {
+      if (legacyHead !== null && !hasTakeover) {
+        const stillLegacyOwned = authority.readSnapshot(() =>
+          canServeLegacyBeforeTakeover(scope),
+        );
+        if (stillLegacyOwned) return { kind: "file" };
+      }
+      return {
+        kind: "refused",
+        refusal: {
+          status: "incomplete",
+          reason: "canonical_view_incomplete",
+          diagnostics: incompleteness(read),
+        },
+      };
+    }
+    const confirmed = authority.confirmRead(
+      scope,
+      legacyHead,
+      () => sameSelection(decide(scope), decision),
+      decision.selection.method,
+    );
+    if (!confirmed) {
+      const current = authority.readSnapshot(() => ({
+        canServeLegacy: canServeLegacyBeforeTakeover(scope),
+        hasTakeover: authority.hasTakeover(
+          scope,
+          decision.selection.instance,
+          decision.generation,
+        ),
+      }));
+      if (current.canServeLegacy && !current.hasTakeover)
+        return { kind: "file" };
+      return {
+        kind: "refused",
+        refusal: {
+          status: "unavailable",
+          reason: "store_inconsistent_read",
+          detail:
+            "legacy head or connection selection changed during canonical projection",
+        },
+      };
+    }
+    return {
+      kind: "canonical",
+      envelope: read.envelope,
+      revision: read.revision,
+    };
+  }
+
+  return {
+    async readLatest(scope) {
+      const initial = readDecision(scope);
+      const body = await chooseBody(scope, initial);
+      return body.kind === "file"
+        ? { kind: "file", deletion: deletionFor(initial.decision) }
+        : body;
     },
 
     listingFor,
@@ -906,7 +1083,7 @@ export function createLegacyScopeView(
     },
 
     ownsScope(scope) {
-      return authority.readSnapshot(() => decide(scope)).kind !== "file";
+      return authority.readSnapshot(() => ownsScope(scope));
     },
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),
