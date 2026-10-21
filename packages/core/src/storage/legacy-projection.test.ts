@@ -623,6 +623,43 @@ describe("withLegacyProjection parity goldens", () => {
   // so the projection time equals legacy's stamped fetched_at.
   const COLLECTED_AT = "2026-10-01T00:00:00.000Z";
 
+  it("does not join identified live messages into historical untagged Claude export rows", async () => {
+    const golden = JSON.parse(
+      readFileSync(
+        new URL(
+          "../legacy-projection/__fixtures__/parity/claude.conversations.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as { streams: Record<string, Record<string, unknown>[]> };
+    const raw = createMemoryDataStorage();
+    for (const [stream, rows] of Object.entries(golden.streams)) {
+      await store(raw, `claude.${stream}`, COLLECTED_AT, {
+        records:
+          stream === "messages"
+            ? rows.map((row) => ({
+                ...row,
+                $pdpp: {
+                  sourceId: "https://registry.pdpp.dev/sources/anthropic-live",
+                },
+              }))
+            : rows,
+      });
+    }
+    await expect(
+      withLegacyProjection(raw).readEnvelope(
+        "claude.conversations",
+        COLLECTED_AT,
+      ),
+    ).rejects.toMatchObject({
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+      details: {
+        reason: "Joined streams have conflicting connector identities",
+      },
+    });
+  });
+
   it.each([
     "chatgpt.conversations",
     "chatgpt.memories",
@@ -764,6 +801,43 @@ describe("supersedeLegacyVersions", () => {
     expect(raw.entries).toHaveLength(2);
   });
 
+  it("keeps the legacy claude.conversations when no conversation count proves the messages complete", async () => {
+    const scope = "claude.conversations";
+    const golden = JSON.parse(
+      readFileSync(
+        new URL(
+          `../legacy-projection/__fixtures__/parity/${scope}.json`,
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as {
+      streams: Record<string, Record<string, unknown>[]>;
+      legacyBody: Record<string, unknown>;
+    };
+    const raw = createMemoryDataStorage();
+    await store(raw, scope, "2026-09-01T00:00:00.000Z", golden.legacyBody);
+    for (const [stream, rows] of Object.entries(golden.streams)) {
+      await store(raw, `claude.${stream}`, "2026-10-01T00:00:00.000Z", {
+        records: rows.map(({ message_count: _count, ...row }) => row),
+      });
+    }
+
+    const result = await supersedeLegacyVersions(
+      withLegacyProjection(raw),
+      scope,
+      "2026-10-01T00:00:00.000Z",
+    );
+
+    expect(result).toEqual({
+      superseded: [],
+      refused: "the projection is partial (records_partial)",
+    });
+    expect(raw.entries.filter((entry) => entry.scope === scope)).toHaveLength(
+      2,
+    );
+  });
+
   it.each([
     ["claude.conversations", "messages", "conversation_id"],
     ["claude.projects", "project_documents", "project_id"],
@@ -784,15 +858,24 @@ describe("supersedeLegacyVersions", () => {
       };
       const raw = createMemoryDataStorage();
       await store(raw, scope, "2026-09-01T00:00:00.000Z", golden.legacyBody);
+      const nested = golden.streams[nestedStream]!;
+      const keptNested = nested.slice(0, nested.length - 1);
       for (const [stream, rows] of Object.entries(golden.streams)) {
+        // The source agrees with itself (its count matches the rows it
+        // kept), but holds fewer nested items than the legacy file.
         const kept =
           stream === nestedStream
-            ? rows.slice(0, rows.length - 1)
-            : rows.map((row) => {
-                // No source count to check the nested rows against.
-                const { message_count: _count, ...rest } = row;
-                return rest;
-              });
+            ? keptNested
+            : rows.map((row) =>
+                "message_count" in row
+                  ? {
+                      ...row,
+                      message_count: keptNested.filter(
+                        (message) => message.conversation_id === row.id,
+                      ).length,
+                    }
+                  : row,
+              );
         await store(raw, `claude.${stream}`, "2026-10-01T00:00:00.000Z", {
           records: kept,
         });

@@ -1565,6 +1565,7 @@ describe("GET /v1/data/:scope", () => {
     });
     expect(await legacyScopeView.readLatest("claude.conversations")).toEqual({
       kind: "file",
+      deletion: "canonical",
     });
     expect(legacyScopeView.verdictFor("claude.conversations")[0]).toMatchObject(
       {

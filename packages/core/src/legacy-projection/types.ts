@@ -15,13 +15,7 @@ export interface PdppRecord {
 export type LegacyScopeLookupError =
   | { kind: "unknown_scope"; scope: string }
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
-  | { kind: "test_debris_scope"; scope: string; reason: string }
-  | {
-      kind: "gap";
-      scope: string;
-      reason: string;
-      provenanceChecked: LegacyScopeBindingProvenance[];
-    };
+  | { kind: "test_debris_scope"; scope: string; reason: string };
 
 export interface LegacyScopeLookupOk {
   ok: true;
@@ -56,7 +50,6 @@ export type ProjectionError =
        */
       diagnostics?: ProjectionDiagnostic[];
     }
-  | { kind: "gap"; scope: string; reason: string }
   | { kind: "empty_singleton"; scope: string };
 
 export interface ProjectionOk {
@@ -147,11 +140,16 @@ export interface ProjectPdppRecordsOptions {
 }
 
 /**
- * One legacy scope's binding. `project` and `requiredStreams` are absent for
- * a scope this phase declares a gap for (see LEGACY_SCOPE_GAPS) — a gap has
- * no binding entry at all, by design: "no entry, no fabricated mapping."
+ * One legacy scope's binding. An unbound scope has no binding entry, so no
+ * mapping is fabricated.
  */
 export interface LegacyScopeBinding {
+  /**
+   * Streams whose `blob_ref` is only a copy of the raw source envelope: the
+   * declared typed fields already carry the full record, so a reader neither
+   * fetches that blob nor treats it as projected content.
+   */
+  ancillaryBlobStreams?: string[];
   /**
    * Per bound stream, the exact set of declared field names `project()`
    * reads off that stream's records. Checked by the self-check against the

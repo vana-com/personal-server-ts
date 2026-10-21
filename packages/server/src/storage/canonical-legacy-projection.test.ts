@@ -68,6 +68,247 @@ describe("canonical legacy projection over the real SQLite record store", () => 
   const writes = () =>
     db.prepare("SELECT total_changes() AS n").get() as { n: number };
 
+  it("reads live Claude inline records through the server's method binding without requiring export blobs", async () => {
+    const selected = connect("conn_live", "claude", "anthropic-live");
+    put(
+      "conn_live",
+      "account_plan",
+      [{ id: "account_plan", account_id: "org", plan_display_name: "Team" }],
+      undefined,
+      "anthropic-live",
+    );
+    put(
+      "conn_live",
+      "conversations",
+      [{ id: "existing", title: "Existing chat", message_count: 1 }],
+      undefined,
+      "anthropic-live",
+    );
+    put(
+      "conn_live",
+      "messages",
+      [
+        {
+          id: "message",
+          conversation_id: "existing",
+          role: "human",
+          content: "Actual message",
+          attachments: [],
+        },
+      ],
+      undefined,
+      "anthropic-live",
+    );
+    const before = writes();
+    const result = await readCanonicalLegacyScope({
+      store,
+      scope: "claude.conversations",
+      selection: selected,
+      profileBy: "method",
+      requireClaudeRawBlobs: true,
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      envelope: {
+        data: {
+          source: "live-session",
+          conversations: [
+            { id: "existing", messages: [{ content: "Actual message" }] },
+          ],
+        },
+      },
+    });
+    expect(writes()).toEqual(before);
+  });
+
+  it("does not report live Claude history complete when a conversation's message count is unknown", async () => {
+    // anthropic_live 0.3.6 writes message_count: null when the run did not
+    // read the conversation detail.
+    const selected = connect("conn_live", "claude", "anthropic-live");
+    put(
+      "conn_live",
+      "account_plan",
+      [{ id: "account_plan", account_id: "org", plan_display_name: null }],
+      undefined,
+      "anthropic-live",
+    );
+    put(
+      "conn_live",
+      "conversations",
+      [{ id: "existing", title: "Existing chat", message_count: null }],
+      undefined,
+      "anthropic-live",
+    );
+    put(
+      "conn_live",
+      "messages",
+      [
+        {
+          id: "message",
+          conversation_id: "existing",
+          role: "human",
+          content: "Only the message this store has",
+          attachments: [],
+        },
+      ],
+      undefined,
+      "anthropic-live",
+    );
+    const result = await readCanonicalLegacyScope({
+      store,
+      scope: "claude.conversations",
+      selection: selected,
+      profileBy: "method",
+      requireClaudeRawBlobs: true,
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      complete: false,
+      diagnostics: {
+        partialRows: [
+          {
+            stream: "conversations",
+            count: 1,
+            reasons: ["message_count_unknown"],
+          },
+        ],
+      },
+      envelope: { data: { conversations: [{ messageCount: 1 }] } },
+    });
+  });
+
+  it("serves complete live Claude inline records when a conversation also carries its declared raw-envelope blob_ref", async () => {
+    const selected = connect("conn_live", "claude", "anthropic-live");
+    const envelope = new TextEncoder().encode(
+      JSON.stringify({ uuid: "existing", name: "Existing chat" }),
+    );
+    const blob = store.storeBlobBytesForInstance({
+      instance: "conn_live",
+      method: "anthropic-live",
+      generation: 1,
+      bytes: envelope,
+      mimeType: "application/json",
+    });
+    put(
+      "conn_live",
+      "account_plan",
+      [{ id: "account_plan", account_id: "org", plan_display_name: "Team" }],
+      undefined,
+      "anthropic-live",
+    );
+    put(
+      "conn_live",
+      "conversations",
+      [
+        {
+          id: "existing",
+          title: "Existing chat",
+          message_count: 1,
+          blob_ref: {
+            blob_id: blob.blobId,
+            mime_type: "application/json",
+            size_bytes: blob.sizeBytes,
+            sha256: blob.sha256,
+          },
+        },
+      ],
+      undefined,
+      "anthropic-live",
+    );
+    put(
+      "conn_live",
+      "messages",
+      [
+        {
+          id: "message",
+          conversation_id: "existing",
+          role: "human",
+          content: "Actual message",
+          attachments: [],
+        },
+      ],
+      undefined,
+      "anthropic-live",
+    );
+    const result = await readCanonicalLegacyScope({
+      store,
+      scope: "claude.conversations",
+      selection: selected,
+      profileBy: "method",
+      requireClaudeRawBlobs: true,
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      complete: true,
+      envelope: {
+        data: {
+          source: "live-session",
+          conversations: [
+            {
+              id: "existing",
+              messageCount: 1,
+              messages: [{ content: "Actual message" }],
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("neither fetches nor budgets a live conversation's raw-envelope blob", async () => {
+    const selected = connect("conn_live", "claude", "anthropic-live");
+    const blob = store.storeBlobBytesForInstance({
+      instance: "conn_live",
+      method: "anthropic-live",
+      generation: 1,
+      bytes: new TextEncoder().encode(JSON.stringify({ uuid: "existing" })),
+      mimeType: "application/json",
+    });
+    put(
+      "conn_live",
+      "account_plan",
+      [{ id: "account_plan", account_id: "org", plan_display_name: "Team" }],
+      undefined,
+      "anthropic-live",
+    );
+    put(
+      "conn_live",
+      "conversations",
+      [
+        {
+          id: "existing",
+          title: "Existing chat",
+          message_count: 0,
+          blob_ref: {
+            blob_id: blob.blobId,
+            mime_type: "application/json",
+            size_bytes: blob.sizeBytes,
+            sha256: blob.sha256,
+          },
+        },
+      ],
+      undefined,
+      "anthropic-live",
+    );
+    const getBlobMeta = vi.spyOn(store, "getBlobMeta");
+    const getBlobBytes = vi.spyOn(store, "getBlobBytes");
+    const result = await readCanonicalLegacyScope({
+      store,
+      scope: "claude.conversations",
+      selection: selected,
+      profileBy: "method",
+      blobByteBudget: 0,
+      allowUnprovenEmptyStreams: true,
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      complete: true,
+      envelope: { data: { conversations: [{ id: "existing", messages: [] }] } },
+    });
+    expect(getBlobMeta).not.toHaveBeenCalled();
+    expect(getBlobBytes).not.toHaveBeenCalled();
+  });
+
   describe("connection selection", () => {
     it("reads only the selected connection when two accounts share a source", async () => {
       const a = connect("conn_a", "oura");

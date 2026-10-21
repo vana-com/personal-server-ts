@@ -323,7 +323,8 @@ export function withLegacyProjection(
       !recordsMatchBindingSource(
         records,
         binding,
-        alternateLegacyBindingsForScope(scope).size > 0,
+        alternateLegacyBindingsForScope(scope).size > 0 &&
+          !(scope === "claude.conversations" && profileKey === undefined),
       )
     ) {
       failProjection(scope, collectedAt, {
@@ -507,6 +508,15 @@ function selectProjectionBinding(
   const alternates = alternateLegacyBindingsForScope(scope);
   const identities = rows.map(recordSourceId);
   if (identities.includes(null)) return null;
+  // Before live-session admission, stored Claude export rows did not require
+  // identity tags. Keep that persisted contract tied to the original binding,
+  // whose account_profile join is still required. Never infer a live profile.
+  if (
+    scope === "claude.conversations" &&
+    identities.every((identity) => identity === undefined)
+  ) {
+    return { binding: original };
+  }
   if (alternates.size > 0 && identities.includes(undefined)) return null;
   const sources = new Set(identities.filter((id): id is string => !!id));
   if (sources.size > 1) return null;
