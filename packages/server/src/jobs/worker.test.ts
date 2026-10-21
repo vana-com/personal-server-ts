@@ -39,6 +39,7 @@ import type {
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import { deriveBuilderId } from "@opendatalabs/personal-server-ts-core/policy";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
+import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import { privateKeyToAccount } from "viem/accounts";
 import { executeJob, JobFailure, type JobWorkerDeps } from "./worker.js";
 
@@ -482,6 +483,34 @@ describe("executeJob", () => {
     expect(fixture.storage.findLatestVersionByScope).not.toHaveBeenCalled();
     expect(fixture.deps.hydrateScope).not.toHaveBeenCalled();
     expect(fixture.resultUploadFetch).not.toHaveBeenCalled();
+    expect(fixture.deps.accessLogWriter.write).not.toHaveBeenCalled();
+  });
+
+  it("does not upload a result whose scope was deleted while the job ran", async () => {
+    const fixture = await createFixture();
+    const tracker = createScopeDeletionTracker({ serverOwner: owner.address });
+    fixture.deps.scopeDeletions = tracker;
+    fixture.resultUploadFetch.mockReset();
+    // The owner deletes the scope while the result is being signed, after
+    // it was read and sealed.
+    fixture.resultUploadFetch.mockImplementationOnce(async () => {
+      tracker.markDeleted(SCOPE, {
+        deletedAt: "2099-01-01T00:00:00Z",
+        version: "9",
+      });
+      return new Response(
+        JSON.stringify({ authorization: "Web3Signed result-signature" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    fixture.resultUploadFetch.mockResolvedValueOnce(
+      new Response(null, { status: 201 }),
+    );
+
+    await expectFailure(fixture, "SCOPE_NOT_FOUND");
+
+    // Signed, never uploaded, never logged as served.
+    expect(fixture.resultUploadFetch).toHaveBeenCalledTimes(1);
     expect(fixture.deps.accessLogWriter.write).not.toHaveBeenCalled();
   });
 

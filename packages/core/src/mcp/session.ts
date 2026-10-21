@@ -19,7 +19,7 @@ import type { McpConnectionRecord } from "./types.js";
 import type { ServerAccount } from "../keys/server-account.js";
 import {
   resolveDataListGrantScopes,
-  verifyDataReadPolicy,
+  authorizeDataRead,
 } from "../policy/data-read.js";
 import type {
   AuthSessionVerifierPort,
@@ -329,7 +329,7 @@ export function createMcpSessionAuthPort(params: {
       return { grantedScopes };
     },
     async authorizeBuilderRead(input: PersonalServerReadAuthInput) {
-      const grant = await verifyDataReadPolicy(
+      const { grant, lease } = await authorizeDataRead(
         {
           signer: params.builderAddress,
           grantId: params.grantId,
@@ -397,7 +397,7 @@ export function createMcpSessionAuthPort(params: {
         // cycle.kind === "ok" — payment settled; proceed to read.
       }
 
-      return { builder: params.builderAddress, grantId: grant.id };
+      return { builder: params.builderAddress, grantId: grant.id, lease };
     },
   };
 }

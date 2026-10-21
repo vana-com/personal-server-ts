@@ -1,6 +1,10 @@
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import { authorizeLegacyRead } from "../policy/data-read.js";
+import {
+  allDeliveryLeases,
+  type DeliveryLease,
+} from "../policy/delivery-lease.js";
 import { storageForReader } from "../storage/disclosure-policy.js";
 import {
   DataDeletedError,
@@ -133,6 +137,12 @@ export interface PersonalServerReadAuthInput {
 export interface PersonalServerReadAuthResult {
   builder?: `0x${string}` | string;
   grantId?: string;
+  /**
+   * The grant-liveness half of the read's delivery lease (see
+   * `policy/delivery-lease.ts`). Absent for reads no grant mediates (owner,
+   * policy bypass, a static bearer): those have nothing to revoke.
+   */
+  lease?: DeliveryLease;
 }
 
 export interface PersonalServerWriteAuthInput {
@@ -1203,6 +1213,38 @@ export async function assertScopeNotDeleted(
 }
 
 /**
+ * The delivery lease for a `/v1/data`-family read (HTTP, MCP, jobs): the
+ * read's grant lease from its authorization, and the scope's live deletion
+ * state through the same tracker `/v1/data` uses. The deletion half answers
+ * from the tracker's local state only (gateway timeout zero): the early gate
+ * already consulted the gateway, and the release gate must catch what this
+ * process learned since (a sync tombstone, a local delete) without a second
+ * round trip. Throws `DataDeletedError` or the grant's refusal.
+ */
+export function readDeliveryLease(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  read: {
+    grant?: DeliveryLease;
+    scope: string;
+    entry: ReadDeletionEntry | null | undefined;
+    body?: "file" | "canonical";
+  },
+): DeliveryLease {
+  return allDeliveryLeases(read.grant, {
+    async assertDeliverable() {
+      const deletion = await resolveReadDeletion(
+        deps,
+        read.scope,
+        read.entry,
+        read.body ?? "file",
+        0,
+      );
+      if (deletion) throw new DataDeletedError(deletion);
+    },
+  });
+}
+
+/**
  * Discovery filter for the scope and version listings: an entry a read would
  * refuse with 410 is not listed either. Undefined (no filtering) when no
  * deletion tracker is wired.
@@ -2234,6 +2276,15 @@ export async function handlePersonalServerDataRequest(
         ipAddress,
         userAgent,
       });
+      // Delivery gate, after every await this read makes and immediately
+      // before the body is built: a grant revoked or a scope deleted while
+      // the read was in progress stops it here.
+      await readDeliveryLease(deps, {
+        grant: authResult?.lease,
+        scope: scopeResult.scope,
+        entry: canonicalOwned ? undefined : selectedEntry,
+        body: canonicalOwned ? "canonical" : "file",
+      }).assertDeliverable();
       const reportReadFulfillment = () => {
         if (!authResult?.grantId || !authResult.builder) return;
         reportPersonalServerReadFulfillment(deps, {
