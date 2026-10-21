@@ -205,6 +205,16 @@ export interface DataStoragePort extends RuntimeStoragePort {
     scope: string,
     collectedAt: string,
   ): boolean | Promise<boolean>;
+  /**
+   * The generation of an index row from before rows recorded one. Storage
+   * computes it from the bytes published at the row's path, reads them a
+   * second time, and records it on that row only if both reads agree and
+   * the row still has none; otherwise undefined. A row that has a
+   * generation returns it unchanged. Never takes a caller's value.
+   */
+  backfillGeneration?(
+    entry: Pick<IndexEntry, "id" | "path" | "generation">,
+  ): Promise<string | undefined>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
   /** Atomic local legacy write, including a version compare when requested. */
   commitEnvelope?(

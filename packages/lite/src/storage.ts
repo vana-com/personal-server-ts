@@ -984,6 +984,44 @@ export async function createPersistentPsLiteStorage(
         : { ...indexed, ...identity };
     },
 
+    async backfillGeneration(entry) {
+      if (entry.generation) return entry.generation;
+      const swap = (expected: string | null, next: string | null) => {
+        let swapped = false;
+        state = {
+          ...state,
+          entries: state.entries.map((item) => {
+            if (
+              item.id !== entry.id ||
+              (item.generation ?? null) !== expected
+            ) {
+              return item;
+            }
+            swapped = true;
+            const { generation: _previous, ...rest } = item;
+            return next === null ? rest : { ...rest, generation: next };
+          }),
+        };
+        return swapped;
+      };
+      const first = (await identityOfPublishedBytes(entry.path)).generation;
+      if (!first) return undefined;
+      if (!swap(null, first)) {
+        const current = state.entries.find((item) => item.id === entry.id);
+        return current?.generation;
+      }
+      // The bytes are read again: a version replaced between the two reads
+      // is not recorded.
+      const second = (await identityOfPublishedBytes(entry.path)).generation;
+      if (second !== first) {
+        swap(first, null);
+        await persist();
+        return undefined;
+      }
+      await persist();
+      return first;
+    },
+
     async updateFileId(path, fileId) {
       let updated = false;
       state = {

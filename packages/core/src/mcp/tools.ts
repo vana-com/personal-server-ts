@@ -897,7 +897,7 @@ const readScope: McpToolDefinition = {
       .max(MAX_SELECTED_BLOCK_IDS)
       .optional()
       .describe(
-        "Block ids from a search hit's blockRef or list_scope_blocks. Ignores cursor; maxBytes still applies.",
+        "Block ids from a search hit's blockRef or list_scope_blocks. Pass list_scope_blocks' versionCursor as cursor to read that exact version; maxBytes still applies.",
       ),
     maxBytes: z.number().int().min(1).max(MAX_READ_SCOPE_MAX_BYTES).optional(),
     timeoutMs: z
@@ -1109,7 +1109,7 @@ const listScopeBlocks: McpToolDefinition = {
   name: "list_scope_blocks",
   title: "List scope blocks",
   description:
-    "Scope table of contents: block ids, paths, sizes. Feed ids to read_scope blockIds.",
+    "Scope table of contents: block ids, paths, sizes. Feed ids to read_scope blockIds, with versionCursor as cursor.",
   inputSchema: {
     scope: z.string().min(1).describe("Exact scope id."),
     offset: z.number().int().min(0).optional(),
@@ -1181,6 +1181,9 @@ const listScopeBlocks: McpToolDefinition = {
         collectedAt: manifest.collectedAt,
         contentKind: manifest.contentKind,
         manifestAvailable: true,
+        ...(manifest.versionCursor
+          ? { versionCursor: manifest.versionCursor }
+          : {}),
         totalBlocks: manifest.blocks.length,
         blocks: page.map((block) => ({
           id: block.id,

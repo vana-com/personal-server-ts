@@ -8,6 +8,12 @@ export interface DataBlockCursor {
   intraBlockOffset?: number;
   /** Identifies a read-time view of the version (see readBuiltScopeBlocks). */
   view?: string;
+  /**
+   * The generation of the version the paged read started on. A read that
+   * resumes the cursor on another version at the same collectedAt is
+   * refused instead of serving that version's bytes.
+   */
+  generation?: string;
 }
 
 export interface EncodeDataBlockCursorInput {
@@ -16,6 +22,7 @@ export interface EncodeDataBlockCursorInput {
   blockIndex: number;
   intraBlockOffset?: number;
   view?: string;
+  generation?: string;
 }
 
 export type DataBlockCursorErrorCode =
@@ -58,6 +65,9 @@ export function encodeDataBlockCursor(
         ? {}
         : { intraBlockOffset: input.intraBlockOffset }),
       ...(input.view === undefined ? {} : { view: input.view }),
+      ...(input.generation === undefined
+        ? {}
+        : { generation: input.generation }),
     }),
   );
 }
@@ -107,7 +117,9 @@ export function decodeDataBlockCursor(
     !isNonNegativeInteger(candidate.blockIndex) ||
     (candidate.intraBlockOffset !== undefined &&
       !isNonNegativeInteger(candidate.intraBlockOffset)) ||
-    (candidate.view !== undefined && typeof candidate.view !== "string")
+    (candidate.view !== undefined && typeof candidate.view !== "string") ||
+    (candidate.generation !== undefined &&
+      typeof candidate.generation !== "string")
   ) {
     return malformedCursor("Cursor payload has invalid fields");
   }
@@ -123,6 +135,9 @@ export function decodeDataBlockCursor(
         ? {}
         : { intraBlockOffset: candidate.intraBlockOffset }),
       ...(typeof candidate.view === "string" ? { view: candidate.view } : {}),
+      ...(typeof candidate.generation === "string"
+        ? { generation: candidate.generation }
+        : {}),
     },
   };
 }

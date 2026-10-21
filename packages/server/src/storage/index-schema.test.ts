@@ -627,7 +627,16 @@ describe("initializeDatabase", () => {
     const dbPath = join(tempDir, "v15.db");
     try {
       const v15 = initializeDatabase(dbPath);
-      v15.exec("ALTER TABLE data_files DROP COLUMN generation");
+      const columns = (db: Database.Database) =>
+        (
+          db.prepare("PRAGMA table_info(data_files)").all() as Array<{
+            name: string;
+          }>
+        ).map((column) => column.name);
+      // A v15 data_files table has no generation column.
+      if (columns(v15).includes("generation")) {
+        v15.exec("ALTER TABLE data_files DROP COLUMN generation");
+      }
       v15
         .prepare(
           "INSERT INTO data_files (path, scope, collected_at, size_bytes, pdpp_origin) VALUES (?, ?, ?, ?, ?)",
@@ -644,6 +653,7 @@ describe("initializeDatabase", () => {
 
       const db = initializeDatabase(dbPath);
       expect(db.pragma("user_version", { simple: true })).toBe(16);
+      expect(columns(db)).toContain("generation");
       expect(
         db
           .prepare("SELECT path, pdpp_origin, generation FROM data_files")

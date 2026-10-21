@@ -585,13 +585,21 @@ describe("mcp/read-client", () => {
       },
     });
 
-    await expect(
-      client.readScopeBlocks({
-        scope: "instagram.profile",
-        grantId: "grant-1",
-        maxBytes: 4096,
-      }),
-    ).resolves.toMatchObject({ nextCursor });
+    const page = await client.readScopeBlocks({
+      scope: "instagram.profile",
+      grantId: "grant-1",
+      maxBytes: 4096,
+    });
+    // The storage cursor's position, also naming the version the read
+    // started on; decoded by hand, not by the cursor module.
+    expect(
+      JSON.parse(Buffer.from(page.nextCursor!, "base64url").toString("utf8")),
+    ).toMatchObject({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      blockIndex: 1,
+      generation: "gen-1",
+    });
 
     expect(accessLogWrite).toHaveBeenCalledTimes(1);
     expect(readFulfillmentReport).not.toHaveBeenCalled();

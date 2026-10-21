@@ -37,6 +37,7 @@ import {
   buildDataFilePath,
   buildScopeDir,
   canonicalJson,
+  envelopeGeneration,
   filenameToTimestamp,
   type HierarchyManagerOptions,
   type WriteResult,
@@ -52,6 +53,7 @@ import {
   type DataScopeBlock,
   type ReadScopeBlocksResponse,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import { previewJsonEnvelopePrefix } from "@opendatalabs/personal-server-ts-core/storage/preview";
 
 const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
@@ -245,8 +247,19 @@ export async function stageDataFile(
   stagePath: string;
   relativePath: string;
   sizeBytes: number;
+  /**
+   * Provenance and generation of the bytes staged, taken with the same
+   * snapshot of `envelope` as the bytes, before any await: a caller that
+   * changes its object later cannot change what is recorded.
+   */
+  identity: { pdppOrigin: boolean; generation: string };
 }> {
   const openFile = deps.openFile ?? open;
+  const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
+  const identity = {
+    pdppOrigin: hasPdppOrigin(envelope),
+    generation: envelopeGeneration(envelope),
+  };
   const finalPath = buildDataFilePath(
     options.dataDir,
     envelope.scope,
@@ -256,7 +269,6 @@ export async function stageDataFile(
   const directorySyncPaths = collectDirectorySyncPaths(finalDir);
   await mkdir(finalDir, { recursive: true });
   const stagePath = `${finalPath}.pending.${randomUUID()}`;
-  const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
   const handle = await openFile(stagePath, "wx");
   try {
     await handle.writeFile(bytes);
@@ -277,6 +289,7 @@ export async function stageDataFile(
     stagePath,
     relativePath: relative(options.dataDir, finalPath),
     sizeBytes: bytes.length,
+    identity,
   };
 }
 

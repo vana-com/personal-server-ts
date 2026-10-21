@@ -25,7 +25,10 @@ import type {
   ReadScopeBlocksResponse,
 } from "../storage/blocks/types.js";
 import type { SearchHit } from "./search/index.js";
-import { decodeDataBlockCursor } from "../storage/blocks/index.js";
+import {
+  decodeDataBlockCursor,
+  encodeDataBlockCursor,
+} from "../storage/blocks/index.js";
 import {
   bytesToBase64,
   isBinaryEnvelope,
@@ -378,7 +381,7 @@ export interface McpDataReadClient {
   readBlockManifest?(params: {
     scope: string;
     grantId: string;
-  }): Promise<DataBlockManifest | null>;
+  }): Promise<McpBlockManifest | null>;
 
   /**
    * Perform a grant-gated raw binary read for an approved binary scope. This
@@ -441,6 +444,13 @@ export interface McpDataReadRawFileResult {
   contentBase64: string;
   metadata?: unknown;
 }
+
+/**
+ * A table of contents with the cursor that pins its version. Pass
+ * `versionCursor` as `cursor` with `blockIds` so the selected blocks come
+ * from this version, or the read is refused.
+ */
+export type McpBlockManifest = DataBlockManifest & { versionCursor?: string };
 
 export class McpDataReadError extends Error {
   constructor(
@@ -725,6 +735,13 @@ export function createMcpDataReadClient(
       // x402 there, and deleted data must never be charged for.
       await assertScopeReadable(scope, selectedEntry);
       authorizeGranteeVersion(selectedEntry);
+      // A cursor (from a page or a table of contents) names the version the
+      // logical read started on. Refused before payment when the selected
+      // row is another version.
+      const cursorGeneration = generationFromCursor(scope, cursor);
+      if (selectedEntry.generation !== undefined) {
+        assertSameVersion(scope, cursorGeneration, selectedEntry.generation);
+      }
 
       const { request, authResult } = await authorizeScopeRead({
         scope,
@@ -737,7 +754,9 @@ export function createMcpDataReadClient(
       });
 
       try {
-        const result = await storage.readScopeBlocks(
+        const generation = await versionGeneration(storage, selectedEntry);
+        assertSameVersion(scope, cursorGeneration, generation);
+        const read = await storage.readScopeBlocks(
           scope,
           selectedEntry.collectedAt,
           {
@@ -746,11 +765,13 @@ export function createMcpDataReadClient(
             ...(blockIds?.length ? { blockIds } : {}),
             // Pin the version authorized above: the view serves only its
             // bytes, never a version published later at the same path.
-            ...(selectedEntry.generation
-              ? { generation: selectedEntry.generation }
-              : {}),
+            ...(generation ? { generation } : {}),
           },
         );
+        // The next page continues this version only.
+        const result = read.nextCursor
+          ? { ...read, nextCursor: cursorFor(read.nextCursor, generation) }
+          : read;
         const { logId, timestamp, ipAddress, userAgent } =
           await writeReadAccessLog(request, { scope, grantId, authResult });
         // A block-addressed read serves a hand-picked subset, so it never
@@ -796,6 +817,7 @@ export function createMcpDataReadClient(
         if (err instanceof ProtocolError) {
           throw new McpDataReadError(err.code, err.toJSON());
         }
+        if (err instanceof McpDataReadError) throw err;
         if (err instanceof Error) {
           const code = dataBlockStorageErrorCode(err);
           const status = code === "cursor_invalid" ? 400 : 503;
@@ -838,13 +860,13 @@ export function createMcpDataReadClient(
         metadataOnly: true,
       });
       let manifest;
+      let generation: string | undefined;
       try {
+        generation = await versionGeneration(storage, selectedEntry);
         manifest = await storage.readBlockManifest(
           scope,
           selectedEntry.collectedAt,
-          selectedEntry.generation
-            ? { generation: selectedEntry.generation }
-            : undefined,
+          generation ? { generation } : undefined,
         );
       } catch (err) {
         if (err instanceof ProtocolError) {
@@ -855,9 +877,21 @@ export function createMcpDataReadClient(
       // Logged like any other grant-gated read, but never reported as a read
       // fulfillment: a table of contents carries no block values.
       await writeReadAccessLog(request, { scope, grantId, authResult });
-      if (manifest && !isOwnerView(authResult)) {
+      if (!manifest) return manifest;
+      // Selection by these block ids reads this version only when the
+      // caller passes this cursor with them.
+      const versionCursor = cursorFor(
+        encodeDataBlockCursor({
+          scope,
+          collectedAt: selectedEntry.collectedAt,
+          blockIndex: 0,
+        }),
+        generation,
+      );
+      if (!isOwnerView(authResult)) {
         return {
           ...manifest,
+          versionCursor,
           blocks: redactBlockRefsForGrantee(
             manifest.blocks,
             await resolveBlockRedactionContext(
@@ -869,7 +903,7 @@ export function createMcpDataReadClient(
           ),
         };
       }
-      return manifest;
+      return { ...manifest, versionCursor };
     },
 
     async readRawScopeFile({ scope, grantId, at, fileId, payment }) {
@@ -967,6 +1001,55 @@ function filenameFromContentDisposition(
   const match =
     /filename="([^"]+)"/i.exec(value) ?? /filename=([^;]+)/i.exec(value);
   return match?.[1]?.trim();
+}
+
+/** The generation a cursor was issued for, when it names one. */
+function generationFromCursor(
+  scope: string,
+  cursor: string | undefined,
+): string | undefined {
+  if (!cursor) return undefined;
+  const decoded = decodeDataBlockCursor(cursor);
+  if (!decoded.ok || decoded.cursor.scope !== scope) return undefined;
+  return decoded.cursor.generation;
+}
+
+/** Refuse a cursor issued for another version than the one selected. */
+function assertSameVersion(
+  scope: string,
+  cursorGeneration: string | undefined,
+  generation: string | undefined,
+): void {
+  if (cursorGeneration === undefined || cursorGeneration === generation) {
+    return;
+  }
+  throw new McpDataReadError(409, {
+    error: "VERSION_CHANGED",
+    message:
+      "The version this cursor reads was replaced. Start the read again without the cursor.",
+    scope,
+    reason: "generation_mismatch",
+  });
+}
+
+/** A cursor that also names the version it reads. */
+function cursorFor(cursor: string, generation: string | undefined): string {
+  if (generation === undefined) return cursor;
+  const decoded = decodeDataBlockCursor(cursor);
+  if (!decoded.ok) return cursor;
+  const { version: _version, ...fields } = decoded.cursor;
+  return encodeDataBlockCursor({ ...fields, generation });
+}
+
+/**
+ * The generation a logical read pins: the row's, or for a row from before
+ * rows recorded one, the value storage backfills from the published bytes.
+ */
+async function versionGeneration(
+  storage: PersonalServerDataApiDeps["storage"],
+  entry: IndexEntry,
+): Promise<string | undefined> {
+  return entry.generation ?? (await storage.backfillGeneration?.(entry));
 }
 
 function collectedAtFromCursor(
