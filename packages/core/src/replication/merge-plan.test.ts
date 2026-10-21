@@ -687,6 +687,29 @@ describe("replica policy v3 vectors", () => {
         finalizedAt: null,
       }),
     );
+    expect(
+      replayedWithFinality.records[0].suppressionMarker?.erasedPayloads,
+    ).not.toContainEqual(
+      expect.objectContaining({
+        operationId: "old",
+        contentHash: old.contentHash,
+        observedAt: old.emittedAt,
+        finalizedAt: null,
+      }),
+    );
+    const reverseReplayWithFinality = planReplicaMerge(
+      {
+        ...context,
+        declarations: [declaration],
+        now: T0 + OWNER_DELETE_GRACE_PERIOD_MS + 2,
+        finalizedAt: () => T0,
+        suppressionMarkers: [markerWithoutFinality],
+      },
+      [del, old, registration],
+    );
+    expect(reverseReplayWithFinality.records[0].suppressionMarker).toEqual(
+      replayedWithFinality.records[0].suppressionMarker,
+    );
     const compactedResolutionReload = planReplicaMerge(
       {
         ...context,

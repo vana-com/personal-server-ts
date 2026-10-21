@@ -573,22 +573,27 @@ export function planReplicaMerge(
       suppressionMarker: marker,
     });
   }
+  const operationsByScope = new Map<string, ReplicaOperation[]>();
+  for (const variants of byId.values()) {
+    for (const operation of variants.values()) {
+      if (!("declaration" in operation)) continue;
+      const scope = recordScopeKey({
+        owner: operation.owner,
+        sourceId: operation.sourceId,
+        connectionId: operation.connectionId,
+        generation: operation.generation,
+        stream: operation.declaration.stream,
+        recordKey: operation.recordKey,
+      });
+      const scopedOperations = operationsByScope.get(scope);
+      if (scopedOperations) scopedOperations.push(operation);
+      else operationsByScope.set(scope, [operation]);
+    }
+  }
   for (const record of result.records) {
     if (!record.suppressionMarker) continue;
-    const operations = [...byId.values()]
-      .flatMap((variants) => [...variants.values()])
-      .filter(
-        (operation) =>
-          "declaration" in operation &&
-          recordScopeKey({
-            owner: operation.owner,
-            sourceId: operation.sourceId,
-            connectionId: operation.connectionId,
-            generation: operation.generation,
-            stream: operation.declaration.stream,
-            recordKey: operation.recordKey,
-          }) === recordScopeKey(record.identity),
-      );
+    const operations =
+      operationsByScope.get(recordScopeKey(record.identity)) ?? [];
     const operationReferences = payloadReferencesToErase(record, operations);
     if (operationReferences.length)
       result.payloadErasures.push({
@@ -993,20 +998,13 @@ function mergeRecord(
     erased || retainedMarker
       ? {
           identity: recordIdentity,
-          erasedOperations: [
-            ...(retainedMarker?.erasedOperations ?? []),
-            ...newlyErasedPayloads.map((payload) => ({
+          erasedOperations: mergeOperationReferences(
+            retainedMarker?.erasedOperations ?? [],
+            newlyErasedPayloads.map((payload) => ({
               writerId: payload.writerId,
               operationId: payload.operationId,
             })),
-          ]
-            .sort((a, b) => text(referenceKey(a), referenceKey(b)))
-            .filter(
-              (reference, index, all) =>
-                all.findIndex(
-                  (other) => referenceKey(other) === referenceKey(reference),
-                ) === index,
-            ),
+          ),
           erasedPayloads: mergeSuppressionEvidence(
             retainedMarker?.erasedPayloads ?? [],
             newlyErasedPayloads,
@@ -1015,22 +1013,15 @@ function mergeRecord(
             retainedMarker?.observations ?? [],
             markerObservations,
           ),
-          removals: [
-            ...(retainedMarker?.removals ?? []),
-            ...purgedDeletes.map((op) => ({
+          removals: mergeSuppressionRemovals(
+            retainedMarker?.removals ?? [],
+            purgedDeletes.map((op) => ({
               writerId: op.revision.writerId,
               operationId: op.revision.operationId,
               deletedAt: op.revision.wallMs,
               finalizedAt: finalizedAt(op)!,
             })),
-          ]
-            .sort((a, b) => text(referenceKey(a), referenceKey(b)))
-            .filter(
-              (removal, index, all) =>
-                all.findIndex(
-                  (other) => referenceKey(other) === referenceKey(removal),
-                ) === index,
-            ),
+          ),
         }
       : null;
   return {
@@ -1376,6 +1367,28 @@ function mergeSuppressionEvidence(
     }
   }
   return merged.sort((a, b) => text(canonicalJson(a), canonicalJson(b)));
+}
+function mergeOperationReferences(
+  ...groups: readonly (readonly OperationReference[])[]
+): OperationReference[] {
+  const byReference = new Map<string, OperationReference>();
+  for (const reference of groups.flat())
+    byReference.set(referenceKey(reference), reference);
+  return [...byReference.entries()]
+    .sort(([left], [right]) => text(left, right))
+    .map(([, reference]) => reference);
+}
+function mergeSuppressionRemovals(
+  ...groups: readonly (readonly SuppressionMarker["removals"][number][])[]
+): SuppressionMarker["removals"] {
+  const byEvidence = new Map<string, SuppressionMarker["removals"][number]>();
+  for (const removal of groups.flat())
+    byEvidence.set(canonicalJson(removal), removal);
+  return [...byEvidence.values()].sort(
+    (a, b) =>
+      text(referenceKey(a), referenceKey(b)) ||
+      text(canonicalJson(a), canonicalJson(b)),
+  );
 }
 function sameRecordScope(a: RecordOperation, b: ReplicaOperation): boolean {
   return (
