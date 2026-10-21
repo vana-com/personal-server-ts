@@ -1071,6 +1071,11 @@ export async function createServer(
       declarations: pdppRecords?.declarations,
       configuredMethods: (sourceId) =>
         pdppRecords?.configuredMethods.get(sourceId) ?? [],
+      optInMethods: new Set(
+        (pdppAuth?.configuredMethods ?? [])
+          .filter((method) => method.optIn)
+          .map((method) => method.methodId),
+      ),
       readLegacyHead: async (head) => {
         if (
           head.path.startsWith("/") ||

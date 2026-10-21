@@ -153,19 +153,6 @@ export interface ProjectPdppRecordsOptions {
  */
 export interface LegacyScopeBinding {
   /**
-   * Absent: the binding's connection may take the scope over from an
-   * eligible legacy file once its projection covers that file. `false`: it
-   * may not. While the scope has an eligible legacy head and no takeover
-   * earned by one of this method's connections, the legacy file stays the
-   * latest body and this binding's connections are not counted as
-   * candidates (so a second connection cannot make the read ambiguous). A
-   * takeover another method earned does not lift this. With no legacy head,
-   * or after this method's own takeover (or one recorded before takeovers
-   * named their connection), the binding serves as any other. Remove the
-   * flag to opt a binding back in to automatic takeover.
-   */
-  canonicalTakeover?: false;
-  /**
    * Per bound stream, the exact set of declared field names `project()`
    * reads off that stream's records. Checked by the self-check against the
    * vendored declaration's own `schema.properties` keys — deleting or

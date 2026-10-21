@@ -197,6 +197,8 @@ function addLegacyClaudeHead(db: InstanceType<typeof Database>) {
   );
 }
 
+const OPT_IN: ReadonlySet<string> = new Set(["oura-browser"]);
+
 describe("legacy scope view over the real SQLite record store", () => {
   let db: InstanceType<typeof Database>;
   let store: Store;
@@ -1893,7 +1895,16 @@ describe("legacy scope view over the real SQLite record store", () => {
     ).run(scope, 7, 9, "2026-01-01T00:00:00.000Z", path, producer);
   }
 
-  describe("oura-browser does not take a scope over from a legacy file", () => {
+  describe("an opt-in oura-browser does not take a scope over from a legacy file", () => {
+    beforeEach(() => {
+      view = createLegacyScopeView({
+        authority: createLegacyScopeAuthority(db),
+        records: store,
+        configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+        optInMethods: OPT_IN,
+      });
+    });
+
     it("keeps the file for a covered projection, and still owns the scope for deletion safety", async () => {
       legacyHead("oura.activity", "oura/activity/old.json");
       connect(store, "conn_b", "oura-browser");
@@ -1969,6 +1980,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         authority: createLegacyScopeAuthority(db),
         records: store,
         configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+        optInMethods: OPT_IN,
         logger: { info },
       });
       legacyHead("oura.activity", "oura/activity/old.json");
@@ -2002,23 +2014,54 @@ describe("legacy scope view over the real SQLite record store", () => {
       expect(info.mock.calls[1]![0]).toMatchObject({ heldConnections: 2 });
     });
 
-    it("keeps a takeover that was already recorded", async () => {
-      legacyHead("oura.activity", "oura/activity/old.json");
+    function recordTakeover(instance: string, method: string) {
       db.prepare(
         `INSERT INTO legacy_scope_takeovers
-         (scope, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
-         VALUES (?, ?, ?, ?, ?)`,
+         (scope, instance, generation, method, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+         VALUES (?, ?, 1, ?, ?, ?, ?, ?)`,
       ).run(
         "oura.activity",
+        instance,
+        method,
         7,
         9,
         "2026-01-01T00:00:00.000Z",
         "oura/activity/old.json",
       );
+    }
+
+    it("serves the projection after a takeover oura-browser itself earned", async () => {
+      legacyHead("oura.activity", "oura/activity/old.json");
       connect(store, "conn_b", "oura-browser");
       replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+      recordTakeover("conn_b", "oura-browser");
       expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
     });
+
+    it.each([
+      ["another method earned on the same connection", "conn_b", "oura"],
+      ["does not name its method (an older runtime)", "", ""],
+    ])(
+      "stays gated for a takeover that %s",
+      async (_name, instance, method) => {
+        legacyHead("oura.activity", "oura/activity/old.json");
+        connect(store, "conn_b", "oura-browser");
+        replace(store, "conn_b", "activity", ["a1"], {
+          method: "oura-browser",
+        });
+        recordTakeover(instance, method);
+        // The browser rows do not serve. The recorded takeover still marks
+        // the file superseded, so the read refuses rather than serving it.
+        expect(await view.readLatest("oura.activity")).toEqual({
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "no_connection",
+            candidates: 0,
+          },
+        });
+      },
+    );
 
     it("serves the file after the oura-browser connection is deleted or replaced", async () => {
       legacyHead("oura.activity", "oura/activity/old.json");
@@ -2068,6 +2111,16 @@ describe("legacy scope view over the real SQLite record store", () => {
 
   describe("every other binding keeps its automatic takeover of a legacy file", () => {
     it.each([
+      {
+        name: "oura-browser where it is not opt-in (a dev build)",
+        scope: "oura.activity",
+        seed: () => {
+          connect(store, "conn_b", "oura-browser");
+          replace(store, "conn_b", "activity", ["a1"], {
+            method: "oura-browser",
+          });
+        },
+      },
       {
         name: "oura (PAT method)",
         scope: "oura.activity",

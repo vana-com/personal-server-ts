@@ -75,7 +75,7 @@ export type PdppAuthBootResult = PdppAuthRouteDeps & {
    */
   retainedDocuments: Map<string, string>;
   /** Configured artifact methods resolved through their retained declaration paths. */
-  configuredMethods: { sourceId: string; methodId: string }[];
+  configuredMethods: { sourceId: string; methodId: string; optIn: boolean }[];
   /** Connection methods remain available when canonical record declarations are off. */
   connectionMethods: Map<string, string[]>;
   /**
@@ -141,7 +141,9 @@ export async function createPdppAuthDeps(
       );
       return [];
     }
-    return [{ sourceId, methodId: method.method_id }];
+    return [
+      { sourceId, methodId: method.method_id, optIn: method.opt_in === true },
+    ];
   });
   const connectionMethods = new Map<string, string[]>();
   for (const method of config.pdpp.connectionMethods ?? []) {

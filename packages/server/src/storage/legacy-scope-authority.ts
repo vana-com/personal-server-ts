@@ -173,6 +173,18 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       );
     },
 
+    hasMethodTakeover(scope, method) {
+      return (
+        method !== "" &&
+        hasTable("legacy_scope_takeovers") &&
+        db
+          .prepare(
+            "SELECT 1 FROM legacy_scope_takeovers WHERE scope = ? AND method = ?",
+          )
+          .get(scope, method) !== undefined
+      );
+    },
+
     hasCoveredHead(scope, head, instance) {
       const instanceFilter =
         instance === undefined ? "" : " AND (instance = ? OR instance = '')";
@@ -344,12 +356,13 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           if (!coverage.covered) return true;
           db.prepare(
             `INSERT OR IGNORE INTO legacy_scope_takeovers
-            (scope, instance, generation, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            (scope, instance, generation, method, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           ).run(
             scope,
             verdict.instance,
             verdict.generation,
+            verdict.method,
             expectedHead.version,
             expectedHead.casRevision,
             expectedHead.collectedAt,

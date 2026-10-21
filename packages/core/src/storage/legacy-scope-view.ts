@@ -139,6 +139,11 @@ export interface LegacyScopeAuthority {
   arrivalRevision(): number;
   /** Whether a complete canonical read has already superseded the legacy head. */
   hasTakeover(scope: string, instance?: string, generation?: number): boolean;
+  /**
+   * Whether a takeover of `scope` is recorded as earned by `method`. Records
+   * that do not name their method (written before takeovers did) never match.
+   */
+  hasMethodTakeover(scope: string, method: string): boolean;
   hasCoveredHead(
     scope: string,
     head: LegacyScopeHead,
@@ -168,6 +173,8 @@ export interface LegacyScopeAuthority {
     verdict?: {
       instance: string;
       generation: number;
+      /** The selected connection's method, recorded with a takeover. */
+      method: string;
       writeClock: number;
       arrivalRevision: number;
       canonicalCursor: string;
@@ -304,6 +311,13 @@ export interface CreateLegacyScopeViewInput {
   declarations?: ReadCanonicalLegacyScopeInput["declarations"];
   /** Methods this boot configures for a store source id. */
   configuredMethods(sourceId: string): readonly string[];
+  /**
+   * Methods this boot runs only at the owner's explicit opt-in, beside the
+   * source's legacy collector (Desktop's stable opt-in tier). While a scope
+   * has an eligible legacy head, such a method does not take the scope over
+   * unless a takeover recorded for that same method exists. Absent: none.
+   */
+  optInMethods?: ReadonlySet<string>;
   /** Read the exact latest indexed legacy file; omitted by in-memory adapters. */
   readLegacyHead?(head: LegacyScopeHead): Promise<DataFileEnvelope>;
   /** Optional payload growth limits for the takeover check. */
@@ -335,14 +349,14 @@ export function createLegacyScopeView(
   >();
 
   /**
-   * The scope's methods, minus each method whose binding opts out of
-   * takeover while the legacy file is still the owner's latest body: an
-   * eligible legacy head and no takeover that this method earned. Such a
-   * method never served this scope, so its deleted, reset or replaced
-   * connections are not ownership evidence: the file was the served body all
-   * along. A takeover another method earned (the PAT `oura` connection, say)
-   * leaves it excluded. Once it has earned one, it serves, and deletion
-   * refuses, as for any other binding.
+   * The scope's methods, minus each opt-in method (`input.optInMethods`)
+   * while the legacy file is still the owner's latest body: an eligible
+   * legacy head and no takeover recorded for that method. Such a method never
+   * served this scope, so its deleted, reset or replaced connections are not
+   * ownership evidence: the file was the served body all along. A takeover
+   * another method earned (the PAT `oura` connection, say), or one that does
+   * not name its method, leaves it excluded. Once it has earned one, it
+   * serves, and deletion refuses, as for any other method.
    */
   function withoutOptedOutMethods(
     scope: string,
@@ -360,18 +374,16 @@ export function createLegacyScopeView(
     return new Map([...methods].filter(([method]) => !gated.has(method)));
   }
 
-  /**
-   * A takeover record names the connection whose read earned it. A record
-   * without one (instance '') predates that, so it cannot show which method
-   * earned it: it counts for every method, as all takeovers did before.
-   */
-  function earnedTakeover(scope: string, method: string): boolean {
-    return (
-      authority.hasTakeover(scope, "") ||
-      authority
-        .listMethodConnections([method])
-        .some((connection) => authority.hasTakeover(scope, connection.instance))
+  function optedOutMethods(scope: string): string[] {
+    const optIn = input.optInMethods;
+    if (!optIn || optIn.size === 0) return [];
+    return [...scopeMethods(scope).keys()].filter((method) =>
+      optIn.has(method),
     );
+  }
+
+  function earnedTakeover(scope: string, method: string): boolean {
+    return authority.hasMethodTakeover(scope, method);
   }
 
   /**
@@ -693,6 +705,7 @@ export function createLegacyScopeView(
         {
           instance: decision.selection.instance,
           generation: decision.generation,
+          method: decision.selection.method,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
           canonicalCursor,
@@ -754,6 +767,7 @@ export function createLegacyScopeView(
         {
           instance: decision.selection.instance,
           generation: decision.generation,
+          method: decision.selection.method,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
           canonicalCursor,
@@ -837,6 +851,7 @@ export function createLegacyScopeView(
           {
             instance: decision.selection.instance,
             generation: decision.generation,
+            method: decision.selection.method,
             writeClock: initial.writeClock,
             arrivalRevision: initial.arrivalRevision,
             canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
@@ -946,6 +961,7 @@ export function createLegacyScopeView(
         {
           instance: decision.selection.instance,
           generation: decision.generation,
+          method: decision.selection.method,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
           canonicalCursor,
@@ -1230,21 +1246,6 @@ function scopeMethods(scope: string): Map<string, readonly string[]> {
     const method = legacyConnectorKey(bound.pdppSource);
     const binding = legacyBindingsForProfile(method).get(scope);
     if (binding) methods.set(method, binding.pdppStreams);
-  }
-  return methods;
-}
-
-/** Methods whose binding for `scope` opts out of automatic takeover. */
-function optedOutMethods(scope: string): Set<string> {
-  const methods = new Set<string>();
-  for (const profile of BINDING_PROFILES) {
-    const bound = profile.get(scope);
-    if (!bound) continue;
-    const method = legacyConnectorKey(bound.pdppSource);
-    if (
-      legacyBindingsForProfile(method).get(scope)?.canonicalTakeover === false
-    )
-      methods.add(method);
   }
   return methods;
 }

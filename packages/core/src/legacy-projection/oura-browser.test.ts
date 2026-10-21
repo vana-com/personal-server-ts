@@ -4,11 +4,7 @@ import { describe, expect, it } from "vitest";
 import browser from "./declarations/oura-browser.collection-profile.json";
 import provenance from "./declarations/oura-browser.provenance.json";
 import {
-  ANTHROPIC_LIVE_BINDINGS,
-  GITHUB_BROWSER_BINDINGS,
-  LEGACY_SCOPE_BINDINGS,
   legacyScopeToPdppSelection,
-  META_040_BINDINGS,
   OURA_BROWSER_BINDINGS,
   projectPdppRecordsToLegacyPayload,
 } from "./index.js";
@@ -97,24 +93,5 @@ describe("Oura browser source bindings", () => {
       payload: { days: [] },
       diagnostics: [{ kind: "records_dropped", stream: "activity", count: 1 }],
     });
-  });
-
-  it("is the only profile that opts out of canonical takeover of a legacy file", () => {
-    const optedOut = [
-      ["legacy", LEGACY_SCOPE_BINDINGS],
-      ["anthropic-live", ANTHROPIC_LIVE_BINDINGS],
-      ["github-browser", GITHUB_BROWSER_BINDINGS],
-      ["meta", META_040_BINDINGS],
-      ["oura-browser", OURA_BROWSER_BINDINGS],
-    ].flatMap(([profile, bindings]) =>
-      [...(bindings as typeof OURA_BROWSER_BINDINGS)]
-        .filter(([, binding]) => binding.canonicalTakeover === false)
-        .map(([scope]) => `${profile as string}:${scope}`),
-    );
-    expect(optedOut.sort()).toEqual([
-      "oura-browser:oura.activity",
-      "oura-browser:oura.readiness",
-      "oura-browser:oura.sleep",
-    ]);
   });
 });

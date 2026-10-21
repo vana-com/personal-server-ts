@@ -16,6 +16,7 @@
  * the view decided with the body.
  */
 
+import Database from "better-sqlite3";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -172,10 +173,15 @@ function grant(): GatewayGrantResponse {
   };
 }
 
-/** `methodIds`: the pdpp.methods Desktop configures for source oura. */
+/**
+ * `methodIds`: the pdpp.methods Desktop configures for source oura.
+ * `optIn`: those it marks opt-in. A stable build marks oura-browser (it runs
+ * only from the owner's deep link); a dev build marks nothing.
+ */
 async function boot(
   methodIds: string[] = ["oura-browser"],
   dataPointFeed?: CreateServerOptions["dataPointFeed"],
+  optIn: readonly string[] = ["oura-browser"],
 ) {
   const dir = join(tempDir, "declarations");
   await mkdir(dir, { recursive: true });
@@ -206,6 +212,7 @@ async function boot(
         methods: methodIds.map((method_id) => ({
           method_id,
           declaration_path: paths.get(method_id)!,
+          ...(optIn.includes(method_id) ? { opt_in: true } : {}),
         })),
       },
     }),
@@ -669,17 +676,20 @@ const ALL = (served: string) => ({
 });
 
 /** Start over in a fresh data dir with another `pdpp.methods` configuration. */
-async function freshBoot(methods: string[]) {
+async function freshBoot(methods: string[], optIn?: readonly string[]) {
   await ctx!.cleanup();
   await rm(tempDir, { recursive: true, force: true });
   tempDir = await mkdtemp(join(tmpdir(), "oura-legacy-first-"));
-  ctx = await boot(methods);
+  ctx = await boot(methods, undefined, optIn);
 }
 
 /** Restart the same data dir with another `pdpp.methods` configuration. */
-async function restartWithMethods(methods: string[]) {
+async function restartWithMethods(
+  methods: string[],
+  optIn?: readonly string[],
+) {
   await ctx!.cleanup();
-  ctx = await boot(methods);
+  ctx = await boot(methods, undefined, optIn);
 }
 
 describe("an owner with a legacy Oura file and an oura-browser connection", () => {
@@ -1097,5 +1107,72 @@ describe("an owner with the PAT `oura` and the `oura-browser` method both config
     ).scopes.map((entry) => entry.scope);
     expect(listed).toEqual(expect.arrayContaining([...SCOPES]));
     expect(label((await observe("oura.activity")).owner)).toBe(CANON);
+  });
+});
+
+describe("a dev build, where oura-browser is the default Oura method (not opt-in)", () => {
+  beforeEach(() => {
+    LEGACY_TS = true;
+  });
+
+  it("lets a covering oura-browser projection take over the legacy file", async () => {
+    await freshBoot(["oura-browser"], []);
+    await writeLegacy(DAYS, T_LEGACY);
+    await writePdpp(DAYS, T_PDPP);
+    expect((await readAll())["oura.sleep"]).toBe(CANON);
+  });
+
+  it("keeps that takeover after a restart into a stable opt-in boot", async () => {
+    await freshBoot(["oura-browser"], []);
+    await writeLegacy(DAYS, T_LEGACY);
+    await writePdpp(DAYS, T_PDPP);
+    expect((await readAll())["oura.sleep"]).toBe(CANON);
+    await restartWithMethods(["oura-browser"], ["oura-browser"]);
+    vi.setSystemTime(new Date(T_PDPP));
+    // oura-browser earned this takeover itself, so the gate does not apply.
+    expect((await readAll())["oura.sleep"]).toBe(CANON);
+  });
+});
+
+describe("a takeover that oura-browser did not earn", () => {
+  beforeEach(() => {
+    LEGACY_TS = false;
+  });
+
+  it("keeps it gated for a takeover recorded without its method", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    await writePdpp(DAYS, T_PDPP);
+    // As a runtime pinned before takeovers named their method would write.
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      for (const scope of SCOPES) {
+        const head = db
+          .prepare(
+            "SELECT version, cas_revision, collected_at, path FROM data_files WHERE scope = ? ORDER BY id DESC LIMIT 1",
+          )
+          .get(scope) as {
+          version: number;
+          cas_revision: number;
+          collected_at: string;
+          path: string;
+        };
+        db.prepare(
+          `INSERT INTO legacy_scope_takeovers
+            (scope, instance, generation, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+            VALUES (?, '', 1, ?, ?, ?, ?)`,
+        ).run(
+          scope,
+          head.version,
+          head.cas_revision,
+          head.collected_at,
+          head.path,
+        );
+      }
+    } finally {
+      db.close();
+    }
+    // Unknown provenance does not let oura-browser serve; the recorded
+    // takeover still marks the file superseded, so the read refuses.
+    expect(await readAll()).toEqual(ALL("503 no_connection"));
   });
 });
