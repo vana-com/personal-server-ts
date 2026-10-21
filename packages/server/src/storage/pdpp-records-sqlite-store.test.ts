@@ -968,7 +968,7 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 12 });
+        ).toEqual({ version: 13 });
         expect(
           dbAfterUpgrade
             .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
@@ -1459,5 +1459,66 @@ describe("sqlite record store", () => {
       expect(store.getBlobBytes(blob.blobId)).toBeUndefined();
       expect(store.getBlobMeta(blob.blobId)).toBeUndefined();
     });
+  });
+});
+
+describe("v13 emitted-time order key", () => {
+  it("backfills the key on upgrade so existing rows list and summarize by instant", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-v13-"));
+    const path = join(dir, "records.db");
+    try {
+      const before = new Database(path);
+      const store = createTestBoundRecordStore(before);
+      store.ingestBatch(
+        [
+          ["late", "2026-01-01T09:00:00Z"],
+          ["early", "2026-01-01T10:00:00+02:00"],
+        ].map(([key, emitted_at]) => ({
+          instance: "inst_1",
+          stream: "events",
+          key: key!,
+          data: { id: key },
+          emitted_at: emitted_at!,
+        })),
+        () => "mutable_state",
+        () => ["id"],
+      );
+      // Rewind to a v12 database: no key on any row.
+      before.exec(`
+        UPDATE pdpp_records SET emitted_key = NULL;
+        UPDATE pdpp_record_changes SET emitted_key = NULL;
+        UPDATE pdpp_schema_version SET version = 12;
+      `);
+      before.close();
+
+      const after = new Database(path);
+      try {
+        const upgraded = createSqliteRecordStore(after);
+        expect(
+          after.prepare("SELECT version FROM pdpp_schema_version").get(),
+        ).toEqual({ version: 13 });
+        expect(
+          upgraded
+            .listRecords("events", {
+              instanceIds: ["inst_1"],
+              limit: 10,
+              order: "asc",
+            })
+            .data.map((r) => r.recordKey),
+        ).toEqual(["early", "late"]);
+        // The latest emitted time is the latest instant, in its stored spelling.
+        expect(upgraded.listStreams(["inst_1"])).toEqual([
+          {
+            stream: "events",
+            recordCount: 2,
+            lastUpdated: "2026-01-01T09:00:00Z",
+          },
+        ]);
+      } finally {
+        after.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
