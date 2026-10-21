@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
@@ -1330,6 +1331,92 @@ it("pending Lamport never advances local edits; preview agrees with eventual can
   expect(preview(receiver)[0].data.text).toBe("remote-100");
   receiver.promote({ credential: "replica-secret", id: "pending" });
   expect(value(d)?.data).toEqual(preview(receiver)[0].data);
+});
+
+// Origin: #440 journey "#9/#21". Promotion marks the key dirty when the
+// blob bytes arrive, then again through the canonical upsert. SQLite lets an
+// outer upsert's ON CONFLICT override a trigger body's OR IGNORE.
+it("promotes a pending blob-backed edit of an existing canonical key", () => {
+  const d = device();
+  put(d, "local");
+  const bytes = new TextEncoder().encode("edited attachment");
+  const blobId = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  const blob = {
+    blobId,
+    sha256: blobId,
+    mimeType: "text/plain",
+    sizeBytes: bytes.length,
+  };
+  const receiver = pendingReceiver(d);
+  receiver.stage({
+    credential: "replica-secret",
+    id: "pending",
+    blobs: [{ blobId, bytes }],
+    envelope: batch([
+      registration(),
+      {
+        ...registration(),
+        kind: "blob-claim",
+        blob,
+        revision: { counter: 99, writerId: "remote", operationId: "claim" },
+      } as ReplicaOperation,
+      {
+        ...upsert(100),
+        blobs: [blob],
+        data: {
+          id: "a",
+          text: "edited",
+          blob_ref: {
+            blob_id: blobId,
+            mime_type: "text/plain",
+            size_bytes: 17,
+          },
+        },
+      },
+    ]),
+  });
+  expect(preview(receiver)[0].data.text).toBe("edited");
+  expect(value(d)?.data.text).toBe("local");
+  receiver.promote({ credential: "replica-secret", id: "pending" });
+  expect(value(d)?.data.text).toBe("edited");
+  expect(preview(receiver, "grant")[0].data.text).toBe("edited");
+  expect(d.store.getBlobBytes(blobId)).toEqual(bytes);
+});
+
+// Structural guard for the case above: an outer statement's conflict clause
+// overrides any conflict clause in a trigger body, so view triggers must
+// guard their inserts with NOT EXISTS instead.
+it("keeps conflict clauses out of every view trigger body", () => {
+  const d = device();
+  // With the conflict-fact table the view also installs its local projection.
+  d.db.exec(
+    "CREATE TABLE pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY)",
+  );
+  const before = new Set(
+    (
+      d.db
+        .prepare("SELECT name FROM sqlite_master WHERE type='trigger'")
+        .all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  pendingReceiver(d);
+  const triggers = (
+    d.db
+      .prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger'")
+      .all() as { name: string; sql: string }[]
+  ).filter((row) => !before.has(row.name));
+  expect(triggers.length).toBeGreaterThan(20);
+  expect(
+    triggers
+      .filter(({ sql }) =>
+        /\b(?:INSERT|UPDATE)\s+OR\s+(?:IGNORE|REPLACE|ABORT|FAIL|ROLLBACK)\b|\bREPLACE\s+INTO\b/i.test(
+          sql,
+        ),
+      )
+      .map((row) => row.name),
+  ).toEqual([]);
 });
 
 it("flag off preserves exact canonical pages and cursors and does not stage", () => {

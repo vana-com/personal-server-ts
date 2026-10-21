@@ -51,7 +51,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 6;
+const VIEW_SCHEMA = 7;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -125,8 +125,9 @@ export function createReplicaVisibilityView(deps: {
   // record operations outside this predicate cannot change the owner preview.
   const touches = (instance: string, stream: string, key: string) =>
     `(EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${instance} AND v.stream=${stream} AND v.record_key=${key}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_pending p WHERE p.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_conflicts c WHERE c.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=${instance} AND b.deleted_at IS NOT NULL))`;
-  // Trigger bodies use NOT EXISTS, not OR IGNORE: an outer statement's conflict
-  // clause, including an upsert's, overrides one inside a trigger.
+  // Trigger bodies use NOT EXISTS, never a conflict clause (OR IGNORE, OR
+  // REPLACE, ...): an outer statement's conflict clause, including an upsert's,
+  // overrides one inside a trigger. A receiver test checks every trigger body.
   const notDirtyKey = (alias: string) =>
     `NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_keys d WHERE d.instance=${alias}.instance AND d.stream=${alias}.stream AND d.record_key=${alias}.record_key)`;
   // Upserts that reference any of `blobIds` (a SQL value list or subquery),
@@ -212,7 +213,7 @@ export function createReplicaVisibilityView(deps: {
           OR EXISTS (SELECT 1 FROM pdpp_replica_view_operations o WHERE o.writer=json_extract(NEW.operation_json,'$.revision.writerId') AND o.operation_id=json_extract(NEW.operation_json,'$.revision.operationId') AND o.digest<>NEW.digest)
           OR ${touches("json_extract(NEW.operation_json,'$.connectionId')", "json_extract(NEW.operation_json,'$.declaration.stream')", "json_extract(NEW.operation_json,'$.recordKey')")}
         BEGIN
-          INSERT OR IGNORE INTO pdpp_replica_view_dirty_operations VALUES (NEW.digest,NEW.operation_json);
+          INSERT INTO pdpp_replica_view_dirty_operations SELECT NEW.digest,NEW.operation_json WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_operations d WHERE d.digest=NEW.digest);
         END;
       `);
     db.exec(`
