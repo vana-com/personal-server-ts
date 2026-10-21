@@ -3040,6 +3040,101 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each(["challenge", "settlement"])(
+    "payment keeps the retained version during grant refresh: %s",
+    async (mode) => {
+      const { createNodeDataStorage } =
+        await import("../storage/node-data-storage.js");
+      const storage = createNodeDataStorage({ indexManager, hierarchyOptions });
+      const scope = "instagram.profile";
+      const dataPointId = ("0x" + "11".repeat(32)) as `0x${string}`;
+      let calls = 0;
+      let publishDuringRefresh = mode === "challenge";
+      let firstAt = "";
+      const gateway = createMockGateway({
+        getGrant: vi.fn(async () => {
+          calls++;
+          if (publishDuringRefresh && calls === 2) {
+            const replacement = {
+              version: "1.0",
+              scope,
+              collectedAt: new Date(Date.parse(firstAt) + 1000).toISOString(),
+              data: { marker: "replacement-B" },
+            };
+            const written = await storage.writeEnvelope(replacement);
+            indexManager.insert({
+              fileId: null,
+              path: written.relativePath,
+              scope,
+              collectedAt: replacement.collectedAt,
+              sizeBytes: written.sizeBytes,
+              dataPointId,
+              version: 2,
+              pdppOrigin: false,
+            });
+          }
+          return paidGrant();
+        }),
+      });
+      const app = createX402App({ gateway });
+      expect((await ingest(app, scope, { marker: "response-A" })).status).toBe(
+        201,
+      );
+      const first = indexManager.findLatestByScope(scope)!;
+      firstAt = first.collectedAt;
+      indexManager.updateDataPointId(first.path, dataPointId);
+      indexManager.updateVersion(first.path, 1);
+      const challenge = await getNoPayment(app, scope);
+      expect(challenge.status).toBe(402);
+      const offered = await challenge.json();
+      if (mode === "challenge") {
+        console.log(
+          JSON.stringify({
+            probe: "payment-retained-challenge",
+            offeredVersion: offered.accepts[0].accessRecord.version,
+            latestVersion: indexManager.findLatestByScope(scope)?.version,
+          }),
+        );
+        expect(indexManager.findLatestByScope(scope)?.version).toBe(2);
+        expect(offered.accepts[0].accessRecord.version).toBe("1");
+        return;
+      }
+      expect(offered.accepts[0].accessRecord.version).toBe("1");
+      const payment = JSON.parse(
+        Buffer.from(await signedXPayment(), "base64").toString(),
+      );
+      payment.payload.accessRecord = offered.accepts[0].accessRecord;
+      const forwarded = vi.fn(async () => new Response("{}", { status: 200 }));
+      vi.stubGlobal("fetch", forwarded);
+      calls = 0;
+      publishDuringRefresh = true;
+      const paid = await getWithPayment(
+        app,
+        scope,
+        encodePaymentHeader(payment),
+      );
+      const body = await paid.json();
+      console.log(
+        JSON.stringify({
+          probe: "payment-retained-settlement",
+          status: paid.status,
+          settled: forwarded.mock.calls.length,
+          returnedMarker: body.data?.marker,
+          latestVersion: indexManager.findLatestByScope(scope)?.version,
+        }),
+      );
+      expect(indexManager.findLatestByScope(scope)?.version).toBe(2);
+      expect(paid.status).toBe(200);
+      expect(body.data.marker).toBe("response-A");
+      expect(forwarded).toHaveBeenCalledTimes(1);
+      const posted = JSON.parse(
+        (forwarded.mock.calls[0] as unknown as [string, RequestInit])[1]
+          .body as string,
+      );
+      expect(posted.accessRecord.version).toBe("1");
+    },
+  );
+
   it.each([false, true])(
     "refuses an unrelated reader before payment with indexed PDPP origin %s",
     async (indexedOrigin) => {

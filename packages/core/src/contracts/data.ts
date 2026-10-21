@@ -169,6 +169,8 @@ export interface ReadDataContractInput {
 }
 
 export interface ReadDataContractResult {
+  /** Snapshot of the entry used by this body read, for payment and logging. */
+  entry: Readonly<IndexEntry>;
   ok: true;
   scope: string;
   envelope: DataFileEnvelope;
@@ -634,17 +636,18 @@ export async function readDataContract(
   // with a code distinct from `NOT_FOUND` (nothing indexed) so an operator
   // can tell a dangling row from an empty scope without reading a stack
   // trace. Before this it escaped as a bare INTERNAL_ERROR 500.
+  const selectedEntry = { ...entry };
   let envelope;
   try {
     envelope =
       input.view === "stored" && input.storage.readStoredEnvelope
         ? await input.storage.readStoredEnvelope(
             scopeResult.scope,
-            entry.collectedAt,
+            selectedEntry.collectedAt,
           )
         : await input.storage.readEnvelope(
             scopeResult.scope,
-            entry.collectedAt,
+            selectedEntry.collectedAt,
           );
   } catch (err) {
     if (!isMissingFileError(err)) throw err;
@@ -660,6 +663,7 @@ export async function readDataContract(
 
   return {
     ok: true,
+    entry: selectedEntry,
     scope: scopeResult.scope,
     envelope,
   };

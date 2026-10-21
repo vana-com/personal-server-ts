@@ -783,6 +783,8 @@ function listAuthCovers(
 }
 
 export interface X402CycleInput {
+  /** Entry snapshot returned with an already-read response; never reselect it. */
+  selectedEntry?: Pick<IndexEntry, "dataPointId" | "scope" | "version">;
   deps: PersonalServerDataApiDeps;
   request: Request;
   scope: string;
@@ -824,6 +826,23 @@ export async function handleX402Cycle(
   // same in the challenge so the builder signs over the canonical form.
   const opIdLower = input.grantId.toLowerCase() as `0x${string}`;
 
+  // Bind the accessRecord to the entry being served, if it exists and has
+  // been registered with DPv2 yet.
+  const entryRow =
+    input.selectedEntry ??
+    deps.storage.findEntry({
+      scope,
+      fileId: input.fileIdParam,
+      at: input.atParam,
+    });
+  const entryForChallenge = entryRow
+    ? {
+        dataPointId: entryRow.dataPointId as `0x${string}` | null,
+        scope: entryRow.scope,
+        version: entryRow.version,
+      }
+    : undefined;
+
   // Live grant — re-fetched every cycle. The fee.totalDue is a snapshot
   // (SDK comment: "clients shouldn't cache"); paymentStatus may have just
   // flipped if a concurrent payer paid the registration fee.
@@ -838,21 +857,6 @@ export async function handleX402Cycle(
       } as unknown as X402Challenge,
     };
   }
-
-  // Bind the accessRecord to the entry being served, if it exists and has
-  // been registered with DPv2 yet.
-  const entryRow = deps.storage.findEntry({
-    scope,
-    fileId: input.fileIdParam,
-    at: input.atParam,
-  });
-  const entryForChallenge = entryRow
-    ? {
-        dataPointId: entryRow.dataPointId as `0x${string}` | null,
-        scope,
-        version: entryRow.version,
-      }
-    : undefined;
 
   // `grant` is narrowed to non-null above, but that narrowing is not carried
   // into this closure (vana-sdk 3.14.0 made getGrant return `... | null`), so
@@ -2108,6 +2112,7 @@ export async function handlePersonalServerDataRequest(
         latest?.kind === "canonical" ? "canonical" : "legacy";
       let envelope: DataFileEnvelope;
       let servedFileId: string | undefined;
+      let servedEntry: Readonly<IndexEntry> | undefined;
       if (latest?.kind === "canonical") {
         envelope = latest.envelope;
         headers.ETag = `"${latest.revision}"`;
@@ -2131,7 +2136,8 @@ export async function handlePersonalServerDataRequest(
           return contractErrorResponse(result);
         }
         envelope = result.envelope;
-        servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
+        servedEntry = result.entry;
+        servedFileId = fileIdParam ?? servedEntry.fileId ?? undefined;
       }
 
       // Demand: this authorized read is what pays for a recompute of a
@@ -2222,6 +2228,7 @@ export async function handlePersonalServerDataRequest(
         deps.gatewayUrl
       ) {
         const x402Result = await handleX402Cycle({
+          selectedEntry: servedEntry,
           deps,
           request,
           scope: scopeResult.scope,

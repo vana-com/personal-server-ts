@@ -25,6 +25,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/write";
 import { derivativesRoutes } from "./routes/derivatives.js";
 import type { PdppEnabled } from "@opendatalabs/personal-server-ts-core/policy";
+import { pdppIsConfigured } from "./pdpp/bootstrap.js";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
@@ -461,10 +462,7 @@ export function createApp(deps: AppDeps): Hono {
       // without configuration or a mounted authority has unknown state.
       pdppEnabled:
         deps.pdppEnabled ??
-        deps.config?.pdpp.enabled ??
-        (deps.pdpp !== undefined || deps.pdppAuth !== undefined
-          ? true
-          : undefined),
+        pdppIsConfigured(deps.config, deps.pdpp ?? deps.pdppAuth),
       writeSessionStore,
       writeProofReplayStore,
       pdppOwnerBearer: deps.pdpp

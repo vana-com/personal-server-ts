@@ -4,6 +4,7 @@ import { encodeDataBlockCursor } from "../storage/blocks/index.js";
 import { buildBinaryEnvelopeData } from "../contracts/binary.js";
 import { createScopeDeletionTracker } from "../sync/scope-deletions.js";
 import { ProtocolError } from "../errors/catalog.js";
+import { PDPP_CLASSIFIER_VERSION } from "../sync/pdpp-import.js";
 
 const SERVER_ORIGIN = "https://personal-server.test";
 
@@ -394,6 +395,7 @@ describe("mcp/read-client", () => {
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json" as const,
       pdppOrigin: false,
+      pdppClassifier: PDPP_CLASSIFIER_VERSION,
       envelopeDigest: "gen-1",
       redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
       blocks: [
@@ -1230,6 +1232,7 @@ describe("mcp/read-client deletion gate", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               contentKind: "vana-envelope" as const,
               pdppOrigin: false,
+              pdppClassifier: PDPP_CLASSIFIER_VERSION,
               envelopeDigest: "gen-1",
               redaction: {
                 dropTopLevelLineage: false,

@@ -759,6 +759,36 @@ describe("/v1/derivatives/questions (composed app)", () => {
       }
     });
 
+    it("mounted PDPP keeps direct writes protected when the config flag is false", async () => {
+      const pdppDb = await enablePdpp();
+      try {
+        const { ServerConfigSchema } =
+          await import("@opendatalabs/personal-server-ts-core/schemas");
+        baseDeps.config = ServerConfigSchema.parse({
+          pdpp: { enabled: false },
+        });
+        app = createApp(baseDeps);
+        const direct = await builderRequest("POST", "/v1/data/coach.direct", {
+          value: MARKER,
+        });
+        expect(direct.status).toBe(201);
+        const read = await thirdPartyRead("coach.direct");
+        const text = await read.text();
+        console.log(
+          JSON.stringify({
+            probe: "mounted-config-off",
+            write: direct.status,
+            reader: read.status,
+            leaked: text.includes(MARKER),
+          }),
+        );
+        expect(read.status).toBe(403);
+        expect(text).not.toContain(MARKER);
+      } finally {
+        pdppDb.close();
+      }
+    });
+
     it("an app with unknown PDPP configuration fails closed for direct writes", async () => {
       const direct = await builderRequest("POST", "/v1/data/coach.direct", {
         value: MARKER,
