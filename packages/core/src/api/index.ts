@@ -334,14 +334,6 @@ export interface PersonalServerIngestSyncManager {
 }
 
 export interface PersonalServerDataApiDeps {
-  /**
-   * Set per request by `trackDeliveryDependencies`, never by a host: the
-   * collector that every read dependency of this request (grant leases from
-   * the auth port, the deletion state of every scope and version the request
-   * reads or lists) is added to. The request's result is released only
-   * through it.
-   */
-  deliveryDependencies?: DeliveryDependencies;
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
   /**
@@ -1191,35 +1183,46 @@ async function parseProducerProvenance(
  * last known state, which is the documented offline behaviour.
  */
 export async function resolveReadDeletion(
-  deps: Pick<
-    PersonalServerDataApiDeps,
-    "scopeDeletions" | "serverOwner" | "deliveryDependencies"
-  >,
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
   body: "file" | "canonical" = "file",
   gatewayTimeoutMs?: number,
-): Promise<{
+): Promise<ReadDeletion | null> {
+  return (await selectReadable(deps, scope, entry, body, gatewayTimeoutMs))
+    .deletion;
+}
+
+/** The deletion a read must refuse with (see `resolveReadDeletion`). */
+export type ReadDeletion = {
   scope: string;
   dataPointId: string | null;
   deletedAt: string;
-} | null> {
-  if (!deps.scopeDeletions) return null;
-  const deletion = await resolveTrackerDeletion(
-    deps,
-    scope,
-    entry,
-    body,
-    gatewayTimeoutMs,
-  );
-  // A visible scope or version is a release dependency of this request: a
-  // deletion that lands before the release refuses it.
-  if (!deletion) {
-    deps.deliveryDependencies?.add(
-      scopeDeletionLease(deps, { scope, entry, body }),
-    );
-  }
-  return deletion;
+};
+
+/**
+ * Select `scope` (at `entry`) for a result: its deletion state now, and the
+ * release dependency that selecting it produces. A result that includes a
+ * selected scope or version must hold `dependency`, so a deletion that lands
+ * before the release refuses it.
+ */
+export async function selectReadable(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  scope: string,
+  entry: ReadDeletionEntry | null | undefined,
+  body: "file" | "canonical" = "file",
+  gatewayTimeoutMs?: number,
+): Promise<{ deletion: ReadDeletion | null; dependency: DeliveryLease }> {
+  return {
+    deletion: await resolveTrackerDeletion(
+      deps,
+      scope,
+      entry,
+      body,
+      gatewayTimeoutMs,
+    ),
+    dependency: scopeDeletionLease(deps, { scope, entry, body }),
+  };
 }
 
 async function resolveTrackerDeletion(
@@ -1274,9 +1277,15 @@ export async function assertScopeNotDeleted(
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
   body: "file" | "canonical" = "file",
-): Promise<void> {
-  const deletion = await resolveReadDeletion(deps, scope, entry, body);
+): Promise<DeliveryLease> {
+  const { deletion, dependency } = await selectReadable(
+    deps,
+    scope,
+    entry,
+    body,
+  );
   if (deletion) throw new DataDeletedError(deletion);
+  return dependency;
 }
 
 /**
@@ -1339,15 +1348,37 @@ export function readDeliveryLease(
 
 /**
  * Discovery filter for the scope and version listings: an entry a read would
- * refuse with 410 is not listed either. Undefined (no filtering) when no
- * deletion tracker is wired.
+ * refuse with 410 is not listed either. Each entry it lets through is a
+ * selection, and its release dependency goes to `hold`. Undefined (no
+ * filtering) when no deletion tracker is wired.
  */
 function discoveryVisibility(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  hold: (dependency: DeliveryLease) => void,
 ): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
   if (!deps.scopeDeletions) return undefined;
-  return async (scope, entry) =>
-    (await resolveReadDeletion(deps, scope, entry)) === null;
+  return (scope, entry) => selectVisible(deps, hold, scope, entry, "file");
+}
+
+/** Select one listed item; hold its dependency when it is visible. */
+async function selectVisible(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  hold: (dependency: DeliveryLease) => void,
+  scope: string,
+  entry: ReadDeletionEntry | undefined,
+  body: "file" | "canonical",
+  gatewayTimeoutMs?: number,
+): Promise<boolean> {
+  const { deletion, dependency } = await selectReadable(
+    deps,
+    scope,
+    entry,
+    body,
+    gatewayTimeoutMs,
+  );
+  if (deletion) return false;
+  hold(dependency);
+  return true;
 }
 
 /**
@@ -1360,16 +1391,18 @@ function listingVisibility(
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
   deadlineAtMs: number,
+  hold: (dependency: DeliveryLease) => void,
 ): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
   const deletion = deps.scopeDeletions
-    ? async (scope: string, entry: ReadDeletionEntry) =>
-        (await resolveReadDeletion(
+    ? (scope: string, entry: ReadDeletionEntry) =>
+        selectVisible(
           deps,
+          hold,
           scope,
           entry,
           "file",
           Math.max(0, deadlineAtMs - Date.now()),
-        )) === null
+        )
     : undefined;
   const view = deps.legacyScopeView;
   if (!view) return deletion;
@@ -1379,14 +1412,13 @@ function listingVisibility(
     const canonicalOwned = deletionHistoryOf(listing) === "canonical";
     // A file's re-add marker cannot revive the canonical body this row
     // describes. Canonical re-adds have no registered version yet.
-    return (
-      (await resolveReadDeletion(
-        deps,
-        scope,
-        canonicalOwned ? undefined : entry,
-        canonicalOwned ? "canonical" : "file",
-        Math.max(0, deadlineAtMs - Date.now()),
-      )) === null
+    return selectVisible(
+      deps,
+      hold,
+      scope,
+      canonicalOwned ? undefined : entry,
+      canonicalOwned ? "canonical" : "file",
+      Math.max(0, deadlineAtMs - Date.now()),
     );
   };
 }
@@ -1402,6 +1434,7 @@ function canonicalOnlyScopes(
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
   deadlineAtMs: number,
+  hold: (dependency: DeliveryLease) => void,
 ):
   | ((
       scopePrefix: string | undefined,
@@ -1417,13 +1450,14 @@ function canonicalOnlyScopes(
     )) {
       if (stored.has(scope)) continue;
       if (
-        (await resolveReadDeletion(
+        !(await selectVisible(
           deps,
+          hold,
           scope,
           undefined,
           "canonical",
           Math.max(0, deadlineAtMs - Date.now()),
-        )) !== null
+        ))
       ) {
         continue;
       }
@@ -1783,96 +1817,98 @@ export { redactEnvelopeForGrantee };
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
 
-/** Where one request's release dependencies and release effects go. */
-export interface DeliveryDependencies {
-  add(lease: DeliveryLease): void;
-  /** Run `effect` only once the result is released (a fulfillment report). */
-  afterRelease(effect: () => void): void;
+const RELEASE = Symbol("release dependencies");
+
+interface ReleaseInfo {
+  dependencies: DeliveryLease;
+  afterRelease: Array<() => void>;
+}
+
+/**
+ * A read result together with the release dependencies its selection
+ * produced (grant leases, scope and version deletion state). The data API
+ * releases a successful read result only in this form; see
+ * `releaseDataResult`.
+ */
+export type SelectedResponse = Response & {
+  readonly [RELEASE]: ReleaseInfo;
+};
+
+/**
+ * Attach a read result's release dependencies. `afterRelease` runs only once
+ * the result is released (a fulfillment report). Use it for every response
+ * that carries data-derived content, error responses included (a payment
+ * challenge, a refusal that reveals the stored shape).
+ */
+export function selected(
+  response: Response,
+  dependencies: DeliveryLease,
+  options: { afterRelease?: () => void } = {},
+): SelectedResponse {
+  const info: ReleaseInfo = {
+    dependencies,
+    afterRelease: options.afterRelease ? [options.afterRelease] : [],
+  };
+  return Object.assign(response, { [RELEASE]: info }) as SelectedResponse;
+}
+
+function releaseOf(response: Response): ReleaseInfo | undefined {
+  return (response as Partial<SelectedResponse>)[RELEASE];
 }
 
 /**
  * The data API (`/v1/data`), shared by Node, Lite and the MCP read client.
  *
  * Every read result, whatever the route (a body, raw content, lineage, a
- * scope or version listing), is released at this one point, through the
- * delivery lease of everything the request read (see
- * `trackDeliveryDependencies` and `policy/delivery-lease.ts`). A route does
- * not opt in: its auth port calls and deletion checks register themselves.
- * Writes are not gated here; their effect is already committed.
+ * scope or version listing), is released at one point (`releaseDataResult`),
+ * through the dependencies its selection produced: the grant lease the
+ * authorization returned and the deletion state of every scope and version
+ * the result was selected from (`selectReadable`). A successful read result
+ * without them is refused. See `policy/delivery-lease.ts`.
  */
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
   options: PersonalServerApiDispatchOptions = {},
 ): Promise<Response> {
-  return releaseDataResult(request, deps, options, (tracked) =>
-    dispatchDataRequest(request, tracked, options),
+  return releaseDataResult(request, options, () =>
+    dispatchDataRequest(request, deps, options),
   );
 }
 
 /**
- * The data API's one release point. `handle` produces the result with deps
- * whose every read dependency is tracked (`trackDeliveryDependencies`); a
- * read result (GET or HEAD) is then released only through all of them, and
- * the effects the handler deferred to release (a fulfillment report) run
- * only once it is. A write result is returned as is: its effect is already
- * committed.
+ * The data API's one release point. A read (GET or HEAD) result that carries
+ * data is released only through the dependencies its selection attached
+ * (`selected`); a successful read result without them is refused, because
+ * nothing says what it may be released on. An unselected error response is
+ * content-free and returned as is. A write result is returned as is: its
+ * effect is already committed.
  */
 export async function releaseDataResult(
   request: Request,
-  deps: PersonalServerDataApiDeps,
   options: Pick<PersonalServerApiDispatchOptions, "onDeliveryLease">,
-  handle: (tracked: PersonalServerDataApiDeps) => Promise<Response>,
+  handle: () => Promise<Response>,
 ): Promise<Response> {
-  const release = collectDeliveryLeases();
-  const effects: Array<() => void> = [];
-  const response = await handle(
-    trackDeliveryDependencies(deps, {
-      add: (lease) => release.add(lease),
-      afterRelease: (effect) => effects.push(effect),
+  const response = await handle();
+  if (request.method !== "GET" && request.method !== "HEAD") return response;
+  const release = releaseOf(response);
+  if (!release) {
+    if (!response.ok) return response;
+    return withApiErrors(() => {
+      throw new ProtocolError(
+        500,
+        "RELEASE_DEPENDENCIES_MISSING",
+        "The read result carries no release dependencies",
+      );
+    });
+  }
+  options.onDeliveryLease?.(release.dependencies);
+  return withApiErrors(() =>
+    deliver(release.dependencies, () => {
+      for (const effect of release.afterRelease) effect();
+      return response;
     }),
   );
-  const released = () => {
-    for (const effect of effects) effect();
-    return response;
-  };
-  if (request.method !== "GET" && request.method !== "HEAD") return released();
-  options.onDeliveryLease?.(release);
-  return withApiErrors(() => deliver(release, released));
-}
-
-/**
- * `deps` for one request, with every release dependency the request incurs
- * added to `release`: the lease of every grant the auth port verifies
- * (reads, listings, version listings) and, through `resolveReadDeletion`,
- * the deletion state of every scope and version found visible.
- */
-export function trackDeliveryDependencies(
-  deps: PersonalServerDataApiDeps,
-  release: DeliveryDependencies,
-): PersonalServerDataApiDeps {
-  const keep = <T>(result: T): T => {
-    const lease = (result as { lease?: DeliveryLease } | undefined)?.lease;
-    if (lease) release.add(lease);
-    return result;
-  };
-  const auth = new Proxy(deps.auth, {
-    get(target, prop, receiver) {
-      const value = Reflect.get(target, prop, receiver);
-      if (typeof value !== "function") return value;
-      const call = (...args: unknown[]) =>
-        (value as (...a: unknown[]) => unknown).apply(target, args);
-      if (
-        prop === "authorizeBuilderRead" ||
-        prop === "authorizeBuilderList" ||
-        prop === "authorizeScopeVersions"
-      ) {
-        return async (...args: unknown[]) => keep(await call(...args));
-      }
-      return call;
-    },
-  });
-  return { ...deps, auth, deliveryDependencies: release };
 }
 
 async function dispatchDataRequest(
@@ -1900,23 +1936,29 @@ async function dispatchDataRequest(
       });
       // One budget for every stored and canonical-only scope, not per row.
       const deletionDeadlineAtMs = Date.now() + 250;
+      // Every scope the listing selects holds its deletion state.
+      const selection = collectDeliveryLeases();
+      const hold = (dependency: DeliveryLease) => selection.add(dependency);
       const result = await listDataScopesContract({
         storage: deps.storage,
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
-        isVisible: listingVisibility(deps, deletionDeadlineAtMs),
+        isVisible: listingVisibility(deps, deletionDeadlineAtMs, hold),
         isListable: (scope) =>
           !isSystemScope(scope) &&
           (!listAuth || listAuthCovers(listAuth, scope)),
-        extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs),
+        extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs, hold),
       });
-      return jsonResponse({
-        ...result.response,
-        scopes: result.response.scopes.map((summary) =>
-          withCanonicalListing(deps, summary),
-        ),
-      });
+      return selected(
+        jsonResponse({
+          ...result.response,
+          scopes: result.response.scopes.map((summary) =>
+            withCanonicalListing(deps, summary),
+          ),
+        }),
+        allDeliveryLeases(listAuth?.lease, selection),
+      );
     }
 
     // "additions" has no dot, so it can never be a real scope name (scopes are
@@ -1926,10 +1968,13 @@ async function dispatchDataRequest(
       // The counts span every scope, so only the owner may read them.
       await deps.auth.authorizeOwner(request);
       const daysRaw = url.searchParams.get("days");
+      const selection = collectDeliveryLeases();
       const result = await summarizeDataAdditionsContract({
         additions: deps.additions,
         storage: deps.storage,
-        isVisible: discoveryVisibility(deps),
+        isVisible: discoveryVisibility(deps, (dependency) =>
+          selection.add(dependency),
+        ),
         timezone: url.searchParams.get("tz") ?? "UTC",
         // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
         days:
@@ -1941,7 +1986,7 @@ async function dispatchDataRequest(
         now: (deps.now ?? (() => new Date()))(),
       });
       if ("ok" in result) return contractErrorResponse(result);
-      return jsonResponse(result);
+      return selected(jsonResponse(result), selection);
     }
 
     const parts = pathname.split("/").filter(Boolean);
@@ -2046,12 +2091,16 @@ async function dispatchDataRequest(
           requestedScope: scopeResult.scope,
         });
       }
+      // Every version the listing selects holds its deletion state.
+      const selection = collectDeliveryLeases();
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
-        isVisible: discoveryVisibility(deps),
+        isVisible: discoveryVisibility(deps, (dependency) =>
+          selection.add(dependency),
+        ),
         // An auth result here means a non-owner listing (owner: undefined).
         forGrantee: Boolean(listAuth),
       });
@@ -2059,9 +2108,14 @@ async function dispatchDataRequest(
       if (result.response.total === 0) {
         // Nothing visible: answer 410 rather than an empty list when that is
         // because the scope is tombstoned, exactly as a read would.
-        await assertScopeNotDeleted(deps, result.scope, undefined);
+        selection.add(
+          await assertScopeNotDeleted(deps, result.scope, undefined),
+        );
       }
-      return jsonResponse(result.response);
+      return selected(
+        jsonResponse(result.response),
+        allDeliveryLeases(listAuth?.lease, selection),
+      );
     }
 
     if ((parts.length === 2 || parts.length === 3) && parts[1] === "lineage") {
@@ -2110,6 +2164,19 @@ async function dispatchDataRequest(
       }
       if (!deps.lineageGateway) throw new LineageUnavailableError();
       const { grantId } = resolveLineageGrantView(authResult);
+      // A grantee's view is selected from the scope's lineage: like a read,
+      // it is refused for a deleted scope, and its release holds the
+      // scope's deletion state. The owner keeps lineage of a deleted scope.
+      const scopeDependency = isOwnerView(authResult)
+        ? undefined
+        : await assertScopeNotDeleted(
+            deps,
+            scopeResult.scope,
+            // The local entry only decides whether a tombstone covers it.
+            deps.scopeDeletions
+              ? deps.storage?.findEntry?.({ scope: scopeResult.scope })
+              : undefined,
+          );
       let result: Awaited<ReturnType<LineageGatewayPort["getLineage"]>>;
       try {
         result = await deps.lineageGateway.getLineage({
@@ -2164,7 +2231,10 @@ async function dispatchDataRequest(
           "unknown",
         userAgent: request.headers.get("user-agent") ?? "unknown",
       });
-      return jsonResponse({ data: result.data, proof: result.proof });
+      return selected(
+        jsonResponse({ data: result.data, proof: result.proof }),
+        allDeliveryLeases(authResult?.lease, scopeDependency),
+      );
     }
 
     if (parts.length !== 1) return notFound();
@@ -2222,11 +2292,16 @@ async function dispatchDataRequest(
       // Deletion gate, after auth (so unauthenticated callers learn nothing)
       // and before payment (so nobody is charged for deleted data). Covers
       // both a stale local copy of a tombstoned scope and a local miss.
-      await assertScopeNotDeleted(
-        deps,
-        scopeResult.scope,
-        canonicalOwned ? undefined : selectedEntry,
-        canonicalOwned ? "canonical" : "file",
+      // The selected scope's deletion state and the grant lease are what the
+      // result is released on.
+      const dependencies = allDeliveryLeases(
+        authResult?.lease,
+        await assertScopeNotDeleted(
+          deps,
+          scopeResult.scope,
+          canonicalOwned ? undefined : selectedEntry,
+          canonicalOwned ? "canonical" : "file",
+        ),
       );
 
       // Disclosure gate, before demand or payment: a chain grant reads actual
@@ -2261,7 +2336,10 @@ async function dispatchDataRequest(
       // versions stay legacy history. Read before payment, so a builder is
       // never challenged or charged for a read that is then refused.
       if (latest?.kind === "refused") {
-        return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
+        return selected(
+          legacyViewRefusalResponse(scopeResult.scope, latest.refusal),
+          dependencies,
+        );
       }
 
       // Decide on and retain the exact response before settlement. Index
@@ -2292,7 +2370,7 @@ async function dispatchDataRequest(
             // An authorized miss still demands the first derivative version.
             notifyDataRead(deps, { scope: scopeResult.scope });
           }
-          return contractErrorResponse(result);
+          return selected(contractErrorResponse(result), dependencies);
         }
         envelope = result.envelope;
         servedEntry = result.entry;
@@ -2369,10 +2447,13 @@ async function dispatchDataRequest(
         });
       }
       if (willCharge && latest?.kind === "canonical") {
-        return legacyViewRefusalResponse(scopeResult.scope, {
-          status: "unavailable",
-          reason: "paid_read_unsupported",
-        });
+        return selected(
+          legacyViewRefusalResponse(scopeResult.scope, {
+            status: "unavailable",
+            reason: "paid_read_unsupported",
+          }),
+          dependencies,
+        );
       }
       // Keep the full condition inline (not `if (willCharge)`) so TS narrows
       // deps.gateway/gatewayConfig/gatewayUrl to non-undefined in the block.
@@ -2400,12 +2481,18 @@ async function dispatchDataRequest(
           gatewayUrl: deps.gatewayUrl,
         });
         if (x402Result.kind === "challenge") {
-          return jsonResponse(x402Result.body, { status: 402 });
+          return selected(
+            jsonResponse(x402Result.body, { status: 402 }),
+            dependencies,
+          );
         }
         if (x402Result.kind === "gateway-error") {
           // Relay the gateway's structured body verbatim so the builder can
           // dispatch on it (insufficient balance vs. replay vs. race etc.).
-          return jsonResponse(x402Result.body, { status: x402Result.status });
+          return selected(
+            jsonResponse(x402Result.body, { status: x402Result.status }),
+            dependencies,
+          );
         }
         // x402Result.kind === "ok" — payment accepted, serve the retained read.
         // The gateway's success body is forwarded back to the builder via
@@ -2466,12 +2553,15 @@ async function dispatchDataRequest(
       // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
       if (wantsRawContent) {
         if (!isBinaryEnvelope(servedEnvelope)) {
-          return jsonResponse(
-            {
-              error: "NOT_BINARY_SCOPE",
-              message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
-            },
-            { status: 400, headers },
+          return selected(
+            jsonResponse(
+              {
+                error: "NOT_BINARY_SCOPE",
+                message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
+              },
+              { status: 400, headers },
+            ),
+            dependencies,
           );
         }
         const decoded = decodeBinaryEnvelope(servedEnvelope);
@@ -2486,20 +2576,18 @@ async function dispatchDataRequest(
             decoded.metadata,
           );
         }
-        const response = new Response(decoded.bytes as unknown as BodyInit, {
-          status: 200,
-          headers,
-        });
-        return response;
+        return selected(
+          new Response(decoded.bytes as unknown as BodyInit, {
+            status: 200,
+            headers,
+          }),
+          dependencies,
+        );
       }
-      const response = jsonResponse(servedEnvelope, { headers });
-      // Reported as served only once the dispatcher releases it.
-      if (deps.deliveryDependencies) {
-        deps.deliveryDependencies.afterRelease(reportReadFulfillment);
-      } else {
-        reportReadFulfillment();
-      }
-      return response;
+      // Reported as served only once the result is released.
+      return selected(jsonResponse(servedEnvelope, { headers }), dependencies, {
+        afterRelease: reportReadFulfillment,
+      });
     }
 
     if (request.method === "POST") {

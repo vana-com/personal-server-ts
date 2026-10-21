@@ -20,6 +20,7 @@ import {
   InvalidCursorSyntaxError,
   recordKeyWithinGrantResources,
   mapInactiveToError,
+  connectionsLease,
   pdppBearerReadLease,
   recordWithinGrantTimeConstraint,
   type PdppChainEvidence,
@@ -33,8 +34,11 @@ import {
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import {
+  allDeliveryLeases,
   deliver,
+  evidenceTime,
   type DeliveryLease,
+  type EvidenceTime,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import { createRecordDataValidator } from "../pdpp/record-schema.js";
 import {
@@ -579,7 +583,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (!c.res.ok) return;
     const read = gate.read;
     try {
-      await deliver(gate.lease, () => {
+      // A read result must name what it was selected from. One that does not
+      // (a handler that returned data without `released`) is not released.
+      if (!gate.selection) {
+        throw new PdppError(
+          "api_error",
+          "The read result carries no release dependencies",
+        );
+      }
+      await deliver(allDeliveryLeases(gate.lease, gate.selection), () => {
         if (read) {
           void logClientRead(
             c,
@@ -612,9 +624,56 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   });
 
   interface DeliveryGate {
+    /** The bearer's release dependencies (`pdppBearerReadLease`). */
     lease: DeliveryLease;
+    /** What the result was selected from; set only by `released`. */
+    selection?: DeliveryLease;
     /** A served client read, logged with the outcome the gate decides. */
     read?: { context: PdppTokenContext; stream: string; reqId: string };
+  }
+
+  /**
+   * Return a read result with the release dependencies its selection
+   * produced. The delivery gate releases it only through them (and the
+   * bearer's); a 2xx read result returned any other way is refused.
+   */
+  function released(
+    c: Context,
+    response: Response,
+    dependencies: DeliveryLease,
+  ): Response {
+    const gate = deliveryGate(c);
+    if (gate) {
+      gate.selection = gate.selection
+        ? allDeliveryLeases(gate.selection, dependencies)
+        : dependencies;
+    }
+    return response;
+  }
+
+  /**
+   * What a read of `stream` selects: its declaration, the read scope, the
+   * connections it reads, and the release dependencies that selection
+   * produces (exactly those connections).
+   */
+  function selectStreamRead(
+    context: PdppTokenContext,
+    stream: string,
+    fields?: string[],
+  ) {
+    const { declaration, ownerInstanceIds } = readDeclaration(context, stream);
+    const scope = resolveReadScope(context, stream, declaration, fields);
+    const instanceIds =
+      context.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
+    if (context.tokenKind === "client") {
+      requireRegisteredConnections(instanceIds);
+    }
+    return {
+      declaration,
+      scope,
+      instanceIds,
+      dependencies: connectionsLease(instanceIds, isConnectionAvailable),
+    };
   }
 
   function deliveryGate(c: Context): DeliveryGate | undefined {
@@ -664,9 +723,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         ),
       };
     }
+    // Dated before the await: a remote AS's answer is as old as the moment
+    // the introspection started.
+    const resolvedAt = evidenceTime();
     const context = await deps.auth.resolveToken(token);
     let chainDecision: Extract<PdppChainDecision, { ok: true }> | undefined;
-    let chainVerifiedAt: number | undefined;
+    let chainVerifiedAt: EvidenceTime | undefined;
 
     // Chain enforcement, when the deployment configures it. Placed here so
     // EVERY endpoint is covered by one gate: a check added per-route is a
@@ -695,7 +757,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           };
         }
 
-        chainVerifiedAt = Date.now();
+        chainVerifiedAt = evidenceTime();
         const decision = await deps.chainEnforcement.authorize({
           clientId: context.clientId ?? "",
           pdppGrantId: grantId,
@@ -715,6 +777,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           ? chainDecision
           : undefined;
       const lease = pdppBearerReadLease(deps.auth, token, context, {
+        resolvedAt,
         ...(chained && {
           chain: {
             admitted: { expiresAt: chained.expiresAt },
@@ -722,7 +785,6 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             verifiedAt: chainVerifiedAt,
           },
         }),
-        isConnectionAvailable,
       });
       // Admission re-check. The chain check above awaits the gateway, and the
       // bearer can end during that wait (the grant revoked, the token
@@ -913,6 +975,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
     }
 
+    // Discovery is an aggregate over every connection it lists; its release
+    // holds all of them.
+    const dependencies = connectionsLease(instanceIds, isConnectionAvailable);
     const streams = deps.store.listStreams(instanceIds);
 
     // A client token gets a closed projection: only the streams its grant
@@ -954,31 +1019,35 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       .filter((s) => s.budgetExhausted)
       .map((s) => s.name);
 
-    return c.json(
-      {
-        object: "list",
-        data: visibleStreams.map((s) => ({
-          object: "stream",
-          name: s.name,
-          record_count: s.recordCount,
-          last_updated: s.lastUpdated,
-        })),
-        ...(cappedStreams.length > 0 && {
-          meta: {
-            warnings: [
-              {
-                code: "record_count_not_counted",
-                // Machine-readable: clients must not parse the prose to learn
-                // which streams were truncated.
-                streams: cappedStreams,
-                message: `record_count is null for ${cappedStreams.join(", ")}: more than ${STREAM_COUNT_CAP} grant-visible records, or the scan budget was reached`,
-              },
-            ],
-          },
-        }),
-      },
-      200,
-      { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+    return released(
+      c,
+      c.json(
+        {
+          object: "list",
+          data: visibleStreams.map((s) => ({
+            object: "stream",
+            name: s.name,
+            record_count: s.recordCount,
+            last_updated: s.lastUpdated,
+          })),
+          ...(cappedStreams.length > 0 && {
+            meta: {
+              warnings: [
+                {
+                  code: "record_count_not_counted",
+                  // Machine-readable: clients must not parse the prose to learn
+                  // which streams were truncated.
+                  streams: cappedStreams,
+                  message: `record_count is null for ${cappedStreams.join(", ")}: more than ${STREAM_COUNT_CAP} grant-visible records, or the scan budget was reached`,
+                },
+              ],
+            },
+          }),
+        },
+        200,
+        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+      ),
+      dependencies,
     );
   });
 
@@ -990,11 +1059,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     try {
       parseRecordQuery(c.req.url, "streamMetadata");
       const stream = c.req.param("stream");
-      const { declaration, ownerInstanceIds } = readDeclaration(
-        context!,
-        stream,
-      );
-      const scope = resolveReadScope(context!, stream, declaration);
+      const {
+        declaration,
+        scope,
+        instanceIds: ownerInstanceIds,
+        dependencies,
+      } = selectStreamRead(context!, stream);
 
       if (context!.tokenKind === "owner" && ownerInstanceIds.length === 0) {
         throw new PdppError(
@@ -1004,7 +1074,34 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       }
 
       if (context!.tokenKind === "owner") {
-        return c.json(
+        return released(
+          c,
+          c.json(
+            {
+              object: "stream_metadata",
+              name: declaration!.name,
+              primary_key: declaration!.primaryKey,
+              cursor_field: declaration!.cursorField,
+              consent_time_field: declaration!.consentTimeField ?? null,
+              query: {},
+              views: [],
+              relationships: [],
+              // §8 owner metadata carries the full declared schema and
+              // selection capability. Omitting them made this a public response
+              // contract mismatch that access-behavior fixtures could not see.
+              schema: declaration!.schema ?? null,
+              selection: declaration!.selection ?? null,
+            },
+            200,
+            { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+          ),
+          dependencies,
+        );
+      }
+
+      return released(
+        c,
+        c.json(
           {
             object: "stream_metadata",
             name: declaration!.name,
@@ -1014,38 +1111,19 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             query: {},
             views: [],
             relationships: [],
-            // §8 owner metadata carries the full declared schema and
-            // selection capability. Omitting them made this a public response
-            // contract mismatch that access-behavior fixtures could not see.
-            schema: declaration!.schema ?? null,
+            // Grant-closed: the declared schema projected to exactly the
+            // granted fields, so a client token learns record shape without
+            // learning the existence of fields it was not granted. Falls back
+            // to bare field names when the retained declaration carries no
+            // schema, rather than fabricating one.
+            schema: projectSchemaToFields(declaration!.schema, scope.fields),
+            // The frozen selection capability the grant was resolved against.
             selection: declaration!.selection ?? null,
           },
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
-        );
-      }
-
-      return c.json(
-        {
-          object: "stream_metadata",
-          name: declaration!.name,
-          primary_key: declaration!.primaryKey,
-          cursor_field: declaration!.cursorField,
-          consent_time_field: declaration!.consentTimeField ?? null,
-          query: {},
-          views: [],
-          relationships: [],
-          // Grant-closed: the declared schema projected to exactly the
-          // granted fields, so a client token learns record shape without
-          // learning the existence of fields it was not granted. Falls back
-          // to bare field names when the retained declaration carries no
-          // schema, rather than fabricating one.
-          schema: projectSchemaToFields(declaration!.schema, scope.fields),
-          // The frozen selection capability the grant was resolved against.
-          selection: declaration!.selection ?? null,
-        },
-        200,
-        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        ),
+        dependencies,
       );
     } catch (err) {
       return sendError(
@@ -1069,21 +1147,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
       const stream = c.req.param("stream");
 
-      const { declaration, ownerInstanceIds } = readDeclaration(
-        context!,
-        stream,
-      );
-      const scope = resolveReadScope(
-        context!,
-        stream,
-        declaration,
-        query.fields,
-      );
-      const effectiveInstanceIds =
-        context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
-      if (context!.tokenKind === "client") {
-        requireRegisteredConnections(effectiveInstanceIds);
-      }
+      const {
+        scope,
+        instanceIds: effectiveInstanceIds,
+        dependencies,
+      } = selectStreamRead(context!, stream, query.fields);
       if (context!.tokenKind === "owner" && effectiveInstanceIds.length === 0) {
         throw new PdppError(
           "grant_stream_not_allowed",
@@ -1149,26 +1217,30 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
               ],
             }
           : {};
-        return c.json(
-          {
-            object: "list",
-            has_more: page.hasMore,
-            ...(page.nextCursor && { next_cursor: page.nextCursor }),
-            ...(page.nextChangesSince && {
-              next_changes_since: page.nextChangesSince,
-            }),
-            data: visible.map((row) =>
-              toRecordJson(
-                stream,
-                row,
-                fields,
-                grantIsCandidate(context!.grant),
+        return released(
+          c,
+          c.json(
+            {
+              object: "list",
+              has_more: page.hasMore,
+              ...(page.nextCursor && { next_cursor: page.nextCursor }),
+              ...(page.nextChangesSince && {
+                next_changes_since: page.nextChangesSince,
+              }),
+              data: visible.map((row) =>
+                toRecordJson(
+                  stream,
+                  row,
+                  fields,
+                  grantIsCandidate(context!.grant),
+                ),
               ),
-            ),
-            ...(clamped && { meta }),
-          },
-          200,
-          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+              ...(clamped && { meta }),
+            },
+            200,
+            { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+          ),
+          dependencies,
         );
       }
 
@@ -1202,7 +1274,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
       logReadAtDelivery(c, context, stream, reqId);
-      return response;
+      return released(c, response, dependencies);
     } catch (err) {
       const mapped = mapAndLog(
         deps,
@@ -1241,22 +1313,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       // narrower thing happened instead.
       const stream = c.req.param("stream");
       const recordKey = decodeURIComponent(c.req.param("id"));
-      const { declaration, ownerInstanceIds } = readDeclaration(
-        context!,
-        stream,
-      );
-      const scope = resolveReadScope(
-        context!,
-        stream,
-        declaration,
-        query.fields,
-      );
-
-      const effectiveInstanceIds =
-        context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
-      if (context!.tokenKind === "client") {
-        requireRegisteredConnections(effectiveInstanceIds);
-      }
+      const {
+        scope,
+        instanceIds: effectiveInstanceIds,
+        dependencies,
+      } = selectStreamRead(context!, stream, query.fields);
 
       if (!recordKeyWithinGrantResources(recordKey, scope.streamGrant)) {
         throw new PdppError("not_found", "Record not found");
@@ -1292,7 +1353,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
       logReadAtDelivery(c, context, stream, reqId);
-      return response;
+      return released(c, response, dependencies);
     } catch (err) {
       const mapped = mapAndLog(
         deps,
