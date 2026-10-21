@@ -1,3 +1,5 @@
+import type { LegacyScopeBindingProvenance } from "./provenance.js";
+
 /** A PDPP selection: one source, one or more streams, no field filter (phase 1 always requests full records). */
 export interface PdppSelection {
   source: string;

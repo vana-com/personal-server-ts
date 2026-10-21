@@ -1025,10 +1025,7 @@ function rejection(
   error: ProjectionError,
   sourceRowCounts: Record<string, number>,
 ): CanonicalLegacyReadResult {
-  if (
-    error.kind === "unknown_scope" ||
-    error.kind === "unsupported_profile"
-  ) {
+  if (error.kind === "unknown_scope" || error.kind === "unsupported_profile") {
     return unavailable({
       reason: "unbound_scope",
       lookup: error,
