@@ -282,6 +282,66 @@ it("reuses the existing authority with an exact verified dynamic declaration and
   expect(fromAccount.headers.get("access-control-allow-origin")).toBe(
     accountOrigin,
   );
+  // Allowed-vs-rejected origin matrix for every forwarded path, with preflight.
+  // Preflight must admit each request header the read forwarder passes on.
+  const forwarded = [
+    ["POST", "/v1/grants"],
+    ["GET", "/v1/data/strava.activities"],
+    ["GET", "/pdpp/v1/streams/activities/records"],
+  ] as const;
+  for (const [method, path] of forwarded) {
+    const allowed = await real.app.request(path, {
+      method,
+      headers: { origin: accountOrigin, "content-type": "application/json" },
+      ...(method === "POST" && { body: "{}" }),
+    });
+    expect(allowed.status).not.toBe(403);
+    expect(allowed.headers.get("access-control-allow-origin")).toBe(
+      accountOrigin,
+    );
+    expect(allowed.headers.get("vary")).toBe("Origin");
+    const preflight = await real.app.request(path, {
+      method: "OPTIONS",
+      headers: {
+        origin: accountOrigin,
+        "access-control-request-method": method,
+      },
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("access-control-allow-origin")).toBe(
+      accountOrigin,
+    );
+    expect(preflight.headers.get("access-control-allow-methods")).toContain(
+      method,
+    );
+    const allowedHeaders = (
+      preflight.headers.get("access-control-allow-headers") ?? ""
+    ).split(",");
+    for (const header of [
+      "authorization",
+      "pdpp-version",
+      "accept",
+      "range",
+      "if-none-match",
+    ])
+      expect(allowedHeaders).toContain(header);
+    for (const foreign of [
+      "http://evil.invalid",
+      "null",
+      "http://localhost:3084.evil.invalid",
+    ])
+      for (const request of [
+        { method, ...(method === "POST" && { body: "{}" }) },
+        { method: "OPTIONS" },
+      ]) {
+        const refused = await real.app.request(path, {
+          ...request,
+          headers: { origin: foreign, "content-type": "application/json" },
+        });
+        expect(refused.status).toBe(403);
+        expect(refused.headers.get("access-control-allow-origin")).toBeNull();
+      }
+  }
   const readProof = await buildWeb3SignedHeader({
     wallet: owner,
     aud: origin,

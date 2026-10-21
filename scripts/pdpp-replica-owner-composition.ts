@@ -181,6 +181,15 @@ export type ConnectorNotReady =
  * `oracle` runs the independent SQL comparison only once the in-memory
  * snapshots already agree; its throw is a mismatch.
  */
+// Request headers the read proxy forwards to B; the CORS preflight allows the same set.
+const FORWARDED_READ_HEADERS = [
+  "authorization",
+  "pdpp-version",
+  "accept",
+  "range",
+  "if-none-match",
+] as const;
+
 export function evaluateConnectorReadiness(input: {
   a: Pick<Snapshot, "ownerRows" | "pending" | "canonicalRows" | "blobs">;
   b: Pick<Snapshot, "appRows" | "canonicalRows" | "blobs" | "evidence">;
@@ -416,9 +425,10 @@ export async function createOwnerComposition(options: CompositionOptions) {
     if (origin) {
       res.headers.set("Access-Control-Allow-Origin", options.accountOrigin);
       res.headers.set("Vary", "Origin");
+      // Preflight admits every header the read forwarder passes on to B.
       res.headers.set(
         "Access-Control-Allow-Headers",
-        "authorization,content-type,pdpp-version",
+        [...new Set(["content-type", ...FORWARDED_READ_HEADERS])].join(","),
       );
       res.headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
       res.headers.set("Access-Control-Allow-Private-Network", "true");
@@ -624,13 +634,7 @@ export async function createOwnerComposition(options: CompositionOptions) {
       return c.json({ error: "not_found" }, 404);
     if (!resourceOrigin) return c.json({ error: "replica_not_ready" }, 503);
     const headers = new Headers();
-    for (const key of [
-      "authorization",
-      "pdpp-version",
-      "accept",
-      "range",
-      "if-none-match",
-    ]) {
+    for (const key of FORWARDED_READ_HEADERS) {
       const value = c.req.header(key);
       if (value) headers.set(key, value);
     }
