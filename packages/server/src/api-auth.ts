@@ -388,6 +388,7 @@ export function createServerApiAuth(
       const selectedEntry = deps.dataStorage?.findEntry({
         scope: input.scope,
         fileId: input.fileId,
+        at: input.at,
       });
       const grant = await verifyDataReadPolicy(
         {

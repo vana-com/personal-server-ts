@@ -28,6 +28,7 @@ import type {
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
   verifyDataReadPolicy,
+  authorizeLegacyRead,
   verifySignedArtifacts,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
@@ -418,6 +419,12 @@ async function selectJobScope(
   if (!entry) {
     throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
   }
+  // A job result goes to the builder, never the owner.
+  try {
+    authorizeLegacyRead("grantee", { kind: "stored-version", entry });
+  } catch (error) {
+    throw mapPolicyFailure(error);
+  }
   if (entry.sizeBytes > resultMaxBytes) {
     throw new JobFailure(
       "RESULT_TOO_LARGE",
@@ -456,7 +463,11 @@ async function openRawReadBodyStream(
     );
     return oneChunkStream(bytes);
   }
-  const read = await readDataContract({ storage, scopeParam: scope });
+  const read = await readDataContract({
+    storage,
+    scopeParam: scope,
+    at: entry.collectedAt,
+  });
   if (!read.ok) {
     throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
   }

@@ -290,6 +290,42 @@ describe("computeQuestion", () => {
     expect(fakeCalls(writeOnly)).toHaveLength(0);
   });
 
+  it("blocks builder inference from a PDPP-projected source while owner compute can read it", async () => {
+    const builder = deps({
+      store: createInMemoryQuestionStore({ initial: [builderRegistration()] }),
+      writePolicyPorts: policyPorts([
+        "write:coach.weekly",
+        "oura.sleep",
+        "chatgpt.conversations",
+      ]),
+    });
+    await seed(builder.storage, "oura.sleep", { secret: "projected" });
+    await seed(builder.storage, "chatgpt.conversations", { items: [] });
+    const readBuilderSource = vi.spyOn(builder.storage, "readEnvelope");
+    builder.storage.findEntry({ scope: "oura.sleep" })!.pdppOrigin = true;
+
+    const builderOutcome = await computeQuestion("q-1", builder);
+
+    expect(builderOutcome.status).toBe("failed");
+    expect(fakeCalls(builder)).toHaveLength(0);
+    expect(readBuilderSource).not.toHaveBeenCalled();
+
+    const owner = deps();
+    await seed(owner.storage, "oura.sleep", { score: 80 });
+    await seed(owner.storage, "chatgpt.conversations", { items: [] });
+    const readOwnerSource = vi.spyOn(owner.storage, "readEnvelope");
+    owner.storage.findEntry({ scope: "oura.sleep" })!.pdppOrigin = true;
+
+    const ownerOutcome = await computeQuestion("q-1", owner);
+
+    expect(ownerOutcome.status).toBe("ready");
+    expect(fakeCalls(owner)).toHaveLength(1);
+    expect(readOwnerSource).toHaveBeenCalledWith(
+      "oura.sleep",
+      "2026-08-20T00:00:00Z",
+    );
+  });
+
   it("fails closed for a builder question when no grant verifier is wired", async () => {
     const d = deps({
       store: createInMemoryQuestionStore({ initial: [builderRegistration()] }),

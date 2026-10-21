@@ -1,11 +1,14 @@
 export {
   verifyDataReadPolicy,
+  authorizeLegacyRead,
   resolveDataListGrantScopes,
   parseGrantExpiresAtSeconds,
   type DataListPolicyInput,
   type DataListPolicyPorts,
   type DataReadPolicyInput,
   type DataReadPolicyPorts,
+  type LegacyReadBody,
+  type LegacyReader,
 } from "./data-read.js";
 export {
   deriveBuilderId,

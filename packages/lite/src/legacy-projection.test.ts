@@ -830,6 +830,13 @@ describe("PS-Lite legacy projection", () => {
     await post(runtime, "chatgpt.messages", messages);
     await post(runtime, "chatgpt.conversations", conversations);
 
+    const owner = await get(runtime, "/v1/data/chatgpt.conversations");
+    expect(owner.status).toBe(200);
+    expect(((await owner.json()) as { data: unknown }).data).toMatchObject({
+      conversations: [{ id: "conv-1", message_count: 1 }],
+      total: 1,
+    });
+
     const res = await get(
       runtime,
       "/v1/data/chatgpt.conversations?grantId=grant-1",

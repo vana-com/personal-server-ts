@@ -17,6 +17,41 @@ function createAccount() {
 }
 
 describe("mcp/read-client", () => {
+  it("refuses a block read when the selected stored version is PDPP-projected", async () => {
+    const readScopeBlocks = vi.fn();
+    const accessLogWrite = vi.fn();
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          findEntry: vi.fn().mockReturnValue({
+            scope: "oura.sleep",
+            collectedAt: "2026-10-01T00:00:00Z",
+            fileId: "file-1",
+            pdppOrigin: true,
+          }),
+          readScopeBlocks,
+        } as never,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi.fn().mockResolvedValue({
+            builder: "0x2222",
+            grantId: "grant-1",
+          }),
+        },
+        accessLogWriter: { write: accessLogWrite },
+      },
+    });
+
+    await expect(
+      client.readScopeBlocks({ scope: "oura.sleep", grantId: "grant-1" }),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(readScopeBlocks).not.toHaveBeenCalled();
+    expect(accessLogWrite).not.toHaveBeenCalled();
+  });
+
   it("preserves a projection refusal from the block manifest read", async () => {
     const client = createMcpDataReadClient({
       serverOrigin: SERVER_ORIGIN,
@@ -27,6 +62,7 @@ describe("mcp/read-client", () => {
             scope: "oura.sleep",
             collectedAt: "2026-10-01T00:00:00Z",
             fileId: "file-1",
+            pdppOrigin: false,
           }),
           readBlockManifest: vi
             .fn()
@@ -123,6 +159,7 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -173,6 +210,7 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -248,6 +286,7 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -323,6 +362,7 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -399,6 +439,7 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -504,6 +545,7 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -571,6 +613,7 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -624,6 +667,7 @@ describe("mcp/read-client", () => {
           collectedAt: at ?? latestCollectedAt,
           fileId: at === oldCollectedAt ? "file-old" : "file-latest",
           sizeBytes: 10,
+          pdppOrigin: false,
         }) as never,
     );
     const readScopeBlocks = vi.fn().mockResolvedValue({
@@ -706,6 +750,7 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: bytes.byteLength,
+              pdppOrigin: false,
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -964,6 +1009,7 @@ describe("mcp/read-client deletion gate", () => {
                 collectedAt: "2026-06-05T00:00:00Z",
                 fileId: "file-1",
                 sizeBytes: 10,
+                pdppOrigin: false,
               }) as never,
             findByFileId: vi.fn(),
             findUnsynced: vi.fn(),

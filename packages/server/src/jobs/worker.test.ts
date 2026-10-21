@@ -182,6 +182,7 @@ async function createFixture(): Promise<Fixture> {
     sizeBytes: 100,
     version: 7,
     dataPointId: null,
+    pdppOrigin: false,
   } satisfies IndexEntry;
   const dataEnvelope: DataFileEnvelope = {
     version: "1.0",
@@ -461,6 +462,27 @@ describe("executeJob", () => {
     expect(fixture.deps.accessLogWriter.write).toHaveBeenCalledWith(
       expect.objectContaining({ grantId: GRANT_ID, scope: SCOPE }),
     );
+  });
+
+  it("denies a live legacy grant for a PDPP-projected entry before reading or computing", async () => {
+    const fixture = await createFixture();
+    fixture.storage.findEntry({ scope: SCOPE })!.pdppOrigin = true;
+    fixture.deps.hydrateScope = vi.fn();
+
+    await expectFailure(fixture, "GRANT_INVALID");
+
+    expect(fixture.gateway.getBuilder).toHaveBeenCalledWith(builder.address);
+    expect(fixture.gateway.getGrant).toHaveBeenCalledWith(GRANT_ID);
+    expect(fixture.storage.findEntry).toHaveBeenCalledWith(
+      expect.objectContaining({ scope: SCOPE }),
+    );
+    expect(fixture.storage.readEnvelope).not.toHaveBeenCalled();
+    expect(fixture.storage.readEnvelopeBytes).not.toHaveBeenCalled();
+    // Refused at selection, before the version lookup.
+    expect(fixture.storage.findLatestVersionByScope).not.toHaveBeenCalled();
+    expect(fixture.deps.hydrateScope).not.toHaveBeenCalled();
+    expect(fixture.resultUploadFetch).not.toHaveBeenCalled();
+    expect(fixture.deps.accessLogWriter.write).not.toHaveBeenCalled();
   });
 
   it("hydrates a missing scope once and serves the populated entry", async () => {

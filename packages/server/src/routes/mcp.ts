@@ -98,6 +98,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { TokenStore } from "../token-store.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
+import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 
 export interface McpRouteDeps {
@@ -137,6 +138,11 @@ export interface McpRouteDeps {
   indexManager?: IndexManager;
   hierarchyOptions?: HierarchyManagerOptions;
   dataStorage?: DataStoragePort;
+  /**
+   * The same deletion tracker `/v1/data` reads with, so an MCP read of a scope
+   * the owner deleted is refused the same way.
+   */
+  scopeDeletions?: ScopeDeletionTracker;
   runtimeAvailability?: RuntimeAvailabilityPort;
   /** Per-process connection store. Defaults to in-memory. */
   connectionStore?: McpConnectionStore;
@@ -317,6 +323,8 @@ function buildDataApiDeps(deps: McpRouteDeps): PersonalServerDataApiDeps {
     readFulfillmentReporter: deps.readFulfillmentReporter,
     runtimeAvailability: deps.runtimeAvailability,
     logger: deps.logger,
+    scopeDeletions: deps.scopeDeletions,
+    serverOwner: deps.serverOwner,
   };
 }
 
