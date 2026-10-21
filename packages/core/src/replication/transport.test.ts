@@ -102,15 +102,29 @@ it("reduces fragment size using actual DPv2 encryption overhead", async () => {
   expect(assembleReplicaPayload(decoded)).toEqual(bytes);
 }, 30000);
 
-it("requires consistent settled head, history and chain instead of same-hash adoption", async () => {
-  const { replicaRegistrationState } = await import("./dpv2.js");
+it("keeps Gateway disagreement pending and quarantines only finalized immutable slot conflicts", async () => {
+  const { replicaRegistrationState, replicaChainCommitment } =
+    await import("./dpv2.js");
   const row = {
     owner: "owner",
     scope: "scope",
     version: "1",
-    dataHash: "hash",
-    metadataHash: "meta",
+    dataHash: `0x${"a".repeat(64)}` as const,
+    metadataHash: `0x${"b".repeat(64)}` as const,
     deleted: false,
+  };
+  const chain = {
+    owner: row.owner,
+    scope: row.scope,
+    version: "1" as const,
+    currentVersion: "1",
+    status: "Active" as const,
+    commitment: replicaChainCommitment(row.dataHash, row.metadataHash),
+    chainId: 14800,
+    registry: `0x${"1".repeat(40)}` as const,
+    blockNumber: 123n,
+    blockHash: `0x${"c".repeat(64)}` as const,
+    blockTimestamp: 1000n,
   };
   const expected = {
     owner: row.owner,
@@ -118,38 +132,105 @@ it("requires consistent settled head, history and chain instead of same-hash ado
     dataHash: row.dataHash,
     metadataHash: row.metadataHash,
   };
+  const evidence = { head: row, chain, pending: false };
   expect(
     replicaRegistrationState(
-      { head: null, history: null, chain: null, pending: false },
-      expected,
-    ),
-  ).toBe("absent");
-  expect(
-    replicaRegistrationState(
-      { head: row, history: row, chain: row, pending: false },
-      expected,
-    ),
-  ).toBe("confirmed");
-  expect(
-    replicaRegistrationState(
-      { head: row, history: row, chain: null, pending: true },
+      { ...evidence, head: { ...row, version: "9" } },
       expected,
     ),
   ).toBe("pending");
-  for (const mutation of [
-    { head: { ...row, version: "9" } },
-    { head: null },
-    { history: null },
+  expect(replicaRegistrationState(evidence, expected)).toBe("confirmed");
+  const absentChain = {
+    ...chain,
+    currentVersion: "0",
+    status: "None" as const,
+    commitment: `0x${"0".repeat(64)}` as const,
+  };
+  expect(
+    replicaRegistrationState(
+      { head: null, chain: absentChain, pending: false },
+      expected,
+    ),
+  ).toBe("absent");
+  const uncertain = [
     { chain: null },
-    { history: { ...row, metadataHash: "other" } },
-    { chain: { ...row, dataHash: "other" } },
+    { head: null },
+    { pending: true },
+    { chain: absentChain },
+    { head: { ...row, version: "9" } },
+    { head: { ...row, owner: "other" } },
+    { head: { ...row, scope: "other" } },
     { head: { ...row, deleted: true } },
-  ]) {
+    { head: { ...row, dataHash: `0x${"c".repeat(64)}` } },
+    { head: { ...row, metadataHash: `0x${"c".repeat(64)}` } },
+    { chain: { ...chain, status: "Unavailable" as const } },
+    { chain: { ...chain, status: "Inactive" as const } },
+  ];
+  for (const patch of uncertain) {
+    expect(replicaRegistrationState({ ...evidence, ...patch }, expected)).toBe(
+      "pending",
+    );
     expect(
       replicaRegistrationState(
-        { head: row, history: row, chain: row, pending: false, ...mutation },
-        expected,
+        { ...evidence, ...patch },
+        { owner: row.owner, scope: row.scope },
       ),
-    ).toBe("conflict");
+    ).toBe("pending");
   }
+  expect(
+    replicaRegistrationState(
+      { head: null, chain: null, pending: false },
+      expected,
+    ),
+  ).toBe("pending");
+  for (const patch of [
+    { chain: { ...chain, currentVersion: "2" } },
+    { chain: { ...chain, commitment: `0x${"c".repeat(64)}` as const } },
+  ]) {
+    expect(replicaRegistrationState({ ...evidence, ...patch }, expected)).toBe(
+      "conflict",
+    );
+  }
+  // Without durable expected hashes, a head/chain mismatch is not terminal evidence.
+  expect(
+    replicaRegistrationState(
+      { ...evidence, chain: { ...chain, commitment: `0x${"d".repeat(64)}` } },
+      { owner: row.owner, scope: row.scope },
+    ),
+  ).toBe("pending");
+});
+
+it("quarantines a finalized tombstone-at-version-1 against the durable replica hashes", async () => {
+  const { replicaRegistrationState, replicaChainCommitment } =
+    await import("./dpv2.js");
+  const { keccak256, stringToHex } = await import("viem");
+  const dataHash = keccak256(stringToHex("vana.data-point.tombstone.v1"));
+  const metadataHash = keccak256(
+    stringToHex("vana.data-point.tombstone.metadata.v1"),
+  );
+  const evidence = {
+    head: null,
+    chain: {
+      owner: "owner",
+      scope: "scope",
+      version: "1" as const,
+      currentVersion: "1",
+      status: "Active" as const,
+      commitment: replicaChainCommitment(dataHash, metadataHash),
+      chainId: 14800,
+      registry: "0x1" as const,
+      blockNumber: 1n,
+      blockHash: "0x1" as const,
+      blockTimestamp: 1n,
+    },
+    pending: false,
+  };
+  expect(
+    replicaRegistrationState(evidence, {
+      owner: "owner",
+      scope: "scope",
+      dataHash: `0x${"a".repeat(64)}`,
+      metadataHash: `0x${"b".repeat(64)}`,
+    }),
+  ).toBe("conflict");
 });
