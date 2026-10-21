@@ -447,3 +447,46 @@ it("expires a list cursor minted under timestamp-text order instead of resuming 
     }
   }
 });
+
+it("expires a sync page cursor minted under the earlier identity order", async () => {
+  const { decodeCursor, encodeCursor, CursorExpiredError } =
+    await import("@opendatalabs/personal-server-ts-core/storage/pdpp-records");
+  for (const store of stores()) {
+    try {
+      // localeCompare put "a" before "A"; code-point order puts "A" first.
+      for (const key of ["a", "A"]) put(store, key, "2026-04-01T00:00:00Z");
+      const options = { instanceIds: ["inst_1"], limit: 1 };
+      const fresh = store.changesSince("events", options);
+      const minted = decodeCursor(fresh.nextCursor!);
+      if (minted.kind !== "changes_since") throw Error("expected sync cursor");
+      // The same page position as an older build minted it.
+      const legacy = {
+        kind: "changes_since" as const,
+        stream: minted.stream,
+        epoch: minted.epoch,
+        horizon: minted.horizon,
+        sinceHorizon: minted.sinceHorizon,
+        offset: 1,
+      };
+      expect(() =>
+        store.changesSince("events", {
+          ...options,
+          cursor: encodeCursor(legacy),
+        }),
+      ).toThrow(CursorExpiredError);
+      // A page cursor this build mints still resumes, and the session's
+      // checkpoint is unaffected.
+      const next = store.changesSince("events", {
+        ...options,
+        cursor: fresh.nextCursor,
+      });
+      expect([...fresh.data, ...next.data].map((r) => r.recordKey)).toEqual([
+        "A",
+        "a",
+      ]);
+      expect(next.nextChangesSince).toBeTruthy();
+    } finally {
+      store.close();
+    }
+  }
+});
