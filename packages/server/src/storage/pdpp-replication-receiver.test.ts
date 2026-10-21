@@ -4252,10 +4252,8 @@ function pendingResetUnderQuarantine(
   );
 }
 
-// Expected to fail until the store's unquarantinedRecordSql takes the
-// generation argument (synthesis lane); until then the binding's current
-// generation (1) applies to every row. Flip to `it.each` when it lands.
-it.fails.each([1, 2] as const)(
+// The store's unquarantinedRecordSql takes the row's generation (3e18fac5).
+it.each([1, 2] as const)(
   "applies a generation-%i key fact to a pending reset's value by the value's generation (store predicate)",
   (generation) => pendingResetUnderQuarantine("store", generation),
 );
