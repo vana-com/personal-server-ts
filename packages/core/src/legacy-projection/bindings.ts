@@ -4150,13 +4150,19 @@ const hebOrders: LegacyScopeBinding = {
   },
 };
 
-// Whole Foods declaration and provenance are pinned to data connector 0.3.34.
+// The vendored Whole Foods declaration is the profile built from the unmerged
+// data-connectors fix/wholefoods-parity branch (PDP-Connect/data-connectors#499).
+// No published, signed artifact contains it: the registry's wholefoods:0.3.34
+// is a different build, from revision a5eea369af4d. So this cites the source
+// revision and the profile bytes, as the iCloud Notes 0.1.24 declaration does,
+// and claims no OCI identity. Replace it with the OCI reference and manifest
+// digest once a version after 0.3.34 is published with these changes.
 const wholefoodsSource = "https://registry.pdpp.dev/connectors/wholefoods";
 const wholefoodsEvidence: LegacyScopeBindingProvenance = {
-  kind: "oci",
-  ref: "ghcr.io/pdp-connect/connector/wholefoods:0.3.34",
+  kind: "collection-profile",
+  ref: "https://github.com/PDP-Connect/data-connectors/tree/6d841da0b70e50593bf07ad1bec81213d30f18b6/connectors/wholefoods",
   digest:
-    "sha256:2240249fc49d663798465d2ea42273402bd31a135cd0d262110098ee72e019de",
+    "sha256:3773286d15b866a2e728898a9e26cfc776087ec26810bc1be5fc4e055a10b4fd",
   path: "declarations/wholefoods.collection-profile.json",
 };
 
@@ -4245,7 +4251,7 @@ const wholefoodsOrders: LegacyScopeBinding = {
   primaryKey: { orders: ["id"], order_items: ["id"] },
   lossy: [
     "The retained legacy data connector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
-    "An order with no usable line and an item_count that is not a known zero is left out and counted; an order whose line count differs from item_count, or whose item_count is unknown, is delivered and reported partial. A missing or duplicate order id still fails the scope.",
+    "An order with no usable line, an item_count that is not a known zero, and a status other than Cancelled is left out and counted. A cancelled order is delivered with no items and a null itemCount, as legacy delivered every order it saw. An order whose line count differs from item_count, or whose item_count is unknown, is delivered and reported partial. A missing or duplicate order id still fails the scope.",
     "Product identity is the source Amazon ASIN in product_id.",
   ],
   provenance: [
@@ -4288,42 +4294,48 @@ const wholefoodsOrders: LegacyScopeBinding = {
     }
     const dropped = new DroppedRows("wholefoods.orders");
     let countMismatches = 0;
+    const linesByOrder = new Map<unknown, typeof sourceItems>();
+    for (const line of sourceItems) {
+      const lines = linesByOrder.get(line.order_id);
+      if (lines) lines.push(line);
+      else linesByOrder.set(line.order_id, [line]);
+    }
     const orders = sourceOrders.flatMap((o) => {
-      const items = sourceItems
-        .filter((i) => i.order_id === o.id)
-        .flatMap((i) => {
-          if (!isNonEmptyString(i.name)) {
-            dropped.add("order_items", "projection_order_item_missing_name");
-            return [];
-          }
-          if (!isNonEmptyString(i.product_id)) {
-            dropped.add(
-              "order_items",
-              "projection_order_item_missing_product_id",
-            );
-            return [];
-          }
-          return [
-            {
-              name: i.name,
-              productId: i.product_id,
-              ...(typeof i.product_url === "string"
-                ? { productUrl: i.product_url }
-                : {}),
-              ...(typeof i.image_url === "string"
-                ? { imageUrl: i.image_url }
-                : {}),
-              quantity:
-                typeof i.quantity === "number" ? String(i.quantity) : null,
-              price:
-                typeof i.unit_price_cents === "number"
-                  ? i.unit_price_cents / 100
-                  : null,
-            },
-          ];
-        });
+      const items = (linesByOrder.get(o.id) ?? []).flatMap((i) => {
+        if (!isNonEmptyString(i.name)) {
+          dropped.add("order_items", "projection_order_item_missing_name");
+          return [];
+        }
+        if (!isNonEmptyString(i.product_id)) {
+          dropped.add(
+            "order_items",
+            "projection_order_item_missing_product_id",
+          );
+          return [];
+        }
+        return [
+          {
+            name: i.name,
+            productId: i.product_id,
+            ...(typeof i.product_url === "string"
+              ? { productUrl: i.product_url }
+              : {}),
+            ...(typeof i.image_url === "string"
+              ? { imageUrl: i.image_url }
+              : {}),
+            quantity:
+              typeof i.quantity === "number" ? String(i.quantity) : null,
+            price:
+              typeof i.unit_price_cents === "number"
+                ? i.unit_price_cents / 100
+                : null,
+          },
+        ];
+      });
       // Whole Foods item_count counts lines. Only a known zero proves an
-      // order with no usable line is empty; otherwise it is a detail gap.
+      // order with no usable line is empty, and only a cancellation explains
+      // one whose count is unknown or positive. Any other order with no
+      // usable line is a detail gap and is left out.
       const itemCount = o.item_count;
       const knownCount =
         typeof itemCount === "number" &&
@@ -4416,8 +4428,6 @@ const wholefoodsNutritionFields = [
   "usda_match_method",
   "usda_description",
   "usda_brand",
-  "error",
-  "page_title",
   "type",
 ];
 const wholefoodsNutrition: LegacyScopeBinding = {
@@ -4429,9 +4439,12 @@ const wholefoodsNutrition: LegacyScopeBinding = {
     nutrition: wholefoodsNutritionFields,
     order_items: ["product_id", "name", "product_url", "image_url"],
   },
-  primaryKey: { nutrition: ["product_id"], order_items: ["id"] },
+  primaryKey: { nutrition: ["id"], order_items: ["id"] },
   lossy: [
     "servingsPerContainer is converted from the declared number to the legacy string field.",
+    "error and pageTitle, which the legacy connector set on failed lookups, are not declared by the nutrition stream and are not emitted.",
+    "The product-page hero image the legacy connector used when an order line had no image is not declared by any stream; images.thumbnail is empty then.",
+    'name, productUrl and images come from the first order line that lists the product, as in the legacy connector; a later line never replaces them. "First" is the order the records are supplied in.',
   ],
   provenance: [
     {
@@ -4460,6 +4473,8 @@ const wholefoodsNutrition: LegacyScopeBinding = {
             reason: "order item lacks a source ASIN or name",
           },
         };
+      // The legacy connector kept the first line per ASIN (`productMap`).
+      if (orderedProducts.has(row.product_id)) continue;
       orderedProducts.set(row.product_id, {
         name: row.name,
         ...(typeof row.product_url === "string"
@@ -4557,8 +4572,6 @@ const wholefoodsNutrition: LegacyScopeBinding = {
         "usda_match_method",
         "usda_description",
         "usda_brand",
-        "error",
-        "page_title",
       ]) {
         if (
           n[field] === null ||
@@ -4572,7 +4585,6 @@ const wholefoodsNutrition: LegacyScopeBinding = {
               usda_match_method: "usdaMatchMethod",
               usda_description: "usdaDescription",
               usda_brand: "usdaBrand",
-              page_title: "pageTitle",
             }[field] ?? field;
           item[legacyField] = n[field];
         }

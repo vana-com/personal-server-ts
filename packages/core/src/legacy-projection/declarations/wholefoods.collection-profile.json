@@ -1,6 +1,12 @@
 {
 	"protocol_version": "0.1.0",
 	"connector_id": "https://registry.pdpp.dev/connectors/wholefoods",
+	"source": {
+		"id": "https://registry.pdpp.dev/sources/wholefoods",
+		"display": {
+			"name": "Whole Foods"
+		}
+	},
 	"connector_key": "wholefoods",
 	"manifest_uri": "https://registry.pdpp.dev/connectors/wholefoods",
 	"version": "0.3.34",
@@ -32,13 +38,18 @@
 					"autocomplete": "off",
 					"help_url": "https://fdc.nal.usda.gov/api-key-signup",
 					"help_text": "Get a free key at https://fdc.nal.usda.gov/api-key-signup. Without one, nutrition lookups use the shared DEMO_KEY, which is more rate-limited.",
-					"env": ["USDA_API_KEY"]
+					"env": [
+						"USDA_API_KEY"
+					]
 				}
 			]
 		}
 	},
 	"capabilities": {
-		"human_interaction": ["manual_action", "otp"],
+		"human_interaction": [
+			"manual_action",
+			"otp"
+		],
 		"refresh_policy": {
 			"recommended_mode": "manual",
 			"minimum_interval_seconds": 7200,
@@ -69,16 +80,26 @@
 						"type": "string"
 					},
 					"name": {
-						"type": ["string", "null"],
+						"type": [
+							"string",
+							"null"
+						],
 						"x_pdpp_role": "primary-title"
 					},
 					"email": {
-						"type": ["string", "null"]
+						"type": [
+							"string",
+							"null"
+						]
 					}
 				},
-				"required": ["id"]
+				"required": [
+					"id"
+				]
 			},
-			"primary_key": ["id"],
+			"primary_key": [
+				"id"
+			],
 			"selection": {
 				"fields": true,
 				"resources": true
@@ -86,7 +107,9 @@
 			"incremental": false,
 			"query": {
 				"search": {
-					"lexical_fields": ["name"]
+					"lexical_fields": [
+						"name"
+					]
 				}
 			},
 			"coverage_strategy": "singleton_presence",
@@ -108,27 +131,47 @@
 						"type": "string"
 					},
 					"order_date": {
-						"type": ["string", "null"],
+						"type": [
+							"string",
+							"null"
+						],
 						"format": "date",
 						"x_pdpp_role": "event-time"
 					},
 					"order_url": {
-						"type": ["string", "null"],
+						"type": [
+							"string",
+							"null"
+						],
 						"format": "uri"
 					},
 					"status": {
-						"type": ["string", "null"]
+						"type": [
+							"string",
+							"null"
+						]
 					},
 					"total_cents": {
-						"type": ["integer", "null"]
+						"type": [
+							"integer",
+							"null"
+						]
 					},
 					"item_count": {
-						"type": "integer"
+						"type": [
+							"integer",
+							"null"
+						]
 					}
 				},
-				"required": ["id", "item_count"]
+				"required": [
+					"id",
+					"item_count"
+				]
 			},
-			"primary_key": ["id"],
+			"primary_key": [
+				"id"
+			],
 			"consent_time_field": "order_date",
 			"selection": {
 				"fields": true,
@@ -137,11 +180,18 @@
 			"incremental": true,
 			"query": {
 				"range_filters": {
-					"order_date": ["gte", "gt", "lte", "lt"]
+					"order_date": [
+						"gte",
+						"gt",
+						"lte",
+						"lt"
+					]
 				},
 				"aggregations": {
 					"count": true,
-					"group_by_time": ["order_date"]
+					"group_by_time": [
+						"order_date"
+					]
 				}
 			},
 			"coverage_strategy": "checkpoint_window",
@@ -173,22 +223,59 @@
 						"type": "string"
 					},
 					"product_url": {
-						"type": ["string", "null"],
+						"type": [
+							"string",
+							"null"
+						],
 						"format": "uri"
 					},
 					"image_url": {
-						"type": ["string", "null"]
+						"type": [
+							"string",
+							"null"
+						]
 					},
 					"quantity": {
-						"type": ["number", "null"]
+						"type": [
+							"number",
+							"null"
+						]
 					},
 					"unit_price_cents": {
-						"type": ["integer", "null"]
+						"type": [
+							"integer",
+							"null"
+						]
+					},
+					"quantity_unit": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"price_unit": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"line_total_cents": {
+						"type": [
+							"integer",
+							"null"
+						]
 					}
 				},
-				"required": ["id", "order_id", "name", "product_id"]
+				"required": [
+					"id",
+					"order_id",
+					"name",
+					"product_id"
+				]
 			},
-			"primary_key": ["id"],
+			"primary_key": [
+				"id"
+			],
 			"selection": {
 				"fields": true,
 				"resources": true
@@ -196,7 +283,9 @@
 			"incremental": false,
 			"query": {
 				"search": {
-					"lexical_fields": ["name"]
+					"lexical_fields": [
+						"name"
+					]
 				}
 			},
 			"coverage_strategy": "parent_detail_accounting",
@@ -205,7 +294,7 @@
 		{
 			"name": "nutrition",
 			"required": false,
-			"description": "Nutrition facts or observed lookup outcome per unique product. Sources are the Whole Foods product page and USDA FoodData Central. Joins to `order_items` on `product_id`.",
+			"description": "Nutrition facts or observed lookup outcome per unique product. Sources are Amazon, Whole Foods, and USDA FoodData Central. Joins to `order_items` on `product_id`.",
 			"display": {
 				"label": "Nutrition facts",
 				"detail": "Nutrition facts when found, or a not found, blocked, or error outcome when lookup fails."
@@ -218,15 +307,18 @@
 						"type": "string"
 					},
 					"name": {
-						"type": ["string", "null"],
+						"type": [
+							"string",
+							"null"
+						],
 						"x_pdpp_role": "primary-title"
 					},
 					"source": {
 						"type": "string",
 						"enum": [
+							"wholefoods_product_page",
 							"wholefoods_structured_data",
 							"amazon_product_page",
-							"wholefoods_product_page",
 							"usda_fdc",
 							"not_found",
 							"error",
@@ -235,60 +327,193 @@
 					},
 					"confidence": {
 						"type": "string",
-						"enum": ["high", "medium", "low"]
+						"enum": [
+							"high",
+							"medium",
+							"low"
+						]
 					},
 					"calories": {
-						"type": ["number", "null"]
+						"type": [
+							"number",
+							"null"
+						]
 					},
 					"protein_g": {
-						"type": ["number", "null"]
+						"type": [
+							"number",
+							"null"
+						]
 					},
 					"carbs_g": {
-						"type": ["number", "null"]
+						"type": [
+							"number",
+							"null"
+						]
 					},
 					"fat_g": {
-						"type": ["number", "null"]
+						"type": [
+							"number",
+							"null"
+						]
 					},
 					"sodium_mg": {
-						"type": ["number", "null"]
+						"type": [
+							"number",
+							"null"
+						]
 					},
 					"fiber_g": {
-						"type": ["number", "null"]
+						"type": [
+							"number",
+							"null"
+						]
 					},
 					"sugar_g": {
-						"type": ["number", "null"]
+						"type": [
+							"number",
+							"null"
+						]
 					},
 					"serving_size": {
-						"type": ["string", "null"]
+						"type": [
+							"string",
+							"null"
+						]
 					},
 					"servings_per_container": {
-						"type": ["number", "null"]
+						"type": [
+							"number",
+							"null"
+						]
 					},
-					"saturated_fat_g": { "type": ["number", "null"] },
-					"trans_fat_g": { "type": ["number", "null"] },
-					"cholesterol_mg": { "type": ["number", "null"] },
-					"added_sugar_g": { "type": ["number", "null"] },
-					"potassium_mg": { "type": ["number", "null"] },
-					"calcium_mg": { "type": ["number", "null"] },
-					"iron_mg": { "type": ["number", "null"] },
-					"vitamin_d_mcg": { "type": ["number", "null"] },
-					"ingredients": { "type": ["string", "null"] },
-					"allergens": { "type": ["string", "null"] },
-					"highlights": { "type": "array" },
-					"category": { "type": "array" },
-					"upc": { "type": ["string", "null"] },
-					"raw_nutrition_text": { "type": ["string", "null"] },
-					"usda_fdc_id": { "type": ["integer", "null"] },
-					"usda_match_method": { "type": ["string", "null"] },
-					"usda_description": { "type": ["string", "null"] },
-					"usda_brand": { "type": ["string", "null"] },
-					"error": { "type": ["string", "null"] },
-					"page_title": { "type": ["string", "null"] },
-					"type": { "type": ["string", "null"] }
+					"id": {
+						"type": "string"
+					},
+					"added_sugar_g": {
+						"type": [
+							"number",
+							"null"
+						]
+					},
+					"allergens": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"calcium_mg": {
+						"type": [
+							"number",
+							"null"
+						]
+					},
+					"category": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"cholesterol_mg": {
+						"type": [
+							"number",
+							"null"
+						]
+					},
+					"ingredients": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"iron_mg": {
+						"type": [
+							"number",
+							"null"
+						]
+					},
+					"highlights": {
+						"type": "array",
+						"items": {
+							"type": "string"
+						}
+					},
+					"potassium_mg": {
+						"type": [
+							"number",
+							"null"
+						]
+					},
+					"raw_nutrition_text": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"saturated_fat_g": {
+						"type": [
+							"number",
+							"null"
+						]
+					},
+					"trans_fat_g": {
+						"type": [
+							"number",
+							"null"
+						]
+					},
+					"upc": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"usda_brand": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"usda_description": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"usda_fdc_id": {
+						"type": [
+							"integer",
+							"null"
+						]
+					},
+					"usda_match_method": {
+						"type": [
+							"string",
+							"null"
+						]
+					},
+					"vitamin_d_mcg": {
+						"type": [
+							"number",
+							"null"
+						]
+					},
+					"type": {
+						"type": [
+							"string"
+						]
+					}
 				},
-				"required": ["product_id", "source", "confidence"]
+				"required": [
+					"id",
+					"product_id",
+					"source",
+					"confidence"
+				]
 			},
-			"primary_key": ["product_id"],
+			"primary_key": [
+				"id"
+			],
 			"selection": {
 				"fields": true,
 				"resources": true
@@ -296,7 +521,9 @@
 			"incremental": true,
 			"query": {
 				"search": {
-					"lexical_fields": ["name"]
+					"lexical_fields": [
+						"name"
+					]
 				}
 			},
 			"coverage_strategy": "parent_detail_accounting",
@@ -304,6 +531,9 @@
 		}
 	],
 	"reason_display_messages": {
-		"wholefoods_filter_pending": "Whole Foods filter support isn't wired up yet"
+		"wholefoods_filter_pending": "Whole Foods filter support isn't wired up yet",
+		"wholefoods_order_item_asin_missing": "Some Whole Foods items lacked a source product ID and were omitted from item records",
+		"wholefoods_order_item_count_unverified": "Some Whole Foods orders were imported, but their item counts could not be checked against your order history",
+		"inventory_not_proven_complete": "Observed Whole Foods records were imported, but the source did not prove the inventory complete. Retry to refresh."
 	}
 }

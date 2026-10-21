@@ -256,10 +256,15 @@ describe("legacy scope binding self-check", () => {
     ]) {
       expect(LEGACY_SCOPE_BINDINGS.has(scope), scope).toBe(true);
     }
+  });
 
+  it("pins Whole Foods bindings to the profile built from data-connectors#499, which no published artifact contains", () => {
     const wholeFoodsStreamNames = wholefoodsDeclaration.streams.map(
       (stream) => stream.name,
     );
+    // The registry's wholefoods:0.3.34 is another build (revision a5eea369af4d).
+    // This profile carries the same version string, so the source revision and
+    // the profile bytes are what identify it.
     expect(wholefoodsDeclaration.version).toBe("0.3.34");
     expect(wholeFoodsStreamNames).toEqual([
       "profile",
@@ -268,15 +273,15 @@ describe("legacy scope binding self-check", () => {
       "nutrition",
     ]);
     expect(wholefoodsProvenance.source.revision).toBe(
-      "4e1f6e4cc5b66c4a70bd6fa38c3579eb22956c10",
+      "6d841da0b70e50593bf07ad1bec81213d30f18b6",
     );
     expect(
       LEGACY_SCOPE_BINDINGS.get("wholefoods.profile")?.provenance[0],
     ).toEqual({
-      kind: "oci",
-      ref: "ghcr.io/pdp-connect/connector/wholefoods:0.3.34",
+      kind: "collection-profile",
+      ref: "https://github.com/PDP-Connect/data-connectors/tree/6d841da0b70e50593bf07ad1bec81213d30f18b6/connectors/wholefoods",
       digest:
-        "sha256:2240249fc49d663798465d2ea42273402bd31a135cd0d262110098ee72e019de",
+        "sha256:3773286d15b866a2e728898a9e26cfc776087ec26810bc1be5fc4e055a10b4fd",
       path: "declarations/wholefoods.collection-profile.json#streams[name=profile]",
     });
     expect(collectionProfileDigest("wholefoods")).toBe(

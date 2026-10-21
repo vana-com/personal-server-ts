@@ -605,7 +605,145 @@ describe("grocery legacy scope projections", () => {
     validates(wholefoodsOrdersSchema, payload);
   });
 
-  it("differentially projects good, failed, and recovered offline refreshes through ingest", () => {
+  describe("Whole Foods order evidence the legacy connector never had", () => {
+    const orderRecord = (id: string, fields: Record<string, unknown>) => ({
+      stream: "orders",
+      data: {
+        id,
+        status: null,
+        order_date: null,
+        order_url: null,
+        total_cents: null,
+        ...fields,
+      },
+    });
+    const projectOrders = (records: PdppRecord[]) => {
+      const result = LEGACY_SCOPE_BINDINGS.get("wholefoods.orders")?.project(
+        records,
+        { fetchedStreams: ["orders", "order_items"] },
+      );
+      expect(result?.ok, JSON.stringify(result)).toBe(true);
+      if (!result?.ok) throw new Error("projection failed");
+      return result;
+    };
+
+    it("keeps an order that is not cancelled when its item_count is a known zero", () => {
+      const result = projectOrders([orderRecord("empty", { item_count: 0 })]);
+      expect(result.payload).toEqual({
+        orders: [
+          {
+            orderId: "empty",
+            orderDate: null,
+            total: null,
+            itemCount: null,
+            status: "Completed",
+            items: [],
+          },
+        ],
+        totalOrders: 1,
+        totalItems: 0,
+      });
+      expect(result.diagnostics).toBeUndefined();
+    });
+
+    it("keeps a cancelled order whose item_count is positive and reports it partial", () => {
+      const result = projectOrders([
+        orderRecord("cancelled", { status: "Cancelled", item_count: 3 }),
+      ]);
+      expect(result.payload).toMatchObject({
+        orders: [
+          {
+            orderId: "cancelled",
+            status: "Cancelled",
+            itemCount: null,
+            items: [],
+          },
+        ],
+      });
+      expect(result.diagnostics).toEqual([
+        {
+          kind: "records_partial",
+          scope: "wholefoods.orders",
+          stream: "orders",
+          count: 1,
+          reasons: ["projection_order_item_count_mismatch"],
+        },
+      ]);
+    });
+
+    it("leaves out an order that is not cancelled, has no items and has no known zero count", () => {
+      const result = LEGACY_SCOPE_BINDINGS.get("wholefoods.orders")?.project(
+        [orderRecord("gap", { item_count: null })],
+        { fetchedStreams: ["orders", "order_items"] },
+      );
+      expect(result?.ok).toBe(false);
+    });
+  });
+
+  describe("Whole Foods product metadata for a repeated ASIN", () => {
+    // The legacy connector kept one record per ASIN, from the first order line
+    // that listed it (`productMap`); later lines never replaced it.
+    const line = (order: string, fields: Record<string, unknown>) => ({
+      stream: "order_items",
+      data: {
+        id: `${order}#B000REPEAT`,
+        order_id: order,
+        product_id: "B000REPEAT",
+        name: "Oats",
+        product_url: "https://amazon.test/dp/B000REPEAT",
+        image_url: null,
+        ...fields,
+      },
+    });
+    const thumbnailFor = (...lines: PdppRecord[]) => {
+      const payload = project(
+        "wholefoods.nutrition",
+        [
+          ...lines,
+          {
+            stream: "nutrition",
+            data: {
+              product_id: "B000REPEAT",
+              name: "Oats",
+              source: "not_found",
+              confidence: "low",
+            },
+          },
+        ],
+        ["nutrition", "order_items"],
+      ) as { items: Record<string, { images: { thumbnail: string } }> };
+      return payload.items.B000REPEAT?.images.thumbnail;
+    };
+
+    it("keeps the first line's image when a later line has none", () => {
+      expect(
+        thumbnailFor(
+          line("a", { image_url: "https://img.test/a.jpg" }),
+          line("b", { image_url: null }),
+        ),
+      ).toBe("https://img.test/a.jpg");
+    });
+
+    it("keeps the first line's image when a later line has a different one", () => {
+      expect(
+        thumbnailFor(
+          line("a", { image_url: "https://img.test/a.jpg" }),
+          line("b", { image_url: "https://img.test/b.jpg" }),
+        ),
+      ).toBe("https://img.test/a.jpg");
+    });
+
+    it("does not borrow a later line's image when the first line has none", () => {
+      expect(
+        thumbnailFor(
+          line("a", { image_url: null }),
+          line("b", { image_url: "https://img.test/b.jpg" }),
+        ),
+      ).toBe("");
+    });
+  });
+
+  it("projects the same bodies after good, failed, and recovered refreshes: a regression test of ingest plus projection, not a legacy comparison", () => {
     const store = createMemoryRecordStore();
     const streamSemantics = () => "mutable_state" as const;
     const primaryKeyFields = (stream: string) =>
@@ -703,6 +841,73 @@ describe("grocery legacy scope projections", () => {
       unit_price_cents: null,
     });
 
+    const expectedOrder = (id: string, cancelled: boolean) => ({
+      orderId: id,
+      orderUrl: `https://amazon.test/order/${id}`,
+      orderDate: "2026-10-01",
+      status: cancelled ? "Cancelled" : "Completed",
+      total: null,
+      itemCount: cancelled ? null : 1,
+      items: cancelled
+        ? []
+        : [
+            {
+              name: "Apples",
+              productId: "B000000001",
+              productUrl: "https://amazon.test/dp/B000000001",
+              imageUrl: "https://img.test/apples.jpg",
+              quantity: "1",
+              price: null,
+            },
+          ],
+    });
+    const expectedNutrition = (calories: number) => ({
+      items: {
+        B000000001: {
+          name: "Apples",
+          source: "wholefoods_structured_data",
+          productUrl: "https://amazon.test/dp/B000000001",
+          images: { thumbnail: "https://img.test/apples.jpg", full: "" },
+          confidence: "high",
+          calories,
+          protein_g: 0.3,
+          carbs_g: 14,
+          fat_g: 0.2,
+          sodium_mg: 1,
+          fiber_g: 2.4,
+          sugar_g: 10,
+          saturated_fat_g: 0,
+          trans_fat_g: 0,
+          cholesterol_mg: 0,
+          added_sugar_g: null,
+          potassium_mg: 107,
+          calcium_mg: 6,
+          iron_mg: 0.1,
+          vitamin_d_mcg: 0,
+          ingredients: "Apples",
+          allergens: null,
+          highlights: [],
+          category: ["Produce"],
+          upc: "012345678905",
+          rawNutritionText: null,
+          usdaFdcId: null,
+          usdaMatchMethod: null,
+          usdaDescription: null,
+          usdaBrand: null,
+          "@type": "https://schema.org/NutritionInformation",
+          servingSize: "1 medium",
+          servingsPerContainer: null,
+        },
+      },
+      coverage: {
+        total: 1,
+        found: 1,
+        foundUSDA: 0,
+        blocked: 0,
+        percentCovered: 100,
+      },
+    });
+
     const good = ingest("2026-10-01T00:00:00.000Z", [
       { stream: "orders", key: "order-1", data: order("order-1") },
       {
@@ -720,16 +925,16 @@ describe("grocery legacy scope projections", () => {
     expect(good.rejected).toEqual([]);
     expect(
       projectStored("wholefoods.nutrition", ["nutrition", "order_items"]),
-    ).toMatchObject({
-      items: {
-        B000000001: {
-          images: { thumbnail: "https://img.test/apples.jpg", full: "" },
-          calories: 52,
-          ingredients: "Apples",
-          upc: "012345678905",
-          "@type": "https://schema.org/NutritionInformation",
-        },
-      },
+    ).toEqual(expectedNutrition(52));
+    expect(
+      projectStored("wholefoods.orders", ["orders", "order_items"]),
+    ).toEqual({
+      orders: [
+        expectedOrder("cancelled-1", true),
+        expectedOrder("order-1", false),
+      ],
+      totalOrders: 2,
+      totalItems: 1,
     });
 
     // This is a failed refresh: a new order and item arrived, one detail was
@@ -753,26 +958,18 @@ describe("grocery legacy scope projections", () => {
     ).toBe("2026-10-01");
     expect(
       projectStored("wholefoods.orders", ["orders", "order_items"]),
-    ).toMatchObject({
-      totalOrders: 3,
+    ).toEqual({
       orders: [
-        {
-          orderId: "cancelled-1",
-          status: "Cancelled",
-          items: [],
-          itemCount: null,
-          total: null,
-        },
-        {
-          orderId: "order-1",
-          items: [{ productId: "B000000001", quantity: "1" }],
-        },
-        {
-          orderId: "order-2",
-          items: [{ productId: "B000000001", quantity: "1" }],
-        },
+        expectedOrder("cancelled-1", true),
+        expectedOrder("order-1", false),
+        expectedOrder("order-2", false),
       ],
+      totalOrders: 3,
+      totalItems: 2,
     });
+    expect(
+      projectStored("wholefoods.nutrition", ["nutrition", "order_items"]),
+    ).toEqual(expectedNutrition(52));
 
     const recovered = ingest("2026-10-03T00:00:00.000Z", [
       { stream: "orders", key: "order-3", data: order("order-3") },
@@ -786,11 +983,18 @@ describe("grocery legacy scope projections", () => {
     expect(recovered.rejected).toEqual([]);
     expect(
       projectStored("wholefoods.nutrition", ["nutrition", "order_items"]),
-    ).toMatchObject({
-      items: {
-        B000000001: { calories: 53, source: "wholefoods_structured_data" },
-      },
-      coverage: { total: 1, found: 1 },
+    ).toEqual(expectedNutrition(53));
+    expect(
+      projectStored("wholefoods.orders", ["orders", "order_items"]),
+    ).toEqual({
+      orders: [
+        expectedOrder("cancelled-1", true),
+        expectedOrder("order-1", false),
+        expectedOrder("order-2", false),
+        expectedOrder("order-3", false),
+      ],
+      totalOrders: 4,
+      totalItems: 3,
     });
   });
 
