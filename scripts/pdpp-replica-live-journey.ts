@@ -113,7 +113,10 @@ type HostRequest = {
 type Snapshot = {
   records: Record<string, unknown>;
   canonicalRecords: CanonicalRecord[];
-  blobs: Record<string, { sha256: string; bytes: number }>;
+  blobs: Record<
+    string,
+    { sha256: string; bytes: number } | { unavailable: true }
+  >;
   published: number;
   importedFragments: number;
   stagedFragments: number;
@@ -147,6 +150,46 @@ type Snapshot = {
   quarantines: number;
   wire: unknown[];
 };
+
+function assertReplicaSnapshotsEqual(expected: Snapshot, actual: Snapshot) {
+  assertCanonicalRecordsEqual(
+    expected.canonicalRecords,
+    actual.canonicalRecords,
+  );
+  assertBlobBytesAvailable(expected.blobs);
+  assertBlobBytesAvailable(actual.blobs);
+  assert.deepEqual(expected.blobs, actual.blobs);
+}
+
+function assertBlobBytesAvailable(blobs: Snapshot["blobs"]) {
+  const unavailable = Object.entries(blobs)
+    .filter(([, value]) => "unavailable" in value)
+    .map(([blobId]) => blobId);
+  assert.deepEqual(
+    unavailable,
+    [],
+    "Referenced blob bytes failed verification",
+  );
+}
+
+function blobMapsEqual(left: Snapshot["blobs"], right: Snapshot["blobs"]) {
+  const stable = (blobs: Snapshot["blobs"]) =>
+    Object.fromEntries(
+      Object.entries(blobs).sort(([leftId], [rightId]) =>
+        leftId < rightId ? -1 : leftId > rightId ? 1 : 0,
+      ),
+    );
+  return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
+}
+
+function blobMatches(blobs: Snapshot["blobs"], blobId: string, sha256: string) {
+  const blob = blobs[blobId];
+  return !!blob && "sha256" in blob && blob.sha256 === sha256;
+}
+
+function blobsVerified(blobs: Snapshot["blobs"]) {
+  return Object.values(blobs).every((value) => !("unavailable" in value));
+}
 
 async function host() {
   const init = await new Promise<Init>((resolve) =>
@@ -360,11 +403,14 @@ async function host() {
     for (const row of canonicalRecords) {
       if (row.deleted === 0 && row.blob_id) {
         const bytes = store.getBlobBytes(row.blob_id);
-        if (bytes)
+        if (bytes) {
           blobs[row.blob_id] = {
             sha256: digest(bytes),
             bytes: bytes.length,
           };
+        } else {
+          blobs[row.blob_id] = { unavailable: true };
+        }
       }
     }
     return {
@@ -704,6 +750,8 @@ async function main() {
   ) {
     const start = Date.now();
     let x!: Snapshot, y!: Snapshot;
+    const leftDevice = ds[0] ?? a;
+    const rightDevice = ds[1] ?? leftDevice;
     while (Date.now() - start < 12 * 60_000) {
       for (const d of ds) {
         try {
@@ -722,8 +770,8 @@ async function main() {
           );
         }
       }
-      x = await a.call("snapshot");
-      y = await b.call("snapshot");
+      x = await leftDevice.call("snapshot");
+      y = rightDevice === leftDevice ? x : await rightDevice.call("snapshot");
       console.log(
         JSON.stringify({
           stage: label,
@@ -742,17 +790,26 @@ async function main() {
           },
         }),
       );
-      if (predicate(x, y)) return { elapsedMs: Date.now() - start, A: x, B: y };
+      const replicasMatch =
+        rightDevice === leftDevice ||
+        (canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
+          blobMapsEqual(x.blobs, y.blobs) &&
+          blobsVerified(x.blobs) &&
+          blobsVerified(y.blobs));
+      if (predicate(x, y) && replicasMatch)
+        return { elapsedMs: Date.now() - start, A: x, B: y };
       await pause(5000);
     }
     report.lastA = x;
     report.lastB = y;
-    try {
-      assertCanonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords);
-    } catch (error) {
-      throw new Error(
-        `Timed out: ${label}; ${error instanceof Error ? error.message : "canonical records differ"}`,
-      );
+    if (rightDevice !== leftDevice) {
+      try {
+        assertReplicaSnapshotsEqual(x, y);
+      } catch (error) {
+        throw new Error(
+          `Timed out: ${label}; ${error instanceof Error ? error.message : "replica state differs"}`,
+        );
+      }
     }
     throw new Error(`Timed out: ${label}`);
   }
@@ -832,10 +889,7 @@ async function main() {
       assert.notEqual(retained.pid, before.pid);
       assert.equal(retained.writer, before.writer);
       assert.deepEqual(retained.wire, before.wire);
-      assertCanonicalRecordsEqual(
-        before.canonicalRecords,
-        retained.canonicalRecords,
-      );
+      assertReplicaSnapshotsEqual(before, retained);
       const resumed = await settle(
         "exact PUT retry",
         (x, y) =>
@@ -850,10 +904,7 @@ async function main() {
       assert.equal(retried[0].sha256, before.puts[0].sha256);
       assert.equal(retried[0].attempts, 2);
       assert.deepEqual(resumed.A.records, resumed.B.records);
-      assertCanonicalRecordsEqual(
-        resumed.A.canonicalRecords,
-        resumed.B.canonicalRecords,
-      );
+      assertReplicaSnapshotsEqual(resumed.A, resumed.B);
       cases.push({
         case: "exact-byte-put-retry",
         status: "passed",
@@ -877,15 +928,12 @@ async function main() {
       (x, y) =>
         !!y.records.a &&
         canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
-        y.blobs[blob.blobId]?.sha256 === blob.sha256 &&
+        blobMatches(y.blobs, blob.blobId, blob.sha256) &&
         x.pending === 0,
     );
     assert.equal(forward.A.journal, localA.journal);
     assert.deepEqual(forward.A.records, forward.B.records);
-    assertCanonicalRecordsEqual(
-      forward.A.canonicalRecords,
-      forward.B.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(forward.A, forward.B);
     assert.deepEqual(forward.A.blobs, forward.B.blobs);
     cases.push({ case: 1, status: "passed", ...forward, blob });
     save();
@@ -900,16 +948,13 @@ async function main() {
       (x, y) =>
         !!x.records.b &&
         canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
-        x.blobs[reverseBlob.blobId]?.sha256 === reverseBlob.sha256 &&
+        blobMatches(x.blobs, reverseBlob.blobId, reverseBlob.sha256) &&
         y.pending === 0,
     );
     assert.equal(reverse.A.journal, localA.journal);
     assert.equal(reverse.B.journal, localB.journal);
     assert.deepEqual(reverse.A.records, reverse.B.records);
-    assertCanonicalRecordsEqual(
-      reverse.A.canonicalRecords,
-      reverse.B.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(reverse.A, reverse.B);
     assert.deepEqual(reverse.A.blobs, reverse.B.blobs);
     cases.push({ case: 2, status: "passed", ...reverse, blob: reverseBlob });
     save();
@@ -965,10 +1010,7 @@ async function main() {
       ),
     );
     assert.equal(partial.records.large, undefined);
-    assertCanonicalRecordsEqual(
-      reverse.B.canonicalRecords,
-      partial.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(reverse.B, partial);
     await b.kill();
     await interrupted;
     b.checkpoint = undefined;
@@ -978,10 +1020,7 @@ async function main() {
     assert.equal(retained.stagedFragments, partial.stagedFragments);
     assert.equal(retained.received, partial.received);
     assert.equal(retained.history, partial.history);
-    assertCanonicalRecordsEqual(
-      partial.canonicalRecords,
-      retained.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(partial, retained);
     await b.call("armImportKill", { id: "large" });
     const transactionPid = b.child.pid;
     const importKillDeadline = Date.now() + 12 * 60_000;
@@ -1002,21 +1041,15 @@ async function main() {
     assert.equal(rolledBack.received, partial.received);
     assert.equal(rolledBack.history, partial.history);
     assert.equal(rolledBack.importedBatches, partial.importedBatches);
-    assertCanonicalRecordsEqual(
-      partial.canonicalRecords,
-      rolledBack.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(partial, rolledBack);
     const resumed = await settle(
       "restart large",
       (x, y) =>
         canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
-        y.blobs[large.blobId]?.sha256 === large.sha256 &&
+        blobMatches(y.blobs, large.blobId, large.sha256) &&
         x.pending === 0,
     );
-    assertCanonicalRecordsEqual(
-      resumed.A.canonicalRecords,
-      resumed.B.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(resumed.A, resumed.B);
     assert.deepEqual(resumed.A.records, resumed.B.records);
     assert.deepEqual(resumed.A.blobs, resumed.B.blobs);
     const largeWire = resumed.A.wire.slice(reverse.A.wire.length) as {
@@ -1039,10 +1072,7 @@ async function main() {
     const before = resumed.B;
     await b.call("cycle");
     const after = await b.call("snapshot");
-    assertCanonicalRecordsEqual(
-      before.canonicalRecords,
-      after.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(before, after);
     assert.equal(after.received, before.received);
     assert.equal(after.history, before.history);
     assert.equal(after.importedBatches, before.importedBatches);
@@ -1132,10 +1162,7 @@ async function main() {
     assert.equal(conflict.B.journal, offlineB.journal);
     assert.deepEqual(conflict.A.records.conflict, winner.data);
     assert.deepEqual(conflict.B.records.conflict, winner.data);
-    assertCanonicalRecordsEqual(
-      conflict.A.canonicalRecords,
-      conflict.B.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(conflict.A, conflict.B);
     await a.call("delete", { id: "conflict" });
     const deletion = await settle(
       "delete",
@@ -1145,10 +1172,7 @@ async function main() {
         canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
         x.pending === 0,
     );
-    assertCanonicalRecordsEqual(
-      deletion.A.canonicalRecords,
-      deletion.B.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(deletion.A, deletion.B);
     for (const rows of [
       deletion.A.canonicalRecords,
       deletion.B.canonicalRecords,
@@ -1181,10 +1205,7 @@ async function main() {
     const resetB = await b.call<Snapshot>("snapshot");
     assert.deepEqual(resetA.records, {});
     assert.deepEqual(resetB.records, {});
-    assertCanonicalRecordsEqual(
-      resetA.canonicalRecords,
-      resetB.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(resetA, resetB);
     assert.deepEqual(resetA.canonicalRecords, []);
     assert.deepEqual(resetB.canonicalRecords, []);
     await a.call("put", { id: "generation2", text: "after reset" });
@@ -1198,10 +1219,7 @@ async function main() {
         x.pending === 0,
     );
     assert.deepEqual(generation2.A.records, generation2.B.records);
-    assertCanonicalRecordsEqual(
-      generation2.A.canonicalRecords,
-      generation2.B.canonicalRecords,
-    );
+    assertReplicaSnapshotsEqual(generation2.A, generation2.B);
     assert.deepEqual(Object.keys(generation2.A.records), ["generation2"]);
     cases.push({
       case: 5,
@@ -1260,44 +1278,65 @@ async function main() {
     let attempted = 0;
     let deleted = 0;
     let notFound = 0;
-    const cleanupFailures: string[] = [];
+    const cleanupFailures: { device: string; scope: string; reason: string }[] =
+      [];
     for (const device of devices) {
       const dbPath = join(device.init.root, "records.sqlite");
       if (!existsSync(dbPath)) continue;
       let db: Database.Database | undefined;
+      const name = device === a ? "A" : "B";
       try {
         db = new Database(dbPath, { readonly: true, fileMustExist: true });
+        const hasPutTable = db
+          .prepare(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='harness_puts'",
+          )
+          .get();
+        if (!hasPutTable) continue;
         const scopes = db
           .prepare("SELECT DISTINCT scope FROM harness_puts")
           .all() as { scope: string }[];
-        const storage = createVanaSyncStorageAdapter({
-          config,
-          serverOwner: owner,
-          serverAccount: serverAccount(device.init.serverKey),
-        });
+        let storage: ReturnType<typeof createVanaSyncStorageAdapter>;
+        try {
+          storage = createVanaSyncStorageAdapter({
+            config,
+            serverOwner: owner,
+            serverAccount: serverAccount(device.init.serverKey),
+          });
+        } catch {
+          cleanupFailures.push({ device: name, scope: "", reason: "adapter" });
+          continue;
+        }
         for (const { scope } of scopes) {
           attempted++;
           const url = storage.urlForKey(`${scope}/1`);
-          try {
-            if (await storage.delete(url)) {
-              deleted++;
-              continue;
+          let cleaned = false;
+          for (let attempt = 0; attempt < 3 && !cleaned; attempt++) {
+            try {
+              if (await storage.delete(url)) {
+                deleted++;
+                cleaned = true;
+                continue;
+              }
+            } catch {
+              // Verify absence after a failed or transient delete.
             }
-          } catch {
-            // A PUT may have failed after its cleanup scope was recorded.
+            try {
+              if (!(await storage.exists(url))) {
+                notFound++;
+                cleaned = true;
+                continue;
+              }
+            } catch {
+              // Retry the delete and existence check within the same bound.
+            }
+            if (attempt < 2) await pause(250 * 2 ** attempt);
           }
-          try {
-            if (!(await storage.exists(url))) notFound++;
-            else
-              cleanupFailures.push(
-                `${device === a ? "A" : "B"}:delete-unconfirmed`,
-              );
-          } catch {
-            cleanupFailures.push(`${device === a ? "A" : "B"}:delete-check`);
-          }
+          if (!cleaned)
+            cleanupFailures.push({ device: name, scope, reason: "delete" });
         }
       } catch {
-        cleanupFailures.push(`${device === a ? "A" : "B"}:scope-read`);
+        cleanupFailures.push({ device: name, scope: "", reason: "scope-read" });
       } finally {
         db?.close();
       }
@@ -1307,15 +1346,19 @@ async function main() {
       deleted,
       notFound,
       errors: cleanupFailures.length,
+      failures: cleanupFailures,
     };
     if (cleanupFailures.length > 0) {
       report.status = "failed";
       report.cleanupErrorCount = cleanupFailures.length;
-      report.error = `Remote test blob cleanup failed (${cleanupFailures.join(", ")})`;
+      report.cleanupError = "Remote test blob cleanup was not fully confirmed";
+      if (!report.error) report.error = report.cleanupError;
+      report.cleanupRetainedRoot = root;
       process.exitCode = 1;
     }
     save();
-    rmSync(root, { recursive: true, force: true });
+    if (cleanupFailures.length === 0)
+      rmSync(root, { recursive: true, force: true });
     console.log(
       JSON.stringify({
         status: report.status,

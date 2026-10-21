@@ -14,6 +14,7 @@ const record: CanonicalRecord = {
   data: JSON.stringify({ id: "one", blob_ref: { blob_id: "blob-a" } }),
   emitted_at: "2026-10-20T10:00:00.000Z",
   deleted: 0,
+  deleted_at: null,
   blob_id: "blob-a",
 };
 
@@ -73,10 +74,34 @@ describe("canonical replica record equality", () => {
     ).toBe(false);
   });
 
+  it("compares JSON numbers without losing integer precision", () => {
+    expect(
+      canonicalRecordsEqual(
+        [{ ...record, data: '{"n":9007199254740993}' }],
+        [{ ...record, data: '{"n":9007199254740992}' }],
+      ),
+    ).toBe(false);
+    expect(
+      canonicalRecordsEqual(
+        [{ ...record, data: '{"n":1.0}' }],
+        [{ ...record, data: '{"n":1e0}' }],
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects duplicate JSON object keys", () => {
+    expect(() =>
+      canonicalRecordsEqual(
+        [{ ...record, data: '{"n":1,"n":2}' }],
+        [{ ...record, data: '{"n":2}' }],
+      ),
+    ).toThrow("Duplicate JSON object key");
+  });
+
   it("projects every canonical column and rejects a missing column", () => {
-    expect(projectCanonicalRecords([{ ...record, version: 9 }])).toEqual([
-      record,
-    ]);
+    expect(
+      projectCanonicalRecords([{ ...record, deleted_at: null, version: 9 }]),
+    ).toEqual([{ ...record, deleted_at: null }]);
     expect(CANONICAL_RECORD_COLUMNS).toEqual([
       "instance",
       "stream",
@@ -84,6 +109,7 @@ describe("canonical replica record equality", () => {
       "data",
       "emitted_at",
       "deleted",
+      "deleted_at",
       "blob_id",
     ]);
     for (const field of CANONICAL_RECORD_COLUMNS) {
@@ -95,8 +121,19 @@ describe("canonical replica record equality", () => {
     }
   });
 
+  it("rejects a deleted_at mismatch", () => {
+    const live = { ...record, deleted_at: null };
+    expect(
+      canonicalRecordsEqual(
+        [live],
+        [{ ...live, deleted_at: "2026-10-20T10:00:00.000Z" }],
+      ),
+    ).toBe(false);
+  });
+
   it.each([
     { ...record, deleted: "0" },
+    { ...record, deleted_at: 42 },
     { ...record, data: {} },
   ])("rejects invalid field values", (invalid) => {
     expect(() => projectCanonicalRecords([invalid])).toThrow(
@@ -104,19 +141,25 @@ describe("canonical replica record equality", () => {
     );
   });
 
-  it.each(["emitted_at", "instance", "stream", "deleted", "blob_id"] as const)(
-    "rejects a %s mismatch",
-    (field) => {
-      const changed = {
-        ...record,
-        [field]:
-          field === "deleted"
-            ? 1
-            : field === "emitted_at"
-              ? "2026-10-20T10:00:01.000Z"
+  it.each([
+    "emitted_at",
+    "instance",
+    "stream",
+    "deleted",
+    "deleted_at",
+    "blob_id",
+  ] as const)("rejects a %s mismatch", (field) => {
+    const changed = {
+      ...record,
+      [field]:
+        field === "deleted"
+          ? 1
+          : field === "emitted_at"
+            ? "2026-10-20T10:00:01.000Z"
+            : field === "deleted_at"
+              ? "2026-10-20T10:00:00.000Z"
               : `${record[field] as string}-changed`,
-      };
-      expect(canonicalRecordsEqual([record], [changed])).toBe(false);
-    },
-  );
+    };
+    expect(canonicalRecordsEqual([record], [changed])).toBe(false);
+  });
 });
