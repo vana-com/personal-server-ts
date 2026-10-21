@@ -16,9 +16,12 @@
  * accessRecord, `accepts` also carries a `data_access` offer: opId = the
  * accessRecord's recordId, so the builder's signature commits to this exact
  * delivery receipt. That is the shape the protocol spec documents and the
- * one the SDK prefers. `verifyPayment` accepts either. A client that
- * implements only one of the two shapes therefore never meets a server that
- * refuses it — see `x402.contract.test.ts`.
+ * one the SDK prefers. `verifyPayment` accepts either. A grant-only client
+ * is therefore always served. A data_access-only client is served only when
+ * the data_access offer is made (see `dataAccessPayable`): with the
+ * registration fee unpaid, no receipt, or a grant that does not list the
+ * served scope verbatim, `accepts` carries the grant offer alone and such a
+ * client has nothing to pay. See `x402.contract.test.ts`.
  *
  * This module is wire-format only — it doesn't talk to the gateway or the
  * storage layer. Callers in `api/index.ts` glue it to `gateway.getGrant`
@@ -485,7 +488,8 @@ export interface VerifyPaymentInput {
   // Authenticated Web3Signed signer of the GET. Must equal payment payerAddress
   // and (when accessRecord present) accessRecord.accessor.
   builder: `0x${string}`;
-  // Lowercased opId from the GET's Web3Signed payload. Must equal payment.opId.
+  // Lowercased opId from the GET's Web3Signed payload. Must equal payment.opId
+  // for a grant payment; a data_access payment's opId is the receipt's recordId.
   grantId: `0x${string}`;
   // Live grant fetched per request for fresh amount/asset checks.
   grant: GatewayGrantResponse;
