@@ -10,7 +10,10 @@ import {
   deriveScopeKey,
   encryptWithPassword,
 } from "@opendatalabs/vana-sdk/browser";
-import type { StorageAdapter } from "../storage/adapters/interface.js";
+import {
+  StoredBlobConflictError,
+  type StorageAdapter,
+} from "../storage/adapters/interface.js";
 import type { VersionInventoryClient } from "./version-inventory.js";
 import {
   additionsLedgerScope,
@@ -55,7 +58,7 @@ function password(scope: string) {
 }
 
 /** Disk-backed fake Gateway ports, not a SQL/concurrency or real Gateway authentication proof. */
-async function fixture() {
+async function fixture(options: { writeOnce?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "durable-additions-"));
   roots.push(root);
   const registryPath = join(root, "registry.json");
@@ -80,6 +83,11 @@ async function fixture() {
       urlForKey: blobPath,
       async upload(key, bytes) {
         const path = blobPath(key);
+        if (options.writeOnce) {
+          const stored = await readFile(path).catch(() => null);
+          if (stored && !stored.equals(Buffer.from(bytes)))
+            throw new StoredBlobConflictError(key);
+        }
         await atomicWrite(path, bytes);
         return path;
       },
@@ -198,6 +206,7 @@ async function fixture() {
   function actor(
     budgets: Pick<DurableAdditionsOptions, "byteBudget" | "timeBudgetMs"> = {},
     beforeInventoryRead?: (scope: string) => Promise<void>,
+    beforeRegistration?: () => void,
   ) {
     // Each actor constructs fresh ports and discovers state solely from the shared files.
     const inventory: VersionInventoryClient = {
@@ -227,6 +236,7 @@ async function fixture() {
       },
       gateway: {
         async registerDataPoint(params) {
+          beforeRegistration?.();
           await setSlot(params.scope, {
             ...params,
             status: "confirmed",
@@ -461,6 +471,33 @@ it("converges after two independent actors summarize concurrently and a third re
   expect(await f.document(additionsLedgerScope(SOURCE))).toMatchObject({
     through: "2",
   });
+});
+
+it("resumes a publication whose registration failed after its upload to a write-once slot", async () => {
+  const f = await fixture({ writeOnce: true });
+  await f.source("1", T1, ["a"]);
+  const scope = additionsLedgerScope(SOURCE);
+  let failed = 0;
+  // The ledger upload lands; its registration fails once.
+  await f
+    .actor({}, undefined, () => {
+      if (failed++ === 0) throw new Error("fetch failed");
+    })
+    .summarize(QUERY);
+  expect(failed).toBeGreaterThan(0);
+  expect((await f.readRegistry())[scope]).toBeUndefined();
+
+  // New source data changes the document, so the retry cannot re-send the
+  // stored bytes; it must resume them instead of conflicting forever.
+  await f.source("2", T2, ["a", "b"]);
+  const healthy = await f.actor().summarize(QUERY);
+
+  expect(healthy).toMatchObject({
+    coverage: "complete",
+    total: 2,
+    through: { [SOURCE]: "2" },
+  });
+  expect(await f.document(scope)).toMatchObject({ through: "2" });
 });
 
 it("returns behind when source commitments change between inventory validation reads", async () => {

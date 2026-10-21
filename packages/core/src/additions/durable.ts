@@ -13,7 +13,10 @@ import {
   encryptWithPassword,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
-import type { StorageAdapter } from "../storage/adapters/interface.js";
+import {
+  StoredBlobConflictError,
+  type StorageAdapter,
+} from "../storage/adapters/interface.js";
 import type { ServerSigner } from "../signing/signer.js";
 import {
   foldVersion,
@@ -332,7 +335,8 @@ export function createDurableAdditions(
     scope: string,
     data: Record<string, unknown>,
     budget: ReadBudget,
-  ) {
+    afterResume = false,
+  ): Promise<void> {
     budget.check();
     if (budget.limited) {
       if (!options.boundedWork)
@@ -360,16 +364,37 @@ export function createDurableAdditions(
     const snapshot = await inventory.list(scope, budget.readOptions);
     const version =
       BigInt(snapshot.versions.at(-1)?.expectedVersion ?? "0") + 1n;
-    const envelope = createDataFileEnvelope(
+    const password = hex(deriveScopeKey(options.masterKey, scope));
+    const key = `${scope}/${version}`;
+    let envelope = createDataFileEnvelope(
       scope,
       new Date().toISOString(),
       data,
     );
-    const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
-    const encrypted = await encryptWithPassword(
-      plaintext,
-      hex(deriveScopeKey(options.masterKey, scope)),
+    let plaintext: Uint8Array = new TextEncoder().encode(
+      JSON.stringify(envelope),
     );
+    let encrypted: Uint8Array = await encryptWithPassword(plaintext, password);
+    let resumed = false;
+    try {
+      await storageAdapter.upload(key, encrypted);
+    } catch (error) {
+      if (!(error instanceof StoredBlobConflictError) || afterResume)
+        throw error;
+      // Version keys are write-once and the inventory has not reached this
+      // version, so the slot holds a publication of this scope whose
+      // registration has not landed (an earlier attempt that failed after
+      // its upload, or a concurrent actor). Its bytes can never change, so
+      // resume exactly that envelope at this version; ours follows it.
+      encrypted = await storageAdapter.download(storageAdapter.urlForKey(key));
+      plaintext = await decryptWithPassword(encrypted, password);
+      envelope = DataFileEnvelopeSchema.parse(
+        JSON.parse(new TextDecoder().decode(plaintext)),
+      );
+      if (envelope.scope !== scope)
+        throw new Error("Additions version slot holds another scope");
+      resumed = true;
+    }
     const dataHash = keccak256(plaintext);
     const metadataHash = keccak256(
       stringToHex(
@@ -380,7 +405,6 @@ export function createDurableAdditions(
         }),
       ),
     );
-    await storageAdapter.upload(`${scope}/${version}`, encrypted);
     const signature = await options.signer.signAddData({
       ownerAddress: getAddress(owner),
       scope,
@@ -396,8 +420,9 @@ export function createDurableAdditions(
       expectedVersion: String(version),
       signature,
     });
-    // A concurrent upload can replace the bytes at this shared version key
-    // independently of registration. Never claim durability without checking.
+    // Storage that is not write-once can replace the bytes at this shared
+    // version key independently of registration. Never claim durability
+    // without checking.
     const check = await inventory.list(scope, budget.readOptions);
     const registered = check.versions.find(
       (slot) =>
@@ -410,6 +435,8 @@ export function createDurableAdditions(
         "Concurrent additions publication replaced the registration",
       );
     await readEnvelope(scope, registered, budget);
+    if (resumed && JSON.stringify(envelope.data) !== JSON.stringify(data))
+      await publish(scope, data, budget, true);
   }
 
   async function recover(

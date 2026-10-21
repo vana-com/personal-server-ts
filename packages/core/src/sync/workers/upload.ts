@@ -294,17 +294,20 @@ export async function uploadOne(
   //                  describes this version without leaking the payload. DPv2
   //                  is scope-addressed with no schema concept — the gateway
   //                  neither records nor registers schemas — so no schemaId is
-  //                  looked up or committed.
+  //                  looked up or committed. sizeBytes is the size of the
+  //                  ciphertext actually stored at the version, which is an
+  //                  earlier encryption when a retry reuses it.
   const dataHash = keccak256(plaintext);
-  const metadataHash = keccak256(
-    stringToHex(
-      JSON.stringify({
-        scope: entry.scope,
-        collectedAt: entry.collectedAt,
-        sizeBytes: encrypted.byteLength,
-      }),
-    ),
-  );
+  const metadataHashFor = (sizeBytes: number) =>
+    keccak256(
+      stringToHex(
+        JSON.stringify({
+          scope: entry.scope,
+          collectedAt: entry.collectedAt,
+          sizeBytes,
+        }),
+      ),
+    );
 
   // 5. Upload ciphertext to storage backend FIRST, version-keyed so the
   // download worker can reconstruct the URL from a DataPointRecord's
@@ -318,12 +321,13 @@ export async function uploadOne(
   // anything else is treated like a version conflict below.
   const putVersion = async (
     version: bigint,
-  ): Promise<{ url: string; created: boolean } | null> => {
+  ): Promise<{ url: string; created: boolean; sizeBytes: number } | null> => {
     const key = `${entry.scope}/${version}`;
     try {
       return {
         url: await storageAdapter.upload(key, encrypted),
         created: true,
+        sizeBytes: encrypted.byteLength,
       };
     } catch (err) {
       if (!(err instanceof StoredBlobConflictError)) throw err;
@@ -339,28 +343,12 @@ export async function uploadOne(
       return null;
     }
     return storedHash.toLowerCase() === dataHash.toLowerCase()
-      ? { url, created: false }
+      ? { url, created: false, sizeBytes: stored.byteLength }
       : null;
   };
-  // Bytes this worker created for a version it will not register under
-  // (the registry refused it). Removing them keeps a committed version that
-  // lost its blob from being filled with a different payload, and frees an
-  // uncommitted slot. Best effort: a failure leaves an orphan, never a
-  // wrong committed payload that was not already there.
-  const abandon = async (created: { url: string }) => {
-    try {
-      await storageAdapter.delete(created.url);
-    } catch (err) {
-      logger.warn(
-        {
-          scope: entry.scope,
-          url: created.url,
-          error: err instanceof Error ? err.message : String(err),
-        },
-        "Could not delete a blob uploaded for a version the registry refused",
-      );
-    }
-  };
+  // A blob this attempt created is never deleted just because the registry
+  // refused its version: another replica with the same plaintext may have
+  // verified and registered those exact bytes in the meantime.
 
   // A committed version goes straight to the conflict handling below
   // (adopt or rebase) without touching its bytes.
@@ -368,6 +356,7 @@ export async function uploadOne(
   let url =
     stored?.url ??
     storageAdapter.urlForKey(`${entry.scope}/${registerVersion}`);
+  let sizeBytes = stored?.sizeBytes ?? encrypted.byteLength;
 
   // 6. DPv2 data-point registration (idempotent — skipped when a prior run
   // already persisted a dataPointId on this entry). registerDataPoint stamps
@@ -376,7 +365,11 @@ export async function uploadOne(
   if (entry.dataPointId) {
     dataPointId = entry.dataPointId;
   } else {
-    const registerAt = async (version: bigint): Promise<string> => {
+    const registerAt = async (
+      version: bigint,
+      storedSize: number,
+    ): Promise<string> => {
+      const metadataHash = metadataHashFor(storedSize);
       const addDataSignature = await signer.signAddData({
         ownerAddress: serverOwner as `0x${string}`,
         scope: entry.scope,
@@ -442,7 +435,7 @@ export async function uploadOne(
     try {
       if (!stored)
         throw new VersionSlotTakenError(entry.scope, registerVersion);
-      dataPointId = await registerAt(registerVersion);
+      dataPointId = await registerAt(registerVersion, sizeBytes);
       if (registerVersion !== BigInt(entry.version)) {
         // Re-add after a deletion: the row must follow the registered
         // version (the blob key embeds it).
@@ -495,9 +488,6 @@ export async function uploadOne(
         // consumers sign from the row's version (e.g. x402 RecordDataAccess),
         // so a stale local version would emit records the registry rejects.
         const adoptedVersion = Number(record.expectedVersion);
-        if (stored?.created && BigInt(adoptedVersion) !== registerVersion) {
-          await abandon(stored);
-        }
         if (adoptedVersion !== entry.version) {
           // Cross-replica adopt: "the registrant already uploaded the blob
           // under the registered version key" is an assumption, not a fact —
@@ -525,6 +515,7 @@ export async function uploadOne(
                 BigInt(adoptedVersion),
               );
             url = healed.url;
+            sizeBytes = healed.sizeBytes;
           }
           await storage.updateEntryVersion(entry.path, adoptedVersion);
         }
@@ -546,7 +537,6 @@ export async function uploadOne(
         const target = Math.max(recordNext, errorNext);
         if (target <= 0) throw err;
         const rebased = BigInt(target);
-        if (stored?.created) await abandon(stored);
         // The registry has not moved past the slot we found taken: nothing
         // to rebase onto until that payload is registered or removed.
         if (err instanceof VersionSlotTakenError && rebased === registerVersion)
@@ -563,16 +553,16 @@ export async function uploadOne(
         // renumber every row for the scope from the gateway's version) is
         // tracked separately; head-block recovery is the fix that matters here.
         // The blob key embeds the version (replicas reconstruct URLs from the
-        // registry record), so the rebased version needs its own blob. Any
-        // blob this attempt created under the refused version was removed
-        // above; the committed bytes there were never touched.
+        // registry record), so the rebased version needs its own blob. The
+        // bytes at the refused version were never touched.
         const rebasedBlob = await putVersion(rebased);
         if (!rebasedBlob) throw new VersionSlotTakenError(entry.scope, rebased);
         url = rebasedBlob.url;
+        sizeBytes = rebasedBlob.sizeBytes;
         // A concurrent replica can still win the race to `rebased`; the next
         // sync cycle re-reads the registry and rebases again, so this stays
         // convergent without looping here.
-        dataPointId = await registerAt(rebased);
+        dataPointId = await registerAt(rebased, sizeBytes);
         await storage.updateEntryVersion(entry.path, Number(rebased));
       }
     }
@@ -591,7 +581,7 @@ export async function uploadOne(
         collectedAt: envelope.collectedAt,
         data: envelope.data as Record<string, unknown>,
       },
-      { envelope, encryptedSize: encrypted.byteLength },
+      { envelope, encryptedSize: sizeBytes },
     );
   }
 

@@ -12,7 +12,8 @@
  * contiguous-version rule.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { keccak256 } from "viem";
+import * as openpgp from "openpgp";
+import { keccak256, stringToHex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import {
   decryptWithPassword,
@@ -101,23 +102,33 @@ class WriteOnceStorage {
   }
 }
 
-/** Gateway registry for one scope: contiguous versions, 409 otherwise. */
+/**
+ * Gateway registry for one scope: contiguous versions, 409 otherwise. With
+ * `pendingRefresh`, every row stays pending and a same-version POST replaces
+ * it, as the gateway allows before a row is broadcast.
+ */
 class Registry {
   readonly versions = new Map<bigint, DataPointRecord>();
   failNextRegistration = false;
+  pendingRefresh = false;
+  beforeRegister?: () => Promise<void>;
 
   head(): DataPointRecord | null {
     const top = [...this.versions.keys()].sort((a, b) => (a < b ? 1 : -1))[0];
     return top === undefined ? null : this.versions.get(top)!;
   }
 
-  commit(version: bigint, dataHash: string) {
+  commit(
+    version: bigint,
+    dataHash: string,
+    metadataHash = `0x${"00".repeat(32)}`,
+  ) {
     this.versions.set(version, {
       id: DATA_POINT_ID,
       ownerAddress: OWNER,
       scope: SCOPE,
       dataHash,
-      metadataHash: `0x${"00".repeat(32)}`,
+      metadataHash,
       expectedVersion: String(version),
       addedAt: "2026-10-21T00:00:00Z",
     });
@@ -127,13 +138,16 @@ class Registry {
     return {
       getDataPoint: vi.fn(async () => this.head()),
       registerDataPoint: vi.fn(async (request) => {
+        await this.beforeRegister?.();
         if (this.failNextRegistration) {
           this.failNextRegistration = false;
           throw new Error("fetch failed");
         }
         const version = BigInt(request.expectedVersion);
-        const next = BigInt(this.head()?.expectedVersion ?? "0") + 1n;
-        if (version < next) {
+        const head = BigInt(this.head()?.expectedVersion ?? "0");
+        const next = head + 1n;
+        const refresh = this.pendingRefresh && version === head;
+        if (version < next && !refresh) {
           throw new Error(
             `Gateway error: 409 Stale expectedVersion ${version}. Next valid version is ${next}.`,
           );
@@ -143,7 +157,7 @@ class Registry {
             `Gateway error: 409 Gap in version sequence: next valid version is ${next}`,
           );
         }
-        this.commit(version, request.dataHash);
+        this.commit(version, request.dataHash, request.metadataHash);
         return { dataPointId: DATA_POINT_ID };
       }),
     } as unknown as GatewayClient;
@@ -159,8 +173,12 @@ function envelope(name: string): DataFileEnvelope {
   };
 }
 
+function plaintextOf(env: DataFileEnvelope): Uint8Array {
+  return new TextEncoder().encode(JSON.stringify(env));
+}
+
 function hashOf(env: DataFileEnvelope): string {
-  return keccak256(new TextEncoder().encode(JSON.stringify(env)));
+  return keccak256(plaintextOf(env));
 }
 
 async function decryptedHash(bytes: Uint8Array): Promise<string> {
@@ -314,17 +332,71 @@ describe("upload worker against write-once storage", () => {
     expect(r.storage.entries[0]?.dataPointId).toBeNull();
   });
 
-  it("does not fill a committed version that lost its bytes with different content", async () => {
+  it("with the registry feed wired, does not fill a committed version that lost its bytes", async () => {
     const lost = envelope("committed but blob lost");
     registry.commit(1n, hashOf(lost));
     const r = await replica(envelope("newer"), 1);
 
-    await upload(r);
+    await upload(r, { feed: true });
 
+    expect(blobs.puts).toEqual([blobs.keyFor(2)]);
     expect(blobs.blobs.has(blobs.keyFor(1))).toBe(false);
     expect(registry.versions.get(2n)?.dataHash).toBe(hashOf(envelope("newer")));
-    expect(await decryptedHash(blobs.blobs.get(blobs.keyFor(2))!)).toBe(
-      hashOf(envelope("newer")),
+  });
+
+  it("never deletes bytes another replica verified and registered while this attempt waited", async () => {
+    const shared = envelope("shared content");
+    const paused = await replica(shared, 1);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    registry.beforeRegister = async () => {
+      registry.beforeRegister = undefined;
+      await gate;
+    };
+    // Creates v1, then waits inside its registration.
+    const first = upload(paused);
+    await vi.waitFor(() => expect(blobs.blobs.has(blobs.keyFor(1))).toBe(true));
+    // Same plaintext elsewhere: it verifies the stored bytes and registers v1.
+    await upload(await replica(shared, 1));
+    // The registry head moves past v1.
+    await upload(await replica(envelope("later"), 2));
+
+    release();
+    await first;
+
+    expect(blobs.blobs.has(blobs.keyFor(1))).toBe(true);
+    await expectCommittedBytesMatch();
+  });
+
+  it("commits to the size of the stored ciphertext when a retry reuses it", async () => {
+    const content = envelope("reused");
+    // An earlier attempt, made with other encryption settings, stored a
+    // differently sized encryption of the same plaintext.
+    const earlier = await openpgp.encrypt({
+      message: await openpgp.createMessage({ binary: plaintextOf(content) }),
+      passwords: [scopeKeyHex],
+      format: "binary",
+      config: {
+        preferredCompressionAlgorithm: openpgp.enums.compression.zlib,
+      },
+    });
+    const fresh = await encryptWithPassword(plaintextOf(content), scopeKeyHex);
+    expect(earlier.byteLength).not.toBe(fresh.byteLength);
+    blobs.blobs.set(blobs.keyFor(1), earlier);
+
+    await upload(await replica(content, 1));
+
+    expect(blobs.blobs.get(blobs.keyFor(1))).toEqual(earlier);
+    expect(registry.versions.get(1n)?.metadataHash).toBe(
+      keccak256(
+        stringToHex(
+          JSON.stringify({
+            scope: SCOPE,
+            collectedAt: content.collectedAt,
+            sizeBytes: earlier.byteLength,
+          }),
+        ),
+      ),
     );
   });
 
@@ -347,6 +419,9 @@ describe("upload worker against write-once storage", () => {
   });
 
   it("keeps every committed version's bytes intact when replicas race", async () => {
+    // Worst case for the gateway: rows stay pending, so a same-version POST
+    // could rebind a version if a writer registered bytes it did not verify.
+    registry.pendingRefresh = true;
     const replicas = await Promise.all(
       ["replica a", "replica bb", "replica ccc"].map((name) =>
         replica(envelope(name), 1),
