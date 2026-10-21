@@ -341,3 +341,30 @@ For each of N1–N7:
 - predecessor terminal → successor `Wait(owner)`;
 - refetch replay of the same `attempt_id` → budget unchanged;
 - savepoint rollback on a receipt conflict → terminal committed, nothing imported.
+
+# v3.1 edits, after round-3 review (verdict: REQUEST CHANGES on one item; everything else resolved)
+
+## H. A terminal batch also makes the rest of its writer chain terminal [round-3 finding 1, blocking]
+Chosen policy: fail closed. In the same transaction that makes batch (W, sequence s) `terminal`:
+- every batch of writer W with sequence > s becomes `terminal` too, whether promoted or not, with `terminal_reason = 'predecessor_terminal'`. Their copies' reason rises to `finalized_conflict`;
+- amendment A's connection quarantine is applied to the union of connections touched by **every promoted batch** in that set;
+- there is no window in which descendants stay visible while dependent work is queued: the visibility change and the epoch bump commit together;
+- later batches of W that arrive afterwards are staged, then immediately decided `terminal` (`predecessor_terminal`) because their predecessor chain is terminal.
+
+Other writers are unaffected: their chains are independent. Repair is by owner/reset (out of scope).
+
+This replaces E's "successor gets `Wait(owner)`": a terminal ancestor now makes every successor terminal.
+
+Tests (red first): writer chain P→S→T on disjoint connections X, Y, Z, all promoted; then contradictory finalized evidence arrives for P. In one transaction, P, S and T are terminal; X, Y and Z are quarantined; cursors expire; nothing from X, Y or Z is served to grants or the owner. Then U (W, s+3) arrives and is terminal on staging. Another writer's chain on X: X stays quarantined (connection scope), and that writer's batches are not terminal.
+
+## I. Non-blocking edits [round-3 finding 2, finding 3]
+- **Lite has no epoch today** (canonical-store.md:194-199):
+  - In the same transaction as the terminal transition, Lite applies connection quarantine and bumps its connection view revisions (canonical-store.ts:1273-1283). The epoch seam maps onto those revisions.
+  - The confirmed-blob path (:1395-1399) must consult connection quarantine. This is required Lite work, not an existing hook.
+- **Eligibility is separate from chain facts.**
+  - `IndexEvidence.committed` carries `{commitment, eligible: boolean}`. `eligible` means `replicaRegistrationState === "confirmed"` at that fact: status Active, with a matching live head.
+  - Proof requires `eligible` at every index. Disproval requires a different commitment, whatever the status.
+  - A matching commitment that is not eligible is neither proof nor disproval, so the decision waits.
+- **Branch table:** add the row `wait`, |V|=0 → quarantine none.
+- **Encoding:** lowercase `0x` applies to EVM hashes (dataHash, metadataHash, commitments, copy_key). `envelopeDigest` and `chunkDigest` keep the `sha256:<hex>` encoding (transport.ts:12, 25, 30).
+- **G supplements the existing checks; it does not replace them.** The complete assembly, owner, and schema checks of v2 §1 stay.
