@@ -163,7 +163,7 @@ describe("replica policy v3 vectors", () => {
       ]).records[0].current?.revision.operationId,
     ).toBe("c");
   });
-  it("N07-N08 and fixture 18: finality caps future clocks; fixture 18 reverses its old winner", () => {
+  it("N07-N08 and fixture 18: finality caps future clocks; fixture 18 reverses its prior display", () => {
     const old = observed("a", "A", "X", -10_000);
     const fast = {
       ...observed("b", "B", "Y", 8),
