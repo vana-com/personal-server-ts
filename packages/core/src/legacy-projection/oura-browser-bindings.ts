@@ -27,8 +27,8 @@ export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
           {
             ...original,
             // Opt-in browser sign-in beside the legacy collector: the file
-            // stays authoritative until this projection passes its parity
-            // checks and the flag is removed.
+            // stays the served body while it is the scope's latest legacy
+            // head (see `LegacyScopeBinding.canonicalTakeover`).
             canonicalTakeover: false as const,
             pdppSource: source,
             fieldsRead:

@@ -402,6 +402,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     );
     expect(await makeView().readLatest("claude.conversations")).toEqual({
       kind: "file",
+      deletion: "canonical",
     });
   });
 
@@ -535,6 +536,7 @@ describe("legacy scope view over the real SQLite record store", () => {
 
     expect(await parityView.readLatest("claude.conversations")).toEqual({
       kind: "file",
+      deletion: "canonical",
     });
     expect(parityView.verdictFor("claude.conversations")[0]).toMatchObject({
       verdict: "not_covered",
@@ -616,12 +618,13 @@ describe("legacy scope view over the real SQLite record store", () => {
 
     expect(parityView.listingFor("claude.conversations")).toEqual({
       kind: "file",
+      deletion: "canonical",
     });
     const conversationRead = await parityView.readLatest(
       "claude.conversations",
     );
     expect(readLegacy).toHaveBeenCalled();
-    expect(conversationRead).toEqual({ kind: "file" });
+    expect(conversationRead).toEqual({ kind: "file", deletion: "canonical" });
     expect(parityView.verdictFor("claude.conversations")[0]).toMatchObject({
       verdict: "not_covered",
       reason: { reason: "missing_raw_blob" },
@@ -629,6 +632,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     });
     expect(await parityView.readLatest("claude.projects")).toEqual({
       kind: "file",
+      deletion: "canonical",
     });
     expect(parityView.verdictFor("claude.projects")[0]).toMatchObject({
       verdict: "not_covered",
@@ -876,7 +880,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     parityView.resetTakeover("oura.activity");
     resume();
 
-    expect(await inFlight).toEqual({ kind: "file" });
+    expect(await inFlight).toEqual({ kind: "file", deletion: "canonical" });
     expect(parityView.verdictFor("oura.activity")).toEqual([]);
     expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
       [],
@@ -1185,13 +1189,25 @@ describe("legacy scope view over the real SQLite record store", () => {
 
   it("leaves a scope to its file until a connection of its methods holds its streams", async () => {
     connect(store, "conn_a", "oura");
-    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
-    expect(await view.readLatest("notes.manual")).toEqual({ kind: "file" });
-    expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
+    expect(await view.readLatest("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "file",
+    });
+    expect(await view.readLatest("notes.manual")).toEqual({
+      kind: "file",
+      deletion: "file",
+    });
+    expect(view.listingFor("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "file",
+    });
 
     // Another stream's data does not convert this scope ...
     replace(store, "conn_a", "readiness", ["r1"]);
-    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(await view.readLatest("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "file",
+    });
     expect(view.ownsScope("oura.activity")).toBe(false);
     // ... and an unbound scope of the namespace is never converted.
     expect(view.ownsScope("oura.manual")).toBe(false);
@@ -1209,7 +1225,10 @@ describe("legacy scope view over the real SQLite record store", () => {
     );
     connect(store, "conn_a", "oura");
 
-    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(await view.readLatest("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "file",
+    });
     expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
       [],
     );
@@ -1227,7 +1246,10 @@ describe("legacy scope view over the real SQLite record store", () => {
     connect(store, "conn_a", "oura");
     ingest(store, "conn_a", "a1", "2026-09-10T07:00:00.000Z");
 
-    expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
+    expect(view.listingFor("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "canonical",
+    });
   });
 
   it("keeps a reset or deleted connection's scopes canonical, never back to the file", async () => {
@@ -1324,6 +1346,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       });
       expect(await other.readLatest("oura.readiness")).toEqual({
         kind: "file",
+        deletion: "file",
       });
     }
   });
@@ -1474,7 +1497,10 @@ describe("legacy scope view over the real SQLite record store", () => {
       emittedAt: "2026-09-11T07:00:00.000Z",
       envelopes: [],
     });
-    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(await view.readLatest("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "canonical",
+    });
     expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
       [],
     );
@@ -1530,8 +1556,12 @@ describe("legacy scope view over the real SQLite record store", () => {
       makeFailure();
       expect(await view.readLatest("claude.projects")).toEqual({
         kind: "file",
+        deletion: "canonical",
       });
-      expect(view.listingFor("claude.projects")).toEqual({ kind: "file" });
+      expect(view.listingFor("claude.projects")).toEqual({
+        kind: "file",
+        deletion: "canonical",
+      });
       expect(db.prepare("SELECT * FROM data_files").all()).toEqual(legacyRows);
       expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
         [],
@@ -1569,7 +1599,10 @@ describe("legacy scope view over the real SQLite record store", () => {
     ).toBe(1);
     expect(store.listStreamCompletions("conn_a")).toEqual([]);
 
-    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(await view.readLatest("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "canonical",
+    });
     expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
       [],
     );
@@ -1601,6 +1634,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     });
     expect(await racingView.readLatest("oura.activity")).toEqual({
       kind: "file",
+      deletion: "canonical",
     });
     expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
       [],
@@ -1640,7 +1674,10 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
       [],
     );
-    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    expect(await view.readLatest("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "canonical",
+    });
     expect(db.prepare("SELECT path FROM data_files").all()).toEqual([
       { path: "oura/activity/concurrent.json" },
     ]);
@@ -1761,8 +1798,14 @@ describe("legacy scope view over the real SQLite record store", () => {
       expectedGeneration: 1,
       nextMethod: "oura",
     });
-    expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
-    expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
+    expect(await view.readLatest("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "canonical",
+    });
+    expect(view.listingFor("oura.activity")).toEqual({
+      kind: "file",
+      deletion: "canonical",
+    });
     expect(view.ownsScope("oura.activity")).toBe(true);
     expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
       [],
@@ -1856,8 +1899,14 @@ describe("legacy scope view over the real SQLite record store", () => {
       connect(store, "conn_b", "oura-browser");
       replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
 
-      expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
-      expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
+      expect(await view.readLatest("oura.activity")).toEqual({
+        kind: "file",
+        deletion: "file",
+      });
+      expect(view.listingFor("oura.activity")).toEqual({
+        kind: "file",
+        deletion: "file",
+      });
       expect(view.listCanonicalScopes(undefined)).toEqual([]);
       // The rows exist; a legacy-only deletion would resurface them.
       expect(view.ownsScope("oura.activity")).toBe(true);
@@ -1874,8 +1923,14 @@ describe("legacy scope view over the real SQLite record store", () => {
 
       for (const scope of ["oura.activity", "oura.sleep"]) {
         legacyHead(scope, `${scope}/old.json`);
-        expect(await view.readLatest(scope)).toEqual({ kind: "file" });
-        expect(view.listingFor(scope)).toEqual({ kind: "file" });
+        expect(await view.readLatest(scope)).toEqual({
+          kind: "file",
+          deletion: "file",
+        });
+        expect(view.listingFor(scope)).toEqual({
+          kind: "file",
+          deletion: "file",
+        });
       }
     });
 
@@ -1902,7 +1957,10 @@ describe("legacy scope view over the real SQLite record store", () => {
       replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
       expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
       legacyHead("oura.activity", "oura/activity/later.json");
-      expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+      expect(await view.readLatest("oura.activity")).toEqual({
+        kind: "file",
+        deletion: "file",
+      });
     });
 
     it("says so once when it keeps the file over a connection that holds synced rows", async () => {
@@ -1918,6 +1976,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       // Registered but never held data: nothing to report.
       expect(await logged.readLatest("oura.activity")).toEqual({
         kind: "file",
+        deletion: "file",
       });
       expect(info).not.toHaveBeenCalled();
 
@@ -1967,17 +2026,29 @@ describe("legacy scope view over the real SQLite record store", () => {
       replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
       expect(view.ownsScope("oura.activity")).toBe(true);
       store.deleteConnection("conn_b");
-      expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
-      expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
+      expect(await view.readLatest("oura.activity")).toEqual({
+        kind: "file",
+        deletion: "file",
+      });
+      expect(view.listingFor("oura.activity")).toEqual({
+        kind: "file",
+        deletion: "file",
+      });
       // The deleted connection's rows are gone: nothing blocks a legacy delete.
       expect(view.ownsScope("oura.activity")).toBe(false);
-      expect(view.servesLegacyFirst("oura.activity")).toBe(false);
 
       connect(store, "conn_c", "oura-browser");
       replace(store, "conn_c", "activity", ["a2"], { method: "oura-browser" });
-      expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+      // Rows a delete would expose, but the file is served and judged as one.
+      expect(await view.readLatest("oura.activity")).toEqual({
+        kind: "file",
+        deletion: "file",
+      });
+      expect(view.listingFor("oura.activity")).toEqual({
+        kind: "file",
+        deletion: "file",
+      });
       expect(view.ownsScope("oura.activity")).toBe(true);
-      expect(view.servesLegacyFirst("oura.activity")).toBe(true);
     });
 
     it("still refuses a deleted oura-browser connection when there is no legacy file", async () => {
@@ -2067,7 +2138,10 @@ describe("the legacy scope authority without the record store", () => {
         authority: createLegacyScopeAuthority(db),
         configuredMethods: () => [],
       });
-      expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+      expect(await view.readLatest("oura.activity")).toEqual({
+        kind: "file",
+        deletion: "file",
+      });
       expect(view.listCanonicalScopes(undefined)).toEqual([]);
       expect(db.prepare("SELECT name FROM sqlite_master").all()).toEqual([]);
     } finally {

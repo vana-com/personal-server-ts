@@ -93,9 +93,10 @@ import {
   type StoredLineage,
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
-import type {
-  LegacyScopeRefusal,
-  LegacyScopeViewPort,
+import {
+  deletionHistoryOf,
+  type LegacyScopeRefusal,
+  type LegacyScopeViewPort,
 } from "../storage/legacy-scope-view.js";
 import {
   binaryFilename,
@@ -1239,9 +1240,7 @@ function listingVisibility(
   return async (scope, entry) => {
     const listing = view.listingFor(scope);
     if (listing.kind === "refused") return false;
-    // The file is what a gated scope lists and reads; its history is the file's.
-    const canonicalOwned =
-      view.ownsScope(scope) && !view.servesLegacyFirst(scope);
+    const canonicalOwned = deletionHistoryOf(listing) === "canonical";
     // A file's re-add marker cannot revive the canonical body this row
     // describes. Canonical re-adds have no registered version yet.
     return (
@@ -2017,12 +2016,10 @@ export async function handlePersonalServerDataRequest(
         fileIdParam === undefined && atParam === undefined && view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
-      // A scope whose file is kept over an opted-out method serves the file,
-      // so a tombstone is judged against that file, not the unserved rows.
+      // The deletion history comes with the body the view chose, never from
+      // a later ownership query a concurrent write could change.
       const canonicalOwned =
-        latest !== undefined &&
-        deps.legacyScopeView?.ownsScope(scopeResult.scope) &&
-        !deps.legacyScopeView.servesLegacyFirst(scopeResult.scope);
+        latest !== undefined && deletionHistoryOf(latest) === "canonical";
 
       // Deletion gate, after auth (so unauthenticated callers learn nothing)
       // and before payment (so nobody is charged for deleted data). Covers
