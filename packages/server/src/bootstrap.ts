@@ -1067,6 +1067,7 @@ export async function createServer(
     // so a scope whose data moved there is refused, not read from its stale
     // file, on a boot that does not mount the RS.
     legacyScopeView: createLegacyScopeView({
+      logger,
       authority: createLegacyScopeAuthority(db),
       records: pdppRecords?.bindingStore,
       // Reuse the source-scoped declarations selected by the record server.
@@ -1075,6 +1076,7 @@ export async function createServer(
       declarations: pdppRecords?.declarations,
       configuredMethods: (sourceId) =>
         pdppRecords?.configuredMethods.get(sourceId) ?? [],
+      optInMethods: new Set(config.pdpp.optInMethods),
       readLegacyHead: async (head) => {
         if (
           head.path.startsWith("/") ||

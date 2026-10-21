@@ -3,7 +3,6 @@ import {
   ANTHROPIC_LIVE_BINDINGS,
   GROCERY_INVALID_ORDER,
   LEGACY_SCOPE_BINDINGS,
-  LEGACY_SCOPE_GAPS,
 } from "./bindings.js";
 import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
@@ -24,7 +23,6 @@ import type {
 
 export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
-export { LEGACY_SCOPE_GAPS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 export { META_040_BINDINGS } from "./meta-040-bindings.js";
 export { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
@@ -83,8 +81,8 @@ export function legacyBindingsForProfile(
 
 /**
  * Translate an exact legacy scope string to the PDPP selection an already
- * deployed app should now be served from. Exact string match only — a known
- * gap is distinct from an unknown scope, and neither is guessed.
+ * deployed app should now be served from. Exact string match only; unbound
+ * scopes are not guessed.
  */
 export function legacyScopeToPdppSelection(
   scope: string,
@@ -107,18 +105,6 @@ export function legacyScopeToPdppSelection(
           kind: "unsupported_profile",
           scope,
           profileKey: options.profileKey,
-        },
-      };
-    }
-    const gap = LEGACY_SCOPE_GAPS.get(scope);
-    if (gap) {
-      return {
-        ok: false,
-        error: {
-          kind: "gap",
-          scope,
-          reason: gap.reason,
-          provenanceChecked: gap.provenanceChecked,
         },
       };
     }
@@ -158,10 +144,6 @@ export function projectPdppRecordsToLegacyPayload(
           profileKey: options.profileKey,
         },
       };
-    }
-    const gap = LEGACY_SCOPE_GAPS.get(scope);
-    if (gap) {
-      return { ok: false, error: { kind: "gap", scope, reason: gap.reason } };
     }
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }

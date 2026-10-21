@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
   scope TEXT NOT NULL,
   instance TEXT NOT NULL DEFAULT '',
   generation INTEGER NOT NULL DEFAULT 1,
+  method TEXT NOT NULL DEFAULT '',
   superseded_version INTEGER NOT NULL,
   superseded_cas_revision INTEGER NOT NULL,
   superseded_collected_at TEXT NOT NULL,
@@ -246,6 +247,14 @@ function ensureSchemaVersion(db: Database.Database): void {
     );
   }
   migrateSchema(db, currentVersion);
+  // The method that earned a takeover. Added without a version bump: a
+  // runtime pinned before it opens the database unchanged and writes ''
+  // (unknown), which never counts as an opt-in method's own takeover.
+  if (!hasColumn(db, "legacy_scope_takeovers", "method")) {
+    db.exec(
+      "ALTER TABLE legacy_scope_takeovers ADD COLUMN method TEXT NOT NULL DEFAULT ''",
+    );
+  }
   db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
 }
 
