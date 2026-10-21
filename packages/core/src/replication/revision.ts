@@ -1,18 +1,21 @@
 /** Hybrid logical observation time persisted atomically with each operation. */
 export interface ReplicaRevision {
   wallMs: number;
-  logical: number;
+  /** Numbers stay convenient within the safe range; decimal strings preserve larger counters. */
+  logical: number | string;
   writerId: string;
   operationId: string;
 }
+const MAX_LOGICAL_COUNTER = (1n << 64n) - 1n;
 
 /** Deterministic code-unit ordering for the final tie-break only. */
 export function compareRevisions(
   a: ReplicaRevision,
   b: ReplicaRevision,
 ): number {
+  const logicalOrder = compareLogicalCounters(a.logical, b.logical);
+  if (logicalOrder !== 0) return logicalOrder;
   for (const [left, right] of [
-    [a.logical, b.logical],
     [a.writerId, b.writerId],
     [a.operationId, b.operationId],
   ] as const) {
@@ -34,8 +37,7 @@ export function nextHlc(
     if (
       !Number.isSafeInteger(revision.wallMs) ||
       revision.wallMs < 0 ||
-      !Number.isSafeInteger(revision.logical) ||
-      revision.logical < 0
+      !isValidLogical(revision.logical)
     ) {
       throw new Error("invalid HLC revision");
     }
@@ -44,11 +46,12 @@ export function nextHlc(
   const logical =
     all
       .filter((revision) => revision.wallMs === wallMs)
-      .reduce((maximum, revision) => Math.max(maximum, revision.logical), -1) +
-    1;
-  if (!Number.isSafeInteger(logical))
-    throw new Error("HLC logical counter exhausted");
-  return { wallMs, logical };
+      .map((revision) => BigInt(revision.logical))
+      .reduce(
+        (maximum, counter) => (counter > maximum ? counter : maximum),
+        -1n,
+      ) + 1n;
+  return { wallMs, logical: toLogicalCounter(logical) };
 }
 
 /** Receiving clocks are bounded so a single bad clock cannot drag peers forward. */
@@ -67,8 +70,7 @@ export function receiveHlc(
     uncertaintyWindowMs < 0 ||
     !Number.isSafeInteger(remote.wallMs) ||
     remote.wallMs < 0 ||
-    !Number.isSafeInteger(remote.logical) ||
-    remote.logical < 0
+    !isValidLogical(remote.logical)
   )
     throw new Error("invalid received HLC revision");
   const maximum = now + uncertaintyWindowMs;
@@ -81,4 +83,27 @@ export function receiveHlc(
     },
     clockAhead: remote.wallMs > maximum,
   };
+}
+
+function isValidLogical(value: number | string): boolean {
+  if (typeof value === "number")
+    return Number.isSafeInteger(value) && value >= 0;
+  return /^(0|[1-9]\d*)$/.test(value) && BigInt(value) <= MAX_LOGICAL_COUNTER;
+}
+
+export function compareLogicalCounters(
+  a: number | string,
+  b: number | string,
+): number {
+  const left = BigInt(a);
+  const right = BigInt(b);
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function toLogicalCounter(value: bigint): number | string {
+  if (value > MAX_LOGICAL_COUNTER)
+    throw new Error("HLC logical counter exhausted");
+  return value <= BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number(value)
+    : value.toString();
 }

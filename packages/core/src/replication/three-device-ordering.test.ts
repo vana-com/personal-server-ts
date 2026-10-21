@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   canonicalJson,
-  replicaOperationSchema,
   type OperationReference,
   type ReplicaOperation,
 } from "./envelope.js";
@@ -663,7 +662,10 @@ function buildOperations(
       ),
       revision: {
         wallMs: sourceTime(symbol),
-        logical: Number(symbol.L),
+        logical:
+          BigInt(symbol.L) <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(symbol.L)
+            : BigInt(symbol.L).toString(),
         writerId: symbol.w,
         operationId: symbol.id,
       },
@@ -994,16 +996,12 @@ describe.each(fixtures)(
           if (operation.kind === "upsert") finality.set(operation.batchId, T0);
         }
       }
-      if (id === "20") {
-        const unsafe = operations.find(
-          (operation) => operation.revision.operationId === "a",
-        );
-        expect(unsafe && replicaOperationSchema.safeParse(unsafe).success).toBe(
-          false,
-        );
-        expect(() => summarize(operations, order)).toThrow();
-        return;
-      }
+      // Fixture 20 carries the decimal counter as text to preserve its exact value.
+      if (id === "20")
+        expect(
+          operations.find((operation) => operation.revision.operationId === "a")
+            ?.revision.logical,
+        ).toBe("9007199254740993");
       const adjustedDisplay = changedDisplays[id] ?? expected.sourceDisplay;
       const expectedState = conflicts.has(id)
         ? "conflict"
@@ -1027,6 +1025,11 @@ describe.each(fixtures)(
           expect(
             canonicalPlan(summarize([registration, ...delivery], order).plan),
           ).toBe(expectedPlan);
+        expect(
+          canonicalPlan(
+            summarize([registration, ...unique, ...unique], order).plan,
+          ),
+        ).toBe(expectedPlan);
         return;
       }
       expect(result.display).toBe(adjustedDisplay);

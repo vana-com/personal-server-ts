@@ -24,14 +24,22 @@ describe("persisted replica HLC revisions", () => {
       clockAhead: true,
     });
   });
-  it("rejects exhausted and malformed clocks instead of emitting unsafe revisions", () => {
-    const exhausted = {
-      wallMs: Number.MAX_SAFE_INTEGER,
+  it("preserves wide logical counters and rejects exhausted or malformed clocks", () => {
+    const wide = {
+      wallMs: 10,
       logical: Number.MAX_SAFE_INTEGER,
       writerId: "a",
       operationId: "a",
     };
-    expect(() => nextHlc(exhausted, [], Number.MAX_SAFE_INTEGER)).toThrow(
+    expect(nextHlc(wide, [], 10)).toEqual({
+      wallMs: 10,
+      logical: "9007199254740992",
+    });
+    const exhausted = {
+      ...wide,
+      logical: "18446744073709551615",
+    };
+    expect(() => nextHlc(exhausted, [], 10)).toThrow(
       "HLC logical counter exhausted",
     );
     expect(() => receiveHlc({ ...exhausted, wallMs: -1 }, 1, 10)).toThrow(

@@ -16,8 +16,9 @@ After version dominance, known causal order wins: a later observation by the
 same writer, or an observation whose batch frontier includes the earlier HLC.
 Remaining candidates use `min(observedAt, finalizedAt(batch))`; before finality,
 the observation time is uncapped. HLC logical value, writer id, and operation id
-form the deterministic final tie-break. The operation counter never selects the
-current value.
+form the deterministic final tie-break. `logical` is encoded as a JSON number
+through JavaScript's safe integer range and as a decimal string above it, up to
+the unsigned 64-bit limit. Comparisons preserve the exact integer value.
 
 Differing candidates within the five-minute policy window are `unsettled` and
 request a source re-observation. A non-reobservable stream promotes that
@@ -41,12 +42,14 @@ frontier shows it received the resolution.
 (30 days by default). The period starts at the delete batch's finality time. Once
 it expires, the derived record retains only a suppression marker with its key,
 writer-qualified operation ids, content hashes, observation times, and finality
-times. The planner omits expired payload from candidates and diagnostic
-operation lists and returns `payloadErasures` with writer-qualified operation
-references and the marker. Storage must apply each erasure and persist its marker
-atomically. A later observation cannot restore erased payload. A restore after
-erasure waits for a new source observation that causally follows the restore;
-remote wall-clock values do not establish this.
+times. The marker lists only payload-bearing operations already erased, with
+hashes and times kept separately from observations received later. The planner
+omits expired payload from candidates and diagnostic operation lists and returns
+`payloadErasures` with writer-qualified references for upserts and resolved
+upsert values. Storage must apply each erasure and persist its marker atomically.
+A later observation cannot restore erased payload. A restore after erasure waits
+for a new source observation that causally follows the restore; remote
+wall-clock values do not establish this.
 
 ## Account identity
 

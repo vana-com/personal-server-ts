@@ -9,7 +9,7 @@ import type {
   UpstreamAccount,
 } from "./envelope.js";
 import { connectionKey } from "./identity.js";
-import { compareRevisions } from "./revision.js";
+import { compareLogicalCounters, compareRevisions } from "./revision.js";
 import { operationReferenceOf } from "./envelope.js";
 
 export const OWNER_DELETE_GRACE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
@@ -71,6 +71,15 @@ export interface MergedRecord {
 }
 export interface SuppressionMarker {
   identity: RecordIdentity;
+  /** Payload-bearing operations compacted by the retention transaction. */
+  erasedOperations: OperationReference[];
+  erasedPayloads: {
+    writerId: string;
+    operationId: string;
+    contentHash: string;
+    observedAt: string;
+    finalizedAt: number | null;
+  }[];
   observations: {
     writerId: string;
     operationId: string;
@@ -120,6 +129,7 @@ export function planReplicaMerge(
     reason: string,
     operations: ReplicaOperation[],
   ) => bucket.push({ reason, operations });
+  const hiddenRecordScopes = new Set<string>();
   const byId = new Map<string, Map<string, ReplicaOperation>>();
   for (const raw of input) {
     const operation = replicaOperationSchema.parse(raw);
@@ -308,9 +318,11 @@ export function planReplicaMerge(
         ),
       );
     }
-    if (entries.some((op) => op.kind === "connection-delete")) {
+    const connectionDeleted = entries.some(
+      (op) => op.kind === "connection-delete",
+    );
+    if (connectionDeleted) {
       issue(result.suppressed, "connection_deleted", entries);
-      continue;
     }
     const methods = new Set(entries.map((op) => op.methodId));
     const sources = new Set(entries.map((op) => op.sourceId));
@@ -331,6 +343,7 @@ export function planReplicaMerge(
       continue;
     }
     const groups = new Map<string, RecordOperation[]>();
+    const retiredGenerationGroups = new Map<string, RecordOperation[]>();
     for (const op of entries) {
       if (
         op.kind === "owner-resolve" &&
@@ -338,10 +351,6 @@ export function planReplicaMerge(
       )
         continue;
       if (!("declaration" in op)) continue;
-      if (op.generation < generation) {
-        issue(result.suppressed, "old_generation", [op]);
-        continue;
-      }
       if (op.generation > generation) {
         issue(result.pending, "missing_generation_reset", [op]);
         continue;
@@ -433,9 +442,58 @@ export function planReplicaMerge(
           continue;
         }
       }
+      if (op.generation < generation) {
+        issue(result.suppressed, "old_generation", [op]);
+        const recordId = canonicalJson([
+          op.generation,
+          op.declaration.stream,
+          op.recordKey,
+        ]);
+        retiredGenerationGroups.set(recordId, [
+          ...(retiredGenerationGroups.get(recordId) ?? []),
+          op,
+        ]);
+        continue;
+      }
       const recordId = canonicalJson([op.declaration.stream, op.recordKey]);
       groups.set(recordId, [...(groups.get(recordId) ?? []), op]);
     }
+    const admittedRecordOperations = new Set(
+      [...groups.values()].flat().map(operationKey),
+    );
+    let dependenciesChanged = true;
+    while (dependenciesChanged) {
+      dependenciesChanged = false;
+      for (const values of groups.values()) {
+        for (const resolution of values) {
+          if (
+            resolution.kind !== "owner-resolve" ||
+            incompleteResolutions.has(operationKey(resolution))
+          )
+            continue;
+          const rejectedDependency = resolution.candidates.some(
+            (reference) =>
+              !admittedRecordOperations.has(referenceKey(reference)) ||
+              incompleteResolutions.has(referenceKey(reference)),
+          );
+          if (!rejectedDependency) continue;
+          incompleteResolutions.add(operationKey(resolution));
+          issue(result.pending, "resolution_dependency_rejected", [resolution]);
+          dependenciesChanged = true;
+        }
+      }
+    }
+    for (const [recordId, values] of groups)
+      groups.set(
+        recordId,
+        values.filter(
+          (op) =>
+            op.kind !== "owner-resolve" ||
+            !incompleteResolutions.has(operationKey(op)),
+        ),
+      );
+    for (const [recordId, values] of groups)
+      if (values.length === 0) groups.delete(recordId);
     for (const values of groups.values()) {
       const first = values[0];
       const identity: RecordIdentity = {
@@ -451,6 +509,17 @@ export function planReplicaMerge(
           recordScopeKey(candidate.identity) === recordScopeKey(identity),
       );
       const record = mergeRecord(context, values, marker);
+      if (connectionDeleted) {
+        hiddenRecordScopes.add(recordScopeKey(identity));
+        result.records.push({
+          ...record,
+          current: null,
+          candidates: [],
+          ownerControl: "deleted",
+          payloadRetained: false,
+        });
+        continue;
+      }
       result.records.push(record);
       if (record.state === "conflict")
         issue(result.conflicts, "source_observation_conflict", values);
@@ -462,6 +531,31 @@ export function planReplicaMerge(
             : "append_only_content_conflict",
           values,
         );
+    }
+    for (const values of retiredGenerationGroups.values()) {
+      const first = values[0];
+      const identity: RecordIdentity = {
+        owner: first.owner,
+        sourceId: first.sourceId,
+        connectionId: first.connectionId,
+        generation: first.generation,
+        stream: first.declaration.stream,
+        recordKey: first.recordKey,
+      };
+      hiddenRecordScopes.add(recordScopeKey(identity));
+      const marker = context.suppressionMarkers?.find(
+        (candidate) =>
+          recordScopeKey(candidate.identity) === recordScopeKey(identity),
+      );
+      const record = mergeRecord(context, values, marker);
+      result.records.push({
+        ...record,
+        current: null,
+        candidates: [],
+        ownerControl: "deleted",
+        payloadRetained: false,
+        flags: [...record.flags, "old-generation"],
+      });
     }
   }
   for (const marker of context.suppressionMarkers ?? []) {
@@ -486,15 +580,11 @@ export function planReplicaMerge(
   }
   for (const record of result.records) {
     if (!record.suppressionMarker) continue;
-    const operationReferences = [...byId.values()]
+    const operations = [...byId.values()]
       .flatMap((variants) => [...variants.values()])
       .filter(
         (operation) =>
-          operation.kind === "upsert" &&
           "declaration" in operation &&
-          !record.candidates.some(
-            (candidate) => operationKey(candidate) === operationKey(operation),
-          ) &&
           recordScopeKey({
             owner: operation.owner,
             sourceId: operation.sourceId,
@@ -503,9 +593,8 @@ export function planReplicaMerge(
             stream: operation.declaration.stream,
             recordKey: operation.recordKey,
           }) === recordScopeKey(record.identity),
-      )
-      .map(operationReferenceOf)
-      .sort((a, b) => text(referenceKey(a), referenceKey(b)));
+      );
+    const operationReferences = payloadReferencesToErase(record, operations);
     if (operationReferences.length)
       result.payloadErasures.push({
         identity: record.identity,
@@ -516,11 +605,20 @@ export function planReplicaMerge(
   result.payloadErasures.sort((a, b) =>
     text(recordScopeKey(a.identity), recordScopeKey(b.identity)),
   );
-  const erasedRecords = new Set(
-    result.records
+  const erasedRecords = new Set([
+    ...result.records
       .filter((record) => !record.payloadRetained)
       .map((record) => recordScopeKey(record.identity)),
-  );
+    ...hiddenRecordScopes,
+  ]);
+  const erasedOperationsByScope = new Map<string, Set<string>>();
+  for (const record of result.records) {
+    if (!record.suppressionMarker) continue;
+    erasedOperationsByScope.set(
+      recordScopeKey(record.identity),
+      new Set(record.suppressionMarker.erasedOperations.map(referenceKey)),
+    );
+  }
   for (const bucket of [
     result.conflicts,
     result.rejected,
@@ -529,20 +627,21 @@ export function planReplicaMerge(
     result.quarantined,
   ]) {
     for (const item of bucket) {
-      item.operations = item.operations.filter(
-        (operation) =>
-          !("declaration" in operation) ||
-          !erasedRecords.has(
-            recordScopeKey({
-              owner: operation.owner,
-              sourceId: operation.sourceId,
-              connectionId: operation.connectionId,
-              generation: operation.generation,
-              stream: operation.declaration.stream,
-              recordKey: operation.recordKey,
-            }),
-          ),
-      );
+      item.operations = item.operations.filter((operation) => {
+        if (!("declaration" in operation)) return true;
+        const scope = recordScopeKey({
+          owner: operation.owner,
+          sourceId: operation.sourceId,
+          connectionId: operation.connectionId,
+          generation: operation.generation,
+          stream: operation.declaration.stream,
+          recordKey: operation.recordKey,
+        });
+        return (
+          !erasedRecords.has(scope) &&
+          !erasedOperationsByScope.get(scope)?.has(operationKey(operation))
+        );
+      });
     }
   }
   normalizeIssues(result);
@@ -649,6 +748,66 @@ function mergeRecord(
   resolutions.forEach((op) => {
     if (op.kind === "owner-resolve") op.candidates.forEach(markResolved);
   });
+  const activePurgedDeletion = [...purgedRemovalIds].some(
+    (removeId) =>
+      !ownerOps.some(
+        (restore) =>
+          restore.kind === "owner-restore" &&
+          restore.parents.some((parent) => referenceKey(parent) === removeId),
+      ),
+  );
+  const priorErasedReferences = new Set(
+    retainedMarker?.erasedOperations.map(referenceKey) ?? [],
+  );
+  const freshUpsertReferences = new Set(
+    observations
+      .filter(
+        (op) =>
+          op.kind === "upsert" &&
+          !activePurgedDeletion &&
+          !priorErasedReferences.has(operationKey(op)) &&
+          purgedRestores.length > 0 &&
+          purgedRestores.every((restore) => knownBefore(restore, op)),
+      )
+      .map(operationKey),
+  );
+  const hasFreshSourceChoice = (
+    reference: OperationReference,
+    path = new Set<string>(),
+  ): boolean => {
+    const id = referenceKey(reference);
+    if (path.has(id)) return false;
+    if (freshUpsertReferences.has(id)) return true;
+    const dependency = byOperationId.get(id);
+    if (dependency?.kind !== "owner-resolve") return false;
+    return hasFreshSourceChoice(dependency.choice, new Set([...path, id]));
+  };
+  const freshResolutionReferences = new Set(
+    resolutions
+      .filter(
+        (op) =>
+          !activePurgedDeletion &&
+          !priorErasedReferences.has(operationKey(op)) &&
+          purgedRestores.length > 0 &&
+          purgedRestores.every((restore) => knownBefore(restore, op)) &&
+          hasFreshSourceChoice(op.choice),
+      )
+      .map(operationKey),
+  );
+  const allowRestoredObservation = (op: SourceObservation): boolean => {
+    if (priorErasedReferences.has(operationKey(op))) return false;
+    if (!erased) return true;
+    if (activePurgedDeletion || purgedRestores.length === 0) return false;
+    return op.kind === "upsert"
+      ? freshUpsertReferences.has(operationKey(op))
+      : purgedRestores.every((restore) => knownBefore(restore, op));
+  };
+  const allowRestoredResolution = (
+    op: Extract<RecordOperation, { kind: "owner-resolve" }>,
+  ): boolean => {
+    if (priorErasedReferences.has(operationKey(op))) return false;
+    return !erased || freshResolutionReferences.has(operationKey(op));
+  };
   const scanConfirms = (scan: SourceObservation) =>
     scan.kind === "source-delete" &&
     scan.origin === "complete-scan" &&
@@ -664,7 +823,7 @@ function mergeRecord(
         sameAccount(prior.upstreamAccount, scan.upstreamAccount) &&
         prior.generation === scan.generation &&
         canonicalJson(prior.declaration) === canonicalJson(scan.declaration) &&
-        prior.revision.wallMs < scan.revision.wallMs,
+        knownBefore(prior, scan),
     );
   const confirmedScanIds = new Set(
     observations
@@ -685,13 +844,13 @@ function mergeRecord(
   let candidates: SourceObservation[] = [
     ...observations.filter(
       (op) =>
-        !resolvedIds.has(operationKey(op)) &&
-        !retainedMarker?.observations.some(
-          (stored) => referenceKey(stored) === operationKey(op),
-        ),
+        !resolvedIds.has(operationKey(op)) && allowRestoredObservation(op),
     ),
     ...resolutions
-      .filter((op) => !resolvedIds.has(operationKey(op)))
+      .filter(
+        (op) =>
+          !resolvedIds.has(operationKey(op)) && allowRestoredResolution(op),
+      )
       .map((op) => materializeResolution(op, byOperationId))
       .filter((op): op is SourceObservation => op !== null),
   ];
@@ -724,16 +883,14 @@ function mergeRecord(
           ),
       ),
   );
-  if (purgedRestores.length)
-    candidates = candidates.filter((op) =>
-      purgedRestores.some((restore) => knownBefore(restore, op)),
-    );
   const effective = (op: SourceObservation) => {
-    const observedAt = Date.parse(op.emittedAt);
-    const observationTime = Number.isNaN(observedAt)
-      ? op.revision.wallMs
-      : observedAt;
-    return Math.min(observationTime, finalizedAt(op) ?? observationTime);
+    const observationTime =
+      parseRFC3339Instant(op.emittedAt) ??
+      instantFromMillis(op.revision.wallMs);
+    const finalized = finalizedAt(op);
+    return finalized === undefined
+      ? observationTime
+      : minInstant(observationTime, instantFromMillis(finalized));
   };
   const appendOnlyEvidence = observations.filter(
     (op) => !resolvedIds.has(operationKey(op)),
@@ -747,7 +904,8 @@ function mergeRecord(
   );
   maxima.sort(
     (a, b) =>
-      effective(a) - effective(b) || compareRevisions(a.revision, b.revision),
+      compareExactInstants(effective(a), effective(b)) ||
+      compareRevisions(a.revision, b.revision),
   );
   const current = maxima[maxima.length - 1] ?? null;
   const epsilon = REPLICA_POLICY.uncertaintyWindowMs;
@@ -757,7 +915,7 @@ function mergeRecord(
       (candidate) =>
         payloadIdentity(candidate) !== payloadIdentity(current) &&
         !knownBefore(candidate, current) &&
-        Math.abs(effective(candidate) - effective(current)) <= epsilon,
+        withinMilliseconds(effective(candidate), effective(current), epsilon),
     );
   const sourceVersionConflict = dominance.conflicting;
   const unobservable = declaration.reobservable === false;
@@ -785,60 +943,115 @@ function mergeRecord(
         : closeDisagreement || unconfirmedScans.length
           ? "unsettled"
           : "settled";
-  const activePurgedDeletion = [...purgedRemovalIds].some(
-    (removeId) =>
-      !ownerOps.some(
-        (restore) =>
-          restore.kind === "owner-restore" &&
-          restore.parents.some((parent) => referenceKey(parent) === removeId),
-      ),
-  );
   const retainedAfterRestore =
-    !activePurgedDeletion &&
-    purgedRestores.length > 0 &&
-    candidates.some(
+    freshUpsertReferences.size > 0 || freshResolutionReferences.size > 0;
+  const newlyErasedPayloads = all.flatMap((op) => {
+    const id = operationKey(op);
+    const previouslyErased = priorErasedReferences.has(id);
+    if (op.kind === "upsert") {
+      const retainedByRestore =
+        retainedAfterRestore && freshUpsertReferences.has(id);
+      if (!previouslyErased && (!erased || retainedByRestore)) return [];
+      return [
+        {
+          writerId: op.revision.writerId,
+          operationId: op.revision.operationId,
+          contentHash: op.contentHash,
+          observedAt: op.emittedAt,
+          finalizedAt: finalizedAt(op) ?? null,
+        },
+      ];
+    }
+    if (op.kind === "owner-resolve" && op.resolvedValue.kind === "upsert") {
+      if (!previouslyErased && (!erased || freshResolutionReferences.has(id)))
+        return [];
+      return [
+        {
+          writerId: op.revision.writerId,
+          operationId: op.revision.operationId,
+          contentHash: op.resolvedValue.contentHash,
+          observedAt: new Date(op.revision.wallMs).toISOString(),
+          finalizedAt: finalizedAt(op) ?? null,
+        },
+      ];
+    }
+    return [];
+  });
+  const erasedPayloadReferences = new Set([
+    ...priorErasedReferences,
+    ...newlyErasedPayloads.map(referenceKey),
+  ]);
+  const markerObservations = observations
+    .filter(
       (op) =>
-        op.kind === "upsert" &&
-        purgedRestores.some((restore) => knownBefore(restore, op)),
-    );
-  const suppressionMarker = erased
-    ? {
-        identity: recordIdentity,
-        observations: [
-          ...(retainedMarker?.observations ?? []),
-          ...observations.map((op) => ({
-            writerId: op.revision.writerId,
-            operationId: op.revision.operationId,
-            contentHash: op.contentHash,
-            observedAt: op.emittedAt,
-            finalizedAt: finalizedAt(op) ?? null,
-          })),
-        ]
-          .sort((a, b) => text(referenceKey(a), referenceKey(b)))
-          .filter(
-            (observation, index, all) =>
-              all.findIndex(
-                (other) => referenceKey(other) === referenceKey(observation),
-              ) === index,
-          ),
-        removals: [
-          ...(retainedMarker?.removals ?? []),
-          ...purgedDeletes.map((op) => ({
-            writerId: op.revision.writerId,
-            operationId: op.revision.operationId,
-            deletedAt: op.revision.wallMs,
-            finalizedAt: finalizedAt(op)!,
-          })),
-        ]
-          .sort((a, b) => text(referenceKey(a), referenceKey(b)))
-          .filter(
-            (removal, index, all) =>
-              all.findIndex(
-                (other) => referenceKey(other) === referenceKey(removal),
-              ) === index,
-          ),
-      }
-    : null;
+        ownerControl === "deleted" ||
+        erasedPayloadReferences.has(operationKey(op)),
+    )
+    .map((op) => ({
+      writerId: op.revision.writerId,
+      operationId: op.revision.operationId,
+      contentHash: op.contentHash,
+      observedAt: op.emittedAt,
+      finalizedAt: finalizedAt(op) ?? null,
+    }));
+  const suppressionMarker =
+    erased || retainedMarker
+      ? {
+          identity: recordIdentity,
+          erasedOperations: [
+            ...(retainedMarker?.erasedOperations ?? []),
+            ...newlyErasedPayloads.map((payload) => ({
+              writerId: payload.writerId,
+              operationId: payload.operationId,
+            })),
+          ]
+            .sort((a, b) => text(referenceKey(a), referenceKey(b)))
+            .filter(
+              (reference, index, all) =>
+                all.findIndex(
+                  (other) => referenceKey(other) === referenceKey(reference),
+                ) === index,
+            ),
+          erasedPayloads: [
+            ...(retainedMarker?.erasedPayloads ?? []),
+            ...newlyErasedPayloads,
+          ]
+            .sort((a, b) => text(referenceKey(a), referenceKey(b)))
+            .filter(
+              (payload, index, allPayloads) =>
+                allPayloads.findIndex(
+                  (other) => referenceKey(other) === referenceKey(payload),
+                ) === index,
+            ),
+          observations: [
+            ...(retainedMarker?.observations ?? []),
+            ...markerObservations,
+          ]
+            .sort((a, b) => text(referenceKey(a), referenceKey(b)))
+            .filter(
+              (observation, index, all) =>
+                all.findIndex(
+                  (other) => referenceKey(other) === referenceKey(observation),
+                ) === index,
+            ),
+          removals: [
+            ...(retainedMarker?.removals ?? []),
+            ...purgedDeletes.map((op) => ({
+              writerId: op.revision.writerId,
+              operationId: op.revision.operationId,
+              deletedAt: op.revision.wallMs,
+              finalizedAt: finalizedAt(op)!,
+            })),
+          ]
+            .sort((a, b) => text(referenceKey(a), referenceKey(b)))
+            .filter(
+              (removal, index, all) =>
+                all.findIndex(
+                  (other) => referenceKey(other) === referenceKey(removal),
+                ) === index,
+            ),
+        }
+      : null;
   return {
     identity: recordIdentity,
     current:
@@ -851,7 +1064,7 @@ function mergeRecord(
     refreshRequested: state === "unsettled" && !alreadyReobserved,
     flags: incompatibleDeclaration ? ["incompatible-declaration"] : [],
     payloadRetained: !erased || retainedAfterRestore,
-    suppressionMarker,
+    suppressionMarker: suppressionMarker ?? retainedMarker ?? null,
   };
 }
 
@@ -902,17 +1115,98 @@ function compareVersion(
   const left = parseRFC3339Instant(a);
   const right = parseRFC3339Instant(b);
   if (left === null || right === null) return null;
-  return left < right ? -1 : left > right ? 1 : 0;
+  if (left.seconds !== right.seconds)
+    return left.seconds < right.seconds ? -1 : 1;
+  const digits = Math.max(left.fraction.length, right.fraction.length);
+  const leftFraction = left.fraction.padEnd(digits, "0");
+  const rightFraction = right.fraction.padEnd(digits, "0");
+  return leftFraction < rightFraction
+    ? -1
+    : leftFraction > rightFraction
+      ? 1
+      : 0;
 }
-function parseRFC3339Instant(value: string): number | null {
-  if (
-    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+type ExactInstant = { seconds: bigint; fraction: string };
+function parseRFC3339Instant(value: string): ExactInstant | null {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(
       value,
-    )
+    );
+  if (!match) return null;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] =
+    match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const offsetHour = Number(match[10] ?? 0);
+  const offsetMinute = Number(match[11] ?? 0);
+  if (
+    year === 0 ||
+    month < 1 ||
+    month > 12 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHour > 23 ||
+    offsetMinute > 59
   )
     return null;
-  const instant = Date.parse(value);
-  return Number.isFinite(instant) ? instant : null;
+  const calendar = new Date(0);
+  calendar.setUTCFullYear(year, month - 1, day);
+  calendar.setUTCHours(hour, minute, second, 0);
+  if (
+    calendar.getUTCFullYear() !== year ||
+    calendar.getUTCMonth() !== month - 1 ||
+    calendar.getUTCDate() !== day
+  )
+    return null;
+  const localSeconds = BigInt(Math.floor(calendar.getTime() / 1000));
+  const offset = BigInt(offsetHour * 3600 + offsetMinute * 60);
+  const signedOffset = match[9] === "+" ? offset : -offset;
+  return {
+    seconds: localSeconds - signedOffset,
+    fraction: (match[7] ?? "").replace(/0+$/, ""),
+  };
+}
+function instantFromMillis(value: number): ExactInstant {
+  const seconds = Math.floor(value / 1000);
+  const milliseconds = value - seconds * 1000;
+  return {
+    seconds: BigInt(seconds),
+    fraction: String(milliseconds).padStart(3, "0").replace(/0+$/, ""),
+  };
+}
+function compareExactInstants(a: ExactInstant, b: ExactInstant): number {
+  if (a.seconds !== b.seconds) return a.seconds < b.seconds ? -1 : 1;
+  const digits = Math.max(a.fraction.length, b.fraction.length);
+  const leftFraction = a.fraction.padEnd(digits, "0");
+  const rightFraction = b.fraction.padEnd(digits, "0");
+  return leftFraction < rightFraction
+    ? -1
+    : leftFraction > rightFraction
+      ? 1
+      : 0;
+}
+function minInstant(a: ExactInstant, b: ExactInstant): ExactInstant {
+  return compareExactInstants(a, b) <= 0 ? a : b;
+}
+function withinMilliseconds(
+  a: ExactInstant,
+  b: ExactInstant,
+  milliseconds: number,
+): boolean {
+  const [earlier, later] = compareExactInstants(a, b) <= 0 ? [a, b] : [b, a];
+  const digits = Math.max(earlier.fraction.length, later.fraction.length);
+  const scale = 10n ** BigInt(digits);
+  const earlierFraction = BigInt(earlier.fraction.padEnd(digits, "0") || "0");
+  const laterFraction = BigInt(later.fraction.padEnd(digits, "0") || "0");
+  const scaledMilliseconds =
+    (later.seconds - earlier.seconds) * 1000n * scale +
+    (laterFraction - earlierFraction) * 1000n;
+  return scaledMilliseconds <= BigInt(milliseconds) * scale;
 }
 function payloadIdentity(op: RecordOperation): string {
   return canonicalJson(
@@ -955,14 +1249,26 @@ function materializeResolution(
   const emittedAt =
     evidence
       .map((op) => op.emittedAt)
-      .sort((a, b) => Date.parse(a) - Date.parse(b))
+      .sort((a, b) =>
+        compareExactInstants(
+          parseRFC3339Instant(a) ?? instantFromMillis(0),
+          parseRFC3339Instant(b) ?? instantFromMillis(0),
+        ),
+      )
       .at(-1) ?? template.emittedAt;
   const version = resolution.version ?? selectedObservation?.sourceVersion;
   const common = {
-    ...template,
+    owner: resolution.owner,
+    sourceId: resolution.sourceId,
+    connectionId: resolution.connectionId,
+    methodId: resolution.methodId,
+    upstreamAccount: resolution.upstreamAccount,
     batchId: resolution.batchId,
     frontier: resolution.frontier,
     revision: resolution.revision,
+    generation: resolution.generation,
+    declaration: resolution.declaration,
+    recordKey: resolution.recordKey,
     emittedAt,
     contentHash: resolution.resolvedValue?.contentHash ?? template.contentHash,
     ...(version ? { sourceVersion: version } : { sourceVersion: undefined }),
@@ -982,7 +1288,18 @@ function materializeResolution(
       blobs: resolution.resolvedValue.blobs,
     };
   if (selectedObservation)
-    return { ...common, ...selectedObservation, ...common };
+    return selectedObservation.kind === "source-delete"
+      ? {
+          ...common,
+          kind: "source-delete",
+          origin: "source-event",
+        }
+      : {
+          ...common,
+          kind: "upsert",
+          data: selectedObservation.data,
+          blobs: selectedObservation.blobs,
+        };
   return null;
 }
 function resolutionPayload(
@@ -995,16 +1312,19 @@ function resolutionPayload(
     : canonicalJson(resolution.resolvedValue);
 }
 function knownBefore(a: RecordOperation, b: RecordOperation): boolean {
-  return (
-    (a.revision.writerId === b.revision.writerId &&
-      (a.revision.wallMs < b.revision.wallMs ||
-        (a.revision.wallMs === b.revision.wallMs &&
-          a.revision.logical < b.revision.logical))) ||
-    (b.frontier[a.revision.writerId] !== undefined &&
-      (b.frontier[a.revision.writerId].wallMs > a.revision.wallMs ||
-        (b.frontier[a.revision.writerId].wallMs === a.revision.wallMs &&
-          b.frontier[a.revision.writerId].logical >= a.revision.logical)))
-  );
+  const sameWriterPrecedes =
+    a.revision.writerId === b.revision.writerId &&
+    (a.revision.wallMs < b.revision.wallMs ||
+      (a.revision.wallMs === b.revision.wallMs &&
+        compareLogicalCounters(a.revision.logical, b.revision.logical) < 0));
+  const receivedFrontier = b.frontier[a.revision.writerId];
+  const frontierIncludes =
+    receivedFrontier !== undefined &&
+    (receivedFrontier.wallMs > a.revision.wallMs ||
+      (receivedFrontier.wallMs === a.revision.wallMs &&
+        compareLogicalCounters(receivedFrontier.logical, a.revision.logical) >=
+          0));
+  return sameWriterPrecedes || frontierIncludes;
 }
 function sameAccount(a: UpstreamAccount, b: UpstreamAccount): boolean {
   return a.issuer === b.issuer && a.subject === b.subject;
@@ -1014,6 +1334,25 @@ function referenceKey(reference: OperationReference): string {
 }
 function operationKey(operation: ReplicaOperation): string {
   return referenceKey(operationReferenceOf(operation));
+}
+function payloadReferencesToErase(
+  record: MergedRecord,
+  operations: readonly ReplicaOperation[],
+): OperationReference[] {
+  if (!record.suppressionMarker) return [];
+  const alreadyErased = new Set(
+    record.suppressionMarker.erasedOperations.map(referenceKey),
+  );
+  return operations
+    .filter(
+      (operation) =>
+        (operation.kind === "upsert" ||
+          (operation.kind === "owner-resolve" &&
+            operation.resolvedValue.kind === "upsert")) &&
+        alreadyErased.has(operationKey(operation)),
+    )
+    .map(operationReferenceOf)
+    .sort((a, b) => text(referenceKey(a), referenceKey(b)));
 }
 function sameRecordScope(a: RecordOperation, b: ReplicaOperation): boolean {
   return (

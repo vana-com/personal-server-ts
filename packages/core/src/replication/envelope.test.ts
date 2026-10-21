@@ -31,6 +31,39 @@ describe("replica wire contract", () => {
       '{"a":{"a":[null,true,"é"],"z":2},"z":1}',
     );
   });
+  it("roundtrips logical counters beyond JavaScript's safe integer range exactly", () => {
+    const wide = {
+      ...upsert("wide-counter", 2),
+      revision: {
+        ...upsert("wide-counter", 2).revision,
+        logical: "9007199254740993",
+      },
+    };
+    const wideEnvelope = replicaEnvelopeSchema.parse({
+      ...envelope,
+      operations: [registration, wide],
+    });
+    const encoded = encodeReplicaEnvelope(wideEnvelope, expected);
+    expect(encoded).toContain('"logical":"9007199254740993"');
+    expect(
+      decodeReplicaEnvelope(encoded, expected).operations[1].revision.logical,
+    ).toBe("9007199254740993");
+    expect(() =>
+      replicaEnvelopeSchema.parse({
+        ...wideEnvelope,
+        operations: [
+          registration,
+          {
+            ...wide,
+            revision: {
+              ...wide.revision,
+              logical: "18446744073709551616",
+            },
+          },
+        ],
+      }),
+    ).toThrow();
+  });
   it.each([
     ["unknown version", { ...envelope, version: 2 }],
     ["altered outer owner", { ...envelope, owner: "other" }],
@@ -48,7 +81,7 @@ describe("replica wire contract", () => {
       decodeReplicaEnvelope(canonicalJson(value), expected),
     ).toThrow(),
   );
-  it("binds a stable upstream principal and rejects missing, changed or undeclared source versions", () => {
+  it("keeps connector principal and source-version admission in the host planner", () => {
     const renamed = {
       ...upsert("renamed", 2),
       upstreamAccount: identity.upstreamAccount,

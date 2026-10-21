@@ -2,11 +2,18 @@ import { z } from "zod";
 
 const token = z.string().min(1);
 const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const logicalCounter = z.union([
+  integer,
+  z
+    .string()
+    .regex(/^(0|[1-9]\d*)$/)
+    .refine((value) => BigInt(value) <= (1n << 64n) - 1n),
+]);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const timestamp = z.string().datetime({ offset: true });
 const revision = z.strictObject({
   wallMs: integer,
-  logical: integer,
+  logical: logicalCounter,
   writerId: token,
   operationId: token,
 });
@@ -48,7 +55,7 @@ const base = {
   upstreamAccount,
   batchId: token,
   frontier: z
-    .record(token, z.strictObject({ wallMs: integer, logical: integer }))
+    .record(token, z.strictObject({ wallMs: integer, logical: logicalCounter }))
     .default({}),
   generation: integer.min(1),
   revision,
@@ -150,7 +157,7 @@ export const replicaEnvelopeSchema = z.strictObject({
   owner: token,
   batchId: token,
   frontier: z
-    .record(token, z.strictObject({ wallMs: integer, logical: integer }))
+    .record(token, z.strictObject({ wallMs: integer, logical: logicalCounter }))
     .default({}),
   operations: z.array(replicaOperationSchema).min(1),
 });
