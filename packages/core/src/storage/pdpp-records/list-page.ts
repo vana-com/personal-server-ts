@@ -4,6 +4,7 @@ import {
   type ListCursorPayload,
 } from "./cursor.js";
 import { InvalidCursorError, CursorExpiredError } from "./types.js";
+import { timeSortKey } from "../../pdpp/time.js";
 import type {
   ListRecordsOptions,
   ListRecordsPage,
@@ -23,7 +24,7 @@ export function decodeListCursor(
 
 /** Complete identity, in the existing public sort order with instance last. */
 export const LIST_ORDER_COLUMNS = [
-  "emitted_at",
+  "emitted_key",
   "record_key",
   "instance",
 ] as const;
@@ -53,11 +54,15 @@ export function compareRecordIdentity(
   );
 }
 
+/** List order: emitted instant, then complete identity. SQLite's `emitted_key` is the same `timeSortKey`. */
 export function compareListRows(
   a: PdppStoredRecord,
   b: PdppStoredRecord,
 ): number {
-  return compareText(a.emittedAt, b.emittedAt) || compareRecordIdentity(a, b);
+  return (
+    compareText(timeSortKey(a.emittedAt), timeSortKey(b.emittedAt)) ||
+    compareRecordIdentity(a, b)
+  );
 }
 
 /** Consume a sorted snapshot until one extra visible row proves continuation. */
@@ -71,9 +76,10 @@ export function listSnapshotPage(
   let hasMore = false;
   for (const row of rows) {
     if (options.isVisible && !options.isVisible(row)) continue;
-    // Erasure overrides historical membership. Expire explicitly rather than
-    // resurrect deleted data or silently call an incomplete traversal complete.
-    if (wasErased?.(row)) throw new CursorExpiredError();
+    // Erasure overrides historical membership for that record only: a list
+    // is not a sync session, so withholding it loses nothing a later read
+    // could have relied on, and the rest of the snapshot stays readable.
+    if (wasErased?.(row)) continue;
     if (data.length === options.limit) {
       hasMore = true;
       break;

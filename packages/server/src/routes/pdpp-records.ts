@@ -969,6 +969,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             ? scope.streamGrant!.fields
             : fields,
           ...(grantIsCandidate(context!.grant) && {
+            expireOnErasure: true,
             isVisible: (row: {
               recordKey: string;
               data: Record<string, unknown>;
@@ -1041,7 +1042,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           object: "list",
           has_more: page.hasMore,
           ...(page.nextCursor && { next_cursor: page.nextCursor }),
-          data: page.data.map((row) => toRecordJson(stream, row, fields)),
+          data: page.data.map((row) =>
+            toRecordJson(stream, row, fields, grantIsCandidate(context?.grant)),
+          ),
           ...(meta && { meta }),
         },
         200,
@@ -1128,13 +1131,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const data = projectFields(found.data, fields);
 
       const response = c.json(
-        {
-          object: "record",
-          id: recordKey,
+        toRecordJson(
           stream,
-          data,
-          emitted_at: found.emittedAt,
-        },
+          { ...found, data },
+          undefined,
+          grantIsCandidate(context?.grant),
+        ),
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
@@ -2025,28 +2027,35 @@ function summarizeGrantVisible(
   };
 }
 
+/**
+ * One response record or tombstone. The candidate names a record by its
+ * instance and key together, so it adds `instance_id` (the grant's handle,
+ * which is the stored instance) and serves the minimal client tombstone. The
+ * current contract's shape is unchanged.
+ */
 function toRecordJson(
   stream: string,
   row: PdppRecordRow,
   fields: string[] | undefined,
-  minimalTombstone = false,
+  candidate = false,
 ) {
+  const identity = {
+    object: "record",
+    id: row.recordKey,
+    ...(candidate && { instance_id: row.instance }),
+    stream,
+  };
   if (row.deleted) {
-    if (minimalTombstone)
-      return { object: "record", id: row.recordKey, stream, deleted: true };
+    if (candidate) return { ...identity, deleted: true };
     return {
-      object: "record",
-      id: row.recordKey,
-      stream,
+      ...identity,
       deleted: true,
       deleted_at: row.deletedAt,
       emitted_at: row.emittedAt,
     };
   }
   return {
-    object: "record",
-    id: row.recordKey,
-    stream,
+    ...identity,
     data: projectFields(row.data, fields),
     emitted_at: row.emittedAt,
   };

@@ -1,5 +1,7 @@
 import {
   compareTime,
+  compareLegacyTimeBounds,
+  legacyTimeBound,
   parseTime,
   declaredTimeType,
   type TimeType,
@@ -168,7 +170,7 @@ export function validateTimeRangeBounds(
     if (bound === undefined) continue;
     if (
       typeof bound !== "string" ||
-      (type ? parseTime(bound, type) === null : Number.isNaN(Date.parse(bound)))
+      (type ? parseTime(bound, type) === null : legacyTimeBound(bound) === null)
     ) {
       return fail(
         "invalid_request",
@@ -180,7 +182,7 @@ export function validateTimeRangeBounds(
     if (
       type
         ? compareTime(since, until, type)! >= 0
-        : Date.parse(since) >= Date.parse(until)
+        : compareLegacyTimeBounds(since, until)! >= 0
     ) {
       return fail(
         "invalid_request",
@@ -273,12 +275,11 @@ function validateMinimum(
         return bad("time_range falls outside the requested time_range");
       return { ok: true };
     }
-    const from = Date.parse(since);
-    const to = Date.parse(until);
-    if (Number.isNaN(from) || Number.isNaN(to)) {
+    const order = compareLegacyTimeBounds(since, until);
+    if (order === null) {
       return bad("time_range bounds must be valid ISO 8601 instants");
     }
-    if (from >= to) {
+    if (order >= 0) {
       return bad("time_range.since must precede time_range.until");
     }
     if (!declared.consent_time_field) {
@@ -290,11 +291,12 @@ function validateMinimum(
     // an offset-bearing timestamp is ordered by the moment it names rather
     // than by its string form.
     const requested = stream.time_range;
-    const ceilingSince =
-      requested?.since !== undefined ? Date.parse(requested.since) : -Infinity;
-    const ceilingUntil =
-      requested?.until !== undefined ? Date.parse(requested.until) : Infinity;
-    if (from < ceilingSince || to > ceilingUntil) {
+    if (
+      (requested?.since !== undefined &&
+        (compareLegacyTimeBounds(since, requested.since) ?? -1) < 0) ||
+      (requested?.until !== undefined &&
+        (compareLegacyTimeBounds(until, requested.until) ?? 1) > 0)
+    ) {
       return bad("time_range falls outside the requested time_range");
     }
   }

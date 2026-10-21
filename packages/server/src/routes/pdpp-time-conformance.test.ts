@@ -39,6 +39,9 @@ for (const backend of ["memory", "sqlite"])
                 name: "events",
                 instance_ids: ["i"],
                 fields: ["id", "blob_ref"],
+                ...(version.endsWith("candidate") && {
+                  required_fields: ["id"],
+                }),
                 time_constraint: {
                   field: "at",
                   ...(version.endsWith("candidate")
@@ -179,6 +182,7 @@ for (const backend of ["memory", "sqlite"])
               {
                 object: "record",
                 id: "visible",
+                instance_id: "i",
                 stream: "events",
                 deleted: true,
               },

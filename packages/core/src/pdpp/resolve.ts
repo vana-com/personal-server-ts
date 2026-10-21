@@ -1,5 +1,10 @@
 import { expandedRequestFields, validateTimeRangeBounds } from "./selection.js";
-import { declaredTimeType, compareTime, type TimeType } from "./time.js";
+import {
+  declaredTimeType,
+  compareTime,
+  compareLegacyTimeBounds,
+  type TimeType,
+} from "./time.js";
 /**
  * PDPP Core §6→§7 resolution: turn a validated selection request into the
  * explicit grant facts that get frozen at issuance.
@@ -88,6 +93,12 @@ export interface ResolutionFailure {
   stream?: string;
   /** For `instance_choice_required`: the handles the owner must choose between. */
   candidates?: string[];
+  /**
+   * For `no_streams_approved`: the omitted streams and requested limits, so a
+   * candidate review can show an unselected proposal without issuing it.
+   */
+  omittedStreams?: string[];
+  requestedStreams?: RequestedStream[];
 }
 
 export type ResolutionResult =
@@ -199,11 +210,6 @@ function narrowFields(
   return ceiling.filter((f) => chosen.includes(f));
 }
 
-/** Instant for a bound, with an absent bound reading as the open end. */
-function instant(value: string | undefined, open: number): number {
-  return value === undefined ? open : Date.parse(value);
-}
-
 /**
  * Clamp the owner's window into the requested window.
  *
@@ -220,12 +226,16 @@ function narrowTimeRange(
   const since = [ceiling?.since, chosen.since]
     .filter((v): v is string => v !== undefined)
     .sort((a, b) =>
-      type ? (compareTime(b, a, type) ?? 0) : Date.parse(b) - Date.parse(a),
+      type
+        ? (compareTime(b, a, type) ?? 0)
+        : (compareLegacyTimeBounds(b, a) ?? 0),
     )[0];
   const until = [ceiling?.until, chosen.until]
     .filter((v): v is string => v !== undefined)
     .sort((a, b) =>
-      type ? (compareTime(a, b, type) ?? 0) : Date.parse(a) - Date.parse(b),
+      type
+        ? (compareTime(a, b, type) ?? 0)
+        : (compareLegacyTimeBounds(a, b) ?? 0),
     )[0];
   if (since === undefined && until === undefined) return undefined;
   return {
@@ -265,17 +275,13 @@ function minimumSatisfied(
     // The resolved window must *contain* the entire minimum window. An absent
     // resolved lower bound is negative infinity and an absent upper bound is
     // positive infinity, so an unbounded window contains every floor.
-    const from = instant(window?.since, -Infinity);
-    const to = instant(window?.until, Infinity);
+    const compare = (a: string, b: string) =>
+      type ? compareTime(a, b, type)! : compareLegacyTimeBounds(a, b)!;
     if (
-      (type
-        ? window?.since !== undefined &&
-          compareTime(minimum.time_range.since, window.since, type)! < 0
-        : Date.parse(minimum.time_range.since) < from) ||
-      (type
-        ? window?.until !== undefined &&
-          compareTime(minimum.time_range.until, window.until, type)! > 0
-        : Date.parse(minimum.time_range.until) > to)
+      (window?.since !== undefined &&
+        compare(minimum.time_range.since, window.since) < 0) ||
+      (window?.until !== undefined &&
+        compare(minimum.time_range.until, window.until) > 0)
     ) {
       return {
         ok: false,
@@ -504,6 +510,11 @@ function resolveOneStream(
       name: declared.name,
       instance_ids: instances.instanceIds,
       fields,
+      ...(revision === "candidate" && {
+        required_fields: declared.required_fields.filter((f) =>
+          fields.includes(f),
+        ),
+      }),
       ...(timeConstraint && { time_constraint: timeConstraint }),
       ...(request.resources && { resources: unique(request.resources) }),
     },
@@ -774,6 +785,10 @@ export function resolveSelection(
     return failure(
       "no_streams_approved",
       "the owner approved no streams; a grant with no authorized stream cannot be issued",
+      {
+        ...(omitted.length > 0 && { omittedStreams: omitted }),
+        ...(revision !== "0.1" && { requestedStreams }),
+      },
     );
   }
 

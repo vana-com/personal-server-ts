@@ -104,6 +104,24 @@ export function compareTime(
     r = right.fraction.padEnd(width, "0");
   return l === r ? 0 : l < r ? -1 : 1;
 }
+// Shifts every representable instant (years 0000-9999) to a non-negative
+// count of seconds with a fixed number of digits.
+const SORT_KEY_EPOCH_SHIFT = 100_000_000_000n;
+const SORT_KEY_SECONDS_WIDTH = 12;
+
+/**
+ * Text whose code-point order is `compareTime` order for RFC 3339 date-times,
+ * for stores that order or seek by text. Equal instants get equal keys. A
+ * value that is not a valid date-time sorts after every valid one, by its text.
+ */
+export function timeSortKey(value: string): string {
+  const parsed = parseTime(value, "date-time");
+  if (!parsed) return `~${value}`;
+  const seconds = (parsed.seconds + SORT_KEY_EPOCH_SHIFT)
+    .toString()
+    .padStart(SORT_KEY_SECONDS_WIDTH, "0");
+  return parsed.fraction ? `${seconds}.${parsed.fraction}` : seconds;
+}
 /** Only eligible top-level temporal schema properties may define candidate bounds. */
 export function declaredTimeType(stream: {
   consent_time_field?: string;
@@ -128,50 +146,73 @@ export function declaredTimeType(stream: {
     : undefined;
 }
 
+/**
+ * The instant an untyped (current or private-v0.2) authorization bound names,
+ * as an RFC 3339 date-time, or `null` if it names none.
+ *
+ * The one interpretation of those bounds for AS validation, minimum checks and
+ * narrowing and for RS enforcement. Existing AS profiles accept Date.parse
+ * syntax; a strict RFC 3339 value keeps its exact precision. A full date is
+ * midnight UTC. Date.parse would give offset-less syntax the host's zone, so
+ * those bounds are read in UTC on every host; an explicit offset is kept.
+ */
+export function legacyTimeBound(input: string): string | null {
+  const normalized = /^\d{4}-\d{2}-\d{2}$/.test(input)
+    ? `${input}T00:00:00Z`
+    : input;
+  if (parseTime(normalized, "date-time")) return normalized;
+  const explicitZone =
+    /(?:[zZ]|(?:GMT|UTC|UT|[ECMP][SD]T)(?:[+-]\d{1,4})?|\s[+-]\d{4}|(?:[Tt]|\s)\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?[+-]\d{2}:?\d{2})$/.test(
+      input.trim(),
+    );
+  const offsetlessIso =
+    /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(input);
+  const portable = explicitZone
+    ? input
+    : offsetlessIso
+      ? `${input}Z`
+      : `${input} UTC`;
+  const legacy = Date.parse(portable);
+  return Number.isFinite(legacy) ? new Date(legacy).toISOString() : null;
+}
+
+/** Order two untyped bounds by the instants they name; `null` if either names none. */
+export function compareLegacyTimeBounds(
+  a: string,
+  b: string,
+): -1 | 0 | 1 | null {
+  const left = legacyTimeBound(a),
+    right = legacyTimeBound(b);
+  return left === null || right === null
+    ? null
+    : compareTime(left, right, "date-time");
+}
+
 /** Current untyped bounds historically accept full dates as midnight UTC. */
 export function withinTimeRange(
   value: string | undefined,
   constraint: { type?: TimeType; since?: string; until?: string },
 ): boolean {
   const type = constraint.type ?? "date-time";
-  const normalize = (input: string | undefined): string | undefined =>
+  // Untyped grants keep their Date.parse bound syntax through
+  // `legacyTimeBound`; stored record values always stay strict.
+  const bound = (input: string): string | null =>
+    constraint.type === undefined ? legacyTimeBound(input) : input;
+  const record =
     constraint.type === undefined &&
-    typeof input === "string" &&
-    /^\d{4}-\d{2}-\d{2}$/.test(input)
-      ? `${input}T00:00:00Z`
-      : input;
-  const bound = (input: string): string => {
-    const normalized = normalize(input)!;
-    // Existing AS profiles deliberately retain their Date.parse bound syntax.
-    // Adapt only those frozen bounds; stored record values always stay strict.
-    if (constraint.type !== undefined || parseTime(normalized, type))
-      return normalized;
-    // Date.parse otherwise gives offset-less legacy syntax the host's zone.
-    // Freeze those accepted bounds in UTC; preserve an explicit legacy offset.
-    const explicitZone =
-      /(?:[zZ]|(?:GMT|UTC|UT|[ECMP][SD]T)(?:[+-]\d{1,4})?|\s[+-]\d{4}|(?:[Tt]|\s)\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?[+-]\d{2}:?\d{2})$/.test(
-        input.trim(),
-      );
-    const offsetlessIso =
-      /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(input);
-    const portable = explicitZone
-      ? input
-      : offsetlessIso
-        ? `${input}Z`
-        : `${input} UTC`;
-    const legacy = Date.parse(portable);
-    return Number.isFinite(legacy)
-      ? new Date(legacy).toISOString()
-      : normalized;
-  };
-  const record = normalize(value);
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(value)
+      ? `${value}T00:00:00Z`
+      : value;
   if (!parseTime(record, type)) return false;
   if (constraint.since !== undefined) {
-    const order = compareTime(record!, bound(constraint.since), type);
+    const since = bound(constraint.since);
+    const order = since === null ? null : compareTime(record!, since, type);
     if (order === null || order < 0) return false;
   }
   if (constraint.until !== undefined) {
-    const order = compareTime(record!, bound(constraint.until), type);
+    const until = bound(constraint.until);
+    const order = until === null ? null : compareTime(record!, until, type);
     if (order === null || order >= 0) return false;
   }
   return true;

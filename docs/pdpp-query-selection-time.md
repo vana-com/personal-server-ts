@@ -20,17 +20,24 @@ identifier or a statement that the candidate is locked.
 
 The comparison uses Core main `541ebc38f0794d5c7c2d09198a978471dd61733e`
 and the unlocked candidate `cba5d6db07bfafc52ae0a7e36c3d49bfb257657b`.
+Frozen required fields, record `instance_id` and the sync deletion exception
+follow the later candidate head `9638aa99a4ceb24c399d8bd4b8cf8670e26cf894`
+(spec-core "Response records", StreamGrant `required_fields`, and the
+paginated `changes_since` deletion rule).
 The server baseline is `0b5eac036a33cb714cdd6d3a71abddd98e609f2d`.
 
-| Finding                                               | Class             | Result                                                                                                                                                                                                                                                   |
-| ----------------------------------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fields outside a frozen grant                         | A, current defect | Required fields are resolved at issuance. Reads never add fields absent from the grant, including after a declaration changes. Sparse reads retain the required floor only inside the grant.                                                             |
-| Malformed limits                                      | A                 | Whole-string positive safe integers; absent defaults to 25. Values above 100 retain the existing clamp and warning. Supplied empty, fractional, suffixed and unsafe values fail.                                                                         |
-| Moving list rows and tied identities                  | A                 | Traverse historical versions at the first page's horizon, ordered by emitted time, record key, then instance. Later edits and inserts cannot move that traversal; encountering a subsequently erased visible record expires it with an explicit restart. |
-| Offset/precision comparison and invalid stored values | A                 | Compare instants rather than strings. Invalid or missing values cannot authorize list, detail, sync data or blob disclosure.                                                                                                                             |
-| Explicit selector and optional opt-in                 | B, candidate only | Every named, wildcard or preset stream requires fields or view. The field wildcard must stand alone. Omitted necessity means optional; optional streams require affirmative owner selection.                                                             |
-| Typed time and strict AS bounds                       | B                 | Freeze date/date-time type from the retained schema. Reject invalid calendars, wrong types, empty or reversed ranges and invalid narrowing. Compare all fractional digits, offsets, lowercase t/z, unknown local offset and inserted leap seconds.       |
-| Time-filtered removals                                | B                 | Compare visibility at both sync horizons. Emit a minimal removal for previously visible records that are deleted or leave the time window. Never use deletion payloads to authorize a removal. First sync has no removals.                               |
+| Finding                                               | Class             | Result                                                                                                                                                                                                                                                                  |
+| ----------------------------------------------------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fields outside a frozen grant                         | A, current defect | Required fields are resolved at issuance. Reads never add fields absent from the grant, including after a declaration changes. Sparse reads retain the required floor only inside the grant.                                                                            |
+| Malformed limits                                      | A                 | Whole-string positive safe integers; absent defaults to 25. Values above 100 retain the existing clamp and warning. Supplied empty, fractional, suffixed and unsafe values fail.                                                                                        |
+| Moving list rows and tied identities                  | A                 | Traverse historical versions at the first page's horizon, ordered by emitted instant, record key, then instance. Later edits and inserts cannot move that traversal. A record erased after the horizon is withheld from later pages; the rest of the listing continues. |
+| Offset/precision comparison and invalid stored values | A                 | Compare instants rather than strings, in authorization and in list order and `last_updated`. Invalid or missing values cannot authorize list, detail, sync data or blob disclosure. One legacy-bound reading serves AS validation, narrowing and RS enforcement.        |
+| Explicit selector and optional opt-in                 | B, candidate only | Every named, wildcard or preset stream requires fields or view. The field wildcard must stand alone. Omitted necessity means optional; optional streams require affirmative owner selection.                                                                            |
+| Typed time and strict AS bounds                       | B                 | Freeze date/date-time type from the retained schema. Reject invalid calendars, wrong types, empty or reversed ranges and invalid narrowing. Compare all fractional digits, offsets, lowercase t/z, unknown local offset and inserted leap seconds.                      |
+| Time-filtered removals                                | B                 | Compare visibility at both sync horizons. Emit a minimal removal for previously visible records that are deleted or leave the time window. Never use deletion payloads to authorize a removal. First sync has no removals.                                              |
+| Record deleted after a sync session's first page      | B                 | A candidate page that reaches it fails with `410 cursor_expired`. The current contract serves every page at the session horizon.                                                                                                                                        |
+| Initial review of an all-optional request             | B                 | The review shows every optional stream unselected. Approval refuses an empty grant until the owner selects a stream.                                                                                                                                                    |
+| Frozen required fields and record identity            | B                 | Candidate grants carry `required_fields`, and the sparse-read floor comes from it, never from a later declaration. Candidate records and tombstones carry `instance_id`.                                                                                                |
 
 Current Core already freezes fields and forbids widening from a current
 declaration (sections 6–8). Its schema-required floor belongs in the resolved
@@ -39,11 +46,12 @@ were corrected. This changes malformed or stale grants that previously depended
 on the wider response; valid grants issued by the AS already include their floor.
 
 Candidate clauses are separate: selection defaults, temporal declaration
-eligibility, frozen time type, exact RFC3339 semantics, and h0/h1 removals.
-Current untyped grants remain readable without a type migration. Offset-less
-legacy authorization bounds use UTC consistently across host time zones; stored
-record values remain strict. Current and
-private-v0.2 tombstone wire behavior stays unchanged.
+eligibility, frozen time type, exact RFC3339 semantics, h0/h1 removals, frozen
+required fields and record `instance_id`. Current untyped grants remain
+readable without a type migration. `legacyTimeBound` reads offset-less legacy
+authorization bounds in UTC on every host, for AS validation, minimum checks,
+narrowing and RS enforcement alike; stored record values remain strict. Current
+and private-v0.2 tombstone and record wire shapes stay unchanged.
 
 ## Invariant owners
 
@@ -52,8 +60,10 @@ private-v0.2 tombstone wire behavior stays unchanged.
 - `expandedRequestFields` owns request selector expansion;
   `streamIsOmitted` owns optional consent inclusion and is shared with inventory
   and fan-in checks.
-- `pdpp/time.ts` owns the time type, strict parser and exact comparator. AS
-  validation and narrowing, RS enforcement and ingest timestamp validation use it.
+- `pdpp/time.ts` owns the time type, strict parser, exact comparator, the
+  legacy-bound reading (`legacyTimeBound`) and the instant sort key
+  (`timeSortKey`). AS validation and narrowing, RS enforcement, ingest
+  timestamp validation and both stores' list order use it.
 - `parseRecordQuery` owns query names, multiplicity, limit and order parsing.
 - `listSnapshotPage` owns visible list pagination and cursor construction. Both
   stores supply ordered historical rows; HTTP never rebuilds a list cursor.
@@ -64,11 +74,17 @@ private-v0.2 tombstone wire behavior stays unchanged.
 
 Legacy list cursors without a horizon or complete identity return the existing
 `410 cursor_expired` restart signal. Their original traversal cannot be recovered
-safely after mutation. New cursors carry both facts. Erasure of an unread visible record also expires
-the listing; no profile returns its historical data after deletion.
+safely after mutation. New cursors carry both facts. A record erased after the
+horizon, including one erased and reinserted, is withheld from later pages; no
+profile returns its historical data after deletion. A list is not a sync
+session, so withholding one record loses nothing a later read relied on.
+Candidate spec-core says the same for sync pages; see the deletion row above
+for why a candidate sync page expires instead.
 
 SQLite list and sync use one `snapshotRows` primitive, with explicit indexes for
 ordered traversal and latest-version lookup. Schema v12 adds those indexes.
+Schema v13 adds `emitted_key` (`timeSortKey(emitted_at)`) to live and history
+rows, backfills it, and orders list traversal and `last_updated` by it.
 SQLite iterates the ordered snapshot until one extra visible row establishes
 continuation; it does not copy the entire list into JavaScript memory. The memory
 backend reconstructs its snapshot from retained history and keeps one bounded
@@ -90,7 +106,8 @@ These are source checks, not deployed-client or mobile acceptance evidence.
 
 Current behavior changes also include rejecting duplicate query parameters with
 400, excluding offset-less stored timestamps, expiring incomplete legacy list
-cursors with 410, and using consistent code-point sync ordering across backends.
+cursors with 410, ordering lists by emitted instant, and using consistent
+code-point sync ordering across backends.
 Clients must restart an expired traversal.
 
 ## Evidence and limits

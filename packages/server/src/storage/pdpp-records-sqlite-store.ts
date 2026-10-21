@@ -1,4 +1,7 @@
-import { parseTime } from "@opendatalabs/personal-server-ts-core/pdpp";
+import {
+  parseTime,
+  timeSortKey,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   selectSyncChange,
   decodeListCursor,
@@ -291,6 +294,10 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_order
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
   ON pdpp_record_changes (instance, stream, record_key, written_at DESC, version DESC);
 `,
+  // v13: an `emitted_key` that orders emitted time by instant rather than by
+  // timestamp text, for list order, list seeks and the latest stream time.
+  // `migrateToV13` applies it.
+  "",
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -325,6 +332,35 @@ function addCompletionProofColumns(db: Database): void {
   }
 }
 
+/** `emitted_key` is `timeSortKey(emitted_at)`, written by SQL on every insert. */
+function registerTimeKey(db: Database): void {
+  db.function("pdpp_time_key", { deterministic: true }, (value: unknown) =>
+    timeSortKey(String(value)),
+  );
+}
+
+function migrateToV13(db: Database): void {
+  for (const table of ["pdpp_records", "pdpp_record_changes"]) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+    }[];
+    if (!columns.some((c) => c.name === "emitted_key")) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN emitted_key TEXT`);
+    }
+    db.exec(
+      `UPDATE ${table} SET emitted_key = pdpp_time_key(emitted_at) WHERE emitted_key IS NULL`,
+    );
+  }
+  db.exec(`
+DROP INDEX IF EXISTS idx_pdpp_record_changes_snapshot_order;
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_key_order
+  ON pdpp_record_changes (stream, emitted_key, record_key, instance, written_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
+  ON pdpp_records (instance, stream, emitted_key)
+  WHERE deleted = 0;
+`);
+}
+
 function migrate(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS pdpp_schema_version (
@@ -346,6 +382,7 @@ function migrate(db: Database): void {
           "INSERT OR IGNORE INTO pdpp_store_metadata (id, epoch) VALUES (1, ?)",
         ).run(randomUUID());
       }
+      if (v === 12) migrateToV13(db);
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -569,6 +606,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    */
   listArrivalOrder(instance: string, stream: string): string[];
 } {
+  // Insert statements call it, so even a readonly handle must register it
+  // before they are prepared.
+  registerTimeKey(db);
   if (db.readonly) {
     const current = db
       .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
@@ -597,20 +637,21 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     "SELECT * FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
   );
   const upsertCurrentStmt = db.prepare(`
-    INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted, deleted_at, blob_id)
-    VALUES (@instance, @stream, @record_key, @data, @version, @emitted_at, @deleted, @deleted_at, @blob_id)
+    INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, emitted_key, deleted, deleted_at, blob_id)
+    VALUES (@instance, @stream, @record_key, @data, @version, @emitted_at, pdpp_time_key(@emitted_at), @deleted, @deleted_at, @blob_id)
     ON CONFLICT (instance, stream, record_key) DO UPDATE SET
       data = excluded.data,
       version = excluded.version,
       emitted_at = excluded.emitted_at,
+      emitted_key = excluded.emitted_key,
       deleted = excluded.deleted,
       deleted_at = excluded.deleted_at,
       blob_id = excluded.blob_id
   `);
   const insertHistoryStmt = db.prepare(`
     INSERT INTO pdpp_record_changes
-      (instance, stream, record_key, version, data, emitted_at, deleted, deleted_at, written_at)
-    VALUES (@instance, @stream, @record_key, @version, @data, @emitted_at, @deleted, @deleted_at, @written_at)
+      (instance, stream, record_key, version, data, emitted_at, emitted_key, deleted, deleted_at, written_at)
+    VALUES (@instance, @stream, @record_key, @version, @data, @emitted_at, pdpp_time_key(@emitted_at), @deleted, @deleted_at, @written_at)
   `);
   const putBlobStmt = db.prepare(`
     INSERT INTO pdpp_blobs (blob_id, mime_type, size_bytes, sha256)
@@ -1559,7 +1600,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   ): Generator<RecordRowDb & { written_at: number }> {
     const dir = options.order === "desc" ? "DESC" : "ASC";
     const comparison = options.order === "desc" ? "<" : ">";
-    let sql = `SELECT c.* FROM pdpp_record_changes c INDEXED BY idx_pdpp_record_changes_snapshot_order
+    let sql = `SELECT c.* FROM pdpp_record_changes c INDEXED BY idx_pdpp_record_changes_snapshot_key_order
       WHERE c.stream = ? AND c.instance IN (${instanceIds.map(() => "?").join(",")}) AND c.written_at <= ?
       AND c.version = (
         SELECT c2.version FROM pdpp_record_changes c2 INDEXED BY idx_pdpp_record_changes_snapshot_latest
@@ -1569,8 +1610,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     const params: unknown[] = [stream, ...instanceIds, horizon, horizon];
     if (options.liveOnly) sql += " AND c.deleted = 0";
     if (options.after) {
-      sql += ` AND (c.emitted_at, c.record_key, c.instance) ${comparison} (?, ?, ?)`;
-      params.push(options.after.val, options.after.key, options.after.instance);
+      sql += ` AND (c.emitted_key, c.record_key, c.instance) ${comparison} (?, ?, ?)`;
+      params.push(
+        timeSortKey(options.after.val),
+        options.after.key,
+        options.after.instance,
+      );
     }
     sql += ` ORDER BY ${LIST_ORDER_COLUMNS.map((column) => `c.${column} ${dir}`).join(", ")}`;
     for (const row of db.prepare(sql).iterate(...params))
@@ -1764,6 +1809,20 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     changed.sort(compareRecordIdentity);
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;
+    if (options.expireOnErasure && horizon < readWriteClock()) {
+      const erasure =
+        db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+        WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
+      if (
+        page.some(
+          (row) =>
+            !row.deleted &&
+            erasure.get(row.instance, stream, row.recordKey, horizon) !==
+              undefined,
+        )
+      )
+        throw new CursorExpiredError();
+    }
 
     return {
       data: page,
@@ -1795,7 +1854,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     const placeholders = instanceIds.map(() => "?").join(",");
     const rows = db
       .prepare(
-        `SELECT stream, COUNT(*) as count, MAX(emitted_at) as last_updated
+        // SQLite takes a bare column from the row that holds the single MAX.
+        `SELECT stream, COUNT(*) as count, emitted_at as last_updated, MAX(emitted_key)
          FROM pdpp_records WHERE deleted = 0 AND instance IN (${placeholders})
          GROUP BY stream`,
       )

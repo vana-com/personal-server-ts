@@ -62,6 +62,20 @@ function grantV01(fields = ["date", "amount"]): Grant {
   return { ...grantV02(fields), version: "0.1.0", grant_id: "grant_v01" };
 }
 
+/** A candidate grant: `required` is the floor frozen at issuance. */
+function grantCandidate(
+  fields = ["date", "amount"],
+  required: string[] = [],
+): Grant {
+  const grant = grantV02(fields);
+  return {
+    ...grant,
+    version: "0.1.0-candidate",
+    grant_id: "grant_candidate",
+    streams: grant.streams.map((s) => ({ ...s, required_fields: required })),
+  };
+}
+
 function buildApp(grant: Grant) {
   const store = createMemoryRecordStore();
   const tokens: Record<string, PdppTokenContext> = {
@@ -185,7 +199,7 @@ describe("v0.2: stream metadata reflects the approved projection", () => {
 });
 
 it("candidate grant closure survives new schema-required fields on list/detail/sync", async () => {
-  const { app } = buildApp({ ...grantV02(), version: "0.1.0-candidate" });
+  const { app } = buildApp(grantCandidate());
   for (const path of [
     "/streams/transactions/records?fields=date",
     "/streams/transactions/records/t1?fields=date",
@@ -201,19 +215,13 @@ it("candidate grant closure survives new schema-required fields on list/detail/s
 });
 
 it("keeps candidate required fields only when frozen in the grant under sparse reads", async () => {
-  const { app } = buildApp({
-    ...grantV02(["id", "date", "amount"]),
-    version: "0.1.0-candidate",
-  });
+  const { app } = buildApp(grantCandidate(["id", "date", "amount"], ["id"]));
   const data = await listData(app, "?fields=date");
   expect(Object.keys(data).sort()).toEqual(["date", "id"]);
 });
 
 it("candidate sync eligibility uses grant fields even when the response is sparse", async () => {
-  const { app, store } = buildApp({
-    ...grantV02(),
-    version: "0.1.0-candidate",
-  });
+  const { app, store } = buildApp(grantCandidate());
   const baseline = await app.request(
     "/streams/transactions/records?changes_since=beginning&fields=date",
     { headers: AUTH },

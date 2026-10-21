@@ -7,6 +7,7 @@ import {
 } from "./list-page.js";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
+import { timeSortKey } from "../../pdpp/time.js";
 import type { PdppRecordStore } from "./interface.js";
 import {
   planIngest,
@@ -413,6 +414,22 @@ export function createMemoryRecordStore(): PdppRecordStore {
 
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;
+    if (
+      options.expireOnErasure &&
+      page.some(
+        (row) =>
+          !row.deleted &&
+          history.some(
+            (h) =>
+              h.row.deleted &&
+              h.writtenAt > horizon &&
+              h.instance === row.instance &&
+              h.stream === stream &&
+              h.recordKey === row.recordKey,
+          ),
+      )
+    )
+      throw new CursorExpiredError();
 
     return {
       data: page,
@@ -451,7 +468,10 @@ export function createMemoryRecordStore(): PdppRecordStore {
       const entry = byStream.get(row.stream) ?? { count: 0, lastUpdated: null };
       entry.count += 1;
       const updated = row.emittedAt;
-      if (!entry.lastUpdated || updated > entry.lastUpdated) {
+      if (
+        !entry.lastUpdated ||
+        timeSortKey(updated) > timeSortKey(entry.lastUpdated)
+      ) {
         entry.lastUpdated = updated;
       }
       byStream.set(row.stream, entry);

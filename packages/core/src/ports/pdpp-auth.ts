@@ -14,6 +14,12 @@ export interface StreamGrant {
   time_constraint?: TimeConstraint;
   /** Canonical key strings. Absent means all records. */
   resources?: string[];
+  /**
+   * Candidate grants only: the schema-required fields frozen from the
+   * retained declaration at issuance, a subset of `fields`. The RS takes its
+   * sparse-read floor from this set, never from a later declaration.
+   */
+  required_fields?: string[];
 }
 
 export interface ClientDisplay {

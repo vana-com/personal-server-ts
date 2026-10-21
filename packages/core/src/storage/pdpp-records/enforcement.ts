@@ -96,8 +96,23 @@ export function resolveReadScope(
 
   // Issuance resolves required fields into grant.fields. A later declaration
   // never adds authority. The current v0.1 sparse-read floor is restricted to
-  // fields the grant already carries; private v0.2 selects exactly.
+  // fields the grant already carries; private v0.2 selects exactly. The
+  // candidate freezes its floor in the grant itself.
   const schemaRequiredFloor = !grantIsV02(context.grant);
+  let requiredFloor = declaration.requiredFields ?? [];
+  if (grantIsCandidate(context.grant)) {
+    const frozen = streamGrant.required_fields;
+    if (
+      !Array.isArray(frozen) ||
+      frozen.some((f) => !streamGrant.fields.includes(f))
+    ) {
+      throw new PdppError(
+        "grant_invalid",
+        "Candidate grant has no frozen required-field floor within its fields",
+      );
+    }
+    requiredFloor = frozen;
+  }
 
   // v0.2 only: can this RS actually serve the projection the grant approved?
   //
@@ -133,8 +148,7 @@ export function resolveReadScope(
     fields: resolveReadFields(
       requestedFields,
       streamGrant.fields,
-      declaration,
-      schemaRequiredFloor,
+      schemaRequiredFloor ? requiredFloor : [],
     ),
     streamGrant,
     schemaRequiredFloor,
@@ -145,8 +159,7 @@ export function resolveReadScope(
 function resolveReadFields(
   requested: string[] | undefined,
   granted: string[],
-  declaration: StreamDeclaration,
-  schemaRequiredFloor: boolean,
+  requiredFloor: string[],
 ): string[] {
   const allowed = [...granted];
   if (!requested || requested.length === 0) return allowed;
@@ -159,11 +172,7 @@ function resolveReadFields(
       );
     }
   }
-  const floor = schemaRequiredFloor
-    ? (declaration.requiredFields ?? []).filter((field) =>
-        granted.includes(field),
-      )
-    : [];
+  const floor = requiredFloor.filter((field) => granted.includes(field));
   return [...new Set([...requested, ...floor])];
 }
 

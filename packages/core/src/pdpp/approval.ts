@@ -44,12 +44,13 @@ import {
 import type { PdppAuthStore } from "./store.js";
 import type { PdppTokenService } from "./tokens.js";
 import { resolveCommitments } from "./commitments.js";
-import type {
-  DeclarationSnapshot,
-  Grant,
-  OwnerConditions,
-  RecipientTerms,
-  SelectionRequest,
+import {
+  PDPP_DATA_ACCESS_TYPE_CANDIDATE,
+  type DeclarationSnapshot,
+  type Grant,
+  type OwnerConditions,
+  type RecipientTerms,
+  type SelectionRequest,
 } from "./types.js";
 
 /** How long an owner has to act on a consent screen before it goes stale. */
@@ -497,7 +498,14 @@ export function fetchReview(input: {
     inventory,
     input.ownerChoices,
   );
-  if (!resolution.ok) {
+  // A candidate's optional streams start unselected. With none selected yet
+  // the owner still needs the review to choose from; only issuance refuses
+  // an empty grant (`approveAuthorization` resolves again and refuses it).
+  const pendingSelection =
+    !resolution.ok &&
+    resolution.failure.code === "no_streams_approved" &&
+    session.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE;
+  if (!resolution.ok && !pendingSelection) {
     // A narrowing incompatible with the request's own requirements is the
     // owner's choice colliding with the client's floor, not a malformed
     // request. Reporting it as `access_denied` is what lets the consent UI
@@ -541,9 +549,17 @@ export function fetchReview(input: {
     subjectId: session.subject_id,
     request: session.request,
     snapshot: session.snapshot,
-    resolvedStreams: resolution.streams,
-    omittedStreams: resolution.omittedStreams,
-    requestedStreams: resolution.requestedStreams,
+    ...(resolution.ok
+      ? {
+          resolvedStreams: resolution.streams,
+          omittedStreams: resolution.omittedStreams,
+          requestedStreams: resolution.requestedStreams,
+        }
+      : {
+          resolvedStreams: [],
+          omittedStreams: resolution.failure.omittedStreams,
+          requestedStreams: resolution.failure.requestedStreams,
+        }),
     requester: session.requester,
     expiresAt: session.grant_expires_at,
     streamDescriptions: session.stream_descriptions,
