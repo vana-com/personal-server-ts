@@ -719,12 +719,26 @@ export function createReplicaReceiver(deps: {
       )
       .get(instance, stream, key);
   }
+  /**
+   * The shared quarantine predicate. A store that takes the row's generation
+   * as a second argument gets it; an older store applies the binding's
+   * current generation to every row.
+   */
+  function unquarantinedRecordSql(alias: string, generationSql?: string) {
+    const predicate = store.unquarantinedRecordSql as (
+      alias: string,
+      generationSql?: string,
+    ) => string;
+    return generationSql !== undefined && predicate.length >= 2
+      ? predicate(alias, generationSql)
+      : predicate(alias);
+  }
   const view = createReplicaVisibilityView({
     db,
     owner,
     declarations: deps.declarations,
     blobsValid: previewBlobsValid,
-    unquarantinedRecordSql: store.unquarantinedRecordSql,
+    unquarantinedRecordSql,
     integrityEpoch: store.replicaIntegrityEpoch,
   });
   store.setReplicaVisibilityObserver(view.flush);
