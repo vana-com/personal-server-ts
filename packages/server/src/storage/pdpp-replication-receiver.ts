@@ -1,3 +1,10 @@
+import {
+  binaryLength,
+  binaryWriter,
+  verifyBinary,
+  copyBinary,
+  type BinaryNamespace,
+} from "./pdpp-binary-chunks.js";
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import {
@@ -90,18 +97,14 @@ export function createReplicaReceiver(deps: {
   }
   const hash = (bytes: Uint8Array) =>
     `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
-  function verifiedBytes(blob: BlobDescriptor): Uint8Array | undefined {
-    const row = db
-      .prepare(
-        "SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id = ?",
-      )
-      .get(blob.blobId) as { bytes: Buffer } | undefined;
-    const bytes = row?.bytes ?? store.getBlobBytes(blob.blobId);
-    return bytes &&
-      bytes.byteLength === blob.sizeBytes &&
-      hash(bytes) === blob.sha256 &&
-      blob.blobId === blob.sha256
-      ? bytes
+  function verifiedBytes(blob: BlobDescriptor): BinaryNamespace | undefined {
+    const namespace =
+      binaryLength(db, "received", blob.blobId) === undefined
+        ? "canonical"
+        : "received";
+    return blob.blobId === blob.sha256 &&
+      verifyBinary(db, namespace, blob.blobId, blob.sha256, blob.sizeBytes)
+      ? namespace
       : undefined;
   }
   function materializeBlob(
@@ -152,19 +155,18 @@ export function createReplicaReceiver(deps: {
         blob.sizeBytes,
         blob.sha256.slice(7),
       );
-      const existing = db
-        .prepare("SELECT bytes FROM pdpp_blob_bytes WHERE blob_id = ?")
-        .get(blob.blobId) as { bytes: Buffer } | undefined;
-      if (
-        existing &&
-        (hash(existing.bytes) !== blob.sha256 ||
-          existing.bytes.length !== blob.sizeBytes)
-      )
-        throw new Error("corrupt canonical blob bytes");
-      db.prepare("INSERT OR IGNORE INTO pdpp_blob_bytes VALUES (?, ?)").run(
-        blob.blobId,
-        bytes,
-      );
+      if (binaryLength(db, "canonical", blob.blobId) !== undefined) {
+        if (
+          !verifyBinary(
+            db,
+            "canonical",
+            blob.blobId,
+            blob.sha256,
+            blob.sizeBytes,
+          )
+        )
+          throw new Error("corrupt canonical blob bytes");
+      } else copyBinary(db, bytes, blob.blobId, "canonical");
       db.prepare(
         "INSERT INTO pdpp_blob_claims VALUES (?, ?, ?) ON CONFLICT(blob_id, instance) DO UPDATE SET generation = excluded.generation",
       ).run(blob.blobId, operation.connectionId, operation.generation);
@@ -524,6 +526,7 @@ export function createReplicaReceiver(deps: {
       credential: unknown;
       envelope: unknown;
       blobs?: { blobId: string; bytes: Uint8Array }[];
+      stagedBlobs?: { blobId: string; key: string; sizeBytes: number }[];
     }): ReplicaMergePlan {
       authorize(input.credential);
       const envelope = replicaEnvelopeSchema.parse(input.envelope);
@@ -538,20 +541,50 @@ export function createReplicaReceiver(deps: {
           for (const blob of input.blobs ?? []) {
             if (hash(blob.bytes) !== blob.blobId)
               throw new Error("corrupt replica blob bytes");
-            const previous = db
-              .prepare(
-                "SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id = ?",
+            if (binaryLength(db, "received", blob.blobId) !== undefined) {
+              if (
+                !verifyBinary(
+                  db,
+                  "received",
+                  blob.blobId,
+                  blob.blobId,
+                  blob.bytes.length,
+                )
               )
-              .get(blob.blobId) as { bytes: Buffer } | undefined;
+                throw new Error("corrupt retained replica bytes");
+            } else if (blob.bytes.length <= 1024 * 1024) {
+              db.prepare(
+                "INSERT INTO pdpp_replica_received_bytes VALUES (?, ?)",
+              ).run(blob.blobId, blob.bytes);
+            } else {
+              const writer = binaryWriter(db, "received", blob.blobId);
+              writer.write(blob.bytes);
+              writer.finish();
+            }
+          }
+          for (const blob of input.stagedBlobs ?? []) {
             if (
-              previous &&
-              (hash(previous.bytes) !== blob.blobId ||
-                !Buffer.from(blob.bytes).equals(previous.bytes))
+              !verifyBinary(
+                db,
+                "staging",
+                blob.key,
+                blob.blobId,
+                blob.sizeBytes,
+              )
             )
-              throw new Error("corrupt retained replica bytes");
-            db.prepare(
-              "INSERT OR IGNORE INTO pdpp_replica_received_bytes VALUES (?, ?)",
-            ).run(blob.blobId, blob.bytes);
+              throw new Error("corrupt replica blob bytes");
+            if (binaryLength(db, "received", blob.blobId) !== undefined) {
+              if (
+                !verifyBinary(
+                  db,
+                  "received",
+                  blob.blobId,
+                  blob.blobId,
+                  blob.sizeBytes,
+                )
+              )
+                throw new Error("corrupt retained replica bytes");
+            } else copyBinary(db, "staging", blob.key, "received", blob.blobId);
           }
           for (const op of envelope.operations) {
             db.prepare(

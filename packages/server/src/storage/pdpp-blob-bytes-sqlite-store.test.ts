@@ -312,7 +312,7 @@ describe("sqlite record store: blob bytes (real on-disk database)", () => {
     const version = db
       .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
       .get() as { version: number };
-    expect(version.version).toBe(14);
+    expect(version.version).toBe(15);
 
     store.close();
   });
@@ -349,4 +349,91 @@ describe("metadata-only completion integrity", () => {
       }
     },
   );
+});
+
+it("reads legacy and chunked blobs together, detects replacement, and removes chunks on connection deletion", () => {
+  const db = new Database(":memory:");
+  const store = createTestBoundRecordStore(db);
+  try {
+    store.registerConnection({
+      instance: "chunks",
+      sourceId: "https://chunks.invalid/source",
+      method: "export",
+      label: "Chunks",
+    });
+    const legacy = store.storeBlobBytes(
+      new Uint8Array([1, 2, 3]),
+      "application/octet-stream",
+    );
+    const bytes = new Uint8Array(2 * 1024 * 1024).fill(31);
+    const chunked = store.storeBlobBytesForInstance({
+      instance: "chunks",
+      method: "export",
+      generation: 1,
+      bytes,
+      mimeType: "application/octet-stream",
+    });
+    expect(store.getBlobBytes(legacy.blobId)).toEqual(
+      new Uint8Array([1, 2, 3]),
+    );
+    expect(sha256Hex(store.getBlobBytes(chunked.blobId)!)).toBe(
+      sha256Hex(bytes),
+    );
+    db.prepare(
+      "UPDATE pdpp_binary_chunks SET bytes=zeroblob(length(bytes)) WHERE namespace='canonical' AND blob_id=? AND position=0",
+    ).run(chunked.blobId);
+    expect(store.getBlobBytes(chunked.blobId)).toBeUndefined();
+    expect(() =>
+      store.storeBlobBytesForInstance({
+        instance: "chunks",
+        method: "export",
+        generation: 1,
+        bytes,
+        mimeType: "application/octet-stream",
+      }),
+    ).toThrow(BlobConflictError);
+    store.deleteConnection("chunks");
+    expect(
+      (
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=?",
+          )
+          .get(chunked.blobId) as { n: number }
+      ).n,
+    ).toBe(0);
+    expect(
+      (
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=?",
+          )
+          .get(chunked.blobId) as { n: number }
+      ).n,
+    ).toBe(0);
+    expect(store.getBlobBytes(chunked.blobId)).toBeUndefined();
+  } finally {
+    store.close();
+  }
+});
+
+it("rejects an incomplete matching chunk manifest before allocating its declared whole size", () => {
+  const db = new Database(":memory:");
+  const store = createTestBoundRecordStore(db);
+  try {
+    const blobId = `sha256:${"a".repeat(64)}`;
+    const sizeBytes = 2 ** 40;
+    store.putBlobMeta({
+      blobId,
+      mimeType: "application/octet-stream",
+      sizeBytes,
+      sha256: blobId.slice(7),
+    });
+    db.prepare(
+      "INSERT INTO pdpp_binary_manifests VALUES ('canonical',?,?)",
+    ).run(blobId, sizeBytes);
+    expect(store.getBlobBytes(blobId)).toBeUndefined();
+  } finally {
+    store.close();
+  }
 });

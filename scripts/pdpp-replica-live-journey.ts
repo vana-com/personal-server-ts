@@ -27,7 +27,10 @@ import type {
   ReplicaEnvelope,
 } from "../packages/core/src/replication/envelope.js";
 import { createReplicaEvidenceAdapter } from "../packages/core/src/replication/evidence.js";
-import { createDpv2ReplicaTransport } from "../packages/core/src/replication/dpv2.js";
+import {
+  createDpv2ReplicaTransport,
+  createReplicaFinalityHints,
+} from "../packages/core/src/replication/dpv2.js";
 import { ServerConfigSchema } from "../packages/core/src/schemas/server-config.js";
 import type { SignTypedDataParams } from "../packages/core/src/keys/server-account.js";
 import { createServerSigner } from "../packages/core/src/signing/signer.js";
@@ -208,6 +211,11 @@ async function host() {
     serverAccount: account,
   });
   const transport = createDpv2ReplicaTransport({
+    finality: createReplicaFinalityHints({
+      rpc: createPublicClient({
+        transport: http(rpcUrl, { timeout: 25_000, retryCount: 0 }),
+      }),
+    }),
     owner: init.owner,
     masterKey: new Uint8Array(init.master),
     storage,
@@ -424,6 +432,26 @@ async function host() {
       if (command === "cycle") {
         await worker.cycle();
         result = snapshot();
+      } else if (command === "cleanupStorage") {
+        const scopes = db
+          .prepare("SELECT scope FROM pdpp_transport_outbox")
+          .all() as { scope: string }[];
+        const cleanup = {
+          attempted: scopes.length,
+          deleted: 0,
+          absent: 0,
+          failed: 0,
+        };
+        for (const { scope } of scopes) {
+          try {
+            if (await storage.delete(storage.urlForKey(`${scope}/1`)))
+              cleanup.deleted++;
+            else cleanup.absent++;
+          } catch {
+            cleanup.failed++;
+          }
+        }
+        result = cleanup;
       } else if (command === "snapshot") result = snapshot();
       else if (command === "put")
         result = put(String(args.id), { text: args.text });
@@ -1125,7 +1153,19 @@ async function main() {
       A: a.peakRssKiB,
       B: b.peakRssKiB,
     };
-    for (const device of devices) await device.kill();
+    report.storageCleanup = [];
+    for (const device of devices) {
+      try {
+        (report.storageCleanup as unknown[]).push(
+          await device.call("cleanupStorage"),
+        );
+      } catch {
+        (report.storageCleanup as unknown[]).push({
+          failed: "host unavailable",
+        });
+      }
+      await device.kill();
+    }
     save();
     rmSync(root, { recursive: true, force: true });
     console.log(
