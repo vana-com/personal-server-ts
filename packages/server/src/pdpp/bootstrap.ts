@@ -228,6 +228,7 @@ export async function createPdppAuthDeps(
       declarations: registry.retained.map((d) => d.source_id),
       supportedConnectors,
       requirePkce: config.pdpp.requirePkce,
+      protocolProfile: config.pdpp.protocolProfile,
     },
     "PDPP Authorization Server mounted at /pdpp/v1",
   );

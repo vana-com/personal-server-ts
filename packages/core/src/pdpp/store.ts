@@ -24,6 +24,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import Database from "better-sqlite3";
+import { hasFiniteExpiration } from "./token-expiry.js";
 import type {
   DeclarationSnapshot,
   Grant,
@@ -576,6 +577,9 @@ export class PdppAuthStore {
     consumeSingleUse: boolean;
     now?: Date;
   }): boolean {
+    if (input.tokenKind === "client" && !hasFiniteExpiration(input.expiresAt)) {
+      throw new Error("Client access tokens require a finite expiration");
+    }
     const now = input.now ?? new Date();
     const at = now.toISOString();
 
