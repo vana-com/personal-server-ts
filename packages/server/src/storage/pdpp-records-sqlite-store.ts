@@ -622,7 +622,20 @@ function toRow(db: RecordRowDb): PdppRecordRow {
  * A readonly database must already have the current schema; no migration,
  * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
+// Shared read predicate for canonical, replica-preview, and known-local projections.
+function unquarantinedRecordSql(alias: string): string {
+  return `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_connections q WHERE q.instance = ${alias}.instance) AND NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_keys q JOIN pdpp_instance_binding b ON b.instance=q.instance AND b.generation=q.generation WHERE q.instance=${alias}.instance AND q.stream=${alias}.stream AND q.record_key=${alias}.record_key)`;
+}
+
 export function createSqliteRecordStore(db: Database): PdppRecordStore & MutationJournalReader & {
+  /** Internal synchronous observer, called after journal capture in the write transaction. */
+  setReplicaVisibilityObserver(observer: () => void): void;
+  unquarantinedRecordSql(alias: string): string;
+  changesSinceForInstances(
+    stream: string,
+    options: ChangesSinceOptions,
+    visibleInstanceIds: string[],
+  ): ChangesSincePage;
   replication: ReplicationExport;
   transitionClaudeToLive(input: ClaudeTransitionInput): PdppInstanceBinding;
   claudeTransition(instance: string): ClaudeTransition | null;
@@ -727,6 +740,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
             @stream, @record_key, @operation, @value_json, @blob_ids_json)
   `);
 
+  let replicaVisibilityObserver: (() => void) | undefined;
   function journalMutation(
     instance: string,
     stream: string,
@@ -757,6 +771,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
       blob_ids_json: JSON.stringify(blobId ? [blobId] : []),
     });
     replica.captureRecord(instance, stream, recordKey, semantics, primaryKey);
+    replicaVisibilityObserver?.();
   }
 
   function readMutationJournalPage(options: MutationJournalPageOptions): MutationJournalPage {
@@ -816,7 +831,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
   `);
   const getBlobStmt = db.prepare("SELECT * FROM pdpp_blobs WHERE blob_id = ?");
   const findBlobRefsStmt = db.prepare(
-    "SELECT instance, stream, record_key FROM pdpp_records WHERE blob_id = ? AND deleted = 0",
+    `SELECT r.instance, r.stream, r.record_key FROM pdpp_records r WHERE r.blob_id = ? AND r.deleted = 0 AND ${unquarantinedRecordSql("r")}`,
   );
   const insertBlobBytesStmt = db.prepare(
     "INSERT INTO pdpp_blob_bytes (blob_id, bytes) VALUES (@blob_id, @bytes)",
@@ -1428,6 +1443,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
         input.instance,
       );
       replica.captureLifecycle(input.instance, "connection-reset");
+      replicaVisibilityObserver?.();
       return {
         binding: toBinding(ensureBinding(db, input.instance)),
         alreadyReset: false,
@@ -1614,6 +1630,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
       ).run(input.sourceId, input.method, input.label, input.instance);
       if (current.source_id === null)
         replica.captureLifecycle(input.instance, "connection-register");
+      replicaVisibilityObserver?.();
       return getInstanceBinding(input.instance);
     })();
   }
@@ -1629,6 +1646,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
         "UPDATE pdpp_instance_binding SET deleted_at = ?, generation = generation + 1, reset_clock = ? WHERE instance = ?",
       ).run(deletedAt, resetClock, instance);
       replica.captureLifecycle(instance, "connection-delete");
+      replicaVisibilityObserver?.();
       return getInstanceBinding(instance);
     })();
   }
@@ -1927,8 +1945,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
     stream: string,
     recordKey: string,
   ): PdppStoredRecord | undefined {
-    const row = getCurrentStmt.get(instance, stream, recordKey) as
-      RecordRowDb | undefined;
+    const row = db
+      .prepare(
+        `SELECT r.* FROM pdpp_records r WHERE r.instance=? AND r.stream=? AND r.record_key=? AND ${unquarantinedRecordSql("r")}`,
+      )
+      .get(instance, stream, recordKey) as RecordRowDb | undefined;
     if (!row || row.deleted) return undefined;
     return toRow(row) as PdppStoredRecord;
   }
@@ -1990,7 +2011,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
     const dir = options.order === "desc" ? "DESC" : "ASC";
     const comparison = options.order === "desc" ? "<" : ">";
     let sql = `SELECT c.* FROM pdpp_record_changes c INDEXED BY idx_pdpp_record_changes_snapshot_key_order
-      WHERE c.stream = ? AND c.instance IN (${instanceIds.map(() => "?").join(",")}) AND c.written_at <= ?
+      WHERE c.stream = ? AND c.instance IN (${instanceIds.map(() => "?").join(",")}) AND c.written_at <= ? AND ${unquarantinedRecordSql("c")}
       AND c.version = (
         SELECT c2.version FROM pdpp_record_changes c2 INDEXED BY idx_pdpp_record_changes_snapshot_latest
         WHERE c2.instance = c.instance AND c2.stream = c.stream AND c2.record_key = c.record_key AND c2.written_at <= ?
@@ -2112,6 +2133,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
   function changesSince(
     stream: string,
     options: ChangesSinceOptions,
+    visibleInstanceIds: string[] = options.instanceIds,
   ): ChangesSincePage {
     let horizon: number;
     let sinceHorizon: number | null;
@@ -2149,7 +2171,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
       sinceHorizon ?? horizon,
     ]);
 
-    const latestRows = snapshotRows(stream, options.instanceIds, horizon);
+    const visibleIds = [...new Set(visibleInstanceIds)].filter((id) =>
+      options.instanceIds.includes(id),
+    );
+    const latestRows = visibleIds.length
+      ? snapshotRows(stream, visibleIds, horizon)
+      : [];
 
     const changed: PdppRecordRow[] = [];
     for (const entry of latestRows) {
@@ -2246,7 +2273,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
       .prepare(
         // SQLite takes a bare column from the row that holds the single MAX.
         `SELECT stream, COUNT(*) as count, emitted_at as last_updated, MAX(emitted_key)
-         FROM pdpp_records WHERE deleted = 0 AND instance IN (${placeholders})
+         FROM pdpp_records r WHERE deleted = 0 AND instance IN (${placeholders}) AND ${unquarantinedRecordSql("r")}
+
          GROUP BY stream`,
       )
       .all(...instanceIds) as Array<{
@@ -2382,6 +2410,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
          ON CONFLICT (blob_id, instance) DO UPDATE SET generation = excluded.generation`,
       ).run(meta.blobId, input.instance, input.generation);
       replica.captureBlob(input.instance, meta.blobId);
+      replicaVisibilityObserver?.();
       return meta;
     })();
   }
@@ -2399,6 +2428,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
   }
 
   return {
+    unquarantinedRecordSql,
+    setReplicaVisibilityObserver: (observer: () => void) => {
+      replicaVisibilityObserver = observer;
+    },
     replication: replica.exporter,
     getInstallationWriterId: () => writerId,
     readMutationJournalPage,
@@ -2423,7 +2456,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
     getRecord,
     listRecords,
     deleteRecord,
-    changesSince,
+    changesSince: (stream, options) => changesSince(stream, options),
+    changesSinceForInstances: changesSince,
     listStreams,
     putBlobMeta: (meta: PdppBlobMeta) =>
       putBlobStmt.run({

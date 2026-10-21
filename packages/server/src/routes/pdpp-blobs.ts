@@ -10,15 +10,17 @@ import {
   recordWithinGrantTimeConstraint,
   resolveReadScope,
   type PdppRecordStore,
+  type PdppReplicaReadStore,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 type BlobReadStore = Pick<
   PdppRecordStore,
-  "getRecord" | "getBlobMeta" | "findBlobReferences"
-> & {
-  getBlobBytes(blobId: string): Uint8Array | undefined;
-};
+  "getBlobMeta" | "findBlobReferences"
+> &
+  Pick<PdppReplicaReadStore, "getRecord"> & {
+    getBlobBytes(blobId: string): Uint8Array | undefined;
+  };
 export interface PdppBlobsRouteDeps {
   store: PdppRecordStore;
   replicaReads?: (reader: ReplicaReader) => BlobReadStore;
@@ -197,6 +199,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       );
       if (
         !record ||
+        record.deleted ||
         !recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
       ) {
         continue;

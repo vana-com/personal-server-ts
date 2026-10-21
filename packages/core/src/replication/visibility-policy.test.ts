@@ -54,3 +54,11 @@ for (const policy of cases)
 it("does not infer local provenance for a conflicted record", () => {
   expect(replicaStateVisible("conflicted", "owner")).toBe(false);
 });
+
+for (const policy of cases)
+  for (const reader of ["owner", "grant"] as const)
+    it(`${policy.owner}/${policy.grant}: corruption quarantine hides local ${reader} rows`, () => {
+      expect(replicaStateVisible("quarantined", reader, policy, "local")).toBe(
+        false,
+      );
+    });

@@ -1421,7 +1421,14 @@ it("pending reset and deletion follow canonical lifecycle semantics without muta
     id: "delete",
     envelope: batch([deletion]),
   });
-  expect(preview(receiver)).toEqual([]);
+  expect(preview(receiver)).toMatchObject([
+    {
+      deleted: true,
+      data: {},
+      confirmation: "not yet confirmed",
+      visibility: "pending",
+    },
+  ]);
   expect(value(d)?.data.text).toBe("local");
   expect(d.store.getInstanceBinding("conn_a").deletedAt).toBeNull();
 });
@@ -1723,4 +1730,1183 @@ it("refuses a changed stage attempt without rewriting a confirmed batch state", 
       .get(),
   ).toEqual({ state: "confirmed" });
   expect(preview(receiver)).toHaveLength(1);
+});
+
+it("F1 expires owner pages when canonical or pending snapshot changes", () => {
+  const d = device();
+  d.store.ingestBatch(
+    ["a", "b"].map((key) => ({
+      instance: "conn_a",
+      stream: "messages",
+      key,
+      data: { id: key },
+      emitted_at: at,
+    })),
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  const receiver = stagePending(d, [
+    { ...upsert(50), recordKey: "z", data: { id: "z" } },
+  ]);
+  const options = {
+    reader: "owner" as const,
+    stream: "messages",
+    instanceIds: ["conn_a"],
+    limit: 1,
+    order: "asc" as const,
+  };
+  const first = receiver.readRecords(options);
+  expect(first.nextCursor).toBeDefined();
+  put(d, "changed-after-page");
+  expect(() =>
+    receiver.readRecords({ ...options, cursor: first.nextCursor }),
+  ).toThrow(/expired/);
+  const current = receiver.readRecords(options);
+  receiver.quarantine({
+    credential: "replica-secret",
+    id: "pending",
+    reason: "test",
+  });
+  expect(() =>
+    receiver.readRecords({ ...options, cursor: current.nextCursor }),
+  ).toThrow(/expired/);
+});
+
+it("F2 exposes pending record removals with the confirmation marker", () => {
+  const d = device();
+  put(d, "confirmed");
+  const {
+    data: _data,
+    blobs: _blobs,
+    ...op
+  } = upsert(50) as Extract<ReplicaOperation, { kind: "upsert" }>;
+  const deletion = { ...op, kind: "delete", deletedAt: at } as ReplicaOperation;
+  const receiver = stagePending(d, [registration(), deletion]);
+  const owner = receiver.readStore({ reader: "owner" });
+  expect(owner.getRecord("conn_a", "messages", "a")).toMatchObject({
+    deleted: true,
+    confirmation: "not yet confirmed",
+    visibility: "pending",
+  });
+  expect(
+    owner.listRecords("messages", {
+      instanceIds: ["conn_a"],
+      limit: 10,
+      order: "asc",
+    }).data,
+  ).toMatchObject([{ deleted: true, confirmation: "not yet confirmed" }]);
+  expect(
+    receiver.readStore().getRecord("conn_a", "messages", "a")?.data.text,
+  ).toBe("confirmed");
+});
+
+it("F3 bounded preview point, page, and summary work is independent of confirmed history and pending backlog", () => {
+  const work: number[] = [];
+  for (const size of [250, 1000]) {
+    const d = device();
+    d.store.ingestBatch(
+      Array.from({ length: size }, (_, n) => ({
+        instance: "conn_a",
+        stream: "messages",
+        key: String(n),
+        data: { id: String(n) },
+        emitted_at: at,
+      })),
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const receiver = stagePending(d);
+    for (let n = 0; n < size / 10; n++)
+      receiver.stage({
+        credential: "replica-secret",
+        id: `backlog-${n}`,
+        envelope: batch([
+          {
+            ...upsert(n + 100),
+            recordKey: `pending-${n}`,
+            data: { id: `pending-${n}` },
+          } as ReplicaOperation,
+        ]),
+      });
+    const prepare = d.db.prepare.bind(d.db);
+    let observedRows = 0;
+    d.db.prepare = ((sql: string) => {
+      const statement = prepare(sql);
+      return new Proxy(statement, {
+        get(target, property) {
+          if (property === "all")
+            return (...args: unknown[]) => {
+              const rows = target.all(...args);
+              observedRows += rows.length;
+              return rows;
+            };
+          if (property === "get")
+            return (...args: unknown[]) => {
+              const row = target.get(...args);
+              if (row !== undefined) observedRows++;
+              return row;
+            };
+          if (property === "iterate")
+            return function* (...args: unknown[]) {
+              for (const row of target.iterate(...args)) {
+                observedRows++;
+                yield row;
+              }
+            };
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }) as typeof d.db.prepare;
+    const owner = receiver.readStore({ reader: "owner" });
+    expect(owner.getRecord("conn_a", "messages", "a")?.data.text).toBe(
+      "remote-20",
+    );
+    expect(
+      owner.listRecords("messages", {
+        instanceIds: ["conn_a"],
+        limit: 10,
+        order: "asc",
+      }).data,
+    ).toHaveLength(10);
+    expect(owner.listStreams(["conn_a"])[0].recordCount).toBe(
+      size + 1 + size / 10,
+    );
+    work.push(observedRows);
+  }
+  expect(work[0]).toBeLessThanOrEqual(20);
+  expect(work[1]).toBeLessThanOrEqual(20);
+  expect(work[1]).toBe(work[0]);
+}, 20000);
+
+it("two devices resolve conflicting pending values by the existing tuple order and recover on quarantine", () => {
+  const a = device(),
+    b = device();
+  const left = {
+    ...upsert(50),
+    revision: { counter: 50, writerId: "device-a", operationId: "edit" },
+    data: { id: "a", text: "left" },
+  } as ReplicaOperation;
+  const right = {
+    ...upsert(50),
+    revision: { counter: 50, writerId: "device-b", operationId: "edit" },
+    data: { id: "a", text: "right" },
+  } as ReplicaOperation;
+  for (const [d, ops] of [
+    [a, [left, right]],
+    [b, [right, left]],
+  ] as const) {
+    put(d, "confirmed");
+    const r = stagePending(
+      d,
+      [
+        registration(),
+        ops[0],
+        {
+          ...upsert(60),
+          recordKey: "z",
+          data: { id: "z" },
+        } as ReplicaOperation,
+      ],
+      "first",
+    );
+    r.stage({
+      credential: "replica-secret",
+      id: "second",
+      envelope: batch([ops[1]]),
+    });
+    expect(preview(r)[0]).toMatchObject({
+      data: { text: "right" },
+      confirmation: "not yet confirmed",
+    });
+    const pageOptions = {
+      reader: "owner" as const,
+      stream: "messages",
+      instanceIds: ["conn_a"],
+      limit: 1,
+      order: "asc" as const,
+    };
+    const page = r.readRecords(pageOptions);
+    expect(page.nextCursor).toBeDefined();
+    const winningId = ops[0] === right ? "first" : "second";
+    r.quarantine({
+      credential: "replica-secret",
+      id: winningId,
+      reason: "unfinalized fork",
+    });
+    expect(() =>
+      r.readRecords({ ...pageOptions, cursor: page.nextCursor }),
+    ).toThrow(/expired/);
+    expect(preview(r)[0]).toMatchObject({
+      data: { text: "left" },
+      confirmation: "not yet confirmed",
+    });
+  }
+});
+
+it("F1 resumes equal timestamp/key tuples across connections in both reader views and orders", () => {
+  const d = device();
+  d.store.registerConnection({
+    instance: "conn_b",
+    sourceId,
+    method: "collector",
+    label: "B",
+  });
+  for (const instance of ["conn_a", "conn_b"])
+    d.store.ingestBatch(
+      ["a", "b"].map((key) => ({
+        instance,
+        stream: "messages",
+        key,
+        data: { id: key },
+        emitted_at: at,
+      })),
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+  const receiver = pendingReceiver(d);
+  for (const reader of ["owner", "grant"] as const)
+    for (const order of ["asc", "desc"] as const) {
+      const rows: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = receiver.readRecords({
+          reader,
+          stream: "messages",
+          instanceIds: ["conn_b", "conn_a"],
+          limit: 1,
+          order,
+          cursor,
+        });
+        rows.push(
+          ...page.data.map((row) => `${row.recordKey}:${row.instance}`),
+        );
+        cursor = page.nextCursor;
+      } while (cursor && rows.length < 10);
+      const expected = ["a:conn_a", "a:conn_b", "b:conn_a", "b:conn_b"];
+      expect(rows).toEqual(order === "asc" ? expected : expected.reverse());
+    }
+});
+
+it("F1 expires confirmed app pages on canonical changes and binds cursors to reader and connection scope", () => {
+  const d = device();
+  d.store.ingestBatch(
+    ["a", "b"].map((key) => ({
+      instance: "conn_a",
+      stream: "messages",
+      key,
+      data: { id: key },
+      emitted_at: at,
+    })),
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  const receiver = pendingReceiver(d);
+  const options = {
+    stream: "messages",
+    instanceIds: ["conn_a"],
+    limit: 1,
+    order: "asc" as const,
+    reader: "grant" as const,
+  };
+  const first = receiver.readRecords(options);
+  expect(first.nextCursor).toBeDefined();
+  expect(() =>
+    receiver.readRecords({
+      ...options,
+      reader: "owner",
+      cursor: first.nextCursor,
+    }),
+  ).toThrow(/expired/);
+  expect(() =>
+    receiver.readRecords({
+      ...options,
+      instanceIds: ["conn_a", "conn_b"],
+      cursor: first.nextCursor,
+    }),
+  ).toThrow(/expired/);
+  put(d, "updated");
+  expect(() =>
+    receiver.readRecords({ ...options, cursor: first.nextCursor }),
+  ).toThrow(/expired/);
+});
+
+it.each(["connection-reset", "connection-delete"] as const)(
+  "F2 preserves removal markers for pending-only records during %s and restores on quarantine",
+  (kind) => {
+    const d = device();
+    const receiver = stagePending(d);
+    const lifecycle = {
+      ...registration(),
+      kind,
+      generation: 2,
+      ...(kind === "connection-reset" ? { previousGeneration: 1 } : {}),
+      revision: { counter: 50, writerId: "remote", operationId: "lifecycle" },
+    } as ReplicaOperation;
+    receiver.stage({
+      credential: "replica-secret",
+      id: "lifecycle",
+      envelope: batch([lifecycle]),
+    });
+    const owner = receiver.readStore({ reader: "owner" });
+    expect(owner.getRecord("conn_a", "messages", "a")).toMatchObject({
+      deleted: true,
+      data: {},
+      confirmation: "not yet confirmed",
+      visibility: "pending",
+    });
+    expect(owner.listStreams(["conn_a"])).toMatchObject([
+      {
+        recordCount: 0,
+        confirmation: "not yet confirmed",
+        visibility: "pending",
+      },
+    ]);
+    receiver.quarantine({
+      credential: "replica-secret",
+      id: "lifecycle",
+      reason: "fork",
+    });
+    expect(owner.getRecord("conn_a", "messages", "a")).toMatchObject({
+      deleted: false,
+      data: { text: "remote-20" },
+      visibility: "pending",
+    });
+    receiver.quarantine({
+      credential: "replica-secret",
+      id: "pending",
+      reason: "fork",
+    });
+    expect(owner.getRecord("conn_a", "messages", "a")).toBeUndefined();
+    expect(owner.listStreams(["conn_a"])).toEqual([]);
+  },
+);
+
+it("F3 recovers the materialized view and pending withdrawal across restart and canonical writes without an attached receiver", () => {
+  const d = device();
+  const receiver = stagePending(d, [registration(), upsert(100)]);
+  const options = {
+    stream: "messages",
+    instanceIds: ["conn_a"],
+    limit: 1,
+    order: "asc" as const,
+    reader: "owner" as const,
+  };
+  receiver.stage({
+    credential: "replica-secret",
+    id: "other",
+    envelope: batch([
+      { ...upsert(101), recordKey: "z", data: { id: "z" } } as ReplicaOperation,
+    ]),
+  });
+  const before = receiver.readRecords(options);
+  d.reopen();
+  put(d, "canonical-during-detach");
+  const restarted = pendingReceiver(d);
+  expect(() =>
+    restarted.readRecords({ ...options, cursor: before.nextCursor }),
+  ).toThrow(/expired/);
+  expect(
+    restarted
+      .readStore({ reader: "owner" })
+      .getRecord("conn_a", "messages", "a")?.data.text,
+  ).toBe("remote-100");
+  restarted.quarantine({
+    credential: "replica-secret",
+    id: "pending",
+    reason: "fork",
+  });
+  expect(
+    restarted
+      .readStore({ reader: "owner" })
+      .getRecord("conn_a", "messages", "a")?.data.text,
+  ).toBe("canonical-during-detach");
+  d.reopen();
+  expect(
+    pendingReceiver(d)
+      .readStore({ reader: "owner" })
+      .getRecord("conn_a", "messages", "a")?.data.text,
+  ).toBe("canonical-during-detach");
+});
+
+it("F3 page continuation seeks the full indexed tuple in canonical and preview tables", () => {
+  const d = device();
+  d.store.ingestBatch(
+    Array.from({ length: 100 }, (_, n) => ({
+      instance: "conn_a",
+      stream: "messages",
+      key: String(n).padStart(3, "0"),
+      data: { id: String(n).padStart(3, "0") },
+      emitted_at: at,
+    })),
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  const receiver = stagePending(d);
+  const prepare = d.db.prepare.bind(d.db);
+  const plans: string[] = [];
+  d.db.prepare = ((sql: string) => {
+    const statement = prepare(sql);
+    if (!sql.startsWith("SELECT * FROM (")) return statement;
+    return new Proxy(statement, {
+      get(target, property) {
+        if (property === "all")
+          return (...args: unknown[]) => {
+            plans.push(
+              ...(
+                prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args) as {
+                  detail: string;
+                }[]
+              ).map((row) => row.detail),
+            );
+            return target.all(...args);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }) as typeof d.db.prepare;
+  for (const reader of ["owner", "grant"] as const) {
+    const options = {
+      stream: "messages",
+      instanceIds: ["conn_a"],
+      limit: 10,
+      order: "asc" as const,
+      reader,
+    };
+    const page = receiver.readRecords(options);
+    receiver.readRecords({ ...options, cursor: page.nextCursor });
+  }
+  expect(
+    plans.filter((plan) =>
+      /SEARCH .*\(instance=\? AND stream=\? AND \(emitted_at,record_key\)>\(\?,\?\)\)/.test(
+        plan,
+      ),
+    ),
+  ).toHaveLength(2);
+});
+
+it("F1 pending-only stage and quarantine expire owner pages while confirmed app pages continue", () => {
+  const d = device();
+  d.store.ingestBatch(
+    ["a", "b", "c"].map((key) => ({
+      instance: "conn_a",
+      stream: "messages",
+      key,
+      data: { id: key },
+      emitted_at: at,
+    })),
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  const receiver = pendingReceiver(d);
+  const options = {
+    stream: "messages",
+    instanceIds: ["conn_a"],
+    limit: 1,
+    order: "asc" as const,
+  };
+  const app = receiver.readRecords({ ...options, reader: "grant" });
+  const owner = receiver.readRecords({ ...options, reader: "owner" });
+  receiver.stage({
+    credential: "replica-secret",
+    id: "pending",
+    envelope: batch([
+      registration(),
+      { ...upsert(50), recordKey: "z", data: { id: "z" } } as ReplicaOperation,
+    ]),
+  });
+  expect(() =>
+    receiver.readRecords({
+      ...options,
+      reader: "owner",
+      cursor: owner.nextCursor,
+    }),
+  ).toThrow(/expired/);
+  const appSecond = receiver.readRecords({
+    ...options,
+    reader: "grant",
+    cursor: app.nextCursor,
+  });
+  expect(appSecond.data[0].recordKey).toBe("b");
+  const ownerCurrent = receiver.readRecords({ ...options, reader: "owner" });
+  receiver.quarantine({
+    credential: "replica-secret",
+    id: "pending",
+    reason: "fork",
+  });
+  expect(() =>
+    receiver.readRecords({
+      ...options,
+      reader: "owner",
+      cursor: ownerCurrent.nextCursor,
+    }),
+  ).toThrow(/expired/);
+  expect(
+    receiver.readRecords({
+      ...options,
+      reader: "grant",
+      cursor: appSecond.nextCursor,
+    }).data[0].recordKey,
+  ).toBe("c");
+});
+
+it("F3 redundant compatible registration staging reconciles only affected keys", () => {
+  const work: number[] = [];
+  for (const size of [20, 200]) {
+    const d = device();
+    d.store.ingestBatch(
+      Array.from({ length: size }, (_, n) => ({
+        instance: "conn_a",
+        stream: "messages",
+        key: String(n),
+        data: { id: String(n) },
+        emitted_at: at,
+      })),
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const receiver = pendingReceiver(d);
+    const prepare = d.db.prepare.bind(d.db);
+    let observed = 0;
+    d.db.prepare = ((sql: string) => {
+      const statement = prepare(sql);
+      return new Proxy(statement, {
+        get(target, property) {
+          if (property === "all")
+            return (...args: unknown[]) => {
+              const rows = target.all(...args);
+              observed += rows.length;
+              return rows;
+            };
+          if (property === "get")
+            return (...args: unknown[]) => {
+              const row = target.get(...args);
+              if (row !== undefined) observed++;
+              return row;
+            };
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }) as typeof d.db.prepare;
+    receiver.stage({
+      credential: "replica-secret",
+      id: "pending",
+      envelope: batch([registration(), upsert(50)]),
+    });
+    work.push(observed);
+  }
+  expect(work[1]).toBe(work[0]);
+  expect(work[1]).toBeLessThan(40);
+});
+
+it.each(["pending", "confirmed"] as const)(
+  "retry revalidates trusted declarations for %s rows and restores visibility",
+  (state) => {
+    const d = device();
+    let allowed = true;
+    let trusted: MergeContext["declarations"] = [
+      {
+        sourceId,
+        binding,
+        validateData: (data) => allowed && typeof data.id === "string",
+      },
+    ];
+    const receiver = createReplicaReceiver({
+      db: d.db,
+      store: d.store,
+      owner: "owner",
+      enabled: true,
+      authenticate: (credential) =>
+        credential === "replica-secret" ? "owner" : undefined,
+      declarations: () => trusted,
+    });
+    if (state === "pending")
+      receiver.stage({
+        credential: "replica-secret",
+        id: "pending",
+        envelope: batch([registration(), upsert()]),
+      });
+    else
+      receiver.import({
+        credential: "replica-secret",
+        envelope: batch([registration(), upsert()]),
+      });
+    const owner = receiver.readStore({ reader: "owner" });
+    const assertVisible = () => {
+      expect(owner.getRecord("conn_a", "messages", "a")).toMatchObject({
+        deleted: false,
+        data: { text: "remote-20" },
+      });
+      expect(owner.getRecord("conn_a", "messages", "a")?.confirmation).toBe(
+        state === "pending" ? "not yet confirmed" : undefined,
+      );
+      expect(
+        receiver.readStore().getRecord("conn_a", "messages", "a")?.data.text,
+      ).toBe(state === "confirmed" ? "remote-20" : undefined);
+    };
+    const assertWithdrawn = () => {
+      expect(owner.getRecord("conn_a", "messages", "a")).toBeUndefined();
+      expect(
+        owner.listRecords("messages", {
+          instanceIds: ["conn_a"],
+          limit: 10,
+          order: "asc",
+        }).data,
+      ).toEqual([]);
+      expect(owner.listStreams(["conn_a"])).toEqual([]);
+      expect(
+        receiver.readStore().getRecord("conn_a", "messages", "a"),
+      ).toBeUndefined();
+    };
+    assertVisible();
+    allowed = false;
+    receiver.retry({ credential: "replica-secret" });
+    assertWithdrawn();
+    allowed = true;
+    receiver.retry({ credential: "replica-secret" });
+    assertVisible();
+    const original = trusted;
+    trusted = [];
+    receiver.retry({ credential: "replica-secret" });
+    assertWithdrawn();
+    trusted = original;
+    receiver.retry({ credential: "replica-secret" });
+    assertVisible();
+  },
+);
+
+// The hardening lane owns migration 18 and the fact writer. This exact fixture
+// composes its read seam without implementing source-identity decisions here.
+function installBindingConflictFixture(d: ReturnType<typeof device>) {
+  d.db
+    .exec(`CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY);
+    CREATE INDEX IF NOT EXISTS idx_pdpp_mutation_journal_local_key ON pdpp_mutation_journal(connection_id,generation,stream,record_key,sequence DESC);`);
+  return (instance = "conn_a") => {
+    d.db
+      .prepare("INSERT INTO pdpp_replica_binding_conflicts VALUES (?)")
+      .run(instance);
+  };
+}
+
+it.each([false, true])(
+  "account conflict exposes only the local journal value to owners with pending enabled=%s",
+  (enabled) => {
+    const d = device();
+    const conflict = installBindingConflictFixture(d);
+    put(d, "known-local");
+    const local = value(d)!;
+    const receiver = pendingReceiver(d, true, {
+      owner: "confirmed-only",
+      grant: "include-pending",
+    });
+    receiver.import({
+      credential: "replica-secret",
+      envelope: batch([
+        registration(),
+        upsert(500),
+        {
+          ...upsert(501),
+          recordKey: "received-only",
+          data: { id: "received-only" },
+        } as ReplicaOperation,
+      ]),
+    });
+    receiver.stage({
+      credential: "replica-secret",
+      id: "pending",
+      envelope: batch([upsert(600)]),
+    });
+    receiver.setPendingEnabled(enabled);
+    const canonicalBefore = d.db.prepare("SELECT * FROM pdpp_records").all();
+    const historyBefore = d.db
+      .prepare("SELECT * FROM pdpp_record_changes")
+      .all();
+    conflict();
+    const owner = receiver.readStore({ reader: "owner" });
+    expect(owner.getRecord("conn_a", "messages", "a")).toEqual({
+      ...local,
+      visibility: "conflicted",
+      status: "account conflict",
+    });
+    expect(
+      owner.getRecord("conn_a", "messages", "received-only"),
+    ).toBeUndefined();
+    expect(
+      owner.listRecords("messages", {
+        instanceIds: ["conn_a"],
+        limit: 1,
+        order: "asc",
+      }).data,
+    ).toEqual([
+      { ...local, visibility: "conflicted", status: "account conflict" },
+    ]);
+    expect(owner.listStreams(["conn_a"])).toMatchObject([
+      { recordCount: 1, visibility: "conflicted", status: "account conflict" },
+    ]);
+    expect(owner.connectionVisibility("conn_a")).toEqual({
+      state: "conflicted",
+      reason: "source_binding",
+    });
+    const grant = receiver.readStore();
+    expect(grant.getRecord("conn_a", "messages", "a")).toBeUndefined();
+    expect(
+      grant.listRecords("messages", {
+        instanceIds: ["conn_a"],
+        limit: 10,
+        order: "asc",
+      }).data,
+    ).toEqual([]);
+    expect(grant.listStreams(["conn_a"])).toEqual([]);
+    expect(d.db.prepare("SELECT * FROM pdpp_records").all()).toEqual(
+      canonicalBefore,
+    );
+    expect(d.db.prepare("SELECT * FROM pdpp_record_changes").all()).toEqual(
+      historyBefore,
+    );
+  },
+);
+
+it("account conflict keeps local tombstones, current-generation identity, and installation provenance authoritative", () => {
+  const d = device();
+  const conflict = installBindingConflictFixture(d);
+  put(d, "deleted-local");
+  d.store.deleteRecord("conn_a", "messages", "a", at, "mutable_state");
+  const receiver = pendingReceiver(d);
+  receiver.import({
+    credential: "replica-secret",
+    envelope: batch([registration(), upsert(500)]),
+  });
+  conflict();
+  expect(
+    receiver
+      .readStore({ reader: "owner" })
+      .getRecord("conn_a", "messages", "a"),
+  ).toBeUndefined();
+  d.store.resetInstanceBinding({
+    instance: "conn_a",
+    expectedMethod: "collector",
+    expectedGeneration: 1,
+    nextMethod: "collector",
+  });
+  d.store.ingestBatch(
+    [
+      {
+        instance: "conn_a",
+        stream: "messages",
+        key: "b",
+        data: { id: "b", text: "current-local" },
+        emitted_at: at,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 2 },
+  );
+  const local = d.store.getRecord("conn_a", "messages", "b")!;
+  d.db
+    .prepare(
+      `INSERT INTO pdpp_mutation_journal(operation_id,writer_id,source_id,connection_id,method,generation,stream,record_key,operation,value_json,blob_ids_json)
+    SELECT 'foreign-journal-writer','foreign',source_id,connection_id,method,generation,stream,record_key,operation,json_set(value_json,'$.data.text','foreign'),blob_ids_json FROM pdpp_mutation_journal WHERE record_key='b' ORDER BY sequence DESC LIMIT 1`,
+    )
+    .run();
+  receiver.retry({ credential: "replica-secret" });
+  const owner = receiver.readStore({ reader: "owner" });
+  expect(owner.getRecord("conn_a", "messages", "a")).toBeUndefined();
+  expect(owner.getRecord("conn_a", "messages", "b")).toEqual({
+    ...local,
+    visibility: "conflicted",
+    status: "account conflict",
+  });
+  d.reopen();
+  expect(
+    pendingReceiver(d)
+      .readStore({ reader: "owner" })
+      .getRecord("conn_a", "messages", "b"),
+  ).toEqual({ ...local, visibility: "conflicted", status: "account conflict" });
+});
+
+it("account conflict grants no local provenance to unbound legacy journal rows", () => {
+  const d = device(false);
+  const conflict = installBindingConflictFixture(d);
+  d.store.ingestBatch(
+    [
+      {
+        instance: "legacy",
+        stream: "messages",
+        key: "a",
+        data: { id: "a" },
+        emitted_at: at,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+  );
+  const receiver = pendingReceiver(d);
+  conflict("legacy");
+  expect(
+    receiver
+      .readStore({ reader: "owner" })
+      .getRecord("legacy", "messages", "a"),
+  ).toBeUndefined();
+  expect(
+    receiver.readStore({ reader: "owner" }).listStreams(["legacy"]),
+  ).toEqual([]);
+});
+
+it("account conflict local blobs follow local journal references and corruption quarantine always wins at read time", () => {
+  const d = device();
+  const conflict = installBindingConflictFixture(d);
+  const bytes = new Uint8Array([1, 7, 9]);
+  const blob = d.store.storeBlobBytesForInstance({
+    instance: "conn_a",
+    method: "collector",
+    generation: 1,
+    bytes,
+    mimeType: "application/octet-stream",
+  });
+  d.store.ingestBatch(
+    [
+      {
+        instance: "conn_a",
+        stream: "messages",
+        key: "a",
+        data: { id: "a", blob_ref: { blob_id: blob.blobId } },
+        emitted_at: at,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  const receiver = pendingReceiver(d);
+  receiver.import({
+    credential: "replica-secret",
+    envelope: batch([registration(), upsert(500)]),
+  });
+  conflict();
+  const owner = receiver.readStore({ reader: "owner" });
+  expect(owner.findBlobReferences(blob.blobId)).toEqual([
+    { instance: "conn_a", stream: "messages", recordKey: "a" },
+  ]);
+  expect(owner.getBlobMeta(blob.blobId)).toEqual(blob);
+  expect([...owner.getBlobBytes(blob.blobId)!]).toEqual([...bytes]);
+  expect(receiver.readStore().findBlobReferences(blob.blobId)).toEqual([]);
+  expect(receiver.readStore().getBlobMeta(blob.blobId)).toBeUndefined();
+  expect(receiver.readStore().getBlobBytes(blob.blobId)).toBeUndefined();
+  d.db
+    .prepare(
+      "INSERT INTO pdpp_replica_quarantined_keys VALUES ('conn_a',1,'messages','a')",
+    )
+    .run();
+  expect(owner.getRecord("conn_a", "messages", "a")).toBeUndefined();
+  expect(
+    owner.listRecords("messages", {
+      instanceIds: ["conn_a"],
+      limit: 10,
+      order: "asc",
+    }).data,
+  ).toEqual([]);
+  expect(owner.findBlobReferences(blob.blobId)).toEqual([]);
+  expect(owner.getBlobBytes(blob.blobId)).toBeUndefined();
+});
+
+it.each(["owner", "grant"] as const)(
+  "corruption quarantine filters stale %s materializations on point, page, and blob reads",
+  (reader) => {
+    const d = device();
+    put(d, "local");
+    const receiver = stagePending(d);
+    const read = receiver.readStore({ reader });
+    expect(read.getRecord("conn_a", "messages", "a")).toBeDefined();
+    d.db
+      .prepare(
+        "INSERT INTO pdpp_replica_quarantined_keys VALUES ('conn_a',1,'messages','a')",
+      )
+      .run();
+    expect(read.getRecord("conn_a", "messages", "a")).toBeUndefined();
+    expect(
+      read.listRecords("messages", {
+        instanceIds: ["conn_a"],
+        limit: 10,
+        order: "asc",
+      }).data,
+    ).toEqual([]);
+  },
+);
+
+it.each(["owner", "grant"] as const)(
+  "F1 %s cursor ignores unrelated connection canonical and pending mutations",
+  (reader) => {
+    const d = device();
+    d.store.registerConnection({
+      instance: "conn_b",
+      sourceId,
+      method: "collector",
+      label: "B",
+    });
+    d.store.ingestBatch(
+      ["a", "b", "c", "d"].map((key) => ({
+        instance: "conn_a",
+        stream: "messages",
+        key,
+        data: { id: key },
+        emitted_at: at,
+      })),
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const receiver = pendingReceiver(d);
+    const options = {
+      reader,
+      stream: "messages",
+      instanceIds: ["conn_a"],
+      limit: 1,
+      order: "asc" as const,
+    };
+    const first = receiver.readRecords(options);
+    d.store.ingestBatch(
+      [
+        {
+          instance: "conn_b",
+          stream: "messages",
+          key: "other",
+          data: { id: "other" },
+          emitted_at: at,
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const second = receiver.readRecords({
+      ...options,
+      cursor: first.nextCursor,
+    });
+    expect(second.data[0].recordKey).toBe("b");
+    receiver.stage({
+      credential: "replica-secret",
+      id: "unrelated",
+      envelope: batch([
+        {
+          ...upsert(90),
+          connectionId: "conn_b",
+          recordKey: "remote",
+          data: { id: "remote" },
+        } as ReplicaOperation,
+      ]),
+    });
+    const third = receiver.readRecords({
+      ...options,
+      cursor: second.nextCursor,
+    });
+    expect(third.data[0].recordKey).toBe("c");
+    receiver.quarantine({
+      credential: "replica-secret",
+      id: "unrelated",
+      reason: "fork",
+    });
+    expect(
+      receiver.readRecords({ ...options, cursor: third.nextCursor }).data[0]
+        .recordKey,
+    ).toBe("d");
+  },
+);
+
+it("corruption quarantine excludes retained canonical rows from flag-off stream summaries", () => {
+  const d = device();
+  d.store.ingestBatch(
+    ["a", "b"].map((key) => ({
+      instance: "conn_a",
+      stream: "messages",
+      key,
+      data: { id: key },
+      emitted_at: at,
+    })),
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  const receiver = pendingReceiver(d, false);
+  d.db
+    .prepare(
+      "INSERT INTO pdpp_replica_quarantined_keys VALUES ('conn_a',1,'messages','a')",
+    )
+    .run();
+  expect(
+    receiver.readStore({ reader: "owner" }).listStreams(["conn_a"]),
+  ).toMatchObject([{ recordCount: 1 }]);
+  expect(receiver.readStore().listStreams(["conn_a"])).toMatchObject([
+    { recordCount: 1 },
+  ]);
+});
+
+it.each(["owner", "grant"] as const)(
+  "F1 mixed-scope %s pages ignore hidden conflicted received and pending churn",
+  (reader) => {
+    const d = device();
+    const conflict = installBindingConflictFixture(d);
+    put(d, "known-local");
+    d.store.registerConnection({
+      instance: "conn_b",
+      sourceId,
+      method: "collector",
+      label: "B",
+    });
+    d.store.ingestBatch(
+      ["b", "c", "d", "e", "f"].map((key) => ({
+        instance: "conn_b",
+        stream: "messages",
+        key,
+        data: { id: key },
+        emitted_at: at,
+      })),
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const receiver = pendingReceiver(d);
+    conflict();
+    const options = {
+      reader,
+      stream: "messages",
+      instanceIds: ["conn_a", "conn_b"],
+      limit: 1,
+      order: "asc" as const,
+    };
+    let page = receiver.readRecords(options);
+    const ownerBefore = receiver.readRecords({ ...options, reader: "owner" });
+    receiver.import({
+      credential: "replica-secret",
+      envelope: batch([registration(), upsert(500)]),
+    });
+    page = receiver.readRecords({ ...options, cursor: page.nextCursor });
+    receiver.stage({
+      credential: "replica-secret",
+      id: "hidden",
+      envelope: batch([upsert(600)]),
+    });
+    page = receiver.readRecords({ ...options, cursor: page.nextCursor });
+    receiver.quarantine({
+      credential: "replica-secret",
+      id: "hidden",
+      reason: "fork",
+    });
+    page = receiver.readRecords({ ...options, cursor: page.nextCursor });
+    // A real local-journal mutation changes the owner projection, while remaining
+    // invisible to the app. The fixture appends through the installation writer.
+    d.db
+      .prepare(
+        `INSERT INTO pdpp_mutation_journal(operation_id,writer_id,source_id,connection_id,method,generation,stream,record_key,operation,value_json,blob_ids_json)
+    SELECT 'next-local-value',writer_id,source_id,connection_id,method,generation,stream,record_key,operation,json_set(value_json,'$.data.text','new-local','$.version',2),blob_ids_json FROM pdpp_mutation_journal WHERE connection_id='conn_a' ORDER BY sequence DESC LIMIT 1`,
+      )
+      .run();
+    expect(() =>
+      receiver.readRecords({
+        ...options,
+        reader: "owner",
+        cursor: ownerBefore.nextCursor,
+      }),
+    ).toThrow(/expired/);
+    if (reader === "grant")
+      expect(
+        receiver.readRecords({ ...options, cursor: page.nextCursor }).data[0]
+          .recordKey,
+      ).toBe("f");
+  },
+);
+
+it("canonical change feeds validate original scope, exclude all conflicted history, and apply the shared quarantine predicate", () => {
+  const d = device();
+  const conflict = installBindingConflictFixture(d);
+  d.store.ingestBatch(
+    ["a", "healthy"].map((key) => ({
+      instance: "conn_a",
+      stream: "messages",
+      key,
+      data: { id: key },
+      emitted_at: at,
+    })),
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  d.store.registerConnection({
+    instance: "conn_b",
+    sourceId,
+    method: "collector",
+    label: "B",
+  });
+  d.store.ingestBatch(
+    [
+      {
+        instance: "conn_b",
+        stream: "messages",
+        key: "b",
+        data: { id: "b" },
+        emitted_at: at,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  const receiver = pendingReceiver(d);
+  d.db
+    .prepare(
+      "INSERT INTO pdpp_replica_quarantined_keys VALUES ('conn_a',1,'messages','a')",
+    )
+    .run();
+  const options = { instanceIds: ["conn_a", "conn_b"], limit: 10 };
+  expect(
+    receiver
+      .readStore()
+      .changesSince("messages", options)
+      .data.map((row) => row.recordKey),
+  ).toEqual(["b", "healthy"]);
+  const old = receiver
+    .readStore()
+    .changesSince("messages", { ...options, limit: 1 });
+  conflict();
+  const clock = d.db
+    .prepare(
+      "UPDATE pdpp_write_clock SET value=value+1 WHERE id=1 RETURNING value",
+    )
+    .get() as { value: number };
+  d.db
+    .prepare(
+      "UPDATE pdpp_instance_binding SET reset_clock=? WHERE instance='conn_a'",
+    )
+    .run(clock.value);
+  for (const reader of ["owner", "grant"] as const) {
+    const read = receiver.readStore({ reader });
+    expect(() =>
+      read.changesSince("messages", { ...options, cursor: old.nextCursor }),
+    ).toThrow(/expired/);
+    expect(
+      read.changesSince("messages", options).data.map((row) => row.recordKey),
+    ).toEqual(["b"]);
+    const hidden = read.changesSince("messages", {
+      instanceIds: ["conn_a"],
+      limit: 10,
+    });
+    expect(hidden.data).toEqual([]);
+    expect(hidden.nextChangesSince).toBeDefined();
+  }
+  expect(
+    d.store.changesSinceForInstances(
+      "messages",
+      { instanceIds: ["conn_a"], limit: 10 },
+      ["conn_b"],
+    ).data,
+  ).toEqual([]);
 });
