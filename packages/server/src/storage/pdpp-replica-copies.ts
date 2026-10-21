@@ -49,14 +49,15 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_copy_rejects (
 CREATE TRIGGER IF NOT EXISTS pdpp_copy_rejects_no_update BEFORE UPDATE ON pdpp_replica_copy_rejects BEGIN SELECT RAISE(ABORT, 'copy rejects are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_copy_rejects_no_delete BEFORE DELETE ON pdpp_replica_copy_rejects BEGIN SELECT RAISE(ABORT, 'copy rejects are append-only'); END;
 CREATE TABLE IF NOT EXISTS pdpp_replica_finalized_facts (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
   chain_id INTEGER NOT NULL, registry TEXT NOT NULL, owner TEXT NOT NULL,
   scope TEXT NOT NULL, fragment_index INTEGER NOT NULL, id TEXT NOT NULL,
   current_version TEXT NOT NULL, status TEXT NOT NULL, commitment TEXT NOT NULL,
   block_number TEXT NOT NULL, block_hash TEXT NOT NULL, eligible INTEGER NOT NULL,
-  observed_at INTEGER NOT NULL,
-  PRIMARY KEY (chain_id, registry, owner, scope, block_hash)
+  observed_at INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS pdpp_finalized_facts_id ON pdpp_replica_finalized_facts(id, fragment_index);
+CREATE INDEX IF NOT EXISTS pdpp_finalized_facts_id ON pdpp_replica_finalized_facts(id, fragment_index, seq);
+CREATE INDEX IF NOT EXISTS pdpp_finalized_facts_scope ON pdpp_replica_finalized_facts(scope, seq);
 CREATE TRIGGER IF NOT EXISTS pdpp_finalized_facts_no_update BEFORE UPDATE ON pdpp_replica_finalized_facts BEGIN SELECT RAISE(ABORT, 'finalized facts are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_finalized_facts_no_delete BEFORE DELETE ON pdpp_replica_finalized_facts BEGIN SELECT RAISE(ABORT, 'finalized facts are append-only'); END;
 CREATE TABLE IF NOT EXISTS pdpp_replica_batch_disposition (
@@ -185,7 +186,7 @@ export function createReplicaCopies(deps: {
   function evidence(id: string): Map<number, IndexEvidence> {
     const facts = db
       .prepare(
-        "SELECT * FROM pdpp_replica_finalized_facts WHERE id=? ORDER BY fragment_index",
+        "SELECT * FROM pdpp_replica_finalized_facts WHERE id=? ORDER BY fragment_index,seq",
       )
       .all(id) as {
       fragment_index: number;
@@ -483,10 +484,55 @@ export function createReplicaCopies(deps: {
     }): boolean {
       if (input.fact.owner.toLowerCase() !== deps.owner.toLowerCase())
         throw new ReplicaCopyRefused("fact_authority");
+      // A poll that observes the same state at a later block adds nothing a
+      // decision reads (the latest fact's content is unchanged), so polling
+      // a waiting slot does not grow the history.
+      const latest = (
+        db
+          .prepare(
+            "SELECT current_version,status,commitment,block_number,eligible FROM pdpp_replica_finalized_facts WHERE chain_id=? AND registry=? AND owner=? AND scope=? ORDER BY seq",
+          )
+          .all(
+            input.fact.chainId,
+            input.fact.registry.toLowerCase(),
+            input.fact.owner.toLowerCase(),
+            input.scope,
+          ) as {
+          current_version: string;
+          status: string;
+          commitment: string;
+          block_number: string;
+          eligible: number;
+        }[]
+      ).reduce<
+        | {
+            current_version: string;
+            status: string;
+            commitment: string;
+            block_number: string;
+            eligible: number;
+          }
+        | undefined
+      >(
+        (a, b) =>
+          a === undefined || BigInt(b.block_number) >= BigInt(a.block_number)
+            ? b
+            : a,
+        undefined,
+      );
+      if (
+        latest &&
+        BigInt(latest.block_number) <= input.fact.blockNumber &&
+        latest.current_version === input.fact.currentVersion &&
+        latest.status === input.fact.status &&
+        latest.commitment === input.fact.commitment.toLowerCase() &&
+        latest.eligible === (input.fact.eligible ? 1 : 0)
+      )
+        return false;
       return (
         db
           .prepare(
-            "INSERT OR IGNORE INTO pdpp_replica_finalized_facts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO pdpp_replica_finalized_facts (chain_id,registry,owner,scope,fragment_index,id,current_version,status,commitment,block_number,block_hash,eligible,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
           )
           .run(
             input.fact.chainId,

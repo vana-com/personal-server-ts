@@ -1,6 +1,6 @@
 import type { Database } from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { keccak256 } from "viem";
+import { keccak256, type Hex } from "viem";
 import { createHash } from "node:crypto";
 import {
   binaryWriter,
@@ -34,6 +34,7 @@ import {
   replicaRegistrationState,
   replicaAwaitingFinality,
   replicaRegistrationInactive,
+  replicaChainCommitment,
   type ReplicaTransportPort,
   type ReplicaRegistrationEvidence,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
@@ -58,7 +59,10 @@ import {
   type ReplicaPhase,
   type ReplicaPhaseOutcome,
 } from "@opendatalabs/personal-server-ts-core/replication/outcome";
+import { replicaCopyKey } from "@opendatalabs/personal-server-ts-core/replication/copy-promotion";
+import { REPLICA_REFETCH_BUDGET } from "./pdpp-replica-copies.js";
 import {
+  defaultReplicaBackoff,
   REPLICA_TERMINAL,
   replicaEligibleAt,
   replicaEligibleAtSql,
@@ -217,6 +221,8 @@ export function createReplicaTransportWorker(deps: {
    * conflict retracts data on the next step.
    */
   revalidateIntervalMs?: number;
+  /** Completed non-matching re-downloads of a batch before the owner decides. */
+  refetchBudget?: number;
 }) {
   const { db, transport } = deps;
   const now = deps.now ?? Date.now;
@@ -243,6 +249,9 @@ export function createReplicaTransportWorker(deps: {
   addColumns("pdpp_transport_batches", [
     ["total_bytes", "INTEGER"],
     ["admission_json", "TEXT"],
+  ]);
+  addColumns("pdpp_transport_import_work", [
+    ["refetch_attempts", "INTEGER NOT NULL DEFAULT 0"],
   ]);
   addColumns("pdpp_transport_inbox", [
     ["data_hash", "TEXT"],
@@ -1019,28 +1028,12 @@ export function createReplicaTransportWorker(deps: {
           metadataHash: row.metadata_hash ?? undefined,
         };
         const status = replicaRegistrationState(evidence, expected);
-        if (status === "conflict") {
-          const of = batchOfScope(row.scope);
-          return withPlan(
-            {
-              tag: "quarantine",
-              proof: {
-                reason: "immutable_registration_conflict",
-                key: row.scope,
-              },
-            },
-            () => {
-              if (of)
-                deps.receiver.quarantine({
-                  credential: deps.credential,
-                  id: canonicalJson([of.writer, of.batch]),
-                  reason: "finalized commitment conflict",
-                });
-            },
-          );
-        }
+        const record = factOf(row.scope, evidence);
+        // A finalized fact that disagrees with this fragment (or a version
+        // above one) is final for the slot. The batch's copy decision, not
+        // this phase, chooses refetch, owner or terminal.
         if (
-          status === "confirmed" &&
+          (status === "confirmed" || status === "conflict") &&
           row.data_hash !== null &&
           row.metadata_hash !== null
         ) {
@@ -1048,6 +1041,7 @@ export function createReplicaTransportWorker(deps: {
           return withPlan(
             { tag: "progress", receipt: { phase: "confirm", key: row.scope } },
             () => {
+              record?.();
               db.prepare(
                 "UPDATE pdpp_transport_inbox SET finalized=1 WHERE scope=?",
               ).run(row.scope);
@@ -1055,12 +1049,19 @@ export function createReplicaTransportWorker(deps: {
             },
           );
         }
-        if (
+        const waiting =
           replicaAwaitingFinality(evidence, expected) ||
           replicaRegistrationInactive(evidence, expected)
-        )
-          return verdict(finalityWait(evidence, row.scope));
-        return verdict({ tag: "retry", problem: "registration_unconfirmed" });
+            ? finalityWait(evidence, row.scope)
+            : ({
+                tag: "retry",
+                problem: "registration_unconfirmed",
+              } as const);
+        return record
+          ? withPlan(waiting, () => {
+              record();
+            })
+          : verdict(waiting);
       } catch (error) {
         // A hint never shortens this error backoff (see hintAllowsSql).
         return verdict(retryFromError(error, "evidence_unavailable"));
@@ -1146,6 +1147,52 @@ export function createReplicaTransportWorker(deps: {
         ).run(entry.scope);
     };
   }
+  /**
+   * A finalized fact disagrees with an imported slot. A copy-backed batch
+   * records the fact and takes the copy decision, which is terminal for a
+   * disproved promoted copy (contract A, H). A batch imported before copies
+   * existed retracts its identities as before.
+   */
+  async function importedConflict(
+    scope: string,
+    evidence: ReplicaRegistrationEvidence,
+  ): Promise<ReplicaAttempt> {
+    const header = db
+      .prepare(
+        "SELECT json_extract(fragment_json,'$.writer') AS writer, json_extract(fragment_json,'$.batch') AS batch, json_extract(fragment_json,'$.sequence') AS sequence FROM pdpp_transport_inbox WHERE scope=?",
+      )
+      .get(scope) as { writer: string; batch: string; sequence: number };
+    const id = canonicalJson([header.writer, header.batch]);
+    const legacy: ReplicaPhaseOutcome = {
+      tag: "quarantine",
+      proof: { reason: "immutable_registration_conflict", key: scope },
+    };
+    if (!deps.receiver.copies.list(id).length)
+      return withPlan(legacy, await quarantineRetained(scope));
+    const record = factOf(scope, evidence);
+    return {
+      outcome: legacy,
+      plan: () => {
+        record?.();
+        const decision = deps.receiver.copies.decide(id, {
+          attempts: 0,
+          budget: deps.refetchBudget ?? REPLICA_REFETCH_BUDGET,
+        });
+        if (decision.kind !== "terminal")
+          return { tag: "retry", problem: "commitment_mismatch" };
+        deps.receiver.copies.apply({
+          credential: deps.credential,
+          id,
+          decision,
+        });
+        quarantineWriterFrom(header.writer, header.sequence);
+        return {
+          tag: "quarantine",
+          proof: { reason: "finalized_conflict", key: id },
+        };
+      },
+    };
+  }
   const revalidate: ReplicaPhaseHandler<Item<Inbox>> = {
     phase: "revalidate",
     due(e, limit) {
@@ -1185,17 +1232,7 @@ export function createReplicaTransportWorker(deps: {
               metadataHash: row.metadata_hash,
             }),
         });
-        if (status === "conflict")
-          return withPlan(
-            {
-              tag: "quarantine",
-              proof: {
-                reason: "immutable_registration_conflict",
-                key: row.scope,
-              },
-            },
-            await quarantineRetained(row.scope),
-          );
+        if (status === "conflict") return importedConflict(row.scope, evidence);
         const checked = {
           tag: "progress" as const,
           receipt: { phase: "revalidate" as const, key: row.scope },
@@ -1250,17 +1287,7 @@ export function createReplicaTransportWorker(deps: {
         });
         // The exact retained bytes disagree with the finalized commitment: the
         // legacy slot is not the registered data. Withdraw it (finding j).
-        if (pinned === "conflict")
-          return withPlan(
-            {
-              tag: "quarantine",
-              proof: {
-                reason: "immutable_registration_conflict",
-                key: row.scope,
-              },
-            },
-            await quarantineRetained(row.scope),
-          );
+        if (pinned === "conflict") return importedConflict(row.scope, evidence);
         if (pinned !== "confirmed")
           throw new ReplicaProblemError("commitment_mismatch");
         return withPlan(checked, () =>
@@ -1304,6 +1331,197 @@ export function createReplicaTransportWorker(deps: {
   };
 
   // --------------------------------------------------------------- import
+  type Refetch = { attempts: number; budget: number };
+  type ImportFragment = {
+    scope: string;
+    finalized: number;
+    data_hash: string | null;
+    metadata_hash: string | null;
+  };
+  /**
+   * Fail closed at writer scope (contract H): every retained fragment of the
+   * writer from `sequence` on leaves import and revalidation.
+   */
+  function quarantineWriterFrom(writer: string, sequence: number) {
+    db.prepare(
+      "UPDATE pdpp_transport_inbox SET state='quarantined',outcome='quarantine',reason='finalized_conflict',error='finalized_conflict' WHERE fragment_json IS NOT NULL AND json_extract(fragment_json,'$.writer')=? AND json_extract(fragment_json,'$.sequence')>=?",
+    ).run(writer, sequence);
+  }
+  /** Durable acknowledgement of an imported batch, and its successor's wake. */
+  function acknowledge(
+    group: Group,
+    first: ReplicaFragment,
+    metadata: ImportFragment[],
+  ) {
+    if (
+      !db
+        .prepare(
+          "SELECT 1 FROM pdpp_transport_imported WHERE writer=? AND batch=?",
+        )
+        .get(group.writer, group.batch)
+    )
+      db.prepare("INSERT INTO pdpp_transport_imported VALUES (?,?,?,?)").run(
+        group.writer,
+        group.batch,
+        first.sequence,
+        first.digest,
+      );
+    for (const row of metadata)
+      db.prepare(
+        "UPDATE pdpp_transport_inbox SET state='imported',error=NULL WHERE scope=?",
+      ).run(row.scope);
+    wake(`predecessor:${group.writer}:${first.sequence}`, now());
+  }
+  /**
+   * The copy decision for one complete download of a batch (contract v3.1
+   * §3 "Coordinator step"). Runs inside the import outcome transaction, over
+   * the durable copies, facts and disposition it commits with.
+   */
+  function decideImport(
+    group: Group,
+    first: ReplicaFragment,
+    metadata: ImportFragment[],
+    stage: ((refetch: Refetch) => void) | undefined,
+  ): ReplicaPhaseOutcome {
+    const { writer, batch } = group;
+    const id = canonicalJson([writer, batch]);
+    const key = `${writer}:${batch}`;
+    const credential = deps.credential;
+    db.prepare(
+      "INSERT INTO pdpp_transport_import_work (writer,batch,sequence) VALUES (?,?,?) ON CONFLICT(writer,batch) DO NOTHING",
+    ).run(writer, batch, group.sequence);
+    const refetch: Refetch = {
+      attempts: (
+        db
+          .prepare(
+            "SELECT refetch_attempts FROM pdpp_transport_import_work WHERE writer=? AND batch=?",
+          )
+          .get(writer, batch) as { refetch_attempts: number }
+      ).refetch_attempts,
+      budget: deps.refetchBudget ?? REPLICA_REFETCH_BUDGET,
+    };
+    stage?.(refetch);
+    const decision = deps.receiver.copies.decide(id, refetch);
+    const terminal = (): ReplicaPhaseOutcome => {
+      quarantineWriterFrom(writer, first.sequence);
+      return {
+        tag: "quarantine",
+        proof: { reason: "finalized_conflict", key: id },
+      };
+    };
+    const progress: ReplicaPhaseOutcome = {
+      tag: "progress",
+      receipt: { phase: "import", key },
+    };
+    switch (decision.kind) {
+      case "terminal":
+        deps.receiver.copies.apply({ credential, id, decision });
+        return terminal();
+      case "wait":
+        deps.receiver.copies.apply({ credential, id, decision });
+        return { tag: "wait", dependency: { kind: "fragments", key } };
+      case "owner":
+        deps.receiver.copies.apply({ credential, id, decision });
+        return { tag: "wait", dependency: { kind: "owner", key } };
+      case "refetch": {
+        // One completed non-matching observation spends one unit of budget,
+        // in the transaction that commits it; a discarded attempt spends none.
+        deps.receiver.copies.apply({ credential, id, decision });
+        db.prepare(
+          "UPDATE pdpp_transport_import_work SET refetch_attempts=refetch_attempts+1 WHERE writer=? AND batch=?",
+        ).run(writer, batch);
+        const at = now() + defaultReplicaBackoff(refetch.attempts + 1);
+        for (const row of metadata)
+          db.prepare(
+            "UPDATE pdpp_transport_inbox SET fragment_json=NULL,data_hash=NULL,metadata_hash=NULL,finalized=0,state='ready',outcome=NULL,reason=NULL,cause_json=NULL,dependency=NULL,error=NULL,attempts=0,next_attempt=?,wait_since=NULL,checked_block=NULL WHERE scope=?",
+          ).run(at, row.scope);
+        return { tag: "wait", dependency: { kind: "fragments", key } };
+      }
+      case "reconcile_promoted":
+        deps.receiver.copies.apply({ credential, id, decision });
+        acknowledge(group, first, metadata);
+        return progress;
+      case "promote": {
+        const result = deps.receiver.copies.promote({
+          credential,
+          id,
+          copyKey: decision.copyKey,
+        });
+        if (result.kind === "terminal") return terminal();
+        if (result.kind === "wait_predecessor")
+          return {
+            tag: "wait",
+            dependency: {
+              kind: "predecessor",
+              key: `${writer}:${first.sequence - 1}`,
+            },
+          };
+        acknowledge(group, first, metadata);
+        return progress;
+      }
+    }
+  }
+  /**
+   * The verified finalized fact a scope's evidence carries (contract F2), as
+   * an effect for the caller's outcome transaction. Unavailable evidence
+   * (thrown) and a chain object for another owner or slot are not facts.
+   * The effect returns true when the fact is new, and then wakes the batch.
+   */
+  function factOf(
+    scope: string,
+    evidence: ReplicaRegistrationEvidence,
+  ): (() => boolean) | undefined {
+    const chain = evidence.chain;
+    const header = db
+      .prepare(
+        "SELECT json_extract(fragment_json,'$.writer') AS writer, json_extract(fragment_json,'$.batch') AS batch, json_extract(fragment_json,'$.index') AS position FROM pdpp_transport_inbox WHERE scope=?",
+      )
+      .get(scope) as
+      | { writer: string | null; batch: string | null; position: number | null }
+      | undefined;
+    if (
+      !chain ||
+      !header?.writer ||
+      !header.batch ||
+      header.position === null ||
+      chain.owner.toLowerCase() !== state().owner.toLowerCase() ||
+      chain.scope !== scope ||
+      chain.version !== "1" ||
+      !/^(0|[1-9][0-9]*)$/.test(chain.currentVersion)
+    )
+      return undefined;
+    const { writer, batch, position } = header;
+    return () => {
+      const added = deps.receiver.copies.recordFact({
+        credential: deps.credential,
+        id: canonicalJson([writer, batch]),
+        scope,
+        fragmentIndex: position,
+        fact: {
+          chainId: chain.chainId,
+          registry: chain.registry,
+          owner: chain.owner,
+          currentVersion: chain.currentVersion,
+          status: chain.status,
+          commitment: chain.commitment,
+          blockNumber: chain.blockNumber,
+          blockHash: chain.blockHash,
+          // Eligibility is the fact's own: Active, with a live head matching
+          // the chain commitment (contract D, I).
+          eligible:
+            replicaRegistrationState(evidence, {
+              owner: state().owner,
+              scope,
+            }) === "confirmed",
+        },
+      });
+      if (added) {
+        wake(`fragments:${writer}:${batch}`, now());
+        wake(`owner:${writer}:${batch}`, now());
+      }
+      return added;
+    };
+  }
   type Group = Work & { writer: string; batch: string; sequence: number };
   const importRun: ReplicaPhaseHandler<Item<Group>> = {
     phase: "import",
@@ -1331,9 +1549,9 @@ export function createReplicaTransportWorker(deps: {
       const id = item.id;
       const metadata = db
         .prepare(
-          `WITH headers AS MATERIALIZED (SELECT scope,finalized,json_extract(fragment_json,'$.index') AS position,json_extract(fragment_json,'$.writer') AS writer,json_extract(fragment_json,'$.batch') AS batch FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='ready') SELECT scope,finalized,position FROM headers WHERE writer=? AND batch=? ORDER BY position`,
+          `WITH headers AS MATERIALIZED (SELECT scope,finalized,data_hash,metadata_hash,json_extract(fragment_json,'$.index') AS position,json_extract(fragment_json,'$.writer') AS writer,json_extract(fragment_json,'$.batch') AS batch FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='ready') SELECT scope,finalized,data_hash,metadata_hash,position FROM headers WHERE writer=? AND batch=? ORDER BY position`,
         )
-        .all(writer, batch) as { scope: string; finalized: number }[];
+        .all(writer, batch) as ImportFragment[];
       const first = JSON.parse(
         (
           db
@@ -1381,24 +1599,27 @@ export function createReplicaTransportWorker(deps: {
         );
       const staging: string[] = [];
       /**
-       * Pending custody of this copy, if it is not held yet. It commits only
-       * inside this attempt's outcome transaction, so a crash or a discarded
-       * attempt never leaves custody without its outcome.
+       * Copy custody of this download, if its copy is not retained yet. It
+       * commits only inside this attempt's outcome transaction, so a crash
+       * or a discarded attempt never leaves custody without its outcome.
        */
-      let stage: (() => void) | undefined;
-      /** Commit `outcome` with the custody this attempt prepared. */
-      const withCustody = (
-        outcome: ReplicaPhaseOutcome,
-        then?: () => void,
-      ): ReplicaAttempt =>
-        stage || then
-          ? withPlan(outcome, () => {
-              stage?.();
-              then?.();
-            })
-          : verdict(outcome);
+      let stage: ((refetch: Refetch) => void) | undefined;
+      const fragments = metadata.map((row) => ({
+        dataHash: (row.data_hash ?? "").toLowerCase(),
+        metadataHash: (row.metadata_hash ?? "").toLowerCase(),
+      }));
       try {
-        if (deps.receiver.pendingState(pendingId) === undefined) {
+        if (fragments.some((f) => !f.dataHash || !f.metadataHash))
+          throw new ReplicaProblemError("payload_invalid");
+        const copyKey = replicaCopyKey(
+          fragments.map((f) =>
+            replicaChainCommitment(f.dataHash as Hex, f.metadataHash as Hex),
+          ),
+        );
+        const retained = deps.receiver.copies
+          .list(pendingId)
+          .some((copy) => copy.copyKey === copyKey);
+        if (!retained) {
           const writers = new Map<
             number,
             { key: string; writer: ReturnType<typeof binaryWriter> }
@@ -1458,62 +1679,35 @@ export function createReplicaTransportWorker(deps: {
               sizeBytes: blob.sizeBytes,
             };
           });
-          // Verified, hidden custody for the owner preview. Idempotent.
-          stage = () => {
-            deps.receiver.stage({
+          stage = (refetch) => {
+            deps.receiver.copies.stage({
               credential: deps.credential,
-              id: pendingId,
-              envelope: payload.envelope,
+              copy: {
+                id: pendingId,
+                writer,
+                batch,
+                sequence: first.sequence,
+                previous: first.previous,
+                envelopeDigest: first.digest,
+                envelope: payload.envelope,
+                fragments,
+              },
               stagedBlobs,
+              refetch,
             });
             for (const key of staging) deleteBinary(db, "staging", key);
           };
         }
-        if (metadata.some((row) => !row.finalized))
-          return withCustody({
-            tag: "wait",
-            dependency: { kind: "fragments", key: `${writer}:${batch}` },
-          });
-        if (
-          !imported &&
-          first.previous &&
-          !db
-            .prepare(
-              "SELECT 1 FROM pdpp_transport_imported WHERE writer=? AND batch=? AND sequence=? AND digest=?",
-            )
-            .get(
-              writer,
-              first.previous.batch,
-              first.sequence - 1,
-              first.previous.digest,
-            )
-        )
-          return withCustody({
-            tag: "wait",
-            dependency: {
-              kind: "predecessor",
-              key: `${writer}:${first.sequence - 1}`,
-            },
-          });
-        return withCustody(
-          { tag: "progress", receipt: { phase: "import", key: id } },
-          () => {
-            // Nested receiver transaction shares this DB: import and durable acknowledgement are atomic.
-            deps.receiver.promote({
-              credential: deps.credential,
-              id: pendingId,
-            });
-            if (!imported)
-              db.prepare(
-                "INSERT INTO pdpp_transport_imported VALUES (?,?,?,?)",
-              ).run(writer, batch, first.sequence, first.digest);
-            for (const row of metadata)
-              db.prepare(
-                "UPDATE pdpp_transport_inbox SET state='imported',error=NULL WHERE scope=?",
-              ).run(row.scope);
-            wake(`predecessor:${writer}:${first.sequence}`, now());
+        const plan = stage;
+        // The copy decision runs inside the outcome transaction, over the
+        // durable copies, facts and disposition it commits with.
+        return {
+          outcome: {
+            tag: "progress",
+            receipt: { phase: "import", key: id },
           },
-        );
+          plan: () => decideImport(item.row, first, metadata, plan),
+        };
       } catch (error) {
         stage = undefined;
         return verdict(retryFromError(error, "import_failed"));

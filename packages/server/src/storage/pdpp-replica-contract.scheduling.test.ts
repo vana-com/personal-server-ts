@@ -265,16 +265,18 @@ interface Hooks {
 /** Call again after every reopen(): the receiver object is rebuilt. */
 function instrument(d: TransportDevice, tally: Tally, hooks: Hooks = {}) {
   const receiver = d.receiver;
-  const stage = receiver.stage.bind(receiver);
-  const promote = receiver.promote.bind(receiver);
+  // The transport stages and promotes through the copy seam (contract v3.1).
+  const copies = receiver.copies;
+  const stage = copies.stage.bind(copies);
+  const promote = copies.promote.bind(copies);
   const retry = receiver.retry.bind(receiver);
-  vi.spyOn(receiver, "stage").mockImplementation((input) => {
-    const call = idParts(input.id);
+  vi.spyOn(copies, "stage").mockImplementation((input) => {
+    const call = idParts(input.copy.id);
     tally.stage.push(call);
     hooks.beforeStage?.(call);
     return stage(input);
   });
-  vi.spyOn(receiver, "promote").mockImplementation((input) => {
+  vi.spyOn(copies, "promote").mockImplementation((input) => {
     const call = idParts(input.id);
     tally.promote.push(call);
     hooks.beforePromote?.(call);

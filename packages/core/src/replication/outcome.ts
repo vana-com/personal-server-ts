@@ -23,7 +23,13 @@ export type ReplicaDependency =
   | { kind: "mapping"; key: string }
   | { kind: "declaration"; key: string }
   | { kind: "blob"; key: string }
-  | { kind: "reset"; key: string };
+  | { kind: "reset"; key: string }
+  /**
+   * Every retained copy of a batch is disproved and the refetch budget is
+   * spent (copy_conflict_unresolved). A new finalized fact for the batch
+   * wakes it; otherwise only the owner can resolve it.
+   */
+  | { kind: "owner"; key: string };
 
 export const dependencyKey = (dependency: ReplicaDependency) =>
   `${dependency.kind}:${dependency.key}`;
@@ -114,6 +120,8 @@ export interface ReplicaAdmission {
 export interface ReplicaQuarantineProof {
   reason:
     | "immutable_registration_conflict"
+    /** Finalized facts contradict a batch, or its writer chain is terminal. */
+    | "finalized_conflict"
     | "batch_equivocation"
     | "source_binding_conflict"
     | "local_mapping_conflict";

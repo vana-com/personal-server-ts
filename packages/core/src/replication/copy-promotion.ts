@@ -173,7 +173,8 @@ export interface FinalizedFact {
  * (amendment D). Contradiction is absorbing: two version-1 commitments, a
  * version above 1, a version-0 fact later than a version-1 fact, one block
  * number with two hashes, or facts from two authorities. Otherwise the fact
- * with the highest block number decides.
+ * with the highest block number decides, and among facts at that block the
+ * last observed. `facts` must be in observation order.
  */
 export function indexEvidenceFromFacts(
   facts: readonly FinalizedFact[],
@@ -206,8 +207,11 @@ export function indexEvidenceFromFacts(
     )
   )
     return { kind: "contradiction" };
+  // Facts arrive in observation order. At one block, a later observation
+  // supersedes: eligibility follows the live head, which can change while
+  // the finalized block does not.
   const latest = facts.reduce((a, b) =>
-    b.blockNumber > a.blockNumber ? b : a,
+    b.blockNumber >= a.blockNumber ? b : a,
   );
   return latest.currentVersion === "1"
     ? {

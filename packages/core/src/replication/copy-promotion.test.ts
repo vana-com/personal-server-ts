@@ -362,6 +362,20 @@ describe("indexEvidenceFromFacts (D)", () => {
       ]),
     ).toEqual({ kind: "contradiction" });
   });
+  it("at one block, the later observation decides: eligibility follows the live head, not the block", () => {
+    expect(
+      indexEvidenceFromFacts([
+        fact(5n, "1", h("a"), { eligible: false }),
+        fact(5n, "1", h("a")),
+      ]),
+    ).toEqual({ kind: "committed", commitment: h("a"), eligible: true });
+    expect(
+      indexEvidenceFromFacts([
+        fact(5n, "1", h("a")),
+        fact(5n, "1", h("a"), { eligible: false }),
+      ]),
+    ).toEqual({ kind: "committed", commitment: h("a"), eligible: false });
+  });
   it("an earlier version-0 fact before version 1 is not a contradiction", () => {
     expect(
       indexEvidenceFromFacts([fact(3n, "0", zero), fact(5n, "1", h("a"))]).kind,
