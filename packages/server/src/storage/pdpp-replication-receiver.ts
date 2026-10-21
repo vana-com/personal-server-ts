@@ -1441,7 +1441,7 @@ export function createReplicaReceiver(deps: {
             const rows = db
               .prepare(
                 `SELECT copy_key,reason,
-            length(CAST(envelope_json AS BLOB)) AS bytes
+            CASE WHEN reason='copy_conflict' THEN length(CAST(envelope_json AS BLOB)) ELSE 0 END AS bytes
             FROM pdpp_replica_copies c WHERE id=? AND state='quarantined'
             AND reason IN ('copy_conflict','finalized_conflict')
             AND (? IS NULL OR NOT EXISTS (

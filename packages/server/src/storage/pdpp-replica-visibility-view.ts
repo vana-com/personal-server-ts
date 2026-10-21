@@ -51,7 +51,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 8;
+const VIEW_SCHEMA = 9;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -323,40 +323,53 @@ export function createReplicaVisibilityView(deps: {
       `);
     }
     if (hasCopyFacts) {
-      // Each copy contributes once per stream, regardless of operation count or
-      // connections. Group identical connection sets to keep metadata reads off
-      // the retained copies and their envelopes (including large backlogs).
-      const copyStreams = (alias: string) => `
-        INSERT INTO pdpp_replica_view_copy_streams
-        SELECT ${alias}.id,${alias}.copy_key,stream,json_group_array(instance)
+      // A copy contributes once per stream, regardless of operation count or
+      // connections. Counts share a group for identical connection sets.
+      const conflict = (alias: string) =>
+        `${alias}.state='quarantined' AND ${alias}.reason IN ('copy_conflict','finalized_conflict')`;
+      const streamGroups = (
+        alias: string,
+      ) => `SELECT stream,json_group_array(instance) AS instances
         FROM (SELECT DISTINCT json_extract(value,'$.declaration.stream') AS stream,
           json_extract(value,'$.connectionId') AS instance
           FROM json_each(${alias}.envelope_json,'$.operations')
           WHERE json_extract(value,'$.declaration.stream') IS NOT NULL
-          ORDER BY stream,instance)
-        WHERE ${alias}.state='quarantined' AND ${alias}.reason IN ('copy_conflict','finalized_conflict')
-        GROUP BY stream;
+          ORDER BY stream,instance) GROUP BY stream`;
+      const addCopy = (alias: string) => `
+        INSERT INTO pdpp_replica_view_copy_counts
+        SELECT stream,instances,0 FROM (${streamGroups(alias)}) groups
+        WHERE ${conflict(alias)} AND NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_counts c
+          WHERE c.stream=groups.stream AND c.instances=groups.instances);
+        UPDATE pdpp_replica_view_copy_counts SET n=n+1
+        WHERE ${conflict(alias)} AND (stream,instances) IN (${streamGroups(alias)});
         INSERT INTO pdpp_replica_view_copy_connections
         SELECT DISTINCT ${alias}.id,${alias}.copy_key,json_extract(value,'$.connectionId')
-        FROM json_each(${alias}.envelope_json,'$.operations')
-        WHERE ${alias}.state='quarantined' AND ${alias}.reason IN ('copy_conflict','finalized_conflict');`;
+        FROM json_each(${alias}.envelope_json,'$.operations') op WHERE ${conflict(alias)}
+        AND NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_connections c
+          WHERE c.id=${alias}.id AND c.copy_key=${alias}.copy_key AND c.instance=json_extract(op.value,'$.connectionId'));
+      `;
+      const removeCopy = (alias: string) => `
+        UPDATE pdpp_replica_view_copy_counts SET n=n-1
+        WHERE ${conflict(alias)} AND (stream,instances) IN (${streamGroups(alias)});
+        DELETE FROM pdpp_replica_view_copy_counts WHERE n=0 AND ${conflict(alias)}
+        AND (stream,instances) IN (${streamGroups(alias)});
+        DELETE FROM pdpp_replica_view_copy_connections WHERE id=${alias}.id AND copy_key=${alias}.copy_key;
+      `;
       db.exec(`
+        -- Composite primary keys are the only access paths. WITHOUT ROWID
+        -- avoids a second B-tree and keeps even the empty layout sparse.
         CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_connections (
           id TEXT NOT NULL,copy_key TEXT NOT NULL,instance TEXT NOT NULL,
           PRIMARY KEY(id,copy_key,instance)
-        );
-        CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_streams (
-          id TEXT NOT NULL,copy_key TEXT NOT NULL,stream TEXT NOT NULL,instances TEXT NOT NULL,
-          PRIMARY KEY(id,copy_key,stream)
-        );
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_counts (
           stream TEXT NOT NULL,instances TEXT NOT NULL,n INTEGER NOT NULL,
           PRIMARY KEY(stream,instances)
-        );
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_groups (
           instance TEXT NOT NULL,stream TEXT NOT NULL,instances TEXT NOT NULL,
           PRIMARY KEY(instance,stream,instances)
-        );
+        ) WITHOUT ROWID;
         CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_group_insert
         AFTER INSERT ON pdpp_replica_view_copy_counts BEGIN
           INSERT INTO pdpp_replica_view_copy_groups
@@ -368,48 +381,33 @@ export function createReplicaVisibilityView(deps: {
         AFTER DELETE ON pdpp_replica_view_copy_counts BEGIN
           DELETE FROM pdpp_replica_view_copy_groups WHERE stream=OLD.stream AND instances=OLD.instances;
         END;
-        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_stream_insert
-        AFTER INSERT ON pdpp_replica_view_copy_streams BEGIN
-          INSERT INTO pdpp_replica_view_copy_counts SELECT NEW.stream,NEW.instances,0
-          WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_counts c
-            WHERE c.stream=NEW.stream AND c.instances=NEW.instances);
-          UPDATE pdpp_replica_view_copy_counts SET n=n+1 WHERE stream=NEW.stream AND instances=NEW.instances;
-        END;
-        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_stream_delete
-        AFTER DELETE ON pdpp_replica_view_copy_streams BEGIN
-          UPDATE pdpp_replica_view_copy_counts SET n=n-1 WHERE stream=OLD.stream AND instances=OLD.instances;
-          DELETE FROM pdpp_replica_view_copy_counts WHERE stream=OLD.stream AND instances=OLD.instances AND n=0;
-        END;
         CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_insert AFTER INSERT ON pdpp_replica_copies BEGIN
-          ${copyStreams("NEW")}
+          ${addCopy("NEW")}
         END;
         CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_update
         AFTER UPDATE OF state,reason,envelope_json ON pdpp_replica_copies
         WHEN OLD.state IS NOT NEW.state OR OLD.reason IS NOT NEW.reason OR OLD.envelope_json IS NOT NEW.envelope_json BEGIN
-          DELETE FROM pdpp_replica_view_copy_streams WHERE id=OLD.id AND copy_key=OLD.copy_key;
-          DELETE FROM pdpp_replica_view_copy_connections WHERE id=OLD.id AND copy_key=OLD.copy_key;
-          ${copyStreams("NEW")}
+          ${removeCopy("OLD")}
+          ${addCopy("NEW")}
         END;
         CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_delete AFTER DELETE ON pdpp_replica_copies BEGIN
-          DELETE FROM pdpp_replica_view_copy_streams WHERE id=OLD.id AND copy_key=OLD.copy_key;
-          DELETE FROM pdpp_replica_view_copy_connections WHERE id=OLD.id AND copy_key=OLD.copy_key;
+          ${removeCopy("OLD")}
         END;
       `);
       if (!initialized)
         db.exec(`
-        INSERT INTO pdpp_replica_view_copy_streams
-        SELECT id,copy_key,stream,json_group_array(instance)
-        FROM (SELECT DISTINCT c.id,c.copy_key,json_extract(op.value,'$.declaration.stream') AS stream,
-          json_extract(op.value,'$.connectionId') AS instance
-          FROM pdpp_replica_copies c,json_each(c.envelope_json,'$.operations') op
-          WHERE c.state='quarantined' AND c.reason IN ('copy_conflict','finalized_conflict')
-          AND json_extract(op.value,'$.declaration.stream') IS NOT NULL
-          ORDER BY c.id,c.copy_key,stream,instance)
-        GROUP BY id,copy_key,stream;
+        INSERT INTO pdpp_replica_view_copy_counts
+        SELECT stream,instances,COUNT(*) FROM (
+          SELECT id,copy_key,stream,json_group_array(instance) AS instances
+          FROM (SELECT DISTINCT c.id,c.copy_key,json_extract(op.value,'$.declaration.stream') AS stream,
+            json_extract(op.value,'$.connectionId') AS instance
+            FROM pdpp_replica_copies c,json_each(c.envelope_json,'$.operations') op
+            WHERE ${conflict("c")} AND json_extract(op.value,'$.declaration.stream') IS NOT NULL
+            ORDER BY c.id,c.copy_key,stream,instance)
+          GROUP BY id,copy_key,stream) GROUP BY stream,instances;
         INSERT INTO pdpp_replica_view_copy_connections
         SELECT DISTINCT c.id,c.copy_key,json_extract(op.value,'$.connectionId')
-        FROM pdpp_replica_copies c,json_each(c.envelope_json,'$.operations') op
-        WHERE c.state='quarantined' AND c.reason IN ('copy_conflict','finalized_conflict');
+        FROM pdpp_replica_copies c,json_each(c.envelope_json,'$.operations') op WHERE ${conflict("c")};
       `);
     }
     if (hasBindingConflictFacts && !localInitialized)

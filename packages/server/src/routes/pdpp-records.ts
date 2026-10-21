@@ -223,9 +223,9 @@ type RouteReadStore = Omit<
   "listStreamCompletions" | "listStreams"
 > &
   Partial<ReplicaCopyConflictReader> & {
-    listStreams(
-      ids: string[],
-    ): (ReturnType<PdppReplicaReadStore["listStreams"]>[number] & {
+    listStreams(ids: string[]): (ReturnType<
+      PdppReplicaReadStore["listStreams"]
+    >[number] & {
       copyConflicts?: number;
     })[];
   };

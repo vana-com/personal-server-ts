@@ -155,15 +155,13 @@ it("createApp serves bounded owner copy diagnostics and summary, never values or
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       object: "list",
-      data: [a.copyKey, b.copyKey]
-        .sort()
-        .map((copyKey) => ({
-          copyKey,
-          reason: "copy_conflict",
-          visibility: "conflicted",
-          status: "copy conflict",
-          values: [copyKey === a.copyKey ? record : b.record],
-        })),
+      data: [a.copyKey, b.copyKey].sort().map((copyKey) => ({
+        copyKey,
+        reason: "copy_conflict",
+        visibility: "conflicted",
+        status: "copy conflict",
+        values: [copyKey === a.copyKey ? record : b.record],
+      })),
     });
     expect((await get("app", path)).status).toBe(403);
     expect((await get("foreign", path)).status).toBe(403);
@@ -215,14 +213,12 @@ it("createApp serves bounded owner copy diagnostics and summary, never values or
   });
   const terminal = async () => {
     expect((await get("owner", path)).body.data).toEqual(
-      [a.copyKey, b.copyKey]
-        .sort()
-        .map((copyKey) => ({
-          copyKey,
-          reason: "finalized_conflict",
-          visibility: "conflicted",
-          status: "integrity conflict",
-        })),
+      [a.copyKey, b.copyKey].sort().map((copyKey) => ({
+        copyKey,
+        reason: "finalized_conflict",
+        visibility: "conflicted",
+        status: "integrity conflict",
+      })),
     );
     for (const token of ["owner", "app"])
       expect(

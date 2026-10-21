@@ -227,7 +227,7 @@ it("hides corrupt rejects and reads copy diagnostics inside one snapshot", () =>
   }
 });
 
-it("limits record operations and envelopes per copy, total bytes, and marker rows without partial output", () => {
+it("limits record operations per copy without partial output", () => {
   const operations = copyReadFixture();
   const many = Array.from({ length: 257 }, (_, i) => ({
     ...upsert(`op-${i}`, i + 10),
@@ -239,7 +239,9 @@ it("limits record operations and envelopes per copy, total bytes, and marker row
   expect(() =>
     operations.receiver.readStore({ reader: "owner" }).readCopyConflicts(a.id),
   ).toThrow("Copy conflict diagnostics exceed the read limit");
+});
 
+it("limits encoded envelopes while retaining scoped terminal markers", () => {
   const envelope = copyReadFixture();
   const large = envelope.copy("A", 1, [
     registration,
@@ -268,7 +270,9 @@ it("limits record operations and envelopes per copy, total bytes, and marker row
       .readStore({ reader: "owner" })
       .readCopyConflicts(large.id, [identity.connectionId]),
   ).toHaveLength(2);
+});
 
+it("limits the aggregate diagnostic bytes without partial output", () => {
   const total = copyReadFixture();
   for (let seed = 1; seed <= 21; seed++)
     total.stage(
@@ -285,7 +289,9 @@ it("limits record operations and envelopes per copy, total bytes, and marker row
       .readStore({ reader: "owner" })
       .readCopyConflicts(total.copy("A", 1).id),
   ).toThrow("Copy conflict diagnostics exceed the read limit");
+});
 
+it("limits marker count after scope filtering while stream counts stay exact", () => {
   const count = copyReadFixture();
   for (let seed = 1; seed <= 101; seed++)
     count.stage(count.copy(`copy-${seed}`, seed));
@@ -304,4 +310,35 @@ it("limits record operations and envelopes per copy, total bytes, and marker row
       .readStore({ reader: "owner" })
       .readCopyConflicts(count.copy("A", 1).id, ["out-of-scope"]),
   ).toEqual([]);
+});
+
+it("does not fetch the envelope column for finalized markers, including scoped reads", () => {
+  const f = copyReadFixture();
+  const a = f.copy("A", 1);
+  f.stage(a);
+  f.stage(f.copy("B", 2));
+  f.receiver.copies.terminate({
+    credential: "test",
+    id: a.id,
+    reason: "finalized_conflict",
+  });
+  // Fault the payload column while keeping real SQLite metadata and scope facts.
+  // A marker-only read must succeed even if the payload source cannot be read.
+  f.db.function("forbidden_copy_payload", () => {
+    throw new Error("finalized payload was fetched");
+  });
+  f.db.exec(`ALTER TABLE pdpp_replica_copies RENAME TO retained_copy_rows;
+    CREATE VIEW pdpp_replica_copies AS SELECT id,copy_key,state,reason,
+    forbidden_copy_payload() AS envelope_json FROM retained_copy_rows;`);
+  const owner = f.receiver.readStore({ reader: "owner" });
+  for (const scope of [undefined, [identity.connectionId]]) {
+    const markers = owner.readCopyConflicts(a.id, scope);
+    expect(markers).toHaveLength(2);
+    expect(
+      markers.every(
+        (marker) =>
+          marker.reason === "finalized_conflict" && !("values" in marker),
+      ),
+    ).toBe(true);
+  }
 });

@@ -32,7 +32,7 @@ The tests use fresh on-disk SQLite databases, existing HTTP grant reads, and pro
 
 `stage({credential,id,envelope,blobs})` persists an immutable pending batch in `pdpp_replica_pending_batches` with binary bytes in separate BLOB rows. It checks envelope structure, owner/mapping and supplied content hashes. The transport caller must first decrypt, validate fragment/payload bindings and validate blob descriptors. No pending operation enters the received operation set, canonical tables, export journals, history or convergence/Lamport clocks.
 
-`readVisibleRecords({reader,connectionId,stream})` returns stored-record models and explicit pending removals. A pending removal has `deleted: true`, its deletion time, and an empty internal data object. HTTP responses omit that empty data object. `reader` defaults to `grant`. One core `ReplicaVisibilityPolicy` governs record, page, stream-summary and blob reads via `readStore({reader})`. The default owner mode includes pending; the default grant mode is confirmed-only. Change either policy member to `include-pending` or `confirmed-only` without changing the merge engine. Quarantined batches are never visible. The authenticated host chooses reader identity; request parameters must not choose it.
+`readVisibleRecords({reader,connectionId,stream})` returns stored-record models and explicit pending removals. A pending removal has `deleted: true`, its deletion time, and an empty internal data object. HTTP responses omit that empty data object. `reader` defaults to `grant`. One core `ReplicaVisibilityPolicy` governs record, page, stream-summary and blob reads via `readStore({reader})`. The default owner mode includes pending; the default grant mode is confirmed-only. Change either policy member to `include-pending` or `confirmed-only` without changing the merge engine. Quarantined copies never appear in ordinary record or blob reads; owner diagnostics are separate (below). The authenticated host chooses reader identity; request parameters must not choose it.
 
 The owner view is a sparse overlay on canonical rows, maintained when evidence or canonical state changes. It persists only keys whose owner-visible state differs from canonical: pending values, marked pending removals, and keys that operation-ID equivocation hides. Without pending evidence or an operation-ID variant among a key's merge inputs, owner preview equals canonical by definition and nothing is stored for that key. A compatible registration already in force counts as no change. The overlay uses the same core merge policy and validates binary availability before exposing a pending winner. Retained operations are read in place through expression indexes on `pdpp_replica_operations` and `pdpp_replica_received`; the view stores no copy of operation JSON or canonical rows. Pending operations live in `pdpp_replica_view_pending` only while their batch is pending. A canonical write or retained record operation marks a key for reconciliation only when the key has an overlay row, its connection has pending work or a variant, or its binding is deleted. Point reads check the overlay key and then the canonical key. Pages merge one bounded canonical keyset page with one bounded overlay keyset page per connection; both are index seeks. A canonical row that an overlay row replaces is consumed but not returned, so a page can be short or empty while `hasMore` is true. Stream summaries read the owner preview's latest row from the summary table: flush derives it at write time for streams whose overlay rows or canonical rows changed. A summary over a stream with quarantined keys still recomputes it at read time. Reads do not replay the operation log or rebuild pending batches. Pending upserts and removals obtain `confirmation: "not yet confirmed"` and `visibility: "pending"` from the core visibility-policy component. A summary affected by pending removals remains present with its live count and the same marker, even if that count is zero. Canonical responses omit pending metadata.
 
@@ -89,7 +89,7 @@ ordering even for equivalent timestamps with different permitted encodings. Repl
 
 Visibility reads consume local snapshots. They do not refresh evidence, schedule network work, or own retry counters. The transport worker owns durable due selection, waiting/error outcomes, cooldowns and complete-batch progress. Head hints may wake waiting work but cannot bypass an error deadline or authorize promotion. Finalized members, predecessor checks and atomic acknowledgment remain host requirements.
 
-Distinct-writer edits retain the provisional tuple order. Recovery from two payloads claiming the same batch identity needs a fingerprint-pinned finality contract; see [the pending-copy decision](../../../../docs/261021-replica-pending-copy-decision.md). A bare batch ID must not silently select a different payload for promotion.
+Distinct-writer edits retain the provisional tuple order. `receiver.copies` retains distinct copies of a batch and promotes only a copy whose commitments match eligible finalized facts. Multiple unproven copies become `copy_conflict`; contradictory finalized facts make the batch terminal. The legacy pending row mirrors the single pending copy, and bytes use `(id, blobId)` custody. A bare batch ID cannot select among multiple retained copies. See the owner diagnostics below and [the original pending-copy decision](../../../../docs/261021-replica-pending-copy-decision.md) for context.
 
 ## Account conflict visibility
 
@@ -141,14 +141,15 @@ entry with zero records and null recency. Ordinary streams report zero. Grant
 entries never contain the field. Disabling pending previews does not disable
 owner diagnostics.
 
-View layout 8 derives copy/stream membership, connection scope facts, and counts
+View layout 9 derives connection scope facts and per-stream copy counts
 inside the write transaction. Counts are grouped by stream and the sorted set
 of connections touched by that copy's stream operations. Indexed connection
 lookups read each relevant group once, so stream listing does not scan retained
 copies or decode their envelopes, and repeated copies on the same connection set
 do not add read work. Work grows with requested connections, distinct connection
 sets, and listed streams. Construction rebuilds these derived facts from retained
-copies when upgrading an older view. State/reason changes, promotion, and terminal
+copies when upgrading an older view. The three copy-summary tables use composite
+primary keys without duplicate rowid indexes to preserve the sparse storage budget. State/reason changes, promotion, and terminal
 transitions update them through triggers with `NOT EXISTS` insertion guards.
 
 Conflicting values never enter the reducer or canonical materialization. Page and
