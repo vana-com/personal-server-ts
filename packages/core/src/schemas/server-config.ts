@@ -75,6 +75,7 @@ export const DEFAULTS = {
     // The PDPP Authorization Server is opt-in. Off by default so an existing
     // deployment gains no new authorization surface on upgrade.
     enabled: false,
+    protocolProfile: "current" as "current" | "candidate-0.1.0",
     // Absolute file paths of retained SourceDeclaration documents. There is
     // deliberately no trust-all option and no default: an AS that accepts any
     // declaration it can reach will issue grants over data it was never meant
@@ -251,6 +252,9 @@ export const ServerConfigSchema = z.object({
   pdpp: z
     .object({
       enabled: z.boolean().default(DEFAULTS.pdpp.enabled),
+      protocolProfile: z
+        .enum(["current", "candidate-0.1.0"])
+        .default(DEFAULTS.pdpp.protocolProfile),
       // No trust-all switch by design. A declaration is trusted because an
       // operator retained this exact document, not because it was reachable.
       declarationPaths: z

@@ -1,3 +1,5 @@
+import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { parseRecordQuery } from "./pdpp-record-query.js";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import {
@@ -14,8 +16,6 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   CursorExpiredError,
-  decodeCursor,
-  encodeCursor,
   InvalidCursorError,
   InvalidCursorSyntaxError,
   recordKeyWithinGrantResources,
@@ -36,24 +36,8 @@ import {
   type StreamCompletionFailure,
 } from "../storage/pdpp-stream-completion.js";
 
-const DEFAULT_LIMIT = 25;
-const MAX_LIMIT = 100;
 export const MAX_BLOB_UPLOAD_BYTES = 512 * 1024 * 1024;
 
-function rebindListCursor(
-  template: string,
-  order: "asc" | "desc",
-  last: PdppRecordRow,
-): string {
-  const bound = decodeCursor(template);
-  if (bound.kind !== "list") throw new InvalidCursorError();
-  return encodeCursor({
-    ...bound,
-    order,
-    sortValue: last.emittedAt,
-    recordKey: last.recordKey,
-  });
-}
 /** 512 MiB — max body size for PDPP record ingest and replace routes. */
 export const MAX_INGEST_BODY_BYTES = 512 * 1024 * 1024;
 /** 64 KiB of UTF-8 — max body size for the completion metadata route. */
@@ -495,124 +479,6 @@ function unauthorized(c: Context, reqId: string, resourceMetadataUrl: string) {
   });
 }
 
-function parseLimit(raw: string | undefined): {
-  limit: number;
-  clamped: boolean;
-} {
-  if (!raw) return { limit: DEFAULT_LIMIT, clamped: false };
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new PdppError("invalid_request", "limit must be a positive integer", {
-      param: "limit",
-    });
-  }
-  if (parsed > MAX_LIMIT) return { limit: MAX_LIMIT, clamped: true };
-  return { limit: parsed, clamped: false };
-}
-
-function parseOrder(raw: string | undefined): "asc" | "desc" {
-  if (raw === undefined) return "desc";
-  if (raw === "asc" || raw === "desc") return raw;
-  throw new PdppError("invalid_request", "order must be 'asc' or 'desc'", {
-    param: "order",
-  });
-}
-
-/** Query parameters implemented by each endpoint. Unsupported shapes must fail. */
-const KNOWN_QUERY_PARAMS: Record<string, readonly string[]> = {
-  listStreams: [],
-  streamMetadata: [],
-  listRecords: ["limit", "order", "cursor", "fields", "changes_since"],
-  getRecord: ["fields"],
-  deleteRecord: [],
-};
-
-/** Validate exact parameter names before consulting serving metadata. */
-function rejectUnknownParams(
-  c: Context,
-  endpoint: keyof typeof KNOWN_QUERY_PARAMS,
-  tokenKind?: PdppTokenContext["tokenKind"],
-) {
-  const allowed = KNOWN_QUERY_PARAMS[endpoint];
-  const recordRead = endpoint === "listRecords" || endpoint === "getRecord";
-  for (const key of new URL(c.req.url).searchParams.keys()) {
-    if (allowed.includes(key)) continue;
-    const base = key.replace(/\[.*$/, "");
-    // Current serving metadata declares no expandable relations. Client
-    // requests must still receive invalid_request, before metadata lookup.
-    if (
-      recordRead &&
-      tokenKind === "owner" &&
-      (base === "expand" || base === "expand_limit")
-    ) {
-      throw new PdppError(
-        "invalid_expand",
-        "No expandable relation is declared",
-        {
-          param: key,
-        },
-      );
-    }
-    throw new PdppError(
-      "invalid_request",
-      `Unsupported query parameter '${key}'`,
-      {
-        param: key,
-      },
-    );
-  }
-}
-
-/**
- * Narrow a client's requested `fields` within what its grant already allows.
- *
- * Three rules, in order:
- *   - a field outside the grant is a 400, not a silent drop. A client asking
- *     for something it was never granted has made an error it needs to see;
- *     quietly returning less would let it believe it received that field.
- *   - the result is the intersection, so a request can only ever narrow.
- *   - under a v0.1 grant ONLY, the declaration's required fields are re-added,
- *     because v0.1 §8 keeps schema-required fields in every projection
- *     regardless of the request. A v0.2 grant gets the bare intersection:
- *     `v0.2-4-2` builds disclosed `data` from only the members permitted by
- *     the grant AND the request-time selection, and `v0.2-4-1` forbids adding
- *     one back because the schema requires it. Re-widening a sparse v0.2
- *     request would disclose more than both the owner and the client asked
- *     for, which is the one direction this function must never move.
- *
- * Returns the full granted set when no `fields` was requested, preserving the
- * existing default.
- */
-function narrowClientFields(
-  requested: string[] | undefined,
-  granted: string[] | undefined,
-  declaration: StreamDeclaration | undefined,
-  schemaRequiredFloor: boolean,
-): string[] | undefined {
-  if (!requested || requested.length === 0) return granted;
-  if (!granted) return requested;
-
-  const grantedSet = new Set(granted);
-  for (const field of requested) {
-    if (!grantedSet.has(field)) {
-      throw new PdppError(
-        "invalid_request",
-        `Field '${field}' is not in this grant's authorized fields for the stream`,
-        { param: "fields" },
-      );
-    }
-  }
-
-  const narrowed = new Set(requested.filter((f) => grantedSet.has(f)));
-  if (schemaRequiredFloor) {
-    // v0.1 only: the consent floor survives a sparse request.
-    for (const required of declaration?.requiredFields ?? []) {
-      if (grantedSet.has(required)) narrowed.add(required);
-    }
-  }
-  return Array.from(narrowed);
-}
-
 /**
  * Project a declared JSON Schema down to exactly the granted fields.
  *
@@ -857,7 +723,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const { context, error } = await authenticate(c, reqId);
     if (error) return error;
     try {
-      rejectUnknownParams(c, "listStreams");
+      parseRecordQuery(c.req.url, "listStreams");
     } catch (err) {
       return sendError(
         c,
@@ -971,7 +837,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
-      rejectUnknownParams(c, "streamMetadata");
+      parseRecordQuery(c.req.url, "streamMetadata");
       const stream = c.req.param("stream");
       const { declaration, ownerInstanceIds } = readDeclaration(
         context!,
@@ -1045,14 +911,23 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
-      rejectUnknownParams(c, "listRecords", context!.tokenKind);
+      const query = parseRecordQuery(
+        c.req.url,
+        "listRecords",
+        context!.tokenKind,
+      );
       const stream = c.req.param("stream");
 
       const { declaration, ownerInstanceIds } = readDeclaration(
         context!,
         stream,
       );
-      const scope = resolveReadScope(context!, stream, declaration);
+      const scope = resolveReadScope(
+        context!,
+        stream,
+        declaration,
+        query.fields,
+      );
       const effectiveInstanceIds =
         context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
       if (context!.tokenKind === "client") {
@@ -1065,36 +940,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
 
-      const { limit, clamped } = parseLimit(c.req.query("limit"));
-      const order = parseOrder(c.req.query("order"));
-      const requestedFields = c.req
-        .query("fields")
-        ?.split(",")
-        .map((f) => f.trim());
-      // §8: `fields` is a sparse fieldset on the durable client surface, and
-      // an unsupported shape must not be silently ignored. A client token
-      // previously had its `fields` parsed and then discarded, so
-      // `?fields=id` returned every granted field — the response did
-      // something other than what was asked, with a 200.
-      //
-      // A client may only NARROW within its grant; it can never widen. So the
-      // request is validated against the granted set, then intersected with
-      // it, then the schema-required floor is re-added.
-      const fields =
-        context!.tokenKind === "client"
-          ? narrowClientFields(
-              requestedFields,
-              scope.fields,
-              declaration,
-              scope.schemaRequiredFloor,
-            )
-          : requestedFields
-            ? [...requestedFields]
-            : undefined;
-      const cursor = c.req.query("cursor");
+      const { limit, clamped, order, cursor } = query;
+      const fields = scope.fields;
 
-      if (c.req.query("changes_since") !== undefined) {
-        // `fields` is passed here for ELIGIBILITY narrowing only (spec §4:
+      if (query.changesSince !== undefined) {
+        // Eligibility compares the frozen candidate grant projection; sparse
+        // request fields shape only the response. Legacy profiles retain their
+        // existing request-field eligibility. The store returns raw rows.
+        // (spec §4:
         // a record whose only change was to an unauthorized field must not
         // appear as "changed" at all). The store returns each row's RAW,
         // unprojected data regardless of `fields` — response-shaping
@@ -1105,12 +958,28 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         // time_constraint field would silently break that filter.
         const page = deps.store.changesSince(stream, {
           instanceIds: effectiveInstanceIds,
-          changesSince: c.req.query("changes_since"),
-          cursor: c.req.query("cursor"),
+          changesSince:
+            grantIsCandidate(context!.grant) &&
+            query.changesSince === "beginning"
+              ? undefined
+              : query.changesSince,
+          cursor,
           limit,
-          fields,
+          fields: grantIsCandidate(context!.grant)
+            ? scope.streamGrant!.fields
+            : fields,
+          ...(grantIsCandidate(context!.grant) && {
+            expireOnErasure: true,
+            isVisible: (row: {
+              recordKey: string;
+              data: Record<string, unknown>;
+            }) =>
+              recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
+              recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
+          }),
         });
         const visible = page.data.filter((row) => {
+          if (grantIsCandidate(context!.grant)) return true; // store compared both authorized historical states
           if (row.deleted) {
             return recordKeyWithinGrantResources(
               row.recordKey,
@@ -1137,7 +1006,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             ...(page.nextChangesSince && {
               next_changes_since: page.nextChangesSince,
             }),
-            data: visible.map((row) => toRecordJson(stream, row, fields)),
+            data: visible.map((row) =>
+              toRecordJson(
+                stream,
+                row,
+                fields,
+                grantIsCandidate(context!.grant),
+              ),
+            ),
             ...(clamped && { meta }),
           },
           200,
@@ -1145,56 +1021,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         );
       }
 
-      // Same ordering requirement as the changes_since branch above: fetch
-      // unprojected, filter by time_constraint against the real value, then
-      // project fields only in toRecordJson.
-      // Grant filtering happens after the store pages, so a page of `limit`
-      // stored rows can yield fewer than `limit` visible rows. Returning that
-      // short page directly would make `limit` mean "at most N stored rows"
-      // rather than "at most N records you may see", and would report
-      // has_more/next_cursor for a position in the unfiltered sequence.
-      // Accumulate visible rows across store pages instead, then derive
-      // paging state from the filtered view.
-      const visible: PdppRecordRow[] = [];
-      let pageCursor = cursor;
-      let storeHasMore = false;
-      let cursorTemplate: string | undefined;
-      do {
-        const requestCursor = pageCursor;
-        const page = deps.store.listRecords(stream, {
-          instanceIds: effectiveInstanceIds,
-          // Fetch at most one client page from the store at a time. The route
-          // may need several store pages to collect enough grant-visible rows,
-          // but keeping this page size at the client limit means the store
-          // usually gives us a bound cursor exactly at the visible boundary.
-          limit,
-          order,
-          cursor: requestCursor,
-        });
-        for (const row of page.data) {
-          if (
-            recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-            recordWithinGrantTimeConstraint(row.data, scope.streamGrant)
-          ) {
-            visible.push(row);
-          }
-          if (visible.length > limit) break;
-        }
-        pageCursor = page.nextCursor ?? undefined;
-        cursorTemplate = pageCursor ?? requestCursor;
-        storeHasMore = page.hasMore;
-      } while (visible.length <= limit && storeHasMore && pageCursor);
-
-      // limit + 1 visible rows means at least one more record the caller may
-      // see; trim it and report has_more from the filtered view.
-      const moreVisible = visible.length > limit;
-      const data = moreVisible ? visible.slice(0, limit) : visible;
-      const last = data[data.length - 1];
-      if (moreVisible && last && !cursorTemplate) {
-        throw new Error(
-          "Filtered list has more rows but no bound store cursor",
-        );
-      }
+      const page = deps.store.listRecords(stream, {
+        instanceIds: effectiveInstanceIds,
+        limit,
+        order,
+        cursor,
+        isVisible: (row) =>
+          recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
+          recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
+      });
       const meta = clamped
         ? {
             warnings: [
@@ -1205,13 +1040,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const response = c.json(
         {
           object: "list",
-          has_more: moreVisible,
-          ...(moreVisible &&
-            last &&
-            cursorTemplate && {
-              next_cursor: rebindListCursor(cursorTemplate, order, last),
-            }),
-          data: data.map((row) => toRecordJson(stream, row, fields)),
+          has_more: page.hasMore,
+          ...(page.nextCursor && { next_cursor: page.nextCursor }),
+          data: page.data.map((row) =>
+            toRecordJson(stream, row, fields, grantIsCandidate(context?.grant)),
+          ),
           ...(meta && { meta }),
         },
         200,
@@ -1246,7 +1079,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
-      rejectUnknownParams(c, "getRecord", context!.tokenKind);
+      const query = parseRecordQuery(
+        c.req.url,
+        "getRecord",
+        context!.tokenKind,
+      );
       // §8 requires client-token `expand[]` to be REJECTED before the
       // declaration is consulted, on single-record reads as well as lists.
       // Silently ignoring it told a client its request was honored when a
@@ -1257,7 +1094,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         context!,
         stream,
       );
-      const scope = resolveReadScope(context!, stream, declaration);
+      const scope = resolveReadScope(
+        context!,
+        stream,
+        declaration,
+        query.fields,
+      );
 
       const effectiveInstanceIds =
         context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
@@ -1284,35 +1126,17 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         throw new PdppError("not_found", "Record not found");
       }
 
-      // `fields` is a declared parameter of this endpoint, and `v0.2-4-2`
-      // builds disclosed `data` from the grant AND the request-time
-      // selection. It was parsed nowhere, so `?fields=date` returned every
-      // granted field with a 200 — the response did something other than what
-      // was asked, and a client narrowing its own exposure did not get it.
-      const requestedFields = c.req
-        .query("fields")
-        ?.split(",")
-        .map((f) => f.trim());
-      const fields =
-        context!.tokenKind === "client"
-          ? narrowClientFields(
-              requestedFields,
-              scope.fields,
-              declaration,
-              scope.schemaRequiredFloor,
-            )
-          : (requestedFields ?? scope.fields);
+      const fields = scope.fields;
 
       const data = projectFields(found.data, fields);
 
       const response = c.json(
-        {
-          object: "record",
-          id: recordKey,
+        toRecordJson(
           stream,
-          data,
-          emitted_at: found.emittedAt,
-        },
+          { ...found, data },
+          undefined,
+          grantIsCandidate(context?.grant),
+        ),
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
@@ -1342,7 +1166,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (error) return error;
 
     try {
-      rejectUnknownParams(c, "deleteRecord");
+      parseRecordQuery(c.req.url, "deleteRecord");
       if (context!.tokenKind !== "owner") {
         throw new PdppError(
           "authentication_error",
@@ -2144,7 +1968,7 @@ function summarizeGrantVisible(
   outer: while (scanned < STREAM_SCAN_ROW_BUDGET) {
     const page = store.listRecords(stream, {
       instanceIds,
-      limit: MAX_LIMIT,
+      limit: 100,
       order: "desc",
       cursor,
     });
@@ -2174,7 +1998,7 @@ function summarizeGrantVisible(
   for (;;) {
     const page = store.listRecords(stream, {
       instanceIds,
-      limit: MAX_LIMIT,
+      limit: 100,
       order: "asc",
       cursor,
     });
@@ -2203,25 +2027,35 @@ function summarizeGrantVisible(
   };
 }
 
+/**
+ * One response record or tombstone. The candidate names a record by its
+ * instance and key together, so it adds `instance_id` (the grant's handle,
+ * which is the stored instance) and serves the minimal client tombstone. The
+ * current contract's shape is unchanged.
+ */
 function toRecordJson(
   stream: string,
   row: PdppRecordRow,
   fields: string[] | undefined,
+  candidate = false,
 ) {
+  const identity = {
+    object: "record",
+    id: row.recordKey,
+    ...(candidate && { instance_id: row.instance }),
+    stream,
+  };
   if (row.deleted) {
+    if (candidate) return { ...identity, deleted: true };
     return {
-      object: "record",
-      id: row.recordKey,
-      stream,
+      ...identity,
       deleted: true,
       deleted_at: row.deletedAt,
       emitted_at: row.emittedAt,
     };
   }
   return {
-    object: "record",
-    id: row.recordKey,
-    stream,
+    ...identity,
     data: projectFields(row.data, fields),
     emitted_at: row.emittedAt,
   };

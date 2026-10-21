@@ -133,14 +133,3 @@ export function createSourceStreamDeclarationRegistry(
     list: () => sources.flatMap((source) => source.streams),
   };
 }
-
-/** Schema-required fields are always included, even under a sparse `fields` request. */
-export function withRequiredFields(
-  requested: string[] | undefined,
-  required: string[],
-): string[] | undefined {
-  if (!requested) return undefined;
-  const merged = new Set(requested);
-  for (const field of required) merged.add(field);
-  return Array.from(merged);
-}

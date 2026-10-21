@@ -61,7 +61,7 @@ describe("resolveReadScope", () => {
     expect(scope.fields).toEqual(expect.arrayContaining(["id", "content"]));
   });
 
-  it("always includes schema-required fields even if the grant omitted them", () => {
+  it("never adds schema-required fields absent from the frozen grant", () => {
     const context: PdppTokenContext = {
       active: true,
       tokenKind: "client",
@@ -69,7 +69,7 @@ describe("resolveReadScope", () => {
       grant: clientGrant({ fields: ["content"] }), // omits required "id"
     };
     const scope = resolveReadScope(context, "messages", messagesDecl);
-    expect(scope.fields).toContain("id");
+    expect(scope.fields).toEqual(["content"]);
   });
 
   it("rejects a client token whose grant does not include the requested stream", () => {
@@ -205,4 +205,30 @@ describe("recordKeyWithinGrantResources", () => {
     expect(recordKeyWithinGrantResources("msg_1", streamGrant)).toBe(true);
     expect(recordKeyWithinGrantResources("msg_2", streamGrant)).toBe(false);
   });
+});
+
+it("keeps current grants closed when the declaration gains a required private field", () => {
+  const context: PdppTokenContext = {
+    active: true,
+    tokenKind: "client",
+    grant: clientGrant({ fields: ["content"] }),
+  };
+  const changed = { ...messagesDecl, requiredFields: ["id", "private_note"] };
+  expect(resolveReadScope(context, "messages", changed).fields).toEqual([
+    "content",
+  ]);
+});
+
+it("fails closed when candidate temporal authority has no frozen type", () => {
+  const context: PdppTokenContext = {
+    active: true,
+    tokenKind: "client",
+    grant: {
+      ...clientGrant({ time_constraint: { field: "at", since: "2026-01-01" } }),
+      version: "0.1.0-candidate",
+    },
+  };
+  expect(() => resolveReadScope(context, "messages", messagesDecl)).toThrow(
+    PdppError,
+  );
 });
