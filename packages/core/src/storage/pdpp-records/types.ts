@@ -72,6 +72,8 @@ export interface IngestResult {
 }
 
 export interface ListRecordsOptions {
+  /** Grant eligibility, evaluated on raw snapshot rows before pagination/projection. */
+  isVisible?: (row: PdppStoredRecord) => boolean;
   instanceIds: string[];
   limit: number;
   cursor?: string;
@@ -89,6 +91,8 @@ export interface ListRecordsPage {
 }
 
 export interface ChangesSinceOptions {
+  /** Candidate visibility policy, evaluated at BOTH historical horizons. */
+  isVisible?: (row: PdppStoredRecord) => boolean;
   instanceIds: string[];
   /** Absent = start a new session anchored at "now". */
   changesSince?: string;

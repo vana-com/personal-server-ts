@@ -51,6 +51,31 @@ describe("sqlite record store", () => {
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
   });
 
+  it("serves the first historical list page without scanning each record's whole instance history", () => {
+    for (let version = 1; version <= 2; version++) {
+      const envelopes = Array.from({ length: 5000 }, (_, i) => ({
+        instance: "inst_1",
+        stream: "playlists",
+        key: `r${i}`,
+        data: { id: `r${i}`, value: version },
+        emitted_at: `2026-04-0${version}T00:00:00.${String(i).padStart(6, "0")}Z`,
+      }));
+      expect(
+        store.ingestBatch(envelopes, playlistsSemantics, playlistsPk).accepted,
+      ).toBe(5000);
+    }
+    const started = performance.now();
+    const page = store.listRecords("playlists", {
+      instanceIds: ["inst_1"],
+      limit: 100,
+      order: "asc",
+    });
+    expect(page.data).toHaveLength(100);
+    // A large margin above an indexed seek; the faulty correlated scan takes
+    // seconds even for this small history, before a client can get page one.
+    expect(performance.now() - started).toBeLessThan(1000);
+  }, 30_000);
+
   it("uses a covering index for per-instance stream summaries", () => {
     const plan = db
       .prepare(
@@ -943,7 +968,7 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 11 });
+        ).toEqual({ version: 12 });
         expect(
           dbAfterUpgrade
             .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
@@ -1229,7 +1254,7 @@ describe("sqlite record store", () => {
       expect(fresh.data.map((r) => r.recordKey)).toEqual(["b1"]);
     });
 
-    it("keeps list cursors valid across writes and resets of instances they do not read", () => {
+    it("keeps list snapshots valid across writes and unrelated instance resets", () => {
       seedA();
       store.registerConnection({
         instance: "inst_c",
@@ -1264,7 +1289,7 @@ describe("sqlite record store", () => {
         order: "asc",
         cursor: page1.nextCursor,
       });
-      expect(page2.data.map((r) => r.recordKey)).toEqual(["c2", "c3"]);
+      expect(page2.data.map((r) => r.recordKey)).toEqual(["c2"]);
     });
 
     it("rejects a minted list cursor reused against a different stream", () => {

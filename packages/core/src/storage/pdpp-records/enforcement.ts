@@ -1,3 +1,4 @@
+import { grantIsCandidate } from "../../pdpp/types.js";
 import { PdppError } from "../../errors/pdpp-catalog.js";
 import {
   findStreamGrant,
@@ -6,10 +7,7 @@ import {
   type PdppTokenContext,
   type StreamGrant,
 } from "../../ports/pdpp-auth.js";
-import {
-  withRequiredFields,
-  type StreamDeclaration,
-} from "./stream-declaration.js";
+import type { StreamDeclaration } from "./stream-declaration.js";
 
 /**
  * Resolves a request-time authorization context to the effective read
@@ -25,20 +23,7 @@ export interface ResolvedReadScope {
   instanceIds: string[];
   fields?: string[];
   streamGrant?: StreamGrant; // undefined for owner tokens (no grant)
-  /**
-   * Whether the declaration's schema-required fields are part of this scope's
-   * disclosure floor.
-   *
-   * True under a v0.1 grant, where §8's per-stream consent floor keeps
-   * schema-required fields in every projection. False under a v0.2 grant,
-   * where the disclosed members are exactly what the grant approved and a
-   * field must not be added "merely because the schema requires it".
-   *
-   * Carried on the scope rather than recomputed at each call site so the two
-   * revisions cannot drift apart between the list read, the single-record
-   * read, and the stream-metadata projection — three places that must agree
-   * about what a grant discloses.
-   */
+  /** Core v0.1 sparse-read floor, capped by the frozen grant fields. */
   schemaRequiredFloor: boolean;
 }
 
@@ -46,6 +31,7 @@ export function resolveReadScope(
   context: PdppTokenContext,
   stream: string,
   declaration: StreamDeclaration | undefined,
+  requestedFields?: string[],
 ): ResolvedReadScope {
   if (!context.active) {
     throw mapInactiveToError(context);
@@ -65,7 +51,11 @@ export function resolveReadScope(
     // projection restriction) since an owner token has no grant field list.
     // An owner token has no grant and so no projection to floor: the owner
     // reads their own records whole.
-    return { instanceIds: [], fields: undefined, schemaRequiredFloor: false };
+    return {
+      instanceIds: [],
+      fields: requestedFields,
+      schemaRequiredFloor: false,
+    };
   }
 
   // Client token: requires an active resolved grant.
@@ -93,12 +83,20 @@ export function resolveReadScope(
     );
   }
 
-  // v0.2 reverses v0.1's consent floor. Under v0.1 the declaration's
-  // required fields are re-added here, so a record is never disclosed in a
-  // shape its own schema would reject. Under v0.2 that is a disclosure bug:
-  // the AS deliberately resolves a grant WITHOUT a schema-required field the
-  // owner did not approve, and re-adding it from the declaration undoes that
-  // narrowing one layer below the decision the owner actually made.
+  if (
+    grantIsCandidate(context.grant) &&
+    streamGrant.time_constraint &&
+    !["date", "date-time"].includes(streamGrant.time_constraint.type ?? "")
+  ) {
+    throw new PdppError(
+      "grant_invalid",
+      "Candidate time constraint has no valid frozen type",
+    );
+  }
+
+  // Issuance resolves required fields into grant.fields. A later declaration
+  // never adds authority. The current v0.1 sparse-read floor is restricted to
+  // fields the grant already carries; private v0.2 selects exactly.
   const schemaRequiredFloor = !grantIsV02(context.grant);
 
   // v0.2 only: can this RS actually serve the projection the grant approved?
@@ -119,7 +117,7 @@ export function resolveReadScope(
   // surfaces (list, single record, stream metadata) resolve through this
   // function, and a refusal one of them forgot would be a surface that
   // discloses what the other two refuse.
-  if (!schemaRequiredFloor && declaration.declaredFields) {
+  if (grantIsV02(context.grant) && declaration.declaredFields) {
     const declared = new Set(declaration.declaredFields);
     const undeclared = streamGrant.fields.filter((f) => !declared.has(f));
     if (undeclared.length > 0) {
@@ -132,12 +130,41 @@ export function resolveReadScope(
 
   return {
     instanceIds: streamGrant.instance_ids,
-    fields: schemaRequiredFloor
-      ? withRequiredFields(streamGrant.fields, declaration.requiredFields)
-      : [...streamGrant.fields],
+    fields: resolveReadFields(
+      requestedFields,
+      streamGrant.fields,
+      declaration,
+      schemaRequiredFloor,
+    ),
     streamGrant,
     schemaRequiredFloor,
   };
+}
+
+/** Selection policy shared by list, detail, sync, metadata and blob reads. */
+function resolveReadFields(
+  requested: string[] | undefined,
+  granted: string[],
+  declaration: StreamDeclaration,
+  schemaRequiredFloor: boolean,
+): string[] {
+  const allowed = [...granted];
+  if (!requested || requested.length === 0) return allowed;
+  for (const field of requested) {
+    if (!allowed.includes(field)) {
+      throw new PdppError(
+        "invalid_request",
+        `Field '${field}' is not in this grant's authorized fields for the stream`,
+        { param: "fields" },
+      );
+    }
+  }
+  const floor = schemaRequiredFloor
+    ? (declaration.requiredFields ?? []).filter((field) =>
+        granted.includes(field),
+      )
+    : [];
+  return [...new Set([...requested, ...floor])];
 }
 
 /**

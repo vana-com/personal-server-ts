@@ -56,10 +56,12 @@ import {
   PDPP_API_VERSION,
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
+  PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   resolveRequesterIdentity,
   validateCodeChallenge,
   validateRedirectUri,
   validateSelectionRequest,
+  validateCandidateOwnerChoices,
   type ApprovalFailure,
   type DeclarationSnapshot,
   type GrantStatus,
@@ -88,6 +90,8 @@ const NO_STORE = {
 export const OWNER_TOKEN_TTL_SECONDS = 15 * 60;
 
 export interface PdppAuthRouteDeps {
+  /** Candidate protocol behavior is opt-in per deployment. */
+  protocolProfile?: "current" | "candidate-0.1.0";
   logger: Logger;
   store: PdppAuthStore;
   tokens: PdppTokenService;
@@ -323,6 +327,7 @@ function negotiateVersion(
  */
 export function pdppAsMetadataHandler(
   issuerSource: PdppAuthRouteDeps["issuer"],
+  protocolProfile: PdppAuthRouteDeps["protocolProfile"] = "current",
 ): (c: Context) => Response {
   return (c: Context) => {
     const issuer =
@@ -346,6 +351,9 @@ export function pdppAsMetadataHandler(
         authorization_details_types_supported: [
           PDPP_DATA_ACCESS_TYPE,
           PDPP_DATA_ACCESS_TYPE_V02,
+          ...(protocolProfile === "candidate-0.1.0"
+            ? [PDPP_DATA_ACCESS_TYPE_CANDIDATE]
+            : []),
         ],
         grant_types_supported: ["authorization_code", "refresh_token"],
         response_types_supported: ["code"],
@@ -431,7 +439,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
    */
   app.get(
     "/.well-known/oauth-authorization-server",
-    pdppAsMetadataHandler(deps.issuer),
+    pdppAsMetadataHandler(deps.issuer, deps.protocolProfile),
   );
 
   /**
@@ -666,6 +674,17 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
 
     const request = details[0];
+    if (
+      request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE &&
+      deps.protocolProfile !== "candidate-0.1.0"
+    ) {
+      return errorResponse(
+        c,
+        400,
+        "invalid_authorization_details",
+        "candidate protocol profile is not enabled on this deployment",
+      );
+    }
     const snapshot = deps.resolveDeclaration(request.source?.id ?? "");
     if (!snapshot) {
       return errorResponse(
@@ -774,6 +793,25 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       );
     }
 
+    const candidate = session?.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE;
+    const ownerChoices = parseOwnerChoices(c, candidate);
+    if (ownerChoices === "invalid")
+      return errorResponse(
+        c,
+        400,
+        "invalid_owner_choices",
+        "approval query values must be true",
+      );
+    if (candidate) {
+      const invalid = validateCandidateOwnerChoices(
+        session!.request,
+        session!.snapshot,
+        ownerChoices,
+      );
+      if (invalid)
+        return errorResponse(c, 400, "invalid_owner_choices", invalid);
+    }
+
     const result = fetchReview({
       sessions: deps.sessions,
       tokens: deps.tokens,
@@ -784,7 +822,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         session?.snapshot.source_id ?? "",
       ),
       instanceChoices: parseInstanceChoices(c),
-      ownerChoices: parseOwnerChoices(c),
+      ownerChoices,
       ownerConditions: parseOwnerConditions(c),
       standingTerms:
         deps.standingTermsFor?.(session?.requester.client_id ?? "") ??
@@ -855,6 +893,16 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       body = await c.req.json();
     } catch {
       return errorResponse(c, 400, "invalid_request", "body must be JSON");
+    }
+
+    if (session?.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE) {
+      const invalid = validateCandidateOwnerChoices(
+        session.request,
+        session.snapshot,
+        body.owner_choices,
+      );
+      if (invalid)
+        return errorResponse(c, 400, "invalid_owner_choices", invalid);
     }
 
     const result = approveAuthorization({
@@ -1434,13 +1482,23 @@ function parseOwnerConditions(c: Context): OwnerConditions | undefined {
   return Object.keys(conditions).length > 0 ? conditions : undefined;
 }
 
-function parseOwnerChoices(c: Context): OwnerChoices | undefined {
+function parseOwnerChoices(
+  c: Context,
+  strict = false,
+): OwnerChoices | undefined | "invalid" {
   const declined: string[] = [];
+  const approved: string[] = [];
   const fields: Record<string, string[]> = {};
   const windows: Record<string, { since?: string; until?: string }> = {};
 
   const url = new URL(c.req.url);
   for (const [key, value] of url.searchParams.entries()) {
+    const approval = /^approve\[(.+)\]$/.exec(key);
+    if (approval && strict && value !== "true") return "invalid";
+    if (approval && value === "true") {
+      approved.push(approval[1]);
+      continue;
+    }
     const decline = /^decline\[(.+)\]$/.exec(key);
     if (decline) {
       declined.push(decline[1]);
@@ -1464,6 +1522,7 @@ function parseOwnerChoices(c: Context): OwnerChoices | undefined {
 
   const choices: OwnerChoices = {
     ...(declined.length > 0 && { declined_streams: declined }),
+    ...(approved.length > 0 && { approved_streams: approved }),
     ...(Object.keys(fields).length > 0 && { fields }),
     ...(Object.keys(windows).length > 0 && { time_ranges: windows }),
   };

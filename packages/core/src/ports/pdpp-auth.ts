@@ -1,33 +1,11 @@
-/**
- * PDPP AS -> RS seam types, MIRRORED from `pdpp-ps-auth-v2-0917`'s published
- * contract (`~/code/pdpp/local/conformance-fleet-0917/ps-auth-contract.md`,
- * branch `feat/pdpp-as-grants`), not authored here.
- *
- * The AS lane owns `packages/core/src/pdpp/**` on its own branch. That branch
- * is not merged as of this lane's implementation, so these types are a local
- * mirror this lane's route/enforcement layer codes against now. When the AS
- * branch merges, this file should be deleted and its imports repointed at
- * `@opendatalabs/personal-server-ts-core/pdpp` — the shapes below are meant
- * to be identical, not a superset or a simplification.
- *
- * DO NOT widen these beyond the AS contract. In particular:
- * - `TimeConstraint.until` is EXCLUSIVE (`record[field] < until`), not `<=`.
- * - Field projection, instance scoping, and time constraint are PER STREAM
- *   (`StreamGrant`), not grant-wide.
- */
-
+/** AS → RS authorization seam. Temporal authority reuses the canonical AS type. */
 export type PdppTokenKind = "owner" | "client";
 export type AccessMode = "single_use" | "continuous";
 export type SourceKind = "connector" | "provider_native";
 
-export interface TimeConstraint {
-  /** Frozen declaration field the bounds are evaluated against. */
-  field: string;
-  /** Inclusive lower bound (record[field] >= since). ISO 8601. */
-  since?: string;
-  /** Exclusive upper bound (record[field] < until). ISO 8601. */
-  until?: string;
-}
+export type { TimeConstraint } from "../pdpp/types.js";
+import type { TimeConstraint } from "../pdpp/types.js";
+import { withinTimeRange } from "../pdpp/time.js";
 
 export interface StreamGrant {
   name: string;
@@ -79,8 +57,8 @@ export const GRANT_VERSION_V02 = "0.2.0";
  * rule for both would either undo the AS's v0.2 narrowing or silently shrink
  * what an already-consented v0.1 grant discloses.
  *
- * An unrecognized version reads as v0.1: the conservative direction is to
- * keep the floor, which discloses no field the grant does not name.
+ * The Core candidate also retains its floor inside the frozen grant.
+ * No profile adds fields that the grant does not name.
  */
 export function grantIsV02(grant: Grant | undefined): boolean {
   return grant?.version === GRANT_VERSION_V02;
@@ -136,9 +114,5 @@ export function withinTimeConstraint(
   value: string | undefined,
   constraint: TimeConstraint | undefined,
 ): boolean {
-  if (!constraint) return true;
-  if (value === undefined) return false;
-  if (constraint.since !== undefined && value < constraint.since) return false;
-  if (constraint.until !== undefined && value >= constraint.until) return false;
-  return true;
+  return !constraint || withinTimeRange(value, constraint);
 }

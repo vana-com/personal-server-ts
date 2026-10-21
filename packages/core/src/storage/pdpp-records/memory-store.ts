@@ -1,3 +1,10 @@
+import { selectSyncChange } from "./sync-selection.js";
+import {
+  compareListRows,
+  listSnapshotPage,
+  compareRecordIdentity,
+  decodeListCursor,
+} from "./list-page.js";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
 import type { PdppRecordStore } from "./interface.js";
@@ -66,6 +73,14 @@ export function createMemoryRecordStore(): PdppRecordStore {
   const blobs = new Map<string, PdppBlobMeta>();
   const blobBytes = new Map<string, Uint8Array>();
   const epoch = randomUUID();
+  let listSnapshot:
+    | {
+        key: string;
+        rows: PdppStoredRecord[];
+        erasureClock: number;
+        erased: Set<RowKey>;
+      }
+    | undefined;
   let writeClock = 0; // monotonic logical clock, avoids wall-clock ties in tests
 
   function nextWriteTimestamp(): string {
@@ -177,91 +192,99 @@ export function createMemoryRecordStore(): PdppRecordStore {
     return row;
   }
 
-  function projectFields(
-    data: Record<string, unknown>,
-    fields: string[] | undefined,
-  ): Record<string, unknown> {
-    if (!fields) return data;
-    const projected: Record<string, unknown> = {};
-    for (const field of fields) {
-      if (field in data) projected[field] = data[field];
-    }
-    return projected;
-  }
-
-  function sortKey(row: PdppStoredRecord): [string, string] {
-    // cursor_field is modeled here as emittedAt (stand-in for the declared
-    // cursor_field — the ingest path only knows emitted_at, per-stream
-    // declared cursor fields are a SourceDeclaration concern the RS route
-    // layer resolves before calling into the store).
-    return [row.emittedAt, row.recordKey];
-  }
-
   function listRecords(
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
-    let startAfter: [string, string] | null = null;
+    let after: PdppStoredRecord | undefined;
+    let horizon = new Date(writeClock).toISOString();
     if (options.cursor) {
-      const payload = decodeCursor(options.cursor);
-      if (payload.kind !== "list") throw new InvalidCursorError();
+      const payload = decodeListCursor(options.cursor);
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
-      startAfter = [payload.sortValue ?? "", payload.recordKey];
+      horizon = payload.horizon;
+      after = {
+        emittedAt: payload.sortValue ?? "",
+        recordKey: payload.recordKey,
+        instance: payload.instance,
+        stream,
+        data: {},
+        version: 0,
+        deleted: false,
+      };
     }
-
-    const rows = Array.from(current.values()).filter(
-      (row): row is PdppStoredRecord =>
-        !row.deleted &&
-        row.stream === stream &&
-        options.instanceIds.includes(row.instance),
+    const snapshotKey = JSON.stringify([
+      stream,
+      [...new Set(options.instanceIds)].sort(),
+      horizon,
+    ]);
+    // One bounded cache of raw row references prevents repeated sorting for a
+    // page walk. It holds no disclosure decision and is rebuilt from history
+    // after eviction, so concurrent traversals retain their own fixed horizons.
+    if (listSnapshot?.key !== snapshotKey) {
+      const snapshot = new Map<RowKey, PdppRecordRow>();
+      const instances = new Set(options.instanceIds);
+      for (const entry of history) {
+        if (
+          entry.stream === stream &&
+          instances.has(entry.instance) &&
+          entry.writtenAt <= horizon
+        ) {
+          snapshot.set(
+            rowKey(entry.instance, stream, entry.recordKey),
+            entry.row,
+          );
+        }
+      }
+      listSnapshot = {
+        key: snapshotKey,
+        erasureClock: -1,
+        erased: new Set(),
+        rows: Array.from(snapshot.values())
+          .filter((row): row is PdppStoredRecord => !row.deleted)
+          .sort(compareListRows),
+      };
+    }
+    if (listSnapshot.erasureClock !== writeClock) {
+      listSnapshot.erased = new Set(
+        history
+          .filter((entry) => entry.row.deleted && entry.writtenAt > horizon)
+          .map((entry) =>
+            rowKey(entry.instance, entry.stream, entry.recordKey),
+          ),
+      );
+      listSnapshot.erasureClock = writeClock;
+    }
+    const erased = listSnapshot.erased;
+    const rows = listSnapshot.rows;
+    const direction = options.order === "asc" ? 1 : -1;
+    let start = direction === 1 ? 0 : rows.length - 1;
+    if (after) {
+      let low = 0,
+        high = rows.length;
+      while (low < high) {
+        const middle = Math.floor((low + high) / 2);
+        const compared = compareListRows(rows[middle], after);
+        if (compared < 0 || (direction === 1 && compared === 0))
+          low = middle + 1;
+        else high = middle;
+      }
+      start = direction === 1 ? low : low - 1;
+    }
+    function* orderedRows(): Generator<PdppStoredRecord> {
+      for (let i = start; i >= 0 && i < rows.length; i += direction)
+        yield rows[i];
+    }
+    return listSnapshotPage(
+      orderedRows(),
+      options,
+      {
+        stream,
+        epoch: cursorEpoch(),
+        horizon,
+      },
+      (row) => erased.has(rowKey(row.instance, row.stream, row.recordKey)),
     );
-
-    rows.sort((a, b) => {
-      const [aVal, aKey] = sortKey(a);
-      const [bVal, bKey] = sortKey(b);
-      const cmp =
-        aVal === bVal ? aKey.localeCompare(bKey) : aVal < bVal ? -1 : 1;
-      return options.order === "asc" ? cmp : -cmp;
-    });
-
-    let filtered = rows;
-    if (startAfter) {
-      const [afterVal, afterKey] = startAfter;
-      filtered = rows.filter((row) => {
-        const [val, key] = sortKey(row);
-        const cmp =
-          val === afterVal
-            ? key.localeCompare(afterKey)
-            : val < afterVal
-              ? -1
-              : 1;
-        return options.order === "asc" ? cmp > 0 : cmp < 0;
-      });
-    }
-
-    const page = filtered.slice(0, options.limit);
-    const hasMore = filtered.length > options.limit;
-    const last = page[page.length - 1];
-
-    return {
-      data: page.map((row) => ({
-        ...row,
-        data: projectFields(row.data, options.fields),
-      })),
-      hasMore,
-      nextCursor:
-        hasMore && last
-          ? encodeCursor({
-              kind: "list",
-              stream,
-              epoch: cursorEpoch(),
-              order: options.order,
-              sortValue: sortKey(last)[0],
-              recordKey: last.recordKey,
-            })
-          : undefined,
-    };
   }
 
   function deleteRecord(
@@ -371,51 +394,22 @@ export function createMemoryRecordStore(): PdppRecordStore {
         if (!wroteSincePrior) continue;
       }
 
-      if (entry.row.deleted) {
-        changed.push(entry.row);
-        continue;
-      }
-
-      const projectedNow = projectFields(entry.row.data, options.fields);
-
-      if (sinceHorizon !== null && options.fields) {
-        // Eligibility MUST be computed on the grant-authorized projection
-        // (spec §4): if only unauthorized fields changed since the prior
-        // session horizon, this record must not appear as "changed".
-        const priorEntry = [...history]
-          .filter(
-            (h) =>
-              h.stream === entry.stream &&
-              h.recordKey === entry.recordKey &&
-              h.instance === entry.instance &&
-              h.writtenAt <= sinceHorizon,
-          )
-          .sort((a, b) => b.version - a.version)[0];
-        if (priorEntry && !priorEntry.row.deleted) {
-          const priorProjected = projectFields(
-            priorEntry.row.data,
-            options.fields,
-          );
-          if (JSON.stringify(priorProjected) === JSON.stringify(projectedNow)) {
-            continue;
-          }
-        }
-      }
-
-      // Return the RAW (unprojected) row here, not `projectedNow`. Eligibility
-      // above legitimately needs the grant-authorized projection to decide
-      // "did the authorized fields change" without leaking a hidden-field
-      // change. But a caller enforcing time_constraint against `row.data`
-      // (packages/server/src/routes/pdpp-records.ts) needs the real field
-      // value, not one already stripped to the grant's fields — projecting
-      // here would silently break that filter for any grant whose fields
-      // don't happen to include the time_constraint field. Field projection
-      // for the response is the caller's job, applied AFTER any filtering
-      // that reads real field values.
-      changed.push(entry.row);
+      const previous =
+        sinceHorizon === null
+          ? undefined
+          : relevant
+              .filter(
+                (h) =>
+                  h.instance === entry.instance &&
+                  h.recordKey === entry.recordKey &&
+                  h.writtenAt <= sinceHorizon,
+              )
+              .at(-1)?.row;
+      const selected = selectSyncChange(entry.row, previous, options);
+      if (selected) changed.push(selected);
     }
 
-    changed.sort((a, b) => a.recordKey.localeCompare(b.recordKey));
+    changed.sort(compareRecordIdentity);
 
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;

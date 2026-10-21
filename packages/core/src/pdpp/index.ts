@@ -10,6 +10,9 @@
 export {
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
+  PDPP_DATA_ACCESS_TYPE_CANDIDATE,
+  grantIsCandidate,
+  PDPP_GRANT_VERSION_CANDIDATE,
   PDPP_GRANT_VERSION,
   PDPP_GRANT_VERSION_V02,
   PDPP_API_VERSION,
@@ -62,7 +65,7 @@ export type {
   ResolvedCommitments,
 } from "./commitments.js";
 
-export { resolveSelection } from "./resolve.js";
+export { resolveSelection, validateCandidateOwnerChoices } from "./resolve.js";
 export type {
   InstanceInventory,
   OwnerChoices,
@@ -198,3 +201,10 @@ export type {
   RegisteredClientMetadata,
   ResolveRequesterInput,
 } from "./client-metadata.js";
+
+export {
+  parseTime,
+  compareTime,
+  declaredTimeType,
+  type TimeType,
+} from "./time.js";

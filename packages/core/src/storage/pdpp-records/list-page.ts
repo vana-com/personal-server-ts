@@ -1,0 +1,112 @@
+import {
+  decodeCursor,
+  encodeCursor,
+  type ListCursorPayload,
+} from "./cursor.js";
+import { InvalidCursorError, CursorExpiredError } from "./types.js";
+import type {
+  ListRecordsOptions,
+  ListRecordsPage,
+  PdppStoredRecord,
+} from "./types.js";
+
+/** A legacy position cannot prove complete snapshot continuation; restart explicitly. */
+export function decodeListCursor(
+  cursor: string,
+): ListCursorPayload & { instance: string; horizon: string } {
+  const payload = decodeCursor(cursor);
+  if (payload.kind !== "list") throw new InvalidCursorError();
+  if (payload.instance === undefined || payload.horizon === undefined)
+    throw new CursorExpiredError();
+  return { ...payload, instance: payload.instance, horizon: payload.horizon };
+}
+
+/** Complete identity, in the existing public sort order with instance last. */
+export const LIST_ORDER_COLUMNS = [
+  "emitted_at",
+  "record_key",
+  "instance",
+] as const;
+
+// SQLite BINARY orders UTF-8 by code point, unlike localeCompare/UTF-16.
+function compareText(a: string, b: string): number {
+  if (a === b) return 0;
+  // UTF-16 and UTF-8 ordering differ only for supplementary characters.
+  // Keep the common ASCII/BMP comparison allocation-free.
+  if (!/[\uD800-\uDBFF]/.test(a) && !/[\uD800-\uDBFF]/.test(b))
+    return a < b ? -1 : 1;
+  const left = Array.from(a, (c) => c.codePointAt(0)!);
+  const right = Array.from(b, (c) => c.codePointAt(0)!);
+  for (let i = 0; i < Math.min(left.length, right.length); i++) {
+    if (left[i] !== right[i]) return left[i] < right[i] ? -1 : 1;
+  }
+  return Math.sign(left.length - right.length);
+}
+
+/** Locale-independent complete record identity, shared by list and sync. */
+export function compareRecordIdentity(
+  a: { recordKey: string; instance: string },
+  b: { recordKey: string; instance: string },
+): number {
+  return (
+    compareText(a.recordKey, b.recordKey) || compareText(a.instance, b.instance)
+  );
+}
+
+export function compareListRows(
+  a: PdppStoredRecord,
+  b: PdppStoredRecord,
+): number {
+  return compareText(a.emittedAt, b.emittedAt) || compareRecordIdentity(a, b);
+}
+
+/** Consume a sorted snapshot until one extra visible row proves continuation. */
+export function listSnapshotPage(
+  rows: Iterable<PdppStoredRecord>,
+  options: ListRecordsOptions,
+  snapshot: { stream: string; epoch: string; horizon: string },
+  wasErased?: (row: PdppStoredRecord) => boolean,
+): ListRecordsPage {
+  const data: PdppStoredRecord[] = [];
+  let hasMore = false;
+  for (const row of rows) {
+    if (options.isVisible && !options.isVisible(row)) continue;
+    // Erasure overrides historical membership. Expire explicitly rather than
+    // resurrect deleted data or silently call an incomplete traversal complete.
+    if (wasErased?.(row)) throw new CursorExpiredError();
+    if (data.length === options.limit) {
+      hasMore = true;
+      break;
+    }
+    data.push(row);
+  }
+  const last = data.at(-1);
+  const payload: ListCursorPayload | undefined =
+    last && hasMore
+      ? {
+          kind: "list",
+          ...snapshot,
+          order: options.order,
+          sortValue: last.emittedAt,
+          recordKey: last.recordKey,
+          instance: last.instance,
+        }
+      : undefined;
+  return {
+    data: data.map((row) =>
+      options.fields
+        ? {
+            ...row,
+            data: Object.fromEntries(
+              options.fields
+                .filter((f) => Object.hasOwn(row.data, f))
+                .map((f) => [f, row.data[f]]),
+            ),
+          }
+        : row,
+    ),
+    hasMore,
+    nextCursor: payload ? encodeCursor(payload) : undefined,
+    horizon: snapshot.horizon,
+  };
+}

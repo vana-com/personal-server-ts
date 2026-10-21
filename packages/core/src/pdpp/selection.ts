@@ -1,3 +1,9 @@
+import {
+  compareTime,
+  parseTime,
+  declaredTimeType,
+  type TimeType,
+} from "./time.js";
 /**
  * PDPP Core §6 selection-request validation.
  *
@@ -16,6 +22,7 @@
 import {
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
+  PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   type DeclarationSnapshot,
   type DeclaredStream,
   type SelectionRequest,
@@ -104,10 +111,11 @@ function validateResourceKey(raw: string, primaryKey: string[]): string | null {
  * here turns a guaranteed `access_denied` at issuance into a fixable shape
  * error before a human is asked to decide anything.
  */
-function expandedRequestFields(
+export function expandedRequestFields(
   stream: StreamRequest,
   declared: DeclaredStream,
   snapshot: DeclarationSnapshot,
+  allFieldsMarker = false,
 ): string[] {
   if (stream.view !== undefined) {
     const view = snapshot.views?.find((v) => v.name === stream.view);
@@ -115,7 +123,11 @@ function expandedRequestFields(
     return view ? view.fields.filter((f) => declared.fields.includes(f)) : [];
   }
   if (stream.fields !== undefined) {
-    return stream.fields.filter((f) => declared.fields.includes(f));
+    return allFieldsMarker &&
+      stream.fields.length === 1 &&
+      stream.fields[0] === "*"
+      ? declared.fields
+      : stream.fields.filter((f) => declared.fields.includes(f));
   }
   // Omitting both asks for all permitted fields, so the whole declared set is
   // in the expanded request.
@@ -137,9 +149,10 @@ function expandedRequestFields(
  * rather than assumed: a `null` or a number here must be a validation failure,
  * not a `TypeError` that the binding turns into a 500.
  */
-function validateTimeRangeBounds(
+export function validateTimeRangeBounds(
   value: unknown,
   subject: string,
+  type?: TimeType,
 ): SelectionValidation {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return fail("invalid_request", `${subject} time_range must be an object`);
@@ -153,7 +166,10 @@ function validateTimeRangeBounds(
     ["until", until],
   ] as const) {
     if (bound === undefined) continue;
-    if (typeof bound !== "string" || Number.isNaN(Date.parse(bound))) {
+    if (
+      typeof bound !== "string" ||
+      (type ? parseTime(bound, type) === null : Number.isNaN(Date.parse(bound)))
+    ) {
       return fail(
         "invalid_request",
         `${subject} time_range.${label} is not a valid ISO 8601 instant`,
@@ -161,7 +177,11 @@ function validateTimeRangeBounds(
     }
   }
   if (typeof since === "string" && typeof until === "string") {
-    if (Date.parse(since) >= Date.parse(until)) {
+    if (
+      type
+        ? compareTime(since, until, type)! >= 0
+        : Date.parse(since) >= Date.parse(until)
+    ) {
       return fail(
         "invalid_request",
         `${subject} time_range.since must precede time_range.until`,
@@ -182,6 +202,7 @@ function validateMinimum(
   stream: StreamRequest,
   declared: DeclaredStream,
   snapshot: DeclarationSnapshot,
+  type?: TimeType,
 ): SelectionValidation {
   const minimum = stream.minimum;
   if (minimum === undefined) return { ok: true };
@@ -217,7 +238,7 @@ function validateMinimum(
     if (new Set(fields).size !== fields.length) {
       return bad("fields must not contain duplicates");
     }
-    const permitted = expandedRequestFields(stream, declared, snapshot);
+    const permitted = expandedRequestFields(stream, declared, snapshot, true);
     const outside = fields.filter((f) => !permitted.includes(f));
     if (outside.length > 0) {
       return bad(`fields outside the expanded request: ${outside.join(", ")}`);
@@ -235,6 +256,22 @@ function validateMinimum(
     // and which the request's own upper limit already bounds.
     if (typeof since !== "string" || typeof until !== "string") {
       return bad("time_range must contain both since and until");
+    }
+    if (type) {
+      const valid = validateTimeRangeBounds(
+        range,
+        `stream '${stream.name}' minimum`,
+        type,
+      );
+      if (!valid.ok) return bad(valid.failure.message);
+      if (
+        (stream.time_range?.since !== undefined &&
+          compareTime(since, stream.time_range.since, type)! < 0) ||
+        (stream.time_range?.until !== undefined &&
+          compareTime(until, stream.time_range.until, type)! > 0)
+      )
+        return bad("time_range falls outside the requested time_range");
+      return { ok: true };
     }
     const from = Date.parse(since);
     const to = Date.parse(until);
@@ -268,7 +305,7 @@ function validateMinimum(
 function validateStreamRequest(
   stream: StreamRequest,
   snapshot: DeclarationSnapshot,
-  revision: "0.1" | "0.2",
+  revision: "0.1" | "0.2" | "candidate",
 ): SelectionValidation {
   // The entry is untrusted JSON: `streams: [null]` and `streams: ["name"]`
   // both reach here. Every check below reads a member off it, so the shape
@@ -292,7 +329,7 @@ function validateStreamRequest(
     }
   }
 
-  if (stream.minimum !== undefined && revision === "0.1") {
+  if (stream.minimum !== undefined && revision !== "0.2") {
     // v0.1 has no `minimum`. Accepting and ignoring it is the one outcome
     // worse than rejecting: the client would ship believing a floor is
     // enforced. A client that wants minima moves to the v0.2 type.
@@ -300,6 +337,41 @@ function validateStreamRequest(
       "unsupported_selection_parameter",
       `stream '${stream.name}' carries minimum, which requires the ${PDPP_DATA_ACCESS_TYPE_V02} detail type`,
     );
+  }
+
+  if (revision === "candidate") {
+    if (stream.name === "*" && stream.view !== undefined)
+      return fail(
+        "unsupported_selection_parameter",
+        "view cannot be combined with a wildcard stream selection",
+      );
+    if (stream.fields === undefined && stream.view === undefined)
+      return fail(
+        "invalid_request",
+        "each candidate stream requires fields or view",
+      );
+    if (
+      stream.fields !== undefined &&
+      (!Array.isArray(stream.fields) ||
+        stream.fields.length === 0 ||
+        !stream.fields.every((f) => typeof f === "string" && f.length > 0) ||
+        (stream.fields.includes("*") && stream.fields.length !== 1))
+    )
+      return fail(
+        "invalid_request",
+        "fields must be non-empty; '*' must appear alone",
+      );
+    if (stream.name === "*") {
+      for (const declared of snapshot.streams) {
+        const result = validateStreamRequest(
+          { ...stream, name: declared.name },
+          snapshot,
+          revision,
+        );
+        if (!result.ok) return result;
+      }
+      return { ok: true };
+    }
   }
 
   // A wildcard is checked by the caller (it must be the sole entry) and
@@ -407,7 +479,11 @@ function validateStreamRequest(
         `stream '${stream.name}' fields must contain non-empty strings`,
       );
     }
-    const absent = stream.fields.filter((f) => !declared.fields.includes(f));
+    const absent = stream.fields.filter(
+      (f) =>
+        !(revision === "candidate" && f === "*") &&
+        !declared.fields.includes(f),
+    );
     if (absent.length > 0) {
       return fail(
         "unknown_field",
@@ -425,9 +501,17 @@ function validateStreamRequest(
         `stream '${stream.name}' declares no consent_time_field and cannot accept time_range`,
       );
     }
+    const timeType =
+      revision === "candidate" ? declaredTimeType(declared) : undefined;
+    if (revision === "candidate" && !timeType)
+      return fail(
+        "unsupported_selection_parameter",
+        "candidate consent_time_field must declare a date or date-time string",
+      );
     const bounds = validateTimeRangeBounds(
       stream.time_range,
       `stream '${stream.name}'`,
+      timeType,
     );
     if (!bounds.ok) return bounds;
   }
@@ -464,7 +548,12 @@ function validateStreamRequest(
 
   // Last, so a minimum naming a field that is itself undeclared reports the
   // undeclared field rather than the floor built on it.
-  return validateMinimum(stream, declared, snapshot);
+  return validateMinimum(
+    stream,
+    declared,
+    snapshot,
+    revision === "candidate" ? declaredTimeType(declared) : undefined,
+  );
 }
 
 /**
@@ -479,20 +568,35 @@ export function validateSelectionRequest(
   request: SelectionRequest,
   snapshot: DeclarationSnapshot,
 ): SelectionValidation {
-  // Exactly two types are recognized, each resolved under its own revision.
+  // Each recognized type is resolved under its own revision.
   // Anything else is rejected rather than processed as the nearest PDPP type:
   // a type URI the AS does not implement carries rules it does not apply.
   const revision =
-    request.type === PDPP_DATA_ACCESS_TYPE_V02
-      ? "0.2"
-      : request.type === PDPP_DATA_ACCESS_TYPE
-        ? "0.1"
-        : null;
+    request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE
+      ? "candidate"
+      : request.type === PDPP_DATA_ACCESS_TYPE_V02
+        ? "0.2"
+        : request.type === PDPP_DATA_ACCESS_TYPE
+          ? "0.1"
+          : null;
   if (revision === null) {
     return fail(
       "invalid_request",
-      `authorization detail type must be ${PDPP_DATA_ACCESS_TYPE} or ${PDPP_DATA_ACCESS_TYPE_V02}`,
+      `authorization detail type must be ${PDPP_DATA_ACCESS_TYPE}, ${PDPP_DATA_ACCESS_TYPE_V02}, or ${PDPP_DATA_ACCESS_TYPE_CANDIDATE}`,
     );
+  }
+
+  if (revision === "candidate") {
+    const ineligible = snapshot.streams.find(
+      (stream) =>
+        stream.consent_time_field !== undefined &&
+        declaredTimeType(stream) === undefined,
+    );
+    if (ineligible)
+      return fail(
+        "invalid_request",
+        `stream '${ineligible.name}' declares an ineligible consent_time_field`,
+      );
   }
 
   if (

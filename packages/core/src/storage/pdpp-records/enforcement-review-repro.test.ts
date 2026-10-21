@@ -8,9 +8,8 @@
  *
  * This file is the reviewer's exact repro, written as an oracle rather than a
  * narrative. It states the requirement (`v0.2-4-1`) in the assertion, and it
- * pairs the v0.2 case with the v0.1 case so a future "fix" that removes the
- * floor everywhere fails here rather than silently retiring v0.1's consent
- * floor.
+ * pairs the private v0.2 case with the current Core frozen-grant boundary.
+ * Schema requirements cannot add authority that issuance did not freeze.
  */
 
 import { describe, expect, it } from "vitest";
@@ -68,15 +67,14 @@ describe("review finding 1 — v0.2 reads must not re-add schema-required fields
     expect(scope.schemaRequiredFloor).toBe(false);
   });
 
-  it("keeps the schema-required floor for the same shape under a v0.1 grant", () => {
+  it("never widens a current grant from a newer schema-required floor", () => {
     const scope = resolveReadScope(
       clientContext(grantApproving("0.1.0", ["name"])),
       "artists",
       requiresId,
     );
-    // v0.1 §8's consent floor is unchanged: this is the behavior the v0.2
-    // case must NOT inherit, and the one a blanket removal would break.
-    expect(scope.fields).toEqual(expect.arrayContaining(["name", "id"]));
+    // Core freezes fields at issuance; required fields belong in that grant.
+    expect(scope.fields).toEqual(["name"]);
     expect(scope.schemaRequiredFloor).toBe(true);
   });
 });

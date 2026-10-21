@@ -36,6 +36,7 @@ import {
 import { issueGrant, type ConsentEvidence } from "./issuance.js";
 import {
   expandSelections,
+  streamIsOmitted,
   resolveSelection,
   type InstanceInventory,
   type OwnerChoices,
@@ -332,10 +333,12 @@ function withInstanceChoices(
 function pendingInstanceChoices(
   session: AuthorizationSession,
   inventory: InstanceInventory,
+  ownerChoices?: OwnerChoices,
 ): InstanceChoice[] {
   const choices: InstanceChoice[] = [];
 
   for (const stream of expandSelections(session.request, session.snapshot)) {
+    if (streamIsOmitted(session.request, stream, ownerChoices)) continue;
     // An explicitly named handle set is already a decision; no choice needed.
     if (stream.instance_ids && stream.instance_ids.length > 0) continue;
     const eligible = inventory.eligibleFor(stream.name);
@@ -451,7 +454,14 @@ export function fetchReview(input: {
     };
   }
 
-  if (requestsFanIn(session.request, session.snapshot, input.instanceChoices)) {
+  if (
+    requestsFanIn(
+      session.request,
+      session.snapshot,
+      input.instanceChoices,
+      input.ownerChoices,
+    )
+  ) {
     return {
       ok: false,
       failure: {
@@ -465,7 +475,11 @@ export function fetchReview(input: {
 
   // Surface outstanding choices before attempting resolution: an unresolvable
   // instance is a consent step, not an error the owner can do nothing about.
-  const choices = pendingInstanceChoices(session, inventory);
+  const choices = pendingInstanceChoices(
+    session,
+    inventory,
+    input.ownerChoices,
+  );
   if (choices.length > 0) {
     return {
       ok: true,
@@ -624,7 +638,14 @@ export function approveAuthorization(input: {
     };
   }
 
-  if (requestsFanIn(session.request, session.snapshot, input.instanceChoices)) {
+  if (
+    requestsFanIn(
+      session.request,
+      session.snapshot,
+      input.instanceChoices,
+      input.ownerChoices,
+    )
+  ) {
     return {
       ok: false,
       failure: {
@@ -702,8 +723,10 @@ function requestsFanIn(
   request: SelectionRequest,
   snapshot: DeclarationSnapshot,
   choices: Record<string, string[]> | undefined,
+  ownerChoices?: OwnerChoices,
 ): boolean {
   return expandSelections(request, snapshot).some((stream) => {
+    if (streamIsOmitted(request, stream, ownerChoices)) return false;
     const ids = choices?.[stream.name] ?? stream.instance_ids ?? [];
     return new Set(ids).size > 1;
   });

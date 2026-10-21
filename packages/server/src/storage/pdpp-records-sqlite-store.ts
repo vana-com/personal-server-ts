@@ -1,3 +1,11 @@
+import { parseTime } from "@opendatalabs/personal-server-ts-core/pdpp";
+import {
+  selectSyncChange,
+  decodeListCursor,
+  listSnapshotPage,
+  compareRecordIdentity,
+  LIST_ORDER_COLUMNS,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
@@ -76,32 +84,9 @@ export interface StreamCompletionReceipt {
   liveCount: number;
 }
 
-const RFC3339_DATE_TIME =
-  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?(?:[Zz]|[+-](\d{2}):(\d{2}))$/;
-
-/** RFC 3339 `date-time`, with calendar-valid fields. No clock check. */
+/** Compatibility export; the portable temporal policy owns RFC3339 validity. */
 export function isRfc3339DateTime(value: unknown): value is string {
-  if (typeof value !== "string") return false;
-  const match = RFC3339_DATE_TIME.exec(value);
-  if (!match) return false;
-  const [year, month, day, hour, minute, second] = match
-    .slice(1, 7)
-    .map(Number);
-  const offsetHour = Number(match[8] ?? 0);
-  const offsetMinute = Number(match[9] ?? 0);
-  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return (
-    month >= 1 &&
-    month <= 12 &&
-    day >= 1 &&
-    day <= daysInMonth &&
-    hour <= 23 &&
-    minute <= 59 &&
-    second <= 59 &&
-    offsetHour <= 23 &&
-    offsetMinute <= 59 &&
-    !Number.isNaN(Date.parse(value))
-  );
+  return parseTime(value, "date-time") !== null;
 }
 
 export class PdppBindingError extends Error {
@@ -297,6 +282,14 @@ CREATE TABLE IF NOT EXISTS pdpp_record_arrival_clock (
   value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO pdpp_record_arrival_clock (id, value) VALUES (1, 0);
+`,
+  // v12: ordered history traversal and one-key as-of lookup. The horizon
+  // index alone scans an instance's full history for every outer row.
+  `
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_order
+  ON pdpp_record_changes (stream, emitted_at, record_key, instance, written_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
+  ON pdpp_record_changes (instance, stream, record_key, written_at DESC, version DESC);
 `,
 ];
 
@@ -502,18 +495,6 @@ function toRow(db: RecordRowDb): PdppRecordRow {
     emittedAt: db.emitted_at,
     deleted: false,
   };
-}
-
-function projectFields(
-  data: Record<string, unknown>,
-  fields: string[] | undefined,
-): Record<string, unknown> {
-  if (!fields) return data;
-  const projected: Record<string, unknown> = {};
-  for (const field of fields) {
-    if (field in data) projected[field] = data[field];
-  }
-  return projected;
 }
 
 /**
@@ -1565,69 +1546,86 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     }
   }
 
+  /** Latest version of each complete identity at one fixed write horizon. */
+  function* snapshotRows(
+    stream: string,
+    instanceIds: string[],
+    horizon: number,
+    options: {
+      order?: "asc" | "desc";
+      after?: { val: string; key: string; instance: string } | null;
+      liveOnly?: boolean;
+    } = {},
+  ): Generator<RecordRowDb & { written_at: number }> {
+    const dir = options.order === "desc" ? "DESC" : "ASC";
+    const comparison = options.order === "desc" ? "<" : ">";
+    let sql = `SELECT c.* FROM pdpp_record_changes c INDEXED BY idx_pdpp_record_changes_snapshot_order
+      WHERE c.stream = ? AND c.instance IN (${instanceIds.map(() => "?").join(",")}) AND c.written_at <= ?
+      AND c.version = (
+        SELECT c2.version FROM pdpp_record_changes c2 INDEXED BY idx_pdpp_record_changes_snapshot_latest
+        WHERE c2.instance = c.instance AND c2.stream = c.stream AND c2.record_key = c.record_key AND c2.written_at <= ?
+        ORDER BY c2.written_at DESC, c2.version DESC LIMIT 1
+      )`;
+    const params: unknown[] = [stream, ...instanceIds, horizon, horizon];
+    if (options.liveOnly) sql += " AND c.deleted = 0";
+    if (options.after) {
+      sql += ` AND (c.emitted_at, c.record_key, c.instance) ${comparison} (?, ?, ?)`;
+      params.push(options.after.val, options.after.key, options.after.instance);
+    }
+    sql += ` ORDER BY ${LIST_ORDER_COLUMNS.map((column) => `c.${column} ${dir}`).join(", ")}`;
+    for (const row of db.prepare(sql).iterate(...params))
+      yield row as RecordRowDb & { written_at: number };
+  }
+
   function listRecords(
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
-    let startAfter: { val: string; key: string } | null = null;
+    let startAfter: { val: string; key: string; instance: string } | null =
+      null;
     let horizon: number;
     if (options.cursor) {
-      const payload = decodeCursor(options.cursor);
-      if (payload.kind !== "list") throw new InvalidCursorError();
+      const payload = decodeListCursor(options.cursor);
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
-      const cursorHorizon =
-        payload.horizon === undefined ? null : parseHorizon(payload.horizon);
-      assertNotResetSince(options.instanceIds, [cursorHorizon]);
-      // A legacy cursor that survives the fence read no reset instance; it
-      // is anchored at the current clock from here on.
-      horizon = cursorHorizon ?? readWriteClock();
-      startAfter = { val: payload.sortValue ?? "", key: payload.recordKey };
+      horizon = parseHorizon(payload.horizon);
+      assertNotResetSince(options.instanceIds, [horizon]);
+      startAfter = {
+        val: payload.sortValue ?? "",
+        key: payload.recordKey,
+        instance: payload.instance,
+      };
     } else {
       horizon = readWriteClock();
     }
 
-    const placeholders = options.instanceIds.map(() => "?").join(",");
-    const dir = options.order === "asc" ? "ASC" : "DESC";
-    const cmp = options.order === "asc" ? ">" : "<";
-
-    let sql = `
-      SELECT * FROM pdpp_records
-      WHERE stream = ? AND deleted = 0 AND instance IN (${placeholders})
-    `;
-    const params: unknown[] = [stream, ...options.instanceIds];
-    if (startAfter) {
-      sql += ` AND (emitted_at ${cmp} ? OR (emitted_at = ? AND record_key ${cmp} ?))`;
-      params.push(startAfter.val, startAfter.val, startAfter.key);
+    // The generator holds at most one raw row beyond the visible client page.
+    function* rows(): Generator<PdppStoredRecord> {
+      for (const row of snapshotRows(stream, options.instanceIds, horizon, {
+        order: options.order,
+        after: startAfter,
+        liveOnly: true,
+      })) {
+        yield toRow(row) as PdppStoredRecord;
+      }
     }
-    sql += ` ORDER BY emitted_at ${dir}, record_key ${dir} LIMIT ?`;
-    params.push(options.limit + 1);
-
-    const rows = db.prepare(sql).all(...params) as RecordRowDb[];
-    const hasMore = rows.length > options.limit;
-    const page = rows.slice(0, options.limit);
-    const last = page[page.length - 1];
-
-    return {
-      data: page.map((row) => {
-        const stored = toRow(row) as PdppStoredRecord;
-        return { ...stored, data: projectFields(stored.data, options.fields) };
-      }),
-      hasMore,
-      nextCursor:
-        hasMore && last
-          ? encodeCursor({
-              kind: "list",
-              stream,
-              epoch: cursorEpoch(),
-              order: options.order,
-              sortValue: last.emitted_at,
-              recordKey: last.record_key,
-              horizon: String(horizon),
-            })
-          : undefined,
-      horizon: String(horizon),
-    };
+    const hasLaterWrites = horizon < readWriteClock();
+    const erasure =
+      db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+      WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
+    return listSnapshotPage(
+      rows(),
+      options,
+      {
+        stream,
+        epoch: cursorEpoch(),
+        horizon: String(horizon),
+      },
+      (row) =>
+        hasLaterWrites &&
+        erasure.get(row.instance, row.stream, row.recordKey, horizon) !==
+          undefined,
+    );
   }
 
   function deleteRecord(
@@ -1717,32 +1715,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       sinceHorizon ?? horizon,
     ]);
 
-    const placeholders = options.instanceIds.map(() => "?").join(",");
-
-    // Latest history row per key, as of the horizon.
-    const latestRows = db
-      .prepare(
-        `
-        SELECT c.* FROM pdpp_record_changes c
-        WHERE c.stream = ? AND c.instance IN (${placeholders}) AND c.written_at <= ?
-        AND c.version = (
-          SELECT MAX(c2.version) FROM pdpp_record_changes c2
-          WHERE c2.stream = c.stream AND c2.instance = c.instance
-            AND c2.record_key = c.record_key AND c2.written_at <= ?
-        )
-      `,
-      )
-      .all(stream, ...options.instanceIds, horizon, horizon) as Array<{
-      instance: string;
-      stream: string;
-      record_key: string;
-      version: number;
-      data: string | null;
-      emitted_at: string;
-      deleted: number;
-      deleted_at: string | null;
-      written_at: number;
-    }>;
+    const latestRows = snapshotRows(stream, options.instanceIds, horizon);
 
     const changed: PdppRecordRow[] = [];
     for (const entry of latestRows) {
@@ -1763,60 +1736,32 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         if (!wroteSincePrior) continue;
       }
 
-      if (entry.deleted) {
-        changed.push({
-          instance: entry.instance,
-          stream: entry.stream,
-          recordKey: entry.record_key,
-          version: entry.version,
-          deletedAt: entry.deleted_at ?? entry.emitted_at,
-          emittedAt: entry.emitted_at,
-          deleted: true,
-        });
-        continue;
-      }
-
-      const currentData = entry.data ? JSON.parse(entry.data) : {};
-      const projectedNow = projectFields(currentData, options.fields);
-
-      if (sinceHorizon !== null && options.fields) {
-        const priorRow = db
-          .prepare(
-            `SELECT * FROM pdpp_record_changes
-             WHERE stream = ? AND instance = ? AND record_key = ? AND written_at <= ?
-             ORDER BY version DESC LIMIT 1`,
-          )
-          .get(entry.stream, entry.instance, entry.record_key, sinceHorizon) as
-          { data: string | null; deleted: number } | undefined;
-        if (priorRow && !priorRow.deleted) {
-          const priorData = priorRow.data ? JSON.parse(priorRow.data) : {};
-          const priorProjected = projectFields(priorData, options.fields);
-          if (JSON.stringify(priorProjected) === JSON.stringify(projectedNow)) {
-            continue;
-          }
-        }
-      }
-
-      // Return the RAW (unprojected) data here, not `projectedNow`.
-      // `projectedNow`/`priorProjected` above exist only to decide
-      // eligibility (did the grant-authorized projection change) without
-      // leaking a hidden-field change. A caller enforcing time_constraint
-      // against `data` needs the real field value; projecting here would
-      // silently break that filter for any grant whose fields don't happen
-      // to include the time_constraint field. Response field projection is
-      // the caller's job, applied after any filtering on real values.
-      changed.push({
-        instance: entry.instance,
-        stream: entry.stream,
-        recordKey: entry.record_key,
-        data: currentData,
-        version: entry.version,
-        emittedAt: entry.emitted_at,
-        deleted: false,
-      });
+      const previous =
+        sinceHorizon === null
+          ? undefined
+          : (db
+              .prepare(
+                `
+        SELECT * FROM pdpp_record_changes
+        WHERE stream = ? AND instance = ? AND record_key = ? AND written_at <= ?
+        ORDER BY version DESC LIMIT 1
+      `,
+              )
+              .get(
+                entry.stream,
+                entry.instance,
+                entry.record_key,
+                sinceHorizon,
+              ) as RecordRowDb | undefined);
+      const selected = selectSyncChange(
+        toRow(entry as RecordRowDb),
+        previous ? toRow(previous) : undefined,
+        options,
+      );
+      if (selected) changed.push(selected);
     }
 
-    changed.sort((a, b) => a.recordKey.localeCompare(b.recordKey));
+    changed.sort(compareRecordIdentity);
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;
 

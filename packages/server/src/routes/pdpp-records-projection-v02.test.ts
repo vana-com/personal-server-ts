@@ -1,30 +1,8 @@
 /**
- * v0.2 disclosed projection on the read path (PR #1 §"Full records and
- * disclosed projections").
- *
- * Inventory rows `v0.2-4-1`, `v0.2-4-2`, `v0.2-4-3`, `v0.2-6.1-2`.
- *
- * ## What changed, and why the v0.1 behaviour is now a disclosure bug
- *
- * v0.1 had a per-stream "consent floor": a declaration's `required_fields`
- * were added to every projection regardless of the request, so a record could
- * never be returned in a shape its own schema would reject. v0.2 reverses
- * that: "The RS MUST NOT add a field to a response merely because the schema
- * requires it", and the disclosed `data` is built "from only the top-level
- * members permitted by the grant and the request-time field selection".
- *
- * The reversal is not cosmetic. The AS side of this already moved — a v0.2
- * grant's resolved `fields` deliberately exclude a schema-required field the
- * owner never approved (`pdpp-auth-v02.test.ts`, "does not add a
- * schema-required field to the reviewed projection"). But the RS re-added the
- * declaration's required fields at read time, from the *declaration*, not the
- * grant. So a field the owner was never shown and never approved was disclosed
- * on every read — the AS's narrowing was silently undone one layer down, and
- * the grant the owner consented to was not the grant that was enforced.
- *
- * v0.1 grants keep the floor exactly as it was: a v0.1 grant has no approved
- * projection beyond its streams/fields, and changing what it discloses would
- * be a breaking change to grants already issued and already consented to.
+ * Frozen field disclosure on the current, candidate and private-v0.2 read paths.
+ * Core resolves schema-required fields at issuance; a later declaration cannot
+ * add authority. Sparse Core reads retain only required fields already in the
+ * grant. The private-v0.2 proposal also permits withholding that sparse floor.
  */
 
 import { describe, it, expect } from "vitest";
@@ -173,24 +151,16 @@ describe("v0.2: disclosed data is built from the approved projection only", () =
     expect("id" in data).toBe(false);
   });
 
-  it("keeps a v0.1 grant's schema-required floor unchanged", async () => {
-    // A v0.1 grant has no approved projection beyond its streams/fields, and
-    // its consent was given under the floor. Removing it here would change
-    // what an already-issued grant discloses.
+  it("keeps current reads inside grant fields when a declaration requires more", async () => {
     const { app } = buildApp(grantV01());
-    const data = await listData(app);
-    expect(Object.keys(data).sort()).toEqual([
-      "amount",
-      "date",
-      "id",
-      "private_note",
-    ]);
+    expect(Object.keys(await listData(app)).sort()).toEqual(["amount", "date"]);
   });
 
-  it("keeps the v0.1 floor under a sparse v0.1 request", async () => {
+  it("keeps a sparse current read inside the frozen grant", async () => {
     const { app } = buildApp(grantV01());
-    const data = await listData(app, "?fields=date");
-    expect(Object.keys(data).sort()).toEqual(["date", "id", "private_note"]);
+    expect(Object.keys(await listData(app, "?fields=date")).sort()).toEqual([
+      "date",
+    ]);
   });
 });
 
@@ -212,4 +182,65 @@ describe("v0.2: stream metadata reflects the approved projection", () => {
     ]);
     expect(body.schema.required).toEqual([]);
   });
+});
+
+it("candidate grant closure survives new schema-required fields on list/detail/sync", async () => {
+  const { app } = buildApp({ ...grantV02(), version: "0.1.0-candidate" });
+  for (const path of [
+    "/streams/transactions/records?fields=date",
+    "/streams/transactions/records/t1?fields=date",
+    "/streams/transactions/records?changes_since=&fields=date",
+  ]) {
+    const res = await app.request(path, { headers: AUTH });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const rows = body.object === "list" ? body.data : [body];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].data).toEqual({ date: "2026-01-02" });
+  }
+});
+
+it("keeps candidate required fields only when frozen in the grant under sparse reads", async () => {
+  const { app } = buildApp({
+    ...grantV02(["id", "date", "amount"]),
+    version: "0.1.0-candidate",
+  });
+  const data = await listData(app, "?fields=date");
+  expect(Object.keys(data).sort()).toEqual(["date", "id"]);
+});
+
+it("candidate sync eligibility uses grant fields even when the response is sparse", async () => {
+  const { app, store } = buildApp({
+    ...grantV02(),
+    version: "0.1.0-candidate",
+  });
+  const baseline = await app.request(
+    "/streams/transactions/records?changes_since=beginning&fields=date",
+    { headers: AUTH },
+  );
+  expect(baseline.status).toBe(200);
+  const { next_changes_since: checkpoint } = await baseline.json();
+  expect(checkpoint).toBeTruthy();
+  store.ingestBatch(
+    [
+      {
+        instance: "inst_1",
+        stream: "transactions",
+        key: "t1",
+        data: { id: "t1", date: "2026-01-02", amount: 99 },
+        emitted_at: "2026-01-03T00:00:00Z",
+        op: "upsert",
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+  );
+  const res = await app.request(
+    `/streams/transactions/records?changes_since=${encodeURIComponent(checkpoint)}&fields=date`,
+    { headers: AUTH },
+  );
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.data).toHaveLength(1);
+  expect(body.data[0].data).toEqual({ date: "2026-01-02" });
 });

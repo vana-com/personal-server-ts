@@ -1,3 +1,5 @@
+import type { TimeType } from "./time.js";
+
 /**
  * PDPP Core v0.1.0 authorization types.
  *
@@ -30,6 +32,11 @@ export const PDPP_DATA_ACCESS_TYPE = "https://pdpp.dev/data-access";
  * a new authorization decision; nothing here silently downgrades one.
  */
 export const PDPP_DATA_ACCESS_TYPE_V02 = "https://pdpp.dev/data-access/0.2";
+
+/** Explicit development profile of the unlocked Core candidate; stable stays default. */
+export const PDPP_DATA_ACCESS_TYPE_CANDIDATE =
+  "https://pdpp.dev/data-access/candidate-0.1.0";
+export const PDPP_GRANT_VERSION_CANDIDATE = "0.1.0-candidate";
 
 /** The v0.1 grant schema version. */
 export const PDPP_GRANT_VERSION = "0.1.0";
@@ -184,7 +191,10 @@ export interface OwnerConditions {
 
 /** One RFC 9396 `authorization_details` entry of PDPP type. */
 export interface SelectionRequest {
-  type: typeof PDPP_DATA_ACCESS_TYPE | typeof PDPP_DATA_ACCESS_TYPE_V02;
+  type:
+    | typeof PDPP_DATA_ACCESS_TYPE
+    | typeof PDPP_DATA_ACCESS_TYPE_V02
+    | typeof PDPP_DATA_ACCESS_TYPE_CANDIDATE;
   /** A request carries `id` alone; provenance is derived, never asserted. */
   source: { id: string };
   purpose_code: string;
@@ -203,6 +213,8 @@ export interface SelectionRequest {
 // ---------------------------------------------------------------------------
 
 export interface TimeConstraint {
+  /** Frozen schema format; absent only for legacy grants. */
+  type?: TimeType;
   /** Frozen `consent_time_field` from the retained declaration. */
   field: string;
   /** Inclusive (>=). */
@@ -395,7 +407,7 @@ export interface DeclarationSnapshot {
 export type PdppTokenKind = "owner" | "client";
 
 export interface PdppAuthorizationDetail {
-  type: typeof PDPP_DATA_ACCESS_TYPE;
+  type: typeof PDPP_DATA_ACCESS_TYPE | typeof PDPP_DATA_ACCESS_TYPE_CANDIDATE;
   source: { kind: SourceKind; id: string };
   purpose_code: string;
   purpose_description?: string;
@@ -474,3 +486,10 @@ export interface PdppTokenContext {
 }
 
 export type GrantStatus = "active" | "expired" | "revoked";
+
+/** Explicit opt-in candidate profile; unknown versions retain current behavior. */
+export function grantIsCandidate(
+  grant: { version: string } | undefined,
+): boolean {
+  return grant?.version === PDPP_GRANT_VERSION_CANDIDATE;
+}
