@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import { createPublicClient, http, type Hex } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
@@ -38,23 +38,18 @@ import { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-rec
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../packages/server/src/storage/pdpp-replication-transport.js";
 
-// This Linux harness samples /proc and must not persist keys in a crash dump.
-if (process.platform !== "linux")
-  throw new Error("Live harness requires Linux");
-execFileSync("prlimit", ["--pid", String(process.pid), "--core=0:0"]);
-
-const gatewayUrl = "https://dp-rpc-dev.vana.org";
-const storageUrl = "https://storage-dev.vana.org";
-const rpcUrl = "https://rpc.moksha.vana.org";
-const registry = "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867";
-const config = ServerConfigSchema.parse({
+export const gatewayUrl = "https://dp-rpc-dev.vana.org";
+export const storageUrl = "https://storage-dev.vana.org";
+export const rpcUrl = "https://rpc.moksha.vana.org";
+export const registry = "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867";
+export const config = ServerConfigSchema.parse({
   gateway: { url: gatewayUrl, chainId: 14800 },
   storage: { backend: "vana", config: { vana: { apiUrl: storageUrl } } },
   tunnel: { enabled: false },
   devUi: { enabled: false },
 });
-const sourceId = "https://replica-journey.invalid/declaration";
-const binding = {
+export const sourceId = "https://replica-journey.invalid/declaration";
+export const binding = {
   digest: `sha256:${"a".repeat(64)}`,
   version: "1",
   stream: "messages",
@@ -62,9 +57,10 @@ const binding = {
   primaryKey: ["id"],
   schemaDigest: `sha256:${"b".repeat(64)}`,
 };
-const digest = (bytes: Uint8Array | string) =>
+export const digest = (bytes: Uint8Array | string) =>
   createHash("sha256").update(bytes).digest("hex");
-const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+export const pause = (ms: number) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 const nativeFetch = globalThis.fetch;
 const boundedFetch: typeof fetch = (input, init) =>
   nativeFetch(input, {
@@ -72,13 +68,31 @@ const boundedFetch: typeof fetch = (input, init) =>
     signal: AbortSignal.timeout(25_000),
     redirect: "error",
   });
-globalThis.fetch = (input, init) => {
-  const url = new URL(input instanceof Request ? input.url : String(input));
-  if (![gatewayUrl, storageUrl, rpcUrl].includes(url.origin))
-    throw new Error("Harness refused non-dev network origin");
-  return boundedFetch(input, init);
-};
-function serverAccount(key: Hex) {
+const loopbackOrigins = new Set<string>();
+export function allowHarnessLoopback(origin: string) {
+  const url = new URL(origin);
+  assert.equal(url.protocol, "http:");
+  assert.equal(url.hostname, "127.0.0.1");
+  assert(url.port && Number(url.port) > 0);
+  assert.equal(url.origin, origin);
+  loopbackOrigins.add(origin);
+  return () => loopbackOrigins.delete(origin);
+}
+export function installHarnessSafety() {
+  if (process.platform !== "linux")
+    throw new Error("Live harness requires Linux");
+  execFileSync("prlimit", ["--pid", String(process.pid), "--core=0:0"]);
+  globalThis.fetch = (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (
+      ![gatewayUrl, storageUrl, rpcUrl].includes(url.origin) &&
+      !loopbackOrigins.has(url.origin)
+    )
+      throw new Error("Harness refused non-dev network origin");
+    return boundedFetch(input, init);
+  };
+}
+export function serverAccount(key: Hex) {
   const account = privateKeyToAccount(key);
   return {
     address: account.address,
@@ -90,19 +104,20 @@ function serverAccount(key: Hex) {
       ),
   };
 }
-type Init = {
+export type Init = {
   root: string;
   owner: Hex;
   master: number[];
   serverKey: Hex;
   scriptSha256: string;
+  consent?: { issuerOrigin: string; credential: string };
 };
 type HostRequest = {
   id: number;
   command: string;
   args?: Record<string, unknown>;
 };
-type Snapshot = {
+export type Snapshot = {
   ownerRows: PdppVisibleRecord[];
   appRows: PdppVisibleRecord[];
   records: Record<string, unknown>;
@@ -142,6 +157,7 @@ type Snapshot = {
 };
 
 async function host() {
+  installHarnessSafety();
   const init = await new Promise<Init>((resolve) =>
     process.once("message", (m) => resolve(m as Init)),
   );
@@ -166,6 +182,26 @@ async function host() {
       method: "export",
       label: "Ephemeral harness",
     });
+  if (
+    init.consent &&
+    !store.listConnections(sourceId).some((c) => c.instance === "conn-other")
+  )
+    store.registerConnection({
+      instance: "conn-other",
+      sourceId,
+      method: "export",
+      label: "Other account",
+    });
+  if (init.consent) allowHarnessLoopback(init.consent.issuerOrigin);
+  const resource = init.consent
+    ? await (
+        await import("./pdpp-replica-consent-live-journey.js")
+      ).openReplicaResourceServer(store, {
+        owner: init.owner,
+        issuerOrigin: init.consent.issuerOrigin,
+        credential: init.consent.credential,
+      })
+    : undefined;
   const expected = { owner: init.owner, declarations: [{ sourceId, binding }] };
   store.replication.beginBaseline(expected);
   const receiver = createReplicaReceiver({
@@ -302,22 +338,27 @@ async function host() {
     transport,
     targetChunkBytes: 4 * 1024 * 1024,
   });
-  function put(id: string, data: Record<string, unknown>) {
+  function put(
+    id: string,
+    data: Record<string, unknown>,
+    instance = "conn",
+    emittedAt = new Date().toISOString(),
+  ) {
     return store.ingestBatch(
       [
         {
-          instance: "conn",
+          instance,
           stream: "messages",
           key: id,
           data: { id, ...data },
-          emitted_at: new Date().toISOString(),
+          emitted_at: emittedAt,
         },
       ],
       () => "mutable_state",
       () => ["id"],
       {
         method: "export",
-        generation: store.getInstanceBinding("conn").generation,
+        generation: store.getInstanceBinding(instance).generation,
       },
     );
   }
@@ -439,8 +480,14 @@ async function host() {
         await worker.cycle();
         result = snapshot();
       } else if (command === "snapshot") result = snapshot();
+      else if (command === "resourceOrigin") result = resource?.origin;
       else if (command === "put")
-        result = put(String(args.id), { text: args.text });
+        result = put(
+          String(args.id),
+          (args.data as Record<string, unknown>) ?? { text: args.text },
+          String(args.instance ?? "conn"),
+          args.emittedAt as string | undefined,
+        );
       else if (command === "blob") {
         const bytes = Buffer.alloc(Number(args.size));
         for (let offset = 0; offset < bytes.length; offset += 65536)
@@ -457,6 +504,7 @@ async function host() {
           mimeType: "application/octet-stream",
         });
         put(String(args.id), {
+          ...(args.data as Record<string, unknown> | undefined),
           blob_ref: {
             blob_id: blob.blobId,
             mime_type: blob.mimeType,
@@ -496,13 +544,24 @@ async function host() {
       process.send?.({
         id,
         error: error instanceof Error ? error.message : "Host failed",
+        failureKinds:
+          error instanceof AggregateError
+            ? error.errors.map((cause: unknown) => {
+                const name = cause instanceof Error ? cause.name : typeof cause;
+                const status =
+                  cause instanceof Error
+                    ? /(?:HTTP |status[ :]+)(\d{3})/i.exec(cause.message)?.[1]
+                    : undefined;
+                return { name, ...(status && { httpStatus: Number(status) }) };
+              })
+            : undefined,
       });
     }
   });
   process.send?.({ ready: true });
 }
 
-class Device {
+export class Device {
   child!: ChildProcess;
   private sequence = 0;
   private pending = new Map<
@@ -567,6 +626,7 @@ class Device {
           id: number;
           result?: unknown;
           error?: string;
+          failureKinds?: { name: string; httpStatus?: number }[];
         };
         if (m.ready) resolve();
         else if (m.checkpoint) this.checkpoint?.();
@@ -575,7 +635,7 @@ class Device {
           if (!p) return;
           this.pending.delete(m.id);
           clearTimeout(p.timer);
-          if (m.error) p.reject(new Error(m.error));
+          if (m.error) p.reject(new Error(m.error, { cause: m.failureKinds }));
           else p.resolve(m.result);
         }
       });
@@ -617,6 +677,7 @@ class Device {
 }
 
 async function main() {
+  installHarnessSafety();
   const parent = join(homedir(), ".tmp");
   mkdirSync(parent, { recursive: true });
   const root = mkdtempSync(join(parent, "replica-live-"));
@@ -1267,5 +1328,16 @@ async function main() {
     );
   }
 }
-if (process.argv.includes("--host")) await host();
-else await main();
+if (
+  process.argv[1] &&
+  pathToFileURL(process.argv[1]).href === import.meta.url
+) {
+  // Finish module evaluation before the optional RS imports this module's helpers.
+  // Awaiting host here creates a top-level-await cycle with the consent runner.
+  if (process.argv.includes("--host"))
+    void host().catch(() => {
+      process.exitCode = 1;
+      process.disconnect?.();
+    });
+  else await main();
+}

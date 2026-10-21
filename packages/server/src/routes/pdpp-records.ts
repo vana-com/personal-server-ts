@@ -13,6 +13,7 @@ import type {
   PdppTokenContext,
   StreamGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   CursorExpiredError,
   decodeCursor,
@@ -472,6 +473,9 @@ function sendError(c: Context, err: PdppError, reqId: string) {
     "Request-Id": reqId,
     "PDPP-Version": PDPP_VERSION,
   };
+  if (err instanceof PdppAuthorizationUnavailableError) {
+    headers["Retry-After"] = String(err.retryAfterSeconds);
+  }
   if (err.status === 401) {
     headers["WWW-Authenticate"] =
       `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
@@ -713,6 +717,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   app.use("*", async (c, next) => {
     const reqId = requestId();
     c.set("reqId" as never, reqId as never);
+    c.header("Cache-Control", "private, no-store");
     await next();
   });
 
@@ -722,7 +727,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     if (!token) {
       return { error: unauthorized(c, reqId, resourceMetadataUrlFor(c)) };
     }
-    const context = await deps.auth.resolveToken(token);
+    let context;
+    try {
+      context = await deps.auth.resolveToken(token);
+    } catch (error) {
+      if (!(error instanceof PdppAuthorizationUnavailableError)) throw error;
+      logApiError(deps, "authorization", reqId, error);
+      return { error: sendError(c, error, reqId) };
+    }
 
     // Chain enforcement, when the deployment configures it. Placed here so
     // EVERY endpoint is covered by one gate: a check added per-route is a
