@@ -15,13 +15,7 @@ export interface PdppRecord {
 export type LegacyScopeLookupError =
   | { kind: "unknown_scope"; scope: string }
   | { kind: "unsupported_profile"; scope: string; profileKey: string }
-  | { kind: "test_debris_scope"; scope: string; reason: string }
-  | {
-      kind: "gap";
-      scope: string;
-      reason: string;
-      provenanceChecked: LegacyScopeBindingProvenance[];
-    };
+  | { kind: "test_debris_scope"; scope: string; reason: string };
 
 export interface LegacyScopeLookupOk {
   ok: true;
@@ -56,7 +50,6 @@ export type ProjectionError =
        */
       diagnostics?: ProjectionDiagnostic[];
     }
-  | { kind: "gap"; scope: string; reason: string }
   | { kind: "empty_singleton"; scope: string };
 
 export interface ProjectionOk {
@@ -147,9 +140,8 @@ export interface ProjectPdppRecordsOptions {
 }
 
 /**
- * One legacy scope's binding. `project` and `requiredStreams` are absent for
- * a scope this phase declares a gap for (see LEGACY_SCOPE_GAPS) — a gap has
- * no binding entry at all, by design: "no entry, no fabricated mapping."
+ * One legacy scope's binding. An unbound scope has no binding entry, so no
+ * mapping is fabricated.
  */
 export interface LegacyScopeBinding {
   /**

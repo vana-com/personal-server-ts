@@ -4618,10 +4618,6 @@ const wholefoodsNutrition: LegacyScopeBinding = {
   },
 };
 
-// amazon.profile is a documented GAP: no `profile` stream exists on the
-// amazon collection-profile.json at all (verified: exactly 2 streams,
-// orders and order_items) — legacy's `name`/`isPrime` have no PDPP source.
-
 // iCloud Notes is bound to the signed 0.1.0 collection profile. Desktop
 // admission and ingest projection are separate gates.
 const icloudNoteFolders: LegacyScopeBinding = {
@@ -4924,10 +4920,3 @@ export const LEGACY_SCOPE_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
       "strava.coverage_diagnostics": stravaCoverageDiagnostics,
     }),
   );
-
-/** Known legacy contracts checked against signed declarations but not
- * projectable without fabricating fields or changing the retained contract. */
-export const LEGACY_SCOPE_GAPS: ReadonlyMap<
-  string,
-  { reason: string; provenanceChecked: LegacyScopeBindingProvenance[] }
-> = new Map([]);
