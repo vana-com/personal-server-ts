@@ -25,8 +25,9 @@ import {
   type PdppBlobMeta,
   type StreamListing,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import { replicaOperationDigest } from "./pdpp-replication-sqlite.js";
 
-type Evidence = { operation_json: string; confirmed: number; pending: number };
+type Evidence = { op: ReplicaOperation; confirmed: boolean; pending: number };
 type CanonicalRow = {
   instance: string;
   stream: string;
@@ -38,29 +39,67 @@ type CanonicalRow = {
   deleted_at: string | null;
   blob_id: string | null;
 };
+type OverlayRow = {
+  emitted_at: string;
+  row_json: string | null;
+  blob_id: string | null;
+  blob_json: string | null;
+  present: number;
+  live: number;
+  pending: number;
+  base_live: number;
+};
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 2;
-/** Cursor revision format. 70d52db0 cursors carry an untagged revision and expire. */
-const CURSOR_FORMAT = "v2";
+const VIEW_SCHEMA = 3;
+/**
+ * Revisions are comparable only within one view layout, so the layout version
+ * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
+ */
+const CURSOR_FORMAT = `v${VIEW_SCHEMA}`;
+const LIFECYCLE =
+  "('connection-register','connection-reset','connection-delete')";
 // Canonical triggers ignore rewrites that change no stored value.
 const recordChanged =
   "(OLD.version IS NOT NEW.version OR OLD.data IS NOT NEW.data OR OLD.emitted_at IS NOT NEW.emitted_at OR OLD.deleted IS NOT NEW.deleted OR OLD.deleted_at IS NOT NEW.deleted_at OR OLD.blob_id IS NOT NEW.blob_id)";
+// Retained operations are indexed in place by these expressions; no copy of their JSON.
+const operationExpressions = {
+  instance: "json_extract(operation_json,'$.connectionId')",
+  stream: "json_extract(operation_json,'$.declaration.stream')",
+  record_key: "json_extract(operation_json,'$.recordKey')",
+  kind: "json_extract(operation_json,'$.kind')",
+  writer: "json_extract(operation_json,'$.revision.writerId')",
+  operation_id: "json_extract(operation_json,'$.revision.operationId')",
+  blob_id:
+    "COALESCE(json_extract(operation_json,'$.blob.blobId'),json_extract(operation_json,'$.blobs[0].blobId'))",
+};
+const expression = (column: keyof typeof operationExpressions) =>
+  operationExpressions[column];
+const operationColumns = Object.entries(operationExpressions)
+  .map(([column, sql]) => `${sql} AS ${column}`)
+  .join(",");
 
 /** Drops only derived view objects. Canonical, retained and pending tables stay. */
 function dropViewObjects(db: Database) {
   const objects = db
     .prepare(
-      "SELECT type,name FROM sqlite_master WHERE (type='trigger' AND (name GLOB 'pdpp_replica_view*' OR name GLOB 'pdpp_replica_local*' OR name GLOB 'pdpp_records_summary_*')) OR (type='table' AND (name GLOB 'pdpp_replica_view*' OR name='pdpp_replica_local_view'))",
+      "SELECT type,name FROM sqlite_master WHERE (type IN ('trigger','view','index') AND (name GLOB 'pdpp_replica_view*' OR name GLOB 'pdpp_replica_local*' OR name GLOB 'pdpp_records_summary_*')) OR (type='table' AND (name GLOB 'pdpp_replica_view*' OR name='pdpp_replica_local_view'))",
     )
-    .all() as { type: "trigger" | "table"; name: string }[];
-  for (const { type, name } of objects.sort((a) =>
-    a.type === "trigger" ? -1 : 1,
+    .all() as { type: "trigger" | "view" | "index" | "table"; name: string }[];
+  const order = ["trigger", "view", "index", "table"];
+  for (const { type, name } of objects.sort(
+    (a, b) => order.indexOf(a.type) - order.indexOf(b.type),
   ))
     db.exec(`DROP ${type.toUpperCase()} IF EXISTS "${name}"`);
 }
 
-/** One durable current preview, reconciled at mutation time. Reads never run the reducer. */
+/**
+ * Sparse owner preview, reconciled at mutation time. It persists only keys whose
+ * owner-visible state differs from canonical: pending values, marked pending
+ * removals and hidden equivocated keys. Without pending evidence or operation-ID
+ * variants for a key's merge inputs, owner preview equals canonical by definition
+ * and stores nothing. Reads never run the reducer.
+ */
 export function createReplicaVisibilityView(deps: {
   db: Database;
   owner: string;
@@ -82,6 +121,12 @@ export function createReplicaVisibilityView(deps: {
   const localIdentitySql = (alias: string) =>
     `EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=${alias}.instance AND b.deleted_at IS NULL AND b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.source_id=${alias}.source_id AND b.method=${alias}.method AND b.generation=${alias}.generation)`;
   const localProjection = `SELECT j.connection_id,j.stream,j.record_key,json_extract(j.value_json,'$.emittedAt'),j.value_json,json_extract(j.value_json,'$.data.blob_ref.blob_id'),0,json_extract(j.value_json,'$.deleted'),NULL,j.sequence,j.generation,j.source_id,j.method FROM pdpp_mutation_journal j JOIN pdpp_instance_binding b ON b.instance=j.connection_id AND b.generation=j.generation AND b.source_id=j.source_id AND b.method=j.method WHERE b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL AND j.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND NOT EXISTS (SELECT 1 FROM pdpp_mutation_journal newer WHERE newer.connection_id=j.connection_id AND newer.generation=j.generation AND newer.stream=j.stream AND newer.record_key=j.record_key AND newer.source_id=j.source_id AND newer.method=j.method AND newer.writer_id=j.writer_id AND newer.sequence>j.sequence)`;
+  // Whether a key can have an overlay row at all. Canonical writes and retained
+  // record operations outside this predicate cannot change the owner preview.
+  const touches = (instance: string, stream: string, key: string) =>
+    `(EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${instance} AND v.stream=${stream} AND v.record_key=${key}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_pending p WHERE p.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_conflicts c WHERE c.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=${instance} AND b.deleted_at IS NOT NULL))`;
+  const markKey = (alias: string) =>
+    `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT ${alias}.instance,${alias}.stream,${alias}.record_key WHERE ${touches(`${alias}.instance`, `${alias}.stream`, `${alias}.record_key`)};`;
 
   db.transaction(() => {
     const schema = db
@@ -98,130 +143,155 @@ export function createReplicaVisibilityView(deps: {
     if (!initialized) dropViewObjects(db);
     db.exec(`
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_schema (version INTEGER NOT NULL);
+      -- Sparse overlay. present: shown in owner pages; live: a visible value;
+      -- base_live: canonical row was live when this row was derived.
       CREATE TABLE IF NOT EXISTS pdpp_replica_view (
         instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL,
-        emitted_at TEXT NOT NULL, row_json TEXT NOT NULL, blob_id TEXT, pending INTEGER NOT NULL,
-        deleted INTEGER NOT NULL, blob_json TEXT, PRIMARY KEY(instance,stream,record_key)
+        emitted_at TEXT NOT NULL, row_json TEXT, blob_id TEXT, blob_json TEXT,
+        present INTEGER NOT NULL, live INTEGER NOT NULL, pending INTEGER NOT NULL, base_live INTEGER NOT NULL,
+        PRIMARY KEY(instance,stream,record_key)
       );
+      CREATE INDEX IF NOT EXISTS pdpp_replica_view_page ON pdpp_replica_view(instance,stream,emitted_at,record_key) WHERE present=1;
+      CREATE INDEX IF NOT EXISTS pdpp_replica_view_blob ON pdpp_replica_view(blob_id) WHERE blob_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS pdpp_replica_canonical_page ON pdpp_records(instance,stream,emitted_at,record_key) WHERE deleted=0;
       CREATE INDEX IF NOT EXISTS pdpp_replica_pending_blob ON pdpp_replica_pending_bytes(blob_id,batch_id);
       -- One summary and one monotone cursor revision per (mode table, connection, stream).
+      -- Mode 1 holds the overlay's deltas against mode 0, not a second count.
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_streams (preview INTEGER NOT NULL, instance TEXT NOT NULL, stream TEXT NOT NULL, live_count INTEGER NOT NULL, row_count INTEGER NOT NULL, pending_count INTEGER NOT NULL, last_updated TEXT, revision INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(preview,instance,stream));
-      CREATE INDEX IF NOT EXISTS pdpp_replica_view_page ON pdpp_replica_view(instance,stream,emitted_at,record_key);
-      CREATE INDEX IF NOT EXISTS pdpp_replica_view_blob ON pdpp_replica_view(blob_id) WHERE blob_id IS NOT NULL;
-      CREATE TABLE IF NOT EXISTS pdpp_replica_view_evidence (
-        operation_json TEXT PRIMARY KEY, confirmed INTEGER NOT NULL DEFAULT 0, pending INTEGER NOT NULL DEFAULT 0,
-        instance TEXT GENERATED ALWAYS AS (json_extract(operation_json,'$.connectionId')) VIRTUAL,
-        stream TEXT GENERATED ALWAYS AS (json_extract(operation_json,'$.declaration.stream')) VIRTUAL,
-        record_key TEXT GENERATED ALWAYS AS (json_extract(operation_json,'$.recordKey')) VIRTUAL,
-        kind TEXT GENERATED ALWAYS AS (json_extract(operation_json,'$.kind')) VIRTUAL,
-        writer TEXT GENERATED ALWAYS AS (json_extract(operation_json,'$.revision.writerId')) VIRTUAL,
-        operation_id TEXT GENERATED ALWAYS AS (json_extract(operation_json,'$.revision.operationId')) VIRTUAL,
-        blob_id TEXT GENERATED ALWAYS AS (COALESCE(json_extract(operation_json,'$.blob.blobId'),json_extract(operation_json,'$.blobs[0].blobId'))) VIRTUAL
+      -- Active pending operations, one row per (batch, operation).
+      CREATE TABLE IF NOT EXISTS pdpp_replica_view_pending (
+        batch_id TEXT NOT NULL, digest TEXT NOT NULL, operation_json TEXT NOT NULL,
+        instance TEXT NOT NULL, stream TEXT, record_key TEXT, kind TEXT NOT NULL,
+        writer TEXT NOT NULL, operation_id TEXT NOT NULL, blob_id TEXT,
+        PRIMARY KEY(batch_id,digest)
       );
-      CREATE INDEX IF NOT EXISTS pdpp_replica_evidence_key ON pdpp_replica_view_evidence(instance,stream,record_key) WHERE confirmed=1 OR pending>0;
-      CREATE INDEX IF NOT EXISTS pdpp_replica_evidence_lifecycle ON pdpp_replica_view_evidence(instance,kind) WHERE confirmed=1 OR pending>0;
-      CREATE INDEX IF NOT EXISTS pdpp_replica_evidence_id ON pdpp_replica_view_evidence(writer,operation_id) WHERE confirmed=1 OR pending>0;
-      CREATE INDEX IF NOT EXISTS pdpp_replica_evidence_blob ON pdpp_replica_view_evidence(blob_id,instance) WHERE confirmed=1 OR pending>0;
-      CREATE TABLE IF NOT EXISTS pdpp_replica_view_pending (batch_id TEXT NOT NULL, operation_json TEXT NOT NULL, PRIMARY KEY(batch_id,operation_json));
-      CREATE TABLE IF NOT EXISTS pdpp_replica_view_conflicts (writer TEXT NOT NULL, operation_id TEXT NOT NULL, instance TEXT NOT NULL, operation_json TEXT NOT NULL, PRIMARY KEY(writer,operation_id,operation_json));
+      CREATE INDEX IF NOT EXISTS pdpp_replica_view_pending_key ON pdpp_replica_view_pending(instance,stream,record_key);
+      CREATE INDEX IF NOT EXISTS pdpp_replica_view_pending_kind ON pdpp_replica_view_pending(instance,kind);
+      CREATE INDEX IF NOT EXISTS pdpp_replica_view_pending_id ON pdpp_replica_view_pending(writer,operation_id);
+      CREATE INDEX IF NOT EXISTS pdpp_replica_view_pending_blob ON pdpp_replica_view_pending(blob_id,instance) WHERE blob_id IS NOT NULL;
+      -- Operation-ID variants (global equivocation), by digest.
+      CREATE TABLE IF NOT EXISTS pdpp_replica_view_conflicts (writer TEXT NOT NULL, operation_id TEXT NOT NULL, instance TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(writer,operation_id,digest));
       CREATE INDEX IF NOT EXISTS pdpp_replica_view_conflict_instance ON pdpp_replica_view_conflicts(instance);
-      CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_operations (operation_json TEXT PRIMARY KEY);
+      CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_operations (digest TEXT PRIMARY KEY, operation_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_keys (instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL, PRIMARY KEY(instance,stream,record_key));
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_connections (instance TEXT PRIMARY KEY);
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_evidence_insert AFTER INSERT ON pdpp_replica_view_evidence BEGIN
-        INSERT INTO pdpp_replica_view_dirty_operations SELECT NEW.operation_json WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_operations WHERE operation_json=NEW.operation_json);
-      END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_evidence_update AFTER UPDATE ON pdpp_replica_view_evidence BEGIN
-        INSERT INTO pdpp_replica_view_dirty_operations SELECT NEW.operation_json WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_operations WHERE operation_json=NEW.operation_json);
-      END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_journal AFTER INSERT ON pdpp_replica_operations BEGIN
-        INSERT INTO pdpp_replica_view_evidence(operation_json,confirmed) VALUES (NEW.operation_json,1) ON CONFLICT(operation_json) DO UPDATE SET confirmed=1;
-      END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_received AFTER INSERT ON pdpp_replica_received BEGIN
-        INSERT INTO pdpp_replica_view_evidence(operation_json,confirmed) VALUES (NEW.operation_json,1) ON CONFLICT(operation_json) DO UPDATE SET confirmed=1;
-      END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_insert AFTER INSERT ON pdpp_records BEGIN
-        INSERT INTO pdpp_replica_view_dirty_keys SELECT NEW.instance,NEW.stream,NEW.record_key WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_keys WHERE instance=NEW.instance AND stream=NEW.stream AND record_key=NEW.record_key);
-      END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_update AFTER UPDATE ON pdpp_records WHEN ${recordChanged} BEGIN
-        INSERT INTO pdpp_replica_view_dirty_keys SELECT NEW.instance,NEW.stream,NEW.record_key WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_keys WHERE instance=NEW.instance AND stream=NEW.stream AND record_key=NEW.record_key);
-      END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_delete AFTER DELETE ON pdpp_records BEGIN
-        INSERT INTO pdpp_replica_view_dirty_keys SELECT OLD.instance,OLD.stream,OLD.record_key WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_keys WHERE instance=OLD.instance AND stream=OLD.stream AND record_key=OLD.record_key);
-      END;
+    `);
+    for (const table of ["pdpp_replica_operations", "pdpp_replica_received"])
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS pdpp_replica_view_ops_key_${table} ON ${table}(${expression("instance")},${expression("stream")},${expression("record_key")}) WHERE ${expression("record_key")} IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS pdpp_replica_view_ops_kind_${table} ON ${table}(${expression("instance")},${expression("kind")});
+        CREATE INDEX IF NOT EXISTS pdpp_replica_view_ops_id_${table} ON ${table}(${expression("writer")},${expression("operation_id")});
+        CREATE INDEX IF NOT EXISTS pdpp_replica_view_ops_blob_${table} ON ${table}(${expression("blob_id")},${expression("instance")}) WHERE ${expression("blob_id")} IS NOT NULL;
+      `);
+    db.exec(`
+      CREATE VIEW IF NOT EXISTS pdpp_replica_view_operations AS
+        SELECT digest,operation_json,${operationColumns},1 AS confirmed,0 AS pending FROM pdpp_replica_operations
+        UNION ALL SELECT digest,operation_json,${operationColumns},1,0 FROM pdpp_replica_received
+        UNION ALL SELECT digest,operation_json,instance,stream,record_key,kind,writer,operation_id,blob_id,0,1 FROM pdpp_replica_view_pending;
+    `);
+    for (const table of ["pdpp_replica_operations", "pdpp_replica_received"])
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_retained_${table} AFTER INSERT ON ${table}
+        WHEN json_extract(NEW.operation_json,'$.kind') NOT IN ('upsert','delete')
+          OR EXISTS (SELECT 1 FROM pdpp_replica_view_operations o WHERE o.writer=json_extract(NEW.operation_json,'$.revision.writerId') AND o.operation_id=json_extract(NEW.operation_json,'$.revision.operationId') AND o.digest<>NEW.digest)
+          OR ${touches("json_extract(NEW.operation_json,'$.connectionId')", "json_extract(NEW.operation_json,'$.declaration.stream')", "json_extract(NEW.operation_json,'$.recordKey')")}
+        BEGIN
+          INSERT OR IGNORE INTO pdpp_replica_view_dirty_operations VALUES (NEW.digest,NEW.operation_json);
+        END;
+      `);
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_insert AFTER INSERT ON pdpp_records BEGIN ${markKey("NEW")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_update AFTER UPDATE ON pdpp_records WHEN ${recordChanged} BEGIN ${markKey("NEW")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_delete AFTER DELETE ON pdpp_records BEGIN ${markKey("OLD")} END;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_binding AFTER UPDATE ON pdpp_instance_binding
       WHEN NEW.generation != OLD.generation OR NEW.deleted_at IS NOT OLD.deleted_at OR NEW.source_id IS NOT OLD.source_id OR NEW.method IS NOT OLD.method OR NEW.reset_clock IS NOT OLD.reset_clock BEGIN
         -- Binding and lifecycle changes expire every stream cursor of the connection.
         UPDATE pdpp_replica_view_streams SET revision=revision+1 WHERE instance=NEW.instance;
-        INSERT INTO pdpp_replica_view_dirty_connections SELECT NEW.instance WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_connections WHERE instance=NEW.instance);
+        INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections VALUES (NEW.instance);
+      END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_insert AFTER INSERT ON pdpp_replica_view BEGIN
+        INSERT INTO pdpp_replica_view_streams VALUES (1,NEW.instance,NEW.stream,NEW.live-NEW.base_live,NEW.present-NEW.base_live,NEW.pending,NULL,1)
+        ON CONFLICT(preview,instance,stream) DO UPDATE SET revision=revision+1,live_count=live_count+NEW.live-NEW.base_live,row_count=row_count+NEW.present-NEW.base_live,pending_count=pending_count+NEW.pending;
+      END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_update AFTER UPDATE ON pdpp_replica_view BEGIN
+        UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count+(NEW.live-NEW.base_live)-(OLD.live-OLD.base_live),row_count=row_count+(NEW.present-NEW.base_live)-(OLD.present-OLD.base_live),pending_count=pending_count+NEW.pending-OLD.pending
+        WHERE preview=1 AND instance=OLD.instance AND stream=OLD.stream;
+      END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_delete AFTER DELETE ON pdpp_replica_view BEGIN
+        UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count-(OLD.live-OLD.base_live),row_count=row_count-(OLD.present-OLD.base_live),pending_count=pending_count-OLD.pending
+        WHERE preview=1 AND instance=OLD.instance AND stream=OLD.stream;
       END;
     `);
+    // The local journal projection exists only for connections with a durable
+    // binding-conflict fact; the fact table is monotone.
     const localInitialized =
       hasBindingConflictFacts &&
-      db
+      !!db
         .prepare(
-          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_local_view'",
+          "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='pdpp_replica_local_conflict'",
         )
         .get();
-    if (hasBindingConflictFacts)
+    if (hasBindingConflictFacts) {
+      const conflicted = (instance: string) =>
+        `EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=${instance})`;
       db.exec(`
       CREATE TABLE IF NOT EXISTS pdpp_replica_local_view (instance TEXT NOT NULL,stream TEXT NOT NULL,record_key TEXT NOT NULL,emitted_at TEXT NOT NULL,row_json TEXT NOT NULL,blob_id TEXT,pending INTEGER NOT NULL,deleted INTEGER NOT NULL,blob_json TEXT,sequence INTEGER NOT NULL,generation INTEGER NOT NULL,source_id TEXT NOT NULL,method TEXT NOT NULL,PRIMARY KEY(instance,stream,record_key));
       CREATE INDEX IF NOT EXISTS pdpp_replica_local_page ON pdpp_replica_local_view(instance,stream,emitted_at,record_key) WHERE deleted=0;
       CREATE INDEX IF NOT EXISTS pdpp_replica_local_blob ON pdpp_replica_local_view(blob_id) WHERE deleted=0 AND blob_id IS NOT NULL;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_journal AFTER INSERT ON pdpp_mutation_journal
-      WHEN NEW.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=NEW.connection_id AND b.generation=NEW.generation AND b.source_id=NEW.source_id AND b.method=NEW.method AND b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL) BEGIN
+      WHEN ${conflicted("NEW.connection_id")} AND NEW.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=NEW.connection_id AND b.generation=NEW.generation AND b.source_id=NEW.source_id AND b.method=NEW.method AND b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL) BEGIN
         INSERT INTO pdpp_replica_local_view VALUES (NEW.connection_id,NEW.stream,NEW.record_key,json_extract(NEW.value_json,'$.emittedAt'),NEW.value_json,json_extract(NEW.value_json,'$.data.blob_ref.blob_id'),0,json_extract(NEW.value_json,'$.deleted'),NULL,NEW.sequence,NEW.generation,NEW.source_id,NEW.method)
         ON CONFLICT(instance,stream,record_key) DO UPDATE SET emitted_at=excluded.emitted_at,row_json=excluded.row_json,blob_id=excluded.blob_id,deleted=excluded.deleted,sequence=excluded.sequence,generation=excluded.generation,source_id=excluded.source_id,method=excluded.method WHERE excluded.sequence>pdpp_replica_local_view.sequence;
       END;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_binding AFTER UPDATE ON pdpp_instance_binding
-      WHEN NEW.generation IS NOT OLD.generation OR NEW.source_id IS NOT OLD.source_id OR NEW.method IS NOT OLD.method OR NEW.deleted_at IS NOT OLD.deleted_at BEGIN
+      WHEN ${conflicted("NEW.instance")} AND (NEW.generation IS NOT OLD.generation OR NEW.source_id IS NOT OLD.source_id OR NEW.method IS NOT OLD.method OR NEW.deleted_at IS NOT OLD.deleted_at) BEGIN
+        DELETE FROM pdpp_replica_local_view WHERE instance=NEW.instance;
+        INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id=NEW.instance;
+      END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_conflict AFTER INSERT ON pdpp_replica_binding_conflicts BEGIN
         DELETE FROM pdpp_replica_local_view WHERE instance=NEW.instance;
         INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id=NEW.instance;
       END;
     `);
+    }
     for (const [table, preview] of [
       ["pdpp_records", 0],
-      ["pdpp_replica_view", 1],
       ...(hasBindingConflictFacts
         ? [["pdpp_replica_local_view", 2] as const]
         : []),
     ] as const) {
-      const pending = (alias: string) =>
-        preview === 1 ? `${alias}.pending` : "0";
-      const visible = (alias: string) =>
-        preview === 1 ? "1" : `(1-${alias}.deleted)`;
-      const latest = `SELECT emitted_at FROM ${table} WHERE instance=OLD.instance AND stream=OLD.stream ${preview === 1 ? "" : "AND deleted=0"} ORDER BY emitted_at DESC,record_key DESC LIMIT 1`;
+      const latest = `SELECT emitted_at FROM ${table} WHERE instance=OLD.instance AND stream=OLD.stream AND deleted=0 ORDER BY emitted_at DESC,record_key DESC LIMIT 1`;
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_summary_insert AFTER INSERT ON ${table} BEGIN
-          INSERT INTO pdpp_replica_view_streams VALUES (${preview},NEW.instance,NEW.stream,1-NEW.deleted,${visible("NEW")},${pending("NEW")},CASE WHEN ${visible("NEW")} THEN NEW.emitted_at ELSE NULL END,1)
+          INSERT INTO pdpp_replica_view_streams VALUES (${preview},NEW.instance,NEW.stream,1-NEW.deleted,1-NEW.deleted,0,CASE WHEN NEW.deleted=0 THEN NEW.emitted_at ELSE NULL END,1)
           ON CONFLICT(preview,instance,stream) DO UPDATE SET revision=revision+1,
-            live_count=live_count+1-NEW.deleted,row_count=row_count+${visible("NEW")},pending_count=pending_count+${pending("NEW")},
-            last_updated=CASE WHEN ${visible("NEW")} AND (last_updated IS NULL OR NEW.emitted_at>last_updated) THEN NEW.emitted_at ELSE last_updated END;
+            live_count=live_count+1-NEW.deleted,row_count=row_count+1-NEW.deleted,
+            last_updated=CASE WHEN NEW.deleted=0 AND (last_updated IS NULL OR NEW.emitted_at>last_updated) THEN NEW.emitted_at ELSE last_updated END;
         END;
         CREATE TRIGGER IF NOT EXISTS ${table}_summary_update AFTER UPDATE ON ${table} ${preview === 0 ? `WHEN ${recordChanged}` : ""} BEGIN
           UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count+OLD.deleted-NEW.deleted,
-            row_count=row_count+${visible("NEW")}-${visible("OLD")},pending_count=pending_count+${pending("NEW")}-${pending("OLD")},
-            last_updated=(${latest}) WHERE preview=${preview} AND instance=OLD.instance AND stream=OLD.stream;
+            row_count=row_count+OLD.deleted-NEW.deleted,last_updated=(${latest}) WHERE preview=${preview} AND instance=OLD.instance AND stream=OLD.stream;
         END;
         CREATE TRIGGER IF NOT EXISTS ${table}_summary_delete AFTER DELETE ON ${table} BEGIN
-          UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count-(1-OLD.deleted),row_count=row_count-${visible("OLD")},pending_count=pending_count-${pending("OLD")},last_updated=(${latest})
+          UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count-(1-OLD.deleted),row_count=row_count-(1-OLD.deleted),last_updated=(${latest})
           WHERE preview=${preview} AND instance=OLD.instance AND stream=OLD.stream;
         END;
       `);
     }
     if (hasBindingConflictFacts && !localInitialized)
-      db.exec(`INSERT INTO pdpp_replica_local_view ${localProjection};`);
-    if (!initialized) {
-      // One-time migration. Thereafter persisted dirty queues also cover downtime/restarts.
       db.exec(
-        `INSERT INTO pdpp_replica_view_streams SELECT 0,instance,stream,SUM(1-deleted),SUM(1-deleted),0,MAX(CASE WHEN deleted=0 THEN emitted_at END),1 FROM pdpp_records GROUP BY instance,stream;`,
+        `DELETE FROM pdpp_replica_local_view; INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id IN (SELECT instance FROM pdpp_replica_binding_conflicts);`,
       );
-      db.exec(`INSERT INTO pdpp_replica_view_evidence(operation_json,confirmed)
-        SELECT operation_json,1 FROM pdpp_replica_operations WHERE true ON CONFLICT(operation_json) DO UPDATE SET confirmed=1;
-        INSERT INTO pdpp_replica_view_evidence(operation_json,confirmed)
-        SELECT operation_json,1 FROM pdpp_replica_received WHERE true ON CONFLICT(operation_json) DO UPDATE SET confirmed=1;
-        INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT instance,stream,record_key FROM pdpp_records;
+    if (!initialized) {
+      // One-time rebuild. Thereafter persisted dirty queues also cover downtime/restarts.
+      // Only pending work, confirmed operation-ID variants and deleted bindings can
+      // differ from canonical, so only they are reconciled; no canonical row is copied.
+      db.exec(`
+        INSERT INTO pdpp_replica_view_streams SELECT 0,instance,stream,SUM(1-deleted),SUM(1-deleted),0,MAX(CASE WHEN deleted=0 THEN emitted_at END),1 FROM pdpp_records GROUP BY instance,stream;
+        INSERT OR IGNORE INTO pdpp_replica_view_dirty_operations
+          SELECT o.digest,o.operation_json FROM pdpp_replica_view_operations o
+          WHERE (o.writer,o.operation_id) IN (SELECT writer,operation_id FROM pdpp_replica_view_operations GROUP BY writer,operation_id HAVING COUNT(DISTINCT digest)>1);
+        INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT instance FROM pdpp_instance_binding WHERE deleted_at IS NOT NULL;
       `);
       for (const row of db
         .prepare(
@@ -237,56 +307,126 @@ export function createReplicaVisibilityView(deps: {
     }
   }).immediate();
 
+  function markOperation(digest: string, json: string) {
+    db.prepare(
+      "INSERT OR IGNORE INTO pdpp_replica_view_dirty_operations VALUES (?,?)",
+    ).run(digest, json);
+  }
   function addPending(batchId: string, operations: ReplicaOperation[]) {
     for (const op of operations) {
       const json = canonicalJson(op);
-      if (
-        !db
-          .prepare(
-            "INSERT OR IGNORE INTO pdpp_replica_view_pending VALUES (?,?)",
-          )
-          .run(batchId, json).changes
-      )
-        continue;
-      db.prepare(
-        "INSERT INTO pdpp_replica_view_evidence(operation_json,pending) VALUES (?,1) ON CONFLICT(operation_json) DO UPDATE SET pending=pending+1",
-      ).run(json);
+      const digest = replicaOperationDigest(op);
+      const inserted = db
+        .prepare(
+          "INSERT OR IGNORE INTO pdpp_replica_view_pending VALUES (?,?,?,?,?,?,?,?,?,?)",
+        )
+        .run(
+          batchId,
+          digest,
+          json,
+          op.connectionId,
+          "declaration" in op ? op.declaration.stream : null,
+          "recordKey" in op ? op.recordKey : null,
+          op.kind,
+          op.revision.writerId,
+          op.revision.operationId,
+          op.kind === "blob-claim"
+            ? op.blob.blobId
+            : op.kind === "upsert"
+              ? (op.blobs[0]?.blobId ?? null)
+              : null,
+        ).changes;
+      if (inserted) markOperation(digest, json);
     }
   }
   function removePending(batchId: string) {
     for (const row of db
       .prepare(
-        "SELECT operation_json FROM pdpp_replica_view_pending WHERE batch_id=?",
+        "SELECT digest,operation_json FROM pdpp_replica_view_pending WHERE batch_id=?",
       )
-      .all(batchId) as { operation_json: string }[]) {
-      db.prepare(
-        "UPDATE pdpp_replica_view_evidence SET pending=pending-1 WHERE operation_json=?",
-      ).run(row.operation_json);
-    }
+      .all(batchId) as { digest: string; operation_json: string }[])
+      markOperation(row.digest, row.operation_json);
     db.prepare("DELETE FROM pdpp_replica_view_pending WHERE batch_id=?").run(
       batchId,
     );
   }
-  const active = "(confirmed=1 OR pending>0)";
-  const operations = (sql: string, ...args: unknown[]): ReplicaOperation[] =>
-    (db.prepare(sql).all(...args) as { operation_json: string }[]).map((row) =>
-      JSON.parse(row.operation_json),
-    );
+  /** Retained and pending evidence matching `where`, merged by operation value. */
+  function evidence(where: string, ...args: unknown[]): Map<string, Evidence> {
+    const merged = new Map<string, Evidence>();
+    for (const row of db
+      .prepare(
+        `SELECT operation_json,confirmed,pending FROM pdpp_replica_view_operations WHERE ${where}`,
+      )
+      .all(...args) as {
+      operation_json: string;
+      confirmed: number;
+      pending: number;
+    }[]) {
+      const entry = merged.get(row.operation_json) ?? {
+        op: JSON.parse(row.operation_json) as ReplicaOperation,
+        confirmed: false,
+        pending: 0,
+      };
+      entry.confirmed ||= row.confirmed === 1;
+      entry.pending += row.pending;
+      merged.set(row.operation_json, entry);
+    }
+    return merged;
+  }
+  const ops = (entries: Map<string, Evidence>) =>
+    [...entries.values()].map((entry) => entry.op);
   function dirtyKey(instance: string, stream: string, key: string) {
     db.prepare(
       "INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys VALUES (?,?,?)",
     ).run(instance, stream, key);
   }
-  function dirtyConnection(instance: string) {
-    db.prepare(
-      "INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections VALUES (?)",
-    ).run(instance);
+  /**
+   * Pending lifecycle, pending blob claims and operation-ID variants can change
+   * every key of a connection. A compatible registration already in force cannot.
+   */
+  function connectionInvolvement(instance: string) {
+    const conflicts = !!db
+      .prepare("SELECT 1 FROM pdpp_replica_view_conflicts WHERE instance=?")
+      .get(instance);
+    const pendingLifecycle = ops(
+      evidence(`instance=? AND kind IN ${LIFECYCLE} AND pending=1`, instance),
+    );
+    const registrations = pendingLifecycle.some(
+      (op) => op.kind === "connection-register",
+    )
+      ? ops(
+          evidence(
+            "instance=? AND kind='connection-register' AND confirmed=1",
+            instance,
+          ),
+        )
+      : [];
+    const lifecycle = pendingLifecycle.some(
+      (op) =>
+        op.kind !== "connection-register" ||
+        !registrations.some(
+          (other) =>
+            other.owner === op.owner &&
+            other.sourceId === op.sourceId &&
+            other.methodId === op.methodId,
+        ),
+    );
+    const claims = !!db
+      .prepare(
+        "SELECT 1 FROM pdpp_replica_view_pending WHERE instance=? AND kind='blob-claim'",
+      )
+      .get(instance);
+    return { all: conflicts || lifecycle, claims };
   }
   function flush(): void {
     if (!db.inTransaction) return db.transaction(flush).immediate();
-    const dirtyOps = operations(
-      "SELECT operation_json FROM pdpp_replica_view_dirty_operations",
-    );
+    const dirtyOps = (
+      db
+        .prepare(
+          "SELECT operation_json FROM pdpp_replica_view_dirty_operations",
+        )
+        .all() as { operation_json: string }[]
+    ).map((row) => JSON.parse(row.operation_json) as ReplicaOperation);
     const connections = new Set(
       (
         db
@@ -301,54 +441,55 @@ export function createReplicaVisibilityView(deps: {
           "SELECT instance FROM pdpp_replica_view_conflicts WHERE writer=? AND operation_id=?",
         )
         .all(writerId, operationId) as { instance: string }[];
-      const variants = operations(
-        `SELECT operation_json FROM pdpp_replica_view_evidence WHERE writer=? AND operation_id=? AND ${active}`,
-        writerId,
-        operationId,
-      );
+      const variants = db
+        .prepare(
+          "SELECT DISTINCT digest,instance FROM pdpp_replica_view_operations WHERE writer=? AND operation_id=?",
+        )
+        .all(writerId, operationId) as { digest: string; instance: string }[];
       db.prepare(
         "DELETE FROM pdpp_replica_view_conflicts WHERE writer=? AND operation_id=?",
       ).run(writerId, operationId);
       for (const row of previous) connections.add(row.instance);
       if (variants.length > 1)
         for (const variant of variants) {
-          connections.add(variant.connectionId);
+          connections.add(variant.instance);
           db.prepare(
-            "INSERT INTO pdpp_replica_view_conflicts VALUES (?,?,?,?)",
-          ).run(
-            writerId,
-            operationId,
-            variant.connectionId,
-            canonicalJson(variant),
-          );
+            "INSERT OR IGNORE INTO pdpp_replica_view_conflicts VALUES (?,?,?,?)",
+          ).run(writerId, operationId, variant.instance, variant.digest);
         }
       if (op.kind === "upsert" || op.kind === "delete")
         dirtyKey(op.connectionId, op.declaration.stream, op.recordKey);
       else if (op.kind === "blob-claim") {
-        for (const dependent of operations(
-          `SELECT operation_json FROM pdpp_replica_view_evidence WHERE blob_id=? AND instance=? AND kind='upsert' AND ${active}`,
-          op.blob.blobId,
-          op.connectionId,
-        )) {
+        for (const dependent of ops(
+          evidence(
+            "blob_id=? AND instance=? AND kind='upsert'",
+            op.blob.blobId,
+            op.connectionId,
+          ),
+        ))
           if (dependent.kind === "upsert")
             dirtyKey(
               dependent.connectionId,
               dependent.declaration.stream,
               dependent.recordKey,
             );
-        }
       } else if (op.kind === "connection-register") {
         // A compatible registration already in force does not change any key.
         // Operation-ID equivocation was handled globally above, before this shortcut.
-        const established = operations(
-          `SELECT operation_json FROM pdpp_replica_view_evidence WHERE instance=? AND kind='connection-register' AND ${active} AND (operation_json<>? OR pending>1 OR (confirmed=1 AND pending>0))`,
-          op.connectionId,
-          canonicalJson(op),
-        ).some(
-          (other) =>
-            other.owner === op.owner &&
-            other.sourceId === op.sourceId &&
-            other.methodId === op.methodId,
+        const json = canonicalJson(op);
+        const established = [
+          ...evidence(
+            "instance=? AND kind='connection-register'",
+            op.connectionId,
+          ),
+        ].some(
+          ([other, entry]) =>
+            (other !== json ||
+              entry.pending > 1 ||
+              (entry.confirmed && entry.pending > 0)) &&
+            entry.op.owner === op.owner &&
+            entry.op.sourceId === op.sourceId &&
+            entry.op.methodId === op.methodId,
         );
         if (!established) connections.add(op.connectionId);
       } else if (op.kind.startsWith("connection-"))
@@ -356,21 +497,44 @@ export function createReplicaVisibilityView(deps: {
     }
     for (const instance of connections) {
       // Lifecycle/equivocation changes can affect every key, once at WRITE time.
+      // Otherwise only existing overlay and pending keys can change.
       db.prepare(
-        `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT instance,stream,record_key FROM pdpp_records WHERE instance=?`,
+        "INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT instance,stream,record_key FROM pdpp_replica_view WHERE instance=?",
       ).run(instance);
       db.prepare(
-        `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT instance,stream,record_key FROM pdpp_replica_view WHERE instance=?`,
+        "INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT instance,stream,record_key FROM pdpp_replica_view_pending WHERE instance=? AND record_key IS NOT NULL",
       ).run(instance);
-      db.prepare(
-        `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT instance,stream,record_key FROM pdpp_replica_view_evidence WHERE instance=? AND record_key IS NOT NULL AND ${active}`,
-      ).run(instance);
+      const deleted = !!db
+        .prepare(
+          "SELECT 1 FROM pdpp_instance_binding WHERE instance=? AND deleted_at IS NOT NULL",
+        )
+        .get(instance);
+      if (deleted || connectionInvolvement(instance).all) {
+        db.prepare(
+          "INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT instance,stream,record_key FROM pdpp_records WHERE instance=?",
+        ).run(instance);
+        db.prepare(
+          "INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT DISTINCT instance,stream,record_key FROM pdpp_replica_view_operations WHERE instance=? AND record_key IS NOT NULL",
+        ).run(instance);
+      }
     }
+    const involvement = new Map<
+      string,
+      ReturnType<typeof connectionInvolvement>
+    >();
     // Cursor revisions advance in the summary triggers, only for rows that change.
     for (const row of db
       .prepare("SELECT * FROM pdpp_replica_view_dirty_keys")
-      .all() as { instance: string; stream: string; record_key: string }[])
-      reconcileKey(row.instance, row.stream, row.record_key);
+      .all() as { instance: string; stream: string; record_key: string }[]) {
+      if (!involvement.has(row.instance))
+        involvement.set(row.instance, connectionInvolvement(row.instance));
+      reconcileKey(
+        row.instance,
+        row.stream,
+        row.record_key,
+        involvement.get(row.instance)!,
+      );
+    }
     db.exec(
       "DELETE FROM pdpp_replica_view_dirty_operations; DELETE FROM pdpp_replica_view_dirty_keys; DELETE FROM pdpp_replica_view_dirty_connections;",
     );
@@ -388,7 +552,37 @@ export function createReplicaVisibilityView(deps: {
           deleted: false,
         };
   }
-  function reconcileKey(instance: string, stream: string, key: string) {
+  /** Whether pending evidence or a variant reaches this key's merge inputs. */
+  function involved(
+    instance: string,
+    stream: string,
+    key: string,
+    connection: ReturnType<typeof connectionInvolvement>,
+  ): boolean {
+    if (connection.all) return true;
+    if (
+      db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_view_pending WHERE instance=? AND stream=? AND record_key=?",
+        )
+        .get(instance, stream, key)
+    )
+      return true;
+    return (
+      connection.claims &&
+      !!db
+        .prepare(
+          "SELECT 1 FROM pdpp_replica_view_operations o WHERE o.instance=? AND o.stream=? AND o.record_key=? AND o.blob_id IN (SELECT blob_id FROM pdpp_replica_view_pending WHERE instance=? AND kind='blob-claim')",
+        )
+        .get(instance, stream, key, instance)
+    );
+  }
+  function reconcileKey(
+    instance: string,
+    stream: string,
+    key: string,
+    connection: ReturnType<typeof connectionInvolvement>,
+  ) {
     const current = db
       .prepare(
         "SELECT * FROM pdpp_records WHERE instance=? AND stream=? AND record_key=?",
@@ -405,50 +599,60 @@ export function createReplicaVisibilityView(deps: {
           deleted_at: string | null;
         }
       | undefined;
-    let row = current && canonical(current);
+    const base = current && canonical(current);
+    let row = base;
     let blobId = row ? current!.blob_id : null;
     let blobMeta: PdppBlobMeta | undefined;
-    if (blobId) {
-      const meta = db
-        .prepare(
-          "SELECT mime_type,size_bytes,sha256 FROM pdpp_blobs WHERE blob_id=?",
-        )
-        .get(blobId) as
-        { mime_type: string; size_bytes: number; sha256: string } | undefined;
-      if (meta)
-        blobMeta = {
-          blobId,
-          mimeType: meta.mime_type,
-          sizeBytes: meta.size_bytes,
-          sha256: meta.sha256,
-        };
-    }
-    if (local?.source_id && !local.deleted_at) {
-      const evidenceRows = db
-        .prepare(
-          `SELECT operation_json,confirmed,pending FROM pdpp_replica_view_evidence WHERE instance=? AND stream=? AND record_key=? AND ${active}`,
-        )
-        .all(instance, stream, key) as Evidence[];
-      // The conflict index carries global operation-ID variants, including other connections.
-      const conflictOps = operations(
-        "SELECT c2.operation_json FROM pdpp_replica_view_conflicts c JOIN pdpp_replica_view_conflicts c2 ON c.writer=c2.writer AND c.operation_id=c2.operation_id WHERE c.instance=?",
-        instance,
-      );
-      const lifecycle = operations(
-        `SELECT operation_json FROM pdpp_replica_view_evidence WHERE instance=? AND kind IN ('connection-register','connection-reset','connection-delete') AND ${active}`,
-        instance,
-      );
-      const claims = operations(
-        `SELECT operation_json FROM pdpp_replica_view_evidence WHERE instance=? AND kind='blob-claim' AND blob_id IN (SELECT blob_id FROM pdpp_replica_view_evidence WHERE instance=? AND stream=? AND record_key=? AND ${active}) AND ${active}`,
-        instance,
+    if (
+      local?.source_id &&
+      !local.deleted_at &&
+      involved(instance, stream, key, connection)
+    ) {
+      const evidenceRows = evidence(
+        "instance=? AND stream=? AND record_key=?",
         instance,
         stream,
         key,
       );
-      const all = [
-        ...evidenceRows.map(
-          (e) => JSON.parse(e.operation_json) as ReplicaOperation,
+      // The conflict index carries global operation-ID variants, including other connections.
+      const conflictOps: ReplicaOperation[] = [];
+      for (const pair of db
+        .prepare(
+          "SELECT DISTINCT c2.writer,c2.operation_id FROM pdpp_replica_view_conflicts c JOIN pdpp_replica_view_conflicts c2 ON c.writer=c2.writer AND c.operation_id=c2.operation_id WHERE c.instance=?",
+        )
+        .all(instance) as { writer: string; operation_id: string }[])
+        conflictOps.push(
+          ...ops(
+            evidence(
+              "writer=? AND operation_id=?",
+              pair.writer,
+              pair.operation_id,
+            ),
+          ),
+        );
+      const lifecycleRows = evidence(
+        `instance=? AND kind IN ${LIFECYCLE}`,
+        instance,
+      );
+      const lifecycle = ops(lifecycleRows);
+      const blobIds = [
+        ...new Set(
+          ops(evidenceRows).flatMap((op) =>
+            op.kind === "upsert" ? op.blobs.map((blob) => blob.blobId) : [],
+          ),
         ),
+      ];
+      const claims = blobIds.length
+        ? ops(
+            evidence(
+              `instance=? AND kind='blob-claim' AND blob_id IN (${blobIds.map(() => "?").join(",")})`,
+              instance,
+              ...blobIds,
+            ),
+          )
+        : [];
+      const all = [
+        ...ops(evidenceRows),
         ...lifecycle,
         ...claims,
         ...conflictOps,
@@ -481,20 +685,14 @@ export function createReplicaVisibilityView(deps: {
               op.kind === "connection-reset" && op.connectionId === instance,
           ),
       );
-      const provisionalLifecycle = lifecycle.some((op) => {
-        const state = db
-          .prepare(
-            "SELECT confirmed,pending FROM pdpp_replica_view_evidence WHERE operation_json=?",
-          )
-          .get(canonicalJson(op)) as Evidence;
-        return (
-          !state.confirmed &&
-          state.pending > 0 &&
+      const provisionalLifecycle = [...lifecycleRows.values()].some(
+        ({ op, confirmed, pending }) =>
+          !confirmed &&
+          pending > 0 &&
           (op.kind === "connection-delete" ||
             (op.kind === "connection-reset" &&
-              op.generation > local.generation))
-        );
-      });
+              op.generation > local.generation)),
+      );
       const removal = (
         emittedAt: string,
         deletedAt: string,
@@ -556,11 +754,7 @@ export function createReplicaVisibilityView(deps: {
         );
         if (record) {
           const winner = record.winner;
-          const state =
-            winner &&
-            evidenceRows.find(
-              (e) => e.operation_json === canonicalJson(winner),
-            );
+          const state = winner && evidenceRows.get(canonicalJson(winner));
           const pending = !!state && !state.confirmed && state.pending > 0;
           if (!winner) {
             row = undefined;
@@ -601,25 +795,59 @@ export function createReplicaVisibilityView(deps: {
       row = undefined;
       blobId = null;
     }
-    if (!row)
+    writeOverlay(instance, stream, key, current, base, row, blobId, blobMeta);
+  }
+  /** Persist the difference from canonical, or nothing when there is none. */
+  function writeOverlay(
+    instance: string,
+    stream: string,
+    key: string,
+    current: CanonicalRow | undefined,
+    base: PdppVisibleRecord | undefined,
+    row: PdppVisibleRecord | undefined,
+    blobId: string | null,
+    blobMeta: PdppBlobMeta | undefined,
+  ) {
+    const same =
+      row === undefined
+        ? base === undefined
+        : base !== undefined &&
+          canonicalJson(row) === canonicalJson(base) &&
+          blobId === current!.blob_id;
+    if (same) {
       db.prepare(
         "DELETE FROM pdpp_replica_view WHERE instance=? AND stream=? AND record_key=?",
       ).run(instance, stream, key);
-    else
-      db.prepare(
-        // An unchanged row is not rewritten, so it advances no cursor revision.
-        "INSERT INTO pdpp_replica_view VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(instance,stream,record_key) DO UPDATE SET emitted_at=excluded.emitted_at,row_json=excluded.row_json,blob_id=excluded.blob_id,pending=excluded.pending,deleted=excluded.deleted,blob_json=excluded.blob_json WHERE emitted_at IS NOT excluded.emitted_at OR row_json IS NOT excluded.row_json OR blob_id IS NOT excluded.blob_id OR pending IS NOT excluded.pending OR deleted IS NOT excluded.deleted OR blob_json IS NOT excluded.blob_json",
-      ).run(
-        instance,
-        stream,
-        key,
-        row.emittedAt,
-        JSON.stringify(row),
-        blobId,
-        row.visibility === "pending" ? 1 : 0,
-        row.deleted ? 1 : 0,
-        blobId && blobMeta ? JSON.stringify(blobMeta) : null,
-      );
+      return;
+    }
+    const overlay: OverlayRow = row
+      ? {
+          emitted_at: row.emittedAt,
+          row_json: JSON.stringify(row),
+          blob_id: blobId,
+          blob_json: blobId && blobMeta ? JSON.stringify(blobMeta) : null,
+          present: 1,
+          live: row.deleted ? 0 : 1,
+          pending: row.visibility === "pending" ? 1 : 0,
+          base_live: base ? 1 : 0,
+        }
+      : {
+          // A hidden key: canonical shows it, the owner preview must not.
+          emitted_at: base!.emittedAt,
+          row_json: null,
+          blob_id: null,
+          blob_json: null,
+          present: 0,
+          live: 0,
+          pending: 0,
+          base_live: 1,
+        };
+    // An unchanged row is not rewritten, so it advances no cursor revision.
+    db.prepare(
+      `INSERT INTO pdpp_replica_view VALUES (@instance,@stream,@key,@emitted_at,@row_json,@blob_id,@blob_json,@present,@live,@pending,@base_live)
+       ON CONFLICT(instance,stream,record_key) DO UPDATE SET emitted_at=excluded.emitted_at,row_json=excluded.row_json,blob_id=excluded.blob_id,blob_json=excluded.blob_json,present=excluded.present,live=excluded.live,pending=excluded.pending,base_live=excluded.base_live
+       WHERE emitted_at IS NOT excluded.emitted_at OR row_json IS NOT excluded.row_json OR blob_id IS NOT excluded.blob_id OR blob_json IS NOT excluded.blob_json OR present IS NOT excluded.present OR live IS NOT excluded.live OR pending IS NOT excluded.pending OR base_live IS NOT excluded.base_live`,
+    ).run({ instance, stream, key, ...overlay });
   }
   function connectionVisibility(instance: string) {
     return replicaConnectionVisibility(
@@ -644,21 +872,40 @@ export function createReplicaVisibilityView(deps: {
         : "hidden";
     return preview ? "preview" : "canonical";
   }
-  const tableFor = (mode: Mode) =>
-    mode === "local"
-      ? "pdpp_replica_local_view"
-      : mode === "preview"
-        ? "pdpp_replica_view"
-        : "pdpp_records";
-  function rowFilter(mode: Mode, alias = "r") {
-    return `${deps.unquarantinedRecordSql(alias)} ${mode === "preview" ? "" : `AND ${alias}.deleted=0`} ${mode === "local" ? `AND ${localIdentitySql(alias)}` : ""}`;
-  }
-  function selectedColumns(mode: Mode, alias = "r") {
-    const json =
-      mode === "canonical"
-        ? `json_object('instance',${alias}.instance,'stream',${alias}.stream,'recordKey',${alias}.record_key,'data',json(${alias}.data),'version',${alias}.version,'emittedAt',${alias}.emitted_at,'deleted',json('false'))`
-        : `${alias}.row_json`;
-    return `${alias}.instance,${alias}.stream,${alias}.record_key,${alias}.emitted_at,${json} AS row_json,'${mode}' AS origin`;
+  const unquarantined = (alias = "r") => deps.unquarantinedRecordSql(alias);
+  const notOverlaid = (alias = "r") =>
+    `NOT EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${alias}.instance AND v.stream=${alias}.stream AND v.record_key=${alias}.record_key)`;
+  const canonicalJsonColumn = (alias = "r") =>
+    `json_object('instance',${alias}.instance,'stream',${alias}.stream,'recordKey',${alias}.record_key,'data',json(${alias}.data),'version',${alias}.version,'emittedAt',${alias}.emitted_at,'deleted',json('false'))`;
+  /**
+   * Row sources of one mode, each an indexed keyset over (emitted_at, record_key).
+   * Preview merges canonical rows that have no overlay with present overlay rows.
+   */
+  function sources(mode: Exclude<Mode, "hidden">, alias = "r") {
+    const columns = (json: string, origin: Mode) =>
+      `${alias}.instance,${alias}.stream,${alias}.record_key,${alias}.emitted_at,${json} AS row_json,'${origin}' AS origin`;
+    const canonicalSource = (extra: string) => ({
+      table: "pdpp_records",
+      columns: columns(canonicalJsonColumn(alias), "canonical"),
+      filter: `${unquarantined(alias)} AND ${alias}.deleted=0${extra}`,
+    });
+    if (mode === "canonical") return [canonicalSource("")];
+    if (mode === "local")
+      return [
+        {
+          table: "pdpp_replica_local_view",
+          columns: columns(`${alias}.row_json`, "local"),
+          filter: `${unquarantined(alias)} AND ${alias}.deleted=0 AND ${localIdentitySql(alias)}`,
+        },
+      ];
+    return [
+      canonicalSource(` AND ${notOverlaid(alias)}`),
+      {
+        table: "pdpp_replica_view",
+        columns: columns(`${alias}.row_json`, "preview"),
+        filter: `${unquarantined(alias)} AND ${alias}.present=1`,
+      },
+    ];
   }
   function visibleRow(row: {
     row_json: string;
@@ -728,9 +975,23 @@ export function createReplicaVisibilityView(deps: {
   ): PdppVisibleRecord | undefined {
     const mode = readBranch(instance, reader, preview);
     if (mode === "hidden") return undefined;
+    if (mode === "preview") {
+      const overlay = db
+        .prepare(
+          `SELECT r.row_json,r.present,(${unquarantined()}) AS visible FROM pdpp_replica_view r WHERE r.instance=? AND r.stream=? AND r.record_key=?`,
+        )
+        .get(instance, stream, key) as
+        | { row_json: string | null; present: number; visible: number }
+        | undefined;
+      if (overlay)
+        return overlay.present && overlay.visible
+          ? JSON.parse(overlay.row_json!)
+          : undefined;
+    }
+    const source = sources(mode === "preview" ? "canonical" : mode)[0];
     const row = db
       .prepare(
-        `SELECT ${selectedColumns(mode)} FROM ${tableFor(mode)} r WHERE r.instance=? AND r.stream=? AND r.record_key=? AND ${rowFilter(mode)}`,
+        `SELECT ${source.columns} FROM ${source.table} r WHERE r.instance=? AND r.stream=? AND r.record_key=? AND ${source.filter}`,
       )
       .get(instance, stream, key) as
       { row_json: string; origin: Mode } | undefined;
@@ -780,8 +1041,8 @@ export function createReplicaVisibilityView(deps: {
         const branches = ids.flatMap((instance) => {
           const mode = modes.get(instance)!;
           if (mode === "hidden") return [];
-          params.push(instance, stream);
           let boundary = "";
+          const bounds: unknown[] = [];
           if (cursor) {
             const instanceOrder = Buffer.compare(
               Buffer.from(instance),
@@ -790,12 +1051,12 @@ export function createReplicaVisibilityView(deps: {
             const equal =
               options.order === "asc" ? instanceOrder > 0 : instanceOrder < 0;
             boundary = ` AND (r.emitted_at,r.record_key) ${equal ? cmp + "=" : cmp} (?,?)`;
-            params.push(cursor.sortValue, cursor.recordKey);
+            bounds.push(cursor.sortValue, cursor.recordKey);
           }
-          params.push(options.limit + 1);
-          return [
-            `SELECT * FROM (SELECT ${selectedColumns(mode)} FROM ${tableFor(mode)} r WHERE r.instance=? AND r.stream=? AND ${rowFilter(mode)}${boundary} ORDER BY r.emitted_at ${dir},r.record_key ${dir} LIMIT ?)`,
-          ];
+          return sources(mode).map((source) => {
+            params.push(instance, stream, ...bounds, options.limit + 1);
+            return `SELECT * FROM (SELECT ${source.columns} FROM ${source.table} r WHERE r.instance=? AND r.stream=? AND ${source.filter}${boundary} ORDER BY r.emitted_at ${dir},r.record_key ${dir} LIMIT ?)`;
+          });
         });
         const rows = branches.length
           ? (db
@@ -846,6 +1107,59 @@ export function createReplicaVisibilityView(deps: {
       })
       .deferred();
   }
+  type Summary = {
+    live_count: number;
+    row_count: number;
+    pending_count: number;
+    last_updated: string | null;
+  };
+  function summary(table: number, instance: string, stream: string) {
+    return db
+      .prepare(
+        "SELECT live_count,row_count,pending_count,last_updated FROM pdpp_replica_view_streams WHERE preview=? AND instance=? AND stream=?",
+      )
+      .get(table, instance, stream) as Summary | undefined;
+  }
+  /** Rows of this stream the shared quarantine predicate removes from the mode. */
+  function quarantinedCounts(
+    mode: Exclude<Mode, "hidden">,
+    instance: string,
+    stream: string,
+  ) {
+    const effective =
+      mode === "preview"
+        ? `SELECT DISTINCT q.record_key,COALESCE(v.present,1) AS present,COALESCE(v.live,1) AS live,COALESCE(v.pending,0) AS pending FROM pdpp_replica_quarantined_keys q LEFT JOIN pdpp_replica_view v ON v.instance=q.instance AND v.stream=q.stream AND v.record_key=q.record_key LEFT JOIN pdpp_records c ON c.instance=q.instance AND c.stream=q.stream AND c.record_key=q.record_key AND c.deleted=0 WHERE q.instance=? AND q.stream=? AND (v.record_key IS NOT NULL OR c.record_key IS NOT NULL) AND NOT (${unquarantined("q")})`
+        : `SELECT DISTINCT r.record_key,1 AS present,1 AS live,0 AS pending FROM pdpp_replica_quarantined_keys q JOIN ${mode === "local" ? "pdpp_replica_local_view" : "pdpp_records"} r ON r.instance=q.instance AND r.stream=q.stream AND r.record_key=q.record_key WHERE q.instance=? AND r.stream=? AND r.deleted=0 AND NOT (${unquarantined("r")})`;
+    return db
+      .prepare(
+        `SELECT COALESCE(SUM(present),0) AS rows,COALESCE(SUM(live),0) AS live,COALESCE(SUM(pending),0) AS pending FROM (${effective})`,
+      )
+      .get(instance, stream) as { rows: number; live: number; pending: number };
+  }
+  function latestVisible(
+    mode: Exclude<Mode, "hidden">,
+    instance: string,
+    stream: string,
+  ) {
+    return sources(mode)
+      .map(
+        (source) =>
+          (
+            db
+              .prepare(
+                `SELECT r.emitted_at FROM ${source.table} r WHERE r.instance=? AND r.stream=? AND ${source.filter} ORDER BY r.emitted_at DESC,r.record_key DESC LIMIT 1`,
+              )
+              .get(instance, stream) as { emitted_at: string } | undefined
+          )?.emitted_at ?? null,
+      )
+      .reduce<string | null>(
+        (latest, value) =>
+          value !== null && (latest === null || value > latest)
+            ? value
+            : latest,
+        null,
+      );
+  }
   function listStreams(
     ids: string[],
     preview = true,
@@ -868,60 +1182,44 @@ export function createReplicaVisibilityView(deps: {
       if (
         !db
           .prepare(
-            `SELECT 1 FROM (SELECT ? AS instance,NULL AS stream,NULL AS record_key) r WHERE ${deps.unquarantinedRecordSql("r")}`,
+            `SELECT 1 FROM (SELECT ? AS instance,NULL AS stream,NULL AS record_key) r WHERE ${unquarantined()}`,
           )
           .get(instance)
       )
         continue;
-      const summaries = db
-        .prepare(
-          "SELECT * FROM pdpp_replica_view_streams WHERE preview=? AND instance=? AND row_count>0",
-        )
-        .all(mode === "local" ? 2 : mode === "preview" ? 1 : 0, instance) as {
-        stream: string;
-        live_count: number;
-        row_count: number;
-        pending_count: number;
-        last_updated: string | null;
-      }[];
-      for (const summary of summaries) {
-        const table = tableFor(mode),
-          pending = mode === "preview" ? "r.pending" : "0";
-        const hidden = db
+      const tables = mode === "local" ? [2] : mode === "preview" ? [0, 1] : [0];
+      const streams = (
+        db
           .prepare(
-            `SELECT COUNT(*) AS rows,COALESCE(SUM(1-deleted),0) AS live,COALESCE(SUM(pending),0) AS pending FROM (SELECT DISTINCT r.record_key,r.deleted,${pending} AS pending FROM pdpp_replica_quarantined_keys q JOIN ${table} r ON r.instance=q.instance AND r.stream=q.stream AND r.record_key=q.record_key WHERE q.instance=? AND r.stream=? ${mode === "preview" ? "" : "AND r.deleted=0"} AND NOT (${deps.unquarantinedRecordSql("r")}))`,
+            `SELECT DISTINCT stream FROM pdpp_replica_view_streams WHERE instance=? AND preview IN (${tables.join(",")})`,
           )
-          .get(instance, summary.stream) as {
-          rows: number;
-          live: number;
-          pending: number;
-        };
-        if (summary.row_count - hidden.rows <= 0) continue;
-        let last = summary.last_updated;
-        if (hidden.rows)
-          last =
-            (
-              db
-                .prepare(
-                  `SELECT r.emitted_at FROM ${table} r WHERE r.instance=? AND r.stream=? AND ${rowFilter(mode)} ORDER BY r.emitted_at DESC,r.record_key DESC LIMIT 1`,
-                )
-                .get(instance, summary.stream) as
-                { emitted_at: string } | undefined
-            )?.emitted_at ?? null;
-        const previous = combined.get(summary.stream) ?? {
+          .all(instance) as { stream: string }[]
+      ).map((row) => row.stream);
+      for (const stream of streams) {
+        const counts = tables.map((table) => summary(table, instance, stream));
+        const total = (field: "live_count" | "row_count" | "pending_count") =>
+          counts.reduce((sum, row) => sum + (row?.[field] ?? 0), 0);
+        const hidden = quarantinedCounts(mode, instance, stream);
+        if (total("row_count") - hidden.rows <= 0) continue;
+        // An overlay or a hidden key can change the latest visible row; recompute it.
+        const last =
+          counts[1] || hidden.rows
+            ? latestVisible(mode, instance, stream)
+            : (counts[0]?.last_updated ?? null);
+        const previous = combined.get(stream) ?? {
           count: 0,
           last: null,
           pending: false,
           conflicted: false,
         };
-        combined.set(summary.stream, {
-          count: previous.count + summary.live_count - hidden.live,
+        combined.set(stream, {
+          count: previous.count + total("live_count") - hidden.live,
           last:
             last && (previous.last === null || last > previous.last)
               ? last
               : previous.last,
           pending:
-            previous.pending || summary.pending_count - hidden.pending > 0,
+            previous.pending || total("pending_count") - hidden.pending > 0,
           conflicted: previous.conflicted || mode === "local",
         });
       }
@@ -943,7 +1241,6 @@ export function createReplicaVisibilityView(deps: {
     preview: boolean,
     onlyExists: boolean,
   ) {
-    const normal: Mode = preview ? "preview" : "canonical";
     const selection = onlyExists
       ? "1"
       : "r.instance,r.stream,r.record_key AS recordKey";
@@ -951,15 +1248,21 @@ export function createReplicaVisibilityView(deps: {
       ? "AND NOT EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=r.instance)"
       : "";
     const branches = [
-      `SELECT ${selection} FROM ${tableFor(normal)} r WHERE r.blob_id=? AND ${rowFilter(normal)} ${normalFact}`,
+      `SELECT ${selection} FROM pdpp_records r WHERE r.blob_id=? AND r.deleted=0 AND ${unquarantined()} ${preview ? `AND ${notOverlaid()}` : ""} ${normalFact}`,
     ];
     const args = [id];
+    if (preview) {
+      branches.push(
+        `SELECT ${selection} FROM pdpp_replica_view r WHERE r.blob_id=? AND r.live=1 AND ${unquarantined()} ${normalFact}`,
+      );
+      args.push(id);
+    }
     if (
       hasBindingConflictFacts &&
       replicaStateVisible("conflicted", reader, undefined, "local")
     ) {
       branches.push(
-        `SELECT ${selection} FROM pdpp_replica_local_view r WHERE r.blob_id=? AND ${rowFilter("local")} AND EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=r.instance)`,
+        `SELECT ${selection} FROM pdpp_replica_local_view r WHERE r.blob_id=? AND ${sources("local")[0].filter} AND EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=r.instance)`,
       );
       args.push(id);
     }
@@ -988,17 +1291,20 @@ export function createReplicaVisibilityView(deps: {
     const query = blobReferenceQuery(id, reader, preview, true);
     return !!db.prepare(query.sql).get(...query.args);
   }
+  /** Descriptor of a pending blob; canonical blobs keep their metadata in pdpp_blobs. */
   function getBlobMeta(id: string): PdppBlobMeta | undefined {
     const row = db
       .prepare(
-        `SELECT r.blob_json FROM pdpp_replica_view r WHERE r.blob_id=? AND r.blob_json IS NOT NULL AND ${rowFilter("preview")} ${hasBindingConflictFacts ? "AND NOT EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=r.instance)" : ""} LIMIT 1`,
+        `SELECT r.blob_json FROM pdpp_replica_view r WHERE r.blob_id=? AND r.blob_json IS NOT NULL AND r.live=1 AND ${unquarantined()} ${hasBindingConflictFacts ? "AND NOT EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=r.instance)" : ""} LIMIT 1`,
       )
       .get(id) as { blob_json: string } | undefined;
     return row ? JSON.parse(row.blob_json) : undefined;
   }
+  /** Explicit host call after trusted declarations change: re-derive every overlay. */
   function reconcileAll() {
-    db.exec(`INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view_evidence WHERE confirmed=1 OR pending>0;
-      INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view;`);
+    db.exec(`INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view;
+      INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view_pending;
+      INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view_conflicts;`);
     flush();
   }
   flush();
@@ -1007,7 +1313,6 @@ export function createReplicaVisibilityView(deps: {
     reconcileAll,
     addPending,
     removePending,
-    dirtyConnection,
     connectionVisibility,
     hasBindingConflictFacts,
     getRecord,

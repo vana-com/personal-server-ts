@@ -1876,8 +1876,10 @@ it("F3 bounded preview point, page, and summary work is independent of confirmed
     );
     work.push(observedRows);
   }
-  expect(work[0]).toBeLessThanOrEqual(20);
-  expect(work[1]).toBeLessThanOrEqual(20);
+  // The sparse preview reads two keysets (canonical and overlay) and two stream
+  // summaries; the constant must not grow with confirmed history or backlog.
+  expect(work[0]).toBeLessThanOrEqual(30);
+  expect(work[1]).toBeLessThanOrEqual(30);
   expect(work[1]).toBe(work[0]);
 }, 20000);
 
@@ -2182,13 +2184,20 @@ it("F3 page continuation seeks the full indexed tuple in canonical and preview t
     const page = receiver.readRecords(options);
     receiver.readRecords({ ...options, cursor: page.nextCursor });
   }
+  // Owner continuation seeks the canonical keyset and the sparse overlay; the
+  // confirmed-only grant continuation seeks the canonical keyset.
   expect(
     plans.filter((plan) =>
       /SEARCH .*\(instance=\? AND stream=\? AND \(emitted_at,record_key\)>\(\?,\?\)\)/.test(
         plan,
       ),
     ),
-  ).toHaveLength(2);
+  ).toHaveLength(3);
+  expect(
+    plans.filter((plan) =>
+      /^SCAN (r|pdpp_records|pdpp_replica_view)$/.test(plan),
+    ),
+  ).toEqual([]);
 });
 
 it("F1 pending-only stage and quarantine expire owner pages while confirmed app pages continue", () => {

@@ -148,7 +148,7 @@ it.each([1, 120])(
     expect(writes()).toBe(0);
     expect(
       prepare.mock.calls.filter(([sql]) =>
-        sql.includes("pdpp_replica_view_evidence"),
+        sql.includes("pdpp_replica_view_operations"),
       ),
     ).toHaveLength(0);
     expect(continues(before)).toEqual(["key-001", "key-001"]);
