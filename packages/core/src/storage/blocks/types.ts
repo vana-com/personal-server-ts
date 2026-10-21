@@ -54,12 +54,13 @@ export interface ReadScopeBlocksRequest {
   scope: string;
   collectedAt?: string;
   cursor?: string;
+  /** UTF-8 content budget; a 1–3 byte budget may emit one whole code point (up to 4 bytes). */
   maxBytes?: number;
   /**
    * Read only these blocks, in this order, instead of paging the scope from
    * `cursor`. Ids come from a manifest listing or from a search hit's
    * `blockRef`. When set, cursor positions are ignored but version/layout binding is checked; no `nextCursor` is returned;
-   * `maxBytes` still bounds the response.
+   * The same UTF-8 content budget applies.
    */
   blockIds?: string[];
 }
