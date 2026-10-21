@@ -549,6 +549,223 @@ describe("legacy scope view over the real SQLite record store", () => {
     });
   });
 
+  describe("live Claude history with an unknown message count", () => {
+    // anthropic-live 0.3.6 writes message_count: null when the run did not
+    // read the conversation detail; the projection reports that row partial.
+    function ingest(stream: string, data: Record<string, unknown>) {
+      store.ingestBatch(
+        [
+          {
+            instance: "live",
+            stream,
+            key: String(data.id),
+            data,
+            emitted_at: CLAUDE_COLLECTED,
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+        { method: "anthropic-live", generation: 1 },
+      );
+    }
+    function seed(messageCount: number | null) {
+      connect(store, "live", "anthropic-live", CLAUDE);
+      ingest("account_plan", {
+        id: "account_plan",
+        account_id: "org",
+        plan_display_name: null,
+      });
+      ingest("conversations", {
+        id: "existing",
+        title: "Existing chat",
+        message_count: messageCount,
+      });
+      ingest("messages", {
+        id: "message",
+        conversation_id: "existing",
+        role: "human",
+        content: "Actual message",
+        attachments: [],
+      });
+      db.prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+      ).run(
+        "claude/conversations/old.json",
+        "claude.conversations",
+        "2026-09-01T00:00:00.000Z",
+        1,
+      );
+    }
+    let legacyData: Record<string, unknown> = {
+      organizationId: "org",
+      profile: { name: null, plan: null },
+      source: "official-export",
+      total: 0,
+      messageTotal: 0,
+      conversations: [],
+    };
+    const makeView = () =>
+      createLegacyScopeView({
+        authority: createLegacyScopeAuthority(db),
+        records: store,
+        configuredMethods: (sourceId) =>
+          sourceId === CLAUDE ? ["anthropic-live"] : [],
+        readLegacyHead: async () => ({
+          version: "1.0",
+          scope: "claude.conversations",
+          collectedAt: "2026-09-01T00:00:00.000Z",
+          data: legacyData,
+        }),
+      });
+
+    it("cannot take over from the legacy file, on first, repeated or recreated reads", async () => {
+      seed(null);
+      const view = makeView();
+      for (const current of [view, view, makeView()]) {
+        expect(await current.readLatest("claude.conversations")).toEqual({
+          kind: "file",
+          deletion: "canonical",
+        });
+      }
+      expect(
+        createLegacyScopeAuthority(db)
+          .verdictFor("claude.conversations")
+          .filter((row) => row.verdict === "covered"),
+      ).toEqual([]);
+    });
+
+    it("keeps serving the canonical view when a partial row appears after takeover", async () => {
+      seed(1);
+      expect(await makeView().readLatest("claude.conversations")).toMatchObject(
+        { kind: "canonical" },
+      );
+      ingest("conversations", {
+        id: "later",
+        title: "Later chat",
+        message_count: null,
+      });
+      const view = makeView();
+      for (const current of [view, view, makeView()]) {
+        expect(await current.readLatest("claude.conversations")).toMatchObject({
+          kind: "canonical",
+          envelope: {
+            data: {
+              conversations: [
+                { id: "existing", messageCount: 1 },
+                { id: "later", messageCount: 0, messages: [] },
+              ],
+            },
+          },
+        });
+      }
+    });
+
+    it("keeps serving the canonical view when a taken-over conversation loses its message count", async () => {
+      seed(1);
+      const first = await makeView().readLatest("claude.conversations");
+      expect(first.kind).toBe("canonical");
+      // A legacy file holding that same conversation is covered and taken over.
+      legacyData = first.kind === "canonical" ? first.envelope.data : {};
+      db.prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+      ).run(
+        "claude/conversations/same.json",
+        "claude.conversations",
+        "2026-09-02T00:00:00.000Z",
+        1,
+      );
+      expect(await makeView().readLatest("claude.conversations")).toMatchObject(
+        { kind: "canonical" },
+      );
+      // The next run did not read its detail.
+      ingest("conversations", {
+        id: "existing",
+        title: "Existing chat",
+        message_count: null,
+      });
+      const view = makeView();
+      for (const current of [view, view, makeView()]) {
+        expect(await current.readLatest("claude.conversations")).toMatchObject({
+          kind: "canonical",
+          envelope: {
+            data: {
+              conversations: [
+                {
+                  id: "existing",
+                  messageCount: 1,
+                  messages: [{ content: "Actual message" }],
+                },
+              ],
+            },
+          },
+        });
+      }
+    });
+
+    it("keeps a proven message deletion after takeover when the count becomes unknown", async () => {
+      seed(1);
+      const first = await makeView().readLatest("claude.conversations");
+      expect(first.kind).toBe("canonical");
+      legacyData = first.kind === "canonical" ? first.envelope.data : {};
+      db.prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+      ).run(
+        "claude/conversations/same.json",
+        "claude.conversations",
+        "2026-09-02T00:00:00.000Z",
+        1,
+      );
+      expect(await makeView().readLatest("claude.conversations")).toMatchObject(
+        { kind: "canonical" },
+      );
+      // A later, receipt-backed full replacement drops the message and does
+      // not know the conversation's count. A partial row is still present,
+      // so it does not undo the receipts' proof of the deletion.
+      const later = "2026-09-20T00:00:00.000Z";
+      for (const [stream, rows] of [
+        [
+          "account_plan",
+          [{ id: "account_plan", account_id: "org", plan_display_name: null }],
+        ],
+        [
+          "conversations",
+          [{ id: "existing", title: "Existing chat", message_count: null }],
+        ],
+        ["messages", []],
+      ] as const) {
+        store.replaceStream({
+          instance: "live",
+          stream,
+          method: "anthropic-live",
+          generation: 1,
+          primaryKey: ["id"],
+          emittedAt: later,
+          sourceCollectedAt: later,
+          envelopes: rows.map((data) => ({
+            instance: "live",
+            stream,
+            key: data.id,
+            data,
+            emitted_at: later,
+          })),
+        });
+      }
+      const view = makeView();
+      for (const current of [view, view, makeView()]) {
+        expect(await current.readLatest("claude.conversations")).toMatchObject({
+          kind: "canonical",
+          envelope: {
+            data: {
+              conversations: [
+                { id: "existing", messageCount: 0, messages: [] },
+              ],
+            },
+          },
+        });
+      }
+    });
+  });
+
   it("compares the projected Claude conversation joined from three streams", async () => {
     connect(store, "conn_claude", "anthropic", CLAUDE);
     const rows = [
@@ -1060,7 +1277,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
       )
       .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/8");
+    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/9");
     const callsAfterFirstRead = listRecords.mock.calls.length;
     expect(callsAfterFirstRead).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe(

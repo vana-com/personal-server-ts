@@ -899,6 +899,15 @@ export function createLegacyScopeView(
       return { kind: "refused", refusal };
     }
     if (legacyHead !== null && input.readLegacyHead) {
+      // Coverage compares against the old file, so it cannot see rows the
+      // source reports short of detail. Such a history cannot take over; once
+      // this file is covered, it keeps serving (no hard break).
+      if (
+        read.diagnostics.partialRows.length > 0 &&
+        !authority.hasCoveredHead(scope, legacyHead)
+      ) {
+        return { kind: "file" };
+      }
       let coverage = cachedCoverage;
       const cached = coverage !== null;
       if (!coverage || decision.selection.method === "anthropic-live") {
@@ -942,8 +951,12 @@ export function createLegacyScopeView(
             decision.streams,
             legacyHead.collectedAt,
           ),
+          // A partial row is present, only short of detail, so it does not
+          // weaken the receipts' proof that a missing entity was deleted. A
+          // dropped row would look deleted, so omissions still block it.
           allowProvenDeletion:
-            read.complete &&
+            read.diagnostics.omissions.length === 0 &&
+            (read.diagnostics.unproven?.length ?? 0) === 0 &&
             allStreamsProvenAfter(
               read,
               decision.streams,
