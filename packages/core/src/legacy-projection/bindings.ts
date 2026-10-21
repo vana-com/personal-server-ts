@@ -2345,11 +2345,13 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
           });
         // Only the source's own count proves the fetched messages are the
         // whole conversation. Without one (anthropic-live writes null when
-        // the run did not read the detail) the conversation is served with
-        // what was fetched and reported partial, never certified complete.
-        const messageCount = conversation.message_count ?? null;
-        if (messageCount === null) unknownMessageCounts += 1;
-        else if (messageCount !== messages.length)
+        // the run did not read the detail) the conversation is reported
+        // partial, never certified complete. messageCount stays the number
+        // of messages collected, as the legacy schema defines it.
+        const sourceCount = conversation.message_count ?? null;
+        const messageCount = messages.length;
+        if (sourceCount === null) unknownMessageCounts += 1;
+        else if (sourceCount !== messageCount)
           return {
             ok: false,
             error: {
@@ -2386,7 +2388,7 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
           conversations: projected,
           total: projected.length,
           messageTotal: projected.reduce(
-            (total, conversation) => total + conversation.messages.length,
+            (total, conversation) => total + conversation.messageCount,
             0,
           ),
           source: live ? "live-session" : "official-export",

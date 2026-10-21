@@ -173,7 +173,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
           },
         ],
       },
-      envelope: { data: { conversations: [{ messageCount: null }] } },
+      envelope: { data: { conversations: [{ messageCount: 1 }] } },
     });
   });
 

@@ -141,7 +141,10 @@ describe("live Claude message coverage", () => {
           total: 1,
           messageTotal: messages.length,
           conversations: [
-            { messageCount: null, messages: { length: messages.length } },
+            {
+              messageCount: messages.length,
+              messages: { length: messages.length },
+            },
           ],
         },
       });

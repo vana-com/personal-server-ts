@@ -596,6 +596,14 @@ describe("legacy scope view over the real SQLite record store", () => {
         1,
       );
     }
+    let legacyData: Record<string, unknown> = {
+      organizationId: "org",
+      profile: { name: null, plan: null },
+      source: "official-export",
+      total: 0,
+      messageTotal: 0,
+      conversations: [],
+    };
     const makeView = () =>
       createLegacyScopeView({
         authority: createLegacyScopeAuthority(db),
@@ -606,14 +614,7 @@ describe("legacy scope view over the real SQLite record store", () => {
           version: "1.0",
           scope: "claude.conversations",
           collectedAt: "2026-09-01T00:00:00.000Z",
-          data: {
-            organizationId: "org",
-            profile: { name: null, plan: null },
-            source: "official-export",
-            total: 0,
-            messageTotal: 0,
-            conversations: [],
-          },
+          data: legacyData,
         }),
       });
 
@@ -651,7 +652,49 @@ describe("legacy scope view over the real SQLite record store", () => {
             data: {
               conversations: [
                 { id: "existing", messageCount: 1 },
-                { id: "later", messageCount: null, messages: [] },
+                { id: "later", messageCount: 0, messages: [] },
+              ],
+            },
+          },
+        });
+      }
+    });
+
+    it("keeps serving the canonical view when a taken-over conversation loses its message count", async () => {
+      seed(1);
+      const first = await makeView().readLatest("claude.conversations");
+      expect(first.kind).toBe("canonical");
+      // A legacy file holding that same conversation is covered and taken over.
+      legacyData = first.kind === "canonical" ? first.envelope.data : {};
+      db.prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+      ).run(
+        "claude/conversations/same.json",
+        "claude.conversations",
+        "2026-09-02T00:00:00.000Z",
+        1,
+      );
+      expect(await makeView().readLatest("claude.conversations")).toMatchObject(
+        { kind: "canonical" },
+      );
+      // The next run did not read its detail.
+      ingest("conversations", {
+        id: "existing",
+        title: "Existing chat",
+        message_count: null,
+      });
+      const view = makeView();
+      for (const current of [view, view, makeView()]) {
+        expect(await current.readLatest("claude.conversations")).toMatchObject({
+          kind: "canonical",
+          envelope: {
+            data: {
+              conversations: [
+                {
+                  id: "existing",
+                  messageCount: 1,
+                  messages: [{ content: "Actual message" }],
+                },
               ],
             },
           },
