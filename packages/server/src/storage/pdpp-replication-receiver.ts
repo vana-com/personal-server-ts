@@ -403,6 +403,10 @@ export function createReplicaReceiver(deps: {
         db.prepare(
           "INSERT OR IGNORE INTO pdpp_replica_quarantined_keys VALUES (?, ?, ?, ?)",
         ).run(connectionId, generation, stream, recordKey);
+      if (isRecordQuarantined(record.identity)) {
+        write(connectionId, stream, recordKey, null);
+        continue;
+      }
       const winner = record.winner;
       if (winner?.kind === "upsert" && !materializeBlob(winner, eligible)) {
         plan.pending.push({
@@ -452,6 +456,18 @@ export function createReplicaReceiver(deps: {
       const local = binding(first.connectionId)!;
       if (local.deleted_at || local.generation !== first.generation) continue;
       const stream = first.declaration.stream;
+      if (
+        db
+          .prepare(
+            "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ? UNION ALL SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND generation = ? AND stream = ? LIMIT 1",
+          )
+          .get(first.connectionId, first.connectionId, first.generation, stream)
+      ) {
+        db.prepare(
+          "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+        ).run(first.connectionId, stream);
+        continue;
+      }
       if (
         new Set(entries.map((op) => canonicalJson(op.declaration))).size > 1
       ) {
@@ -564,6 +580,19 @@ export function createReplicaReceiver(deps: {
         replicaEnvelopeSchema.parse(JSON.parse(row.envelope_json)).operations,
     );
   }
+  function isRecordQuarantined(identity: {
+    connectionId: string;
+    generation: number;
+    stream: string;
+    recordKey: string;
+  }): boolean {
+    const { connectionId, generation, stream, recordKey } = identity;
+    return !!db
+      .prepare(
+        "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ? UNION ALL SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND generation = ? AND stream = ? AND record_key = ? LIMIT 1",
+      )
+      .get(connectionId, connectionId, generation, stream, recordKey);
+  }
   function readVisibleRecords(input: {
     reader?: ReplicaReader;
     connectionId: string;
@@ -652,6 +681,13 @@ export function createReplicaReceiver(deps: {
         record.identity.generation !== generation
       )
         continue;
+      // Retained operations remain merge evidence after imported-slot quarantine.
+      // Apply the same durable fence as canonical materialization before previewing
+      // their winners or deriving any blob references from them.
+      if (isRecordQuarantined(record.identity)) {
+        rows.delete(record.identity.recordKey);
+        continue;
+      }
       const winner = record.winner;
       if (!winner || winner.kind === "delete") {
         rows.delete(record.identity.recordKey);
@@ -1012,6 +1048,77 @@ export function createReplicaReceiver(deps: {
         findBlobReferences: (id: string) =>
           mayPreview() ? refs(id) : store.findBlobReferences(id),
       };
+    },
+    /** Called only after the transport proves a finalized immutable-slot conflict.
+     * Keep evidence, but permanently retract the authority derived from its batch.
+     */
+    quarantineImported(input: {
+      credential: unknown;
+      envelope: unknown;
+    }): void {
+      authorize(input.credential);
+      const envelope = replicaEnvelopeSchema.parse(input.envelope);
+      if (
+        envelope.owner !== owner ||
+        envelope.operations.some((op) => op.owner !== owner)
+      )
+        throw new Error("wrong replica owner");
+      db.transaction(() => {
+        for (const op of envelope.operations) validateMapping(op);
+        const records = envelope.operations.filter(
+          (op): op is RecordOperation =>
+            op.kind === "upsert" || op.kind === "delete",
+        );
+        const connections = new Set(
+          envelope.operations
+            .filter(
+              (op) =>
+                op.kind !== "upsert" &&
+                op.kind !== "delete" &&
+                (op.kind !== "blob-claim" ||
+                  !records.some(
+                    (record) =>
+                      record.kind === "upsert" &&
+                      record.connectionId === op.connectionId &&
+                      record.generation === op.generation &&
+                      record.blobs.some(
+                        (blob) =>
+                          canonicalJson(blob) === canonicalJson(op.blob),
+                      ),
+                  )),
+            )
+            .map((op) => op.connectionId),
+        );
+        for (const instance of connections) {
+          db.prepare(
+            "INSERT OR IGNORE INTO pdpp_replica_quarantined_connections VALUES (?)",
+          ).run(instance);
+          for (const row of db
+            .prepare(
+              "SELECT stream,record_key FROM pdpp_records WHERE instance = ? AND deleted = 0",
+            )
+            .all(instance) as { stream: string; record_key: string }[])
+            write(instance, row.stream, row.record_key, null);
+          db.prepare("DELETE FROM pdpp_blob_claims WHERE instance = ?").run(
+            instance,
+          );
+          db.prepare(
+            "DELETE FROM pdpp_stream_completion WHERE instance = ?",
+          ).run(instance);
+        }
+        for (const op of records) {
+          db.prepare(
+            "INSERT OR IGNORE INTO pdpp_replica_quarantined_keys VALUES (?, ?, ?, ?)",
+          ).run(
+            op.connectionId,
+            op.generation,
+            op.declaration.stream,
+            op.recordKey,
+          );
+          if (binding(op.connectionId)?.generation === op.generation)
+            write(op.connectionId, op.declaration.stream, op.recordKey, null);
+        }
+      }).immediate();
     },
     import(input: {
       credential: unknown;

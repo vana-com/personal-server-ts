@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { resourceMetadataUrlFor } from "./pdpp-records.js";
 import {
   recordKeyWithinGrantResources,
@@ -57,6 +58,9 @@ function jsonError(
     }),
     ...extraHeaders,
   };
+  if (err instanceof PdppAuthorizationUnavailableError) {
+    headers["Retry-After"] = String(err.retryAfterSeconds);
+  }
   return c.json(err.toJSON(reqId), err.status as never, headers);
 }
 
@@ -90,7 +94,13 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         }),
       };
     }
-    const context = await deps.auth.resolveToken(token);
+    let context;
+    try {
+      context = await deps.auth.resolveToken(token);
+    } catch (error) {
+      if (!(error instanceof PdppAuthorizationUnavailableError)) throw error;
+      return { error: jsonError(c, error, reqId) };
+    }
     if (!context.active) {
       const err = new PdppError("authentication_error", "Invalid access token");
       return { error: jsonError(c, err, reqId) };
