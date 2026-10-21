@@ -770,3 +770,84 @@ describe("list snapshot completeness", () => {
     ]);
   });
 });
+
+describe("memory record store: ingest atomicity", () => {
+  const pk = () => ["id"];
+  const mutable = () => "mutable_state" as const;
+
+  it("F2 commits a batch larger than the engine's argument limit whole", () => {
+    const store = createMemoryRecordStore();
+    const n = 300_000;
+    const envelopes = Array.from({ length: n }, (_, i) => ({
+      instance: "inst_1",
+      stream: "events",
+      key: `k${i}`,
+      data: { id: `k${i}` },
+      emitted_at: "2026-04-01T00:00:00Z",
+    }));
+    expect(store.ingestBatch(envelopes, mutable, pk).accepted).toBe(n);
+    // History, which list and sync read, agrees with current state.
+    const listed = store.listRecords("events", {
+      instanceIds: ["inst_1"],
+      limit: 1,
+      order: "desc",
+    });
+    expect(listed.data).toHaveLength(1);
+    const sync = createPdppSyncSessionService(store).read({
+      stream: "events",
+      instanceIds: ["inst_1"],
+      limit: 1,
+    });
+    expect(sync.hasMore).toBe(true);
+    expect(store.getRecord("inst_1", "events", `k${n - 1}`)).toBeDefined();
+  });
+
+  it("F2 a throw mid-batch leaves no rows, no history and no clock tick", () => {
+    const store = createMemoryRecordStore();
+    let calls = 0;
+    const failSecond = () => {
+      calls += 1;
+      if (calls === 2) throw new Error("validator exploded");
+      return null;
+    };
+    expect(() =>
+      store.ingestBatch(
+        ["a", "b"].map((key) => ({
+          instance: "inst_1",
+          stream: "events",
+          key,
+          data: { id: key },
+          emitted_at: "2026-04-01T00:00:00Z",
+        })),
+        mutable,
+        pk,
+        undefined,
+        failSecond,
+      ),
+    ).toThrow("validator exploded");
+    expect(store.getRecord("inst_1", "events", "a")).toBeUndefined();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "events",
+          key: "c",
+          data: { id: "c" },
+          emitted_at: "2026-04-01T00:00:00Z",
+        },
+      ],
+      mutable,
+      pk,
+    );
+    const page = createPdppSyncSessionService(store).read({
+      stream: "events",
+      instanceIds: ["inst_1"],
+      limit: 10,
+    });
+    expect(page.data.map((row) => row.recordKey)).toEqual(["c"]);
+    // One committed write: the clock advanced exactly once.
+    expect(decodeCursor(page.nextChangesSince!)).toMatchObject({
+      horizon: new Date(1).toISOString(),
+    });
+  });
+});

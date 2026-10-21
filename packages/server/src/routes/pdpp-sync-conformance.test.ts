@@ -11,7 +11,7 @@ import type {
   StreamGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
-import { pdppRecordsRoutes } from "./pdpp-records.js";
+import { pdppRecordsRoutes, type PdppAccessLogPort } from "./pdpp-records.js";
 
 // Black-box sync conformance over the public HTTP surface. Class A cases run
 // under both the current and the candidate grant profile; class B cases run
@@ -71,10 +71,16 @@ afterEach(() => {
   for (const store of opened.splice(0)) store.close();
 });
 
+interface HarnessOptions {
+  accessLog?: PdppAccessLogPort;
+  syncPageBudget?: number;
+}
+
 function harness(
   backend: string,
   grants: Record<string, Grant>,
   db = new Database(":memory:"),
+  options: HarnessOptions = {},
 ) {
   const store =
     backend === "memory"
@@ -90,7 +96,7 @@ function harness(
       cursorField: "emitted_at",
     })),
   );
-  return serve(store, grants, declarations, db);
+  return serve(store, grants, declarations, db, options);
 }
 
 function serve(
@@ -98,6 +104,7 @@ function serve(
   grants: Record<string, Grant>,
   declarations: ReturnType<typeof createStreamDeclarationRegistry>,
   db: Database.Database,
+  options: HarnessOptions = {},
 ) {
   const auth = createFixtureAuthorizationService(
     Object.fromEntries(
@@ -107,12 +114,13 @@ function serve(
           active: true,
           tokenKind: "client" as const,
           subjectId: "subject",
+          clientId: g.client.client_id,
           grant: g,
         },
       ]),
     ),
   );
-  const app = pdppRecordsRoutes({ store, auth, declarations });
+  const app = pdppRecordsRoutes({ store, auth, declarations, ...options });
   let clock = 0;
   return {
     store,
@@ -366,7 +374,7 @@ for (const backend of ["memory", "sqlite"]) {
           );
         });
 
-      it(`pages through one key held by two instances (${version})`, async () => {
+      it(`F1 refuses to serve one key from two instances under one id (${version})`, async () => {
         const h = harness(backend, {
           g1: grant(version, "G1", [
             streamGrant(version, { instance_ids: ["i", "j"] }),
@@ -374,27 +382,135 @@ for (const backend of ["memory", "sqlite"]) {
         });
         for (const instance of ["i", "j"])
           h.put("a", { name: instance, t: INSIDE }, { instance });
-        const orders = version === CANDIDATE ? ["asc", "desc"] : ["asc"];
-        for (const order of orders) {
-          const seen: unknown[] = [];
-          let cursor: string | undefined;
-          do {
-            const page = await h.get(
-              records("s", {
-                changes_since: begin(version),
-                limit: "1",
-                order,
-                cursor,
-              }),
-            );
-            expect(page.status).toBe(200);
-            seen.push(...page.body.data.map((row) => row.data?.name));
-            cursor = page.body.next_cursor;
-          } while (cursor);
-          expect(seen).toEqual(order === "asc" ? ["i", "j"] : ["j", "i"]);
+        h.put("b", { name: "B", t: INSIDE }, { instance: "j" });
+        for (const path of [
+          records("s", { changes_since: begin(version) }),
+          records("s", { changes_since: begin(version), limit: "1" }),
+          records("s", {}),
+          "/streams/s/records/a",
+        ]) {
+          const response = await h.get(path);
+          expect(response.status).toBe(403);
+          expect(response.body.error?.code).toBe("disclosure_unavailable");
         }
+        // A key held by one instance stays readable.
+        expect((await h.get("/streams/s/records/b")).status).toBe(200);
       });
 
+      it(`F1 a same-key record the grant hides is not a conflict (${version})`, async () => {
+        const h = harness(backend, {
+          g1: grant(version, "G1", [
+            streamGrant(version, { instance_ids: ["j", "i"] }),
+          ]),
+        });
+        h.put("a", { name: "visible", t: INSIDE }, { instance: "i" });
+        h.put("a", { name: "hidden", t: OUTSIDE }, { instance: "j" });
+        const detail = await h.get("/streams/s/records/a");
+        expect(detail.status).toBe(200);
+        expect(detail.body.data).toEqual({ id: "a", name: "visible" });
+        const listed = await h.get(records("s", {}));
+        expect(listed.body.data.map((row) => row.data?.name)).toEqual([
+          "visible",
+        ]);
+        const synced = await h.get(
+          records("s", { changes_since: begin(version) }),
+        );
+        expect(synced.body.data.map((row) => row.data?.name)).toEqual([
+          "visible",
+        ]);
+        // Deleting the visible one is a plain deletion of `a`.
+        h.remove("a", "i");
+        const next = await h.get(
+          records("s", { changes_since: synced.body.next_changes_since }),
+        );
+        expect(next.body.data).toEqual([
+          expect.objectContaining({ id: "a", deleted: true }),
+        ]);
+      });
+
+      it(`F1 a later change cannot make two records share an id (${version})`, async () => {
+        const h = harness(backend, {
+          g1: grant(version, "G1", [
+            streamGrant(version, { instance_ids: ["i", "j"] }),
+          ]),
+        });
+        h.put("a", { name: "i", t: INSIDE }, { instance: "i" });
+        h.put("a", { name: "j", t: OUTSIDE }, { instance: "j" });
+        const baseline = await checkpoint(h, version);
+        h.put("a", { name: "j", t: INSIDE }, { instance: "j" });
+        const sync = await h.get(records("s", { changes_since: baseline }));
+        expect(sync.status).toBe(403);
+        expect(sync.body.error?.code).toBe("disclosure_unavailable");
+      });
+
+      it(`F5 every successful sync page is one completed access event (${version})`, async () => {
+        const events: Array<{ outcome: string; grantId: string }> = [];
+        const h = harness(
+          backend,
+          { g1: grant(version, "G1", [streamGrant(version)]) },
+          new Database(":memory:"),
+          { accessLog: { record: async (entry) => void events.push(entry) } },
+        );
+        for (const key of ["a", "b", "c"]) h.put(key, { name: key, t: INSIDE });
+        let cursor: string | undefined;
+        let pages = 0;
+        do {
+          const page = await h.get(
+            records("s", { changes_since: begin(version), limit: "1", cursor }),
+          );
+          expect(page.status).toBe(200);
+          pages += 1;
+          cursor = page.body.next_cursor;
+        } while (cursor);
+        expect(pages).toBe(3);
+        expect(events).toEqual(
+          Array.from({ length: 3 }, () =>
+            expect.objectContaining({ outcome: "completed", grantId: "G1" }),
+          ),
+        );
+      });
+
+      it(`F6 a page stops after its work budget, revealing no hidden key (${version})`, async () => {
+        const h = harness(
+          backend,
+          {
+            g1: grant(version, "G1", [
+              streamGrant(version, { resources: ["z"] }),
+            ]),
+          },
+          new Database(":memory:"),
+          { syncPageBudget: 3 },
+        );
+        for (let n = 0; n < 7; n++)
+          h.put(`hidden${n}`, { name: "H", t: INSIDE });
+        h.put("z", { name: "Z", t: INSIDE });
+        const seen: string[] = [];
+        let cursor: string | undefined;
+        let pages = 0;
+        do {
+          const page = await h.get(
+            records("s", {
+              changes_since: begin(version),
+              limit: "5",
+              order: "asc",
+              cursor,
+            }),
+          );
+          expect(page.status).toBe(200);
+          pages += 1;
+          seen.push(...ids(page.body));
+          cursor = page.body.next_cursor;
+          if (cursor) {
+            expect(decodesAsJson(cursor)).toBe(false);
+            expect(
+              Buffer.from(cursor, "base64url").toString("latin1"),
+            ).not.toContain("hidden");
+          }
+        } while (cursor);
+        // Eight changed keys, three examined per page.
+        expect(pages).toBe(3);
+        expect(seen).toEqual(["z"]);
+      });
       it(`fixed horizon: writes after page 1 wait for the next session (${version})`, async () => {
         const h = harness(backend, {
           g1: grant(version, "G1", [streamGrant(version)]),
