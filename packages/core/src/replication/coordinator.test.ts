@@ -174,6 +174,11 @@ function row(world: World, id: string): Row {
   return found;
 }
 
+/** A hint source that is configured but never knows a head. */
+const silentHint = {
+  head: () => Promise.reject(new Error("no finalized head")),
+};
+
 function handlerFor(world: World, phase: ReplicaPhase): ReplicaPhaseHandler {
   const mine = () => [...world.rows.values()].filter((r) => r.phase === phase);
   const handler: ReplicaPhaseHandler = {
@@ -181,7 +186,7 @@ function handlerFor(world: World, phase: ReplicaPhase): ReplicaPhaseHandler {
     // Due is a function of durable SCHEDULE STATE only (like next_attempt in
     // SQL): a terminal item is never due because the coordinator stored a
     // state that is never due, not because this fake special-cases it.
-    due(now, limit) {
+    due({ now }, limit) {
       world.dueCalls.push({ phase, now, ...limit });
       const sorted = mine()
         .filter((r) => !r.done && r.state.nextEligible <= now)
@@ -214,18 +219,22 @@ function handlerFor(world: World, phase: ReplicaPhase): ReplicaPhaseHandler {
       const act = acts?.shift();
       try {
         if (act === undefined)
-          return { tag: "progress", receipt: { phase, key: item.id } };
+          return {
+            outcome: { tag: "progress", receipt: { phase, key: item.id } },
+          };
         if (act instanceof Error) throw act;
-        if (typeof act === "function") return await act(item, signal);
-        return act;
+        if (typeof act === "function")
+          return { outcome: await act(item, signal) };
+        return { outcome: act };
       } finally {
         world.events.push(`end:${item.id}`);
       }
     },
-    settle(item, outcome, state) {
+    commit(item, attempt, settle) {
       world.events.push(`settle:${item.id}`);
       if (world.failSettleOnce.delete(item.id))
         throw new Error("simulated durable write failure");
+      const { outcome, state } = settle(attempt.plan?.() ?? attempt.outcome);
       const target = row(world, item.id);
       const call: SettleCall = {
         id: item.id,
@@ -243,8 +252,9 @@ function handlerFor(world: World, phase: ReplicaPhase): ReplicaPhaseHandler {
         target.dependency = dependencyKey(outcome.dependency);
       world.settles.push(call);
       world.onSettle?.(call, world);
+      return outcome;
     },
-    nextWake() {
+    earliest() {
       let min: number | undefined;
       for (const r of mine()) {
         if (r.done || r.terminal) continue;
@@ -905,7 +915,7 @@ describe("coordinator transitions", () => {
       new Error("evidence read failed"),
       finalityWait("50"),
     );
-    const co = build(world, { backoff: expBackoff, hints: () => true });
+    const co = build(world, { backoff: expBackoff, hint: silentHint });
     await stepAt(world, co, T0);
     expect(row(world, "c1").state.checkedBlock).toBe("50");
 
@@ -932,7 +942,7 @@ describe("coordinator transitions", () => {
       finalityWait("99"),
       finalityWait("124"),
     );
-    const co = build(world, { hints: () => true });
+    const co = build(world, { hint: silentHint });
     await stepAt(world, co, T0);
     expect(row(world, "c1").state.nextEligible).toBe(T0 + 2000);
     await stepAt(world, co, T0 + 2000);
@@ -948,7 +958,7 @@ describe("coordinator transitions", () => {
     const world = newWorld();
     addRow(world, "c1", "confirm", "A");
     script(world, "c1", new Error("rpc"), finalityWait("5"));
-    const co = build(world, { backoff: expBackoff, hints: () => true });
+    const co = build(world, { backoff: expBackoff, hint: silentHint });
     await stepAt(world, co, T0);
     const deadline = row(world, "c1").state.nextEligible;
     expect(deadline).toBe(T0 + 1000);
@@ -1974,8 +1984,7 @@ describe("coordinator settle", () => {
     const before = new Map(
       [...world.rows].map(([id, r]) => [id, structuredClone(r.state)]),
     );
-    const hints = () => true;
-    const co = build(world, { backoff: sevenBackoff, hints });
+    const co = build(world, { backoff: sevenBackoff, hint: silentHint });
     const phaseOutcomes: Record<string, ReplicaPhaseOutcome> = {
       r1: retry,
       w1: finalityWait("7"),

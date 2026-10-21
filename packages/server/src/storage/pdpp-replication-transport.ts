@@ -38,7 +38,10 @@ import {
   type ReplicaRegistrationEvidence,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import {
+  abortable,
   createReplicaCoordinator,
+  type ReplicaAttempt,
+  type ReplicaSettle,
   type ProgressReport,
   type ReplicaBudget,
   type ReplicaPhaseHandler,
@@ -54,11 +57,12 @@ import {
   type ReplicaOutcome,
   type ReplicaPhase,
   type ReplicaPhaseOutcome,
-  type ReplicaProblem,
 } from "@opendatalabs/personal-server-ts-core/replication/outcome";
 import {
   REPLICA_TERMINAL,
-  settleReplicaWork,
+  replicaEligibleAt,
+  replicaEligibleAtSql,
+  type ReplicaEligibility,
   type ReplicaWorkState,
 } from "@opendatalabs/personal-server-ts-core/replication/schedule";
 import type { ReplicationExport } from "./pdpp-replication-sqlite.js";
@@ -286,55 +290,49 @@ export function createReplicaTransportWorker(deps: {
     return bound;
   }
 
-  // Effects computed by run() and committed by settle() in one transaction.
-  const effects = new Map<string, () => void>();
-  const effectKey = (phase: ReplicaPhase, id: string) => `${phase}\0${id}`;
-  function runOutcome(
-    phase: ReplicaPhase,
-    id: string,
+  /** An attempt with no durable effect besides its outcome. */
+  const verdict = (outcome: ReplicaPhaseOutcome): ReplicaAttempt => ({
+    outcome,
+  });
+  /** An attempt whose effect commits only together with its own outcome. */
+  const withPlan = (
     outcome: ReplicaPhaseOutcome,
-    effect?: () => void,
-  ) {
-    if (effect) effects.set(effectKey(phase, id), effect);
-    return outcome;
-  }
-  function takeEffect(phase: ReplicaPhase, id: string) {
-    const key = effectKey(phase, id);
-    const effect = effects.get(key);
-    effects.delete(key);
-    return effect;
-  }
+    effect: () => void,
+  ): ReplicaAttempt => ({
+    outcome,
+    plan: () => {
+      effect();
+    },
+  });
   /**
-   * Commit a run's effect and the item's work state in one transaction. If the
-   * effect itself fails (for example the canonical import rolls back), persist
-   * the Retry that failure means instead, and report that.
+   * Every adapter's commit: in one transaction run this attempt's plan,
+   * settle the (possibly refined) verdict and write the item's state.
    */
-  function commitWork<I extends ReplicaWorkItem>(
-    phase: ReplicaPhase,
-    item: I,
-    outcome: ReplicaOutcome,
-    work: ReplicaWorkState,
-    write: (outcome: ReplicaOutcome, work: ReplicaWorkState) => void,
-    fallback: ReplicaProblem,
-  ): ReplicaOutcome {
-    const effect = takeEffect(phase, item.id);
-    try {
-      db.transaction(() => {
-        effect?.();
-        write(outcome, work);
-      }).immediate();
-      return outcome;
-    } catch (error) {
-      if (!effect) throw error;
-      const failed = settleReplicaWork(
-        item.state,
-        retryFromError(error, fallback),
-        now(),
-      );
-      db.transaction(() => write(failed.outcome, failed.state)).immediate();
-      return failed.outcome;
-    }
-  }
+  const commitIn =
+    <I extends ReplicaWorkItem>(
+      write: (outcome: ReplicaOutcome, work: ReplicaWorkState, item: I) => void,
+    ) =>
+    (item: I, attempt: ReplicaAttempt, settle: ReplicaSettle): ReplicaOutcome =>
+      db
+        .transaction(() => {
+          const settled = settle(attempt.plan?.() ?? attempt.outcome);
+          write(settled.outcome, settled.state, item);
+          return settled.outcome;
+        })
+        .immediate();
+  /** Network calls stop at the attempt's deadline or the host's abort. */
+  const call = <T>(signal: AbortSignal, start: () => Promise<T>) =>
+    abortable(signal, start);
+  /** The coordinator's eligibility policy over a work table's columns. */
+  const due = (e: ReplicaEligibility) =>
+    `${replicaEligibleAtSql(e)} <= ${e.now}`;
+  /** Earliest eligibility among rows of `from` (a table plus WHERE clause). */
+  const earliestIn = (e: ReplicaEligibility, from: string) => {
+    const row = db
+      .prepare(`SELECT min(${replicaEligibleAtSql(e)}) AS next FROM ${from}`)
+      .get() as { next: number | null } | undefined;
+    return row?.next ?? undefined;
+  };
   /**
    * Writer-fair due selection (see ReplicaPhaseHandler.due). Parameters:
    * perWriter, the writer served last ('' for none), total.
@@ -347,36 +345,6 @@ export function createReplicaTransportWorker(deps: {
   ) =>
     `SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY ${writer} ORDER BY ${order}) AS writer_rank FROM ${from} WHERE ${where}) WHERE writer_rank<=? ORDER BY writer_rank, ${writer}<=?, ${writer}, ${order} LIMIT ?`;
 
-  // ---------------------------------------------------------------- hints
-  let finalizedHead: bigint | undefined;
-  let lastHeadPoll = -Infinity;
-  async function pollFinalizedHead() {
-    if (!transport.finality || now() - lastHeadPoll < 2000) return;
-    lastHeadPoll = now();
-    // A failed hint cannot authorize progress or move a durable error retry.
-    try {
-      finalizedHead = await transport.finality.head();
-      if (typeof finalizedHead !== "bigint" || finalizedHead < 0n)
-        throw new Error("invalid scheduling head");
-    } catch {
-      finalizedHead = undefined;
-    }
-  }
-  /**
-   * A hint can only keep a due finality wait parked: when the finalized head
-   * has not passed the verified checked height, re-reading evidence cannot
-   * succeed. It never makes anything due before its durable deadline, so it
-   * never shortens a Retry. A ten-minute wait polls regardless of hints.
-   */
-  function hintAllowsSql() {
-    if (finalizedHead === undefined) return "1";
-    const head = String(finalizedHead);
-    return `(coalesce(outcome,'') <> 'wait' OR checked_block IS NULL OR
-      length(checked_block)<${head.length} OR (length(checked_block)=${head.length} AND checked_block<'${head}') OR
-      wait_since<=${now() - 600000})`;
-  }
-  // Parked waits are filtered before LIMIT so they cannot hide fresh or error work.
-  const dueSql = () => `(next_attempt<=${now()} AND ${hintAllowsSql()})`;
   const finalityWait = (
     evidence: ReplicaRegistrationEvidence,
     key: string,
@@ -388,16 +356,15 @@ export function createReplicaTransportWorker(deps: {
       checkedBlock: String(evidence.chain!.blockNumber),
     },
   });
-  const nextWakeOf = (sql: string) => {
-    const row = db.prepare(sql).get() as { next: number | null } | undefined;
-    return row?.next ?? undefined;
-  };
 
   // --------------------------------------------------------------- retain
   const singleton = (phase: ReplicaPhase) =>
     (db
       .prepare("SELECT * FROM pdpp_transport_phase_state WHERE phase=?")
-      .get(phase) as (Work & { fingerprint: string | null }) | undefined) ?? {
+      .get(phase) as
+      | (Work & { fingerprint: string | null; outcome: string | null })
+      | undefined) ?? {
+      outcome: null,
       attempts: 0,
       next_attempt: 0,
       wait_since: null,
@@ -421,21 +388,47 @@ export function createReplicaTransportWorker(deps: {
       phase,
     );
   }
+  /** A singleton phase's durable deadline, by the shared eligibility policy. */
+  function singletonEligibleAt(
+    row: Work & { outcome?: string | null },
+    e: ReplicaEligibility,
+  ) {
+    return replicaEligibleAt(
+      {
+        finalityWait: false,
+        nextEligible: row.next_attempt,
+        waitSince: row.wait_since,
+        checkedBlock: row.checked_block,
+      },
+      e,
+    );
+  }
+  /** Only an outstanding Retry or Wait of a singleton is a deadline. */
+  function singletonDeadline(phase: ReplicaPhase, e: ReplicaEligibility) {
+    const row = singleton(phase);
+    return row.outcome === "retry" || row.outcome === "wait"
+      ? singletonEligibleAt(row, e)
+      : undefined;
+  }
+  /** The local export has operations not yet retained. One indexed probe. */
+  function tailPending() {
+    const s = state();
+    return (
+      !s.baseline_done ||
+      deps.exporter.readTailPage({
+        limit: 1,
+        ...(s.tail_cursor === null ? {} : { afterSequence: s.tail_cursor }),
+      }).operations.length > 0
+    );
+  }
   const retain: ReplicaPhaseHandler<Item<Work>> = {
     phase: "retain",
-    due(at) {
+    due(e) {
       const row = singleton("retain");
-      if (row.next_attempt > at) return [];
+      const at = singletonEligibleAt(row, e);
+      if (at === undefined || at > e.now) return [];
       // An idle tail costs one indexed probe and no budget unit.
-      const s = state();
-      if (
-        s.baseline_done &&
-        !deps.exporter.readTailPage({
-          limit: 1,
-          ...(s.tail_cursor === null ? {} : { afterSequence: s.tail_cursor }),
-        }).operations.length
-      )
-        return [];
+      if (!tailPending()) return [];
       return [
         {
           id: "retain",
@@ -492,9 +485,7 @@ export function createReplicaTransportWorker(deps: {
       }
       // Queue + export cursor commit together with the phase outcome. They
       // acknowledge durable local responsibility, not publication.
-      return runOutcome(
-        "retain",
-        "retain",
+      return withPlan(
         { tag: "progress", receipt: { phase: "retain", key: batch } },
         () => {
           const current = state();
@@ -538,20 +529,14 @@ export function createReplicaTransportWorker(deps: {
         },
       );
     },
-    settle(item, outcome, work) {
-      return commitWork(
-        "retain",
-        item,
-        outcome,
-        work,
-        (outcome, work) => {
-          settleSingleton("retain", outcome, work);
-        },
-        "retain_failed",
+    commit: commitIn((outcome, work) => {
+      settleSingleton("retain", outcome, work);
+    }),
+    commitProblem: "retain_failed",
+    earliest(e) {
+      return (
+        singletonDeadline("retain", e) ?? (tailPending() ? e.now : undefined)
       );
-    },
-    nextWake() {
-      return undefined;
     },
   };
 
@@ -570,13 +555,13 @@ export function createReplicaTransportWorker(deps: {
   }
   const prepare: ReplicaPhaseHandler<Item<Batch>> = {
     phase: "prepare",
-    due(at, limit) {
+    due(e, limit) {
       return (
         db
           .prepare(
-            `SELECT batch,sequence,previous_json,collected_at,digest,attempts,next_attempt,wait_since,checked_block,coalesce(total_bytes,length(payload)) AS total_bytes,total_bytes IS NULL AS legacy FROM pdpp_transport_batches WHERE prepared=0 AND next_attempt<=? ORDER BY next_attempt,sequence LIMIT ?`,
+            `SELECT batch,sequence,previous_json,collected_at,digest,attempts,next_attempt,wait_since,checked_block,coalesce(total_bytes,length(payload)) AS total_bytes,total_bytes IS NULL AS legacy FROM pdpp_transport_batches WHERE prepared=0 AND ${due(e)} ORDER BY next_attempt,sequence LIMIT ?`,
           )
-          .all(at, limit.total) as Batch[]
+          .all(limit.total) as Batch[]
       ).map((row) => ({
         id: row.batch,
         phase: "prepare",
@@ -586,7 +571,7 @@ export function createReplicaTransportWorker(deps: {
         row,
       }));
     },
-    async run(item) {
+    async run(item, signal) {
       const batch = item.row;
       const token = randomUUID();
       const s = state();
@@ -608,7 +593,8 @@ export function createReplicaTransportWorker(deps: {
               digest: batch.digest,
               totalBytes: batch.total_bytes,
               bytes: () => payloadBytes(batch),
-              encrypt: transport.encrypt,
+              encrypt: (scope, bytes) =>
+                call(signal, () => transport.encrypt(scope, bytes)),
               maxBlobBytes: cap,
               targetChunkBytes: chunkBytes,
             })) {
@@ -641,9 +627,7 @@ export function createReplicaTransportWorker(deps: {
               chunkBytes = Math.max(1, Math.floor(chunkBytes / 2));
               continue;
             }
-            return runOutcome(
-              "prepare",
-              batch.batch,
+            return withPlan(
               {
                 tag: "unsupported",
                 admission: {
@@ -679,11 +663,9 @@ export function createReplicaTransportWorker(deps: {
         db.prepare("DELETE FROM pdpp_transport_preparing WHERE token=?").run(
           token,
         );
-        return retryFromError(error, "prepare_failed");
+        return verdict(retryFromError(error, "prepare_failed"));
       }
-      return runOutcome(
-        "prepare",
-        batch.batch,
+      return withPlan(
         { tag: "progress", receipt: { phase: "prepare", key: batch.batch } },
         () => {
           const current = db
@@ -717,40 +699,30 @@ export function createReplicaTransportWorker(deps: {
         },
       );
     },
-    settle(item, outcome, work) {
-      return commitWork(
-        "prepare",
-        item,
-        outcome,
-        work,
-        (outcome, work) => {
-          db.prepare(
-            `UPDATE pdpp_transport_batches SET ${WORK_SET} WHERE batch=?`,
-          ).run(...workValues(outcome, work), item.id);
-        },
-        "prepare_failed",
-      );
-    },
-    nextWake() {
-      return nextWakeOf(
-        "SELECT min(next_attempt) AS next FROM pdpp_transport_batches WHERE prepared=0",
-      );
+    commit: commitIn((outcome, work, item) => {
+      db.prepare(
+        `UPDATE pdpp_transport_batches SET ${WORK_SET} WHERE batch=?`,
+      ).run(...workValues(outcome, work), item.id);
+    }),
+    commitProblem: "prepare_failed",
+    earliest(e) {
+      return earliestIn(e, "pdpp_transport_batches WHERE prepared=0");
     },
   };
 
   // -------------------------------------------------------------- publish
   const publish: ReplicaPhaseHandler<Item<Outbox>> = {
     phase: "publish",
-    due(at, limit) {
+    due(e, limit) {
       // Parked waits are filtered before LIMIT so they cannot hide fresh or error work.
       return (
         db
           .prepare(
             dueWindow(
-              `(SELECT rowid AS position,scope,batch,data_hash,metadata_hash,attempts,next_attempt,wait_since,checked_block,outcome FROM pdpp_transport_outbox WHERE state='ready')`,
+              `(SELECT rowid AS position,scope,batch,data_hash,metadata_hash,attempts,next_attempt,wait_since,checked_block,outcome,dependency FROM pdpp_transport_outbox WHERE state='ready')`,
               "batch",
               "next_attempt,position",
-              dueSql(),
+              due(e),
             ),
           )
           .all(limit.perWriter, limit.after ?? "", limit.total) as Outbox[]
@@ -763,7 +735,7 @@ export function createReplicaTransportWorker(deps: {
         row,
       }));
     },
-    async run(item) {
+    async run(item, signal) {
       const row = item.row;
       const expected = {
         owner: state().owner,
@@ -772,7 +744,7 @@ export function createReplicaTransportWorker(deps: {
         metadataHash: row.metadata_hash,
       };
       try {
-        let evidence = await transport.evidence(row.scope);
+        let evidence = await call(signal, () => transport.evidence(row.scope));
         let status = replicaRegistrationState(evidence, expected);
         if (status === "absent") {
           const bytes = db
@@ -787,60 +759,62 @@ export function createReplicaTransportWorker(deps: {
             dataHash: row.data_hash,
             metadataHash: row.metadata_hash,
           };
-          await transport.put(part);
-          await transport.register(part);
-          evidence = await transport.evidence(row.scope);
+          await call(signal, () => transport.put(part));
+          await call(signal, () => transport.register(part));
+          evidence = await call(signal, () => transport.evidence(row.scope));
           status = replicaRegistrationState(evidence, expected);
         }
         if (status === "conflict")
-          return {
+          return verdict({
             tag: "quarantine",
             proof: {
               reason: "immutable_registration_conflict",
               key: row.scope,
             },
-          };
+          });
         if (status === "confirmed")
-          return {
+          return verdict({
             tag: "progress",
             receipt: { phase: "publish", key: row.scope },
-          };
+          });
         if (
           replicaAwaitingFinality(evidence, expected) ||
           replicaRegistrationInactive(evidence, expected)
         )
-          return finalityWait(evidence, row.scope);
-        return { tag: "retry", problem: "registration_unconfirmed" };
+          return verdict(finalityWait(evidence, row.scope));
+        return verdict({ tag: "retry", problem: "registration_unconfirmed" });
       } catch (error) {
-        return retryFromError(error, "publish_failed");
+        return verdict(retryFromError(error, "publish_failed"));
       }
     },
-    settle(item, outcome, work) {
-      db.prepare(
-        `UPDATE pdpp_transport_outbox SET ${WORK_SET},state=? WHERE scope=?`,
-      ).run(
-        ...workValues(outcome, work),
-        outcome.tag === "progress"
-          ? "published"
-          : outcome.tag === "quarantine"
-            ? "quarantined"
-            : "ready",
-        item.id,
-      );
-    },
-    nextWake() {
-      return nextWakeOf(
-        "SELECT min(next_attempt) AS next FROM pdpp_transport_outbox WHERE state='ready'",
-      );
+    commit: (item, attempt, settle) =>
+      commitIn((outcome, work) =>
+        db
+          .prepare(
+            `UPDATE pdpp_transport_outbox SET ${WORK_SET},state=? WHERE scope=?`,
+          )
+          .run(
+            ...workValues(outcome, work),
+            outcome.tag === "progress"
+              ? "published"
+              : outcome.tag === "quarantine"
+                ? "quarantined"
+                : "ready",
+            item.id,
+          ),
+      )(item, attempt, settle),
+    commitProblem: "publish_failed",
+    earliest(e) {
+      return earliestIn(e, "pdpp_transport_outbox WHERE state='ready'");
     },
   };
 
   // ------------------------------------------------------------- discover
   const discover: ReplicaPhaseHandler<Item<Work>> = {
     phase: "discover",
-    due(at) {
+    due(e) {
       const row = singleton("discover");
-      return row.next_attempt <= at
+      return (singletonEligibleAt(row, e) ?? Infinity) <= e.now
         ? [
             {
               id: "discover",
@@ -852,18 +826,16 @@ export function createReplicaTransportWorker(deps: {
           ]
         : [];
     },
-    async run() {
+    async run(_item, signal) {
       let page: { scopes: string[]; cursor: string | null };
       try {
-        page = await transport.list(state().scan_cursor);
+        page = await call(signal, () => transport.list(state().scan_cursor));
       } catch (error) {
-        return retryFromError(error, "discovery_failed");
+        return verdict(retryFromError(error, "discovery_failed"));
       }
       // Page admissions and its cursor commit together. A null cursor restarts
       // from page one next step: no timestamp high-water mark can hide a late registration.
-      return runOutcome(
-        "discover",
-        "discover",
+      return withPlan(
         {
           tag: "progress",
           receipt: { phase: "discover", key: page.cursor ?? "" },
@@ -879,20 +851,13 @@ export function createReplicaTransportWorker(deps: {
         },
       );
     },
-    settle(item, outcome, work) {
-      return commitWork(
-        "discover",
-        item,
-        outcome,
-        work,
-        (outcome, work) => {
-          settleSingleton("discover", outcome, work);
-        },
-        "discovery_failed",
-      );
-    },
-    nextWake() {
-      return undefined;
+    commit: commitIn((outcome, work) => {
+      settleSingleton("discover", outcome, work);
+    }),
+    commitProblem: "discovery_failed",
+    earliest(e) {
+      // A polling source: only an outstanding Retry is a deadline.
+      return singletonDeadline("discover", e);
     },
   };
 
@@ -908,36 +873,38 @@ export function createReplicaTransportWorker(deps: {
     });
   const download: ReplicaPhaseHandler<Item<Inbox>> = {
     phase: "download",
-    due(at, limit) {
+    due(e, limit) {
       return (
         db
           .prepare(
             dueWindow(
-              `(SELECT rowid AS position,scope,attempts,next_attempt,wait_since,checked_block,outcome,data_hash,metadata_hash,${SCOPE_WRITER_SQL} AS writer FROM pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NULL)`,
+              `(SELECT rowid AS position,scope,attempts,next_attempt,wait_since,checked_block,outcome,dependency,data_hash,metadata_hash,${SCOPE_WRITER_SQL} AS writer FROM pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NULL)`,
               "writer",
               "next_attempt,position",
-              dueSql(),
+              due(e),
             ),
           )
           .all(limit.perWriter, limit.after ?? "", limit.total) as Inbox[]
       ).map(inboxItem("download"));
     },
-    async run(item) {
+    async run(item, signal) {
       const row = item.row;
       try {
-        const evidence = await transport.evidence(row.scope);
+        const evidence = await call(signal, () =>
+          transport.evidence(row.scope),
+        );
         const status = replicaRegistrationState(evidence, {
           owner: state().owner,
           scope: row.scope,
         });
         if (status === "conflict")
-          return {
+          return verdict({
             tag: "quarantine",
             proof: {
               reason: "immutable_registration_conflict",
               key: row.scope,
             },
-          };
+          });
         // Gateway heads may be optimistic. They bind cheap decrypt/hash validation,
         // but only pinned finalized evidence permits canonical promotion.
         const head = evidence.head;
@@ -948,11 +915,13 @@ export function createReplicaTransportWorker(deps: {
           head.version !== "1" ||
           head.deleted
         )
-          return { tag: "retry", problem: "head_unavailable" };
-        const encrypted = await transport.get(row.scope);
+          return verdict({ tag: "retry", problem: "head_unavailable" });
+        const encrypted = await call(signal, () => transport.get(row.scope));
         if (encrypted.length > cap)
           throw new ReplicaProblemError("download_failed");
-        const plaintext = await transport.decrypt(row.scope, encrypted);
+        const plaintext = await call(signal, () =>
+          transport.decrypt(row.scope, encrypted),
+        );
         const fragment = decodeReplicaFragment(
           plaintext,
           row.scope,
@@ -966,9 +935,7 @@ export function createReplicaTransportWorker(deps: {
         );
         if (dataHash !== head.dataHash || metadataHash !== head.metadataHash)
           throw new ReplicaProblemError("commitment_mismatch");
-        return runOutcome(
-          "download",
-          row.scope,
+        return withPlan(
           { tag: "progress", receipt: { phase: "download", key: row.scope } },
           () =>
             db
@@ -979,30 +946,23 @@ export function createReplicaTransportWorker(deps: {
         );
       } catch (error) {
         // Network and unavailable bytes are retryable; authenticated malformed bytes back off.
-        return retryFromError(error, "download_failed");
+        return verdict(retryFromError(error, "download_failed"));
       }
     },
-    settle(item, outcome, work) {
-      return commitWork(
-        "download",
-        item,
-        outcome,
-        work,
-        (outcome, work) => {
-          db.prepare(
-            `UPDATE pdpp_transport_inbox SET ${WORK_SET},state=? WHERE scope=?`,
-          ).run(
-            ...workValues(outcome, work),
-            outcome.tag === "quarantine" ? "quarantined" : "ready",
-            item.id,
-          );
-        },
-        "download_failed",
+    commit: commitIn((outcome, work, item) => {
+      db.prepare(
+        `UPDATE pdpp_transport_inbox SET ${WORK_SET},state=? WHERE scope=?`,
+      ).run(
+        ...workValues(outcome, work),
+        outcome.tag === "quarantine" ? "quarantined" : "ready",
+        item.id,
       );
-    },
-    nextWake() {
-      return nextWakeOf(
-        "SELECT min(next_attempt) AS next FROM pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NULL",
+    }),
+    commitProblem: "download_failed",
+    earliest(e) {
+      return earliestIn(
+        e,
+        "pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NULL",
       );
     },
   };
@@ -1029,27 +989,29 @@ export function createReplicaTransportWorker(deps: {
   }
   const confirm: ReplicaPhaseHandler<Item<Inbox>> = {
     phase: "confirm",
-    due(at, limit) {
+    due(e, limit) {
       // Metadata only: retained fragment bodies stay in SQLite.
       return (
         db
           .prepare(
             dueWindow(
-              `(SELECT rowid AS position,scope,attempts,next_attempt,wait_since,checked_block,outcome,data_hash,metadata_hash,${SCOPE_WRITER_SQL} AS writer FROM pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NOT NULL AND finalized=0)`,
+              `(SELECT rowid AS position,scope,attempts,next_attempt,wait_since,checked_block,outcome,dependency,data_hash,metadata_hash,${SCOPE_WRITER_SQL} AS writer FROM pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NOT NULL AND finalized=0)`,
               "writer",
               "next_attempt,position",
-              dueSql(),
+              due(e),
             ),
           )
           .all(limit.perWriter, limit.after ?? "", limit.total) as Inbox[]
       ).map(inboxItem("confirm"));
     },
-    async run(item) {
+    async run(item, signal) {
       // Only unfinalized fragments are selected: finalized evidence for a slot
       // does not change, and revalidation covers imported slots.
       const row = item.row;
       try {
-        const evidence = await transport.evidence(row.scope);
+        const evidence = await call(signal, () =>
+          transport.evidence(row.scope),
+        );
         const expected = {
           owner: state().owner,
           scope: row.scope,
@@ -1059,9 +1021,7 @@ export function createReplicaTransportWorker(deps: {
         const status = replicaRegistrationState(evidence, expected);
         if (status === "conflict") {
           const of = batchOfScope(row.scope);
-          return runOutcome(
-            "confirm",
-            row.scope,
+          return withPlan(
             {
               tag: "quarantine",
               proof: {
@@ -1085,9 +1045,7 @@ export function createReplicaTransportWorker(deps: {
           row.metadata_hash !== null
         ) {
           const of = batchOfScope(row.scope);
-          return runOutcome(
-            "confirm",
-            row.scope,
+          return withPlan(
             { tag: "progress", receipt: { phase: "confirm", key: row.scope } },
             () => {
               db.prepare(
@@ -1101,34 +1059,27 @@ export function createReplicaTransportWorker(deps: {
           replicaAwaitingFinality(evidence, expected) ||
           replicaRegistrationInactive(evidence, expected)
         )
-          return finalityWait(evidence, row.scope);
-        return { tag: "retry", problem: "registration_unconfirmed" };
+          return verdict(finalityWait(evidence, row.scope));
+        return verdict({ tag: "retry", problem: "registration_unconfirmed" });
       } catch (error) {
         // A hint never shortens this error backoff (see hintAllowsSql).
-        return retryFromError(error, "evidence_unavailable");
+        return verdict(retryFromError(error, "evidence_unavailable"));
       }
     },
-    settle(item, outcome, work) {
-      return commitWork(
-        "confirm",
-        item,
-        outcome,
-        work,
-        (outcome, work) => {
-          db.prepare(
-            `UPDATE pdpp_transport_inbox SET ${WORK_SET},state=? WHERE scope=?`,
-          ).run(
-            ...workValues(outcome, work),
-            outcome.tag === "quarantine" ? "quarantined" : "ready",
-            item.id,
-          );
-        },
-        "evidence_unavailable",
+    commit: commitIn((outcome, work, item) => {
+      db.prepare(
+        `UPDATE pdpp_transport_inbox SET ${WORK_SET},state=? WHERE scope=?`,
+      ).run(
+        ...workValues(outcome, work),
+        outcome.tag === "quarantine" ? "quarantined" : "ready",
+        item.id,
       );
-    },
-    nextWake() {
-      return nextWakeOf(
-        "SELECT min(next_attempt) AS next FROM pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NOT NULL AND finalized=0",
+    }),
+    commitProblem: "evidence_unavailable",
+    earliest(e) {
+      return earliestIn(
+        e,
+        "pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NOT NULL AND finalized=0",
       );
     },
   };
@@ -1197,17 +1148,17 @@ export function createReplicaTransportWorker(deps: {
   }
   const revalidate: ReplicaPhaseHandler<Item<Inbox>> = {
     phase: "revalidate",
-    due(at, limit) {
+    due(e, limit) {
       // Round-robin by last check, so a fixed prefix cannot starve later slots.
       return (
         db
           .prepare(
-            `SELECT scope,attempts,next_attempt,wait_since,checked_block,data_hash,metadata_hash FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='imported' AND next_attempt<=? ORDER BY evidence_checked,rowid LIMIT ?`,
+            `SELECT scope,attempts,next_attempt,wait_since,checked_block,data_hash,metadata_hash FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='imported' AND ${due(e)} ORDER BY evidence_checked,rowid LIMIT ?`,
           )
-          .all(at, limit.total) as Inbox[]
+          .all(limit.total) as Inbox[]
       ).map(inboxItem("revalidate"));
     },
-    async run(item) {
+    async run(item, signal) {
       const row = item.row;
       try {
         // A preceding sibling may already have quarantined this batch.
@@ -1215,14 +1166,16 @@ export function createReplicaTransportWorker(deps: {
           .prepare("SELECT state FROM pdpp_transport_inbox WHERE scope=?")
           .get(row.scope) as { state: string };
         if (current.state === "quarantined")
-          return {
+          return verdict({
             tag: "quarantine",
             proof: {
               reason: "immutable_registration_conflict",
               key: row.scope,
             },
-          };
-        const evidence = await transport.evidence(row.scope);
+          });
+        const evidence = await call(signal, () =>
+          transport.evidence(row.scope),
+        );
         const status = replicaRegistrationState(evidence, {
           owner: state().owner,
           scope: row.scope,
@@ -1233,9 +1186,7 @@ export function createReplicaTransportWorker(deps: {
             }),
         });
         if (status === "conflict")
-          return runOutcome(
-            "revalidate",
-            row.scope,
+          return withPlan(
             {
               tag: "quarantine",
               proof: {
@@ -1249,14 +1200,30 @@ export function createReplicaTransportWorker(deps: {
           tag: "progress" as const,
           receipt: { phase: "revalidate" as const, key: row.scope },
         };
-        if (status !== "confirmed" || (row.data_hash && row.metadata_hash))
-          return checked;
+        // Only a confirmed check is Progress. Unavailable or inactive evidence
+        // is not a successful check (an imported slot stays visible meanwhile).
+        if (status !== "confirmed") {
+          const expected = {
+            owner: state().owner,
+            scope: row.scope,
+            dataHash: row.data_hash ?? undefined,
+            metadataHash: row.metadata_hash ?? undefined,
+          };
+          return verdict(
+            replicaRegistrationInactive(evidence, expected)
+              ? finalityWait(evidence, row.scope)
+              : { tag: "retry", problem: "evidence_unavailable" },
+          );
+        }
+        if (row.data_hash && row.metadata_hash) return verdict(checked);
         // Upgrade legacy retained rows only after downloading the exact retained
         // fragment and verifying its hash-pair against finalized evidence.
-        const encrypted = await transport.get(row.scope);
+        const encrypted = await call(signal, () => transport.get(row.scope));
         if (encrypted.length > cap)
           throw new ReplicaProblemError("download_failed");
-        const plaintext = await transport.decrypt(row.scope, encrypted);
+        const plaintext = await call(signal, () =>
+          transport.decrypt(row.scope, encrypted),
+        );
         const fragment = decodeReplicaFragment(
           plaintext,
           row.scope,
@@ -1284,9 +1251,7 @@ export function createReplicaTransportWorker(deps: {
         // The exact retained bytes disagree with the finalized commitment: the
         // legacy slot is not the registered data. Withdraw it (finding j).
         if (pinned === "conflict")
-          return runOutcome(
-            "revalidate",
-            row.scope,
+          return withPlan(
             {
               tag: "quarantine",
               proof: {
@@ -1298,7 +1263,7 @@ export function createReplicaTransportWorker(deps: {
           );
         if (pinned !== "confirmed")
           throw new ReplicaProblemError("commitment_mismatch");
-        return runOutcome("revalidate", row.scope, checked, () =>
+        return withPlan(checked, () =>
           db
             .prepare(
               "UPDATE pdpp_transport_inbox SET data_hash=?,metadata_hash=? WHERE scope=?",
@@ -1306,40 +1271,34 @@ export function createReplicaTransportWorker(deps: {
             .run(dataHash, metadataHash, row.scope),
         );
       } catch (error) {
-        return retryFromError(error, "evidence_unavailable");
+        return verdict(retryFromError(error, "evidence_unavailable"));
       }
     },
-    settle(item, outcome, work) {
-      return commitWork(
-        "revalidate",
-        item,
-        outcome,
-        work,
-        (outcome, work) => {
-          const checked = (
-            db
-              .prepare(
-                "SELECT COALESCE(MAX(evidence_checked),0) AS value FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='imported'",
-              )
-              .get() as { value: number }
-          ).value;
-          const interval = deps.revalidateIntervalMs ?? 0;
-          // A revalidated slot is never terminal: it is checked again on the sweep interval.
-          const next =
-            outcome.tag === "progress"
-              ? { ...work, nextEligible: now() + interval }
-              : work;
-          if (outcome.tag !== "quarantine")
-            db.prepare(
-              `UPDATE pdpp_transport_inbox SET ${WORK_SET},evidence_checked=? WHERE scope=?`,
-            ).run(...workValues(outcome, next), checked + 1, item.id);
-        },
-        "evidence_unavailable",
-      );
-    },
-    nextWake() {
-      return nextWakeOf(
-        "SELECT min(next_attempt) AS next FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='imported'",
+    commit: commitIn((outcome, work, item) => {
+      const checked = (
+        db
+          .prepare(
+            "SELECT COALESCE(MAX(evidence_checked),0) AS value FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='imported'",
+          )
+          .get() as { value: number }
+      ).value;
+      const interval = deps.revalidateIntervalMs ?? 0;
+      // A revalidated slot is never terminal: it is checked again on the sweep interval.
+      const next =
+        outcome.tag === "progress"
+          ? { ...work, nextEligible: now() + interval }
+          : work;
+      if (outcome.tag !== "quarantine")
+        db.prepare(
+          `UPDATE pdpp_transport_inbox SET ${WORK_SET},evidence_checked=? WHERE scope=?`,
+        ).run(...workValues(outcome, next), checked + 1, item.id);
+    }),
+    commitProblem: "evidence_unavailable",
+    earliest(e) {
+      // A sweep on the host's cadence: only Retry and Wait are deadlines.
+      return earliestIn(
+        e,
+        "pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='imported' AND outcome IN ('retry','wait')",
       );
     },
   };
@@ -1348,17 +1307,17 @@ export function createReplicaTransportWorker(deps: {
   type Group = Work & { writer: string; batch: string; sequence: number };
   const importRun: ReplicaPhaseHandler<Item<Group>> = {
     phase: "import",
-    due(at, limit) {
+    due(e, limit) {
       // JSON metadata only: no retained content strings from incomplete or other groups.
       return (
         db
           .prepare(
             `WITH headers AS MATERIALIZED (SELECT json_extract(fragment_json,'$.writer') AS writer, json_extract(fragment_json,'$.batch') AS batch, json_extract(fragment_json,'$.count') AS expected_count, json_extract(fragment_json,'$.sequence') AS sequence FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='ready'),
             complete AS (SELECT writer,batch,min(sequence) AS sequence FROM headers GROUP BY writer,batch HAVING count(*)=max(expected_count)),
-            candidates AS (SELECT c.writer,c.batch,c.sequence,coalesce(w.attempts,0) AS attempts,coalesce(w.next_attempt,0) AS next_attempt,w.wait_since,w.checked_block FROM complete c LEFT JOIN pdpp_transport_import_work w ON w.writer=c.writer AND w.batch=c.batch WHERE w.writer IS NULL OR (w.next_attempt<=? AND coalesce(w.outcome,'') NOT IN ('quarantine','unsupported')))
+            candidates AS (SELECT c.writer,c.batch,c.sequence,coalesce(w.attempts,0) AS attempts,coalesce(w.next_attempt,0) AS next_attempt,w.wait_since,w.checked_block FROM complete c LEFT JOIN pdpp_transport_import_work w ON w.writer=c.writer AND w.batch=c.batch WHERE w.writer IS NULL OR (${replicaEligibleAtSql(e, { outcome: "w.outcome", dependency: "w.dependency", next: "w.next_attempt", since: "w.wait_since", checked: "w.checked_block" })} <= ${e.now} AND coalesce(w.outcome,'') NOT IN ('quarantine','unsupported')))
             SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY writer ORDER BY next_attempt,sequence,batch) AS writer_rank FROM candidates) WHERE writer_rank<=? ORDER BY writer_rank, writer<=?, writer, next_attempt, sequence, batch LIMIT ?`,
           )
-          .all(at, limit.perWriter, limit.after ?? "", limit.total) as Group[]
+          .all(limit.perWriter, limit.after ?? "", limit.total) as Group[]
       ).map((row) => ({
         id: `${row.writer}:${row.batch}`,
         phase: "import",
@@ -1367,7 +1326,7 @@ export function createReplicaTransportWorker(deps: {
         row,
       }));
     },
-    async run(item) {
+    async run(item, signal) {
       const { writer, batch } = item.row;
       const id = item.id;
       const metadata = db
@@ -1403,9 +1362,7 @@ export function createReplicaTransportWorker(deps: {
             imported.sequence !== first.sequence)) ||
         (sequenceHolder && sequenceHolder.batch !== batch)
       )
-        return runOutcome(
-          "import",
-          id,
+        return withPlan(
           {
             tag: "quarantine",
             proof: { reason: "batch_equivocation", key: id },
@@ -1423,6 +1380,23 @@ export function createReplicaTransportWorker(deps: {
           },
         );
       const staging: string[] = [];
+      /**
+       * Pending custody of this copy, if it is not held yet. It commits only
+       * inside this attempt's outcome transaction, so a crash or a discarded
+       * attempt never leaves custody without its outcome.
+       */
+      let stage: (() => void) | undefined;
+      /** Commit `outcome` with the custody this attempt prepared. */
+      const withCustody = (
+        outcome: ReplicaPhaseOutcome,
+        then?: () => void,
+      ): ReplicaAttempt =>
+        stage || then
+          ? withPlan(outcome, () => {
+              stage?.();
+              then?.();
+            })
+          : verdict(outcome);
       try {
         if (deps.receiver.pendingState(pendingId) === undefined) {
           const writers = new Map<
@@ -1443,6 +1417,8 @@ export function createReplicaTransportWorker(deps: {
               db.transaction(() => target.writer.write(chunk))();
             },
           );
+          // A discarded attempt stops before it prepares any custody.
+          signal.throwIfAborted();
           if (payload.envelope.batchId !== first.batch)
             throw new ReplicaProblemError("payload_invalid");
           // Trusted retained declarations, never claims copied from the envelope.
@@ -1459,13 +1435,13 @@ export function createReplicaTransportWorker(deps: {
               ),
           );
           if (missing && "declaration" in missing)
-            return {
+            return verdict({
               tag: "wait",
               dependency: {
                 kind: "declaration",
                 key: `${missing.sourceId}:${missing.declaration.stream}`,
               },
-            };
+            });
           decodeReplicaEnvelope(canonicalJson(payload.envelope), expected);
           const stagedBlobs = payload.blobs.map((blob, index) => {
             let target = writers.get(index);
@@ -1483,18 +1459,21 @@ export function createReplicaTransportWorker(deps: {
             };
           });
           // Verified, hidden custody for the owner preview. Idempotent.
-          deps.receiver.stage({
-            credential: deps.credential,
-            id: pendingId,
-            envelope: payload.envelope,
-            stagedBlobs,
-          });
+          stage = () => {
+            deps.receiver.stage({
+              credential: deps.credential,
+              id: pendingId,
+              envelope: payload.envelope,
+              stagedBlobs,
+            });
+            for (const key of staging) deleteBinary(db, "staging", key);
+          };
         }
         if (metadata.some((row) => !row.finalized))
-          return {
+          return withCustody({
             tag: "wait",
             dependency: { kind: "fragments", key: `${writer}:${batch}` },
-          };
+          });
         if (
           !imported &&
           first.previous &&
@@ -1509,16 +1488,14 @@ export function createReplicaTransportWorker(deps: {
               first.previous.digest,
             )
         )
-          return {
+          return withCustody({
             tag: "wait",
             dependency: {
               kind: "predecessor",
               key: `${writer}:${first.sequence - 1}`,
             },
-          };
-        return runOutcome(
-          "import",
-          id,
+          });
+        return withCustody(
           { tag: "progress", receipt: { phase: "import", key: id } },
           () => {
             // Nested receiver transaction shares this DB: import and durable acknowledgement are atomic.
@@ -1538,31 +1515,27 @@ export function createReplicaTransportWorker(deps: {
           },
         );
       } catch (error) {
-        return retryFromError(error, "import_failed");
+        stage = undefined;
+        return verdict(retryFromError(error, "import_failed"));
       } finally {
-        for (const key of staging) deleteBinary(db, "staging", key);
+        // Without a plan to consume it, staging is scratch. A discarded
+        // attempt's staging is reclaimed at the next step start.
+        if (!stage) for (const key of staging) deleteBinary(db, "staging", key);
       }
     },
-    settle(item, outcome, work) {
-      return commitWork(
-        "import",
-        item,
-        outcome,
-        work,
-        (outcome, work) => {
-          db.prepare(
-            "INSERT INTO pdpp_transport_import_work (writer,batch,sequence) VALUES (?,?,?) ON CONFLICT(writer,batch) DO NOTHING",
-          ).run(item.row.writer, item.row.batch, item.row.sequence);
-          db.prepare(
-            `UPDATE pdpp_transport_import_work SET ${WORK_SET} WHERE writer=? AND batch=?`,
-          ).run(...workValues(outcome, work), item.row.writer, item.row.batch);
-        },
-        "import_failed",
-      );
-    },
-    nextWake() {
-      return nextWakeOf(
-        "SELECT min(w.next_attempt) AS next FROM pdpp_transport_import_work w WHERE coalesce(w.outcome,'') NOT IN ('progress','quarantine','unsupported')",
+    commit: commitIn((outcome, work, item) => {
+      db.prepare(
+        "INSERT INTO pdpp_transport_import_work (writer,batch,sequence) VALUES (?,?,?) ON CONFLICT(writer,batch) DO NOTHING",
+      ).run(item.row.writer, item.row.batch, item.row.sequence);
+      db.prepare(
+        `UPDATE pdpp_transport_import_work SET ${WORK_SET} WHERE writer=? AND batch=?`,
+      ).run(...workValues(outcome, work), item.row.writer, item.row.batch);
+    }),
+    commitProblem: "import_failed",
+    earliest(e) {
+      return earliestIn(
+        e,
+        "pdpp_transport_import_work WHERE coalesce(outcome,'') NOT IN ('progress','quarantine','unsupported')",
       );
     },
   };
@@ -1621,9 +1594,10 @@ export function createReplicaTransportWorker(deps: {
    */
   const reconcile: ReplicaPhaseHandler<Item<Work>> = {
     phase: "reconcile",
-    due(at) {
+    due(e) {
       const row = singleton("reconcile");
-      return row.fingerprint !== fingerprint || row.next_attempt <= at
+      return row.fingerprint !== fingerprint ||
+        (singletonEligibleAt(row, e) ?? Infinity) <= e.now
         ? [
             {
               id: "reconcile",
@@ -1636,33 +1610,37 @@ export function createReplicaTransportWorker(deps: {
         : [];
     },
     async run() {
-      let plan: ReturnType<typeof deps.receiver.retry>;
-      try {
-        plan = deps.receiver.retry({ credential: deps.credential });
-      } catch (error) {
-        return retryFromError(error, "reconcile_failed");
-      }
-      const dependency = pendingDependency(plan);
-      return dependency
-        ? { tag: "wait", dependency }
-        : {
-            tag: "progress",
-            receipt: { phase: "reconcile", key: fingerprint },
-          };
+      // The canonical commit runs inside this attempt's outcome transaction:
+      // the plan reconciles and returns the verdict its result implies.
+      const seen = fingerprint;
+      return {
+        outcome: {
+          tag: "progress",
+          receipt: { phase: "reconcile", key: seen },
+        },
+        plan: () => {
+          const plan = deps.receiver.retry({ credential: deps.credential });
+          const dependency = pendingDependency(plan);
+          return dependency ? { tag: "wait", dependency } : undefined;
+        },
+      };
     },
-    settle(_item, outcome, work) {
-      const next =
+    commit: commitIn((outcome, work) =>
+      settleSingleton(
+        "reconcile",
+        outcome,
+        // With nothing outstanding it waits for a dependency change only.
         outcome.tag === "progress"
           ? { ...work, nextEligible: REPLICA_TERMINAL }
-          : work;
-      db.transaction(() =>
-        settleSingleton("reconcile", outcome, next, fingerprint),
-      ).immediate();
-    },
-    nextWake() {
+          : work,
+        fingerprint,
+      ),
+    ),
+    commitProblem: "reconcile_failed",
+    earliest(e) {
       const row = singleton("reconcile");
-      if (row.fingerprint !== fingerprint) return now();
-      return row.next_attempt < REPLICA_TERMINAL ? row.next_attempt : undefined;
+      if (row.fingerprint !== fingerprint) return e.now;
+      return singletonEligibleAt(row, e);
     },
     wake(key, at) {
       const row = singleton("reconcile");
@@ -1714,7 +1692,13 @@ export function createReplicaTransportWorker(deps: {
     perWriter: deps.perWriter,
     deadlineMs: deps.deadlineMs,
     background: ["revalidate"],
-    hints: () => transport.finality !== undefined,
+    clock: now,
+    ...(transport.finality && {
+      hint: {
+        head: (signal: AbortSignal) =>
+          abortable(signal, () => transport.finality!.head()),
+      },
+    }),
   });
 
   function acquireWriter(token: string) {
@@ -1780,7 +1764,6 @@ export function createReplicaTransportWorker(deps: {
           ).run();
         }
       }).immediate();
-      await pollFinalizedHead();
       const current = dependencyFingerprint();
       if (current !== fingerprint) {
         fingerprint = current;

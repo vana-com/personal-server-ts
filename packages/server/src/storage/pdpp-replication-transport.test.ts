@@ -1248,11 +1248,13 @@ it("rolls staged binary and import acknowledgement back together, then retries w
   await cycles([b], 3);
   expect(b.get("binary")).toBeUndefined();
   expect(b.store.getBlobBytes(blob.blobId)).toBeUndefined();
+  // No custody survives the failed attempt. Its hidden staging scratch is
+  // reclaimed at the next step start, not by the failed transaction.
   expect(
     (
       b.db
         .prepare(
-          "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace IN ('received','canonical','staging')",
+          "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace IN ('received','canonical','pending')",
         )
         .get() as { n: number }
     ).n,
