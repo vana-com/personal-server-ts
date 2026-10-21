@@ -9,6 +9,7 @@ import type { DeclarationBinding } from "@opendatalabs/personal-server-ts-core/r
 import {
   RECEIVER_MIGRATION,
   REPLICA_INTEGRITY_MIGRATION,
+  REPLICA_FACT_REMOVAL_MIGRATION,
 } from "./pdpp-replication-receiver.js";
 import { REPLICA_COPY_MIGRATION } from "./pdpp-replica-copies.js";
 import {
@@ -359,6 +360,8 @@ BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
   REPLICA_INTEGRITY_MIGRATION,
   // Replica family: batch copies, finalized facts, dispositions, receipts.
   REPLICA_COPY_MIGRATION,
+  // Replica family: removing a quarantine fact raises the integrity epoch.
+  REPLICA_FACT_REMOVAL_MIGRATION,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -589,14 +592,23 @@ function projectFields(
  * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
 // Shared read predicate for canonical, replica-preview, and known-local projections.
-function unquarantinedRecordSql(alias: string): string {
-  return `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_connections q WHERE q.instance = ${alias}.instance) AND NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_keys q JOIN pdpp_instance_binding b ON b.instance=q.instance AND b.generation=q.generation WHERE q.instance=${alias}.instance AND q.stream=${alias}.stream AND q.record_key=${alias}.record_key)`;
+// `generationSql` is the row's own generation, for rows that can belong to a
+// generation a pending reset introduces: a key fact then applies from its
+// generation on (fail closed). Without it the fact applies to the binding's
+// current generation only, so canonical rows behave as before.
+function unquarantinedRecordSql(alias: string, generationSql?: string): string {
+  const connection = `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_connections q WHERE q.instance = ${alias}.instance)`;
+  const key = (scope: string) =>
+    `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_keys q ${scope} q.instance=${alias}.instance AND q.stream=${alias}.stream AND q.record_key=${alias}.record_key`;
+  return generationSql === undefined
+    ? `${connection} AND ${key("JOIN pdpp_instance_binding b ON b.instance=q.instance AND b.generation=q.generation WHERE")})`
+    : `${connection} AND ${key("WHERE")} AND q.generation >= (${generationSql}))`;
 }
 
 export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   /** Internal synchronous observer, called after journal capture in the write transaction. */
   setReplicaVisibilityObserver(observer: () => void): void;
-  unquarantinedRecordSql(alias: string): string;
+  unquarantinedRecordSql(alias: string, generationSql?: string): string;
   changesSinceForInstances(
     stream: string,
     options: ChangesSinceOptions,

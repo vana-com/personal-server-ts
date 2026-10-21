@@ -943,7 +943,7 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 17 });
+        ).toEqual({ version: 18 });
         expect(
           dbAfterUpgrade
             .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")

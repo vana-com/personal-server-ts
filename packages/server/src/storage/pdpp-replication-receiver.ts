@@ -80,6 +80,18 @@ CREATE TRIGGER IF NOT EXISTS pdpp_binding_conflicts_no_update BEFORE UPDATE ON p
 CREATE TRIGGER IF NOT EXISTS pdpp_binding_conflicts_no_delete BEFORE DELETE ON pdpp_replica_binding_conflicts BEGIN SELECT RAISE(ABORT, 'binding conflicts are append-only'); END;
 `;
 
+/**
+ * Invariant: removing a quarantine fact un-hides data, so it must raise the
+ * connection's integrity epoch in the same transaction, exactly as adding
+ * one does (fenceReplicaConnection). These triggers make that structural:
+ * any DELETE of a key or connection fact fences its connection, so no
+ * future removal path can forget it. pdpp-replica-invariants.test.ts (1).
+ */
+export const REPLICA_FACT_REMOVAL_MIGRATION = `
+CREATE TRIGGER IF NOT EXISTS pdpp_quarantined_keys_removal_fence AFTER DELETE ON pdpp_replica_quarantined_keys BEGIN INSERT INTO pdpp_replica_integrity_fences VALUES (OLD.instance, 1) ON CONFLICT(instance) DO UPDATE SET fences = fences + 1; END;
+CREATE TRIGGER IF NOT EXISTS pdpp_quarantined_connections_removal_fence AFTER DELETE ON pdpp_replica_quarantined_connections BEGIN INSERT INTO pdpp_replica_integrity_fences VALUES (OLD.instance, 1) ON CONFLICT(instance) DO UPDATE SET fences = fences + 1; END;
+`;
+
 type Store = ReturnType<typeof createSqliteRecordStore>;
 type Binding = {
   instance: string;

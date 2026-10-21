@@ -12,6 +12,21 @@ CREATE TABLE IF NOT EXISTS pdpp_binary_chunks (
 `;
 export type BinaryNamespace =
   "canonical" | "pinned" | "received" | "staging" | "payload" | "pending";
+/**
+ * What each namespace's bytes are for. A "reader" namespace holds bytes a
+ * reader can be served. Each one MUST have manifest insert and delete
+ * triggers in the visibility view (pdpp-replica-visibility-view.ts), or
+ * records stay stale when its chunked bytes arrive or leave. Add a new
+ * namespace here first; pdpp-replica-invariants.test.ts guards the triggers.
+ */
+export const BINARY_NAMESPACE_ROLE = {
+  canonical: "reader",
+  received: "reader",
+  pending: "reader",
+  pinned: "export",
+  staging: "scratch",
+  payload: "scratch",
+} as const satisfies Record<BinaryNamespace, "reader" | "export" | "scratch">;
 const legacy = {
   canonical: "pdpp_blob_bytes",
   pinned: "pdpp_replica_blob_bytes",
