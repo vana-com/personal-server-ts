@@ -77,6 +77,8 @@ PR #438 adds the pending-read policy. Source commit `602e0b8de8603e6db62c7880be3
 
 The intended integration contracts are `ReplicaVisibilityPolicy`, `readStore({reader})`, both route factories' optional `replicaReads` adapter, and the `confirmation: "not yet confirmed"` row field. Low-level `stage`, `promote`, pending `quarantine` and `readVisibleRecords` remain provisional internal hooks. A receiving host must derive reader identity from authentication, never a URL parameter. The worker is inert unless explicitly enabled; production bootstrap remains unwired.
 
+Later the same day the optional `replicaReads` route adapter became the required host capability `createApp({ pdpp: { reads } })`, which also feeds the legacy `/v1/data` view; see `packages/server/src/storage/pdpp-replication-receiver.md`.
+
 Claude Opus 5.5 reviewed the source at high effort in two rounds. Its final verdict is **MERGE-WITH-NITS for the internal draft only; do not enable at runtime**. It independently reproduced the connection-isolation and host-byte-source regressions by removing their fixes. Its design findings map to the leverage rubric as follows:
 
 1. Goal: owners can see pending records with a marker, while the default app view requires finalized evidence.

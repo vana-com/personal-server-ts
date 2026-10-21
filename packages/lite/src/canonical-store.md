@@ -246,8 +246,13 @@ row page with one bounded preview row page: at most 200 native input entries and
 pending metadata. Pages reuse scanned values without row point re-reads. A
 byte-trimmed page continues after its last returned key, without skipping the
 unreturned rows. Reads do not load pending batches or
-reconstruct operation history. Blob visibility checks use a per-blob active-batch
-index. Ordinary record writes reconcile affected keys; lifecycle, blob-claim,
+reconstruct operation history. Pending blob bytes need a live reference that
+the reader sees, as on Node: `readBlob` walks the per-blob active-batch index and
+returns bytes only when an upsert in one of those batches still owns a visible,
+undeleted row whose `blob_ref` names the blob. An active batch alone does not
+authorize bytes, because a later pending deletion or an operation-ID variant can
+hide its record. Its work grows with the active batches that carry the blob, not
+with stored rows. Ordinary record writes reconcile affected keys; lifecycle, blob-claim,
 equivocation and provisioning writes may fan out across a connection's keys.
 Native write latency and large-backlog write costs remain unmeasured. An older
 database without pending-index version two requires authenticated `retry`
