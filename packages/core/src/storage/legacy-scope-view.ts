@@ -899,6 +899,15 @@ export function createLegacyScopeView(
       return { kind: "refused", refusal };
     }
     if (legacyHead !== null && input.readLegacyHead) {
+      // Coverage compares against the old file, so it cannot see rows the
+      // source reports short of detail. Such a history cannot take over; once
+      // this file is covered, it keeps serving (no hard break).
+      if (
+        read.diagnostics.partialRows.length > 0 &&
+        !authority.hasCoveredHead(scope, legacyHead)
+      ) {
+        return { kind: "file" };
+      }
       let coverage = cachedCoverage;
       const cached = coverage !== null;
       if (!coverage || decision.selection.method === "anthropic-live") {
