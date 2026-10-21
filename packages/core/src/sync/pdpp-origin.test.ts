@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { hasPdppOrigin, isPdppProducer } from "./pdpp-import.js";
+import {
+  hasPdppOrigin,
+  inputHasPdppOrigin,
+  isPdppProducer,
+} from "./pdpp-import.js";
 
 describe("hasPdppOrigin producer stamps", () => {
   it.each(["pdpp-projector", "pdpp-import-projection", "pdpp-derivative"])(
@@ -17,5 +21,33 @@ describe("hasPdppOrigin producer stamps", () => {
     );
     expect(isPdppProducer("pdpp-other")).toBe(false);
     expect(hasPdppOrigin(undefined)).toBe(false);
+  });
+});
+
+describe("hasPdppOrigin for derivatives", () => {
+  const lineage = { sources: [], writtenAt: "2026-09-01T00:00:00Z" };
+  it("treats a derivative with no stated origin as PDPP until it is recomputed", () => {
+    expect(hasPdppOrigin({ data: { answer: "x", $lineage: lineage } })).toBe(
+      true,
+    );
+    expect(hasPdppOrigin({ data: { $lineage: "garbage" } })).toBe(true);
+  });
+  it("treats a derivative stamped legacy by the server as legacy", () => {
+    expect(
+      hasPdppOrigin({
+        data: { answer: "x", $lineage: { ...lineage, origin: "legacy" } },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("inputHasPdppOrigin", () => {
+  it("is PDPP when the index row or the bytes say so", () => {
+    const legacy = { data: { id: 1 } };
+    expect(inputHasPdppOrigin({ pdppOrigin: true }, legacy)).toBe(true);
+    expect(inputHasPdppOrigin({ pdppOrigin: false }, legacy)).toBe(false);
+    expect(
+      inputHasPdppOrigin(undefined, { data: {}, producer: "pdpp-derivative" }),
+    ).toBe(true);
   });
 });

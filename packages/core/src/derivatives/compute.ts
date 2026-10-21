@@ -15,7 +15,7 @@ import {
   readStoredLineage,
 } from "../lineage/lineage.js";
 import { uncoveredSourceScopes } from "./registration.js";
-import { hasPdppOrigin } from "../sync/pdpp-import.js";
+import { inputHasPdppOrigin } from "../sync/pdpp-import.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
@@ -473,8 +473,8 @@ async function loadSource(
       truncated: trimmed.truncated,
     },
     lineageSources,
-    // Decided like a read: the index row and the bytes just read.
-    pdppOrigin: entry.pdppOrigin === true || hasPdppOrigin(envelope),
+    // The served envelope carries the provenance of every input it joined.
+    pdppOrigin: inputHasPdppOrigin(entry, envelope),
   };
 }
 
@@ -621,12 +621,9 @@ export async function computeQuestion(
       collectedAt,
       status: deps.syncManager ? "syncing" : "stored",
       lineage,
-      // The answer is computed from PDPP data read as the owner, so it is
-      // PDPP-origin: a legacy chain grant that covers the derived scope must
-      // not read it. Server-only stamp; the HTTP producer header refuses it.
-      ...(sourcesHavePdppOrigin
-        ? { producer: "pdpp-derivative" as const }
-        : {}),
+      // Handed to the publication point, which stamps the output: an answer
+      // computed from PDPP data must not be readable by a legacy chain grant.
+      lineageInputsPdppOrigin: sourcesHavePdppOrigin,
       afterTombstoneVersion: await tombstoneMarker(
         deps.scopeDeletions,
         registration.derivedScope,

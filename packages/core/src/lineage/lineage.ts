@@ -46,6 +46,13 @@ export interface StoredLineage {
   sources: `0x${string}`[];
   /** ISO timestamp the Personal Server validated and stamped the lineage. */
   writtenAt: string;
+  /**
+   * Written by the server only, and only when every input was known to be
+   * legacy data. A derivative without it counts as PDPP-origin (see
+   * `hasPdppOrigin`), which is how derivatives written before this field
+   * existed fail closed.
+   */
+  origin?: "legacy";
 }
 
 /** A source as the resolver saw it (local index or gateway). */
@@ -132,6 +139,7 @@ export function readStoredLineage(
   return {
     sources: sources.map((id) => id.toLowerCase() as `0x${string}`),
     writtenAt: value.writtenAt,
+    ...(value.origin === "legacy" ? { origin: "legacy" as const } : {}),
   };
 }
 
@@ -342,9 +350,19 @@ export interface PrepareLineageInput {
   /** The raw caller value (`body.lineage` / `metadata.lineage`). */
   field: unknown;
   serverOwner: `0x${string}` | undefined;
-  storage: Pick<DataStoragePort, "listScopes">;
+  storage: Pick<DataStoragePort, "listScopes" | "findEntry">;
   gateway?: LineageSourceLookup;
   now: () => Date;
+}
+
+export interface PreparedLineage {
+  lineage: StoredLineage;
+  /**
+   * True unless every source is a local scope whose latest version is known
+   * legacy. A source with no local row is unknown, so it counts as PDPP.
+   * `ingestDataContract` turns this into the output's origin stamp.
+   */
+  inputsPdppOrigin: boolean;
 }
 
 /**
@@ -357,7 +375,7 @@ export interface PrepareLineageInput {
  */
 export async function prepareLineage(
   input: PrepareLineageInput,
-): Promise<StoredLineage> {
+): Promise<PreparedLineage> {
   const sources = parseLineageSources(input.field);
   if (!input.serverOwner) {
     throw new ServerNotConfiguredError({
@@ -375,5 +393,12 @@ export async function prepareLineage(
     input.scope,
     resolved.map((source) => source.scope),
   );
-  return { sources, writtenAt: input.now().toISOString() };
+  const inputsPdppOrigin = !resolved.every((source) => {
+    const entry = input.storage.findEntry({ scope: source.scope });
+    return entry !== undefined && entry.pdppOrigin !== true;
+  });
+  return {
+    lineage: { sources, writtenAt: input.now().toISOString() },
+    inputsPdppOrigin,
+  };
 }

@@ -60,6 +60,7 @@ import type {
 } from "../storage/pdpp-records/index.js";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { Logger } from "../logger/index.js";
+import { LINEAGE_KEY } from "../lineage/lineage.js";
 
 /** The reserved key carrying PDPP import metadata inside `data`. */
 export const PDPP_METADATA_KEY = "$pdpp";
@@ -309,9 +310,22 @@ export function isPdppProducer(value: unknown): value is PdppProducer {
 }
 
 /**
+ * A derivative output (it carries `$lineage`) must state its origin. Only the
+ * server's write path stamps `origin: "legacy"`, and only when every input was
+ * known to be legacy. A derivative without that statement (written before the
+ * statement existed, or malformed) is PDPP-origin until it is recomputed.
+ */
+function derivativeLacksLegacyOrigin(data: unknown): boolean {
+  if (!isRecord(data) || !(LINEAGE_KEY in data)) return false;
+  const lineage = data[LINEAGE_KEY];
+  return !(isRecord(lineage) && lineage.origin === "legacy");
+}
+
+/**
  * Immutable PDPP provenance at storage publication. Native metadata (including
- * malformed claims) and owner-stamped PDPP cache producers require grant-bound
- * reads. Nested phone `{records}` metadata is ordinary legacy compatibility.
+ * malformed claims), owner-stamped PDPP producers and derivatives that do not
+ * state a legacy origin require grant-bound reads. Nested phone `{records}`
+ * metadata is ordinary legacy compatibility.
  */
 export function hasPdppOrigin(
   envelope:
@@ -323,8 +337,23 @@ export function hasPdppOrigin(
 ): boolean {
   return (
     envelope !== undefined &&
-    (isPdppProducer(envelope.producer) || readMetadata(envelope.data) !== null)
+    (isPdppProducer(envelope.producer) ||
+      readMetadata(envelope.data) !== null ||
+      derivativeLacksLegacyOrigin(envelope.data))
   );
+}
+
+/**
+ * Origin of one input an owner-authority transform reads: the index row or the
+ * bytes read, whichever says PDPP. Every such transform combines the origin of
+ * ALL its inputs with this one function and passes the result to the single
+ * publication point (`ingestDataContract`), which stamps the output.
+ */
+export function inputHasPdppOrigin(
+  entry: { pdppOrigin?: boolean } | undefined,
+  envelope: { data: unknown; producer?: unknown } | undefined,
+): boolean {
+  return entry?.pdppOrigin === true || hasPdppOrigin(envelope);
 }
 
 /**

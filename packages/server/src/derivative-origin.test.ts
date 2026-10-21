@@ -25,6 +25,9 @@ import {
   createInMemoryQuestionStore,
   type QuestionRegistration,
 } from "@opendatalabs/personal-server-ts-core/derivatives";
+import { reindexLegacyDataFiles } from "./storage/node-data-storage.js";
+import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
+import { computeDataPointId } from "@opendatalabs/personal-server-ts-core/sync";
 import { dataRoutes } from "./routes/data.js";
 
 const logger = pino({ level: "silent" });
@@ -272,5 +275,315 @@ describe("derivative output carries the origin of its sources", () => {
       body: raw,
     });
     expect(res.status).toBe(400);
+  });
+});
+
+describe("joined projection and derivative history", () => {
+  function conversations(): DataFileEnvelope {
+    return {
+      version: "1.0",
+      scope: "chatgpt.conversations",
+      collectedAt: AT,
+      data: {
+        records: [
+          {
+            id: "conv-1",
+            title: "Trip",
+            create_time: AT,
+            update_time: AT,
+            current_node: "m1",
+            message_count_on_current_branch: 1,
+          },
+        ],
+      },
+    } as DataFileEnvelope;
+  }
+  function messages(producer?: "pdpp-projector"): DataFileEnvelope {
+    return {
+      version: "1.0",
+      scope: "chatgpt.messages",
+      collectedAt: AT,
+      ...(producer ? { producer } : {}),
+      data: {
+        records: [
+          {
+            id: "m1",
+            conversation_id: "conv-1",
+            parent_id: null,
+            role: "user",
+            content: "joined-legacy-marker",
+            content_type: "text",
+            model_slug: null,
+            create_time: AT,
+            on_current_branch: true,
+          },
+        ],
+      },
+    } as DataFileEnvelope;
+  }
+
+  async function computeOverProjection() {
+    const outcome = await computeQuestion("q-1", {
+      storage: withLegacyProjection(storage),
+      store: createInMemoryQuestionStore({
+        initial: [registration(["chatgpt.conversations"])],
+      }),
+      provider: createFakeInferenceProvider({
+        respond: (request) => ({
+          content: JSON.stringify({
+            answer: JSON.stringify(request).includes("joined-legacy-marker")
+              ? "joined-legacy-marker"
+              : "absent",
+            evidence: null,
+          }),
+        }),
+      }),
+      serverOwner: owner.address,
+      now: () => new Date("2026-09-02T00:00:00.000Z"),
+      retryDelaysMs: [0, 0],
+    });
+    expect(outcome.status).toBe("ready");
+  }
+
+  it("positive control: a joined projection whose inputs are all legacy stays readable", async () => {
+    await put(conversations());
+    await put(messages());
+    await computeOverProjection();
+    const chain = await signedGet(builder, `/${DERIVED}`);
+    const text = await chain.text();
+    expect(chain.status, text).toBe(200);
+    expect(text).toContain("joined-legacy-marker");
+  });
+
+  it("a recompute of a pre-fix derivative from legacy sources is readable again", async () => {
+    await put(sourceEnvelope("oura.legacy", false));
+    await put({
+      version: "1.0",
+      scope: DERIVED,
+      collectedAt: AT,
+      data: {
+        questionId: "q-1",
+        answer: "old-answer",
+        $lineage: {
+          sources: [computeDataPointId(owner.address, "oura.legacy")],
+          writtenAt: AT,
+        },
+      },
+    } as DataFileEnvelope);
+    const before = await signedGet(builder, `/${DERIVED}`);
+    expect(before.status, await before.text()).toBe(403);
+
+    await computeOwnerDerivative(["oura.legacy"]);
+    const after = await signedGet(builder, `/${DERIVED}`);
+    const text = await after.text();
+    expect(after.status, text).toBe(200);
+    expect(text).toContain("legacy-score-7");
+    expect(
+      (await storage.readEnvelope(DERIVED, "2026-09-02T00:00:00Z")).data,
+    ).toMatchObject({ $lineage: { origin: "legacy" } });
+  });
+
+  it("a derivative a request writes cannot claim a legacy origin", async () => {
+    const raw = JSON.stringify({
+      id: "x",
+      $lineage: { sources: [], writtenAt: AT, origin: "legacy" },
+    });
+    const res = await app().request(`/${DERIVED}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: await buildWeb3SignedHeader({
+          wallet: owner,
+          aud: ORIGIN,
+          method: "POST",
+          uri: `/${DERIVED}`,
+          body: new TextEncoder().encode(raw),
+        }),
+      },
+      body: raw,
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("independent review probes", () => {
+  it("preserves PDPP origin through an owner projection that joins a PDPP sibling", async () => {
+    const marker = "synthetic-joined-marker";
+    await put({
+      version: "1.0",
+      scope: "chatgpt.conversations",
+      collectedAt: AT,
+      data: {
+        records: [
+          {
+            id: "conv-1",
+            title: "Trip",
+            create_time: AT,
+            update_time: AT,
+            current_node: "m1",
+            message_count_on_current_branch: 1,
+          },
+        ],
+      },
+    } as DataFileEnvelope);
+    await put({
+      version: "1.0",
+      scope: "chatgpt.messages",
+      collectedAt: AT,
+      producer: "pdpp-projector",
+      data: {
+        records: [
+          {
+            id: "m1",
+            conversation_id: "conv-1",
+            parent_id: null,
+            role: "user",
+            content: marker,
+            content_type: "text",
+            model_slug: null,
+            create_time: AT,
+            on_current_branch: true,
+          },
+        ],
+      },
+    } as DataFileEnvelope);
+    expect(
+      storage.findEntry({ scope: "chatgpt.conversations" })?.pdppOrigin,
+    ).toBe(false);
+    expect(storage.findEntry({ scope: "chatgpt.messages" })?.pdppOrigin).toBe(
+      true,
+    );
+    const served = withLegacyProjection(storage);
+    let sawInput = false;
+    const outcome = await computeQuestion("q-1", {
+      storage: served,
+      store: createInMemoryQuestionStore({
+        initial: [registration(["chatgpt.conversations"])],
+      }),
+      provider: createFakeInferenceProvider({
+        respond: (request) => {
+          sawInput = JSON.stringify(request).includes(marker);
+          return {
+            content: JSON.stringify({
+              answer: sawInput ? marker : "absent",
+              evidence: null,
+            }),
+          };
+        },
+      }),
+      serverOwner: owner.address,
+      now: () => new Date("2026-09-02T00:00:00.000Z"),
+      retryDelaysMs: [0, 0],
+    });
+    expect(outcome.status).toBe("ready");
+    expect(sawInput).toBe(true);
+    const response = await signedGet(builder, `/${DERIVED}`);
+    const leakedMarker = (await response.text()).includes(marker);
+    console.log(
+      JSON.stringify({
+        probe: "projection-origin",
+        status: response.status,
+        leakedSyntheticMarker: leakedMarker,
+        outputPdpp: storage.findEntry({ scope: DERIVED })?.pdppOrigin,
+      }),
+    );
+    expect(response.status).toBe(403);
+  });
+});
+
+describe("independent version and chain probes", () => {
+  it("keeps a new derivative chain marked", async () => {
+    await put(sourceEnvelope("oura.sleep", true));
+    await computeOwnerDerivative(["oura.sleep"]);
+    const outcome = await computeQuestion("q-chain", {
+      storage,
+      store: createInMemoryQuestionStore({
+        initial: [
+          {
+            ...registration([DERIVED]),
+            questionId: "q-chain",
+            derivedScope: "summary.daily",
+          },
+        ],
+      }),
+      provider: createFakeInferenceProvider(),
+      serverOwner: owner.address,
+      now: () => new Date("2026-09-03T00:00:00.000Z"),
+      retryDelaysMs: [0, 0],
+    });
+    expect(outcome.status).toBe("ready");
+    expect(storage.findEntry({ scope: "summary.daily" })?.pdppOrigin).toBe(
+      true,
+    );
+  });
+  it("marks a recompute after a legacy source gets a new PDPP version", async () => {
+    await put(sourceEnvelope("oura.sleep", false));
+    await computeOwnerDerivative(["oura.sleep"]);
+    expect(storage.findEntry({ scope: DERIVED })?.pdppOrigin).toBe(false);
+    await put({
+      ...sourceEnvelope("oura.sleep", true),
+      collectedAt: "2026-09-03T00:00:00.000Z",
+    });
+    await computeOwnerDerivative(["oura.sleep"]);
+    expect(storage.findEntry({ scope: DERIVED })?.pdppOrigin).toBe(true);
+    expect((await signedGet(builder, `/${DERIVED}`)).status).toBe(403);
+  });
+  it("refuses an existing pre-patch PDPP answer used as a new derivative source", async () => {
+    await put(sourceEnvelope("oura.sleep", true));
+    await put({
+      version: "1.0",
+      scope: "archive.answer",
+      collectedAt: AT,
+      data: {
+        questionId: "old-question",
+        question: "How did I sleep?",
+        answer: SECRET,
+        sources: [{ scope: "oura.sleep", version: 1, collectedAt: AT }],
+        $lineage: {
+          sources: [computeDataPointId(owner.address, "oura.sleep")],
+          writtenAt: AT,
+        },
+      },
+    } as DataFileEnvelope);
+    await computeOwnerDerivative(["archive.answer"]);
+    const response = await signedGet(builder, `/${DERIVED}`);
+    console.log(
+      JSON.stringify({
+        probe: "pre-patch-chain",
+        status: response.status,
+        outputPdpp: storage.findEntry({ scope: DERIVED })?.pdppOrigin,
+      }),
+    );
+    expect(response.status).toBe(403);
+  });
+});
+
+describe("independent stamp persistence probe", () => {
+  it("keeps the stamp through reindex and rejects removing it at the same version", async () => {
+    await put(sourceEnvelope("oura.sleep", true));
+    await computeOwnerDerivative(["oura.sleep"]);
+    const entry = storage.findEntry({ scope: DERIVED })!;
+    const original = await storage.readEnvelope(DERIVED, entry.collectedAt);
+    expect((original as unknown as { producer: string }).producer).toBe(
+      "pdpp-derivative",
+    );
+    const stripped = { ...original } as unknown as Record<string, unknown>;
+    delete stripped.producer;
+    await expect(
+      storage.writeEnvelope(stripped as unknown as DataFileEnvelope),
+    ).rejects.toThrow(/conflict/i);
+    const recoveredIndex = createIndexManager(initializeDatabase(":memory:"));
+    try {
+      await reindexLegacyDataFiles({
+        indexManager: recoveredIndex,
+        hierarchyOptions: { dataDir },
+      });
+      expect(recoveredIndex.findLatestByScope(DERIVED)).toMatchObject({
+        producer: "pdpp-derivative",
+        pdppOrigin: true,
+      });
+    } finally {
+      recoveredIndex.close();
+    }
   });
 });

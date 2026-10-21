@@ -146,6 +146,7 @@ describe("computeQuestion", () => {
     expect(readStoredLineage(envelope.data)).toEqual({
       sources: expectedIds,
       writtenAt: "2026-08-27T12:00:00.000Z",
+      origin: "legacy",
     });
     expect(envelope.data).toMatchObject({
       questionId: "q-1",

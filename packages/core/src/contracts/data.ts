@@ -259,6 +259,13 @@ export interface IngestDataContractInput {
    * unchanged.
    */
   lineage?: StoredLineage;
+  /**
+   * Whether any input of this derivative is PDPP-origin. The single place the
+   * output's origin is decided: `false` stamps `$lineage.origin = "legacy"`;
+   * anything else (including absent) leaves it out, and a JSON write also gets
+   * the `pdpp-derivative` producer, so the output counts as PDPP-origin.
+   */
+  lineageInputsPdppOrigin?: boolean;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
   precondition?: LegacyPrecondition;
@@ -302,6 +309,13 @@ export interface IngestBinaryDataContractInput {
   attribution?: WriterAttribution;
   /** Validated lineage for a derivative write (see IngestDataContractInput). */
   lineage?: StoredLineage;
+  /**
+   * Whether any input of this derivative is PDPP-origin. The single place the
+   * output's origin is decided: `false` stamps `$lineage.origin = "legacy"`;
+   * anything else (including absent) leaves it out, and a JSON write also gets
+   * the `pdpp-derivative` producer, so the output counts as PDPP-origin.
+   */
+  lineageInputsPdppOrigin?: boolean;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
   precondition?: LegacyPrecondition;
@@ -708,13 +722,18 @@ export async function ingestDataContract(
     };
   }
 
+  const producer: LegacyProducer | undefined =
+    input.producer ??
+    (input.lineage && input.lineageInputsPdppOrigin !== false
+      ? "pdpp-derivative"
+      : undefined);
   let envelope: DataFileEnvelope = {
     ...createDataFileEnvelope(
       scopeResult.scope,
       input.collectedAt,
       stampServerKeys(input.body, input),
     ),
-    ...(input.producer ? { producer: input.producer } : {}),
+    ...(producer ? { producer } : {}),
     ...(input.producerProvenance
       ? { producer_provenance: input.producerProvenance }
       : {}),
@@ -766,7 +785,7 @@ export async function ingestDataContract(
         scope: scopeResult.scope,
         collectedAt: input.collectedAt,
         afterTombstoneVersion: input.afterTombstoneVersion ?? null,
-        producer: input.producer ?? null,
+        producer: producer ?? null,
         producerProvenance: input.producerProvenance
           ? JSON.stringify(input.producerProvenance)
           : null,
@@ -807,12 +826,27 @@ export async function ingestDataContract(
  * record about to be stored. Both are absent from owner root writes, so such
  * an envelope stays byte-identical to today's.
  */
+/** The one place a derivative's origin is stamped (see lineageInputsPdppOrigin). */
+function lineageWithOrigin(
+  input: Pick<IngestDataContractInput, "lineage" | "lineageInputsPdppOrigin">,
+): StoredLineage | undefined {
+  if (!input.lineage) return undefined;
+  const { origin: _claimed, ...lineage } = input.lineage;
+  return input.lineageInputsPdppOrigin === false
+    ? { ...lineage, origin: "legacy" }
+    : lineage;
+}
+
 function stampServerKeys(
   data: Record<string, unknown>,
-  input: Pick<IngestDataContractInput, "attribution" | "lineage">,
+  input: Pick<
+    IngestDataContractInput,
+    "attribution" | "lineage" | "lineageInputsPdppOrigin"
+  >,
 ): Record<string, unknown> {
   let stamped = data;
-  if (input.lineage) stamped = stampLineage(stamped, input.lineage);
+  const lineage = lineageWithOrigin(input);
+  if (lineage) stamped = stampLineage(stamped, lineage);
   if (input.attribution) {
     stamped = stampWriterAttribution(stamped, input.attribution);
   }

@@ -88,6 +88,7 @@ export {
 
 export {
   hasPdppOrigin,
+  inputHasPdppOrigin,
   isPdppProducer,
   PDPP_PRODUCERS,
   type PdppProducer,
