@@ -310,6 +310,15 @@ export function isPdppProducer(value: unknown): value is PdppProducer {
 }
 
 /**
+ * Version of the provenance classifier (`hasPdppOrigin`). A block manifest
+ * records the version that classified it, and a non-owner trusts the recorded
+ * `pdppOrigin` only when that version is current. Bump it whenever the
+ * classification rules change: older sidecars are then re-classified on the
+ * bytes instead of trusted. 1 = before derivatives stated their origin.
+ */
+export const PDPP_CLASSIFIER_VERSION = 2;
+
+/**
  * A derivative output (it carries `$lineage`) must state its origin. Only the
  * server's write path stamps `origin: "legacy"`, and only when every input was
  * known to be legacy. A derivative without that statement (written before the

@@ -14,6 +14,12 @@ export interface DataBlockManifest {
    */
   pdppOrigin?: boolean;
   /**
+   * The `PDPP_CLASSIFIER_VERSION` that computed `pdppOrigin`. A non-owner
+   * trusts `pdppOrigin` only when this is the current version. Absent on
+   * manifests written before it existed.
+   */
+  pdppClassifier?: number;
+  /**
    * The generation (`envelopeGeneration`) of the envelope these blocks were
    * built from. With a `digest` on every block, it binds the sidecar to one
    * published version. Absent on manifests written before this field.

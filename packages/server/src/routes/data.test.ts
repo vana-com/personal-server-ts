@@ -3041,6 +3041,67 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each([false, true])(
+    "refuses an unrelated reader before payment with indexed PDPP origin %s",
+    async (indexedOrigin) => {
+      const { createNodeDataStorage } =
+        await import("../storage/node-data-storage.js");
+      const storage = createNodeDataStorage({ indexManager, hierarchyOptions });
+      const envelope = {
+        version: "1.0",
+        scope: "instagram.profile",
+        collectedAt: "2026-09-01T00:00:00Z",
+        producer: "pdpp-derivative",
+        data: {
+          value: "private-to-other-writer",
+          $writtenBy: {
+            builder: createTestWallet(2).address,
+            grantId: "other-grant",
+            signature: "server-stamped-proof",
+            bodyHash: "sha256:proof",
+            writtenAt: "2026-09-01T00:00:00Z",
+          },
+        },
+      };
+      const written = await storage.writeEnvelope(envelope as never);
+      await storage.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: written.sizeBytes,
+        pdppOrigin: indexedOrigin,
+        producer: "pdpp-derivative",
+      });
+      const app = createX402App();
+      const gatewayFetch = vi.fn().mockResolvedValue(
+        new Response("{}", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      vi.stubGlobal("fetch", gatewayFetch);
+      const challenge = await getNoPayment(app, "instagram.profile");
+      const paid = await getWithPayment(
+        app,
+        "instagram.profile",
+        await signedXPayment(),
+      );
+      console.log(
+        JSON.stringify({
+          probe: "charge-before-refusal",
+          challenge: challenge.status,
+          paidResponse: paid.status,
+          settled: gatewayFetch.mock.calls.length,
+          body: await paid.clone().text(),
+        }),
+      );
+      expect(challenge.status).toBe(403);
+      expect(paid.status).toBe(403);
+      expect(gatewayFetch).not.toHaveBeenCalled();
+    },
+  );
+
   it("answers 410 for a deleted scope before issuing any payment challenge", async () => {
     // Deletion is checked ahead of the x402 cycle so a builder is never
     // charged (or even challenged) for data the owner deleted.

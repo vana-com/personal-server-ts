@@ -696,7 +696,7 @@ describe("immutable served block representation", () => {
       data: {
         ordinary: "visible",
         $writtenBy: { builder: "hidden-builder" },
-        $lineage: { origin: "legacy", sources: [] },
+        $lineage: { origin: "legacy", sources: [], writtenAt: AT },
         lineage: { private: "hidden-caller" },
       },
     } as DataFileEnvelope;
@@ -744,7 +744,7 @@ describe("immutable served block representation", () => {
       data: {
         ordinary: "visible",
         $writtenBy: { builder: "hidden-builder" },
-        $lineage: { origin: "legacy", sources: [] },
+        $lineage: { origin: "legacy", sources: [], writtenAt: AT },
         lineage: { private: "hidden-caller" },
       },
     } as DataFileEnvelope);
@@ -931,4 +931,52 @@ describe("immutable served block representation", () => {
     } while (cursor);
     expect(received).toEqual(originals);
   });
+});
+
+describe("historical derivative blocks classified before lineage policy", () => {
+  it.each([
+    [false, "read_scope"],
+    [true, "read_scope"],
+    [true, "list_scope_blocks"],
+  ] as const)(
+    "historical false sidecar, digest binding %s, tool %s",
+    async (bound, tool) => {
+      const scope = "oura.raw";
+      const envelope = {
+        version: "1.0",
+        scope,
+        collectedAt: AT,
+        data: {
+          answer: "combined-historical-marker",
+          $lineage: { sources: ["0x" + "11".repeat(32)], writtenAt: AT },
+        },
+      };
+      const written = await storage.writeEnvelope(envelope as never);
+      indexManager.insert({
+        fileId: null,
+        path: written.relativePath,
+        scope,
+        collectedAt: AT,
+        sizeBytes: written.sizeBytes,
+        pdppOrigin: false,
+      });
+      const built = await buildDataBlocksAsync({
+        scope,
+        collectedAt: AT,
+        content: envelope,
+      });
+      const { pdppClassifier: _classifier, ...historical } = built.manifest;
+      const { envelopeDigest: _digest, ...old } = historical;
+      old.blocks = old.blocks.map(({ digest: _digest, ...ref }) => ref);
+      await storage.writeBlockManifest!(
+        scope,
+        AT,
+        { ...(bound ? historical : old), pdppOrigin: false },
+        built.blocks,
+      );
+      const result = await (await mcpTool(tool, { scope }))();
+      expect(result).not.toContain("combined-historical-marker");
+      expect(result).toContain("GRANT_REQUIRED");
+    },
+  );
 });

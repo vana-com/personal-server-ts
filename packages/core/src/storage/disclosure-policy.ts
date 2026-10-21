@@ -26,7 +26,7 @@ import type { DataStoragePort } from "../ports/index.js";
 import { previewEnvelopeValue } from "./preview.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
 import { blockRepresentationId } from "./blocks/representation.js";
-import { boundEnvelopeDigest } from "./blocks/digest.js";
+import { boundEnvelopeDigest, trustedPdppOrigin } from "./blocks/digest.js";
 import { DataBlockStorageError } from "./blocks/errors.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
 import type {
@@ -73,6 +73,7 @@ function servedBlocks(
 function servedManifest(manifest: DataBlockManifest): DataBlockManifest {
   const {
     pdppOrigin: _origin,
+    pdppClassifier: _classifier,
     envelopeDigest: _digest,
     redaction: _redaction,
     blocks,
@@ -239,15 +240,16 @@ export function withDisclosurePolicy(
       const manifest = await rawManifest(scope, collectedAt);
       // A version with no sidecar has no table of contents, as for the owner.
       if (!manifest) return null;
+      const pdppOrigin = trustedPdppOrigin(manifest);
       if (
         generation !== undefined &&
         boundEnvelopeDigest(manifest) === generation &&
-        manifest.pdppOrigin !== undefined &&
+        pdppOrigin !== undefined &&
         manifest.redaction !== undefined
       ) {
         authorizeLegacyRead("grantee", {
           kind: "stored-blocks",
-          pdppOrigin: manifest.pdppOrigin,
+          pdppOrigin,
         });
         return servedManifest(manifest);
       }

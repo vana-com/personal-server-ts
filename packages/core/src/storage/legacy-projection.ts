@@ -125,6 +125,14 @@ const textEncoder = new TextEncoder();
 export function withLegacyProjection(
   raw: DataStoragePort,
   options: LegacyProjectionOptions = {},
+  /**
+   * The port every read that FEEDS a projection goes through, when it must
+   * decide differently from `raw`. A non-owner's `raw` may let a writer read
+   * back its own stored version; once a projection applies, that exception
+   * does not, so the requested version and every joined sibling are read
+   * through this plain port instead.
+   */
+  projectionRaw: DataStoragePort = raw,
 ): DataStoragePort {
   if ((raw as { [SERVED]?: true })[SERVED]) return raw;
 
@@ -255,7 +263,11 @@ export function withLegacyProjection(
     ]);
     if (memo?.key === key) return { view: memo.value, own };
 
-    own ??= await raw.readEnvelope(scope, collectedAt);
+    // A projection applies: its inputs are read through `projectionRaw`.
+    own =
+      projectionRaw === raw
+        ? (own ?? (await raw.readEnvelope(scope, collectedAt)))
+        : await projectionRaw.readEnvelope(scope, collectedAt);
 
     const value = await project(
       scope,
@@ -323,7 +335,10 @@ export function withLegacyProjection(
       const envelope =
         input.storedScope === scope
           ? own
-          : await raw.readEnvelope(input.storedScope, input.collectedAt);
+          : await projectionRaw.readEnvelope(
+              input.storedScope,
+              input.collectedAt,
+            );
       viewPdppOrigin ||= inputHasPdppOrigin(input, envelope);
       if (classifyStoredBody(input.storedScope, envelope.data) === "legacy") {
         continue;
@@ -525,9 +540,13 @@ export function withLegacyProjection(
           if (granteeViews.size >= 16) {
             granteeViews.delete(granteeViews.keys().next().value!);
           }
+          // Classification reads go through the reader-aware guard (an own
+          // write served unprojected); anything a projection reads goes
+          // through the plain guard.
           view = withLegacyProjection(
             withDisclosurePolicy(raw, reader),
             options,
+            withDisclosurePolicy(raw, "grantee"),
           );
           granteeViews.set(key, view);
         }

@@ -1,3 +1,4 @@
+import { PDPP_CLASSIFIER_VERSION } from "../../sync/pdpp-import.js";
 import { canonicalDigest } from "../hierarchy/generation.js";
 import { DataBlockStorageError } from "./errors.js";
 import type {
@@ -47,6 +48,21 @@ export function boundEnvelopeDigest(
 }
 
 /**
+ * The manifest's `pdppOrigin` if, and only if, the current classifier
+ * produced it. A manifest from an older classifier says nothing a non-owner
+ * may rely on: it is reported as absent, so the disclosure policy decides on
+ * the bytes instead. A matching generation proves byte identity, not that the
+ * recorded classification still holds under today's rules.
+ */
+export function trustedPdppOrigin(
+  manifest: Pick<DataBlockManifest, "pdppOrigin" | "pdppClassifier">,
+): boolean | undefined {
+  return manifest.pdppClassifier === PDPP_CLASSIFIER_VERSION
+    ? manifest.pdppOrigin
+    : undefined;
+}
+
+/**
  * The provenance and version binding a block read reports, for the
  * disclosure policy. A storage reports it only for blocks it checked with
  * `verifyStoredBlock` against this same manifest, in the same read.
@@ -58,11 +74,10 @@ export function manifestBinding(
   "pdppOrigin" | "envelopeDigest" | "redaction"
 > {
   const envelopeDigest = boundEnvelopeDigest(manifest);
+  const pdppOrigin = trustedPdppOrigin(manifest);
   return {
     ...(manifest.redaction ? { redaction: manifest.redaction } : {}),
-    ...(manifest.pdppOrigin === undefined
-      ? {}
-      : { pdppOrigin: manifest.pdppOrigin }),
+    ...(pdppOrigin === undefined ? {} : { pdppOrigin }),
     ...(envelopeDigest === undefined ? {} : { envelopeDigest }),
   };
 }

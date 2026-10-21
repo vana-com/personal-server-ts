@@ -2095,6 +2095,47 @@ export async function handlePersonalServerDataRequest(
         );
       }
 
+      // A canonical scope's latest body is the canonical view, and only it:
+      // a refusal is answered, never replaced by the legacy file. Explicit
+      // versions stay legacy history. Read before payment, so a builder is
+      // never challenged or charged for a read that is then refused.
+      if (latest?.kind === "refused") {
+        return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
+      }
+
+      // Decide on and retain the exact response before settlement. Index
+      // provenance can be stale, and a projection can add other inputs.
+      const headers: Record<string, string> = {};
+      headers["X-Vana-Data-Source"] =
+        latest?.kind === "canonical" ? "canonical" : "legacy";
+      let envelope: DataFileEnvelope;
+      let servedFileId: string | undefined;
+      if (latest?.kind === "canonical") {
+        envelope = latest.envelope;
+        headers.ETag = `"${latest.revision}"`;
+      } else {
+        const result = await readDataContract({
+          storage: storageForReader(deps.storage, reader),
+          scopeParam: scopeResult.scope,
+          fileId: fileIdParam,
+          at: atParam ?? selectedEntry?.collectedAt,
+          ...(view === "stored" ? { view } : {}),
+        });
+        if (!result.ok) {
+          if (result.status === 404) {
+            // The entry selected above can vanish before the read (a sync
+            // reconcile applying a tombstone concurrently); answer 410, not
+            // 404, when that is why.
+            await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
+            // An authorized miss still demands the first derivative version.
+            notifyDataRead(deps, { scope: scopeResult.scope });
+          }
+          return contractErrorResponse(result);
+        }
+        envelope = result.envelope;
+        servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
+      }
+
       // Demand: this authorized read is what pays for a recompute of a
       // derivative whose sources have moved on. It runs after the gates
       // above (an unauthenticated or refused read must never spend an
@@ -2104,14 +2145,6 @@ export async function handlePersonalServerDataRequest(
       // answer unreachable through this route. Nothing here blocks: a
       // previous version is served now, the fresh one lands in a later read.
       notifyDataRead(deps, { scope: scopeResult.scope });
-
-      // A canonical scope's latest body is the canonical view, and only it:
-      // a refusal is answered, never replaced by the legacy file. Explicit
-      // versions stay legacy history. Read before payment, so a builder is
-      // never challenged or charged for a read that is then refused.
-      if (latest?.kind === "refused") {
-        return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
-      }
 
       // X402 payment dance for builder reads. Owner-exempt reads (the
       // grantId sentinels "owner" / "policy-bypass") skip payment entirely
@@ -2210,44 +2243,13 @@ export async function handlePersonalServerDataRequest(
           // dispatch on it (insufficient balance vs. replay vs. race etc.).
           return jsonResponse(x402Result.body, { status: x402Result.status });
         }
-        // x402Result.kind === "ok" — payment accepted, proceed to read.
+        // x402Result.kind === "ok" — payment accepted, serve the retained read.
         // The gateway's success body is forwarded back to the builder via
         // X-PAYMENT-RESPONSE (canonical X402 convention) so callers can see
         // breakdown / paidAt / paymentNonce without a second gateway round-trip.
         paymentResponseHeader = encodePaymentResponseHeader(
           x402Result.payResponse,
         );
-      }
-
-      const headers: Record<string, string> = {};
-      headers["X-Vana-Data-Source"] =
-        latest?.kind === "canonical" ? "canonical" : "legacy";
-      let envelope: DataFileEnvelope;
-      let servedFileId: string | undefined;
-      if (latest?.kind === "canonical") {
-        envelope = latest.envelope;
-        headers.ETag = `"${latest.revision}"`;
-      } else {
-        const result = await readDataContract({
-          // A non-owner reads through the disclosure policy, which decides
-          // on the bytes actually read, not on the row selected above.
-          storage: storageForReader(deps.storage, reader),
-          scopeParam: scopeResult.scope,
-          fileId: fileIdParam,
-          at: atParam ?? selectedEntry?.collectedAt,
-          ...(view === "stored" ? { view } : {}),
-        });
-        if (!result.ok) {
-          if (result.status === 404) {
-            // The entry selected above can vanish before the read (a sync
-            // reconcile applying a tombstone concurrently); answer 410, not
-            // 404, when that is why.
-            await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
-          }
-          return contractErrorResponse(result);
-        }
-        envelope = result.envelope;
-        servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
       }
 
       const servedEnvelope = isOwnerView(authResult)
