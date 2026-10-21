@@ -226,3 +226,40 @@ export function mapInactiveToError(context: PdppTokenContext): PdppError {
       );
   }
 }
+
+/**
+ * A read authorization that delivery re-checks at each boundary.
+ *
+ * A response that is delivered in parts (a blob body sent chunk by chunk)
+ * keeps the authorization that admitted it and asks it again before each part
+ * is released. Bytes already sent are not recalled; nothing after a failed
+ * check is sent.
+ */
+export interface PdppReadLease {
+  /** Throws the inactive-bearer `PdppError` once the authorization ends. */
+  assertStillAuthorized(): Promise<void>;
+}
+
+/**
+ * The lease for a PDPP bearer read. It re-resolves the same token through the
+ * token and grant store, which reports a revoked or expired grant, a revoked
+ * or expired token, and a revoked refresh family. It also holds the read to
+ * the grant it was admitted under. Re-resolving is a local store read, so it
+ * is cheap enough to run before every part.
+ */
+export function pdppBearerReadLease(
+  auth: { resolveToken(token: string): Promise<PdppTokenContext> },
+  token: string,
+  admitted: PdppTokenContext,
+): PdppReadLease {
+  const grantId = admitted.grant?.grant_id;
+  return {
+    async assertStillAuthorized() {
+      const current = await auth.resolveToken(token);
+      if (!current.active) throw mapInactiveToError(current);
+      if (current.grant?.grant_id !== grantId) {
+        throw mapInactiveToError({ active: false, inactiveReason: "unknown" });
+      }
+    },
+  };
+}

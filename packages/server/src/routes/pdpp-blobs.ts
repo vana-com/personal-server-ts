@@ -8,9 +8,11 @@ import {
   type PdppProtocolProfile,
 } from "../pdpp/bearer-response.js";
 import {
+  pdppBearerReadLease,
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
+  type PdppReadLease,
   type PdppRecordStore,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
@@ -30,6 +32,45 @@ export interface PdppBlobsRouteDeps {
   readBlobBytes?: (
     blobId: string,
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
+}
+
+/** Bytes released per delivery boundary of a blob body. */
+export const BLOB_DELIVERY_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * A blob body released one chunk at a time, each only after the read lease
+ * still authorizes it. The stream pulls on demand, so a slow client holds the
+ * remaining bytes back. When the lease ends, the body stream errors: the
+ * client sees a failed, truncated transfer, never a clean end.
+ */
+function leasedBlobBody(
+  bytes: Uint8Array<ArrayBuffer>,
+  lease: PdppReadLease,
+): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        if (offset >= bytes.byteLength) {
+          controller.close();
+          return;
+        }
+        try {
+          await lease.assertStillAuthorized();
+        } catch (err) {
+          controller.error(err);
+          return;
+        }
+        const end = Math.min(
+          offset + BLOB_DELIVERY_CHUNK_BYTES,
+          bytes.byteLength,
+        );
+        controller.enqueue(bytes.subarray(offset, end));
+        offset = end;
+      },
+    },
+    { highWaterMark: 0 },
+  );
 }
 
 function requestId(): string {
@@ -57,7 +98,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   async function authorizeBlobAccess(
     c: Context,
     blobId: string,
-  ): Promise<{ error: Response } | { ok: true }> {
+  ): Promise<{ error: Response } | { ok: true; lease: PdppReadLease }> {
     const reqId = requestId();
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -141,7 +182,10 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         ownedInstances.includes(reference.instance),
       );
       if (!visible) return { error: notFound() };
-      return { ok: true };
+      return {
+        ok: true,
+        lease: pdppBearerReadLease(deps.auth, token, context),
+      };
     }
 
     // Client token: the blob must be referenced by a record this exact
@@ -179,7 +223,10 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         continue;
       }
 
-      return { ok: true };
+      return {
+        ok: true,
+        lease: pdppBearerReadLease(deps.auth, token, context),
+      };
     }
 
     return { error: notFound() };
@@ -238,7 +285,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         reqId,
       );
     }
-    return c.body(bytes, 200, headers);
+    return c.body(leasedBlobBody(bytes, authz.lease), 200, headers);
   });
 
   return app;
