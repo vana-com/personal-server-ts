@@ -13,7 +13,11 @@ import {
   encryptWithPassword,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
-import type { StorageAdapter } from "../storage/adapters/interface.js";
+import {
+  CreateOnlyUnavailableError,
+  StoredBlobConflictError,
+  type StorageAdapter,
+} from "../storage/adapters/interface.js";
 import type { ServerSigner } from "../signing/signer.js";
 import {
   foldVersion,
@@ -58,7 +62,11 @@ const documentSchema = z.object({
 });
 type LedgerDocument = Omit<z.infer<typeof documentSchema>, "ledger"> & {
   ledger: ScopeFirstSeenLedger | null;
-  repairHead?: true;
+};
+type RetainedCheckpoint = {
+  document: LedgerDocument;
+  publicationVersion: string;
+  repairHead: boolean;
 };
 
 /** The separate hash namespace cannot collide with a literal source suffix. */
@@ -77,6 +85,9 @@ export type AdditionsRecoveryCode =
   | "invalid_envelope"
   | "unsupported_source_data"
   | "replay_failed"
+  | "immutable_storage_unavailable"
+  | "checkpoint_adoption_failed"
+  | "publication_failed"
   | "budget_exceeded"
   | "cancelled";
 export interface AdditionsRecoveryDiagnostic {
@@ -120,6 +131,7 @@ export interface DurableAdditionsOptions {
       password: string,
       budget: ByteBudget,
     ): Promise<Uint8Array>;
+    /** Must create immutable candidate bytes before registering. Never overwrite an occupied key. */
     publish(
       scope: string,
       data: Record<string, unknown>,
@@ -135,6 +147,11 @@ export interface DurableAdditionsOptions {
   signal?: AbortSignal;
   /** Existing durable delete pipeline, including exact-key cleanup/retry. */
   deleteSystemScope?: (scope: string) => Promise<void>;
+  /** Registry tombstones and journal clearing only; must settle on budget cancellation. */
+  deleteSystemScopeBounded?: (
+    scope: string,
+    budget: ByteBudget,
+  ) => Promise<void>;
 }
 
 export interface DurableAdditionsService {
@@ -191,6 +208,18 @@ class ReadBudget extends AdditionsBudget {
   }
 }
 
+/** Shared durable-only deletion policy; hosts provide their own registry/journal effects. */
+export function createAdditionsDeletionBudget(
+  options: { byteBudget?: number; timeBudgetMs?: number },
+  signal?: AbortSignal,
+) {
+  return new AdditionsBudget(
+    Math.min(options.byteBudget ?? 8 * 1024 * 1024, 8 * 1024 * 1024),
+    options.timeBudgetMs ?? 10_000,
+    signal,
+  );
+}
+
 function hex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
@@ -217,10 +246,78 @@ function sameInventory(a: VersionInventory, b: VersionInventory): boolean {
 function settled(slot: { status: string }): boolean {
   return slot.status === "confirmed" || slot.status === "finalized";
 }
+function eligible(slot: { status: string; isTombstone: boolean }): boolean {
+  return (
+    !slot.isTombstone &&
+    ["confirmed", "finalized", "pending", "submitting"].includes(slot.status)
+  );
+}
+function sourceWindow(snapshot: VersionInventory) {
+  const end = BigInt(snapshot.head?.expectedVersion ?? "0");
+  const rows = snapshot.versions.filter(
+    (slot) => BigInt(slot.expectedVersion) <= end,
+  );
+  const after = BigInt(
+    rows.filter((slot) => slot.isTombstone && settled(slot)).at(-1)
+      ?.expectedVersion ?? "0",
+  );
+  return {
+    end,
+    after,
+    relevant: rows.filter((slot) => BigInt(slot.expectedVersion) > after),
+  };
+}
+
+/** Reuse only a commitment still visible after the current registry deletion boundary. */
+export function findCheckpointRegistration(
+  snapshot: VersionInventory,
+  version: string,
+  commitment: { dataHash: string; metadataHash: string },
+) {
+  if (!snapshot.head || snapshot.head.deletedAt !== null) return undefined;
+  const { end, after } = sourceWindow(snapshot);
+  if (BigInt(version) > end || BigInt(version) <= after) return undefined;
+  return snapshot.versions.find(
+    (row) =>
+      row.expectedVersion === version &&
+      eligible(row) &&
+      row.dataHash.toLowerCase() === commitment.dataHash.toLowerCase() &&
+      row.metadataHash.toLowerCase() === commitment.metadataHash.toLowerCase(),
+  );
+}
 function sourceData(data: unknown): Record<string, unknown> | null {
   if (data === null || typeof data !== "object" || Array.isArray(data))
     return null;
   return Object.fromEntries(Object.entries(data));
+}
+
+/** Commitments describe the stored plaintext and ciphertext size, independent of publication order. */
+export function checkpointCommitment(
+  scope: string,
+  plaintext: Uint8Array,
+  encryptedSize: number,
+) {
+  const envelope = DataFileEnvelopeSchema.parse(
+    JSON.parse(new TextDecoder().decode(plaintext)),
+  );
+  if (
+    envelope.scope !== scope ||
+    !Number.isFinite(Date.parse(envelope.collectedAt))
+  )
+    throw new AdditionsRecoveryError("metadata_hash_mismatch");
+  return {
+    envelope,
+    dataHash: keccak256(plaintext),
+    metadataHash: keccak256(
+      stringToHex(
+        JSON.stringify({
+          scope,
+          collectedAt: envelope.collectedAt,
+          sizeBytes: encryptedSize,
+        }),
+      ),
+    ),
+  };
 }
 
 /**
@@ -233,10 +330,11 @@ export function createDurableAdditions(
   const owner = options.ownerAddress.toLowerCase();
   const { inventory, storageAdapter } = options;
 
-  async function readEnvelope(
+  async function readCandidate(
     scope: string,
-    slot: InventoryVersion,
+    version: string,
     budget: ReadBudget,
+    slot?: InventoryVersion,
   ) {
     budget.check();
     if (
@@ -246,7 +344,7 @@ export function createDurableAdditions(
       throw new BoundedWorkUnavailable(
         "Abortable bounded crypto/storage capability unavailable",
       );
-    const url = storageAdapter.urlForKey(`${scope}/${slot.expectedVersion}`);
+    const url = storageAdapter.urlForKey(`${scope}/${version}`);
     const encrypted =
       budget.limited && storageAdapter.downloadBounded
         ? await storageAdapter.downloadBounded(url, budget)
@@ -269,40 +367,41 @@ export function createDurableAdditions(
       throw new AdditionsRecoveryError("decrypt_failed");
     }
     budget.check(plaintext.byteLength);
-    if (keccak256(plaintext).toLowerCase() !== slot.dataHash.toLowerCase())
+    if (
+      slot &&
+      keccak256(plaintext).toLowerCase() !== slot.dataHash.toLowerCase()
+    )
       throw new AdditionsRecoveryError(
         "data_hash_mismatch",
         "Additions content commitment mismatch",
       );
     budget.check(plaintext.byteLength * 3);
-    let envelope: ReturnType<typeof DataFileEnvelopeSchema.parse>;
+    let candidate: ReturnType<typeof checkpointCommitment>;
     try {
-      envelope = DataFileEnvelopeSchema.parse(
-        JSON.parse(new TextDecoder().decode(plaintext)),
-      );
-    } catch {
+      candidate = checkpointCommitment(scope, plaintext, encrypted.byteLength);
+    } catch (error) {
+      if (error instanceof AdditionsRecoveryError) throw error;
       throw new AdditionsRecoveryError("invalid_envelope");
     }
-    const metadataHash = keccak256(
-      stringToHex(
-        JSON.stringify({
-          scope,
-          collectedAt: envelope.collectedAt,
-          sizeBytes: encrypted.byteLength,
-        }),
-      ),
-    );
     if (
-      envelope.scope !== scope ||
-      !Number.isFinite(Date.parse(envelope.collectedAt)) ||
-      metadataHash.toLowerCase() !== slot.metadataHash.toLowerCase()
+      slot &&
+      candidate.metadataHash.toLowerCase() !== slot.metadataHash.toLowerCase()
     )
       throw new AdditionsRecoveryError(
         "metadata_hash_mismatch",
         "Additions metadata commitment mismatch",
       );
     budget.check();
-    return envelope;
+    return candidate;
+  }
+
+  async function readEnvelope(
+    scope: string,
+    slot: InventoryVersion,
+    budget: ReadBudget,
+  ) {
+    return (await readCandidate(scope, slot.expectedVersion, budget, slot))
+      .envelope;
   }
 
   async function current(scope: string, budget: ReadBudget) {
@@ -325,19 +424,31 @@ export function createDurableAdditions(
   async function readDocument(
     scope: string,
     budget: ReadBudget,
-  ): Promise<LedgerDocument | null> {
+    source: VersionInventory,
+    search?: { before: string; longerThan: number },
+  ): Promise<RetainedCheckpoint | null> {
+    const { relevant, after } = sourceWindow(source);
     const systemScope = additionsLedgerScope(scope);
     const snapshot = await inventory.list(systemScope, budget.readOptions);
     if (!snapshot.head || snapshot.head.deletedAt !== null) return null;
+    // Same visibility as source recovery: only settled tombstones at or below the head delete history.
     const boundary =
-      snapshot.versions.filter((row) => row.isTombstone).at(-1)
-        ?.expectedVersion ?? "0";
+      snapshot.versions
+        .filter(
+          (row) =>
+            row.isTombstone &&
+            settled(row) &&
+            BigInt(row.expectedVersion) <=
+              BigInt(snapshot.head!.expectedVersion),
+        )
+        .at(-1)?.expectedVersion ?? "0";
     let inaccessible = false;
     for (const slot of [...snapshot.versions].reverse()) {
       if (
         BigInt(slot.expectedVersion) <= BigInt(boundary) ||
         BigInt(slot.expectedVersion) > BigInt(snapshot.head.expectedVersion) ||
-        slot.isTombstone
+        (search && BigInt(slot.expectedVersion) >= BigInt(search.before)) ||
+        !eligible(slot)
       )
         continue;
       let envelope;
@@ -363,12 +474,22 @@ export function createDurableAdditions(
           : readScopeFirstSeenLedger(parsed.data.ledger);
       if (parsed.data.ledger !== null && (!ledger || ledger.scope !== scope))
         continue;
+      const candidate = { ...parsed.data, ledger };
+      if (
+        candidate.slots.length > relevant.length ||
+        !candidate.slots.every(
+          (row, i) =>
+            eligible(relevant[i]!) && sameCommitment(row, relevant[i]!),
+        ) ||
+        candidate.through !==
+          (candidate.slots.at(-1)?.expectedVersion ?? String(after)) ||
+        (search && candidate.slots.length <= search.longerThan)
+      )
+        continue;
       return {
-        ...parsed.data,
-        ledger,
-        ...(slot.expectedVersion !== snapshot.head.expectedVersion
-          ? { repairHead: true as const }
-          : {}),
+        document: candidate,
+        publicationVersion: slot.expectedVersion,
+        repairHead: slot.expectedVersion !== snapshot.head.expectedVersion,
       };
     }
     if (inaccessible)
@@ -378,7 +499,7 @@ export function createDurableAdditions(
     return null;
   }
 
-  async function publish(
+  async function performPublication(
     scope: string,
     data: Record<string, unknown>,
     budget: ReadBudget,
@@ -392,11 +513,10 @@ export function createDurableAdditions(
       const proof = await options.boundedWork.publish(scope, data, budget);
       budget.check();
       const check = await inventory.list(scope, budget.readOptions);
-      const slot = check.versions.find(
-        (row) =>
-          row.expectedVersion === proof.expectedVersion &&
-          row.dataHash === proof.dataHash &&
-          row.metadataHash === proof.metadataHash,
+      const slot = findCheckpointRegistration(
+        check,
+        proof.expectedVersion,
+        proof,
       );
       if (!slot)
         throw new Error("Bounded checkpoint registration was replaced");
@@ -407,6 +527,8 @@ export function createDurableAdditions(
       await options.boundedWork.confirmed?.(scope, budget);
       return;
     }
+    if (!storageAdapter.uploadCreateOnly)
+      throw new CreateOnlyUnavailableError();
     const snapshot = await inventory.list(scope, budget.readOptions);
     const version =
       BigInt(snapshot.versions.at(-1)?.expectedVersion ?? "0") + 1n;
@@ -420,17 +542,31 @@ export function createDurableAdditions(
       plaintext,
       hex(deriveScopeKey(options.masterKey, scope)),
     );
-    const dataHash = keccak256(plaintext);
-    const metadataHash = keccak256(
-      stringToHex(
-        JSON.stringify({
-          scope,
-          collectedAt: envelope.collectedAt,
-          sizeBytes: encrypted.byteLength,
-        }),
-      ),
+    let candidate = checkpointCommitment(
+      scope,
+      plaintext,
+      encrypted.byteLength,
     );
-    await storageAdapter.upload(`${scope}/${version}`, encrypted);
+    try {
+      await storageAdapter.uploadCreateOnly(`${scope}/${version}`, encrypted);
+    } catch (error) {
+      if (!(error instanceof StoredBlobConflictError)) throw error;
+      try {
+        candidate = await readCandidate(scope, String(version), budget);
+      } catch (failure) {
+        if (failure instanceof BudgetExceeded || budget.signal?.aborted)
+          throw failure;
+        throw new AdditionsRecoveryError("checkpoint_adoption_failed");
+      }
+      // A settled winner needs no registration from the losing publisher.
+      const check = await inventory.list(scope, budget.readOptions);
+      if (findCheckpointRegistration(check, String(version), candidate)) {
+        if (JSON.stringify(candidate.envelope.data) === JSON.stringify(data))
+          return;
+        throw new Error("Checkpoint slot already committed by another writer");
+      }
+    }
+    const { dataHash, metadataHash } = candidate;
     const signature = await options.signer.signAddData({
       ownerAddress: getAddress(owner),
       scope,
@@ -446,20 +582,53 @@ export function createDurableAdditions(
       expectedVersion: String(version),
       signature,
     });
-    // A concurrent upload can replace the bytes at this shared version key
-    // independently of registration. Never claim durability without checking.
+    // Verify registration visibility and content; the atomic upload prevents
+    // a later writer from destroying this verified checkpoint.
     const check = await inventory.list(scope, budget.readOptions);
-    const registered = check.versions.find(
-      (slot) =>
-        slot.expectedVersion === String(version) &&
-        slot.dataHash === dataHash &&
-        slot.metadataHash === metadataHash,
+    const registered = findCheckpointRegistration(
+      check,
+      String(version),
+      candidate,
     );
     if (!registered)
       throw new Error(
         "Concurrent additions publication replaced the registration",
       );
     await readEnvelope(scope, registered, budget);
+    if (JSON.stringify(candidate.envelope.data) !== JSON.stringify(data))
+      throw new Error(
+        "Recovered an interrupted checkpoint; retry newer source progress",
+      );
+  }
+
+  async function publish(
+    scope: string,
+    data: Record<string, unknown>,
+    budget: ReadBudget,
+  ) {
+    try {
+      return await performPublication(scope, data, budget);
+    } catch (error) {
+      try {
+        options.onRecoveryDiagnostic?.({
+          scope,
+          version: "0",
+          code:
+            error instanceof CreateOnlyUnavailableError
+              ? "immutable_storage_unavailable"
+              : error instanceof AdditionsRecoveryError
+                ? error.code
+                : error instanceof BudgetExceeded
+                  ? "budget_exceeded"
+                  : budget.signal?.aborted
+                    ? "cancelled"
+                    : "publication_failed",
+        });
+      } catch {
+        /* Observation cannot alter publication. */
+      }
+      throw error;
+    }
   }
 
   async function recover(
@@ -508,32 +677,18 @@ export function createDurableAdditions(
               : "complete",
       };
     }
-    const end = BigInt(head.expectedVersion);
-    const rows = snapshot.versions.filter(
-      (slot) => BigInt(slot.expectedVersion) <= end,
-    );
-    const boundary = rows
-      .filter((slot) => slot.isTombstone && settled(slot))
-      .at(-1);
-    const after = BigInt(boundary?.expectedVersion ?? "0");
-    const relevant = rows.filter(
-      (slot) => BigInt(slot.expectedVersion) > after,
-    );
-    let existing: LedgerDocument | null = null;
+    const { end, after, relevant } = sourceWindow(snapshot);
+    let checkpoint: RetainedCheckpoint | null = null;
     let inaccessibleExisting = false;
     try {
-      existing = await readDocument(scope, budget);
+      checkpoint = await readDocument(scope, budget, snapshot);
     } catch (error) {
       if (error instanceof BudgetExceeded || budget.signal?.aborted)
         throw error;
       inaccessibleExisting = true;
     }
-    const prefixValid =
-      existing !== null &&
-      existing.slots.length <= relevant.length &&
-      existing.slots.every((slot, i) => sameCommitment(slot, relevant[i]!)) &&
-      existing.through ===
-        (existing.slots.at(-1)?.expectedVersion ?? String(after));
+    let existing = checkpoint?.document ?? null;
+    const prefixValid = existing !== null;
     let ledger = prefixValid ? existing!.ledger : null;
     const folded = prefixValid ? relevant.slice(0, existing!.slots.length) : [];
     let currentTotal = prefixValid ? existing!.currentTotal : 0;
@@ -552,6 +707,7 @@ export function createDurableAdditions(
         coverage = "partial";
       expected = BigInt(slot.expectedVersion) + 1n;
     }
+    const sourceCoverage = coverage;
     const checkpointBytes = (
       candidate: ScopeFirstSeenLedger | null,
       count: number,
@@ -569,7 +725,8 @@ export function createDurableAdditions(
             currentTotal,
           }),
         ).byteLength;
-    for (const slot of relevant.slice(folded.length)) {
+    while (folded.length < relevant.length) {
+      const slot = relevant[folded.length]!;
       let unitBudget = budget;
       try {
         // Keep publication capacity in the same owner-wide allowance. Exhaustion
@@ -581,16 +738,7 @@ export function createDurableAdditions(
         if (BigInt(slot.expectedVersion) !== BigInt(through) + 1n)
           coverage = "partial";
         // Mutable slots are provisional; failed/unknown slots cannot advance the prefix.
-        if (
-          slot.status === "failed" ||
-          !["confirmed", "finalized", "pending", "submitting"].includes(
-            slot.status,
-          )
-        ) {
-          coverage = "partial";
-          break;
-        }
-        if (slot.isTombstone) {
+        if (!eligible(slot)) {
           coverage = "partial";
           break;
         }
@@ -654,6 +802,38 @@ export function createDurableAdditions(
         folded.push(slot);
         through = slot.expectedVersion;
       } catch (error) {
+        // Normal advancement needs one checkpoint, not the complete publication
+        // history. Search older evidence only when replay cannot advance, keeping
+        // the bytes reserved for publishing our best verified source prefix.
+        if (checkpoint && !budget.signal?.aborted) {
+          try {
+            const searchBudget = budget.limited
+              ? budget.excluding(checkpointBytes(ledger, folded.length))
+              : budget;
+            const fallback = await readDocument(scope, searchBudget, snapshot, {
+              before: checkpoint.publicationVersion,
+              longerThan: folded.length,
+            });
+            if (fallback) {
+              checkpoint = fallback;
+              existing = fallback.document;
+              ledger = existing.ledger;
+              currentTotal = existing.currentTotal;
+              through = existing.through;
+              folded.splice(
+                0,
+                folded.length,
+                ...relevant.slice(0, existing.slots.length),
+              );
+              coverage = sourceCoverage;
+              continue;
+            }
+          } catch (failure) {
+            // Keep the verified prefix and its publication reserve, but expose
+            // a bounded search that could not finish as retryable coverage.
+            if (failure instanceof BudgetExceeded) error = failure;
+          }
+        }
         try {
           options.onRecoveryDiagnostic?.({
             scope,
@@ -710,7 +890,8 @@ export function createDurableAdditions(
       ((!existing && !inaccessibleExisting) ||
         prefixValid ||
         coverage === "complete") &&
-      JSON.stringify(document) !== JSON.stringify(existing)
+      (checkpoint?.repairHead ||
+        JSON.stringify(document) !== JSON.stringify(existing))
     ) {
       // A write failure affects durability, never hides the verified in-memory result.
       try {
@@ -858,13 +1039,10 @@ export function createDurableAdditions(
           ) !== head.dataHash
         )
           return;
-        const previous = await readDocument(version.scope, budget);
-        const boundary =
-          snapshot.versions
-            .filter((slot) => slot.isTombstone && settled(slot))
-            .at(-1)?.expectedVersion ?? "0";
-        const startsFresh =
-          BigInt(head.expectedVersion) === BigInt(boundary) + 1n;
+        const previous = (await readDocument(version.scope, budget, snapshot))
+          ?.document;
+        const { after } = sourceWindow(snapshot);
+        const startsFresh = BigInt(head.expectedVersion) === after + 1n;
         if (
           !startsFresh &&
           (!previous ||
@@ -880,8 +1058,28 @@ export function createDurableAdditions(
         /* Next reader retries. */
       }
     },
-    async deleteScope(scope) {
+    async deleteScope(scope, deletion) {
+      deletion?.signal?.throwIfAborted();
+      options.signal?.throwIfAborted();
       if (isSystemScope(scope)) return;
+      if (deletion?.durableOnly) {
+        if (!options.deleteSystemScopeBounded)
+          throw new Error("Bounded additions deletion is unavailable");
+        const signal =
+          options.signal && deletion.signal
+            ? AbortSignal.any([options.signal, deletion.signal])
+            : (options.signal ?? deletion.signal);
+        const budget = createAdditionsDeletionBudget(options, signal);
+        for (const target of [
+          additionsLedgerScope(scope),
+          ADDITIONS_SUMMARY_SCOPE,
+        ]) {
+          budget.charge();
+          await options.deleteSystemScopeBounded(target, budget);
+          budget.charge();
+        }
+        return;
+      }
       if (!options.deleteSystemScope)
         throw new Error("Durable additions deletion is unavailable");
       await options.deleteSystemScope(additionsLedgerScope(scope));

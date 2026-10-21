@@ -1,3 +1,4 @@
+import { withCreateOnlyUploads } from "./write-once.js";
 import { readBoundedResponse } from "../../additions/budget.js";
 import { createVanaStorageProvider } from "@opendatalabs/vana-sdk/browser";
 import { StorageError } from "@opendatalabs/vana-sdk/storage/index";
@@ -93,7 +94,7 @@ export function createVanaSyncStorageAdapter(params: {
   // Blob GET is public by the existing storage contract. Use the supported
   // canonical URL directly so bounded recovery never enters SDK blob buffering.
   return {
-    ...adapter,
+    ...withCreateOnlyUploads(adapter, endpoint),
     async downloadBounded(url, budget) {
       const prefix = `${endpoint}/v1/chains/${chainId}/blobs/${owner}/`;
       const parsed = new URL(url);

@@ -99,6 +99,10 @@ async function fixture() {
   const slots = new Map<string, Slot[]>();
   const blobs = new Map<string, Uint8Array>();
   const stall = new Set<string>();
+  const failRegistration = new Set<string>();
+  const hideInventory = new Map<string, number>();
+  const registrations: string[] = [];
+  const conflicts: string[] = [];
   const collectedAt = "2026-10-20T00:00:00.000Z";
   function register(scope: string, slot: Slot) {
     slots.set(scope, [...(slots.get(scope) ?? []), slot]);
@@ -143,13 +147,20 @@ async function fixture() {
     "fetch",
     async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(String(input));
+      if (url.pathname === "/v1/capabilities")
+        return Response.json({ blobs: { writeOnce: true } });
       if (url.pathname.includes("/blobs/")) {
         const key = url.pathname.split("/").slice(-2).join("/");
         if (init?.method === "PUT") {
-          blobs.set(
-            key,
-            new Uint8Array(await new Response(init.body).arrayBuffer()),
+          const bytes = new Uint8Array(
+            await new Response(init.body).arrayBuffer(),
           );
+          const previous = blobs.get(key);
+          if (previous && !Buffer.from(previous).equals(Buffer.from(bytes))) {
+            conflicts.push(key);
+            return Response.json({ code: "BLOB_EXISTS" }, { status: 409 });
+          }
+          blobs.set(key, bytes);
           return Response.json({}, { status: 201 });
         }
         if (stall.has(key)) {
@@ -169,6 +180,15 @@ async function fixture() {
       }
       if (init?.method === "POST") {
         const data = JSON.parse(await new Response(init.body).text());
+        registrations.push(data.scope);
+        if (failRegistration.has(data.scope))
+          return Response.json({}, { status: 503 });
+        if (
+          slots
+            .get(data.scope)
+            ?.some((slot) => slot.expectedVersion === data.expectedVersion)
+        )
+          return Response.json({}, { status: 409 });
         register(data.scope, {
           ...data,
           status: "finalized",
@@ -179,7 +199,9 @@ async function fixture() {
       }
       const scope = url.searchParams.get("scope");
       if (scope !== null) {
-        const versions = slots.get(scope) ?? [];
+        const hidden = hideInventory.get(scope) ?? 0;
+        if (hidden) hideInventory.set(scope, hidden - 1);
+        const versions = hidden ? [] : (slots.get(scope) ?? []);
         return Response.json({
           data: {
             dataPointId: idFor(scope),
@@ -221,6 +243,7 @@ async function fixture() {
     bytes?: number,
     diagnostics?: DiagnosticsRecorder,
     milliseconds = 120_000,
+    persistenceName = dbName,
   ) {
     const result = await createPsLiteSyncManager({
       config: ServerConfigSchema.parse({
@@ -228,7 +251,7 @@ async function fixture() {
         storage: { config: { vana: { apiUrl: "https://storage.example" } } },
       }),
       storage: createMemoryPsLiteStorage(),
-      stateStore: createIndexedDbPsLiteStateStore({ dbName }),
+      stateStore: createIndexedDbPsLiteStateStore({ dbName: persistenceName }),
       ownerSignature: signature,
       serverAccount: owner,
       ownerSyncSigner: {
@@ -262,8 +285,69 @@ async function fixture() {
       ),
     ).data;
   }
-  return { source, session, document, slots, blobs, stall, query };
+  return {
+    source,
+    session,
+    document,
+    slots,
+    blobs,
+    stall,
+    query,
+    failRegistration,
+    hideInventory,
+    registrations,
+    conflicts,
+  };
 }
+
+it("uses an already registered immutable winner without a duplicate registration", async () => {
+  const f = await fixture();
+  const scope = "vana.system.additions.instagram.posts";
+  await f.source("instagram.posts", "1", { posts: [{ taken_at: 1 }] });
+  expect(await (await f.session()).summarize(f.query)).toMatchObject({
+    coverage: "complete",
+    total: 1,
+  });
+  f.registrations.length = 0;
+  // A second device allocates from a stale view, then sees the settled winner on conflict.
+  f.hideInventory.set(scope, 2);
+  expect(
+    await (
+      await f.session(undefined, undefined, 120_000, crypto.randomUUID())
+    ).summarize(f.query),
+  ).toMatchObject({ coverage: "complete", total: 1 });
+  expect(f.registrations).toEqual([]);
+  expect(f.conflicts).toContain(`${scope}/1`);
+}, 30_000);
+
+it("adopts another device's immutable orphan through the real bounded worker before pruning", async () => {
+  const f = await fixture();
+  const scope = "vana.system.additions.instagram.posts";
+  await f.source("instagram.posts", "1", { posts: [{ taken_at: 1 }] });
+  f.failRegistration.add(scope);
+  expect(await (await f.session()).summarize(f.query)).toMatchObject({
+    coverage: "behind",
+    total: 1,
+  });
+  const orphan = Uint8Array.from(f.blobs.get(`${scope}/1`)!);
+  expect(f.slots.get(scope)).toBeUndefined();
+  f.failRegistration.clear();
+  const otherDevice = crypto.randomUUID();
+  await (
+    await f.session(undefined, undefined, 120_000, otherDevice)
+  ).summarize(f.query);
+  expect(f.blobs.get(`${scope}/1`)).toEqual(orphan);
+  expect(await f.document(scope)).toMatchObject({
+    through: "1",
+    currentTotal: 1,
+  });
+  f.blobs.delete("instagram.posts/1");
+  expect(
+    await (
+      await f.session(undefined, undefined, 120_000, otherDevice)
+    ).summarize(f.query),
+  ).toMatchObject({ coverage: "complete", total: 1 });
+}, 30_000);
 
 it("recovers a large source after warm checkpoints while upload hints retain their smaller allowance", async () => {
   const { source, session, document, blobs, query } = await fixture();
