@@ -20,12 +20,16 @@ The accepted endpoints are fixed dev Gateway/storage/Moksha origins and the exac
 
 ## Evidence boundaries
 
-The Account dev deployment was probed on 21 October 2026. Its PDPP review API returned an HTML 404, and its request URL with `pdpp_session` returned the legacy request-not-found page. This harness therefore drives the same PS authorize/review/approve API used by the Account transport. It exercises owner narrowing, exact review digest approval and PKCE code redemption over real HTTP. It does not prove the deployed Account UI, Account login, Context Gateway callback or browser return navigation.
+This command drives the same PS authorize/review/approve API used by the Account transport. It exercises owner narrowing, exact review digest approval and PKCE code redemption over real HTTP. It does not prove deployed Account UI, Account login, Context Gateway callback or browser return navigation. For a separate local composition with a real Account embedded-wallet owner and requester, use [the external-owner host](./pdpp-replica-owner-composition.md); its browser, connection-readiness and callback outcomes require their own evidence.
 
 The app reads the actual B resource HTTP routes. A separate independent read-only SQL oracle compares A and B across `instance`, `stream`, `record_key`, `data`, `emitted_at`, `deleted` and `blob_id`; canonical serialization supplies the record SHA-256. App responses must equal the approved field projection, with out-of-window and other-connection records excluded. Blob responses must match A's byte length and SHA-256. Raw snapshots alone are never an app-access oracle.
+
+Both owner and grant reads use the receiver's shared visibility policy. The live run requires an owner-visible pending record while the app sees only confirmed data, repeats that boundary across a B restart, and checks a new edit under the same active grant. Revocation and expiry receipts require a healthy issuer and an explicit inactive-token response before B's denial counts as a pass; an unavailable issuer is a distinct error.
 
 This is explicit experimental host composition. It does not enable replication or separated authorization in ordinary application bootstrap. The introspection credential is the existing source-scoped owner-token mechanism; a general long-lived resource-server identity and credential renewal remain separate deployment work. v0.1's incomplete introspection projection is refused rather than reconstructed.
 
 ## Adversarial coverage
 
 The 35-case acceptance ledger is maintained with the run report. Distinguish live dev evidence, deterministic HTTP/SQLite evidence, partial coverage and deferred contracts. A prior 8a transport receipt does not prove consent. Account UI, phone/Desktop persistence and the supported producer/reader compatibility matrix remain promotion work unless separately proved.
+
+Generation-bound grants remain a promotion blocker: resetting a connection does not currently bind an existing grant to its previous generation. The protocol must decide that authority boundary; the recommended behavior is fail closed and require owner reapproval. Revocation during an already-started response is a separate open specification question, not a blocker for the current request-based OAuth contract. New requests, pages and requests after restart reauthorize.
