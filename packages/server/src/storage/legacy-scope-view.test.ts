@@ -271,7 +271,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       byteDelta: 0,
     };
     expect(
-      authority.confirmRead("oura.sleep", head, () => true, {
+      authority.confirmRead("oura.sleep", head, () => true, "oura", {
         instance: "conn_a",
         generation: 1,
         writeClock: authority.writeClock(),
@@ -281,6 +281,18 @@ describe("legacy scope view over the real SQLite record store", () => {
         cached: false,
       }),
     ).toBe(true);
+    // The takeover names the method whose read proved it.
+    expect(
+      db
+        .prepare(
+          "SELECT instance, generation, method FROM legacy_scope_takeovers WHERE scope = ?",
+        )
+        .all("oura.sleep"),
+    ).toEqual([{ instance: "conn_a", generation: 1, method: "oura" }]);
+    expect(authority.hasMethodTakeover("oura.sleep", "oura")).toBe(true);
+    expect(authority.hasMethodTakeover("oura.sleep", "oura-browser")).toBe(
+      false,
+    );
     expect(authority.verdictFor("oura.sleep")[0]).toMatchObject({
       verdict: "covered",
       comparisonCase: "canonical_newer",

@@ -85,11 +85,8 @@ export const DEFAULTS = {
     declarationPaths: [] as Array<string | { path: string; sha256: string }>,
     // At most one acquisition method may write each retained source. The
     // declaration path ties an artifact method id to the source it produces.
-    methods: [] as Array<{
-      method_id: string;
-      declaration_path: string;
-      opt_in?: boolean;
-    }>,
+    methods: [] as Array<{ method_id: string; declaration_path: string }>,
+    optInMethods: [] as string[],
     // Per-source connection methods are independent of canonical record
     // declarations. They let Desktop manage account handles while canonical
     // writers remain disabled for sources absent from declarationPaths.
@@ -274,13 +271,17 @@ export const ServerConfigSchema = z.object({
           z.object({
             method_id: z.string().min(1),
             declaration_path: z.string().min(1),
-            // Run only at the owner's explicit opt-in, beside the source's
-            // legacy collector: it does not take over a legacy scope from
-            // the owner's legacy file (see `LegacyScopeView`).
-            opt_in: z.boolean().optional(),
           }),
         )
         .default(DEFAULTS.pdpp.methods),
+      // Methods the host runs only at the owner's explicit opt-in, beside
+      // the source's legacy collector: they do not take a legacy scope over
+      // from the owner's legacy file (see `LegacyScopeView`). A boot policy
+      // of its own: it applies whether or not a listed method is configured
+      // or PDPP is enabled, so rows a method already wrote stay gated.
+      optInMethods: z
+        .array(z.string().min(1))
+        .default(DEFAULTS.pdpp.optInMethods),
       connectionMethods: z
         .array(
           z.object({

@@ -212,8 +212,8 @@ async function boot(
         methods: methodIds.map((method_id) => ({
           method_id,
           declaration_path: paths.get(method_id)!,
-          ...(optIn.includes(method_id) ? { opt_in: true } : {}),
         })),
+        optInMethods: [...optIn],
       },
     }),
     {
@@ -864,6 +864,19 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
       }
     });
 
+    it("keeps serving the file after a restart where oura-browser is opt-in but not configured", async () => {
+      // Desktop drops a method whose retained declaration no longer matches
+      // its pin (a re-pin before the owner reinstalls). The opt-in policy is
+      // a boot input of its own and still applies.
+      LEGACY_TS = false;
+      await writeLegacy(DAYS, T_LEGACY);
+      await writePdpp(DAYS, T_PDPP);
+      expect(await readAll()).toEqual(ALL(FILE));
+      await restartWithMethods([], ["oura-browser"]);
+      vi.setSystemTime(new Date(T_PDPP));
+      expect(await readAll()).toEqual(ALL(FILE));
+    });
+
     it("refuses to delete a scope whose oura-browser rows exist, though the file is what reads serve", async () => {
       await writeLegacy(DAYS, T_LEGACY);
       await writePdpp(DAYS, T_PDPP);
@@ -1137,6 +1150,48 @@ describe("a dev build, where oura-browser is the default Oura method (not opt-in
 describe("a takeover that oura-browser did not earn", () => {
   beforeEach(() => {
     LEGACY_TS = false;
+  });
+
+  it("names the method of an older unknown record from a fresh proof, so a later opt-in boot keeps it", async () => {
+    // Dev boot: oura-browser is the default method.
+    await freshBoot(["oura-browser"], []);
+    await writeLegacy(DAYS, T_LEGACY);
+    await writePdpp(DAYS, T_PDPP);
+    // A takeover of the same key, as a runtime pinned before takeovers
+    // named their method wrote it.
+    const db = new Database(join(tempDir, "index.db"));
+    try {
+      for (const scope of SCOPES) {
+        const head = db
+          .prepare(
+            "SELECT version, cas_revision, collected_at, path FROM data_files WHERE scope = ? ORDER BY id DESC LIMIT 1",
+          )
+          .get(scope) as {
+          version: number;
+          cas_revision: number;
+          collected_at: string;
+          path: string;
+        };
+        db.prepare(
+          `INSERT INTO legacy_scope_takeovers
+            (scope, instance, generation, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+            VALUES (?, ?, 1, ?, ?, ?, ?)`,
+        ).run(
+          scope,
+          accountOne,
+          head.version,
+          head.cas_revision,
+          head.collected_at,
+          head.path,
+        );
+      }
+    } finally {
+      db.close();
+    }
+    expect((await readAll())["oura.sleep"]).toBe(CANON);
+    await restartWithMethods(["oura-browser"], ["oura-browser"]);
+    vi.setSystemTime(new Date(T_PDPP));
+    expect((await readAll())["oura.sleep"]).toBe(CANON);
   });
 
   it("keeps it gated for a takeover recorded without its method", async () => {

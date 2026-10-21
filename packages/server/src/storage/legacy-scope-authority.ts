@@ -275,7 +275,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       return readEligibleLegacyHead(scope);
     },
 
-    confirmRead(scope, expectedHead, selectionIsCurrent, verdict) {
+    confirmRead(scope, expectedHead, selectionIsCurrent, method, verdict) {
       if (!hasTable("data_files")) return expectedHead === null;
       const validate = () => {
         if (isReset(scope)) return false;
@@ -306,7 +306,23 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
         )
           return false;
         if (expectedHead === null) return true;
-        if (verdict?.cached) return true;
+        if (verdict?.cached) {
+          // The same proof as when the takeover was recorded: it also names
+          // the method of a record written before takeovers did.
+          if (verdict.coverage.covered && hasTable("legacy_scope_takeovers"))
+            db.prepare(
+              `UPDATE legacy_scope_takeovers SET method = ?
+               WHERE scope = ? AND instance = ? AND generation = ?
+                 AND superseded_path = ? AND method = ''`,
+            ).run(
+              method,
+              scope,
+              verdict.instance,
+              verdict.generation,
+              expectedHead.path,
+            );
+          return true;
+        }
         if (!hasTable("legacy_scope_takeovers")) return false;
 
         if (verdict) {
@@ -355,14 +371,17 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           );
           if (!coverage.covered) return true;
           db.prepare(
-            `INSERT OR IGNORE INTO legacy_scope_takeovers
+            `INSERT INTO legacy_scope_takeovers
             (scope, instance, generation, method, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope, instance, generation, superseded_path) DO UPDATE
+              SET method = excluded.method
+              WHERE legacy_scope_takeovers.method = ''`,
           ).run(
             scope,
             verdict.instance,
             verdict.generation,
-            verdict.method,
+            method,
             expectedHead.version,
             expectedHead.casRevision,
             expectedHead.collectedAt,
@@ -375,17 +394,20 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
         // legacy pipeline. Null covers manual and old connector files.
         db.prepare(
           `
-          INSERT OR IGNORE INTO legacy_scope_takeovers (
-            scope, superseded_version, superseded_cas_revision,
+          INSERT INTO legacy_scope_takeovers (
+            scope, method, superseded_version, superseded_cas_revision,
             superseded_collected_at, superseded_path
           )
-          SELECT scope, version, cas_revision, collected_at, path
+          SELECT scope, ?, version, cas_revision, collected_at, path
             FROM data_files
            WHERE scope = ?
              AND (producer IS NULL OR producer NOT IN ('pdpp-projector', 'pdpp-import-projection'))
            ORDER BY julianday(collected_at) DESC, id DESC
+          ON CONFLICT(scope, instance, generation, superseded_path) DO UPDATE
+            SET method = excluded.method
+            WHERE legacy_scope_takeovers.method = ''
         `,
-        ).run(scope);
+        ).run(method, scope);
         return true;
       };
       try {

@@ -163,18 +163,19 @@ export interface LegacyScopeAuthority {
   eligibleLegacyHead(scope: string): LegacyScopeHead | null;
   /**
    * Revalidates the head and connection selection under a write lock, then
-   * records the eligible legacy versions. A null head confirms a read that
-   * did not observe legacy data and records no takeover.
+   * records the eligible legacy versions as taken over by `method`, the
+   * selected connection's method. A takeover already recorded for the same
+   * key without a method gains it from this proof. A null head confirms a
+   * read that did not observe legacy data and records no takeover.
    */
   confirmRead(
     scope: string,
     expectedHead: LegacyScopeHead | null,
     selectionIsCurrent: () => boolean,
+    method: string,
     verdict?: {
       instance: string;
       generation: number;
-      /** The selected connection's method, recorded with a takeover. */
-      method: string;
       writeClock: number;
       arrivalRevision: number;
       canonicalCursor: string;
@@ -702,10 +703,10 @@ export function createLegacyScopeView(
         () =>
           sameSelection(decide(scope), decision) &&
           receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
         {
           instance: decision.selection.instance,
           generation: decision.generation,
-          method: decision.selection.method,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
           canonicalCursor,
@@ -764,10 +765,10 @@ export function createLegacyScopeView(
         () =>
           sameSelection(decide(scope), decision) &&
           receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
         {
           instance: decision.selection.instance,
           generation: decision.generation,
-          method: decision.selection.method,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
           canonicalCursor,
@@ -848,10 +849,10 @@ export function createLegacyScopeView(
             sameSelection(decide(scope), decision) &&
             receiptCursor(decision, input.declarations) ===
               initial.receiptCursor,
+          decision.selection.method,
           {
             instance: decision.selection.instance,
             generation: decision.generation,
-            method: decision.selection.method,
             writeClock: initial.writeClock,
             arrivalRevision: initial.arrivalRevision,
             canonicalCursor: `${initial.writeClock}:${initial.arrivalRevision}:${initial.receiptCursor}:unavailable:${read.reason}:${COVERAGE_RULE_VERSION}`,
@@ -958,10 +959,10 @@ export function createLegacyScopeView(
         () =>
           sameSelection(decide(scope), decision) &&
           receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
         {
           instance: decision.selection.instance,
           generation: decision.generation,
-          method: decision.selection.method,
           writeClock: initial.writeClock,
           arrivalRevision: initial.arrivalRevision,
           canonicalCursor,
@@ -1022,8 +1023,11 @@ export function createLegacyScopeView(
         },
       };
     }
-    const confirmed = authority.confirmRead(scope, legacyHead, () =>
-      sameSelection(decide(scope), decision),
+    const confirmed = authority.confirmRead(
+      scope,
+      legacyHead,
+      () => sameSelection(decide(scope), decision),
+      decision.selection.method,
     );
     if (!confirmed) {
       const current = authority.readSnapshot(() => ({
