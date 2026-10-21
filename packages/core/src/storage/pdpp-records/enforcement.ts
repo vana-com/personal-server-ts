@@ -10,6 +10,7 @@ import {
 } from "../../ports/pdpp-auth.js";
 import type { StreamDeclaration } from "./stream-declaration.js";
 import {
+  evidenceTime,
   remoteEvidence,
   type DeliveryLease,
   type EvidenceTime,
@@ -240,6 +241,28 @@ export interface PdppChainEvidence {
 }
 
 /**
+ * A bearer as admitted: the token, what it resolved to, and when the
+ * resolution started. The time is part of the admission because a remote
+ * AS's answer is as old as the moment its introspection started; a lease
+ * built from an admission cannot date it later.
+ */
+export interface BearerAdmission {
+  readonly token: string;
+  readonly context: PdppTokenContext;
+  readonly resolvedAt: EvidenceTime;
+}
+
+/** Resolve a bearer, dated before the resolution is awaited. */
+export async function admitBearer(
+  auth: Pick<PdppAuthorizationService, "resolveToken">,
+  token: string,
+): Promise<BearerAdmission> {
+  const resolvedAt = evidenceTime();
+  const context = await auth.resolveToken(token);
+  return { token, context, resolvedAt };
+}
+
+/**
  * The connections a read result was selected from, as a release dependency:
  * once any of them is unavailable (deleted or unbound), the release refuses
  * with `instance_unavailable`. A selection holds exactly the connections it
@@ -285,11 +308,8 @@ export function connectionsLease(
  */
 export function pdppBearerReadLease(
   auth: PdppAuthorizationService,
-  token: string,
-  admitted: PdppTokenContext,
+  admission: BearerAdmission,
   options: {
-    /** When the bearer was resolved (before `resolveToken` was awaited). */
-    resolvedAt?: EvidenceTime;
     chain?: {
       admitted: PdppChainEvidence;
       reverify: () => Promise<PdppChainEvidence>;
@@ -304,6 +324,7 @@ export function pdppBearerReadLease(
       "The PDPP authorization server's locality is not declared",
     );
   }
+  const { token, context: admitted, resolvedAt } = admission;
   const grantId = admitted.grant?.grant_id;
   const chain = options.chain
     ? remoteEvidence(options.chain.admitted, options.chain.reverify, {
@@ -315,7 +336,7 @@ export function pdppBearerReadLease(
   const remoteAs =
     auth.locality === "remote"
       ? remoteEvidence(admitted, () => auth.resolveToken(token), {
-          ...(options.resolvedAt && { verifiedAt: options.resolvedAt }),
+          verifiedAt: resolvedAt,
         })
       : undefined;
   const evidence = [chain, remoteAs].filter(

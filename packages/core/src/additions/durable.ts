@@ -114,6 +114,12 @@ export interface DurableAdditionsService {
     timezone: string;
     days: number;
     now: Date;
+    /**
+     * Whether a scope, folded through registry version `through`, may be in
+     * this summary (a deletion filter). A scope it excludes contributes
+     * nothing. Absent: every scope is included.
+     */
+    isIncluded?: (scope: string, through: string) => Promise<boolean>;
   }): Promise<AdditionsSummary>;
   recordUpload(
     version: VersionToFold | Pick<VersionToFold, "scope">,
@@ -679,6 +685,11 @@ export function createDurableAdditions(
           .sort();
         for (const scope of scopes) {
           const result = await recover(scope, budget);
+          if (
+            input.isIncluded &&
+            !(await input.isIncluded(scope, result.through))
+          )
+            continue;
           if (result.ledger)
             ledgers.push({
               ...result.ledger,
