@@ -1,3 +1,8 @@
+import {
+  admitPdppRead,
+  type PdppReadAdmission,
+  type PdppChainEnforcementPort,
+} from "../pdpp/read-admission.js";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
@@ -16,8 +21,6 @@ import {
 import {
   admitBearer,
   connectionsLease,
-  pdppBearerReadLease,
-  type BearerAdmission,
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
@@ -27,6 +30,8 @@ import {
 
 export interface PdppBlobsRouteDeps {
   protocolProfile?: PdppProtocolProfile;
+  /** Same deployment authority as records; absent only for a chain-neutral deployment. */
+  chainEnforcement?: PdppChainEnforcementPort;
   store: PdppRecordStore;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
@@ -96,11 +101,11 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
    * of the record reference that authorized it (what the read selected).
    */
   function blobLease(
-    admission: BearerAdmission,
+    admission: PdppReadAdmission,
     selectedInstance: string,
   ): DeliveryLease {
     return allDeliveryLeases(
-      pdppBearerReadLease(deps.auth, admission),
+      admission.lease,
       connectionsLease([selectedInstance], deps.isConnectionAvailable),
     );
   }
@@ -152,13 +157,24 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         error: jsonError(c, err, reqId),
       };
     }
-    // Dated before the await: see `admitBearer`.
-    const admission = await admitBearer(deps.auth, token);
-    const context = admission.context;
-    if (!context.active) {
-      const err = new PdppError("authentication_error", "Invalid access token");
-      return { error: jsonError(c, err, reqId, { inactiveBearer: true }) };
+    let admission: PdppReadAdmission;
+    try {
+      admission = await admitPdppRead(
+        deps,
+        await admitBearer(deps.auth, token),
+      );
+    } catch (err) {
+      const refusal = toLeaseRefusal(err);
+      return {
+        error: jsonError(c, refusal, reqId, {
+          inactiveBearer: refusal.code === "authentication_error",
+          ...(refusal.code === "api_error" && {
+            headers: { "Retry-After": "5" },
+          }),
+        }),
+      };
     }
+    const context = admission.context;
 
     const notFound = () =>
       jsonError(

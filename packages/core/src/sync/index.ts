@@ -69,6 +69,7 @@ export {
   createScopeDeletionTracker,
   deletionTimestamp,
   isEntryCoveredByTombstone,
+  laterScopeDeletion,
   tombstoneVersion,
   DEFAULT_SCOPE_DELETION_GATEWAY_RETRY_MS,
   DEFAULT_SCOPE_DELETION_MAX_STALENESS_MS,

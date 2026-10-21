@@ -41,7 +41,6 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type {
   LocalPdppAuthorizationService,
-  PdppAuthorizationService,
   PdppTokenContext,
   Grant as PdppPortGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
@@ -51,16 +50,16 @@ import {
   type RetainedDeclaration,
 } from "@opendatalabs/personal-server-ts-core/sync";
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
+import type { PdppReadAuthority } from "./read-admission.js";
 import {
   createSqliteRecordStore,
   PdppBindingError,
 } from "../storage/pdpp-records-sqlite-store.js";
 
-export interface PdppRecordsDeps {
+export interface PdppRecordsDeps extends PdppReadAuthority {
   store: PdppRecordStore;
   bindingStore: ReturnType<typeof createSqliteRecordStore>;
   configuredMethods: Map<string, string[]>;
-  auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
   instancesForSource?: (subjectId: string, sourceId: string) => string[];

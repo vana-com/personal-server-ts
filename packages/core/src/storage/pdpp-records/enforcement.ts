@@ -303,8 +303,8 @@ export function connectionsLease(
  * Local checks, synchronous, at release: the bearer resolved again (a local
  * AS through `resolveTokenNow`, which reports a revoked or expired grant, a
  * revoked or expired token, and a revoked refresh family; a remote AS's last
- * answer and its token expiry); the same grant the read was admitted under;
- * and the carried chain expiry.
+ * answer); the same grant the read was admitted under; and every carried
+ * token, PDPP grant and chain deadline. Malformed deadlines fail closed.
  */
 export function pdppBearerReadLease(
   auth: PdppAuthorizationService,
@@ -354,13 +354,33 @@ export function pdppBearerReadLease(
         throw mapInactiveToError({ active: false, inactiveReason: "unknown" });
       }
       const now = Date.now();
-      if (current.expiresAt && Date.parse(current.expiresAt) <= now) {
+      if (
+        current.expiresAt !== undefined &&
+        !liveDeadline(current.expiresAt, now)
+      ) {
         throw mapInactiveToError({ active: false, inactiveReason: "expired" });
       }
+      const grantExpiry = current.grant?.expires_at;
+      if (grantExpiry !== undefined && !liveDeadline(grantExpiry, now)) {
+        throw mapInactiveToError({
+          active: false,
+          inactiveReason: "grant_expired",
+        });
+      }
       const chainExpiry = chain?.current.expiresAt;
-      if (chainExpiry && Date.parse(chainExpiry) <= now) {
+      if (
+        chainExpiry !== undefined &&
+        chainExpiry !== null &&
+        !liveDeadline(chainExpiry, now)
+      ) {
         throw new PdppError("grant_expired", "Chain permission has expired");
       }
     },
   };
+}
+
+/** A carried deadline is authority, even before remote evidence ages out. */
+function liveDeadline(deadline: string, now: number): boolean {
+  const at = Date.parse(deadline);
+  return Number.isFinite(at) && at > now;
 }
