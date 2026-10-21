@@ -9,9 +9,11 @@
  * through a real `createServer` app, the real SQLite record store, real P7
  * replaces and real legacy files, for both the owner token and the builder.
  *
- * Rule under test: while a scope has an eligible legacy head and no recorded
- * takeover, an `oura-browser` connection is not a takeover candidate. Without a
- * legacy head it still serves the scope, and a recorded takeover is kept.
+ * Rule under test: while a scope has an eligible legacy head and no takeover
+ * that an `oura-browser` connection earned, an `oura-browser` connection is not
+ * a takeover candidate. Without a legacy head it still serves the scope, and a
+ * recorded takeover is kept. The deletion history judging a read is the one
+ * the view decided with the body.
  */
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -35,6 +37,40 @@ import {
   type ServerContext,
 } from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
+import type * as LegacyScopeViewModule from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
+
+/**
+ * A pass-through to the real view. A case may arm `afterReadLatest` to run
+ * a concurrent write after the view has chosen a body and before the API
+ * judges that body's deletion history.
+ */
+const barrier = vi.hoisted(() => ({
+  afterReadLatest: null as null | ((scope: string) => Promise<void>),
+}));
+vi.mock(
+  "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view",
+  async (importOriginal) => {
+    const actual = await importOriginal<typeof LegacyScopeViewModule>();
+    return {
+      ...actual,
+      createLegacyScopeView: (
+        input: Parameters<typeof actual.createLegacyScopeView>[0],
+      ) => {
+        const view = actual.createLegacyScopeView(input);
+        return {
+          ...view,
+          async readLatest(scope: string) {
+            const latest = await view.readLatest(scope);
+            const after = barrier.afterReadLatest;
+            barrier.afterReadLatest = null;
+            if (after) await after(scope);
+            return latest;
+          },
+        };
+      },
+    };
+  },
+);
 
 // Each case boots a real server (some boot twice); the 5s default flakes under load.
 vi.setConfig({ testTimeout: 60_000 });
@@ -44,6 +80,7 @@ const KNOWN_SIG =
 const CONTROL_PLANE_TOKEN = "oura-legacy-first-control-plane";
 const OURA = "https://registry.pdpp.dev/sources/oura";
 const SECOND_ACCOUNT = "conn_123e4567-e89b-42d3-a456-426614174000";
+const PAT_ACCOUNT = "conn_323e4567-e89b-42d3-a456-426614174002";
 const GRANT_ID = `0x${"11".repeat(32)}`;
 const BUILDER_ID = "builder-openpet";
 const builder = createTestWallet(0);
@@ -589,6 +626,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  barrier.afterReadLatest = null;
   await ctx?.cleanup();
   ctx = undefined;
   await rm(tempDir, { recursive: true, force: true });
@@ -931,5 +969,116 @@ describe("deletion history and the legacy file that is served", () => {
       (await listing.json()) as { scopes: { scope: string }[] }
     ).scopes.map((entry) => entry.scope);
     expect(listed).toEqual(expect.arrayContaining([...SCOPES]));
+  });
+});
+
+describe("a read whose legacy file is re-added while the canonical body is chosen", () => {
+  beforeEach(() => {
+    LEGACY_TS = false;
+  });
+
+  it("refuses (410) the canonical body its deletion history covers, though the file arrives before the API judges it", async () => {
+    let deleted = true;
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope }) => ({
+        id: "synthetic-point",
+        ownerAddress,
+        scope,
+        dataHash: `0x${"00".repeat(32)}`,
+        metadataHash: `0x${"00".repeat(32)}`,
+        expectedVersion: "1",
+        addedAt: "2026-09-01T00:00:00Z",
+        deletedAt: deleted ? "2026-09-11T00:00:00Z" : null,
+      }),
+    };
+    await ctx!.cleanup();
+    ctx = await boot(["oura-browser"], dataPointFeed);
+    // No legacy file; the oura-browser projection is the body, and the
+    // owner has deleted the scope elsewhere: the projection is refused.
+    await writePdpp(DAYS, T_PDPP);
+    expect((await observe("oura.activity")).owner.status).toBe(410);
+
+    // The collector re-adds a file elsewhere. Once the remembered tombstone
+    // is stale the gateway shows the scope live, but the canonical body is
+    // still covered by its deletion history.
+    deleted = false;
+    vi.setSystemTime(new Date(T_LEGACY_NEWER));
+    expect((await observe("oura.activity")).owner.status).toBe(410);
+
+    // The re-added file is indexed locally after the view has chosen the
+    // canonical body and before the API judges it.
+    barrier.afterReadLatest = async (scope) => {
+      await writeLegacy([{ n: 7, score: 71 }], T_LEGACY_NEWER);
+      expect(scope).toBe("oura.activity");
+    };
+    const raced = await ownerRead("oura.activity");
+    expect(barrier.afterReadLatest).toBeNull();
+    expect(raced.status).toBe(410);
+    expect(raced.source).not.toBe("canonical");
+
+    // Settled, the re-added file is what every reader is served.
+    expect(await readAll()).toEqual(ALL(FILE));
+  });
+});
+
+describe("an owner with the PAT `oura` and the `oura-browser` method both configured", () => {
+  beforeEach(() => {
+    LEGACY_TS = false;
+  });
+
+  it("keeps the PAT takeover of activity on repeated reads, while oura-browser stays gated (no 409)", async () => {
+    // Each boot registers connections of its one active method.
+    await freshBoot(["oura"]);
+    await writeLegacy(DAYS, T_LEGACY);
+    vi.setSystemTime(new Date(T_PDPP));
+    // The PAT connection's activity covers the file's two days.
+    await registerAccount(await mintSourceToken(), PAT_ACCOUNT, "oura");
+    await replace(
+      await ownerPdppToken(PAT_ACCOUNT),
+      "activity",
+      DAYS.map(pdppActivity),
+      T_PDPP,
+      { instance: PAT_ACCOUNT, method: "oura" },
+    );
+    // A browser account with a distinguishable day.
+    await restartWithMethods(["oura-browser"]);
+    vi.setSystemTime(new Date(T_PDPP));
+    await registerAccount(
+      await mintSourceToken(),
+      SECOND_ACCOUNT,
+      "oura-browser",
+    );
+    await writePdpp(
+      [{ n: 5, score: 70 }],
+      T_PDPP,
+      await ownerPdppToken(SECOND_ACCOUNT),
+      { instance: SECOND_ACCOUNT },
+    );
+    // Desktop configures both methods where both are admitted.
+    await restartWithMethods(["oura", "oura-browser"]);
+    vi.setSystemTime(new Date(T_PDPP));
+
+    const scores = (o: Outcome) =>
+      dayRows(o, "oura.activity").map((row) => row.score);
+    for (let read = 1; read <= 3; read++) {
+      const activity = await observe("oura.activity");
+      expect(label(activity.owner), `read ${read}`).toBe(CANON);
+      expect(scores(activity.owner)).toEqual(DAYS.map((day) => day.score));
+      expect(scores(activity.builder)).toEqual(DAYS.map((day) => day.score));
+      // No PAT rows, no takeover: the browser method stays gated.
+      expect(label((await observe("oura.sleep")).owner)).toBe(FILE);
+      expect(label((await observe("oura.readiness")).owner)).toBe(FILE);
+    }
+
+    const listing = await ctx!.app.request("/v1/data", {
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(listing.status).toBe(200);
+    const listed = (
+      (await listing.json()) as { scopes: { scope: string }[] }
+    ).scopes.map((entry) => entry.scope);
+    expect(listed).toEqual(expect.arrayContaining([...SCOPES]));
+    expect(label((await observe("oura.activity")).owner)).toBe(CANON);
   });
 });
