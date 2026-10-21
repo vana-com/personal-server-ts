@@ -3,6 +3,15 @@ import { z } from "zod";
 const token = z.string().min(1);
 const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+const timestamp = z.string().datetime({ offset: true });
+const revision = z.strictObject({
+  wallMs: integer,
+  logical: integer,
+  writerId: token,
+  operationId: token,
+});
+const upstreamAccount = z.strictObject({ issuer: token, subject: token });
+export type UpstreamAccount = z.infer<typeof upstreamAccount>;
 export const declarationBindingSchema = z.strictObject({
   digest,
   version: token,
@@ -10,6 +19,11 @@ export const declarationBindingSchema = z.strictObject({
   semantics: z.enum(["mutable_state", "append_only"]),
   primaryKey: z.array(token).min(1),
   schemaDigest: digest,
+  sourceVersionOrder: z
+    .enum(["ordered-integer", "ordered-rfc3339", "equality-only"])
+    .optional(),
+  reobservable: z.boolean().optional(),
+  completeScanDeletes: z.boolean().optional(),
 });
 export type DeclarationBinding = z.infer<typeof declarationBindingSchema>;
 const base = {
@@ -17,33 +31,74 @@ const base = {
   sourceId: token,
   connectionId: token,
   methodId: token,
+  upstreamAccount,
+  batchId: token,
+  frontier: z
+    .record(token, z.strictObject({ wallMs: integer, logical: integer }))
+    .default({}),
   generation: integer.min(1),
-  revision: z.strictObject({
-    counter: integer.min(1),
-    writerId: token,
-    operationId: token,
-  }),
+  revision,
 };
 const record = {
   ...base,
   declaration: declarationBindingSchema,
   recordKey: z.string(),
-  emittedAt: token,
+  emittedAt: timestamp,
+  contentHash: digest,
 };
+const sourceVersion = z.strictObject({
+  domain: token,
+  incarnation: token,
+  value: token,
+});
 const blob = z.strictObject({
   blobId: token,
   sha256: digest,
   mimeType: token,
   sizeBytes: integer,
 });
+const ownerRecord = {
+  ...base,
+  declaration: declarationBindingSchema,
+  recordKey: z.string(),
+};
 export const replicaOperationSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     ...record,
     kind: z.literal("upsert"),
     data: z.record(z.string(), z.json()),
     blobs: z.array(blob),
+    sourceVersion: sourceVersion.optional(),
   }),
-  z.strictObject({ ...record, kind: z.literal("delete"), deletedAt: token }),
+  z.strictObject({
+    ...record,
+    kind: z.literal("source-delete"),
+    origin: z.enum(["source-event", "complete-scan"]),
+    confirmationOf: token.optional(),
+    sourceVersion: sourceVersion.optional(),
+  }),
+  z.strictObject({
+    ...ownerRecord,
+    kind: z.literal("owner-hide"),
+    parents: z.array(token),
+  }),
+  z.strictObject({
+    ...ownerRecord,
+    kind: z.literal("owner-delete"),
+    parents: z.array(token),
+  }),
+  z.strictObject({
+    ...ownerRecord,
+    kind: z.literal("owner-restore"),
+    parents: z.array(token),
+  }),
+  z.strictObject({
+    ...ownerRecord,
+    kind: z.literal("owner-resolve"),
+    candidates: z.array(token),
+    choice: token,
+    version: sourceVersion.optional(),
+  }),
   z.strictObject({
     ...base,
     kind: z.literal("connection-register"),
@@ -59,13 +114,20 @@ export const replicaOperationSchema = z.discriminatedUnion("kind", [
 export type ReplicaOperation = z.infer<typeof replicaOperationSchema>;
 export type RecordOperation = Extract<
   ReplicaOperation,
-  { kind: "upsert" | "delete" }
+  { declaration: DeclarationBinding }
+>;
+export type SourceObservation = Extract<
+  RecordOperation,
+  { kind: "upsert" | "source-delete" }
 >;
 export const replicaEnvelopeSchema = z.strictObject({
   format: z.literal("vana-pdpp-replica"),
   version: z.literal(1),
   owner: token,
   batchId: token,
+  frontier: z
+    .record(token, z.strictObject({ wallMs: integer, logical: integer }))
+    .default({}),
   operations: z.array(replicaOperationSchema).min(1),
 });
 export type ReplicaEnvelope = z.infer<typeof replicaEnvelopeSchema>;
@@ -102,6 +164,10 @@ export function decodeReplicaEnvelope(
   for (const operation of envelope.operations) {
     if (operation.owner !== expected.owner)
       throw new Error("wrong operation owner");
+    if (operation.batchId !== envelope.batchId)
+      throw new Error("operation batch binding mismatch");
+    if (canonicalJson(operation.frontier) !== canonicalJson(envelope.frontier))
+      throw new Error("operation frontier binding mismatch");
     if (
       "declaration" in operation &&
       !expected.declarations.some(

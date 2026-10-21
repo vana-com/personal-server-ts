@@ -4,30 +4,44 @@
     "format": "vana-pdpp-replica",
     "version": 1,
     "owner": "owner-a",
-    "batchId": "batch-a",
+    "batchId": "batch-default",
+    "frontier": {},
     "operations": [
       {
         "owner": "owner-a",
         "sourceId": "https://example.test/source",
         "connectionId": "connection-a",
         "methodId": "export",
+        "upstreamAccount": {
+          "issuer": "https://github.com",
+          "subject": "gh:1001"
+        },
+        "batchId": "batch-default",
+        "frontier": {},
         "generation": 1,
-        "kind": "connection-register",
         "revision": {
-          "counter": 1,
+          "wallMs": 1792540800000,
+          "logical": 0,
           "writerId": "device-a",
           "operationId": "register"
-        }
+        },
+        "kind": "connection-register"
       },
       {
         "owner": "owner-a",
         "sourceId": "https://example.test/source",
         "connectionId": "connection-a",
         "methodId": "export",
+        "upstreamAccount": {
+          "issuer": "https://github.com",
+          "subject": "gh:1001"
+        },
+        "batchId": "batch-default",
+        "frontier": {},
         "generation": 1,
-        "kind": "upsert",
         "revision": {
-          "counter": 2,
+          "wallMs": 1792540800000,
+          "logical": 2,
           "writerId": "device-a",
           "operationId": "a"
         },
@@ -37,10 +51,14 @@
           "stream": "messages",
           "semantics": "mutable_state",
           "primaryKey": ["id"],
-          "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "reobservable": true,
+          "completeScanDeletes": true
         },
         "recordKey": "same-key",
-        "emittedAt": "2026-10-20T00:00:00Z",
+        "emittedAt": "2026-10-21T00:00:00.000Z",
+        "contentHash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "kind": "upsert",
         "data": {
           "id": "same-key",
           "text": "hello"
@@ -49,5 +67,5 @@
       }
     ]
   },
-  "encoded": "{\"batchId\":\"batch-a\",\"format\":\"vana-pdpp-replica\",\"operations\":[{\"connectionId\":\"connection-a\",\"generation\":1,\"kind\":\"connection-register\",\"methodId\":\"export\",\"owner\":\"owner-a\",\"revision\":{\"counter\":1,\"operationId\":\"register\",\"writerId\":\"device-a\"},\"sourceId\":\"https://example.test/source\"},{\"blobs\":[],\"connectionId\":\"connection-a\",\"data\":{\"id\":\"same-key\",\"text\":\"hello\"},\"declaration\":{\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"primaryKey\":[\"id\"],\"schemaDigest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"semantics\":\"mutable_state\",\"stream\":\"messages\",\"version\":\"1.0.0\"},\"emittedAt\":\"2026-10-20T00:00:00Z\",\"generation\":1,\"kind\":\"upsert\",\"methodId\":\"export\",\"owner\":\"owner-a\",\"recordKey\":\"same-key\",\"revision\":{\"counter\":2,\"operationId\":\"a\",\"writerId\":\"device-a\"},\"sourceId\":\"https://example.test/source\"}],\"owner\":\"owner-a\",\"version\":1}"
+  "encoded": "{\"batchId\":\"batch-default\",\"format\":\"vana-pdpp-replica\",\"frontier\":{},\"operations\":[{\"batchId\":\"batch-default\",\"connectionId\":\"connection-a\",\"frontier\":{},\"generation\":1,\"kind\":\"connection-register\",\"methodId\":\"export\",\"owner\":\"owner-a\",\"revision\":{\"logical\":0,\"operationId\":\"register\",\"wallMs\":1792540800000,\"writerId\":\"device-a\"},\"sourceId\":\"https://example.test/source\",\"upstreamAccount\":{\"issuer\":\"https://github.com\",\"subject\":\"gh:1001\"}},{\"batchId\":\"batch-default\",\"blobs\":[],\"connectionId\":\"connection-a\",\"contentHash\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"data\":{\"id\":\"same-key\",\"text\":\"hello\"},\"declaration\":{\"completeScanDeletes\":true,\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"primaryKey\":[\"id\"],\"reobservable\":true,\"schemaDigest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"semantics\":\"mutable_state\",\"stream\":\"messages\",\"version\":\"1.0.0\"},\"emittedAt\":\"2026-10-21T00:00:00.000Z\",\"frontier\":{},\"generation\":1,\"kind\":\"upsert\",\"methodId\":\"export\",\"owner\":\"owner-a\",\"recordKey\":\"same-key\",\"revision\":{\"logical\":2,\"operationId\":\"a\",\"wallMs\":1792540800000,\"writerId\":\"device-a\"},\"sourceId\":\"https://example.test/source\",\"upstreamAccount\":{\"issuer\":\"https://github.com\",\"subject\":\"gh:1001\"}}],\"owner\":\"owner-a\",\"version\":1}"
 }

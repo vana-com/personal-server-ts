@@ -1,17 +1,18 @@
-/** Persist with the mutation, never derive from a local query version or timestamp. */
+/** Hybrid logical observation time persisted atomically with each operation. */
 export interface ReplicaRevision {
-  counter: number;
+  wallMs: number;
+  logical: number;
   writerId: string;
   operationId: string;
 }
 
-/** Code-unit ordering is independent of runtime locale. */
+/** Deterministic code-unit ordering for the final tie-break only. */
 export function compareRevisions(
   a: ReplicaRevision,
   b: ReplicaRevision,
 ): number {
   for (const [left, right] of [
-    [a.counter, b.counter],
+    [a.logical, b.logical],
     [a.writerId, b.writerId],
     [a.operationId, b.operationId],
   ] as const) {
@@ -21,18 +22,49 @@ export function compareRevisions(
   return 0;
 }
 
-/** Caller must persist the result atomically with its new local operation. */
-export function nextLamportCounter(
-  local: number,
-  observed: readonly number[],
-): number {
-  let maximum = local;
-  for (const counter of [local, ...observed]) {
-    if (!Number.isSafeInteger(counter) || counter < 0)
-      throw new Error("invalid Lamport counter");
-    maximum = Math.max(maximum, counter);
+export function nextHlc(
+  local: ReplicaRevision,
+  observed: readonly ReplicaRevision[],
+  now: number,
+): Pick<ReplicaRevision, "wallMs" | "logical"> {
+  if (!Number.isSafeInteger(now) || now < 0)
+    throw new Error("invalid HLC wall time");
+  const all = [local, ...observed];
+  for (const revision of all) {
+    if (
+      !Number.isSafeInteger(revision.wallMs) ||
+      revision.wallMs < 0 ||
+      !Number.isSafeInteger(revision.logical) ||
+      revision.logical < 0
+    ) {
+      throw new Error("invalid HLC revision");
+    }
   }
-  if (maximum === Number.MAX_SAFE_INTEGER)
-    throw new Error("Lamport counter exhausted");
-  return maximum + 1;
+  const wallMs = Math.max(now, ...all.map((revision) => revision.wallMs));
+  const logical =
+    all
+      .filter((revision) => revision.wallMs === wallMs)
+      .reduce((maximum, revision) => Math.max(maximum, revision.logical), -1) +
+    1;
+  return { wallMs, logical };
+}
+
+/** Receiving clocks are bounded so a single bad clock cannot drag peers forward. */
+export function receiveHlc(
+  remote: ReplicaRevision,
+  now: number,
+  uncertaintyWindowMs: number,
+): {
+  revision: Pick<ReplicaRevision, "wallMs" | "logical">;
+  clockAhead: boolean;
+} {
+  const maximum = now + uncertaintyWindowMs;
+  const wallMs = Math.min(remote.wallMs, maximum);
+  return {
+    revision: {
+      wallMs,
+      logical: wallMs === remote.wallMs ? remote.logical : 0,
+    },
+    clockAhead: remote.wallMs > maximum,
+  };
 }

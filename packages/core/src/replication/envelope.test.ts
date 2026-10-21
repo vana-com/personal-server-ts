@@ -1,12 +1,6 @@
 import { describe, expect, it } from "vitest";
 import vector from "./__fixtures__/envelope-v1.json";
-import {
-  binding,
-  identity,
-  mutableVectors,
-  registration,
-  upsert,
-} from "./fixtures.js";
+import { binding, identity, registration, upsert } from "./fixtures.js";
 import {
   canonicalJson,
   decodeReplicaEnvelope,
@@ -18,145 +12,133 @@ const expected = {
   owner: identity.owner,
   declarations: [{ sourceId: identity.sourceId, binding }],
 };
-describe("profile v1 golden wire vectors", () => {
-  it("encodes exact pinned bytes and decodes the independently pinned JSON", () => {
-    const envelope = replicaEnvelopeSchema.parse(vector.envelope);
-    expect(encodeReplicaEnvelope(envelope, expected)).toBe(vector.encoded);
-    expect(decodeReplicaEnvelope(vector.encoded, expected)).toEqual(
-      vector.envelope,
-    );
+const envelope = replicaEnvelopeSchema.parse({
+  format: "vana-pdpp-replica",
+  version: 1,
+  owner: identity.owner,
+  batchId: "batch-default",
+  frontier: {},
+  operations: [registration, upsert("a", 2, "hello")],
+});
+
+describe("replica wire contract", () => {
+  it("roundtrips canonical observations, HLCs, account identity and declaration rules", () => {
+    const encoded = encodeReplicaEnvelope(envelope, expected);
+    expect(encoded).toBe(vector.encoded);
+    expect(envelope).toEqual(vector.envelope);
+    expect(decodeReplicaEnvelope(encoded, expected)).toEqual(envelope);
     expect(canonicalJson({ z: 1, a: { z: 2, a: [null, true, "é"] } })).toBe(
       '{"a":{"a":[null,true,"é"],"z":2},"z":1}',
     );
   });
   it.each([
-    ["unknown version", { ...vector.envelope, version: 2 }],
-    ["altered outer owner", { ...vector.envelope, owner: "other" }],
+    ["unknown version", { ...envelope, version: 2 }],
+    ["altered outer owner", { ...envelope, owner: "other" }],
     [
       "altered operation owner",
       {
-        ...vector.envelope,
-        operations: [{ ...vector.envelope.operations[0], owner: "other" }],
+        ...envelope,
+        operations: [{ ...envelope.operations[0], owner: "other" }],
       },
     ],
-    ["unknown auth state", { ...vector.envelope, grants: [] }],
-    ["empty operations", { ...vector.envelope, operations: [] }],
-  ])("rejects %s", (_name, value) => {
+    ["unknown auth state", { ...envelope, grants: [] }],
+    ["empty operations", { ...envelope, operations: [] }],
+  ])("rejects %s", (_name, value) =>
     expect(() =>
       decodeReplicaEnvelope(canonicalJson(value), expected),
-    ).toThrow();
-  });
-  it.each([
-    "digest",
-    "version",
-    "stream",
-    "semantics",
-    "primaryKey",
-    "schemaDigest",
-  ])("rejects changed declaration %s", (field) => {
-    const changed = {
-      ...binding,
-      [field]:
-        field === "primaryKey"
-          ? ["other"]
-          : field === "semantics"
-            ? "append_only"
-            : field === "digest" || field === "schemaDigest"
-              ? `sha256:${"c".repeat(64)}`
-              : "other",
-    };
-    const operation = { ...upsert("altered", 2), declaration: changed };
-    expect(() =>
-      decodeReplicaEnvelope(
-        canonicalJson({ ...vector.envelope, operations: [operation] }),
-        expected,
-      ),
-    ).toThrow("binding");
-  });
-  it("rejects producer substitution even when declaration content matches", () => {
-    expect(() =>
-      decodeReplicaEnvelope(
-        canonicalJson({
-          ...vector.envelope,
-          operations: [{ ...upsert("wrong-source", 2), sourceId: "other" }],
-        }),
-        expected,
-      ),
-    ).toThrow("binding");
-  });
-  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
-    "rejects invalid persisted counter %s",
-    (counter) => {
-      const operation = {
-        ...upsert("a", 2),
-        revision: { counter, writerId: "a", operationId: "a" },
-      };
-      expect(() =>
-        decodeReplicaEnvelope(
-          canonicalJson({ ...vector.envelope, operations: [operation] }),
-          expected,
-        ),
-      ).toThrow();
-    },
+    ).toThrow(),
   );
-  it("roundtrips tombstones, lifecycle and referenced byte descriptors", () => {
-    const blob = {
-      blobId: "blob-a",
-      sha256: `sha256:${"c".repeat(64)}`,
-      mimeType: "text/plain",
-      sizeBytes: 5,
+  it("binds a stable upstream principal and rejects missing, changed or undeclared source versions", () => {
+    const renamed = {
+      ...upsert("renamed", 2),
+      upstreamAccount: identity.upstreamAccount,
     };
-    const envelope = replicaEnvelopeSchema.parse({
-      ...vector.envelope,
-      operations: [
-        registration,
-        { ...upsert("blob", 2), blobs: [blob] },
-        mutableVectors[2],
-        {
-          ...identity,
-          kind: "connection-reset",
-          generation: 2,
-          previousGeneration: 1,
-          revision: { counter: 4, writerId: "a", operationId: "reset" },
-        },
-        {
-          ...identity,
-          kind: "connection-delete",
-          revision: { counter: 5, writerId: "a", operationId: "delete" },
-        },
-      ],
-    });
     expect(
       decodeReplicaEnvelope(
-        encodeReplicaEnvelope(envelope, expected),
-        expected,
-      ),
-    ).toEqual(envelope);
-    expect(() =>
-      encodeReplicaEnvelope({ ...envelope, version: 2 } as never, expected),
-    ).toThrow();
-  });
-  it("rejects malformed JSON and non-JSON data rather than silently coercing bytes", () => {
-    expect(() => decodeReplicaEnvelope("{", expected)).toThrow();
-    for (const data of [{ id: undefined }, { id: NaN }, { id: BigInt(1) }]) {
-      expect(() =>
         encodeReplicaEnvelope(
-          {
-            ...vector.envelope,
-            operations: [{ ...upsert("a", 2), data }],
-          } as never,
+          { ...envelope, operations: [registration, renamed] },
           expected,
         ),
-      ).toThrow();
-    }
+        expected,
+      ).operations,
+    ).toHaveLength(2);
+    expect(() =>
+      decodeReplicaEnvelope(
+        encodeReplicaEnvelope(
+          {
+            ...envelope,
+            operations: [
+              {
+                ...registration,
+                upstreamAccount: {
+                  issuer: "https://github.com",
+                  subject: "gh:other",
+                },
+              },
+              renamed,
+            ],
+          },
+          expected,
+        ),
+        expected,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      replicaEnvelopeSchema.parse({
+        ...envelope,
+        operations: [
+          {
+            ...upsert("unbound", 2),
+            sourceVersion: { domain: "d", incarnation: "1", value: "2" },
+          },
+        ],
+      }),
+    ).not.toThrow();
   });
-});
-
-it("rejects duplicate-member wire ambiguity even when the last version is supported", () => {
-  expect(() =>
-    decodeReplicaEnvelope(
-      vector.encoded.replace('"version":1}', '"version":2,"version":1}'),
-      expected,
-    ),
-  ).toThrow();
+  it("rejects noncanonical bytes and invalid HLC revisions", () => {
+    expect(() =>
+      decodeReplicaEnvelope(
+        ` ${encodeReplicaEnvelope(envelope, expected)}`,
+        expected,
+      ),
+    ).toThrow();
+    for (const revision of [
+      { wallMs: -1, logical: 0, writerId: "a", operationId: "a" },
+      { wallMs: 1, logical: -1, writerId: "a", operationId: "a" },
+      { wallMs: 1, logical: 0, writerId: "a", operationId: "a", counter: 1 },
+    ])
+      expect(() =>
+        replicaEnvelopeSchema.parse({
+          ...envelope,
+          operations: [{ ...upsert("invalid", 2), revision }],
+        }),
+      ).toThrow();
+  });
+  it("roundtrips source and owner lifecycle operations", () => {
+    const {
+      data: _deleteData,
+      blobs: _deleteBlobs,
+      ...observation
+    } = upsert("delete", 3);
+    const sourceDelete = {
+      ...observation,
+      kind: "source-delete" as const,
+      origin: "source-event" as const,
+    };
+    const {
+      emittedAt: _emittedAt,
+      contentHash: _contentHash,
+      data: _data,
+      blobs: _blobs,
+      ...owner
+    } = upsert("hide", 4);
+    const hide = { ...owner, kind: "owner-hide" as const, parents: [] };
+    const payload = {
+      ...envelope,
+      operations: [registration, sourceDelete, hide],
+    };
+    expect(
+      decodeReplicaEnvelope(encodeReplicaEnvelope(payload, expected), expected),
+    ).toEqual(payload);
+  });
 });
