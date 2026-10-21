@@ -403,12 +403,7 @@ export function createReplicaReceiver(deps: {
         db.prepare(
           "INSERT OR IGNORE INTO pdpp_replica_quarantined_keys VALUES (?, ?, ?, ?)",
         ).run(connectionId, generation, stream, recordKey);
-      const quarantined = db
-        .prepare(
-          "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ? UNION ALL SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND generation = ? AND stream = ? AND record_key = ? LIMIT 1",
-        )
-        .get(connectionId, connectionId, generation, stream, recordKey);
-      if (quarantined) {
+      if (isRecordQuarantined(record.identity)) {
         write(connectionId, stream, recordKey, null);
         continue;
       }
@@ -585,6 +580,19 @@ export function createReplicaReceiver(deps: {
         replicaEnvelopeSchema.parse(JSON.parse(row.envelope_json)).operations,
     );
   }
+  function isRecordQuarantined(identity: {
+    connectionId: string;
+    generation: number;
+    stream: string;
+    recordKey: string;
+  }): boolean {
+    const { connectionId, generation, stream, recordKey } = identity;
+    return !!db
+      .prepare(
+        "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ? UNION ALL SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND generation = ? AND stream = ? AND record_key = ? LIMIT 1",
+      )
+      .get(connectionId, connectionId, generation, stream, recordKey);
+  }
   function readVisibleRecords(input: {
     reader?: ReplicaReader;
     connectionId: string;
@@ -673,6 +681,13 @@ export function createReplicaReceiver(deps: {
         record.identity.generation !== generation
       )
         continue;
+      // Retained operations remain merge evidence after imported-slot quarantine.
+      // Apply the same durable fence as canonical materialization before previewing
+      // their winners or deriving any blob references from them.
+      if (isRecordQuarantined(record.identity)) {
+        rows.delete(record.identity.recordKey);
+        continue;
+      }
       const winner = record.winner;
       if (!winner || winner.kind === "delete") {
         rows.delete(record.identity.recordKey);
