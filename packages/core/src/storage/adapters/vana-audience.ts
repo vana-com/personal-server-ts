@@ -1,6 +1,6 @@
 import { buildWeb3SignedHeader } from "@opendatalabs/vana-sdk/browser";
 import type { ServerAccount } from "../../keys/server-account.js";
-import type { StorageAdapter } from "./interface.js";
+import { StoredBlobConflictError, type StorageAdapter } from "./interface.js";
 
 /** SDK 3.x couples routing and authentication origins. This adapter supplies the
  * explicit audience needed by preview workers without rewriting a signed claim. */
@@ -44,6 +44,8 @@ export function createAudienceVanaAdapter(input: {
     });
     if (!response.ok && response.status !== 404) {
       await response.body?.cancel();
+      if (method === "PUT" && response.status === 409)
+        throw new StoredBlobConflictError(new URL(url).pathname);
       throw new Error(`Storage ${method} failed (${response.status})`);
     }
     return response;

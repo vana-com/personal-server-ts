@@ -1,4 +1,4 @@
-import type { StorageAdapter } from "./interface.js";
+import { StoredBlobConflictError, type StorageAdapter } from "./interface.js";
 
 export interface SdkStorageProvider {
   upload(
@@ -38,11 +38,16 @@ export function createSdkStorageAdapter(
 
   return {
     async upload(key, data) {
-      const result = await provider().upload(
-        new Blob([copyBytes(data)], { type: "application/octet-stream" }),
-        key,
-      );
-      return result.url;
+      try {
+        const result = await provider().upload(
+          new Blob([copyBytes(data)], { type: "application/octet-stream" }),
+          key,
+        );
+        return result.url;
+      } catch (err) {
+        if (isWriteConflict(err)) throw new StoredBlobConflictError(key);
+        throw err;
+      }
     },
 
     urlForKey,
@@ -93,6 +98,17 @@ function isDefinitiveNotFound(err: unknown): boolean {
   }
   const message = err instanceof Error ? err.message : String(err);
   return /download failed: (404|410)\b/.test(message);
+}
+
+// vana-storage answers a PUT of different bytes to an existing key with 409.
+// The SDK's StorageError carries the status only in its message
+// ("vana-storage upload failed: 409 Conflict - ..."), like downloads above.
+function isWriteConflict(err: unknown): boolean {
+  const status =
+    numericProperty(err, "status") ?? numericProperty(err, "statusCode");
+  if (status !== undefined) return status === 409;
+  const message = err instanceof Error ? err.message : String(err);
+  return /upload failed: 409\b/.test(message);
 }
 
 function numericProperty(value: unknown, key: string): number | undefined {

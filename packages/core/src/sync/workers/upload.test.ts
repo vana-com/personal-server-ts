@@ -887,8 +887,8 @@ describe("upload worker", () => {
     });
 
     it("drops the entry when a 409 reveals a tombstone that landed after the guard ran", async () => {
-      // Step 1b saw a live row; another replica deleted the scope before
-      // this worker registered. The 409 path must apply the same rule
+      // Step 1b saw a live row below this entry's version; another replica
+      // deleted the scope before this worker registered. The 409 path must apply the same rule
       // instead of rebasing past the tombstone (which would resurrect it).
       const deps = withFeed(makeMockDeps(), {
         deletedAt: null,
@@ -900,7 +900,7 @@ describe("upload worker", () => {
         scope: SCOPE,
         dataHash: "0x" + "33".repeat(32),
         metadataHash: "0x" + "44".repeat(32),
-        expectedVersion: "2",
+        expectedVersion: "3",
         addedAt: DELETED_AT,
         deletedAt: DELETED_AT,
       };
@@ -912,7 +912,7 @@ describe("upload worker", () => {
         deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
       ).mockRejectedValueOnce(
         new Error(
-          "Gateway error: 409 Stale expectedVersion 1: must be strictly greater than the stored value 2",
+          "Gateway error: 409 Stale expectedVersion 2: must be strictly greater than the stored value 3",
         ),
       );
       const scopeDeletions = {
@@ -926,7 +926,10 @@ describe("upload worker", () => {
       };
       deps.scopeDeletions = scopeDeletions;
       deps.storageAdapter.delete = vi.fn(async () => true);
-      const entry = makeEntry({ createdAt: "2026-01-21T10:00:00Z" });
+      const entry = makeEntry({
+        createdAt: "2026-01-21T10:00:00Z",
+        version: 2,
+      });
 
       await expect(uploadOne(deps, entry)).rejects.toMatchObject({
         name: "DeletedScopeEntryError",
@@ -964,7 +967,7 @@ describe("upload worker", () => {
         scope: SCOPE,
         dataHash: "0x" + "33".repeat(32),
         metadataHash: "0x" + "44".repeat(32),
-        expectedVersion: "2",
+        expectedVersion: "3",
         addedAt: DELETED_AT,
         deletedAt: DELETED_AT,
       });
@@ -972,7 +975,7 @@ describe("upload worker", () => {
         deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
       ).mockRejectedValueOnce(
         new Error(
-          "Gateway error: 409 Stale expectedVersion 1: must be strictly greater than the stored value 2",
+          "Gateway error: 409 Stale expectedVersion 2: must be strictly greater than the stored value 3",
         ),
       );
       deps.storageAdapter.delete = vi.fn(async () => {
@@ -985,12 +988,14 @@ describe("upload worker", () => {
       };
       deps.pendingBlobDeletions = pendingBlobDeletions;
 
-      await expect(uploadOne(deps, makeEntry())).rejects.toMatchObject({
+      await expect(
+        uploadOne(deps, makeEntry({ version: 2 })),
+      ).rejects.toMatchObject({
         name: "DeletedScopeEntryError",
       });
 
       expect(pendingBlobDeletions.add).toHaveBeenCalledWith([
-        { scope: SCOPE, version: "1" },
+        { scope: SCOPE, version: "2" },
       ]);
       expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
         SCOPE,
@@ -1025,9 +1030,9 @@ describe("upload worker", () => {
         deletedAt: null,
         expectedVersion: "1",
       });
-      await uploadOne(live, makeEntry());
+      await uploadOne(live, makeEntry({ version: 2 }));
       expect(live.gateway.registerDataPoint).toHaveBeenCalledWith(
-        expect.objectContaining({ expectedVersion: "1" }),
+        expect.objectContaining({ expectedVersion: "2" }),
       );
 
       const none = withFeed(makeMockDeps(), null);

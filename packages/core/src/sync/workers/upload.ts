@@ -1,7 +1,11 @@
 import type { DurableAdditionsService } from "../../additions/durable.js";
 import { keccak256, stringToHex } from "viem";
-import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
+  StoredBlobConflictError,
+  type StorageAdapter,
+} from "../../storage/adapters/interface.js";
+import {
+  decryptWithPassword,
   deriveScopeKey,
   encryptWithPassword,
   type GatewayClient,
@@ -106,6 +110,22 @@ export class DeletedScopeEntryError extends Error {
   constructor(path: string, deletedAt: string) {
     super(`Dropped local entry for a scope deleted at ${deletedAt}: ${path}`);
     this.name = "DeletedScopeEntryError";
+  }
+}
+
+/**
+ * Thrown when the storage slot for a version already holds a payload with
+ * different content that the registry has not committed (another replica's
+ * upload that has not registered yet, or never will). The slot's bytes are
+ * write-once, so this entry cannot use that version; it stays unsynced and
+ * the next sync cycle re-reads the registry.
+ */
+export class VersionSlotTakenError extends Error {
+  constructor(scope: string, version: bigint) {
+    super(
+      `Storage for ${scope} version ${version} already holds a different payload`,
+    );
+    this.name = "VersionSlotTakenError";
   }
 }
 
@@ -234,6 +254,11 @@ export async function uploadOne(
   // would resurrect the scope. An entry ingested after the deletion is a
   // real re-add and goes up at a version strictly after the tombstone.
   let registerVersion = BigInt(entry.version);
+  // Whether the registry already holds a live row at or past the version this
+  // entry would take: that version is committed, so its storage slot is never
+  // written (only known when the feed is wired; write-once storage covers
+  // the rest).
+  let versionCommitted = false;
   if (!entry.dataPointId && deps.dataPointFeed) {
     const remote = await deps.dataPointFeed.getDataPoint({
       ownerAddress: serverOwner,
@@ -244,6 +269,8 @@ export async function uploadOne(
       await dropIfCoveredByDeletion(deps, entry, remote, deletedAt);
       const afterTombstone = BigInt(remote.expectedVersion) + 1n;
       if (afterTombstone > registerVersion) registerVersion = afterTombstone;
+    } else if (remote) {
+      versionCommitted = BigInt(remote.expectedVersion) >= registerVersion;
     }
   }
 
@@ -284,8 +311,63 @@ export async function uploadOne(
   // (scope, expectedVersion) — DataPointRecords carry no URL. We upload
   // before registering so the on-chain data point (the synced marker) is
   // never stamped ahead of a blob that failed to land.
-  const storageKey = `${entry.scope}/${registerVersion}`;
-  let url = await storageAdapter.upload(storageKey, encrypted);
+  //
+  // Storage keys are write-once (BUI-911), so the first payload written at a
+  // version is the only one it will ever hold. This worker registers a
+  // version only when that payload is its own plaintext; a slot holding
+  // anything else is treated like a version conflict below.
+  const putVersion = async (
+    version: bigint,
+  ): Promise<{ url: string; created: boolean } | null> => {
+    const key = `${entry.scope}/${version}`;
+    try {
+      return {
+        url: await storageAdapter.upload(key, encrypted),
+        created: true,
+      };
+    } catch (err) {
+      if (!(err instanceof StoredBlobConflictError)) throw err;
+    }
+    // OpenPGP salts every encryption, so a retry of this same plaintext
+    // never re-sends identical bytes. Compare plaintext commitments instead.
+    const url = storageAdapter.urlForKey(key);
+    const stored = await storageAdapter.download(url);
+    let storedHash: string;
+    try {
+      storedHash = keccak256(await decryptWithPassword(stored, scopeKeyHex));
+    } catch {
+      return null;
+    }
+    return storedHash.toLowerCase() === dataHash.toLowerCase()
+      ? { url, created: false }
+      : null;
+  };
+  // Bytes this worker created for a version it will not register under
+  // (the registry refused it). Removing them keeps a committed version that
+  // lost its blob from being filled with a different payload, and frees an
+  // uncommitted slot. Best effort: a failure leaves an orphan, never a
+  // wrong committed payload that was not already there.
+  const abandon = async (created: { url: string }) => {
+    try {
+      await storageAdapter.delete(created.url);
+    } catch (err) {
+      logger.warn(
+        {
+          scope: entry.scope,
+          url: created.url,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        "Could not delete a blob uploaded for a version the registry refused",
+      );
+    }
+  };
+
+  // A committed version goes straight to the conflict handling below
+  // (adopt or rebase) without touching its bytes.
+  const stored = versionCommitted ? null : await putVersion(registerVersion);
+  let url =
+    stored?.url ??
+    storageAdapter.urlForKey(`${entry.scope}/${registerVersion}`);
 
   // 6. DPv2 data-point registration (idempotent — skipped when a prior run
   // already persisted a dataPointId on this entry). registerDataPoint stamps
@@ -358,6 +440,8 @@ export async function uploadOne(
     };
 
     try {
+      if (!stored)
+        throw new VersionSlotTakenError(entry.scope, registerVersion);
       dataPointId = await registerAt(registerVersion);
       if (registerVersion !== BigInt(entry.version)) {
         // Re-add after a deletion: the row must follow the registered
@@ -365,7 +449,11 @@ export async function uploadOne(
         await storage.updateEntryVersion(entry.path, Number(registerVersion));
       }
     } catch (err) {
-      if (!isStaleVersionConflict(err)) throw err;
+      if (
+        !isStaleVersionConflict(err) &&
+        !(err instanceof VersionSlotTakenError)
+      )
+        throw err;
       // The registry's version for this (owner, scope) is ahead of the local
       // index: pre-DPv2 rows were backfilled to version 1, and other replicas
       // (PS Lite in the browser) advance the same per-scope sequence. The
@@ -389,9 +477,13 @@ export async function uploadOne(
       // genuine re-add rebases past the tombstone below.
       const conflictDeletedAt = record ? deletionTimestamp(record) : null;
       if (record && conflictDeletedAt !== null) {
-        await dropIfCoveredByDeletion(deps, entry, record, conflictDeletedAt, {
-          url,
-        });
+        await dropIfCoveredByDeletion(
+          deps,
+          entry,
+          record,
+          conflictDeletedAt,
+          stored?.created ? stored : undefined,
+        );
       }
 
       if (record && record.dataHash.toLowerCase() === dataHash.toLowerCase()) {
@@ -403,6 +495,9 @@ export async function uploadOne(
         // consumers sign from the row's version (e.g. x402 RecordDataAccess),
         // so a stale local version would emit records the registry rejects.
         const adoptedVersion = Number(record.expectedVersion);
+        if (stored?.created && BigInt(adoptedVersion) !== registerVersion) {
+          await abandon(stored);
+        }
         if (adoptedVersion !== entry.version) {
           // Cross-replica adopt: "the registrant already uploaded the blob
           // under the registered version key" is an assumption, not a fact —
@@ -421,7 +516,15 @@ export async function uploadOne(
               { scope: entry.scope, version: adoptedVersion, dataPointId },
               "Adopted registry version has no blob in storage; re-uploading from local content",
             );
-            url = await storageAdapter.upload(adoptedKey, encrypted);
+            const healed = await putVersion(BigInt(adoptedVersion));
+            // dataHash matched the registry, so a slot that refuses our
+            // plaintext holds bytes that already disagree with the record.
+            if (!healed)
+              throw new VersionSlotTakenError(
+                entry.scope,
+                BigInt(adoptedVersion),
+              );
+            url = healed.url;
           }
           await storage.updateEntryVersion(entry.path, adoptedVersion);
         }
@@ -443,6 +546,11 @@ export async function uploadOne(
         const target = Math.max(recordNext, errorNext);
         if (target <= 0) throw err;
         const rebased = BigInt(target);
+        if (stored?.created) await abandon(stored);
+        // The registry has not moved past the slot we found taken: nothing
+        // to rebase onto until that payload is registered or removed.
+        if (err instanceof VersionSlotTakenError && rebased === registerVersion)
+          throw err;
         // Known limitation (BUI-715 follow-up): when the registry regressed
         // BELOW the local index, `target` can land on a version this scope
         // already has an (older, now-defunct) synced row for. We realign only
@@ -455,13 +563,12 @@ export async function uploadOne(
         // renumber every row for the scope from the gateway's version) is
         // tracked separately; head-block recovery is the fix that matters here.
         // The blob key embeds the version (replicas reconstruct URLs from the
-        // registry record), so the rebased version needs its own blob; the one
-        // written under the stale key above is orphaned, which storage
-        // tolerates.
-        url = await storageAdapter.upload(
-          `${entry.scope}/${rebased}`,
-          encrypted,
-        );
+        // registry record), so the rebased version needs its own blob. Any
+        // blob this attempt created under the refused version was removed
+        // above; the committed bytes there were never touched.
+        const rebasedBlob = await putVersion(rebased);
+        if (!rebasedBlob) throw new VersionSlotTakenError(entry.scope, rebased);
+        url = rebasedBlob.url;
         // A concurrent replica can still win the race to `rebased`; the next
         // sync cycle re-reads the registry and rebases again, so this stays
         // convergent without looping here.
