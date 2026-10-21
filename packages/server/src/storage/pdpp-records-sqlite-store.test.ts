@@ -1546,3 +1546,47 @@ describe("v13 emitted-time order key", () => {
     }
   });
 });
+
+describe("v14 upgrade from an earlier v13", () => {
+  it("rebuilds the live summary index as covering when an earlier v13 left it narrow", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-v14-"));
+    const path = join(dir, "records.db");
+    try {
+      const before = new Database(path);
+      createTestBoundRecordStore(before);
+      // An earlier v13 (this branch before its rebase, or #441's first v13)
+      // built the summary index without `emitted_at`, and had no token key.
+      before.exec(`
+        DROP INDEX idx_pdpp_records_live_instance_stream_emitted_key;
+        CREATE INDEX idx_pdpp_records_live_instance_stream_emitted_key
+          ON pdpp_records (instance, stream, emitted_key) WHERE deleted = 0;
+        UPDATE pdpp_store_metadata SET sync_token_key = NULL;
+        UPDATE pdpp_schema_version SET version = 13;
+      `);
+      before.close();
+
+      const after = new Database(path);
+      try {
+        const upgraded = createSqliteRecordStore(after);
+        expect(upgraded.syncTokenScope().key).toHaveLength(32);
+        const columns = (
+          after
+            .prepare(
+              "PRAGMA index_info(idx_pdpp_records_live_instance_stream_emitted_key)",
+            )
+            .all() as { name: string }[]
+        ).map((c) => c.name);
+        expect(columns).toEqual([
+          "instance",
+          "stream",
+          "emitted_key",
+          "emitted_at",
+        ]);
+      } finally {
+        after.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
