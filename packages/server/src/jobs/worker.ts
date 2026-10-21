@@ -812,15 +812,21 @@ function watchedLease(lease: DeliveryLease): WatchedLease {
       return refusal;
     },
     evidence: () =>
-      lease.evidence().map((piece) => ({
-        get verifiedAt() {
-          return piece.verifiedAt;
-        },
-        refresh: () =>
-          piece.refresh().catch((error: unknown) => {
-            throw remember(error);
+      lease.evidence().map(
+        (piece) =>
+          // Preserve the complete live evidence; only observe refresh failures.
+          new Proxy(piece, {
+            get(target, key, receiver) {
+              if (key === "refresh") {
+                return () =>
+                  target.refresh().catch((error: unknown) => {
+                    throw remember(error);
+                  });
+              }
+              return Reflect.get(target, key, receiver);
+            },
           }),
-      })),
+      ),
     assertLocal() {
       try {
         lease.assertLocal();

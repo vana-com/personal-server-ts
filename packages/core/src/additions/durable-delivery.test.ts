@@ -265,9 +265,15 @@ describe("durable additions release", () => {
       tracker: ReturnType<typeof createScopeDeletionTracker>,
     ) => void,
     before?: (tracker: ReturnType<typeof createScopeDeletionTracker>) => void,
+    version = "1",
+    readdAfter?: string,
   ) {
     const f = await fixture();
-    await f.source("1", T1, ["private"]);
+    if (readdAfter) {
+      await f.source("1", T1, ["old"]);
+      await f.tombstone(readdAfter);
+    }
+    await f.source(version, readdAfter ? T4 : T1, ["private"]);
     const actor = f.actor();
     const tracker = createScopeDeletionTracker({ serverOwner: OWNER });
     before?.(tracker);
@@ -313,6 +319,41 @@ describe("durable additions release", () => {
 
   it("serves the summary when nothing is deleted (positive control)", async () => {
     const { response, captured } = await summaryRequest();
+    expect(response.status).toBe(200);
+    expect(captured()?.total).toBe(1);
+  });
+
+  it("omits an exact uint256 version covered by its equal tombstone", async () => {
+    const version = "9007199254740995";
+    const { response, captured } = await summaryRequest(
+      undefined,
+      (tracker) => tracker.markDeleted(SOURCE, { deletedAt: T4, version }),
+      version,
+    );
+    expect(response.status).toBe(200);
+    expect(captured()?.total).toBe(0);
+  });
+
+  it("refuses an exact uint256 version deleted after summary selection", async () => {
+    const version = "9007199254740995";
+    const { response, captured } = await summaryRequest(
+      (tracker) => tracker.markDeleted(SOURCE, { deletedAt: T4, version }),
+      undefined,
+      version,
+    );
+    expect(captured()?.total).toBe(1);
+    expect(response.status, await response.text()).toBe(410);
+  });
+
+  it("keeps an exact uint256 re-add newer than its tombstone", async () => {
+    const tombstone = "9007199254740992";
+    const { response, captured } = await summaryRequest(
+      undefined,
+      (tracker) =>
+        tracker.markDeleted(SOURCE, { deletedAt: T2, version: tombstone }),
+      "9007199254740993",
+      tombstone,
+    );
     expect(response.status).toBe(200);
     expect(captured()?.total).toBe(1);
   });

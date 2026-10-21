@@ -33,7 +33,7 @@ import {
   isEntryCoveredByTombstone,
   type ScopeDeletionTracker,
 } from "../sync/scope-deletions.js";
-import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
+import type { ScopeSummary } from "../storage/index/types.js";
 import {
   isPermanentRejection,
   type PdppImporter,
@@ -1363,7 +1363,7 @@ function registryVersionVisibility(
       hold,
       scope,
       {
-        version: Number(registryVersion),
+        version: registryVersion,
         // Registered at the gateway (any non-null id): the version is then
         // compared as a registry version.
         dataPointId: "registry",
@@ -1535,11 +1535,8 @@ function legacyViewRefusalResponse(
   );
 }
 
-/** The index fields the deletion gate needs from the entry a read would serve. */
-export type ReadDeletionEntry = Pick<
-  IndexEntry,
-  "version" | "dataPointId" | "afterTombstoneVersion"
->;
+/** The deletion gate's entry contract, including exact registry versions. */
+export type ReadDeletionEntry = Parameters<typeof isEntryCoveredByTombstone>[0];
 
 /**
  * The causal marker a fresh ingest carries: the tombstone version this

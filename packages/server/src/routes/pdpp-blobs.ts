@@ -92,16 +92,16 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
 
   /**
-   * The blob read's release dependencies: the bearer's, and the connections
-   * of the record references that authorized it (what the read selected).
+   * The blob read's release dependencies: the bearer's, and the connection
+   * of the record reference that authorized it (what the read selected).
    */
   function blobLease(
     admission: BearerAdmission,
-    selectedInstances: readonly string[],
+    selectedInstance: string,
   ): DeliveryLease {
     return allDeliveryLeases(
       pdppBearerReadLease(deps.auth, admission),
-      connectionsLease(selectedInstances, deps.isConnectionAvailable),
+      connectionsLease([selectedInstance], deps.isConnectionAvailable),
     );
   }
 
@@ -222,10 +222,10 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         .map((reference) => reference.instance)
         .filter((instance) => ownedInstances.includes(instance));
       if (visible.length === 0) return { error: notFound() };
-      // The read is selected from the visible references whose connection is
-      // available, and holds exactly those.
-      const selected = visible.filter(available);
-      if (selected.length === 0) return { error: unavailable() };
+      // One available reference authorizes the bytes, just as for a client.
+      // Other visible connections are alternative authorities, not dependencies.
+      const selected = visible.find(available);
+      if (selected === undefined) return { error: unavailable() };
       return {
         ok: true,
         lease: blobLease(admission, selected),
@@ -277,7 +277,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       }
       return {
         ok: true,
-        lease: blobLease(admission, [reference.instance]),
+        lease: blobLease(admission, reference.instance),
       };
     }
 

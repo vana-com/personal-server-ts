@@ -491,7 +491,10 @@ function normalizeVersion(value: string | null | undefined): string | null {
  * failure this guards against, and the window is one sync poll interval.
  */
 export function isEntryCoveredByTombstone(
-  entry: Pick<IndexEntry, "version" | "dataPointId" | "afterTombstoneVersion">,
+  entry: Pick<IndexEntry, "dataPointId" | "afterTombstoneVersion"> & {
+    /** Local index number or exact uint256 registry version. */
+    version: number | string;
+  },
   tombstone: Pick<ScopeTombstone, "version">,
 ): boolean {
   const version = normalizeVersion(tombstone.version);
