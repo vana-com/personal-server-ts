@@ -198,3 +198,9 @@ export type {
   LiteStorageEntry,
   LiteStoragePage,
 } from "./canonical-persistence.js";
+export { createLiteReplicaWorker } from "./replication.js";
+export {
+  createLiteReplicaHostTransport,
+  type LiteReplicaHostPorts,
+  type LiteReplicaWorker,
+} from "./replication-host.js";

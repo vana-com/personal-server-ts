@@ -41,6 +41,7 @@ import {
 } from "./runtime.js";
 import {
   createPsLiteSyncManager,
+  createPsLiteSyncPorts,
   type PsLiteOwnerSyncSigner,
   type PsLiteSyncOptions,
 } from "./sync.js";
@@ -55,6 +56,7 @@ import {
   assertCompletePsLitePersistenceBundle,
   type PsLitePersistenceBundle,
 } from "./persistence.js";
+import type { LiteReplicaHostPorts } from "./replication-host.js";
 
 export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   PsLiteRuntimeOptions,
@@ -76,6 +78,7 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
   inferenceProvider?: InferenceProvider;
   ownerSignature: `0x${string}`;
   ownerSyncSigner?: PsLiteOwnerSyncSigner;
+  storageAudience?: string;
   additionsWorkerFactory?: PsLiteSyncOptions["additionsWorkerFactory"];
   dbName?: string;
   stateStoreName?: string;
@@ -99,6 +102,11 @@ export interface IndexedDbPsLiteRuntimeOptions extends Omit<
    * port for a host-owned persistence implementation.
    */
   persistence?: PsLitePersistenceBundle;
+  /** Trusted native sidecar only. Omitted/false performs no replica work. */
+  replication?: {
+    enabled?: boolean;
+    bind: (ports: LiteReplicaHostPorts) => Promise<void>;
+  };
 }
 
 export interface IndexedDbPsLiteRuntime {
@@ -187,6 +195,7 @@ export async function createIndexedDbPsLiteRuntime(
   let syncManager = options.syncManager ?? null;
   let scopeDeletions = options.scopeDeletions;
   let additions = options.additions;
+  let replicaPorts: LiteReplicaHostPorts | undefined;
   let runtimeRef: PsLiteRuntime | null = null;
   // Derivative compute: built before sync so downloads can mark questions
   // stale; it reaches the sync manager lazily to upload its results.
@@ -194,6 +203,7 @@ export async function createIndexedDbPsLiteRuntime(
   // /v1/derivatives answers 503: the browser never calls a provider
   // directly with no key.
   let derivatives = options.derivatives ?? null;
+  let syncStartsAfterReplicaBind = false;
   if (
     derivatives === null &&
     options.derivatives === undefined &&
@@ -233,6 +243,7 @@ export async function createIndexedDbPsLiteRuntime(
       ownerSignature: options.ownerSignature,
       ownerAddress: options.ownerAddress,
       ownerSyncSigner: options.ownerSyncSigner,
+      storageAudience: options.storageAudience,
       additionsWorkerFactory: options.additionsWorkerFactory,
       serverAccount: identity.account,
       gateway,
@@ -241,6 +252,7 @@ export async function createIndexedDbPsLiteRuntime(
       diagnostics,
       logger: options.logger,
       lineageGateway,
+      start: options.replication?.enabled !== true,
       onDataPointIndexed: (event) =>
         derivatives?.scheduler.markSourceChanged(event.scope, {
           lineageSources: event.lineageSources,
@@ -249,6 +261,8 @@ export async function createIndexedDbPsLiteRuntime(
     additions = sync.additions ?? additions;
     syncManager = sync.syncManager;
     scopeDeletions = sync.scopeDeletions;
+    replicaPorts = sync.replicaPorts;
+    syncStartsAfterReplicaBind = options.replication?.enabled === true;
   }
   const runtimeAvailability = {
     isAvailable: () => runtimeRef?.isAvailable() ?? Boolean(options.active),
@@ -332,6 +346,23 @@ export async function createIndexedDbPsLiteRuntime(
       injected?.mcpOAuthAuthorizations ?? options.mcpOAuthAuthorizationStore,
   });
   runtimeRef = runtime;
+
+  if (options.replication?.enabled === true) {
+    replicaPorts ??= (
+      await createPsLiteSyncPorts({
+        config,
+        ownerAddress: options.ownerAddress,
+        ownerSignature: options.ownerSignature,
+        ownerSyncSigner: options.ownerSyncSigner,
+        serverAccount: identity.account,
+        gateway,
+        dataPointFeed: options.dataPointFeed,
+        storageAudience: options.storageAudience,
+      })
+    ).replicaPorts;
+    await options.replication.bind(replicaPorts);
+  }
+  if (syncStartsAfterReplicaBind) syncManager?.start?.();
 
   return {
     runtime,

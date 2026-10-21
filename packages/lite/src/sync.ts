@@ -107,6 +107,8 @@ export interface PsLiteSyncOptions {
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   /** Post-index download hook (marks derivative questions stale). */
   onDataPointIndexed?: DownloadWorkerDeps["onDataPointIndexed"];
+  /** Keep owned workers stopped until an opt-in runtime handshake succeeds. */
+  start?: boolean;
 }
 
 function createBrowserLogger(logger?: Logger): Logger {
@@ -234,15 +236,20 @@ function buildDownloadDiagnosticsHook(
   };
 }
 
-export async function createPsLiteSyncManager(
-  options: PsLiteSyncOptions,
-): Promise<{
-  syncManager: SyncManager;
-  additions?: DurableAdditionsService;
-  serverOwner: `0x${string}`;
-  dataPointFeed: DataPointFeedPort;
-  scopeDeletions: ScopeDeletionTracker;
-}> {
+/** The single Lite authority/storage/feed composition, shared with native replicas. */
+export async function createPsLiteSyncPorts(
+  options: Pick<
+    PsLiteSyncOptions,
+    | "config"
+    | "ownerAddress"
+    | "ownerSignature"
+    | "ownerSyncSigner"
+    | "serverAccount"
+    | "gateway"
+    | "dataPointFeed"
+    | "storageAudience"
+  >,
+) {
   const serverOwner = await resolvePsLiteOwner({
     ownerAddress: options.ownerAddress,
     ownerSignature: options.ownerSignature,
@@ -279,6 +286,58 @@ export async function createPsLiteSyncManager(
           }),
       }
     : undefined;
+  const dataPointFeed =
+    options.dataPointFeed ??
+    createGatewayDataPointFeed({
+      gatewayUrl: options.config.gateway.url,
+      ownerRequestSigner,
+    });
+  const replicaPorts = {
+    owner: serverOwner,
+    masterKey,
+    gateway,
+    feed: dataPointFeed,
+    signer,
+    storage: storageAdapter,
+    chainId: options.config.gateway.chainId,
+    registry: options.config.gateway.contracts.dataRegistry as `0x${string}`,
+  };
+  return {
+    serverOwner,
+    syncAccount,
+    masterKey,
+    gateway,
+    storageAdapter,
+    signer,
+    ownerSigner,
+    dataPointFeed,
+    replicaPorts,
+  };
+}
+
+export async function createPsLiteSyncManager(
+  options: PsLiteSyncOptions,
+): Promise<{
+  syncManager: SyncManager;
+  additions?: DurableAdditionsService;
+  serverOwner: `0x${string}`;
+  dataPointFeed: DataPointFeedPort;
+  scopeDeletions: ScopeDeletionTracker;
+  replicaPorts: Awaited<
+    ReturnType<typeof createPsLiteSyncPorts>
+  >["replicaPorts"];
+}> {
+  const {
+    serverOwner,
+    syncAccount,
+    masterKey,
+    gateway,
+    storageAdapter,
+    signer,
+    ownerSigner,
+    dataPointFeed,
+    replicaPorts,
+  } = await createPsLiteSyncPorts(options);
   const boundedSigner =
     ownerSigner?.signMessageBounded && ownerSigner.signAddDataBounded
       ? {
@@ -316,12 +375,6 @@ export async function createPsLiteSyncManager(
       : undefined;
   const cursor = createPsLiteSyncCursor(options.stateStore);
   const logger = createBrowserLogger(options.logger);
-  const dataPointFeed =
-    options.dataPointFeed ??
-    createGatewayDataPointFeed({
-      gatewayUrl: options.config.gateway.url,
-      ownerRequestSigner,
-    });
   const scopeDeletions =
     options.scopeDeletions ??
     createScopeDeletionTracker({ feed: dataPointFeed, serverOwner, logger });
@@ -401,6 +454,13 @@ export async function createPsLiteSyncManager(
       },
     },
   );
-  syncManager.start();
-  return { syncManager, additions, serverOwner, dataPointFeed, scopeDeletions };
+  if (options.start !== false) syncManager.start();
+  return {
+    syncManager,
+    additions,
+    serverOwner,
+    dataPointFeed,
+    scopeDeletions,
+    replicaPorts,
+  };
 }

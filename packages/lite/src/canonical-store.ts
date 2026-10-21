@@ -16,6 +16,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records/portable";
 import { sha256, toBytes } from "viem";
 import { createReplicaRecordReducer } from "@opendatalabs/personal-server-ts-core/replication/record-reducer";
+import { replicaPayloadByteLength } from "@opendatalabs/personal-server-ts-core/replication/stream";
 import type {
   LiteCanonicalPersistence,
   LiteCanonicalTransaction,
@@ -93,7 +94,7 @@ async function operations(
 }
 
 /**
- * Experimental canonical persistence port. No runtime/route/publisher wiring.
+ * Experimental canonical persistence port; trusted hosts opt into replication.ts.
  * Lifecycle plus one record's retained variants enter the EXISTING merge planner;
  * a scope's record bodies are never loaded together. Native transactions hide all
  * intermediate rows, blob references, journal entries, outbox and import receipts.
@@ -103,6 +104,8 @@ export function createLiteCanonicalStore(deps: {
   context: () => MergeContext;
   authenticateReplica: (credential: unknown) => string | undefined;
   enabled?: boolean;
+  /** Opt-in transport admission; flag-off canonical behavior stays unchanged. */
+  transportEnabled?: boolean;
   newId?: () => string;
 }) {
   const persistence = deps.persistence;
@@ -362,6 +365,7 @@ export function createLiteCanonicalStore(deps: {
     envelope?: unknown;
     credential?: unknown;
     blobs?: { stagingId: string; descriptor: LiteBlobDescriptor }[];
+    withinTransaction?: (tx: LiteCanonicalTransaction) => Promise<void>;
   }): Promise<LiteCommitReceipt> {
     enabled();
     if (
@@ -428,6 +432,29 @@ export function createLiteCanonicalStore(deps: {
             },
           });
         } else op = replicaOperationSchema.parse(raw);
+        if (local && deps.transportEnabled === true) {
+          const single = {
+            format: "vana-pdpp-replica" as const,
+            version: 1 as const,
+            owner: context.owner,
+            batchId: "0".repeat(32),
+            operations: [op],
+          };
+          const blobBytes =
+            op.kind === "blob-claim"
+              ? op.blob.sizeBytes
+              : op.kind === "upsert"
+                ? op.blobs.reduce((total, blob) => total + blob.sizeBytes, 0)
+                : 0;
+          if (
+            encoder.encode(canonicalJson(single)).length > 192 * 1024 ||
+            replicaPayloadByteLength(single) > 32768 * 100000 ||
+            blobBytes > 256 * 1024 * 1024
+          )
+            throw new Error(
+              "operation exceeds Lite replica transport admission limit",
+            );
+        }
         if (op.owner !== context.owner)
           throw new Error("wrong operation owner");
         const mapped = await mapping(tx, op);
@@ -600,6 +627,9 @@ export function createLiteCanonicalStore(deps: {
         sequence: current.sequence,
         operationCount: accepted.length,
       };
+      // Trusted transport receipt/sequence fences share the canonical commit.
+      // A fork or lost predecessor rolls back rows and attached blobs as well.
+      await input.withinTransaction?.(tx);
       await put(tx, receiptKey, { fingerprint, receipt });
       return receipt;
     });
@@ -640,6 +670,7 @@ export function createLiteCanonicalStore(deps: {
       envelope: unknown;
       credential: unknown;
       blobs?: { stagingId: string; descriptor: LiteBlobDescriptor }[];
+      withinTransaction?: (tx: LiteCanonicalTransaction) => Promise<void>;
     }) => commit(input),
     /** Invoke after trusted declaration/validator changes. Continue until after is absent. */
     async retry(input: { credential: unknown; after?: string }) {
@@ -758,6 +789,11 @@ export function createLiteCanonicalStore(deps: {
       chunks: AsyncIterable<Uint8Array>,
     ) {
       enabled();
+      if (
+        deps.transportEnabled === true &&
+        descriptor.sizeBytes > 256 * 1024 * 1024
+      )
+        throw new Error("blob exceeds Lite replica transport admission limit");
       await persistence.transaction(async (tx) => {
         await clock(tx);
       });
