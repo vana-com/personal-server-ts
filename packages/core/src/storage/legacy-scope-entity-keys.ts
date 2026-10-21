@@ -6,6 +6,9 @@
  * LinkedIn experience/education/skills/languages, Instagram ads, H-E-B delivery
  * addresses, GitHub achievements and Spotify artists retain no upstream ID in
  * the legacy body. Keep those lists unkeyed: names/content are not identities.
+ * GitHub repository URLs/qualified names, organization logins and LinkedIn
+ * profile URLs are reusable aliases, not stable IDs. Their source IDs are
+ * omitted from the legacy body, so those lists must also stay unkeyed.
  */
 export const LEGACY_SCOPE_ENTITY_KEYS: Readonly<
   Record<string, Readonly<Record<string, readonly string[]>>>
@@ -39,19 +42,6 @@ export const LEGACY_SCOPE_ENTITY_KEYS: Readonly<
     "$.pullRequests": ["id"],
     "$.issues": ["id"],
   },
-  "github.profile": {
-    // Qualified repository names and organization logins are source identifiers.
-    // A rename conservatively leaves the saved head uncovered.
-    "$.pinnedRepositories": ["fullName"],
-    "$.organizations": ["login"],
-  },
-  "github.repositories": {
-    // Both legacy and PDPP projections retain GitHub's repository URL.
-    "$.repositories": ["url"],
-  },
-  "github.starred": {
-    "$.starred": ["url"],
-  },
   "heb.orders": {
     "$.orders": ["orderId"],
     "$.orders[].items": ["productId"],
@@ -67,10 +57,6 @@ export const LEGACY_SCOPE_ENTITY_KEYS: Readonly<
   },
   "instagram.posts": {
     "$.posts[].who_liked": ["id"],
-  },
-  "linkedin.connections": {
-    // Retained source profile URL, not the connection's display name.
-    "$.connections": ["profileUrl"],
   },
   "oura.activity": {
     "$.days": ["id"],

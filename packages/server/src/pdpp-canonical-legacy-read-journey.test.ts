@@ -1890,7 +1890,7 @@ describe.each([
   "linkedin.profile",
   "spotify.profile",
   "instagram.profile",
-])("owner takeover of %s", (scope) => {
+])("owner coverage decision for %s", (scope) => {
   it.each([false, true])(
     "serves canonical only when its PDPP read covers the old file (complete=%s)",
     async (complete) => {
@@ -2002,7 +2002,14 @@ describe.each([
       }
       const read = await ownerGet(`/v1/data/${scope}`);
       expect(read.status).toBe(200);
-      expect(read.dataSource).toBe(complete ? "canonical" : "legacy");
+      const hasOnlyReusableAliases = [
+        "linkedin.connections",
+        "github.repositories",
+        "github.starred",
+      ].includes(scope);
+      expect(read.dataSource).toBe(
+        complete && !hasOnlyReusableAliases ? "canonical" : "legacy",
+      );
       expect(JSON.parse(read.text).data).toEqual(fixture.legacyBody);
     },
   );

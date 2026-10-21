@@ -1,9 +1,59 @@
 import { describe, expect, it } from "vitest";
 import { compareLegacyCoverage } from "./legacy-scope-coverage.js";
+import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
 
 const keys = { "$.items": ["id"], "$.items[].children": ["id"] };
 
 describe("legacy scope coverage", () => {
+  it.each([
+    {
+      scope: "github.repositories",
+      list: "repositories",
+      key: "url",
+      value: "https://github.com/a/foo",
+    },
+    {
+      scope: "github.starred",
+      list: "starred",
+      key: "url",
+      value: "https://github.com/a/foo",
+    },
+    {
+      scope: "github.profile",
+      list: "pinnedRepositories",
+      key: "fullName",
+      value: "a/foo",
+    },
+    {
+      scope: "github.profile",
+      list: "organizations",
+      key: "login",
+      value: "example",
+    },
+    {
+      scope: "linkedin.connections",
+      list: "connections",
+      key: "profileUrl",
+      value: "https://www.linkedin.com/in/alex",
+    },
+  ])(
+    "does not treat a reused source alias as the same $scope entity",
+    ({ scope, list, key, value }) => {
+      const verdict = compareLegacyCoverage(
+        { [list]: [{ [key]: value, label: "original entity", stars: 99 }] },
+        {
+          [list]: [{ [key]: value, label: "unrelated replacement", stars: 0 }],
+        },
+        {
+          scope,
+          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          canonicalNewer: true,
+          allowProvenDeletion: false,
+        },
+      );
+      expect(verdict.covered).toBe(false);
+    },
+  );
   describe.each([false, true])(
     "memory creation coverage (newer=%s)",
     (canonicalNewer) => {

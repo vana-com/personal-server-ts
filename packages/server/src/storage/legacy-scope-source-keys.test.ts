@@ -38,7 +38,11 @@ describe("source identities qualify legacy scope takeover", () => {
   });
   afterEach(() => store.close());
 
-  function setup(input: Fixture, complete = true) {
+  function setup(
+    input: Fixture,
+    complete = true,
+    legacyCollectedAt = collectedAt,
+  ) {
     const method = input.profileKey ?? input.scope.split(".")[0]!;
     const sourceId = `https://registry.pdpp.dev/sources/${method === "github-browser" ? "github" : method}`;
     const instance = "conn_source_keys";
@@ -80,11 +84,11 @@ describe("source identities qualify legacy scope takeover", () => {
     }
     db.prepare(
       "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
-    ).run("source/old.json", input.scope, collectedAt, 1);
+    ).run("source/old.json", input.scope, legacyCollectedAt, 1);
     const envelope = {
       version: "1.0",
       scope: input.scope,
-      collectedAt,
+      collectedAt: legacyCollectedAt,
       data: input.legacyBody,
     };
     return createLegacyScopeView({
@@ -178,12 +182,38 @@ describe("source identities qualify legacy scope takeover", () => {
     },
   );
 
-  it("takes over GitHub profile repository and organization identifiers", async () => {
+  it.each(["spotify.savedTracks", "spotify.playlists"] as const)(
+    "allows newer %s metadata under the same immutable URI",
+    async (scope) => {
+      const input = spotify(scope);
+      const stream =
+        scope === "spotify.savedTracks" ? "saved_tracks" : "playlist_items";
+      input.streams[stream]![0]!.name = "Updated track name";
+      const read = await setup(
+        input,
+        true,
+        "2026-10-09T00:00:00.000Z",
+      ).readLatest(scope);
+      expect(read.kind).toBe("canonical");
+      if (read.kind === "canonical") {
+        const tracks =
+          scope === "spotify.savedTracks"
+            ? read.envelope.data.savedTracks
+            : (read.envelope.data.playlists as { tracks: unknown[] }[])[0]!
+                .tracks;
+        expect(tracks).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ name: "Updated track name" }),
+          ]),
+        );
+      }
+    },
+  );
+
+  it("keeps GitHub profile lists unkeyed because repository names and logins are reusable", async () => {
     const input = githubProfile();
     const read = await setup(input).readLatest(input.scope);
-    expect(read.kind).toBe("canonical");
-    if (read.kind === "canonical")
-      expect(read.envelope.data).toEqual(input.legacyBody);
+    expect(read.kind).toBe("file");
   });
 
   it.each([
@@ -217,6 +247,9 @@ describe("source identities qualify legacy scope takeover", () => {
   );
 
   it.each([
+    "linkedin.connections",
+    "github.repositories",
+    "github.starred",
     "linkedin.experience",
     "linkedin.education",
     "linkedin.skills",
@@ -233,26 +266,6 @@ describe("source identities qualify legacy scope takeover", () => {
         verdict: "not_covered",
         reason: { reason: "no_stable_key" },
       });
-    },
-  );
-
-  it("takes over LinkedIn connections using their upstream profile URLs", async () => {
-    const input = fixture("linkedin.connections");
-    const view = setup(input);
-    const read = await view.readLatest(input.scope);
-    expect(read.kind).toBe("canonical");
-    if (read.kind === "canonical")
-      expect(read.envelope.data).toEqual(input.legacyBody);
-  });
-
-  it.each(["github.repositories", "github.starred"])(
-    "takes over %s using upstream repository URLs without changing its field shape",
-    async (scope) => {
-      const input = fixture(scope);
-      const read = await setup(input).readLatest(scope);
-      expect(read.kind).toBe("canonical");
-      if (read.kind === "canonical")
-        expect(read.envelope.data).toEqual(input.legacyBody);
     },
   );
 
