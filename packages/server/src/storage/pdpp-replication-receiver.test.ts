@@ -2369,17 +2369,17 @@ it.each(["pending", "confirmed"] as const)(
     };
     assertVisible();
     allowed = false;
-    receiver.retry({ credential: "replica-secret" });
+    receiver.reconcileDeclarations({ credential: "replica-secret" });
     assertWithdrawn();
     allowed = true;
-    receiver.retry({ credential: "replica-secret" });
+    receiver.reconcileDeclarations({ credential: "replica-secret" });
     assertVisible();
     const original = trusted;
     trusted = [];
-    receiver.retry({ credential: "replica-secret" });
+    receiver.reconcileDeclarations({ credential: "replica-secret" });
     assertWithdrawn();
     trusted = original;
-    receiver.retry({ credential: "replica-secret" });
+    receiver.reconcileDeclarations({ credential: "replica-secret" });
     assertVisible();
   },
 );
@@ -2910,3 +2910,177 @@ it("canonical change feeds validate original scope, exclude all conflicted histo
     ).data,
   ).toEqual([]);
 });
+
+it.each([
+  ["canonical", "owner"],
+  ["canonical", "grant"],
+  ["received", "owner"],
+  ["received", "grant"],
+  ["pending", "owner"],
+] as const)(
+  "preserves byte integrity for %s blobs read by %s after materialization",
+  (origin, reader) => {
+    const source = device();
+    const target = origin === "canonical" ? source : device();
+    installBindingConflictFixture(target);
+    const bytes = new Uint8Array([4, 5, 6]);
+    const blob = source.store.storeBlobBytesForInstance({
+      instance: "conn_a",
+      method: "collector",
+      generation: 1,
+      bytes,
+      mimeType: "application/octet-stream",
+    });
+    source.store.ingestBatch(
+      [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          emitted_at: at,
+          data: {
+            id: "a",
+            blob_ref: {
+              blob_id: blob.blobId,
+              sha256: blob.sha256,
+              size_bytes: blob.sizeBytes,
+              mime_type: blob.mimeType,
+            },
+          },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const receiver = pendingReceiver(target);
+    if (origin === "pending")
+      receiver.stage({
+        credential: "replica-secret",
+        id: "integrity",
+        envelope: batch(all(source)),
+        blobs: [{ blobId: blob.blobId, bytes }],
+      });
+    if (origin === "received")
+      receiver.import({
+        credential: "replica-secret",
+        envelope: batch(all(source)),
+        blobs: [{ blobId: blob.blobId, bytes }],
+      });
+    const read = receiver.readStore({ reader });
+    expect(Array.from(read.getBlobBytes(blob.blobId)!)).toEqual(
+      Array.from(bytes),
+    );
+    const table =
+      origin === "pending" ? "pdpp_replica_pending_bytes" : "pdpp_blob_bytes";
+    target.db
+      .prepare(`UPDATE ${table} SET bytes=? WHERE blob_id=?`)
+      .run(new Uint8Array([7, 8, 9]), blob.blobId);
+    expect(read.getBlobBytes(blob.blobId)).toBeUndefined();
+    target.db
+      .prepare(`UPDATE ${table} SET bytes=? WHERE blob_id=?`)
+      .run(bytes, blob.blobId);
+    expect(Array.from(read.getBlobBytes(blob.blobId)!)).toEqual(
+      Array.from(bytes),
+    );
+  },
+);
+
+it.each(["point", "page", "streams", "changes"] as const)(
+  "selects conflict policy and %s values from one SQLite snapshot",
+  (surface) => {
+    const d = device();
+    installBindingConflictFixture(d);
+    put(d, "before-conflict");
+    const receiver = pendingReceiver(d, false);
+    const other = new Database(d.path);
+    other.pragma("busy_timeout=0");
+    const otherStore = createSqliteRecordStore(other);
+    const prepare = d.db.prepare.bind(d.db);
+    let interleaved = false;
+    d.db.prepare = ((sql: string) => {
+      const statement = prepare(sql);
+      if (
+        sql.includes(
+          "SELECT 1 FROM pdpp_replica_binding_conflicts WHERE instance=?",
+        )
+      ) {
+        const get = statement.get.bind(statement);
+        statement.get = ((...args: unknown[]) => {
+          const result = get(...args);
+          if (!interleaved) {
+            interleaved = true;
+            try {
+              other.transaction(() => {
+                other
+                  .prepare(
+                    "INSERT INTO pdpp_replica_binding_conflicts VALUES ('conn_a')",
+                  )
+                  .run();
+                const clock = other
+                  .prepare(
+                    "UPDATE pdpp_write_clock SET value=value+1 WHERE id=1 RETURNING value",
+                  )
+                  .get() as { value: number };
+                other
+                  .prepare(
+                    "UPDATE pdpp_instance_binding SET reset_clock=? WHERE instance='conn_a'",
+                  )
+                  .run(clock.value);
+                otherStore.ingestBatch(
+                  ["a", "new-after-conflict"].map((key) => ({
+                    instance: "conn_a",
+                    stream: "messages",
+                    key,
+                    emitted_at: at,
+                    data: { id: key, text: "after-conflict" },
+                  })),
+                  () => "mutable_state",
+                  () => ["id"],
+                  { method: "collector", generation: 1 },
+                );
+              })();
+            } catch (error) {
+              // An immediate read transaction may serialize the competing writer.
+              if ((error as { code?: string }).code !== "SQLITE_BUSY")
+                throw error;
+            }
+          }
+          return result;
+        }) as typeof statement.get;
+      }
+      return statement;
+    }) as typeof d.db.prepare;
+    try {
+      const read = receiver.readStore({ reader: "grant" });
+      if (surface === "point")
+        expect(read.getRecord("conn_a", "messages", "a")?.data.text).toBe(
+          "before-conflict",
+        );
+      if (surface === "page")
+        expect(
+          read
+            .listRecords("messages", {
+              instanceIds: ["conn_a"],
+              limit: 10,
+              order: "asc",
+            })
+            .data.map((row) => row.data.text),
+        ).toEqual(["before-conflict"]);
+      if (surface === "streams")
+        expect(read.listStreams(["conn_a"])).toMatchObject([
+          { recordCount: 1 },
+        ]);
+      if (surface === "changes")
+        expect(
+          read
+            .changesSince("messages", { instanceIds: ["conn_a"], limit: 10 })
+            .data.map((row) => !row.deleted && row.data.text),
+        ).toEqual(["before-conflict"]);
+      expect(interleaved).toBe(true);
+    } finally {
+      d.db.prepare = prepare;
+      other.close();
+    }
+  },
+);

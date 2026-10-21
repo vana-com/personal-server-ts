@@ -118,13 +118,16 @@ export function createReplicaReceiver(deps: {
   }
   const hash = (bytes: Uint8Array) =>
     `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
-  function verifiedBytes(blob: BlobDescriptor): Uint8Array | undefined {
+  function verifiedBytes(
+    blob: BlobDescriptor,
+    supplied?: Uint8Array,
+  ): Uint8Array | undefined {
     const row = db
       .prepare(
         "SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id = ?",
       )
       .get(blob.blobId) as { bytes: Buffer } | undefined;
-    const bytes = row?.bytes ?? store.getBlobBytes(blob.blobId);
+    const bytes = supplied ?? row?.bytes ?? store.getBlobBytes(blob.blobId);
     return bytes &&
       bytes.byteLength === blob.sizeBytes &&
       hash(bytes) === blob.sha256 &&
@@ -639,6 +642,23 @@ export function createReplicaReceiver(deps: {
       .get(id, id) as { bytes: Buffer } | undefined;
     return row?.bytes ?? pendingBlob(id);
   }
+  function verifiedVisibleBlob(id: string): Uint8Array | undefined {
+    const meta = store.getBlobMeta(id) ?? view.getBlobMeta(id);
+    const bytes = rawVisibleBlob(id);
+    if (!meta || !bytes) return undefined;
+    return verifiedBytes(
+      {
+        blobId: id,
+        sha256: `sha256:${meta.sha256}`,
+        sizeBytes: meta.sizeBytes,
+        mimeType: meta.mimeType,
+      },
+      bytes,
+    );
+  }
+  function readSnapshot<T>(read: () => T): T {
+    return db.transaction(read).deferred();
+  }
   function previewBlobsValid(
     op: Extract<ReplicaOperation, { kind: "upsert" }>,
     operations: ReplicaOperation[],
@@ -800,17 +820,19 @@ export function createReplicaReceiver(deps: {
     readRecords(
       input: ListRecordsOptions & { stream: string; reader?: ReplicaReader },
     ): ListVisibleRecordsPage {
-      if (
-        !pendingEnabled &&
-        !input.instanceIds.some((id) => view.connectionVisibility(id))
-      )
-        return store.listRecords(input.stream, input);
-      return view.listRecords(
-        input.stream,
-        input,
-        input.reader ?? "grant",
-        includesPending(input.reader),
-      );
+      return readSnapshot(() => {
+        if (
+          !pendingEnabled &&
+          !input.instanceIds.some((id) => view.connectionVisibility(id))
+        )
+          return store.listRecords(input.stream, input);
+        return view.listRecords(
+          input.stream,
+          input,
+          input.reader ?? "grant",
+          includesPending(input.reader),
+        );
+      });
     },
     readStore(input: { reader?: ReplicaReader } = {}) {
       const reader = input.reader ?? "grant";
@@ -818,50 +840,65 @@ export function createReplicaReceiver(deps: {
       const needsReferenceGate = () =>
         hasPreview() || view.hasBindingConflictFacts;
       const refs = (id: string) =>
-        needsReferenceGate()
-          ? view.findBlobReferences(id, reader, hasPreview())
-          : store.findBlobReferences(id);
+        readSnapshot(() =>
+          needsReferenceGate()
+            ? view.findBlobReferences(id, reader, hasPreview())
+            : store.findBlobReferences(id),
+        );
       const canReadBlob = (id: string) =>
         view.hasBlobReference(id, reader, hasPreview());
       return {
         connectionVisibility: view.connectionVisibility,
         getRecord: (instance: string, stream: string, key: string) =>
-          hasPreview() || view.connectionVisibility(instance)
-            ? view.getRecord(instance, stream, key, reader, hasPreview())
-            : store.getRecord(instance, stream, key),
+          readSnapshot(() =>
+            hasPreview() || view.connectionVisibility(instance)
+              ? view.getRecord(instance, stream, key, reader, hasPreview())
+              : store.getRecord(instance, stream, key),
+          ),
         listRecords: (stream: string, options: ListRecordsOptions) =>
           api.readRecords({ ...options, stream, reader }),
         listStreams: (ids: string[]) =>
-          pendingEnabled || ids.some((id) => view.connectionVisibility(id))
-            ? view.listStreams(ids, hasPreview(), reader)
-            : store.listStreams(ids),
-        changesSince: (stream: string, options: ChangesSinceOptions) => {
-          const visible = options.instanceIds.filter((instance) => {
-            const visibility = view.connectionVisibility(instance);
-            return (
-              !visibility ||
-              replicaStateVisible(
-                visibility.state,
-                reader,
-                deps.visibilityPolicy,
-                "received",
-              )
-            );
-          });
-          return store.changesSinceForInstances(stream, options, visible);
-        },
+          readSnapshot(() =>
+            pendingEnabled || ids.some((id) => view.connectionVisibility(id))
+              ? view.listStreams(ids, hasPreview(), reader)
+              : store.listStreams(ids),
+          ),
+        // Changes sessions allocate a canonical horizon. Reserve the writer before
+        // selecting policy so that the horizon and conflict fence cannot race.
+        changesSince: (stream: string, options: ChangesSinceOptions) =>
+          db
+            .transaction(() => {
+              const visible = options.instanceIds.filter((instance) => {
+                const visibility = view.connectionVisibility(instance);
+                return (
+                  !visibility ||
+                  replicaStateVisible(
+                    visibility.state,
+                    reader,
+                    deps.visibilityPolicy,
+                    "received",
+                  )
+                );
+              });
+              return store.changesSinceForInstances(stream, options, visible);
+            })
+            .immediate(),
         getBlobBytes: (id: string) =>
-          !needsReferenceGate()
-            ? store.getBlobBytes(id)
-            : canReadBlob(id)
-              ? rawVisibleBlob(id)
-              : undefined,
+          readSnapshot(() =>
+            !needsReferenceGate()
+              ? store.getBlobBytes(id)
+              : canReadBlob(id)
+                ? verifiedVisibleBlob(id)
+                : undefined,
+          ),
         getBlobMeta: (id: string) =>
-          !needsReferenceGate()
-            ? store.getBlobMeta(id)
-            : canReadBlob(id)
-              ? (store.getBlobMeta(id) ?? view.getBlobMeta(id))
-              : undefined,
+          readSnapshot(() =>
+            !needsReferenceGate()
+              ? store.getBlobMeta(id)
+              : canReadBlob(id)
+                ? (store.getBlobMeta(id) ?? view.getBlobMeta(id))
+                : undefined,
+          ),
         findBlobReferences: refs,
       };
     },
@@ -912,12 +949,23 @@ export function createReplicaReceiver(deps: {
         })
         .immediate();
     },
-    retry(input: { credential: unknown }): ReplicaMergePlan {
+    /** Trusted host notification after declaration documents or validators change. */
+    reconcileDeclarations(input: { credential: unknown }): ReplicaMergePlan {
       authorize(input.credential);
       return db
         .transaction(() => {
           const plan = reconcile();
           view.reconcileAll();
+          return plan;
+        })
+        .immediate();
+    },
+    retry(input: { credential: unknown }): ReplicaMergePlan {
+      authorize(input.credential);
+      return db
+        .transaction(() => {
+          const plan = reconcile();
+          view.flush();
           return plan;
         })
         .immediate();
