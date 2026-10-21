@@ -1383,9 +1383,9 @@ it("upgrades version-one derived indexes and global revisions to connection snap
   await expect(read(make(), "owner")).rejects.toThrow(
     "requires reconciliation",
   );
-  await expect(
-    make().readConnectionPage(identity.connectionId),
-  ).rejects.toThrow("require reconciliation");
+  expect((await make().readConnectionPage(identity.connectionId)).rows).toEqual(
+    [],
+  );
   await make().retry({ credential: "replica" });
   expect(adapter.disk.rows.get("pending-index-version")).toBe("2");
   expect(await read(make(), "owner")).toMatchObject({
@@ -1404,3 +1404,147 @@ it("upgrades version-one derived indexes and global revisions to connection snap
   });
   expect(await read(make(), "owner")).toBeUndefined();
 });
+
+it.each(["canonical", "preview", "both"] as const)(
+  "continues bounded native empty %s pages without skipping rows",
+  async (empty) => {
+    const { adapter } = device();
+    let reading = false;
+    let scans = 0;
+    const persistence = {
+      ...adapter.port,
+      transaction: ((run) =>
+        adapter.port.transaction((tx) =>
+          run({
+            ...tx,
+            scan: async (prefix, after) => {
+              if (
+                reading &&
+                (prefix.startsWith("rows/") ||
+                  prefix.startsWith("preview/rows/"))
+              ) {
+                scans++;
+                const mode = prefix.startsWith("preview/")
+                  ? "preview"
+                  : "canonical";
+                if (after === undefined && (empty === "both" || empty === mode))
+                  return { entries: [], after: prefix };
+              }
+              return tx.scan(prefix, after);
+            },
+          }),
+        )) as typeof adapter.port.transaction,
+    };
+    const store = createLiteCanonicalStore({
+      persistence,
+      enabled: true,
+      context: () => ({
+        owner: identity.owner,
+        declarations: [
+          { sourceId: identity.sourceId, binding, validateData: () => true },
+        ],
+      }),
+      authenticateReplica: () => identity.owner,
+    });
+    await provision(store);
+    await store.import({ ...pending("confirmed", 2), id: "confirmed" });
+    await store.stagePending(pending());
+    reading = true;
+    const first = await store.readConnectionPage(
+      identity.connectionId,
+      undefined,
+      { reader: "owner" },
+    );
+    expect(first.rows).toEqual([]);
+    expect(first.after).toBeDefined();
+    expect(scans).toBe(2);
+    const second = await store.readConnectionPage(
+      identity.connectionId,
+      first.after,
+      { reader: "owner" },
+    );
+    expect(second.rows).toEqual([
+      expect.objectContaining({
+        recordKey: "same-key",
+        data: { id: "same-key", text: "pending" },
+        visibility: "pending",
+      }),
+    ]);
+    expect(second.after).toBeUndefined();
+    expect(scans).toBe(4);
+  },
+);
+
+it.each([undefined, 1])(
+  "serves old-db grant pages before index version %s upgrade and expires their revision-zero cursors afterwards",
+  async (version) => {
+    const { adapter, make } = device();
+    const store = make();
+    await provision(store);
+    const records = Array.from({ length: 101 }, (_, i) => ({
+      ...upsert(`legacy-${i}`, i + 2),
+      recordKey: i ? `key-${i}` : "same-key",
+      data: { id: i ? `key-${i}` : "same-key", text: "canonical" },
+    }));
+    await store.import({
+      ...pending(),
+      id: "canonical",
+      envelope: {
+        ...pending().envelope,
+        operations: [registration, ...records],
+      },
+    });
+    await store.stagePending(pending("preview", 500));
+    for (const key of adapter.disk.rows.keys()) {
+      if (
+        key.startsWith("preview-revision/") ||
+        key.startsWith("canonical-view-revision/") ||
+        (version === undefined &&
+          (key.startsWith("pending-index/") ||
+            key.startsWith("pending-refs/") ||
+            key.startsWith("pending-bindings/") ||
+            key.startsWith("preview/")))
+      )
+        adapter.disk.rows.delete(key);
+    }
+    if (version === undefined)
+      adapter.disk.rows.delete("pending-index-version");
+    else
+      adapter.disk.rows.set("pending-index-version", JSON.stringify(version));
+    await expect(read(make(), "owner")).rejects.toThrow(
+      "requires reconciliation",
+    );
+    await expect(
+      make().readConnectionPage(identity.connectionId, undefined, {
+        reader: "owner",
+      }),
+    ).rejects.toThrow("requires reconciliation");
+    const first = await make().readConnectionPage(identity.connectionId);
+    expect(first.rows).toHaveLength(100);
+    expect(first.after).toContain("/v2/0/canonical/");
+    const second = await make().readConnectionPage(
+      identity.connectionId,
+      first.after,
+    );
+    expect(second.rows).toHaveLength(1);
+    const rows = [...first.rows, ...second.rows];
+    expect(new Set(rows.map((row) => row.recordKey)).size).toBe(101);
+    expect(
+      rows.every(
+        (row) =>
+          !row.deleted &&
+          row.data.text === "canonical" &&
+          row.confirmation === undefined,
+      ),
+    ).toBe(true);
+    await make().retry({ credential: "replica" });
+    await expect(
+      make().readConnectionPage(identity.connectionId, first.after),
+    ).rejects.toThrow("cursor expired");
+    expect(await read(make())).toMatchObject({ data: { text: "canonical" } });
+    expect(await read(make(), "owner")).toMatchObject({
+      data: { text: "preview" },
+      visibility: "pending",
+    });
+  },
+);

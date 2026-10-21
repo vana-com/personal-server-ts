@@ -185,8 +185,9 @@ pending churn. Changes to an unrelated connection preserve both modes' cursors.
 Global operation-id collisions also invalidate every connection whose canonical
 or preview view is affected. A changed revision expires the cursor explicitly;
 restart the listing from its first page. Continue until `after` is absent; a page
-boundary is not stream completion. The caller filters streams/tombstones and owns
-its read budget.
+boundary is not stream completion. A native empty page can carry a continuation;
+continue from it without treating the empty page as completion. The caller filters
+streams/tombstones and owns its read budget.
 This is an internal trusted-host API, not a grant-relative PDPP list route,
 public query cursor or completion proof. It makes no identity/issuer decisions.
 
@@ -243,12 +244,14 @@ index. Ordinary record writes reconcile affected keys; lifecycle, blob-claim,
 equivocation and provisioning writes may fan out across a connection's keys.
 Native write latency and large-backlog write costs remain unmeasured. An older
 database without pending-index version two requires authenticated `retry`
-(continue its pages) before owner preview or connection-page reads. Grant point
-reads continue to use canonical rows. A first state-changing hook also upgrades
-it atomically. The upgrade initializes per-connection canonical and preview
-revision receipts, including when version-one derived indexes already exist.
-This one-time write-side upgrade reads retained pending-batch metadata; owner
-preview and connection-page reads fail explicitly until it completes.
+(continue its pages) before preview-mode reads. Canonical point and connection-page
+reads remain available before upgrade. Canonical pages use revision zero until
+receipts are initialized; the first write-side upgrade expires those cursors.
+A first state-changing hook also upgrades the database atomically. The upgrade
+initializes per-connection canonical and preview revision receipts, including
+when version-one derived indexes already exist.
+This one-time write-side upgrade reads retained pending-batch metadata;
+preview-mode reads fail explicitly until it completes.
 Pending work never advances the canonical clock. Journal, mutation and outbox
 exports read canonical state only.
 

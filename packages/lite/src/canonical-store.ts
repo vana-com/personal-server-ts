@@ -786,7 +786,7 @@ export function createLiteCanonicalStore(deps: {
     return {
       entries: page,
       ...(boundary !== undefined || page.length < sorted.length
-        ? { after: page.at(-1)!.key }
+        ? { after: page.at(-1)?.key ?? boundary }
         : {}),
     };
   }
@@ -1266,10 +1266,6 @@ export function createLiteCanonicalStore(deps: {
       return persistence.transaction(async (tx) => {
         await clock(tx);
         const view = await readView(tx, options);
-        if ((await get(tx, "pending-index-version")) !== 2)
-          throw new Error(
-            "connection snapshots require reconciliation; call retry before page reads",
-          );
         const mode = view === tx ? "canonical" : "pending";
         const revision =
           (await get<number>(
