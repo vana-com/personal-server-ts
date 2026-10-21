@@ -983,7 +983,7 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 14 });
+        ).toEqual({ version: 15 });
         // v14 gives the upgraded store a 32-byte sync token key.
         expect(upgraded.syncTokenScope().key).toHaveLength(32);
         expect(
@@ -1520,7 +1520,7 @@ describe("v13 emitted-time order key", () => {
         const upgraded = createSqliteRecordStore(after);
         expect(
           after.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 14 });
+        ).toEqual({ version: 15 });
         expect(
           upgraded
             .listRecords("events", {
@@ -1582,6 +1582,44 @@ describe("v14 upgrade from an earlier v13", () => {
           "emitted_key",
           "emitted_at",
         ]);
+      } finally {
+        after.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("v15 sync session state table", () => {
+  it("adds the table to a database an earlier build already stamped v14", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-v15-"));
+    const path = join(dir, "records.db");
+    try {
+      const before = new Database(path);
+      createTestBoundRecordStore(before);
+      // An earlier v14 had no session-state table.
+      before.exec(`
+        DROP TABLE IF EXISTS pdpp_sync_state;
+        UPDATE pdpp_schema_version SET version = 14;
+      `);
+      before.close();
+
+      const after = new Database(path);
+      try {
+        const upgraded = createSqliteRecordStore(after);
+        expect(
+          after.prepare("SELECT version FROM pdpp_schema_version").get(),
+        ).toEqual({ version: 15 });
+        upgraded.syncStates().put({
+          id: "x",
+          owner: "o",
+          state: "{}",
+          expiresAt: 2,
+          now: 1,
+          maxPerOwner: 1,
+        });
+        expect(upgraded.syncStates().get("x", 1)).toBe("{}");
       } finally {
         after.close();
       }
