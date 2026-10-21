@@ -16,6 +16,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   createPdppSyncSessionService,
+  MAX_SYNC_INSTANCES,
   SyncRetryLaterError,
   type SyncSessionOptions,
   CursorExpiredError,
@@ -988,6 +989,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         // route only states the grant and maps the page. Candidate
         // eligibility compares the frozen grant projection; sparse request
         // fields shape only the response.
+        // One sync request reads a bounded instance scope.
+        if (new Set(effectiveInstanceIds).size > MAX_SYNC_INSTANCES) {
+          throw new PdppError(
+            "disclosure_unavailable",
+            `This stream spans more than ${MAX_SYNC_INSTANCES} connections, more than one sync session reads`,
+          );
+        }
         const page = sync.read({
           stream,
           owner: context!.grant?.subject.id ?? context!.subjectId,

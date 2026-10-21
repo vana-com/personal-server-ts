@@ -121,15 +121,27 @@ a changed `limit`, retries, and a SQLite restart followed by a reset.
   instances, so there is nothing to skip. Tests compare the median SQLite time
   per request for keys with 2 and with 300 versions, the most rows one request
   reads or writes for 1,000 and 4,000 keys, and every sync read's plan.
-- Charged to the budget: the one-record-per-key check, one unit per other
-  read instance per identity, paid before the identity is read. Charged but
-  never cut short: re-reading the at most 101 results a paused or paged request
-  already found (one page plus one, as the service refuses a `limit` over
-  100), because a request that stopped among them would read them again.
-  Re-reading is not progress, so the next new identity is always granted.
-  Bounded but not charged: cleanup, which deletes at most 1,000 candidate rows
-  and 100 expired states per write, and the owner's preparation count and row
-  total, read over at most `maxStatesPerOwner` rows.
+- One request reads at most 64 instances (`MAX_SYNC_INSTANCES`); a stream
+  spanning more connections answers `403 disclosure_unavailable`. The
+  one-record-per-key check runs for the current profile only, since candidate
+  records carry `instance_id`. It costs one unit per other read instance and
+  is paid before an identity is read, but one identity's check is not split:
+  at most 63 lookups past the budget.
+- Re-reading the results a paused or paged request already found is charged
+  but never cut short, because a request that stopped among them would read
+  them again, and it is not progress, so the next new identity is always
+  granted. A current-profile page keeps at most one found result; a paused
+  candidate scan at most 101 (one page plus one; the service refuses a
+  `limit` over 100), with no sibling check. Bounded but not charged: cleanup,
+  which deletes at most 1,000 candidate rows and 100 expired states per
+  write; the owner's preparation count and row total, over at most
+  `maxStatesPerOwner` rows; and parsing the page's records.
+- The tests measure SQLite work deterministically per request: rows read or
+  written plus statements run, for one key with 10 and 20,000 versions and
+  for 2 and 64 instances, and median statement time for keys with 2 and 300
+  versions. better-sqlite3 exposes no count of index entries visited, so no
+  test proves a visit bound directly; the plans show strict seeks on unique
+  keys.
 - The memory store is a reference implementation and keeps the same logical
   bounds (one unit per history entry read and per identity), not the physical
   ones: inserting a candidate shifts its sorted array, and sweeping and
@@ -138,9 +150,12 @@ a changed `limit`, retries, and a SQLite restart followed by a reset.
   use, so a client can retry a session's last page; each owner keeps at most
   `maxStatesPerOwner` preparations, and their candidates may hold at most
   `maxPreparedRowsPerOwner` (10,000,000) rows. A session that would exceed the
-  cap is `410 cursor_expired` until older preparations expire. A single stream
-  with more keys than the cap cannot sync. Expired preparations, paused scans
-  and states are swept in bounded steps by later sync requests.
+  cap is `410 cursor_expired` until older preparations expire, and its paused
+  scan is retired at once, so an identical restart starts afresh. A single
+  stream with more keys, live or deleted, than the cap cannot sync: that is
+  the supported data envelope. Streaming a first sync through a maintained
+  unique identity index would lift it. Expired preparations, paused scans and
+  states are swept in bounded steps by later sync requests.
 - A readonly SQLite handle cannot prepare: an incremental sync there fails.
   Only the declaration witness opens one, and it does not sync.
 - Paused scans are compare-and-set: a request saves or ends a scan only if no

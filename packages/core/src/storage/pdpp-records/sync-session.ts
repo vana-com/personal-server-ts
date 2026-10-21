@@ -106,6 +106,8 @@ export const DEFAULT_SYNC_STATE_BYTES = 256 * 1024;
 export const DEFAULT_SYNC_PREPARED_ROWS_PER_OWNER = 10_000_000;
 /** The largest page one sync request serves. */
 export const MAX_SYNC_PAGE_LIMIT = 100;
+/** The most instances one sync request reads. */
+export const MAX_SYNC_INSTANCES = 64;
 
 /**
  * The single owner of PDPP `changes_since` sessions: horizons, the
@@ -183,6 +185,19 @@ export function createPdppSyncSessionService(
         `sync page limit must be an integer from 1 to ${MAX_SYNC_PAGE_LIMIT}`,
       );
     }
+    // A finite scope bounds the one-record-per-key check, which reads every
+    // other instance for one identity at once.
+    if (new Set(request.instanceIds).size > MAX_SYNC_INSTANCES) {
+      throw new RangeError(
+        `one sync request reads at most ${MAX_SYNC_INSTANCES} instances`,
+      );
+    }
+    // Candidate records carry instance_id: the check is the current wire's.
+    if (request.candidate && request.oneRecordPerKey) {
+      throw new RangeError(
+        "oneRecordPerKey applies to the current profile only",
+      );
+    }
     const tokens = sessionTokens(
       store.syncTokenScope(),
       store.syncStates(),
@@ -212,181 +227,202 @@ export function createPdppSyncSessionService(
       return result;
     };
 
-    // Every session first prepares its candidate set, in budgeted steps and
-    // possibly over several requests: the keys written in its window, or for
-    // a first sync every key held at its horizon.
-    if (!preparation?.done) {
-      preparation ??= {
-        id: `prep:${randomBytes(16).toString("base64url")}`,
-        done: false,
-      };
-      const prepared = store.prepareSyncWindow(request.stream, {
-        id: preparation.id,
-        owner,
-        instanceIds: request.instanceIds,
-        low: position.low,
-        ...(high !== undefined && { high }),
-        budget,
-        now,
-        expiresAt: now + policy.ttl.page,
-        maxPerOwner: policy.maxPerOwner,
-        maxRowsPerOwner: preparedRows,
-      });
-      high = prepared.high;
-      preparation = { id: preparation.id, done: prepared.done };
-      if (!prepared.done) {
-        const scan: PausedScan = {
-          high,
-          ...(paused?.after && { after: paused.after }),
-          found: paused?.found ?? position.found,
-          withheld: withheld0,
-          preparation,
-        };
-        if (request.candidate) {
-          tokens.pauseScan(scan);
-          store.sweepSyncPreparations(policy.now());
-          throw new SyncRetryLaterError();
-        }
-        // The current profile keeps its early, possibly empty page.
-        return finish({
-          data: [],
-          hasMore: true,
-          nextCursor: tokens.page({
-            low: position.low,
-            high,
-            ...(position.after && { after: position.after }),
-            found: position.found,
-            carried: position.carried,
-            withheld: withheld0,
-            preparation,
-          }),
-        });
-      }
+    try {
+      return walk();
+    } catch (err) {
+      // A paused scan whose preparation is gone (expired, evicted, over the
+      // row cap) would fail every identical retry. Retire it, unless another
+      // request moved it, so the next request starts afresh.
+      if (paused && err instanceof CursorExpiredError) tokens.endScan();
+      throw err;
     }
 
-    const result = store.readSyncWindow(
-      request.stream,
-      {
-        instanceIds: request.instanceIds,
-        low: position.low,
-        ...(high !== undefined && { high }),
-        preparation: preparation.id,
-        now: policy.now(),
-      },
-      (window): ChangesSincePage | { paused: PausedScan } => {
-        const direction = request.candidate?.order === "desc" ? "desc" : "asc";
-        const withheld = [...withheld0];
-        const rows: PdppRecordRow[] = [];
-        // Accepts one disclosed change, or withholds it; false if neither.
-        const take = (change: SyncWindowChange): boolean => {
-          const row = disclose(
-            change,
-            position.low,
-            request,
-            carried.has(identityKey(change.after)),
-          );
-          if (!row) return false;
-          if (request.oneRecordPerKey) assertOnlyHolder(row, window, request);
-          // Candidate deletion exception: never serve a record deleted after
-          // the session's first page. The next session returns it.
-          if (request.candidate && !row.deleted && change.deletedAfterHigh()) {
-            withheld.push({ recordKey: row.recordKey, instance: row.instance });
-            return false;
-          }
-          rows.push(row);
-          return true;
+    function walk(): ChangesSincePage {
+      // Every session first prepares its candidate set, in budgeted steps and
+      // possibly over several requests: the keys written in its window, or for
+      // a first sync every key held at its horizon.
+      if (!preparation?.done) {
+        preparation ??= {
+          id: `prep:${randomBytes(16).toString("base64url")}`,
+          done: false,
         };
-        // Changes an earlier request already disclosed, read again at the
-        // same horizon so a deletion since then still withholds them. Charged,
-        // but never cut short: there are at most one page plus one, and a
-        // resumed request that stopped among them would read them again.
-        for (const id of paused?.found ?? position.found) {
-          budget.spend(
-            1 + (request.oneRecordPerKey ? request.instanceIds.length - 1 : 0),
-          );
-          const change = window.change(id);
-          if (change) take(change);
-        }
-        // Re-reading is not progress: the first new identity below is always
-        // granted, so a session whose found rows exceed the budget still moves.
-        const need = request.limit + 1;
-        let scanned: RecordIdentity | undefined =
-          paused?.after ?? position.after;
-        let exhausted = false;
-        // One seek per identity, each paid from the budget.
-        while (rows.length < need) {
-          const id = window.next(direction, scanned, budget);
-          if (id === null) {
-            exhausted = true;
-            break;
-          }
-          if (id === undefined) break;
-          // The other instances this row's key is checked against, paid
-          // before the row is read so a spent budget stops here.
-          if (
-            request.oneRecordPerKey &&
-            !budget.spend(request.instanceIds.length - 1)
-          ) {
-            exhausted = true;
-            break;
-          }
-          scanned = id;
-          const change = window.change(id);
-          if (change) take(change);
-          budget.progressed();
-        }
-        if (exhausted && request.candidate) {
-          return {
-            paused: {
-              high: window.high,
-              ...(scanned && { after: scanned }),
-              found: rows.map(identity),
-              withheld,
-              preparation: preparation!,
-            },
+        const prepared = store.prepareSyncWindow(request.stream, {
+          id: preparation.id,
+          owner,
+          instanceIds: request.instanceIds,
+          low: position.low,
+          ...(high !== undefined && { high }),
+          budget,
+          now,
+          expiresAt: now + policy.ttl.page,
+          maxPerOwner: policy.maxPerOwner,
+          maxRowsPerOwner: preparedRows,
+        });
+        high = prepared.high;
+        preparation = { id: preparation.id, done: prepared.done };
+        if (!prepared.done) {
+          const scan: PausedScan = {
+            high,
+            ...(paused?.after && { after: paused.after }),
+            found: paused?.found ?? position.found,
+            withheld: withheld0,
+            preparation,
           };
-        }
-        if (rows.length === need || exhausted) {
-          // The extra row is kept for the next page, which starts after the
-          // last change this request examined.
-          return {
-            data: rows.slice(0, request.limit),
+          if (request.candidate) {
+            tokens.pauseScan(scan);
+            store.sweepSyncPreparations(policy.now());
+            throw new SyncRetryLaterError();
+          }
+          // The current profile keeps its early, possibly empty page.
+          return finish({
+            data: [],
             hasMore: true,
             nextCursor: tokens.page({
               low: position.low,
-              high: window.high,
-              ...(scanned && { after: scanned }),
-              found: rows.slice(request.limit).map(identity),
+              high,
+              ...(position.after && { after: position.after }),
+              found: position.found,
               carried: position.carried,
-              withheld,
-              preparation: preparation!,
+              withheld: withheld0,
+              preparation,
             }),
-          };
+          });
         }
-        return {
-          data: rows,
-          hasMore: false,
-          nextChangesSince: tokens.checkpoint(window.high, withheld),
-        };
-      },
-    );
-    if ("paused" in result) {
-      tokens.pauseScan(result.paused);
+      }
+
+      const result = store.readSyncWindow(
+        request.stream,
+        {
+          instanceIds: request.instanceIds,
+          low: position.low,
+          ...(high !== undefined && { high }),
+          preparation: preparation.id,
+          now: policy.now(),
+        },
+        (window): ChangesSincePage | { paused: PausedScan } => {
+          const direction =
+            request.candidate?.order === "desc" ? "desc" : "asc";
+          const withheld = [...withheld0];
+          const rows: PdppRecordRow[] = [];
+          // Accepts one disclosed change, or withholds it; false if neither.
+          const take = (change: SyncWindowChange): boolean => {
+            const row = disclose(
+              change,
+              position.low,
+              request,
+              carried.has(identityKey(change.after)),
+            );
+            if (!row) return false;
+            if (request.oneRecordPerKey) assertOnlyHolder(row, window, request);
+            // Candidate deletion exception: never serve a record deleted after
+            // the session's first page. The next session returns it.
+            if (
+              request.candidate &&
+              !row.deleted &&
+              change.deletedAfterHigh()
+            ) {
+              withheld.push({
+                recordKey: row.recordKey,
+                instance: row.instance,
+              });
+              return false;
+            }
+            rows.push(row);
+            return true;
+          };
+          // Changes an earlier request already disclosed, read again at the
+          // same horizon so a deletion since then still withholds them. Charged,
+          // but never cut short: there are at most one page plus one, and a
+          // resumed request that stopped among them would read them again.
+          for (const id of paused?.found ?? position.found) {
+            budget.spend(
+              1 +
+                (request.oneRecordPerKey ? request.instanceIds.length - 1 : 0),
+            );
+            const change = window.change(id);
+            if (change) take(change);
+          }
+          // Re-reading is not progress: the first new identity below is always
+          // granted, so a session whose found rows exceed the budget still moves.
+          const need = request.limit + 1;
+          let scanned: RecordIdentity | undefined =
+            paused?.after ?? position.after;
+          let exhausted = false;
+          // One seek per identity, each paid from the budget.
+          while (rows.length < need) {
+            const id = window.next(direction, scanned, budget);
+            if (id === null) {
+              exhausted = true;
+              break;
+            }
+            if (id === undefined) break;
+            // The other instances this row's key is checked against, paid
+            // before the row is read so a spent budget stops here.
+            if (
+              request.oneRecordPerKey &&
+              !budget.spend(request.instanceIds.length - 1)
+            ) {
+              exhausted = true;
+              break;
+            }
+            scanned = id;
+            const change = window.change(id);
+            if (change) take(change);
+            budget.progressed();
+          }
+          if (exhausted && request.candidate) {
+            return {
+              paused: {
+                high: window.high,
+                ...(scanned && { after: scanned }),
+                found: rows.map(identity),
+                withheld,
+                preparation: preparation!,
+              },
+            };
+          }
+          if (rows.length === need || exhausted) {
+            // The extra row is kept for the next page, which starts after the
+            // last change this request examined.
+            return {
+              data: rows.slice(0, request.limit),
+              hasMore: true,
+              nextCursor: tokens.page({
+                low: position.low,
+                high: window.high,
+                ...(scanned && { after: scanned }),
+                found: rows.slice(request.limit).map(identity),
+                carried: position.carried,
+                withheld,
+                preparation: preparation!,
+              }),
+            };
+          }
+          return {
+            data: rows,
+            hasMore: false,
+            nextChangesSince: tokens.checkpoint(window.high, withheld),
+          };
+        },
+      );
+      if ("paused" in result) {
+        tokens.pauseScan(result.paused);
+        store.touchSyncPreparation(
+          preparation.id,
+          policy.now() + policy.ttl.page,
+          policy.now(),
+        );
+        throw new SyncRetryLaterError();
+      }
+      // The preparation lives as long as a page cursor that can replay it,
+      // including a retry of the session's last page.
       store.touchSyncPreparation(
         preparation.id,
         policy.now() + policy.ttl.page,
         policy.now(),
       );
-      throw new SyncRetryLaterError();
+      return finish(result);
     }
-    // The preparation lives as long as a page cursor that can replay it,
-    // including a retry of the session's last page.
-    store.touchSyncPreparation(
-      preparation.id,
-      policy.now() + policy.ttl.page,
-      policy.now(),
-    );
-    return finish(result);
   }
 
   return { read };
