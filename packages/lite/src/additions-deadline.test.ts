@@ -105,9 +105,18 @@ it.each([
   },
 );
 
-it.each([0, -1, 1.5, 120_001, Infinity, NaN])(
-  "rejects an invalid recovery deadline %s before starting work",
-  async (deadline) => {
+it.each([
+  ...[0, -1, 1.5, 120_001, Infinity, NaN].map((value) => ({
+    field: "additionsTimeBudgetMs",
+    value,
+  })),
+  ...[0, -1, 1.5, 32 * 1024 * 1024 + 1, Infinity, NaN].map((value) => ({
+    field: "additionsByteBudget",
+    value,
+  })),
+])(
+  "rejects invalid $field=$value before starting work",
+  async ({ field, value }) => {
     const owner = privateKeyToAccount(`0x${"12".repeat(32)}`);
     await expect(
       createPsLiteSyncManager({
@@ -120,7 +129,7 @@ it.each([0, -1, 1.5, 120_001, Infinity, NaN])(
           message: "vana-master-key-v1",
         }),
         serverAccount: owner,
-        additionsTimeBudgetMs: deadline,
+        [field]: value,
       }),
     ).rejects.toThrow(RangeError);
   },

@@ -89,8 +89,11 @@ export interface PsLiteSyncOptions {
   ownerSyncSigner?: PsLiteOwnerSyncSigner;
   additionsWorkerFactory?: () => AdditionsWorkerPort;
   /** Background recovery deadline, including lock wait. Defaults to 10 seconds;
-   * hosted owner signing may use up to two minutes. The byte cap is unchanged. */
+   * hosted owner signing may use up to two minutes. */
   additionsTimeBudgetMs?: number;
+  /** Summary recovery work allowance, default 8 MiB, maximum 32 MiB.
+   * Upload hints and bounded deletion retain their 8 MiB allowance. */
+  additionsByteBudget?: number;
   /** Metrics-only hosts can use the bounded coordinator without starting sync. */
   autoStartSync?: boolean;
   /** Storage authentication origin, independent of its routing endpoint. */
@@ -249,6 +252,16 @@ export async function createPsLiteSyncManager(
   scopeDeletions: ScopeDeletionTracker;
 }> {
   const additionsTimeBudgetMs = options.additionsTimeBudgetMs ?? 10_000;
+  const additionsByteBudget = options.additionsByteBudget ?? 8 * 1024 * 1024;
+  if (
+    !Number.isSafeInteger(additionsByteBudget) ||
+    additionsByteBudget < 1 ||
+    additionsByteBudget > 32 * 1024 * 1024
+  ) {
+    throw new RangeError(
+      "Additions recovery allowance must be 1..33554432 bytes",
+    );
+  }
   if (
     !Number.isSafeInteger(additionsTimeBudgetMs) ||
     additionsTimeBudgetMs < 1 ||
@@ -308,7 +321,7 @@ export async function createPsLiteSyncManager(
             gatewayUrl: options.config.gateway.url,
             storageEndpoint: resolveVanaStorageEndpoint(options.config),
             masterKey,
-            byteBudget: 8 * 1024 * 1024,
+            byteBudget: additionsByteBudget,
             timeBudgetMs: additionsTimeBudgetMs,
           },
           transport: createPsLiteAdditionsTransport({

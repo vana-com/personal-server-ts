@@ -198,7 +198,14 @@ export function createPsLiteAdditionsSession(
         };
         worker.postMessage({
           kind: "run",
-          init: { ...options.init, timeBudgetMs: remainingMs },
+          init: {
+            ...options.init,
+            timeBudgetMs: remainingMs,
+            byteBudget:
+              operation.method === "summarize"
+                ? options.init.byteBudget
+                : Math.min(8 * 1024 * 1024, options.init.byteBudget),
+          },
           operation,
         });
       });
@@ -241,7 +248,7 @@ export function createPsLiteAdditionsSession(
       // has no bounded-recovery deadline or noncancelable worker RPC.
       const budget = deletion?.durableOnly
         ? new AdditionsBudget(
-            options.init.byteBudget,
+            Math.min(8 * 1024 * 1024, options.init.byteBudget),
             options.init.timeBudgetMs,
             deletion.signal,
           )
