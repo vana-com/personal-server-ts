@@ -1,3 +1,10 @@
+import { expandedRequestFields, validateTimeRangeBounds } from "./selection.js";
+import {
+  declaredTimeType,
+  compareTime,
+  compareLegacyTimeBounds,
+  type TimeType,
+} from "./time.js";
 /**
  * PDPP Core §6→§7 resolution: turn a validated selection request into the
  * explicit grant facts that get frozen at issuance.
@@ -17,6 +24,7 @@
 
 import {
   PDPP_DATA_ACCESS_TYPE_V02,
+  PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   type DeclarationSnapshot,
   type DeclaredStream,
   type RequestedStream,
@@ -43,6 +51,8 @@ import {
 export interface OwnerChoices {
   /** Streams the owner removed. Only an `optional` stream may appear. */
   declined_streams?: string[];
+  /** Candidate optional streams require affirmative approval. */
+  approved_streams?: string[];
   /** Per-stream field narrowing, intersected with the requested allowlist. */
   fields?: Record<string, string[]>;
   /** Per-stream window narrowing, clamped into the requested window. */
@@ -61,6 +71,8 @@ export interface InstanceInventory {
 }
 
 export type ResolutionFailureCode =
+  | "invalid_owner_choices"
+  | "invalid_time_range"
   | "unknown_stream"
   | "unknown_instance"
   | "instance_choice_required"
@@ -81,6 +93,12 @@ export interface ResolutionFailure {
   stream?: string;
   /** For `instance_choice_required`: the handles the owner must choose between. */
   candidates?: string[];
+  /**
+   * For `no_streams_approved`: the omitted streams and requested limits, so a
+   * candidate review can show an unselected proposal without issuing it.
+   */
+  omittedStreams?: string[];
+  requestedStreams?: RequestedStream[];
 }
 
 export type ResolutionResult =
@@ -135,36 +153,29 @@ function requestedFields(
   request: StreamRequest,
   declared: DeclaredStream,
   snapshot: DeclarationSnapshot,
-  revision: "0.1" | "0.2",
+  revision: "0.1" | "0.2" | "candidate",
 ): { ok: true; fields: string[] } | { ok: false; failure: ResolutionFailure } {
-  let requested: string[];
-
-  if (request.view !== undefined) {
-    const view = snapshot.views?.find((v) => v.name === request.view);
-    if (!view) {
-      return {
-        ok: false,
-        failure: {
-          code: "unknown_view",
-          message: `view '${request.view}' is not defined for this source`,
-          stream: declared.name,
-        },
-      };
-    }
-    requested = view.fields;
-  } else if (request.fields !== undefined) {
-    requested = request.fields;
-  } else {
-    // §6 "Note on defaults": omitting both asks the AS to resolve all
-    // permitted fields from the retained snapshot.
-    requested = declared.fields;
+  if (
+    request.view !== undefined &&
+    !snapshot.views?.some((v) => v.name === request.view)
+  ) {
+    return {
+      ok: false,
+      failure: {
+        code: "unknown_view",
+        message: `view '${request.view}' is not defined for this source`,
+        stream: declared.name,
+      },
+    };
   }
-
-  // Intersect with the declared schema first, so a view or allowlist can
-  // never introduce a field the snapshot does not define.
-  const permitted = requested.filter((f) => declared.fields.includes(f));
+  const permitted = expandedRequestFields(
+    request,
+    declared,
+    snapshot,
+    revision === "candidate",
+  );
   const fields =
-    revision === "0.1"
+    revision !== "0.2"
       ? unique([...permitted, ...declared.required_fields])
       : unique(permitted);
 
@@ -199,11 +210,6 @@ function narrowFields(
   return ceiling.filter((f) => chosen.includes(f));
 }
 
-/** Instant for a bound, with an absent bound reading as the open end. */
-function instant(value: string | undefined, open: number): number {
-  return value === undefined ? open : Date.parse(value);
-}
-
 /**
  * Clamp the owner's window into the requested window.
  *
@@ -214,14 +220,23 @@ function instant(value: string | undefined, open: number): number {
 function narrowTimeRange(
   ceiling: TimeRange | undefined,
   chosen: TimeRange | undefined,
+  type?: TimeType,
 ): TimeRange | undefined {
   if (chosen === undefined) return ceiling;
   const since = [ceiling?.since, chosen.since]
     .filter((v): v is string => v !== undefined)
-    .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+    .sort((a, b) =>
+      type
+        ? (compareTime(b, a, type) ?? 0)
+        : (compareLegacyTimeBounds(b, a) ?? 0),
+    )[0];
   const until = [ceiling?.until, chosen.until]
     .filter((v): v is string => v !== undefined)
-    .sort((a, b) => Date.parse(a) - Date.parse(b))[0];
+    .sort((a, b) =>
+      type
+        ? (compareTime(a, b, type) ?? 0)
+        : (compareLegacyTimeBounds(a, b) ?? 0),
+    )[0];
   if (since === undefined && until === undefined) return undefined;
   return {
     ...(since !== undefined && { since }),
@@ -242,6 +257,7 @@ function minimumSatisfied(
   minimum: StreamRequest["minimum"],
   fields: string[],
   window: TimeRange | undefined,
+  type?: TimeType,
 ): { ok: true } | { ok: false; reason: string } {
   if (!minimum) return { ok: true };
 
@@ -259,11 +275,13 @@ function minimumSatisfied(
     // The resolved window must *contain* the entire minimum window. An absent
     // resolved lower bound is negative infinity and an absent upper bound is
     // positive infinity, so an unbounded window contains every floor.
-    const from = instant(window?.since, -Infinity);
-    const to = instant(window?.until, Infinity);
+    const compare = (a: string, b: string) =>
+      type ? compareTime(a, b, type)! : compareLegacyTimeBounds(a, b)!;
     if (
-      Date.parse(minimum.time_range.since) < from ||
-      Date.parse(minimum.time_range.until) > to
+      (window?.since !== undefined &&
+        compare(minimum.time_range.since, window.since) < 0) ||
+      (window?.until !== undefined &&
+        compare(minimum.time_range.until, window.until) > 0)
     ) {
       return {
         ok: false,
@@ -347,6 +365,7 @@ function resolveInstances(
 function resolveTimeConstraint(
   window: TimeRange | undefined,
   declared: DeclaredStream,
+  candidate: boolean,
 ): TimeConstraint | undefined {
   if (!window) return undefined;
   const { since, until } = window;
@@ -356,6 +375,7 @@ function resolveTimeConstraint(
   if (!field) return undefined;
   return {
     field,
+    ...(candidate && { type: declaredTimeType(declared) }),
     ...(since !== undefined && { since }),
     ...(until !== undefined && { until }),
   };
@@ -377,17 +397,23 @@ function resolveOneStream(
   declared: DeclaredStream,
   snapshot: DeclarationSnapshot,
   inventory: InstanceInventory,
-  revision: "0.1" | "0.2",
+  revision: "0.1" | "0.2" | "candidate",
   choices: OwnerChoices | undefined,
 ): StreamOutcome {
   const ceiling = requestedFields(request, declared, snapshot, revision);
   if (!ceiling.ok) return { kind: "failed", failure: ceiling.failure };
 
   // v0.1 has no narrowing step, so its resolution is untouched by choices.
-  const fields =
-    revision === "0.2"
+  const narrowedFields =
+    revision !== "0.1"
       ? narrowFields(ceiling.fields, choices?.fields?.[declared.name])
       : ceiling.fields;
+  // Core candidate retains the schema-required floor at issuance, unlike
+  // the independent private-v0.2 proposal. The RS only sees frozen authority.
+  const fields =
+    revision === "candidate"
+      ? unique([...narrowedFields, ...declared.required_fields])
+      : narrowedFields;
 
   if (fields.length === 0) {
     // The resolved selection must contain at least one field per retained
@@ -403,20 +429,67 @@ function resolveOneStream(
     };
   }
 
+  if (
+    revision === "candidate" &&
+    choices?.time_ranges?.[declared.name] !== undefined
+  ) {
+    const type = declaredTimeType(declared);
+    const chosen =
+      type &&
+      validateTimeRangeBounds(
+        choices.time_ranges[declared.name],
+        `owner time range for '${declared.name}'`,
+        type,
+      );
+    if (!chosen || !chosen.ok)
+      return {
+        kind: "failed",
+        failure: {
+          code: "invalid_time_range",
+          message:
+            "candidate owner bounds must be valid values of the frozen temporal type",
+          stream: declared.name,
+        },
+      };
+  }
+
   const window =
-    revision === "0.2"
+    revision !== "0.1"
       ? narrowTimeRange(
           request.time_range,
           choices?.time_ranges?.[declared.name],
+          revision === "candidate" ? declaredTimeType(declared) : undefined,
         )
       : request.time_range;
 
-  if (revision === "0.2") {
+  if (revision === "candidate" && window) {
+    const type = declaredTimeType(declared);
+    const valid =
+      type &&
+      validateTimeRangeBounds(window, `stream '${declared.name}'`, type);
+    if (!valid || !valid.ok)
+      return {
+        kind: "failed",
+        failure: {
+          code: "invalid_time_range",
+          message:
+            "candidate temporal narrowing must have valid typed bounds in increasing order",
+          stream: declared.name,
+        },
+      };
+  }
+
+  if (revision !== "0.1") {
     // Checked before instance resolution: an unsatisfiable minimum is a
     // decision about this stream that does not depend on which handle serves
     // it, and an optional stream that is about to drop out should not fail
     // the whole authorization on a missing instance it will never use.
-    const satisfied = minimumSatisfied(request.minimum, fields, window);
+    const satisfied = minimumSatisfied(
+      request.minimum,
+      fields,
+      window,
+      revision === "candidate" ? declaredTimeType(declared) : undefined,
+    );
     if (!satisfied.ok) {
       return { kind: "minimum_unmet", reason: satisfied.reason };
     }
@@ -425,7 +498,11 @@ function resolveOneStream(
   const instances = resolveInstances(request, declared.name, inventory);
   if (!instances.ok) return { kind: "failed", failure: instances.failure };
 
-  const timeConstraint = resolveTimeConstraint(window, declared);
+  const timeConstraint = resolveTimeConstraint(
+    window,
+    declared,
+    revision === "candidate",
+  );
 
   return {
     kind: "resolved",
@@ -433,6 +510,11 @@ function resolveOneStream(
       name: declared.name,
       instance_ids: instances.instanceIds,
       fields,
+      ...(revision === "candidate" && {
+        required_fields: declared.required_fields.filter((f) =>
+          fields.includes(f),
+        ),
+      }),
       ...(timeConstraint && { time_constraint: timeConstraint }),
       ...(request.resources && { resources: unique(request.resources) }),
     },
@@ -462,7 +544,18 @@ export function expandSelections(
     const preset = snapshot.selection_presets?.find(
       (p) => p.name === request.selection_preset,
     );
-    return preset ? preset.streams : [];
+    return !preset
+      ? []
+      : request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE
+        ? expandSelections(
+            {
+              ...request,
+              selection_preset: undefined,
+              streams: preset.streams,
+            },
+            snapshot,
+          )
+        : preset.streams;
   }
 
   const streams = request.streams ?? [];
@@ -492,13 +585,115 @@ export function expandSelections(
  * names, fields, resources, and temporal bounds, which only exist once this
  * has run.
  */
+export function streamIsOmitted(
+  request: SelectionRequest,
+  selection: StreamRequest,
+  choices?: OwnerChoices,
+): boolean {
+  if (
+    request.type !== PDPP_DATA_ACCESS_TYPE_V02 &&
+    request.type !== PDPP_DATA_ACCESS_TYPE_CANDIDATE
+  )
+    return false;
+  if (
+    Array.isArray(choices?.declined_streams) &&
+    choices.declined_streams.includes(selection.name)
+  )
+    return true;
+  return (
+    request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE &&
+    (selection.necessity ?? "optional") === "optional" &&
+    !(
+      Array.isArray(choices?.approved_streams) &&
+      choices.approved_streams.includes(selection.name)
+    )
+  );
+}
+
+/** The single candidate owner-choice boundary, before choices affect consent. */
+export function validateCandidateOwnerChoices(
+  request: SelectionRequest,
+  snapshot: DeclarationSnapshot,
+  choices: unknown,
+): string | undefined {
+  if (choices === undefined) return undefined;
+  const object = (value: unknown): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value);
+  const names = (value: unknown): value is string[] =>
+    Array.isArray(value) &&
+    value.every((name) => typeof name === "string" && name.length > 0);
+  if (!object(choices)) return "owner choices must be an object";
+  if (
+    Object.keys(choices).some(
+      (key) =>
+        ![
+          "approved_streams",
+          "declined_streams",
+          "fields",
+          "time_ranges",
+        ].includes(key),
+    )
+  )
+    return "unknown owner choice member";
+  const selected = new Set(
+    expandSelections(request, snapshot).map((stream) => stream.name),
+  );
+  for (const key of ["approved_streams", "declined_streams"] as const) {
+    const values = choices[key];
+    if (values === undefined) continue;
+    if (!names(values) || values.some((name) => !selected.has(name)))
+      return `${key} must name only requested streams`;
+  }
+  if (
+    (choices.approved_streams as string[] | undefined)?.some((name) =>
+      (choices.declined_streams as string[] | undefined)?.includes(name),
+    )
+  )
+    return "a stream cannot be both approved and declined";
+  if (choices.fields !== undefined) {
+    if (
+      !object(choices.fields) ||
+      Object.entries(choices.fields).some(
+        ([name, fields]) => !selected.has(name) || !names(fields),
+      )
+    )
+      return "fields must map requested streams to field lists";
+  }
+  if (choices.time_ranges !== undefined) {
+    if (
+      !object(choices.time_ranges) ||
+      Object.entries(choices.time_ranges).some(
+        ([name, range]) =>
+          !selected.has(name) ||
+          !object(range) ||
+          Object.keys(range).length === 0 ||
+          Object.entries(range).some(
+            ([key, value]) =>
+              !["since", "until"].includes(key) || typeof value !== "string",
+          ),
+      )
+    )
+      return "time_ranges must map requested streams to non-empty bound objects";
+  }
+  return undefined;
+}
+
 export function resolveSelection(
   request: SelectionRequest,
   snapshot: DeclarationSnapshot,
   inventory: InstanceInventory,
   choices?: OwnerChoices,
 ): ResolutionResult {
-  const revision = request.type === PDPP_DATA_ACCESS_TYPE_V02 ? "0.2" : "0.1";
+  const revision =
+    request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE
+      ? "candidate"
+      : request.type === PDPP_DATA_ACCESS_TYPE_V02
+        ? "0.2"
+        : "0.1";
+  if (revision === "candidate") {
+    const invalid = validateCandidateOwnerChoices(request, snapshot, choices);
+    if (invalid) return failure("invalid_owner_choices", invalid);
+  }
   const selections = expandSelections(request, snapshot);
   if (selections.length === 0) {
     return failure(
@@ -521,14 +716,13 @@ export function resolveSelection(
       );
     }
 
-    // `necessity` defaults to `required`, so an unmarked stream is one the AS
-    // must retain or refuse. Inferring "optional" from omission would let a
-    // client's silence become the owner's permission to drop a stream the
-    // client actually depends on.
-    const necessity = selection.necessity ?? "required";
+    // Legacy profiles default to required; candidate streams default optional.
+    const necessity =
+      selection.necessity ??
+      (revision === "candidate" ? "optional" : "required");
 
-    if (revision === "0.2") {
-      const ceiling = requestedFields(selection, declared, snapshot, "0.2");
+    if (revision !== "0.1") {
+      const ceiling = requestedFields(selection, declared, snapshot, revision);
       requestedStreams.push({
         name: declared.name,
         necessity,
@@ -537,7 +731,7 @@ export function resolveSelection(
         ...(selection.minimum && { minimum: selection.minimum }),
       });
 
-      if (choices?.declined_streams?.includes(declared.name)) {
+      if (streamIsOmitted(request, selection, choices)) {
         if (necessity === "required") {
           // A required stream is retained or the authorization is refused.
           // There is no third outcome, and in particular no weaker grant.
@@ -591,6 +785,10 @@ export function resolveSelection(
     return failure(
       "no_streams_approved",
       "the owner approved no streams; a grant with no authorized stream cannot be issued",
+      {
+        ...(omitted.length > 0 && { omittedStreams: omitted }),
+        ...(revision !== "0.1" && { requestedStreams }),
+      },
     );
   }
 
@@ -598,6 +796,6 @@ export function resolveSelection(
     ok: true,
     streams: resolved,
     ...(omitted.length > 0 && { omittedStreams: omitted }),
-    ...(revision === "0.2" && { requestedStreams }),
+    ...(revision !== "0.1" && { requestedStreams }),
   };
 }

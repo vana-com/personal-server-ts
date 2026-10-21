@@ -24,6 +24,8 @@ import {
 } from "./store.js";
 import {
   isV02Grant,
+  grantIsCandidate,
+  PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   type AccessMode,
@@ -541,7 +543,9 @@ export function toAuthorizationEntry(grant: Grant): PdppAuthorizationEntry {
 
 export function toAuthorizationDetail(grant: Grant): PdppAuthorizationDetail {
   return {
-    type: PDPP_DATA_ACCESS_TYPE,
+    type: grantIsCandidate(grant)
+      ? PDPP_DATA_ACCESS_TYPE_CANDIDATE
+      : PDPP_DATA_ACCESS_TYPE,
     source: grant.source,
     purpose_code: grant.purpose_code,
     ...(grant.purpose_description && {

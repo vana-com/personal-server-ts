@@ -13,12 +13,20 @@ export interface ListCursorPayload {
   order: "asc" | "desc";
   sortValue: string | null; // cursor_field value of the last row on the page
   recordKey: string; // primary key tiebreaker
+  instance?: string; // final tiebreaker; absent only on legacy cursors
   /**
    * Write clock when page 1 was served. A reset of a read instance after
    * this point expires the cursor (410), so one paginated read never mixes
    * rows from two generations. Absent on cursors minted before the fence.
    */
   horizon?: string;
+  /**
+   * The list order this position belongs to. `instant` orders emitted time by
+   * `timeSortKey`; a cursor without it was minted under timestamp-text order
+   * and cannot be resumed under instant order without skipping or repeating
+   * rows.
+   */
+  orderKey?: "instant";
 }
 
 export interface ChangesSinceCursorPayload {
@@ -33,6 +41,13 @@ export interface ChangesSinceCursorPayload {
   sinceHorizon: string | null;
   /** Pagination offset within the horizon-anchored result set. */
   offset: number;
+  /**
+   * Page cursors only: the identity order `offset` counts in. `code-point`
+   * is `compareRecordIdentity`; a page cursor without it counted a
+   * locale-dependent key order, so its offset names a different record.
+   * Checkpoints carry no position and need none.
+   */
+  orderKey?: "code-point";
 }
 
 export type CursorPayload = ListCursorPayload | ChangesSinceCursorPayload;

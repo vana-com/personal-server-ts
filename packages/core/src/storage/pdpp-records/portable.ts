@@ -11,3 +11,6 @@ export * from "./cursor.js";
 export * from "./ingest-plan.js";
 export * from "./stream-declaration.js";
 export * from "./enforcement.js";
+
+export * from "./list-page.js";
+export * from "./sync-selection.js";

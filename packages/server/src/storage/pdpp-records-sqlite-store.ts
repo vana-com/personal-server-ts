@@ -1,3 +1,15 @@
+import {
+  parseTime,
+  timeSortKey,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
+import {
+  selectSyncChange,
+  decodeListCursor,
+  decodeSyncPageCursor,
+  listSnapshotPage,
+  compareRecordIdentity,
+  LIST_ORDER_COLUMNS,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
@@ -76,32 +88,9 @@ export interface StreamCompletionReceipt {
   liveCount: number;
 }
 
-const RFC3339_DATE_TIME =
-  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?(?:[Zz]|[+-](\d{2}):(\d{2}))$/;
-
-/** RFC 3339 `date-time`, with calendar-valid fields. No clock check. */
+/** Compatibility export; the portable temporal policy owns RFC3339 validity. */
 export function isRfc3339DateTime(value: unknown): value is string {
-  if (typeof value !== "string") return false;
-  const match = RFC3339_DATE_TIME.exec(value);
-  if (!match) return false;
-  const [year, month, day, hour, minute, second] = match
-    .slice(1, 7)
-    .map(Number);
-  const offsetHour = Number(match[8] ?? 0);
-  const offsetMinute = Number(match[9] ?? 0);
-  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return (
-    month >= 1 &&
-    month <= 12 &&
-    day >= 1 &&
-    day <= daysInMonth &&
-    hour <= 23 &&
-    minute <= 59 &&
-    second <= 59 &&
-    offsetHour <= 23 &&
-    offsetMinute <= 59 &&
-    !Number.isNaN(Date.parse(value))
-  );
+  return parseTime(value, "date-time") !== null;
 }
 
 export class PdppBindingError extends Error {
@@ -298,6 +287,18 @@ CREATE TABLE IF NOT EXISTS pdpp_record_arrival_clock (
 );
 INSERT OR IGNORE INTO pdpp_record_arrival_clock (id, value) VALUES (1, 0);
 `,
+  // v12: ordered history traversal and one-key as-of lookup. The horizon
+  // index alone scans an instance's full history for every outer row.
+  `
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_order
+  ON pdpp_record_changes (stream, emitted_at, record_key, instance, written_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
+  ON pdpp_record_changes (instance, stream, record_key, written_at DESC, version DESC);
+`,
+  // v13: an `emitted_key` that orders emitted time by instant rather than by
+  // timestamp text, for list order, list seeks and the latest stream time.
+  // `migrateToV13` applies it.
+  "",
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -332,6 +333,35 @@ function addCompletionProofColumns(db: Database): void {
   }
 }
 
+/** `emitted_key` is `timeSortKey(emitted_at)`, written by SQL on every insert. */
+function registerTimeKey(db: Database): void {
+  db.function("pdpp_time_key", { deterministic: true }, (value: unknown) =>
+    timeSortKey(String(value)),
+  );
+}
+
+function migrateToV13(db: Database): void {
+  for (const table of ["pdpp_records", "pdpp_record_changes"]) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+    }[];
+    if (!columns.some((c) => c.name === "emitted_key")) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN emitted_key TEXT`);
+    }
+    db.exec(
+      `UPDATE ${table} SET emitted_key = pdpp_time_key(emitted_at) WHERE emitted_key IS NULL`,
+    );
+  }
+  db.exec(`
+DROP INDEX IF EXISTS idx_pdpp_record_changes_snapshot_order;
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_key_order
+  ON pdpp_record_changes (stream, emitted_key, record_key, instance, written_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
+  ON pdpp_records (instance, stream, emitted_key, emitted_at)
+  WHERE deleted = 0;
+`);
+}
+
 function migrate(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS pdpp_schema_version (
@@ -353,6 +383,7 @@ function migrate(db: Database): void {
           "INSERT OR IGNORE INTO pdpp_store_metadata (id, epoch) VALUES (1, ?)",
         ).run(randomUUID());
       }
+      if (v === 12) migrateToV13(db);
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -504,18 +535,6 @@ function toRow(db: RecordRowDb): PdppRecordRow {
   };
 }
 
-function projectFields(
-  data: Record<string, unknown>,
-  fields: string[] | undefined,
-): Record<string, unknown> {
-  if (!fields) return data;
-  const projected: Record<string, unknown> = {};
-  for (const field of fields) {
-    if (field in data) projected[field] = data[field];
-  }
-  return projected;
-}
-
 /**
  * SQLite-backed PdppRecordStore for desktop persistence. Requires
  * `better-sqlite3` (already a `packages/server` dependency in this repo).
@@ -588,6 +607,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    */
   listArrivalOrder(instance: string, stream: string): string[];
 } {
+  // Insert statements call it, so even a readonly handle must register it
+  // before they are prepared.
+  registerTimeKey(db);
   if (db.readonly) {
     const current = db
       .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
@@ -616,20 +638,21 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     "SELECT * FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
   );
   const upsertCurrentStmt = db.prepare(`
-    INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted, deleted_at, blob_id)
-    VALUES (@instance, @stream, @record_key, @data, @version, @emitted_at, @deleted, @deleted_at, @blob_id)
+    INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, emitted_key, deleted, deleted_at, blob_id)
+    VALUES (@instance, @stream, @record_key, @data, @version, @emitted_at, pdpp_time_key(@emitted_at), @deleted, @deleted_at, @blob_id)
     ON CONFLICT (instance, stream, record_key) DO UPDATE SET
       data = excluded.data,
       version = excluded.version,
       emitted_at = excluded.emitted_at,
+      emitted_key = excluded.emitted_key,
       deleted = excluded.deleted,
       deleted_at = excluded.deleted_at,
       blob_id = excluded.blob_id
   `);
   const insertHistoryStmt = db.prepare(`
     INSERT INTO pdpp_record_changes
-      (instance, stream, record_key, version, data, emitted_at, deleted, deleted_at, written_at)
-    VALUES (@instance, @stream, @record_key, @version, @data, @emitted_at, @deleted, @deleted_at, @written_at)
+      (instance, stream, record_key, version, data, emitted_at, emitted_key, deleted, deleted_at, written_at)
+    VALUES (@instance, @stream, @record_key, @version, @data, @emitted_at, pdpp_time_key(@emitted_at), @deleted, @deleted_at, @written_at)
   `);
   const putBlobStmt = db.prepare(`
     INSERT INTO pdpp_blobs (blob_id, mime_type, size_bytes, sha256)
@@ -1565,69 +1588,90 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     }
   }
 
+  /** Latest version of each complete identity at one fixed write horizon. */
+  function* snapshotRows(
+    stream: string,
+    instanceIds: string[],
+    horizon: number,
+    options: {
+      order?: "asc" | "desc";
+      after?: { val: string; key: string; instance: string } | null;
+      liveOnly?: boolean;
+    } = {},
+  ): Generator<RecordRowDb & { written_at: number }> {
+    const dir = options.order === "desc" ? "DESC" : "ASC";
+    const comparison = options.order === "desc" ? "<" : ">";
+    let sql = `SELECT c.* FROM pdpp_record_changes c INDEXED BY idx_pdpp_record_changes_snapshot_key_order
+      WHERE c.stream = ? AND c.instance IN (${instanceIds.map(() => "?").join(",")}) AND c.written_at <= ?
+      AND c.version = (
+        SELECT c2.version FROM pdpp_record_changes c2 INDEXED BY idx_pdpp_record_changes_snapshot_latest
+        WHERE c2.instance = c.instance AND c2.stream = c.stream AND c2.record_key = c.record_key AND c2.written_at <= ?
+        ORDER BY c2.written_at DESC, c2.version DESC LIMIT 1
+      )`;
+    const params: unknown[] = [stream, ...instanceIds, horizon, horizon];
+    if (options.liveOnly) sql += " AND c.deleted = 0";
+    if (options.after) {
+      sql += ` AND (c.emitted_key, c.record_key, c.instance) ${comparison} (?, ?, ?)`;
+      params.push(
+        timeSortKey(options.after.val),
+        options.after.key,
+        options.after.instance,
+      );
+    }
+    sql += ` ORDER BY ${LIST_ORDER_COLUMNS.map((column) => `c.${column} ${dir}`).join(", ")}`;
+    for (const row of db.prepare(sql).iterate(...params))
+      yield row as RecordRowDb & { written_at: number };
+  }
+
   function listRecords(
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
-    let startAfter: { val: string; key: string } | null = null;
+    let startAfter: { val: string; key: string; instance: string } | null =
+      null;
     let horizon: number;
     if (options.cursor) {
-      const payload = decodeCursor(options.cursor);
-      if (payload.kind !== "list") throw new InvalidCursorError();
+      const payload = decodeListCursor(options.cursor);
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
-      const cursorHorizon =
-        payload.horizon === undefined ? null : parseHorizon(payload.horizon);
-      assertNotResetSince(options.instanceIds, [cursorHorizon]);
-      // A legacy cursor that survives the fence read no reset instance; it
-      // is anchored at the current clock from here on.
-      horizon = cursorHorizon ?? readWriteClock();
-      startAfter = { val: payload.sortValue ?? "", key: payload.recordKey };
+      horizon = parseHorizon(payload.horizon);
+      assertNotResetSince(options.instanceIds, [horizon]);
+      startAfter = {
+        val: payload.sortValue ?? "",
+        key: payload.recordKey,
+        instance: payload.instance,
+      };
     } else {
       horizon = readWriteClock();
     }
 
-    const placeholders = options.instanceIds.map(() => "?").join(",");
-    const dir = options.order === "asc" ? "ASC" : "DESC";
-    const cmp = options.order === "asc" ? ">" : "<";
-
-    let sql = `
-      SELECT * FROM pdpp_records
-      WHERE stream = ? AND deleted = 0 AND instance IN (${placeholders})
-    `;
-    const params: unknown[] = [stream, ...options.instanceIds];
-    if (startAfter) {
-      sql += ` AND (emitted_at ${cmp} ? OR (emitted_at = ? AND record_key ${cmp} ?))`;
-      params.push(startAfter.val, startAfter.val, startAfter.key);
+    // The generator holds at most one raw row beyond the visible client page.
+    function* rows(): Generator<PdppStoredRecord> {
+      for (const row of snapshotRows(stream, options.instanceIds, horizon, {
+        order: options.order,
+        after: startAfter,
+        liveOnly: true,
+      })) {
+        yield toRow(row) as PdppStoredRecord;
+      }
     }
-    sql += ` ORDER BY emitted_at ${dir}, record_key ${dir} LIMIT ?`;
-    params.push(options.limit + 1);
-
-    const rows = db.prepare(sql).all(...params) as RecordRowDb[];
-    const hasMore = rows.length > options.limit;
-    const page = rows.slice(0, options.limit);
-    const last = page[page.length - 1];
-
-    return {
-      data: page.map((row) => {
-        const stored = toRow(row) as PdppStoredRecord;
-        return { ...stored, data: projectFields(stored.data, options.fields) };
-      }),
-      hasMore,
-      nextCursor:
-        hasMore && last
-          ? encodeCursor({
-              kind: "list",
-              stream,
-              epoch: cursorEpoch(),
-              order: options.order,
-              sortValue: last.emitted_at,
-              recordKey: last.record_key,
-              horizon: String(horizon),
-            })
-          : undefined,
-      horizon: String(horizon),
-    };
+    const hasLaterWrites = horizon < readWriteClock();
+    const erasure =
+      db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+      WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
+    return listSnapshotPage(
+      rows(),
+      options,
+      {
+        stream,
+        epoch: cursorEpoch(),
+        horizon: String(horizon),
+      },
+      (row) =>
+        hasLaterWrites &&
+        erasure.get(row.instance, row.stream, row.recordKey, horizon) !==
+          undefined,
+    );
   }
 
   function deleteRecord(
@@ -1685,8 +1729,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     let offset = 0;
 
     if (options.cursor) {
-      const payload = decodeCursor(options.cursor);
-      if (payload.kind !== "changes_since") throw new InvalidCursorError();
+      const payload = decodeSyncPageCursor(options.cursor);
       assertCursorScope(payload, stream);
       horizon = parseHorizon(payload.horizon);
       sinceHorizon =
@@ -1717,32 +1760,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       sinceHorizon ?? horizon,
     ]);
 
-    const placeholders = options.instanceIds.map(() => "?").join(",");
-
-    // Latest history row per key, as of the horizon.
-    const latestRows = db
-      .prepare(
-        `
-        SELECT c.* FROM pdpp_record_changes c
-        WHERE c.stream = ? AND c.instance IN (${placeholders}) AND c.written_at <= ?
-        AND c.version = (
-          SELECT MAX(c2.version) FROM pdpp_record_changes c2
-          WHERE c2.stream = c.stream AND c2.instance = c.instance
-            AND c2.record_key = c.record_key AND c2.written_at <= ?
-        )
-      `,
-      )
-      .all(stream, ...options.instanceIds, horizon, horizon) as Array<{
-      instance: string;
-      stream: string;
-      record_key: string;
-      version: number;
-      data: string | null;
-      emitted_at: string;
-      deleted: number;
-      deleted_at: string | null;
-      written_at: number;
-    }>;
+    const latestRows = snapshotRows(stream, options.instanceIds, horizon);
 
     const changed: PdppRecordRow[] = [];
     for (const entry of latestRows) {
@@ -1763,62 +1781,48 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         if (!wroteSincePrior) continue;
       }
 
-      if (entry.deleted) {
-        changed.push({
-          instance: entry.instance,
-          stream: entry.stream,
-          recordKey: entry.record_key,
-          version: entry.version,
-          deletedAt: entry.deleted_at ?? entry.emitted_at,
-          emittedAt: entry.emitted_at,
-          deleted: true,
-        });
-        continue;
-      }
-
-      const currentData = entry.data ? JSON.parse(entry.data) : {};
-      const projectedNow = projectFields(currentData, options.fields);
-
-      if (sinceHorizon !== null && options.fields) {
-        const priorRow = db
-          .prepare(
-            `SELECT * FROM pdpp_record_changes
-             WHERE stream = ? AND instance = ? AND record_key = ? AND written_at <= ?
-             ORDER BY version DESC LIMIT 1`,
-          )
-          .get(entry.stream, entry.instance, entry.record_key, sinceHorizon) as
-          { data: string | null; deleted: number } | undefined;
-        if (priorRow && !priorRow.deleted) {
-          const priorData = priorRow.data ? JSON.parse(priorRow.data) : {};
-          const priorProjected = projectFields(priorData, options.fields);
-          if (JSON.stringify(priorProjected) === JSON.stringify(projectedNow)) {
-            continue;
-          }
-        }
-      }
-
-      // Return the RAW (unprojected) data here, not `projectedNow`.
-      // `projectedNow`/`priorProjected` above exist only to decide
-      // eligibility (did the grant-authorized projection change) without
-      // leaking a hidden-field change. A caller enforcing time_constraint
-      // against `data` needs the real field value; projecting here would
-      // silently break that filter for any grant whose fields don't happen
-      // to include the time_constraint field. Response field projection is
-      // the caller's job, applied after any filtering on real values.
-      changed.push({
-        instance: entry.instance,
-        stream: entry.stream,
-        recordKey: entry.record_key,
-        data: currentData,
-        version: entry.version,
-        emittedAt: entry.emitted_at,
-        deleted: false,
-      });
+      const previous =
+        sinceHorizon === null
+          ? undefined
+          : (db
+              .prepare(
+                `
+        SELECT * FROM pdpp_record_changes
+        WHERE stream = ? AND instance = ? AND record_key = ? AND written_at <= ?
+        ORDER BY version DESC LIMIT 1
+      `,
+              )
+              .get(
+                entry.stream,
+                entry.instance,
+                entry.record_key,
+                sinceHorizon,
+              ) as RecordRowDb | undefined);
+      const selected = selectSyncChange(
+        toRow(entry as RecordRowDb),
+        previous ? toRow(previous) : undefined,
+        options,
+      );
+      if (selected) changed.push(selected);
     }
 
-    changed.sort((a, b) => a.recordKey.localeCompare(b.recordKey));
+    changed.sort(compareRecordIdentity);
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;
+    if (options.expireOnErasure && horizon < readWriteClock()) {
+      const erasure =
+        db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+        WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
+      if (
+        page.some(
+          (row) =>
+            !row.deleted &&
+            erasure.get(row.instance, stream, row.recordKey, horizon) !==
+              undefined,
+        )
+      )
+        throw new CursorExpiredError();
+    }
 
     return {
       data: page,
@@ -1831,6 +1835,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             horizon: String(horizon),
             sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
             offset: offset + options.limit,
+            orderKey: "code-point",
           })
         : undefined,
       nextChangesSince: hasMore
@@ -1850,7 +1855,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     const placeholders = instanceIds.map(() => "?").join(",");
     const rows = db
       .prepare(
-        `SELECT stream, COUNT(*) as count, MAX(emitted_at) as last_updated
+        // SQLite takes a bare column from the row that holds the single MAX.
+        `SELECT stream, COUNT(*) as count, emitted_at as last_updated, MAX(emitted_key)
          FROM pdpp_records WHERE deleted = 0 AND instance IN (${placeholders})
          GROUP BY stream`,
       )

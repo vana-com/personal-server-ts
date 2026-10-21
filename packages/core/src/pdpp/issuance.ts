@@ -30,6 +30,8 @@ import {
 import {
   AI_TRAINING_PURPOSE,
   PDPP_DATA_ACCESS_TYPE_V02,
+  PDPP_DATA_ACCESS_TYPE_CANDIDATE,
+  PDPP_GRANT_VERSION_CANDIDATE,
   PDPP_GRANT_VERSION,
   PDPP_GRANT_VERSION_V02,
   type DeclarationSnapshot,
@@ -237,7 +239,12 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
   const isV02 = input.request.type === PDPP_DATA_ACCESS_TYPE_V02;
 
   const grant: Grant = {
-    version: isV02 ? PDPP_GRANT_VERSION_V02 : PDPP_GRANT_VERSION,
+    version:
+      input.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE
+        ? PDPP_GRANT_VERSION_CANDIDATE
+        : isV02
+          ? PDPP_GRANT_VERSION_V02
+          : PDPP_GRANT_VERSION,
     grant_id: newGrantId(),
     issued_at: now.toISOString(),
     subject: { id: input.subjectId },

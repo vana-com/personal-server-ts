@@ -1487,3 +1487,27 @@ describe("pdpp records routes: snapshot replace", () => {
     db.close();
   });
 });
+
+describe("strict record queries", () => {
+  it.each(["", "1junk", "1.5", "1e2", " 1", "9007199254740992"])(
+    "rejects malformed limit %j on list and sync",
+    async (limit) => {
+      const { app } = buildApp({
+        owner: {
+          active: true,
+          tokenKind: "owner",
+          subjectId: "sub_1",
+          instanceIds: ["inst_1"],
+        },
+      });
+      for (const suffix of ["", "&changes_since="]) {
+        const res = await app.request(
+          `/streams/playlists/records?limit=${encodeURIComponent(limit)}${suffix}`,
+          { headers: { Authorization: "Bearer owner" } },
+        );
+        expect(res.status).toBe(400);
+        expect((await res.json()).error.param).toBe("limit");
+      }
+    },
+  );
+});

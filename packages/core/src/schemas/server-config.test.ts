@@ -241,3 +241,23 @@ describe("saveConfig", () => {
     });
   });
 });
+
+describe("pdpp.protocolProfile", () => {
+  it("defaults existing deployments to current behavior", () => {
+    expect(ServerConfigSchema.parse({}).pdpp.protocolProfile).toBe("current");
+    expect(
+      ServerConfigSchema.parse({ pdpp: { enabled: true } }).pdpp
+        .protocolProfile,
+    ).toBe("current");
+  });
+  it("accepts only an explicit known candidate profile", () => {
+    expect(
+      ServerConfigSchema.parse({ pdpp: { protocolProfile: "candidate-0.1.0" } })
+        .pdpp.protocolProfile,
+    ).toBe("candidate-0.1.0");
+    expect(
+      ServerConfigSchema.safeParse({ pdpp: { protocolProfile: "candidate" } })
+        .success,
+    ).toBe(false);
+  });
+});

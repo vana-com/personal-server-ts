@@ -686,7 +686,10 @@ export function createApp(deps: AppDeps): Hono {
     // keeps it distinct from the bare well-known the MCP AS owns.
     app.get(
       "/.well-known/oauth-authorization-server/pdpp/v1",
-      pdppAsMetadataHandler(deps.pdppAuth.issuer),
+      pdppAsMetadataHandler(
+        deps.pdppAuth.issuer,
+        deps.pdppAuth.protocolProfile,
+      ),
     );
 
     // Declaration submission (§5 acceptance). Mounted at `/pdpp`, NOT under
