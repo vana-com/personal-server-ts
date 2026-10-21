@@ -20,6 +20,13 @@ export interface ListCursorPayload {
    * rows from two generations. Absent on cursors minted before the fence.
    */
   horizon?: string;
+  /**
+   * The list order this position belongs to. `instant` orders emitted time by
+   * `timeSortKey`; a cursor without it was minted under timestamp-text order
+   * and cannot be resumed under instant order without skipping or repeating
+   * rows.
+   */
+  orderKey?: "instant";
 }
 
 export interface ChangesSinceCursorPayload {

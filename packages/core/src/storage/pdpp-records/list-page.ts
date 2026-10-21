@@ -11,13 +11,20 @@ import type {
   PdppStoredRecord,
 } from "./types.js";
 
-/** A legacy position cannot prove complete snapshot continuation; restart explicitly. */
+/**
+ * A legacy position cannot prove complete snapshot continuation, and one
+ * minted under another list order names a different place; restart explicitly.
+ */
 export function decodeListCursor(
   cursor: string,
 ): ListCursorPayload & { instance: string; horizon: string } {
   const payload = decodeCursor(cursor);
   if (payload.kind !== "list") throw new InvalidCursorError();
-  if (payload.instance === undefined || payload.horizon === undefined)
+  if (
+    payload.instance === undefined ||
+    payload.horizon === undefined ||
+    payload.orderKey !== "instant"
+  )
     throw new CursorExpiredError();
   return { ...payload, instance: payload.instance, horizon: payload.horizon };
 }
@@ -96,6 +103,7 @@ export function listSnapshotPage(
           sortValue: last.emittedAt,
           recordKey: last.recordKey,
           instance: last.instance,
+          orderKey: "instant",
         }
       : undefined;
   return {
