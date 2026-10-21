@@ -233,3 +233,40 @@ describe("a multi-page list whose grant is revoked between pages", () => {
     expect((await page2.json()).error.code).toBe("grant_revoked");
   });
 });
+
+describe("a blob HEAD whose grant is revoked before the headers leave", () => {
+  it("refuses instead of disclosing the blob's size and type", async () => {
+    seedBlob(1024);
+    let metaReads = 0;
+    // The route reads blob metadata once to authorize and once to build the
+    // headers; the owner revokes in between.
+    const store = new Proxy(records, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function") return value;
+        if (prop === "getBlobMeta") {
+          return (...args: unknown[]) => {
+            metaReads += 1;
+            if (metaReads === 2) authStore.revokeGrant(GRANT.grant_id);
+            return (value as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        }
+        return (value as (...a: unknown[]) => unknown).bind(target);
+      },
+    });
+    const app = pdppBlobsRoutes({
+      store,
+      auth,
+      declarations,
+      instancesForSubject: () => ["inst_1"],
+      readBlobBytes: async () => new Uint8Array(1024),
+    });
+    const response = await app.request("/blob_1", {
+      method: "HEAD",
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(metaReads).toBe(2);
+    expect(response.status).toBe(403);
+    expect(response.headers.get("Content-Length")).not.toBe("1024");
+  });
+});

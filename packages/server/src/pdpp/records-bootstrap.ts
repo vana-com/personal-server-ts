@@ -41,6 +41,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type {
   PdppAuthorizationService,
+  PdppTokenContext,
   Grant as PdppPortGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
@@ -334,27 +335,31 @@ export function createPdppRecordsDeps(
 export function coLocatedAuthorizationService(
   pdppAuth: PdppAuthRouteDeps,
 ): PdppAuthorizationService {
-  return {
-    async resolveToken(accessToken: string) {
-      const context = pdppAuth.tokens.resolveToken(accessToken);
-      if (!context.active) {
-        return {
-          active: false as const,
-          tokenKind: "client" as const,
-          subjectId: "",
-          inactiveReason: context.inactiveReason,
-        };
-      }
+  const resolveTokenNow = (accessToken: string): PdppTokenContext => {
+    const context = pdppAuth.tokens.resolveToken(accessToken);
+    if (!context.active) {
       return {
-        active: true as const,
-        tokenKind: context.tokenKind ?? "client",
-        subjectId: context.subjectId ?? "",
-        sourceId: context.sourceId,
-        instanceIds: context.instanceIds,
-        grant: context.grant as PdppPortGrant | undefined,
-        clientId: context.clientId,
-        expiresAt: context.expiresAt,
+        active: false as const,
+        tokenKind: "client" as const,
+        subjectId: "",
+        inactiveReason: context.inactiveReason,
       };
+    }
+    return {
+      active: true as const,
+      tokenKind: context.tokenKind ?? "client",
+      subjectId: context.subjectId ?? "",
+      sourceId: context.sourceId,
+      instanceIds: context.instanceIds,
+      grant: context.grant as PdppPortGrant | undefined,
+      clientId: context.clientId,
+      expiresAt: context.expiresAt,
+    };
+  };
+  return {
+    resolveTokenNow,
+    async resolveToken(accessToken: string) {
+      return resolveTokenNow(accessToken);
     },
   };
 }

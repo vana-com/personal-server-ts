@@ -28,7 +28,7 @@ import {
   type GrantVerifierPort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
-import { type DeliveryLease, remoteReverification } from "./delivery-lease.js";
+import { type DeliveryLease, remoteEvidence } from "./delivery-lease.js";
 import { verifyPdppGrantBinding } from "../grants/pdpp-binding.js";
 import type { PdppGrantBindingStore } from "../grants/pdpp-binding-store.js";
 
@@ -203,25 +203,29 @@ export async function verifyDataReadPolicy(
 
 /**
  * `verifyDataReadPolicy`, plus the delivery lease the read must hold when its
- * body is released. The lease checks the grant's known expiry on every call
- * (no network) and runs the whole policy again, gateway included, only when
- * the verification that admitted the read is older than
- * `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s). A normal request therefore makes
- * no extra gateway call.
+ * body is released (see `delivery-lease.ts`). The lease carries the verified
+ * grant as evidence: its expiry is checked locally at every release. The
+ * whole policy, gateway included, runs again only when the last verification
+ * is older than `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s), so a normal request
+ * makes no extra gateway call, and a gateway-side revocation with no expiry
+ * is seen within 30 s.
  */
 export async function authorizeDataRead(
   input: DataReadPolicyInput,
   ports: DataReadPolicyPorts,
 ): Promise<{ grant: GatewayGrantResponse; lease: DeliveryLease }> {
   const grant = await verifyDataReadPolicy(input, ports);
-  const expiresAtSec = parseGrantExpiresAtSeconds(grant.expiresAt);
-  const reverify = remoteReverification(async () => {
-    await verifyDataReadPolicy(input, ports);
-  });
+  const evidence = remoteEvidence(grant, () =>
+    verifyDataReadPolicy(input, ports),
+  );
   return {
     grant,
     lease: {
-      async assertDeliverable() {
+      refresh: () => evidence.refresh(),
+      assertLocal() {
+        const expiresAtSec = parseGrantExpiresAtSeconds(
+          evidence.current.expiresAt,
+        );
         if (
           expiresAtSec !== null &&
           expiresAtSec > 0 &&
@@ -229,7 +233,6 @@ export async function authorizeDataRead(
         ) {
           throw new GrantExpiredError({ expiresAt: expiresAtSec });
         }
-        await reverify();
       },
     },
   };

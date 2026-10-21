@@ -202,7 +202,13 @@ export function chainPermissionEnforcement(
         }
       }
 
-      return { ok: true };
+      // The expiry rides with the decision so a read's delivery lease can
+      // refuse at release once it passes, without asking the chain again.
+      return {
+        ok: true,
+        expiresAt:
+          expiresAtSec > 0 ? new Date(expiresAtSec * 1000).toISOString() : null,
+      };
     },
   };
 }

@@ -2,8 +2,14 @@ import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
-import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
-import type { DeliveryLease } from "@opendatalabs/personal-server-ts-core/policy";
+import type {
+  PdppAuthorizationService,
+  PdppTokenContext,
+} from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import {
+  deliver,
+  leasedStream,
+} from "@opendatalabs/personal-server-ts-core/policy";
 import {
   bearerErrorResponse,
   type PdppProtocolProfile,
@@ -11,6 +17,7 @@ import {
 import {
   pdppBearerReadLease,
   recordKeyWithinGrantResources,
+  type PdppReadLease,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
   type PdppRecordStore,
@@ -37,28 +44,16 @@ export interface PdppBlobsRouteDeps {
 /** Bytes released per delivery boundary of a blob body. */
 export const BLOB_DELIVERY_CHUNK_BYTES = 64 * 1024;
 
-/**
- * A blob body released one chunk at a time, each only after the read lease
- * still authorizes it. The stream pulls on demand, so a slow client holds the
- * remaining bytes back. When the lease ends, the body stream errors: the
- * client sees a failed, truncated transfer, never a clean end.
- */
-function leasedBlobBody(
+/** The blob bytes as a stream of `BLOB_DELIVERY_CHUNK_BYTES` parts. */
+function chunkedBytes(
   bytes: Uint8Array<ArrayBuffer>,
-  lease: DeliveryLease,
 ): ReadableStream<Uint8Array> {
   let offset = 0;
   return new ReadableStream<Uint8Array>(
     {
-      async pull(controller) {
+      pull(controller) {
         if (offset >= bytes.byteLength) {
           controller.close();
-          return;
-        }
-        try {
-          await lease.assertDeliverable();
-        } catch (err) {
-          controller.error(err);
           return;
         }
         const end = Math.min(
@@ -71,6 +66,13 @@ function leasedBlobBody(
     },
     { highWaterMark: 0 },
   );
+}
+
+/** A lease refusal as a PDPP error; anything unexpected fails closed. */
+function toLeaseRefusal(err: unknown): PdppError {
+  return err instanceof PdppError
+    ? err
+    : new PdppError("api_error", "Blob delivery could not be authorized");
 }
 
 function requestId(): string {
@@ -88,6 +90,42 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   }
   const app = new Hono();
 
+  /** The read's lease, held to the grant's connections like admission is. */
+  function blobLease(token: string, context: PdppTokenContext): PdppReadLease {
+    const lease = pdppBearerReadLease(deps.auth, token, context, {
+      ...(deps.isConnectionAvailable && {
+        isConnectionAvailable: deps.isConnectionAvailable,
+      }),
+    });
+    if (context.tokenKind !== "owner") {
+      lease.requireConnections(
+        (context.grant?.streams ?? []).flatMap((stream) => stream.instance_ids),
+      );
+    }
+    return lease;
+  }
+
+  /**
+   * Release a response through the read's lease (see `deliver`). Headers
+   * disclose the blob's size and type, so the headers of a GET or a HEAD are
+   * released through it too, before any body part.
+   */
+  async function release(
+    c: Context,
+    lease: PdppReadLease,
+    reqId: string,
+    build: () => Response,
+  ): Promise<Response> {
+    try {
+      return await deliver(lease, build);
+    } catch (err) {
+      const refusal = toLeaseRefusal(err);
+      return jsonError(c, refusal, reqId, {
+        inactiveBearer: refusal.code === "authentication_error",
+      });
+    }
+  }
+
   /**
    * Authorizes a blob fetch through the same path a record read uses (spec §8): finds every
    * record referencing this blob_id, then grants access if ANY one passes instance scope,
@@ -98,7 +136,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   async function authorizeBlobAccess(
     c: Context,
     blobId: string,
-  ): Promise<{ error: Response } | { ok: true; lease: DeliveryLease }> {
+  ): Promise<{ error: Response } | { ok: true; lease: PdppReadLease }> {
     const reqId = requestId();
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -184,7 +222,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       if (!visible) return { error: notFound() };
       return {
         ok: true,
-        lease: pdppBearerReadLease(deps.auth, token, context),
+        lease: blobLease(token, context),
       };
     }
 
@@ -225,7 +263,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
 
       return {
         ok: true,
-        lease: pdppBearerReadLease(deps.auth, token, context),
+        lease: blobLease(token, context),
       };
     }
 
@@ -250,7 +288,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     };
 
     if (c.req.method === "HEAD") {
-      return c.body(null, 200, headers);
+      return release(c, authz.lease, reqId, () => c.body(null, 200, headers));
     }
 
     let bytes: Uint8Array<ArrayBuffer> | undefined;
@@ -285,7 +323,12 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         reqId,
       );
     }
-    return c.body(leasedBlobBody(bytes, authz.lease), 200, headers);
+    // The headers, then each part, are released only through the read's
+    // lease: a grant that ends mid-download errors the body before the next
+    // part.
+    return release(c, authz.lease, reqId, () =>
+      c.body(leasedStream(authz.lease, chunkedBytes(bytes)), 200, headers),
+    );
   });
 
   return app;

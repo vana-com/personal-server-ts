@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { stat } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -514,6 +514,55 @@ describe("executeJob", () => {
     expect(fixture.deps.accessLogWriter.write).not.toHaveBeenCalled();
   });
 
+  it("aborts an upload whose scope is deleted while the result is uploading", async () => {
+    const fixture = await createFixture();
+    const pad = "abc123".repeat(524_288);
+    const stored = new TextEncoder().encode(
+      JSON.stringify({ ...fixture.dataEnvelope, data: { pad } }, null, 2),
+    );
+    vi.mocked(fixture.storage.findEntry).mockReturnValue({
+      ...fixture.storage.findEntry({ scope: SCOPE })!,
+      sizeBytes: stored.byteLength,
+    });
+    Object.assign(fixture.storage, {
+      readEnvelopeStream: vi.fn(async () => new Blob([stored]).stream()),
+    });
+    fixture.deps.resultMaxBytes = stored.byteLength;
+    const tracker = createScopeDeletionTracker({ serverOwner: owner.address });
+    fixture.deps.scopeDeletions = tracker;
+    let uploadedBytes = 0;
+    let sealedBytes = 0;
+    fixture.resultUploadFetch.mockReset();
+    fixture.resultUploadFetch
+      .mockImplementationOnce(async (_url: string, init: RequestInit) => {
+        sealedBytes = Number(JSON.parse(init.body as string).byteLength);
+        return new Response(
+          JSON.stringify({ authorization: "Web3Signed result-signature" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      })
+      .mockImplementationOnce(async (_url: string, init: RequestInit) => {
+        // The owner deletes the scope after the first part has gone out.
+        for await (const chunk of init.body as unknown as Readable) {
+          uploadedBytes += (chunk as Buffer).byteLength;
+          if (!tracker.knownDeletion(SCOPE)) {
+            tracker.markDeleted(SCOPE, {
+              deletedAt: "2099-01-01T00:00:00Z",
+              version: "9",
+            });
+          }
+        }
+        return new Response(null, { status: 201 });
+      });
+
+    await expectFailure(fixture, "SCOPE_NOT_FOUND");
+
+    expect(fixture.resultUploadFetch).toHaveBeenCalledTimes(2);
+    expect(uploadedBytes).toBeGreaterThan(0);
+    expect(uploadedBytes).toBeLessThan(sealedBytes);
+    expect(fixture.deps.accessLogWriter.write).not.toHaveBeenCalled();
+  });
+
   it("hydrates a missing scope once and serves the populated entry", async () => {
     const fixture = await createFixture();
     const entry = fixture.storage.findEntry({ scope: SCOPE });
@@ -608,15 +657,15 @@ describe("executeJob", () => {
       readEnvelopeStream: vi.fn(async () => new Blob([stored]).stream()),
     });
     fixture.deps.resultMaxBytes = stored.byteLength;
-    fixture.deps.resultTempDir = tmpdir();
+    const resultTempDir = await mkdtemp(join(tmpdir(), "job-result-test-"));
+    fixture.deps.resultTempDir = resultTempDir;
 
     await executeJob(fixture.envelope, fixture.deps);
 
     expect(fixture.uploadedBody()).toBeInstanceOf(Readable);
-    const uploadPath = (fixture.uploadedBody() as Readable & { path: string })
-      .path;
-    expect(uploadPath).toContain(join(tmpdir(), ".job-result-"));
-    await expect(stat(uploadPath)).rejects.toMatchObject({ code: "ENOENT" });
+    // The temporary result directory is removed after the upload.
+    expect(await readdir(resultTempDir)).toEqual([]);
+    await rm(resultTempDir, { recursive: true, force: true });
     expect(fixture.uploadedBytes().byteLength).toBeGreaterThan(3 * 1024 * 1024);
   });
 

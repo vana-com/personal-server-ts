@@ -3,6 +3,7 @@ import { isSystemScope } from "../policy/reserved-scopes.js";
 import { authorizeLegacyRead } from "../policy/data-read.js";
 import {
   allDeliveryLeases,
+  deliver,
   type DeliveryLease,
 } from "../policy/delivery-lease.js";
 import { storageForReader } from "../storage/disclosure-policy.js";
@@ -509,6 +510,13 @@ export interface PersonalServerOauthTokenApiDeps {
 
 export interface PersonalServerApiDispatchOptions {
   basePath?: string;
+  /**
+   * Receives the delivery lease of a body this request releases. An in-process
+   * caller that keeps working on the body (the MCP read client materializing
+   * a raw file into a tool result) holds the read to it until its own final
+   * release.
+   */
+  onDeliveryLease?: (lease: DeliveryLease) => void;
 }
 
 type JsonStatus =
@@ -1214,12 +1222,12 @@ export async function assertScopeNotDeleted(
 
 /**
  * The delivery lease for a `/v1/data`-family read (HTTP, MCP, jobs): the
- * read's grant lease from its authorization, and the scope's live deletion
- * state through the same tracker `/v1/data` uses. The deletion half answers
- * from the tracker's local state only (gateway timeout zero): the early gate
- * already consulted the gateway, and the release gate must catch what this
- * process learned since (a sync tombstone, a local delete) without a second
- * round trip. Throws `DataDeletedError` or the grant's refusal.
+ * read's grant lease from its authorization, and the scope's deletion state
+ * in the same tracker `/v1/data` uses. The deletion half is local evidence:
+ * it reads what this process knows (`knownDeletion`, the deletion history),
+ * synchronously, with no gateway call. The early gate already consulted the
+ * gateway; the release gate catches what this process learned since (a sync
+ * tombstone, a local delete). It refuses with `DataDeletedError`.
  */
 export function readDeliveryLease(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
@@ -1231,15 +1239,30 @@ export function readDeliveryLease(
   },
 ): DeliveryLease {
   return allDeliveryLeases(read.grant, {
-    async assertDeliverable() {
-      const deletion = await resolveReadDeletion(
-        deps,
-        read.scope,
-        read.entry,
-        read.body ?? "file",
-        0,
-      );
-      if (deletion) throw new DataDeletedError(deletion);
+    async refresh() {},
+    assertLocal() {
+      const tracker = deps.scopeDeletions;
+      if (!tracker) return;
+      const known = tracker.knownDeletion(read.scope);
+      const tombstone =
+        read.body === "canonical"
+          ? (tracker.deletionHistory?.get(read.scope) ?? known)
+          : known;
+      if (!tombstone) return;
+      if (
+        read.body !== "canonical" &&
+        read.entry &&
+        !isEntryCoveredByTombstone(read.entry, tombstone)
+      ) {
+        return;
+      }
+      throw new DataDeletedError({
+        scope: read.scope,
+        dataPointId: deps.serverOwner
+          ? computeDataPointId(deps.serverOwner, read.scope)
+          : null,
+        deletedAt: tombstone.deletedAt,
+      });
     },
   });
 }
@@ -2276,71 +2299,74 @@ export async function handlePersonalServerDataRequest(
         ipAddress,
         userAgent,
       });
-      // Delivery gate, after every await this read makes and immediately
-      // before the body is built: a grant revoked or a scope deleted while
-      // the read was in progress stops it here.
-      await readDeliveryLease(deps, {
+      // Delivery gate, after every await this read makes: a grant revoked or
+      // a scope deleted while the read was in progress stops it here. The
+      // response is built inside `deliver`, in the same tick as the check.
+      const lease = readDeliveryLease(deps, {
         grant: authResult?.lease,
         scope: scopeResult.scope,
         entry: canonicalOwned ? undefined : selectedEntry,
         body: canonicalOwned ? "canonical" : "file",
-      }).assertDeliverable();
-      const reportReadFulfillment = () => {
-        if (!authResult?.grantId || !authResult.builder) return;
-        reportPersonalServerReadFulfillment(deps, {
-          builder: authResult.builder,
-          fileId: servedFileId,
-          grantId: authResult.grantId,
-          ipAddress,
-          logId,
-          outcome: "served",
-          scope: scopeResult.scope,
-          servedAt: timestamp,
-          source: "api",
-          userAgent,
-        });
-      };
+      });
+      options.onDeliveryLease?.(lease);
+      return deliver(lease, (): Response => {
+        const reportReadFulfillment = () => {
+          if (!authResult?.grantId || !authResult.builder) return;
+          reportPersonalServerReadFulfillment(deps, {
+            builder: authResult.builder,
+            fileId: servedFileId,
+            grantId: authResult.grantId,
+            ipAddress,
+            logId,
+            outcome: "served",
+            scope: scopeResult.scope,
+            servedAt: timestamp,
+            source: "api",
+            userAgent,
+          });
+        };
 
-      if (paymentResponseHeader) {
-        headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
-      }
+        if (paymentResponseHeader) {
+          headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
+        }
 
-      const wantsRawContent = url.searchParams.get("content") === "raw";
+        const wantsRawContent = url.searchParams.get("content") === "raw";
 
-      // `?content=raw` streams the decoded bytes of a binary envelope with its
-      // original media type, so a builder can download the file directly. The
-      // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
-      if (wantsRawContent) {
-        if (!isBinaryEnvelope(servedEnvelope)) {
-          return jsonResponse(
-            {
-              error: "NOT_BINARY_SCOPE",
-              message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
-            },
-            { status: 400, headers },
-          );
+        // `?content=raw` streams the decoded bytes of a binary envelope with its
+        // original media type, so a builder can download the file directly. The
+        // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
+        if (wantsRawContent) {
+          if (!isBinaryEnvelope(servedEnvelope)) {
+            return jsonResponse(
+              {
+                error: "NOT_BINARY_SCOPE",
+                message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
+              },
+              { status: 400, headers },
+            );
+          }
+          const decoded = decodeBinaryEnvelope(servedEnvelope);
+          headers["Content-Type"] = decoded.mimeType;
+          headers["Content-Length"] = String(decoded.bytes.length);
+          if (decoded.filename) {
+            headers["Content-Disposition"] =
+              `attachment; filename="${decoded.filename}"`;
+          }
+          if (decoded.metadata !== undefined) {
+            headers["X-Vana-Metadata"] = stringifyMetadataHeader(
+              decoded.metadata,
+            );
+          }
+          const response = new Response(decoded.bytes as unknown as BodyInit, {
+            status: 200,
+            headers,
+          });
+          return response;
         }
-        const decoded = decodeBinaryEnvelope(servedEnvelope);
-        headers["Content-Type"] = decoded.mimeType;
-        headers["Content-Length"] = String(decoded.bytes.length);
-        if (decoded.filename) {
-          headers["Content-Disposition"] =
-            `attachment; filename="${decoded.filename}"`;
-        }
-        if (decoded.metadata !== undefined) {
-          headers["X-Vana-Metadata"] = stringifyMetadataHeader(
-            decoded.metadata,
-          );
-        }
-        const response = new Response(decoded.bytes as unknown as BodyInit, {
-          status: 200,
-          headers,
-        });
+        const response = jsonResponse(servedEnvelope, { headers });
+        reportReadFulfillment();
         return response;
-      }
-      const response = jsonResponse(servedEnvelope, { headers });
-      reportReadFulfillment();
-      return response;
+      });
     }
 
     if (request.method === "POST") {
