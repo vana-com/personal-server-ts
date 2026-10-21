@@ -1277,17 +1277,23 @@ async function main() {
         });
         for (const { scope } of scopes) {
           attempted++;
+          const url = storage.urlForKey(`${scope}/1`);
           try {
-            if (await storage.delete(storage.urlForKey(`${scope}/1`)))
+            if (await storage.delete(url)) {
               deleted++;
-            else if (!(await storage.exists(storage.urlForKey(`${scope}/1`))))
-              notFound++;
+              continue;
+            }
+          } catch {
+            // A PUT may have failed after its cleanup scope was recorded.
+          }
+          try {
+            if (!(await storage.exists(url))) notFound++;
             else
               cleanupFailures.push(
                 `${device === a ? "A" : "B"}:delete-unconfirmed`,
               );
           } catch {
-            cleanupFailures.push(`${device === a ? "A" : "B"}:delete`);
+            cleanupFailures.push(`${device === a ? "A" : "B"}:delete-check`);
           }
         }
       } catch {
