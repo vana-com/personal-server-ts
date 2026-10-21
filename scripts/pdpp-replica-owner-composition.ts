@@ -171,28 +171,37 @@ export type ConnectorNotReady =
   | "outbound_pending"
   | "rows_unconfirmed"
   | "canonical_rows_differ"
-  | "oracle_mismatch"
+  | "sql_rows_differ"
   | "blobs_differ"
   | "no_active_chain";
 
+const canonicalFields = [
+  "instance",
+  "stream",
+  "record_key",
+  "data",
+  "emitted_at",
+  "deleted",
+  "blob_id",
+];
+
 /**
  * Decides whether device B has confirmed device A's real-source records.
- * Fails closed: every mismatch is "not ready" with a reason, never a throw.
- * `oracle` runs the independent SQL comparison only once the in-memory
- * snapshots already agree; its throw is a mismatch.
+ * Pure: the caller reads both canonical SQL tables first (`sql`), so a read
+ * fault surfaces as the caller's failure, never as "not ready". Every
+ * disagreement is "not ready" with its reason.
  */
 export function evaluateConnectorReadiness(input: {
   a: Pick<Snapshot, "ownerRows" | "pending" | "canonicalRows" | "blobs">;
   b: Pick<Snapshot, "appRows" | "canonicalRows" | "blobs" | "evidence">;
-  aCanonical: readonly unknown[];
+  sql: { a: readonly unknown[]; b: readonly unknown[] };
   sourceId: string;
-  oracle: () => { B: string; fields: string[] };
 }):
   | { ready: true; receipt: ConnectorReceipt }
   | { ready: false; reason: ConnectorNotReady } {
-  const { a, b } = input;
+  const { a, b, sql } = input;
   const no = (reason: ConnectorNotReady) => ({ ready: false as const, reason });
-  if (input.aCanonical.length === 0) return no("no_rows");
+  if (sql.a.length === 0) return no("no_rows");
   if (a.pending !== 0) return no("outbound_pending");
   if (
     a.ownerRows.length === 0 ||
@@ -202,21 +211,16 @@ export function evaluateConnectorReadiness(input: {
     return no("rows_unconfirmed");
   if (!b.canonicalRows || !isDeepStrictEqual(a.canonicalRows, b.canonicalRows))
     return no("canonical_rows_differ");
-  let oracle: { B: string; fields: string[] };
-  try {
-    oracle = input.oracle();
-  } catch {
-    return no("oracle_mismatch");
-  }
+  if (!isDeepStrictEqual(sql.a, sql.b)) return no("sql_rows_differ");
   if (!isDeepStrictEqual(a.blobs, b.blobs)) return no("blobs_differ");
   if (!b.evidence.some((entry) => entry.chain?.status === "Active"))
     return no("no_active_chain");
   return {
     ready: true,
     receipt: {
-      canonical_rows: input.aCanonical.length,
-      canonical_sha256: oracle.B,
-      canonical_fields: oracle.fields,
+      canonical_rows: sql.a.length,
+      canonical_sha256: digest(JSON.stringify(sql.b)),
+      canonical_fields: canonicalFields,
       referenced_blobs: Object.keys(b.blobs).length,
       records_sha256: digest(JSON.stringify(b.canonicalRows)),
       source_id: input.sourceId,
@@ -390,6 +394,7 @@ export async function createOwnerComposition(options: CompositionOptions) {
       }
     | undefined;
   let connectorConfirmed: ConnectorReceipt | undefined;
+  let readinessReason: ConnectorNotReady | null = null;
   const devices: Device[] = [];
   let collector: Awaited<ReturnType<typeof openReplicaRuntime>> | undefined;
   let collectorRoutes: Hono | undefined;
@@ -711,6 +716,7 @@ export async function createOwnerComposition(options: CompositionOptions) {
               })),
             },
             referenced_blobs: connectorConfirmed?.referenced_blobs ?? 0,
+            readiness_reason: readinessReason,
             legacy: {
               ready: Boolean(legacyRoutes),
               grant_endpoint: `${options.origin}/v1/grants`,
@@ -832,17 +838,17 @@ export async function createOwnerComposition(options: CompositionOptions) {
             if (result.status === "rejected") cycleRetries++;
           const left = a.snapshot();
           const right = await b.call("snapshot");
+          // A read fault here propagates to the failure handler below.
           const readiness = evaluateConnectorReadiness({
             a: left,
             b: right,
-            aCanonical: canonicalRows(join(dataRoot, "A/records.sqlite")),
+            sql: {
+              a: canonicalRows(join(dataRoot, "A/records.sqlite")),
+              b: canonicalRows(join(dataRoot, "B/records.sqlite")),
+            },
             sourceId,
-            oracle: () =>
-              assertCanonicalEquality(
-                join(dataRoot, "A/records.sqlite"),
-                join(dataRoot, "B/records.sqlite"),
-              ),
           });
+          readinessReason = readiness.ready ? null : readiness.reason;
           if (readiness.ready) {
             connectorConfirmed = readiness.receipt;
             phase = "ready";
@@ -962,6 +968,7 @@ export async function createOwnerComposition(options: CompositionOptions) {
       // Publish only the known stage; never stringify the underlying exception.
       failure = `${phase}_failed`;
       phase = "failed";
+      connectorConfirmed = undefined;
     }
   }
   return {
