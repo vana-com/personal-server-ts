@@ -13,6 +13,7 @@ import type {
   HostMessage,
   WorkerMessage,
 } from "./additions-protocol.js";
+import type { DiagnosticsRecorder } from "./diagnostics.js";
 import type { PsLiteAdditionsTransport } from "./additions-transport.js";
 
 export interface AdditionsWorkerPort {
@@ -23,6 +24,7 @@ export interface AdditionsWorkerPort {
 }
 export interface PsLiteAdditionsSessionOptions {
   init: AdditionsWorkerInit;
+  diagnostics?: DiagnosticsRecorder;
   transport: PsLiteAdditionsTransport;
   deleteSystemScope(scope: string): Promise<void>;
   /** Bundlers may supply their own URL/factory; no synchronous fallback exists. */
@@ -97,6 +99,16 @@ export function createPsLiteAdditionsSession(
         worker.onmessage = (event) => {
           if (finished) return;
           const message = event.data;
+          if (message.kind === "diagnostic") {
+            options.diagnostics?.push({
+              phase: "unknown",
+              scope: message.event.scope,
+              fileId: message.event.version,
+              detail: `additions:${message.event.code}`,
+              error: true,
+            });
+            return;
+          }
           if (message.kind === "result") {
             finish(undefined, message.result);
             return;

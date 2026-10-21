@@ -1,4 +1,7 @@
-import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
+import type {
+  DurableAdditionsService,
+  AdditionsRecoveryDiagnostic,
+} from "@opendatalabs/personal-server-ts-core/additions";
 import type { PsLiteAdditionsTransport } from "./additions-transport.js";
 
 export interface AdditionsWorkerInit {
@@ -9,6 +12,7 @@ export interface AdditionsWorkerInit {
   masterKey: Uint8Array;
   byteBudget: number;
   timeBudgetMs: number;
+  diagnostics?: boolean;
 }
 export type AdditionsOperation =
   | {
@@ -36,6 +40,7 @@ export type HostMessage =
       remaining: number;
       remainingMilliseconds?: number;
     }
+  | { kind: "diagnostic"; event: AdditionsRecoveryDiagnostic }
   | { kind: "result"; result: unknown }
   | { kind: "error"; error: string };
 

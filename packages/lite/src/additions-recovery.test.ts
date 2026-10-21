@@ -1,4 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { createMessage, encrypt, enums } from "openpgp";
+import { DiagnosticsRecorder } from "./diagnostics.js";
 import { Worker } from "node:worker_threads";
 import { build } from "esbuild";
 import { IDBFactory } from "fake-indexeddb";
@@ -24,7 +26,7 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-it("recovers a large source after warm checkpoints while upload hints retain their smaller allowance", async () => {
+async function fixture() {
   vi.stubGlobal("indexedDB", new IDBFactory());
   vi.stubGlobal("navigator", {
     locks: {
@@ -96,6 +98,7 @@ it("recovers a large source after warm checkpoints while upload hints retain the
   };
   const slots = new Map<string, Slot[]>();
   const blobs = new Map<string, Uint8Array>();
+  const stall = new Set<string>();
   const collectedAt = "2026-10-20T00:00:00.000Z";
   function register(scope: string, slot: Slot) {
     slots.set(scope, [...(slots.get(scope) ?? []), slot]);
@@ -104,11 +107,19 @@ it("recovers a large source after warm checkpoints while upload hints retain the
     scope: string,
     version: string,
     data: Record<string, unknown>,
+    compressed = false,
   ) {
     const plaintext = new TextEncoder().encode(
       JSON.stringify(createDataFileEnvelope(scope, collectedAt, data)),
     );
-    const encrypted = await encryptWithPassword(plaintext, password(scope));
+    const encrypted = compressed
+      ? await encrypt({
+          message: await createMessage({ binary: plaintext }),
+          passwords: [password(scope)],
+          format: "binary",
+          config: { preferredCompressionAlgorithm: enums.compression.zlib },
+        })
+      : await encryptWithPassword(plaintext, password(scope));
     blobs.set(`${scope}/${version}`, encrypted);
     register(scope, {
       expectedVersion: version,
@@ -140,6 +151,16 @@ it("recovers a large source after warm checkpoints while upload hints retain the
             new Uint8Array(await new Response(init.body).arrayBuffer()),
           );
           return Response.json({}, { status: 201 });
+        }
+        if (stall.has(key)) {
+          const signal = init?.signal;
+          if (!signal) throw new Error("Missing bounded download signal");
+          signal.throwIfAborted();
+          await new Promise<never>((_resolve, reject) =>
+            signal.addEventListener("abort", () => reject(signal.reason), {
+              once: true,
+            }),
+          );
         }
         const bytes = blobs.get(key);
         return bytes
@@ -196,7 +217,11 @@ it("recovers a large source after warm checkpoints while upload hints retain the
     },
   );
   const dbName = crypto.randomUUID();
-  async function session(bytes?: number) {
+  async function session(
+    bytes?: number,
+    diagnostics?: DiagnosticsRecorder,
+    milliseconds = 120_000,
+  ) {
     const result = await createPsLiteSyncManager({
       config: ServerConfigSchema.parse({
         gateway: { url: "https://gateway.example" },
@@ -216,7 +241,8 @@ it("recovers a large source after warm checkpoints while upload hints retain the
       },
       additionsWorkerFactory: workerFactory,
       autoStartSync: false,
-      additionsTimeBudgetMs: 120_000,
+      diagnostics,
+      additionsTimeBudgetMs: milliseconds,
       ...{ additionsByteBudget: bytes },
     });
     return result.additions!;
@@ -236,6 +262,11 @@ it("recovers a large source after warm checkpoints while upload hints retain the
       ),
     ).data;
   }
+  return { source, session, document, slots, blobs, stall, query };
+}
+
+it("recovers a large source after warm checkpoints while upload hints retain their smaller allowance", async () => {
+  const { source, session, document, blobs, query } = await fixture();
   await source("github.events", "1", {
     events: Array.from({ length: 100 }, (_, id) => ({ id: String(id) })),
   });
@@ -285,3 +316,54 @@ it("recovers a large source after warm checkpoints while upload hints retain the
     through: { "instagram.posts": "2" },
   });
 }, 60_000);
+
+it.each(["metadata_hash_mismatch", "compressed_packet"] as const)(
+  "reports %s through the existing diagnostics recorder while rejecting the source",
+  async (code) => {
+    const { source, session, slots, query } = await fixture();
+    await source(
+      "github.profile",
+      "1",
+      { name: "private-diagnostic-sentinel" },
+      code === "compressed_packet",
+    );
+    if (code === "metadata_hash_mismatch")
+      slots.get("github.profile")![0]!.metadataHash = `0x${"ab".repeat(32)}`;
+    const diagnostics = new DiagnosticsRecorder();
+    const summary = await (
+      await session(32 * 1024 * 1024, diagnostics)
+    ).summarize(query);
+    expect(summary).toMatchObject({
+      coverage: "partial",
+      total: 0,
+      through: { "github.profile": "0" },
+    });
+    expect(diagnostics.snapshot().recentEvents).toContainEqual(
+      expect.objectContaining({
+        scope: "github.profile",
+        fileId: "1",
+        detail: `additions:${code}`,
+        error: true,
+      }),
+    );
+    expect(JSON.stringify(diagnostics.snapshot())).not.toContain(
+      "private-diagnostic-sentinel",
+    );
+  },
+  30_000,
+);
+
+it("reports a source-unit timeout as a budget limit rather than corrupt data", async () => {
+  const { source, session, stall, query } = await fixture();
+  await source("github.profile", "1", { name: "valid" });
+  stall.add("github.profile/1");
+  const diagnostics = new DiagnosticsRecorder();
+  await (await session(32 * 1024 * 1024, diagnostics, 3000)).summarize(query);
+  expect(diagnostics.snapshot().recentEvents).toContainEqual(
+    expect.objectContaining({
+      scope: "github.profile",
+      fileId: "1",
+      detail: "additions:budget_exceeded",
+    }),
+  );
+}, 10000);

@@ -323,7 +323,9 @@ export async function createPsLiteSyncManager(
             masterKey,
             byteBudget: additionsByteBudget,
             timeBudgetMs: additionsTimeBudgetMs,
+            diagnostics: Boolean(options.diagnostics),
           },
+          diagnostics: options.diagnostics,
           transport: createPsLiteAdditionsTransport({
             config: options.config,
             ownerAddress: serverOwner,

@@ -69,7 +69,35 @@ export function additionsLedgerScope(scope: string): string {
     : `vana.system.additions-hash.${keccak256(stringToHex(scope)).slice(2)}`;
 }
 
+export type AdditionsRecoveryCode =
+  | "compressed_packet"
+  | "decrypt_failed"
+  | "data_hash_mismatch"
+  | "metadata_hash_mismatch"
+  | "invalid_envelope"
+  | "unsupported_source_data"
+  | "replay_failed"
+  | "budget_exceeded"
+  | "cancelled";
+export interface AdditionsRecoveryDiagnostic {
+  scope: string;
+  version: string;
+  code: AdditionsRecoveryCode;
+}
+/** Fixed operator codes only: never retain payloads or raw exception text. */
+export class AdditionsRecoveryError extends Error {
+  constructor(
+    readonly code: AdditionsRecoveryCode,
+    message: string = code,
+  ) {
+    super(message);
+    this.name = "AdditionsRecoveryError";
+  }
+}
+
 export interface DurableAdditionsOptions {
+  /** Transient operator observation; never persisted in ledgers or summaries. */
+  onRecoveryDiagnostic?: (event: AdditionsRecoveryDiagnostic) => void;
   ownerAddress: string;
   /** Include chain and Gateway origin. A service instance belongs to one owner/network. */
   network: string;
@@ -225,17 +253,36 @@ export function createDurableAdditions(
         : await storageAdapter.download(url);
     if (!budget.limited) budget.check(encrypted.byteLength);
     const password = hex(deriveScopeKey(options.masterKey, scope));
-    const plaintext =
-      budget.limited && options.boundedWork
-        ? await options.boundedWork.decrypt(encrypted, password, budget)
-        : await decryptWithPassword(encrypted, password);
+    let plaintext: Uint8Array;
+    try {
+      plaintext =
+        budget.limited && options.boundedWork
+          ? await options.boundedWork.decrypt(encrypted, password, budget)
+          : await decryptWithPassword(encrypted, password);
+    } catch (error) {
+      if (
+        error instanceof AdditionsRecoveryError ||
+        error instanceof BudgetExceeded ||
+        budget.signal?.aborted
+      )
+        throw error;
+      throw new AdditionsRecoveryError("decrypt_failed");
+    }
     budget.check(plaintext.byteLength);
     if (keccak256(plaintext).toLowerCase() !== slot.dataHash.toLowerCase())
-      throw new Error("Additions content commitment mismatch");
+      throw new AdditionsRecoveryError(
+        "data_hash_mismatch",
+        "Additions content commitment mismatch",
+      );
     budget.check(plaintext.byteLength * 3);
-    const envelope = DataFileEnvelopeSchema.parse(
-      JSON.parse(new TextDecoder().decode(plaintext)),
-    );
+    let envelope: ReturnType<typeof DataFileEnvelopeSchema.parse>;
+    try {
+      envelope = DataFileEnvelopeSchema.parse(
+        JSON.parse(new TextDecoder().decode(plaintext)),
+      );
+    } catch {
+      throw new AdditionsRecoveryError("invalid_envelope");
+    }
     const metadataHash = keccak256(
       stringToHex(
         JSON.stringify({
@@ -250,7 +297,10 @@ export function createDurableAdditions(
       !Number.isFinite(Date.parse(envelope.collectedAt)) ||
       metadataHash.toLowerCase() !== slot.metadataHash.toLowerCase()
     )
-      throw new Error("Additions metadata commitment mismatch");
+      throw new AdditionsRecoveryError(
+        "metadata_hash_mismatch",
+        "Additions metadata commitment mismatch",
+      );
     budget.check();
     return envelope;
   }
@@ -520,10 +570,11 @@ export function createDurableAdditions(
           }),
         ).byteLength;
     for (const slot of relevant.slice(folded.length)) {
+      let unitBudget = budget;
       try {
         // Keep publication capacity in the same owner-wide allowance. Exhaustion
         // of the child leaves the already-folded prefix publishable.
-        const unitBudget = budget.limited
+        unitBudget = budget.limited
           ? budget.excluding(checkpointBytes(ledger, folded.length))
           : budget;
         unitBudget.check();
@@ -571,12 +622,14 @@ export function createDurableAdditions(
           metadata === slot.metadataHash
         ) {
           const data = sourceData(inMemory.data.data);
-          if (!data) throw new Error("Unsupported source envelope");
+          if (!data)
+            throw new AdditionsRecoveryError("unsupported_source_data");
           version = { scope, collectedAt: inMemory.data.collectedAt, data };
         } else {
           const envelope = await readEnvelope(scope, slot, unitBudget);
           const data = sourceData(envelope.data);
-          if (!data) throw new Error("Unsupported source envelope");
+          if (!data)
+            throw new AdditionsRecoveryError("unsupported_source_data");
           version = { scope, collectedAt: envelope.collectedAt, data };
         }
         const hadBaseline = ledger !== null && ledger.baseline !== null;
@@ -601,6 +654,25 @@ export function createDurableAdditions(
         folded.push(slot);
         through = slot.expectedVersion;
       } catch (error) {
+        try {
+          options.onRecoveryDiagnostic?.({
+            scope,
+            version: slot.expectedVersion,
+            code:
+              error instanceof BudgetExceeded ||
+              (unitBudget.signal?.aborted &&
+                unitBudget.signal.reason instanceof DOMException &&
+                unitBudget.signal.reason.name === "TimeoutError")
+                ? "budget_exceeded"
+                : budget.signal?.aborted
+                  ? "cancelled"
+                  : error instanceof AdditionsRecoveryError
+                    ? error.code
+                    : "replay_failed",
+          });
+        } catch {
+          /* Observation cannot alter recovery. */
+        }
         coverage =
           error instanceof BudgetExceeded || budget.signal?.aborted
             ? "behind"
