@@ -25,6 +25,7 @@ const OUTSIDE = "2025-06-01T00:00:00Z";
 type Body = {
   data: Array<{
     id: string;
+    instance_id?: string;
     deleted?: boolean;
     data?: Record<string, unknown>;
   }>;
@@ -384,7 +385,7 @@ for (const backend of ["memory", "sqlite"]) {
         for (const instance of ["i", "j"])
           h.put("a", { name: instance, t: INSIDE }, { instance });
         h.put("b", { name: "B", t: INSIDE }, { instance: "j" });
-        for (const path of [
+        const lists = [
           records("s", { changes_since: begin(version) }),
           records("s", {
             changes_since: begin(version),
@@ -392,11 +393,26 @@ for (const backend of ["memory", "sqlite"]) {
             order: "asc",
           }),
           records("s", {}),
-          "/streams/s/records/a",
-        ]) {
+        ];
+        // A candidate record is named by its instance and key together, so
+        // a list or sync page can serve both. A detail read names a key
+        // alone, so it stays ambiguous in every profile.
+        for (const path of version === CANDIDATE
+          ? ["/streams/s/records/a"]
+          : [...lists, "/streams/s/records/a"]) {
           const response = await h.get(path);
           expect(response.status).toBe(403);
           expect(response.body.error?.code).toBe("disclosure_unavailable");
+        }
+        if (version === CANDIDATE) {
+          for (const path of [lists[0], lists[2]]) {
+            const response = await h.get(path);
+            expect(response.status).toBe(200);
+            const ids = response.body.data
+              .map((row) => `${row.instance_id}/${row.id}`)
+              .sort();
+            expect(ids).toEqual(["i/a", "j/a", "j/b"]);
+          }
         }
         // A key held by one instance stays readable.
         expect((await h.get("/streams/s/records/b")).status).toBe(200);
@@ -444,8 +460,19 @@ for (const backend of ["memory", "sqlite"]) {
         const baseline = await checkpoint(h, version);
         h.put("a", { name: "j2", t: INSIDE }, { instance: "j" });
         const sync = await h.get(records("s", { changes_since: baseline }));
-        expect(sync.status).toBe(403);
-        expect(sync.body.error?.code).toBe("disclosure_unavailable");
+        if (version === CANDIDATE) {
+          expect(sync.status).toBe(200);
+          expect(sync.body.data).toEqual([
+            expect.objectContaining({
+              id: "a",
+              instance_id: "j",
+              data: { id: "a", name: "j2" },
+            }),
+          ]);
+        } else {
+          expect(sync.status).toBe(403);
+          expect(sync.body.error?.code).toBe("disclosure_unavailable");
+        }
       });
 
       it(`F5 every successful sync page is one completed access event (${version})`, async () => {

@@ -978,7 +978,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           cursor,
           limit,
           eligibilityFields: candidate ? streamGrant!.fields : fields,
-          oneRecordPerKey: context!.tokenKind === "client",
+          // Candidate records carry instance_id, so one key held by two
+          // instances names two records; the current wire would merge them.
+          oneRecordPerKey: context!.tokenKind === "client" && !candidate,
           ...(streamGrant && {
             access: {
               canSeeKey: (recordKey) =>
@@ -1035,7 +1037,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         limit,
         order,
         cursor,
-        oneRecordPerKey: context!.tokenKind === "client",
+        oneRecordPerKey:
+          context!.tokenKind === "client" && !grantIsCandidate(context!.grant),
         isVisible: (row) =>
           recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
           recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
