@@ -1,5 +1,12 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, writeFile, rename, rm } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  mkdtemp,
+  readFile,
+  writeFile,
+  rename,
+  rm,
+  link,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { keccak256, stringToHex } from "viem";
@@ -10,13 +17,17 @@ import {
   deriveScopeKey,
   encryptWithPassword,
 } from "@opendatalabs/vana-sdk/browser";
-import type { StorageAdapter } from "../storage/adapters/interface.js";
+import {
+  StoredBlobConflictError,
+  type StorageAdapter,
+} from "../storage/adapters/interface.js";
 import type { VersionInventoryClient } from "./version-inventory.js";
 import {
   additionsLedgerScope,
   createDurableAdditions,
   type DurableAdditionsOptions,
 } from "./durable.js";
+import type { ByteBudget } from "./budget.js";
 
 const OWNER = "0x1111111111111111111111111111111111111111";
 const SOURCE = "test.conversations";
@@ -83,6 +94,26 @@ async function fixture() {
         await atomicWrite(path, bytes);
         return path;
       },
+      async uploadCreateOnly(key, bytes) {
+        const path = blobPath(key);
+        const candidate = `${path}.candidate-${fileSequence++}`;
+        await writeFile(candidate, bytes);
+        try {
+          await link(candidate, path);
+        } catch (error) {
+          if (
+            !(error instanceof Error) ||
+            !("code" in error) ||
+            error.code !== "EEXIST"
+          )
+            throw error;
+          if (!Buffer.from(await readFile(path)).equals(Buffer.from(bytes)))
+            throw new StoredBlobConflictError(key);
+        } finally {
+          await rm(candidate);
+        }
+        return path;
+      },
       async download(path) {
         return new Uint8Array(await readFile(path));
       },
@@ -132,12 +163,17 @@ async function fixture() {
     expectedVersion: string,
     collectedAt: string,
     data: Record<string, unknown>,
+    createOnly = false,
   ) {
     const plaintext = new TextEncoder().encode(
       JSON.stringify(createDataFileEnvelope(scope, collectedAt, data)),
     );
     const encrypted = await encryptWithPassword(plaintext, password(scope));
-    await storage().upload(`${scope}/${expectedVersion}`, encrypted);
+    const adapter = storage();
+    await (createOnly ? adapter.uploadCreateOnly! : adapter.upload)(
+      `${scope}/${expectedVersion}`,
+      encrypted,
+    );
     await setSlot(scope, {
       expectedVersion,
       dataHash: keccak256(plaintext),
@@ -196,7 +232,7 @@ async function fixture() {
       ).data;
   }
   function actor(
-    budgets: Pick<DurableAdditionsOptions, "byteBudget" | "timeBudgetMs"> = {},
+    budgets: Partial<DurableAdditionsOptions> = {},
     beforeInventoryRead?: (scope: string) => Promise<void>,
   ) {
     // Each actor constructs fresh ports and discovers state solely from the shared files.
@@ -239,6 +275,69 @@ async function fixture() {
       ...budgets,
     });
   }
+  function boundedActor(
+    input: {
+      beforeDownload?: (key: string, budget: ByteBudget) => Promise<void>;
+      proof?: (proof: {
+        expectedVersion: string;
+        dataHash: string;
+        metadataHash: string;
+      }) => { expectedVersion: string; dataHash: string; metadataHash: string };
+      options?: Partial<DurableAdditionsOptions>;
+    } = {},
+  ) {
+    const events: string[] = [];
+    const adapter = storage();
+    const service = actor({
+      byteBudget: 2 * 1024 * 1024,
+      storageAdapter: {
+        ...adapter,
+        async downloadBounded(key, budget) {
+          budget.charge();
+          events.push(`download:${key}`);
+          await input.beforeDownload?.(key, budget);
+          budget.charge();
+          const bytes = new Uint8Array(
+            await readFile(key, { signal: budget.signal }),
+          );
+          budget.charge(bytes.byteLength * 2);
+          return bytes;
+        },
+      },
+      boundedWork: {
+        async decrypt(bytes, key, budget) {
+          budget.charge(bytes.byteLength * 8);
+          const plaintext = await decryptWithPassword(bytes, key);
+          budget.charge(plaintext.byteLength);
+          return plaintext;
+        },
+        async publish(scope, data, budget) {
+          budget.charge();
+          events.push(`publish:${scope}`);
+          const previous =
+            (await readRegistry())[scope]?.versions.at(-1)?.expectedVersion ??
+            "0";
+          const expectedVersion = String(BigInt(previous) + 1n);
+          budget.charge(JSON.stringify(data).length * 16);
+          await put(scope, expectedVersion, T4, data, true);
+          budget.charge();
+          const slot = (await readRegistry())[scope].versions.at(-1)!;
+          const proof = {
+            expectedVersion,
+            dataHash: slot.dataHash,
+            metadataHash: slot.metadataHash,
+          };
+          return input.proof?.(proof) ?? proof;
+        },
+        async confirmed(scope, budget) {
+          budget.charge();
+          events.push(`confirmed:${scope}`);
+        },
+      },
+      ...input.options,
+    });
+    return { service, events };
+  }
   return {
     root,
     actor,
@@ -249,6 +348,8 @@ async function fixture() {
     readRegistry,
     blobPath,
     setSlot,
+    boundedActor,
+    storage,
   };
 }
 
@@ -307,6 +408,8 @@ describe("durable owner additions recovery", () => {
       .parse(await f.document(additionsLedgerScope(SOURCE)));
     await f.source("2", T2, ["a", "b"]);
     expect((await tee.summarize(QUERY)).through).toEqual({ [SOURCE]: "2" });
+    await rm(f.blobPath(`${SOURCE}/1`));
+    await rm(f.blobPath(`${SOURCE}/2`));
     // Simulate a delayed registration of the older whole-document writer.
     await f.put(additionsLedgerScope(SOURCE), "3", T3, oldDocument);
     const repaired = await desktop.summarize(QUERY);
@@ -436,6 +539,215 @@ describe("durable owner additions recovery", () => {
   });
 });
 
+it("honors cancellation and uses only bounded registry deletion for durable-only cleanup", async () => {
+  const f = await fixture();
+  const ordinary = vi.fn(async () => {});
+  const bounded = vi.fn(async (_scope: string, _budget: ByteBudget) => {});
+  const actor = f.actor({
+    deleteSystemScope: ordinary,
+    deleteSystemScopeBounded: bounded,
+  });
+  const aborted = AbortSignal.abort(new Error("cancel deletion"));
+  await expect(
+    actor.deleteScope(SOURCE, { durableOnly: true, signal: aborted }),
+  ).rejects.toThrow("cancel deletion");
+  expect(ordinary).not.toHaveBeenCalled();
+  expect(bounded).not.toHaveBeenCalled();
+  await actor.deleteScope(SOURCE, { durableOnly: true });
+  expect(bounded.mock.calls.map((call) => call[0])).toEqual([
+    additionsLedgerScope(SOURCE),
+    "vana.system.additions",
+  ]);
+  expect(ordinary).not.toHaveBeenCalled();
+  await expect(
+    f
+      .actor({ deleteSystemScope: ordinary })
+      .deleteScope(SOURCE, { durableOnly: true }),
+  ).rejects.toThrow("Bounded additions deletion is unavailable");
+  expect(ordinary).not.toHaveBeenCalled();
+});
+
+it("persists a bounded prefix when the next source unit exhausts its allowance and resumes after pruning", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.source("2", T2, ["a", "b"]);
+  const first = f.boundedActor({
+    beforeDownload: async (key, budget) => {
+      if (key === f.blobPath(`${SOURCE}/2`))
+        budget.charge(budget.remaining + 1);
+    },
+  });
+  expect(await first.service.summarize(QUERY)).toMatchObject({
+    coverage: "behind",
+    total: 1,
+    through: { [SOURCE]: "1" },
+  });
+  expect(first.events).toContain(`confirmed:${additionsLedgerScope(SOURCE)}`);
+  expect(await f.document(additionsLedgerScope(SOURCE))).toMatchObject({
+    through: "1",
+    currentTotal: 1,
+  });
+  await rm(f.blobPath(`${SOURCE}/1`));
+  expect(await f.boundedActor().service.summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 2,
+    through: { [SOURCE]: "2" },
+  });
+});
+
+it("advances bounded recovery without rereading all older checkpoints", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.actor().summarize(QUERY);
+  const scope = additionsLedgerScope(SOURCE);
+  const document = z
+    .record(z.string(), z.unknown())
+    .parse(await f.document(scope));
+  for (let version = 2; version <= 20; version++)
+    await f.put(scope, String(version), T4, document);
+  await f.source("2", T2, ["a", "b"]);
+  const actor = f.boundedActor({
+    beforeDownload: async (key, budget) => {
+      if (
+        key.startsWith(f.blobPath(`${scope}/`).slice(0, -".encrypted".length))
+      )
+        budget.charge(150_000);
+    },
+  });
+  expect(await actor.service.summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 2,
+    through: { [SOURCE]: "2" },
+  });
+});
+
+it("preserves publication capacity on bounded fallback overflow and resumes only from longer evidence", async () => {
+  const f = await fixture();
+  const scope = additionsLedgerScope(SOURCE);
+  await f.source("1", T1, ["a"]);
+  await f.actor().summarize(QUERY);
+  const stale = z
+    .record(z.string(), z.unknown())
+    .parse(await f.document(scope));
+  await f.source("2", T2, ["a", "b"]);
+  await f.source("3", T3, ["a", "b", "c"]);
+  await f.actor().summarize(QUERY);
+  await f.source("4", T4, ["a", "b", "c", "d"]);
+  await f.put(scope, "3", T4, stale);
+  await rm(f.blobPath(`${SOURCE}/1`));
+  await rm(f.blobPath(`${SOURCE}/3`));
+  const limited = f.boundedActor({
+    beforeDownload: async (key, budget) => {
+      if (key === f.blobPath(`${scope}/2`)) {
+        budget.charge(budget.remaining);
+        budget.charge(1);
+      }
+    },
+  });
+  expect(await limited.service.summarize(QUERY)).toMatchObject({
+    coverage: "behind",
+    total: 2,
+    through: { [SOURCE]: "2" },
+  });
+  expect(limited.events).toContain(`confirmed:${scope}`);
+  expect(await f.document(scope)).toMatchObject({
+    through: "2",
+    currentTotal: 2,
+  });
+  await rm(f.blobPath(`${SOURCE}/2`));
+  const downloaded: string[] = [];
+  const restarted = f.boundedActor({
+    beforeDownload: async (key) => {
+      downloaded.push(key);
+    },
+  });
+  expect(await restarted.service.summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 4,
+    through: { [SOURCE]: "4" },
+  });
+  expect(downloaded).not.toContain(f.blobPath(`${SOURCE}/2`));
+  expect(
+    downloaded.filter((key) => key === f.blobPath(`${SOURCE}/3`)),
+  ).toHaveLength(1);
+});
+
+it.each(["proof", "content"])(
+  "does not confirm bounded publication with mismatched %s",
+  async (failure) => {
+    const f = await fixture();
+    await f.source("1", T1, ["a"]);
+    const actor = f.boundedActor({
+      proof:
+        failure === "proof"
+          ? (proof) => ({ ...proof, dataHash: `0x${"ff".repeat(32)}` })
+          : undefined,
+      beforeDownload: async (key) => {
+        if (
+          failure === "content" &&
+          key === f.blobPath(`${additionsLedgerScope(SOURCE)}/1`)
+        )
+          await f.put(additionsLedgerScope(SOURCE), "1", T3, { forged: true });
+      },
+    });
+    expect(await actor.service.summarize(QUERY)).toMatchObject({
+      coverage: "behind",
+      total: 1,
+    });
+    expect(
+      actor.events.filter((event) => event.startsWith("confirmed:")),
+    ).toEqual([]);
+  },
+);
+
+it("settles an aborted bounded source unit before returning and starts no later effects", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  const controller = new AbortController();
+  let started!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const settling = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const actor = f.boundedActor({
+    options: { signal: controller.signal },
+    beforeDownload: async () => {
+      controller.abort(new Error("cancel recovery"));
+      started();
+      await settling;
+      controller.signal.throwIfAborted();
+    },
+  });
+  let returned = false;
+  const summary = actor.service.summarize(QUERY).then((result) => {
+    returned = true;
+    return result;
+  });
+  await entered;
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(returned).toBe(false);
+  } finally {
+    release();
+  }
+  expect(await summary).toMatchObject({
+    coverage: "behind",
+    total: 0,
+  });
+  const completedEvents = [...actor.events];
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(actor.events).toEqual(completedEvents);
+  expect(
+    actor.events.filter((event) => /^(publish|confirmed):/.test(event)),
+  ).toEqual([]);
+  expect(await f.readRegistry()).not.toHaveProperty(
+    additionsLedgerScope(SOURCE),
+  );
+});
+
 it("converges after two independent actors summarize concurrently and a third restarts", async () => {
   const f = await fixture();
   await f.source("1", T1, ["a"]);
@@ -460,6 +772,158 @@ it("converges after two independent actors summarize concurrently and a third re
   expect(restarted.days.map((day) => day.added)).toEqual([1, 1, 0, 0]);
   expect(await f.document(additionsLedgerScope(SOURCE))).toMatchObject({
     through: "2",
+  });
+});
+
+it("keeps the first committed checkpoint when a late writer uploads then crashes after originals are pruned", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  const scope = additionsLedgerScope(SOURCE);
+  let resume!: () => void;
+  let entered!: () => void;
+  const paused = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  const adapter = f.storage();
+  async function delayedUpload(
+    key: string,
+    bytes: Uint8Array,
+    createOnly: boolean,
+  ) {
+    if (key === `${scope}/1`) {
+      entered();
+      await released;
+    }
+    return (createOnly ? adapter.uploadCreateOnly! : adapter.upload)(
+      key,
+      bytes,
+    );
+  }
+  const late = f
+    .actor({
+      storageAdapter: {
+        ...adapter,
+        upload: (key, bytes) => delayedUpload(key, bytes, false),
+        uploadCreateOnly: (key, bytes) => delayedUpload(key, bytes, true),
+      },
+      gateway: {
+        async registerDataPoint() {
+          throw new Error("writer crashed before registration");
+        },
+      },
+    })
+    .summarize(QUERY);
+  await Promise.race([
+    paused,
+    late.then(() => {
+      throw new Error("late actor returned before reaching upload");
+    }),
+  ]);
+  try {
+    await f.source("2", T2, ["a", "b"]);
+    expect(await f.actor().summarize(QUERY)).toMatchObject({
+      coverage: "complete",
+      total: 2,
+    });
+    await rm(f.blobPath(`${SOURCE}/1`));
+    await rm(f.blobPath(`${SOURCE}/2`));
+  } finally {
+    resume();
+    await late;
+  }
+  expect(await f.actor().summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 2,
+    through: { [SOURCE]: "2" },
+  });
+});
+
+it("does not upload any checkpoint through an adapter without atomic create-only support", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  const upload = vi.fn(f.storage().upload);
+  const actor = f.actor({
+    storageAdapter: { ...f.storage(), upload, uploadCreateOnly: undefined },
+  });
+  expect(await actor.summarize(QUERY)).toMatchObject({
+    coverage: "behind",
+    total: 1,
+  });
+  expect(upload).not.toHaveBeenCalled();
+});
+
+it("distinguishes unavailable immutable storage from an invalid orphan in publication diagnostics", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  const codes: string[] = [];
+  await f
+    .actor({
+      storageAdapter: { ...f.storage(), uploadCreateOnly: undefined },
+      onRecoveryDiagnostic: (event) => codes.push(event.code),
+    })
+    .summarize(QUERY);
+  expect(codes).toContain("immutable_storage_unavailable");
+  codes.length = 0;
+  await writeFile(
+    f.blobPath(`${additionsLedgerScope(SOURCE)}/1`),
+    new Uint8Array([1, 2, 3]),
+  );
+  await f
+    .actor({ onRecoveryDiagnostic: (event) => codes.push(event.code) })
+    .summarize(QUERY);
+  expect(codes).toContain("checkpoint_adoption_failed");
+  expect(await f.readRegistry()).not.toHaveProperty(
+    additionsLedgerScope(SOURCE),
+  );
+});
+
+it("registers an authenticated immutable orphan without rewriting or skipping its version", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f
+    .actor({
+      gateway: {
+        async registerDataPoint() {
+          throw new Error("crashed after upload");
+        },
+      },
+    })
+    .summarize(QUERY);
+  const path = f.blobPath(`${additionsLedgerScope(SOURCE)}/1`);
+  const orphan = await readFile(path);
+  expect(
+    (await f.readRegistry())[additionsLedgerScope(SOURCE)],
+  ).toBeUndefined();
+  await f.actor().summarize(QUERY);
+  expect(await readFile(path)).toEqual(orphan);
+  expect(await f.document(additionsLedgerScope(SOURCE))).toMatchObject({
+    through: "1",
+    currentTotal: 1,
+  });
+  await rm(f.blobPath(`${SOURCE}/1`));
+  expect(await f.actor().summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 1,
+  });
+});
+
+it("selects an older compatible checkpoint when the source head rolls back after pruning", async () => {
+  const f = await fixture();
+  await f.source("1", T1, ["a"]);
+  await f.actor().summarize(QUERY);
+  const first = (await f.readRegistry())[SOURCE].versions[0];
+  await f.source("2", T2, ["a", "b"]);
+  await f.actor().summarize(QUERY);
+  await rm(f.blobPath(`${SOURCE}/1`));
+  await rm(f.blobPath(`${SOURCE}/2`));
+  await f.setSlot(SOURCE, first);
+  expect(await f.actor().summarize(QUERY)).toMatchObject({
+    coverage: "complete",
+    total: 1,
+    through: { [SOURCE]: "1" },
   });
 });
 
@@ -541,6 +1005,33 @@ it.each(["owner", "network"])(
       network: "chain:1:https://gateway.example",
       ledger: { latest: { total: 1 } },
     });
+  },
+);
+
+it.each(["failed", "unknown"])(
+  "discards a checkpoint contribution when its pending registration becomes %s",
+  async (status) => {
+    const f = await fixture();
+    await f.source("1", T1, ["a"]);
+    await f.actor().summarize(QUERY);
+    await f.source("2", T2, ["a", "b"]);
+    const slot = (await f.readRegistry())[SOURCE].versions[1];
+    await f.setSlot(SOURCE, { ...slot, status: "pending" });
+    expect(await f.actor().summarize(QUERY)).toMatchObject({
+      total: 2,
+      through: { [SOURCE]: "2" },
+    });
+    await rm(f.blobPath(`${SOURCE}/1`));
+    await f.setSlot(SOURCE, { ...slot, status });
+    for (let read = 0; read < 2; read++) {
+      const summary = await f.actor().summarize(QUERY);
+      expect(summary).toMatchObject({
+        coverage: "partial",
+        total: 1,
+        through: { [SOURCE]: "1" },
+      });
+      expect(summary.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
+    }
   },
 );
 

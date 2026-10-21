@@ -1,16 +1,17 @@
 import {
   AdditionsBudgetExceeded,
+  AdditionsRecoveryError,
   createDurableAdditions,
   createVersionInventoryClient,
+  checkpointCommitment,
+  findCheckpointRegistration,
   type ByteBudget,
 } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   createDataFileEnvelope,
-  DataFileEnvelopeSchema,
   deriveScopeKey,
   encryptWithPassword,
 } from "@opendatalabs/vana-sdk/browser";
-import { keccak256, stringToHex } from "viem";
 import { decryptBoundedAdditions } from "./additions-crypto.js";
 import { additionsTransfers } from "./additions-protocol.js";
 import type {
@@ -19,7 +20,10 @@ import type {
   HostMethod,
   WorkerMessage,
 } from "./additions-protocol.js";
-import type { PsLiteAdditionsTransport } from "./additions-transport.js";
+import type {
+  PsLiteAdditionsTransport,
+  PsLitePreparedPublication,
+} from "./additions-transport.js";
 
 const worker = globalThis as unknown as {
   postMessage(message: HostMessage, transfer?: Transferable[]): void;
@@ -106,13 +110,65 @@ function createService(init: AdditionsWorkerInit) {
     },
   });
   const reconciledScopes = new Set<string>();
+  async function publishCandidate(
+    prepared: PsLitePreparedPublication,
+    budget: ByteBudget,
+  ) {
+    const result = await transport("publish", [prepared], budget);
+    if (!result?.conflict) return prepared;
+    // The immutable occupant may be an interrupted writer. Authenticate its
+    // bytes before replacing our local intent or registering its commitment.
+    const encrypted = await transport(
+      "download",
+      [`${prepared.scope}/${prepared.expectedVersion}`],
+      budget,
+    );
+    let commitment: ReturnType<typeof checkpointCommitment>;
+    try {
+      const plaintext = await decryptBoundedAdditions(
+        encrypted,
+        hex(deriveScopeKey(init.masterKey, prepared.scope)),
+        budget,
+      );
+      budget.charge(plaintext.byteLength * 4);
+      commitment = checkpointCommitment(
+        prepared.scope,
+        plaintext,
+        encrypted.byteLength,
+      );
+    } catch (error) {
+      if (error instanceof AdditionsBudgetExceeded || budget.signal?.aborted)
+        throw error;
+      throw new AdditionsRecoveryError("checkpoint_adoption_failed");
+    }
+    const adopted = {
+      scope: prepared.scope,
+      expectedVersion: prepared.expectedVersion,
+      encrypted,
+      dataHash: commitment.dataHash,
+      metadataHash: commitment.metadataHash,
+    };
+    const snapshot = await inventory.list(prepared.scope, {
+      budget,
+      signal: budget.signal,
+    });
+    if (
+      findCheckpointRegistration(snapshot, prepared.expectedVersion, commitment)
+    )
+      return adopted;
+    const retry = await transport("publish", [adopted, true], budget);
+    if (retry?.conflict)
+      throw new Error("Checkpoint occupant changed during recovery");
+    return adopted;
+  }
   async function reconcilePending(scope: string, budget: ByteBudget) {
     if (reconciledScopes.has(scope)) return null;
-    const prior = await transport("readPending", [scope], budget);
-    if (!prior) {
+    const pending = await transport("readPending", [scope], budget);
+    if (!pending) {
       reconciledScopes.add(scope);
       return null;
     }
+    let prior: PsLitePreparedPublication = pending;
     let snapshot = await inventory.list(scope, {
       budget,
       signal: budget.signal,
@@ -130,7 +186,7 @@ function createService(init: AdditionsWorkerInit) {
     if (!slot) {
       // The exact encrypted candidate is retried; never bump the version
       // on an ambiguous PUT or registration receipt.
-      await transport("publish", [prior], budget);
+      prior = await publishCandidate(prior, budget);
       snapshot = await inventory.list(scope, {
         budget,
         signal: budget.signal,
@@ -162,21 +218,14 @@ function createService(init: AdditionsWorkerInit) {
         budget,
       );
       budget.charge(plaintext.byteLength * 4);
-      const envelope = DataFileEnvelopeSchema.parse(
-        JSON.parse(new TextDecoder().decode(plaintext)),
-      );
-      const metadataHash = keccak256(
-        stringToHex(
-          JSON.stringify({
-            scope,
-            collectedAt: envelope.collectedAt,
-            sizeBytes: ciphertext.byteLength,
-          }),
-        ),
+      const { envelope, dataHash, metadataHash } = checkpointCommitment(
+        scope,
+        plaintext,
+        ciphertext.byteLength,
       );
       if (
         envelope.scope !== scope ||
-        keccak256(plaintext) !== proof.dataHash ||
+        dataHash !== proof.dataHash ||
         metadataHash !== proof.metadataHash
       )
         throw new Error("Interrupted checkpoint commitment mismatch");
@@ -291,23 +340,19 @@ function createService(init: AdditionsWorkerInit) {
           hex(deriveScopeKey(init.masterKey, scope)),
         );
         budget.charge(encrypted.byteLength * 2);
+        const { dataHash, metadataHash } = checkpointCommitment(
+          scope,
+          plaintext,
+          encrypted.byteLength,
+        );
         const prepared = {
           scope,
           expectedVersion,
           encrypted,
-          dataHash: keccak256(plaintext),
-          metadataHash: keccak256(
-            stringToHex(
-              JSON.stringify({
-                scope,
-                collectedAt: envelope.collectedAt,
-                sizeBytes: encrypted.byteLength,
-              }),
-            ),
-          ),
+          dataHash,
+          metadataHash,
         };
-        await transport("publish", [prepared], budget);
-        return prepared;
+        return publishCandidate(prepared, budget);
       },
     },
   });
@@ -324,7 +369,9 @@ worker.onmessage = (event) => {
         request?.reject(
           message.budgetExceeded
             ? new AdditionsBudgetExceeded(message.error)
-            : new Error(message.error),
+            : message.recoveryCode
+              ? new AdditionsRecoveryError(message.recoveryCode)
+              : new Error(message.error),
         );
       else request?.resolve(message.result);
     } catch (error) {

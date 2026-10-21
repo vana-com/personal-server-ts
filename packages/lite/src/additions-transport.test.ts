@@ -39,12 +39,55 @@ function setup(fetcher: typeof fetch, storageAudience?: string) {
     stateStore,
     ownerSigner,
     storageAudience,
-    fetch: fetcher,
+    fetch: (input, init) =>
+      String(input).endsWith("/v1/capabilities")
+        ? Promise.resolve(Response.json({ blobs: { writeOnce: true } }))
+        : fetcher(input, init),
   });
   return { transport, stateStore, config, ownerSigner };
 }
 
 describe("bounded owner checkpoint transport", () => {
+  it("performs no signing, PUT, or journal mutation on a backend without immutable uploads", async () => {
+    const { config, stateStore, ownerSigner } = setup(vi.fn());
+    const fetcher = vi.fn<typeof fetch>(
+      async () => new Response(null, { status: 404 }),
+    );
+    const transport = createPsLiteAdditionsTransport({
+      config,
+      stateStore,
+      ownerSigner,
+      ownerAddress,
+      masterKey: new Uint8Array(32).fill(4),
+      fetch: fetcher,
+    });
+    await expect(
+      transport.publish(prepared, new AdditionsBudget(100_000)),
+    ).rejects.toThrow("Atomic create-only storage is unavailable");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0][0])).toBe(
+      "https://storage.example/v1/capabilities",
+    );
+    expect(ownerSigner.signMessageBounded).not.toHaveBeenCalled();
+    expect(
+      await transport.readPending(prepared.scope, new AdditionsBudget(100_000)),
+    ).toBeNull();
+  });
+
+  it("does not register a conflicting upload and retains its intent for worker reconciliation", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () =>
+      Response.json({ code: "BLOB_EXISTS" }, { status: 409 }),
+    );
+    const { transport, ownerSigner } = setup(fetcher);
+    expect(
+      await transport.publish(prepared, new AdditionsBudget(100_000)),
+    ).toEqual({ conflict: true });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(ownerSigner.signAddDataBounded).not.toHaveBeenCalled();
+    expect(
+      await transport.readPending(prepared.scope, new AdditionsBudget(100_000)),
+    ).toEqual(prepared);
+  });
   it("sends the installed SDK wire contract and retains interrupted publication across restart", async () => {
     const requests: { url: string; init: RequestInit }[] = [];
     const fetcher = vi.fn<typeof fetch>(async (input, init) => {
@@ -66,7 +109,7 @@ describe("bounded owner checkpoint transport", () => {
     });
     expect(requests[0].init.body).toEqual(prepared.encrypted);
     expect(new Headers(requests[1].init.headers).get("authorization")).toBe(
-      "Web3Signed 0x5678",
+      "Web3Signed 0x5678", // copy-assertion-ok: HTTP authorization scheme and signature are the wire contract.
     );
     expect(
       JSON.parse(
