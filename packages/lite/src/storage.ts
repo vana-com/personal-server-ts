@@ -472,6 +472,39 @@ export function createIndexedDbPsLitePersistence(
   };
 }
 
+/** Publications in this realm when the Web Locks API is not available. */
+const realmPublications = new Map<string, Promise<unknown>>();
+
+/**
+ * Run a compare-and-publish of one version path exclusively, across every
+ * storage instance that shares the file store: other tabs and workers through
+ * the Web Locks API, other instances in this realm through a shared chain.
+ * The comparison inside reads the file store, never one instance's memory.
+ */
+function withPublicationLock<T>(
+  path: string,
+  publish: () => Promise<T>,
+): Promise<T> {
+  const locks = (
+    globalThis as {
+      navigator?: {
+        locks?: {
+          request<R>(name: string, callback: () => Promise<R>): Promise<R>;
+        };
+      };
+    }
+  ).navigator?.locks;
+  if (locks) return locks.request(`ps-lite:publish:${path}`, publish);
+  const previous = realmPublications.get(path) ?? Promise.resolve();
+  const next = previous.then(publish, publish);
+  const settled = next.catch(() => undefined);
+  realmPublications.set(path, settled);
+  void settled.then(() => {
+    if (realmPublications.get(path) === settled) realmPublications.delete(path);
+  });
+  return next;
+}
+
 export async function createPersistentPsLiteStorage(
   adapter: PsLiteStorageAdapter,
   persistence: PsLitePersistenceAdapter = createIndexedDbPsLitePersistence(),
@@ -571,23 +604,6 @@ export async function createPersistentPsLiteStorage(
     return sortEntries(state.entries.filter((entry) => entry.scope === scope));
   }
 
-  // One publication per version path at a time, so the existence check and
-  // the write below cannot interleave with another write to the same path.
-  const publications = new Map<string, Promise<unknown>>();
-  function serializePublication<T>(
-    path: string,
-    publish: () => Promise<T>,
-  ): Promise<T> {
-    const previous = publications.get(path) ?? Promise.resolve();
-    const next = previous.then(publish, publish);
-    const settled = next.catch(() => undefined);
-    publications.set(path, settled);
-    void settled.then(() => {
-      if (publications.get(path) === settled) publications.delete(path);
-    });
-    return next;
-  }
-
   const storagePort: PsLiteStoragePort = {
     kind: adapter.kind === "custom" ? "custom" : "browser-indexeddb-opfs",
     capabilities,
@@ -635,7 +651,7 @@ export async function createPersistentPsLiteStorage(
      */
     async writeEnvelope(envelope): Promise<WriteResult> {
       const path = envelopePath(envelope.scope, envelope.collectedAt);
-      return serializePublication(path, async () => {
+      return withPublicationLock(path, async () => {
         const published = await readPublishedEnvelope(path);
         // An index row whose bytes were lost still names its version: new
         // bytes may restore it only with the provenance the row records.
