@@ -55,6 +55,7 @@ describe("mcp/read-client", () => {
   it("refuses a read whose version identity storage cannot establish, retryably", async () => {
     const readScopeBlocks = vi.fn();
     const readBlockManifest = vi.fn();
+    const settle = vi.fn().mockResolvedValue({ grantId: "grant-1" });
     const client = createMcpDataReadClient({
       serverOrigin: SERVER_ORIGIN,
       granteeAccount: createAccount(),
@@ -75,9 +76,7 @@ describe("mcp/read-client", () => {
         auth: {
           authorizeOwner: vi.fn(),
           authorizeBuilderList: vi.fn(),
-          authorizeBuilderRead: vi
-            .fn()
-            .mockResolvedValue({ grantId: "grant-1" }),
+          authorizeBuilderRead: settle,
         },
         accessLogWriter: { write: vi.fn() },
       },
@@ -94,6 +93,7 @@ describe("mcp/read-client", () => {
     }
     expect(readScopeBlocks).not.toHaveBeenCalled();
     expect(readBlockManifest).not.toHaveBeenCalled();
+    expect(settle).not.toHaveBeenCalled();
   });
 
   it("preserves a projection refusal from the block manifest read", async () => {
@@ -309,6 +309,7 @@ describe("mcp/read-client", () => {
       // A sidecar bound to the selected version.
       pdppOrigin: false,
       envelopeDigest: "gen-1",
+      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
       blocks: [
         {
           id: "block-42",
@@ -371,7 +372,12 @@ describe("mcp/read-client", () => {
     expect(readScopeBlocks).toHaveBeenCalledWith(
       "instagram.profile",
       "2026-06-05T00:00:00Z",
-      { cursor: undefined, maxBytes: 4096, blockIds: ["block-42"] },
+      {
+        cursor: undefined,
+        maxBytes: 4096,
+        blockIds: ["block-42"],
+        representation: "grantee",
+      },
     );
     expect(accessLogWrite).toHaveBeenCalledTimes(1);
     expect(readFulfillmentReport).not.toHaveBeenCalled();
@@ -389,6 +395,7 @@ describe("mcp/read-client", () => {
       contentKind: "json" as const,
       pdppOrigin: false,
       envelopeDigest: "gen-1",
+      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
       blocks: [
         {
           id: "block-1",
@@ -470,6 +477,7 @@ describe("mcp/read-client", () => {
       // A sidecar bound to the selected version.
       pdppOrigin: false,
       envelopeDigest: "gen-1",
+      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
       blocks: [
         {
           id: "block-1",
@@ -544,7 +552,7 @@ describe("mcp/read-client", () => {
     expect(readScopeBlocks).toHaveBeenCalledWith(
       "instagram.profile",
       "2026-06-05T00:00:00Z",
-      { cursor: undefined, maxBytes: 4096 },
+      { cursor: undefined, maxBytes: 4096, representation: "grantee" },
     );
     expect(accessLogWrite).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -587,6 +595,7 @@ describe("mcp/read-client", () => {
       // A sidecar bound to the selected version.
       pdppOrigin: false,
       envelopeDigest: "gen-1",
+      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
       blocks: [],
       nextCursor,
       warnings: [],
@@ -660,6 +669,7 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       blockIndex: 99,
+      representationId: "fixture-layout",
     });
     const readScopeBlocks = vi.fn().mockResolvedValue({
       scope: "instagram.profile",
@@ -668,6 +678,7 @@ describe("mcp/read-client", () => {
       // A sidecar bound to the selected version.
       pdppOrigin: false,
       envelopeDigest: "gen-1",
+      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
       blocks: [],
       warnings: [],
     });
@@ -734,6 +745,7 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: oldCollectedAt,
       blockIndex: 1,
+      representationId: "fixture-layout",
     });
     const findEntry = vi.fn(
       ({ at }: { at?: string }) =>
@@ -754,6 +766,7 @@ describe("mcp/read-client", () => {
       // version's generation is the one pinned.
       pdppOrigin: false,
       envelopeDigest: "gen-old",
+      redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
       blocks: [],
       warnings: [],
     });
@@ -800,7 +813,7 @@ describe("mcp/read-client", () => {
     expect(readScopeBlocks).toHaveBeenCalledWith(
       "instagram.profile",
       oldCollectedAt,
-      { cursor, maxBytes: 16_384 },
+      { cursor, maxBytes: 16_384, representation: "grantee" },
     );
     // The auth port sees the pinned version too, so a payment-enforcing port
     // (paid self-signing session) settles against the version actually served.
@@ -840,6 +853,7 @@ describe("mcp/read-client", () => {
         contentKind: "json",
         pdppOrigin: false,
         envelopeDigest: "gen-republished",
+        redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
         blocks: [
           {
             id: "block-1",
@@ -858,6 +872,7 @@ describe("mcp/read-client", () => {
         contentKind: "json" as const,
         pdppOrigin: false,
         envelopeDigest: "gen-republished",
+        redaction: { dropTopLevelLineage: false, dropMetadataLineage: false },
         blocks: [
           {
             id: "block-1",
@@ -1204,6 +1219,10 @@ describe("mcp/read-client deletion gate", () => {
               // Sidecars record their envelope's provenance and version.
               pdppOrigin: false,
               envelopeDigest: "gen-1",
+              redaction: {
+                dropTopLevelLineage: false,
+                dropMetadataLineage: false,
+              },
             }),
             readBlockManifest: vi.fn().mockResolvedValue({
               version: 1 as const,
@@ -1212,6 +1231,10 @@ describe("mcp/read-client deletion gate", () => {
               contentKind: "vana-envelope" as const,
               pdppOrigin: false,
               envelopeDigest: "gen-1",
+              redaction: {
+                dropTopLevelLineage: false,
+                dropMetadataLineage: false,
+              },
               blocks: STAMPED_BLOCKS.map(({ id, path, sizeBytes }) => ({
                 id,
                 path,

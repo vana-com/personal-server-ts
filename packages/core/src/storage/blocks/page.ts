@@ -1,52 +1,71 @@
-/**
- * Serve `readScopeBlocks` from blocks already built in memory (for example
- * from an envelope that exists only as a read-time view, with no sidecar on
- * disk). Paging, cursors and block selection behave as in the stored-sidecar
- * implementations.
- */
-
+/** One verified, immutable representation, then selection and UTF-8 paging. */
 import { encodeDataBlockCursor, validateDataBlockCursor } from "./cursor.js";
 import { DataBlockStorageError } from "./errors.js";
 import { selectScopeBlocksByIds } from "./select.js";
+import { manifestBinding, verifyStoredBlock } from "./digest.js";
+import {
+  blockRepresentationId,
+  representBlock,
+  pageBlock,
+  type BlockRepresentation,
+} from "./representation.js";
 import type {
   DataBlockManifest,
   DataScopeBlock,
   ReadScopeBlocksResponse,
 } from "./types.js";
 
-const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+export interface BlockPageOptions {
+  cursor?: string;
+  maxBytes: number;
+  blockIds?: readonly string[];
+  cursorView?: string;
+  representation?: BlockRepresentation;
+}
 
-export async function readBuiltScopeBlocks(
-  built: { manifest: DataBlockManifest; blocks: DataScopeBlock[] },
-  options: {
-    cursor?: string;
-    maxBytes: number;
-    blockIds?: readonly string[];
-    /** Bound into every cursor; a cursor from another view is rejected. */
-    cursorView?: string;
-  },
+export async function readManifestScopeBlocks(
+  manifest: DataBlockManifest,
+  loadBlock: (id: string) => Promise<DataScopeBlock | null>,
+  options: BlockPageOptions,
 ): Promise<ReadScopeBlocksResponse> {
-  const { manifest, blocks: builtBlocks } = built;
   const { scope, collectedAt } = manifest;
+  const representation = options.representation ?? "stored";
+  const representationId = blockRepresentationId(
+    manifest,
+    representation,
+    options.cursorView,
+  );
+  const cursor = options.cursor
+    ? validateDataBlockCursor(options.cursor, {
+        scope,
+        collectedAt,
+        view: options.cursorView,
+        representationId,
+      })
+    : { ok: true as const, cursor: null };
+  if (!cursor.ok)
+    throw new DataBlockStorageError(
+      cursor.error.message.startsWith("representation_mismatch")
+        ? "representation_mismatch"
+        : "cursor_invalid",
+      cursor.error.message,
+    );
   const head = {
     scope,
     collectedAt,
     ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
     contentKind: manifest.contentKind,
-    ...(manifest.pdppOrigin === undefined
-      ? {}
-      : { pdppOrigin: manifest.pdppOrigin }),
+    ...manifestBinding(manifest),
+    representationId,
   };
-  const byId = new Map(builtBlocks.map((block) => [block.id, block]));
-
+  const prepare = (block: DataScopeBlock) =>
+    representBlock(block, manifest, representation);
   if (options.blockIds?.length) {
     const selection = await selectScopeBlocksByIds(
       manifest,
       options.blockIds,
-      { maxBytes: options.maxBytes },
-      async (blockId) => byId.get(blockId) ?? null,
+      { maxBytes: options.maxBytes, prepare },
+      loadBlock,
     );
     return {
       ...head,
@@ -54,43 +73,33 @@ export async function readBuiltScopeBlocks(
       warnings: [...manifest.warnings, ...selection.warnings],
     };
   }
-
-  const cursorResult = options.cursor
-    ? validateDataBlockCursor(options.cursor, {
-        scope,
-        collectedAt,
-        view: options.cursorView,
-      })
-    : { ok: true as const, cursor: null };
-  if (!cursorResult.ok) {
-    throw new DataBlockStorageError(
-      "cursor_invalid",
-      cursorResult.error.message,
-    );
-  }
-
   const maxBytes = Math.max(1, options.maxBytes);
-  const startIndex = cursorResult.cursor?.blockIndex ?? 0;
-  const startOffset = cursorResult.cursor?.intraBlockOffset ?? 0;
+  const startIndex = cursor.cursor?.blockIndex ?? 0;
+  const startOffset = cursor.cursor?.intraBlockOffset ?? 0;
   const blocks: DataScopeBlock[] = [];
-  let bytes = 0;
-  let nextIndex = startIndex;
+  let bytes = 0,
+    nextIndex = startIndex;
   let nextOffset: number | undefined;
-
   while (nextIndex < manifest.blocks.length) {
-    const ref = manifest.blocks[nextIndex];
-    const block = ref ? byId.get(ref.id) : undefined;
-    if (!ref || !block) {
-      nextIndex += 1;
+    const ref = manifest.blocks[nextIndex]!;
+    if (blocks.length && bytes >= maxBytes) break;
+    // Raw refs are conservative size bounds; do not load the next block until needed.
+    if (blocks.length && bytes + ref.sizeBytes > maxBytes) break;
+    const stored = await loadBlock(ref.id);
+    if (!stored)
+      throw new DataBlockStorageError(
+        "block_payload_not_found",
+        `Block ${ref.id} is missing`,
+      );
+    const block = prepare(verifyStoredBlock(ref, stored));
+    if (!block) {
+      nextIndex++;
       continue;
     }
     const offset = nextIndex === startIndex ? startOffset : 0;
-    if (offset >= ref.sizeBytes) {
-      nextIndex += 1;
+    if (offset >= block.sizeBytes) {
+      nextIndex++;
       continue;
-    }
-    if (blocks.length > 0 && offset === 0 && bytes + ref.sizeBytes > maxBytes) {
-      break;
     }
     const page = pageBlock(block, offset, maxBytes - bytes);
     blocks.push(page.block);
@@ -99,9 +108,8 @@ export async function readBuiltScopeBlocks(
       nextOffset = page.nextOffset;
       break;
     }
-    nextIndex += 1;
+    nextIndex++;
   }
-
   return {
     ...head,
     blocks,
@@ -115,6 +123,7 @@ export async function readBuiltScopeBlocks(
               ? {}
               : { intraBlockOffset: nextOffset }),
             ...(options.cursorView ? { view: options.cursorView } : {}),
+            representationId,
           }),
         }
       : {}),
@@ -122,31 +131,14 @@ export async function readBuiltScopeBlocks(
   };
 }
 
-function pageBlock(
-  block: DataScopeBlock,
-  offsetBytes: number,
-  maxBytes: number,
-): { block: DataScopeBlock; nextOffset?: number } {
-  const text =
-    typeof block.value === "string" ? block.value : JSON.stringify(block.value);
-  const bytes = textEncoder.encode(text);
-  if (offsetBytes <= 0 && bytes.length <= maxBytes) {
-    return { block };
-  }
-
-  const start = Math.min(Math.max(0, offsetBytes), bytes.length);
-  const end = Math.min(bytes.length, start + Math.max(1, maxBytes));
-  return {
-    block: {
-      ...block,
-      path: `${block.path}[bytes ${start}:${end}]`,
-      mediaType: block.mediaType.startsWith("text/")
-        ? block.mediaType
-        : TEXT_PAGE_MEDIA_TYPE,
-      value: textDecoder.decode(bytes.slice(start, end)),
-      sizeBytes: end - start,
-      truncated: end < bytes.length,
-    },
-    ...(end < bytes.length ? { nextOffset: end } : {}),
-  };
+export async function readBuiltScopeBlocks(
+  built: { manifest: DataBlockManifest; blocks: DataScopeBlock[] },
+  options: BlockPageOptions,
+): Promise<ReadScopeBlocksResponse> {
+  const byId = new Map(built.blocks.map((block) => [block.id, block]));
+  return readManifestScopeBlocks(
+    built.manifest,
+    async (id) => byId.get(id) ?? null,
+    options,
+  );
 }

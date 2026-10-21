@@ -14,6 +14,7 @@ export interface DataBlockCursor {
    * refused instead of serving that version's bytes.
    */
   generation?: string;
+  representationId?: string;
 }
 
 export interface EncodeDataBlockCursorInput {
@@ -23,6 +24,7 @@ export interface EncodeDataBlockCursorInput {
   intraBlockOffset?: number;
   view?: string;
   generation?: string;
+  representationId?: string;
 }
 
 export type DataBlockCursorErrorCode =
@@ -64,6 +66,9 @@ export function encodeDataBlockCursor(
       ...(input.intraBlockOffset === undefined
         ? {}
         : { intraBlockOffset: input.intraBlockOffset }),
+      ...(input.representationId === undefined
+        ? {}
+        : { representationId: input.representationId }),
       ...(input.view === undefined ? {} : { view: input.view }),
       ...(input.generation === undefined
         ? {}
@@ -118,6 +123,8 @@ export function decodeDataBlockCursor(
     (candidate.intraBlockOffset !== undefined &&
       !isNonNegativeInteger(candidate.intraBlockOffset)) ||
     (candidate.view !== undefined && typeof candidate.view !== "string") ||
+    (candidate.representationId !== undefined &&
+      typeof candidate.representationId !== "string") ||
     (candidate.generation !== undefined &&
       typeof candidate.generation !== "string")
   ) {
@@ -134,6 +141,9 @@ export function decodeDataBlockCursor(
       ...(candidate.intraBlockOffset === undefined
         ? {}
         : { intraBlockOffset: candidate.intraBlockOffset }),
+      ...(typeof candidate.representationId === "string"
+        ? { representationId: candidate.representationId }
+        : {}),
       ...(typeof candidate.view === "string" ? { view: candidate.view } : {}),
       ...(typeof candidate.generation === "string"
         ? { generation: candidate.generation }
@@ -144,7 +154,12 @@ export function decodeDataBlockCursor(
 
 export function validateDataBlockCursor(
   cursor: string,
-  expected: { scope: string; collectedAt: string; view?: string },
+  expected: {
+    scope: string;
+    collectedAt: string;
+    view?: string;
+    representationId?: string;
+  },
 ): ValidateDataBlockCursorResult {
   const decoded = decodeDataBlockCursor(cursor);
   if (!decoded.ok) return decoded;
@@ -165,6 +180,20 @@ export function validateDataBlockCursor(
       error: {
         code: "cursor_collected_at_mismatch",
         message: "Cursor collectedAt does not match requested collectedAt",
+      },
+    };
+  }
+
+  if (
+    decoded.cursor.representationId !== undefined &&
+    decoded.cursor.representationId !== expected.representationId
+  ) {
+    return {
+      ok: false,
+      error: {
+        code: "cursor_view_mismatch",
+        message:
+          "representation_mismatch: the block layout or serialization changed; restart without a cursor",
       },
     };
   }

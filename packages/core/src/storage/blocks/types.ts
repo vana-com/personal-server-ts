@@ -19,6 +19,10 @@ export interface DataBlockManifest {
    * published version. Absent on manifests written before this field.
    */
   envelopeDigest?: string;
+  /** Redaction evidence from the envelope that generated this sidecar. */
+  redaction?: { dropTopLevelLineage: boolean; dropMetadataLineage: boolean };
+  /** Ordered layout and serialization identity, separate from envelopeDigest. */
+  representationId?: string;
   blocks: DataBlockRef[];
   warnings: DataBlockWarning[];
 }
@@ -52,7 +56,7 @@ export interface ReadScopeBlocksRequest {
   /**
    * Read only these blocks, in this order, instead of paging the scope from
    * `cursor`. Ids come from a manifest listing or from a search hit's
-   * `blockRef`. When set, `cursor` is ignored and no `nextCursor` is returned;
+   * `blockRef`. When set, cursor positions are ignored but version/layout binding is checked; no `nextCursor` is returned;
    * `maxBytes` still bounds the response.
    */
   blockIds?: string[];
@@ -63,6 +67,8 @@ export interface ReadScopeBlocksResponse {
   collectedAt: string;
   schemaId?: string;
   contentKind: ContentKind;
+  representationId?: string;
+  redaction?: { dropTopLevelLineage: boolean; dropMetadataLineage: boolean };
   blocks: DataScopeBlock[];
   nextCursor?: string;
   warnings: DataBlockWarning[];

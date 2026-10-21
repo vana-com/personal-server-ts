@@ -173,7 +173,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
       maxBytes: number;
       /**
        * Block-addressed read: return only these blocks, in this order. When
-       * set, `cursor` is ignored and no `nextCursor` is produced; `maxBytes`
+       * set, cursor positions are ignored but its version/layout binding is checked; no `nextCursor` is produced; `maxBytes`
        * still applies and any ids it cuts off are reported as warnings.
        */
       blockIds?: readonly string[];
@@ -183,6 +183,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
        * than serve another version's bytes. A raw port ignores it.
        */
       generation?: string;
+      representation?: "stored" | "grantee";
     },
   ): Promise<ReadScopeBlocksResponse>;
   /**

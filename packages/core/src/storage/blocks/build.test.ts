@@ -353,3 +353,24 @@ function rebuildString(blocks: DataBlockPayload[], path: string): string {
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+describe("Unicode block publication", () => {
+  it.each(["text/plain", "application/json"])(
+    "keeps surrogate pairs intact in %s chunks",
+    (mediaType) => {
+      const text = "🙂".repeat(8);
+      const built = buildDataBlocks({
+        scope: "unicode.text",
+        collectedAt: "2026-10-01T00:00:00Z",
+        content: text,
+        mediaType,
+        blockTargetBytes: 3,
+        maxBlockBytes: 8,
+      });
+      const joined = built.blocks.flatMap((block) => [
+        ...new TextEncoder().encode(String(block.value)),
+      ]);
+      expect(joined).toEqual([...new TextEncoder().encode(text)]);
+    },
+  );
+});

@@ -8,6 +8,7 @@
  * here instead of being copied into each of them.
  */
 
+import { pageBlock } from "./representation.js";
 import { verifyStoredBlock } from "./digest.js";
 import type {
   DataBlockManifest,
@@ -20,10 +21,6 @@ export const MAX_SELECTED_BLOCK_IDS = 50;
 
 /** Ids listed inline in a warning message before it is summarized by count. */
 const WARNING_ID_SAMPLE = 10;
-
-const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 export interface SelectScopeBlocksResult {
   blocks: DataScopeBlock[];
@@ -42,7 +39,10 @@ export interface SelectScopeBlocksResult {
 export async function selectScopeBlocksByIds(
   manifest: DataBlockManifest,
   blockIds: readonly string[],
-  options: { maxBytes: number },
+  options: {
+    maxBytes: number;
+    prepare?: (block: DataScopeBlock) => DataScopeBlock | null;
+  },
   loadBlock: (blockId: string) => Promise<DataScopeBlock | null>,
 ): Promise<SelectScopeBlocksResult> {
   const maxBytes = Math.max(1, options.maxBytes);
@@ -85,10 +85,13 @@ export async function selectScopeBlocksByIds(
       missingIds.push(blockId);
       continue;
     }
-    const page = pageBlock(verifyStoredBlock(ref, block), maxBytes - bytes);
+    const verified = verifyStoredBlock(ref, block);
+    const represented = options.prepare ? options.prepare(verified) : verified;
+    if (!represented) continue;
+    const page = pageBlock(represented, 0, maxBytes - bytes);
     blocks.push(page.block);
     bytes += page.block.sizeBytes;
-    if (page.truncated) {
+    if (page.nextOffset !== undefined) {
       skippedIds.push(...requested.slice(index + 1));
       break;
     }
@@ -121,31 +124,4 @@ function summarizeIds(ids: readonly string[]): string {
   return ids.length > WARNING_ID_SAMPLE
     ? `${sample}, ...(${ids.length - WARNING_ID_SAMPLE} more)`
     : sample;
-}
-
-function pageBlock(
-  block: DataScopeBlock,
-  maxBytes: number,
-): { block: DataScopeBlock; truncated: boolean } {
-  const text =
-    typeof block.value === "string" ? block.value : JSON.stringify(block.value);
-  const bytes = textEncoder.encode(text);
-  if (bytes.length <= maxBytes) {
-    return { block, truncated: false };
-  }
-
-  const end = Math.max(1, maxBytes);
-  return {
-    block: {
-      ...block,
-      path: `${block.path}[bytes 0:${end}]`,
-      mediaType: block.mediaType.startsWith("text/")
-        ? block.mediaType
-        : TEXT_PAGE_MEDIA_TYPE,
-      value: textDecoder.decode(bytes.slice(0, end)),
-      sizeBytes: end,
-      truncated: true,
-    },
-    truncated: true,
-  };
 }

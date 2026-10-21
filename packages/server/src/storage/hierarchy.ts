@@ -44,21 +44,13 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import {
   DataBlockStorageError,
-  encodeDataBlockCursor,
-  manifestBinding,
-  selectScopeBlocksByIds,
-  validateDataBlockCursor,
-  verifyStoredBlock,
+  readManifestScopeBlocks,
   type DataBlockManifest,
   type DataScopeBlock,
   type ReadScopeBlocksResponse,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import { previewJsonEnvelopePrefix } from "@opendatalabs/personal-server-ts-core/storage/preview";
-
-const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 function syncDirectory(path: string): void {
   if (process.platform === "win32") return;
@@ -513,98 +505,15 @@ export async function readScopeBlocks(
     cursor?: string;
     maxBytes: number;
     blockIds?: readonly string[];
+    representation?: "stored" | "grantee";
   },
 ): Promise<ReadScopeBlocksResponse> {
   const manifest = await readBlockManifest(options, scope, collectedAt);
-
-  if (readOptions.blockIds?.length) {
-    const selection = await selectScopeBlocksByIds(
-      manifest,
-      readOptions.blockIds,
-      { maxBytes: readOptions.maxBytes },
-      (blockId) =>
-        readBlockPayloadIfPresent(options, scope, collectedAt, blockId),
-    );
-    return {
-      scope: manifest.scope,
-      collectedAt: manifest.collectedAt,
-      ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
-      contentKind: manifest.contentKind,
-      ...manifestBinding(manifest),
-      blocks: selection.blocks,
-      warnings: [...manifest.warnings, ...selection.warnings],
-    };
-  }
-
-  const cursor = readOptions.cursor
-    ? validateDataBlockCursor(readOptions.cursor, { scope, collectedAt })
-    : undefined;
-
-  if (cursor && !cursor.ok) {
-    throw new DataBlockStorageError("cursor_invalid", cursor.error.message);
-  }
-
-  const maxBytes = Math.max(1, readOptions.maxBytes);
-  const startIndex = cursor?.ok ? cursor.cursor.blockIndex : 0;
-  const startOffset = cursor?.ok ? (cursor.cursor.intraBlockOffset ?? 0) : 0;
-  const blocks: DataScopeBlock[] = [];
-  let totalBytes = 0;
-  let nextIndex = startIndex;
-  let nextOffset: number | undefined;
-
-  while (nextIndex < manifest.blocks.length) {
-    const ref = manifest.blocks[nextIndex]!;
-    const offset = nextIndex === startIndex ? startOffset : 0;
-    if (offset >= ref.sizeBytes) {
-      nextIndex++;
-      continue;
-    }
-    if (
-      blocks.length > 0 &&
-      offset === 0 &&
-      totalBytes + ref.sizeBytes > maxBytes
-    )
-      break;
-
-    const block = verifyStoredBlock(
-      ref,
-      await readBlockPayload(options, scope, collectedAt, ref.id),
-    );
-    const page = pageBlock(block, offset, maxBytes - totalBytes);
-    blocks.push(page.block);
-    totalBytes += page.block.sizeBytes;
-
-    if (page.nextOffset !== undefined) {
-      nextOffset = page.nextOffset;
-      break;
-    }
-
-    nextIndex++;
-
-    if (totalBytes >= maxBytes) break;
-  }
-
-  return {
-    scope: manifest.scope,
-    collectedAt: manifest.collectedAt,
-    ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
-    contentKind: manifest.contentKind,
-    ...manifestBinding(manifest),
-    blocks,
-    ...(nextOffset !== undefined || nextIndex < manifest.blocks.length
-      ? {
-          nextCursor: encodeDataBlockCursor({
-            scope,
-            collectedAt,
-            blockIndex: nextIndex,
-            ...(nextOffset === undefined
-              ? {}
-              : { intraBlockOffset: nextOffset }),
-          }),
-        }
-      : {}),
-    warnings: manifest.warnings,
-  };
+  return readManifestScopeBlocks(
+    manifest,
+    (id) => readBlockPayloadIfPresent(options, scope, collectedAt, id),
+    readOptions,
+  );
 }
 
 /**
@@ -769,37 +678,6 @@ async function readBlockPayloadIfPresent(
     }
     throw err;
   }
-}
-
-function pageBlock(
-  block: DataScopeBlock,
-  offsetBytes: number,
-  maxBytes: number,
-): { block: DataScopeBlock; nextOffset?: number } {
-  const text =
-    typeof block.value === "string" ? block.value : JSON.stringify(block.value);
-  const bytes = textEncoder.encode(text);
-  if (offsetBytes <= 0 && bytes.length <= maxBytes) {
-    return { block };
-  }
-
-  const start = Math.min(Math.max(0, offsetBytes), bytes.length);
-  const end = Math.min(bytes.length, start + Math.max(1, maxBytes));
-  const value = textDecoder.decode(bytes.slice(start, end));
-
-  return {
-    block: {
-      ...block,
-      path: `${block.path}[bytes ${start}:${end}]`,
-      mediaType: block.mediaType.startsWith("text/")
-        ? block.mediaType
-        : TEXT_PAGE_MEDIA_TYPE,
-      value,
-      sizeBytes: end - start,
-      truncated: end < bytes.length,
-    },
-    ...(end < bytes.length ? { nextOffset: end } : {}),
-  };
 }
 
 async function deleteBlockSidecars(

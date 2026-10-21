@@ -11,11 +11,7 @@ import type {
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import {
   DataBlockStorageError,
-  encodeDataBlockCursor,
-  manifestBinding,
-  selectScopeBlocksByIds,
-  validateDataBlockCursor,
-  verifyStoredBlock,
+  readManifestScopeBlocks,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -104,9 +100,6 @@ export interface IndexedDbPsLitePersistenceOptions {
 const DEFAULT_INDEXED_DB_NAME = "personal-server-lite-storage";
 const DEFAULT_INDEXED_DB_STORE = "state";
 const DEFAULT_INDEXED_DB_KEY = "data-storage-v1";
-const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 function schemaIdFromEnvelope(envelope: DataFileEnvelope): string | undefined {
   const schemaId = (envelope as { schemaId?: unknown }).schemaId;
@@ -729,123 +722,32 @@ export async function createPersistentPsLiteStorage(
         }
       }
 
-      if (options.blockIds?.length) {
-        const selection = await selectScopeBlocksByIds(
-          manifest,
-          options.blockIds,
-          { maxBytes: options.maxBytes },
-          async (blockId) =>
-            inMemoryBlocks?.find((candidate) => candidate.id === blockId) ??
-            (await readBlockPayloadFromStores(
-              fileStore,
-              fallbackStore,
-              blockPayloadPath(scope, collectedAt, blockId),
-            )),
-        );
-        return {
-          scope: manifest.scope,
-          collectedAt: manifest.collectedAt,
-          ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
-          contentKind: manifest.contentKind,
-          ...manifestBinding(manifest),
-          blocks: selection.blocks,
-          warnings: [...manifest.warnings, ...selection.warnings],
-        };
-      }
-
-      const cursorResult = options.cursor
-        ? validateDataBlockCursor(options.cursor, { scope, collectedAt })
-        : { ok: true as const, cursor: null };
-      if (!cursorResult.ok) {
-        throw new DataBlockStorageError(
-          "cursor_invalid",
-          cursorResult.error.message,
-        );
-      }
-
-      const maxBytes = Math.max(1, options.maxBytes);
-      const startIndex = cursorResult.cursor?.blockIndex ?? 0;
-      const startOffset = cursorResult.cursor?.intraBlockOffset ?? 0;
-      const blocks: DataScopeBlock[] = [];
-      let bytes = 0;
-      let nextIndex = startIndex;
-      let nextOffset: number | undefined;
-
-      while (nextIndex < manifest.blocks.length) {
-        const ref = manifest.blocks[nextIndex];
-        if (!ref) {
-          nextIndex += 1;
-          continue;
-        }
-        const offset = nextIndex === startIndex ? startOffset : 0;
-        if (offset >= ref.sizeBytes) {
-          nextIndex += 1;
-          continue;
-        }
+      const load = async (id: string) =>
+        inMemoryBlocks?.find((b) => b.id === id) ??
+        (await readBlockPayloadFromStores(
+          fileStore,
+          fallbackStore,
+          blockPayloadPath(scope, collectedAt, id),
+        ));
+      try {
+        return await readManifestScopeBlocks(manifest, load, options);
+      } catch (error) {
         if (
-          blocks.length > 0 &&
-          offset === 0 &&
-          bytes + ref.sizeBytes > maxBytes
-        ) {
-          break;
-        }
-        const block =
-          inMemoryBlocks?.find((candidate) => candidate.id === ref.id) ??
-          (await readBlockPayloadFromStores(
-            fileStore,
-            fallbackStore,
-            blockPayloadPath(scope, collectedAt, ref.id),
-          ));
-        if (block) verifyStoredBlock(ref, block);
-        if (!block) {
-          const envelope = await storagePort.readEnvelope(scope, collectedAt);
-          const rebuilt = await buildDataBlocksAsync({
-            scope,
-            collectedAt,
-            schemaId: schemaIdFromEnvelope(envelope),
-            content: envelope,
-          });
-          manifest = rebuilt.manifest;
-          inMemoryBlocks = rebuilt.blocks;
-          nextIndex = startIndex;
-          nextOffset = undefined;
-          bytes = 0;
-          blocks.length = 0;
-          continue;
-        }
-        const page = pageBlock(block, offset, maxBytes - bytes);
-        blocks.push(page.block);
-        bytes += page.block.sizeBytes;
-
-        if (page.nextOffset !== undefined) {
-          nextOffset = page.nextOffset;
-          break;
-        }
-
-        nextIndex += 1;
+          !(error instanceof DataBlockStorageError) ||
+          error.code !== "block_payload_not_found"
+        )
+          throw error;
+        const envelope = await storagePort.readEnvelope(scope, collectedAt);
+        const built = await buildDataBlocksAsync({
+          scope,
+          collectedAt,
+          schemaId: schemaIdFromEnvelope(envelope),
+          content: envelope,
+        });
+        inMemoryBlocks = built.blocks;
+        // Same cursor is validated against the rebuilt representation before any offsets are consumed.
+        return readManifestScopeBlocks(built.manifest, load, options);
       }
-
-      return {
-        scope: manifest.scope,
-        collectedAt: manifest.collectedAt,
-        ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
-        contentKind: manifest.contentKind,
-        ...manifestBinding(manifest),
-        blocks,
-        ...(nextOffset !== undefined || nextIndex < manifest.blocks.length
-          ? {
-              nextCursor: encodeDataBlockCursor({
-                scope,
-                collectedAt,
-                blockIndex: nextIndex,
-                ...(nextOffset === undefined
-                  ? {}
-                  : { intraBlockOffset: nextOffset }),
-              }),
-            }
-          : {}),
-        warnings: manifest.warnings,
-      };
     },
 
     async readBlockManifest(scope, collectedAt) {
@@ -1272,37 +1174,6 @@ async function readPreviewFromFileStore(
   maxBytes: number,
 ): Promise<{ text: string; truncated: boolean } | null> {
   return (await store.readEnvelopePreview?.(path, { maxBytes })) ?? null;
-}
-
-function pageBlock(
-  block: DataScopeBlock,
-  offsetBytes: number,
-  maxBytes: number,
-): { block: DataScopeBlock; nextOffset?: number } {
-  const text =
-    typeof block.value === "string" ? block.value : JSON.stringify(block.value);
-  const bytes = textEncoder.encode(text);
-  if (offsetBytes <= 0 && bytes.length <= maxBytes) {
-    return { block };
-  }
-
-  const start = Math.min(Math.max(0, offsetBytes), bytes.length);
-  const end = Math.min(bytes.length, start + Math.max(1, maxBytes));
-  const value = textDecoder.decode(bytes.slice(start, end));
-
-  return {
-    block: {
-      ...block,
-      path: `${block.path}[bytes ${start}:${end}]`,
-      mediaType: block.mediaType.startsWith("text/")
-        ? block.mediaType
-        : TEXT_PAGE_MEDIA_TYPE,
-      value,
-      sizeBytes: end - start,
-      truncated: end < bytes.length,
-    },
-    ...(end < bytes.length ? { nextOffset: end } : {}),
-  };
 }
 
 async function readBlockPayloadFromStores(
