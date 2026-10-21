@@ -29,7 +29,11 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import { createServer, type ServerContext } from "./bootstrap.js";
+import {
+  createServer,
+  type CreateServerOptions,
+  type ServerContext,
+} from "./bootstrap.js";
 import { registerTestConnection } from "./pdpp/test-connections.js";
 
 // Each case boots a real server (some boot twice); the 5s default flakes under load.
@@ -121,7 +125,10 @@ function grant(): GatewayGrantResponse {
 }
 
 /** `methodIds`: the pdpp.methods Desktop configures for source oura. */
-async function boot(methodIds: string[] = ["oura-browser"]) {
+async function boot(
+  methodIds: string[] = ["oura-browser"],
+  dataPointFeed?: CreateServerOptions["dataPointFeed"],
+) {
   const dir = join(tempDir, "declarations");
   await mkdir(dir, { recursive: true });
   const path = join(dir, "declaration.json");
@@ -154,6 +161,7 @@ async function boot(methodIds: string[] = ["oura-browser"]) {
       serverDir: tempDir,
       dataDir: join(tempDir, "data"),
       gatewayClient: gateway,
+      ...(dataPointFeed ? { dataPointFeed } : {}),
     },
   );
 }
@@ -313,15 +321,38 @@ async function outcome(response: Response): Promise<Outcome> {
   };
 }
 
+/**
+ * Which producer wrote the body: the envelope's `collectedAt` is the legacy
+ * write time (T_LEGACY, T_LEGACY_NEWER) for a file and the stream's
+ * `source_collected_at` (T_PDPP) for a projection. Independent of the
+ * X-Vana-Data-Source header the same code sets.
+ */
+function bodyProducer(o: Outcome): "L" | "P" | "?" {
+  const at = (o.body as { collectedAt?: string }).collectedAt ?? "";
+  if (at.startsWith(T_PDPP.slice(0, 10))) return "P";
+  if (
+    at.startsWith(T_LEGACY.slice(0, 10)) ||
+    at.startsWith(T_LEGACY_NEWER.slice(0, 10))
+  )
+    return "L";
+  return "?";
+}
+
 function label(o: Outcome): string {
   if (o.status === 200) {
-    return o.source === "legacy"
-      ? "FILE (legacy body L)"
-      : o.source === "canonical"
-        ? "CANONICAL (projection P)"
-        : `200 source=${o.source}`;
+    const body = bodyProducer(o);
+    if (o.source === "legacy" && body === "L") return "FILE (legacy body L)";
+    if (o.source === "canonical" && body === "P")
+      return "CANONICAL (projection P)";
+    return `200 header=${o.source} body=${body}`;
   }
   return `${o.status} ${o.reason}`;
+}
+
+/** The scope's day rows (sleep keeps its daily scores under `dailyScores`). */
+function dayRows(o: Outcome, scope: Scope): { id: string; score: number }[] {
+  const data = (o.body as { data: Record<string, any> }).data;
+  return scope === "oura.sleep" ? data.dailyScores : data.days;
 }
 
 async function observe(
@@ -635,6 +666,13 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
       await writeLegacy(DAYS, T_LEGACY);
       await writePdpp(pdppDays, T_PDPP);
       expect(await readAll()).toEqual(ALL(FILE));
+      // The body is the file's two days and scores, not the projection's.
+      for (const scope of SCOPES) {
+        const rows = dayRows((await observe(scope)).builder, scope);
+        expect(rows.map((row) => row.score)).toEqual(
+          DAYS.map((day) => day.score),
+        );
+      }
     });
 
     it("when the file is newer than the projection and differs", async () => {
@@ -749,21 +787,6 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
   });
 
   describe("keeps its safety refusals", () => {
-    it("refuses (503) when the oura-browser connection was deleted", async () => {
-      await writeLegacy(DAYS, T_LEGACY);
-      const token = await writePdpp(DAYS, T_PDPP);
-      const deleted = await ctx!.app.request(
-        `/pdpp/connections/${encodeURIComponent(accountOne)}`,
-        { method: "DELETE", headers: { authorization: `Bearer ${token}` } },
-      );
-      expect(deleted.status).toBe(200);
-      for (const scope of SCOPES) {
-        const r = await observe(scope);
-        expect(r.owner.status).toBe(503);
-        expect(r.owner.reason).toBe("no_connection");
-      }
-    });
-
     it("refuses (503) when oura-browser holds data and the method is no longer configured", async () => {
       LEGACY_TS = false;
       await writePdpp(DAYS, T_PDPP);
@@ -789,5 +812,108 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
         error: "CANONICAL_DELETE_UNSUPPORTED",
       });
     });
+  });
+});
+
+describe("an owner who disconnects or reconnects oura-browser while the legacy file is the served body", () => {
+  beforeEach(() => {
+    LEGACY_TS = false;
+  });
+
+  /** The owner removes the connection, the natural way to undo the opt-in. */
+  async function disconnect(token: string, connectionId = accountOne) {
+    const deleted = await ctx!.app.request(
+      `/pdpp/connections/${encodeURIComponent(connectionId)}`,
+      { method: "DELETE", headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(deleted.status).toBe(200);
+  }
+
+  it("keeps serving the file after the connection is deleted", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    const token = await writePdpp(DAYS, T_PDPP);
+    await disconnect(token);
+    expect(await readAll()).toEqual(ALL(FILE));
+  });
+
+  it.each([1, 2])(
+    "keeps serving the file after delete and reconnect with %i live connection(s) holding data",
+    async (live) => {
+      await writeLegacy(DAYS, T_LEGACY);
+      const first = await writePdpp(DAYS, T_PDPP);
+      await disconnect(first);
+      const source = await mintSourceToken();
+      const ids = [SECOND_ACCOUNT, "conn_223e4567-e89b-42d3-a456-426614174001"];
+      for (const id of ids.slice(0, live)) {
+        await registerAccount(source, id, "oura-browser");
+        const token = await ownerPdppToken(id);
+        await writePdpp(DAYS, T_PDPP, token, { instance: id });
+      }
+      expect(await readAll()).toEqual(ALL(FILE));
+    },
+  );
+
+  it("still refuses (503) a deleted connection when there is no legacy file", async () => {
+    const token = await writePdpp(DAYS, T_PDPP);
+    await disconnect(token);
+    for (const scope of SCOPES) {
+      const r = await observe(scope);
+      expect(r.owner.status).toBe(503);
+      expect(r.owner.reason).toBe("no_connection");
+    }
+  });
+});
+
+describe("deletion history and the legacy file that is served", () => {
+  beforeEach(() => {
+    LEGACY_TS = false;
+  });
+
+  it("serves a legacy file re-added after a gateway tombstone while oura-browser rows exist (no 410)", async () => {
+    let deleted = false;
+    const dataPointFeed: NonNullable<CreateServerOptions["dataPointFeed"]> = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async ({ ownerAddress, scope }) =>
+        deleted
+          ? {
+              id: "synthetic-point",
+              ownerAddress,
+              scope,
+              dataHash: `0x${"00".repeat(32)}`,
+              metadataHash: `0x${"00".repeat(32)}`,
+              expectedVersion: "1",
+              addedAt: "2026-09-01T00:00:00Z",
+              deletedAt: "2026-09-11T00:00:00Z",
+            }
+          : null,
+    };
+    await ctx!.cleanup();
+    ctx = await boot(["oura-browser"], dataPointFeed);
+    await writeLegacy(DAYS, T_LEGACY);
+    await writePdpp(DAYS, T_PDPP);
+
+    // The owner deletes the scope elsewhere; the old file is covered.
+    deleted = true;
+    for (const scope of SCOPES) {
+      expect((await observe(scope)).owner.status).toBe(410);
+    }
+
+    // The collector runs again and re-adds the file after that tombstone.
+    const readded: Day[] = [{ n: 7, score: 71 }];
+    await writeLegacy(readded, T_LEGACY_NEWER);
+    expect(await readAll()).toEqual(ALL(FILE));
+    for (const scope of SCOPES) {
+      const rows = dayRows((await observe(scope)).builder, scope);
+      expect(rows.map((row) => row.score)).toEqual([71]);
+    }
+    // The listing agrees with the read.
+    const listing = await ctx!.app.request("/v1/data", {
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(listing.status).toBe(200);
+    const listed = (
+      (await listing.json()) as { scopes: { scope: string }[] }
+    ).scopes.map((entry) => entry.scope);
+    expect(listed).toEqual(expect.arrayContaining([...SCOPES]));
   });
 });

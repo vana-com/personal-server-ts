@@ -1905,6 +1905,44 @@ describe("legacy scope view over the real SQLite record store", () => {
       expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
     });
 
+    it("says so once when it keeps the file over a connection that holds synced rows", async () => {
+      const info = vi.fn();
+      const logged = createLegacyScopeView({
+        authority: createLegacyScopeAuthority(db),
+        records: store,
+        configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+        logger: { info },
+      });
+      legacyHead("oura.activity", "oura/activity/old.json");
+      connect(store, "conn_b", "oura-browser");
+      // Registered but never held data: nothing to report.
+      expect(await logged.readLatest("oura.activity")).toEqual({
+        kind: "file",
+      });
+      expect(info).not.toHaveBeenCalled();
+
+      replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+      await logged.readLatest("oura.activity");
+      logged.listingFor("oura.activity");
+      await logged.readLatest("oura.activity");
+      expect(info).toHaveBeenCalledTimes(1);
+      expect(info).toHaveBeenCalledWith(
+        {
+          scope: "oura.activity",
+          legacyHeadCollectedAt: "2026-01-01T00:00:00.000Z",
+          heldConnections: 1,
+        },
+        "Legacy file kept as the latest body; a method that opts out of takeover holds synced rows",
+      );
+
+      // A second connection that holds rows is a new fact worth one more line.
+      connect(store, "conn_c", "oura-browser");
+      replace(store, "conn_c", "sleep", ["s1"], { method: "oura-browser" });
+      await logged.readLatest("oura.activity");
+      expect(info).toHaveBeenCalledTimes(2);
+      expect(info.mock.calls[1]![0]).toMatchObject({ heldConnections: 2 });
+    });
+
     it("keeps a takeover that was already recorded", async () => {
       legacyHead("oura.activity", "oura/activity/old.json");
       db.prepare(
@@ -1923,8 +1961,20 @@ describe("legacy scope view over the real SQLite record store", () => {
       expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
     });
 
-    it("still refuses after the oura-browser connection is deleted", async () => {
+    it("serves the file after the oura-browser connection is deleted or replaced", async () => {
       legacyHead("oura.activity", "oura/activity/old.json");
+      connect(store, "conn_b", "oura-browser");
+      replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+      store.deleteConnection("conn_b");
+      expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+      expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
+
+      connect(store, "conn_c", "oura-browser");
+      replace(store, "conn_c", "activity", ["a2"], { method: "oura-browser" });
+      expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    });
+
+    it("still refuses a deleted oura-browser connection when there is no legacy file", async () => {
       connect(store, "conn_b", "oura-browser");
       replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
       store.deleteConnection("conn_b");
