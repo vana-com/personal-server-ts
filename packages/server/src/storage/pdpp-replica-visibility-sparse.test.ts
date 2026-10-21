@@ -8,6 +8,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/fixtures";
 import { planReplicaMerge } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import type * as MergePlan from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
+import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
+import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import { pdppRecordsRoutes } from "../routes/pdpp-records.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
@@ -345,3 +348,113 @@ it.each(["overwrite", "delete"] as const)(
   },
   120_000,
 );
+
+/**
+ * Rows visited by one owner HTTP page and one owner stream summary when a
+ * pending overwrite masks every canonical key. The overwrites sort before the
+ * canonical rows, so a descending page starts in a fully masked range.
+ */
+async function maskedReaderWork(masked: number) {
+  const { db, store } = device(masked);
+  let visits = 0;
+  db.function("pdpp_test_visit", { deterministic: false }, () => {
+    visits += 1;
+    return 1;
+  });
+  const replica = createReplicaReceiver({
+    db,
+    store: {
+      ...store,
+      unquarantinedRecordSql: (alias: string) =>
+        `pdpp_test_visit() AND ${store.unquarantinedRecordSql(alias)}`,
+    },
+    owner: identity.owner,
+    authenticate: () => identity.owner,
+    declarations: () => declarations,
+    enabled: true,
+  });
+  replica.stage({
+    credential: "x",
+    id: "mask-all",
+    envelope: envelope(
+      "mask-all",
+      rows("base", masked).map((row, i) => ({
+        ...upsert(`overwrite-${i}`, 1_000_000 + i, "pending", "device-b"),
+        recordKey: row.key,
+        data: { id: row.key, text: "pending" },
+      })),
+    ),
+  });
+  const app = pdppRecordsRoutes({
+    store,
+    reads: (reader) => replica.readStore({ reader }),
+    auth: createFixtureAuthorizationService({
+      owner: {
+        active: true,
+        tokenKind: "owner",
+        subjectId: identity.owner,
+        instanceIds: [identity.connectionId],
+      },
+    }),
+    declarations: createStreamDeclarationRegistry([
+      {
+        name: binding.stream,
+        semantics: binding.semantics,
+        primaryKey: ["id"],
+        cursorField: "emitted_at",
+        requiredFields: ["id"],
+      },
+    ]),
+    instancesForSubject: () => [identity.connectionId],
+  });
+  visits = 0;
+  const response = await app.request(
+    `/streams/${binding.stream}/records?order=desc&limit=1`,
+    { headers: { Authorization: "Bearer owner" } },
+  );
+  const body = await response.json();
+  const page = visits;
+  visits = 0;
+  const [summary] = replica
+    .readStore({ reader: "owner" })
+    .listStreams([identity.connectionId]);
+  // A later unmasked canonical write moves the summary at write time.
+  store.ingestBatch(
+    [{ ...rows("late", 1)[0]!, emitted_at: "2026-10-22T00:00:00.000Z" }],
+    () => "mutable_state",
+    () => ["id"],
+    { method: identity.methodId, generation: 1 },
+  );
+  const [afterWrite] = replica
+    .readStore({ reader: "owner" })
+    .listStreams([identity.connectionId]);
+  return {
+    afterWrite,
+    work: {
+      "owner HTTP desc limit=1 page": page,
+      "owner stream summary": visits,
+    },
+    page: body,
+    summary,
+  };
+}
+
+it("bounds owner HTTP page and stream summary work by page size, not by masked keys", async () => {
+  const small = await maskedReaderWork(100);
+  const large = await maskedReaderWork(3000);
+  console.log(
+    JSON.stringify({ masked100: small.work, masked3000: large.work }, null, 2),
+  );
+  for (const [read, visits] of Object.entries(large.work))
+    expect(visits, read).toBeLessThanOrEqual(small.work[read] + 4);
+  // A short page continues; the summary still reports the overlay's latest row.
+  expect(large.page.has_more).toBe(true);
+  expect(large.summary).toMatchObject({
+    recordCount: 3000,
+    lastUpdated: "2026-10-20T00:00:00Z",
+  });
+  expect(large.afterWrite).toMatchObject({
+    recordCount: 3001,
+    lastUpdated: "2026-10-22T00:00:00.000Z",
+  });
+}, 120_000);

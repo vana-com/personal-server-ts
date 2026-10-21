@@ -51,7 +51,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 4;
+const VIEW_SCHEMA = 5;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -129,6 +129,12 @@ export function createReplicaVisibilityView(deps: {
   // restricted to keys that can have an overlay row.
   const markBlobDependents = (blobIds: string) =>
     `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT DISTINCT o.instance,o.stream,o.record_key FROM pdpp_replica_view_operations o WHERE o.blob_id IN (${blobIds}) AND o.kind='upsert' AND o.record_key IS NOT NULL AND ${touches("o.instance", "o.stream", "o.record_key")};`;
+  const markLatest = (alias: string) =>
+    // NOT EXISTS, not OR IGNORE: an outer statement's conflict clause
+    // overrides one inside a trigger.
+    `INSERT INTO pdpp_replica_view_dirty_latest SELECT ${alias}.instance,${alias}.stream WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_latest d WHERE d.instance=${alias}.instance AND d.stream=${alias}.stream);`;
+  const hasOverlaySummary = (alias: string) =>
+    `EXISTS (SELECT 1 FROM pdpp_replica_view_streams s WHERE s.preview=1 AND s.instance=${alias}.instance AND s.stream=${alias}.stream)`;
   const markKey = (alias: string) =>
     `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT ${alias}.instance,${alias}.stream,${alias}.record_key WHERE ${touches(`${alias}.instance`, `${alias}.stream`, `${alias}.record_key`)};`;
 
@@ -179,6 +185,8 @@ export function createReplicaVisibilityView(deps: {
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_operations (digest TEXT PRIMARY KEY, operation_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_keys (instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL, PRIMARY KEY(instance,stream,record_key));
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_connections (instance TEXT PRIMARY KEY);
+      -- Streams whose owner-preview latest row may have moved; flush recomputes them.
+      CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_latest (instance TEXT NOT NULL, stream TEXT NOT NULL, PRIMARY KEY(instance,stream));
     `);
     for (const table of ["pdpp_replica_operations", "pdpp_replica_received"])
       db.exec(`
@@ -227,6 +235,14 @@ export function createReplicaVisibilityView(deps: {
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_batch AFTER UPDATE OF state ON pdpp_replica_pending_batches WHEN NEW.state IS NOT OLD.state BEGIN
         ${markBlobDependents("SELECT blob_id FROM pdpp_replica_pending_bytes WHERE batch_id=NEW.id")}
       END;
+      -- Mode 1's last_updated is the owner preview's latest row, derived at
+      -- write time: overlay rows can mask any number of newer canonical rows.
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_overlay_insert AFTER INSERT ON pdpp_replica_view BEGIN ${markLatest("NEW")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_overlay_update AFTER UPDATE ON pdpp_replica_view BEGIN ${markLatest("NEW")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_overlay_delete AFTER DELETE ON pdpp_replica_view BEGIN ${markLatest("OLD")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_record_insert AFTER INSERT ON pdpp_records WHEN ${hasOverlaySummary("NEW")} BEGIN ${markLatest("NEW")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_record_update AFTER UPDATE ON pdpp_records WHEN ${recordChanged} AND ${hasOverlaySummary("NEW")} BEGIN ${markLatest("NEW")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_record_delete AFTER DELETE ON pdpp_records WHEN ${hasOverlaySummary("OLD")} BEGIN ${markLatest("OLD")} END;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_insert AFTER INSERT ON pdpp_replica_view BEGIN
         INSERT INTO pdpp_replica_view_streams VALUES (1,NEW.instance,NEW.stream,NEW.live-NEW.base_live,NEW.present-NEW.base_live,NEW.pending,NULL,1)
         ON CONFLICT(preview,instance,stream) DO UPDATE SET revision=revision+1,live_count=live_count+NEW.live-NEW.base_live,row_count=row_count+NEW.present-NEW.base_live,pending_count=pending_count+NEW.pending;
@@ -553,10 +569,26 @@ export function createReplicaVisibilityView(deps: {
         involvement.get(row.instance)!,
       );
     }
+    // The scan below can step over every masked canonical row of a stream,
+    // so it runs here, once per changed stream, and never in a read.
+    for (const row of db
+      .prepare("SELECT instance,stream FROM pdpp_replica_view_dirty_latest")
+      .all() as { instance: string; stream: string }[])
+      db.prepare(
+        `UPDATE pdpp_replica_view_streams SET last_updated=(${previewLatestSql}) WHERE preview=1 AND instance=@instance AND stream=@stream`,
+      ).run(row);
     db.exec(
-      "DELETE FROM pdpp_replica_view_dirty_operations; DELETE FROM pdpp_replica_view_dirty_keys; DELETE FROM pdpp_replica_view_dirty_connections;",
+      "DELETE FROM pdpp_replica_view_dirty_operations; DELETE FROM pdpp_replica_view_dirty_keys; DELETE FROM pdpp_replica_view_dirty_connections; DELETE FROM pdpp_replica_view_dirty_latest;",
     );
   }
+  /**
+   * Latest owner-preview emitted_at of one stream: present overlay rows and
+   * canonical live rows without an overlay row. Quarantine is not applied;
+   * a read with quarantined keys in the stream recomputes it instead.
+   */
+  const previewLatestSql = `SELECT MAX(t) FROM (
+    SELECT (SELECT r.emitted_at FROM pdpp_records r WHERE r.instance=@instance AND r.stream=@stream AND r.deleted=0 AND NOT EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=r.instance AND v.stream=r.stream AND v.record_key=r.record_key) ORDER BY r.emitted_at DESC,r.record_key DESC LIMIT 1) AS t
+    UNION ALL SELECT (SELECT v.emitted_at FROM pdpp_replica_view v WHERE v.instance=@instance AND v.stream=@stream AND v.present=1 ORDER BY v.emitted_at DESC,v.record_key DESC LIMIT 1))`;
   function canonical(row: CanonicalRow): PdppVisibleRecord | undefined {
     return row.deleted
       ? undefined
@@ -1251,11 +1283,13 @@ export function createReplicaVisibilityView(deps: {
           counts.reduce((sum, row) => sum + (row?.[field] ?? 0), 0);
         const hidden = quarantinedCounts(mode, instance, stream);
         if (total("row_count") - hidden.rows <= 0) continue;
-        // An overlay or a hidden key can change the latest visible row; recompute it.
-        const last =
-          counts[1] || hidden.rows
-            ? latestVisible(mode, instance, stream)
-            : (counts[0]?.last_updated ?? null);
+        // A quarantined key can hide the latest row; that read recomputes it
+        // (its work grows with the rows it skips). Otherwise the summary holds
+        // it: mode 1's latest is derived at write time, mode 0's and 2's by
+        // their triggers.
+        const last = hidden.rows
+          ? latestVisible(mode, instance, stream)
+          : ((counts[1] ?? counts[0])?.last_updated ?? null);
         const previous = combined.get(stream) ?? {
           count: 0,
           last: null,

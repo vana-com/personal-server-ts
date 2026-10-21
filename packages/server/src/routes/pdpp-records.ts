@@ -1174,29 +1174,28 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       // Same ordering requirement as the changes_since branch above: fetch
       // unprojected, filter by time_constraint against the real value, then
       // project fields only in toRecordJson.
-      // Grant filtering happens after the store pages, so a page of `limit`
-      // stored rows can yield fewer than `limit` visible rows. Returning that
-      // short page directly would make `limit` mean "at most N stored rows"
-      // rather than "at most N records you may see", and would report
-      // has_more/next_cursor for a position in the unfiltered sequence.
-      // Accumulate visible rows across store pages instead, then derive
-      // paging state from the filtered view.
+      // The grant filter runs after the store pages, so a page of `limit`
+      // stored rows can yield fewer than `limit` visible rows. A cursor must
+      // never sit on a row the grant may not see (it would disclose that row's
+      // key and time), so while the filter drops rows the route reads further
+      // store pages and rebinds the cursor to the last visible row. A store
+      // page can also be short by itself: the reader steps over rows it masks
+      // and continues after them. The route then returns that short page with
+      // the reader's own cursor instead of walking every masked row.
       const visible: PdppRecordRow[] = [];
       let pageCursor = cursor;
       let storeHasMore = false;
       let cursorTemplate: string | undefined;
+      let dropped: boolean;
       do {
         const requestCursor = pageCursor;
         const page = reads(context!).listRecords(stream, {
           instanceIds: effectiveInstanceIds,
-          // Fetch at most one client page from the store at a time. The route
-          // may need several store pages to collect enough grant-visible rows,
-          // but keeping this page size at the client limit means the store
-          // usually gives us a bound cursor exactly at the visible boundary.
           limit,
           order,
           cursor: requestCursor,
         });
+        dropped = false;
         for (const row of page.data) {
           if (
             recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
@@ -1204,16 +1203,24 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
               recordWithinGrantTimeConstraint(row.data, scope.streamGrant))
           ) {
             visible.push(row);
-          }
+          } else dropped = true;
           if (visible.length > limit) break;
         }
         pageCursor = page.nextCursor ?? undefined;
         cursorTemplate = pageCursor ?? requestCursor;
         storeHasMore = page.hasMore;
-      } while (visible.length <= limit && storeHasMore && pageCursor);
+      } while (
+        visible.length <= limit &&
+        storeHasMore &&
+        pageCursor &&
+        dropped
+      );
 
       // limit + 1 visible rows means at least one more record the caller may
-      // see; trim it and report has_more from the filtered view.
+      // see; trim it and rebind the cursor to the last returned row. Fewer
+      // rows with more stored rows ahead is a short page: the last store page
+      // dropped nothing, so the reader's cursor sits on a returned or masked
+      // row, never on one the grant filter removed.
       const moreVisible = visible.length > limit;
       const data = moreVisible ? visible.slice(0, limit) : visible;
       const last = data[data.length - 1];
@@ -1222,6 +1229,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           "Filtered list has more rows but no bound store cursor",
         );
       }
+      const nextCursor = moreVisible
+        ? last &&
+          cursorTemplate &&
+          rebindListCursor(cursorTemplate, order, last)
+        : storeHasMore
+          ? pageCursor
+          : undefined;
       const meta = clamped
         ? {
             warnings: [
@@ -1232,12 +1246,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const response = c.json(
         {
           object: "list",
-          has_more: moreVisible,
-          ...(moreVisible &&
-            last &&
-            cursorTemplate && {
-              next_cursor: rebindListCursor(cursorTemplate, order, last),
-            }),
+          has_more: Boolean(nextCursor),
+          ...(nextCursor && { next_cursor: nextCursor }),
           data: data.map((row) => toRecordJson(stream, row, fields)),
           ...(meta && { meta }),
         },
