@@ -3380,3 +3380,227 @@ it.each(["point", "page", "streams", "changes"] as const)(
     }
   },
 );
+
+it.each([
+  ["key", "receiver"],
+  ["key", "fact"],
+  ["connection", "receiver"],
+  ["connection", "fact"],
+] as const)(
+  "a %s quarantine (%s) hides pending-only, overwritten and pending-removed keys on every read and restores them",
+  (scope, path) => {
+    const d = device();
+    const time = (second: number) => `2026-10-20T00:00:0${second}.000Z`;
+    d.store.ingestBatch(
+      (
+        [
+          ["d", 0],
+          ["c", 1],
+          ["b", 2],
+          ["a", 3],
+        ] as const
+      ).map(([key, second]) => ({
+        instance: "conn_a",
+        stream: "messages",
+        key,
+        data: { id: key, text: key },
+        emitted_at: time(second),
+      })),
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const bytes = new Uint8Array([1, 2, 3]);
+    const blobId = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+    const blob = {
+      blobId,
+      sha256: blobId,
+      mimeType: "application/octet-stream",
+      sizeBytes: bytes.length,
+    };
+    const record = (
+      counter: number,
+      key: string,
+      second: number,
+    ): Extract<ReplicaOperation, { kind: "upsert" }> => ({
+      ...(upsert(counter) as Extract<ReplicaOperation, { kind: "upsert" }>),
+      recordKey: key,
+      emittedAt: time(second),
+      data: { id: key, text: `pending-${key}` },
+    });
+    const { data: _data, blobs: _blobs, ...removed } = record(51, "b", 4);
+    // a: canonical row with a pending overwrite; b: pending removal of a
+    // canonical row; p: pending-only key whose blob only the pending batch holds.
+    const operations: ReplicaOperation[] = [
+      registration(),
+      {
+        kind: "blob-claim",
+        owner: "owner",
+        sourceId,
+        connectionId: "conn_a",
+        methodId: "collector",
+        generation: 1,
+        revision: { counter: 49, writerId: "remote", operationId: "claim-p" },
+        blob,
+      } as ReplicaOperation,
+      { ...removed, kind: "delete", deletedAt: time(4) } as ReplicaOperation,
+      record(52, "a", 5),
+      {
+        ...record(53, "p", 6),
+        blobs: [blob],
+        data: {
+          id: "p",
+          text: "pending-p",
+          blob_ref: {
+            blob_id: blobId,
+            sha256: blobId.slice(7),
+            size_bytes: bytes.length,
+            mime_type: blob.mimeType,
+          },
+        },
+      },
+    ];
+    const receiver = pendingReceiver(d);
+    receiver.stage({
+      credential: "replica-secret",
+      id: "pending",
+      envelope: batch(operations),
+      blobs: [{ blobId, bytes }],
+    });
+    const page = (reader: "owner" | "grant", limit: number, cursor?: string) =>
+      receiver.readStore({ reader }).listRecords("messages", {
+        instanceIds: ["conn_a"],
+        limit,
+        order: "asc",
+        cursor,
+      });
+    const shown = (row: PdppVisibleRecordLike | undefined) =>
+      row
+        ? `${row.recordKey}:${row.deleted ? "removed" : row.data.text}`
+        : null;
+    const snapshot = (reader: "owner" | "grant") => {
+      const read = receiver.readStore({ reader });
+      const blobBytes = read.getBlobBytes(blobId);
+      return {
+        point: ["a", "b", "c", "p"].map((key) =>
+          shown(read.getRecord("conn_a", "messages", key)),
+        ),
+        page: page(reader, 10).data.map(shown),
+        // Continuation must agree with the single page.
+        pages: (() => {
+          const rows: (string | null)[] = [];
+          let cursor: string | undefined;
+          do {
+            const next = page(reader, 1, cursor);
+            rows.push(...next.data.map(shown));
+            cursor = next.nextCursor;
+          } while (cursor);
+          return rows;
+        })(),
+        streams: read
+          .listStreams(["conn_a"])
+          .map(({ recordCount, lastUpdated }) => ({
+            recordCount,
+            lastUpdated,
+          })),
+        blob: {
+          bytes: blobBytes && Array.from(blobBytes),
+          meta: read.getBlobMeta(blobId)?.blobId,
+          refs: read.findBlobReferences(blobId).map((ref) => ref.recordKey),
+        },
+      };
+    };
+    const noBlob = { bytes: undefined, meta: undefined, refs: [] };
+    const before = {
+      owner: {
+        point: ["a:pending-a", "b:removed", "c:c", "p:pending-p"],
+        page: ["d:d", "c:c", "b:removed", "a:pending-a", "p:pending-p"],
+        pages: ["d:d", "c:c", "b:removed", "a:pending-a", "p:pending-p"],
+        streams: [{ recordCount: 4, lastUpdated: time(6) }],
+        blob: { bytes: [1, 2, 3], meta: blobId, refs: ["p"] },
+      },
+      grant: {
+        point: ["a:a", "b:b", "c:c", null],
+        page: ["d:d", "c:c", "b:b", "a:a"],
+        pages: ["d:d", "c:c", "b:b", "a:a"],
+        streams: [{ recordCount: 4, lastUpdated: time(3) }],
+        blob: noBlob,
+      },
+    };
+    const only = (rows: string[]) => ({
+      point: [null, null, rows.length ? "c:c" : null, null],
+      page: rows,
+      pages: rows,
+      streams: rows.length ? [{ recordCount: 2, lastUpdated: time(1) }] : [],
+      blob: noBlob,
+    });
+    const quarantined = scope === "key" ? only(["d:d", "c:c"]) : only([]);
+    expect(snapshot("owner")).toEqual(before.owner);
+    expect(snapshot("grant")).toEqual(before.grant);
+    const open = {
+      owner: page("owner", 1).nextCursor!,
+      grant: page("grant", 1).nextCursor!,
+    };
+
+    const facts = () => {
+      if (scope === "key")
+        for (const key of ["a", "b", "p"])
+          d.db
+            .prepare(
+              "INSERT INTO pdpp_replica_quarantined_keys VALUES ('conn_a', 1, 'messages', ?)",
+            )
+            .run(key);
+      else
+        d.db
+          .prepare(
+            "INSERT INTO pdpp_replica_quarantined_connections VALUES ('conn_a')",
+          )
+          .run();
+    };
+    if (path === "fact")
+      // Only the fact and its epoch move: no canonical withdrawal marks a key.
+      d.db.transaction(() => {
+        facts();
+        d.store.fenceReplicaConnection("conn_a");
+      })();
+    else
+      receiver.quarantineImported({
+        credential: "replica-secret",
+        envelope: batch(
+          scope === "key"
+            ? operations.filter(
+                (op) => op.kind === "upsert" || op.kind === "delete",
+              )
+            : [registration()],
+        ),
+      });
+    expect(snapshot("owner")).toEqual(quarantined);
+    expect(snapshot("grant")).toEqual(quarantined);
+    for (const reader of ["owner", "grant"] as const)
+      expect(() => page(reader, 1, open[reader])).toThrow(/expired/);
+    if (path === "receiver") return;
+
+    // Restoration: no write path removes a fact today; a restoring writer
+    // must move the epoch as the hiding writer does.
+    const during = {
+      owner: page("owner", 1).nextCursor,
+      grant: page("grant", 1).nextCursor,
+    };
+    d.db.transaction(() => {
+      d.db.exec(
+        "DELETE FROM pdpp_replica_quarantined_keys; DELETE FROM pdpp_replica_quarantined_connections;",
+      );
+      d.store.fenceReplicaConnection("conn_a");
+    })();
+    expect(snapshot("owner")).toEqual(before.owner);
+    expect(snapshot("grant")).toEqual(before.grant);
+    for (const reader of ["owner", "grant"] as const)
+      if (scope === "key")
+        expect(() => page(reader, 1, during[reader]!)).toThrow(/expired/);
+  },
+);
+type PdppVisibleRecordLike = {
+  recordKey: string;
+  deleted: boolean;
+  data: Record<string, unknown>;
+};
