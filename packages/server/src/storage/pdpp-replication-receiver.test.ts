@@ -3250,15 +3250,26 @@ it.each([
     expect(Array.from(read.getBlobBytes(blob.blobId)!)).toEqual(
       Array.from(bytes),
     );
-    const table =
-      origin === "pending" ? "pdpp_replica_pending_bytes" : "pdpp_blob_bytes";
-    target.db
-      .prepare(`UPDATE ${table} SET bytes=? WHERE blob_id=?`)
-      .run(new Uint8Array([7, 8, 9]), blob.blobId);
+    // Since #439 materialized canonical bytes may live in the chunked binary
+    // store; a store write or small pending bytes keep a legacy row.
+    const overwrite = (value: Uint8Array) =>
+      origin === "pending"
+        ? target.db
+            .prepare(
+              "UPDATE pdpp_replica_pending_bytes SET bytes=? WHERE blob_id=?",
+            )
+            .run(value, blob.blobId).changes
+        : target.db
+            .prepare("UPDATE pdpp_blob_bytes SET bytes=? WHERE blob_id=?")
+            .run(value, blob.blobId).changes ||
+          target.db
+            .prepare(
+              "UPDATE pdpp_binary_chunks SET bytes=? WHERE namespace='canonical' AND blob_id=? AND position=0",
+            )
+            .run(value, blob.blobId).changes;
+    expect(overwrite(new Uint8Array([7, 8, 9]))).toBe(1);
     expect(read.getBlobBytes(blob.blobId)).toBeUndefined();
-    target.db
-      .prepare(`UPDATE ${table} SET bytes=? WHERE blob_id=?`)
-      .run(bytes, blob.blobId);
+    overwrite(bytes);
     expect(Array.from(read.getBlobBytes(blob.blobId)!)).toEqual(
       Array.from(bytes),
     );

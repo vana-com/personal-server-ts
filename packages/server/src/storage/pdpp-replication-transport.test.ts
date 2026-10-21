@@ -2,8 +2,8 @@ import { readBinary } from "./pdpp-binary-chunks.js";
 import Database from "better-sqlite3";
 import { keccak256, stringToHex } from "viem";
 import { afterEach, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
@@ -1361,3 +1361,128 @@ function finalizedRows(d: ReturnType<typeof device>) {
       .get() as { n: number }
   ).n;
 }
+
+it("does not acknowledge export when persisted payload chunks change before cursor commit", async () => {
+  const net = network(),
+    a = device(net);
+  a.put("retained source");
+  a.db.exec(
+    "CREATE TRIGGER corrupt_payload_stage AFTER INSERT ON pdpp_binary_manifests WHEN NEW.namespace='payload' BEGIN UPDATE pdpp_binary_chunks SET bytes=zeroblob(length(bytes)) WHERE namespace='payload' AND blob_id=NEW.blob_id AND position=0; END",
+  );
+  await expect(a.cycle()).rejects.toBeInstanceOf(AggregateError);
+  expect(a.store.replication.getBaselineCheckpoint()).toBe(0);
+  expect(
+    (
+      a.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_batches")
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
+  a.db.exec("DROP TRIGGER corrupt_payload_stage");
+  await cycles([a], 2);
+  expect(a.store.replication.getBaselineCheckpoint()).toBeGreaterThan(0);
+  expect(outbox(a).length).toBeGreaterThan(0);
+});
+
+it("does not promote a prepared batch whose staged fragment set became incomplete", async () => {
+  const net = network(),
+    a = device(net);
+  a.put("retained source");
+  a.db.exec(
+    "CREATE TRIGGER drop_prepared_stage AFTER INSERT ON pdpp_transport_preparing BEGIN DELETE FROM pdpp_transport_preparing WHERE token=NEW.token AND scope=NEW.scope; END",
+  );
+  await a.cycle();
+  expect(
+    (
+      a.db
+        .prepare(
+          "SELECT prepared FROM pdpp_transport_batches ORDER BY sequence LIMIT 1",
+        )
+        .get() as { prepared: number }
+    ).prepared,
+  ).toBe(0);
+  expect(outbox(a)).toHaveLength(0);
+  a.db.exec("DROP TRIGGER drop_prepared_stage");
+  await cycles([a], 2);
+  expect(outbox(a).length).toBeGreaterThan(0);
+  expect(outbox(a).every((row) => row.state === "published")).toBe(true);
+});
+
+it("reclaims a prior container's stale same-PID token and keeps making progress", async () => {
+  const net = network(),
+    a = device(net);
+  a.put("restart");
+  a.db
+    .prepare("INSERT INTO pdpp_transport_lock VALUES (1,?,?)")
+    .run(process.pid, "prior-container-token");
+  for (let cycle = 0; cycle < 3; cycle++)
+    await expect(a.cycle()).resolves.toBeUndefined();
+  expect(outbox(a).every((row) => row.state === "published")).toBe(true);
+});
+
+it("recovers a same-process stale lock after SQL lock release fails", async () => {
+  const net = network(),
+    a = device(net);
+  a.put("release retry");
+  a.db.exec(
+    "CREATE TRIGGER reject_lock_release BEFORE DELETE ON pdpp_transport_lock BEGIN SELECT RAISE(ABORT,'release unavailable'); END",
+  );
+  await expect(a.cycle()).rejects.toThrow();
+  expect(a.db.prepare("SELECT 1 FROM pdpp_transport_lock").get()).toBeDefined();
+  a.db.exec("DROP TRIGGER reject_lock_release");
+  await expect(a.cycle()).resolves.toBeUndefined();
+});
+
+it("protects a live same-process writer opened through a different directory alias", async () => {
+  const net = network(),
+    a = device(net);
+  a.put("live writer");
+  let unpause!: () => void, ready!: () => void;
+  const paused = new Promise<void>((resolve) => {
+    ready = resolve;
+  });
+  const resumed = new Promise<void>((resolve) => {
+    unpause = resolve;
+  });
+  const encrypt = net.port.encrypt;
+  let first = true;
+  net.port.encrypt = async (scope, bytes) => {
+    if (first) {
+      first = false;
+      ready();
+      await resumed;
+    }
+    return encrypt(scope, bytes);
+  };
+  const aliasRoot = mkdtempSync(join(tmpdir(), "replica-alias-"));
+  directories.push(aliasRoot);
+  symlinkSync(dirname(a.db.name), join(aliasRoot, "alias"), "dir");
+  const aliasDb = new Database(join(aliasRoot, "alias", "records.sqlite"));
+  const aliasStore = createSqliteRecordStore(aliasDb);
+  const aliasWorker = createReplicaTransportWorker({
+    db: aliasDb,
+    enabled: true,
+    expected: () => expected,
+    exporter: aliasStore.replication,
+    receiver: createReplicaReceiver({
+      db: aliasDb,
+      store: aliasStore,
+      owner,
+      authenticate: () => owner,
+      declarations: () => expected.declarations,
+    }),
+    credential: "replica-secret",
+    transport: net.port,
+  });
+  const running = a.cycle();
+  try {
+    await paused;
+    await expect(aliasWorker.cycle()).rejects.toMatchObject({
+      code: "replica_worker_active",
+    });
+  } finally {
+    unpause();
+    await running;
+    aliasStore.close();
+  }
+});

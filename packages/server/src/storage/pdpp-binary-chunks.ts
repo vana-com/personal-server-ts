@@ -57,15 +57,16 @@ export function* readBinaryChunks(
       .prepare(`SELECT length(bytes) AS size FROM ${table} WHERE blob_id=?`)
       .get(id) as { size: number } | undefined;
     if (row) {
-      for (let offset = 0; offset < row.size; offset += BINARY_CHUNK_BYTES) {
-        const part = db
-          .prepare(
-            `SELECT substr(bytes,?,?) AS bytes FROM ${table} WHERE blob_id=?`,
-          )
-          .get(offset + 1, BINARY_CHUNK_BYTES, id) as { bytes: Buffer };
-        if (!part?.bytes.length) throw new Error("missing binary chunk");
-        yield part.bytes;
-      }
+      // One whole legacy read avoids SQLite reloading the value per substring.
+      const value = db
+        .prepare(`SELECT bytes FROM ${table} WHERE blob_id=?`)
+        .get(id) as { bytes: Buffer };
+      for (
+        let offset = 0;
+        offset < value.bytes.length;
+        offset += BINARY_CHUNK_BYTES
+      )
+        yield value.bytes.subarray(offset, offset + BINARY_CHUNK_BYTES);
       return;
     }
   }

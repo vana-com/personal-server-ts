@@ -2,7 +2,7 @@ import { readBinaryChunks } from "./pdpp-binary-chunks.js";
 /** Isolated real-worker memory probe. Loopback-free, disk-backed transport; no accounts. */
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
@@ -40,8 +40,8 @@ const open = (role: string) => {
   store.replication.beginBaseline(expected);
   return { db, store };
 };
-if (mode === "seed") {
-  const { store } = open("source");
+if (mode === "seed" || mode === "seed-legacy") {
+  const { db, store } = open("source");
   const blob = store.storeBlobBytesForInstance({
     instance: "conn",
     method: "export",
@@ -70,9 +70,22 @@ if (mode === "seed") {
     () => ["id"],
     { method: "export", generation: 1 },
   );
+  if (mode === "seed-legacy")
+    db.prepare("INSERT INTO pdpp_blob_bytes VALUES (?,?)").run(
+      blob.blobId,
+      Buffer.alloc(size, 31),
+    );
   writeFileSync(join(directory, "blob-id"), blob.blobId);
   store.close();
-} else if (mode === "measure") {
+} else if (mode === "legacy-read") {
+  const { store } = open("source");
+  const bytes = store.getBlobBytes(
+    readFileSync(join(directory, "blob-id"), "utf8"),
+  );
+  if (bytes?.length !== size) throw new Error("legacy read failed");
+  console.log(JSON.stringify({ size: bytes.length }));
+  store.close();
+} else if (mode === "measure" || mode === "probe") {
   const source = open("source"),
     destination = open("destination");
   const heads = new Map<string, ReplicaCommitment>();
@@ -154,8 +167,45 @@ if (mode === "seed") {
       transport,
       targetChunkBytes: 3 * 1024 * 1024,
     });
+  if (process.env.REPLICA_PAUSE_DIR) {
+    const read = source.store.replication.readPinnedBlobChunks;
+    source.store.replication.readPinnedBlobChunks = function* (id) {
+      let paused = false;
+      for (const chunk of read(id)) {
+        yield chunk;
+        if (!paused) {
+          paused = true;
+          writeFileSync(
+            join(process.env.REPLICA_PAUSE_DIR!, "paused"),
+            "ready",
+          );
+          const sleep = new Int32Array(new SharedArrayBuffer(4));
+          while (!existsSync(join(process.env.REPLICA_PAUSE_DIR!, "resume")))
+            Atomics.wait(sleep, 0, 0, 20);
+        }
+      }
+    };
+  }
   const a = worker(source),
     b = worker(destination);
+  if (mode === "probe") {
+    try {
+      await a.cycle();
+    } catch (error) {
+      if (
+        error &&
+        typeof error === "object" &&
+        "code" in error &&
+        error.code === "replica_worker_active"
+      )
+        process.exit(2);
+      throw error;
+    }
+    console.log(JSON.stringify({ probe: true }));
+    source.store.close();
+    destination.store.close();
+    process.exit(0);
+  }
   for (let cycle = 0; cycle < 12; cycle++) {
     await a.cycle();
     await b.cycle();
