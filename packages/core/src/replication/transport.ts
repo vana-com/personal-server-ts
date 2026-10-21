@@ -2,10 +2,13 @@ import { z } from "zod";
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { sha256, keccak256, stringToHex } from "viem";
 import { canonicalJson } from "./envelope.js";
+import { ReplicaFramingUnsupported } from "./outcome.js";
 
 /** Reserved across ordinary reads, grants, inventory, MCP and legacy sync. */
 import { REPLICA_SCOPE_PREFIX } from "./namespace.js";
 export { REPLICA_SCOPE_PREFIX, isReplicaScope } from "./namespace.js";
+/** Protocol limit on fragments per batch. */
+export const REPLICA_MAX_FRAGMENTS = 100000;
 /** vana-storage DEFAULT_MAX_BLOB_SIZE. Compare the actual encrypted request. */
 export const REPLICA_MAX_BLOB_BYTES = 100 * 1024 * 1024;
 const token = z.string().regex(/^[a-f0-9]{32}$/);
@@ -23,7 +26,7 @@ export const replicaFragmentSchema = z.strictObject({
   collectedAt: z.string().datetime({ offset: true }),
   digest,
   totalBytes: integer.min(1),
-  count: integer.min(1).max(100000),
+  count: integer.min(1).max(REPLICA_MAX_FRAGMENTS),
   index: integer,
   offset: integer,
   chunkDigest: digest,
@@ -210,9 +213,14 @@ export async function fragmentReplicaPayload(input: {
   const digest = replicaDigest(input.bytes);
   while (true) {
     const count = Math.ceil(input.bytes.length / chunkSize);
-    if (count > 100000) throw new RangeError("too many replica fragments");
+    if (count > REPLICA_MAX_FRAGMENTS)
+      throw new ReplicaFramingUnsupported(
+        count,
+        REPLICA_MAX_FRAGMENTS,
+        "fragment_count",
+      );
     const parts: PreparedFragment[] = [];
-    let oversized = false;
+    let oversized = 0;
     for (let index = 0; index < count; index++) {
       const offset = index * chunkSize;
       const chunk = input.bytes.subarray(offset, offset + chunkSize);
@@ -226,14 +234,13 @@ export async function fragmentReplicaPayload(input: {
         chunk,
       });
       if (part.encrypted.length > cap) {
-        oversized = true;
+        oversized = part.encrypted.length;
         break;
       }
       parts.push(part);
     }
     if (!oversized) return parts;
-    if (chunkSize === 1)
-      throw new RangeError("encrypted fragment header exceeds storage cap");
+    if (chunkSize === 1) throw new ReplicaFramingUnsupported(oversized, cap);
     chunkSize = Math.max(1, Math.floor(chunkSize / 2));
   }
 }

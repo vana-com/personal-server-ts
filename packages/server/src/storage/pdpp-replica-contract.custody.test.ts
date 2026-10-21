@@ -66,7 +66,6 @@ const count = (db: Database.Database, sql: string, ...args: unknown[]) =>
   (db.prepare(sql).get(...args) as { n: number }).n;
 const sha = (bytes: Uint8Array | undefined) =>
   bytes ? createHash("sha256").update(bytes).digest("hex") : undefined;
-const labelKind = (label: string) => label.split(":")[0]!;
 
 /** Resume: clear injected faults, then several cycles with clock advances. */
 async function cycleAll(devices: TransportDevice[], n = 6, ms = 10_000) {
@@ -969,8 +968,14 @@ describe("section C: fences, outcomes and claims", () => {
       expect(r.error).toBeNull();
       expect(r.attempts).toBe(0);
     }
+    // B also imports its own registration batch; A's batch is the one under test.
+    const writerA = (
+      a.db.prepare("SELECT writer FROM pdpp_transport_state").get() as {
+        writer: string;
+      }
+    ).writer;
     const imports = workRecords(b.db).filter(
-      (r) => r.table === "pdpp_transport_import_work",
+      (r) => r.table === "pdpp_transport_import_work" && r.writer === writerA,
     );
     expect(imports.map((r) => r.outcome)).toEqual(["progress"]);
   });

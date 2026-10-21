@@ -290,6 +290,7 @@ function device(
       return store.getRecord("conn", "messages", id)?.data;
     },
     cycle: () => engine.cycle(),
+    notify: (key: string) => engine.onDependencyChanged(key),
     declarations(entries: typeof declarations) {
       declarations = entries;
     },
@@ -321,6 +322,14 @@ function outbox(d: ReturnType<typeof device>) {
     encrypted: Buffer;
     plaintext: Buffer;
     attempts: number;
+  }[];
+}
+function importWork(d: ReturnType<typeof device>) {
+  return d.db.prepare("SELECT * FROM pdpp_transport_import_work").all() as {
+    outcome: string | null;
+    reason: string | null;
+    dependency: string | null;
+    error: string | null;
   }[];
 }
 function inbox(d: ReturnType<typeof device>) {
@@ -615,7 +624,10 @@ it("keeps unknown declarations pending and refuses wrong owner/declaration bindi
   b.declarations([]);
   await b.cycle();
   expect(b.get()).toBeUndefined();
-  expect(inbox(b).some((r) => r.error?.includes("declaration"))).toBe(true);
+  // The unknown declaration is a durable Wait on the batch's import work.
+  expect(
+    importWork(b).some((r) => r.dependency?.startsWith("declaration:")),
+  ).toBe(true);
   b.declarations(expected.declarations);
   await cycles([b], 2);
   expect(b.get()).toEqual(a.get());
@@ -805,10 +817,14 @@ it("does not acknowledge or apply a different batch reusing an imported writer s
     .run(owner, writer);
   await cycles([clone, b], 2);
   expect(b.get()).toEqual(a.get());
+  // A second batch on an imported writer sequence is proven equivocation:
+  // terminal and never imported, instead of a hot retry on a UNIQUE error.
   const cloneScope = outbox(clone)[0]!.scope;
-  expect(inbox(b).find((r) => r.scope === cloneScope)?.state).toBe("ready");
-  expect(inbox(b).find((r) => r.scope === cloneScope)?.error).toContain(
-    "UNIQUE",
+  expect(inbox(b).find((r) => r.scope === cloneScope)?.state).toBe(
+    "quarantined",
+  );
+  expect(importWork(b).find((r) => r.outcome === "quarantine")?.reason).toBe(
+    "batch_equivocation",
   );
 });
 
@@ -853,6 +869,8 @@ it("retries durable imports while owner discovery is unavailable", async () => {
   net.port.list = async () => {
     throw new Error("gateway listing offline");
   };
+  // The failed import is due again after its first backoff, not every cycle.
+  time += 1000;
   await b.cycle().catch(() => undefined);
   expect(b.get()).toEqual(a.get());
 });
@@ -1239,10 +1257,14 @@ it("rolls staged binary and import acknowledgement back together, then retries w
         .get() as { n: number }
     ).n,
   ).toBe(0);
-  expect(inbox(b).filter((row) => row.error !== null).length).toBeGreaterThan(
-    0,
+  // The failure is a durable Retry on the batch's import work, with a closed
+  // problem code and no exception text.
+  expect(importWork(b)).toContainEqual(
+    expect.objectContaining({ outcome: "retry", reason: "import_failed" }),
   );
+  expect(JSON.stringify(importWork(b))).not.toContain("fault after binary");
   b.db.exec("DROP TRIGGER reject_binary");
+  time += 3_600_000;
   await b.cycle();
   expect(
     Buffer.from(b.store.getBlobBytes(blob.blobId)!).equals(Buffer.from(bytes)),
@@ -1252,7 +1274,13 @@ it("rolls staged binary and import acknowledgement back together, then retries w
       "UPDATE pdpp_binary_chunks SET bytes=zeroblob(length(bytes)) WHERE namespace='canonical' AND blob_id=? AND position=0",
     )
     .run(blob.blobId);
-  // retry rehashes current rows, detecting replacement/corruption without a verification cache.
+  // Reads rehash current rows, so corruption is never served.
+  expect(b.store.getBlobBytes(blob.blobId)).toBeUndefined();
+  // Canonical reconcile reads all retained history, so it runs on a dependency
+  // change, not every cycle. When it runs it rehashes and detects the
+  // replacement without a verification cache.
+  await b.cycle();
+  b.notify(`declaration:${sourceId}:messages`);
   await expect(b.cycle()).rejects.toThrow("Replica transport cycle incomplete");
   expect(b.store.getBlobBytes(blob.blobId)).toBeUndefined();
 }, 30000);

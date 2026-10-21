@@ -185,8 +185,11 @@ describe("01 Progress with retained custody, not premature availability", () => 
 
     expect(b.get()).toBeUndefined(); // hidden before mapping
     const aBatches = batchRows(a).length;
-    // One retention/import receipt per complete retained batch.
-    const work = importWork(b);
+    // One retention/import receipt per complete retained batch of A (B also
+    // imports its own registration batch).
+    const writerA = writerOf(a);
+    const workOfA = () => importWork(b).filter((w) => w.writer === writerA);
+    const work = workOfA();
     expect(work).toHaveLength(aBatches);
     expect(work.every((w) => w.outcome === "progress")).toBe(true);
     expect(work.every((w) => w.attempts === 0)).toBe(true);
@@ -199,7 +202,7 @@ describe("01 Progress with retained custody, not premature availability", () => 
 
     // Restart: the retention receipt and the wait are durable facts.
     b.reopen();
-    expect(importWork(b)).toEqual(work);
+    expect(workOfA()).toEqual(work);
     expect(b.get()).toBeUndefined();
     let retries = 0;
     const receiver = b.receiver;
@@ -233,7 +236,7 @@ describe("01 Progress with retained custody, not premature availability", () => 
     expect(b.get()).toEqual(a.get());
     expect(woken?.waits ?? []).toEqual([]);
     expect(tableRows(b.db, "pdpp_mutation_journal")).toEqual(journal); // no local echo
-    expect(importWork(b)).toEqual(work); // visibility did not rewrite the import receipt
+    expect(workOfA()).toEqual(work); // visibility did not rewrite the import receipt
   });
 
   for (const [name, make] of Object.entries(adapterFactories))
@@ -348,7 +351,7 @@ describe("02 Progress to the next phase is atomic", () => {
       d.close();
       cleanupHarness();
     }
-  });
+  }, 60_000); // one full pipeline step per crash point
 
   it("02 a prepared batch makes no remote availability claim before finalized evidence", async () => {
     const net = network();
@@ -675,6 +678,7 @@ describe("08 Wait to Retry on evidence transport failure", () => {
   it("08 a hint advance never replaces the verified checked height, and the failure is B(1)", async () => {
     const net = network();
     net.port.finality = { head: async () => 1000n };
+    net.port.list = async () => ({ scopes: [], cursor: null }); // the writer must not read itself
     const evidence = instrumentEvidence(net);
     instrumentPut(net, { pending: true });
     const d = transportDevice(net, { preexisting: "record" });

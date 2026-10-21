@@ -13,10 +13,12 @@ import {
   prepareReplicaFragment,
   replicaFragmentSchema,
   REPLICA_MAX_BLOB_BYTES,
+  REPLICA_MAX_FRAGMENTS,
   type ReplicaFragment,
   type PreparedFragment,
   type Predecessor,
 } from "./transport.js";
+import { ReplicaFramingUnsupported } from "./outcome.js";
 
 const FRAME_LIMIT = 128 * 1024;
 const BASE64_PIECE = 48 * 1024;
@@ -130,7 +132,12 @@ export async function* fragmentReplicaStream(input: {
   )
     throw new RangeError("invalid replica size limit");
   const count = Math.ceil(input.totalBytes / chunkSize);
-  if (count > 100000) throw new RangeError("too many replica fragments");
+  if (count > REPLICA_MAX_FRAGMENTS)
+    throw new ReplicaFramingUnsupported(
+      count,
+      REPLICA_MAX_FRAGMENTS,
+      "fragment_count",
+    );
   const hash = sha256.create();
   let offset = 0;
   let index = 0;
@@ -154,7 +161,7 @@ export async function* fragmentReplicaStream(input: {
           chunk,
         });
         if (prepared.encrypted.length > cap)
-          throw new RangeError("encrypted fragment exceeds storage cap");
+          throw new ReplicaFramingUnsupported(prepared.encrypted.length, cap);
         yield prepared;
         offset += used;
         index++;

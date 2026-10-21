@@ -62,6 +62,8 @@ export function replicaChainCommitment(dataHash: Hex, metadataHash: Hex): Hex {
   );
 }
 export interface ReplicaTransportPort {
+  /** The owner whose keys and signer this port uses. A worker refuses any other binding. */
+  owner?: string;
   finality?: ReplicaFinalityHints;
   encrypt(scope: string, plaintext: Uint8Array): Promise<Uint8Array>;
   decrypt(scope: string, encrypted: Uint8Array): Promise<Uint8Array>;
@@ -90,6 +92,7 @@ export function createDpv2ReplicaTransport(deps: {
   const password = (scope: string) =>
     bytesToHex(deriveScopeKey(deps.masterKey, scope)).slice(2);
   return {
+    owner: deps.owner,
     finality: deps.finality,
     encrypt: (scope, bytes) => encryptWithPassword(bytes, password(scope)),
     decrypt: (scope, bytes) => decryptWithPassword(bytes, password(scope)),
@@ -186,6 +189,39 @@ export function replicaRegistrationState(
   ).toLowerCase() === chain.commitment.toLowerCase()
     ? "confirmed"
     : "pending";
+}
+
+/**
+ * A finalized version-one registration of exactly the expected commitment whose
+ * status is not Active (for example temporarily Unavailable). Status can
+ * reactivate, so this is a Wait on the chain, never a conflict or an error.
+ */
+export function replicaRegistrationInactive(
+  evidence: ReplicaRegistrationEvidence,
+  expected: {
+    owner: string;
+    scope: string;
+    dataHash?: string;
+    metadataHash?: string;
+  },
+): boolean {
+  const { chain } = evidence;
+  return (
+    replicaRegistrationState(evidence, expected) === "pending" &&
+    !evidence.pending &&
+    chain !== null &&
+    chain.owner.toLowerCase() === expected.owner.toLowerCase() &&
+    chain.scope === expected.scope &&
+    chain.version === "1" &&
+    chain.currentVersion === "1" &&
+    chain.status !== "Active" &&
+    expected.dataHash !== undefined &&
+    expected.metadataHash !== undefined &&
+    replicaChainCommitment(
+      expected.dataHash as Hex,
+      expected.metadataHash as Hex,
+    ).toLowerCase() === chain.commitment.toLowerCase()
+  );
 }
 
 /** Expected optimistic version-one registration, distinct from disagreements/errors. */

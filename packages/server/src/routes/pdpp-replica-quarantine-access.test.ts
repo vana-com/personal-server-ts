@@ -211,8 +211,14 @@ async function fixture() {
       receiver: (activeReceiver = receiver()),
       credential,
       transport: network.port,
-      now: () => Date.parse(at),
+      now: () => time,
     });
+  // Each cycle advances a fixed clock past the one-second first error backoff.
+  let time = Date.parse(at);
+  const advance = () => {
+    time += 10_000;
+    return transport.cycle();
+  };
   let transport = worker();
   let batchIndex = 0;
   async function publish(
@@ -246,7 +252,7 @@ async function fixture() {
       encrypt: network.port.encrypt,
     });
     for (const part of parts) network.register(part);
-    if (runCycle) await transport.cycle();
+    if (runCycle) await advance();
     return parts;
   }
   const claim = (r: Upsert): ReplicaOperation => ({
@@ -408,7 +414,7 @@ async function fixture() {
     publish,
     assertQuarantined,
     controlWorks,
-    cycle: () => transport.cycle(),
+    cycle: advance,
     withdrawDeclarations() {
       trustedBindings = [];
     },
@@ -513,7 +519,12 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
     for (let cycle = 0; cycle < 2; cycle++) {
       f.network.observed.length = 0;
       await f.cycle();
-      expect(f.network.observed.length).toBeLessThanOrEqual(50);
+      // Only revalidation reads of the staged slots count against its quantum;
+      // the clock now advances, so the fixture's own publish wait also polls.
+      const scopes = new Set(staged.map((part) => part.scope));
+      expect(
+        f.network.observed.filter((scope) => scopes.has(scope)).length,
+      ).toBeLessThanOrEqual(50);
     }
     expect(
       staged.every(

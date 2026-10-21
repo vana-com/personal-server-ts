@@ -9,14 +9,20 @@
  */
 import { afterEach, expect, it, vi } from "vitest";
 import type { ProgressReport } from "@opendatalabs/personal-server-ts-core/replication/coordinator";
+import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
   CrashController,
+  at,
+  binding,
   clock,
   cleanupHarness,
+  credential,
   cycles,
   durableSnapshot,
+  envelope,
   expected,
   network,
+  owner,
   sourceId,
   transportDevice,
   transportInvariantViolations,
@@ -133,6 +139,18 @@ const recordChanges = (d: TransportDevice) =>
   num(d, "SELECT count(*) AS n FROM pdpp_record_changes");
 const journalOperations = (d: TransportDevice) =>
   num(d, "SELECT count(*) AS n FROM pdpp_replica_operations");
+/** Local journal record operations. An imported remote record must never echo here. */
+const journalRecords = (d: TransportDevice) =>
+  num(
+    d,
+    "SELECT count(*) AS n FROM pdpp_replica_operations WHERE json_extract(operation_json,'$.kind') IN ('upsert','delete')",
+  );
+const importedFrom = (d: TransportDevice, writer: string) =>
+  num(
+    d,
+    "SELECT count(*) AS n FROM pdpp_transport_imported WHERE writer=?",
+    writer,
+  );
 const writerOf = (d: TransportDevice) =>
   (
     d.db
@@ -276,41 +294,52 @@ async function publishedWriter(
   net: Network,
   fill: (d: TransportDevice) => void,
   opts: { chunk?: number; pageSize?: number } = {},
+  maxSteps = 20,
 ) {
   const d = transportDevice(net, opts);
   fill(d);
+  // Retention takes one export page per step (the connection registration
+  // first), so "published" also needs a step that retained nothing new.
+  let batches = -1;
   await stepUntil(
     d,
-    () =>
-      outboxCount(d) > 0 && unpublished(d) === 0 && unpreparedBatches(d) === 0,
-    20,
+    () => {
+      const settled =
+        batchCount(d) === batches &&
+        outboxCount(d) > 0 &&
+        unpublished(d) === 0 &&
+        unpreparedBatches(d) === 0;
+      batches = batchCount(d);
+      return settled;
+    },
+    maxSteps,
     10_000,
   );
   return d;
 }
 
 /**
- * Writer with two batches (sequence 1 and 2). The importer sees only batch 2
- * until reveal(); its import must Wait(predecessor:<writer>:1).
+ * Writer whose last two batches carry records a and b (the first batch is its
+ * connection registration). The importer does not see the record-a batch
+ * until reveal(); the record-b import must Wait(predecessorKey).
  */
 async function twoBatchRemote(opts: { crash?: CrashController } = {}) {
   const net = network();
-  const a = transportDevice(net, { pageSize: 1 });
-  a.put("one", "a");
-  a.put("two", "b");
-  await stepUntil(
-    a,
-    () =>
-      batchCount(a) >= 2 && unpreparedBatches(a) === 0 && unpublished(a) === 0,
-    30,
-    10_000,
+  const a = await publishedWriter(
+    net,
+    (d) => {
+      d.put("one", "a");
+      d.put("two", "b");
+    },
+    { pageSize: 1 },
   );
-  const batches = a.db
+  const all = a.db
     .prepare(
       "SELECT batch,sequence FROM pdpp_transport_batches ORDER BY sequence",
     )
     .all() as { batch: string; sequence: number }[];
-  expect(batches).toHaveLength(2);
+  expect(all.length).toBeGreaterThanOrEqual(2);
+  const batches = all.slice(-2);
   const writer = writerOf(a);
   const list = net.port.list;
   net.port.list = async (cursor) => {
@@ -328,6 +357,9 @@ async function twoBatchRemote(opts: { crash?: CrashController } = {}) {
     writer,
     first: batches[0]!.batch,
     second: batches[1]!.batch,
+    predecessorKey: `predecessor:${writer}:${batches[0]!.sequence}`,
+    /** Every batch the writer published. */
+    batchCount: all.length,
     reveal() {
       net.port.list = list;
     },
@@ -341,7 +373,11 @@ const both = (d: TransportDevice) =>
 
 // ===================================================================== 15, 16
 
-/** Two writers: A (whose first import fails once) and C (unrelated). */
+/**
+ * Two writers: A (whose first import fails once) and C (unrelated). Every
+ * writer's first batch carries its connection registration and its second the
+ * record, so the failure hits A's first batch and the record batch waits for it.
+ */
 async function failedOnceImport(withUnrelatedWriter: boolean) {
   const net = network();
   const a = transportDevice(net);
@@ -357,23 +393,43 @@ async function failedOnceImport(withUnrelatedWriter: boolean) {
   }
   const b = transportDevice(net);
   const tally = newTally();
-  let failuresLeft = 1;
+  const failed: { batch?: string } = {};
   const hooks: Hooks = {
-    beforePromote: ({ writer }) => {
-      if (writer === writerA && failuresLeft-- > 0)
+    beforePromote: ({ writer, batch }) => {
+      if (writer === writerA && failed.batch === undefined) {
+        failed.batch = batch;
         throw new Error("transient import failure");
+      }
     },
   };
   instrument(b, tally, hooks);
   await stepUntil(b, () => countFor(tally.promote, writerA) >= 1, 12);
-  return { net, a, b, c, writerA, tally, hooks, failedAt: clock.now() };
+  return {
+    net,
+    a,
+    b,
+    c,
+    writerA,
+    tally,
+    hooks,
+    failedAt: clock.now(),
+    failedBatch: failed.batch!,
+  };
 }
+const forBatch = (calls: { batch: string }[], batch: string) =>
+  calls.filter((c) => c.batch === batch).length;
+const importedBatch = (d: TransportDevice, batch: string) =>
+  num(
+    d,
+    "SELECT count(*) AS n FROM pdpp_transport_imported WHERE batch=?",
+    batch,
+  );
 
 it("15 complete batch import fails transiently: no decode/stage/promote before B(1), deadline survives reopen, one import at the deadline", async () => {
-  const { b, a, writerA, tally, hooks, failedAt } =
+  const { b, a, writerA, tally, hooks, failedAt, failedBatch } =
     await failedOnceImport(false);
-  expect(countFor(tally.promote, writerA)).toBe(1);
-  expect(countFor(tally.stage, writerA)).toBe(1);
+  expect(forBatch(tally.promote, failedBatch)).toBe(1);
+  expect(forBatch(tally.stage, failedBatch)).toBe(1);
 
   // 20 cycles inside the backoff window (20 x 40 ms = 800 ms < B(1)).
   for (let i = 0; i < 20; i++) {
@@ -381,17 +437,17 @@ it("15 complete batch import fails transiently: no decode/stage/promote before B
     await step(b);
   }
   expect(
-    countFor(tally.stage, writerA),
+    forBatch(tally.stage, failedBatch),
     "stage re-ran inside the backoff",
   ).toBe(1);
   expect(
-    countFor(tally.promote, writerA),
+    forBatch(tally.promote, failedBatch),
     "promote re-ran inside the backoff",
   ).toBe(1);
-  expect(importedReceipts(b)).toBe(0);
+  expect(importedBatch(b, failedBatch)).toBe(0);
   expect(b.get("a")).toBeUndefined();
 
-  const rows = importWork(b);
+  const rows = importWorkFor(b, failedBatch);
   expect(rows).toHaveLength(1);
   expect(rows[0]).toMatchObject({
     writer: writerA,
@@ -407,20 +463,22 @@ it("15 complete batch import fails transiently: no decode/stage/promote before B
     clock.advance(30);
     await step(b);
   }
-  expect(importWork(b)).toEqual(rows);
-  expect(countFor(tally.promote, writerA)).toBe(1);
-  expect(importedReceipts(b)).toBe(0);
+  expect(importWorkFor(b, failedBatch)).toEqual(rows);
+  expect(forBatch(tally.promote, failedBatch)).toBe(1);
+  expect(importedBatch(b, failedBatch)).toBe(0);
 
-  // At the deadline the batch imports once.
+  // At the deadline the batch imports once, and its successor follows.
   clock.advance(failedAt + B1 - clock.now());
-  await stepUntil(b, () => importedReceipts(b) === 1, 6);
-  expect(countFor(tally.promote, writerA)).toBe(2);
+  await stepUntil(b, () => b.get("a") !== undefined, 6);
+  expect(importedBatch(b, failedBatch)).toBe(1);
+  expect(forBatch(tally.promote, failedBatch)).toBe(2);
   expect(b.get("a")).toEqual(a.get("a"));
   expect(importWork(b).every((r) => r.outcome !== "retry")).toBe(true);
 });
 
 it("16 discovery duplicates and unrelated dependency wakes before the deadline keep one work row and deadline; an unrelated writer still imports", async () => {
-  const { b, net, c, writerA, tally, failedAt } = await failedOnceImport(true);
+  const { b, net, c, writerA, tally, failedAt, failedBatch } =
+    await failedOnceImport(true);
   expect(c).toBeDefined();
   const list = net.port.list;
   // The feed lists every scope twice on every page.
@@ -428,10 +486,11 @@ it("16 discovery duplicates and unrelated dependency wakes before the deadline k
     const page = await list(cursor);
     return { ...page, scopes: [...page.scopes, ...page.scopes] };
   };
-  const rowsOf = () => importWork(b).filter((r) => r.writer === writerA);
+  const rowsOf = () => importWorkFor(b, failedBatch);
   const before = rowsOf();
   expect(before).toHaveLength(1);
   expect(before[0]).toMatchObject({
+    writer: writerA,
     outcome: "retry",
     attempts: 1,
     next_attempt: failedAt + B1,
@@ -444,7 +503,10 @@ it("16 discovery duplicates and unrelated dependency wakes before the deadline k
     notify(b, `predecessor:${writerA}:99`);
     await step(b);
   }
-  expect(countFor(tally.promote, writerA), "wake bypassed the backoff").toBe(1);
+  expect(
+    forBatch(tally.promote, failedBatch),
+    "wake bypassed the backoff",
+  ).toBe(1);
   expect(rowsOf()).toEqual(before);
   expect(b.get("a")).toBeUndefined();
   expect(b.get("c")).toEqual({ id: "c", text: "from C" });
@@ -468,8 +530,17 @@ it("17a confirmation of many retained ready fragments is budgeted: evidence read
   );
   const total = outboxCount(a);
   expect(total).toBeGreaterThan(20);
-  const b = transportDevice(net);
-  await stepUntil(b, () => retained(b) === total, 20, 10_000);
+  // Revalidation of imported slots is a separate sweep that also reads
+  // evidence; space it out so the k-unit budget goes to confirmation.
+  const b = transportDevice(net, { worker: { revalidateIntervalMs: 600_000 } });
+  const writerA = writerOf(a);
+  const retainedFromA = () =>
+    num(
+      b,
+      "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND instr(scope, ?) > 0",
+      `.${writerA}_`,
+    );
+  await stepUntil(b, () => retainedFromA() === total, 20, 10_000);
   expect(b.get("a")).toBeUndefined(); // pending, so nothing is confirmed yet
   net.finalizeAll();
 
@@ -514,7 +585,7 @@ it("17b revalidation of many imported fragments is budgeted: evidence reads grow
   }
 });
 
-it("17c receiver.retry runs at most once per step and not on an idle step without a dependency change or due fallback", async () => {
+it("17c receiver.retry runs at most once per step, never on an idle step, and once per dependency change", async () => {
   const net = network();
   const a = await publishedWriter(net, (d) => d.put("reconcile me", "a"));
   const b = transportDevice(net);
@@ -531,25 +602,76 @@ it("17c receiver.retry runs at most once per step and not on an idle step withou
   }
   expect(tally.retry - base, "idle steps ran receiver.retry").toBe(0);
 
-  // The bounded fallback still runs it, never more than once per step.
+  // With nothing outstanding there is no timer either: ten idle minutes run
+  // no canonical reconcile (it reads all retained history).
   for (let i = 0; i < 20; i++) {
     clock.advance(30_000);
-    const before = tally.retry;
     await step(b);
-    expect(tally.retry - before).toBeLessThanOrEqual(1);
   }
+  expect(tally.retry - base, "an idle timer ran receiver.retry").toBe(0);
+
+  // A dependency change runs it exactly once: a notified declaration change,
+  // then a local mapping change found by the durable fingerprint.
+  notify(b, `declaration:${sourceId}:messages`);
+  await steps(b, 3, 10);
+  expect(tally.retry - base).toBe(1);
+  b.store.registerConnection({
+    instance: "other",
+    sourceId,
+    method: "export",
+    label: "O",
+  });
+  await steps(b, 3, 10);
+  expect(tally.retry - base).toBe(2);
+});
+
+/** Remote upserts on the importer's own mapped connection "conn". */
+function remoteHistory(count: number): ReplicaOperation[] {
+  return Array.from({ length: count }, (_, i) => ({
+    kind: "upsert" as const,
+    owner,
+    sourceId,
+    connectionId: "conn",
+    methodId: "export",
+    generation: 1,
+    revision: { counter: i + 10, writerId: "remote", operationId: `op-${i}` },
+    declaration: binding,
+    recordKey: `r${i}`,
+    emittedAt: at,
+    data: { id: `r${i}`, text: `remote ${i}` },
+    blobs: [],
+  }));
+}
+
+it("17d an idle step reads no retained history: no canonical reconcile and no query on received operations", async () => {
+  const net = network();
+  const b = transportDevice(net);
+  const tally = newTally();
+  instrument(b, tally);
+  b.receiver.import({ credential, envelope: envelope(remoteHistory(200)) });
+  expect(b.get("r199")).toEqual({ id: "r199", text: "remote 199" });
+  await steps(b, 3, 10_000); // settle: the first step reconciles once
+  const sql: string[] = [];
+  const prepare = b.db.prepare.bind(b.db);
+  vi.spyOn(b.db, "prepare").mockImplementation(((source: string) => {
+    sql.push(source);
+    return prepare(source);
+  }) as typeof b.db.prepare);
+  const base = tally.retry;
+  await steps(b, 5, 10_000);
+  expect(sql.length, "the idle steps ran no SQL at all").toBeGreaterThan(0);
+  expect(tally.retry - base, "an idle step ran receiver.retry").toBe(0);
   expect(
-    tally.retry,
-    "no fallback reconciliation within 10 minutes",
-  ).toBeGreaterThan(base);
+    sql.filter((source) => source.includes("pdpp_replica_received")),
+  ).toEqual([]);
 });
 
 // ========================================================================= 18
 
 it("18 per-phase isolation: a preparation backlog does not stop an independent remote batch from importing in one step", async () => {
   const net = network();
-  const a = transportDevice(net);
-  a.put("remote", "a");
+  // Written before the baseline: registration and record travel in one batch.
+  const a = transportDevice(net, { preexisting: "remote" });
   await cycles([a], 3);
   const writerA = writerOf(a);
 
@@ -655,10 +777,11 @@ it("20 parked finality waits are filtered before the runnable quota: a due item 
     chunk: 500,
     worker: { quantum: { publish: 1 } },
   });
+  // Publication quantum 1: one fragment per step until every one is parked.
   await stepUntil(
     a,
     () => outboxCount(a) > 0 && net.head.size === outboxCount(a),
-    20,
+    400,
   );
   const parked = outboxScopes(a);
   expect(parked.length).toBeGreaterThanOrEqual(100);
@@ -913,7 +1036,7 @@ it("26 dependency events wake only matching waits: unrelated and duplicate event
   instrument(fx.b, tally);
   await fx.start();
   const rows = () => importWorkFor(fx.b, fx.second);
-  const dependency = `predecessor:${fx.writer}:1`;
+  const dependency = fx.predecessorKey;
   expect(rows()).toHaveLength(1);
   expect(rows()[0]).toMatchObject({
     writer: fx.writer,
@@ -963,7 +1086,7 @@ it("26 dependency events wake only matching waits: unrelated and duplicate event
     await step(fx.b);
   }
   expect(both(fx.b)).toBe(true);
-  expect(importedReceipts(fx.b)).toBe(2);
+  expect(importedFrom(fx.b, fx.writer)).toBe(fx.batchCount);
 });
 
 it("27a a notification delivered before the wait is registered is not lost: the wait becomes eligible within the bounded fallback", async () => {
@@ -976,7 +1099,7 @@ it("27a a notification delivered before the wait is registered is not lost: the 
       if (fired || batch !== fx.second) return;
       fired = true;
       fx.reveal();
-      notify(fx.b, `predecessor:${fx.writer}:1`);
+      notify(fx.b, fx.predecessorKey);
     },
   });
   await fx.start();
@@ -985,7 +1108,7 @@ it("27a a notification delivered before the wait is registered is not lost: the 
     await step(fx.b);
   }
   expect(both(fx.b), "wait lost the notification").toBe(true);
-  expect(importedReceipts(fx.b)).toBe(2);
+  expect(importedFrom(fx.b, fx.writer)).toBe(fx.batchCount);
   expect(hasWake(fx.b), "worker.onDependencyChanged is missing").toBe(true);
 });
 
@@ -1033,7 +1156,7 @@ it("27c mapping provisioned with no notification: the wait wakes within the boun
     await step(b);
   }
   expect(b.get("a")).toEqual(a.get("a"));
-  expect(journalOperations(b), "import echoed into the local journal").toBe(0);
+  expect(journalRecords(b), "import echoed into the local journal").toBe(0);
 });
 
 it("27d mapping provisioned and announced: the wait is eligible on the very next step", async () => {
@@ -1089,7 +1212,8 @@ it("28a process death between the predecessor's commit and the successor's notif
   const { fx, crash } = await crashAfterPredecessorCommit(commit);
   expect(crash.dead, "the crash point was never reached").toBe(true);
   fx.b.crashReopen();
-  expect(importedReceipts(fx.b)).toBe(1); // exactly the committed predecessor
+  // Exactly the committed predecessor: everything but the successor.
+  expect(importedFrom(fx.b, fx.writer)).toBe(fx.batchCount - 1);
   expect(fx.b.get("a")).toBeDefined();
   for (let i = 0; i < 14 && !both(fx.b); i++) {
     clock.advance(5000); // no event is ever delivered: <= 70 s
@@ -1116,25 +1240,26 @@ it("28b process death after the mapping commit, before any notification: the wai
     await step(b);
   }
   expect(b.get("a")).toEqual(a.get("a"));
-  expect(journalOperations(b)).toBe(0);
+  expect(journalRecords(b)).toBe(0);
 });
 
 // ========================================================================= 29
 
 it("29 a wake flood on one shared declaration is bounded per step and every wait is eventually served", async () => {
   const net = network();
-  const a = transportDevice(net, { pageSize: 1 });
   const total = 24;
-  for (let i = 0; i < total; i++) a.put(`record ${i}`, `r${i}`);
-  await stepUntil(
-    a,
-    () =>
-      batchCount(a) >= total &&
-      unpreparedBatches(a) === 0 &&
-      unpublished(a) === 0,
+  const a = await publishedWriter(
+    net,
+    (d) => {
+      for (let i = 0; i < total; i++) d.put(`record ${i}`, `r${i}`);
+    },
+    { pageSize: 1 },
     80,
-    10_000,
   );
+  // One batch per record plus the connection registration.
+  const batches = batchCount(a);
+  expect(batches).toBe(total + 1);
+  const writerA = writerOf(a);
   const b = transportDevice(net);
   b.declarations([]); // no trusted declaration yet: nothing can materialize
   const tally = newTally();
@@ -1146,7 +1271,7 @@ it("29 a wake flood on one shared declaration is bounded per step and every wait
   for (let i = 0; i < 100; i++) notify(b, `declaration:${sourceId}:messages`);
   const units = 5;
   let rounds = 0;
-  for (; rounds < 40 && importedReceipts(b) < total; rounds++) {
+  for (; rounds < 40 && importedFrom(b, writerA) < batches; rounds++) {
     clock.advance(10_000);
     const promoted = tally.promote.length;
     await step(b, { units });
@@ -1155,7 +1280,7 @@ it("29 a wake flood on one shared declaration is bounded per step and every wait
       `step ${rounds} imported more than its ${units} units`,
     ).toBeLessThanOrEqual(units);
   }
-  expect(importedReceipts(b)).toBe(total);
+  expect(importedFrom(b, writerA)).toBe(batches);
   expect(b.get(`r${total - 1}`)).toBeDefined();
   expect(hasWake(b), "worker.onDependencyChanged is missing").toBe(true);
 });
@@ -1223,20 +1348,23 @@ async function retryIsNotBypassedByHint(kind: "publish" | "confirm") {
   holdPending(net);
   let actor: TransportDevice;
   let table: string;
+  let source: TransportDevice;
   if (kind === "publish") {
     net.port.list = async () => ({ scopes: [], cursor: null }); // no own inbox
     actor = transportDevice(net, { preexisting: "retry me" });
+    source = actor;
     await steps(actor, 4, 0);
     table = OUTBOX;
   } else {
-    const writer = transportDevice(net, { preexisting: "retry me" });
-    await steps(writer, 4, 0);
+    source = transportDevice(net, { preexisting: "retry me" });
+    await steps(source, 4, 0);
     actor = transportDevice(net);
     await steps(actor, 4, 0);
     table = INBOX;
   }
-  expect(net.head.size).toBe(1);
-  const scope = [...net.head.keys()][0]!;
+  // The record and its registration travel in one single-fragment batch.
+  expect(outboxScopes(source)).toHaveLength(1);
+  const scope = outboxScopes(source)[0]!;
   expect(record(actor, table, scope)).toMatchObject({
     outcome: "wait",
     attempts: 0,

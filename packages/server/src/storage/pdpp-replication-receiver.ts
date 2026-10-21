@@ -893,6 +893,17 @@ export function createReplicaReceiver(deps: {
         view.flush();
       }).immediate();
     },
+    /** Durable state of a staged batch, or undefined when never staged. */
+    pendingState(
+      id: string,
+    ): "pending" | "confirmed" | "quarantined" | undefined {
+      const row = db
+        .prepare("SELECT state FROM pdpp_replica_pending_batches WHERE id=?")
+        .get(id) as
+        | { state: "pending" | "confirmed" | "quarantined" }
+        | undefined;
+      return row?.state;
+    },
     quarantine(input: { credential: unknown; id: string; reason: string }) {
       authorize(input.credential);
       db.transaction(() => {
