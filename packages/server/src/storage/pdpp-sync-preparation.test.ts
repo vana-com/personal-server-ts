@@ -786,6 +786,30 @@ describe("sqlite sync scope with repeated instances", () => {
       );
       expect(seen).toHaveLength(2);
       expect(Math.max(...perRequest)).toBeLessThanOrEqual(60);
+
+      // limit 1 with room in the budget: each page buffers its extra row,
+      // and the next page re-reads it against the same deduplicated scope.
+      const paged = createPdppSyncSessionService(store, {
+        maxExaminedPerRequest: 100,
+      });
+      const pages: number[] = [];
+      work.statements = 0;
+      const again = drain(
+        paged,
+        {
+          stream: "events",
+          owner: "owner-a",
+          instanceIds: ["inst_1", ...Array(10_000).fill("inst_2")],
+          limit: 1,
+          oneRecordPerKey: true,
+        } as never,
+        () => {
+          pages.push(work.statements);
+          work.statements = 0;
+        },
+      );
+      expect(again.seen).toHaveLength(2);
+      expect(Math.max(...pages)).toBeLessThanOrEqual(60);
     } finally {
       store.close();
     }
