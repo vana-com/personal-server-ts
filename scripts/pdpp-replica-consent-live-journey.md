@@ -26,6 +26,8 @@ The app reads the actual B resource HTTP routes. A separate independent read-onl
 
 Both owner and grant reads use the receiver's shared visibility policy. The live run requires an owner-visible pending record while the app sees only confirmed data, repeats that boundary across a B restart, and checks a new edit under the same active grant. Revocation and expiry receipts require a healthy issuer and an explicit inactive-token response before B's denial counts as a pass; an unavailable issuer is a distinct error.
 
+The live owner-pending observation is receiver instrumentation. Separated-replica owner HTTP authentication is not implemented and remains a promotion item under the authorization-topology decision. Deterministic owner HTTP tests use the supported co-located issuer topology. The live host also provisions identical issuer and local connection IDs; distinct-handle mapping is covered by deterministic adapter tests, not by this live run. A durable identity mapping and live proof with different IDs remain promotion work.
+
 This is explicit experimental host composition. It does not enable replication or separated authorization in ordinary application bootstrap. The introspection credential is the existing source-scoped owner-token mechanism; a general long-lived resource-server identity and credential renewal remain separate deployment work. v0.1's incomplete introspection projection is refused rather than reconstructed.
 
 ## Adversarial coverage

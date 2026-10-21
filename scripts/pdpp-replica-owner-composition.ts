@@ -1,4 +1,4 @@
-/** Local acceptance composition. Wallet secrets remain in the Account SDK. */
+/** Dedicated dev owner only: receives its master-key signature and derives worker keys. */
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
