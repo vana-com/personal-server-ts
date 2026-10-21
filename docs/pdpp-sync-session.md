@@ -79,9 +79,10 @@ read, alter or reuse its own current-profile tokens.
   because a sync read no longer advances the clock.
 - Changing `order` between candidate sessions invalidates the checkpoint, as
   the candidate binds `order` into the query context.
-- Schema v14 adds a column and the `pdpp_sync_state` table. As with earlier
-  migrations, an older build refuses to open the upgraded database.
-- A sync read now writes session state. It never moves the write clock.
+- Schema v14 adds a column, and v15 adds the `pdpp_sync_state` table. As with
+  earlier migrations, an older build refuses to open the upgraded database.
+- A sync read now writes session state, after the store's read has ended. It
+  never moves the write clock.
 - Error precedence is unchanged: a deleted connection answers
   `404 instance_unavailable` before any `410`.
 
@@ -103,9 +104,21 @@ a changed `limit`, retries, and a SQLite restart followed by a reset.
 - A candidate request never returns a page shaped by hidden changes: it serves
   a page of disclosed items with one more to prove `has_more`, or the end of
   the window. When the budget runs out first it answers the same `429` whether
-  hidden changes or a slow store caused it; how often a client sees it is a
-  timing signal, which is outside this contract. A request whose budget runs
-  out exactly at the end pays one extra `429`.
+  hidden changes or a slow store caused it. This is the chosen trade-off, not
+  non-interference: with the same visible records, enough hidden changes turn
+  a `200` into one or more `429`s. A request whose budget runs out exactly at
+  the end pays one extra `429`. Every retry examines at least one new change,
+  so a session always finishes.
+- The budgets bound the changes a request discloses or skips, not all store
+  work. Before the first change reaches the session, the memory store builds
+  an index of the stream's history, and SQLite sorts the keys written in the
+  window. Neither is interrupted by the time budget. That cost grows with the
+  window's writes, not with the stream, and each retry seeks past what earlier
+  requests examined.
+- Paused scans are compare-and-set: a request saves or ends a scan only if no
+  other request moved it since it was resumed, so a stale request cannot
+  overwrite newer progress or revive a finished scan. Two identical requests
+  at once can still both do the same work.
 - A current-profile page that examines its whole work budget without filling
   still ends early with `has_more: true`, possibly empty. Moving current
   clients to `429` would be a visible change, so this stays a deliberate

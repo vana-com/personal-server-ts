@@ -146,8 +146,10 @@ export interface SyncWindow {
  */
 export interface SyncStateStore {
   /**
-   * Store or replace one state. Drops the owner's expired states, then the
-   * owner's oldest states beyond `maxPerOwner`.
+   * Store or replace one state, atomically. With `expect`, only if the live
+   * state is still exactly `expect` (`null`: only if there is none); returns
+   * whether it wrote. Drops expired states, then the owner's oldest states
+   * beyond `maxPerOwner`.
    */
   put(entry: {
     id: string;
@@ -156,10 +158,12 @@ export interface SyncStateStore {
     expiresAt: number;
     now: number;
     maxPerOwner: number;
-  }): void;
+    expect?: string | null;
+  }): boolean;
   /** The state, unless it is absent, expired or evicted. */
   get(id: string, now: number): string | undefined;
-  delete(id: string): void;
+  /** Deletes one state; with `expected`, only if it is still that state. */
+  delete(id: string, expected?: string): void;
 }
 
 /**

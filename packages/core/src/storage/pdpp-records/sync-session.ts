@@ -217,9 +217,11 @@ export function createPdppSyncSessionService(
             for (;;) {
               // Checked before the next change is read, so a resumed scan
               // starts at the first change no request has examined.
+              // The time budget applies once this request has examined a
+              // new change, so every retry makes progress.
               if (
                 examined === budget ||
-                (request.candidate && policy.now() >= deadline)
+                (request.candidate && examined > 0 && policy.now() >= deadline)
               ) {
                 exhausted = true;
                 break;
@@ -271,10 +273,14 @@ export function createPdppSyncSessionService(
         };
       },
     );
+    // State is written after the store's read ends, so a read snapshot never
+    // turns into a write and a store that reads in a transaction never rolls
+    // a write back.
     if ("paused" in result) {
       tokens.pauseScan(result.paused);
       throw new SyncRetryLaterError();
     }
+    tokens.flush();
     if (paused) tokens.endScan();
     return result;
   }
@@ -421,8 +427,12 @@ interface SessionTokens {
   checkpoint(high: string, withheld: RecordIdentity[]): string;
   /** A scan this same request paused earlier, if any. */
   resumeScan(): PausedScan | undefined;
+  /** Saves the scan unless another request moved it since it was resumed. */
   pauseScan(scan: PausedScan): void;
+  /** Ends the resumed scan unless another request moved it. */
   endScan(): void;
+  /** Writes the handles this request minted. */
+  flush(): void;
 }
 
 function identityKey(id: RecordIdentity): string {
@@ -510,34 +520,42 @@ function sessionTokens(
     canonicalJson([context, request.cursor ?? null, baseline, request.limit]),
   )}`;
 
-  function store(
-    id: string,
-    state: StoredState,
-    role: keyof StatePolicy["ttl"],
-  ): void {
+  function serialize(state: StoredState): string {
     const json = JSON.stringify(state);
     if (Buffer.byteLength(json, "utf8") > policy.maxBytes) {
       throw new CursorExpiredError();
     }
+    return json;
+  }
+
+  function write(
+    id: string,
+    json: string,
+    role: keyof StatePolicy["ttl"],
+    expect?: string | null,
+  ): boolean {
     const now = policy.now();
-    states.put({
+    return states.put({
       id,
       owner,
       state: json,
       expiresAt: now + policy.ttl[role],
       now,
       maxPerOwner: policy.maxPerOwner,
+      ...(expect !== undefined && { expect }),
     });
   }
 
+  const minted: { id: string; json: string; role: "page" | "checkpoint" }[] =
+    [];
   function mint(state: StoredState): string {
     const id = randomBytes(ID_BYTES);
     const body = Buffer.concat([Buffer.from([HANDLE_VERSION]), keyId, id]);
-    store(
-      id.toString("base64url"),
-      state,
-      state.r === "page" ? "page" : "checkpoint",
-    );
+    minted.push({
+      id: id.toString("base64url"),
+      json: serialize(state),
+      role: state.r === "page" ? "page" : "checkpoint",
+    });
     return Buffer.concat([body, mac(body)]).toString("base64url");
   }
 
@@ -617,10 +635,16 @@ function sessionTokens(
       w: toPairs(position.withheld),
     });
 
+  // The paused state this request resumed, compared on every later write.
+  let resumed: string | undefined;
   const scans = {
+    flush(): void {
+      for (const { id, json, role } of minted.splice(0)) write(id, json, role);
+    },
     resumeScan(): PausedScan | undefined {
       const json = states.get(scanId, policy.now());
       if (json === undefined) return undefined;
+      resumed = json;
       const state = JSON.parse(json) as StoredState;
       if (state.r !== "scan" || state.b !== context) return undefined;
       return {
@@ -633,21 +657,22 @@ function sessionTokens(
       };
     },
     pauseScan(scan: PausedScan): void {
-      store(
+      write(
         scanId,
-        {
+        serialize({
           r: "scan",
           b: context,
           h: scan.high,
           ...(scan.after && { a: [scan.after.recordKey, scan.after.instance] }),
           f: toPairs(scan.found),
           w: toPairs(scan.withheld),
-        },
+        }),
         "scan",
+        resumed ?? null,
       );
     },
     endScan(): void {
-      states.delete(scanId);
+      if (resumed !== undefined) states.delete(scanId, resumed);
     },
   };
 

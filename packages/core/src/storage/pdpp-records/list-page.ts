@@ -90,16 +90,17 @@ export function listSnapshotPage(
 ): ListRecordsPage {
   const data: PdppStoredRecord[] = [];
   let hasMore = false;
-  const visible = (row: PdppRecordRow | undefined): boolean =>
+  // The one visibility rule for enumeration and the identity check alike.
+  // Erasure overrides historical membership for that record only: a list is
+  // not a sync session, so withholding it loses nothing a later read could
+  // have relied on, and the rest of the snapshot stays readable.
+  const served = (row: PdppRecordRow | undefined): row is PdppStoredRecord =>
     row !== undefined &&
     !row.deleted &&
-    (!options.isVisible || options.isVisible(row));
+    (!options.isVisible || options.isVisible(row as PdppStoredRecord)) &&
+    !wasErased?.(row as PdppStoredRecord);
   for (const row of rows) {
-    if (!visible(row)) continue;
-    // Erasure overrides historical membership for that record only: a list
-    // is not a sync session, so withholding it loses nothing a later read
-    // could have relied on, and the rest of the snapshot stays readable.
-    if (wasErased?.(row)) continue;
+    if (!served(row)) continue;
     if (data.length === options.limit) {
       hasMore = true;
       break;
@@ -109,7 +110,7 @@ export function listSnapshotPage(
       for (const instance of options.instanceIds) {
         if (
           instance !== row.instance &&
-          visible(versionAt(instance, row.recordKey))
+          served(versionAt(instance, row.recordKey))
         ) {
           throw new RecordIdentityConflictError(row.recordKey);
         }

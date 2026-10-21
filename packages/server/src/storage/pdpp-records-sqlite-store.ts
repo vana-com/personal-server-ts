@@ -421,18 +421,31 @@ function sqliteSyncStates(db: Database): SyncStateStore {
     "SELECT state FROM pdpp_sync_state WHERE id = ? AND expires_at > ?",
   );
   const del = db.prepare("DELETE FROM pdpp_sync_state WHERE id = ?");
+  const delIf = db.prepare(
+    "DELETE FROM pdpp_sync_state WHERE id = ? AND state = ?",
+  );
   const putTx = db.transaction(
-    (entry: Parameters<SyncStateStore["put"]>[0]) => {
+    (entry: Parameters<SyncStateStore["put"]>[0]): boolean => {
+      if (entry.expect !== undefined) {
+        const current =
+          (get.get(entry.id, entry.now) as { state: string } | undefined)
+            ?.state ?? null;
+        if (current !== entry.expect) return false;
+      }
       put.run(entry.id, entry.owner, entry.state, entry.expiresAt);
       dropExpired.run(entry.now);
       evict.run(entry.owner, entry.maxPerOwner);
+      return true;
     },
   );
   return {
-    put: (entry) => putTx(entry),
+    // IMMEDIATE takes the write lock before the compare, so another
+    // connection cannot change the state between the compare and the write.
+    put: (entry) => putTx.immediate(entry),
     get: (id, now) =>
       (get.get(id, now) as { state: string } | undefined)?.state,
-    delete: (id) => void del.run(id),
+    delete: (id, expected) =>
+      void (expected === undefined ? del.run(id) : delIf.run(id, expected)),
   };
 }
 
