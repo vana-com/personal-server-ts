@@ -5,6 +5,7 @@ import {
 import {
   selectSyncChange,
   decodeListCursor,
+  decodeSyncPageCursor,
   listSnapshotPage,
   compareRecordIdentity,
   LIST_ORDER_COLUMNS,
@@ -1728,8 +1729,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     let offset = 0;
 
     if (options.cursor) {
-      const payload = decodeCursor(options.cursor);
-      if (payload.kind !== "changes_since") throw new InvalidCursorError();
+      const payload = decodeSyncPageCursor(options.cursor);
       assertCursorScope(payload, stream);
       horizon = parseHorizon(payload.horizon);
       sinceHorizon =
@@ -1835,6 +1835,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             horizon: String(horizon),
             sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
             offset: offset + options.limit,
+            orderKey: "code-point",
           })
         : undefined,
       nextChangesSince: hasMore

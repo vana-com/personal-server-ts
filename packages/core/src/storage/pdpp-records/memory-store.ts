@@ -4,6 +4,7 @@ import {
   listSnapshotPage,
   compareRecordIdentity,
   decodeListCursor,
+  decodeSyncPageCursor,
 } from "./list-page.js";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
@@ -333,8 +334,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
     if (options.cursor) {
       // Continuing an already-anchored session: horizon and sinceHorizon
       // both come from the page cursor, not re-derived from changesSince.
-      const payload = decodeCursor(options.cursor);
-      if (payload.kind !== "changes_since") throw new InvalidCursorError();
+      const payload = decodeSyncPageCursor(options.cursor);
       assertCursorScope(payload, stream);
       horizon = payload.horizon;
       sinceHorizon = payload.sinceHorizon;
@@ -442,6 +442,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
             horizon,
             sinceHorizon,
             offset: offset + options.limit,
+            orderKey: "code-point",
           })
         : undefined,
       nextChangesSince: hasMore

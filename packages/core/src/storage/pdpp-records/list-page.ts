@@ -1,6 +1,7 @@
 import {
   decodeCursor,
   encodeCursor,
+  type ChangesSinceCursorPayload,
   type ListCursorPayload,
 } from "./cursor.js";
 import { InvalidCursorError, CursorExpiredError } from "./types.js";
@@ -27,6 +28,20 @@ export function decodeListCursor(
   )
     throw new CursorExpiredError();
   return { ...payload, instance: payload.instance, horizon: payload.horizon };
+}
+
+/**
+ * A sync page cursor's offset counts records in `compareRecordIdentity`
+ * order. One minted under the earlier locale-dependent order names a
+ * different record, so it restarts explicitly; checkpoints are unaffected.
+ */
+export function decodeSyncPageCursor(
+  cursor: string,
+): ChangesSinceCursorPayload {
+  const payload = decodeCursor(cursor);
+  if (payload.kind !== "changes_since") throw new InvalidCursorError();
+  if (payload.orderKey !== "code-point") throw new CursorExpiredError();
+  return payload;
 }
 
 /** Complete identity, in the existing public sort order with instance last. */

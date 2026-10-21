@@ -41,6 +41,13 @@ export interface ChangesSinceCursorPayload {
   sinceHorizon: string | null;
   /** Pagination offset within the horizon-anchored result set. */
   offset: number;
+  /**
+   * Page cursors only: the identity order `offset` counts in. `code-point`
+   * is `compareRecordIdentity`; a page cursor without it counted a
+   * locale-dependent key order, so its offset names a different record.
+   * Checkpoints carry no position and need none.
+   */
+  orderKey?: "code-point";
 }
 
 export type CursorPayload = ListCursorPayload | ChangesSinceCursorPayload;

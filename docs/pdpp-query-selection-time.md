@@ -77,7 +77,10 @@ Legacy list cursors without a horizon or complete identity return the existing
 safely after mutation. New cursors carry both facts. They also carry the list
 order they belong to (`orderKey: "instant"`). A cursor minted under the earlier
 timestamp-text order names a different position under instant order, so it
-also returns `410` rather than skip or repeat rows. A record erased after the
+also returns `410` rather than skip or repeat rows. Sync page cursors carry
+`orderKey: "code-point"` for the same reason: their offset counted the earlier
+locale-dependent key order. Completed checkpoints carry no position and stay
+valid. A record erased after the
 horizon, including one erased and reinserted, is withheld from later pages; no
 profile returns its historical data after deletion. A list is not a sync
 session, so withholding one record loses nothing a later read relied on.
