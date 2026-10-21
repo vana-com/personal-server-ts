@@ -967,7 +967,7 @@ const instagramPosts: LegacyScopeBinding = {
   },
   primaryKey: { posts: ["id"], post_likes: ["post_id", "liker_ordinal"] },
   lossy: [
-    "nullable media_url, caption, and like_count use the retained collector's empty-string and zero sentinels; every source post is retained",
+    "nullable media_url, caption, and like_count use the retained legacy data connector's empty-string and zero sentinels; every source post is retained",
     "media_url is only available for images and the first image in a carousel; video posts and later carousel images are absent from the artifact's parser output",
     "who_liked.profile_pic_url is omitted because the post_likes stream does not declare it",
     "who_liked.pk and who_liked.id both use post_likes.user_id because the source exposes one liker identity field",
@@ -3059,8 +3059,8 @@ const spotifyPlaylists: LegacyScopeBinding = {
     playlist_items: ["id"],
   },
   lossy: [
-    "tracks[].uri: raw playlist item URIs are retained when available; older pinned records fall back to a canonical Spotify track ID, and a null ID uses the retained collector's empty-string sentinel.",
-    "tracks_total counts joined fetched tracks, as in the retained collector; catalog track_count is not a fetched-row count.",
+    "tracks[].uri: raw playlist item URIs are retained when available; older pinned records fall back to a canonical Spotify track ID, and a null ID uses the retained legacy data connector's empty-string sentinel.",
+    "tracks_total counts joined fetched tracks, as in the retained legacy data connector; catalog track_count is not a fetched-row count.",
     "images: legacy stores string URLs. String entries are retained, and structured PDPP image entries project their string url field.",
   ],
   provenance: [
@@ -4010,7 +4010,7 @@ const hebOrders: LegacyScopeBinding = {
     "orderUrl and address: the signed profile has no equivalent fields; fulfillment_location is not treated as an address.",
     "status_code, store_name, timeslot_start/end, unfulfilled_count, fulfillment_method, and fetched_at are not represented by the legacy schema.",
     "total and item price: derived from declared integer cents when present; omitted when absent. No currency or decimal text is guessed.",
-    "the retained collector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
+    "the retained legacy data connector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
     "An order without a usable id, or with no usable line and an item_count that is not a known zero, is left out and counted; valid peers are still delivered.",
     "item_count counts quantity units; an order whose summed line quantities differ is delivered and reported partial.",
     "quantity: a declared numeric quantity is converted to its decimal string form to match the legacy connector output type.",
@@ -4150,13 +4150,19 @@ const hebOrders: LegacyScopeBinding = {
   },
 };
 
-// Whole Foods 0.3.0 is the published, signature-verified OCI artifact.
+// The vendored Whole Foods declaration is the profile built from the unmerged
+// data-connectors fix/wholefoods-parity branch (PDP-Connect/data-connectors#499).
+// No published, signed artifact contains it: the registry's wholefoods:0.3.34
+// is a different build, from revision a5eea369af4d. So this cites the source
+// revision and the profile bytes, as the iCloud Notes 0.1.24 declaration does,
+// and claims no OCI identity. Replace it with the OCI reference and manifest
+// digest once a version after 0.3.34 is published with these changes.
 const wholefoodsSource = "https://registry.pdpp.dev/connectors/wholefoods";
 const wholefoodsEvidence: LegacyScopeBindingProvenance = {
-  kind: "oci",
-  ref: "ghcr.io/pdp-connect/connector/wholefoods:0.3.0",
+  kind: "collection-profile",
+  ref: "https://github.com/PDP-Connect/data-connectors/tree/6d841da0b70e50593bf07ad1bec81213d30f18b6/connectors/wholefoods",
   digest:
-    "sha256:873e287a153673bb9b96cae87dfe64e36730e18b30ea2e5c1731bdcff8d4432c",
+    "sha256:3773286d15b866a2e728898a9e26cfc776087ec26810bc1be5fc4e055a10b4fd",
   path: "declarations/wholefoods.collection-profile.json",
 };
 
@@ -4244,8 +4250,8 @@ const wholefoodsOrders: LegacyScopeBinding = {
   },
   primaryKey: { orders: ["id"], order_items: ["id"] },
   lossy: [
-    "The retained collector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
-    "An order with no usable line and an item_count that is not a known zero is left out and counted; an order whose line count differs from item_count, or whose item_count is unknown, is delivered and reported partial. A missing or duplicate order id still fails the scope.",
+    "The retained legacy data connector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
+    "An order with no usable line, an item_count that is not a known zero, and a status other than Cancelled is left out and counted. A cancelled order is delivered with no items and a null itemCount, as legacy delivered every order it saw. An order whose line count differs from item_count, or whose item_count is unknown, is delivered and reported partial. A missing or duplicate order id still fails the scope.",
     "Product identity is the source Amazon ASIN in product_id.",
   ],
   provenance: [
@@ -4288,48 +4294,60 @@ const wholefoodsOrders: LegacyScopeBinding = {
     }
     const dropped = new DroppedRows("wholefoods.orders");
     let countMismatches = 0;
+    const linesByOrder = new Map<unknown, typeof sourceItems>();
+    for (const line of sourceItems) {
+      const lines = linesByOrder.get(line.order_id);
+      if (lines) lines.push(line);
+      else linesByOrder.set(line.order_id, [line]);
+    }
     const orders = sourceOrders.flatMap((o) => {
-      const items = sourceItems
-        .filter((i) => i.order_id === o.id)
-        .flatMap((i) => {
-          if (!isNonEmptyString(i.name)) {
-            dropped.add("order_items", "projection_order_item_missing_name");
-            return [];
-          }
-          if (!isNonEmptyString(i.product_id)) {
-            dropped.add(
-              "order_items",
-              "projection_order_item_missing_product_id",
-            );
-            return [];
-          }
-          return [
-            {
-              name: i.name,
-              productId: i.product_id,
-              ...(typeof i.product_url === "string"
-                ? { productUrl: i.product_url }
-                : {}),
-              ...(typeof i.image_url === "string"
-                ? { imageUrl: i.image_url }
-                : {}),
-              quantity:
-                typeof i.quantity === "number" ? String(i.quantity) : null,
-              price:
-                typeof i.unit_price_cents === "number"
-                  ? i.unit_price_cents / 100
-                  : null,
-            },
-          ];
-        });
+      const items = (linesByOrder.get(o.id) ?? []).flatMap((i) => {
+        if (!isNonEmptyString(i.name)) {
+          dropped.add("order_items", "projection_order_item_missing_name");
+          return [];
+        }
+        if (!isNonEmptyString(i.product_id)) {
+          dropped.add(
+            "order_items",
+            "projection_order_item_missing_product_id",
+          );
+          return [];
+        }
+        return [
+          {
+            name: i.name,
+            productId: i.product_id,
+            ...(typeof i.product_url === "string"
+              ? { productUrl: i.product_url }
+              : {}),
+            ...(typeof i.image_url === "string"
+              ? { imageUrl: i.image_url }
+              : {}),
+            quantity:
+              typeof i.quantity === "number" ? String(i.quantity) : null,
+            price:
+              typeof i.unit_price_cents === "number"
+                ? i.unit_price_cents / 100
+                : null,
+          },
+        ];
+      });
       // Whole Foods item_count counts lines. Only a known zero proves an
-      // order with no usable line is empty; otherwise it is a detail gap.
+      // order with no usable line is empty, and only a cancellation explains
+      // one whose count is unknown or positive. Any other order with no
+      // usable line is a detail gap and is left out.
       const itemCount = o.item_count;
       const knownCount =
         typeof itemCount === "number" &&
         Number.isSafeInteger(itemCount) &&
         itemCount >= 0;
-      if (items.length === 0 && !(knownCount && itemCount === 0)) {
+      const cancelled =
+        typeof o.status === "string" && /cancelled/i.test(o.status);
+      if (
+        items.length === 0 &&
+        !(knownCount && itemCount === 0) &&
+        !cancelled
+      ) {
         dropped.add("orders", GROCERY_ORDER_ITEMS_GAP);
         return [];
       }
@@ -4342,19 +4360,15 @@ const wholefoodsOrders: LegacyScopeBinding = {
           ...(typeof o.order_date === "string" || o.order_date === null
             ? { orderDate: o.order_date }
             : {}),
-          // The legacy Whole Foods collector labeled every observed order Completed;
-          // source 0.3.0 correctly reports status as unknown (null).
+          // The legacy data connector labeled every observed order Completed;
+          // source 0.3.34 correctly reports status as unknown (null).
           ...(o.status === null
             ? { status: "Completed" }
             : typeof o.status === "string"
               ? { status: o.status }
               : {}),
-          ...(typeof o.total_cents === "number"
-            ? { total: o.total_cents / 100 }
-            : {}),
-          ...(typeof o.item_count === "number"
-            ? { itemCount: o.item_count }
-            : {}),
+          total: typeof o.total_cents === "number" ? o.total_cents / 100 : null,
+          itemCount: items.length > 0 && knownCount ? itemCount : null,
         },
       ];
     });
@@ -4396,6 +4410,25 @@ const wholefoodsNutritionFields = [
   "sugar_g",
   "serving_size",
   "servings_per_container",
+  "saturated_fat_g",
+  "trans_fat_g",
+  "cholesterol_mg",
+  "added_sugar_g",
+  "potassium_mg",
+  "calcium_mg",
+  "iron_mg",
+  "vitamin_d_mcg",
+  "ingredients",
+  "allergens",
+  "highlights",
+  "category",
+  "upc",
+  "raw_nutrition_text",
+  "usda_fdc_id",
+  "usda_match_method",
+  "usda_description",
+  "usda_brand",
+  "type",
 ];
 const wholefoodsNutrition: LegacyScopeBinding = {
   scope: "wholefoods.nutrition",
@@ -4406,10 +4439,13 @@ const wholefoodsNutrition: LegacyScopeBinding = {
     nutrition: wholefoodsNutritionFields,
     order_items: ["product_id", "name", "product_url", "image_url"],
   },
-  primaryKey: { nutrition: ["product_id"], order_items: ["id"] },
+  primaryKey: { nutrition: ["id"], order_items: ["id"] },
   lossy: [
-    "ingredients and allergens are not collected by the current nutrition stream.",
     "servingsPerContainer is converted from the declared number to the legacy string field.",
+    "error and pageTitle, which the legacy connector set on failed lookups, are not declared by the nutrition stream and are not emitted.",
+    "The product-page hero image the legacy connector used when an order line had no image is not declared by any stream; images.thumbnail is empty then.",
+    'name, productUrl and images come from the first order line that lists the product, as in the legacy connector; a later line never replaces them. "First" is the order the records are supplied in.',
+    'An ordered product without a nutrition row uses the legacy source "not_found", with no nutrient facts or confidence. This does not distinguish an unread page from a page with no panel; run diagnostics retain that distinction.',
   ],
   provenance: [
     {
@@ -4438,6 +4474,8 @@ const wholefoodsNutrition: LegacyScopeBinding = {
             reason: "order item lacks a source ASIN or name",
           },
         };
+      // The legacy connector kept the first line per ASIN (`productMap`).
+      if (orderedProducts.has(row.product_id)) continue;
       orderedProducts.set(row.product_id, {
         name: row.name,
         ...(typeof row.product_url === "string"
@@ -4458,6 +4496,8 @@ const wholefoodsNutrition: LegacyScopeBinding = {
         typeof n.source !== "string" ||
         ![
           "wholefoods_product_page",
+          "wholefoods_structured_data",
+          "amazon_product_page",
           "usda_fdc",
           "not_found",
           "error",
@@ -4490,7 +4530,10 @@ const wholefoodsNutrition: LegacyScopeBinding = {
       const item: Record<string, unknown> = { name, source: n.source };
       if (ordered?.productUrl !== undefined)
         item.productUrl = ordered.productUrl;
-      if (ordered?.imageUrl !== undefined) item.images = ordered.imageUrl;
+      item.images = {
+        thumbnail: ordered?.imageUrl ?? "",
+        full: "",
+      };
       if (["high", "medium", "low"].includes(String(n.confidence))) {
         item.confidence = n.confidence;
       }
@@ -4507,6 +4550,58 @@ const wholefoodsNutrition: LegacyScopeBinding = {
           item[field] = n[field];
         }
       }
+      for (const field of [
+        "saturated_fat_g",
+        "trans_fat_g",
+        "cholesterol_mg",
+        "added_sugar_g",
+        "potassium_mg",
+        "calcium_mg",
+        "iron_mg",
+        "vitamin_d_mcg",
+      ]) {
+        if (n[field] === null || typeof n[field] === "number") {
+          item[field] = n[field];
+        }
+      }
+      for (const field of [
+        "ingredients",
+        "allergens",
+        "upc",
+        "raw_nutrition_text",
+        "usda_fdc_id",
+        "usda_match_method",
+        "usda_description",
+        "usda_brand",
+      ]) {
+        if (
+          n[field] === null ||
+          typeof n[field] === "string" ||
+          typeof n[field] === "number"
+        ) {
+          const legacyField =
+            {
+              raw_nutrition_text: "rawNutritionText",
+              usda_fdc_id: "usdaFdcId",
+              usda_match_method: "usdaMatchMethod",
+              usda_description: "usdaDescription",
+              usda_brand: "usdaBrand",
+            }[field] ?? field;
+          item[legacyField] = n[field];
+        }
+      }
+      for (const field of ["highlights", "category"]) {
+        if (
+          Array.isArray(n[field]) &&
+          n[field].every((value) => typeof value === "string")
+        ) {
+          item[field] = n[field];
+        }
+      }
+      item["@type"] =
+        typeof n.type === "string"
+          ? n.type
+          : "https://schema.org/NutritionInformation";
       if (n.serving_size === null || typeof n.serving_size === "string")
         item.servingSize = n.serving_size;
       if (typeof n.servings_per_container === "number")
@@ -4514,20 +4609,31 @@ const wholefoodsNutrition: LegacyScopeBinding = {
       else if (n.servings_per_container === null)
         item.servingsPerContainer = null;
       items[n.product_id] = item;
-      if (n.source === "wholefoods_product_page") found++;
+      if (
+        n.source === "wholefoods_product_page" ||
+        n.source === "wholefoods_structured_data" ||
+        n.source === "amazon_product_page"
+      )
+        found++;
       if (n.source === "usda_fdc") foundUSDA++;
       if (n.source === "blocked") blocked++;
     }
     const total = orderedProducts.size;
-    if (seenNutrition.size !== total)
-      return {
-        ok: false,
-        error: {
-          kind: "incomplete_scope",
-          scope: "wholefoods.nutrition",
-          reason: "nutrition outcomes do not cover every ordered product",
-        },
+    // Connectors collect facts; the legacy projection supplies the absence
+    // representation. Inventory completeness is checked by the canonical
+    // reader, independently of whether individual panels were readable.
+    for (const [productId, ordered] of orderedProducts) {
+      if (seenNutrition.has(productId)) continue;
+      items[productId] = {
+        name: ordered.name,
+        source: "not_found",
+        ...(ordered.productUrl !== undefined
+          ? { productUrl: ordered.productUrl }
+          : {}),
+        images: { thumbnail: ordered.imageUrl ?? "", full: "" },
+        "@type": "https://schema.org/NutritionInformation",
       };
+    }
     return {
       ok: true,
       payload: {

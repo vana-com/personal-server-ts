@@ -2,45 +2,53 @@
   "generated_file_notice": "GENERATED FILE — DO NOT HAND-EDIT. Rebuild with scripts/build-connector-oci-artifact.mjs.",
   "connector_key": "wholefoods",
   "connector_id": "https://registry.pdpp.dev/connectors/wholefoods",
-  "version": "0.3.0",
+  "version": "0.3.34",
   "protocol_version": "0.1.0",
   "source": {
     "repository": "https://github.com/PDP-Connect/data-connectors",
-    "revision": "4e1f6e4cc5b66c4a70bd6fa38c3579eb22956c10",
+    "revision": "6d841da0b70e50593bf07ad1bec81213d30f18b6",
     "package": "connectors/wholefoods"
   },
   "source_inventory": [
     {
       "path": "connectors/wholefoods/index.ts",
-      "sha256": "sha256:3312d66838ef930667c0a3b584c2aca1b6fe850b3ebe112e894b02b821b4c690"
+      "sha256": "sha256:de66843d551f183d945bc7d561f73e43a90fc7119e00a0f5bc54fc687fb7e33f"
     },
     {
       "path": "connectors/wholefoods/parsers.ts",
-      "sha256": "sha256:6797b76b05f5cfcd8bc1050375649392749be4da505cac91b255803f97542657"
+      "sha256": "sha256:c1b8a48f1177a92ff705b21f780870bf09ca9e728eda92b3d8046a7c1b827404"
     },
     {
       "path": "connectors/wholefoods/schemas.ts",
-      "sha256": "sha256:8de8140f1cb02c312166080c38d6571dee219f27c958c1fe3f23009f46b4d06b"
+      "sha256": "sha256:84da1c707cf684fde5ae5d589d26951bb8dca97b4ee42c750c1ab0d9a9fff233"
     },
     {
       "path": "packages/polyfill-connectors/src/auto-login/amazon.ts",
-      "sha256": "sha256:370296d1117f1fae2f71cec72c5facaca96272f0e87f4deb08531ab743c0fb90"
+      "sha256": "sha256:ecf7e30874d95c45da0aa8c56a47017d2dc7b0ab075817c52a2b975705cb42e7"
     },
     {
       "path": "packages/polyfill-connectors/src/auto-login/login-credentials.ts",
-      "sha256": "sha256:f7c5763fee3b38be70103350de9245c41874060d98d3c550ed5e67e59293b689"
+      "sha256": "sha256:5b6790381ea51e052abcaaae1483a9678db8b88a39d757ca76d75a5707879b13"
     },
     {
       "path": "packages/polyfill-connectors/src/browser-handoff.ts",
-      "sha256": "sha256:dd316a8f9bce9a7f1a623d59612575d426d35b212ad3e8d075590ce9d2d1b6d7"
+      "sha256": "sha256:353a484de582c2233bc30ba779c518637d31208e4904393e1262cc393bc1e30c"
     },
     {
       "path": "packages/polyfill-connectors/src/browser-launch.ts",
-      "sha256": "sha256:914bc80f3a4c53a6f52324ece77e42fa0e0e762ab9d48604364fe346a9ed6607"
+      "sha256": "sha256:84c583e590d1bd8fe1c3c37b5da3509e55e91921426cd737e3bb66da85c05190"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/browser-window.ts",
+      "sha256": "sha256:d51e702c88cb9053a7a0a778929f829bbbe919498f9f8b89da173ccbc2518bd4"
     },
     {
       "path": "packages/polyfill-connectors/src/capture-redaction.ts",
       "sha256": "sha256:de9f0ef459574d5ef3a03b060e241dab705e8f981958c6d7d2eca8f7a97b4e4a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/connector-diagnostic.ts",
+      "sha256": "sha256:8f26461acbd053917f21bdfc4bd9b314323d76919601e0aa33a41e1fb774f0b2"
     },
     {
       "path": "packages/polyfill-connectors/src/connector-exit.ts",
@@ -52,7 +60,7 @@
     },
     {
       "path": "packages/polyfill-connectors/src/connector-runtime.ts",
-      "sha256": "sha256:60da17a95dc8c2b7bcb9dac7e770d7aab2b0b00abee9ee6e1a1c774674dfe8d3"
+      "sha256": "sha256:d66c9b3ff46c69a985bf248eae3d9e497ce8f13acba370e60f6d04d8be8c956a"
     },
     {
       "path": "packages/polyfill-connectors/src/fingerprint-cursor.ts",
@@ -63,8 +71,24 @@
       "sha256": "sha256:4005e66d066f45a28e1bd05599a4f959c96b383f043bf064f51c7c0366cd984b"
     },
     {
+      "path": "packages/polyfill-connectors/src/generated/consent-time-fields/wholefoods.generated.ts",
+      "sha256": "sha256:d3f789f077473bd7115127047fdae5a8a280825edda8d4be2cfb695f95110d0a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/observation.ts",
+      "sha256": "sha256:cd38885586d60b7940d768b133e461bb787c6d4a293bf114922236665d3d7cc5"
+    },
+    {
       "path": "packages/polyfill-connectors/src/profile-lock.ts",
       "sha256": "sha256:e4398bd9a175edcc62cfed0df33bd5c2cd570450f846e5e9e73a8b99e523ad36"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/remote-download-har.ts",
+      "sha256": "sha256:1f7c348d4cfe785e45a67beec753bfb03d82e1019da960a6774e135c2648911a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/run-owned-pages.ts",
+      "sha256": "sha256:51e40c037266a54c7569e82686d17a2536e4ec8916a053e145754910fd69a3d3"
     },
     {
       "path": "packages/polyfill-connectors/src/runtime-environment.ts",
@@ -76,7 +100,7 @@
     },
     {
       "path": "packages/polyfill-connectors/src/session-establish.ts",
-      "sha256": "sha256:8ceb1a0451ef5a03f5f83259a91cbe44401ad44ba82c8c5b0f4ee80579f30a42"
+      "sha256": "sha256:6a469020cc8afbe977a3a7cb4a02bae8afdf221d599436adafd14f09d5db6647"
     },
     {
       "path": "packages/polyfill-connectors/src/shutdown-hook.ts",
@@ -89,6 +113,10 @@
     {
       "path": "packages/polyfill-connectors/src/terminal-error.ts",
       "sha256": "sha256:4bc3efc944ca22615905239ee7f875cfc27aabd8ca5dafe28ee5cc8e6d8c426a"
+    },
+    {
+      "path": "packages/polyfill-connectors/src/time-range.ts",
+      "sha256": "sha256:4665e5b89d66aae0e989464a436e61f62fd6f873601e0995a08cec42ca17f1b7"
     }
   ],
   "build": {
@@ -149,9 +177,10 @@
     "zod"
   ],
   "outputs": {
-    "collection-profile.json": "sha256:b61408fd381da52e9d395696d875282ffb763837381b598e855c7c250c08e4e0",
-    "code.tar.gz": "sha256:759dd8cd05efe581bb27b4ec2dd1fda408224cf724f3cd8929eb104b3f225a3f",
+    "collection-profile.json": "sha256:3773286d15b866a2e728898a9e26cfc776087ec26810bc1be5fc4e055a10b4fd",
+    "code.tar.gz": "sha256:b5153bad4398f4db8678139ec057872c3afbb334a9f486823bf8ae4aee07db53",
     "assets.tar.gz": null,
-    "licenses.tar.gz": "sha256:8d502bb8a83e63101397c7a57af52da4a456d5bfe382c4731920594d485c3398"
+    "licenses.tar.gz": "sha256:63cdd995fe40f13e77e166439ccb96567e7cab03f89df93456e6edaf4e57264e",
+    "source-declaration.json": "sha256:186cc53d9acd64bf482cc4c4d1cc6e05bf33349719fc7345b98b87fa2d3785c9"
   }
 }

@@ -256,11 +256,16 @@ describe("legacy scope binding self-check", () => {
     ]) {
       expect(LEGACY_SCOPE_BINDINGS.has(scope), scope).toBe(true);
     }
+  });
 
+  it("pins Whole Foods bindings to the profile built from data-connectors#499, which no published artifact contains", () => {
     const wholeFoodsStreamNames = wholefoodsDeclaration.streams.map(
       (stream) => stream.name,
     );
-    expect(wholefoodsDeclaration.version).toBe("0.3.0");
+    // The registry's wholefoods:0.3.34 is another build (revision a5eea369af4d).
+    // This profile carries the same version string, so the source revision and
+    // the profile bytes are what identify it.
+    expect(wholefoodsDeclaration.version).toBe("0.3.34");
     expect(wholeFoodsStreamNames).toEqual([
       "profile",
       "orders",
@@ -268,15 +273,15 @@ describe("legacy scope binding self-check", () => {
       "nutrition",
     ]);
     expect(wholefoodsProvenance.source.revision).toBe(
-      "4e1f6e4cc5b66c4a70bd6fa38c3579eb22956c10",
+      "6d841da0b70e50593bf07ad1bec81213d30f18b6",
     );
     expect(
       LEGACY_SCOPE_BINDINGS.get("wholefoods.profile")?.provenance[0],
     ).toEqual({
-      kind: "oci",
-      ref: "ghcr.io/pdp-connect/connector/wholefoods:0.3.0",
+      kind: "collection-profile",
+      ref: "https://github.com/PDP-Connect/data-connectors/tree/6d841da0b70e50593bf07ad1bec81213d30f18b6/connectors/wholefoods",
       digest:
-        "sha256:873e287a153673bb9b96cae87dfe64e36730e18b30ea2e5c1731bdcff8d4432c",
+        "sha256:3773286d15b866a2e728898a9e26cfc776087ec26810bc1be5fc4e055a10b4fd",
       path: "declarations/wholefoods.collection-profile.json#streams[name=profile]",
     });
     expect(collectionProfileDigest("wholefoods")).toBe(
@@ -593,7 +598,7 @@ describe("legacy scope binding self-check", () => {
         return;
       }
       // These bindings require evidence that a null-filled declaration row
-      // cannot provide. Whole Foods 0.3.0 can project its declared item row;
+      // cannot provide. Whole Foods 0.3.34 can project its declared item row;
       // the production gate still rejects unproven collection completeness.
       if (
         [
