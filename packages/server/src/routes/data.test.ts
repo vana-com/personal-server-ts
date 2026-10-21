@@ -17,6 +17,7 @@ import {
   buildScopeDir,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import {
@@ -3040,6 +3041,109 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     await rm(dataDir, { recursive: true, force: true });
     vi.unstubAllGlobals();
   });
+
+  it.each([
+    ["payment-refresh", "control"],
+    ["payment-refresh", "legacy-mutation"],
+    ["payment-refresh", "pdpp-mutation"],
+    ["read-return", "control"],
+    ["read-return", "legacy-mutation"],
+    ["read-return", "pdpp-mutation"],
+  ])(
+    "payment serves the approved owned Lite envelope: %s/%s",
+    async (window, mode) => {
+      const {
+        createPersistentPsLiteStorage,
+        createIndexedDbFallbackDataFileStore,
+      } = await import("../../../lite/src/storage.js");
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        { read: async () => null, write: async () => {} },
+        createIndexedDbFallbackDataFileStore(
+          new Map<string, DataFileEnvelope>(),
+        ),
+      );
+      const data: {
+        nested: { marker: string };
+        $pdpp?: { version: 1; sourceId: string };
+      } = { nested: { marker: "authorized-original" } };
+      const source = {
+        version: "1.0",
+        scope: "instagram.profile",
+        collectedAt: "2026-10-01T00:00:00.000Z",
+        data,
+      };
+      const published = await storage.writeEnvelope(source);
+      await storage.insertEntry({
+        fileId: null,
+        path: published.relativePath,
+        scope: source.scope,
+        collectedAt: source.collectedAt,
+        sizeBytes: published.sizeBytes,
+      });
+      // Exercise the actual borrowed-object adapter, not a fake storage port.
+      expect(await storage.readEnvelope(source.scope, source.collectedAt)).toBe(
+        source,
+      );
+      const mutate = () => {
+        if (mode === "control") return;
+        data.nested.marker = `${mode}-after-policy`;
+        if (mode === "pdpp-mutation") {
+          data.$pdpp = {
+            version: 1,
+            sourceId: "https://registry.pdpp.dev/oura",
+          };
+        }
+      };
+      if (window === "read-return") {
+        const read = storage.readEnvelope.bind(storage);
+        storage.readEnvelope = async (scope, collectedAt) => {
+          const borrowed = await read(scope, collectedAt);
+          // First let the guard's await continue, then mutate before its
+          // caller continues. A snapshot in HTTP after await is too late.
+          queueMicrotask(() => queueMicrotask(mutate));
+          return borrowed;
+        };
+      }
+      let calls = 0;
+      const gateway = createMockGateway({
+        getGrant: vi.fn(async () => {
+          calls++;
+          if (calls === 2 && window === "payment-refresh") mutate();
+          return paidGrant();
+        }),
+      });
+      const forwarded = vi.fn(async () => new Response("{}", { status: 200 }));
+      vi.stubGlobal("fetch", forwarded);
+      const app = createX402App({ dataStorage: storage, gateway });
+      const response = await getWithPayment(
+        app,
+        source.scope,
+        await signedXPayment(),
+      );
+      const body = await response.json();
+      console.log(
+        JSON.stringify({
+          probe: "http-approved-body-ownership",
+          window,
+          mode,
+          status: response.status,
+          grantCalls: calls,
+          settled: forwarded.mock.calls.length,
+          body,
+        }),
+      );
+      expect(calls).toBe(2);
+      expect(response.status).toBe(200);
+      expect(body).toEqual({
+        version: source.version,
+        scope: source.scope,
+        collectedAt: source.collectedAt,
+        data: { nested: { marker: "authorized-original" } },
+      });
+      expect(forwarded).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each(["challenge", "settlement"])(
     "payment keeps the retained version during grant refresh: %s",
