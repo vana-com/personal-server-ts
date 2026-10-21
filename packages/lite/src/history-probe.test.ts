@@ -38,6 +38,9 @@ it("checks retained originals through the real read-only worker without exposing
     candidates.push({
       scope,
       expectedVersion: "1",
+      ...(kind === "match"
+        ? { storageVersion: "2026-06-03T08%3A11%3A27Z" }
+        : {}),
       dataHash: kind === "content" ? `0x${"00".repeat(32)}` : keccak256(plain),
       metadataHash:
         kind === "metadata"
@@ -59,7 +62,11 @@ it("checks retained originals through the real read-only worker without exposing
     methods.push(req.method!);
     authSeen ||= Boolean(req.headers.authorization);
     const scope = req.url!.split("/").at(-2)!;
-    const data = bodies.get(scope);
+    const suffix = req.url!.split("/").at(-1);
+    const data =
+      scope === "github.profile" && suffix !== "2026-06-03T08%3A11%3A27Z"
+        ? undefined
+        : bodies.get(scope);
     res.writeHead(data ? 200 : 404);
     res.end(data ? Buffer.from(data) : undefined);
   });
@@ -136,6 +143,15 @@ it("checks retained originals through the real read-only worker without exposing
     await worker?.terminate();
     expect(
       await invoke({ ...input, storageEndpoint: "https://storage.vana.org" }),
+    ).toEqual([{ kind: "refused", code: "invalid_input_or_owner" }]);
+    await worker?.terminate();
+    expect(
+      await invoke({
+        ...input,
+        candidates: [
+          { ...input.candidates[0]!, storageVersion: "../other-owner/1" },
+        ],
+      }),
     ).toEqual([{ kind: "refused", code: "invalid_input_or_owner" }]);
     expect(methods).toHaveLength(6);
   } finally {

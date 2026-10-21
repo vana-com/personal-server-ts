@@ -22,6 +22,10 @@ const inputSchema = z.object({
       z.object({
         scope: z.string().regex(/^[a-zA-Z0-9._-]{1,256}$/),
         expectedVersion: z.string().regex(/^[1-9][0-9]{0,63}$/),
+        storageVersion: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}T\d{2}%3A\d{2}%3A\d{2}Z$/)
+          .optional(),
         dataHash: hexHash,
         metadataHash: hexHash,
       }),
@@ -46,6 +50,7 @@ export type OriginalHistoryProbeMessage =
       kind: "candidate";
       scope: string;
       version: string;
+      storageVersion?: string;
       namespace: "legacy" | "moksha";
       code: OriginalHistoryProbeCode;
       size?: number;
@@ -101,7 +106,7 @@ worker.onmessage = async ({ data }) => {
           const prefix =
             namespace === "legacy" ? "v1/blobs" : "v1/chains/14800/blobs";
           const response = await fetch(
-            `${endpoint.origin}/${prefix}/${owner}/${candidate.scope}/${candidate.expectedVersion}`,
+            `${endpoint.origin}/${prefix}/${owner}/${candidate.scope}/${candidate.storageVersion ?? candidate.expectedVersion}`,
             {
               method: "GET",
               credentials: "omit",
@@ -193,6 +198,7 @@ worker.onmessage = async ({ data }) => {
           kind: "candidate",
           scope: candidate.scope,
           version: candidate.expectedVersion,
+          storageVersion: candidate.storageVersion,
           namespace,
           code,
           size,
