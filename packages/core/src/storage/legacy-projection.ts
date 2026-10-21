@@ -715,13 +715,21 @@ export function projectedReads(
       const view = await projected(
         scope,
         collectedAt,
-        defaultRead(options?.generation !== undefined ? { generation: options.generation } : {}),
+        defaultRead(
+          options?.generation !== undefined
+            ? { generation: options.generation }
+            : {},
+        ),
       );
       if (!view) return rawManifest(scope, collectedAt, options);
       const manifest = (await builtBlocks(scope, view)).manifest;
       return {
         ...manifest,
-        ...blockRepresentationMetadata(manifest, nonOwner ? "grantee" : "stored", view.view),
+        ...blockRepresentationMetadata(
+          manifest,
+          nonOwner ? "grantee" : "stored",
+          view.view,
+        ),
       };
     };
   }

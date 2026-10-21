@@ -24,6 +24,7 @@ import {
   type GranteeReadPort,
 } from "./disclosure-policy.js";
 import { readDataContract } from "../contracts/data.js";
+import { resolveBlockRedactionContext } from "./blocks/redaction.js";
 import { withLegacyProjection } from "./legacy-projection.js";
 import {
   loadSource,
@@ -377,11 +378,14 @@ export function granteeReadPortTypeContract(
   // @ts-expect-error A non-owner read never takes a raw storage port.
   void readDataContract({ source: rawAsGrantee, scopeParam: "a.b" });
 
-  // The real derivative source reader takes a reader-specific port.
-  // MCP redaction is now a pure pager operation with no storage capability.
+  // The real derivative source reader and MCP legacy redaction fallback
+  // take reader-specific ports, including after the pager extraction.
   void loadSource(computeDeps, "a.b", granted);
   // @ts-expect-error A non-owner's derivative source never reads a raw port.
   void loadSource(computeDeps, "a.b", rawAsGrantee);
+  void resolveBlockRedactionContext(port, "a.b", "t", []);
+  // @ts-expect-error MCP block redaction reads the grantee's view only.
+  void resolveBlockRedactionContext(raw, "a.b", "t", []);
 }
 
 describe("granteeReadPort type", () => {
@@ -432,7 +436,7 @@ describe("granteeReadPort type", () => {
       source.replace(/\/\/ @ts-expect-error[^\n]*\n/g, "\n"),
     );
     expect(unguarded.map((d) => d.code).sort()).toEqual([
-      2322, 2345, 2345, 2345, 2345, 2551,
+      2322, 2345, 2345, 2345, 2345, 2345, 2551,
     ]);
   }, 120_000);
 });

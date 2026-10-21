@@ -176,7 +176,8 @@ function servedManifest(manifest: DataBlockManifest): DataBlockManifest {
   } = manifest;
   return {
     ...served,
-    representationId: manifest.representationId ?? blockRepresentationId(manifest, "grantee"),
+    representationId:
+      manifest.representationId ?? blockRepresentationId(manifest, "grantee"),
     blocks: blocks.map(({ digest: _blockDigest, ...ref }) => ref),
   };
 }
@@ -332,9 +333,9 @@ function authorizedSource(raw: DataStoragePort): ProjectionSource {
         return result;
       }
       return readBuiltScopeBlocks(
-          await readCheckedBlocks(scope, collectedAt, generation),
-          readOptions,
-        );
+        await readCheckedBlocks(scope, collectedAt, generation),
+        readOptions,
+      );
     };
   }
   if (raw.readBlockManifest) {
@@ -511,13 +512,17 @@ export function granteeReadPort(
     };
   }
   const readBlocks = reads.readScopeBlocks;
-  if (readBlocks) port.readScopeBlocks = async (scope, at, options) =>
-    servedBlocks(await readBlocks(scope, at, {...options, representation:"grantee"}));
+  if (readBlocks)
+    port.readScopeBlocks = async (scope, at, options) =>
+      servedBlocks(
+        await readBlocks(scope, at, { ...options, representation: "grantee" }),
+      );
   const readManifest = reads.readBlockManifest;
-  if (readManifest) port.readBlockManifest = async (scope, at, options) => {
-    const manifest = await readManifest(scope, at, options);
-    return manifest ? servedManifest(manifest) : null;
-  };
+  if (readManifest)
+    port.readBlockManifest = async (scope, at, options) => {
+      const manifest = await readManifest(scope, at, options);
+      return manifest ? servedManifest(manifest) : null;
+    };
   const branded = port as GranteeReadPort;
   const ports = minted.get(storage) ?? new Map<number, GranteeReadPort>();
   ports.set(maxBytes, branded);

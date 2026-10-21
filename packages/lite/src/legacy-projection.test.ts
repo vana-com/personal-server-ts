@@ -7,6 +7,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { canonicalJson } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import {
   alternateLegacyBindingsForScope,
   LEGACY_SCOPE_BINDINGS,
@@ -904,9 +905,15 @@ describe("PS-Lite legacy projection", () => {
       content: projected,
     });
 
-    expect(
-      await served.readBlockManifest!("chatgpt.conversations", collectedAt),
-    ).toEqual(expected.manifest);
+    const manifest = await served.readBlockManifest!(
+      "chatgpt.conversations",
+      collectedAt,
+    );
+    expect(manifest).not.toBeNull();
+    const { representationId, cursorView, ...contentManifest } = manifest!;
+    expect(contentManifest).toEqual(expected.manifest);
+    expect(representationId).toMatch(/^[a-f0-9]{64}$/);
+    expect(cursorView).toContain("chatgpt.conversations");
     expect(
       await served.hasScopeBlocks!("chatgpt.conversations", collectedAt),
     ).toBe(true);
@@ -950,7 +957,7 @@ describe("PS-Lite legacy projection", () => {
         paged.push(
           typeof block.value === "string"
             ? block.value
-            : JSON.stringify(block.value),
+            : canonicalJson(block.value),
         );
       }
       cursor = page.nextCursor;
@@ -961,7 +968,7 @@ describe("PS-Lite legacy projection", () => {
         .map((block) =>
           typeof block.value === "string"
             ? block.value
-            : JSON.stringify(block.value),
+            : canonicalJson(block.value),
         )
         .join(""),
     );
@@ -990,7 +997,7 @@ describe("PS-Lite legacy projection", () => {
         maxBytes: 40,
         cursor: first.nextCursor,
       }),
-    ).rejects.toMatchObject({ code: "cursor_invalid" });
+    ).rejects.toMatchObject({ code: "representation_mismatch" });
   });
 
   it("binds projected cursors to a newly covered scope and version", async () => {
