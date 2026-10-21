@@ -6,6 +6,7 @@ import {
   binaryWriter,
   readBinaryChunks,
   deleteBinary,
+  verifyBinary,
 } from "./pdpp-binary-chunks.js";
 import {
   encodeReplicaPayload,
@@ -40,8 +41,10 @@ import type { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
 // One process owns a transport writer per database; other local instances serialize cycles.
 const activeDatabases = new Set<Database | string>();
+const ownedTokens = new Set<string>();
 
 const migration = `
+CREATE TABLE IF NOT EXISTS pdpp_transport_lock (id INTEGER PRIMARY KEY CHECK(id=1), pid INTEGER NOT NULL, token TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pdpp_transport_state (
  id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, writer TEXT NOT NULL,
  baseline_cursor INTEGER NOT NULL DEFAULT 0, baseline_done INTEGER NOT NULL DEFAULT 0,
@@ -210,6 +213,8 @@ export function createReplicaTransportWorker(deps: {
         )
           throw new Error("replica retention checkpoint conflict");
         if (page.operations.length) {
+          if (!verifyBinary(db, "payload", batch, digest, totalBytes))
+            throw new Error("corrupt retained replica payload");
           db.prepare(
             "INSERT INTO pdpp_transport_batches (batch,sequence,previous_json,collected_at,digest,payload,total_bytes) VALUES (?,?,?,?,?,?,?)",
           ).run(
@@ -249,21 +254,11 @@ export function createReplicaTransportWorker(deps: {
       return;
     }
     // Durable batches retained by older workers remain retryable.
-    const size = (
-      db
-        .prepare(
-          "SELECT length(payload) AS size FROM pdpp_transport_batches WHERE batch=?",
-        )
-        .get(batch.batch) as { size: number }
-    ).size;
-    for (let offset = 0; offset < size; offset += 64 * 1024)
-      yield (
-        db
-          .prepare(
-            "SELECT substr(payload,?,?) AS bytes FROM pdpp_transport_batches WHERE batch=?",
-          )
-          .get(offset + 1, 64 * 1024, batch.batch) as { bytes: Buffer }
-      ).bytes;
+    const row = db
+      .prepare("SELECT payload FROM pdpp_transport_batches WHERE batch=?")
+      .get(batch.batch) as { payload: Buffer };
+    for (let offset = 0; offset < row.payload.length; offset += 64 * 1024)
+      yield row.payload.subarray(offset, offset + 64 * 1024);
   }
   async function prepare() {
     const batches = db
@@ -276,8 +271,10 @@ export function createReplicaTransportWorker(deps: {
       try {
         const s = state();
         let chunkBytes = deps.targetChunkBytes ?? 4 * 1024 * 1024;
+        let preparedCount = 0;
         while (true) {
           try {
+            preparedCount = 0;
             for await (const part of fragmentReplicaStream({
               owner: s.owner,
               writer: s.writer,
@@ -298,7 +295,8 @@ export function createReplicaTransportWorker(deps: {
               encrypt: transport.encrypt,
               maxBlobBytes: cap,
               targetChunkBytes: chunkBytes,
-            }))
+            })) {
+              preparedCount++;
               db.prepare(
                 "INSERT INTO pdpp_transport_preparing VALUES (?,?,?,?,?,?,?)",
               ).run(
@@ -310,6 +308,7 @@ export function createReplicaTransportWorker(deps: {
                 part.dataHash,
                 part.metadataHash,
               );
+            }
             break;
           } catch (error) {
             db.prepare(
@@ -331,6 +330,16 @@ export function createReplicaTransportWorker(deps: {
             )
             .get(batch.batch) as { prepared: number };
           if (!current.prepared) {
+            const retained = db
+              .prepare(
+                "SELECT count(*) AS count FROM pdpp_transport_preparing WHERE token=?",
+              )
+              .get(token) as { count: number };
+            if (
+              retained.count !== preparedCount ||
+              preparedCount !== Math.ceil(batch.total_bytes / chunkBytes)
+            )
+              throw new Error("incomplete prepared replica batch");
             db.prepare(
               "INSERT INTO pdpp_transport_outbox (scope,batch,plaintext,encrypted,data_hash,metadata_hash) SELECT scope,batch,plaintext,encrypted,data_hash,metadata_hash FROM pdpp_transport_preparing WHERE token=?",
             ).run(token);
@@ -569,13 +578,13 @@ export function createReplicaTransportWorker(deps: {
     // JSON metadata only: no retained content strings from incomplete or other groups.
     const groups = db
       .prepare(
-        `SELECT json_extract(fragment_json,'$.writer') AS writer, json_extract(fragment_json,'$.batch') AS batch, count(*) AS rows, json_extract(fragment_json,'$.count') AS count FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='ready' GROUP BY writer,batch HAVING rows=count ORDER BY json_extract(fragment_json,'$.sequence'),writer,batch`,
+        `WITH headers AS MATERIALIZED (SELECT json_extract(fragment_json,'$.writer') AS writer, json_extract(fragment_json,'$.batch') AS batch, json_extract(fragment_json,'$.count') AS expected_count, json_extract(fragment_json,'$.sequence') AS sequence FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='ready') SELECT writer,batch FROM headers GROUP BY writer,batch HAVING count(*)=max(expected_count) ORDER BY min(sequence),writer,batch`,
       )
       .all() as { writer: string; batch: string }[];
     for (const group of groups) {
       const metadata = db
         .prepare(
-          `SELECT scope,json_extract(fragment_json,'$.index') AS position FROM pdpp_transport_inbox WHERE state='ready' AND json_extract(fragment_json,'$.writer')=? AND json_extract(fragment_json,'$.batch')=? ORDER BY position`,
+          `WITH headers AS MATERIALIZED (SELECT scope,json_extract(fragment_json,'$.index') AS position,json_extract(fragment_json,'$.writer') AS writer,json_extract(fragment_json,'$.batch') AS batch FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='ready') SELECT scope,position FROM headers WHERE writer=? AND batch=? ORDER BY position`,
         )
         .all(group.writer, group.batch) as {
         scope: string;
@@ -685,11 +694,41 @@ export function createReplicaTransportWorker(deps: {
       }
     }
   }
+  function acquireWriter(token: string) {
+    db.transaction(() => {
+      const holder = db
+        .prepare("SELECT pid,token FROM pdpp_transport_lock WHERE id=1")
+        .get() as { pid: number; token: string } | undefined;
+      if (holder?.pid === process.pid && !ownedTokens.has(holder.token)) {
+        db.prepare("DELETE FROM pdpp_transport_lock WHERE id=1").run();
+      } else if (holder) {
+        try {
+          process.kill(holder.pid, 0);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+            db.prepare("DELETE FROM pdpp_transport_lock WHERE id=1").run();
+          } else throw error;
+        }
+        if (db.prepare("SELECT 1 FROM pdpp_transport_lock WHERE id=1").get())
+          throw Object.assign(
+            new Error("replica database worker already active"),
+            { code: "replica_worker_active" },
+          );
+      }
+      db.prepare("INSERT INTO pdpp_transport_lock VALUES (1,?,?)").run(
+        process.pid,
+        token,
+      );
+    }).immediate();
+    ownedTokens.add(token);
+  }
   let running = false;
   const databaseKey = db.name && db.name !== ":memory:" ? db.name : db;
   return {
     async cycle() {
       if (!enabled() || running || activeDatabases.has(databaseKey)) return;
+      const writerToken = randomUUID();
+      acquireWriter(writerToken);
       running = true;
       activeDatabases.add(databaseKey);
       try {
@@ -728,6 +767,13 @@ export function createReplicaTransportWorker(deps: {
       } finally {
         running = false;
         activeDatabases.delete(databaseKey);
+        try {
+          db.prepare(
+            "DELETE FROM pdpp_transport_lock WHERE id=1 AND token=?",
+          ).run(writerToken);
+        } finally {
+          ownedTokens.delete(writerToken);
+        }
       }
     },
   };
