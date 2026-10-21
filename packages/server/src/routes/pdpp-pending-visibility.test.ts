@@ -92,9 +92,13 @@ it("serves owner pending markers while the same grant sees nothing until promoti
         receiver.readStore({ reader }),
     };
     const app = pdppRecordsRoutes(deps as PdppRecordsRouteDeps);
+    let confirmedBlobReads = 0;
     const blobs = pdppBlobsRoutes({
       ...deps,
-      readBlobBytes: async (id: string) => store.getBlobBytes(id),
+      readBlobBytes: async (id: string) => {
+        confirmedBlobReads++;
+        return store.getBlobBytes(id);
+      },
     } as PdppBlobsRouteDeps);
     const bytes = new TextEncoder().encode("pending binary");
     const blobId = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -167,6 +171,7 @@ it("serves owner pending markers while the same grant sees nothing until promoti
     receiver.promote({ id: "batch", credential: "replica" });
     const appBlob = await readBlob("app");
     expect(appBlob.status).toBe(200);
+    expect(confirmedBlobReads).toBe(1);
     expect(new Uint8Array(await appBlob.arrayBuffer())).toEqual(bytes);
     expect((await read("app")).body.data).toEqual([
       expect.objectContaining({

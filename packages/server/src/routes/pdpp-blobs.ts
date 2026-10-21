@@ -231,7 +231,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
 
     let bytes: Uint8Array<ArrayBuffer> | undefined;
     try {
-      if (deps.replicaReads) {
+      if (deps.replicaReads && !deps.store.getBlobMeta(blobId)) {
         const payload = authz.store.getBlobBytes(blobId);
         bytes = payload === undefined ? undefined : new Uint8Array(payload);
       } else bytes = await deps.readBlobBytes?.(blobId);
