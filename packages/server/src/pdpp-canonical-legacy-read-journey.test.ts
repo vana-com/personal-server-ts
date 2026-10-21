@@ -1937,14 +1937,17 @@ describe.each([
                 "utf8",
               ),
             );
+      const canonicalBody = structuredClone(fixture.legacyBody);
       if (scope === "spotify.playlists") {
-        // These IDs cover the track lists, not name-only artist lists.
-        for (const row of fixture.streams.playlist_items!)
-          row.artist_names = [];
+        // No old track entities need an identity. The newer complete read can
+        // add real tracks, including local tracks and nonempty artist lists.
         for (const playlist of fixture.legacyBody.playlists as {
-          tracks: { artists: unknown[] }[];
-        }[])
-          for (const track of playlist.tracks) track.artists = [];
+          tracks: unknown[];
+          tracks_total: number;
+        }[]) {
+          playlist.tracks = [];
+          playlist.tracks_total = 0;
+        }
       }
       const method = fixture.profileKey ?? scope.split(".")[0]!;
       const source = `https://registry.pdpp.dev/sources/${method}`;
@@ -1966,7 +1969,13 @@ describe.each([
       await ctx!.cleanup();
       ctx = await boot(method, { declaration });
       // Store the old file before registering the canonical owner.
-      await legacyWrite(scope, fixture.legacyBody);
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-10-09T00:00:00.000Z"));
+        await legacyWrite(scope, fixture.legacyBody);
+      } finally {
+        vi.useRealTimers();
+      }
       const token = await registerTestConnection(
         ctx.app,
         ctx.devToken!,
@@ -2002,15 +2011,17 @@ describe.each([
       }
       const read = await ownerGet(`/v1/data/${scope}`);
       expect(read.status).toBe(200);
-      const hasOnlyReusableAliases = [
+      const hasUnkeyedEntities = [
         "linkedin.connections",
         "github.repositories",
         "github.starred",
+        "spotify.savedTracks",
       ].includes(scope);
-      expect(read.dataSource).toBe(
-        complete && !hasOnlyReusableAliases ? "canonical" : "legacy",
+      const canonical = complete && !hasUnkeyedEntities;
+      expect(read.dataSource).toBe(canonical ? "canonical" : "legacy");
+      expect(JSON.parse(read.text).data).toEqual(
+        canonical ? canonicalBody : fixture.legacyBody,
       );
-      expect(JSON.parse(read.text).data).toEqual(fixture.legacyBody);
     },
   );
 });

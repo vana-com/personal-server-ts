@@ -9,6 +9,9 @@
  * GitHub repository URLs/qualified names, organization logins and LinkedIn
  * profile URLs are reusable aliases, not stable IDs. Their source IDs are
  * omitted from the legacy body, so those lists must also stay unkeyed.
+ * Spotify track URIs may identify local files by tags/duration rather than an
+ * opaque source ID. The collector does not enforce catalog-only URIs, so keep
+ * both playlist track arrays and saved-track arrays unkeyed.
  */
 export const LEGACY_SCOPE_ENTITY_KEYS: Readonly<
   Record<string, Readonly<Record<string, readonly string[]>>>
@@ -72,13 +75,8 @@ export const LEGACY_SCOPE_ENTITY_KEYS: Readonly<
     "$.orders": ["id"],
   },
   "spotify.playlists": {
-    // Repeated track URIs are ambiguous and still fail the duplicate-key guard.
-    // Nonempty nested artist lists remain unkeyed even with these outer keys.
+    // Only the opaque playlist ID is stable across upstream metadata edits.
     "$.playlists": ["uri"],
-    "$.playlists[].tracks": ["uri"],
-  },
-  "spotify.savedTracks": {
-    "$.savedTracks": ["uri"],
   },
   "strava.activities": {
     "$.activities": ["id"],

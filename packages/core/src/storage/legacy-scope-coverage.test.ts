@@ -5,6 +5,31 @@ import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
 const keys = { "$.items": ["id"], "$.items[].children": ["id"] };
 
 describe("legacy scope coverage", () => {
+  it.each(["spotify.playlists", "spotify.savedTracks"])(
+    "keeps metadata-derived local-file track URIs unkeyed in %s",
+    (scope) => {
+      const track = {
+        uri: "spotify:local:Artist:Album:Title:180",
+        name: "Title",
+        artists: [],
+      };
+      const body =
+        scope === "spotify.playlists"
+          ? {
+              playlists: [
+                { uri: "spotify:playlist:playlist-a", tracks: [track] },
+              ],
+            }
+          : { savedTracks: [track] };
+      const verdict = compareLegacyCoverage(body, body, {
+        scope,
+        entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+        canonicalNewer: true,
+      });
+      expect(verdict.covered).toBe(false);
+      expect(verdict.reason).toBe("no_stable_key");
+    },
+  );
   it.each([
     {
       scope: "github.repositories",

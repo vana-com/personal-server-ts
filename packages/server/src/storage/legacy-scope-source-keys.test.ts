@@ -171,42 +171,56 @@ describe("source identities qualify legacy scope takeover", () => {
     return input;
   }
 
-  it.each(["spotify.savedTracks", "spotify.playlists"] as const)(
-    "takes over %s by URI only when nested artist lists need no invented identity",
-    async (scope) => {
-      const input = spotify(scope);
-      const read = await setup(input).readLatest(scope);
-      expect(read.kind).toBe("canonical");
-      if (read.kind === "canonical")
-        expect(read.envelope.data).toEqual(input.legacyBody);
-    },
-  );
+  function playlistMetadata(): Fixture {
+    const input = fixture("spotify.playlists");
+    for (const playlist of input.legacyBody.playlists as {
+      tracks: unknown[];
+      tracks_total: number;
+    }[]) {
+      playlist.tracks = [];
+      playlist.tracks_total = 0;
+    }
+    return input;
+  }
+
+  it("takes over playlist metadata when no old track entities need an identity", async () => {
+    const input = playlistMetadata();
+    const read = await setup(
+      input,
+      true,
+      "2026-10-09T00:00:00.000Z",
+    ).readLatest(input.scope);
+    expect(read.kind).toBe("canonical");
+    if (read.kind === "canonical")
+      expect(read.envelope.data).toEqual(fixture(input.scope).legacyBody);
+  });
+
+  it("allows newer playlist metadata under the same opaque playlist URI", async () => {
+    const input = playlistMetadata();
+    input.streams.playlists![0]!.name = "Updated playlist name";
+    const read = await setup(
+      input,
+      true,
+      "2026-10-09T00:00:00.000Z",
+    ).readLatest(input.scope);
+    expect(read.kind).toBe("canonical");
+    if (read.kind === "canonical")
+      expect(read.envelope.data.playlists).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: "Updated playlist name" }),
+        ]),
+      );
+  });
 
   it.each(["spotify.savedTracks", "spotify.playlists"] as const)(
-    "allows newer %s metadata under the same immutable URI",
+    "keeps artist-free %s track lists unkeyed because URIs can encode local metadata",
     async (scope) => {
       const input = spotify(scope);
-      const stream =
-        scope === "spotify.savedTracks" ? "saved_tracks" : "playlist_items";
-      input.streams[stream]![0]!.name = "Updated track name";
-      const read = await setup(
-        input,
-        true,
-        "2026-10-09T00:00:00.000Z",
-      ).readLatest(scope);
-      expect(read.kind).toBe("canonical");
-      if (read.kind === "canonical") {
-        const tracks =
-          scope === "spotify.savedTracks"
-            ? read.envelope.data.savedTracks
-            : (read.envelope.data.playlists as { tracks: unknown[] }[])[0]!
-                .tracks;
-        expect(tracks).toEqual(
-          expect.arrayContaining([
-            expect.objectContaining({ name: "Updated track name" }),
-          ]),
-        );
-      }
+      const view = setup(input);
+      expect(await view.readLatest(scope)).toMatchObject({ kind: "file" });
+      expect(view.verdictFor(scope)[0]).toMatchObject({
+        reason: { reason: "no_stable_key" },
+      });
     },
   );
 
@@ -221,7 +235,12 @@ describe("source identities qualify legacy scope takeover", () => {
     "spotify.playlists",
     "github.profile",
   ] as const)("keeps the old file for an incomplete %s read", async (scope) => {
-    const input = scope === "github.profile" ? githubProfile() : spotify(scope);
+    const input =
+      scope === "github.profile"
+        ? githubProfile()
+        : scope === "spotify.playlists"
+          ? playlistMetadata()
+          : spotify(scope);
     expect(await setup(input, false).readLatest(scope)).toMatchObject({
       kind: "file",
     });
