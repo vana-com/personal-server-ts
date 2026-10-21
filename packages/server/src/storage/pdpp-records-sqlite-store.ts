@@ -316,8 +316,9 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
   "",
   // v14: the secret that seals sync tokens, beside the epoch so a rebuilt
   // records DB expires every token the old one issued, and the
-  // identity-ordered history index sync pages seek in. `migrateToV14`
-  // applies it.
+  // identity-ordered history index sync pages seek in. It also rebuilds the
+  // live summary index an earlier v13 left without `emitted_at`.
+  // `migrateToV14` applies it.
   "",
   // v14: one recoverable export-to-live transition per Claude connection.
   `CREATE TABLE IF NOT EXISTS pdpp_claude_transition (
@@ -400,9 +401,15 @@ function migrateToV14(db: Database): void {
   db.prepare(
     "UPDATE pdpp_store_metadata SET sync_token_key = ? WHERE id = 1 AND sync_token_key IS NULL",
   ).run(randomBytes(32).toString("base64"));
+  // An earlier v13 built the live summary index without `emitted_at`, so
+  // rebuild it as the covering index v13 now creates.
   db.exec(`
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_sync_identity
   ON pdpp_record_changes (stream, record_key, instance, written_at);
+DROP INDEX IF EXISTS idx_pdpp_records_live_instance_stream_emitted_key;
+CREATE INDEX idx_pdpp_records_live_instance_stream_emitted_key
+  ON pdpp_records (instance, stream, emitted_key, emitted_at)
+  WHERE deleted = 0;
 `);
 }
 
