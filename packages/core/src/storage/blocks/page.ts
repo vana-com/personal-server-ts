@@ -28,6 +28,13 @@ export async function readManifestScopeBlocks(
   loadBlock: (id: string) => Promise<DataScopeBlock | null>,
   options: BlockPageOptions,
 ): Promise<ReadScopeBlocksResponse> {
+  // Lite stores may return Map-owned objects. A prepared read owns its
+  // snapshots across later async authorization and delivery boundaries.
+  manifest = structuredClone(manifest);
+  const loadSnapshot = async (id: string) => {
+    const block = await loadBlock(id);
+    return block === null ? null : structuredClone(block);
+  };
   const { scope, collectedAt } = manifest;
   const representation = options.representation ?? "stored";
   const representationId = blockRepresentationId(
@@ -65,7 +72,7 @@ export async function readManifestScopeBlocks(
       manifest,
       options.blockIds,
       { maxBytes: options.maxBytes, prepare },
-      loadBlock,
+      loadSnapshot,
     );
     return {
       ...head,
@@ -85,7 +92,7 @@ export async function readManifestScopeBlocks(
     if (blocks.length && bytes >= maxBytes) break;
     // Raw refs are conservative size bounds; do not load the next block until needed.
     if (blocks.length && bytes + ref.sizeBytes > maxBytes) break;
-    const stored = await loadBlock(ref.id);
+    const stored = await loadSnapshot(ref.id);
     if (!stored)
       throw new DataBlockStorageError(
         "block_payload_not_found",
