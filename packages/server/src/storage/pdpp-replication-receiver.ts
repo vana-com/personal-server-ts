@@ -806,14 +806,25 @@ export function createReplicaReceiver(deps: {
   }
   /** One stored copy of a blob's bytes: a legacy whole row or #439 chunks. */
   type ByteCopy = { size: number; chunks: () => Iterable<Uint8Array> };
+  /**
+   * A stored copy, "absent", or "invalid": a published manifest whose size is
+   * not a safe non-negative integer. binaryLength reports both of the last
+   * two as undefined; a legacy row's size is length(bytes) and is always valid.
+   */
   function namespaceCopy(
     namespace: BinaryNamespace,
     id: string,
-  ): ByteCopy | undefined {
+  ): ByteCopy | "absent" | "invalid" {
     const size = binaryLength(db, namespace, id);
-    return size === undefined
-      ? undefined
-      : { size, chunks: () => readBinaryChunks(db, namespace, id) };
+    if (size !== undefined)
+      return { size, chunks: () => readBinaryChunks(db, namespace, id) };
+    return db
+      .prepare(
+        "SELECT 1 FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
+      )
+      .get(namespace, id)
+      ? "invalid"
+      : "absent";
   }
   /** Custody of batches still pending: legacy rows, then chunks, by batch. */
   function* pendingCopies(blobId: string): Generator<ByteCopy> {
@@ -840,7 +851,7 @@ export function createReplicaReceiver(deps: {
       )
       .all() as { id: string }[]) {
       const copy = namespaceCopy("pending", pendingBlobKey(id, blobId));
-      if (copy) yield copy;
+      if (typeof copy === "object") yield copy;
     }
   }
   /** Hashes a copy chunk by chunk; the whole value is never held. */
@@ -871,12 +882,14 @@ export function createReplicaReceiver(deps: {
     size: number,
   ): ByteCopy | undefined {
     if (blobId !== digest) return undefined;
-    const retained = (["canonical", "received"] as const).flatMap(
-      (namespace) => namespaceCopy(namespace, blobId) ?? [],
-    );
+    const retained = (["canonical", "received"] as const)
+      .map((namespace) => namespaceCopy(namespace, blobId))
+      .filter((copy) => copy !== "absent");
     if (retained.length)
-      return retained.every((copy) => copyVerifies(copy, digest, size))
-        ? retained[0]
+      return retained.every(
+        (copy) => copy !== "invalid" && copyVerifies(copy, digest, size),
+      )
+        ? (retained[0] as ByteCopy)
         : undefined;
     for (const copy of pendingCopies(blobId))
       if (copyVerifies(copy, digest, size)) return copy;
