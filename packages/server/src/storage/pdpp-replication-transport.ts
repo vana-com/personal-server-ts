@@ -93,6 +93,9 @@ type Inbox = {
   state: string;
   attempts: number;
   next_attempt: number;
+  data_hash: string | null;
+  metadata_hash: string | null;
+  evidence_checked: number;
 };
 
 /** Internal experiment only. No bootstrap wiring; false by default, no runtime scheduling. */
@@ -115,6 +118,26 @@ export function createReplicaTransportWorker(deps: {
   if (!Number.isSafeInteger(cap) || cap < 1 || cap > REPLICA_MAX_BLOB_BYTES)
     throw new RangeError("invalid storage cap");
   db.exec(migration);
+  const inboxColumns = new Set(
+    (
+      db.prepare("PRAGMA table_info(pdpp_transport_inbox)").all() as {
+        name: string;
+      }[]
+    ).map((row) => row.name),
+  );
+  for (const [name, definition] of [
+    ["data_hash", "TEXT"],
+    ["metadata_hash", "TEXT"],
+    ["evidence_checked", "INTEGER NOT NULL DEFAULT 0"],
+  ]) {
+    if (!inboxColumns.has(name))
+      db.exec(
+        `ALTER TABLE pdpp_transport_inbox ADD COLUMN ${name} ${definition}`,
+      );
+  }
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS pdpp_inbox_evidence_checked ON pdpp_transport_inbox(evidence_checked) WHERE fragment_json IS NOT NULL AND state IN ('ready','imported')",
+  );
   const enabled = () => deps.enabled === true;
   const state = () =>
     db.prepare("SELECT * FROM pdpp_transport_state WHERE id=1").get() as State;
@@ -400,11 +423,136 @@ export function createReplicaTransportWorker(deps: {
         )
           throw new Error("replica commitment mismatch");
         db.prepare(
-          "UPDATE pdpp_transport_inbox SET fragment_json=?,error=NULL WHERE scope=?",
-        ).run(canonicalJson(fragment), row.scope);
+          "UPDATE pdpp_transport_inbox SET fragment_json=?,data_hash=?,metadata_hash=?,error=NULL WHERE scope=?",
+        ).run(canonicalJson(fragment), dataHash, metadataHash, row.scope);
       } catch (error) {
         // Network and unavailable bytes are retryable; authenticated malformed bytes remain visible and backed off.
         retry("pdpp_transport_inbox", row, error);
+      }
+    }
+  }
+  function retainedPayload(fragments: ReplicaFragment[]) {
+    const bytes = assembleReplicaPayload(fragments);
+    const encoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const payload = payloadSchema.parse(JSON.parse(encoded));
+    if (
+      canonicalJson(payload) !== encoded ||
+      payload.envelope.batchId !== fragments[0].batch
+    )
+      throw new Error("invalid replica payload binding");
+    return payload;
+  }
+  function quarantineRetained(scope: string) {
+    const row = db
+      .prepare("SELECT fragment_json FROM pdpp_transport_inbox WHERE scope=?")
+      .get(scope) as { fragment_json: string };
+    const fragment = JSON.parse(row.fragment_json) as ReplicaFragment;
+    const entries = db
+      .prepare(
+        "SELECT * FROM pdpp_transport_inbox WHERE json_extract(fragment_json,'$.writer')=? AND json_extract(fragment_json,'$.batch')=?",
+      )
+      .all(fragment.writer, fragment.batch) as Inbox[];
+    db.transaction(() => {
+      // A partially downloaded batch has never authorized canonical data. A
+      // complete retained batch lets the receiver retract only its identities.
+      if (entries.length === fragment.count) {
+        const payload = retainedPayload(
+          entries.map((entry) => JSON.parse(entry.fragment_json!)),
+        );
+        deps.receiver.quarantine({
+          credential: deps.credential,
+          envelope: payload.envelope,
+        });
+      }
+      for (const entry of entries)
+        db.prepare(
+          "UPDATE pdpp_transport_inbox SET state='quarantined',error='immutable registration conflict' WHERE scope=?",
+        ).run(entry.scope);
+    }).immediate();
+  }
+  async function revalidateRetained() {
+    // Round-robin 50 retained fragments per cycle, including imported ones.
+    // Persisted scheduling prevents both an unbounded rescan and starvation.
+    const rows = db
+      .prepare(
+        "SELECT scope,data_hash,metadata_hash FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state IN ('ready','imported') ORDER BY evidence_checked,rowid LIMIT 50",
+      )
+      .all() as Pick<Inbox, "scope" | "data_hash" | "metadata_hash">[];
+    let checked = (
+      db
+        .prepare(
+          "SELECT COALESCE(MAX(evidence_checked),0) AS value FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state IN ('ready','imported')",
+        )
+        .get() as { value: number }
+    ).value;
+    for (const row of rows) {
+      try {
+        // A preceding sibling may already have quarantined this batch.
+        const current = db
+          .prepare("SELECT state FROM pdpp_transport_inbox WHERE scope=?")
+          .get(row.scope) as { state: string };
+        if (current.state === "quarantined") continue;
+        const evidence = await transport.evidence(row.scope);
+        const status = replicaRegistrationState(evidence, {
+          owner: state().owner,
+          scope: row.scope,
+          ...(row.data_hash &&
+            row.metadata_hash && {
+              dataHash: row.data_hash,
+              metadataHash: row.metadata_hash,
+            }),
+        });
+        if (status === "conflict") {
+          quarantineRetained(row.scope);
+          continue;
+        }
+        if (status !== "confirmed" || (row.data_hash && row.metadata_hash))
+          continue;
+        // Upgrade legacy retained rows only after downloading the exact retained
+        // fragment and verifying its hash-pair against finalized evidence.
+        const encrypted = await transport.get(row.scope);
+        if (encrypted.length > cap)
+          throw new Error("replica ciphertext exceeds storage cap");
+        const plaintext = await transport.decrypt(row.scope, encrypted);
+        const fragment = decodeReplicaFragment(
+          plaintext,
+          row.scope,
+          state().owner,
+        );
+        const retained = db
+          .prepare(
+            "SELECT fragment_json FROM pdpp_transport_inbox WHERE scope=?",
+          )
+          .get(row.scope) as { fragment_json: string };
+        if (canonicalJson(fragment) !== retained.fragment_json)
+          throw new Error("legacy retained replica fragment mismatch");
+        const dataHash = keccak256(plaintext);
+        const metadataHash = replicaMetadataHash(
+          row.scope,
+          fragment.collectedAt,
+          encrypted.length,
+        );
+        if (
+          replicaRegistrationState(evidence, {
+            owner: state().owner,
+            scope: row.scope,
+            dataHash,
+            metadataHash,
+          }) !== "confirmed"
+        )
+          throw new Error("legacy retained replica commitment mismatch");
+        db.prepare(
+          "UPDATE pdpp_transport_inbox SET data_hash=?,metadata_hash=? WHERE scope=?",
+        ).run(dataHash, metadataHash, row.scope);
+      } catch (error) {
+        db.prepare("UPDATE pdpp_transport_inbox SET error=? WHERE scope=?").run(
+          String(error),
+          row.scope,
+        );
+      } finally {
+        db.prepare(
+          "UPDATE pdpp_transport_inbox SET evidence_checked=? WHERE scope=?",
+        ).run(++checked, row.scope);
       }
     }
   }
@@ -446,15 +594,9 @@ export function createReplicaTransportWorker(deps: {
         if (!previous) continue;
       }
       try {
-        const bytes = assembleReplicaPayload(entries.map((e) => e.fragment));
-        const encoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-        const payload = payloadSchema.parse(JSON.parse(encoded));
-        if (
-          canonicalJson(payload) !== encoded ||
-          payload.envelope.batchId !== first.batch
-        )
-          throw new Error("invalid replica payload binding");
-        // Trusted retained declarations, never claims copied from the downloaded envelope.
+        const payload = retainedPayload(entries.map((e) => e.fragment));
+        // Admission needs current declarations. Retraction of previously
+        // validated evidence must also work after a declaration is withdrawn.
         decodeReplicaEnvelope(canonicalJson(payload.envelope), deps.expected());
         const descriptors = payload.envelope.operations.flatMap((op) =>
           op.kind === "blob-claim"
@@ -521,6 +663,7 @@ export function createReplicaTransportWorker(deps: {
           publish,
           discover,
           download,
+          revalidateRetained,
           importReady,
           () => deps.receiver.retry({ credential: deps.credential }),
         ]) {
