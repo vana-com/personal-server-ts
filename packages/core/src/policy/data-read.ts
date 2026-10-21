@@ -28,7 +28,11 @@ import {
   type GrantVerifierPort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
-import { type DeliveryLease, remoteEvidence } from "./delivery-lease.js";
+import {
+  evidenceTime,
+  remoteEvidence,
+  type DeliveryLease,
+} from "./delivery-lease.js";
 import { verifyPdppGrantBinding } from "../grants/pdpp-binding.js";
 import type { PdppGrantBindingStore } from "../grants/pdpp-binding-store.js";
 
@@ -214,7 +218,7 @@ export async function authorizeDataRead(
   input: DataReadPolicyInput,
   ports: DataReadPolicyPorts,
 ): Promise<{ grant: GatewayGrantResponse; lease: DeliveryLease }> {
-  const verifiedAt = Date.now();
+  const verifiedAt = evidenceTime();
   const grant = await verifyDataReadPolicy(input, ports);
   const evidence = remoteEvidence(
     grant,
@@ -387,26 +391,55 @@ export async function authorizeDataList(
   input: DataListPolicyInput,
   ports: DataListPolicyPorts,
 ): Promise<{ grantedScopes: string[]; lease: DeliveryLease }> {
-  const verifiedAt = Date.now();
-  const grantedScopes = await resolveDataListGrantScopes(input, ports);
-  const evidence = remoteEvidence(
-    grantedScopes,
-    () => resolveDataListGrantScopes(input, ports),
-    { verifiedAt },
-  );
+  const verifiedAt = evidenceTime();
+  const admitted = await listingGrants(input, ports);
+  const evidence = remoteEvidence(admitted, () => listingGrants(input, ports), {
+    verifiedAt,
+  });
+  const grantedScopes = scopesOf(admitted);
   return {
     grantedScopes,
     lease: {
       evidence: () => [evidence],
       assertLocal() {
-        const still = new Set(evidence.current);
-        const lost = grantedScopes.filter((scope) => !still.has(scope));
-        if (lost.length > 0) {
-          throw new GrantRevokedError({ reason: "Listed grant ended" });
+        // Each listed scope must still be covered by a grant that has not
+        // expired: the carried expiry is checked now, whatever the evidence's
+        // age.
+        const nowSec = Math.floor(Date.now() / 1000);
+        const live = new Set(
+          evidence.current
+            .filter(
+              (grant) =>
+                grant.expiresAtSec === 0 || grant.expiresAtSec > nowSec,
+            )
+            .flatMap((grant) => grant.scopes),
+        );
+        if (grantedScopes.some((scope) => !live.has(scope))) {
+          throw new GrantExpiredError({ reason: "A listed grant has ended" });
         }
       },
     },
   };
+}
+
+/** The grants a listing is built from, with their expiry (0 = none). */
+interface ListingGrant {
+  scopes: string[];
+  expiresAtSec: number;
+}
+
+function scopesOf(grants: readonly ListingGrant[]): string[] {
+  return [...new Set(grants.flatMap((grant) => grant.scopes))];
+}
+
+async function listingGrants(
+  input: DataListPolicyInput,
+  ports: DataListPolicyPorts,
+): Promise<ListingGrant[]> {
+  return (await resolveDataListGrants(input, ports)).map((grant) => ({
+    scopes: grant.scopes.filter((scope) => !isSystemScope(scope)),
+    expiresAtSec: parseGrantExpiresAtSeconds(grant.expiresAt) ?? 0,
+  }));
 }
 
 /**
@@ -422,10 +455,10 @@ export async function authorizeDataList(
  * Throws `UnregisteredBuilderError` itself, so callers need no separate
  * registration check (that would be a second gateway round-trip).
  */
-export async function resolveDataListGrantScopes(
+async function resolveDataListGrants(
   input: DataListPolicyInput,
   ports: DataListPolicyPorts,
-): Promise<string[]> {
+): Promise<GatewayGrantResponse[]> {
   const available = await ports.runtimeAvailability?.isAvailable();
   if (available === false) {
     throw new PsUnavailableError();
@@ -456,14 +489,14 @@ export async function resolveDataListGrantScopes(
       });
     }
     assertGrantAuthorizesBuilder(grant, builder, input);
-    return grant.scopes.filter((scope) => !isSystemScope(scope));
+    return [grant];
   }
 
   if (!ports.grantLister) return [];
   // A lookup failure (gateway outage, malformed envelope) propagates: the
   // listing fails closed rather than silently coming back empty.
   const grants = await ports.grantLister.listGrantsByUser(input.serverOwner);
-  const scopes = new Set<string>();
+  const authorizing: GatewayGrantResponse[] = [];
   for (const grant of grants) {
     // Gateway rows are untrusted runtime data. One that lacks the fields the
     // checks below read can't authorize anything, so it is skipped like any
@@ -475,9 +508,14 @@ export async function resolveDataListGrantScopes(
       if (err instanceof ProtocolError) continue;
       throw err;
     }
-    for (const scope of grant.scopes) {
-      if (!isSystemScope(scope)) scopes.add(scope);
-    }
+    authorizing.push(grant);
   }
-  return [...scopes];
+  return authorizing;
+}
+
+export async function resolveDataListGrantScopes(
+  input: DataListPolicyInput,
+  ports: DataListPolicyPorts,
+): Promise<string[]> {
+  return scopesOf(await listingGrants(input, ports));
 }

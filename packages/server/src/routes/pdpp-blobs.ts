@@ -7,6 +7,7 @@ import type {
   PdppTokenContext,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
+  allDeliveryLeases,
   deliver,
   leasedStream,
   type DeliveryLease,
@@ -16,6 +17,7 @@ import {
   type PdppProtocolProfile,
 } from "../pdpp/bearer-response.js";
 import {
+  connectionsLease,
   pdppBearerReadLease,
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
@@ -90,13 +92,19 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   }
   const app = new Hono();
 
-  /** The read's lease; it holds the read to the grant's connections. */
-  function blobLease(token: string, context: PdppTokenContext): DeliveryLease {
-    return pdppBearerReadLease(deps.auth, token, context, {
-      ...(deps.isConnectionAvailable && {
-        isConnectionAvailable: deps.isConnectionAvailable,
-      }),
-    });
+  /**
+   * The blob read's release dependencies: the bearer's, and the connections
+   * of the record references that authorized it (what the read selected).
+   */
+  function blobLease(
+    token: string,
+    context: PdppTokenContext,
+    selectedInstances: readonly string[],
+  ): DeliveryLease {
+    return allDeliveryLeases(
+      pdppBearerReadLease(deps.auth, token, context),
+      connectionsLease(selectedInstances, deps.isConnectionAvailable),
+    );
   }
 
   /**
@@ -210,13 +218,13 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         : context.sourceId
           ? sourceInstances
           : [];
-      const visible = references.some((reference) =>
-        ownedInstances.includes(reference.instance),
-      );
-      if (!visible) return { error: notFound() };
+      const visible = references
+        .map((reference) => reference.instance)
+        .filter((instance) => ownedInstances.includes(instance));
+      if (visible.length === 0) return { error: notFound() };
       return {
         ok: true,
-        lease: blobLease(token, context),
+        lease: blobLease(token, context, visible),
       };
     }
 
@@ -257,7 +265,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
 
       return {
         ok: true,
-        lease: blobLease(token, context),
+        lease: blobLease(token, context, [reference.instance]),
       };
     }
 

@@ -395,10 +395,12 @@ function markResponsePreparing(
 
 /**
  * The tool-result boundary of the delivery lease (see
- * `policy/delivery-lease.ts`): a result that carries data from any read is
+ * `policy/delivery-lease.ts`). Whether a result carries data is decided by
+ * what produced it, not by `isError`: a result built after any read of this
+ * call (success or error, e.g. an error that reports a file's size) is
  * released only when every one of those reads may still be delivered. A
- * refusal replaces the whole result with the read error a client would get
- * from the read itself.
+ * result no read contributed to is content-free. A refusal replaces the
+ * whole result with the read error a client would get from the read itself.
  */
 async function releaseToolResult(
   leases: DeliveryLeaseCollector,
@@ -481,14 +483,17 @@ export function createMcpServerForConnection(
                 leases.add(lease),
               ) ?? ctx.readClient,
           };
-          const handled = await withToolTimeout(
-            tool.handler(args as Record<string, unknown>, callCtx),
+          // The timeout bounds the handler and the release together: a
+          // release that must re-verify a grant cannot outlive the call.
+          const result = await withToolTimeout(
+            (async () =>
+              releaseToolResult(
+                leases,
+                await tool.handler(args as Record<string, unknown>, callCtx),
+              ))(),
             tool.name,
             timeoutMs,
           );
-          const result = handled.isError
-            ? handled
-            : await releaseToolResult(leases, handled);
           reportToolDenial(options, tool.name, args, result);
           if (activityId && recorder) {
             const handlerDurationMs = Math.round(

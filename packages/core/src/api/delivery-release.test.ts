@@ -9,9 +9,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   handlePersonalServerDataRequest,
   releaseDataResult,
-  resolveReadDeletion,
+  selectReadable,
+  selected,
   type PersonalServerDataApiDeps,
 } from "./index.js";
+import { allDeliveryLeases } from "../policy/delivery-lease.js";
 import { authorizeDataRead } from "../policy/data-read.js";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import {
@@ -206,57 +208,70 @@ describe("listings", () => {
   });
 });
 
-describe("a result-producing handler that registers nothing", () => {
-  /**
-   * A new route, as a future change would add one: it authorizes through the
-   * auth port and checks deletion like any route, and does nothing about the
-   * delivery lease. Its result is still released only through it.
-   */
-  function newRoute(during: () => void) {
-    return async (deps: PersonalServerDataApiDeps) => {
-      await deps.auth.authorizeBuilderRead({
-        request: new Request(`http://ps/v1/data/${SCOPE}/new-view`),
-        scope: SCOPE,
-      });
-      const entry = deps.storage.findEntry({ scope: SCOPE });
-      await resolveReadDeletion(deps, SCOPE, entry);
-      during();
-      return new Response(JSON.stringify({ secret: "new-view-body" }), {
-        status: 200,
-      });
-    };
-  }
-
-  async function newRouteDeps(tracker: ScopeDeletionTracker) {
-    const { deps } = await listingFixture();
-    vi.useFakeTimers({ toFake: ["Date"] });
-    const { lease } = await expiringGrantLease();
-    return {
-      ...deps,
-      scopeDeletions: tracker,
-      auth: {
-        authorizeBuilderRead: async () => ({
-          builder: BUILDER,
-          grantId: "g",
-          lease,
-        }),
-      },
-    } as unknown as PersonalServerDataApiDeps;
-  }
-
-  it("is refused when the scope it read is deleted before release", async () => {
-    const tracker = createScopeDeletionTracker({ serverOwner: OWNER });
-    const deps = await newRouteDeps(tracker);
+/**
+ * API-shape tests: they exercise `releaseDataResult` and `selected`, which do
+ * not exist before this change, so on earlier heads they fail for a missing
+ * export rather than for a leak.
+ */
+describe("a new result-producing route", () => {
+  it("cannot release data it returns without release dependencies", async () => {
     const response = await releaseDataResult(
       new Request(`http://ps/v1/data/${SCOPE}/new-view`),
-      deps,
       {},
-      newRoute(() =>
-        tracker.markDeleted(SCOPE, {
-          deletedAt: "2099-01-01T00:00:00Z",
-          version: "9",
+      async () =>
+        new Response(JSON.stringify({ secret: "new-view-body" }), {
+          status: 200,
         }),
-      ),
+    );
+    const text = await response.text();
+    expect(response.status, text).toBe(500);
+    expect(text).toContain("RELEASE_DEPENDENCIES_MISSING");
+    expect(text).not.toContain("new-view-body");
+  });
+
+  it("returns a content-free error without dependencies", async () => {
+    const response = await releaseDataResult(
+      new Request(`http://ps/v1/data/${SCOPE}/new-view`),
+      {},
+      async () => new Response("{}", { status: 404 }),
+    );
+    expect(response.status).toBe(404);
+  });
+
+  /** A route that selects a scope and returns it through `selected`. */
+  async function selectedRoute(
+    during: (tracker: ScopeDeletionTracker) => void,
+  ) {
+    const tracker = createScopeDeletionTracker({ serverOwner: OWNER });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { lease } = await expiringGrantLease();
+    const deps = {
+      scopeDeletions: tracker,
+      serverOwner: OWNER,
+    } as unknown as PersonalServerDataApiDeps;
+    const response = await releaseDataResult(
+      new Request(`http://ps/v1/data/${SCOPE}/new-view`),
+      {},
+      async () => {
+        const { dependency } = await selectReadable(deps, SCOPE, undefined);
+        during(tracker);
+        return selected(
+          new Response(JSON.stringify({ secret: "new-view-body" }), {
+            status: 200,
+          }),
+          allDeliveryLeases(lease, dependency),
+        );
+      },
+    );
+    return { response, tracker };
+  }
+
+  it("is refused when the scope it selected is deleted before release", async () => {
+    const { response } = await selectedRoute((tracker) =>
+      tracker.markDeleted(SCOPE, {
+        deletedAt: "2099-01-01T00:00:00Z",
+        version: "9",
+      }),
     );
     const text = await response.text();
     expect(response.status, text).toBe(410);
@@ -264,13 +279,8 @@ describe("a result-producing handler that registers nothing", () => {
   });
 
   it("is refused when its grant expires before release", async () => {
-    const tracker = createScopeDeletionTracker({ serverOwner: OWNER });
-    const deps = await newRouteDeps(tracker);
-    const response = await releaseDataResult(
-      new Request(`http://ps/v1/data/${SCOPE}/new-view`),
-      deps,
-      {},
-      newRoute(() => vi.setSystemTime(Date.now() + 10_000)),
+    const { response } = await selectedRoute(() =>
+      vi.setSystemTime(Date.now() + 10_000),
     );
     const text = await response.text();
     expect(response.status, text).toBe(403);
@@ -278,15 +288,42 @@ describe("a result-producing handler that registers nothing", () => {
   });
 
   it("is released when nothing changes (positive control)", async () => {
-    const tracker = createScopeDeletionTracker({ serverOwner: OWNER });
-    const deps = await newRouteDeps(tracker);
-    const response = await releaseDataResult(
-      new Request(`http://ps/v1/data/${SCOPE}/new-view`),
-      deps,
-      {},
-      newRoute(() => undefined),
-    );
+    const { response } = await selectedRoute(() => undefined);
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("new-view-body");
+  });
+});
+
+describe("lineage", () => {
+  it("refuses a grantee's lineage when the scope is deleted while the graph is prepared", async () => {
+    const tracker = createScopeDeletionTracker({ serverOwner: OWNER });
+    const response = await handlePersonalServerDataRequest(
+      new Request(`http://ps/v1/data/${SCOPE}/lineage`),
+      {
+        auth: {
+          authorizeBuilderRead: async () => ({
+            builder: BUILDER,
+            grantId: "g",
+          }),
+        },
+        serverOwner: OWNER,
+        scopeDeletions: tracker,
+        storage: createMemoryDataStorage(),
+        lineageGateway: {
+          getLineage: async () => {
+            tracker.markDeleted(SCOPE, {
+              deletedAt: "2026-10-21T19:00:00Z",
+              version: "9",
+            });
+            return { ok: true, data: { private: "graph" }, proof: {} };
+          },
+        },
+        accessLogWriter: { write: async () => undefined },
+      } as unknown as PersonalServerDataApiDeps,
+      { basePath: "/v1/data" },
+    );
+    const text = await response.text();
+    expect(response.status, text).toBe(410);
+    expect(text).not.toContain("graph");
   });
 });

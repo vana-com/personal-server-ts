@@ -34,6 +34,7 @@ import {
   createScopeDeletionTracker,
   type ScopeDeletionTracker,
 } from "@opendatalabs/personal-server-ts-core/sync";
+import { REMOTE_GRANT_REVERIFY_AFTER_MS } from "@opendatalabs/personal-server-ts-core/policy";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createIndexManager } from "./storage/index-manager.js";
 import { createNodeDataStorage } from "./storage/node-data-storage.js";
@@ -61,6 +62,7 @@ let dataDir: string;
 let indexManager: IndexManager;
 let storage: DataStoragePort;
 let duringGrantLookup: (() => void) | undefined;
+let revokedRemotely = false;
 
 function gatewayFor(granteeAddress: `0x${string}`): GatewayClient {
   const grant = {
@@ -91,7 +93,9 @@ function gatewayFor(granteeAddress: `0x${string}`): GatewayClient {
       const hook = duringGrantLookup;
       duringGrantLookup = undefined;
       hook?.();
-      return grant;
+      return revokedRemotely
+        ? { ...grant, revokedAt: "2026-10-21T00:00:00.000Z" }
+        : grant;
     }),
     listGrantsByUser: vi.fn().mockResolvedValue([]),
     getSchemaForScope: vi.fn().mockResolvedValue(null),
@@ -138,10 +142,12 @@ beforeEach(async () => {
     hierarchyOptions: { dataDir },
   });
   duringGrantLookup = undefined;
+  revokedRemotely = false;
   await putLegacyVersion();
 });
 
 afterEach(async () => {
+  vi.useRealTimers();
   indexManager.close();
   await rm(dataDir, { recursive: true, force: true });
 });
@@ -301,5 +307,47 @@ describe("MCP search across scopes when one is deleted during another's read", (
     });
     expect(text).toContain("alpha-private");
     expect(text).toContain("beta");
+  });
+});
+
+/**
+ * The remote revocation policy for a composed MCP call: the gateway revokes
+ * the grant while a search is still reading its second scope. A result
+ * released before REMOTE_GRANT_REVERIFY_AFTER_MS may succeed on the admitting
+ * answers; the first release after it asks the gateway again and is refused.
+ */
+describe("remote revocation stops a composed MCP call within REMOTE_GRANT_REVERIFY_AFTER_MS", () => {
+  async function searchRevokedDuringSecondScope(elapsedMs: number) {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const A = "oura.sleep";
+    const B = "oura.readiness";
+    await putLegacyVersion(A, { note: "needle alpha-private" });
+    await putLegacyVersion(B, { note: "needle beta-private" });
+    const tracker = createScopeDeletionTracker({ serverOwner: owner.address });
+    const call = await mcpClient(tracker, (scope) => {
+      if (scope === B && !revokedRemotely) {
+        revokedRemotely = true;
+        vi.setSystemTime(Date.now() + elapsedMs);
+      }
+    });
+    return call("search_personal_context", { query: "needle", scopes: [A, B] });
+  }
+
+  it("a release before the bound may succeed", async () => {
+    const text = await searchRevokedDuringSecondScope(
+      REMOTE_GRANT_REVERIFY_AFTER_MS - 1_000,
+    );
+    expect(revokedRemotely).toBe(true);
+    expect(text).toContain("alpha-private");
+  });
+
+  it("the first release after the bound is refused", async () => {
+    const text = await searchRevokedDuringSecondScope(
+      REMOTE_GRANT_REVERIFY_AFTER_MS,
+    );
+    expect(revokedRemotely).toBe(true);
+    expect(text).not.toContain("alpha-private");
+    expect(text).not.toContain("beta-private");
+    expect(text).toContain("GRANT_REVOKED");
   });
 });

@@ -12,6 +12,7 @@ import type { StreamDeclaration } from "./stream-declaration.js";
 import {
   remoteEvidence,
   type DeliveryLease,
+  type EvidenceTime,
 } from "../../policy/delivery-lease.js";
 
 /**
@@ -239,47 +240,61 @@ export interface PdppChainEvidence {
 }
 
 /**
- * The connections a bearer can read through: every connection its grant
- * names (client), or the owner token's selected connections. A read's
- * release depends on all of them, derived from the authorization itself so
- * that no endpoint (records, metadata, discovery, blobs) has to register them.
+ * The connections a read result was selected from, as a release dependency:
+ * once any of them is unavailable (deleted or unbound), the release refuses
+ * with `instance_unavailable`. A selection holds exactly the connections it
+ * used; an aggregate (stream discovery) holds all of its own.
  */
-export function bearerConnections(context: PdppTokenContext): string[] {
-  if (context.tokenKind === "owner") return [...(context.instanceIds ?? [])];
-  return [
-    ...new Set(
-      (context.grant?.streams ?? []).flatMap((stream) => stream.instance_ids),
-    ),
-  ];
+export function connectionsLease(
+  instanceIds: readonly string[],
+  isConnectionAvailable: ((instance: string) => boolean) | undefined,
+): DeliveryLease {
+  const held = [...new Set(instanceIds)];
+  return {
+    evidence: () => [],
+    assertLocal() {
+      for (const instance of held) {
+        if (isConnectionAvailable?.(instance) === false) {
+          throw new PdppError(
+            "instance_unavailable",
+            "The connection for this grant is unavailable",
+          );
+        }
+      }
+    },
+  };
 }
 
 /**
- * The delivery lease for a PDPP bearer read (records, metadata, discovery
- * and blobs). See `policy/delivery-lease.ts` for the release rule.
+ * The bearer half of a PDPP read's release dependencies (records, metadata,
+ * discovery and blobs). See `policy/delivery-lease.ts` for the release rule.
+ * What the read selected (its connections) is a separate dependency, produced
+ * by the selection (`connectionsLease`).
  *
  * Remote evidence: the chain permission, when the deployment enforces one
  * (its answer carries the permission's expiry); and, for a remote AS, its
- * introspection answer. `deliver` asks either again once it is older than
+ * introspection answer. Each is dated from when its check started
+ * (`verifiedAt`), and `deliver` asks it again once it is older than
  * `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s).
  *
  * Local checks, synchronous, at release: the bearer resolved again (a local
  * AS through `resolveTokenNow`, which reports a revoked or expired grant, a
  * revoked or expired token, and a revoked refresh family; a remote AS's last
  * answer and its token expiry); the same grant the read was admitted under;
- * the carried chain expiry; and every connection the bearer can read through
- * (`bearerConnections`).
+ * and the carried chain expiry.
  */
 export function pdppBearerReadLease(
   auth: PdppAuthorizationService,
   token: string,
   admitted: PdppTokenContext,
   options: {
+    /** When the bearer was resolved (before `resolveToken` was awaited). */
+    resolvedAt?: EvidenceTime;
     chain?: {
       admitted: PdppChainEvidence;
       reverify: () => Promise<PdppChainEvidence>;
-      verifiedAt?: number;
+      verifiedAt?: EvidenceTime;
     };
-    isConnectionAvailable?: (instance: string) => boolean;
   } = {},
 ): DeliveryLease {
   if (auth.locality !== "local" && auth.locality !== "remote") {
@@ -290,17 +305,18 @@ export function pdppBearerReadLease(
     );
   }
   const grantId = admitted.grant?.grant_id;
-  const connections = bearerConnections(admitted);
   const chain = options.chain
     ? remoteEvidence(options.chain.admitted, options.chain.reverify, {
-        ...(options.chain.verifiedAt !== undefined && {
+        ...(options.chain.verifiedAt && {
           verifiedAt: options.chain.verifiedAt,
         }),
       })
     : undefined;
   const remoteAs =
     auth.locality === "remote"
-      ? remoteEvidence(admitted, () => auth.resolveToken(token))
+      ? remoteEvidence(admitted, () => auth.resolveToken(token), {
+          ...(options.resolvedAt && { verifiedAt: options.resolvedAt }),
+        })
       : undefined;
   const evidence = [chain, remoteAs].filter(
     (piece): piece is NonNullable<typeof piece> => piece !== undefined,
@@ -323,14 +339,6 @@ export function pdppBearerReadLease(
       const chainExpiry = chain?.current.expiresAt;
       if (chainExpiry && Date.parse(chainExpiry) <= now) {
         throw new PdppError("grant_expired", "Chain permission has expired");
-      }
-      for (const instance of connections) {
-        if (options.isConnectionAvailable?.(instance) === false) {
-          throw new PdppError(
-            "instance_unavailable",
-            "The connection for this grant is unavailable",
-          );
-        }
       }
     },
   };

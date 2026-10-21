@@ -6,10 +6,12 @@ export {
   localLease,
   collectDeliveryLeases,
   deliver,
+  evidenceTime,
   leasedStream,
   remoteEvidence,
   type DeliveryLease,
   type DeliveryLeaseCollector,
+  type EvidenceTime,
   type RemoteEvidence,
 } from "./delivery-lease.js";
 export {

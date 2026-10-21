@@ -24,6 +24,7 @@ import {
   createStreamDeclarationRegistry,
   type PdppRecordStore,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import { REMOTE_GRANT_REVERIFY_AFTER_MS } from "@opendatalabs/personal-server-ts-core/policy";
 import { coLocatedAuthorizationService } from "../pdpp/records-bootstrap.js";
 import type { PdppAuthRouteDeps } from "./pdpp-auth.js";
 import {
@@ -417,7 +418,7 @@ describe("chain evidence at release", () => {
         headers,
       });
       const text = await response.text();
-      expect(calls).toBe(2);
+      expect(calls).toBeGreaterThanOrEqual(2);
       expect(response.status, text).toBeGreaterThanOrEqual(400);
       expect(text).not.toContain(SECRET);
     });
@@ -536,5 +537,198 @@ describe("the authorization server's locality decides the release check", () => 
       expect(response.status, text).toBe(403);
       expect(text).not.toContain(SECRET);
     });
+  });
+});
+
+describe("a remote AS answer is dated from when introspection started", () => {
+  it("refreshes, and refuses, an answer whose introspection took 31 s", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const as = coLocatedAuthorizationService({ tokens } as PdppAuthRouteDeps);
+    let calls = 0;
+    const app = routes({
+      auth: {
+        locality: "remote",
+        async resolveToken(token: string) {
+          calls += 1;
+          if (calls > 1) {
+            return {
+              active: false,
+              tokenKind: "client",
+              subjectId: "",
+              inactiveReason: "grant_revoked",
+            };
+          }
+          const answer = await as.resolveToken(token);
+          vi.setSystemTime(Date.now() + 31_000);
+          return answer;
+        },
+      },
+    });
+    const response = await app.request("/streams/media/records", { headers });
+    const text = await response.text();
+    expect(calls).toBe(2);
+    expect(response.status, text).toBe(403);
+    expect(text).not.toContain(SECRET);
+  });
+});
+
+describe("a read holds exactly the connections it selected", () => {
+  const twoConnectionGrant: Grant = {
+    ...GRANT,
+    grant_id: "grt_two",
+    streams: [
+      { name: "media", instance_ids: ["inst_1"], fields: ["id"] },
+      { name: "other", instance_ids: ["inst_2"], fields: ["id"] },
+    ],
+  };
+  const context = {
+    active: true as const,
+    tokenKind: "client" as const,
+    subjectId: "sub_1",
+    clientId: "client_1",
+    grant: twoConnectionGrant,
+  };
+  const fixedAuth = {
+    locality: "local" as const,
+    resolveToken: async () => context,
+    resolveTokenNow: () => context,
+  };
+  const deletedSecond = {
+    getInstanceBinding: (instance: string) => ({
+      sourceId: "src_1",
+      deletedAt: instance === "inst_2" ? "2026-10-21T19:00:00Z" : null,
+    }),
+  } as unknown as PdppRecordsRouteDeps["bindingStore"];
+
+  it("deleting an unrelated connection does not refuse a read of another", async () => {
+    const response = await routes({
+      auth: fixedAuth as never,
+      bindingStore: deletedSecond,
+    }).request("/streams/media/records", { headers });
+    const text = await response.text();
+    expect(response.status, text).toBe(200);
+    expect(text).toContain(SECRET);
+  });
+
+  it("stream discovery, an aggregate, holds all of its connections", async () => {
+    const response = await routes({
+      auth: fixedAuth as never,
+      bindingStore: deletedSecond,
+    }).request("/streams", { headers });
+    expect(response.status).toBe(404);
+  });
+
+  it("a source-scoped owner token holds the connections it resolved", async () => {
+    let deleted = false;
+    let checks = 0;
+    const owner = {
+      active: true as const,
+      tokenKind: "owner" as const,
+      subjectId: "sub_1",
+      sourceId: "src_1",
+    };
+    const app = routes({
+      auth: {
+        locality: "local",
+        resolveToken: async () => owner,
+        resolveTokenNow: () => owner,
+      } as never,
+      instancesForSubject: () => (deleted ? [] : ["inst_1"]),
+      instancesForSource: () => (deleted ? [] : ["inst_1"]),
+      bindingStore: {
+        getInstanceBinding: () => {
+          checks += 1;
+          return {
+            sourceId: "src_1",
+            deletedAt: deleted ? "2026-10-21T19:00:00Z" : null,
+          };
+        },
+      } as unknown as PdppRecordsRouteDeps["bindingStore"],
+      store: new Proxy(records, {
+        get(target, prop, receiver) {
+          const value = Reflect.get(target, prop, receiver);
+          if (prop === "listStreams") {
+            return (...args: unknown[]) => {
+              const result = (value as (...a: unknown[]) => unknown).apply(
+                target,
+                args,
+              );
+              // The connection is deleted while discovery is built.
+              deleted = true;
+              return result;
+            };
+          }
+          return typeof value === "function"
+            ? (value as (...a: unknown[]) => unknown).bind(target)
+            : value;
+        },
+      }),
+    });
+    const response = await app.request("/streams", {
+      headers: { Authorization: "Bearer owner" },
+    });
+    const text = await response.text();
+    expect(deleted).toBe(true);
+    expect(checks).toBeGreaterThan(0);
+    expect(response.status, text).toBe(404);
+  });
+});
+
+/**
+ * The remote revocation policy: a grant revoked at a remote authority (here
+ * the chain) stops reads within `REMOTE_GRANT_REVERIFY_AFTER_MS`. A release
+ * before the bound may succeed on the admitting answer; the first release
+ * after it asks again and is refused.
+ */
+describe("remote revocation stops reads within REMOTE_GRANT_REVERIFY_AFTER_MS", () => {
+  function chainRevokedAfterAdmission(elapsedMs: number) {
+    let revoked = false;
+    const authorize = vi.fn(async (): Promise<PdppChainDecision> =>
+      revoked
+        ? {
+            ok: false,
+            retryable: false,
+            reason: "permission revoked on chain",
+            cause: "revoked",
+          }
+        : { ok: true },
+    );
+    const app = routes({
+      chainEnforcement: { authorize },
+      store: storeReading(() => {
+        // Revoked remotely right after admission; the read takes elapsedMs.
+        revoked = true;
+        vi.setSystemTime(Date.now() + elapsedMs);
+      }),
+    });
+    return { app, authorize };
+  }
+
+  it("a release before the bound may succeed", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const token = longToken();
+    const { app, authorize } = chainRevokedAfterAdmission(
+      REMOTE_GRANT_REVERIFY_AFTER_MS - 1_000,
+    );
+    const response = await app.request(`/streams/media/records/${SECRET}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(response.status).toBe(200);
+    expect(authorize).toHaveBeenCalledTimes(1);
+  });
+
+  it("the first release after the bound is refused", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const token = longToken();
+    const { app, authorize } = chainRevokedAfterAdmission(
+      REMOTE_GRANT_REVERIFY_AFTER_MS,
+    );
+    const response = await app.request(`/streams/media/records/${SECRET}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const text = await response.text();
+    expect(authorize).toHaveBeenCalledTimes(2);
+    expect(response.status, text).toBe(403);
+    expect(text).not.toContain(`"id":"${SECRET}"`);
   });
 });

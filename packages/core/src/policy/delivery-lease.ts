@@ -53,10 +53,44 @@ export interface DeliveryLease {
 
 /** One answer from a remote authority, as of `verifiedAt`. */
 export interface RemoteEvidence {
-  /** When the remote check that produced it started (ms since epoch). */
+  /** When the remote check that produced it started (wall clock, ms). */
   readonly verifiedAt: number;
+  /**
+   * The same moment on the monotonic clock (`performance.now()`), so a wall
+   * clock set backwards cannot make old evidence look fresh.
+   */
+  readonly verifiedAtMonotonic?: number;
   /** Ask the authority again; throws its refusal. */
   refresh(): Promise<void>;
+}
+
+/** A moment on both clocks: wall time for expiry, monotonic for age. */
+export interface EvidenceTime {
+  wallMs: number;
+  monotonicMs: number;
+}
+
+/** Now, on both clocks. Capture it before a remote check starts. */
+export function evidenceTime(now?: () => number): EvidenceTime {
+  return now
+    ? { wallMs: now(), monotonicMs: now() }
+    : { wallMs: Date.now(), monotonicMs: performance.now() };
+}
+
+/**
+ * Whether evidence is too old to release on. Its age is the larger of the
+ * wall-clock and monotonic ages, so neither a wall clock set backwards nor
+ * one set forwards makes it look younger than it is. An age that is negative
+ * or unknown proves nothing, so it counts as stale.
+ */
+function isStale(piece: RemoteEvidence, at: EvidenceTime): boolean {
+  const wallAge = at.wallMs - piece.verifiedAt;
+  const monotonicAge =
+    piece.verifiedAtMonotonic === undefined
+      ? wallAge
+      : at.monotonicMs - piece.verifiedAtMonotonic;
+  if (!(wallAge >= 0) || !(monotonicAge >= 0)) return true;
+  return Math.max(wallAge, monotonicAge) >= REMOTE_GRANT_REVERIFY_AFTER_MS;
 }
 
 /** The maximum age of remote evidence at the moment of release. */
@@ -87,14 +121,9 @@ export async function deliver<T>(
   release: () => T,
   options: { now?: () => number } = {},
 ): Promise<T> {
-  const now = options.now ?? Date.now;
   for (let attempt = 0; ; attempt += 1) {
-    const at = now();
-    const stale = lease
-      .evidence()
-      .filter(
-        (piece) => at - piece.verifiedAt >= REMOTE_GRANT_REVERIFY_AFTER_MS,
-      );
+    const at = evidenceTime(options.now);
+    const stale = lease.evidence().filter((piece) => isStale(piece, at));
     if (stale.length === 0) {
       lease.assertLocal();
       return release();
@@ -159,17 +188,19 @@ export function collectDeliveryLeases(): DeliveryLeaseCollector {
 export function remoteEvidence<T>(
   initial: T,
   reverify: () => Promise<T>,
-  options: { now?: () => number; verifiedAt?: number } = {},
+  options: { now?: () => number; verifiedAt?: EvidenceTime } = {},
 ): RemoteEvidence & { readonly current: T } {
-  const now = options.now ?? Date.now;
   let current = initial;
-  let verifiedAt = options.verifiedAt ?? now();
+  let verifiedAt = options.verifiedAt ?? evidenceTime(options.now);
   return {
     get verifiedAt() {
-      return verifiedAt;
+      return verifiedAt.wallMs;
+    },
+    get verifiedAtMonotonic() {
+      return verifiedAt.monotonicMs;
     },
     async refresh() {
-      const startedAt = now();
+      const startedAt = evidenceTime(options.now);
       current = await reverify();
       verifiedAt = startedAt;
     },
