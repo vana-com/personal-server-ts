@@ -136,13 +136,48 @@ export interface SyncWindow {
   ): Iterable<SyncWindowChange>;
   /** One key's version at the high horizon. */
   versionAtHigh(instance: string, recordKey: string): PdppRecordRow | undefined;
+  /** One key known to be in the window, read as `changes` would yield it. */
+  change(id: RecordIdentity): SyncWindowChange | undefined;
+}
+
+/**
+ * Server-side sync session state, keyed by an opaque handle id. Holds no
+ * policy: the session owner decides what a state means and when it expires.
+ */
+export interface SyncStateStore {
+  /**
+   * Store or replace one state. Drops the owner's expired states, then the
+   * owner's oldest states beyond `maxPerOwner`.
+   */
+  put(entry: {
+    id: string;
+    owner: string;
+    state: string;
+    expiresAt: number;
+    now: number;
+    maxPerOwner: number;
+  }): void;
+  /** The state, unless it is absent, expired or evicted. */
+  get(id: string, now: number): string | undefined;
+  delete(id: string): void;
+}
+
+/**
+ * A sync request ran out of its work or time budget before it had a page to
+ * serve. Its scan position is saved; the same request resumes there.
+ */
+export class SyncRetryLaterError extends Error {
+  constructor(readonly retryAfterSeconds = 1) {
+    super("sync scan paused; retry the same request");
+    this.name = "SyncRetryLaterError";
+  }
 }
 
 /** Store identity for sync tokens. Both change when the store is rebuilt. */
 export interface SyncTokenScope {
   /** Store reset epoch carried by current-profile tokens. */
   epoch: string;
-  /** 32-byte secret that seals candidate-profile tokens. */
+  /** 32-byte secret that authenticates sync handles. */
   key: Uint8Array;
 }
 

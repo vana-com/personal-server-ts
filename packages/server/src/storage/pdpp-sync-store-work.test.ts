@@ -154,7 +154,7 @@ for (const backend of ["memory", "sqlite"])
           put(store, `k${String(n).padStart(2, "0")}`, "2026-01-01T00:00:00Z");
         const { take } = counted(store);
         const sync = createPdppSyncSessionService(store, {
-          maxExaminedPerPage: 4,
+          maxExaminedPerRequest: 4,
         });
         const hidden = {
           stream: "events",
@@ -170,10 +170,62 @@ for (const backend of ["memory", "sqlite"])
           pages += 1;
           cursor = page.nextCursor;
         } while (cursor);
-        expect(pages).toBe(5);
+        // Four examined per page. The fifth page reaches the budget before it
+        // can see the end, so a sixth, empty page ends the session.
+        expect(pages).toBe(6);
         take();
       } finally {
         store.close();
       }
     });
   });
+
+describe("sqlite sync session state", () => {
+  it("keeps a candidate checkpoint usable across a store restart", async () => {
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-sync-state-"));
+    const path = join(dir, "records.db");
+    const request = {
+      stream: "events",
+      owner: "owner-a",
+      instanceIds: ["inst_1"],
+      limit: 10,
+      candidate: { binding: "grant-1", order: "asc" as const },
+    };
+    try {
+      const first = createTestBoundRecordStore(new Database(path));
+      first.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "events",
+            key: "a",
+            data: { id: "a" },
+            emitted_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+      );
+      const checkpoint =
+        createPdppSyncSessionService(first).read(request).nextChangesSince!;
+      first.close();
+
+      const second = createTestBoundRecordStore(new Database(path));
+      try {
+        const next = createPdppSyncSessionService(second).read({
+          ...request,
+          changesSince: checkpoint,
+        });
+        expect(next.data).toEqual([]);
+        expect(next.nextChangesSince).toHaveLength(checkpoint.length);
+      } finally {
+        second.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -1,9 +1,4 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  randomBytes,
-} from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import {
   decodeCursor,
   encodeCursor,
@@ -15,10 +10,12 @@ import {
   CursorExpiredError,
   InvalidCursorError,
   RecordIdentityConflictError,
+  SyncRetryLaterError,
   type ChangesSincePage,
   type PdppRecordRow,
   type PdppStoredRecord,
   type RecordIdentity,
+  type SyncStateStore,
   type SyncTokenScope,
   type SyncWindow,
   type SyncWindowChange,
@@ -34,6 +31,11 @@ export interface SyncAccess {
 
 export interface SyncRequest {
   stream: string;
+  /**
+   * Whose session state this is: the grant subject, or the owner. Stored
+   * state is capped per owner.
+   */
+  owner?: string;
   instanceIds: string[];
   /**
    * The `changes_since` value. Current profile: empty or absent begins.
@@ -64,120 +66,217 @@ export interface SyncRequest {
 
 export interface SyncSessionOptions {
   /**
-   * Changes one page may examine. A page that reaches it ends early with a
-   * page cursor past the last change it examined, so one request never walks
-   * an unbounded window of changes the grant does not disclose.
+   * Changes one request may examine. A candidate request that reaches it
+   * before it has a page saves its scan and answers `SyncRetryLaterError`; a
+   * current-profile page ends early with a page cursor past the last change
+   * it examined.
    */
-  maxExaminedPerPage?: number;
+  maxExaminedPerRequest?: number;
+  /** Wall-clock budget of one candidate scan, in milliseconds. */
+  maxScanMillis?: number;
+  /** Clock for budgets and expiry. */
+  now?: () => number;
+  /** How long a page cursor stays usable. */
+  pageTtlMs?: number;
+  /** How long a candidate checkpoint stays usable. */
+  checkpointTtlMs?: number;
+  /** How long a paused scan waits for its retry. */
+  scanTtlMs?: number;
+  /** Stored session states per owner; the oldest are expired beyond it. */
+  maxStatesPerOwner?: number;
+  /** UTF-8 bytes one session state may hold; beyond it the session expires. */
+  maxStateBytes?: number;
 }
 
 /** Matches the stream summary's scan budget in the HTTP route. */
-export const DEFAULT_SYNC_EXAMINED_PER_PAGE = 10_000;
+export const DEFAULT_SYNC_EXAMINED_PER_REQUEST = 10_000;
+export const DEFAULT_SYNC_SCAN_MILLIS = 2_000;
+const HOUR = 3_600_000;
+export const DEFAULT_SYNC_PAGE_TTL_MS = HOUR;
+export const DEFAULT_SYNC_CHECKPOINT_TTL_MS = 30 * 24 * HOUR;
+export const DEFAULT_SYNC_SCAN_TTL_MS = 10 * 60_000;
+export const DEFAULT_SYNC_STATES_PER_OWNER = 1_000;
+export const DEFAULT_SYNC_STATE_BYTES = 256 * 1024;
 
 /**
  * The single owner of PDPP `changes_since` sessions: horizons, the
- * authorized change set, its pagination, the work one page may do, and every
- * token a session issues. Stores only supply raw history
- * (`readSyncWindow`); HTTP only maps the page.
+ * authorized change set, its pagination, the work one request may do, and
+ * every token a session issues. Stores only supply raw history
+ * (`readSyncWindow`) and opaque state storage (`syncStates`); HTTP only maps
+ * the page.
  *
  * Profiles differ only in policy, never in path:
  * - current: one-horizon visibility, current-state grant filter, readable
  *   checkpoints that existing clients store;
  * - candidate: visibility at both horizons with removals, key order in the
- *   requested direction, sealed checkpoints bound to grant and query context.
+ *   requested direction, checkpoints bound to grant and query context.
  *
- * Both profiles paginate over the authorized result only and seal every page
- * cursor, because a page that ends on its work budget resumes after a change
- * it may not disclose. Only the candidate refuses to serve a record deleted
- * after the session's fixed horizon. It withholds that record, carries its
- * identity in the session's sealed tokens, and the next session returns it
- * as of its own horizon even when its projection did not change. That is the
- * candidate's rule for a reference redacted on a later page, applied to the
- * record itself: comparing projections alone would lose a record deleted and
- * recreated unchanged. A session that withholds more than a token can carry
- * expires instead.
+ * Every page cursor, and every candidate checkpoint, is a fixed-length
+ * handle: a random id with a MAC, naming state this service keeps on the
+ * server. A token's length therefore says nothing about keys, positions or
+ * how much a session carries, and its size never limits a session.
+ *
+ * A candidate request scans until it has a page of authorized results, one
+ * more to prove `has_more`, or the end of the window. Hidden changes never
+ * shape a page. When the request's work or time budget runs out first, it
+ * saves the scan and throws `SyncRetryLaterError`; the same request then
+ * resumes where the scan stopped, so nothing is examined twice. The answer
+ * is the same whatever exhausted the budget.
+ *
+ * Only the candidate refuses to serve a record deleted after the session's
+ * fixed horizon. It withholds that record and keeps its identity in the
+ * session state, and the next session returns it as of its own horizon even
+ * when its projection did not change. That is the candidate's rule for a
+ * reference redacted on a later page, applied to the record itself: comparing
+ * projections alone would lose a record deleted and recreated unchanged.
  */
 export function createPdppSyncSessionService(
-  store: Pick<PdppRecordStore, "readSyncWindow" | "syncTokenScope">,
+  store: Pick<
+    PdppRecordStore,
+    "readSyncWindow" | "syncTokenScope" | "syncStates"
+  >,
   options: SyncSessionOptions = {},
 ) {
-  const budget = options.maxExaminedPerPage ?? DEFAULT_SYNC_EXAMINED_PER_PAGE;
+  const budget =
+    options.maxExaminedPerRequest ?? DEFAULT_SYNC_EXAMINED_PER_REQUEST;
   if (!Number.isSafeInteger(budget) || budget < 1) {
-    throw new RangeError("sync page budget must be a positive integer");
+    throw new RangeError("sync request budget must be a positive integer");
   }
+  const policy: StatePolicy = {
+    now: options.now ?? Date.now,
+    ttl: {
+      page: options.pageTtlMs ?? DEFAULT_SYNC_PAGE_TTL_MS,
+      checkpoint: options.checkpointTtlMs ?? DEFAULT_SYNC_CHECKPOINT_TTL_MS,
+      scan: options.scanTtlMs ?? DEFAULT_SYNC_SCAN_TTL_MS,
+    },
+    maxPerOwner: options.maxStatesPerOwner ?? DEFAULT_SYNC_STATES_PER_OWNER,
+    maxBytes: options.maxStateBytes ?? DEFAULT_SYNC_STATE_BYTES,
+  };
+  const scanMillis = options.maxScanMillis ?? DEFAULT_SYNC_SCAN_MILLIS;
 
   function read(request: SyncRequest): ChangesSincePage {
     if (!Number.isSafeInteger(request.limit) || request.limit < 1) {
       throw new RangeError("sync page limit must be a positive integer");
     }
-    const tokens = sessionTokens(store.syncTokenScope(), request);
+    const tokens = sessionTokens(
+      store.syncTokenScope(),
+      store.syncStates(),
+      policy,
+      request,
+    );
     const position = tokens.open(request);
+    const paused = request.candidate ? tokens.resumeScan() : undefined;
     const carried = new Set(position.carried.map(identityKey));
-    const withheld = [...position.withheld];
-    return store.readSyncWindow(
+    const result = store.readSyncWindow(
       request.stream,
       {
         instanceIds: request.instanceIds,
         low: position.low,
-        ...(position.high !== undefined && { high: position.high }),
+        ...((paused?.high ?? position.high) !== undefined && {
+          high: paused?.high ?? position.high,
+        }),
       },
-      (window) => {
+      (window): ChangesSincePage | { paused: PausedScan } => {
         const direction = request.candidate?.order === "desc" ? "desc" : "asc";
-        const data: PdppRecordRow[] = [];
-        let examined = 0;
-        let last: RecordIdentity | undefined;
-        let resumeAfter: RecordIdentity | undefined;
-        for (const change of window.changes(direction, position.after)) {
-          if (examined === budget) {
-            // Another change exists past the budget: end this page there.
-            resumeAfter = last;
-            break;
-          }
-          examined += 1;
-          last = change.after;
+        const deadline = policy.now() + scanMillis;
+        const withheld = [...(paused?.withheld ?? position.withheld)];
+        const rows: PdppRecordRow[] = [];
+        // Accepts one disclosed change, or withholds it; false if neither.
+        const take = (change: SyncWindowChange): boolean => {
           const row = disclose(
             change,
             position.low,
             request,
             carried.has(identityKey(change.after)),
           );
-          if (!row) continue;
-          if (data.length === request.limit) {
-            resumeAfter = data[data.length - 1];
-            break;
-          }
+          if (!row) return false;
           if (request.oneRecordPerKey) assertOnlyHolder(row, window, request);
           // Candidate deletion exception: never serve a record deleted after
           // the session's first page. The next session returns it.
           if (request.candidate && !row.deleted && change.deletedAfterHigh()) {
             withheld.push({ recordKey: row.recordKey, instance: row.instance });
-            continue;
+            return false;
           }
-          data.push(row);
+          rows.push(row);
+          return true;
+        };
+        // Changes an earlier request already disclosed, read again at the
+        // same horizon so a deletion since then still withholds them.
+        for (const id of paused?.found ?? position.found) {
+          const change = window.change(id);
+          if (change) take(change);
         }
-        if (!resumeAfter) {
+        const need = request.limit + 1;
+        let examined = 0;
+        let scanned: RecordIdentity | undefined =
+          paused?.after ?? position.after;
+        let exhausted = false;
+        if (rows.length < need) {
+          const changes = window.changes(direction, scanned)[Symbol.iterator]();
+          try {
+            for (;;) {
+              // Checked before the next change is read, so a resumed scan
+              // starts at the first change no request has examined.
+              if (
+                examined === budget ||
+                (request.candidate && policy.now() >= deadline)
+              ) {
+                exhausted = true;
+                break;
+              }
+              const next = changes.next();
+              if (next.done) break;
+              examined += 1;
+              scanned = identity(next.value.after);
+              if (take(next.value) && rows.length === need) break;
+            }
+          } finally {
+            // A store may hold a cursor open while changes are read.
+            changes.return?.();
+          }
+        }
+        if (exhausted && request.candidate) {
+          // Saved after the store's read ends, so a store that reads in a
+          // transaction does not roll the saved scan back.
+          return {
+            paused: {
+              high: window.high,
+              after: scanned,
+              found: rows.map(identity),
+              withheld,
+            },
+          };
+        }
+        if (rows.length === need || exhausted) {
+          // The extra row is kept for the next page, which starts after the
+          // last change this request examined.
+          const data = rows.slice(0, request.limit);
           return {
             data,
-            hasMore: false,
-            nextChangesSince: tokens.checkpoint(window.high, withheld),
+            hasMore: true,
+            nextCursor: tokens.page({
+              low: position.low,
+              high: window.high,
+              after: scanned!,
+              found: rows.slice(request.limit).map(identity),
+              carried: position.carried,
+              withheld,
+            }),
           };
         }
         return {
-          data,
-          hasMore: true,
-          nextCursor: tokens.page({
-            low: position.low,
-            high: window.high,
-            after: {
-              recordKey: resumeAfter.recordKey,
-              instance: resumeAfter.instance,
-            },
-            carried: position.carried,
-            withheld,
-          }),
+          data: rows,
+          hasMore: false,
+          nextChangesSince: tokens.checkpoint(window.high, withheld),
         };
       },
     );
+    if ("paused" in result) {
+      tokens.pauseScan(result.paused);
+      throw new SyncRetryLaterError();
+    }
+    if (paused) tokens.endScan();
+    return result;
   }
 
   return { read };
@@ -186,6 +285,10 @@ export function createPdppSyncSessionService(
 export type PdppSyncSessionService = ReturnType<
   typeof createPdppSyncSessionService
 >;
+
+function identity(row: { recordKey: string; instance: string }) {
+  return { recordKey: row.recordKey, instance: row.instance };
+}
 
 /**
  * The record a session discloses for one changed key, if any. `carried`
@@ -288,84 +391,90 @@ function sameProjection(
 interface Position {
   low: string | null;
   high?: string;
+  /** The last change an earlier page examined. */
   after?: RecordIdentity;
+  /** Changes an earlier page disclosed but did not serve. */
+  found: RecordIdentity[];
   /** Candidate: records the previous session withheld, returned in this one. */
   carried: RecordIdentity[];
   /** Candidate: records this session has withheld so far. */
   withheld: RecordIdentity[];
 }
 
+interface PausedScan {
+  high: string;
+  after?: RecordIdentity;
+  found: RecordIdentity[];
+  withheld: RecordIdentity[];
+}
+
+interface StatePolicy {
+  now: () => number;
+  ttl: { page: number; checkpoint: number; scan: number };
+  maxPerOwner: number;
+  maxBytes: number;
+}
+
 interface SessionTokens {
   open(request: SyncRequest): Position;
-  page(position: Required<Position>): string;
+  page(position: Required<Omit<Position, "high">> & { high: string }): string;
   checkpoint(high: string, withheld: RecordIdentity[]): string;
+  /** A scan this same request paused earlier, if any. */
+  resumeScan(): PausedScan | undefined;
+  pauseScan(scan: PausedScan): void;
+  endScan(): void;
 }
 
 function identityKey(id: RecordIdentity): string {
   return JSON.stringify([id.recordKey, id.instance]);
 }
 
-/**
- * The most UTF-8 bytes of identity JSON one token carries for `carried` and
- * `withheld` together. Beyond it the session expires, so a token stays a
- * usable query parameter. Reaching it needs that many visible records deleted
- * between pages of one session.
- */
-export const MAX_SYNC_CARRY_BYTES = 2048;
+type Pair = [string, string];
+const toPairs = (ids: RecordIdentity[]): Pair[] =>
+  ids.map((id): Pair => [id.recordKey, id.instance]);
+const fromPairs = (pairs: Pair[] | undefined): RecordIdentity[] =>
+  (pairs ?? []).map(([recordKey, instance]) => ({ recordKey, instance }));
 
-/** Both identity lists as token pairs, or 410 when they exceed the carry. */
-function carryPairs(
-  carried: RecordIdentity[],
-  withheld: RecordIdentity[],
-): { c?: [string, string][]; w?: [string, string][] } {
-  const c = toPairs(carried),
-    w = toPairs(withheld);
-  if (
-    Buffer.byteLength(JSON.stringify([c, w]), "utf8") > MAX_SYNC_CARRY_BYTES
-  ) {
-    throw new CursorExpiredError();
-  }
-  return { ...(c.length > 0 && { c }), ...(w.length > 0 && { w }) };
-}
-
-const SEALED_VERSION = 1;
-const KEY_ID_BYTES = 4;
-const IV_BYTES = 12;
-const TAG_BYTES = 16;
-const HEADER_BYTES = 1 + KEY_ID_BYTES + IV_BYTES + TAG_BYTES;
-/** Horizons are padded so a token's size never tracks the store clock. */
-const HORIZON_WIDTH = 32;
-const PLAINTEXT_BLOCK = 64;
-
-interface SealedPayload {
-  /** Role: a page cursor or a completed-session checkpoint. */
-  r: "page" | "checkpoint";
-  /** Digest of the context the token is bound to. */
+/** What the server keeps behind one handle. */
+interface StoredState {
+  /** Role: a page cursor, a completed-session checkpoint, or a paused scan. */
+  r: "page" | "checkpoint" | "scan";
+  /** Digest of the context the state is bound to. */
   b: string;
-  /** Candidate page only: digest of the session's `changes_since` input. */
+  /** Page and scan: digest of the session's `changes_since` input. */
   s?: string;
-  l?: string;
+  l?: string | null;
   h: string;
-  a?: [string, string];
-  /** Candidate: carried and withheld identities, as [recordKey, instance]. */
-  c?: [string, string][];
-  w?: [string, string][];
+  a?: Pair;
+  f?: Pair[];
+  c?: Pair[];
+  w?: Pair[];
 }
 
+const HANDLE_VERSION = 2;
+const KEY_ID_BYTES = 4;
+const ID_BYTES = 16;
+const MAC_BYTES = 16;
+const HANDLE_BYTES = 1 + KEY_ID_BYTES + ID_BYTES + MAC_BYTES;
+
 /**
- * Every page cursor, in both profiles, and every candidate checkpoint is
- * AES-256-GCM over its position with fresh randomness, so it reveals no
- * position, time or key, and token equality signals nothing. A
- * current-profile checkpoint keeps the readable format existing clients
- * store; the store validates the horizons it carries.
+ * Handles name server-side state. Each is the same length: version, store
+ * key id, random id and a MAC over them under the store's token key. A
+ * handle reveals nothing; altering one fails its MAC (400), one from another
+ * or a rebuilt store names another key (410), and one whose state expired or
+ * was evicted is gone (410).
  *
- * Bindings: a candidate token is bound to its role and to the grant and
- * query context, and a candidate page cursor also to its session's input
- * checkpoint. A current-profile page cursor is bound to its role, stream and
- * instances only, as the current contract leaves the rest of the query free.
+ * Bindings: a candidate state is bound to its role and to the grant and query
+ * context, and a candidate page also to its session's input checkpoint. A
+ * current-profile page is bound to its role, stream and instances only, as
+ * the current contract leaves the rest of the query free. Current-profile
+ * checkpoints keep the readable format existing clients store; the store
+ * validates the horizons they carry.
  */
 function sessionTokens(
   scope: SyncTokenScope,
+  states: SyncStateStore,
+  policy: StatePolicy,
   request: SyncRequest,
 ): SessionTokens {
   const instances = [...new Set(request.instanceIds)].sort();
@@ -384,83 +493,97 @@ function sessionTokens(
         : { profile: "current", stream: request.stream, instances },
     ),
   );
-  const baseline = request.candidate
-    ? digest(request.changesSince ?? "beginning")
-    : undefined;
+  const baseline = digest(request.changesSince ?? "beginning");
+  const owner = request.owner ?? "";
   const keyId = createHash("sha256")
     .update(scope.key)
     .digest()
     .subarray(0, KEY_ID_BYTES);
+  const mac = (body: Buffer) =>
+    createHmac("sha256", scope.key)
+      .update(body)
+      .digest()
+      .subarray(0, MAC_BYTES);
+  // A paused scan is found again by the request that paused it: the same
+  // context, input tokens and limit.
+  const scanId = `scan:${digest(
+    canonicalJson([context, request.cursor ?? null, baseline, request.limit]),
+  )}`;
 
-  function seal(payload: SealedPayload): string {
-    let json = JSON.stringify(payload);
-    json += " ".repeat(
-      (PLAINTEXT_BLOCK - (json.length % PLAINTEXT_BLOCK)) % PLAINTEXT_BLOCK,
+  function store(
+    id: string,
+    state: StoredState,
+    role: keyof StatePolicy["ttl"],
+  ): void {
+    const json = JSON.stringify(state);
+    if (Buffer.byteLength(json, "utf8") > policy.maxBytes) {
+      throw new CursorExpiredError();
+    }
+    const now = policy.now();
+    states.put({
+      id,
+      owner,
+      state: json,
+      expiresAt: now + policy.ttl[role],
+      now,
+      maxPerOwner: policy.maxPerOwner,
+    });
+  }
+
+  function mint(state: StoredState): string {
+    const id = randomBytes(ID_BYTES);
+    const body = Buffer.concat([Buffer.from([HANDLE_VERSION]), keyId, id]);
+    store(
+      id.toString("base64url"),
+      state,
+      state.r === "page" ? "page" : "checkpoint",
     );
-    const iv = randomBytes(IV_BYTES);
-    const cipher = createCipheriv("aes-256-gcm", scope.key, iv);
-    const body = Buffer.concat([cipher.update(json, "utf8"), cipher.final()]);
-    return Buffer.concat([
-      Buffer.from([SEALED_VERSION]),
-      keyId,
-      iv,
-      cipher.getAuthTag(),
-      body,
-    ]).toString("base64url");
+    return Buffer.concat([body, mac(body)]).toString("base64url");
   }
 
-  function isSealed(token: string): boolean {
-    return Buffer.from(token, "base64url")[0] === SEALED_VERSION;
+  function isHandle(token: string): boolean {
+    return Buffer.from(token, "base64url")[0] === HANDLE_VERSION;
   }
 
-  function unseal(token: string, role: SealedPayload["r"]): SealedPayload {
+  function load(token: string, role: StoredState["r"]): StoredState {
     const bytes = Buffer.from(token, "base64url");
     if (
-      bytes.length <= HEADER_BYTES ||
+      bytes.length !== HANDLE_BYTES ||
       bytes.toString("base64url") !== token ||
-      bytes[0] !== SEALED_VERSION
+      bytes[0] !== HANDLE_VERSION
     ) {
       throw new InvalidCursorError();
     }
-    // Sealed by another store or a rebuilt one: its history is gone here.
+    // Minted by another store or a rebuilt one: its history is gone here.
     if (!bytes.subarray(1, 1 + KEY_ID_BYTES).equals(keyId)) {
       throw new CursorExpiredError();
     }
-    let payload: SealedPayload;
-    try {
-      const ivStart = 1 + KEY_ID_BYTES;
-      const decipher = createDecipheriv(
-        "aes-256-gcm",
-        scope.key,
-        bytes.subarray(ivStart, ivStart + IV_BYTES),
-      );
-      decipher.setAuthTag(bytes.subarray(ivStart + IV_BYTES, HEADER_BYTES));
-      payload = JSON.parse(
-        Buffer.concat([
-          decipher.update(bytes.subarray(HEADER_BYTES)),
-          decipher.final(),
-        ]).toString("utf8"),
-      ) as SealedPayload;
-    } catch {
+    const body = bytes.subarray(0, HANDLE_BYTES - MAC_BYTES);
+    if (!mac(body).equals(bytes.subarray(HANDLE_BYTES - MAC_BYTES))) {
       throw new InvalidCursorError();
     }
-    if (payload.r !== role || payload.b !== context) {
+    const id = body.subarray(1 + KEY_ID_BYTES).toString("base64url");
+    const json = states.get(id, policy.now());
+    if (json === undefined) throw new CursorExpiredError();
+    const state = JSON.parse(json) as StoredState;
+    if (state.r !== role || state.b !== context) {
       throw new InvalidCursorError();
     }
-    return payload;
+    return state;
   }
 
   function openPage(cursor: string): Position {
-    const payload = unseal(cursor, "page");
-    if (payload.s !== baseline) throw new InvalidCursorError();
+    const state = load(cursor, "page");
+    if (state.s !== baseline) throw new InvalidCursorError();
     return {
-      low: payload.l?.trim() ?? null,
-      high: payload.h.trim(),
-      ...(payload.a && {
-        after: { recordKey: payload.a[0], instance: payload.a[1] },
+      low: state.l ?? null,
+      high: state.h,
+      ...(state.a && {
+        after: { recordKey: state.a[0], instance: state.a[1] },
       }),
-      carried: fromPairs(payload.c),
-      withheld: fromPairs(payload.w),
+      found: fromPairs(state.f),
+      carried: fromPairs(state.c),
+      withheld: fromPairs(state.w),
     };
   }
 
@@ -474,16 +597,59 @@ function sessionTokens(
     return payload;
   }
 
-  const page = ({ low, high, after, carried, withheld }: Required<Position>) =>
-    seal({
+  const fresh = (low: string | null): Position => ({
+    low,
+    found: [],
+    carried: [],
+    withheld: [],
+  });
+
+  const page: SessionTokens["page"] = (position) =>
+    mint({
       r: "page",
       b: context,
-      ...(baseline && { s: baseline }),
-      ...(low !== null && { l: low.padStart(HORIZON_WIDTH) }),
-      h: high.padStart(HORIZON_WIDTH),
-      a: [after.recordKey, after.instance],
-      ...carryPairs(carried, withheld),
+      s: baseline,
+      l: position.low,
+      h: position.high,
+      a: [position.after.recordKey, position.after.instance],
+      f: toPairs(position.found),
+      c: toPairs(position.carried),
+      w: toPairs(position.withheld),
     });
+
+  const scans = {
+    resumeScan(): PausedScan | undefined {
+      const json = states.get(scanId, policy.now());
+      if (json === undefined) return undefined;
+      const state = JSON.parse(json) as StoredState;
+      if (state.r !== "scan" || state.b !== context) return undefined;
+      return {
+        high: state.h,
+        ...(state.a && {
+          after: { recordKey: state.a[0], instance: state.a[1] },
+        }),
+        found: fromPairs(state.f),
+        withheld: fromPairs(state.w),
+      };
+    },
+    pauseScan(scan: PausedScan): void {
+      store(
+        scanId,
+        {
+          r: "scan",
+          b: context,
+          h: scan.high,
+          ...(scan.after && { a: [scan.after.recordKey, scan.after.instance] }),
+          f: toPairs(scan.found),
+          w: toPairs(scan.withheld),
+        },
+        "scan",
+      );
+    },
+    endScan(): void {
+      states.delete(scanId);
+    },
+  };
 
   if (request.candidate) {
     return {
@@ -493,43 +659,30 @@ function sessionTokens(
           request.changesSince === undefined ||
           request.changesSince === "beginning"
         ) {
-          return { low: null, carried: [], withheld: [] };
+          return fresh(null);
         }
-        const payload = unseal(request.changesSince, "checkpoint");
-        return {
-          low: payload.h.trim(),
-          carried: fromPairs(payload.w),
-          withheld: [],
-        };
+        const state = load(request.changesSince, "checkpoint");
+        return { ...fresh(state.h), carried: fromPairs(state.w) };
       },
       page,
       checkpoint: (high, withheld) =>
-        seal({
-          r: "checkpoint",
-          b: context,
-          h: high.padStart(HORIZON_WIDTH),
-          ...carryPairs([], withheld),
-        }),
+        mint({ r: "checkpoint", b: context, h: high, w: toPairs(withheld) }),
+      ...scans,
     };
   }
 
   return {
     open(request) {
       if (request.cursor) {
-        if (isSealed(request.cursor)) return openPage(request.cursor);
-        // A readable page cursor predates sealed cursors. Its position
+        if (isHandle(request.cursor)) return openPage(request.cursor);
+        // A readable page cursor predates server-side sessions. Its position
         // counted rows the grant hides, so it cannot be resumed.
         decodeCurrent(request.cursor);
         throw new CursorExpiredError();
       }
-      if (!request.changesSince)
-        return { low: null, carried: [], withheld: [] };
+      if (!request.changesSince) return fresh(null);
       try {
-        return {
-          low: decodeCurrent(request.changesSince).horizon,
-          carried: [],
-          withheld: [],
-        };
+        return fresh(decodeCurrent(request.changesSince).horizon);
       } catch (err) {
         if (err instanceof InvalidCursorSyntaxError) {
           throw new CursorExpiredError();
@@ -547,18 +700,8 @@ function sessionTokens(
         sinceHorizon: null,
         offset: 0,
       }),
+    ...scans,
   };
-}
-
-function toPairs(ids: RecordIdentity[]): [string, string][] {
-  return ids.map((id): [string, string] => [id.recordKey, id.instance]);
-}
-
-function fromPairs(pairs: [string, string][] | undefined): RecordIdentity[] {
-  return (pairs ?? []).map(([recordKey, instance]) => ({
-    recordKey,
-    instance,
-  }));
 }
 
 function digest(value: string): string {

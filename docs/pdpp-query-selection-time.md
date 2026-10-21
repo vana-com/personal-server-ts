@@ -78,7 +78,7 @@ safely after mutation. New cursors carry both facts. They also carry the list
 order they belong to (`orderKey: "instant"`). A cursor minted under the earlier
 timestamp-text order names a different position under instant order, so it
 also returns `410` rather than skip or repeat rows. The sync owner
-(`docs/pdpp-sync-session.md`) seals every page cursor and expires a readable
+(`docs/pdpp-sync-session.md`) issues every page cursor as a handle and expires a readable
 one, whose offset counted the earlier locale-dependent key order. Completed
 checkpoints carry no position and stay valid. A record erased after the
 horizon, including one erased and reinserted, is withheld from later pages; no

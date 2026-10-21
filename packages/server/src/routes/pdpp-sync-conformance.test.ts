@@ -4,6 +4,7 @@ import {
   createMemoryRecordStore,
   createStreamDeclarationRegistry,
   type PdppRecordStore,
+  type SyncSessionOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import type {
@@ -76,6 +77,7 @@ afterEach(() => {
 interface HarnessOptions {
   accessLog?: PdppAccessLogPort;
   syncPageBudget?: number;
+  syncSession?: SyncSessionOptions;
 }
 
 function harness(
@@ -423,13 +425,18 @@ for (const backend of ["memory", "sqlite"]) {
           expect(after.body.data).toEqual([]);
         });
 
-        it("measures the carry in UTF-8 bytes, so non-ASCII keys cannot exceed it", async () => {
-          const h = harness(backend, {
-            g1: grant(version, "G1", [streamGrant(version)]),
-          });
-          // About 820 UTF-16 code units of identity JSON, but about 2,460
-          // UTF-8 bytes: over the 2 KiB carry.
-          const wide = ["一", "二"].map((c) => c.repeat(400));
+        it("measures session state in UTF-8 bytes, so non-ASCII keys cannot exceed its cap", async () => {
+          const h = harness(
+            backend,
+            { g1: grant(version, "G1", [streamGrant(version)]) },
+            new Database(":memory:"),
+            { syncSession: { maxStateBytes: 3000 } },
+          );
+          // Page 1 keeps one wide key twice (position and extra row), about
+          // 2,420 UTF-8 bytes. The checkpoint withholds three: about 1,230
+          // UTF-16 code units of identity JSON but about 3,630 UTF-8 bytes,
+          // over the 3,000-byte cap.
+          const wide = ["一", "二", "三"].map((c) => c.repeat(400));
           for (const key of ["0", ...wide])
             h.put(key, { name: "N", t: INSIDE });
           const session = {
@@ -447,10 +454,13 @@ for (const backend of ["memory", "sqlite"]) {
           expect(second.body.error?.code).toBe("cursor_expired");
         });
 
-        it("expires a session whose withheld records exceed what a token can carry", async () => {
-          const h = harness(backend, {
-            g1: grant(version, "G1", [streamGrant(version)]),
-          });
+        it("expires a session whose withheld records exceed the state cap", async () => {
+          const h = harness(
+            backend,
+            { g1: grant(version, "G1", [streamGrant(version)]) },
+            new Database(":memory:"),
+            { syncSession: { maxStateBytes: 4096 } },
+          );
           const keys = Array.from(
             { length: 200 },
             (_, i) => `key-${String(i).padStart(4, "0")}-${"x".repeat(40)}`,
@@ -614,7 +624,8 @@ for (const backend of ["memory", "sqlite"]) {
         const seen: string[] = [];
         let cursor: string | undefined;
         let pages = 0;
-        do {
+        let retries = 0;
+        for (;;) {
           const page = await h.get(
             records("s", {
               changes_since: begin(version),
@@ -623,19 +634,30 @@ for (const backend of ["memory", "sqlite"]) {
               cursor,
             }),
           );
+          if (version === CANDIDATE && page.status === 429) {
+            // The candidate never shapes a page by hidden changes: it asks
+            // for a retry and resumes the scan.
+            retries += 1;
+            continue;
+          }
           expect(page.status).toBe(200);
           pages += 1;
           seen.push(...ids(page.body));
           cursor = page.body.next_cursor;
-          if (cursor) {
-            expect(decodesAsJson(cursor)).toBe(false);
-            expect(
-              Buffer.from(cursor, "base64url").toString("latin1"),
-            ).not.toContain("hidden");
-          }
-        } while (cursor);
-        // Eight changed keys, three examined per page.
-        expect(pages).toBe(3);
+          if (!cursor) break;
+          expect(decodesAsJson(cursor)).toBe(false);
+          expect(
+            Buffer.from(cursor, "base64url").toString("latin1"),
+          ).not.toContain("hidden");
+        }
+        if (version === CANDIDATE) {
+          // Eight changed keys, three examined per request: one page.
+          expect(retries).toBe(2);
+          expect(pages).toBe(1);
+        } else {
+          // Eight changed keys, three examined per page.
+          expect(pages).toBe(3);
+        }
         expect(seen).toEqual(["z"]);
       });
       it(`fixed horizon: writes after page 1 wait for the next session (${version})`, async () => {

@@ -16,6 +16,8 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   createPdppSyncSessionService,
+  SyncRetryLaterError,
+  type SyncSessionOptions,
   CursorExpiredError,
   RecordIdentityConflictError,
   InvalidCursorError,
@@ -235,8 +237,10 @@ export interface PdppRecordsRouteDeps {
    * explicit rather than leaving to chance.
    */
   accessLog?: PdppAccessLogPort;
-  /** Changes one sync page may examine; defaults to the session service's. */
+  /** Changes one sync request may examine; defaults to the session service's. */
   syncPageBudget?: number;
+  /** Sync session budgets, expiry and storage caps; defaults are the service's. */
+  syncSession?: SyncSessionOptions;
   /**
    * Vana chain enforcement for client reads. Absent by default, and absence
    * is the chain-NEUTRAL path: a standalone PDPP deployment has no chain, so
@@ -344,6 +348,14 @@ function toPdppError(err: unknown): PdppError {
   if (err instanceof PdppError) return err;
   if (err instanceof CursorExpiredError) {
     return new PdppError("cursor_expired", "changes_since cursor has expired");
+  }
+  if (err instanceof SyncRetryLaterError) {
+    // One answer whatever exhausted the budget: hidden changes or a slow
+    // store. The route adds Retry-After.
+    return new PdppError(
+      "rate_limit_exceeded",
+      "The sync request needs more time; retry it unchanged",
+    );
   }
   if (err instanceof RecordIdentityConflictError) {
     // Records carry only their key on the wire, so two instances' records
@@ -455,6 +467,8 @@ function sendError(c: Context, err: PdppError, reqId: string) {
     "Request-Id": reqId,
     "PDPP-Version": PDPP_VERSION,
   };
+  // The spec's retryable answer carries its delay.
+  if (err.status === 429) headers["Retry-After"] = "1";
   if (err.status === 401) {
     headers["WWW-Authenticate"] =
       `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
@@ -540,7 +554,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
   const validateData = createRecordDataValidator(deps.declarations);
   const sync = createPdppSyncSessionService(deps.store, {
-    maxExaminedPerPage: deps.syncPageBudget,
+    ...(deps.syncPageBudget !== undefined && {
+      maxExaminedPerRequest: deps.syncPageBudget,
+    }),
+    ...deps.syncSession,
   });
 
   /**
@@ -973,6 +990,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         // fields shape only the response.
         const page = sync.read({
           stream,
+          owner: context!.grant?.subject.id ?? context!.subjectId,
           instanceIds: effectiveInstanceIds,
           changesSince: query.changesSince,
           cursor,

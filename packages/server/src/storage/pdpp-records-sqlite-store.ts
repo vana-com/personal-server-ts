@@ -3,6 +3,7 @@ import {
   timeSortKey,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
+  createMemorySyncStateStore,
   decodeListCursor,
   listSnapshotPage,
   LIST_ORDER_COLUMNS,
@@ -30,6 +31,7 @@ import {
   type RecordDataValidator,
   type StreamListing,
   type StreamSemantics,
+  type SyncStateStore,
   type SyncTokenScope,
   type SyncWindow,
   type RecordIdentity,
@@ -316,7 +318,8 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
   // v14: the secret that seals sync tokens, beside the epoch so a rebuilt
   // records DB expires every token the old one issued, and the
   // identity-ordered history index sync pages seek in. It also rebuilds the
-  // live summary index an earlier v13 left without `emitted_at`.
+  // live summary index an earlier v13 left without `emitted_at`, and adds
+  // the table that holds sync session state behind opaque handles.
   // `migrateToV14` applies it.
   "",
   // v14: one recoverable export-to-live transition per Claude connection.
@@ -390,6 +393,36 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
 `);
 }
 
+/** Sync session state behind opaque handles (`sync-session.ts`). */
+function sqliteSyncStates(db: Database): SyncStateStore {
+  const put = db.prepare(`INSERT OR REPLACE INTO pdpp_sync_state
+    (id, owner, state, expires_at) VALUES (?, ?, ?, ?)`);
+  const dropExpired = db.prepare(
+    "DELETE FROM pdpp_sync_state WHERE expires_at <= ?",
+  );
+  // rowid grows with each insert or replace, so it orders states by age.
+  const evict = db.prepare(`DELETE FROM pdpp_sync_state WHERE rowid IN (
+    SELECT rowid FROM pdpp_sync_state WHERE owner = ?
+    ORDER BY rowid DESC LIMIT -1 OFFSET ?)`);
+  const get = db.prepare(
+    "SELECT state FROM pdpp_sync_state WHERE id = ? AND expires_at > ?",
+  );
+  const del = db.prepare("DELETE FROM pdpp_sync_state WHERE id = ?");
+  const putTx = db.transaction(
+    (entry: Parameters<SyncStateStore["put"]>[0]) => {
+      put.run(entry.id, entry.owner, entry.state, entry.expiresAt);
+      dropExpired.run(entry.now);
+      evict.run(entry.owner, entry.maxPerOwner);
+    },
+  );
+  return {
+    put: (entry) => putTx(entry),
+    get: (id, now) =>
+      (get.get(id, now) as { state: string } | undefined)?.state,
+    delete: (id) => void del.run(id),
+  };
+}
+
 function migrateToV14(db: Database): void {
   const columns = db
     .prepare("PRAGMA table_info(pdpp_store_metadata)")
@@ -409,6 +442,16 @@ DROP INDEX IF EXISTS idx_pdpp_records_live_instance_stream_emitted_key;
 CREATE INDEX idx_pdpp_records_live_instance_stream_emitted_key
   ON pdpp_records (instance, stream, emitted_key, emitted_at)
   WHERE deleted = 0;
+CREATE TABLE IF NOT EXISTS pdpp_sync_state (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  state TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_owner
+  ON pdpp_sync_state (owner);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_expires
+  ON pdpp_sync_state (expires_at);
 `);
 }
 
@@ -1996,27 +2039,41 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           record_key: string;
           instance: string;
         }>) {
-          const key = [id.instance, stream, id.record_key] as const;
-          yield {
-            after: versionAt(id.instance, id.record_key, high)!,
-            before: () =>
-              low === null
-                ? undefined
-                : versionAt(id.instance, id.record_key, low),
-            deletedAfterHigh: () =>
-              high < clock && deletedAfterStmt.get(...key, high) !== undefined,
-          };
+          yield change({ recordKey: id.record_key, instance: id.instance })!;
         }
+      }
+
+      function change({
+        recordKey,
+        instance,
+      }: RecordIdentity): SyncWindowChange | undefined {
+        const after = versionAt(instance, recordKey, high);
+        if (!after) return undefined;
+        return {
+          after,
+          before: () =>
+            low === null ? undefined : versionAt(instance, recordKey, low),
+          deletedAfterHigh: () =>
+            high < clock &&
+            deletedAfterStmt.get(instance, stream, recordKey, high) !==
+              undefined,
+        };
       }
 
       return read({
         high: String(high),
         changes,
+        change,
         versionAtHigh: (instance, recordKey) =>
           versionAt(instance, recordKey, high),
       });
     })();
   }
+
+  // A readonly handle cannot persist session state; it keeps it in process.
+  const syncStates: SyncStateStore = db.readonly
+    ? createMemorySyncStateStore()
+    : sqliteSyncStates(db);
 
   function syncTokenScope(): SyncTokenScope {
     const row = db
@@ -2212,6 +2269,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     deleteRecord,
     readSyncWindow,
     syncTokenScope,
+    syncStates: () => syncStates,
     listStreams,
     putBlobMeta: (meta: PdppBlobMeta) =>
       putBlobStmt.run({

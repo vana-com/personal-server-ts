@@ -8,6 +8,7 @@ import type {
   PdppStoredRecord,
   StreamListing,
   StreamSemantics,
+  SyncStateStore,
   SyncTokenScope,
   SyncWindow,
   SyncWindowRequest,
@@ -82,6 +83,9 @@ export interface PdppRecordStore {
   ): T;
 
   syncTokenScope(): SyncTokenScope;
+
+  /** Where the sync session owner keeps handle state. */
+  syncStates(): SyncStateStore;
 
   listStreams(instanceIds: string[]): StreamListing[];
 

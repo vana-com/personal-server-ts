@@ -41,7 +41,7 @@ export interface ChangesSinceCursorPayload {
   sinceHorizon: string | null;
   /**
    * Always 0 on checkpoints. Readable page cursors are no longer issued: the
-   * session owner seals every page cursor (`sync-session.ts`).
+   * session owner issues every page cursor as a handle (`sync-session.ts`).
    */
   offset: number;
 }

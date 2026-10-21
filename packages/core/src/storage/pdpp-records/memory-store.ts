@@ -6,6 +6,7 @@ import {
 } from "./list-page.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { timeSortKey } from "../../pdpp/time.js";
+import { createMemorySyncStateStore } from "./sync-state.js";
 import type { PdppRecordStore } from "./interface.js";
 import {
   planIngest,
@@ -78,6 +79,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
   const blobBytes = new Map<string, Uint8Array>();
   const epoch = randomUUID();
   const syncTokenKey = new Uint8Array(randomBytes(32));
+  const syncStates = createMemorySyncStateStore();
   let listSnapshot:
     | {
         key: string;
@@ -414,27 +416,36 @@ export function createMemoryRecordStore(): PdppRecordStore {
         while (i >= 0 && i < changed.length && !beyond(changed[i])) i += step;
       }
       for (; i >= 0 && i < changed.length; i += step) {
-        const { recordKey, instance } = changed[i];
-        yield {
-          after: versionAt(instance, recordKey, high)!,
-          before: () =>
-            low === null ? undefined : versionAt(instance, recordKey, low),
-          deletedAfterHigh: () =>
-            history.some(
-              (h) =>
-                h.stream === stream &&
-                h.instance === instance &&
-                h.recordKey === recordKey &&
-                h.row.deleted &&
-                h.writtenAt > high,
-            ),
-        };
+        yield change(changed[i])!;
       }
+    }
+
+    function change({
+      recordKey,
+      instance,
+    }: RecordIdentity): SyncWindowChange | undefined {
+      const after = versionAt(instance, recordKey, high);
+      if (!after) return undefined;
+      return {
+        after,
+        before: () =>
+          low === null ? undefined : versionAt(instance, recordKey, low),
+        deletedAfterHigh: () =>
+          history.some(
+            (h) =>
+              h.stream === stream &&
+              h.instance === instance &&
+              h.recordKey === recordKey &&
+              h.row.deleted &&
+              h.writtenAt > high,
+          ),
+      };
     }
 
     return read({
       high,
       changes,
+      change,
       versionAtHigh: (instance, recordKey) =>
         versionAt(instance, recordKey, high),
     });
@@ -563,6 +574,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
     deleteRecord,
     readSyncWindow,
     syncTokenScope: () => ({ epoch, key: syncTokenKey }),
+    syncStates: () => syncStates,
     listStreams,
     putBlobMeta: (meta: PdppBlobMeta) => blobs.set(meta.blobId, meta),
     getBlobMeta: (blobId: string) => blobs.get(blobId),
