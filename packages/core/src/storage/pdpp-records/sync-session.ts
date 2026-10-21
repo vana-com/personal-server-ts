@@ -89,7 +89,13 @@ export const DEFAULT_SYNC_EXAMINED_PER_PAGE = 10_000;
  * Both profiles paginate over the authorized result only and seal every page
  * cursor, because a page that ends on its work budget resumes after a change
  * it may not disclose. Only the candidate refuses to serve a record deleted
- * after the session's fixed horizon; it expires that session instead.
+ * after the session's fixed horizon. It withholds that record, carries its
+ * identity in the session's sealed tokens, and the next session returns it
+ * as of its own horizon even when its projection did not change. That is the
+ * candidate's rule for a reference redacted on a later page, applied to the
+ * record itself: comparing projections alone would lose a record deleted and
+ * recreated unchanged. A session that withholds more than a token can carry
+ * expires instead.
  */
 export function createPdppSyncSessionService(
   store: Pick<PdppRecordStore, "readSyncWindow" | "syncTokenScope">,
@@ -106,6 +112,8 @@ export function createPdppSyncSessionService(
     }
     const tokens = sessionTokens(store.syncTokenScope(), request);
     const position = tokens.open(request);
+    const carried = new Set(position.carried.map(identityKey));
+    const withheld = [...position.withheld];
     return store.readSyncWindow(
       request.stream,
       {
@@ -127,7 +135,12 @@ export function createPdppSyncSessionService(
           }
           examined += 1;
           last = change.after;
-          const row = disclose(change, position.low, request);
+          const row = disclose(
+            change,
+            position.low,
+            request,
+            carried.has(identityKey(change.after)),
+          );
           if (!row) continue;
           if (data.length === request.limit) {
             resumeAfter = data[data.length - 1];
@@ -135,11 +148,10 @@ export function createPdppSyncSessionService(
           }
           if (request.oneRecordPerKey) assertOnlyHolder(row, window, request);
           // Candidate deletion exception: never serve a record deleted after
-          // the session's first page. Withholding it silently could lose it,
-          // since the next session compares against this horizon, so the
-          // session fails and the client restarts, as a list read does.
+          // the session's first page. The next session returns it.
           if (request.candidate && !row.deleted && change.deletedAfterHigh()) {
-            throw new CursorExpiredError();
+            withheld.push({ recordKey: row.recordKey, instance: row.instance });
+            continue;
           }
           data.push(row);
         }
@@ -147,7 +159,7 @@ export function createPdppSyncSessionService(
           return {
             data,
             hasMore: false,
-            nextChangesSince: tokens.checkpoint(window.high),
+            nextChangesSince: tokens.checkpoint(window.high, withheld),
           };
         }
         return {
@@ -160,6 +172,8 @@ export function createPdppSyncSessionService(
               recordKey: resumeAfter.recordKey,
               instance: resumeAfter.instance,
             },
+            carried: position.carried,
+            withheld,
           }),
         };
       },
@@ -173,11 +187,16 @@ export type PdppSyncSessionService = ReturnType<
   typeof createPdppSyncSessionService
 >;
 
-/** The record a session discloses for one changed key, if any. */
+/**
+ * The record a session discloses for one changed key, if any. `carried`
+ * marks a record the previous session withheld: it is returned even when its
+ * projection is the same at both horizons.
+ */
 function disclose(
   change: SyncWindowChange,
   low: string | null,
   request: SyncRequest,
+  carried: boolean,
 ): PdppRecordRow | undefined {
   const { after } = change;
   const { access, eligibilityFields: fields } = request;
@@ -187,7 +206,9 @@ function disclose(
     if (!visible(after, access)) {
       return wasVisible ? removal(after) : undefined;
     }
-    if (wasVisible && sameProjection(before!, after, fields)) return undefined;
+    if (!carried && wasVisible && sameProjection(before!, after, fields)) {
+      return undefined;
+    }
     return after;
   }
   if (after.deleted) {
@@ -268,13 +289,29 @@ interface Position {
   low: string | null;
   high?: string;
   after?: RecordIdentity;
+  /** Candidate: records the previous session withheld, returned in this one. */
+  carried: RecordIdentity[];
+  /** Candidate: records this session has withheld so far. */
+  withheld: RecordIdentity[];
 }
 
 interface SessionTokens {
   open(request: SyncRequest): Position;
   page(position: Required<Position>): string;
-  checkpoint(high: string): string;
+  checkpoint(high: string, withheld: RecordIdentity[]): string;
 }
+
+function identityKey(id: RecordIdentity): string {
+  return JSON.stringify([id.recordKey, id.instance]);
+}
+
+/**
+ * The most identity text one token carries for each of `carried` and
+ * `withheld`. Beyond it the session expires, so a token stays a usable query
+ * parameter. Reaching it needs that many visible records deleted between
+ * pages of one session.
+ */
+export const MAX_SYNC_CARRY_BYTES = 2048;
 
 const SEALED_VERSION = 1;
 const KEY_ID_BYTES = 4;
@@ -295,6 +332,9 @@ interface SealedPayload {
   l?: string;
   h: string;
   a?: [string, string];
+  /** Candidate: carried and withheld identities, as [recordKey, instance]. */
+  c?: [string, string][];
+  w?: [string, string][];
 }
 
 /**
@@ -404,6 +444,8 @@ function sessionTokens(
       ...(payload.a && {
         after: { recordKey: payload.a[0], instance: payload.a[1] },
       }),
+      carried: fromPairs(payload.c),
+      withheld: fromPairs(payload.w),
     };
   }
 
@@ -417,7 +459,7 @@ function sessionTokens(
     return payload;
   }
 
-  const page = ({ low, high, after }: Required<Position>) =>
+  const page = ({ low, high, after, carried, withheld }: Required<Position>) =>
     seal({
       r: "page",
       b: context,
@@ -425,6 +467,8 @@ function sessionTokens(
       ...(low !== null && { l: low.padStart(HORIZON_WIDTH) }),
       h: high.padStart(HORIZON_WIDTH),
       a: [after.recordKey, after.instance],
+      ...(carried.length > 0 && { c: toPairs(carried) }),
+      ...(withheld.length > 0 && { w: toPairs(withheld) }),
     });
 
   if (request.candidate) {
@@ -435,13 +479,23 @@ function sessionTokens(
           request.changesSince === undefined ||
           request.changesSince === "beginning"
         ) {
-          return { low: null };
+          return { low: null, carried: [], withheld: [] };
         }
-        return { low: unseal(request.changesSince, "checkpoint").h.trim() };
+        const payload = unseal(request.changesSince, "checkpoint");
+        return {
+          low: payload.h.trim(),
+          carried: fromPairs(payload.w),
+          withheld: [],
+        };
       },
       page,
-      checkpoint: (high) =>
-        seal({ r: "checkpoint", b: context, h: high.padStart(HORIZON_WIDTH) }),
+      checkpoint: (high, withheld) =>
+        seal({
+          r: "checkpoint",
+          b: context,
+          h: high.padStart(HORIZON_WIDTH),
+          ...(withheld.length > 0 && { w: toPairs(withheld) }),
+        }),
     };
   }
 
@@ -454,9 +508,14 @@ function sessionTokens(
         decodeCurrent(request.cursor);
         throw new CursorExpiredError();
       }
-      if (!request.changesSince) return { low: null };
+      if (!request.changesSince)
+        return { low: null, carried: [], withheld: [] };
       try {
-        return { low: decodeCurrent(request.changesSince).horizon };
+        return {
+          low: decodeCurrent(request.changesSince).horizon,
+          carried: [],
+          withheld: [],
+        };
       } catch (err) {
         if (err instanceof InvalidCursorSyntaxError) {
           throw new CursorExpiredError();
@@ -475,6 +534,21 @@ function sessionTokens(
         offset: 0,
       }),
   };
+}
+
+function toPairs(ids: RecordIdentity[]): [string, string][] {
+  const pairs = ids.map((id): [string, string] => [id.recordKey, id.instance]);
+  if (JSON.stringify(pairs).length > MAX_SYNC_CARRY_BYTES) {
+    throw new CursorExpiredError();
+  }
+  return pairs;
+}
+
+function fromPairs(pairs: [string, string][] | undefined): RecordIdentity[] {
+  return (pairs ?? []).map(([recordKey, instance]) => ({
+    recordKey,
+    instance,
+  }));
 }
 
 function digest(value: string): string {
