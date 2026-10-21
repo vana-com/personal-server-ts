@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { keccak256, stringToHex } from "viem";
 import { afterEach, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -9,6 +10,8 @@ import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import {
   createDpv2ReplicaTransport,
+  replicaChainCommitment,
+  type ReplicaFinalizedChainEvidence,
   type ReplicaCommitment,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import { REPLICA_MAX_BLOB_BYTES } from "@opendatalabs/personal-server-ts-core/replication/transport";
@@ -31,12 +34,32 @@ const directories: string[] = [];
 const devices: ReturnType<typeof device>[] = [];
 let time = Date.parse(at);
 
-/** Storage cap + DPv2 contiguous version guard, plus independent head/history/chain stores. */
+/** Storage cap + DPv2 contiguous version guard, plus independent head and finalized chain stores. */
 function network(realCrypto = false, cap = 8192) {
   const blobs = new Map<string, Uint8Array>();
   const head = new Map<string, ReplicaCommitment>();
-  const history = new Map<string, ReplicaCommitment>();
-  const chain = new Map<string, ReplicaCommitment>();
+  const chain = new Map<string, ReplicaFinalizedChainEvidence>();
+  const chainRow = (
+    scope: string,
+    row?: ReplicaCommitment,
+  ): ReplicaFinalizedChainEvidence => ({
+    owner,
+    scope,
+    version: "1",
+    currentVersion: row?.version ?? "0",
+    status: row ? "Active" : "None",
+    commitment: row
+      ? replicaChainCommitment(
+          row.dataHash as `0x${string}`,
+          row.metadataHash as `0x${string}`,
+        )
+      : `0x${"0".repeat(64)}`,
+    chainId: 14800,
+    registry: `0x${"2".repeat(40)}`,
+    blockNumber: 123n,
+    blockHash: `0x${"3".repeat(64)}`,
+    blockTimestamp: 1000n,
+  });
   const pending = new Set<string>();
   const puts: { scope: string; bytes: Uint8Array }[] = [];
   const gets: string[] = [];
@@ -82,8 +105,8 @@ function network(realCrypto = false, cap = 8192) {
       async registerDataPoint(input) {
         registrations.push(input.scope);
         const max = Math.max(
-          Number(history.get(input.scope)?.version ?? 0),
-          Number(chain.get(input.scope)?.version ?? 0),
+          Number(head.get(input.scope)?.version ?? 0),
+          Number(chain.get(input.scope)?.currentVersion ?? 0),
         );
         if (Number(input.expectedVersion) <= max)
           throw new Error(
@@ -102,8 +125,8 @@ function network(realCrypto = false, cap = 8192) {
           deleted: false,
         };
         head.set(input.scope, row);
-        history.set(input.scope, row);
-        if (!pending.has(input.scope)) chain.set(input.scope, row);
+        if (!pending.has(input.scope))
+          chain.set(input.scope, chainRow(input.scope, row));
         if (loseRegistrationResponse) {
           loseRegistrationResponse = false;
           throw new Error("response lost after commit");
@@ -128,8 +151,7 @@ function network(realCrypto = false, cap = 8192) {
     },
     evidence: async (scope) => ({
       head: head.get(scope) ?? null,
-      history: history.get(scope) ?? null,
-      chain: chain.get(scope) ?? null,
+      chain: chain.get(scope) ?? chainRow(scope),
       pending: pending.has(scope),
     }),
   });
@@ -167,7 +189,7 @@ function network(realCrypto = false, cap = 8192) {
     port,
     blobs,
     head,
-    history,
+    chainRow,
     chain,
     pending,
     puts,
@@ -451,34 +473,70 @@ it("rejects tampered ciphertext and imports only after the correct fragment is r
   expect(b.get()).toEqual(a.get());
 });
 
-it("quarantines the false head 9/history 1/chain 1 case without rebase or PUT", async () => {
+it("holds false head 9 and other Gateway disagreements pending, then heals without rebase or PUT", async () => {
   const net = network();
-  const a = device(net);
-  // Lose response leaves a retryable local row after authoritative remote commit.
+  const a = device(net, { preexisting: "authentic" });
   net.loseNextRegistrationResponse();
   await a.cycle();
   const scope = outbox(a)[0]!.scope;
-  net.head.set(scope, { ...net.head.get(scope)!, version: "9" });
-  const putCount = net.puts.length;
-  await cycles([a], 2);
+  const authentic = net.head.get(scope)!;
+  const b = device(net);
+  const putCount = net.puts.filter((p) => p.scope === scope).length;
+  for (const mutation of [
+    { ...authentic, version: "9" },
+    { ...authentic, owner: "other" },
+    { ...authentic, scope: "other" },
+    { ...authentic, deleted: true },
+    { ...authentic, dataHash: `0x${"f".repeat(64)}` },
+    { ...authentic, metadataHash: `0x${"f".repeat(64)}` },
+    null,
+  ]) {
+    if (mutation) net.head.set(scope, mutation);
+    else net.head.delete(scope);
+    await cycles([a, b], 2);
+    expect(outbox(a).find((r) => r.scope === scope)?.state).toBe("ready");
+    expect(b.get()).toBeUndefined();
+    expect(net.puts.filter((p) => p.scope === scope)).toHaveLength(putCount);
+    expect(net.registrations.filter((s) => s === scope)).toHaveLength(1);
+  }
+  net.head.set(scope, authentic);
+  time += 3600000; // allow the bounded pending backoff to expire
+  await cycles([a, b], 3);
+  expect(outbox(a).find((r) => r.scope === scope)?.state).toBe("published");
+  expect(b.get()).toEqual(a.get());
+  expect(net.puts.filter((p) => p.scope === scope)).toHaveLength(putCount);
+});
+
+it("quarantines a finalized currentVersion 9 without rebase, PUT or import", async () => {
+  const net = network();
+  const a = device(net, { preexisting: "immutable" });
+  net.loseNextRegistrationResponse();
+  await a.cycle();
+  const scope = outbox(a)[0]!.scope;
+  net.chain.set(scope, { ...net.chain.get(scope)!, currentVersion: "9" });
+  const b = device(net);
+  const putCount = net.puts.filter((p) => p.scope === scope).length;
+  await cycles([a, b], 2);
   expect(outbox(a).find((r) => r.scope === scope)?.state).toBe("quarantined");
-  expect(net.puts).toHaveLength(putCount);
+  expect(inbox(b).find((r) => r.scope === scope)?.state).toBe("quarantined");
+  expect(b.get()).toBeUndefined();
+  expect(net.puts.filter((p) => p.scope === scope)).toHaveLength(putCount);
   expect(net.registrations.filter((s) => s === scope)).toHaveLength(1);
 });
 
-it("pending chain settlement is not publication, and deletion never resurrects a batch", async () => {
+it("pending chain settlement and Gateway deletion never trigger re-upload", async () => {
   const net = network();
   const a = device(net);
   net.beforePut((scope) => net.pending.add(scope));
   await a.cycle();
   expect(outbox(a).every((r) => r.state === "ready")).toBe(true);
   for (const scope of net.pending) {
-    net.chain.set(scope, net.history.get(scope)!);
+    net.chain.set(scope, net.chainRow(scope, net.head.get(scope)!));
   }
   net.pending.clear();
   await cycles([a], 1);
   expect(outbox(a).every((r) => r.state === "published")).toBe(true);
-  // A different pending batch whose remote head has been tombstoned is a terminal conflict.
+  // A Gateway-only tombstone can roll back; hold the durable batch pending.
   a.put("next");
   net.loseNextRegistrationResponse();
   await a.cycle();
@@ -486,9 +544,7 @@ it("pending chain settlement is not publication, and deletion never resurrects a
   net.head.set(next.scope, { ...net.head.get(next.scope)!, deleted: true });
   const n = net.puts.length;
   await cycles([a], 1);
-  expect(outbox(a).find((r) => r.scope === next.scope)?.state).toBe(
-    "quarantined",
-  );
+  expect(outbox(a).find((r) => r.scope === next.scope)?.state).toBe("ready");
   expect(net.puts).toHaveLength(n);
 });
 
@@ -566,7 +622,7 @@ it("keeps unknown declarations pending and refuses wrong owner/declaration bindi
   net.head.set(scope, { ...net.head.get(scope)!, owner: "other-owner" });
   await c.cycle();
   expect(c.get()).toBeUndefined();
-  expect(inbox(c).find((r) => r.scope === scope)?.state).toBe("quarantined");
+  expect(inbox(c).find((r) => r.scope === scope)?.state).toBe("ready");
 });
 
 it("is disabled by default and rejects a configured limit above the real storage cap", async () => {
@@ -752,24 +808,27 @@ it("does not acknowledge or apply a different batch reusing an imported writer s
   );
 });
 
-it("the gateway oracle enforces chain-backed continuity even when history is missing", async () => {
+it("the gateway oracle enforces chain-backed continuity even when the head is missing", async () => {
   const net = network();
   const scope = "pdpp_replica_v1.test.0";
-  net.chain.set(scope, {
-    owner,
+  net.chain.set(
     scope,
-    version: "1",
-    dataHash: "0xaa",
-    metadataHash: "0xbb",
-    deleted: false,
-  });
+    net.chainRow(scope, {
+      owner,
+      scope,
+      version: "1",
+      dataHash: `0x${"a".repeat(64)}`,
+      metadataHash: `0x${"b".repeat(64)}`,
+      deleted: false,
+    }),
+  );
   await expect(
     net.port.register({
       scope,
       plaintext: new Uint8Array(),
       encrypted: new Uint8Array(),
-      dataHash: "0xaa",
-      metadataHash: "0xbb",
+      dataHash: `0x${"a".repeat(64)}`,
+      metadataHash: `0x${"b".repeat(64)}`,
     }),
   ).rejects.toThrow();
   expect(net.head.has(scope)).toBe(false);
@@ -792,4 +851,48 @@ it("retries durable imports while owner discovery is unavailable", async () => {
   };
   await b.cycle().catch(() => undefined);
   expect(b.get()).toEqual(a.get());
+});
+
+it("holds version-1 soft deletion pending and imports after chain status reactivation", async () => {
+  const net = network();
+  const a = device(net, { preexisting: "retained" });
+  net.loseNextRegistrationResponse();
+  await a.cycle();
+  const scope = outbox(a)[0]!.scope;
+  net.chain.set(scope, { ...net.chain.get(scope)!, status: "Unavailable" });
+  expect(net.head.get(scope)?.deleted).toBe(false);
+  const putCount = net.puts.filter((p) => p.scope === scope).length;
+  const b = device(net);
+  await cycles([a, b], 2);
+  expect(outbox(a).find((r) => r.scope === scope)?.state).toBe("ready");
+  expect(inbox(b).find((r) => r.scope === scope)?.state).toBe("ready");
+  expect(b.get()).toBeUndefined();
+  expect(net.puts.filter((p) => p.scope === scope)).toHaveLength(putCount);
+  net.chain.set(scope, { ...net.chain.get(scope)!, status: "Active" });
+  await cycles([a, b], 3);
+  expect(outbox(a).find((r) => r.scope === scope)?.state).toBe("published");
+  expect(b.get()).toEqual(a.get());
+  expect(net.puts.filter((p) => p.scope === scope)).toHaveLength(putCount);
+});
+
+it("quarantines a finalized version-1 commitment mismatch including a tombstone pair", async () => {
+  for (const commitment of [
+    `0x${"f".repeat(64)}` as const,
+    replicaChainCommitment(
+      keccak256(stringToHex("vana.data-point.tombstone.v1")),
+      keccak256(stringToHex("vana.data-point.tombstone.metadata.v1")),
+    ),
+  ]) {
+    const net = network();
+    const a = device(net, { preexisting: "durable hash pair" });
+    net.loseNextRegistrationResponse();
+    await a.cycle();
+    const scope = outbox(a)[0]!.scope;
+    net.chain.set(scope, { ...net.chain.get(scope)!, commitment });
+    const putCount = net.puts.length;
+    await cycles([a], 2);
+    expect(outbox(a).find((r) => r.scope === scope)?.state).toBe("quarantined");
+    expect(net.puts).toHaveLength(putCount);
+    expect(net.registrations.filter((s) => s === scope)).toHaveLength(1);
+  }
 });

@@ -25,6 +25,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import {
   replicaRegistrationState,
+  replicaChainCommitment,
   type ReplicaTransportPort,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import type { ReplicationExport } from "./pdpp-replication-sqlite.js";
@@ -94,7 +95,7 @@ type Inbox = {
   next_attempt: number;
 };
 
-/** Internal experiment only. No bootstrap wiring; false by default, no production evidence adapter. */
+/** Internal experiment only. No bootstrap wiring; false by default, no runtime scheduling. */
 export function createReplicaTransportWorker(deps: {
   db: Database;
   enabled?: boolean;
@@ -373,6 +374,8 @@ export function createReplicaTransportWorker(deps: {
           retry("pdpp_transport_inbox", row, "registration not confirmed");
           continue;
         }
+        // Retain the exact head whose hash-pair preimage was verified against the chain.
+        const head = evidence.head!;
         const encrypted = await transport.get(row.scope);
         if (encrypted.length > cap)
           throw new Error("replica ciphertext exceeds storage cap");
@@ -382,13 +385,18 @@ export function createReplicaTransportWorker(deps: {
           row.scope,
           state().owner,
         );
+        const dataHash = keccak256(plaintext);
+        const metadataHash = replicaMetadataHash(
+          row.scope,
+          fragment.collectedAt,
+          encrypted.length,
+        );
+        // The chain is the authority even when the Gateway head matches the downloaded bytes.
         if (
-          keccak256(plaintext) !== evidence.head!.dataHash ||
-          replicaMetadataHash(
-            row.scope,
-            fragment.collectedAt,
-            encrypted.length,
-          ) !== evidence.head!.metadataHash
+          replicaChainCommitment(dataHash, metadataHash).toLowerCase() !==
+            evidence.chain!.commitment.toLowerCase() ||
+          dataHash !== head.dataHash ||
+          metadataHash !== head.metadataHash
         )
           throw new Error("replica commitment mismatch");
         db.prepare(

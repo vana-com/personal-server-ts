@@ -4,11 +4,24 @@ import {
   encryptWithPassword,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
-import { bytesToHex } from "viem";
+import {
+  bytesToHex,
+  encodeAbiParameters,
+  keccak256,
+  stringToHex,
+  type Hex,
+} from "viem";
 import type { StorageAdapter } from "../storage/adapters/interface.js";
 import type { DataPointFeedPort } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
 import type { PreparedFragment } from "./transport.js";
+
+const tombstoneDataHash = keccak256(
+  stringToHex("vana.data-point.tombstone.v1"),
+);
+const tombstoneMetadataHash = keccak256(
+  stringToHex("vana.data-point.tombstone.metadata.v1"),
+);
 
 export interface ReplicaCommitment {
   owner: string;
@@ -18,12 +31,33 @@ export interface ReplicaCommitment {
   metadataHash: string;
   deleted: boolean;
 }
-/** All three sources are mandatory. A denormalized GET head alone is insufficient. */
+/** DataRegistryV2 stores the hash-pair commitment, never its preimages. */
+export interface ReplicaFinalizedChainEvidence {
+  owner: string;
+  scope: string;
+  version: "1";
+  currentVersion: string;
+  status: "None" | "Active" | "Inactive" | "Unavailable";
+  commitment: Hex;
+  chainId: number;
+  registry: Hex;
+  blockNumber: bigint;
+  blockHash: Hex;
+  blockTimestamp: bigint;
+}
 export interface ReplicaRegistrationEvidence {
   head: ReplicaCommitment | null;
-  history: ReplicaCommitment | null;
-  chain: ReplicaCommitment | null;
+  /** null means unavailable, never authoritative absence. currentVersion=0 proves absence. */
+  chain: ReplicaFinalizedChainEvidence | null;
   pending: boolean;
+}
+export function replicaChainCommitment(dataHash: Hex, metadataHash: Hex): Hex {
+  return keccak256(
+    encodeAbiParameters(
+      [{ type: "bytes32" }, { type: "bytes32" }],
+      [dataHash, metadataHash],
+    ),
+  );
 }
 export interface ReplicaTransportPort {
   encrypt(scope: string, plaintext: Uint8Array): Promise<Uint8Array>;
@@ -45,7 +79,7 @@ export function createDpv2ReplicaTransport(deps: {
   gateway: Pick<GatewayClient, "registerDataPoint">;
   feed: DataPointFeedPort;
   signer: Pick<ServerSigner, "signAddData">;
-  /** Host verifies version history + finalized chain as well as the head, including absence.
+  /** Host verifies the current head against a pinned finalized DataRegistryV2 commitment.
    * SDK head-only lookup cannot implement this port. No production fallback is allowed. */
   evidence: (scope: string) => Promise<ReplicaRegistrationEvidence>;
 }): ReplicaTransportPort {
@@ -95,29 +129,56 @@ export function replicaRegistrationState(
     metadataHash?: string;
   },
 ): "absent" | "pending" | "confirmed" | "conflict" {
-  const rows = [evidence.head, evidence.history, evidence.chain];
-  const present = rows.filter((r): r is ReplicaCommitment => r !== null);
-  for (const row of present) {
-    if (
-      row.owner !== expected.owner ||
-      row.scope !== expected.scope ||
-      row.version !== "1" ||
-      row.deleted ||
-      (expected.dataHash !== undefined && row.dataHash !== expected.dataHash) ||
-      (expected.metadataHash !== undefined &&
-        row.metadataHash !== expected.metadataHash)
-    )
-      return "conflict";
-  }
+  const { head, chain } = evidence;
+  // Only facts from the requested finalized slot can permanently quarantine.
+  // A Gateway optimistic head can roll back; status can reactivate.
   if (
-    present.some(
-      (r) =>
-        r.dataHash !== present[0]!.dataHash ||
-        r.metadataHash !== present[0]!.metadataHash,
-    )
+    !chain ||
+    chain.owner.toLowerCase() !== expected.owner.toLowerCase() ||
+    chain.scope !== expected.scope ||
+    chain.version !== "1" ||
+    !/^(0|[1-9][0-9]*)$/.test(chain.currentVersion)
+  )
+    return "pending";
+  if (BigInt(chain.currentVersion) > 1n) return "conflict";
+  if (
+    chain.currentVersion === "1" &&
+    expected.dataHash !== undefined &&
+    expected.metadataHash !== undefined &&
+    replicaChainCommitment(
+      expected.dataHash as Hex,
+      expected.metadataHash as Hex,
+    ).toLowerCase() !== chain.commitment.toLowerCase()
   )
     return "conflict";
   if (evidence.pending) return "pending";
-  if (present.length === 0) return "absent";
-  return present.length === 3 ? "confirmed" : "conflict";
+  if (chain.currentVersion === "0") {
+    return !head &&
+      chain.status === "None" &&
+      /^0x0{64}$/i.test(chain.commitment)
+      ? "absent"
+      : "pending";
+  }
+  if (chain.status !== "Active" || !head) return "pending";
+  if (
+    head.owner.toLowerCase() !== expected.owner.toLowerCase() ||
+    head.scope !== expected.scope ||
+    head.version !== "1" ||
+    head.deleted ||
+    (head.dataHash.toLowerCase() === tombstoneDataHash &&
+      head.metadataHash.toLowerCase() === tombstoneMetadataHash) ||
+    !/^0x[0-9a-fA-F]{64}$/.test(head.dataHash) ||
+    !/^0x[0-9a-fA-F]{64}$/.test(head.metadataHash) ||
+    (expected.dataHash !== undefined &&
+      head.dataHash.toLowerCase() !== expected.dataHash.toLowerCase()) ||
+    (expected.metadataHash !== undefined &&
+      head.metadataHash.toLowerCase() !== expected.metadataHash.toLowerCase())
+  )
+    return "pending";
+  return replicaChainCommitment(
+    head.dataHash as Hex,
+    head.metadataHash as Hex,
+  ).toLowerCase() === chain.commitment.toLowerCase()
+    ? "confirmed"
+    : "pending";
 }
