@@ -33,7 +33,10 @@ import {
   type DeclarationSnapshot,
   type Grant,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
-import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import {
+  createStreamDeclarationRegistry,
+  type PdppReplicaReads,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { pdppAuthRoutes } from "../packages/server/src/routes/pdpp-auth.js";
 import { pdppRecordsRoutes } from "../packages/server/src/routes/pdpp-records.js";
 import { pdppWellKnownRoutes } from "../packages/server/src/routes/pdpp-well-known.js";
@@ -57,6 +60,7 @@ import {
 
 const logger = pino({ level: "silent" });
 const clientId = "replica-consent-acceptance";
+const expiryClientId = `${clientId}-expiry`;
 const redirect = "https://replica-app.invalid/callback";
 const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 export const window = {
@@ -111,7 +115,7 @@ export async function openConsentIssuer(
 ) {
   const store = openPdppAuthStore(join(root, "auth.sqlite"));
   const tokens = new PdppTokenService(store, {
-    accessTokenTtlSeconds: ttlSeconds,
+    accessTokenTtlSeconds: 600,
   });
   const ownerToken = (subjectId = owner) =>
     tokens.issueOwnerToken({ subjectId, sourceId, ttlSeconds: 3600 })
@@ -137,7 +141,14 @@ export async function openConsentIssuer(
           : null;
       },
       registeredClient: (id) =>
-        id === clientId ? { client_id: id, redirect_uris: [redirect] } : null,
+        [clientId, expiryClientId].includes(id)
+          ? { client_id: id, redirect_uris: [redirect] }
+          : null,
+      // Harness-only AS policy: one client exercises real short expiry in the same issuer/store.
+      grantExpiryFor: (_request, id) =>
+        id === expiryClientId
+          ? new Date(Date.now() + ttlSeconds * 1000).toISOString()
+          : undefined,
     }),
   );
   const httpServer = await listen(app);
@@ -156,7 +167,17 @@ export type ConsentIssuer = Awaited<ReturnType<typeof openConsentIssuer>>;
 /** Real RS routes over B's canonical SQLite store; no local grant/token database. */
 export async function openReplicaResourceServer(
   store: ReturnType<typeof createSqliteRecordStore>,
-  options: { owner: string; issuerOrigin: string; credential: string },
+  options: {
+    owner: string;
+    issuerOrigin: string;
+    credential: string;
+    fetch?: typeof fetch;
+    /**
+     * The host reader capability (`AppDeps.pdpp.reads`). A host with a
+     * receiver passes `receiver.readStore`; one without passes the store.
+     */
+    reads: PdppReplicaReads;
+  },
 ) {
   const auth = createReplicaAuthorizationService({
     ...options,
@@ -194,6 +215,7 @@ export async function openReplicaResourceServer(
       auth,
       declarations,
       ownerSubjectId: options.owner,
+      reads: options.reads,
     }),
   );
   app.route(
@@ -202,6 +224,7 @@ export async function openReplicaResourceServer(
       store,
       auth,
       declarations,
+      reads: options.reads,
       readBlobBytes: async (id) => {
         const bytes = store.getBlobBytes(id);
         return bytes ? new Uint8Array(bytes) : undefined;
@@ -261,10 +284,12 @@ function form(
 export async function approveNarrowConsent(
   issuer: ConsentIssuer,
   ownerCredential = issuer.credential,
+  options: { expiring?: boolean } = {},
 ) {
+  const selectedClient = options.expiring ? expiryClientId : clientId;
   const created = await json(
     await api(issuer.origin, "/authorize", ownerCredential, {
-      client_id: clientId,
+      client_id: selectedClient,
       redirect_uri: redirect,
       state: "replica-8b",
       code_challenge: computeS256Challenge(verifier),
@@ -346,7 +371,7 @@ export async function approveNarrowConsent(
     form(issuer.origin, "/token", {
       grant_type: "authorization_code",
       code,
-      client_id: clientId,
+      client_id: selectedClient,
       redirect_uri: redirect,
       code_verifier: verifier,
     });
@@ -451,11 +476,49 @@ export async function assertAppRead(
   assert.equal(bytes.length, blob.bytes);
   assert.equal(digest(bytes), blob.sha256);
 }
+export async function assertIssuerInactive(
+  issuer: ConsentIssuer,
+  token: string,
+) {
+  const health = await json(
+    await form(
+      issuer.origin,
+      "/introspect",
+      { token: issuer.credential },
+      issuer.credential,
+    ),
+    200,
+    "issuer credential health",
+  );
+  assert.equal(
+    health.active,
+    true,
+    "issuer authenticated credential remains active",
+  );
+  assert.equal(health.pdpp_token_kind, "owner");
+  const inactive = await json(
+    await form(issuer.origin, "/introspect", { token }, issuer.credential),
+    200,
+    "issuer inactive decision",
+  );
+  assert.equal(
+    inactive.active,
+    false,
+    "issuer explicitly rejects this app token",
+  );
+  return {
+    checkedAt: new Date().toISOString(),
+    issuerCredentialActive: true,
+    introspectionActive: false,
+  };
+}
 export async function assertTokenDenied(
   origin: string,
   token: string,
   blobId: string,
+  issuer: ConsentIssuer,
 ) {
+  const authority = await assertIssuerInactive(issuer, token);
   for (const path of [
     "/streams/messages/records",
     "/streams/messages/records/visible",
@@ -464,8 +527,9 @@ export async function assertTokenDenied(
     await json(
       await api(origin, path, token),
       401,
-      "inactive/foreign token read",
+      "issuer-inactive token read",
     );
+  return authority;
 }
 export async function revokeConsent(
   issuer: ConsentIssuer,
@@ -571,6 +635,24 @@ async function main() {
       }),
   );
   const [a, b] = devices;
+  const sourcePaths = [
+    "scripts/pdpp-replica-live-journey.ts",
+    "scripts/pdpp-replica-consent-live-journey.ts",
+    "packages/core/src/ports/pdpp-auth.ts",
+    "packages/core/dist/ports/pdpp-auth.js",
+    "packages/server/src/pdpp/replica-authorization.ts",
+    "packages/server/src/routes/pdpp-auth.ts",
+    "packages/server/src/routes/pdpp-records.ts",
+    "packages/server/src/routes/pdpp-blobs.ts",
+    "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+    "packages/server/src/storage/pdpp-replication-receiver.ts",
+    "packages/server/src/storage/pdpp-replication-transport.ts",
+  ];
+  const sourceHashes = () =>
+    Object.fromEntries(
+      sourcePaths.map((path) => [path, digest(readFileSync(path))]),
+    );
+  const initialSourceHashes = sourceHashes();
   const report: Record<string, unknown> = {
     run,
     owner,
@@ -589,6 +671,7 @@ async function main() {
       ["status", "--porcelain", "--", "packages", "scripts"],
       { encoding: "utf8" },
     ).trim(),
+    sourceHashes: initialSourceHashes,
     startedAt: new Date().toISOString(),
     gatewayUrl,
     storageUrl,
@@ -604,7 +687,11 @@ async function main() {
     writeFileSync(reportPath, JSON.stringify(report, null, 2) + "\n", {
       mode: 0o600,
     });
-  async function settle(label: string, predicate: (s: Snapshot) => boolean) {
+  async function settle(
+    label: string,
+    predicate: (s: Snapshot) => boolean,
+    inspect?: (s: Snapshot) => Promise<void>,
+  ) {
     const start = Date.now();
     while (Date.now() - start < 12 * 60_000) {
       for (const [index, device] of devices.entries()) {
@@ -648,6 +735,7 @@ async function main() {
           errors: receiving.inboxErrors,
         }),
       );
+      await inspect?.(receiving);
       if (predicate(receiving))
         return { elapsedMs: Date.now() - start, snapshot: receiving };
       await pause(5000);
@@ -739,12 +827,132 @@ async function main() {
       data: { ...data, collected_at: window.until },
     });
     await a.call("put", { id: "other-only", instance: "conn-other", data });
+    const pendingLabels = new Set<string>();
+    async function inspectPending(
+      label: string,
+      snapshot: Snapshot,
+      consent: ApprovedConsent,
+      pendingText: string,
+      current: typeof expected | undefined,
+    ) {
+      const row = snapshot.ownerRows.find(
+        (candidate) => candidate.recordKey === "visible",
+      );
+      if (
+        row?.confirmation !== "not yet confirmed" ||
+        row.data.text !== pendingText ||
+        pendingLabels.has(label)
+      )
+        return;
+      const appRow = snapshot.appRows.find(
+        (candidate) => candidate.recordKey === "visible",
+      );
+      assert.equal(
+        appRow?.data.text,
+        current?.text,
+        "shared grant read port excludes the pending edit",
+      );
+      const active = await json(
+        await form(
+          issuer.origin,
+          "/introspect",
+          { token: consent.token },
+          issuer.credential,
+        ),
+        200,
+        "pending-phase issuer decision",
+      );
+      assert.equal(active.active, true);
+      assert.equal(active.grant_id, consent.grantId);
+      const appControl = async () => {
+        if (current) await assertAppRead(origin, consent.token, current, blob);
+        else {
+          await json(
+            await api(
+              origin,
+              "/streams/messages/records/visible",
+              consent.token,
+            ),
+            404,
+            "pending record withheld",
+          );
+          const list = await json(
+            await api(origin, "/streams/messages/records", consent.token),
+            200,
+            "pending list",
+          );
+          assert.deepEqual(list.data, []);
+          await json(
+            await api(
+              origin,
+              `/blobs/${encodeURIComponent(blob.blobId)}`,
+              consent.token,
+            ),
+            404,
+            "pending blob withheld",
+          );
+        }
+        const changes = await json(
+          await api(
+            origin,
+            "/streams/messages/records?changes_since=",
+            consent.token,
+          ),
+          200,
+          "pending changes feed",
+        );
+        assert(
+          !(changes.data as { data?: { text?: string } }[]).some(
+            (record) => record.data?.text === pendingText,
+          ),
+          "pending text absent from actual app history",
+        );
+      };
+      await appControl();
+      const restarted = await restartB();
+      origin = restarted.origin;
+      const retained = await b.call("snapshot");
+      const retainedOwner = retained.ownerRows.find(
+        (candidate) => candidate.recordKey === "visible",
+      );
+      assert.equal(retainedOwner?.confirmation, "not yet confirmed");
+      assert.equal(retainedOwner?.data.text, pendingText);
+      await appControl();
+      pendingLabels.add(label);
+      cases.push({
+        case: label,
+        grantId: consent.grantId,
+        issuerActive: true,
+        ownerRow: row,
+        appCurrent: current ?? null,
+        afterRestartOwnerRow: retainedOwner,
+        restarted,
+        appPendingPayloadDenied: true,
+        appCurrentControlPassed: true,
+      });
+      save();
+    }
+    const initialGrant = await approveNarrowConsent(issuer);
     const replicated = await settle(
       "initial replication",
       (s) =>
         s.blobs[blob.blobId]?.sha256 === blob.sha256 &&
         !!s.records["other-only"],
+      (snapshot) =>
+        inspectPending(
+          "initial pending",
+          snapshot,
+          initialGrant,
+          data.text,
+          undefined,
+        ),
     );
+    assert(
+      pendingLabels.has("initial pending"),
+      "live run must observe owner pending before app confirmation",
+    );
+    await assertAppRead(origin, initialGrant.token, expected, blob);
+    await revokeConsent(issuer, initialGrant);
     cases.push({
       case: "initial replication",
       ...replicated,
@@ -758,9 +966,11 @@ async function main() {
       issuer,
       issuer.foreignCredential,
     );
-    await assertTokenDenied(origin, forbidden.token, blob.blobId);
+    await assertTokenDenied(origin, forbidden.token, blob.blobId, issuer);
     for (const phase of ["initial", "after replicated edit"]) {
+      const consent = await approveNarrowConsent(issuer);
       if (phase !== "initial") {
+        const previousExpected = { ...expected };
         data.text = "after replicated edit";
         expected.text = data.text;
         await a.call("put", {
@@ -770,6 +980,18 @@ async function main() {
         const edited = await settle(
           "replicated edit",
           (s) => (s.records.visible as { text?: string })?.text === data.text,
+          (snapshot) =>
+            inspectPending(
+              "edit pending under active grant",
+              snapshot,
+              consent,
+              data.text,
+              previousExpected,
+            ),
+        );
+        assert(
+          pendingLabels.has("edit pending under active grant"),
+          "live edit must be observed pending under the existing grant",
         );
         cases.push({
           case: "replicated edit",
@@ -781,7 +1003,6 @@ async function main() {
         });
         save();
       }
-      const consent = await approveNarrowConsent(issuer);
       await assertAppRead(origin, consent.token, expected, blob);
       const restarted = await restartB();
       origin = restarted.origin;
@@ -789,32 +1010,48 @@ async function main() {
       await consent.replayCode();
       await consent.replayApproval();
       await revokeConsent(issuer, consent);
-      await assertTokenDenied(origin, consent.token, blob.blobId);
+      const revokeDecision = await assertTokenDenied(
+        origin,
+        consent.token,
+        blob.blobId,
+        issuer,
+      );
       const afterRevoke = await restartB();
       origin = afterRevoke.origin;
-      await assertTokenDenied(origin, consent.token, blob.blobId);
+      await assertTokenDenied(origin, consent.token, blob.blobId, issuer);
       await consent.replayCode();
       await consent.replayApproval();
-      const expiring = await approveNarrowConsent(issuer);
+      const expiring = await approveNarrowConsent(issuer, issuer.credential, {
+        expiring: true,
+      });
       await assertAppRead(origin, expiring.token, expected, blob);
       const waitStarted = Date.now();
       await pause((expiring.ttlSeconds + 1) * 1000);
-      await assertTokenDenied(origin, expiring.token, blob.blobId);
+      const expiryDecision = await assertTokenDenied(
+        origin,
+        expiring.token,
+        blob.blobId,
+        issuer,
+      );
       const afterExpiry = await restartB();
       origin = afterExpiry.origin;
-      await assertTokenDenied(origin, expiring.token, blob.blobId);
+      await assertTokenDenied(origin, expiring.token, blob.blobId, issuer);
       await expiring.replayCode();
       await expiring.replayApproval();
       const fresh = await approveNarrowConsent(issuer);
       await assertAppRead(origin, fresh.token, expected, blob);
       await revokeConsent(issuer, fresh);
-      await assertTokenDenied(origin, forbidden.token, blob.blobId);
+      await assertTokenDenied(origin, forbidden.token, blob.blobId, issuer);
       cases.push({
         case: phase,
         restart: restarted,
         revokedRestart: afterRevoke,
         expiredRestart: afterExpiry,
         exactDigest: consent.reviewDigest,
+        grantId: consent.grantId,
+        activeGrantAcrossEdit: phase === "after replicated edit",
+        revokeDecision,
+        expiryDecision,
         staleDigestDenied: true,
         oldApprovalDenied: true,
         codeReplayDenied: true,
@@ -833,6 +1070,11 @@ async function main() {
       assert.equal(final.quarantines, 0);
       assert.deepEqual(final.inboxErrors, []);
     }
+    assert.deepEqual(
+      sourceHashes(),
+      initialSourceHashes,
+      "source and built auth seam stayed frozen during the live run",
+    );
     report.status = "passed";
   } catch (error) {
     report.status = "failed";

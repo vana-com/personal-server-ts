@@ -2,6 +2,7 @@ import { mkdtempSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
 import { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-records-sqlite-store.js";
@@ -17,6 +18,7 @@ import {
 } from "./pdpp-replica-consent-live-journey.js";
 import {
   Device,
+  binding,
   digest,
   pause,
   sourceId,
@@ -124,6 +126,7 @@ describe("single issuer harness through real HTTP AS/RS and SQLite", () => {
       owner: "ephemeral-test-owner",
       issuerOrigin: issuer.origin,
       credential: issuer.credential,
+      reads: () => f.store,
     });
     const reopen = async () => {
       await rs.close();
@@ -131,6 +134,7 @@ describe("single issuer harness through real HTTP AS/RS and SQLite", () => {
         owner: "ephemeral-test-owner",
         issuerOrigin: issuer.origin,
         credential: issuer.credential,
+        reads: () => f.store,
       });
     };
     try {
@@ -139,22 +143,24 @@ describe("single issuer harness through real HTTP AS/RS and SQLite", () => {
       await reopen();
       await assertAppRead(rs.origin, consent.token, f.expected, f.blob);
       await revokeConsent(issuer, consent);
-      await assertTokenDenied(rs.origin, consent.token, f.blob.blobId);
+      await assertTokenDenied(rs.origin, consent.token, f.blob.blobId, issuer);
       await reopen();
-      await assertTokenDenied(rs.origin, consent.token, f.blob.blobId);
+      await assertTokenDenied(rs.origin, consent.token, f.blob.blobId, issuer);
       await consent.replayApproval();
       await consent.replayCode();
       const foreign = await approveNarrowConsent(
         issuer,
         issuer.foreignCredential,
       );
-      await assertTokenDenied(rs.origin, foreign.token, f.blob.blobId);
-      const expiring = await approveNarrowConsent(issuer);
+      await assertTokenDenied(rs.origin, foreign.token, f.blob.blobId, issuer);
+      const expiring = await approveNarrowConsent(issuer, issuer.credential, {
+        expiring: true,
+      });
       await assertAppRead(rs.origin, expiring.token, f.expected, f.blob);
       await pause((expiring.ttlSeconds + 1) * 1000);
-      await assertTokenDenied(rs.origin, expiring.token, f.blob.blobId);
+      await assertTokenDenied(rs.origin, expiring.token, f.blob.blobId, issuer);
       await reopen();
-      await assertTokenDenied(rs.origin, expiring.token, f.blob.blobId);
+      await assertTokenDenied(rs.origin, expiring.token, f.blob.blobId, issuer);
       await expiring.replayApproval();
       await expiring.replayCode();
     } finally {
@@ -398,6 +404,7 @@ async function scenario(
     owner: "ephemeral-contract-owner",
     issuerOrigin: issuer.origin,
     credential: issuer.credential,
+    reads: () => f.store,
   });
   try {
     await run({ root, f, issuer, rs });
@@ -699,6 +706,200 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         );
     }));
 
+  it("#9/#21 one active AS grant sees the old current record while owner preview is pending, then the confirmed edit", async () =>
+    scenario(async ({ issuer, f }) => {
+      const owner = "ephemeral-contract-owner";
+      f.store.replication.beginBaseline({
+        owner,
+        declarations: [{ sourceId, binding }],
+      });
+      const receiver = createReplicaReceiver({
+        db: f.db,
+        store: f.store,
+        owner,
+        enabled: true,
+        authenticate: (credential) =>
+          credential === "test-host" ? owner : undefined,
+        declarations: () => [{ sourceId, binding, validateData: () => true }],
+      });
+      const rs = await openReplicaResourceServer(f.store, {
+        owner,
+        issuerOrigin: issuer.origin,
+        credential: issuer.credential,
+        reads: (reader) => receiver.readStore({ reader }),
+      });
+      try {
+        const consent = await approveNarrowConsent(issuer);
+        await assertAppRead(rs.origin, consent.token, f.expected, f.blob);
+        const bytes = new TextEncoder().encode(
+          "NEW_PENDING_BLOB_MUST_NOT_LEAK",
+        );
+        const id = `sha256:${digest(bytes)}`;
+        const descriptor = {
+          blobId: id,
+          sha256: id,
+          mimeType: "application/octet-stream",
+          sizeBytes: bytes.length,
+        };
+        const identity = {
+          owner,
+          sourceId,
+          connectionId: "conn",
+          methodId: "export",
+          generation: 1,
+        };
+        const data = {
+          id: "visible",
+          text: "new confirmed edit",
+          collected_at: f.expected.collected_at,
+          private_note: "NEW_PENDING_SECRET_MUST_NOT_LEAK",
+          blob_ref: {
+            blob_id: id,
+            mime_type: descriptor.mimeType,
+            size_bytes: bytes.length,
+          },
+        };
+        receiver.stage({
+          credential: "test-host",
+          id: "pending-edit",
+          blobs: [{ blobId: id, bytes }],
+          envelope: {
+            format: "vana-pdpp-replica",
+            version: 1,
+            owner,
+            batchId: "pending-edit",
+            operations: [
+              {
+                ...identity,
+                kind: "blob-claim",
+                blob: descriptor,
+                revision: {
+                  counter: 100,
+                  writerId: "peer",
+                  operationId: "new-claim",
+                },
+              },
+              {
+                ...identity,
+                kind: "upsert",
+                declaration: binding,
+                recordKey: "visible",
+                emittedAt: "2026-10-21T00:00:00Z",
+                data,
+                blobs: [descriptor],
+                revision: {
+                  counter: 101,
+                  writerId: "peer",
+                  operationId: "new-edit",
+                },
+              },
+            ],
+          },
+        });
+        const ownerRows = receiver.readVisibleRecords({
+          reader: "owner",
+          connectionId: "conn",
+          stream: "messages",
+        });
+        expect(
+          ownerRows.find((r) => r.recordKey === "visible")?.confirmation,
+        ).toBe("not yet confirmed"); // copy-assertion-ok: Required receiver confirmation state in returned data.
+        expect(
+          ownerRows.find((r) => r.recordKey === "visible")?.data.text,
+        ).toBe(data.text);
+        await assertAppRead(rs.origin, consent.token, f.expected, f.blob);
+        for (const path of [
+          "/streams/messages/records?changes_since=",
+          `/blobs/${encodeURIComponent(id)}`,
+        ]) {
+          const response = await request(rs.origin, path, consent.token);
+          await noDisclosure(response, path.includes("/blobs/") ? 404 : 200, [
+            "NEW_PENDING_SECRET_MUST_NOT_LEAK",
+            "new confirmed edit",
+            id,
+            "NEW_PENDING_BLOB_MUST_NOT_LEAK",
+          ]);
+        }
+        receiver.promote({ credential: "test-host", id: "pending-edit" });
+        await assertAppRead(
+          rs.origin,
+          consent.token,
+          {
+            text: data.text,
+            collected_at: data.collected_at,
+            blob_ref: data.blob_ref,
+          },
+          { blobId: id, sha256: digest(bytes), bytes: bytes.length },
+        );
+        expect(
+          receiver
+            .readVisibleRecords({
+              reader: "owner",
+              connectionId: "conn",
+              stream: "messages",
+            })
+            .find((r) => r.recordKey === "visible")?.confirmation,
+        ).toBeUndefined();
+        await noDisclosure(
+          await request(
+            rs.origin,
+            `/blobs/${encodeURIComponent(f.blob.blobId)}`,
+            consent.token,
+          ),
+          404,
+          ["replicated blob fixture"],
+        );
+      } finally {
+        await rs.close();
+      }
+    }));
+
+  it("denial evidence requires a healthy issuer and an explicit inactive decision", async () => {
+    const root = temporaryRoot();
+    const f = fixture(join(root, "records.sqlite"));
+    const issuer = await openConsentIssuer(root, "ephemeral-contract-owner", 2);
+    const rs = await openReplicaResourceServer(f.store, {
+      owner: "ephemeral-contract-owner",
+      issuerOrigin: issuer.origin,
+      credential: issuer.credential,
+      reads: () => f.store,
+    });
+    let closed = false;
+    try {
+      const consent = await approveNarrowConsent(issuer);
+      await expect(
+        assertTokenDenied(rs.origin, consent.token, f.blob.blobId, issuer),
+      ).rejects.toThrow("issuer explicitly rejects");
+      await revokeConsent(issuer, consent);
+      const receipt = await assertTokenDenied(
+        rs.origin,
+        consent.token,
+        f.blob.blobId,
+        issuer,
+      );
+      expect(receipt.issuerCredentialActive).toBe(true);
+      expect(receipt.introspectionActive).toBe(false);
+      await issuer.close();
+      closed = true;
+      await expect(
+        assertTokenDenied(rs.origin, consent.token, f.blob.blobId, issuer),
+      ).rejects.toThrow();
+      const unavailable = await request(
+        rs.origin,
+        "/streams/messages/records",
+        consent.token,
+      );
+      expect(unavailable.status).toBe(500);
+      expect(unavailable.headers.get("retry-after")).toBe("5");
+      await unavailable.body?.cancel();
+    } finally {
+      await rs.close();
+      if (!closed) await issuer.close();
+      f.db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("#10 rejects hidden-field operations and projects direct/list/change and metadata responses", async () =>
     scenario(async ({ issuer, rs, f }) => {
       const allowed = await mint(issuer, { fields: ["text"] });
@@ -814,7 +1015,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
       );
       try {
         const token = await mint(rogue);
-        await assertTokenDenied(rs.origin, token.token, f.blob.blobId);
+        await assertTokenDenied(rs.origin, token.token, f.blob.blobId, issuer);
         const good = await mint(issuer);
         await assertAppRead(rs.origin, good.token, f.expected, f.blob);
       } finally {
@@ -903,7 +1104,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
       });
       let armed = true;
       const ordering: string[] = [];
-      globalThis.fetch = async (input, init) => {
+      const decisionFetch: typeof fetch = async (input, init) => {
         if (String(input).endsWith("/introspect") && armed) {
           armed = false;
           ordering.push("read awaits issuer");
@@ -913,16 +1114,13 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         }
         return normalFetch(input, init);
       };
-      let rs: Awaited<ReturnType<typeof openReplicaResourceServer>>;
-      try {
-        rs = await openReplicaResourceServer(f.store, {
-          owner: "ephemeral-contract-owner",
-          issuerOrigin: issuer.origin,
-          credential: issuer.credential,
-        });
-      } finally {
-        globalThis.fetch = normalFetch;
-      }
+      const rs = await openReplicaResourceServer(f.store, {
+        owner: "ephemeral-contract-owner",
+        issuerOrigin: issuer.origin,
+        credential: issuer.credential,
+        reads: () => f.store,
+        fetch: decisionFetch,
+      });
       try {
         const pendingRead = request(
           rs.origin,
@@ -944,7 +1142,7 @@ describe("P0 adversarial public AS and app-read contracts", () => {
         ]);
       } finally {
         release();
-        await rs!.close();
+        await rs.close();
       }
     }));
 });
