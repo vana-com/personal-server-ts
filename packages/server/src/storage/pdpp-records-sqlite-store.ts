@@ -4,7 +4,6 @@ import {
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   decodeListCursor,
-  decodeSyncPageCursor,
   listSnapshotPage,
   LIST_ORDER_COLUMNS,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";

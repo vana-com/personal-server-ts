@@ -3,7 +3,6 @@ import {
   listSnapshotPage,
   compareRecordIdentity,
   decodeListCursor,
-  decodeSyncPageCursor,
 } from "./list-page.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { timeSortKey } from "../../pdpp/time.js";
