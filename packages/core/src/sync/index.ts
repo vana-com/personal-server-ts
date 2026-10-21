@@ -93,6 +93,7 @@ export {
 } from "../publication/publish.js";
 export {
   hasPdppOrigin,
+  inputHasPdppOrigin,
   isPdppProducer,
   PDPP_PRODUCERS,
   type PdppProducer,

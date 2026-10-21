@@ -92,7 +92,7 @@ import {
   extractLineageField,
   LINEAGE_KEY,
   prepareLineage,
-  type StoredLineage,
+  type PreparedLineage,
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import {
@@ -1572,7 +1572,7 @@ async function prepareWriteLineage(
   deps: PersonalServerDataApiDeps,
   scope: string,
   field: unknown,
-): Promise<StoredLineage | undefined> {
+): Promise<PreparedLineage | undefined> {
   if (field === undefined || field === null) return undefined;
   return prepareLineage({
     scope,
@@ -2442,11 +2442,12 @@ export async function handlePersonalServerDataRequest(
           );
           // A binary derivative names its sources inside the metadata
           // object; the validated mirror lands at the top of the record.
-          const lineage = await prepareWriteLineage(
+          const prepared = await prepareWriteLineage(
             deps,
             scopeResult.scope,
             extractLineageField(metadata),
           );
+          const lineage = prepared?.lineage;
           const result = await ingestBinaryDataContract({
             storage: deps.storage,
             scopeParam: scopeResult.scope,
@@ -2458,6 +2459,7 @@ export async function handlePersonalServerDataRequest(
             status,
             attribution: writeAuth?.attribution,
             lineage,
+            lineageInputsPdppOrigin: prepared?.inputsPdppOrigin,
             afterTombstoneVersion,
             precondition: parsedPrecondition,
           });
@@ -2496,11 +2498,12 @@ export async function handlePersonalServerDataRequest(
         if (provenance instanceof Response) return failWrite(provenance);
         // Derivative writes: validate the caller's `lineage` before anything
         // is stored (a failure here throws, releasing the builder's proof).
-        const lineage = await prepareWriteLineage(
+        const prepared = await prepareWriteLineage(
           deps,
           scopeResult.scope,
           extractLineageField(parsed.body),
         );
+        const lineage = prepared?.lineage;
         // DPv2 is scope-addressed and the gateway records no schemas, so JSON
         // ingest is schemaless too — no lookup, no schemaId/$schema stamped.
         const result = await ingestDataContract({
@@ -2511,6 +2514,7 @@ export async function handlePersonalServerDataRequest(
           status,
           attribution: writeAuth?.attribution,
           lineage,
+          lineageInputsPdppOrigin: prepared?.inputsPdppOrigin,
           afterTombstoneVersion,
           precondition: parsedPrecondition,
           producer: producerHeader.producer,

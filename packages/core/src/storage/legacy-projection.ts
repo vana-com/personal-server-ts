@@ -28,6 +28,7 @@ import {
 import type { DataStoragePort } from "../ports/index.js";
 import { ProtocolError } from "../errors/catalog.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
+import { inputHasPdppOrigin, isPdppProducer } from "../sync/pdpp-import.js";
 import type { IndexEntry } from "./index/types.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
 import { blockRepresentationMetadata } from "./blocks/representation.js";
@@ -242,6 +243,7 @@ export function withLegacyProjection(
         // The index row id changes when a version is deleted and written
         // again under the same collectedAt, so it identifies the content.
         version: entry ? `${entry.id}@${entry.collectedAt}` : null,
+        pdppOrigin: entry?.pdppOrigin === true,
       };
     });
     const key = JSON.stringify([
@@ -258,6 +260,7 @@ export function withLegacyProjection(
       scope,
       collectedAt,
       own,
+      requestedEntry,
       inputs,
       binding,
       profileKey,
@@ -295,7 +298,13 @@ export function withLegacyProjection(
     scope: string,
     collectedAt: string,
     own: DataFileEnvelope,
-    inputs: { stream: string; storedScope: string; collectedAt?: string }[],
+    requestedEntry: { pdppOrigin?: boolean } | undefined,
+    inputs: {
+      stream: string;
+      storedScope: string;
+      collectedAt?: string;
+      pdppOrigin: boolean;
+    }[],
     binding: LegacyScopeBinding,
     profileKey?: string,
   ): Promise<Projected | null> {
@@ -304,12 +313,17 @@ export function withLegacyProjection(
     // The projection time is the newest input version, so the same stored
     // data always projects to the same bytes.
     let now = collectedAt;
+    // The served view carries the provenance of EVERY input it joins, not of
+    // the requested version alone: a PDPP sibling joined into an unmarked
+    // scope makes the view PDPP-origin.
+    let viewPdppOrigin = inputHasPdppOrigin(requestedEntry, own);
     for (const input of inputs) {
       if (!input.collectedAt) continue;
       const envelope =
         input.storedScope === scope
           ? own
           : await raw.readEnvelope(input.storedScope, input.collectedAt);
+      viewPdppOrigin ||= inputHasPdppOrigin(input, envelope);
       if (classifyStoredBody(input.storedScope, envelope.data) === "legacy") {
         continue;
       }
@@ -366,7 +380,14 @@ export function withLegacyProjection(
     }
     // Server stamps signed the stored records, not this view, so they are
     // not carried over. `?view=stored` returns them with the stored body.
-    const envelope = { ...own, data: result.payload } as DataFileEnvelope;
+    const envelope = {
+      ...own,
+      data: result.payload,
+      ...(viewPdppOrigin &&
+      !isPdppProducer((own as { producer?: unknown }).producer)
+        ? { producer: "pdpp-projector" as const }
+        : {}),
+    } as DataFileEnvelope;
     return {
       envelope,
       bytes: textEncoder.encode(JSON.stringify(envelope)),
