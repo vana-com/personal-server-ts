@@ -746,3 +746,48 @@ describe("sqlite deterministic work per request", () => {
     expect(b).toBeLessThanOrEqual(a + 4 * 64 + 50);
   }, 180_000);
 });
+
+describe("sqlite sync scope with repeated instances", () => {
+  it("reads a repeated instance once, however often the request names it", () => {
+    const { store, work } = countingSqlite();
+    try {
+      for (const instance of ["inst_1", "inst_2"])
+        store.ingestBatch(
+          [
+            {
+              instance,
+              stream: "events",
+              key: `${instance}-k`,
+              data: { id: `${instance}-k`, v: "1" },
+              emitted_at: "2026-01-01T00:00:00Z",
+            },
+          ],
+          () => "mutable_state",
+          () => ["id"],
+        );
+      const sync = createPdppSyncSessionService(store, {
+        maxExaminedPerRequest: 1,
+      });
+      const perRequest: number[] = [];
+      work.statements = 0;
+      const { seen } = drain(
+        sync,
+        {
+          stream: "events",
+          owner: "owner-a",
+          instanceIds: ["inst_1", ...Array(10_000).fill("inst_2")],
+          limit: 100,
+          oneRecordPerKey: true,
+        } as never,
+        () => {
+          perRequest.push(work.statements);
+          work.statements = 0;
+        },
+      );
+      expect(seen).toHaveLength(2);
+      expect(Math.max(...perRequest)).toBeLessThanOrEqual(60);
+    } finally {
+      store.close();
+    }
+  });
+});
