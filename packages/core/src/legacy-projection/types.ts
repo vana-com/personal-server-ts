@@ -145,6 +145,12 @@ export interface ProjectPdppRecordsOptions {
  */
 export interface LegacyScopeBinding {
   /**
+   * Streams whose `blob_ref` is only a copy of the raw source envelope: the
+   * declared typed fields already carry the full record, so a reader neither
+   * fetches that blob nor treats it as projected content.
+   */
+  ancillaryBlobStreams?: string[];
+  /**
    * Per bound stream, the exact set of declared field names `project()`
    * reads off that stream's records. Checked by the self-check against the
    * vendored declaration's own `schema.properties` keys — deleting or
