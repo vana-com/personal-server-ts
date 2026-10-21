@@ -36,6 +36,13 @@ import { createGatewayDataPointFeed } from "../packages/core/src/sync/data-point
 import { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-records-sqlite-store.js";
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../packages/server/src/storage/pdpp-replication-transport.js";
+import {
+  assertCanonicalRecordsEqual,
+  CANONICAL_RECORD_COLUMNS,
+  canonicalRecordsEqual,
+  projectCanonicalRecords,
+  type CanonicalRecord,
+} from "./pdpp-replica-record-oracle.js";
 
 // This Linux harness samples /proc and must not persist keys in a crash dump.
 if (process.platform !== "linux")
@@ -103,6 +110,7 @@ type HostRequest = {
 };
 type Snapshot = {
   records: Record<string, unknown>;
+  canonicalRecords: CanonicalRecord[];
   blobs: Record<string, { sha256: string; bytes: number }>;
   published: number;
   importedFragments: number;
@@ -324,19 +332,23 @@ async function host() {
           n: number;
         }
       ).n;
+    const canonicalRecords = projectCanonicalRecords(
+      db
+        .prepare(
+          `SELECT ${CANONICAL_RECORD_COLUMNS.join(", ")} FROM pdpp_records ORDER BY instance, stream, record_key`,
+        )
+        .all() as Record<string, unknown>[],
+    );
     const records: Record<string, unknown> = {};
-    for (const row of db
-      .prepare("SELECT record_key, data FROM pdpp_records WHERE deleted=0")
-      .all() as { record_key: string; data: string }[])
-      records[row.record_key] = JSON.parse(row.data);
+    for (const row of canonicalRecords) {
+      if (row.deleted === 0) records[row.record_key] = JSON.parse(row.data!);
+    }
     const blobs: Snapshot["blobs"] = {};
-    for (const data of Object.values(records) as {
-      blob_ref?: { blob_id: string };
-    }[]) {
-      if (data.blob_ref) {
-        const bytes = store.getBlobBytes(data.blob_ref.blob_id);
+    for (const row of canonicalRecords) {
+      if (row.deleted === 0 && row.blob_id) {
+        const bytes = store.getBlobBytes(row.blob_id);
         if (bytes)
-          blobs[data.blob_ref.blob_id] = {
+          blobs[row.blob_id] = {
             sha256: digest(bytes),
             bytes: bytes.length,
           };
@@ -381,6 +393,7 @@ async function host() {
           .all() as { json: string }[]
       ).map((r) => JSON.parse(r.json)),
       records,
+      canonicalRecords,
       blobs,
       published: n("pdpp_transport_outbox", "WHERE state='published'"),
       importedFragments: n("pdpp_transport_inbox", "WHERE state='imported'"),
@@ -712,6 +725,13 @@ async function main() {
     }
     report.lastA = x;
     report.lastB = y;
+    try {
+      assertCanonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords);
+    } catch (error) {
+      throw new Error(
+        `Timed out: ${label}; ${error instanceof Error ? error.message : "canonical records differ"}`,
+      );
+    }
     throw new Error(`Timed out: ${label}`);
   }
   try {
@@ -790,9 +810,16 @@ async function main() {
       assert.notEqual(retained.pid, before.pid);
       assert.equal(retained.writer, before.writer);
       assert.deepEqual(retained.wire, before.wire);
+      assertCanonicalRecordsEqual(
+        before.canonicalRecords,
+        retained.canonicalRecords,
+      );
       const resumed = await settle(
         "exact PUT retry",
-        (x, y) => !!y.records.retry && x.pending === 0,
+        (x, y) =>
+          !!y.records.retry &&
+          canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
+          x.pending === 0,
       );
       const retried = resumed.A.puts.filter(
         (row) => row.scope === before.puts[0].scope,
@@ -801,6 +828,10 @@ async function main() {
       assert.equal(retried[0].sha256, before.puts[0].sha256);
       assert.equal(retried[0].attempts, 2);
       assert.deepEqual(resumed.A.records, resumed.B.records);
+      assertCanonicalRecordsEqual(
+        resumed.A.canonicalRecords,
+        resumed.B.canonicalRecords,
+      );
       cases.push({
         case: "exact-byte-put-retry",
         status: "passed",
@@ -823,11 +854,16 @@ async function main() {
       "A to B",
       (x, y) =>
         !!y.records.a &&
+        canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
         y.blobs[blob.blobId]?.sha256 === blob.sha256 &&
         x.pending === 0,
     );
     assert.equal(forward.A.journal, localA.journal);
     assert.deepEqual(forward.A.records, forward.B.records);
+    assertCanonicalRecordsEqual(
+      forward.A.canonicalRecords,
+      forward.B.canonicalRecords,
+    );
     assert.deepEqual(forward.A.blobs, forward.B.blobs);
     cases.push({ case: 1, status: "passed", ...forward, blob });
     save();
@@ -841,12 +877,17 @@ async function main() {
       "B to A",
       (x, y) =>
         !!x.records.b &&
+        canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
         x.blobs[reverseBlob.blobId]?.sha256 === reverseBlob.sha256 &&
         y.pending === 0,
     );
     assert.equal(reverse.A.journal, localA.journal);
     assert.equal(reverse.B.journal, localB.journal);
     assert.deepEqual(reverse.A.records, reverse.B.records);
+    assertCanonicalRecordsEqual(
+      reverse.A.canonicalRecords,
+      reverse.B.canonicalRecords,
+    );
     assert.deepEqual(reverse.A.blobs, reverse.B.blobs);
     cases.push({ case: 2, status: "passed", ...reverse, blob: reverseBlob });
     save();
@@ -902,6 +943,10 @@ async function main() {
       ),
     );
     assert.equal(partial.records.large, undefined);
+    assertCanonicalRecordsEqual(
+      reverse.B.canonicalRecords,
+      partial.canonicalRecords,
+    );
     await b.kill();
     await interrupted;
     b.checkpoint = undefined;
@@ -911,6 +956,10 @@ async function main() {
     assert.equal(retained.stagedFragments, partial.stagedFragments);
     assert.equal(retained.received, partial.received);
     assert.equal(retained.history, partial.history);
+    assertCanonicalRecordsEqual(
+      partial.canonicalRecords,
+      retained.canonicalRecords,
+    );
     await b.call("armImportKill", { id: "large" });
     const transactionPid = b.child.pid;
     const importKillDeadline = Date.now() + 12 * 60_000;
@@ -931,10 +980,20 @@ async function main() {
     assert.equal(rolledBack.received, partial.received);
     assert.equal(rolledBack.history, partial.history);
     assert.equal(rolledBack.importedBatches, partial.importedBatches);
+    assertCanonicalRecordsEqual(
+      partial.canonicalRecords,
+      rolledBack.canonicalRecords,
+    );
     const resumed = await settle(
       "restart large",
       (x, y) =>
-        y.blobs[large.blobId]?.sha256 === large.sha256 && x.pending === 0,
+        canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
+        y.blobs[large.blobId]?.sha256 === large.sha256 &&
+        x.pending === 0,
+    );
+    assertCanonicalRecordsEqual(
+      resumed.A.canonicalRecords,
+      resumed.B.canonicalRecords,
     );
     assert.deepEqual(resumed.A.records, resumed.B.records);
     assert.deepEqual(resumed.A.blobs, resumed.B.blobs);
@@ -958,6 +1017,10 @@ async function main() {
     const before = resumed.B;
     await b.call("cycle");
     const after = await b.call("snapshot");
+    assertCanonicalRecordsEqual(
+      before.canonicalRecords,
+      after.canonicalRecords,
+    );
     assert.equal(after.received, before.received);
     assert.equal(after.history, before.history);
     assert.equal(after.importedBatches, before.importedBatches);
@@ -1037,6 +1100,7 @@ async function main() {
       (x, y) =>
         receivedBoth(x, y) &&
         !!x.records.conflict &&
+        canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
         JSON.stringify(x.records.conflict) ===
           JSON.stringify(y.records.conflict) &&
         x.pending === 0 &&
@@ -1046,11 +1110,38 @@ async function main() {
     assert.equal(conflict.B.journal, offlineB.journal);
     assert.deepEqual(conflict.A.records.conflict, winner.data);
     assert.deepEqual(conflict.B.records.conflict, winner.data);
+    assertCanonicalRecordsEqual(
+      conflict.A.canonicalRecords,
+      conflict.B.canonicalRecords,
+    );
     await a.call("delete", { id: "conflict" });
     const deletion = await settle(
       "delete",
-      (x, y) => !x.records.conflict && !y.records.conflict && x.pending === 0,
+      (x, y) =>
+        !x.records.conflict &&
+        !y.records.conflict &&
+        canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
+        x.pending === 0,
     );
+    assertCanonicalRecordsEqual(
+      deletion.A.canonicalRecords,
+      deletion.B.canonicalRecords,
+    );
+    for (const rows of [
+      deletion.A.canonicalRecords,
+      deletion.B.canonicalRecords,
+    ]) {
+      assert.equal(
+        rows.find(
+          (row) =>
+            row.instance === "conn" &&
+            row.stream === "messages" &&
+            row.record_key === "conflict",
+        )?.deleted,
+        1,
+        "Deletion checkpoint must retain the canonical tombstone",
+      );
+    }
     await b.call("reset");
     const reset = await settle(
       "reset",
@@ -1059,18 +1150,36 @@ async function main() {
         y.generation === 2 &&
         Object.keys(x.records).length === 0 &&
         Object.keys(y.records).length === 0 &&
+        canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
         y.pending === 0,
     );
     await a.call("cycle");
     await b.call("cycle");
-    assert.deepEqual((await a.call("snapshot")).records, {});
-    assert.deepEqual((await b.call("snapshot")).records, {});
+    const resetA = await a.call<Snapshot>("snapshot");
+    const resetB = await b.call<Snapshot>("snapshot");
+    assert.deepEqual(resetA.records, {});
+    assert.deepEqual(resetB.records, {});
+    assertCanonicalRecordsEqual(
+      resetA.canonicalRecords,
+      resetB.canonicalRecords,
+    );
+    assert.deepEqual(resetA.canonicalRecords, []);
+    assert.deepEqual(resetB.canonicalRecords, []);
     await a.call("put", { id: "generation2", text: "after reset" });
     const generation2 = await settle(
       "generation 2",
-      (x, y) => !!y.records.generation2 && x.pending === 0,
+      (x, y) =>
+        x.generation === 2 &&
+        y.generation === 2 &&
+        !!y.records.generation2 &&
+        canonicalRecordsEqual(x.canonicalRecords, y.canonicalRecords) &&
+        x.pending === 0,
     );
     assert.deepEqual(generation2.A.records, generation2.B.records);
+    assertCanonicalRecordsEqual(
+      generation2.A.canonicalRecords,
+      generation2.B.canonicalRecords,
+    );
     assert.deepEqual(Object.keys(generation2.A.records), ["generation2"]);
     cases.push({
       case: 5,
@@ -1125,6 +1234,46 @@ async function main() {
       A: a.peakRssKiB,
       B: b.peakRssKiB,
     };
+    const scopes = new Set<string>();
+    let cleanupErrors = 0;
+    for (const device of devices) {
+      try {
+        const snapshot = await device.call<Snapshot>("snapshot");
+        for (const row of snapshot.puts) scopes.add(row.scope);
+      } catch {
+        cleanupErrors++;
+      }
+    }
+    try {
+      const storage = createVanaSyncStorageAdapter({
+        config,
+        serverOwner: owner,
+        serverAccount: serverAccount(a.init.serverKey),
+      });
+      let deleted = 0;
+      for (const scope of scopes) {
+        try {
+          if (await storage.delete(storage.urlForKey(`${scope}/1`))) deleted++;
+        } catch {
+          cleanupErrors++;
+        }
+      }
+      report.remoteBlobCleanup = {
+        attempted: scopes.size,
+        deleted,
+        errors: cleanupErrors,
+      };
+    } catch {
+      report.remoteBlobCleanup = {
+        attempted: scopes.size,
+        deleted: 0,
+        errors: cleanupErrors + 1,
+      };
+    }
+    if (cleanupErrors > 0) {
+      report.status = "failed";
+      report.cleanupErrorCount = cleanupErrors;
+    }
     for (const device of devices) await device.kill();
     save();
     rmSync(root, { recursive: true, force: true });
