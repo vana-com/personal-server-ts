@@ -682,6 +682,8 @@ export async function createServer(
           derivativeScheduler.markSourceChanged(event.scope, {
             lineageSources: event.lineageSources,
           }),
+        // Read when a question computes, after the PDPP surface is resolved.
+        pdppEnabled: () => pdppAuth !== undefined,
         storage: dataStorage,
         store: questionStore,
         provider: inferenceProvider,

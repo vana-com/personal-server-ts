@@ -40,7 +40,7 @@ import {
   createBodyLimit,
   DATA_INGEST_MAX_SIZE,
 } from "../middleware/body-limit.js";
-import type { WriterExposurePolicy } from "@opendatalabs/personal-server-ts-core/grants";
+import type { PdppEnabled } from "@opendatalabs/personal-server-ts-core/policy";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createServerApiAuth } from "../api-auth.js";
@@ -144,8 +144,8 @@ export interface DataRouteDeps {
    * and the same delegate the sync download worker is given at boot.
    */
   pdppImporter?: PdppImporter;
-  /** See `PersonalServerDataApiDeps.writerExposure`. */
-  writerExposure?: WriterExposurePolicy;
+  /** See `PersonalServerDataApiDeps.pdppEnabled`. */
+  pdppEnabled?: PdppEnabled;
   mountPath?: PersonalServerApiDispatchOptions["basePath"];
 }
 
@@ -379,7 +379,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         gatewayUrl: deps.gatewayUrl,
         paymentEnabled: deps.paymentEnabled,
         lineageGateway: deps.lineageGateway,
-        writerExposure: deps.writerExposure,
+        pdppEnabled: deps.pdppEnabled,
         onDataWritten: deps.onDataWritten,
         onDataRead: deps.onDataRead,
         pdppImporter: deps.pdppImporter,

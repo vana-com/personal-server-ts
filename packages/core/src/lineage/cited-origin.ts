@@ -10,9 +10,9 @@ import { inputHasPdppOrigin } from "../sync/pdpp-import.js";
  *
  * This checks a CLAIM, not what the writer consumed: it cannot see inputs the
  * writer left uncited, or an older version it read before a newer one was
- * published. It is a second gate for a writer the server has already shown to
- * be unexposed to PDPP (see `writerHasPdppExposure`); only server compute
- * knows its real inputs.
+ * published. It is only used where no PDPP data can exist (a PDPP-disabled
+ * server, see `nonOwnerPublicationIsPdpp`) and for the owner's own derivatives;
+ * only server compute knows its real inputs.
  */
 export async function citedSourcesHavePdppOrigin(
   storage: Pick<DataStoragePort, "findEntry" | "readEnvelope">,

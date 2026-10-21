@@ -347,6 +347,44 @@ describe("computeQuestion", () => {
     expect(entry?.pdppOrigin).toBeFalsy();
   });
 
+  it("publishes a builder-registered question as PDPP-origin unless the server has no PDPP surface", async () => {
+    const ports = policyPorts([
+      "write:coach.weekly",
+      "oura.sleep",
+      "chatgpt.conversations",
+    ]);
+    const stampFor = async (pdppEnabled: boolean | undefined) => {
+      const d = deps({
+        store: createInMemoryQuestionStore({
+          initial: [builderRegistration()],
+        }),
+        writePolicyPorts: ports,
+        ...(pdppEnabled === undefined ? {} : { pdppEnabled }),
+      });
+      await seed(d.storage, "oura.sleep", { score: 80 });
+      await seed(d.storage, "chatgpt.conversations", { items: [] });
+      expect((await computeQuestion("q-1", d)).status).toBe("ready");
+      return d.storage.findEntry({ scope: "coach.weekly" });
+    };
+    // Legacy-only sources, builder question text: still PDPP when enabled or unknown.
+    expect(await stampFor(true)).toMatchObject({
+      producer: "pdpp-derivative",
+      pdppOrigin: true,
+    });
+    expect(await stampFor(undefined)).toMatchObject({ pdppOrigin: true });
+    expect((await stampFor(false))?.pdppOrigin).toBeFalsy();
+  });
+
+  it("keeps owner compute over legacy sources legacy even on a PDPP-enabled server", async () => {
+    const d = deps({ pdppEnabled: true });
+    await seed(d.storage, "oura.sleep", { score: 80 });
+    await seed(d.storage, "chatgpt.conversations", { items: [] });
+    expect((await computeQuestion("q-1", d)).status).toBe("ready");
+    expect(d.storage.findEntry({ scope: "coach.weekly" })?.pdppOrigin).toBe(
+      false,
+    );
+  });
+
   it("fails closed for a builder question when no grant verifier is wired", async () => {
     const d = deps({
       store: createInMemoryQuestionStore({ initial: [builderRegistration()] }),

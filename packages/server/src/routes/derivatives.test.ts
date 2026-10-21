@@ -100,6 +100,8 @@ describe("/v1/derivatives/questions (composed app)", () => {
   let scheduler: RecomputeScheduler;
   let writeSessionStore: WriteSessionStore;
   let baseDeps: AppDeps;
+  // Whether the compute sees a PDPP surface; the app side follows baseDeps.pdpp.
+  let pdppOn = false;
 
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "derivatives-route-test-"));
@@ -118,6 +120,7 @@ describe("/v1/derivatives/questions (composed app)", () => {
       debounceMs: 0,
       compute: (questionId) =>
         computeQuestion(questionId, {
+          pdppEnabled: () => pdppOn,
           storage: dataStorage,
           store,
           provider,
@@ -128,6 +131,7 @@ describe("/v1/derivatives/questions (composed app)", () => {
           },
         }),
     });
+    pdppOn = false;
     writeSessionStore = createInMemoryWriteSessionStore();
     await writeSessionStore.create({
       tokenHash: await hashWriteSessionToken(SESSION_TOKEN),
@@ -657,6 +661,126 @@ describe("/v1/derivatives/questions (composed app)", () => {
       const readApp = readerApp();
       const res = await readerStatus(readApp, "coach.weekly");
       expect(res.status).toBe(404);
+    });
+  });
+
+  describe("non-owner publication on a PDPP-enabled server", () => {
+    async function enablePdpp() {
+      const { createMemoryRecordStore, createStreamDeclarationRegistry } =
+        await import("@opendatalabs/personal-server-ts-core/storage/pdpp-records");
+      const { createFixtureAuthorizationService } =
+        await import("@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils");
+      const { createSqliteRecordStore } =
+        await import("../storage/pdpp-records-sqlite-store.js");
+      const pdppDb = initializeDatabase(":memory:");
+      baseDeps.pdpp = {
+        store: createMemoryRecordStore(),
+        bindingStore: createSqliteRecordStore(pdppDb),
+        configuredMethods: new Map(),
+        auth: createFixtureAuthorizationService({}),
+        declarations: createStreamDeclarationRegistry([]),
+        resource: SERVER_ORIGIN,
+      };
+      pdppOn = true;
+      app = createApp(baseDeps);
+      return pdppDb;
+    }
+    async function thirdPartyRead(scope: string, third = createTestWallet(2)) {
+      const thirdGateway = createMockGateway(["coach.*"]);
+      vi.mocked(thirdGateway.getBuilder).mockResolvedValue({
+        id: BUILDER_ID,
+        ownerAddress: ownerWallet.address,
+        granteeAddress: third.address,
+        publicKey: "0x04",
+        appUrl: "https://reader.test",
+        addedAt: new Date().toISOString(),
+      });
+      const thirdApp = createApp({ ...baseDeps, gateway: thirdGateway });
+      return thirdApp.request(`/v1/data/${scope}`, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: third,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: `/v1/data/${scope}`,
+            grantId: WRITE_GRANT_ID,
+          }),
+        },
+      });
+    }
+    const MARKER = "round5-question-only-marker";
+
+    it("a builder-registered question naming only legacy sources is PDPP-origin", async () => {
+      const pdppDb = await enablePdpp();
+      try {
+        expect((await ownerIngest("oura.sleep", { score: 7 })).status).toBe(
+          201,
+        );
+        const registered = await builderRequest(
+          "POST",
+          "/v1/derivatives/questions",
+          { ...question, question: "Explain " + MARKER },
+        );
+        expect(registered.status).toBe(201);
+        await scheduler.whenIdle();
+        const output = await (
+          await app.request("/v1/data/coach.weekly", { headers: owner })
+        ).json();
+        expect(output.data.question).toContain(MARKER);
+        expect(output.producer).toBe("pdpp-derivative");
+        const read = await thirdPartyRead("coach.weekly");
+        const text = await read.text();
+        expect(read.status, text).toBe(403);
+        expect(text).not.toContain(MARKER);
+        // Not even the registering builder: the answer is computed with owner
+        // authority over the owner's data, so it is new information to it.
+        const registrant = await thirdPartyRead("coach.weekly", builderWallet);
+        expect(registrant.status, await registrant.text()).toBe(403);
+      } finally {
+        pdppDb.close();
+      }
+    });
+
+    it("a third party cannot read a direct write; the writing app can read it back", async () => {
+      const pdppDb = await enablePdpp();
+      try {
+        const direct = await builderRequest("POST", "/v1/data/coach.direct", {
+          value: MARKER,
+        });
+        expect(direct.status).toBe(201);
+        const read = await thirdPartyRead("coach.direct");
+        const text = await read.text();
+        expect(read.status, text).toBe(403);
+        expect(text).not.toContain(MARKER);
+        const own = await thirdPartyRead("coach.direct", builderWallet);
+        expect(own.status, await own.text()).toBe(200);
+      } finally {
+        pdppDb.close();
+      }
+    });
+
+    it("positive control: a PDPP-disabled server keeps legacy behaviour for builder compute and writes", async () => {
+      expect((await ownerIngest("oura.sleep", { score: 7 })).status).toBe(201);
+      expect(
+        (
+          await builderRequest("POST", "/v1/derivatives/questions", {
+            ...question,
+            question: "Explain " + MARKER,
+          })
+        ).status,
+      ).toBe(201);
+      await scheduler.whenIdle();
+      const compute = await thirdPartyRead("coach.weekly");
+      expect(compute.status, await compute.text()).toBe(200);
+      expect(
+        (
+          await builderRequest("POST", "/v1/data/coach.direct", {
+            value: MARKER,
+          })
+        ).status,
+      ).toBe(201);
+      const direct = await thirdPartyRead("coach.direct");
+      expect(direct.status, await direct.text()).toBe(200);
     });
   });
 });

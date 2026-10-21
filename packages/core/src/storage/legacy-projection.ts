@@ -28,6 +28,7 @@ import {
 import type { DataStoragePort } from "../ports/index.js";
 import { ProtocolError } from "../errors/catalog.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
+import type { LegacyReader } from "../policy/legacy-disclosure.js";
 import { inputHasPdppOrigin, isPdppProducer } from "../sync/pdpp-import.js";
 import type { IndexEntry } from "./index/types.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
@@ -509,14 +510,29 @@ export function withLegacyProjection(
   // A non-owner's view projects from the guarded raw port, so the requested
   // version and every joined sibling version are authorized on their bytes.
   // Built once per served port, so it keeps its own projection caches.
-  let granteeView: DataStoragePort | undefined;
+  // One view per reader identity (the own-write exception depends on who
+  // reads); a few at most.
+  const granteeViews = new Map<string, DataStoragePort>();
   (overrides as Record<symbol, unknown>)[GRANTEE_VIEW] = isGuarded(raw)
     ? () => served
-    : () =>
-        (granteeView ??= withLegacyProjection(
-          withDisclosurePolicy(raw),
-          options,
-        ));
+    : (reader: LegacyReader) => {
+        const key =
+          typeof reader === "object"
+            ? `builder:${reader.builder.toLowerCase()}`
+            : "grantee";
+        let view = granteeViews.get(key);
+        if (!view) {
+          if (granteeViews.size >= 16) {
+            granteeViews.delete(granteeViews.keys().next().value!);
+          }
+          view = withLegacyProjection(
+            withDisclosurePolicy(raw, reader),
+            options,
+          );
+          granteeViews.set(key, view);
+        }
+        return view;
+      };
   return served;
 }
 
