@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
@@ -9,11 +10,25 @@ import { createIndexManager } from "./index-manager.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
-import {
-  buildDataFilePath,
-  envelopeGeneration,
-} from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataBlocks } from "@opendatalabs/personal-server-ts-core/storage/blocks/build";
+
+/**
+ * An oracle for a generation that does not use the code under test:
+ * SHA-256 (node:crypto) of the JSON value with object keys sorted.
+ */
+function oracleGeneration(value: unknown): string {
+  const sorted = JSON.stringify(value, (_key, item: unknown) =>
+    item !== null && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.entries(item as Record<string, unknown>).sort(([a], [b]) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          ),
+        )
+      : item,
+  );
+  return createHash("sha256").update(sorted).digest("hex");
+}
 
 describe("owner import deletion ordering", () => {
   it("preserves a new import accepted after scope retirement committed", async () => {
@@ -609,7 +624,7 @@ describe("immutable PDPP version provenance", () => {
         scope: legacy.scope,
         version: legacy.version,
       };
-      expect(inserted.generation).toBe(envelopeGeneration(reordered));
+      expect(inserted.generation).toBe(oracleGeneration(reordered));
       expect(index.findByPath(written.relativePath)?.generation).toBe(
         inserted.generation,
       );
@@ -630,7 +645,7 @@ describe("immutable PDPP version provenance", () => {
         generation: "caller-value",
       });
       expect(storage.findEntry({ scope: committed.scope })?.generation).toBe(
-        envelopeGeneration(committed),
+        oracleGeneration(committed),
       );
     } finally {
       await close();

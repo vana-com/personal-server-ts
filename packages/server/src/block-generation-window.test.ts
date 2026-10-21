@@ -7,7 +7,9 @@
  * file-read hook is the only fake. A live chain grant must never receive the
  * PDPP bytes, and the owner must still read an old sidecar.
  */
+import { createHash } from "node:crypto";
 import type * as FsPromises from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
 import { readFile as readFileOriginal, writeFile } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -28,6 +30,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { createTestWallet } from "@opendatalabs/personal-server-ts-core/test-utils";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import { initializeDatabase } from "./storage/index-schema.js";
@@ -263,6 +266,35 @@ function mcpReadScope(scope: string) {
   return mcpTool("read_scope", { scope });
 }
 
+/**
+ * An oracle for a generation that does not use the code under test:
+ * SHA-256 (node:crypto) of the JSON value with object keys sorted.
+ */
+function oracleGeneration(value: unknown): string {
+  const sorted = JSON.stringify(value, (_key, item: unknown) =>
+    item !== null && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.entries(item as Record<string, unknown>).sort(([a], [b]) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          ),
+        )
+      : item,
+  );
+  return createHash("sha256").update(sorted).digest("hex");
+}
+
+/** The structured result of an MCP tool call, or its error text. */
+function structured(text: string): Record<string, unknown> {
+  const parsed = JSON.parse(text) as {
+    result?: { structuredContent?: Record<string, unknown> };
+  };
+  return parsed.result?.structuredContent ?? {};
+}
+
+function dataFile(scope: string): string {
+  return buildDataFilePath(dataDir, scope, AT);
+}
+
 function manifestFile(scope: string): string {
   return join(dataDir, "blocks", ...scope.split("."), AT, "manifest.json");
 }
@@ -317,9 +349,10 @@ describe("a non-owner block read is pinned to the version it authorized", () => 
     const text = await call();
     expect(fired).toBe(true);
     expect(text).not.toContain(SECRET);
-    // The row had no generation, so the read decided on one full read of the
-    // envelope, which now holds the legacy bytes it then served.
-    expect(text).toContain("legacy-row");
+    // The row had no generation, so the read backfilled it from the PDPP
+    // bytes it authorized; the legacy bytes now at the path are another
+    // version, and the read is refused.
+    expect(text).toContain("generation_mismatch");
   });
 
   it("refuses an old sidecar's fallback when the version changed after authorization", async () => {
@@ -393,7 +426,10 @@ describe("a non-owner block read is pinned to the version it authorized", () => 
     const repaired = JSON.parse(
       await readFileOriginal(manifestFile("oura.raw"), "utf8"),
     );
-    expect(repaired.envelopeDigest).toBe(entry.generation);
+    expect(repaired.envelopeDigest).toBe(
+      oracleGeneration(legacyEnvelope("oura.raw")),
+    );
+    expect(entry.generation).toBe(repaired.envelopeDigest);
     expect(await call()).toContain("legacy-row");
   });
 
@@ -418,5 +454,160 @@ describe("a non-owner block read is pinned to the version it authorized", () => 
       maxBytes: 65_536,
     });
     expect(JSON.stringify(result.blocks)).toContain(SECRET);
+  });
+});
+
+describe("one logical read keeps the version it started on", () => {
+  it("refuses a cursor resumed on another legacy version at the same collectedAt", async () => {
+    await put(legacyEnvelope("oura.activity"));
+    const first = structured(
+      await (
+        await mcpTool("read_scope", { scope: "oura.activity", maxBytes: 83 })
+      )(),
+    );
+    const cursor = (first.page as { nextCursor?: string }).nextCursor;
+    expect(cursor).toBeTruthy();
+    await replaceAt({
+      ...legacyEnvelope("oura.activity"),
+      data: { id: "different-legacy-version" },
+    } as DataFileEnvelope);
+    const resumed = await (
+      await mcpTool("read_scope", { scope: "oura.activity", cursor })
+    )();
+    expect(resumed).not.toContain("different-legacy-version");
+    expect(resumed).toContain("VERSION_CHANGED");
+  });
+
+  it("refuses a selection by a table of contents' ids once its version was replaced", async () => {
+    await put(legacyEnvelope("oura.activity"));
+    const toc = structured(
+      await (
+        await mcpTool("list_scope_blocks", { scope: "oura.activity" })
+      )(),
+    );
+    const versionCursor = toc.versionCursor as string;
+    expect(versionCursor).toBeTruthy();
+    // Control: the selection reads the version the table listed.
+    const same = await (
+      await mcpTool("read_scope", {
+        scope: "oura.activity",
+        blockIds: ["block-000002"],
+        cursor: versionCursor,
+      })
+    )();
+    expect(same).toContain("legacy-row");
+    await replaceAt({
+      ...legacyEnvelope("oura.activity"),
+      data: { id: "different-legacy-version" },
+    } as DataFileEnvelope);
+    const selected = await (
+      await mcpTool("read_scope", {
+        scope: "oura.activity",
+        blockIds: ["block-000002"],
+        cursor: versionCursor,
+      })
+    )();
+    expect(selected).not.toContain("different-legacy-version");
+    expect(selected).toContain("VERSION_CHANGED");
+  });
+
+  it("backfills a pre-v16 row once, then pages it without reading the envelope again", async () => {
+    const scope = "oura.raw";
+    const envelope = {
+      ...legacyEnvelope(scope),
+      data: {
+        rows: Array.from({ length: 64 }, (_, id) => ({
+          id,
+          text: "x".repeat(200),
+        })),
+      },
+    } as DataFileEnvelope;
+    await put(envelope, true);
+    expect(storage.findEntry({ scope })?.generation).toBeUndefined();
+    const read = await mcpTool("read_scope", { scope, maxBytes: 4096 });
+    let envelopeReads = 0;
+    race.afterRead = async (path) => {
+      if (path === dataFile(scope)) envelopeReads += 1;
+    };
+    let page = structured(await read());
+    expect(storage.findEntry({ scope })?.generation).toBe(
+      oracleGeneration(envelope),
+    );
+    // The first page read the bytes: to backfill (twice) and to serve.
+    expect(envelopeReads).toBeGreaterThan(0);
+    envelopeReads = 0;
+    let pages = 1;
+    while ((page.page as { nextCursor?: string }).nextCursor) {
+      const next = await mcpTool("read_scope", {
+        scope,
+        maxBytes: 4096,
+        cursor: (page.page as { nextCursor: string }).nextCursor,
+      });
+      page = structured(await next());
+      pages += 1;
+    }
+    expect(pages).toBeGreaterThan(2);
+    expect(envelopeReads).toBe(0);
+  });
+});
+
+describe("storage derives identity once, from what it publishes", () => {
+  it("commitEnvelope records the generation of the bytes it staged, even if its caller mutates its object", async () => {
+    const envelope = legacyEnvelope("oura.activity");
+    const originalOpen = fsPromises.open;
+    let fired = false;
+    const spy = vi
+      .spyOn(fsPromises, "open")
+      .mockImplementation(async (...args: Parameters<typeof originalOpen>) => {
+        const handle = await originalOpen(...args);
+        if (String(args[0]).includes(".pending.")) {
+          const write = handle.writeFile.bind(handle);
+          handle.writeFile = async (
+            ...writeArgs: Parameters<typeof handle.writeFile>
+          ) => {
+            await write(...writeArgs);
+            fired = true;
+            envelope.data = { id: "mutated-after-stage" };
+          };
+        }
+        return handle;
+      });
+    try {
+      const committed = await storage.commitEnvelope!(envelope, {
+        fileId: null,
+        scope: envelope.scope,
+        collectedAt: AT,
+      });
+      expect(committed.ok).toBe(true);
+      expect(fired).toBe(true);
+      const published = JSON.parse(
+        await readFileOriginal(dataFile(envelope.scope), "utf8"),
+      );
+      expect(published.data).toEqual({ id: "legacy-row" });
+      expect(storage.findEntry({ scope: envelope.scope })?.generation).toBe(
+        oracleGeneration(published),
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a replica commit ignores a generation in the caller's metadata", async () => {
+    const envelope = legacyEnvelope("oura.activity");
+    const result = await storage.commitVersion!({
+      kind: "replica",
+      envelope,
+      metadata: {
+        schemaId: null,
+        dataPointId: "test-data-point",
+        version: 1,
+        generation: "caller-generation",
+        pdppOrigin: true,
+      },
+    } as never);
+    expect(result.kind).toBe("stored");
+    const entry = storage.findEntry({ scope: envelope.scope });
+    expect(entry?.generation).toBe(oracleGeneration(envelope));
+    expect(entry?.pdppOrigin).toBe(false);
   });
 });

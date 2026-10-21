@@ -1,10 +1,10 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type {
   DataBlockManifest,
   DataScopeBlock,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
-import { envelopeGeneration } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   createMemoryPsLiteStorage,
@@ -16,6 +16,23 @@ import {
   type PsLiteDataFileStore,
 } from "./storage.js";
 import { previewEnvelopeValue } from "./storage-utils.js";
+
+/**
+ * An oracle for a generation that does not use the code under test:
+ * SHA-256 (node:crypto) of the JSON value with object keys sorted.
+ */
+function oracleGeneration(value: unknown): string {
+  const sorted = JSON.stringify(value, (_key, item: unknown) =>
+    item !== null && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.entries(item as Record<string, unknown>).sort(([a], [b]) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          ),
+        )
+      : item,
+  );
+  return createHash("sha256").update(sorted).digest("hex");
+}
 
 describe("createPersistentPsLiteStorage", () => {
   it("refuses to replace a published version with different bytes", async () => {
@@ -162,7 +179,7 @@ describe("createPersistentPsLiteStorage", () => {
       scope: envelope.scope,
       version: envelope.version,
     };
-    expect(inserted.generation).toBe(envelopeGeneration(reordered));
+    expect(inserted.generation).toBe(oracleGeneration(reordered));
     expect(storage.findEntry({ scope: envelope.scope })?.generation).toBe(
       inserted.generation,
     );
@@ -172,6 +189,46 @@ describe("createPersistentPsLiteStorage", () => {
       content: envelope,
     });
     expect(built.manifest.envelopeDigest).toBe(inserted.generation);
+  });
+
+  it("backfills a pre-generation row once, from the published bytes", async () => {
+    const files = createMemoryPsLiteDataFileStore();
+    const persistence = createMemoryPsLitePersistence();
+    const first = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      files,
+    );
+    const envelope = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "legacy" },
+    );
+    const written = await first.writeEnvelope(envelope);
+    await first.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: written.sizeBytes,
+    });
+    // The same state as a row persisted before rows recorded a generation.
+    const saved = (await persistence.read())!;
+    const old = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence({
+        ...saved,
+        entries: saved.entries.map(({ generation: _g, ...entry }) => entry),
+      }),
+      files,
+    );
+    const entry = old.findEntry({ scope: envelope.scope })!;
+    expect(entry.generation).toBeUndefined();
+    const generation = await old.backfillGeneration!(entry);
+    expect(generation).toBe(oracleGeneration(envelope));
+    expect(old.findEntry({ scope: envelope.scope })?.generation).toBe(
+      generation,
+    );
   });
 
   it("P2-e: republishes the same envelope in another key order", async () => {

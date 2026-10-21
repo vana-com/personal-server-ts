@@ -79,6 +79,15 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateVersion(path: string, version: number): boolean;
+  /**
+   * Compare-and-set a row's generation (see the core `IndexManager`). Only
+   * storage calls it, with a value it computed from the published bytes.
+   */
+  swapGeneration(
+    id: number,
+    expected: string | null,
+    next: string | null,
+  ): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;
@@ -552,6 +561,15 @@ export function createIndexManager(
     countByScope(scope) {
       const row = countByScopeStmt.get({ scope }) as { cnt: number };
       return row.cnt;
+    },
+
+    swapGeneration(id, expected, next) {
+      const result = db
+        .prepare(
+          "UPDATE data_files SET generation = @next WHERE id = @id AND generation IS @expected",
+        )
+        .run({ id, expected, next });
+      return result.changes > 0;
     },
 
     deleteByPath(path) {

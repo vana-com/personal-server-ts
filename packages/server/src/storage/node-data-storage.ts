@@ -287,8 +287,7 @@ export function createNodeDataStorage(
         const result = deps.indexManager.insertIfCurrent(
           {
             ...entry,
-            pdppOrigin: hasPdppOrigin(envelope),
-            generation: envelopeGeneration(envelope),
+            ...staged.identity,
             path: staged.relativePath,
             sizeBytes: entry.sizeBytes ?? staged.sizeBytes,
           },
@@ -336,6 +335,23 @@ export function createNodeDataStorage(
         ...callerEntry,
         ...(await identityOfPublishedBytes(entry.path)),
       });
+    },
+    async backfillGeneration(entry) {
+      if (entry.generation) return entry.generation;
+      const first = (await identityOfPublishedBytes(entry.path)).generation;
+      if (!first) return undefined;
+      if (!deps.indexManager.swapGeneration(entry.id, null, first)) {
+        const current = deps.indexManager.findByPath(entry.path);
+        return current?.id === entry.id ? current.generation : undefined;
+      }
+      // The bytes are read again: a version replaced between the two reads
+      // is not recorded.
+      const second = (await identityOfPublishedBytes(entry.path)).generation;
+      if (second !== first) {
+        deps.indexManager.swapGeneration(entry.id, first, null);
+        return undefined;
+      }
+      return first;
     },
     updateFileId(path: string, fileId: string) {
       return deps.indexManager.updateFileId(path, fileId);
