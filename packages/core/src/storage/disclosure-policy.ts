@@ -25,6 +25,7 @@ import {
 import type { DataStoragePort } from "../ports/index.js";
 import { previewEnvelopeValue } from "./preview.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
+import { blockRepresentationId } from "./blocks/representation.js";
 import { boundEnvelopeDigest } from "./blocks/digest.js";
 import { DataBlockStorageError } from "./blocks/errors.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
@@ -60,7 +61,12 @@ function authorizeEnvelope(envelope: {
 function servedBlocks(
   result: ReadScopeBlocksResponse,
 ): ReadScopeBlocksResponse {
-  const { pdppOrigin: _origin, envelopeDigest: _digest, ...served } = result;
+  const {
+    pdppOrigin: _origin,
+    envelopeDigest: _digest,
+    redaction: _redaction,
+    ...served
+  } = result;
   return served;
 }
 
@@ -68,11 +74,13 @@ function servedManifest(manifest: DataBlockManifest): DataBlockManifest {
   const {
     pdppOrigin: _origin,
     envelopeDigest: _digest,
+    redaction: _redaction,
     blocks,
     ...served
   } = manifest;
   return {
     ...served,
+    representationId: blockRepresentationId(manifest, "grantee"),
     blocks: blocks.map(({ digest: _blockDigest, ...ref }) => ref),
   };
 }
@@ -200,7 +208,8 @@ export function withDisclosurePolicy(raw: DataStoragePort): DataStoragePort {
       if (
         generation !== undefined &&
         result.envelopeDigest === generation &&
-        result.pdppOrigin !== undefined
+        result.pdppOrigin !== undefined &&
+        result.redaction !== undefined
       ) {
         authorizeLegacyRead("grantee", {
           kind: "stored-blocks",
@@ -226,7 +235,8 @@ export function withDisclosurePolicy(raw: DataStoragePort): DataStoragePort {
       if (
         generation !== undefined &&
         boundEnvelopeDigest(manifest) === generation &&
-        manifest.pdppOrigin !== undefined
+        manifest.pdppOrigin !== undefined &&
+        manifest.redaction !== undefined
       ) {
         authorizeLegacyRead("grantee", {
           kind: "stored-blocks",

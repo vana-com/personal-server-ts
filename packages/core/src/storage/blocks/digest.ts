@@ -53,9 +53,13 @@ export function boundEnvelopeDigest(
  */
 export function manifestBinding(
   manifest: DataBlockManifest,
-): Pick<ReadScopeBlocksResponse, "pdppOrigin" | "envelopeDigest"> {
+): Pick<
+  ReadScopeBlocksResponse,
+  "pdppOrigin" | "envelopeDigest" | "redaction"
+> {
   const envelopeDigest = boundEnvelopeDigest(manifest);
   return {
+    ...(manifest.redaction ? { redaction: manifest.redaction } : {}),
     ...(manifest.pdppOrigin === undefined
       ? {}
       : { pdppOrigin: manifest.pdppOrigin }),

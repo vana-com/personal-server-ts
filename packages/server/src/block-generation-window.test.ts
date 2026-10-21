@@ -687,3 +687,193 @@ describe("storage derives identity once, from what it publishes", () => {
     expect(entry?.pdppOrigin).toBe(false);
   });
 });
+
+describe("immutable served block representation", () => {
+  it("redacts grouped server stamps before byte paging and block selection", async () => {
+    const scope = "oura.raw";
+    const envelope = {
+      ...legacyEnvelope(scope),
+      data: {
+        ordinary: "visible",
+        $writtenBy: { builder: "hidden-builder" },
+        $lineage: { origin: "legacy", sources: [] },
+        lineage: { private: "hidden-caller" },
+      },
+    } as DataFileEnvelope;
+    await put(envelope);
+    const toc = structured(
+      await (
+        await mcpTool("list_scope_blocks", { scope })
+      )(),
+    );
+    const pages: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const text = await (
+        await mcpTool("read_scope", {
+          scope,
+          maxBytes: 128,
+          ...(cursor ? { cursor } : {}),
+        })
+      )();
+      pages.push(text);
+      cursor = (structured(text).page as { nextCursor?: string } | undefined)
+        ?.nextCursor;
+    } while (cursor && pages.length < 30);
+    expect(pages.length).toBeGreaterThan(1);
+    expect(pages.join("")).not.toMatch(
+      /hidden-builder|hidden-caller|\$writtenBy|\$lineage/,
+    );
+    const refs = (toc.blocks ?? []) as { id: string }[];
+    const selected = await (
+      await mcpTool("read_scope", {
+        scope,
+        blockIds: refs.map((r) => r.id),
+        maxBytes: 128,
+      })
+    )();
+    expect(selected).not.toMatch(
+      /hidden-builder|hidden-caller|\$writtenBy|\$lineage/,
+    );
+  });
+
+  it("redacts a grouped block before a small blockIds selection", async () => {
+    const scope = "oura.raw";
+    await put({
+      ...legacyEnvelope(scope),
+      data: {
+        ordinary: "visible",
+        $writtenBy: { builder: "hidden-builder" },
+        $lineage: { origin: "legacy", sources: [] },
+        lineage: { private: "hidden-caller" },
+      },
+    } as DataFileEnvelope);
+    const selected = await (
+      await mcpTool("read_scope", {
+        scope,
+        blockIds: ["block-000002"],
+        maxBytes: 128,
+      })
+    )();
+    expect(selected).toContain("visible");
+    expect(selected).not.toMatch(
+      /hidden-builder|hidden-caller|\$writtenBy|\$lineage/,
+    );
+  });
+
+  it.each(["page", "selection"])(
+    "refuses an old %s after same-envelope layout replacement",
+    async (mode) => {
+      const scope = "oura.raw";
+      const envelope = {
+        ...legacyEnvelope(scope),
+        data: {
+          rows: Array.from({ length: 30 }, (_, i) => ({
+            i,
+            text: "x".repeat(100),
+          })),
+        },
+      } as DataFileEnvelope;
+      await put(envelope);
+      async function layout(target: number) {
+        const b = await buildDataBlocksAsync({
+          scope,
+          collectedAt: AT,
+          content: envelope,
+          blockTargetBytes: target,
+          maxBlockBytes: target,
+        });
+        await storage.writeBlockManifest!(scope, AT, b.manifest, b.blocks);
+      }
+      await layout(256);
+      const page = structured(
+        await (
+          await mcpTool("read_scope", { scope, maxBytes: 256 })
+        )(),
+      );
+      const toc = structured(
+        await (
+          await mcpTool("list_scope_blocks", { scope })
+        )(),
+      );
+      const cursor = (page.page as { nextCursor: string }).nextCursor;
+      expect(cursor).toBeTruthy();
+      await layout(2048);
+      const resumed = await (
+        await mcpTool("read_scope", { scope, maxBytes: 256, cursor })
+      )();
+      if (mode === "page")
+        expect(resumed).toMatch(
+          /layout_mismatch|representation_mismatch|VERSION_CHANGED/,
+        );
+      const selected = await (
+        await mcpTool("read_scope", {
+          scope,
+          blockIds: ["block-000002"],
+          cursor: toc.versionCursor,
+        })
+      )();
+      if (mode === "selection")
+        expect(selected).toMatch(
+          /layout_mismatch|representation_mismatch|VERSION_CHANGED/,
+        );
+    },
+  );
+
+  it("refuses a grantee cursor without representation identity", async () => {
+    const scope = "oura.raw";
+    await put({
+      ...legacyEnvelope(scope),
+      data: { text: "x".repeat(300) },
+    } as DataFileEnvelope);
+    const first = structured(
+      await (
+        await mcpTool("read_scope", { scope, maxBytes: 128 })
+      )(),
+    );
+    const cursor = (first.page as { nextCursor: string }).nextCursor;
+    const fields = JSON.parse(Buffer.from(cursor, "base64url").toString());
+    delete fields.representationId;
+    const oldCursor = Buffer.from(JSON.stringify(fields)).toString("base64url");
+    const text = await (
+      await mcpTool("read_scope", { scope, maxBytes: 128, cursor: oldCursor })
+    )();
+    expect(text).toContain("VERSION_CHANGED");
+  });
+
+  it("round trips multilingual block text through one-byte storage pages", async () => {
+    const scope = "oura.raw";
+    const envelope = {
+      ...legacyEnvelope(scope),
+      data: { text: "é漢🙂".repeat(5) },
+    } as DataFileEnvelope;
+    await put(envelope);
+    const built = await buildDataBlocksAsync({
+      scope,
+      collectedAt: AT,
+      content: envelope,
+    });
+    const originals = new Map(
+      built.blocks.map((b) => [
+        b.id,
+        typeof b.value === "string" ? b.value : JSON.stringify(b.value),
+      ]),
+    );
+    const received = new Map<string, string>();
+    let cursor: string | undefined;
+    do {
+      const page = await storage.readScopeBlocks!(scope, AT, {
+        maxBytes: 1,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const b of page.blocks) {
+        const text =
+          typeof b.value === "string" ? b.value : JSON.stringify(b.value);
+        expect(new TextEncoder().encode(text).length).toBe(b.sizeBytes);
+        received.set(b.id, (received.get(b.id) ?? "") + text);
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+    expect(received).toEqual(originals);
+  });
+});

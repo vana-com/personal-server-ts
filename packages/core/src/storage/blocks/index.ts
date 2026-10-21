@@ -29,7 +29,7 @@ export {
   verifyStoredBlock,
 } from "./digest.js";
 
-export { readBuiltScopeBlocks } from "./page.js";
+export { readBuiltScopeBlocks, readManifestScopeBlocks } from "./page.js";
 
 export {
   MAX_SELECTED_BLOCK_IDS,
@@ -41,3 +41,5 @@ export {
   DataBlockStorageError,
   type DataBlockStorageErrorCode,
 } from "./errors.js";
+
+export { blockRepresentationId, pageBlock } from "./representation.js";
