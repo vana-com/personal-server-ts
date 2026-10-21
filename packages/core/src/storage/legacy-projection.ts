@@ -30,6 +30,7 @@ import { ProtocolError } from "../errors/catalog.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import type { IndexEntry } from "./index/types.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
+import { blockRepresentationMetadata } from "./blocks/representation.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
 import type { DataBlockManifest, DataScopeBlock } from "./blocks/types.js";
 import { previewEnvelopeValue } from "./preview.js";
@@ -448,9 +449,16 @@ export function withLegacyProjection(
     const rawManifest = raw.readBlockManifest.bind(raw);
     overrides.readBlockManifest = async (scope, collectedAt, options) => {
       const view = await projected(scope, collectedAt);
-      return view
-        ? (await builtBlocks(scope, view)).manifest
-        : rawManifest(scope, collectedAt, options);
+      if (!view) return rawManifest(scope, collectedAt, options);
+      const manifest = (await builtBlocks(scope, view)).manifest;
+      return {
+        ...manifest,
+        ...blockRepresentationMetadata(
+          manifest,
+          isGuarded(raw) ? "grantee" : "stored",
+          view.view,
+        ),
+      };
     };
   }
   // Inventory inherits raw metadata readiness. Projection belongs to reads.

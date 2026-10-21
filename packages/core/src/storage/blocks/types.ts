@@ -23,6 +23,8 @@ export interface DataBlockManifest {
   redaction?: { dropTopLevelLineage: boolean; dropMetadataLineage: boolean };
   /** Ordered layout and serialization identity, separate from envelopeDigest. */
   representationId?: string;
+  /** Continuation namespace of a read-time projection; not stored envelope identity. */
+  cursorView?: string;
   blocks: DataBlockRef[];
   warnings: DataBlockWarning[];
 }

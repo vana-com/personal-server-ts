@@ -104,7 +104,7 @@ function gatewayFor(granteeAddress: `0x${string}`): GatewayClient {
     id: GRANT_ID,
     grantorAddress: owner.address,
     granteeId: granteeAddress,
-    scopes: ["oura.*"],
+    scopes: ["oura.*", "chatgpt.*"],
     status: "confirmed",
     addedAt: "2026-01-21T10:00:00.000Z",
     expiresAt: null,
@@ -222,7 +222,7 @@ async function mcpTool(name: string, args: Record<string, unknown>) {
   await approveMcpConnection(
     {
       connectionId: created.connectionId,
-      grants: [{ grantId: GRANT_ID, scopes: ["oura.*"] }],
+      grants: [{ grantId: GRANT_ID, scopes: ["oura.*", "chatgpt.*"] }],
     },
     { store: connections },
   );
@@ -819,6 +819,61 @@ describe("immutable served block representation", () => {
         );
     },
   );
+
+  it("round trips a projected TOC selection and refuses it after a sibling changes", async () => {
+    const scope = "chatgpt.conversations";
+    await put({
+      ...legacyEnvelope(scope),
+      data: {
+        records: [
+          {
+            id: "c",
+            title: "projected-title",
+            create_time: AT,
+            update_time: AT,
+            current_node: null,
+            message_count_on_current_branch: 0,
+          },
+        ],
+      },
+    } as DataFileEnvelope);
+    await put({
+      ...legacyEnvelope("chatgpt.messages"),
+      data: { records: [] },
+    } as DataFileEnvelope);
+    const toc = structured(
+      await (
+        await mcpTool("list_scope_blocks", { scope })
+      )(),
+    );
+    const ids = (toc.blocks as { id: string }[]).map((b) => b.id);
+    expect(toc.versionCursor).toBeTruthy();
+    const read = await (
+      await mcpTool("read_scope", {
+        scope,
+        blockIds: ids,
+        cursor: toc.versionCursor,
+        maxBytes: 4096,
+      })
+    )();
+    expect(read).toContain("projected-title");
+    await put({
+      ...legacyEnvelope("chatgpt.messages"),
+      collectedAt: "2026-09-02T00:00:00.000Z",
+      data: { records: [] },
+    } as DataFileEnvelope);
+    const changed = await (
+      await mcpTool("read_scope", {
+        scope,
+        blockIds: ids,
+        cursor: toc.versionCursor,
+        maxBytes: 4096,
+      })
+    )();
+    expect(changed).toMatch(
+      /VERSION_CHANGED|representation_mismatch|cursor_invalid/,
+    );
+  });
 
   it("refuses a grantee cursor without representation identity", async () => {
     const scope = "oura.raw";
