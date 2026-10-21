@@ -3,7 +3,10 @@ import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
-import { resourceMetadataUrlFor } from "./pdpp-records.js";
+import {
+  bearerErrorResponse,
+  type PdppProtocolProfile,
+} from "../pdpp/bearer-response.js";
 import {
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
@@ -13,6 +16,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 export interface PdppBlobsRouteDeps {
+  protocolProfile?: PdppProtocolProfile;
   store: PdppRecordStore;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
@@ -32,27 +36,15 @@ function requestId(): string {
   return `req_${randomUUID()}`;
 }
 
-function jsonError(
-  c: Context,
-  err: PdppError,
-  reqId: string,
-  extraHeaders?: Record<string, string>,
-) {
-  // Every 401 carries the challenge, not just the missing-token branch: a
-  // client holding a STALE token is exactly who needs the pointer back to the
-  // metadata document in order to re-authorize.
-  const headers: Record<string, string> = {
-    "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
-    ...(err.status === 401 && {
-      "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
-    }),
-    ...extraHeaders,
-  };
-  return c.json(err.toJSON(reqId), err.status as never, headers);
-}
-
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
+  function jsonError(
+    c: Context,
+    err: PdppError,
+    reqId: string,
+    options?: Parameters<typeof bearerErrorResponse>[4],
+  ) {
+    return bearerErrorResponse(c, err, reqId, deps.protocolProfile, options);
+  }
   const app = new Hono();
 
   /**
@@ -75,17 +67,13 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         "Missing or invalid access token",
       );
       return {
-        error: jsonError(c, err, reqId, {
-          // Absolute, derived from this request's origin (RFC 9728 §5.1) --
-          // shares the records route's helper so the two cannot drift.
-          "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
-        }),
+        error: jsonError(c, err, reqId),
       };
     }
     const context = await deps.auth.resolveToken(token);
     if (!context.active) {
       const err = new PdppError("authentication_error", "Invalid access token");
-      return { error: jsonError(c, err, reqId) };
+      return { error: jsonError(c, err, reqId, { inactiveBearer: true }) };
     }
 
     // DELETE removes the grant's record references and claim rows. Check its

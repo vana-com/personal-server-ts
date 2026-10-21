@@ -319,13 +319,20 @@ export function createApp(deps: AppDeps): Hono {
   // the legacy DPP fileId/scope routes above; mounted only when a pdpp deps
   // bundle is supplied.
   if (deps.pdppConnections) {
-    app.route("/", pdppConnectionRoutes(deps.pdppConnections));
+    app.route(
+      "/",
+      pdppConnectionRoutes({
+        ...deps.pdppConnections,
+        protocolProfile: deps.pdppAuth?.protocolProfile,
+      }),
+    );
   }
 
   if (deps.pdpp) {
     app.route(
       "/",
       pdppInstanceBindingRoutes({
+        protocolProfile: deps.pdppAuth?.protocolProfile,
         store: deps.pdpp.bindingStore,
         auth: deps.pdpp.auth,
         ownerSubjectId: deps.serverOwner!,
@@ -337,6 +344,7 @@ export function createApp(deps: AppDeps): Hono {
     app.route(
       "/v1",
       pdppRecordsRoutes({
+        protocolProfile: deps.pdppAuth?.protocolProfile,
         store: deps.pdpp.store,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
@@ -380,6 +388,7 @@ export function createApp(deps: AppDeps): Hono {
     app.route(
       "/v1/blobs",
       pdppBlobsRoutes({
+        protocolProfile: deps.pdppAuth?.protocolProfile,
         store: deps.pdpp.store,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,

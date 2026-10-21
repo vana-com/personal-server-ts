@@ -23,6 +23,7 @@ export type PdppErrorCode =
   | "unknown_field"
   | "unsupported_version"
   | "authentication_error"
+  | "invalid_token"
   | "authorization_state.unsupported_legacy_shape"
   | "field_not_granted"
   | "insufficient_scope"
@@ -46,6 +47,7 @@ const STATUS_BY_CODE: Record<PdppErrorCode, number> = {
   unknown_field: 400,
   unsupported_version: 400,
   authentication_error: 401,
+  invalid_token: 401,
   "authorization_state.unsupported_legacy_shape": 401,
   field_not_granted: 403,
   insufficient_scope: 403,
@@ -70,6 +72,7 @@ const TYPE_BY_CODE: Record<PdppErrorCode, PdppErrorType> = {
   unknown_field: "invalid_request_error",
   unsupported_version: "invalid_request_error",
   authentication_error: "authentication_error",
+  invalid_token: "authentication_error",
   "authorization_state.unsupported_legacy_shape": "authentication_error",
   field_not_granted: "permission_error",
   insufficient_scope: "permission_error",

@@ -1,3 +1,7 @@
+import {
+  bearerChallengeMiddleware,
+  type PdppProtocolProfile,
+} from "../pdpp/bearer-response.js";
 import { Hono } from "hono";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
@@ -19,6 +23,8 @@ export interface PdppConnectionStore {
 }
 
 export interface PdppConnectionRouteDeps {
+  /** Selects the bearer challenge on 401s; see `bearer-response.ts`. */
+  protocolProfile?: PdppProtocolProfile;
   store: PdppConnectionStore;
   auth: PdppAuthorizationService;
   ownerSubjectId: string;
@@ -61,6 +67,7 @@ function connectionJson(
 
 export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
   const app = new Hono();
+  app.use("*", bearerChallengeMiddleware(deps.protocolProfile));
 
   async function owner(
     request: Request,

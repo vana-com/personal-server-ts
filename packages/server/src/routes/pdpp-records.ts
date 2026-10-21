@@ -36,6 +36,13 @@ import {
   type StreamCompletionFailure,
 } from "../storage/pdpp-stream-completion.js";
 
+import {
+  bearerErrorResponse,
+  chainDenialError,
+  type PdppChainDenialCause,
+  type PdppProtocolProfile,
+} from "../pdpp/bearer-response.js";
+export { resourceMetadataUrlFor } from "../pdpp/bearer-response.js";
 export const MAX_BLOB_UPLOAD_BYTES = 512 * 1024 * 1024;
 
 /** 512 MiB — max body size for PDPP record ingest and replace routes. */
@@ -194,6 +201,7 @@ function parseIngestBody(bytes: Uint8Array): unknown {
 }
 
 export interface PdppRecordsRouteDeps {
+  protocolProfile?: PdppProtocolProfile;
   store: PdppRecordStore;
   bindingStore?: {
     getInstanceBinding(instance: string): {
@@ -306,7 +314,19 @@ export interface PdppChainEnforcementPort {
 }
 
 export type PdppChainDecision =
-  { ok: true } | { ok: false; retryable: boolean; reason: string };
+  | { ok: true }
+  | {
+      ok: false;
+      retryable: true;
+      reason: string;
+    }
+  | {
+      ok: false;
+      retryable: false;
+      reason: string;
+      /** Why the chain refused; never inferred from `reason`. */
+      cause: PdppChainDenialCause;
+    };
 
 /**
  * The slice of the owner access feed a PDPP read can populate.
@@ -431,54 +451,6 @@ function requireSubjectId(context: PdppTokenContext): string {
   return context.subjectId;
 }
 
-function sendError(c: Context, err: PdppError, reqId: string) {
-  // Every 401 carries the challenge, whichever branch produced it.
-  //
-  // Previously only the missing-token branch built one, so a client holding a
-  // STALE token -- the exact case §8's challenge exists to bootstrap -- got a
-  // bare 401 with no `WWW-Authenticate` and no pointer to the metadata it
-  // needed in order to re-authorize. Attaching it here rather than at each
-  // call site means a future 401 path cannot forget it.
-  const headers: Record<string, string> = {
-    "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
-  };
-  if (err.status === 401) {
-    headers["WWW-Authenticate"] =
-      `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
-  }
-  return c.json(err.toJSON(reqId), err.status as never, headers);
-}
-
-/**
- * The RFC 9728 protected-resource metadata URL for THIS request's origin.
- *
- * RFC 9728 §5.1 requires `resource_metadata` to be a URI the client can
- * dereference. A relative path only resolves if the client already knows the
- * origin -- which an unauthenticated client bootstrapping discovery from a
- * failed read cannot be assumed to have. Deriving it from the request also
- * keeps it correct behind a tunnel or proxy, where a hardcoded origin would
- * point the client somewhere it cannot reach.
- */
-export function resourceMetadataUrlFor(c: Context): string {
-  return new URL(
-    "/.well-known/oauth-protected-resource",
-    new URL(c.req.url).origin,
-  ).toString();
-}
-
-function unauthorized(c: Context, reqId: string, resourceMetadataUrl: string) {
-  const err = new PdppError(
-    "authentication_error",
-    "Missing or invalid access token",
-  );
-  return c.json(err.toJSON(reqId), 401, {
-    "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
-    "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl}"`,
-  });
-}
-
 /**
  * Project a declared JSON Schema down to exactly the granted fields.
  *
@@ -513,6 +485,14 @@ function projectSchemaToFields(
 }
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
+  function sendError(
+    c: Context,
+    err: PdppError,
+    reqId: string,
+    options?: Parameters<typeof bearerErrorResponse>[4],
+  ) {
+    return bearerErrorResponse(c, err, reqId, deps.protocolProfile, options);
+  }
   const app = new Hono();
   const validateData = createRecordDataValidator(deps.declarations);
 
@@ -568,7 +548,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
     if (!token) {
-      return { error: unauthorized(c, reqId, resourceMetadataUrlFor(c)) };
+      return {
+        error: sendError(
+          c,
+          new PdppError(
+            "authentication_error",
+            "Missing or invalid access token",
+          ),
+          reqId,
+        ),
+      };
     }
     const context = await deps.auth.resolveToken(token);
 
@@ -589,7 +578,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           return {
             error: sendError(
               c,
-              new PdppError("grant_revoked", "No chain binding for this grant"),
+              chainDenialError(
+                "invalid",
+                "No chain binding for this grant",
+                deps.protocolProfile,
+              ),
               reqId,
             ),
           };
@@ -627,7 +620,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           return {
             error: sendError(
               c,
-              new PdppError("grant_revoked", decision.reason),
+              chainDenialError(
+                decision.cause,
+                decision.reason,
+                deps.protocolProfile,
+              ),
               reqId,
             ),
           };
@@ -738,7 +735,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     // depending only on which endpoint it happened to call first. Found by
     // driving Context Gateway's real PdppContextClient against this server.
     if (!context?.active) {
-      return sendError(c, mapInactiveToError(context!), reqId);
+      return sendError(c, mapInactiveToError(context!), reqId, {
+        inactiveBearer: true,
+      });
     }
 
     const instanceIds =

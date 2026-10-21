@@ -68,6 +68,27 @@ The server reads `${PERSONAL_SERVER_ROOT_PATH:-~/personal-server}/config.json` o
 
 Set `"pretty": true` for human-readable logs during development.
 
+### PDPP bearer compatibility
+
+`pdpp.protocolProfile` defaults to `"current"`, which keeps the existing
+403 `grant_revoked` and `grant_expired` responses. `"candidate-0.1.0"` answers
+an inactive bearer (a revoked or expired grant, by the authorization server or
+on chain) with HTTP 401 `invalid_token` and a
+`WWW-Authenticate: Bearer error="invalid_token"` challenge; the cause stays in
+the message. In both profiles, chain expiry is never reported as revocation,
+and a client access token without a finite expiry is refused when stored and
+inactive when presented. Unknown profile values fail configuration loading.
+
+### PDPP data and legacy grants
+
+A legacy chain grant reads actual legacy files only, with or without a PDPP
+grant binding. The canonical view of a scope, and every stored version with
+PDPP origin (native `$pdpp` import metadata, or a `pdpp-projector` /
+`pdpp-import-projection` producer stamp), reach a non-owner only through the
+PDPP resource server with a PDPP access token. This applies to `/v1/data`
+(Node and Lite), MCP, derivative questions and TEE jobs. The owner keeps full
+access. A version path never changes its bytes once published.
+
 ### Server Registration
 
 Register your server with the Vana Gateway so it can participate in the data portability network:
