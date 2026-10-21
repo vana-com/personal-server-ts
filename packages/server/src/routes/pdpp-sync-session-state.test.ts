@@ -84,14 +84,10 @@ function harness(
       store.readSyncWindow(stream, request, (window) =>
         read({
           ...window,
-          changes: (direction, after) => {
-            const source = window.changes(direction, after);
-            return (function* () {
-              for (const change of source) {
-                examined += 1;
-                yield change;
-              }
-            })();
+          next: (direction, after, budget) => {
+            const id = window.next(direction, after, budget);
+            if (id) examined += 1;
+            return id;
           },
         }),
       ),

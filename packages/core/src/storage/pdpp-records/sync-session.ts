@@ -15,6 +15,8 @@ import {
   type PdppRecordRow,
   type PdppStoredRecord,
   type RecordIdentity,
+  type SyncBudget,
+  type SyncPreparationProgress,
   type SyncStateStore,
   type SyncTokenScope,
   type SyncWindow,
@@ -86,6 +88,11 @@ export interface SyncSessionOptions {
   maxStatesPerOwner?: number;
   /** UTF-8 bytes one session state may hold; beyond it the session expires. */
   maxStateBytes?: number;
+  /**
+   * Candidate rows one owner's prepared sessions may hold. A window over it
+   * expires (410); the client restarts from `beginning`, which needs none.
+   */
+  maxPreparedRowsPerOwner?: number;
 }
 
 /** Matches the stream summary's scan budget in the HTTP route. */
@@ -97,6 +104,9 @@ export const DEFAULT_SYNC_CHECKPOINT_TTL_MS = 30 * 24 * HOUR;
 export const DEFAULT_SYNC_SCAN_TTL_MS = 10 * 60_000;
 export const DEFAULT_SYNC_STATES_PER_OWNER = 1_000;
 export const DEFAULT_SYNC_STATE_BYTES = 256 * 1024;
+export const DEFAULT_SYNC_PREPARED_ROWS_PER_OWNER = 1_000_000;
+/** The largest page one sync request serves. */
+export const MAX_SYNC_PAGE_LIMIT = 100;
 
 /**
  * The single owner of PDPP `changes_since` sessions: horizons, the
@@ -133,13 +143,18 @@ export const DEFAULT_SYNC_STATE_BYTES = 256 * 1024;
 export function createPdppSyncSessionService(
   store: Pick<
     PdppRecordStore,
-    "readSyncWindow" | "syncTokenScope" | "syncStates"
+    | "readSyncWindow"
+    | "syncTokenScope"
+    | "syncStates"
+    | "prepareSyncWindow"
+    | "touchSyncPreparation"
+    | "sweepSyncPreparations"
   >,
   options: SyncSessionOptions = {},
 ) {
-  const budget =
+  const budgetUnits =
     options.maxExaminedPerRequest ?? DEFAULT_SYNC_EXAMINED_PER_REQUEST;
-  if (!Number.isSafeInteger(budget) || budget < 1) {
+  if (!Number.isSafeInteger(budgetUnits) || budgetUnits < 1) {
     throw new RangeError("sync request budget must be a positive integer");
   }
   const policy: StatePolicy = {
@@ -153,10 +168,21 @@ export function createPdppSyncSessionService(
     maxBytes: options.maxStateBytes ?? DEFAULT_SYNC_STATE_BYTES,
   };
   const scanMillis = options.maxScanMillis ?? DEFAULT_SYNC_SCAN_MILLIS;
+  const preparedRows =
+    options.maxPreparedRowsPerOwner ?? DEFAULT_SYNC_PREPARED_ROWS_PER_OWNER;
 
   function read(request: SyncRequest): ChangesSincePage {
-    if (!Number.isSafeInteger(request.limit) || request.limit < 1) {
-      throw new RangeError("sync page limit must be a positive integer");
+    // The HTTP route clamps `limit` to the same maximum. It also bounds the
+    // rows a resumed request reads again (`found`), which the budget does not
+    // charge.
+    if (
+      !Number.isSafeInteger(request.limit) ||
+      request.limit < 1 ||
+      request.limit > MAX_SYNC_PAGE_LIMIT
+    ) {
+      throw new RangeError(
+        `sync page limit must be an integer from 1 to ${MAX_SYNC_PAGE_LIMIT}`,
+      );
     }
     const tokens = sessionTokens(
       store.syncTokenScope(),
@@ -167,19 +193,93 @@ export function createPdppSyncSessionService(
     const position = tokens.open(request);
     const paused = request.candidate ? tokens.resumeScan() : undefined;
     const carried = new Set(position.carried.map(identityKey));
+    const now = policy.now();
+    const budget = requestBudget(
+      budgetUnits,
+      request.candidate ? now + scanMillis : undefined,
+      policy.now,
+    );
+    const owner = request.owner ?? "";
+    const withheld0 = paused?.withheld ?? position.withheld;
+    let high = paused?.high ?? position.high;
+    let preparation = paused?.preparation ?? position.preparation;
+    // State is written after the store's read ends, so a read snapshot never
+    // turns into a write and a store that reads in a transaction never rolls
+    // a write back.
+    const finish = <T>(result: T): T => {
+      tokens.flush();
+      if (paused) tokens.endScan();
+      store.sweepSyncPreparations(policy.now());
+      return result;
+    };
+
+    // An incremental session first prepares the keys written in its window,
+    // in bounded chunks, possibly over several requests.
+    if (position.low !== null && !preparation?.done) {
+      preparation ??= {
+        id: `prep:${randomBytes(16).toString("base64url")}`,
+        done: false,
+      };
+      const prepared = store.prepareSyncWindow(request.stream, {
+        id: preparation.id,
+        owner,
+        instanceIds: request.instanceIds,
+        low: position.low,
+        ...(high !== undefined && { high }),
+        ...(preparation.progress && { progress: preparation.progress }),
+        budget,
+        now,
+        expiresAt: now + policy.ttl.page,
+        maxPerOwner: policy.maxPerOwner,
+        maxRowsPerOwner: preparedRows,
+      });
+      high = prepared.high;
+      preparation = {
+        id: preparation.id,
+        progress: prepared.progress,
+        done: prepared.done,
+      };
+      if (!prepared.done) {
+        const scan: PausedScan = {
+          high,
+          ...(paused?.after && { after: paused.after }),
+          found: paused?.found ?? position.found,
+          withheld: withheld0,
+          preparation,
+        };
+        if (request.candidate) {
+          tokens.pauseScan(scan);
+          store.sweepSyncPreparations(policy.now());
+          throw new SyncRetryLaterError();
+        }
+        // The current profile keeps its early, possibly empty page.
+        return finish({
+          data: [],
+          hasMore: true,
+          nextCursor: tokens.page({
+            low: position.low,
+            high,
+            ...(position.after && { after: position.after }),
+            found: position.found,
+            carried: position.carried,
+            withheld: withheld0,
+            preparation,
+          }),
+        });
+      }
+    }
+
     const result = store.readSyncWindow(
       request.stream,
       {
         instanceIds: request.instanceIds,
         low: position.low,
-        ...((paused?.high ?? position.high) !== undefined && {
-          high: paused?.high ?? position.high,
-        }),
+        ...(high !== undefined && { high }),
+        ...(preparation && { preparation: preparation.id }),
       },
       (window): ChangesSincePage | { paused: PausedScan } => {
         const direction = request.candidate?.order === "desc" ? "desc" : "asc";
-        const deadline = policy.now() + scanMillis;
-        const withheld = [...(paused?.withheld ?? position.withheld)];
+        const withheld = [...withheld0];
         const rows: PdppRecordRow[] = [];
         // Accepts one disclosed change, or withholds it; false if neither.
         const take = (change: SyncWindowChange): boolean => {
@@ -201,68 +301,53 @@ export function createPdppSyncSessionService(
           return true;
         };
         // Changes an earlier request already disclosed, read again at the
-        // same horizon so a deletion since then still withholds them.
+        // same horizon so a deletion since then still withholds them. At most
+        // one page plus one, so not charged to the budget.
         for (const id of paused?.found ?? position.found) {
           const change = window.change(id);
           if (change) take(change);
         }
         const need = request.limit + 1;
-        let examined = 0;
         let scanned: RecordIdentity | undefined =
           paused?.after ?? position.after;
         let exhausted = false;
-        if (rows.length < need) {
-          const changes = window.changes(direction, scanned)[Symbol.iterator]();
-          try {
-            for (;;) {
-              // Checked before the next change is read, so a resumed scan
-              // starts at the first change no request has examined.
-              // The time budget applies once this request has examined a
-              // new change, so every retry makes progress.
-              if (
-                examined === budget ||
-                (request.candidate && examined > 0 && policy.now() >= deadline)
-              ) {
-                exhausted = true;
-                break;
-              }
-              const next = changes.next();
-              if (next.done) break;
-              examined += 1;
-              scanned = identity(next.value.after);
-              if (take(next.value) && rows.length === need) break;
-            }
-          } finally {
-            // A store may hold a cursor open while changes are read.
-            changes.return?.();
+        // One seek per identity, each paid from the budget.
+        while (rows.length < need) {
+          const id = window.next(direction, scanned, budget);
+          if (id === null) {
+            exhausted = true;
+            break;
           }
+          if (id === undefined) break;
+          scanned = id;
+          const change = window.change(id);
+          if (change) take(change);
         }
         if (exhausted && request.candidate) {
-          // Saved after the store's read ends, so a store that reads in a
-          // transaction does not roll the saved scan back.
           return {
             paused: {
               high: window.high,
-              after: scanned,
+              ...(scanned && { after: scanned }),
               found: rows.map(identity),
               withheld,
+              ...(preparation && { preparation }),
             },
           };
         }
         if (rows.length === need || exhausted) {
           // The extra row is kept for the next page, which starts after the
           // last change this request examined.
-          const data = rows.slice(0, request.limit);
           return {
-            data,
+            data: rows.slice(0, request.limit),
             hasMore: true,
             nextCursor: tokens.page({
               low: position.low,
               high: window.high,
-              after: scanned!,
+              ...(scanned && { after: scanned }),
               found: rows.slice(request.limit).map(identity),
               carried: position.carried,
               withheld,
+              ...(preparation && { preparation }),
             }),
           };
         }
@@ -273,16 +358,26 @@ export function createPdppSyncSessionService(
         };
       },
     );
-    // State is written after the store's read ends, so a read snapshot never
-    // turns into a write and a store that reads in a transaction never rolls
-    // a write back.
     if ("paused" in result) {
       tokens.pauseScan(result.paused);
+      if (preparation) {
+        store.touchSyncPreparation(
+          preparation.id,
+          policy.now() + policy.ttl.page,
+          policy.now(),
+        );
+      }
       throw new SyncRetryLaterError();
     }
-    tokens.flush();
-    if (paused) tokens.endScan();
-    return result;
+    if (preparation) {
+      // A finished session frees its candidates; a paged one keeps them.
+      store.touchSyncPreparation(
+        preparation.id,
+        result.hasMore ? policy.now() + policy.ttl.page : 0,
+        policy.now(),
+      );
+    }
+    return finish(result);
   }
 
   return { read };
@@ -291,6 +386,33 @@ export function createPdppSyncSessionService(
 export type PdppSyncSessionService = ReturnType<
   typeof createPdppSyncSessionService
 >;
+
+/**
+ * One request's budget: `units` of store work, and for a candidate request a
+ * deadline. The first unit is always granted, so every request makes
+ * progress and a session always finishes.
+ */
+function requestBudget(
+  units: number,
+  deadline: number | undefined,
+  now: () => number,
+): SyncBudget {
+  let left = units;
+  let spent = 0;
+  return {
+    spend(n = 1) {
+      if (
+        spent > 0 &&
+        (left < n || (deadline !== undefined && now() >= deadline))
+      ) {
+        return false;
+      }
+      left -= n;
+      spent += n;
+      return true;
+    },
+  };
+}
 
 function identity(row: { recordKey: string; instance: string }) {
   return { recordKey: row.recordKey, instance: row.instance };
@@ -394,9 +516,18 @@ function sameProjection(
   );
 }
 
+/** A session's prepared candidate set and how far its preparation got. */
+interface Preparation {
+  id: string;
+  progress?: SyncPreparationProgress;
+  done: boolean;
+}
+
 interface Position {
   low: string | null;
   high?: string;
+  /** Incremental sessions: their prepared candidate set. */
+  preparation?: Preparation;
   /** The last change an earlier page examined. */
   after?: RecordIdentity;
   /** Changes an earlier page disclosed but did not serve. */
@@ -412,6 +543,7 @@ interface PausedScan {
   after?: RecordIdentity;
   found: RecordIdentity[];
   withheld: RecordIdentity[];
+  preparation?: Preparation;
 }
 
 interface StatePolicy {
@@ -423,7 +555,12 @@ interface StatePolicy {
 
 interface SessionTokens {
   open(request: SyncRequest): Position;
-  page(position: Required<Omit<Position, "high">> & { high: string }): string;
+  page(
+    position: Omit<Position, "high"> &
+      Pick<Required<Position>, "found" | "carried" | "withheld"> & {
+        high: string;
+      },
+  ): string;
   checkpoint(high: string, withheld: RecordIdentity[]): string;
   /** A scan this same request paused earlier, if any. */
   resumeScan(): PausedScan | undefined;
@@ -434,6 +571,17 @@ interface SessionTokens {
   /** Writes the handles this request minted. */
   flush(): void;
 }
+
+const toStored = (p: Preparation): NonNullable<StoredState["p"]> => ({
+  i: p.id,
+  ...(p.progress && { g: p.progress }),
+  d: p.done,
+});
+const fromStored = (p: NonNullable<StoredState["p"]>): Preparation => ({
+  id: p.i,
+  ...(p.g && { progress: p.g }),
+  done: p.d,
+});
 
 function identityKey(id: RecordIdentity): string {
   return JSON.stringify([id.recordKey, id.instance]);
@@ -459,6 +607,8 @@ interface StoredState {
   f?: Pair[];
   c?: Pair[];
   w?: Pair[];
+  /** Incremental sessions: preparation id, progress and whether it is done. */
+  p?: { i: string; g?: SyncPreparationProgress; d: boolean };
 }
 
 const HANDLE_VERSION = 2;
@@ -602,6 +752,7 @@ function sessionTokens(
       found: fromPairs(state.f),
       carried: fromPairs(state.c),
       withheld: fromPairs(state.w),
+      ...(state.p && { preparation: fromStored(state.p) }),
     };
   }
 
@@ -629,10 +780,13 @@ function sessionTokens(
       s: baseline,
       l: position.low,
       h: position.high,
-      a: [position.after.recordKey, position.after.instance],
+      ...(position.after && {
+        a: [position.after.recordKey, position.after.instance] as Pair,
+      }),
       f: toPairs(position.found),
       c: toPairs(position.carried),
       w: toPairs(position.withheld),
+      ...(position.preparation && { p: toStored(position.preparation) }),
     });
 
   // The paused state this request resumed, compared on every later write.
@@ -654,6 +808,7 @@ function sessionTokens(
         }),
         found: fromPairs(state.f),
         withheld: fromPairs(state.w),
+        ...(state.p && { preparation: fromStored(state.p) }),
       };
     },
     pauseScan(scan: PausedScan): void {
@@ -666,6 +821,7 @@ function sessionTokens(
           ...(scan.after && { a: [scan.after.recordKey, scan.after.instance] }),
           f: toPairs(scan.found),
           w: toPairs(scan.withheld),
+          ...(scan.preparation && { p: toStored(scan.preparation) }),
         }),
         "scan",
         resumed ?? null,

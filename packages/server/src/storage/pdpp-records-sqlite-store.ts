@@ -31,6 +31,9 @@ import {
   type RecordDataValidator,
   type StreamListing,
   type StreamSemantics,
+  type SyncBudget,
+  type SyncPreparationRequest,
+  type SyncPreparationResult,
   type SyncStateStore,
   type SyncTokenScope,
   type SyncWindow,
@@ -343,6 +346,31 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_owner
 CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_expires
   ON pdpp_sync_state (expires_at);
 `,
+  // v16: bounded sync work. A session's prepared candidate set, walked by
+  // key, and an index of deletions alone for the deletion-after-horizon test.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_sync_preparation (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  high INTEGER NOT NULL,
+  rows INTEGER NOT NULL DEFAULT 0,
+  done INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_preparation_owner
+  ON pdpp_sync_preparation (owner, expires_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_preparation_expires
+  ON pdpp_sync_preparation (expires_at);
+CREATE TABLE IF NOT EXISTS pdpp_sync_candidate (
+  preparation TEXT NOT NULL,
+  record_key TEXT NOT NULL,
+  instance TEXT NOT NULL,
+  PRIMARY KEY (preparation, record_key, instance)
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_deleted
+  ON pdpp_record_changes (instance, stream, record_key, written_at)
+  WHERE deleted = 1;
+`,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -410,9 +438,10 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
 function sqliteSyncStates(db: Database): SyncStateStore {
   const put = db.prepare(`INSERT OR REPLACE INTO pdpp_sync_state
     (id, owner, state, expires_at) VALUES (?, ?, ?, ?)`);
-  const dropExpired = db.prepare(
-    "DELETE FROM pdpp_sync_state WHERE expires_at <= ?",
-  );
+  // Bounded per write: a backlog of expired states drains over later writes.
+  const dropExpired = db.prepare(`DELETE FROM pdpp_sync_state WHERE rowid IN (
+    SELECT rowid FROM pdpp_sync_state INDEXED BY idx_pdpp_sync_state_expires
+    WHERE expires_at <= ? LIMIT 100)`);
   // rowid grows with each insert or replace, so it orders states by age.
   const evict = db.prepare(`DELETE FROM pdpp_sync_state WHERE rowid IN (
     SELECT rowid FROM pdpp_sync_state WHERE owner = ?
@@ -2008,8 +2037,36 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
      ORDER BY written_at DESC, version DESC LIMIT 1`,
   );
   const deletedAfterStmt =
-    db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+    lazy(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_deleted
       WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
+
+  // One seek per identity. A first sync walks the identity index; an
+  // incremental session walks its prepared candidates. Neither groups or
+  // sorts: each statement returns at most one row.
+  const seekStmts = new Map<string, { get(...params: unknown[]): unknown }>();
+  function seek(
+    source: "history" | "candidates",
+    direction: "asc" | "desc",
+    hasAfter: boolean,
+  ) {
+    const key = `${source}:${direction}:${hasAfter}`;
+    let stmt = seekStmts.get(key);
+    if (!stmt) {
+      const dir = direction === "desc" ? "DESC" : "ASC";
+      const cmp = direction === "desc" ? "<" : ">";
+      const table =
+        source === "history"
+          ? "pdpp_record_changes INDEXED BY idx_pdpp_record_changes_sync_identity WHERE stream = ?"
+          : "pdpp_sync_candidate WHERE preparation = ?";
+      stmt = db.prepare(
+        `SELECT record_key, instance FROM ${table}` +
+          (hasAfter ? ` AND (record_key, instance) ${cmp} (?, ?)` : "") +
+          ` ORDER BY record_key ${dir}, instance ${dir} LIMIT 1`,
+      );
+      seekStmts.set(key, stmt);
+    }
+    return stmt;
+  }
 
   function readSyncWindow<T>(
     stream: string,
@@ -2035,37 +2092,50 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         return row ? toRow(row) : undefined;
       };
 
+      const preparation =
+        request.preparation === undefined
+          ? undefined
+          : (preparationRow.get(request.preparation) as
+              { done: number; expires_at: number } | undefined);
+      // A released or evicted preparation is expired before it is swept.
+      if (
+        request.preparation !== undefined &&
+        (!preparation?.done || preparation.expires_at === 0)
+      ) {
+        throw new CursorExpiredError();
+      }
+      // An incremental window walks only its prepared keys.
+      if (low !== null && request.preparation === undefined) {
+        throw new RangeError("an incremental sync window needs a preparation");
+      }
+      const granted = new Set(instanceIds);
+      const scope =
+        request.preparation === undefined ? stream : request.preparation;
+      const source =
+        request.preparation === undefined ? "history" : "candidates";
+
       // Identities in record-key then instance order; SQLite's BINARY text
-      // order is `compareRecordIdentity`'s code-point order. A first sync
-      // walks the identity index; an incremental window enumerates only the
-      // keys written in it, through the horizon index.
-      function* changes(
+      // order is `compareRecordIdentity`'s code-point order.
+      function next(
         direction: "asc" | "desc",
-        after?: RecordIdentity,
-      ): Generator<SyncWindowChange> {
-        if (instanceIds.length === 0 || low === high) return;
-        const dir = direction === "desc" ? "DESC" : "ASC";
-        const placeholders = instanceIds.map(() => "?").join(",");
-        let sql =
-          low === null
-            ? `SELECT record_key, instance FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_sync_identity
-               WHERE stream = ? AND instance IN (${placeholders}) AND written_at <= ?`
-            : `SELECT record_key, instance FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_horizon
-               WHERE stream = ? AND instance IN (${placeholders}) AND written_at > ? AND written_at <= ?`;
-        const params: unknown[] =
-          low === null
-            ? [stream, ...instanceIds, high]
-            : [stream, ...instanceIds, low, high];
-        if (after) {
-          sql += ` AND (record_key, instance) ${direction === "desc" ? "<" : ">"} (?, ?)`;
-          params.push(after.recordKey, after.instance);
-        }
-        sql += ` GROUP BY record_key, instance ORDER BY record_key ${dir}, instance ${dir}`;
-        for (const id of db.prepare(sql).iterate(...params) as Iterable<{
-          record_key: string;
-          instance: string;
-        }>) {
-          yield change({ recordKey: id.record_key, instance: id.instance })!;
+        after: RecordIdentity | undefined,
+        budget: SyncBudget,
+      ): RecordIdentity | undefined | null {
+        let at = after;
+        for (;;) {
+          if (!budget.spend()) return null;
+          const row = (
+            at
+              ? seek(source, direction, true).get(
+                  scope,
+                  at.recordKey,
+                  at.instance,
+                )
+              : seek(source, direction, false).get(scope)
+          ) as { record_key: string; instance: string } | undefined;
+          if (!row) return undefined;
+          at = { recordKey: row.record_key, instance: row.instance };
+          if (granted.has(row.instance)) return at;
         }
       }
 
@@ -2088,13 +2158,183 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
 
       return read({
         high: String(high),
-        changes,
+        next,
         change,
         versionAtHigh: (instance, recordKey) =>
           versionAt(instance, recordKey, high),
       });
     })();
   }
+
+  // Prepared on first use: a database at an older schema version than these
+  // statements need still opens, migrates, and only then runs them.
+  function lazy(sql: string) {
+    let stmt: ReturnType<Database["prepare"]> | undefined;
+    const get = () => (stmt ??= db.prepare(sql));
+    return {
+      get: (...params: unknown[]) => get().get(...params),
+      all: (...params: unknown[]) => get().all(...params),
+      run: (...params: unknown[]) => get().run(...params),
+    };
+  }
+  const preparationRow = lazy(
+    "SELECT * FROM pdpp_sync_preparation WHERE id = ?",
+  );
+  const insertPreparation = lazy(`INSERT INTO pdpp_sync_preparation
+    (id, owner, high, rows, done, expires_at) VALUES (?, ?, ?, 0, 0, ?)`);
+  const updatePreparation = lazy(
+    "UPDATE pdpp_sync_preparation SET rows = ?, done = ?, expires_at = ? WHERE id = ?",
+  );
+  const expirePreparation = lazy(
+    "UPDATE pdpp_sync_preparation SET expires_at = 0 WHERE id = ?",
+  );
+  const ownerPreparations = lazy(`SELECT COUNT(*) AS count,
+    COALESCE(SUM(rows), 0) AS rows FROM pdpp_sync_preparation
+    INDEXED BY idx_pdpp_sync_preparation_owner WHERE owner = ? AND expires_at > ?`);
+  // rowid orders preparations by age.
+  const evictPreparations =
+    db.prepare(`UPDATE pdpp_sync_preparation SET expires_at = 0
+    WHERE rowid IN (SELECT rowid FROM pdpp_sync_preparation
+      INDEXED BY idx_pdpp_sync_preparation_owner WHERE owner = ? AND expires_at > ?
+      ORDER BY rowid DESC LIMIT -1 OFFSET ?)`);
+  const preparationWrites = lazy(`SELECT id, record_key, written_at
+    FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_horizon
+    WHERE stream = ? AND instance = ? AND written_at > ? AND written_at <= ?
+    ORDER BY written_at LIMIT ?`);
+  const addCandidate = lazy(
+    "INSERT OR IGNORE INTO pdpp_sync_candidate (preparation, record_key, instance) VALUES (?, ?, ?)",
+  );
+  const expiredPreparations = lazy(`SELECT id FROM pdpp_sync_preparation
+    INDEXED BY idx_pdpp_sync_preparation_expires WHERE expires_at <= ? LIMIT 4`);
+  const dropCandidates =
+    db.prepare(`DELETE FROM pdpp_sync_candidate WHERE rowid IN (
+    SELECT rowid FROM pdpp_sync_candidate WHERE preparation = ? LIMIT ?)`);
+  const dropPreparation = lazy(
+    "DELETE FROM pdpp_sync_preparation WHERE id = ?",
+  );
+  /** Candidate rows one write may delete while sweeping expired preparations. */
+  const SWEEP_ROWS = 1000;
+
+  /** Frees expired preparations in bounded steps; the rest wait for later writes. */
+  function sweepPreparations(now: number): void {
+    let left = SWEEP_ROWS;
+    for (const { id } of expiredPreparations.all(now) as { id: string }[]) {
+      const dropped = dropCandidates.run(id, left).changes;
+      left -= dropped;
+      if (left <= 0) return;
+      dropPreparation.run(id);
+    }
+  }
+
+  const prepareTx = db.transaction(
+    (
+      stream: string,
+      request: SyncPreparationRequest,
+    ): SyncPreparationResult => {
+      sweepPreparations(request.now);
+      let row = preparationRow.get(request.id) as
+        | { high: number; rows: number; done: number; expires_at: number }
+        | undefined;
+      if (row && row.expires_at <= request.now) {
+        expirePreparation.run(request.id);
+        throw new CursorExpiredError();
+      }
+      if (!row) {
+        // Gone after it started: expired, evicted or swept.
+        if (request.progress) throw new CursorExpiredError();
+        const high =
+          request.high === undefined
+            ? readWriteClock()
+            : parseHorizon(request.high);
+        insertPreparation.run(
+          request.id,
+          request.owner,
+          high,
+          request.expiresAt,
+        );
+        evictPreparations.run(request.owner, request.now, request.maxPerOwner);
+        row = { high, rows: 0, done: 0, expires_at: request.expiresAt };
+      }
+      const low = parseHorizon(request.low);
+      const high = row.high;
+      assertNotResetSince(request.instanceIds, [high, low]);
+      const instanceIds = [...new Set(request.instanceIds)].sort();
+      let rows = row.rows;
+      let i = Number(request.progress?.i ?? 0);
+      let after = Number(request.progress?.w ?? low);
+      let done = row.done === 1;
+      const owner = ownerPreparations.get(request.owner, request.now) as {
+        rows: number;
+      };
+      let ownerRows = owner.rows;
+      chunks: while (!done) {
+        if (i >= instanceIds.length) {
+          done = true;
+          break;
+        }
+        // Read one row at a time from the horizon index, so a spent budget
+        // stops the scan at once and the next request resumes after it.
+        if (!request.budget.spend()) break chunks;
+        const write = preparationWrites.get(
+          stream,
+          instanceIds[i],
+          after,
+          high,
+          1,
+        ) as { id: number; record_key: string; written_at: number } | undefined;
+        if (!write) {
+          i += 1;
+          after = low;
+          continue;
+        }
+        after = write.written_at;
+        if (
+          addCandidate.run(request.id, write.record_key, instanceIds[i])
+            .changes > 0
+        ) {
+          rows += 1;
+          ownerRows += 1;
+          if (ownerRows > request.maxRowsPerOwner) {
+            expirePreparation.run(request.id);
+            throw new CursorExpiredError();
+          }
+        }
+      }
+      updatePreparation.run(rows, done ? 1 : 0, request.expiresAt, request.id);
+      return {
+        high: String(high),
+        progress: { i, w: after },
+        done,
+      };
+    },
+  );
+
+  function prepareSyncWindow(
+    stream: string,
+    request: SyncPreparationRequest,
+  ): SyncPreparationResult {
+    if (db.readonly) {
+      throw new Error("a readonly store cannot prepare a sync window");
+    }
+    try {
+      return prepareTx.immediate(stream, request);
+    } catch (err) {
+      // An expiry decided inside the transaction must survive its rollback.
+      if (err instanceof CursorExpiredError) expirePreparation.run(request.id);
+      throw err;
+    }
+  }
+
+  const touchPreparation = lazy(
+    "UPDATE pdpp_sync_preparation SET expires_at = ? WHERE id = ? AND expires_at > ?",
+  );
+  const touchTx = db.transaction(
+    (id: string, expiresAt: number, now: number) => {
+      sweepPreparations(now);
+      touchPreparation.run(expiresAt <= now ? 0 : expiresAt, id, now);
+    },
+  );
+  const sweepTx = db.transaction((now: number) => sweepPreparations(now));
 
   // A readonly handle cannot persist session state; it keeps it in process.
   const syncStates: SyncStateStore = db.readonly
@@ -2296,6 +2536,26 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     readSyncWindow,
     syncTokenScope,
     syncStates: () => syncStates,
+    prepareSyncWindow,
+    touchSyncPreparation: (id, expiresAt, now) => {
+      if (!db.readonly) touchTx.immediate(id, expiresAt, now);
+    },
+    sweepSyncPreparations: (now) => {
+      if (!db.readonly) sweepTx.immediate(now);
+    },
+    inspectSyncState: () => {
+      const count = (table: string) =>
+        (
+          db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as {
+            n: number;
+          }
+        ).n;
+      return {
+        states: db.readonly ? 0 : count("pdpp_sync_state"),
+        preparations: count("pdpp_sync_preparation"),
+        candidates: count("pdpp_sync_candidate"),
+      };
+    },
     listStreams,
     putBlobMeta: (meta: PdppBlobMeta) =>
       putBlobStmt.run({

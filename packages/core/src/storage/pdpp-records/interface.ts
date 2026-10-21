@@ -8,6 +8,8 @@ import type {
   PdppStoredRecord,
   StreamListing,
   StreamSemantics,
+  SyncPreparationRequest,
+  SyncPreparationResult,
   SyncStateStore,
   SyncTokenScope,
   SyncWindow,
@@ -86,6 +88,29 @@ export interface PdppRecordStore {
 
   /** Where the sync session owner keeps handle state. */
   syncStates(): SyncStateStore;
+
+  /**
+   * Adds the next bounded chunk of the keys written in (low, high] to a
+   * session's candidate set. Throws `CursorExpiredError` when the
+   * preparation expired or the owner's row cap is exceeded.
+   */
+  prepareSyncWindow(
+    stream: string,
+    request: SyncPreparationRequest,
+  ): SyncPreparationResult;
+
+  /** Keeps a preparation alive until `expiresAt`, or ends it with 0. */
+  touchSyncPreparation(id: string, expiresAt: number, now: number): void;
+
+  /** Frees expired preparations in one bounded step. */
+  sweepSyncPreparations(now: number): void;
+
+  /** Diagnostic counts of stored sync state, for tests and operators. */
+  inspectSyncState(): {
+    states: number;
+    preparations: number;
+    candidates: number;
+  };
 
   listStreams(instanceIds: string[]): StreamListing[];
 

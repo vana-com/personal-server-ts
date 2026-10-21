@@ -118,7 +118,9 @@ describe("sqlite bounded sync work", () => {
       const options: SyncSessionOptions = { maxExaminedPerRequest: 100 };
       const sync = createPdppSyncSessionService(store, options);
       const perRequest: number[] = [];
-      const first = drain(sync, { ...request(), limit: 1000 }, () => {
+      // Rows read before each request belong to the request before it.
+      work.rows = 0;
+      const first = drain(sync, { ...request(), limit: 100 }, () => {
         perRequest.push(work.rows);
         work.rows = 0;
       });
@@ -126,9 +128,10 @@ describe("sqlite bounded sync work", () => {
       // A backlog: every key changes after the checkpoint.
       put(store, keys(2000), "2");
       for (let n = 0; n < 50; n++) put(store, ["hot"], `b${n}`);
+      work.rows = 0;
       const next = drain(
         sync,
-        { ...request(), limit: 1000, changesSince: first.checkpoint },
+        { ...request(), limit: 100, changesSince: first.checkpoint },
         () => {
           perRequest.push(work.rows);
           work.rows = 0;
@@ -195,7 +198,7 @@ for (const backend of ["memory", "sqlite"])
       try {
         put(store, keys(500), "1");
         const unbounded = createPdppSyncSessionService(store);
-        const first = drain(unbounded, { ...request(), limit: 1000 });
+        const first = drain(unbounded, { ...request(), limit: 100 });
         put(store, keys(500), "2");
         const growth: number[] = [];
         let last = 0;
@@ -204,7 +207,7 @@ for (const backend of ["memory", "sqlite"])
         });
         const resumed = drain(
           bounded,
-          { ...request(), limit: 1000, changesSince: first.checkpoint },
+          { ...request(), limit: 100, changesSince: first.checkpoint },
           () => {
             const now = store.inspectSyncState().candidates;
             growth.push(now - last);
@@ -216,8 +219,8 @@ for (const backend of ["memory", "sqlite"])
         expect(resumed.retries).toBeGreaterThanOrEqual(10);
         // The result equals an unbudgeted session over the same window.
         const reference = drain(unbounded, {
-          ...request("grant-ref", "owner-ref"),
-          limit: 1000,
+          ...request(),
+          limit: 100,
           changesSince: first.checkpoint,
         });
         expect(resumed.seen).toEqual(reference.seen);
@@ -236,11 +239,11 @@ for (const backend of ["memory", "sqlite"])
           maxExaminedPerRequest: 50,
           now: () => now,
         });
-        const first = drain(sync, { ...request(), limit: 1000 });
+        const first = drain(sync, { ...request(), limit: 100 });
         put(store, keys(300), "2");
         const session = {
           ...request(),
-          limit: 1000,
+          limit: 100,
           changesSince: first.checkpoint,
         };
         expect(() => sync.read(session)).toThrow(SyncRetryLaterError);
@@ -250,13 +253,44 @@ for (const backend of ["memory", "sqlite"])
         // Other sessions' writes sweep expired state in bounded steps.
         const other = createPdppSyncSessionService(store, { now: () => now });
         for (let n = 0; n < 20; n++)
-          drain(other, { ...request(`other-${n}`, "owner-b"), limit: 1000 });
+          drain(other, { ...request(`other-${n}`, "owner-b"), limit: 100 });
         expect(store.inspectSyncState()).toMatchObject({ candidates: 0 });
-        // Only owner-b's live checkpoints remain; the paused scan is gone.
-        expect(store.inspectSyncState().states).toBeLessThanOrEqual(20);
+        // Left: owner-b's 20 sessions of three pages (two live page handles
+        // and a checkpoint each) and owner-a's first checkpoint, which lives
+        // 30 days. The paused scan (it would make 62) and its preparation are
+        // gone.
+        expect(store.inspectSyncState()).toMatchObject({
+          states: 61,
+          preparations: 0,
+        });
         // A retry of the abandoned request starts afresh and still completes.
         const retried = drain(sync, session);
         expect(retried.seen).toHaveLength(300);
+      } finally {
+        store.close();
+      }
+    });
+
+    it("sweeps an orphaned paused scan once it expires", () => {
+      const store = create();
+      try {
+        put(store, keys(50), "1");
+        let now = 1_000_000;
+        const sync = createPdppSyncSessionService(store, {
+          maxExaminedPerRequest: 5,
+          now: () => now,
+        });
+        // A first sync pauses and its client never retries.
+        expect(() => sync.read({ ...request(), limit: 100 })).toThrow(
+          SyncRetryLaterError,
+        );
+        expect(store.inspectSyncState().states).toBe(1);
+        now += 11 * 60_000; // past the 10-minute paused-scan lifetime
+        // Another session's write sweeps it.
+        const other = createPdppSyncSessionService(store, { now: () => now });
+        drain(other, { ...request("g2", "owner-b"), limit: 100 });
+        // Only owner-b's checkpoint remains.
+        expect(store.inspectSyncState().states).toBe(1);
       } finally {
         store.close();
       }
@@ -269,15 +303,15 @@ for (const backend of ["memory", "sqlite"])
         const sync = createPdppSyncSessionService(store, {
           maxExaminedPerRequest: 30,
         });
-        const one = drain(sync, { ...request("g1", "owner-a"), limit: 1000 });
-        const two = drain(sync, { ...request("g2", "owner-b"), limit: 1000 });
+        const one = drain(sync, { ...request("g1", "owner-a"), limit: 100 });
+        const two = drain(sync, { ...request("g2", "owner-b"), limit: 100 });
         put(store, keys(200, "a"), "2");
         // Interleave the two incremental sessions request by request.
         const sessions = [
           {
             base: {
               ...request("g1", "owner-a"),
-              limit: 1000,
+              limit: 100,
               changesSince: one.checkpoint,
             },
             seen: [] as string[],
@@ -287,7 +321,7 @@ for (const backend of ["memory", "sqlite"])
           {
             base: {
               ...request("g2", "owner-b"),
-              limit: 1000,
+              limit: 100,
               changesSince: two.checkpoint,
             },
             seen: [] as string[],
@@ -327,17 +361,17 @@ for (const backend of ["memory", "sqlite"])
         const sync = createPdppSyncSessionService(store, {
           maxPreparedRowsPerOwner: 50,
         });
-        const first = drain(sync, { ...request(), limit: 1000 });
+        const first = drain(sync, { ...request(), limit: 100 });
         put(store, keys(100), "2");
         expect(() =>
           sync.read({
             ...request(),
-            limit: 1000,
+            limit: 100,
             changesSince: first.checkpoint,
           }),
         ).toThrow(CursorExpiredError);
         // A restart from beginning needs no prepared set.
-        expect(drain(sync, { ...request(), limit: 1000 }).seen).toHaveLength(
+        expect(drain(sync, { ...request(), limit: 100 }).seen).toHaveLength(
           100,
         );
       } finally {

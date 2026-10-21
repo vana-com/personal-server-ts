@@ -106,6 +106,48 @@ export interface SyncWindowRequest {
   low: string | null;
   /** Fixed horizon of an anchored session. Absent captures the current one. */
   high?: string;
+  /**
+   * Incremental windows: the prepared candidate set to walk
+   * (`prepareSyncWindow`). A preparation that has expired is
+   * `CursorExpiredError`.
+   */
+  preparation?: string;
+}
+
+/**
+ * The work one sync request may still do, owned by the session service.
+ * Stores call `spend` before each unit of physical work (one history row
+ * read, one index seek) and stop when it returns false.
+ */
+export interface SyncBudget {
+  spend(units?: number): boolean;
+}
+
+/** Where a preparation stopped; opaque to everyone but the store. */
+export type SyncPreparationProgress = Record<string, unknown>;
+
+export interface SyncPreparationRequest {
+  /** The session's preparation id; the store creates it on first use. */
+  id: string;
+  owner: string;
+  instanceIds: string[];
+  low: string;
+  /** Absent on the first call: the store fixes the horizon then. */
+  high?: string;
+  progress?: SyncPreparationProgress;
+  budget: SyncBudget;
+  now: number;
+  expiresAt: number;
+  /** Preparations one owner keeps; the oldest expire beyond it. */
+  maxPerOwner: number;
+  /** Candidate rows one owner's live preparations may hold. */
+  maxRowsPerOwner: number;
+}
+
+export interface SyncPreparationResult {
+  high: string;
+  progress: SyncPreparationProgress;
+  done: boolean;
 }
 
 export interface RecordIdentity {
@@ -126,17 +168,20 @@ export interface SyncWindowChange {
 export interface SyncWindow {
   high: string;
   /**
-   * The window's changes in `compareRecordIdentity` order, starting strictly
-   * after `after`. Lazy: the store does work only for changes the caller
-   * pulls, and an incremental window enumerates only keys written in it.
+   * The next candidate identity strictly after `after`, in
+   * `compareRecordIdentity` order: one indexed seek, paid from `budget`. A
+   * first sync walks every identity the stream holds; an incremental window
+   * walks its prepared candidate set. `undefined` at the end, `null` when the
+   * budget is spent. A candidate need not exist at the high horizon.
    */
-  changes(
+  next(
     direction: "asc" | "desc",
-    after?: RecordIdentity,
-  ): Iterable<SyncWindowChange>;
+    after: RecordIdentity | undefined,
+    budget: SyncBudget,
+  ): RecordIdentity | undefined | null;
   /** One key's version at the high horizon. */
   versionAtHigh(instance: string, recordKey: string): PdppRecordRow | undefined;
-  /** One key known to be in the window, read as `changes` would yield it. */
+  /** One key's change, or undefined if it does not exist at the high horizon. */
   change(id: RecordIdentity): SyncWindowChange | undefined;
 }
 

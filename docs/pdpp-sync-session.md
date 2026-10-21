@@ -13,16 +13,16 @@ them.
 
 ## Invariant owners
 
-| Invariant                                             | Owner                                                                                                                                                                                                                      |
-| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Which change a session discloses                      | `disclose` in the session service. Profiles differ only in policy.                                                                                                                                                         |
-| Page boundaries, `has_more` and work per request      | The session service. It counts only disclosed items and examines at most `maxExaminedPerRequest` changes (default 10,000) per request. A candidate request also stops after `maxScanMillis` (default 2 s).                 |
-| Token format, role, binding and integrity             | The session service: fixed-length handles for every page cursor and every candidate checkpoint, naming server-side state; readable checkpoints for the current profile.                                                    |
-| History at a horizon, reset fence, horizon validation | Each store's `readSyncWindow`, inside one read transaction. Its window yields changes lazily in identity order from a seek boundary.                                                                                       |
-| One record per id on the wire                         | `assertOnlyHolder` in the session service and `listSnapshotPage` for lists; the detail route for single reads.                                                                                                             |
-| Order of emitted time                                 | `timeSortKey` in `pdpp/time.ts`, from the same parser as `compareTime`. SQLite stores it as `emitted_key`.                                                                                                                 |
-| Handle key, epoch and session state                   | Each store's `syncTokenScope` and `syncStates`. SQLite keeps the key and epoch in `pdpp_store_metadata` and session state in `pdpp_sync_state` (schema v14); a readonly handle and the memory store keep state in process. |
-| Stream discovery for a client token                   | The grant. `GET /v1/streams` lists every stream the grant names.                                                                                                                                                           |
+| Invariant                                                          | Owner                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Which change a session discloses                                   | `disclose` in the session service. Profiles differ only in policy.                                                                                                                                                                                                                                                         |
+| Page boundaries, `has_more` and work per request                   | The session service. It counts only disclosed items and owns one budget per request: `maxExaminedPerRequest` units (default 10,000), where a unit is one history row read or one index seek, and for a candidate request `maxScanMillis` (default 2 s). The first unit is always granted, so every request makes progress. |
+| Token format, role, binding and integrity                          | The session service: fixed-length handles for every page cursor and every candidate checkpoint, naming server-side state; readable checkpoints for the current profile.                                                                                                                                                    |
+| History at a horizon, reset fence, horizon validation, preparation | Each store. `prepareSyncWindow` adds the keys written in an incremental window to the session's candidate set in budgeted steps; `readSyncWindow` then seeks one identity at a time, through the identity index for a first sync or the candidate set for an incremental one. No step groups or sorts.                     |
+| One record per id on the wire                                      | `assertOnlyHolder` in the session service and `listSnapshotPage` for lists; the detail route for single reads.                                                                                                                                                                                                             |
+| Order of emitted time                                              | `timeSortKey` in `pdpp/time.ts`, from the same parser as `compareTime`. SQLite stores it as `emitted_key`.                                                                                                                                                                                                                 |
+| Handle key, epoch and session state                                | Each store's `syncTokenScope` and `syncStates`. SQLite keeps the key and epoch in `pdpp_store_metadata` and session state in `pdpp_sync_state` (schema v14); a readonly handle and the memory store keep state in process.                                                                                                 |
+| Stream discovery for a client token                                | The grant. `GET /v1/streams` lists every stream the grant names.                                                                                                                                                                                                                                                           |
 
 Stores no longer mint cursors, bump the write clock for a sync read, or
 compare projections. The route no longer filters a page after pagination.
@@ -79,8 +79,10 @@ read, alter or reuse its own current-profile tokens.
   because a sync read no longer advances the clock.
 - Changing `order` between candidate sessions invalidates the checkpoint, as
   the candidate binds `order` into the query context.
-- Schema v14 adds a column, and v15 adds the `pdpp_sync_state` table. As with
-  earlier migrations, an older build refuses to open the upgraded database.
+- Schema v14 adds a column, v15 adds the `pdpp_sync_state` table, and v16
+  adds `pdpp_sync_preparation`, `pdpp_sync_candidate` and an index of
+  deletions alone. As with earlier migrations, an older build refuses to open
+  the upgraded database.
 - A sync read now writes session state, after the store's read has ended. It
   never moves the write clock.
 - Error precedence is unchanged: a deleted connection answers
@@ -109,12 +111,30 @@ a changed `limit`, retries, and a SQLite restart followed by a reset.
   a `200` into one or more `429`s. A request whose budget runs out exactly at
   the end pays one extra `429`. Every retry examines at least one new change,
   so a session always finishes.
-- The budgets bound the changes a request discloses or skips, not all store
-  work. Before the first change reaches the session, the memory store builds
-  an index of the stream's history, and SQLite sorts the keys written in the
-  window. Neither is interrupted by the time budget. That cost grows with the
-  window's writes, not with the stream, and each retry seeks past what earlier
-  requests examined.
+- Store work per request is bounded. An incremental session first prepares
+  its candidate set: each history row in the window, read one at a time from
+  the horizon index, costs one unit and adds its key once. A candidate request
+  answers `429` until preparation is done; a current-profile request returns
+  its early, possibly empty page with `has_more`. Pages then seek through the
+  candidate set by key. A first sync seeks through the identity index one
+  identity at a time, so a key with many versions costs one seek. A test
+  counts the rows SQLite returns per request and checks each sync read's plan
+  for a temporary sort or a table scan.
+- Not charged to the budget, but bounded: re-reading the at most 101 results a
+  paused or paged request already found (one page plus one, as the service
+  refuses a `limit` over 100), the one-record-per-key check across read
+  instances, and cleanup, which deletes at most 1,000 candidate rows and 100
+  expired states per write. The memory store merges keys first written since
+  its last sync read into its sorted index on that read.
+- A preparation is session state: it expires one page lifetime after its last
+  use, a finished session frees it at once, each owner keeps at most
+  `maxStatesPerOwner` preparations, and their candidates may hold at most
+  `maxPreparedRowsPerOwner` (1,000,000) rows. A window over that cap is
+  `410 cursor_expired`; the client restarts from `beginning`, which needs no
+  preparation. Expired preparations and paused scans are swept in bounded
+  steps by later sync requests.
+- A readonly SQLite handle cannot prepare: an incremental sync there fails.
+  Only the declaration witness opens one, and it does not sync.
 - Paused scans are compare-and-set: a request saves or ends a scan only if no
   other request moved it since it was resumed, so a stale request cannot
   overwrite newer progress or revive a finished scan. Two identical requests
