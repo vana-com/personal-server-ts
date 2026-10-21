@@ -332,6 +332,40 @@ async function expectFailure(
 }
 
 describe("executeJob", () => {
+  it("refreshes revoked evidence after 31 monotonic seconds despite a wall clock correction", async () => {
+    const fixture = await createFixture();
+    let monotonic = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW);
+    const clock = vi
+      .spyOn(performance, "now")
+      .mockImplementation(() => monotonic);
+    try {
+      vi.mocked(fixture.gateway.getGrant)
+        .mockResolvedValueOnce({ ...fixture.grant })
+        .mockResolvedValue({ ...fixture.grant, revokedAt: NOW.toISOString() });
+      const bytes = await fixture.storage.readEnvelopeBytes!(SCOPE, "ignored");
+      vi.mocked(fixture.storage.readEnvelopeBytes!).mockImplementation(
+        async () => {
+          monotonic = 31_000;
+          return bytes;
+        },
+      );
+
+      await expect(
+        executeJob(fixture.envelope, fixture.deps),
+      ).rejects.toMatchObject({
+        code: "GRANT_REVOKED",
+        retryable: false,
+      });
+      expect(fixture.gateway.getGrant).toHaveBeenCalledTimes(2);
+      expect(fixture.uploadedBytes().byteLength).toBe(0);
+    } finally {
+      clock.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
   it("verifies builder auth over the SDK canonical request hash", async () => {
     const bytes = canonicalJobRequestBytes(VECTOR_REQUEST);
     const hash = createHash("sha256").update(bytes).digest("hex");
