@@ -2230,6 +2230,9 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
     lossy: [
       "href is reconstructed from the retained Claude route convention; rawContent and unavailable fetchError are omitted.",
     ],
+    // The live declaration's conversation blob_ref is the raw envelope; its
+    // typed record and messages are complete without it.
+    ...(live ? { ancillaryBlobStreams: ["conversations"] } : {}),
     provenance: live
       ? [
           {
@@ -2282,6 +2285,7 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
           },
         };
       const projected = [];
+      let unknownMessageCounts = 0;
       for (const conversation of conversations) {
         if (
           typeof conversation.id !== "string" ||
@@ -2339,11 +2343,13 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
               attachments: message.attachments ?? [],
             };
           });
-        const messageCount =
-          typeof conversation.message_count === "number"
-            ? conversation.message_count
-            : messages.length;
-        if (messageCount !== messages.length)
+        // Only the source's own count proves the fetched messages are the
+        // whole conversation. Without one (anthropic-live writes null when
+        // the run did not read the detail) the conversation is served with
+        // what was fetched and reported partial, never certified complete.
+        const messageCount = conversation.message_count ?? null;
+        if (messageCount === null) unknownMessageCounts += 1;
+        else if (messageCount !== messages.length)
           return {
             ok: false,
             error: {
@@ -2365,16 +2371,22 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
           messages,
         });
       }
+      const diagnostics = partialRows(
+        scope,
+        "conversations",
+        "message_count_unknown",
+        unknownMessageCounts,
+      );
       return {
         ok: true,
+        ...(diagnostics.length > 0 ? { diagnostics } : {}),
         payload: {
           profile: metadata.profile,
           organizationId: metadata.organizationId,
           conversations: projected,
           total: projected.length,
           messageTotal: projected.reduce(
-            (total, conversation) =>
-              total + (conversation.messageCount as number),
+            (total, conversation) => total + conversation.messages.length,
             0,
           ),
           source: live ? "live-session" : "official-export",
