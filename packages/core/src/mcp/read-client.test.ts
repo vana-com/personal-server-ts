@@ -52,6 +52,50 @@ describe("mcp/read-client", () => {
     expect(accessLogWrite).not.toHaveBeenCalled();
   });
 
+  it("refuses a read whose version identity storage cannot establish, retryably", async () => {
+    const readScopeBlocks = vi.fn();
+    const readBlockManifest = vi.fn();
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          // A row from before generations, whose backfill lost a race.
+          findEntry: () => ({
+            id: 1,
+            path: "oura/sleep/a.json",
+            scope: "oura.sleep",
+            collectedAt: "2026-10-01T00:00:00Z",
+            fileId: "file-1",
+          }),
+          backfillGeneration: vi.fn().mockResolvedValue(undefined),
+          readScopeBlocks,
+          readBlockManifest,
+        } as never,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi
+            .fn()
+            .mockResolvedValue({ grantId: "grant-1" }),
+        },
+        accessLogWriter: { write: vi.fn() },
+      },
+    });
+
+    for (const read of [
+      client.readScopeBlocks({ scope: "oura.sleep", grantId: "grant-1" }),
+      client.readBlockManifest!({ scope: "oura.sleep", grantId: "grant-1" }),
+    ]) {
+      await expect(read).rejects.toMatchObject({
+        status: 409,
+        body: { error: "VERSION_CHANGED", reason: "identity_unavailable" },
+      });
+    }
+    expect(readScopeBlocks).not.toHaveBeenCalled();
+    expect(readBlockManifest).not.toHaveBeenCalled();
+  });
+
   it("preserves a projection refusal from the block manifest read", async () => {
     const client = createMcpDataReadClient({
       serverOrigin: SERVER_ORIGIN,
@@ -63,6 +107,7 @@ describe("mcp/read-client", () => {
             collectedAt: "2026-10-01T00:00:00Z",
             fileId: "file-1",
             pdppOrigin: false,
+            generation: "gen-1",
           }),
           readBlockManifest: vi
             .fn()
