@@ -54,6 +54,8 @@ const compareText = (left: string, right: string) =>
   left < right ? -1 : left > right ? 1 : 0;
 
 function stableJson(value: unknown): string {
+  // `data` is a JSON value contract: object key order is ignored, while array
+  // order and every decoded JSON value remain significant.
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value !== null && typeof value === "object") {
     const entries = Object.entries(value).sort(([left], [right]) =>

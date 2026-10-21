@@ -5,6 +5,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   mkdtempSync,
   mkdirSync,
+  existsSync,
   rmSync,
   writeFileSync,
   readFileSync,
@@ -102,6 +103,7 @@ type Init = {
   master: number[];
   serverKey: Hex;
   scriptSha256: string;
+  oracleSha256: string;
 };
 type HostRequest = {
   id: number;
@@ -154,6 +156,17 @@ async function host() {
     digest(readFileSync(fileURLToPath(import.meta.url))),
     init.scriptSha256,
     "Harness changed during run",
+  );
+  assert.equal(
+    digest(
+      readFileSync(
+        fileURLToPath(
+          new URL("./pdpp-replica-record-oracle.ts", import.meta.url),
+        ),
+      ),
+    ),
+    init.oracleSha256,
+    "Canonical oracle changed during run",
   );
   mkdirSync(init.root, { recursive: true, mode: 0o700 });
   const db = new Database(join(init.root, "records.sqlite"));
@@ -621,6 +634,12 @@ async function main() {
   const root = mkdtempSync(join(parent, "replica-live-"));
   const reportPath =
     process.argv[2] ?? join(parent, `replica-live-${Date.now()}.json`);
+  const harnessFile = fileURLToPath(import.meta.url);
+  const oracleFile = fileURLToPath(
+    new URL("./pdpp-replica-record-oracle.ts", import.meta.url),
+  );
+  const scriptSha256 = digest(readFileSync(harnessFile));
+  const oracleSha256 = digest(readFileSync(oracleFile));
   const ownerAccount = privateKeyToAccount(generatePrivateKey());
   const owner = ownerAccount.address;
   const master = [
@@ -635,7 +654,8 @@ async function main() {
         owner,
         master,
         serverKey: generatePrivateKey(),
-        scriptSha256: digest(readFileSync(fileURLToPath(import.meta.url))),
+        scriptSha256,
+        oracleSha256,
       }),
   );
   const [a, b] = devices;
@@ -650,7 +670,8 @@ async function main() {
     head: execFileSync("git", ["rev-parse", "HEAD"], {
       encoding: "utf8",
     }).trim(),
-    harnessSha256: digest(readFileSync(fileURLToPath(import.meta.url))),
+    harnessSha256: scriptSha256,
+    oracleSha256,
     node: process.version,
     dirtyTree: execFileSync(
       "git",
@@ -660,6 +681,7 @@ async function main() {
         "--",
         "packages",
         "scripts/pdpp-replica-live-journey.ts",
+        "scripts/pdpp-replica-record-oracle.ts",
       ],
       { encoding: "utf8" },
     ).trim(),
@@ -1234,47 +1256,58 @@ async function main() {
       A: a.peakRssKiB,
       B: b.peakRssKiB,
     };
-    const scopes = new Set<string>();
-    let cleanupErrors = 0;
-    for (const device of devices) {
-      try {
-        const snapshot = await device.call<Snapshot>("snapshot");
-        for (const row of snapshot.puts) scopes.add(row.scope);
-      } catch {
-        cleanupErrors++;
-      }
-    }
-    try {
-      const storage = createVanaSyncStorageAdapter({
-        config,
-        serverOwner: owner,
-        serverAccount: serverAccount(a.init.serverKey),
-      });
-      let deleted = 0;
-      for (const scope of scopes) {
-        try {
-          if (await storage.delete(storage.urlForKey(`${scope}/1`))) deleted++;
-        } catch {
-          cleanupErrors++;
-        }
-      }
-      report.remoteBlobCleanup = {
-        attempted: scopes.size,
-        deleted,
-        errors: cleanupErrors,
-      };
-    } catch {
-      report.remoteBlobCleanup = {
-        attempted: scopes.size,
-        deleted: 0,
-        errors: cleanupErrors + 1,
-      };
-    }
-    if (cleanupErrors > 0) {
-      report.status = "failed";
-      report.cleanupErrorCount = cleanupErrors;
-    }
     for (const device of devices) await device.kill();
+    let attempted = 0;
+    let deleted = 0;
+    let notFound = 0;
+    const cleanupFailures: string[] = [];
+    for (const device of devices) {
+      const dbPath = join(device.init.root, "records.sqlite");
+      if (!existsSync(dbPath)) continue;
+      let db: Database.Database | undefined;
+      try {
+        db = new Database(dbPath, { readonly: true, fileMustExist: true });
+        const scopes = db
+          .prepare("SELECT DISTINCT scope FROM harness_puts")
+          .all() as { scope: string }[];
+        const storage = createVanaSyncStorageAdapter({
+          config,
+          serverOwner: owner,
+          serverAccount: serverAccount(device.init.serverKey),
+        });
+        for (const { scope } of scopes) {
+          attempted++;
+          try {
+            if (await storage.delete(storage.urlForKey(`${scope}/1`)))
+              deleted++;
+            else if (!(await storage.exists(storage.urlForKey(`${scope}/1`))))
+              notFound++;
+            else
+              cleanupFailures.push(
+                `${device === a ? "A" : "B"}:delete-unconfirmed`,
+              );
+          } catch {
+            cleanupFailures.push(`${device === a ? "A" : "B"}:delete`);
+          }
+        }
+      } catch {
+        cleanupFailures.push(`${device === a ? "A" : "B"}:scope-read`);
+      } finally {
+        db?.close();
+      }
+    }
+    report.remoteBlobCleanup = {
+      attempted,
+      deleted,
+      notFound,
+      errors: cleanupFailures.length,
+    };
+    if (cleanupFailures.length > 0) {
+      report.status = "failed";
+      report.cleanupErrorCount = cleanupFailures.length;
+      report.error = `Remote test blob cleanup failed (${cleanupFailures.join(", ")})`;
+      process.exitCode = 1;
+    }
     save();
     rmSync(root, { recursive: true, force: true });
     console.log(
