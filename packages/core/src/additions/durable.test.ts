@@ -14,6 +14,11 @@ import {
   StoredBlobConflictError,
   type StorageAdapter,
 } from "../storage/adapters/interface.js";
+import type {
+  FencedPublicationPort,
+  PublicationFence,
+} from "../publication/publish.js";
+import { computeDataPointId } from "../sync/data-point-id.js";
 import type { VersionInventoryClient } from "./version-inventory.js";
 import {
   additionsLedgerScope,
@@ -63,6 +68,8 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
   roots.push(root);
   const registryPath = join(root, "registry.json");
   await writeFile(registryPath, "{}");
+  const generations = new Map<string, number>();
+  let afterDownload: ((url: string) => Promise<void>) | undefined;
   let registryWrites = Promise.resolve();
   let fileSequence = 0;
   const readRawRegistry = async () =>
@@ -92,7 +99,9 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
         return path;
       },
       async download(path) {
-        return new Uint8Array(await readFile(path));
+        const bytes = new Uint8Array(await readFile(path));
+        await afterDownload?.(path);
+        return bytes;
       },
       async delete(path) {
         try {
@@ -116,10 +125,19 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
     scope: string,
     slot: z.infer<typeof slotSchema>,
     deletedAt: string | null = null,
+    expectedFence?: PublicationFence,
   ) {
     // Serialize fake DB statements, not actor recovery: independent registrations remain last-writer wins.
     const pending = registryWrites.then(async () => {
       const registry = await readRawRegistry();
+      if (
+        expectedFence &&
+        JSON.stringify(expectedFence) !==
+          JSON.stringify(fenceFor(scope, registry))
+      )
+        throw new Error("Gateway error: 409 PUBLICATION_FENCE_CHANGED");
+      if (slot.isTombstone)
+        generations.set(scope, (generations.get(scope) ?? 0) + 1);
       const previous = registry[scope]?.versions ?? [];
       const versions = [
         ...previous.filter(
@@ -135,6 +153,49 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
     registryWrites = pending.catch(() => {});
     return pending;
   }
+  function fenceFor(
+    scope: string,
+    registry: z.infer<typeof registrySchema>,
+  ): PublicationFence {
+    const head = registry[scope]?.head;
+    return {
+      generation: String(generations.get(scope) ?? 0),
+      head: head
+        ? {
+            id: computeDataPointId(OWNER, scope),
+            ...head,
+          }
+        : null,
+    };
+  }
+  const fenced: FencedPublicationPort = {
+    read: async ({ scope }) => fenceFor(scope, await readRegistry()),
+    commit: async (params) => {
+      if (params.mode === "register")
+        await setSlot(
+          params.scope,
+          {
+            expectedVersion: params.expectedVersion,
+            dataHash: params.dataHash,
+            metadataHash: params.metadataHash,
+            status: "pending",
+            addedAt: T4,
+            isTombstone: false,
+          },
+          null,
+          params.fence,
+        );
+      else if (
+        JSON.stringify(params.fence) !==
+        JSON.stringify(fenceFor(params.scope, await readRegistry()))
+      )
+        throw new Error("Gateway error: 409 PUBLICATION_FENCE_CHANGED");
+      return {
+        dataPointId: computeDataPointId(OWNER, params.scope),
+        fence: fenceFor(params.scope, await readRegistry()),
+      };
+    },
+  };
   async function put(
     scope: string,
     expectedVersion: string,
@@ -207,6 +268,8 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
     budgets: Pick<DurableAdditionsOptions, "byteBudget" | "timeBudgetMs"> = {},
     beforeInventoryRead?: (scope: string) => Promise<void>,
     beforeRegistration?: () => void,
+    fencedPublication?: FencedPublicationPort,
+    onPublicationBlocked?: DurableAdditionsOptions["onPublicationBlocked"],
   ) {
     // Each actor constructs fresh ports and discovers state solely from the shared files.
     const inventory: VersionInventoryClient = {
@@ -225,6 +288,8 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
     };
     return createDurableAdditions({
       ownerAddress: OWNER,
+      fencedPublication,
+      onPublicationBlocked,
       network: "chain:1:https://gateway.example",
       inventory,
       storageAdapter: storage(),
@@ -243,7 +308,10 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
             addedAt: T4,
             isTombstone: false,
           });
-          return { expectedVersion: params.expectedVersion };
+          return {
+            dataPointId: computeDataPointId(OWNER, params.scope),
+            expectedVersion: params.expectedVersion,
+          };
         },
       },
       ...budgets,
@@ -259,6 +327,10 @@ async function fixture(options: { writeOnce?: boolean } = {}) {
     readRegistry,
     blobPath,
     setSlot,
+    fenced,
+    onDownload: (hook: typeof afterDownload) => {
+      afterDownload = hook;
+    },
   };
 }
 
@@ -490,7 +562,9 @@ it("resumes a publication whose registration failed after its upload to a write-
   // New source data changes the document, so the retry cannot re-send the
   // stored bytes; it must resume them instead of conflicting forever.
   await f.source("2", T2, ["a", "b"]);
-  const healthy = await f.actor().summarize(QUERY);
+  const healthy = await f
+    .actor({}, undefined, undefined, f.fenced)
+    .summarize(QUERY);
 
   expect(healthy).toMatchObject({
     coverage: "complete",
@@ -498,6 +572,62 @@ it("resumes a publication whose registration failed after its upload to a write-
     through: { [SOURCE]: "2" },
   });
   expect(await f.document(scope)).toMatchObject({ through: "2" });
+});
+
+it("reports retryable fenced-publication state instead of resuming an orphan on the legacy gateway", async () => {
+  const f = await fixture({ writeOnce: true });
+  await f.source("1", T1, ["a"]);
+  await f
+    .actor({}, undefined, () => {
+      throw new Error("crash after upload");
+    })
+    .summarize(QUERY);
+  const blocked: string[] = [];
+  const result = await f
+    .actor({}, undefined, undefined, undefined, (error) => {
+      expect(error.retryable).toBe(true);
+      blocked.push(error.code);
+    })
+    .summarize(QUERY);
+  expect(blocked).toContain("NEEDS_FENCED_PUBLICATION");
+  expect(result.coverage).toBe("behind");
+  expect(
+    (await f.readRegistry())[additionsLedgerScope(SOURCE)],
+  ).toBeUndefined();
+});
+
+it("keeps a pending system-scope tombstone when deletion races orphan recovery after download", async () => {
+  const f = await fixture({ writeOnce: true });
+  await f.source("1", T1, ["a"]);
+  await f
+    .actor({}, undefined, () => {
+      throw new Error("crash after upload");
+    })
+    .summarize(QUERY);
+  const scope = additionsLedgerScope(SOURCE);
+  f.onDownload(async (url) => {
+    if (url !== f.blobPath(`${scope}/1`)) return;
+    f.onDownload(undefined);
+    await f.setSlot(
+      scope,
+      {
+        expectedVersion: "1",
+        dataHash:
+          "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+        metadataHash:
+          "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90",
+        status: "pending",
+        addedAt: T2,
+        isTombstone: true,
+      },
+      T2,
+    );
+  });
+  await f.actor({}, undefined, undefined, f.fenced).summarize(QUERY);
+  const state = (await f.readRegistry())[scope]!;
+  expect(state.head?.deletedAt).toBe(T2);
+  expect(state.versions).toHaveLength(1);
+  expect(state.versions[0]?.isTombstone).toBe(true);
 });
 
 it("returns behind when source commitments change between inventory validation reads", async () => {
@@ -757,7 +887,9 @@ it("preserves a durable checkpoint through a one-time inventory failure after or
   expect(failed).toBe(true);
   expect(["partial", "unavailable", "behind"]).toContain(unresolved.coverage);
   expect(await f.document(scope)).toEqual(checkpoint);
-  const healthy = await f.actor().summarize(QUERY);
+  const healthy = await f
+    .actor({}, undefined, undefined, f.fenced)
+    .summarize(QUERY);
   expect(healthy).toMatchObject({
     coverage: "complete",
     total: 2,

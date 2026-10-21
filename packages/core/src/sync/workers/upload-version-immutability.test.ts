@@ -31,6 +31,8 @@ import { createVanaSyncStorageAdapter } from "../../storage/adapters/vana.js";
 import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
 import type { Logger } from "../../logger/index.js";
 import { uploadOne } from "./upload.js";
+import type { FencedPublicationPort } from "../../publication/publish.js";
+import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
 
 const ENDPOINT = "https://storage.test";
 const CHAIN_ID = 14800;
@@ -111,7 +113,60 @@ class Registry {
   readonly versions = new Map<bigint, DataPointRecord>();
   failNextRegistration = false;
   pendingRefresh = false;
+  generation = 0;
+  readonly lineageAtVersion = new Map<bigint, readonly string[] | undefined>();
+
+  deleteScope() {
+    this.generation++;
+    const version = BigInt(this.head()?.expectedVersion ?? "0") + 1n;
+    this.commit(version, TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH);
+    Object.assign(this.versions.get(version)!, {
+      deletedAt: "2026-10-21T01:00:00Z",
+      status: "pending",
+    });
+  }
+
+  fenced(): FencedPublicationPort {
+    const snapshot = () => ({
+      generation: String(this.generation),
+      head: this.head() ? { ...this.head()! } : null,
+    });
+    return {
+      read: async () => snapshot(),
+      commit: async (request) => {
+        const before = this.beforeRegister;
+        this.beforeRegister = undefined;
+        await before?.();
+        if (JSON.stringify(request.fence) !== JSON.stringify(snapshot()))
+          throw new Error("Gateway error: 409 PUBLICATION_FENCE_CHANGED");
+        if (this.failNextRegistration) {
+          this.failNextRegistration = false;
+          throw new Error("fetch failed");
+        }
+        const version = BigInt(request.expectedVersion);
+        if (request.mode === "register") {
+          if (version !== BigInt(this.head()?.expectedVersion ?? "0") + 1n)
+            throw new Error("Gateway error: 409 wrong next version");
+          this.commit(version, request.dataHash, request.metadataHash);
+          this.lineageAtVersion.set(version, request.lineage);
+          this.afterCommit?.();
+        } else {
+          const head = this.head();
+          if (
+            !head ||
+            head.expectedVersion !== request.expectedVersion ||
+            head.dataHash !== request.dataHash ||
+            head.metadataHash !== request.metadataHash ||
+            (head as { deletedAt?: string }).deletedAt
+          )
+            throw new Error("Gateway error: 409 adoption mismatch");
+        }
+        return { dataPointId: DATA_POINT_ID, fence: snapshot() };
+      },
+    };
+  }
   beforeRegister?: () => Promise<void>;
+  afterCommit?: () => void;
 
   head(): DataPointRecord | null {
     const top = [...this.versions.keys()].sort((a, b) => (a < b ? 1 : -1))[0];
@@ -246,12 +301,27 @@ describe("upload worker against write-once storage", () => {
 
   async function upload(
     r: Awaited<ReturnType<typeof replica>>,
-    options: { feed?: boolean } = {},
+    options: {
+      feed?: boolean;
+      fenced?: boolean;
+      afterDownload?: () => Promise<void>;
+      configureAdapter?: (adapter: StorageAdapter) => void;
+    } = {},
   ) {
+    const adapter = vanaAdapter();
+    const download = adapter.download.bind(adapter);
+    adapter.download = async (url) => {
+      const result = await download(url);
+      await options.afterDownload?.();
+      return result;
+    };
+    options.configureAdapter?.(adapter);
     return uploadOne(
       {
         storage: r.storage,
-        storageAdapter: vanaAdapter(),
+        storageAdapter: adapter,
+        fencedPublication:
+          options.fenced === false ? undefined : registry.fenced(),
         gateway,
         signer,
         masterKey,
@@ -292,6 +362,254 @@ describe("upload worker against write-once storage", () => {
     }
   }
 
+  it("refuses an interrupted publication without a deletion fence", async () => {
+    const content = envelope("interrupted");
+    const occupant = await encryptWithPassword(
+      plaintextOf(content),
+      scopeKeyHex,
+    );
+    blobs.blobs.set(blobs.keyFor(1), occupant);
+    const r = await replica(content, 1);
+
+    await expect(upload(r, { fenced: false })).rejects.toMatchObject({
+      code: "NEEDS_FENCED_PUBLICATION",
+      retryable: true,
+    });
+    expect(registry.versions.size).toBe(0);
+    expect(blobs.blobs.get(blobs.keyFor(1))).toEqual(occupant);
+    expect(r.storage.entries[0]?.dataPointId).toBeNull();
+  });
+
+  it("keeps a fresh uncontended upload working without the new capability", async () => {
+    const r = await replica(envelope("fresh"), 1);
+    await upload(r, { fenced: false });
+    expect(r.storage.entries[0]?.dataPointId).toBe(DATA_POINT_ID);
+    await expectCommittedBytesMatch();
+  });
+
+  it("fences deletion after downloading an orphan and before registering it", async () => {
+    const old = envelope("abandoned");
+    const occupant = await encryptWithPassword(plaintextOf(old), scopeKeyHex);
+    blobs.blobs.set(blobs.keyFor(1), occupant);
+    const r = await replica(envelope("mine"), 1);
+    await expect(
+      upload(r, { afterDownload: async () => registry.deleteScope() }),
+    ).rejects.toThrow("PUBLICATION_FENCE_CHANGED");
+    expect(registry.head()?.dataHash).toBe(TOMBSTONE_DATA_HASH);
+    expect(registry.versions.size).toBe(1);
+    expect(r.storage.entries[0]?.dataPointId).toBeNull();
+    expect(blobs.blobs.get(blobs.keyFor(1))).toEqual(occupant);
+  });
+
+  it("does not adopt a same-version matching registration with missing bytes", async () => {
+    const content = envelope("missing");
+    registry.commit(1n, hashOf(content)); // metadata is not satisfiable by a new encryption
+    const r = await replica(content, 1);
+    await expect(upload(r, { feed: true })).rejects.toThrow(
+      "metadata commitment mismatch",
+    );
+    expect(r.storage.entries[0]?.dataPointId).toBeNull();
+    expect(blobs.blobs.has(blobs.keyFor(1))).toBe(false);
+  });
+
+  it("returns the adopted v7 URL even when a stale local v1 points at different bytes", async () => {
+    await upload(await replica(envelope("history"), 1));
+    const content = envelope("current");
+    const bytes = await encryptWithPassword(plaintextOf(content), scopeKeyHex);
+    blobs.blobs.set(blobs.keyFor(7), bytes);
+    registry.commit(
+      7n,
+      hashOf(content),
+      keccak256(
+        stringToHex(
+          JSON.stringify({
+            scope: SCOPE,
+            collectedAt: content.collectedAt,
+            sizeBytes: bytes.byteLength,
+          }),
+        ),
+      ),
+    );
+    const r = await replica(content, 1);
+    const result = await upload(r, { feed: true });
+    expect(result.url).toBe(vanaAdapter().urlForKey(`${SCOPE}/7`));
+    expect(r.storage.entries[0]?.version).toBe(7);
+    expect(
+      await decryptWithPassword(
+        await vanaAdapter().download(result.url),
+        scopeKeyHex,
+      ),
+    ).toEqual(plaintextOf(content));
+  });
+
+  it("requires a fence before adopting a registered version even when bytes exist", async () => {
+    const content = envelope("same");
+    await upload(await replica(content, 1));
+    const r = await replica(content, 1);
+    await expect(
+      upload(r, { feed: true, fenced: false }),
+    ).rejects.toMatchObject({ code: "NEEDS_FENCED_PUBLICATION" });
+    expect(r.storage.entries[0]?.dataPointId).toBeNull();
+  });
+
+  it("registers an acknowledged re-add strictly after the tombstone with a fence", async () => {
+    registry.deleteScope();
+    const r = await replica(envelope("re-added"), 1);
+    r.storage.entries[0]!.afterTombstoneVersion = 1;
+    await upload(r, { feed: true });
+    expect(registry.versions.get(1n)?.dataHash).toBe(TOMBSTONE_DATA_HASH);
+    expect(registry.versions.get(2n)?.dataHash).toBe(
+      hashOf(envelope("re-added")),
+    );
+    expect(r.storage.entries[0]?.version).toBe(2);
+  });
+
+  it.each([
+    "before upload",
+    "after upload",
+    "before register",
+    "after register",
+    "before version acknowledgement",
+    "after version acknowledgement",
+    "before synced acknowledgement",
+    "after synced acknowledgement",
+  ])(
+    "recovers after a crash %s without changing committed bytes",
+    async (transition) => {
+      await upload(await replica(envelope("original"), 1));
+      const original = blobs.blobs.get(blobs.keyFor(1));
+      const content = envelope("next");
+      const r = await replica(content, 1);
+      const crash = () => {
+        throw new Error(`crash ${transition}`);
+      };
+      const versionUpdate = r.storage.updateEntryVersion.bind(r.storage);
+      const syncedUpdate = r.storage.updateDataPointId.bind(r.storage);
+      if (transition.includes("version acknowledgement"))
+        r.storage.updateEntryVersion = (...args) => {
+          if (transition.startsWith("before")) crash();
+          versionUpdate(...args);
+          return crash();
+        };
+      if (transition.includes("synced acknowledgement"))
+        r.storage.updateDataPointId = (...args) => {
+          if (transition.startsWith("before")) crash();
+          syncedUpdate(...args);
+          return crash();
+        };
+      if (transition === "before register")
+        registry.beforeRegister = async () => crash();
+      if (transition === "after register") registry.afterCommit = crash;
+      await expect(
+        upload(r, {
+          configureAdapter: (adapter) => {
+            if (!transition.includes("upload")) return;
+            const put = adapter.upload.bind(adapter);
+            adapter.upload = async (...args) => {
+              if (transition === "before upload") crash();
+              await put(...args);
+              return crash();
+            };
+          },
+        }),
+      ).rejects.toThrow(`crash ${transition}`);
+      r.storage.updateEntryVersion = versionUpdate;
+      r.storage.updateDataPointId = syncedUpdate;
+      registry.afterCommit = undefined;
+      await upload(r);
+      expect(r.storage.entries[0]?.dataPointId).toBe(DATA_POINT_ID);
+      expect(r.storage.entries[0]?.version).toBe(2);
+      expect(blobs.blobs.get(blobs.keyFor(1))).toEqual(original);
+      await expectCommittedBytesMatch();
+    },
+  );
+
+  it.each([false, true])(
+    "uses the contiguous fenced version when the local counter is ahead (existing head: %s)",
+    async (existing) => {
+      if (existing) await upload(await replica(envelope("original"), 1));
+      const r = await replica(envelope("ahead"), 999);
+      await upload(r);
+      expect(r.storage.entries[0]?.version).toBe(existing ? 2 : 1);
+      expect(blobs.blobs.has(blobs.keyFor(999))).toBe(false);
+      await expectCommittedBytesMatch();
+    },
+  );
+
+  it("fences deletion between orphan registration and superseding publication", async () => {
+    const occupant = await encryptWithPassword(
+      plaintextOf(envelope("orphan")),
+      scopeKeyHex,
+    );
+    blobs.blobs.set(blobs.keyFor(1), occupant);
+    const r = await replica(envelope("mine"), 1);
+    await expect(
+      upload(r, {
+        configureAdapter: (adapter) => {
+          const put = adapter.upload.bind(adapter);
+          adapter.upload = async (key, bytes) => {
+            if (key === `${SCOPE}/2`) registry.deleteScope();
+            return put(key, bytes);
+          };
+        },
+      }),
+    ).rejects.toThrow("PUBLICATION_FENCE_CHANGED");
+    expect(registry.versions.get(1n)?.dataHash).toBe(
+      hashOf(envelope("orphan")),
+    );
+    expect(blobs.blobs.get(blobs.keyFor(1))).toEqual(occupant);
+    expect(registry.versions.get(2n)?.dataHash).toBe(TOMBSTONE_DATA_HASH);
+    expect(r.storage.entries[0]?.dataPointId).toBeNull();
+  });
+
+  it("preserves a foreign orphan's lineage when registering before superseding", async () => {
+    const orphan = envelope("derivative");
+    const sources = [`0x${"cd".repeat(32)}`];
+    Object.assign(orphan.data, {
+      $lineage: { sources, writtenAt: "2026-10-21T00:00:00Z" },
+    });
+    const bytes = await encryptWithPassword(plaintextOf(orphan), scopeKeyHex);
+    blobs.blobs.set(blobs.keyFor(1), bytes);
+    await upload(await replica(envelope("mine"), 1));
+    expect(registry.lineageAtVersion.get(1n)).toEqual(sources);
+    expect(registry.lineageAtVersion.get(2n)).toBeUndefined();
+    expect(signer.signLineageAttestation).toHaveBeenCalledWith(
+      expect.objectContaining({
+        expectedVersion: 1n,
+        dataHash: hashOf(orphan),
+        sources,
+      }),
+    );
+    await expectCommittedBytesMatch();
+  });
+
+  it("heals a missing same-version blob only when both registered commitments match", async () => {
+    const content = envelope("heal");
+    const lostBytes = await encryptWithPassword(
+      plaintextOf(content),
+      scopeKeyHex,
+    );
+    registry.commit(
+      1n,
+      hashOf(content),
+      keccak256(
+        stringToHex(
+          JSON.stringify({
+            scope: SCOPE,
+            collectedAt: content.collectedAt,
+            sizeBytes: lostBytes.byteLength,
+          }),
+        ),
+      ),
+    );
+    const r = await replica(content, 1);
+    const result = await upload(r, { feed: true });
+    expect(result.url).toBe(vanaAdapter().urlForKey(`${SCOPE}/1`));
+    expect(r.storage.entries[0]?.dataPointId).toBe(DATA_POINT_ID);
+    expect(registry.versions.size).toBe(1);
+    await expectCommittedBytesMatch();
+  });
+
   it("a stale replica cannot replace the bytes of a committed version", async () => {
     const original = envelope("original");
     await upload(await replica(original, 1));
@@ -324,7 +642,7 @@ describe("upload worker against write-once storage", () => {
     await expectCommittedBytesMatch();
   });
 
-  it("leaves an unregistered different payload in place and keeps the entry unsynced", async () => {
+  it("adopts a foreign unregistered reservation and supersedes it when its writer never returns", async () => {
     const occupant = await encryptWithPassword(
       new TextEncoder().encode(JSON.stringify(envelope("in flight elsewhere"))),
       scopeKeyHex,
@@ -332,13 +650,15 @@ describe("upload worker against write-once storage", () => {
     blobs.blobs.set(blobs.keyFor(1), occupant);
     const r = await replica(envelope("mine"), 1);
 
-    await expect(upload(r)).rejects.toThrow(
-      /already holds a different payload/,
-    );
+    await upload(r);
 
     expect(blobs.blobs.get(blobs.keyFor(1))).toEqual(occupant);
-    expect(registry.versions.size).toBe(0);
-    expect(r.storage.entries[0]?.dataPointId).toBeNull();
+    expect(registry.versions.get(1n)?.dataHash).toBe(
+      hashOf(envelope("in flight elsewhere")),
+    );
+    expect(registry.versions.get(2n)?.dataHash).toBe(hashOf(envelope("mine")));
+    expect(r.storage.entries[0]?.dataPointId).toBe(DATA_POINT_ID);
+    await expectCommittedBytesMatch();
   });
 
   it("with the registry feed wired, does not fill a committed version that lost its bytes", async () => {
@@ -371,7 +691,8 @@ describe("upload worker against write-once storage", () => {
     await upload(await replica(envelope("later"), 2));
 
     release();
-    await first;
+    await expect(first).rejects.toThrow("PUBLICATION_FENCE_CHANGED");
+    await upload(paused);
 
     expect(blobs.blobs.has(blobs.keyFor(1))).toBe(true);
     await expectCommittedBytesMatch();
