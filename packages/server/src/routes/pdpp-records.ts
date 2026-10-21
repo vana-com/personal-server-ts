@@ -17,6 +17,7 @@ import type {
 import {
   createPdppSyncSessionService,
   CursorExpiredError,
+  RecordIdentityConflictError,
   InvalidCursorError,
   InvalidCursorSyntaxError,
   recordKeyWithinGrantResources,
@@ -234,6 +235,8 @@ export interface PdppRecordsRouteDeps {
    * explicit rather than leaving to chance.
    */
   accessLog?: PdppAccessLogPort;
+  /** Changes one sync page may examine; defaults to the session service's. */
+  syncPageBudget?: number;
   /**
    * Vana chain enforcement for client reads. Absent by default, and absence
    * is the chain-NEUTRAL path: a standalone PDPP deployment has no chain, so
@@ -341,6 +344,14 @@ function toPdppError(err: unknown): PdppError {
   if (err instanceof PdppError) return err;
   if (err instanceof CursorExpiredError) {
     return new PdppError("cursor_expired", "changes_since cursor has expired");
+  }
+  if (err instanceof RecordIdentityConflictError) {
+    // Records carry only their key on the wire, so two instances' records
+    // under one key would reach the client as one. Refuse instead.
+    return new PdppError(
+      "disclosure_unavailable",
+      "More than one connection this grant reads holds a record with this id; records from them cannot be told apart",
+    );
   }
   // Two distinct classes reach here and both mean "this cursor is not usable":
   // the stores throw `InvalidCursorError` (decoded fine, but wrong order or
@@ -499,24 +510,38 @@ function projectSchemaToFields(
     };
   }
 
+  // Built, never copied: any keyword outside a granted property (`allOf`,
+  // `$defs`, `dependentSchemas`, `if`, root `examples`, `title`, ...) can
+  // name or describe an ungranted field. A granted property whose schema
+  // refers elsewhere is reduced to `{}`, since following the reference would
+  // need the definitions it names.
   const properties = (schema.properties ?? {}) as Record<string, unknown>;
   const required = Array.isArray(schema.required)
     ? (schema.required as string[]).filter((f) => allowed.has(f))
     : [];
-
   return {
-    ...schema,
+    ...(typeof schema.$schema === "string" && { $schema: schema.$schema }),
+    type: "object",
     properties: Object.fromEntries(
-      Object.entries(properties).filter(([name]) => allowed.has(name)),
+      Object.entries(properties)
+        .filter(([name]) => allowed.has(name))
+        .map(([name, property]) => [
+          name,
+          /"\$(?:ref|dynamicRef|recursiveRef)"/.test(JSON.stringify(property))
+            ? {}
+            : property,
+        ]),
     ),
-    ...(required.length > 0 ? { required } : { required: [] }),
+    required,
   };
 }
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
   const validateData = createRecordDataValidator(deps.declarations);
-  const sync = createPdppSyncSessionService(deps.store);
+  const sync = createPdppSyncSessionService(deps.store, {
+    maxExaminedPerPage: deps.syncPageBudget,
+  });
 
   /**
    * Append one PDPP read to the owner access feed.
@@ -953,6 +978,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           cursor,
           limit,
           eligibilityFields: candidate ? streamGrant!.fields : fields,
+          oneRecordPerKey: context!.tokenKind === "client",
           ...(streamGrant && {
             access: {
               canSeeKey: (recordKey) =>
@@ -984,7 +1010,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
               ],
             }
           : {};
-        return c.json(
+        const response = c.json(
           {
             object: "list",
             has_more: page.hasMore,
@@ -1000,6 +1026,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
         );
+        await logClientRead(c, context, stream, "completed", reqId);
+        return response;
       }
 
       const page = deps.store.listRecords(stream, {
@@ -1007,6 +1035,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         limit,
         order,
         cursor,
+        oneRecordPerKey: context!.tokenKind === "client",
         isVisible: (row) =>
           recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
           recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
@@ -1092,20 +1121,23 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         throw new PdppError("not_found", "Record not found");
       }
 
-      let found;
-      for (const instance of effectiveInstanceIds) {
+      // Every read instance is consulted: the first holder of the key may be
+      // one the grant hides, and a second visible holder would make the id
+      // name two records.
+      const matches = effectiveInstanceIds.flatMap((instance) => {
         const record = deps.store.getRecord(instance, stream, recordKey);
-        if (record) {
-          found = record;
-          break;
-        }
-      }
-      if (
-        !found ||
-        !recordWithinGrantTimeConstraint(found.data, scope.streamGrant)
-      ) {
+        return record &&
+          recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
+          ? [record]
+          : [];
+      });
+      if (matches.length === 0) {
         throw new PdppError("not_found", "Record not found");
       }
+      if (matches.length > 1 && context!.tokenKind === "client") {
+        throw new RecordIdentityConflictError(recordKey);
+      }
+      const found = matches[0];
 
       const fields = scope.fields;
 

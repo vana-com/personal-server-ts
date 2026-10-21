@@ -40,12 +40,10 @@ export interface ChangesSinceCursorPayload {
   /** The previous session's horizon, or null for a first-ever sync. */
   sinceHorizon: string | null;
   /**
-   * Always 0 on new tokens. A nonzero offset is a pre-boundary page cursor,
-   * which cannot be resumed against the authorized result and expires.
+   * Always 0 on checkpoints. Readable page cursors are no longer issued: the
+   * session owner seals every page cursor (`sync-session.ts`).
    */
   offset: number;
-  /** Last record the previous page disclosed; the next page starts after it. */
-  after?: { recordKey: string; instance: string };
 }
 
 export type CursorPayload = ListCursorPayload | ChangesSinceCursorPayload;

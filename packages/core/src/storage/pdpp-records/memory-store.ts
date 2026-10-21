@@ -6,6 +6,7 @@ import {
   decodeSyncPageCursor,
 } from "./list-page.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { timeSortKey } from "../../pdpp/time.js";
 import type { PdppRecordStore } from "./interface.js";
 import {
   planIngest,
@@ -28,6 +29,7 @@ import {
   type StreamListing,
   type StreamSemantics,
   type SyncWindow,
+  type RecordIdentity,
   type SyncWindowChange,
   type SyncWindowRequest,
 } from "./types.js";
@@ -125,6 +127,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
     const staged = new Map<RowKey, PdppRecordRow>();
     const stagedHistory: HistoryEntry[] = [];
     const read = (key: RowKey) => staged.get(key) ?? current.get(key);
+    let stagedClock = writeClock;
 
     envelopes.forEach((envelope, index) => {
       const plan = planIngest(
@@ -175,13 +178,17 @@ export function createMemoryRecordStore(): PdppRecordStore {
         stream: envelope.stream,
         recordKey,
         version,
-        writtenAt: nextWriteTimestamp(),
+        writtenAt: new Date(++stagedClock).toISOString(),
         row,
       });
     });
 
+    // Publish only after every envelope is decided, without argument
+    // spreading: nothing below can throw, so current state, history and the
+    // write clock move together or not at all.
     for (const [key, row] of staged) current.set(key, row);
-    history.push(...stagedHistory);
+    for (const entry of stagedHistory) history.push(entry);
+    writeClock = stagedClock;
 
     return summarizeIngest(results);
   }
@@ -288,6 +295,16 @@ export function createMemoryRecordStore(): PdppRecordStore {
         horizon,
       },
       (row) => erased.has(rowKey(row.instance, row.stream, row.recordKey)),
+      (instance, recordKey) =>
+        history
+          .filter(
+            (entry) =>
+              entry.stream === stream &&
+              entry.instance === instance &&
+              entry.recordKey === recordKey &&
+              entry.writtenAt <= horizon,
+          )
+          .at(-1)?.row,
     );
   }
 
@@ -339,43 +356,89 @@ export function createMemoryRecordStore(): PdppRecordStore {
       throw new CursorExpiredError();
     }
     const instances = new Set(request.instanceIds);
-    const relevant = history.filter(
-      (entry) =>
-        entry.stream === stream &&
-        instances.has(entry.instance) &&
-        entry.writtenAt <= high,
-    );
-    const latest = new Map<RowKey, HistoryEntry>();
-    const changed = new Set<RowKey>();
-    for (const entry of relevant) {
-      const key = rowKey(entry.instance, entry.stream, entry.recordKey);
-      const prior = latest.get(key);
-      if (!prior || entry.version > prior.version) latest.set(key, entry);
-      if (low === null || entry.writtenAt > low) changed.add(key);
+    // Built on first use: one pass over history, then per-key versions in
+    // write order, so neither lookup rescans history per key.
+    let index:
+      | { versions: Map<RowKey, HistoryEntry[]>; changed: RecordIdentity[] }
+      | undefined;
+    const indexed = () => {
+      if (index) return index;
+      const versions = new Map<RowKey, HistoryEntry[]>();
+      const changed = new Map<RowKey, RecordIdentity>();
+      for (const entry of history) {
+        if (
+          entry.stream !== stream ||
+          !instances.has(entry.instance) ||
+          entry.writtenAt > high
+        )
+          continue;
+        const key = rowKey(entry.instance, stream, entry.recordKey);
+        const list = versions.get(key) ?? [];
+        list.push(entry);
+        versions.set(key, list);
+        if (low === null || entry.writtenAt > low) {
+          changed.set(key, {
+            recordKey: entry.recordKey,
+            instance: entry.instance,
+          });
+        }
+      }
+      index = {
+        versions,
+        changed: [...changed.values()].sort(compareRecordIdentity),
+      };
+      return index;
+    };
+    const versionAt = (
+      instance: string,
+      recordKey: string,
+      horizon: string,
+    ): PdppRecordRow | undefined =>
+      indexed()
+        .versions.get(rowKey(instance, stream, recordKey))
+        ?.filter((entry) => entry.writtenAt <= horizon)
+        .at(-1)?.row;
+
+    function* changes(
+      direction: "asc" | "desc",
+      after?: RecordIdentity,
+    ): Generator<SyncWindowChange> {
+      if (low === high) return;
+      const { changed } = indexed();
+      const step = direction === "asc" ? 1 : -1;
+      let i = direction === "asc" ? 0 : changed.length - 1;
+      if (after) {
+        const beyond = (id: RecordIdentity) => {
+          const compared = compareRecordIdentity(id, after);
+          return direction === "asc" ? compared > 0 : compared < 0;
+        };
+        while (i >= 0 && i < changed.length && !beyond(changed[i])) i += step;
+      }
+      for (; i >= 0 && i < changed.length; i += step) {
+        const { recordKey, instance } = changed[i];
+        yield {
+          after: versionAt(instance, recordKey, high)!,
+          before: () =>
+            low === null ? undefined : versionAt(instance, recordKey, low),
+          deletedAfterHigh: () =>
+            history.some(
+              (h) =>
+                h.stream === stream &&
+                h.instance === instance &&
+                h.recordKey === recordKey &&
+                h.row.deleted &&
+                h.writtenAt > high,
+            ),
+        };
+      }
     }
-    const changes: SyncWindowChange[] = [];
-    for (const [key, entry] of latest) {
-      if (!changed.has(key)) continue;
-      const same = (h: HistoryEntry) =>
-        h.instance === entry.instance && h.recordKey === entry.recordKey;
-      changes.push({
-        after: entry.row,
-        before: () =>
-          low === null
-            ? undefined
-            : relevant.filter((h) => same(h) && h.writtenAt <= low).at(-1)?.row,
-        deletedAfterHigh: () =>
-          history.some(
-            (h) =>
-              h.stream === stream &&
-              same(h) &&
-              h.row.deleted &&
-              h.writtenAt > high,
-          ),
-      });
-    }
-    changes.sort((a, b) => compareRecordIdentity(a.after, b.after));
-    return read({ high, changes });
+
+    return read({
+      high,
+      changes,
+      versionAtHigh: (instance, recordKey) =>
+        versionAt(instance, recordKey, high),
+    });
   }
 
   function listStreams(instanceIds: string[]): StreamListing[] {

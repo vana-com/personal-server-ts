@@ -87,12 +87,10 @@ session, so withholding one record loses nothing a later read relied on.
 Candidate spec-core says the same for sync pages; see the deletion row above
 for why a candidate sync page expires instead.
 
-SQLite list and sync use one `snapshotRows` primitive, with explicit indexes for
-ordered traversal and latest-version lookup. Schema v12 adds those indexes.
-Schema v13 adds `emitted_key` (`timeSortKey(emitted_at)`) to live and history
-rows, backfills it, and orders list traversal and `last_updated` by it. Its live
-summary index also carries `emitted_at`, so `last_updated` stays an index-only
-read.
+SQLite lists use the `snapshotRows` primitive, with explicit indexes for
+ordered traversal and latest-version lookup; sync reads its own identity-ordered
+window (`docs/pdpp-sync-session.md`). Schema v12 adds those indexes, and v13
+orders traversal by emitted instant (`emitted_key`).
 SQLite iterates the ordered snapshot until one extra visible row establishes
 continuation; it does not copy the entire list into JavaScript memory. The memory
 backend reconstructs its snapshot from retained history and keeps one bounded

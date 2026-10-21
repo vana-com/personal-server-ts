@@ -364,7 +364,7 @@ describe("memory record store: list records", () => {
 });
 
 describe("memory record store: changes_since", () => {
-  it("rejects invalid changes_since page offsets", () => {
+  it("seals page cursors and expires a readable one", () => {
     const store = createMemoryRecordStore();
     store.ingestBatch(
       ["a", "b", "c"].map((key) => ({
@@ -377,40 +377,32 @@ describe("memory record store: changes_since", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const page = createPdppSyncSessionService(store).read({
+    const sync = createPdppSyncSessionService(store);
+    const request = {
       stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 1,
+    };
+    const page = sync.read(request);
+    expect(() => decodeCursor(page.nextCursor!)).toThrow();
+    const tampered =
+      page.nextCursor!.slice(0, -2) +
+      (page.nextCursor!.endsWith("A") ? "BB" : "AA");
+    expect(() => sync.read({ ...request, cursor: tampered })).toThrow(
+      InvalidCursorError,
+    );
+    // The pre-sealing shape: a checkpoint's fields with a raw page offset.
+    const readable = encodeCursor({
+      ...(decodeCursor(
+        sync.read({ ...request, limit: 10 }).nextChangesSince!,
+      ) as CursorPayload & { kind: "changes_since" }),
+      offset: 1,
     });
-    const payload = decodeCursor(page.nextCursor!);
-    const forgeOffset = (offset: unknown) =>
-      encodeCursor({ ...payload, offset } as CursorPayload);
-
-    for (const offset of [
-      "1",
-      "abc",
-      -1,
-      1.5,
-      null,
-      "9007199254740993",
-      9007199254740992,
-    ]) {
-      expect(() =>
-        createPdppSyncSessionService(store).read({
-          stream: "playlists",
-          instanceIds: ["inst_1"],
-          limit: 1,
-          cursor: forgeOffset(offset),
-        }),
-      ).toThrow(InvalidCursorError);
-    }
+    expect(() => sync.read({ ...request, cursor: readable })).toThrow(
+      CursorExpiredError,
+    );
     expect(
-      createPdppSyncSessionService(store).read({
-        stream: "playlists",
-        instanceIds: ["inst_1"],
-        limit: 1,
-        cursor: forgeOffset(1),
-      }).data,
+      sync.read({ ...request, cursor: page.nextCursor }).data,
     ).toHaveLength(1);
   });
 

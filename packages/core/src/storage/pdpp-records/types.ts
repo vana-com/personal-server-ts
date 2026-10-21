@@ -72,6 +72,12 @@ export interface IngestResult {
 }
 
 export interface ListRecordsOptions {
+  /**
+   * The wire names a record by key alone. When set, a page that would
+   * disclose a key that another read instance also holds visibly throws
+   * `RecordIdentityConflictError` rather than serve two records as one.
+   */
+  oneRecordPerKey?: boolean;
   /** Grant eligibility, evaluated on raw snapshot rows before pagination/projection. */
   isVisible?: (row: PdppStoredRecord) => boolean;
   instanceIds: string[];
@@ -102,6 +108,11 @@ export interface SyncWindowRequest {
   high?: string;
 }
 
+export interface RecordIdentity {
+  recordKey: string;
+  instance: string;
+}
+
 /** One record key written in (low, high], or present at high for a first sync. */
 export interface SyncWindowChange {
   /** The key's version at the high horizon. */
@@ -114,8 +125,17 @@ export interface SyncWindowChange {
 
 export interface SyncWindow {
   high: string;
-  /** Ordered by `compareRecordIdentity`, ascending. */
-  changes: SyncWindowChange[];
+  /**
+   * The window's changes in `compareRecordIdentity` order, starting strictly
+   * after `after`. Lazy: the store does work only for changes the caller
+   * pulls, and an incremental window enumerates only keys written in it.
+   */
+  changes(
+    direction: "asc" | "desc",
+    after?: RecordIdentity,
+  ): Iterable<SyncWindowChange>;
+  /** One key's version at the high horizon. */
+  versionAtHigh(instance: string, recordKey: string): PdppRecordRow | undefined;
 }
 
 /** Store identity for sync tokens. Both change when the store is rebuilt. */
@@ -179,3 +199,10 @@ export class CursorExpiredError extends Error {
 export class InvalidCursorError extends Error {}
 
 export class RecordIdentityMismatchError extends Error {}
+
+/** Two read instances hold a visible record under one key, which the wire cannot tell apart. */
+export class RecordIdentityConflictError extends Error {
+  constructor(public readonly recordKey: string) {
+    super(`More than one read instance holds a visible record '${recordKey}'`);
+  }
+}

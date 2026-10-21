@@ -4,11 +4,16 @@ import {
   type ChangesSinceCursorPayload,
   type ListCursorPayload,
 } from "./cursor.js";
-import { InvalidCursorError, CursorExpiredError } from "./types.js";
+import {
+  InvalidCursorError,
+  CursorExpiredError,
+  RecordIdentityConflictError,
+} from "./types.js";
 import { timeSortKey } from "../../pdpp/time.js";
 import type {
   ListRecordsOptions,
   ListRecordsPage,
+  PdppRecordRow,
   PdppStoredRecord,
 } from "./types.js";
 
@@ -93,18 +98,36 @@ export function listSnapshotPage(
   options: ListRecordsOptions,
   snapshot: { stream: string; epoch: string; horizon: string },
   wasErased?: (row: PdppStoredRecord) => boolean,
+  versionAt?: (
+    instance: string,
+    recordKey: string,
+  ) => PdppRecordRow | undefined,
 ): ListRecordsPage {
   const data: PdppStoredRecord[] = [];
   let hasMore = false;
+  const visible = (row: PdppRecordRow | undefined): boolean =>
+    row !== undefined &&
+    !row.deleted &&
+    (!options.isVisible || options.isVisible(row));
   for (const row of rows) {
-    if (options.isVisible && !options.isVisible(row)) continue;
-    // Erasure overrides historical membership for that record only: a list
-    // is not a sync session, so withholding it loses nothing a later read
-    // could have relied on, and the rest of the snapshot stays readable.
-    if (wasErased?.(row)) continue;
+    if (!visible(row)) continue;
+    // Erasure overrides historical membership. Expire explicitly rather than
+    // resurrect deleted data or silently call an incomplete traversal complete.
+    if (wasErased?.(row)) throw new CursorExpiredError();
     if (data.length === options.limit) {
       hasMore = true;
       break;
+    }
+    // The wire names a record by key alone: never send two records as one.
+    if (options.oneRecordPerKey && versionAt) {
+      for (const instance of options.instanceIds) {
+        if (
+          instance !== row.instance &&
+          visible(versionAt(instance, row.recordKey))
+        ) {
+          throw new RecordIdentityConflictError(row.recordKey);
+        }
+      }
     }
     data.push(row);
   }

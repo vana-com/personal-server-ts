@@ -385,7 +385,11 @@ for (const backend of ["memory", "sqlite"]) {
         h.put("b", { name: "B", t: INSIDE }, { instance: "j" });
         for (const path of [
           records("s", { changes_since: begin(version) }),
-          records("s", { changes_since: begin(version), limit: "1" }),
+          records("s", {
+            changes_since: begin(version),
+            limit: "1",
+            order: "asc",
+          }),
           records("s", {}),
           "/streams/s/records/a",
         ]) {
@@ -437,7 +441,7 @@ for (const backend of ["memory", "sqlite"]) {
         h.put("a", { name: "i", t: INSIDE }, { instance: "i" });
         h.put("a", { name: "j", t: OUTSIDE }, { instance: "j" });
         const baseline = await checkpoint(h, version);
-        h.put("a", { name: "j", t: INSIDE }, { instance: "j" });
+        h.put("a", { name: "j2", t: INSIDE }, { instance: "j" });
         const sync = await h.get(records("s", { changes_since: baseline }));
         expect(sync.status).toBe(403);
         expect(sync.body.error?.code).toBe("disclosure_unavailable");
@@ -567,7 +571,7 @@ for (const backend of ["memory", "sqlite"]) {
       expect(sync.body.error?.code).toBe("cursor_expired");
     });
 
-    it("(current) a page cursor issued before authorized boundaries expires", async () => {
+    it("(current) a readable page cursor from before sealed cursors expires", async () => {
       const h = harness(backend, {
         g1: grant(CURRENT, "G1", [streamGrant(CURRENT)]),
       });
@@ -575,12 +579,18 @@ for (const backend of ["memory", "sqlite"]) {
       const first = await h.get(
         records("s", { changes_since: "", limit: "1" }),
       );
-      const payload = JSON.parse(
-        Buffer.from(first.body.next_cursor!, "base64url").toString("utf8"),
+      // Page cursors are sealed now; a readable one has the old shape: the
+      // checkpoint's fields plus the raw offset of the next page.
+      expect(decodesAsJson(first.body.next_cursor!)).toBe(false);
+      const checkpointPayload = JSON.parse(
+        Buffer.from(await checkpoint(h, CURRENT), "base64url").toString("utf8"),
       );
-      delete payload.after;
       const old = Buffer.from(
-        JSON.stringify({ ...payload, offset: 1 }),
+        JSON.stringify({
+          ...checkpointPayload,
+          sinceHorizon: null,
+          offset: 1,
+        }),
       ).toString("base64url");
       const resumed = await h.get(
         records("s", { changes_since: "", limit: "1", cursor: old }),

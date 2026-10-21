@@ -6,7 +6,6 @@ import {
   decodeListCursor,
   decodeSyncPageCursor,
   listSnapshotPage,
-  compareRecordIdentity,
   LIST_ORDER_COLUMNS,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
@@ -34,6 +33,7 @@ import {
   type StreamSemantics,
   type SyncTokenScope,
   type SyncWindow,
+  type RecordIdentity,
   type SyncWindowChange,
   type SyncWindowRequest,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
@@ -310,9 +310,11 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_order
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
   ON pdpp_record_changes (instance, stream, record_key, written_at DESC, version DESC);
 `,
-  // v13: secret that seals candidate-profile sync tokens. It lives beside the
-  // epoch, so a rebuilt records DB expires every token the old one issued.
-  // `addSyncTokenKey` applies it.
+  // v13: the secret that seals sync tokens, beside the epoch so a rebuilt
+  // records DB expires every token the old one issued; an `emitted_key` that
+  // orders emitted time by instant rather than by timestamp text; and the
+  // identity-ordered history index sync pages seek in. `migrateToV13`
+  // applies it.
   "",
   // v14: one recoverable export-to-live transition per Claude connection.
   `CREATE TABLE IF NOT EXISTS pdpp_claude_transition (
@@ -356,16 +358,42 @@ function addCompletionProofColumns(db: Database): void {
   }
 }
 
-function addSyncTokenKey(db: Database): void {
-  const columns = db
-    .prepare("PRAGMA table_info(pdpp_store_metadata)")
-    .all() as { name: string }[];
-  if (!columns.some((column) => column.name === "sync_token_key")) {
-    db.exec("ALTER TABLE pdpp_store_metadata ADD COLUMN sync_token_key TEXT");
-  }
+/** `emitted_key` is `timeSortKey(emitted_at)`, written by SQL on every insert. */
+function registerTimeKey(db: Database): void {
+  db.function("pdpp_time_key", { deterministic: true }, (value: unknown) =>
+    timeSortKey(String(value)),
+  );
+}
+
+function migrateToV13(db: Database): void {
+  const addColumn = (table: string, column: string) => {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+    }[];
+    if (!columns.some((c) => c.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    }
+  };
+  addColumn("pdpp_store_metadata", "sync_token_key");
   db.prepare(
     "UPDATE pdpp_store_metadata SET sync_token_key = ? WHERE id = 1 AND sync_token_key IS NULL",
   ).run(randomBytes(32).toString("base64"));
+  for (const table of ["pdpp_records", "pdpp_record_changes"]) {
+    addColumn(table, "emitted_key");
+    db.exec(
+      `UPDATE ${table} SET emitted_key = pdpp_time_key(emitted_at) WHERE emitted_key IS NULL`,
+    );
+  }
+  db.exec(`
+DROP INDEX IF EXISTS idx_pdpp_record_changes_snapshot_order;
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_key_order
+  ON pdpp_record_changes (stream, emitted_key, record_key, instance, written_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_sync_identity
+  ON pdpp_record_changes (stream, record_key, instance, written_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
+  ON pdpp_records (instance, stream, emitted_key)
+  WHERE deleted = 0;
+`);
 }
 
 function migrate(db: Database): void {
@@ -389,7 +417,7 @@ function migrate(db: Database): void {
           "INSERT OR IGNORE INTO pdpp_store_metadata (id, epoch) VALUES (1, ?)",
         ).run(randomUUID());
       }
-      if (v === 12) addSyncTokenKey(db);
+      if (v === 12) migrateToV13(db);
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -1834,6 +1862,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         hasLaterWrites &&
         erasure.get(row.instance, row.stream, row.recordKey, horizon) !==
           undefined,
+      (instance, recordKey) => {
+        const row = versionAtStmt.get(instance, stream, recordKey, horizon) as
+          RecordRowDb | undefined;
+        return row ? toRow(row) : undefined;
+      },
     );
   }
 
@@ -1883,11 +1916,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     return result;
   }
 
-  const wroteInWindowStmt = db.prepare(
-    `SELECT 1 FROM pdpp_record_changes
-     WHERE stream = ? AND instance = ? AND record_key = ?
-     AND written_at > ? AND written_at <= ? LIMIT 1`,
-  );
   const versionAtStmt = db.prepare(
     `SELECT * FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
      WHERE instance = ? AND stream = ? AND record_key = ? AND written_at <= ?
@@ -1914,35 +1942,62 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         throw new CursorExpiredError();
       }
       assertNotResetSince(request.instanceIds, [high, low ?? high]);
-      const changes: SyncWindowChange[] = [];
-      for (const entry of snapshotRows(stream, request.instanceIds, high)) {
-        const key = [entry.instance, stream, entry.record_key] as const;
-        if (
-          low !== null &&
-          !wroteInWindowStmt.get(
-            stream,
-            entry.instance,
-            entry.record_key,
-            low,
-            high,
-          )
-        ) {
-          continue;
+      const instanceIds = request.instanceIds;
+      const versionAt = (instance: string, recordKey: string, at: number) => {
+        const row = versionAtStmt.get(instance, stream, recordKey, at) as
+          RecordRowDb | undefined;
+        return row ? toRow(row) : undefined;
+      };
+
+      // Identities in record-key then instance order; SQLite's BINARY text
+      // order is `compareRecordIdentity`'s code-point order. A first sync
+      // walks the identity index; an incremental window enumerates only the
+      // keys written in it, through the horizon index.
+      function* changes(
+        direction: "asc" | "desc",
+        after?: RecordIdentity,
+      ): Generator<SyncWindowChange> {
+        if (instanceIds.length === 0 || low === high) return;
+        const dir = direction === "desc" ? "DESC" : "ASC";
+        const placeholders = instanceIds.map(() => "?").join(",");
+        let sql =
+          low === null
+            ? `SELECT record_key, instance FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_sync_identity
+               WHERE stream = ? AND instance IN (${placeholders}) AND written_at <= ?`
+            : `SELECT record_key, instance FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_horizon
+               WHERE stream = ? AND instance IN (${placeholders}) AND written_at > ? AND written_at <= ?`;
+        const params: unknown[] =
+          low === null
+            ? [stream, ...instanceIds, high]
+            : [stream, ...instanceIds, low, high];
+        if (after) {
+          sql += ` AND (record_key, instance) ${direction === "desc" ? "<" : ">"} (?, ?)`;
+          params.push(after.recordKey, after.instance);
         }
-        changes.push({
-          after: toRow(entry),
-          before: () => {
-            if (low === null) return undefined;
-            const row = versionAtStmt.get(...key, low) as
-              RecordRowDb | undefined;
-            return row ? toRow(row) : undefined;
-          },
-          deletedAfterHigh: () =>
-            high < clock && deletedAfterStmt.get(...key, high) !== undefined,
-        });
+        sql += ` GROUP BY record_key, instance ORDER BY record_key ${dir}, instance ${dir}`;
+        for (const id of db.prepare(sql).iterate(...params) as Iterable<{
+          record_key: string;
+          instance: string;
+        }>) {
+          const key = [id.instance, stream, id.record_key] as const;
+          yield {
+            after: versionAt(id.instance, id.record_key, high)!,
+            before: () =>
+              low === null
+                ? undefined
+                : versionAt(id.instance, id.record_key, low),
+            deletedAfterHigh: () =>
+              high < clock && deletedAfterStmt.get(...key, high) !== undefined,
+          };
+        }
       }
-      changes.sort((a, b) => compareRecordIdentity(a.after, b.after));
-      return read({ high: String(high), changes });
+
+      return read({
+        high: String(high),
+        changes,
+        versionAtHigh: (instance, recordKey) =>
+          versionAt(instance, recordKey, high),
+      });
     })();
   }
 

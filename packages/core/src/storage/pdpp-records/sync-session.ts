@@ -4,18 +4,23 @@ import {
   createHash,
   randomBytes,
 } from "node:crypto";
-import { decodeCursor, InvalidCursorSyntaxError } from "./cursor.js";
-import { encodeCursor } from "./cursor.js";
+import {
+  decodeCursor,
+  encodeCursor,
+  InvalidCursorSyntaxError,
+} from "./cursor.js";
 import { canonicalJson } from "./ingest-plan.js";
 import type { PdppRecordStore } from "./interface.js";
-import { compareRecordIdentity } from "./list-page.js";
 import {
   CursorExpiredError,
   InvalidCursorError,
+  RecordIdentityConflictError,
   type ChangesSincePage,
   type PdppRecordRow,
   type PdppStoredRecord,
+  type RecordIdentity,
   type SyncTokenScope,
+  type SyncWindow,
   type SyncWindowChange,
 } from "./types.js";
 
@@ -44,6 +49,12 @@ export interface SyncRequest {
   eligibilityFields?: string[];
   access?: SyncAccess;
   /**
+   * The wire names a record by key alone. When set, a session that would
+   * disclose a key another read instance holds visibly at the horizon throws
+   * `RecordIdentityConflictError` rather than send two records as one.
+   */
+  oneRecordPerKey?: boolean;
+  /**
    * Selects the candidate profile. `binding` is the caller's query context
    * (grant identity and restrictions, response fields) that every token of
    * the session is bound to, in addition to what this service reads itself.
@@ -51,33 +62,50 @@ export interface SyncRequest {
   candidate?: { binding: unknown; order: "asc" | "desc" };
 }
 
+export interface SyncSessionOptions {
+  /**
+   * Changes one page may examine. A page that reaches it ends early with a
+   * page cursor past the last change it examined, so one request never walks
+   * an unbounded window of changes the grant does not disclose.
+   */
+  maxExaminedPerPage?: number;
+}
+
+/** Matches the stream summary's scan budget in the HTTP route. */
+export const DEFAULT_SYNC_EXAMINED_PER_PAGE = 10_000;
+
 /**
  * The single owner of PDPP `changes_since` sessions: horizons, the
- * authorized change set, its pagination and every token a session issues.
- * Stores only supply raw history (`readSyncWindow`); HTTP only maps the page.
+ * authorized change set, its pagination, the work one page may do, and every
+ * token a session issues. Stores only supply raw history
+ * (`readSyncWindow`); HTTP only maps the page.
  *
  * Profiles differ only in policy, never in path:
  * - current: one-horizon visibility, current-state grant filter, readable
- *   tokens that existing clients store;
+ *   checkpoints that existing clients store;
  * - candidate: visibility at both horizons with removals, key order in the
- *   requested direction, sealed tokens bound to grant and query context.
+ *   requested direction, sealed checkpoints bound to grant and query context.
  *
- * Both profiles paginate over the authorized result only, so hidden records
- * never shape a page. Only the candidate refuses to serve a record deleted
+ * Both profiles paginate over the authorized result only and seal every page
+ * cursor, because a page that ends on its work budget resumes after a change
+ * it may not disclose. Only the candidate refuses to serve a record deleted
  * after the session's fixed horizon; it expires that session instead.
  */
 export function createPdppSyncSessionService(
   store: Pick<PdppRecordStore, "readSyncWindow" | "syncTokenScope">,
+  options: SyncSessionOptions = {},
 ) {
+  const budget = options.maxExaminedPerPage ?? DEFAULT_SYNC_EXAMINED_PER_PAGE;
+  if (!Number.isSafeInteger(budget) || budget < 1) {
+    throw new RangeError("sync page budget must be a positive integer");
+  }
+
   function read(request: SyncRequest): ChangesSincePage {
     if (!Number.isSafeInteger(request.limit) || request.limit < 1) {
       throw new RangeError("sync page limit must be a positive integer");
     }
-    const tokens = request.candidate
-      ? candidateTokens(store.syncTokenScope(), request)
-      : currentTokens(store.syncTokenScope(), request.stream);
+    const tokens = sessionTokens(store.syncTokenScope(), request);
     const position = tokens.open(request);
-    const descending = request.candidate?.order === "desc";
     return store.readSyncWindow(
       request.stream,
       {
@@ -86,32 +114,26 @@ export function createPdppSyncSessionService(
         ...(position.high !== undefined && { high: position.high }),
       },
       (window) => {
-        const { changes } = window;
-        const step = descending ? -1 : 1;
-        let index = descending ? changes.length - 1 : 0;
-        if (position.after) {
-          const boundary = position.after;
-          const firstNotBefore = searchChanges(
-            changes,
-            (row) => compareRecordIdentity(row, boundary) < 0,
-          );
-          index = descending
-            ? firstNotBefore - 1
-            : searchChanges(
-                changes,
-                (row) => compareRecordIdentity(row, boundary) <= 0,
-              );
-        }
+        const direction = request.candidate?.order === "desc" ? "desc" : "asc";
         const data: PdppRecordRow[] = [];
-        let hasMore = false;
-        for (; index >= 0 && index < changes.length; index += step) {
-          const change = changes[index];
+        let examined = 0;
+        let last: RecordIdentity | undefined;
+        let resumeAfter: RecordIdentity | undefined;
+        for (const change of window.changes(direction, position.after)) {
+          if (examined === budget) {
+            // Another change exists past the budget: end this page there.
+            resumeAfter = last;
+            break;
+          }
+          examined += 1;
+          last = change.after;
           const row = disclose(change, position.low, request);
           if (!row) continue;
           if (data.length === request.limit) {
-            hasMore = true;
+            resumeAfter = data[data.length - 1];
             break;
           }
+          if (request.oneRecordPerKey) assertOnlyHolder(row, window, request);
           // Candidate deletion exception: never serve a record deleted after
           // the session's first page. Withholding it silently could lose it,
           // since the next session compares against this horizon, so the
@@ -121,21 +143,23 @@ export function createPdppSyncSessionService(
           }
           data.push(row);
         }
-        if (!hasMore) {
+        if (!resumeAfter) {
           return {
             data,
-            hasMore,
+            hasMore: false,
             nextChangesSince: tokens.checkpoint(window.high),
           };
         }
-        const last = data[data.length - 1];
         return {
           data,
-          hasMore,
+          hasMore: true,
           nextCursor: tokens.page({
             low: position.low,
             high: window.high,
-            after: { recordKey: last.recordKey, instance: last.instance },
+            after: {
+              recordKey: resumeAfter.recordKey,
+              instance: resumeAfter.instance,
+            },
           }),
         };
       },
@@ -158,13 +182,11 @@ function disclose(
   const { after } = change;
   const { access, eligibilityFields: fields } = request;
   if (request.candidate) {
-    const visible = (row: PdppRecordRow | undefined) =>
-      row !== undefined &&
-      !row.deleted &&
-      (!access || access.canSeeRecord(row));
     const before = low === null ? undefined : change.before();
-    const wasVisible = visible(before);
-    if (!visible(after)) return wasVisible ? removal(after) : undefined;
+    const wasVisible = visible(before, access);
+    if (!visible(after, access)) {
+      return wasVisible ? removal(after) : undefined;
+    }
     if (wasVisible && sameProjection(before!, after, fields)) return undefined;
     return after;
   }
@@ -179,6 +201,36 @@ function disclose(
   // The current contract fixes every page at the session horizon, with no
   // deletion exception: the next session carries the tombstone.
   return after;
+}
+
+function visible(
+  row: PdppRecordRow | undefined,
+  access: SyncAccess | undefined,
+): row is PdppStoredRecord {
+  return (
+    row !== undefined && !row.deleted && (!access || access.canSeeRecord(row))
+  );
+}
+
+/**
+ * A disclosed record or removal names its key alone. If another read
+ * instance holds that key visibly at the horizon, the client cannot tell the
+ * two apart, so the session refuses instead of conflating them. A same-key
+ * record the grant hides is no conflict and is not revealed.
+ */
+function assertOnlyHolder(
+  row: PdppRecordRow,
+  window: SyncWindow,
+  request: SyncRequest,
+): void {
+  for (const instance of request.instanceIds) {
+    if (instance === row.instance) continue;
+    if (
+      visible(window.versionAtHigh(instance, row.recordKey), request.access)
+    ) {
+      throw new RecordIdentityConflictError(row.recordKey);
+    }
+  }
 }
 
 /** A minimal removal: never the now-hidden payload. */
@@ -212,25 +264,10 @@ function sameProjection(
   );
 }
 
-/** First index whose row fails `isBefore`; `changes` is identity-ordered. */
-function searchChanges(
-  changes: SyncWindowChange[],
-  isBefore: (row: PdppRecordRow) => boolean,
-): number {
-  let low = 0;
-  let high = changes.length;
-  while (low < high) {
-    const middle = (low + high) >>> 1;
-    if (isBefore(changes[middle].after)) low = middle + 1;
-    else high = middle;
-  }
-  return low;
-}
-
 interface Position {
   low: string | null;
   high?: string;
-  after?: { recordKey: string; instance: string };
+  after?: RecordIdentity;
 }
 
 interface SessionTokens {
@@ -239,76 +276,11 @@ interface SessionTokens {
   checkpoint(high: string): string;
 }
 
-/**
- * Current-profile tokens: the readable format existing clients already
- * store. The store validates the horizons they carry.
- */
-function currentTokens(scope: SyncTokenScope, stream: string): SessionTokens {
-  function decodeScoped(token: string) {
-    const payload = decodeCursor(token);
-    if (payload.kind !== "changes_since") throw new InvalidCursorError();
-    if (payload.stream !== stream || payload.epoch !== scope.epoch) {
-      throw new CursorExpiredError();
-    }
-    return payload;
-  }
-  return {
-    open(request) {
-      if (request.cursor) {
-        const payload = decodeScoped(request.cursor);
-        const { offset, after } = payload;
-        if (!Number.isSafeInteger(offset) || offset < 0) {
-          throw new InvalidCursorError();
-        }
-        if (after === undefined) {
-          // A pre-boundary cursor counted hidden rows; it cannot be resumed.
-          if (offset !== 0) throw new CursorExpiredError();
-          return { low: payload.sinceHorizon, high: payload.horizon };
-        }
-        if (
-          typeof after?.recordKey !== "string" ||
-          typeof after.instance !== "string"
-        ) {
-          throw new InvalidCursorError();
-        }
-        return { low: payload.sinceHorizon, high: payload.horizon, after };
-      }
-      if (!request.changesSince) return { low: null };
-      try {
-        return { low: decodeScoped(request.changesSince).horizon };
-      } catch (err) {
-        if (err instanceof InvalidCursorSyntaxError) {
-          throw new CursorExpiredError();
-        }
-        throw err;
-      }
-    },
-    page: ({ low, high, after }) =>
-      encodeCursor({
-        kind: "changes_since",
-        stream,
-        epoch: scope.epoch,
-        horizon: high,
-        sinceHorizon: low,
-        offset: 0,
-        after,
-      }),
-    checkpoint: (high) =>
-      encodeCursor({
-        kind: "changes_since",
-        stream,
-        epoch: scope.epoch,
-        horizon: high,
-        sinceHorizon: null,
-        offset: 0,
-      }),
-  };
-}
-
 const SEALED_VERSION = 1;
 const KEY_ID_BYTES = 4;
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
+const HEADER_BYTES = 1 + KEY_ID_BYTES + IV_BYTES + TAG_BYTES;
 /** Horizons are padded so a token's size never tracks the store clock. */
 const HORIZON_WIDTH = 32;
 const PLAINTEXT_BLOCK = 64;
@@ -316,9 +288,9 @@ const PLAINTEXT_BLOCK = 64;
 interface SealedPayload {
   /** Role: a page cursor or a completed-session checkpoint. */
   r: "page" | "checkpoint";
-  /** Digest of the grant and query context. */
+  /** Digest of the context the token is bound to. */
   b: string;
-  /** Page only: digest of the session's `changes_since` input. */
+  /** Candidate page only: digest of the session's `changes_since` input. */
   s?: string;
   l?: string;
   h: string;
@@ -326,28 +298,40 @@ interface SealedPayload {
 }
 
 /**
- * Candidate-profile tokens: AES-256-GCM over the position, with fresh
- * randomness per issue, so no token reveals a position or time and token
- * equality signals nothing. Each token is bound to its role, its grant and
- * query context, and (for a page) its session's input checkpoint.
+ * Every page cursor, in both profiles, and every candidate checkpoint is
+ * AES-256-GCM over its position with fresh randomness, so it reveals no
+ * position, time or key, and token equality signals nothing. A
+ * current-profile checkpoint keeps the readable format existing clients
+ * store; the store validates the horizons it carries.
+ *
+ * Bindings: a candidate token is bound to its role and to the grant and
+ * query context, and a candidate page cursor also to its session's input
+ * checkpoint. A current-profile page cursor is bound to its role, stream and
+ * instances only, as the current contract leaves the rest of the query free.
  */
-function candidateTokens(
+function sessionTokens(
   scope: SyncTokenScope,
   request: SyncRequest,
 ): SessionTokens {
-  const { binding, order } = request.candidate!;
+  const instances = [...new Set(request.instanceIds)].sort();
   const context = digest(
-    canonicalJson({
-      binding,
-      stream: request.stream,
-      instances: [...new Set(request.instanceIds)].sort(),
-      fields: request.eligibilityFields
-        ? [...new Set(request.eligibilityFields)].sort()
-        : null,
-      order,
-    }),
+    canonicalJson(
+      request.candidate
+        ? {
+            binding: request.candidate.binding,
+            stream: request.stream,
+            instances,
+            fields: request.eligibilityFields
+              ? [...new Set(request.eligibilityFields)].sort()
+              : null,
+            order: request.candidate.order,
+          }
+        : { profile: "current", stream: request.stream, instances },
+    ),
   );
-  const baseline = digest(request.changesSince ?? "beginning");
+  const baseline = request.candidate
+    ? digest(request.changesSince ?? "beginning")
+    : undefined;
   const keyId = createHash("sha256")
     .update(scope.key)
     .digest()
@@ -370,11 +354,14 @@ function candidateTokens(
     ]).toString("base64url");
   }
 
+  function isSealed(token: string): boolean {
+    return Buffer.from(token, "base64url")[0] === SEALED_VERSION;
+  }
+
   function unseal(token: string, role: SealedPayload["r"]): SealedPayload {
     const bytes = Buffer.from(token, "base64url");
-    const header = 1 + KEY_ID_BYTES + IV_BYTES + TAG_BYTES;
     if (
-      bytes.length <= header ||
+      bytes.length <= HEADER_BYTES ||
       bytes.toString("base64url") !== token ||
       bytes[0] !== SEALED_VERSION
     ) {
@@ -392,10 +379,10 @@ function candidateTokens(
         scope.key,
         bytes.subarray(ivStart, ivStart + IV_BYTES),
       );
-      decipher.setAuthTag(bytes.subarray(ivStart + IV_BYTES, header));
+      decipher.setAuthTag(bytes.subarray(ivStart + IV_BYTES, HEADER_BYTES));
       payload = JSON.parse(
         Buffer.concat([
-          decipher.update(bytes.subarray(header)),
+          decipher.update(bytes.subarray(HEADER_BYTES)),
           decipher.final(),
         ]).toString("utf8"),
       ) as SealedPayload;
@@ -408,38 +395,85 @@ function candidateTokens(
     return payload;
   }
 
+  function openPage(cursor: string): Position {
+    const payload = unseal(cursor, "page");
+    if (payload.s !== baseline) throw new InvalidCursorError();
+    return {
+      low: payload.l?.trim() ?? null,
+      high: payload.h.trim(),
+      ...(payload.a && {
+        after: { recordKey: payload.a[0], instance: payload.a[1] },
+      }),
+    };
+  }
+
+  /** A readable current-profile token, checked against this store and stream. */
+  function decodeCurrent(token: string) {
+    const payload = decodeCursor(token);
+    if (payload.kind !== "changes_since") throw new InvalidCursorError();
+    if (payload.stream !== request.stream || payload.epoch !== scope.epoch) {
+      throw new CursorExpiredError();
+    }
+    return payload;
+  }
+
+  const page = ({ low, high, after }: Required<Position>) =>
+    seal({
+      r: "page",
+      b: context,
+      ...(baseline && { s: baseline }),
+      ...(low !== null && { l: low.padStart(HORIZON_WIDTH) }),
+      h: high.padStart(HORIZON_WIDTH),
+      a: [after.recordKey, after.instance],
+    });
+
+  if (request.candidate) {
+    return {
+      open(request) {
+        if (request.cursor) return openPage(request.cursor);
+        if (
+          request.changesSince === undefined ||
+          request.changesSince === "beginning"
+        ) {
+          return { low: null };
+        }
+        return { low: unseal(request.changesSince, "checkpoint").h.trim() };
+      },
+      page,
+      checkpoint: (high) =>
+        seal({ r: "checkpoint", b: context, h: high.padStart(HORIZON_WIDTH) }),
+    };
+  }
+
   return {
     open(request) {
       if (request.cursor) {
-        const payload = unseal(request.cursor, "page");
-        if (payload.s !== baseline) throw new InvalidCursorError();
-        return {
-          low: payload.l?.trim() ?? null,
-          high: payload.h.trim(),
-          ...(payload.a && {
-            after: { recordKey: payload.a[0], instance: payload.a[1] },
-          }),
-        };
+        if (isSealed(request.cursor)) return openPage(request.cursor);
+        // A readable page cursor predates sealed cursors. Its position
+        // counted rows the grant hides, so it cannot be resumed.
+        decodeCurrent(request.cursor);
+        throw new CursorExpiredError();
       }
-      if (
-        request.changesSince === undefined ||
-        request.changesSince === "beginning"
-      ) {
-        return { low: null };
+      if (!request.changesSince) return { low: null };
+      try {
+        return { low: decodeCurrent(request.changesSince).horizon };
+      } catch (err) {
+        if (err instanceof InvalidCursorSyntaxError) {
+          throw new CursorExpiredError();
+        }
+        throw err;
       }
-      return { low: unseal(request.changesSince, "checkpoint").h.trim() };
     },
-    page: ({ low, high, after }) =>
-      seal({
-        r: "page",
-        b: context,
-        s: baseline,
-        ...(low !== null && { l: low.padStart(HORIZON_WIDTH) }),
-        h: high.padStart(HORIZON_WIDTH),
-        a: [after.recordKey, after.instance],
-      }),
+    page,
     checkpoint: (high) =>
-      seal({ r: "checkpoint", b: context, h: high.padStart(HORIZON_WIDTH) }),
+      encodeCursor({
+        kind: "changes_since",
+        stream: request.stream,
+        epoch: scope.epoch,
+        horizon: high,
+        sinceHorizon: null,
+        offset: 0,
+      }),
   };
 }
 
