@@ -41,6 +41,20 @@ describe("hasPdppOrigin for derivatives", () => {
   });
 });
 
+describe("a malformed legacy marker fails closed", () => {
+  const ok = { sources: [], writtenAt: "2026-09-01T00:00:00Z" };
+  it.each([
+    ["no sources or writtenAt", { origin: "legacy" }],
+    ["bad sources", { ...ok, sources: ["not-an-id"] }],
+    ["no writtenAt", { sources: [], origin: "legacy" }],
+    ["not an object", "legacy"],
+  ])("%s counts as PDPP", (_name, lineage) => {
+    const marked =
+      typeof lineage === "object" ? { ...lineage, origin: "legacy" } : lineage;
+    expect(hasPdppOrigin({ data: { $lineage: marked } })).toBe(true);
+  });
+});
+
 describe("inputHasPdppOrigin", () => {
   it("is PDPP when the index row or the bytes say so", () => {
     const legacy = { data: { id: 1 } };
