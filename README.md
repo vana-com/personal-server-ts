@@ -112,6 +112,29 @@ All authenticated endpoints use `Authorization: Web3Signed <base64url(json)>.<si
 | `/v1/sync/status`                      | GET    | Owner           | Sync status                    |
 | `/v1/sync/file/{fileId}`               | POST   | Owner           | Sync specific file             |
 
+### Claude export-to-live transition
+
+The owner-only `POST /pdpp/instances/:instance/transition-claude-live` accepts
+`{ "expected_generation": N }` for the single registered Claude connection,
+configured as `anthropic` or `anthropic-live`. It is deliberately separate from
+reset: reset still cannot change a registered connection's method.
+
+The transition captures currently readable conversations and projects, archives
+the old canonical rows/history/blob claims, and binds `anthropic-live` at N+1 in
+one SQLite transaction. Snapshot preparation checks the write clock. Stale export
+runs cannot write afterward; replaying N never clears live data. Unreadable,
+nonempty prior data refuses transition. Desktop must verify the signed successor
+before requesting this operation, then activate its declaration at an idle
+restart boundary. A lost response is reconciled by reading the binding.
+
+The previous public bodies remain readable while live collection is incomplete.
+Conversations take over only after covering the saved messages in the same
+organization; a later regression refuses instead of resurrecting the old export.
+Saved projects remain available, but the live connector does not refresh them.
+Deletion/reset removes the corresponding saved baseline and archived data. This
+is a one-way method transition, not an arbitrary method-switching API. Saved
+provider sessions stay at their existing host-owned credential boundary.
+
 ### Owner import acceptance
 
 `PUT /v1/data/{scope}/imports/{operation}` accepts an owner root JSON object up to the data-ingest limit (512 MiB). `operation` is a stable 64-character lowercase hexadecimal identifier for one intended import; derive it from the owner, saved run identity and scope, excluding the body digest and server port. Ordinary `POST` continues to create a distinct write on each request. Binary, lineage and query parameters (including `supersede`) are refused on import PUT.
