@@ -303,8 +303,39 @@ export function createLegacyScopeView(
     { key: string; envelope: DataFileEnvelope; revision: string }
   >();
 
-  function decide(scope: string): Decision {
-    const streamsByMethod = scopeMethods(scope);
+  /**
+   * The scope's methods, minus those whose binding opts out of takeover while
+   * the legacy file is still the owner's latest body: an eligible legacy head,
+   * no recorded takeover, and no deleted connection of those methods (a
+   * deletion erased rows that would show ownership; it keeps refusing).
+   */
+  function withoutOptedOutMethods(
+    scope: string,
+  ): Map<string, readonly string[]> {
+    const methods = scopeMethods(scope);
+    const optedOut = optedOutMethods(scope);
+    if (optedOut.size === 0) return methods;
+    if (
+      authority.hasTakeover(scope) ||
+      authority.eligibleLegacyHead(scope) === null ||
+      authority
+        .listMethodConnections([...optedOut])
+        .some((connection) => connection.deletedAt !== null)
+    ) {
+      return methods;
+    }
+    return new Map([...methods].filter(([method]) => !optedOut.has(method)));
+  }
+
+  /**
+   * `legacyFirst` (the default) lets the legacy file stay authoritative over
+   * methods whose binding opts out of takeover. Deletion safety asks the
+   * ungated question: do any connection rows exist for this scope?
+   */
+  function decide(scope: string, legacyFirst = true): Decision {
+    const streamsByMethod = legacyFirst
+      ? withoutOptedOutMethods(scope)
+      : scopeMethods(scope);
     if (streamsByMethod.size === 0) {
       return authority.hasTakeover(scope)
         ? refused({
@@ -906,7 +937,7 @@ export function createLegacyScopeView(
     },
 
     ownsScope(scope) {
-      return authority.readSnapshot(() => decide(scope)).kind !== "file";
+      return authority.readSnapshot(() => decide(scope, false)).kind !== "file";
     },
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),
@@ -1073,6 +1104,21 @@ function scopeMethods(scope: string): Map<string, readonly string[]> {
     const method = legacyConnectorKey(bound.pdppSource);
     const binding = legacyBindingsForProfile(method).get(scope);
     if (binding) methods.set(method, binding.pdppStreams);
+  }
+  return methods;
+}
+
+/** Methods whose binding for `scope` opts out of automatic takeover. */
+function optedOutMethods(scope: string): Set<string> {
+  const methods = new Set<string>();
+  for (const profile of BINDING_PROFILES) {
+    const bound = profile.get(scope);
+    if (!bound) continue;
+    const method = legacyConnectorKey(bound.pdppSource);
+    if (
+      legacyBindingsForProfile(method).get(scope)?.canonicalTakeover === false
+    )
+      methods.add(method);
   }
   return methods;
 }
