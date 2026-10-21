@@ -85,3 +85,5 @@ export {
   TOMBSTONE_METADATA_HASH,
   isTombstoneRecord,
 } from "./tombstone.js";
+
+export { hasPdppOrigin } from "./pdpp-import.js";

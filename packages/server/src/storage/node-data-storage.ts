@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   deleteAllForScope,
   deleteDataFile,
@@ -23,7 +25,10 @@ import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/cont
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type {
+  IndexEntry,
+  IndexManager,
+} from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
   DataStorageEntryLookup,
   DataStorageListOptions,
@@ -133,6 +138,7 @@ export async function reindexLegacyDataFiles(
           envelope.producer === "pdpp-import-projection"
             ? envelope.producer
             : null,
+        pdppOrigin: hasPdppOrigin(envelope),
         producerProvenance:
           envelope.producer_provenance &&
           typeof envelope.producer_provenance === "object"
@@ -154,6 +160,39 @@ export function createNodeDataStorage(
   deps: NodeDataStorageDeps,
 ): DataStoragePort {
   const db = indexDatabase(deps.indexManager);
+  const stampOrigin = db?.prepare(
+    "UPDATE data_files SET pdpp_origin = ? WHERE path = ? AND pdpp_origin IS NULL",
+  );
+  /**
+   * PDPP provenance of the bytes at a version path, or undefined when they
+   * cannot be read. The bytes never change once published (see
+   * `publishStagedDataFile`), so the answer is stable.
+   */
+  function originOfPublishedBytes(path: string): boolean | undefined {
+    try {
+      return hasPdppOrigin(
+        JSON.parse(
+          readFileSync(join(deps.hierarchyOptions.dataDir, path), "utf8"),
+        ),
+      );
+    } catch {
+      return undefined;
+    }
+  }
+  /**
+   * Resolve a row whose provenance is still unknown (written before the
+   * column existed, or inserted without it) from its published bytes, once.
+   * Unreadable bytes stay unknown, which the read policy refuses to grantees.
+   */
+  function withOrigin<T extends IndexEntry | undefined>(entry: T): T {
+    if (!entry || entry.pdppOrigin !== undefined) return entry;
+    const pdppOrigin = entry.producer
+      ? true
+      : originOfPublishedBytes(entry.path);
+    if (pdppOrigin === undefined) return entry;
+    stampOrigin?.run(Number(pdppOrigin), entry.path);
+    return { ...entry, pdppOrigin };
+  }
   const operations = db
     ? createImportOperations(db, deps.indexManager, deps.hierarchyOptions)
     : undefined;
@@ -177,15 +216,17 @@ export function createNodeDataStorage(
     },
     findEntry(lookup: DataStorageEntryLookup) {
       if (lookup.fileId) {
-        return deps.indexManager.findByFileId(lookup.fileId);
+        return withOrigin(deps.indexManager.findByFileId(lookup.fileId));
       }
       if (lookup.at) {
-        return deps.indexManager.findClosestByScope(lookup.scope, lookup.at);
+        return withOrigin(
+          deps.indexManager.findClosestByScope(lookup.scope, lookup.at),
+        );
       }
-      return deps.indexManager.findLatestByScope(lookup.scope);
+      return withOrigin(deps.indexManager.findLatestByScope(lookup.scope));
     },
     findByFileId(fileId: string) {
-      return deps.indexManager.findByFileId(fileId);
+      return withOrigin(deps.indexManager.findByFileId(fileId));
     },
     findByDataPointId(dataPointId: string) {
       return deps.indexManager.findByDataPointId(dataPointId);
@@ -225,6 +266,29 @@ export function createNodeDataStorage(
       return readScopeBlockManifest(deps.hierarchyOptions, scope, collectedAt);
     },
     writeEnvelope(envelope: DataFileEnvelope) {
+      // Publication refuses different bytes at an existing file. An index row
+      // whose file was lost still names its version: new bytes may restore
+      // it only with the same provenance the row already records.
+      const indexed = deps.indexManager.findByPath(
+        relative(
+          deps.hierarchyOptions.dataDir,
+          buildDataFilePath(
+            deps.hierarchyOptions.dataDir,
+            envelope.scope,
+            envelope.collectedAt,
+          ),
+        ),
+      );
+      if (
+        indexed?.pdppOrigin !== undefined &&
+        indexed.pdppOrigin !== hasPdppOrigin(envelope)
+      ) {
+        return Promise.reject(
+          new Error(
+            `Stored envelope conflicts with publication at ${indexed.path}`,
+          ),
+        );
+      }
       return writeDataFile(deps.hierarchyOptions, envelope);
     },
     async commitEnvelope(envelope, entry, precondition) {
@@ -234,6 +298,7 @@ export function createNodeDataStorage(
         const result = deps.indexManager.insertIfCurrent(
           {
             ...entry,
+            pdppOrigin: hasPdppOrigin(envelope),
             path: staged.relativePath,
             sizeBytes: entry.sizeBytes ?? staged.sizeBytes,
           },
@@ -270,6 +335,8 @@ export function createNodeDataStorage(
       );
     },
     insertEntry(entry) {
+      // A writer that omits provenance leaves it unknown; `withOrigin`
+      // resolves it from the published bytes on first selection.
       return deps.indexManager.insert(entry);
     },
     updateFileId(path: string, fileId: string) {

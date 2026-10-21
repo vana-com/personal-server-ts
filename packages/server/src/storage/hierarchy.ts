@@ -1,5 +1,6 @@
 import {
   access,
+  link,
   mkdir,
   open,
   readFile,
@@ -287,11 +288,33 @@ function collectDirectorySyncPaths(finalDir: string): string[] {
   }
 }
 
+/**
+ * Publish a staged envelope at its version path without replacing one.
+ *
+ * A version path names immutable bytes. Readers authorize the version they
+ * selected, including its PDPP provenance, and only then read the path, so
+ * different bytes appearing there would bypass that decision. Identical bytes
+ * republish idempotently; different bytes fail, as in `publishDataFile`.
+ */
 export async function publishStagedDataFile(
   stagePath: string,
   finalPath: string,
 ): Promise<void> {
-  await rename(stagePath, finalPath);
+  try {
+    await link(stagePath, finalPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    const [published, staged] = await Promise.all([
+      readFile(finalPath),
+      readFile(stagePath),
+    ]);
+    if (!published.equals(staged)) {
+      throw new Error(
+        `Stored envelope conflicts with publication at ${finalPath}`,
+      );
+    }
+  }
+  await unlink(stagePath);
   const directory = await open(dirname(finalPath), "r");
   try {
     await directory.sync();

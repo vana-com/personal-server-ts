@@ -24,6 +24,14 @@ export interface IndexEntry {
   // without knowledge of any tombstone, so any tombstone covers it. Never a
   // wall-clock comparison: clocks differ across replicas, versions do not.
   afterTombstoneVersion?: number | null;
+  /**
+   * Whether this version's bytes came from PDPP: they carry native `$pdpp`
+   * import metadata, or a PDPP producer stamped them as a canonical cache.
+   * Storage derives it from the published bytes, which never change at a
+   * version path. Undefined means not yet known (a row from before this
+   * field); the read policy treats unknown as PDPP until storage resolves it.
+   */
+  pdppOrigin?: boolean;
   /** Server-stamped origin of a legacy cache version. Null for older/manual writes. */
   producer?: "pdpp-projector" | "pdpp-import-projection" | null;
   /** JSON provenance stored outside the grantee-visible data object. */

@@ -1,4 +1,5 @@
 import { isSystemScope } from "../policy/reserved-scopes.js";
+import { hasPdppOrigin } from "../sync/pdpp-import.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import {
   type DataStoragePort,
@@ -204,6 +205,9 @@ async function commitWrittenEnvelope(
   entry: Omit<NewIndexEntry, "path" | "sizeBytes"> & { sizeBytes?: number },
   precondition?: LegacyPrecondition,
 ): Promise<{ ok: true; writeResult: WriteResult } | DataContractError> {
+  // Publication never replaces a version path with different bytes, so the
+  // provenance of this envelope is the provenance of the bytes indexed.
+  entry = { ...entry, pdppOrigin: hasPdppOrigin(envelope) };
   if (storage.commitEnvelope) {
     const result = await storage.commitEnvelope(envelope, entry, precondition);
     if (!result.ok) {

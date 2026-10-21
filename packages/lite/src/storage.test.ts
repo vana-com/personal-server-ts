@@ -16,6 +16,117 @@ import {
 import { previewEnvelopeValue } from "./storage-utils.js";
 
 describe("createPersistentPsLiteStorage", () => {
+  it("resolves unknown provenance from published bytes once, at startup", async () => {
+    const persistence = createMemoryPsLitePersistence();
+    const files = createMemoryPsLiteDataFileStore();
+    let storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      files,
+    );
+    for (const [scope, data] of [
+      ["native.rows", { id: "native", $pdpp: { version: 1 } }],
+      [
+        "legacy.rows",
+        { records: [{ id: "legacy", $pdpp: { sourceId: "phone" } }] },
+      ],
+    ] as const) {
+      const envelope = createDataFileEnvelope(
+        scope,
+        "2026-10-01T00:00:00Z",
+        data,
+      );
+      const written = await storage.writeEnvelope(envelope);
+      // A version indexed without provenance, as before the field existed.
+      await storage.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: written.sizeBytes,
+      });
+    }
+    expect(storage.findEntry({ scope: "native.rows" })?.pdppOrigin).toBe(
+      undefined,
+    );
+    const reads = vi.spyOn(files, "readEnvelope");
+    storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      files,
+    );
+    expect(reads).toHaveBeenCalledTimes(2);
+    reads.mockClear();
+    expect(storage.findEntry({ scope: "native.rows" })?.pdppOrigin).toBe(true);
+    expect(storage.findEntry({ scope: "legacy.rows" })?.pdppOrigin).toBe(false);
+    await createPersistentPsLiteStorage({ kind: "custom" }, persistence, files);
+    expect(reads).not.toHaveBeenCalled();
+  });
+
+  it("refuses to replace a published version with different bytes", async () => {
+    const files = createMemoryPsLiteDataFileStore();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      files,
+    );
+    const legacy = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "legacy" },
+    );
+    const written = await storage.writeEnvelope(legacy);
+    await storage.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: legacy.scope,
+      collectedAt: legacy.collectedAt,
+      sizeBytes: written.sizeBytes,
+      pdppOrigin: false,
+    });
+    const selected = storage.findEntry({ scope: legacy.scope })!;
+
+    // Native PDPP bytes at the same scope and collectedAt.
+    await expect(
+      storage.writeEnvelope({
+        ...legacy,
+        data: { id: "native", $pdpp: { version: 1 } },
+      }),
+    ).rejects.toThrow("Stored envelope conflicts with publication");
+    expect(
+      (await storage.readEnvelope(selected.scope, selected.collectedAt)).data,
+    ).toEqual({ id: "legacy" });
+    // The same bytes again are an idempotent republish.
+    await expect(storage.writeEnvelope(legacy)).resolves.toMatchObject({
+      relativePath: written.relativePath,
+    });
+    // An index row whose bytes were lost keeps its provenance.
+    await files.deleteEnvelope(written.relativePath);
+    await expect(
+      storage.writeEnvelope({
+        ...legacy,
+        data: { id: "native", $pdpp: { version: 1 } },
+      }),
+    ).rejects.toThrow("Stored envelope conflicts with publication");
+
+    // Two concurrent first publications of one path: exactly one wins.
+    const fresh = { ...legacy, collectedAt: "2026-10-02T00:00:00Z" };
+    const results = await Promise.allSettled([
+      storage.writeEnvelope({ ...fresh, data: { id: "first" } }),
+      storage.writeEnvelope({
+        ...fresh,
+        data: { id: "second", $pdpp: { version: 1 } },
+      }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual([
+      "fulfilled",
+      "rejected",
+    ]);
+    expect(
+      (await storage.readEnvelope(fresh.scope, fresh.collectedAt)).data,
+    ).toEqual({ id: "first" });
+  });
+
   it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {
     const envelope = createDataFileEnvelope(
       "chatgpt.conversations",
@@ -57,6 +168,9 @@ describe("createPersistentPsLiteStorage", () => {
 
     const write = await storage.writeEnvelope(envelope);
     expect(write.sizeBytes).toBeGreaterThan(1_000);
+    // Publication looks for an existing version at the path; only reads
+    // after it are about previews.
+    readEnvelope.mockClear();
     await storage.insertEntry({
       fileId: "file-1",
       path: write.relativePath,

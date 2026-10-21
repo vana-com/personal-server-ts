@@ -292,6 +292,27 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Immutable PDPP provenance at storage publication. Native metadata (including
+ * malformed claims) and owner-stamped PDPP cache producers require grant-bound
+ * reads. Nested phone `{records}` metadata is ordinary legacy compatibility.
+ */
+export function hasPdppOrigin(
+  envelope:
+    | {
+        data: unknown;
+        producer?: unknown;
+      }
+    | undefined,
+): boolean {
+  return (
+    envelope !== undefined &&
+    (envelope.producer === "pdpp-projector" ||
+      envelope.producer === "pdpp-import-projection" ||
+      readMetadata(envelope.data) !== null)
+  );
+}
+
+/**
  * Read `data.$pdpp` into a typed shape, or explain why it is not usable.
  *
  * Returns `null` for "no metadata present", which is the ordinary legacy

@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS data_files (
   data_point_id TEXT,
   after_tombstone_version INTEGER,
   producer TEXT,
-  producer_provenance TEXT
+  producer_provenance TEXT,
+  pdpp_origin INTEGER
 )`;
 
 const CREATE_SCOPE_REVISIONS_SQL = `
@@ -34,7 +35,7 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 14;
+export const INDEX_SCHEMA_VERSION = 15;
 
 const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
@@ -92,6 +93,9 @@ function hasTable(db: Database.Database, table: string): boolean {
 }
 
 function migrateSchema(db: Database.Database, currentVersion: number): void {
+  if (!hasColumn(db, "data_files", "pdpp_origin")) {
+    db.exec("ALTER TABLE data_files ADD COLUMN pdpp_origin INTEGER");
+  }
   if (currentVersion < 2 && !hasColumn(db, "data_files", "schema_id")) {
     db.exec("ALTER TABLE data_files ADD COLUMN schema_id TEXT");
   }
