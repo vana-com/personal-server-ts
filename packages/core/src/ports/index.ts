@@ -171,6 +171,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
     collectedAt: string,
     options: {
       cursor?: string;
+      /** UTF-8 content budget; a 1–3 byte budget may emit one whole code point (up to 4 bytes). */
       maxBytes: number;
       /**
        * Block-addressed read: return only these blocks, in this order. When
