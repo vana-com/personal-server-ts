@@ -214,14 +214,17 @@ export async function authorizeDataRead(
   input: DataReadPolicyInput,
   ports: DataReadPolicyPorts,
 ): Promise<{ grant: GatewayGrantResponse; lease: DeliveryLease }> {
+  const verifiedAt = Date.now();
   const grant = await verifyDataReadPolicy(input, ports);
-  const evidence = remoteEvidence(grant, () =>
-    verifyDataReadPolicy(input, ports),
+  const evidence = remoteEvidence(
+    grant,
+    () => verifyDataReadPolicy(input, ports),
+    { verifiedAt },
   );
   return {
     grant,
     lease: {
-      refresh: () => evidence.refresh(),
+      evidence: () => [evidence],
       assertLocal() {
         const expiresAtSec = parseGrantExpiresAtSeconds(
           evidence.current.expiresAt,
@@ -371,6 +374,39 @@ export interface DataListPolicyPorts extends DataReadPolicyPorts {
    * a grantId is covered by nothing.
    */
   grantLister?: GrantListerPort;
+}
+
+/**
+ * `resolveDataListGrantScopes`, plus the delivery lease the listing must hold
+ * when it is released. Its remote evidence is the granted scope set, asked
+ * again at release once it is older than `REMOTE_GRANT_REVERIFY_AFTER_MS`;
+ * the listing is refused when any scope it was built from is no longer
+ * granted (a grant revoked or expired on the gateway).
+ */
+export async function authorizeDataList(
+  input: DataListPolicyInput,
+  ports: DataListPolicyPorts,
+): Promise<{ grantedScopes: string[]; lease: DeliveryLease }> {
+  const verifiedAt = Date.now();
+  const grantedScopes = await resolveDataListGrantScopes(input, ports);
+  const evidence = remoteEvidence(
+    grantedScopes,
+    () => resolveDataListGrantScopes(input, ports),
+    { verifiedAt },
+  );
+  return {
+    grantedScopes,
+    lease: {
+      evidence: () => [evidence],
+      assertLocal() {
+        const still = new Set(evidence.current);
+        const lost = grantedScopes.filter((scope) => !still.has(scope));
+        if (lost.length > 0) {
+          throw new GrantRevokedError({ reason: "Listed grant ended" });
+        }
+      },
+    },
+  };
 }
 
 /**

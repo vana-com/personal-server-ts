@@ -1,14 +1,19 @@
 export {
+  DELIVERY_FRESHNESS_ATTEMPTS,
+  DeliveryNotFreshError,
   REMOTE_GRANT_REVERIFY_AFTER_MS,
   allDeliveryLeases,
+  localLease,
   collectDeliveryLeases,
   deliver,
   leasedStream,
   remoteEvidence,
   type DeliveryLease,
   type DeliveryLeaseCollector,
+  type RemoteEvidence,
 } from "./delivery-lease.js";
 export {
+  authorizeDataList,
   authorizeDataRead,
   verifyDataReadPolicy,
   authorizeLegacyRead,

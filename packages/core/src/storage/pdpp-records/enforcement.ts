@@ -238,63 +238,80 @@ export interface PdppChainEvidence {
   expiresAt?: string | null;
 }
 
-/** The delivery lease of a PDPP bearer read; see `pdppBearerReadLease`. */
-export interface PdppReadLease extends DeliveryLease {
-  /**
-   * Hold the read to these connections: once any of them is unavailable
-   * (deleted or unbound), the lease refuses with `instance_unavailable`.
-   */
-  requireConnections(instanceIds: readonly string[]): void;
+/**
+ * The connections a bearer can read through: every connection its grant
+ * names (client), or the owner token's selected connections. A read's
+ * release depends on all of them, derived from the authorization itself so
+ * that no endpoint (records, metadata, discovery, blobs) has to register them.
+ */
+export function bearerConnections(context: PdppTokenContext): string[] {
+  if (context.tokenKind === "owner") return [...(context.instanceIds ?? [])];
+  return [
+    ...new Set(
+      (context.grant?.streams ?? []).flatMap((stream) => stream.instance_ids),
+    ),
+  ];
 }
 
 /**
- * The delivery lease for a PDPP bearer read (records and blobs). See
- * `policy/delivery-lease.ts` for what a lease is and its ordering rule.
+ * The delivery lease for a PDPP bearer read (records, metadata, discovery
+ * and blobs). See `policy/delivery-lease.ts` for the release rule.
  *
- * Remote half (`refresh`): when the deployment enforces a chain permission,
- * the chain check runs again only when the last one is older than
- * `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s); the check that admitted the read
- * counts as the first. Its answer, with the permission's expiry, becomes the
- * lease's chain evidence. An AS without local resolution
- * (`resolveTokenNow`) is asked here too.
+ * Remote evidence: the chain permission, when the deployment enforces one
+ * (its answer carries the permission's expiry); and, for a remote AS, its
+ * introspection answer. `deliver` asks either again once it is older than
+ * `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s).
  *
- * Local half (`assertLocal`, synchronous, last): the same token resolved
- * again through the token and grant store, which reports a revoked or expired
- * grant, a revoked or expired token, and a revoked refresh family; the same
- * grant the read was admitted under; the carried chain expiry; and every
- * connection the read requires.
+ * Local checks, synchronous, at release: the bearer resolved again (a local
+ * AS through `resolveTokenNow`, which reports a revoked or expired grant, a
+ * revoked or expired token, and a revoked refresh family; a remote AS's last
+ * answer and its token expiry); the same grant the read was admitted under;
+ * the carried chain expiry; and every connection the bearer can read through
+ * (`bearerConnections`).
  */
 export function pdppBearerReadLease(
-  auth: Pick<PdppAuthorizationService, "resolveToken" | "resolveTokenNow">,
+  auth: PdppAuthorizationService,
   token: string,
   admitted: PdppTokenContext,
   options: {
     chain?: {
       admitted: PdppChainEvidence;
       reverify: () => Promise<PdppChainEvidence>;
+      verifiedAt?: number;
     };
     isConnectionAvailable?: (instance: string) => boolean;
   } = {},
-): PdppReadLease {
+): DeliveryLease {
+  if (auth.locality !== "local" && auth.locality !== "remote") {
+    // Fail closed: the lease cannot know how to re-check this bearer.
+    throw new PdppError(
+      "api_error",
+      "The PDPP authorization server's locality is not declared",
+    );
+  }
   const grantId = admitted.grant?.grant_id;
+  const connections = bearerConnections(admitted);
   const chain = options.chain
-    ? remoteEvidence(options.chain.admitted, options.chain.reverify)
+    ? remoteEvidence(options.chain.admitted, options.chain.reverify, {
+        ...(options.chain.verifiedAt !== undefined && {
+          verifiedAt: options.chain.verifiedAt,
+        }),
+      })
     : undefined;
-  const connections = new Set<string>();
-  // Only for an AS without local resolution: its last answer.
-  let resolved = admitted;
+  const remoteAs =
+    auth.locality === "remote"
+      ? remoteEvidence(admitted, () => auth.resolveToken(token))
+      : undefined;
+  const evidence = [chain, remoteAs].filter(
+    (piece): piece is NonNullable<typeof piece> => piece !== undefined,
+  );
   return {
-    requireConnections(instanceIds) {
-      for (const instance of instanceIds) connections.add(instance);
-    },
-    async refresh() {
-      await chain?.refresh();
-      if (!auth.resolveTokenNow) resolved = await auth.resolveToken(token);
-    },
+    evidence: () => evidence,
     assertLocal() {
-      const current = auth.resolveTokenNow
-        ? auth.resolveTokenNow(token)
-        : resolved;
+      const current =
+        auth.locality === "local"
+          ? auth.resolveTokenNow(token)
+          : remoteAs!.current;
       if (!current.active) throw mapInactiveToError(current);
       if (current.grant?.grant_id !== grantId) {
         throw mapInactiveToError({ active: false, inactiveReason: "unknown" });

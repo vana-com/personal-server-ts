@@ -11,7 +11,7 @@ import type {
   PersonalServerWriteAuthInput,
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
-  resolveDataListGrantScopes,
+  authorizeDataList,
   authorizeDataRead,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import {
@@ -315,10 +315,10 @@ export function createServerApiAuth(
     }
     // A builder lists only what its grants cover, bound to this server's
     // owner like a read; fail closed when we can't identify the owner.
-    // resolveDataListGrantScopes does the one builder lookup (and throws
+    // authorizeDataList does the one builder lookup (and throws
     // UnregisteredBuilderError), so no separate registration check here.
     if (!deps.serverOwner) throw serverNotConfigured();
-    const grantedScopes = await resolveDataListGrantScopes(
+    const { grantedScopes, lease: listLease } = await authorizeDataList(
       {
         signer: result.auth.signer,
         grantId: result.auth.payload.grantId ?? options?.grantId,
@@ -331,7 +331,7 @@ export function createServerApiAuth(
         runtimeAvailability: deps.runtimeAvailability,
       },
     );
-    return { grantedScopes };
+    return { grantedScopes, lease: listLease };
   }
 
   return {

@@ -38,13 +38,17 @@ import {
   handlePersonalServerDataRequest,
   isOwnerView,
   reportPersonalServerReadFulfillment,
-  readDeliveryLease,
   resolveReadDeletion,
+  trackDeliveryDependencies,
   type PersonalServerDataApiDeps,
   type ReadDeletionEntry,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
-import { deliver, type DeliveryLease } from "../policy/delivery-lease.js";
+import {
+  collectDeliveryLeases,
+  deliver,
+  type DeliveryLease,
+} from "../policy/delivery-lease.js";
 import { authorizeLegacyRead } from "../policy/data-read.js";
 import { storageForReader } from "../storage/disclosure-policy.js";
 import type { IndexEntry } from "../storage/index/types.js";
@@ -514,11 +518,12 @@ export function createMcpDataReadClient(
    * shape. Runs before `authorizeScopeRead`, which may settle payment.
    */
   async function assertScopeReadable(
+    deps: PersonalServerDataApiDeps,
     scope: string,
     entry: ReadDeletionEntry,
   ): Promise<void> {
     try {
-      await assertScopeNotDeleted(options.dataApiDeps, scope, entry);
+      await assertScopeNotDeleted(deps, scope, entry);
     } catch (err) {
       if (err instanceof ProtocolError) {
         throw new McpDataReadError(err.code, err.toJSON());
@@ -533,6 +538,8 @@ export function createMcpDataReadClient(
    * them can drift away from the external read path's authorization.
    */
   async function authorizeScopeRead(params: {
+    /** The read's tracked deps (see `startRead`). */
+    deps: PersonalServerDataApiDeps;
     scope: string;
     grantId: string;
     fileId?: string;
@@ -570,7 +577,7 @@ export function createMcpDataReadClient(
     });
 
     try {
-      const authResult = await options.dataApiDeps.auth.authorizeBuilderRead({
+      const authResult = await params.deps.auth.authorizeBuilderRead({
         request,
         scope: params.scope,
         grantId: params.grantId,
@@ -640,7 +647,24 @@ export function createMcpDataReadClient(
     return { logId, timestamp, ipAddress, userAgent };
   }
 
+  /**
+   * One read's tracked deps: its grant lease and the deletion state of what
+   * it reads register themselves (see `trackDeliveryDependencies`) into
+   * `release`, which the read passes before returning (an early gate) and
+   * hands to the tool call's collector.
+   */
+  function startRead() {
+    const release = collectDeliveryLeases();
+    const deps = trackDeliveryDependencies(options.dataApiDeps, {
+      add: (lease) => release.add(lease),
+      afterRelease: (effect) => effect(),
+    });
+    return { deps, release };
+  }
+
   function client(sink?: (lease: DeliveryLease) => void): McpDataReadClient {
+    const releaseRead = (release: DeliveryLease) =>
+      deliver(release, () => sink?.(release));
     return {
       withDeliveryLeases: (next) => client(next),
       enforcesPayment: options.enforcesPayment ?? false,
@@ -669,7 +693,7 @@ export function createMcpDataReadClient(
         const response = await handlePersonalServerDataRequest(
           request,
           options.dataApiDeps,
-          { basePath },
+          { basePath, ...(sink && { onDeliveryLease: sink }) },
         );
 
         const body = await parseJsonOrText(response);
@@ -687,19 +711,26 @@ export function createMcpDataReadClient(
         if (!entry) return null;
         // A tombstoned scope is absent for discovery purposes, exactly like a
         // scope with no local copy; the same gate the HTTP read applies.
-        if (await resolveReadDeletion(options.dataApiDeps, scope, entry)) {
+        const read = startRead();
+        if (await resolveReadDeletion(read.deps, scope, entry)) {
           return null;
         }
         const hasBlocks =
           typeof storage.hasScopeBlocks === "function"
             ? await storage.hasScopeBlocks(scope, entry.collectedAt)
             : false;
-        return {
-          scope,
-          collectedAt: entry.collectedAt,
-          sizeBytes: entry.sizeBytes,
-          hasBlocks,
-        };
+        try {
+          return await releaseRead(read.release).then(() => ({
+            scope,
+            collectedAt: entry.collectedAt,
+            sizeBytes: entry.sizeBytes,
+            hasBlocks,
+          }));
+        } catch (err) {
+          // Deleted while this ran: absent, as above.
+          if (err instanceof ProtocolError) return null;
+          throw err;
+        }
       },
 
       async readScopeBlocks({
@@ -732,12 +763,14 @@ export function createMcpDataReadClient(
             message: `No data found for scope "${scope}"`,
           });
         }
+        const read = startRead();
         // Before authorizeScopeRead: a payment-enforcing auth port settles
         // x402 there, and deleted data must never be charged for.
-        await assertScopeReadable(scope, selectedEntry);
+        await assertScopeReadable(read.deps, scope, selectedEntry);
         authorizeGranteeVersion(selectedEntry);
 
         const { request, authResult } = await authorizeScopeRead({
+          deps: read.deps,
           scope,
           grantId,
           fileId: selectedEntry.fileId ?? undefined,
@@ -774,16 +807,9 @@ export function createMcpDataReadClient(
                   ),
                 ),
               };
-          // Early delivery gate, after every await of this read: a grant
-          // revoked or a scope deleted while it ran stops it, the same as
-          // `/v1/data`. The lease then goes to the tool call, whose result is
-          // released through it again.
-          const lease = readDeliveryLease(options.dataApiDeps, {
-            grant: authResult?.lease,
-            scope,
-            entry: selectedEntry,
-          });
-          await deliver(lease, () => sink?.(lease));
+          // Early delivery gate, after every await of this read; the lease
+          // then goes to the tool call, whose result is released through it.
+          await releaseRead(read.release);
           // A block-addressed read serves a hand-picked subset, so it never
           // completes the scope the way an uncursored full read does; reporting
           // fulfillment for it would settle the read on partial data.
@@ -844,10 +870,12 @@ export function createMcpDataReadClient(
             message: `No data found for scope "${scope}"`,
           });
         }
-        await assertScopeReadable(scope, selectedEntry);
+        const read = startRead();
+        await assertScopeReadable(read.deps, scope, selectedEntry);
         authorizeGranteeVersion(selectedEntry);
 
         const { request, authResult } = await authorizeScopeRead({
+          deps: read.deps,
           scope,
           grantId,
           fileId: selectedEntry.fileId ?? undefined,
@@ -886,12 +914,7 @@ export function createMcpDataReadClient(
             : manifest;
         // Early delivery gate, as for block values above.
         try {
-          const lease = readDeliveryLease(options.dataApiDeps, {
-            grant: authResult?.lease,
-            scope,
-            entry: selectedEntry,
-          });
-          await deliver(lease, () => sink?.(lease));
+          await releaseRead(read.release);
         } catch (err) {
           if (err instanceof ProtocolError) {
             throw new McpDataReadError(err.code, err.toJSON());

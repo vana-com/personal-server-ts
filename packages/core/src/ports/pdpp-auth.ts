@@ -100,16 +100,36 @@ export interface PdppTokenContext {
  * deployment would call RFC 7662 introspection instead — that wire path is
  * the AS lane's concern, not this lane's.
  */
-export interface PdppAuthorizationService {
+/**
+ * The PDPP authorization server, as the resource server sees it. Which kind
+ * it is decides how a read's delivery lease re-checks the bearer at release
+ * (see `pdppBearerReadLease`), so it is explicit:
+ */
+export type PdppAuthorizationService =
+  LocalPdppAuthorizationService | RemotePdppAuthorizationService;
+
+/**
+ * An AS whose token and grant store is in this process (co-located). It must
+ * resolve synchronously: the lease's last check uses `resolveTokenNow`, so a
+ * revocation, expiry or family revocation takes effect at release, with
+ * nothing awaited between that check and the release.
+ */
+export interface LocalPdppAuthorizationService {
+  readonly locality: "local";
   resolveToken(accessToken: string): Promise<PdppTokenContext>;
-  /**
-   * The same resolution, synchronously, for an AS whose token and grant store
-   * is local (co-located). The delivery lease uses it as its last check, so
-   * nothing is awaited between that check and the release. An AS reached over
-   * the network omits it; the lease then resolves through `resolveToken` in
-   * its remote half and checks the answer, with its carried expiry, locally.
-   */
-  resolveTokenNow?(accessToken: string): PdppTokenContext;
+  resolveTokenNow(accessToken: string): PdppTokenContext;
+}
+
+/**
+ * An AS reached over the network (token introspection). Its answer is remote
+ * evidence: the lease asks again once it is older than
+ * `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s), and checks the answer and its
+ * carried token expiry locally at release. A revocation at such an AS takes
+ * effect within 30 s, under the documented remote-staleness policy.
+ */
+export interface RemotePdppAuthorizationService {
+  readonly locality: "remote";
+  resolveToken(accessToken: string): Promise<PdppTokenContext>;
 }
 
 /** Looks up the StreamGrant entry for a stream name, or undefined if not granted. */

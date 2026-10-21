@@ -42,7 +42,11 @@ const declarations = createStreamDeclarationRegistry([
 ]);
 
 const ownerAuth: PdppAuthorizationService = {
-  async resolveToken() {
+  locality: "local" as const,
+  async resolveToken(token: string) {
+    return this.resolveTokenNow(token);
+  },
+  resolveTokenNow() {
     return {
       active: true,
       tokenKind: "owner" as const,
@@ -199,7 +203,11 @@ describe("RS-16: a REJECTED token is challenged, not just a missing one", () => 
 
   /** Resolves every token as inactive — the stale-token client. */
   const rejectingAuth: PdppAuthorizationService = {
-    async resolveToken() {
+    locality: "local" as const,
+    async resolveToken(token: string) {
+      return this.resolveTokenNow(token);
+    },
+    resolveTokenNow() {
       return {
         active: false,
         tokenKind: "client" as const,

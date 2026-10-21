@@ -93,7 +93,11 @@ const GRANT = {
 };
 
 const clientAuth: PdppAuthorizationService = {
-  async resolveToken() {
+  locality: "local" as const,
+  async resolveToken(token: string) {
+    return this.resolveTokenNow(token);
+  },
+  resolveTokenNow() {
     return {
       active: true,
       tokenKind: "client" as const,
