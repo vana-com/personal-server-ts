@@ -29,7 +29,9 @@ it("pins all registry reads to the same fresh finalized block and proves genuine
           : `0x${"0".repeat(64)}`,
     ),
   };
-  const fetcher = vi.fn(async () => new Response(null, { status: 404 }));
+  const fetcher = vi.fn(async () =>
+    Response.json({ error: "Data point not found" }, { status: 404 }),
+  );
   const evidence = await createReplicaEvidenceAdapter({
     owner,
     registry,
@@ -153,7 +155,9 @@ it("verifies head preimages against the independent commitment, including the fa
 });
 it("treats missing head and unsettled head as propagation lag", async () => {
   const f = fixture();
-  f.fetcher.mockImplementation(async () => new Response(null, { status: 404 }));
+  f.fetcher.mockImplementation(async () =>
+    Response.json({ error: "Data point not found" }, { status: 404 }),
+  );
   expect(replicaRegistrationState(await f.read(), { owner, scope })).toBe(
     "pending",
   );
@@ -293,7 +297,8 @@ it("accepts an injected viem client and uses real ABI RPC decoding", async () =>
     chainId: 14800,
     rpc,
     gatewayUrl: "https://gateway.invalid",
-    fetch: async () => new Response(null, { status: 404 }),
+    fetch: async () =>
+      Response.json({ error: "Data point not found" }, { status: 404 }),
     now: () => 1010_000,
   })(scope);
   expect(replicaRegistrationState(evidence, { owner, scope })).toBe("absent");
@@ -375,5 +380,32 @@ it("keeps Gateway lifecycle refusal pending before deletedAt is populated", asyn
 it("matches the DataRegistryV2 abi.encode hash-pair golden commitment", () => {
   expect(replicaChainCommitment(dataHash, metadataHash)).toBe(
     "0x3e92e0db88d6afea9edc4eedf62fffa4d92bcdfc310dccbe943747fe8302e871",
+  );
+});
+
+it("does not treat a missing Gateway route as authoritative head absence", async () => {
+  const f = fixture();
+  f.rpc.readContract.mockImplementation(async ({ functionName }) =>
+    functionName === "currentVersion"
+      ? 0n
+      : functionName === "dataPoints"
+        ? info(0n)
+        : `0x${"0".repeat(64)}`,
+  );
+  for (const response of [
+    new Response("NOT_FOUND", { status: 404 }),
+    Response.json(
+      { error: "Not found", path: "/wrong-route" },
+      { status: 404 },
+    ),
+  ]) {
+    f.fetcher.mockImplementation(async () => response);
+    await expect(f.read()).rejects.toMatchObject({ retryable: true });
+  }
+  f.fetcher.mockImplementation(async () =>
+    Response.json({ error: "Data point not found" }, { status: 404 }),
+  );
+  expect(replicaRegistrationState(await f.read(), { owner, scope })).toBe(
+    "absent",
   );
 });

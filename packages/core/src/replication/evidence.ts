@@ -186,7 +186,12 @@ export function createReplicaEvidenceAdapter(deps: {
       base.hash = "";
       const response = await (deps.fetch ?? globalThis.fetch)(base.toString());
       let head: ReplicaRegistrationEvidence["head"] = null;
-      if (response.status !== 404) {
+      if (response.status === 404) {
+        // A missing deployment/route is not the Gateway's precise unknown-head response.
+        z.object({ error: z.literal("Data point not found") }).parse(
+          await response.json(),
+        );
+      } else {
         if (!response.ok && response.status !== 410)
           throw new Error(`Gateway HTTP ${response.status}`);
         const envelope = z

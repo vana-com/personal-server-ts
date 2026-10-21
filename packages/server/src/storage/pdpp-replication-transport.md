@@ -91,8 +91,11 @@ const evidence = createReplicaEvidenceAdapter({
 ```
 
 `rpc` can be a viem PublicClient or the exported `ReplicaEvidenceRpc` port.
-`fetch` and millisecond `now` are injectable. The adapter checks configured
-chain identity, reads a `finalized` block with number/hash/timestamp, and pins
+`fetch` and millisecond `now` are injectable.
+Hosts must supply a timeout-bounded fetch and RPC transport, as the dev
+preflight does; the adapter does not install network timeouts itself.
+The adapter checks configured chain identity, reads a `finalized` block with
+number/hash/timestamp, and pins
 `currentVersion(owner, scope)`, `dataCommitment(owner, scope, 1)` and the exact
 nine-field `dataPoints(owner, scope)` tuple to that block number. It rechecks
 the block hash and freshness after I/O. The default freshness limit is 1,800
@@ -103,7 +106,9 @@ and network failures throw `ReplicaEvidenceUnavailableError` with
 `retryable: true`. They never become absence.
 
 The Gateway supplies only the current head, fetched explicitly with
-`includeDeleted=true`. A 410 body is decoded and retained as deletion evidence;
+`includeDeleted=true`. Only its JSON `Data point not found` 404 means no head;
+a generic route or Vercel 404 throws retryably. A 410 body is decoded and
+retained as deletion evidence;
 a bare/malformed 410 remains retryable. No versions/history HTTP API is used.
 Chain evidence carries the actual bytes32 commitment, current version, status,
 configured chain/registry, and finalized block coordinates. It never invents
