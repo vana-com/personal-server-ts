@@ -260,12 +260,13 @@ export interface IngestDataContractInput {
    */
   lineage?: StoredLineage;
   /**
-   * Whether any input of this derivative is PDPP-origin. The single place the
-   * output's origin is decided: `false` stamps `$lineage.origin = "legacy"`;
-   * anything else (including absent) leaves it out, and a JSON write also gets
-   * the `pdpp-derivative` producer, so the output counts as PDPP-origin.
+   * Whether any input of this write is PDPP-origin. The single place the
+   * output's origin is decided. `true`: the `pdpp-derivative` producer, with or
+   * without lineage. `false`: `$lineage.origin = "legacy"` when lineage is
+   * present, otherwise nothing. Absent: lineage present means `true`; no
+   * lineage means an ordinary root write, left unstamped.
    */
-  lineageInputsPdppOrigin?: boolean;
+  inputsPdppOrigin?: boolean;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
   precondition?: LegacyPrecondition;
@@ -310,12 +311,13 @@ export interface IngestBinaryDataContractInput {
   /** Validated lineage for a derivative write (see IngestDataContractInput). */
   lineage?: StoredLineage;
   /**
-   * Whether any input of this derivative is PDPP-origin. The single place the
-   * output's origin is decided: `false` stamps `$lineage.origin = "legacy"`;
-   * anything else (including absent) leaves it out, and a JSON write also gets
-   * the `pdpp-derivative` producer, so the output counts as PDPP-origin.
+   * Whether any input of this write is PDPP-origin. The single place the
+   * output's origin is decided. `true`: the `pdpp-derivative` producer, with or
+   * without lineage. `false`: `$lineage.origin = "legacy"` when lineage is
+   * present, otherwise nothing. Absent: lineage present means `true`; no
+   * lineage means an ordinary root write, left unstamped.
    */
-  lineageInputsPdppOrigin?: boolean;
+  inputsPdppOrigin?: boolean;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
   precondition?: LegacyPrecondition;
@@ -722,11 +724,7 @@ export async function ingestDataContract(
     };
   }
 
-  const producer: LegacyProducer | undefined =
-    input.producer ??
-    (input.lineage && input.lineageInputsPdppOrigin !== false
-      ? "pdpp-derivative"
-      : undefined);
+  const producer = outputProducer(input);
   let envelope: DataFileEnvelope = {
     ...createDataFileEnvelope(
       scopeResult.scope,
@@ -826,13 +824,25 @@ export async function ingestDataContract(
  * record about to be stored. Both are absent from owner root writes, so such
  * an envelope stays byte-identical to today's.
  */
-/** The one place a derivative's origin is stamped (see lineageInputsPdppOrigin). */
+/** The producer stamp of an output: a caller's own, else `pdpp-derivative`. */
+function outputProducer(
+  input: Pick<
+    IngestDataContractInput,
+    "producer" | "lineage" | "inputsPdppOrigin"
+  >,
+): LegacyProducer | undefined {
+  if (input.producer) return input.producer;
+  const pdpp = input.inputsPdppOrigin ?? input.lineage !== undefined;
+  return pdpp ? "pdpp-derivative" : undefined;
+}
+
+/** The one place a derivative's origin is stamped (see inputsPdppOrigin). */
 function lineageWithOrigin(
-  input: Pick<IngestDataContractInput, "lineage" | "lineageInputsPdppOrigin">,
+  input: Pick<IngestDataContractInput, "lineage" | "inputsPdppOrigin">,
 ): StoredLineage | undefined {
   if (!input.lineage) return undefined;
   const { origin: _claimed, ...lineage } = input.lineage;
-  return input.lineageInputsPdppOrigin === false
+  return input.inputsPdppOrigin === false
     ? { ...lineage, origin: "legacy" }
     : lineage;
 }
@@ -841,7 +851,7 @@ function stampServerKeys(
   data: Record<string, unknown>,
   input: Pick<
     IngestDataContractInput,
-    "attribution" | "lineage" | "lineageInputsPdppOrigin"
+    "attribution" | "lineage" | "inputsPdppOrigin"
   >,
 ): Record<string, unknown> {
   let stamped = data;
@@ -918,11 +928,15 @@ export async function ingestBinaryDataContract(
     metadata: input.metadata,
   });
 
-  const envelope = createDataFileEnvelope(
-    scopeResult.scope,
-    input.collectedAt,
-    stampServerKeys(data, input),
-  );
+  const producer = outputProducer(input);
+  const envelope: DataFileEnvelope = {
+    ...createDataFileEnvelope(
+      scopeResult.scope,
+      input.collectedAt,
+      stampServerKeys(data, input),
+    ),
+    ...(producer ? { producer } : {}),
+  };
   const committed = await commitWrittenEnvelope(
     input.storage,
     envelope,
@@ -931,6 +945,7 @@ export async function ingestBinaryDataContract(
       schemaId: null,
       scope: scopeResult.scope,
       collectedAt: input.collectedAt,
+      producer: producer ?? null,
       sizeBytes: input.bytes.length,
       afterTombstoneVersion: input.afterTombstoneVersion ?? null,
     },

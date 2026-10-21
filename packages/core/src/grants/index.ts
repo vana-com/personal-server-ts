@@ -46,3 +46,8 @@ export {
   permissionKey,
   type PdppGrantBindingStore,
 } from "./pdpp-binding-store.js";
+export {
+  writerExposureFromBindings,
+  writerHasPdppExposure,
+  type WriterExposurePolicy,
+} from "./writer-exposure.js";

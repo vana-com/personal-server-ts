@@ -144,6 +144,9 @@ export function createSqlitePdppGrantBindingStore(
   const getByPermissionKeyStmt = db.prepare(
     "SELECT * FROM pdpp_grant_bindings WHERE permission_key = ? ORDER BY bound_at ASC, pdpp_grant_id ASC",
   );
+  const hasGranteeStmt = db.prepare(
+    "SELECT 1 FROM pdpp_grant_bindings WHERE lower(grantee_address) = lower(?) LIMIT 1",
+  );
   const insertStmt = db.prepare(`
     INSERT INTO pdpp_grant_bindings
       (pdpp_grant_id, permission_key, chain_id, contract_address, permission_id,
@@ -193,6 +196,9 @@ export function createSqlitePdppGrantBindingStore(
 
   return {
     putBinding,
+    hasBindingForGrantee(granteeAddress: string): boolean {
+      return hasGranteeStmt.get(granteeAddress) !== undefined;
+    },
     getByPdppGrantId(pdppGrantId: string): PdppGrantBinding | null {
       const row = getByGrantIdStmt.get(pdppGrantId) as BindingRowDb | undefined;
       return row ? toBinding(row) : null;

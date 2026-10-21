@@ -1148,6 +1148,8 @@ export function createPsLiteRuntime(
               serverOwner: options.serverOwner,
               serverSigner: x402ServerSigner,
               lineageGateway: options.lineageGateway,
+              // Lite has no PDPP surface, so no writer can hold PDPP data.
+              writerExposure: { kind: "pdpp-disabled" },
               // A new local version marks every question that reads the
               // scope stale; the recompute waits for a reader.
               onDataWritten: options.derivatives

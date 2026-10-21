@@ -36,6 +36,10 @@ import {
   type LineageGatewayPort,
   type LineageView,
 } from "@opendatalabs/personal-server-ts-core/lineage";
+import {
+  createInMemoryPdppGrantBindingStore,
+  writerExposureFromBindings,
+} from "@opendatalabs/personal-server-ts-core/grants";
 import { dataRoutes, type DataRouteDeps } from "./data.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
@@ -208,6 +212,8 @@ describe("derivative data routes", () => {
       accessLogWriter,
       writeSessionStore,
       lineageGateway,
+      // Most tests are about lineage, not exposure: no PDPP surface here.
+      writerExposure: { kind: "pdpp-disabled" },
     };
     app = dataRoutes(deps);
     cleanup = () => indexManager.close();
@@ -1211,6 +1217,257 @@ describe("derivative data routes", () => {
         }),
       );
       expect(read.status).toBe(403);
+    });
+  });
+
+  describe("a non-owner write is classified by the writer's PDPP exposure", () => {
+    const MARKER = "exposure-synthetic-marker";
+
+    function bindingFor(grantee: `0x${string}`, permissionId = "perm-1") {
+      return {
+        pdppGrantId: `pdpp-grant-${permissionId}`,
+        permission: {
+          chainId: 14800,
+          contractAddress:
+            "0x0000000000000000000000000000000000000001" as const,
+          permissionId,
+        },
+        ownerAddress: ownerWallet.address,
+        granteeAddress: grantee,
+        pdppClientId: "client-1",
+        granteeId: BUILDER_ID,
+        grantVersion: "1",
+        boundAt: "2026-09-01T00:00:00.000Z",
+      };
+    }
+    function useExposure(policy: DataRouteDeps["writerExposure"]) {
+      deps.writerExposure = policy;
+      app = dataRoutes(deps);
+    }
+    function exposedBuilder(revokedGrant = false) {
+      const store = createInMemoryPdppGrantBindingStore();
+      store.putBinding(bindingFor(builderWallet.address));
+      if (revokedGrant) {
+        // The binding carries no revocation: the chain grant is dead, the
+        // exposure is not.
+        grants["perm-1"] = {
+          ...grants[READ_GRANT_ID]!,
+          id: "perm-1",
+          revokedAt: "2026-09-02T00:00:00.000Z",
+        } as GatewayGrantResponse;
+      }
+      useExposure(writerExposureFromBindings(store));
+    }
+    function unexposedBuilder() {
+      const store = createInMemoryPdppGrantBindingStore();
+      store.putBinding(
+        bindingFor("0x00000000000000000000000000000000000000aa", "perm-other"),
+      );
+      useExposure(writerExposureFromBindings(store));
+    }
+    async function builderRead(scope: string, grantId: string) {
+      return app.request(`/${scope}`, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: `/${scope}`,
+            grantId,
+          }),
+        },
+      });
+    }
+    async function binaryWrite(metadata: unknown) {
+      const bytes = new TextEncoder().encode(MARKER);
+      const representation = {
+        contentType: "application/pdf",
+        filename: "report.pdf",
+        metadataHeader:
+          metadata === undefined ? undefined : JSON.stringify(metadata),
+      };
+      return app.request(`/${REPORT_SCOPE}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": representation.contentType,
+          "X-Filename": representation.filename,
+          ...(representation.metadataHeader
+            ? { "X-Vana-Metadata": representation.metadataHeader }
+            : {}),
+          Authorization: `Bearer ${SESSION_TOKEN}`,
+          [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: `/${REPORT_SCOPE}`,
+            body: await binaryWriteSignedBytes({ bytes, ...representation }),
+            grantId: WRITE_GRANT_ID,
+          }),
+        },
+        body: bytes,
+      });
+    }
+
+    const jsonVariants: [string, () => Record<string, unknown>][] = [
+      [
+        "cites only a legacy scope",
+        () => ({ summary: MARKER, lineage: [OTHER_SOURCE_ID] }),
+      ],
+      ["cites an empty list", () => ({ summary: MARKER, lineage: [] })],
+      ["omits lineage", () => ({ summary: MARKER })],
+    ];
+
+    it.each(jsonVariants)(
+      "an exposed builder's JSON write that %s is PDPP-origin and refused to a legacy grant",
+      async (_name, body) => {
+        await seedSource(OTHER_SOURCE_SCOPE);
+        exposedBuilder();
+        expect((await sessionWrite(DERIVED_SCOPE, body())).status).toBe(201);
+        const read = await builderRead(DERIVED_SCOPE, READ_GRANT_ID);
+        const text = await read.text();
+        expect(read.status, text).toBe(403);
+        expect(text).not.toContain(MARKER);
+        expect((await (await ownerRead(DERIVED_SCOPE)).json()).producer).toBe(
+          "pdpp-derivative",
+        );
+      },
+    );
+
+    it.each([
+      ["cites only a legacy scope", () => ({ lineage: [OTHER_SOURCE_ID] })],
+      ["cites an empty list", () => ({ lineage: [] })],
+      ["omits lineage", () => undefined],
+    ])(
+      "an exposed builder's binary write that %s is PDPP-origin and refused",
+      async (_name, metadata) => {
+        await seedSource(OTHER_SOURCE_SCOPE);
+        exposedBuilder();
+        expect((await binaryWrite(metadata())).status).toBe(201);
+        const read = await builderRead(REPORT_SCOPE, READ_REPORT_GRANT_ID);
+        const text = await read.text();
+        expect(read.status, text).toBe(403);
+        expect(text).not.toContain(Buffer.from(MARKER).toString("base64"));
+      },
+    );
+
+    it("positive control: an unexposed builder citing legacy-only sources stays readable (JSON and binary)", async () => {
+      await seedSource(OTHER_SOURCE_SCOPE);
+      unexposedBuilder();
+      expect(
+        (
+          await sessionWrite(DERIVED_SCOPE, {
+            summary: MARKER,
+            lineage: [OTHER_SOURCE_ID],
+          })
+        ).status,
+      ).toBe(201);
+      const json = await builderRead(DERIVED_SCOPE, READ_GRANT_ID);
+      expect(json.status, await json.text()).toBe(200);
+      expect((await binaryWrite({ lineage: [OTHER_SOURCE_ID] })).status).toBe(
+        201,
+      );
+      const binary = await builderRead(REPORT_SCOPE, READ_REPORT_GRANT_ID);
+      expect(binary.status, await binary.text()).toBe(200);
+    });
+
+    it("an exposed builder whose only grant was revoked is still exposed", async () => {
+      await seedSource(OTHER_SOURCE_SCOPE);
+      exposedBuilder(true);
+      expect(
+        (
+          await sessionWrite(DERIVED_SCOPE, {
+            summary: MARKER,
+            lineage: [OTHER_SOURCE_ID],
+          })
+        ).status,
+      ).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        403,
+      );
+    });
+
+    it("fails closed to PDPP when exposure cannot be determined", async () => {
+      await seedSource(OTHER_SOURCE_SCOPE);
+      const write = () =>
+        sessionWrite(DERIVED_SCOPE, {
+          summary: MARKER,
+          lineage: [OTHER_SOURCE_ID],
+        });
+      // A failing lookup.
+      useExposure({
+        kind: "lookup",
+        hasExposure: () => {
+          throw new Error("mapping store unavailable");
+        },
+      });
+      expect((await write()).status).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        403,
+      );
+      // PDPP enabled but no mapping store wired.
+      useExposure(undefined);
+      expect((await write()).status).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        403,
+      );
+    });
+
+    it("a server with PDPP disabled stays legacy", async () => {
+      await seedSource(OTHER_SOURCE_SCOPE);
+      useExposure({ kind: "pdpp-disabled" });
+      expect(
+        (await sessionWrite(DERIVED_SCOPE, { summary: MARKER, lineage: [] }))
+          .status,
+      ).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        200,
+      );
+    });
+
+    it("an exposed builder is refused even when the cited scope's PDPP version is no longer the latest", async () => {
+      // V1 PDPP, V2 legacy: citation checking would certify V2. Exposure does not.
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      for (const envelope of [
+        {
+          version: "1.0",
+          scope: OTHER_SOURCE_SCOPE,
+          collectedAt: "2026-09-01T00:00:00Z",
+          data: {
+            v: "one",
+            $pdpp: { version: 1, sourceId: "https://registry.pdpp.dev/oura" },
+          },
+        },
+        {
+          version: "1.0",
+          scope: OTHER_SOURCE_SCOPE,
+          collectedAt: "2026-09-02T00:00:00Z",
+          data: { v: "two" },
+        },
+      ]) {
+        const written = await raw.writeEnvelope(envelope as never);
+        await raw.insertEntry({
+          fileId: null,
+          path: written.relativePath,
+          scope: envelope.scope,
+          collectedAt: envelope.collectedAt,
+          sizeBytes: written.sizeBytes,
+        });
+      }
+      exposedBuilder();
+      expect(
+        (
+          await sessionWrite(DERIVED_SCOPE, {
+            summary: MARKER,
+            lineage: [OTHER_SOURCE_ID],
+          })
+        ).status,
+      ).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        403,
+      );
     });
   });
 });
