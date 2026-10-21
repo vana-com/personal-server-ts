@@ -207,6 +207,10 @@
     "./storage/legacy-scope-entity-keys": {
       "types": "./dist/storage/legacy-scope-entity-keys.d.ts",
       "import": "./dist/storage/legacy-scope-entity-keys.js"
+    },
+    "./oura": {
+      "types": "./dist/oura/index.d.ts",
+      "import": "./dist/oura/index.js"
     }
   },
   "scripts": {

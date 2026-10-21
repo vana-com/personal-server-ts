@@ -357,7 +357,9 @@ describe("Lite Oura browser takeover", () => {
         },
       },
     );
-    expect((await post(input())).status).toBe(200);
+    const imported = await post(input());
+    expect(imported.status).toBe(200);
+    const success = await imported.json();
     for (const stream of streams) {
       const scope = `oura.${stream}`;
       const head = storage.findEntry({ scope })!;
@@ -365,6 +367,18 @@ describe("Lite Oura browser takeover", () => {
         scope,
         head.collectedAt,
       )) as unknown as Record<string, unknown>;
+      expect
+        .soft(
+          success.receipts?.find(
+            (receipt: { scope: string }) => receipt.scope === scope,
+          ),
+        )
+        .toEqual({
+          scope,
+          collectedAt: head.collectedAt,
+          plaintextBytes: new TextEncoder().encode(JSON.stringify(envelope))
+            .byteLength,
+        });
       expect.soft(envelope.producer).toBe("pdpp-import-projection");
       expect.soft(envelope.producer_provenance).toMatchObject({
         method: "oura-browser",
@@ -391,5 +405,93 @@ describe("Lite Oura browser takeover", () => {
       }),
     );
     expect.soft(read.status).toBe(200);
+  });
+
+  it.each(["oura", "oura-browser"])(
+    "compares an existing stored %s PDPP head through its served projection",
+    async (connector) => {
+      const { storage, post } = await setup();
+      await storage.writeEnvelope(
+        createDataFileEnvelope("oura.activity", oldTime, {
+          records: [
+            {
+              id: "activity-1",
+              day: "2026-10-13",
+              score: 60,
+              $pdpp: {
+                sourceId: `https://registry.pdpp.dev/sources/${connector}`,
+              },
+            },
+          ],
+        }),
+      );
+      const result = await post(input());
+      expect(result.status, await result.clone().text()).toBe(200);
+    },
+  );
+
+  it("authenticates requirements and fails closed on malformed retained dates, with null only for no history", async () => {
+    const { storage, runtime } = await setup();
+    const get = (token = "owner") =>
+      runtime.fetch(
+        new Request("https://ps.test/v1/import/oura-browser/requirements", {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      );
+    expect((await get("builder")).status).toBe(401);
+    expect((await get("unknown")).status).toBe(401);
+    await storage.writeEnvelope(
+      createDataFileEnvelope("oura.activity", oldTime, {
+        days: [{ day: "2026-02-30" }],
+      }),
+    );
+    const malformed = await get();
+    expect(malformed.status).toBe(409);
+    expect(await malformed.json()).toMatchObject({
+      error: "OURA_HISTORY_INVALID",
+    });
+    await storage.deleteScope("oura.activity");
+    const empty = await get();
+    expect(empty.headers.get("cache-control")).toBe("no-store");
+    expect(await empty.json()).toEqual({
+      ok: true,
+      contract: "oura-legacy-takeover-v1",
+      since: null,
+    });
+  });
+
+  it("requires the oldest actual day before every run and preserves aged legacy history through covering imports", async () => {
+    const { storage, runtime, post } = await setup(true);
+    const requirements = () =>
+      runtime.fetch(
+        new Request("https://ps.test/v1/import/oura-browser/requirements", {
+          headers: { authorization: "Bearer owner" },
+        }),
+      );
+    const required = await requirements();
+    expect(required.status).toBe(200);
+    expect(await required.json()).toEqual({
+      ok: true,
+      contract: "oura-legacy-takeover-v1",
+      since: "2025-01-01",
+    });
+    expect((await post(input())).status).toBe(409);
+    const covering = input();
+    covering.records.push({
+      stream: "activity",
+      data: { id: "activity-older", day: "2025-01-01", score: 50 },
+    });
+    covering.completion.streams[2]!.recordCount = 2;
+    expect((await post(covering)).status).toBe(200);
+    expect(await (await requirements()).json()).toMatchObject({
+      since: "2025-01-01",
+    });
+    const refresh = structuredClone(covering);
+    refresh.collectedAt = "2026-10-16T00:00:00.000Z";
+    refresh.records[2]!.data.score = 81;
+    expect((await post(refresh)).status).toBe(200);
+    expect(
+      (await storage.readEnvelope("oura.activity", oldTime)).data,
+    ).toMatchObject({ days: [{ score: 60 }, { score: 50 }] });
   });
 });

@@ -103,3 +103,9 @@ export type {
   OAuthTokenResult,
   OAuthTokenStorePort,
 } from "./oauth.js";
+
+export {
+  deriveOuraCollectionRequirements,
+  OURA_LEGACY_TAKEOVER_CONTRACT,
+  type OuraCollectionRequirements,
+} from "./oura-collection-requirements.js";

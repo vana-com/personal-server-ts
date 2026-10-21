@@ -30,6 +30,7 @@ import {
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
+  handleOuraCollectionRequirementsRequest,
   handlePersonalServerGrantsRequest,
   handlePersonalServerOauthTokenRequest,
   handlePersonalServerSyncRequest,
@@ -1110,6 +1111,13 @@ export function createPsLiteRuntime(
 
         if (!active) {
           return unavailableResponse();
+        }
+
+        if (url.pathname === "/v1/import/oura-browser/requirements") {
+          return handleOuraCollectionRequirementsRequest(request, {
+            auth,
+            storage: toDataStoragePort(options.storage),
+          });
         }
 
         if (url.pathname === "/v1/import/oura-browser") {

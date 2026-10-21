@@ -535,6 +535,19 @@ function toRow(db: RecordRowDb): PdppRecordRow {
   };
 }
 
+export interface SqliteReplaceStreamInput {
+  instance: string;
+  stream: string;
+  method: string;
+  generation: number;
+  emittedAt: string;
+  envelopes: PdppRecordEnvelopeInput[];
+  primaryKey: string[];
+  validateData?: RecordDataValidator;
+  sourceCollectedAt?: string;
+  completionPolicy?: "preserve_if_unchanged";
+}
+
 /**
  * SQLite-backed PdppRecordStore for desktop persistence. Requires
  * `better-sqlite3` (already a `packages/server` dependency in this repo).
@@ -570,18 +583,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     bytes: Uint8Array;
     mimeType: string;
   }): PdppBlobMeta;
-  replaceStream(input: {
-    instance: string;
-    stream: string;
-    method: string;
-    generation: number;
-    emittedAt: string;
-    envelopes: PdppRecordEnvelopeInput[];
-    primaryKey: string[];
-    validateData?: RecordDataValidator;
-    sourceCollectedAt?: string;
-    completionPolicy?: "preserve_if_unchanged";
-  }): ReplaceStreamResult;
+  replaceStream(input: SqliteReplaceStreamInput): ReplaceStreamResult;
+  /** P7 replacements and their completion receipts commit together or all roll back. */
+  replaceStreams(inputs: readonly SqliteReplaceStreamInput[]): void;
   /** Completion receipts of one instance, as stored. */
   listStreamCompletions(instance: string): StreamCompletionReceipt[];
   /**
@@ -888,18 +892,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   // receipt in the same transaction. Without it there is no receipt, and an
   // older one is deleted: it would describe a collection that is no longer
   // the latest.
-  function replaceStream(input: {
-    instance: string;
-    stream: string;
-    method: string;
-    generation: number;
-    emittedAt: string;
-    envelopes: PdppRecordEnvelopeInput[];
-    primaryKey: string[];
-    validateData?: RecordDataValidator;
-    sourceCollectedAt?: string;
-    completionPolicy?: "preserve_if_unchanged";
-  }): ReplaceStreamResult {
+  function replaceStream(input: SqliteReplaceStreamInput): ReplaceStreamResult {
     if (
       input.sourceCollectedAt !== undefined &&
       !isRfc3339DateTime(input.sourceCollectedAt)
@@ -2018,6 +2011,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,
+    replaceStreams: (inputs) =>
+      db.transaction(() => {
+        for (const input of inputs) {
+          if (!replaceStream(input).applied)
+            throw new Error("canonical_batch_rejected");
+        }
+      })(),
     listStreamCompletions,
     completeStreams,
     listArrivalOrder,

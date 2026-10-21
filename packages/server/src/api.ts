@@ -43,3 +43,5 @@ export {
   resolveRootPath,
   type LoadConfigOptions,
 } from "./config/index.js";
+
+export { OURA_LEGACY_TAKEOVER_CONTRACT } from "@opendatalabs/personal-server-ts-core/api";
