@@ -2,6 +2,8 @@
 export type ReplicaReader = "owner" | "grant";
 export type ReplicaVisibilityState =
   "confirmed" | "pending" | "quarantined" | "conflicted";
+export type ReplicaQuarantineReason =
+  "copy_conflict" | "finalized_conflict" | "corruption";
 export type ReplicaRecordOrigin = "local" | "received";
 export interface ReplicaVisibilityPolicy {
   owner: "confirmed-only" | "include-pending";
@@ -17,7 +19,13 @@ export function replicaStateVisible(
   reader: ReplicaReader = "grant",
   policy: ReplicaVisibilityPolicy = DEFAULT_REPLICA_VISIBILITY_POLICY,
   origin: ReplicaRecordOrigin = "received",
+  reason?: ReplicaQuarantineReason,
 ): boolean {
+  if (state === "quarantined")
+    return (
+      reader === "owner" &&
+      (reason === "copy_conflict" || reason === "finalized_conflict")
+    );
   if (state === "conflicted") return reader === "owner" && origin === "local";
   return (
     state === "confirmed" ||
@@ -46,4 +54,17 @@ export function replicaConnectionVisibility(bindingConflict: boolean) {
   return bindingConflict
     ? { state: "conflicted" as const, reason: "source_binding" as const }
     : undefined;
+}
+
+/** Copy values remain on the separate owner diagnostic path, never in the reducer. */
+export function replicaCopyConflictMetadata(
+  reason: "copy_conflict" | "finalized_conflict",
+) {
+  return {
+    visibility: "conflicted" as const,
+    status:
+      reason === "copy_conflict"
+        ? ("copy conflict" as const)
+        : ("integrity conflict" as const),
+  };
 }

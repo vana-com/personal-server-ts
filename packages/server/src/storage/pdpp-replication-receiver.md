@@ -100,3 +100,59 @@ The hardening lane owns the monotone conflict fact and its cursor fence. Recordi
 The hardening migration must run before receiver construction. The standalone adapter detects the fact-table capability once; an absent table means there are no facts to read in that checkout. It is not a way to resolve a conflict.
 
 The replica read port also owns `changesSince`. Canonical history lacks authoritative local provenance for an ambiguous connection, so its change feed is hidden for both readers. Owners use the marked current local projection through point reads and pages. The canonical store validates the original scoped reset fence before the adapter narrows the history instances; pre-conflict cursors expire. When the store exposes `replicaIntegrityEpoch`, the adapter binds the epoch of every requested connection into changes page cursors and session tokens, so an epoch move (a connection quarantine, a terminal batch) expires both with HTTP 410. This does not delete history or add pending records to the change feed.
+
+## Owner copy-conflict diagnostics
+
+`readStore({ reader: "owner" }).readCopyConflicts(id)` returns a copy-key-ordered
+array of `{ copyKey, reason, visibility: "conflicted", status, values? }`.
+For `copy_conflict`, `status` is `"copy conflict"` and `values` contains only the
+copy's decoded record operations (`upsert` and `delete`). For
+`finalized_conflict`, `status` is `"integrity conflict"` and `values` is absent.
+Corrupt rejects are separate from retained copies and never appear. Grant
+readers do not have this method, at runtime or in the owner/grant literal types.
+Each call runs in the same SQLite read-snapshot boundary as the other adapter
+reads.
+
+The owner HTTP route is `GET /v1/replica/copy-conflicts/:id`; URL-encode the batch
+identity as one path segment. It returns `{ object: "list", data: [...] }` with
+the entries above. It uses `AppDeps.pdpp.reads("owner")`; a host without that
+reader's diagnostic capability returns 404. An active client/grant token or a
+foreign owner gets 403. Missing or inactive authentication uses the existing
+PDPP authentication errors. The route restricts results to the token's currently
+owned connections: every operation in a copy must be in scope, or that copy is
+omitted. A missing batch or a batch outside that scope returns an empty list.
+There is no raw-store fallback or query parameter that selects owner authority.
+
+Diagnostics fail as a whole, with no partial response, when a bound is exceeded:
+100 conflicting copies per batch, 256 record operations per copy, 256 KiB of
+UTF-8 JSON record values per copy, 1 MiB of encoded envelope per value-bearing
+copy, and 4 MiB of encoded envelopes across the response. The adapter throws
+`ReplicaCopyConflictLimitError`; HTTP returns 413 with `invalid_request` and no
+`data`. Envelope lengths are checked before fetching or decoding values. A
+finalized marker consumes only the copy-count bound; even a large former
+payload does not prevent a marker or require its values to be decoded.
+
+Owner `listStreams` entries have `copyConflicts: n` (HTTP: `copy_conflicts`). This
+is the number of distinct quarantined copies with `copy_conflict` or
+`finalized_conflict` whose operations name that stream in any requested
+connection. A copy touching several requested connections or containing several
+operations for the stream counts once. Conflicts can therefore produce a stream
+entry with zero records and null recency. Ordinary streams report zero. Grant
+entries never contain the field. Disabling pending previews does not disable
+owner diagnostics.
+
+View layout 8 derives copy/stream membership, connection scope facts, and counts
+inside the write transaction. Counts are grouped by stream and the sorted set
+of connections touched by that copy's stream operations. Indexed connection
+lookups read each relevant group once, so stream listing does not scan retained
+copies or decode their envelopes, and repeated copies on the same connection set
+do not add read work. Work grows with requested connections, distinct connection
+sets, and listed streams. Construction rebuilds these derived facts from retained
+copies when upgrading an older view. State/reason changes, promotion, and terminal
+transitions update them through triggers with `NOT EXISTS` insertion guards.
+
+Conflicting values never enter the reducer or canonical materialization. Page and
+point reads retain the confirmed predecessor until promotion. A terminal batch
+withdraws the affected connections through the existing integrity fence, so both
+readers lose those record values and blob references. Diagnostic markers and
+counts remain available to the owner.

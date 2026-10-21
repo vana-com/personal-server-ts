@@ -39,6 +39,7 @@ import type { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 
 import {
   replicaStateVisible,
+  replicaCopyConflictMetadata,
   type ReplicaReader,
   type ReplicaVisibilityPolicy,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
@@ -54,6 +55,48 @@ import {
   type ListVisibleRecordsPage,
   type PdppReplicaReadStore,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+
+/** Owner diagnostics never participate in record materialization. */
+export interface ReplicaCopyConflict {
+  copyKey: string;
+  reason: "copy_conflict" | "finalized_conflict";
+  visibility: "conflicted";
+  status: "copy conflict" | "integrity conflict";
+  values?: RecordOperation[];
+}
+export interface ReplicaCopyConflictReader {
+  /** Scope, when supplied by HTTP, must contain every operation connection in a copy. */
+  readCopyConflicts(
+    id: string,
+    instanceIds?: readonly string[],
+  ): ReplicaCopyConflict[];
+}
+export class ReplicaCopyConflictLimitError extends Error {
+  constructor() {
+    super("Copy conflict diagnostics exceed the read limit");
+    this.name = "ReplicaCopyConflictLimitError";
+  }
+}
+export const COPY_CONFLICT_READ_LIMITS = {
+  copies: 100,
+  operations: 256,
+  envelopeBytes: 1024 * 1024,
+  valueBytes: 256 * 1024,
+  totalBytes: 4 * 1024 * 1024,
+} as const;
+type ReplicaReaderStore<R extends ReplicaReader> = Omit<
+  PdppReplicaReadStore,
+  "listStreams"
+> & {
+  connectionVisibility: (
+    instance: string,
+  ) => { state: "conflicted"; reason: "source_binding" } | undefined;
+  listStreams(ids: string[]): (ReturnType<
+    PdppReplicaReadStore["listStreams"]
+  >[number] & {
+    copyConflicts?: number;
+  })[];
+} & (R extends "owner" ? ReplicaCopyConflictReader : object);
 
 export const RECEIVER_MIGRATION = `
 CREATE TABLE IF NOT EXISTS pdpp_replica_received (operation_json TEXT PRIMARY KEY, digest TEXT NOT NULL);
@@ -1374,9 +1417,9 @@ export function createReplicaReceiver(deps: {
         );
       });
     },
-    readStore(input: { reader?: ReplicaReader } = {}): PdppReplicaReadStore & {
-      connectionVisibility: typeof view.connectionVisibility;
-    } {
+    readStore<R extends ReplicaReader = "grant">(
+      input: { reader?: R } = {},
+    ): ReplicaReaderStore<R> {
       const reader = input.reader ?? "grant";
       const hasPreview = () => includesPending(reader);
       const needsReferenceGate = () =>
@@ -1389,7 +1432,73 @@ export function createReplicaReceiver(deps: {
         );
       const canReadBlob = (id: string) =>
         view.hasBlobReference(id, reader, hasPreview());
+      const readCopyConflicts: ReplicaCopyConflictReader["readCopyConflicts"] =
+        (id, instanceIds) =>
+          readSnapshot(() => {
+            const scope = instanceIds ? JSON.stringify(instanceIds) : null;
+            // Select metadata first: never bring an unbounded envelope or finalized
+            // conflict values into JS. LIMIT also caps the number of marker rows.
+            const rows = db
+              .prepare(
+                `SELECT copy_key,reason,
+            length(CAST(envelope_json AS BLOB)) AS bytes
+            FROM pdpp_replica_copies c WHERE id=? AND state='quarantined'
+            AND reason IN ('copy_conflict','finalized_conflict')
+            AND (? IS NULL OR NOT EXISTS (
+              SELECT 1 FROM pdpp_replica_view_copy_connections scope
+              WHERE scope.id=c.id AND scope.copy_key=c.copy_key
+              AND scope.instance NOT IN (SELECT value FROM json_each(?))))
+            ORDER BY copy_key LIMIT ?`,
+              )
+              .all(id, scope, scope, COPY_CONFLICT_READ_LIMITS.copies + 1) as {
+              copy_key: string;
+              reason: ReplicaCopyConflict["reason"];
+              bytes: number;
+            }[];
+            if (rows.length > COPY_CONFLICT_READ_LIMITS.copies)
+              throw new ReplicaCopyConflictLimitError();
+            let totalBytes = 0;
+            const result: ReplicaCopyConflict[] = [];
+            for (const row of rows) {
+              const marker = {
+                copyKey: row.copy_key,
+                reason: row.reason,
+                ...replicaCopyConflictMetadata(row.reason),
+              };
+              // Finalized diagnostics use only indexed scope facts and markers;
+              // their former values never need to be fetched or decoded.
+              if (row.reason === "finalized_conflict") {
+                result.push(marker);
+                continue;
+              }
+              if (row.bytes > COPY_CONFLICT_READ_LIMITS.envelopeBytes)
+                throw new ReplicaCopyConflictLimitError();
+              totalBytes += row.bytes;
+              if (totalBytes > COPY_CONFLICT_READ_LIMITS.totalBytes)
+                throw new ReplicaCopyConflictLimitError();
+              const stored = db
+                .prepare(
+                  "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
+                )
+                .get(id, row.copy_key) as { envelope_json: string };
+              const values = replicaEnvelopeSchema
+                .parse(JSON.parse(stored.envelope_json))
+                .operations.filter(
+                  (op): op is RecordOperation =>
+                    op.kind === "upsert" || op.kind === "delete",
+                );
+              if (
+                values.length > COPY_CONFLICT_READ_LIMITS.operations ||
+                Buffer.byteLength(JSON.stringify(values)) >
+                  COPY_CONFLICT_READ_LIMITS.valueBytes
+              )
+                throw new ReplicaCopyConflictLimitError();
+              result.push({ ...marker, values });
+            }
+            return result;
+          });
       return {
+        ...(reader === "owner" ? { readCopyConflicts } : {}),
         connectionVisibility: view.connectionVisibility,
         getRecord: (instance: string, stream: string, key: string) =>
           readSnapshot(() =>
@@ -1401,7 +1510,9 @@ export function createReplicaReceiver(deps: {
           api.readRecords({ ...options, stream, reader }),
         listStreams: (ids: string[]) =>
           readSnapshot(() =>
-            pendingEnabled || ids.some((id) => view.connectionVisibility(id))
+            reader === "owner" ||
+            pendingEnabled ||
+            ids.some((id) => view.connectionVisibility(id))
               ? view.listStreams(ids, hasPreview(), reader)
               : store.listStreams(ids),
           ),
@@ -1452,7 +1563,7 @@ export function createReplicaReceiver(deps: {
               ? []
               : store.listStreamCompletions(instance),
           ),
-      };
+      } as ReplicaReaderStore<R>;
     },
     /** Called only after the transport proves a finalized immutable-slot conflict.
      * Keep evidence, but permanently retract the authority derived from its batch.

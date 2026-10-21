@@ -62,3 +62,34 @@ for (const policy of cases)
         false,
       );
     });
+
+for (const policy of cases)
+  for (const reader of ["owner", "grant"] as const)
+    for (const reason of [
+      "copy_conflict",
+      "finalized_conflict",
+      "corruption",
+    ] as const)
+      it(`${policy.owner}/${policy.grant}: ${reader} quarantine ${reason}`, () => {
+        expect(
+          replicaStateVisible(
+            "quarantined",
+            reader,
+            policy,
+            "received",
+            reason,
+          ),
+        ).toBe(reader === "owner" && reason !== "corruption");
+      });
+
+it("maps copy quarantine reasons to distinct owner markers", async () => {
+  const policy = await import("./visibility-policy.js");
+  expect(policy.replicaCopyConflictMetadata("copy_conflict")).toEqual({
+    visibility: "conflicted",
+    status: "copy conflict",
+  });
+  expect(policy.replicaCopyConflictMetadata("finalized_conflict")).toEqual({
+    visibility: "conflicted",
+    status: "integrity conflict",
+  });
+});

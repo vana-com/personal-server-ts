@@ -51,7 +51,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 7;
+const VIEW_SCHEMA = 8;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -116,6 +116,11 @@ export function createReplicaVisibilityView(deps: {
   const hasBindingConflictFacts = !!db
     .prepare(
       "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_binding_conflicts'",
+    )
+    .get();
+  const hasCopyFacts = !!db
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_copies'",
     )
     .get();
   const localIdentitySql = (alias: string) =>
@@ -315,6 +320,96 @@ export function createReplicaVisibilityView(deps: {
           UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count-(1-OLD.deleted),row_count=row_count-(1-OLD.deleted),last_updated=(${latest})
           WHERE preview=${preview} AND instance=OLD.instance AND stream=OLD.stream;
         END;
+      `);
+    }
+    if (hasCopyFacts) {
+      // Each copy contributes once per stream, regardless of operation count or
+      // connections. Group identical connection sets to keep metadata reads off
+      // the retained copies and their envelopes (including large backlogs).
+      const copyStreams = (alias: string) => `
+        INSERT INTO pdpp_replica_view_copy_streams
+        SELECT ${alias}.id,${alias}.copy_key,stream,json_group_array(instance)
+        FROM (SELECT DISTINCT json_extract(value,'$.declaration.stream') AS stream,
+          json_extract(value,'$.connectionId') AS instance
+          FROM json_each(${alias}.envelope_json,'$.operations')
+          WHERE json_extract(value,'$.declaration.stream') IS NOT NULL
+          ORDER BY stream,instance)
+        WHERE ${alias}.state='quarantined' AND ${alias}.reason IN ('copy_conflict','finalized_conflict')
+        GROUP BY stream;
+        INSERT INTO pdpp_replica_view_copy_connections
+        SELECT DISTINCT ${alias}.id,${alias}.copy_key,json_extract(value,'$.connectionId')
+        FROM json_each(${alias}.envelope_json,'$.operations')
+        WHERE ${alias}.state='quarantined' AND ${alias}.reason IN ('copy_conflict','finalized_conflict');`;
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_connections (
+          id TEXT NOT NULL,copy_key TEXT NOT NULL,instance TEXT NOT NULL,
+          PRIMARY KEY(id,copy_key,instance)
+        );
+        CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_streams (
+          id TEXT NOT NULL,copy_key TEXT NOT NULL,stream TEXT NOT NULL,instances TEXT NOT NULL,
+          PRIMARY KEY(id,copy_key,stream)
+        );
+        CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_counts (
+          stream TEXT NOT NULL,instances TEXT NOT NULL,n INTEGER NOT NULL,
+          PRIMARY KEY(stream,instances)
+        );
+        CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_groups (
+          instance TEXT NOT NULL,stream TEXT NOT NULL,instances TEXT NOT NULL,
+          PRIMARY KEY(instance,stream,instances)
+        );
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_group_insert
+        AFTER INSERT ON pdpp_replica_view_copy_counts BEGIN
+          INSERT INTO pdpp_replica_view_copy_groups
+          SELECT value,NEW.stream,NEW.instances FROM json_each(NEW.instances)
+          WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_groups g
+            WHERE g.instance=value AND g.stream=NEW.stream AND g.instances=NEW.instances);
+        END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_group_delete
+        AFTER DELETE ON pdpp_replica_view_copy_counts BEGIN
+          DELETE FROM pdpp_replica_view_copy_groups WHERE stream=OLD.stream AND instances=OLD.instances;
+        END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_stream_insert
+        AFTER INSERT ON pdpp_replica_view_copy_streams BEGIN
+          INSERT INTO pdpp_replica_view_copy_counts SELECT NEW.stream,NEW.instances,0
+          WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_counts c
+            WHERE c.stream=NEW.stream AND c.instances=NEW.instances);
+          UPDATE pdpp_replica_view_copy_counts SET n=n+1 WHERE stream=NEW.stream AND instances=NEW.instances;
+        END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_stream_delete
+        AFTER DELETE ON pdpp_replica_view_copy_streams BEGIN
+          UPDATE pdpp_replica_view_copy_counts SET n=n-1 WHERE stream=OLD.stream AND instances=OLD.instances;
+          DELETE FROM pdpp_replica_view_copy_counts WHERE stream=OLD.stream AND instances=OLD.instances AND n=0;
+        END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_insert AFTER INSERT ON pdpp_replica_copies BEGIN
+          ${copyStreams("NEW")}
+        END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_update
+        AFTER UPDATE OF state,reason,envelope_json ON pdpp_replica_copies
+        WHEN OLD.state IS NOT NEW.state OR OLD.reason IS NOT NEW.reason OR OLD.envelope_json IS NOT NEW.envelope_json BEGIN
+          DELETE FROM pdpp_replica_view_copy_streams WHERE id=OLD.id AND copy_key=OLD.copy_key;
+          DELETE FROM pdpp_replica_view_copy_connections WHERE id=OLD.id AND copy_key=OLD.copy_key;
+          ${copyStreams("NEW")}
+        END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_delete AFTER DELETE ON pdpp_replica_copies BEGIN
+          DELETE FROM pdpp_replica_view_copy_streams WHERE id=OLD.id AND copy_key=OLD.copy_key;
+          DELETE FROM pdpp_replica_view_copy_connections WHERE id=OLD.id AND copy_key=OLD.copy_key;
+        END;
+      `);
+      if (!initialized)
+        db.exec(`
+        INSERT INTO pdpp_replica_view_copy_streams
+        SELECT id,copy_key,stream,json_group_array(instance)
+        FROM (SELECT DISTINCT c.id,c.copy_key,json_extract(op.value,'$.declaration.stream') AS stream,
+          json_extract(op.value,'$.connectionId') AS instance
+          FROM pdpp_replica_copies c,json_each(c.envelope_json,'$.operations') op
+          WHERE c.state='quarantined' AND c.reason IN ('copy_conflict','finalized_conflict')
+          AND json_extract(op.value,'$.declaration.stream') IS NOT NULL
+          ORDER BY c.id,c.copy_key,stream,instance)
+        GROUP BY id,copy_key,stream;
+        INSERT INTO pdpp_replica_view_copy_connections
+        SELECT DISTINCT c.id,c.copy_key,json_extract(op.value,'$.connectionId')
+        FROM pdpp_replica_copies c,json_each(c.envelope_json,'$.operations') op
+        WHERE c.state='quarantined' AND c.reason IN ('copy_conflict','finalized_conflict');
       `);
     }
     if (hasBindingConflictFacts && !localInitialized)
@@ -1251,7 +1346,26 @@ export function createReplicaVisibilityView(deps: {
     ids: string[],
     preview = true,
     reader: ReplicaReader = "owner",
-  ): StreamListing[] {
+  ): (StreamListing & { copyConflicts?: number })[] {
+    const copyCounts = new Map<string, number>();
+    if (reader === "owner" && hasCopyFacts && ids.length) {
+      // Indexed by the requested connections, then deduplicate groups before
+      // summing: a copy on two requested connections still counts only once.
+      const groups = db
+        .prepare(
+          `SELECT DISTINCT g.stream,g.instances,c.n
+        FROM json_each(?) requested
+        JOIN pdpp_replica_view_copy_groups g ON g.instance=requested.value
+        JOIN pdpp_replica_view_copy_counts c ON c.stream=g.stream AND c.instances=g.instances`,
+        )
+        .all(JSON.stringify([...new Set(ids)])) as {
+        stream: string;
+        instances: string;
+        n: number;
+      }[];
+      for (const { stream, n } of groups)
+        copyCounts.set(stream, (copyCounts.get(stream) ?? 0) + n);
+    }
     const combined = new Map<
       string,
       {
@@ -1313,10 +1427,21 @@ export function createReplicaVisibilityView(deps: {
         });
       }
     }
+    for (const stream of copyCounts.keys())
+      if (!combined.has(stream))
+        combined.set(stream, {
+          count: 0,
+          last: null,
+          pending: false,
+          conflicted: false,
+        });
     return [...combined].map(([stream, row]) => ({
       stream,
       recordCount: row.count,
       lastUpdated: row.last,
+      ...(reader === "owner"
+        ? { copyConflicts: copyCounts.get(stream) ?? 0 }
+        : {}),
       ...(row.conflicted
         ? replicaConflictMetadata()
         : row.pending

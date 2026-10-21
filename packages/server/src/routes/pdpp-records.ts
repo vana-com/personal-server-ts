@@ -1,3 +1,7 @@
+import {
+  ReplicaCopyConflictLimitError,
+  type ReplicaCopyConflictReader,
+} from "../storage/pdpp-replication-receiver.js";
 import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
@@ -214,7 +218,17 @@ function parseIngestBody(bytes: Uint8Array): unknown {
 }
 
 /** The record routes read everything a reader serves except completion receipts. */
-type RouteReadStore = Omit<PdppReplicaReadStore, "listStreamCompletions">;
+type RouteReadStore = Omit<
+  PdppReplicaReadStore,
+  "listStreamCompletions" | "listStreams"
+> &
+  Partial<ReplicaCopyConflictReader> & {
+    listStreams(
+      ids: string[],
+    ): (ReturnType<PdppReplicaReadStore["listStreams"]>[number] & {
+      copyConflicts?: number;
+    })[];
+  };
 
 export interface PdppRecordsRouteDeps {
   /** Writes and write-side lookups. Reads go through `reads`. */
@@ -882,6 +896,60 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     }
   }
 
+  // Owner diagnostics use the same mandatory host reader as record/blob reads.
+  // Never fall back to raw storage for this optional capability.
+  app.get("/replica/copy-conflicts/:id", async (c) => {
+    const reqId = requestId();
+    const { context, error } = await authenticate(c, reqId);
+    if (error) return error;
+    if (!context?.active)
+      return sendError(c, mapInactiveToError(context!), reqId);
+    try {
+      if (
+        context.tokenKind !== "owner" ||
+        !context.subjectId ||
+        !deps.ownerSubjectId ||
+        context.subjectId.toLowerCase() !== deps.ownerSubjectId.toLowerCase()
+      )
+        throw new PdppError(
+          "insufficient_scope",
+          "Copy conflict diagnostics require the server owner",
+        );
+      const instanceIds = ownerInstances(context);
+      if (!instanceIds.length)
+        throw new PdppError(
+          "insufficient_scope",
+          "No currently owned instance is in scope",
+        );
+      const reader = deps.reads?.("owner");
+      if (!reader?.readCopyConflicts)
+        throw new PdppError(
+          "not_found",
+          "Copy conflict diagnostics are unavailable",
+        );
+      return c.json(
+        {
+          object: "list",
+          data: reader.readCopyConflicts(c.req.param("id"), instanceIds),
+        },
+        200,
+        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+      );
+    } catch (err) {
+      if (err instanceof ReplicaCopyConflictLimitError)
+        return c.json(
+          new PdppError("invalid_request", err.message).toJSON(reqId),
+          413,
+          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        );
+      return sendError(
+        c,
+        mapAndLog(deps, "GET /v1/replica/copy-conflicts/:id", reqId, err),
+        reqId,
+      );
+    }
+  });
+
   app.get("/streams", async (c) => {
     const reqId = requestId();
     const { context, error } = await authenticate(c, reqId);
@@ -940,6 +1008,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             confirmation: s.confirmation,
             visibility: s.visibility,
             status: s.status,
+            copyConflicts: s.copyConflicts,
             recordCount: s.recordCount as number | null,
             lastUpdated: s.lastUpdated,
             budgetExhausted: false,
@@ -957,6 +1026,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
                 confirmation: undefined,
                 visibility: undefined,
                 status: undefined,
+                copyConflicts: undefined,
                 ...summarizeGrantVisible(
                   reads(context),
                   s.stream,
@@ -981,6 +1051,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           name: s.name,
           record_count: s.recordCount,
           last_updated: s.lastUpdated,
+          ...(s.copyConflicts !== undefined && {
+            copy_conflicts: s.copyConflicts,
+          }),
           ...(s.confirmation && { confirmation: s.confirmation }),
           ...(s.status && { visibility: s.visibility, status: s.status }),
         })),
