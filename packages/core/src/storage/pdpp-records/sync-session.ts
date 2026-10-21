@@ -172,7 +172,13 @@ export function createPdppSyncSessionService(
   const preparedRows =
     options.maxPreparedRowsPerOwner ?? DEFAULT_SYNC_PREPARED_ROWS_PER_OWNER;
 
-  function read(request: SyncRequest): ChangesSincePage {
+  function read(input: SyncRequest): ChangesSincePage {
+    // One normalized scope for every consumer: the instance cap, the sibling
+    // check, the token binding and every store query see each instance once.
+    const request: SyncRequest = {
+      ...input,
+      instanceIds: [...new Set(input.instanceIds)],
+    };
     // The HTTP route clamps `limit` to the same maximum. It also bounds the
     // rows a resumed request reads again (`found`), which the budget charges
     // but never cuts short.
@@ -187,7 +193,7 @@ export function createPdppSyncSessionService(
     }
     // A finite scope bounds the one-record-per-key check, which reads every
     // other instance for one identity at once.
-    if (new Set(request.instanceIds).size > MAX_SYNC_INSTANCES) {
+    if (request.instanceIds.length > MAX_SYNC_INSTANCES) {
       throw new RangeError(
         `one sync request reads at most ${MAX_SYNC_INSTANCES} instances`,
       );
