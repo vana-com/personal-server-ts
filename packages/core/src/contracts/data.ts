@@ -544,7 +544,16 @@ export async function listDataVersionsContract(
 export interface SummarizeDataAdditionsContractInput {
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
+  /** Deletion filter for scopes summarized from local storage. */
   isVisible?: DataVisibilityFilter;
+  /**
+   * Deletion filter for scopes summarized from the durable registry: the
+   * scope and the registry version its counts were folded through.
+   */
+  isRegistryVersionVisible?: (
+    scope: string,
+    registryVersion: string,
+  ) => Promise<boolean>;
   /** IANA timezone, e.g. "America/Toronto". */
   timezone: string;
   /** Number of local calendar days to report. Must be an integer 1..31. */
@@ -582,7 +591,16 @@ export async function summarizeDataAdditionsContract(
     throw err;
   }
 
-  if (input.additions) return input.additions.summarize(input);
+  if (input.additions) {
+    return input.additions.summarize({
+      timezone: input.timezone,
+      days: input.days,
+      now: input.now,
+      ...(input.isRegistryVersionVisible && {
+        isIncluded: input.isRegistryVersionVisible,
+      }),
+    });
+  }
   const scopes = (
     await collectScopes(input.storage, undefined, input.isVisible)
   ).filter((row) => !isSystemScope(row.scope));

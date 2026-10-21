@@ -2,10 +2,7 @@ import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
-import type {
-  PdppAuthorizationService,
-  PdppTokenContext,
-} from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
   allDeliveryLeases,
   deliver,
@@ -17,8 +14,10 @@ import {
   type PdppProtocolProfile,
 } from "../pdpp/bearer-response.js";
 import {
+  admitBearer,
   connectionsLease,
   pdppBearerReadLease,
+  type BearerAdmission,
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
@@ -97,15 +96,17 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
    * of the record references that authorized it (what the read selected).
    */
   function blobLease(
-    token: string,
-    context: PdppTokenContext,
+    admission: BearerAdmission,
     selectedInstances: readonly string[],
   ): DeliveryLease {
     return allDeliveryLeases(
-      pdppBearerReadLease(deps.auth, token, context),
+      pdppBearerReadLease(deps.auth, admission),
       connectionsLease(selectedInstances, deps.isConnectionAvailable),
     );
   }
+
+  const available = (instance: string) =>
+    deps.isConnectionAvailable?.(instance) !== false;
 
   /**
    * Release a response through the read's lease (see `deliver`). Headers
@@ -151,38 +152,12 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         error: jsonError(c, err, reqId),
       };
     }
-    const context = await deps.auth.resolveToken(token);
+    // Dated before the await: see `admitBearer`.
+    const admission = await admitBearer(deps.auth, token);
+    const context = admission.context;
     if (!context.active) {
       const err = new PdppError("authentication_error", "Invalid access token");
       return { error: jsonError(c, err, reqId, { inactiveBearer: true }) };
-    }
-
-    // DELETE removes the grant's record references and claim rows. Check its
-    // connection before blob metadata so callers still get the K7 refusal.
-    if (context.tokenKind !== "owner") {
-      const grantInstances = (context.grant?.streams ?? []).flatMap(
-        (stream) => stream.instance_ids,
-      );
-      if (
-        grantInstances.some(
-          (instance) => deps.isConnectionAvailable?.(instance) === false,
-        )
-      ) {
-        const err = new PdppError(
-          "instance_unavailable",
-          "The connection for this grant is unavailable",
-        );
-        return { error: jsonError(c, err, reqId) };
-      }
-    }
-
-    const meta = deps.store.getBlobMeta(blobId);
-    if (!meta) {
-      const err = new PdppError(
-        "blob_not_found",
-        "blob_id is unknown or stale",
-      );
-      return { error: jsonError(c, err, reqId) };
     }
 
     const notFound = () =>
@@ -191,13 +166,38 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         new PdppError("blob_not_found", "blob_id is unknown or stale"),
         reqId,
       );
+    const unavailable = () =>
+      jsonError(
+        c,
+        new PdppError(
+          "instance_unavailable",
+          "The connection for this grant is unavailable",
+        ),
+        reqId,
+      );
+    // DELETE of a connection removes the grant's record references and claim
+    // rows, so a blob of a deleted connection is no longer found. When nothing
+    // authorizes the blob and one of the grant's connections is gone, answer
+    // with that (the K7 refusal) rather than "not found". A blob that an
+    // available connection still authorizes is not affected by an unrelated
+    // deleted one.
+    const missing = () =>
+      context.tokenKind !== "owner" &&
+      (context.grant?.streams ?? [])
+        .flatMap((stream) => stream.instance_ids)
+        .some((instance) => !available(instance))
+        ? unavailable()
+        : notFound();
+
+    const meta = deps.store.getBlobMeta(blobId);
+    if (!meta) return { error: missing() };
 
     // Identical blob bytes can legitimately be referenced by more than one
     // record or instance (e.g. re-ingested via a different stream). Access
     // is granted if ANY visible reference passes its authorization check —
     // an inaccessible reference must never hide an accessible one.
     const references = deps.store.findBlobReferences(blobId);
-    if (references.length === 0) return { error: notFound() };
+    if (references.length === 0) return { error: missing() };
 
     if (context.tokenKind === "owner") {
       // Owner tokens carry no grant: current-capability read, scoped to the
@@ -222,15 +222,20 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         .map((reference) => reference.instance)
         .filter((instance) => ownedInstances.includes(instance));
       if (visible.length === 0) return { error: notFound() };
+      // The read is selected from the visible references whose connection is
+      // available, and holds exactly those.
+      const selected = visible.filter(available);
+      if (selected.length === 0) return { error: unavailable() };
       return {
         ok: true,
-        lease: blobLease(token, context, visible),
+        lease: blobLease(admission, selected),
       };
     }
 
     // Client token: the blob must be referenced by a record this exact
     // grant can see — instance scope, resources allowlist, time_constraint,
     // and blob_ref must be in the granted fields for that record's stream.
+    let authorizedButUnavailable = false;
     for (const reference of references) {
       const declaration = deps.declarations.forInstance(
         reference.instance,
@@ -263,13 +268,20 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         continue;
       }
 
+      // Authorized by this reference: the read is selected from its
+      // connection, which must be available; another reference may still
+      // authorize it through an available one.
+      if (!available(reference.instance)) {
+        authorizedButUnavailable = true;
+        continue;
+      }
       return {
         ok: true,
-        lease: blobLease(token, context, [reference.instance]),
+        lease: blobLease(admission, [reference.instance]),
       };
     }
 
-    return { error: notFound() };
+    return { error: authorizedButUnavailable ? unavailable() : missing() };
   }
 
   // Hono dispatches HEAD via the GET handler and discards the body, so no separate HEAD handler is

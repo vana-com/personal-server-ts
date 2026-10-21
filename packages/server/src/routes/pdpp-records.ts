@@ -20,6 +20,7 @@ import {
   InvalidCursorSyntaxError,
   recordKeyWithinGrantResources,
   mapInactiveToError,
+  admitBearer,
   connectionsLease,
   pdppBearerReadLease,
   recordWithinGrantTimeConstraint,
@@ -723,10 +724,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         ),
       };
     }
-    // Dated before the await: a remote AS's answer is as old as the moment
-    // the introspection started.
-    const resolvedAt = evidenceTime();
-    const context = await deps.auth.resolveToken(token);
+    // Admission is dated before the resolution is awaited: a remote AS's
+    // answer is as old as the moment its introspection started.
+    const admission = await admitBearer(deps.auth, token);
+    const context = admission.context;
     let chainDecision: Extract<PdppChainDecision, { ok: true }> | undefined;
     let chainVerifiedAt: EvidenceTime | undefined;
 
@@ -776,8 +777,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         deps.chainEnforcement && context.tokenKind === "client"
           ? chainDecision
           : undefined;
-      const lease = pdppBearerReadLease(deps.auth, token, context, {
-        resolvedAt,
+      const lease = pdppBearerReadLease(deps.auth, admission, {
         ...(chained && {
           chain: {
             admitted: { expiresAt: chained.expiresAt },

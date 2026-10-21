@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { AddressInfo } from "node:net";
 import { Hono } from "hono";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   openPdppAuthStore,
   PdppTokenService,
@@ -268,5 +268,100 @@ describe("a blob HEAD whose grant is revoked before the headers leave", () => {
     expect(metaReads).toBe(2);
     expect(response.status).toBe(403);
     expect(response.headers.get("Content-Length")).not.toBe("1024");
+  });
+});
+
+/** Blob routes over `records` (seeded by `seedBlob`), with this auth. */
+function blobRoutes(
+  auth: Parameters<typeof pdppBlobsRoutes>[0]["auth"],
+  isConnectionAvailable?: (instance: string) => boolean,
+) {
+  return pdppBlobsRoutes({
+    store: records,
+    auth,
+    declarations,
+    instancesForSubject: () => ["inst_1"],
+    readBlobBytes: async () => new Uint8Array(1024),
+    ...(isConnectionAvailable && { isConnectionAvailable }),
+  });
+}
+
+describe("a blob read's remote AS answer is dated from when introspection started", () => {
+  for (const method of ["GET", "HEAD"]) {
+    it(`${method} refreshes, and refuses, an answer whose introspection took 31 s`, async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        seedBlob(1024);
+        let calls = 0;
+        const app = blobRoutes({
+          locality: "remote",
+          async resolveToken(token: string) {
+            calls += 1;
+            if (calls > 1) {
+              return {
+                active: false,
+                tokenKind: "client",
+                subjectId: "",
+                inactiveReason: "grant_revoked",
+              };
+            }
+            const answer = await auth.resolveToken(token);
+            vi.setSystemTime(Date.now() + 31_000);
+            return answer;
+          },
+        });
+        const response = await app.request("/blob_1", {
+          method,
+          headers: { Authorization: `Bearer ${TOKEN}` },
+        });
+        expect(calls).toBe(2);
+        expect(response.status).toBe(403);
+        expect(response.headers.get("Content-Length")).not.toBe("1024");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+});
+
+describe("a blob read holds the connection of the reference that authorized it", () => {
+  const twoConnections: Grant = {
+    ...GRANT,
+    streams: [
+      ...GRANT.streams,
+      { name: "other", instance_ids: ["inst_2"], fields: ["id"] },
+    ],
+  };
+  const context = {
+    active: true as const,
+    tokenKind: "client" as const,
+    subjectId: "sub_1",
+    clientId: "client_1",
+    grant: twoConnections,
+  };
+  const fixedAuth = {
+    locality: "local" as const,
+    resolveToken: async () => context,
+    resolveTokenNow: () => context,
+  };
+
+  it("is still served when an unrelated grant connection was deleted", async () => {
+    seedBlob(1024);
+    const response = await blobRoutes(
+      fixedAuth,
+      (instance) => instance === "inst_1",
+    ).request("/blob_1", { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(response.status, await response.text()).toBe(200);
+  });
+
+  it("is refused when the authorizing reference's connection is unavailable", async () => {
+    seedBlob(1024);
+    const response = await blobRoutes(
+      fixedAuth,
+      (instance) => instance !== "inst_1",
+    ).request("/blob_1", { headers: { Authorization: `Bearer ${TOKEN}` } });
+    const text = await response.text();
+    expect(response.status, text).toBe(404);
+    expect(JSON.parse(text).error.code).toBe("instance_unavailable");
   });
 });

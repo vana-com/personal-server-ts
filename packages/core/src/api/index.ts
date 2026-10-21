@@ -1360,6 +1360,34 @@ function discoveryVisibility(
   return (scope, entry) => selectVisible(deps, hold, scope, entry, "file");
 }
 
+/**
+ * Discovery filter for a summary built from the durable registry: a scope
+ * whose counts were folded through registry version `registryVersion`. That
+ * version is what a gateway tombstone is compared with, so it stands in for
+ * the local entry. Each scope it lets through is a selection, and its
+ * release dependency goes to `hold`.
+ */
+function registryVersionVisibility(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  hold: (dependency: DeliveryLease) => void,
+): ((scope: string, registryVersion: string) => Promise<boolean>) | undefined {
+  if (!deps.scopeDeletions) return undefined;
+  return (scope, registryVersion) =>
+    selectVisible(
+      deps,
+      hold,
+      scope,
+      {
+        version: Number(registryVersion),
+        // Registered at the gateway (any non-null id): the version is then
+        // compared as a registry version.
+        dataPointId: "registry",
+        afterTombstoneVersion: null,
+      },
+      "file",
+    );
+}
+
 /** Select one listed item; hold its dependency when it is visible. */
 async function selectVisible(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
@@ -1974,6 +2002,10 @@ async function dispatchDataRequest(
         storage: deps.storage,
         isVisible: discoveryVisibility(deps, (dependency) =>
           selection.add(dependency),
+        ),
+        isRegistryVersionVisible: registryVersionVisibility(
+          deps,
+          (dependency) => selection.add(dependency),
         ),
         timezone: url.searchParams.get("tz") ?? "UTC",
         // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
