@@ -224,3 +224,124 @@ it("keeps the local journal projection only for conflicted connections", () => {
     }).data,
   ).toHaveLength(55);
 });
+
+/**
+ * Rows the canonical and overlay keysets visit per owner page. A counting SQL
+ * function wraps the quarantine predicate that every page source evaluates on
+ * each row it visits, so the count is SQLite work, not rows returned.
+ */
+function maskedPageWork(masked: number, mask: "overwrite" | "delete") {
+  const { db, store } = device(masked);
+  let visits = 0;
+  db.function("pdpp_test_visit", { deterministic: false }, () => {
+    visits += 1;
+    return 1;
+  });
+  const replica = createReplicaReceiver({
+    db,
+    store: {
+      ...store,
+      unquarantinedRecordSql: (alias: string) =>
+        `pdpp_test_visit() AND ${store.unquarantinedRecordSql(alias)}`,
+    },
+    owner: identity.owner,
+    authenticate: () => identity.owner,
+    declarations: () => declarations,
+    enabled: true,
+  });
+  // Either mask gives every canonical key an overlay row: pending overwrites
+  // sort before canonical rows; pending removals share their positions.
+  replica.stage({
+    credential: "x",
+    id: "mask-all",
+    envelope: envelope(
+      "mask-all",
+      mask === "overwrite"
+        ? rows("base", masked).map((row, i) => ({
+            ...upsert(`overwrite-${i}`, 1_000_000 + i, "pending", "device-b"),
+            recordKey: row.key,
+            data: { id: row.key, text: "pending" },
+          }))
+        : [
+            {
+              ...identity,
+              kind: "connection-delete",
+              revision: {
+                counter: 2_000_000,
+                writerId: "device-b",
+                operationId: "delete-b",
+              },
+            },
+          ],
+    ),
+  });
+  expect(overlayRows(db)).toBe(masked);
+  const owner = replica.readStore({ reader: "owner" });
+  const page = (order: "asc" | "desc", limit: number, cursor?: string) => {
+    visits = 0;
+    const result = owner.listRecords(binding.stream, {
+      instanceIds: [identity.connectionId],
+      limit,
+      order,
+      cursor,
+    });
+    return { ...result, visits };
+  };
+  const work: Record<string, number> = {};
+  const times: Record<string, number> = {};
+  for (const order of ["asc", "desc"] as const) {
+    const first = page(order, 1);
+    work[`${order} first`] = first.visits;
+    work[`${order} continuation`] = page(order, 1, first.nextCursor).visits;
+    const samples: number[] = [];
+    for (let i = 0; i < 21; i += 1) {
+      const start = process.hrtime.bigint();
+      page(order, 1);
+      samples.push(Number(process.hrtime.bigint() - start) / 1e6);
+    }
+    times[`${order} first ms (median of 21)`] = samples.sort(
+      (a, b) => a - b,
+    )[10];
+    // Walking every page returns each key once, all marked, in merged order.
+    const seen: [string, string][] = [];
+    let cursor: string | undefined;
+    let maxPageWork = 0;
+    do {
+      const next = page(order, 100, cursor);
+      maxPageWork = Math.max(maxPageWork, next.visits);
+      for (const row of next.data) {
+        expect(row.visibility).toBe("pending");
+        expect(row.deleted).toBe(mask === "delete");
+        seen.push([row.emittedAt, row.recordKey]);
+      }
+      cursor = next.nextCursor;
+    } while (cursor);
+    work[`${order} max per 100-row page`] = maxPageWork;
+    const sorted = [...seen].sort(([a, x], [b, y]) =>
+      a === b ? (x < y ? -1 : x > y ? 1 : 0) : a < b ? -1 : 1,
+    );
+    expect(seen).toEqual(order === "asc" ? sorted : sorted.reverse());
+    expect(new Set(seen.map(([, key]) => key)).size).toBe(masked);
+  }
+  return { work, times };
+}
+
+it.each(["overwrite", "delete"] as const)(
+  "bounds owner page work by page size, not by keys a pending %s masks",
+  (mask) => {
+    const small = maskedPageWork(100, mask);
+    const large = maskedPageWork(3000, mask);
+    console.log(
+      JSON.stringify({ mask, masked100: small, masked3000: large }, null, 2),
+    );
+    for (const [read, visits] of Object.entries(large.work)) {
+      // Each of the two sources visits at most limit+1 rows, plus a few rows
+      // at the keyset seek boundary. Nothing grows with the masked count.
+      const limit = read.includes("100-row") ? 100 : 1;
+      expect(visits, read).toBeGreaterThan(0);
+      expect(visits, read).toBeLessThanOrEqual(2 * (limit + 1) + 4);
+      expect(visits, read).toBeLessThanOrEqual(small.work[read] + 4);
+    }
+  },
+  120_000,
+);

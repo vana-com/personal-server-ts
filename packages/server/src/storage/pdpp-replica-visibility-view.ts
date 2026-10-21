@@ -891,38 +891,56 @@ export function createReplicaVisibilityView(deps: {
     return preview ? "preview" : "canonical";
   }
   const unquarantined = (alias = "r") => deps.unquarantinedRecordSql(alias);
-  const notOverlaid = (alias = "r") =>
-    `NOT EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${alias}.instance AND v.stream=${alias}.stream AND v.record_key=${alias}.record_key)`;
+  const overlaid = (alias = "r") =>
+    `EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${alias}.instance AND v.stream=${alias}.stream AND v.record_key=${alias}.record_key)`;
+  const notOverlaid = (alias = "r") => `NOT ${overlaid(alias)}`;
   const canonicalJsonColumn = (alias = "r") =>
     `json_object('instance',${alias}.instance,'stream',${alias}.stream,'recordKey',${alias}.record_key,'data',json(${alias}.data),'version',${alias}.version,'emittedAt',${alias}.emitted_at,'deleted',json('false'))`;
   /**
    * Row sources of one mode, each an indexed keyset over (emitted_at, record_key).
-   * Preview merges canonical rows that have no overlay with present overlay rows.
+   * Preview merges canonical rows with present overlay rows. A canonical row
+   * that has an overlay row is `masked`: the overlay row replaces it. Masked
+   * rows stay in the keyset so a page can step over them within its window.
    */
   function sources(mode: Exclude<Mode, "hidden">, alias = "r") {
-    const columns = (json: string, origin: Mode) =>
-      `${alias}.instance,${alias}.stream,${alias}.record_key,${alias}.emitted_at,${json} AS row_json,'${origin}' AS origin`;
-    const canonicalSource = (extra: string) => ({
-      table: "pdpp_records",
-      columns: columns(canonicalJsonColumn(alias), "canonical"),
-      filter: `${unquarantined(alias)} AND ${alias}.deleted=0${extra}`,
+    const source = (
+      table: string,
+      json: string,
+      origin: Mode,
+      filter: string,
+      masked = "0",
+    ) => ({
+      table,
+      columns: `${alias}.instance,${alias}.stream,${alias}.record_key,${alias}.emitted_at,${json} AS row_json,'${origin}' AS origin,(${masked}) AS masked`,
+      filter,
+      masked,
     });
-    if (mode === "canonical") return [canonicalSource("")];
+    const canonicalSource = (masked?: string) =>
+      source(
+        "pdpp_records",
+        canonicalJsonColumn(alias),
+        "canonical",
+        `${unquarantined(alias)} AND ${alias}.deleted=0`,
+        masked,
+      );
+    if (mode === "canonical") return [canonicalSource()];
     if (mode === "local")
       return [
-        {
-          table: "pdpp_replica_local_view",
-          columns: columns(`${alias}.row_json`, "local"),
-          filter: `${unquarantined(alias)} AND ${alias}.deleted=0 AND ${localIdentitySql(alias)}`,
-        },
+        source(
+          "pdpp_replica_local_view",
+          `${alias}.row_json`,
+          "local",
+          `${unquarantined(alias)} AND ${alias}.deleted=0 AND ${localIdentitySql(alias)}`,
+        ),
       ];
     return [
-      canonicalSource(` AND ${notOverlaid(alias)}`),
-      {
-        table: "pdpp_replica_view",
-        columns: columns(`${alias}.row_json`, "preview"),
-        filter: `${unquarantined(alias)} AND ${alias}.present=1`,
-      },
+      canonicalSource(overlaid(alias)),
+      source(
+        "pdpp_replica_view",
+        `${alias}.row_json`,
+        "preview",
+        `${unquarantined(alias)} AND ${alias}.present=1`,
+      ),
     ];
   }
   function visibleRow(row: {
@@ -1076,30 +1094,44 @@ export function createReplicaVisibilityView(deps: {
             return `SELECT * FROM (SELECT ${source.columns} FROM ${source.table} r WHERE r.instance=? AND r.stream=? AND ${source.filter}${boundary} ORDER BY r.emitted_at ${dir},r.record_key ${dir} LIMIT ?)`;
           });
         });
+        // Each source contributes at most limit+1 keyset rows, masked ones
+        // included, so the merged window is exact and the work is bounded by
+        // the page size, not by how many canonical rows an overlay masks. A
+        // masked row and its overlay can share a position; the overlay sorts
+        // first, so a window boundary between them loses nothing.
         const rows = branches.length
           ? (db
               .prepare(
-                `SELECT * FROM (${branches.join(" UNION ALL ")}) ORDER BY emitted_at ${dir},record_key ${dir},instance ${dir} LIMIT ?`,
+                `SELECT * FROM (${branches.join(" UNION ALL ")}) ORDER BY emitted_at ${dir},record_key ${dir},instance ${dir},masked ASC LIMIT ?`,
               )
               .all(...params, options.limit + 1) as {
+              instance: string;
+              record_key: string;
+              emitted_at: string;
               row_json: string;
               origin: Mode;
+              masked: number;
             }[])
           : [];
-        const data = rows.slice(0, options.limit).map((raw) => {
-          const row = visibleRow(raw);
-          return options.fields && !row.deleted
-            ? {
-                ...row,
-                data: Object.fromEntries(
-                  options.fields
-                    .filter((field) => field in row.data)
-                    .map((field) => [field, row.data[field]]),
-                ),
-              }
-            : row;
-        });
-        const last = data[data.length - 1],
+        // The page may hold fewer than `limit` rows; the cursor then continues
+        // after the last consumed position, visible or masked.
+        const consumed = rows.slice(0, options.limit);
+        const data = consumed
+          .filter((raw) => !raw.masked)
+          .map((raw) => {
+            const row = visibleRow(raw);
+            return options.fields && !row.deleted
+              ? {
+                  ...row,
+                  data: Object.fromEntries(
+                    options.fields
+                      .filter((field) => field in row.data)
+                      .map((field) => [field, row.data[field]]),
+                  ),
+                }
+              : row;
+          });
+        const last = consumed[consumed.length - 1],
           hasMore = rows.length > options.limit;
         return {
           data,
@@ -1116,8 +1148,8 @@ export function createReplicaVisibilityView(deps: {
                   instanceIds: ids,
                   instance: last.instance,
                   order: options.order,
-                  sortValue: last.emittedAt,
-                  recordKey: last.recordKey,
+                  sortValue: last.emitted_at,
+                  recordKey: last.record_key,
                   horizon: String(value),
                 })
               : undefined,
@@ -1165,7 +1197,7 @@ export function createReplicaVisibilityView(deps: {
           (
             db
               .prepare(
-                `SELECT r.emitted_at FROM ${source.table} r WHERE r.instance=? AND r.stream=? AND ${source.filter} ORDER BY r.emitted_at DESC,r.record_key DESC LIMIT 1`,
+                `SELECT r.emitted_at FROM ${source.table} r WHERE r.instance=? AND r.stream=? AND ${source.filter} AND NOT (${source.masked}) ORDER BY r.emitted_at DESC,r.record_key DESC LIMIT 1`,
               )
               .get(instance, stream) as { emitted_at: string } | undefined
           )?.emitted_at ?? null,
