@@ -4,7 +4,7 @@ import { DataBlockStorageError } from "./errors.js";
 import { selectScopeBlocksByIds } from "./select.js";
 import { manifestBinding, verifyStoredBlock } from "./digest.js";
 import {
-  blockRepresentationId,
+  blockRepresentationMetadata,
   representBlock,
   pageBlock,
   type BlockRepresentation,
@@ -37,7 +37,7 @@ export async function readManifestScopeBlocks(
   };
   const { scope, collectedAt } = manifest;
   const representation = options.representation ?? "stored";
-  const representationId = blockRepresentationId(
+  const { representationId } = blockRepresentationMetadata(
     manifest,
     representation,
     options.cursorView,

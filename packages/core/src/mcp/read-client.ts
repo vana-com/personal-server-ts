@@ -513,7 +513,10 @@ export function createMcpDataReadClient(
             });
           }
         }
-        const read = await storage.readScopeBlocks(
+        const blockStorage = isOwnerView(admission.authResult)
+          ? options.dataApiDeps.storage
+          : storage;
+        const read = await blockStorage.readScopeBlocks!(
           scope,
           selectedEntry.collectedAt,
           {
@@ -630,13 +633,24 @@ export function createMcpDataReadClient(
       authorizeGranteeVersion(selectedEntry);
 
       let manifest;
+      let admission: Awaited<ReturnType<typeof authorizeScopeRead>>;
       let pinned: PinnedVersion;
       try {
         pinned = pinnedVersion(
           scope,
           await establishVersion(storage, selectedEntry),
         );
-        manifest = await storage.readBlockManifest(
+        admission = await authorizeScopeRead({
+          scope,
+          grantId,
+          fileId: selectedEntry.fileId ?? undefined,
+          at: selectedEntry.collectedAt,
+          metadataOnly: true,
+        });
+        const manifestStorage = isOwnerView(admission.authResult)
+          ? options.dataApiDeps.storage
+          : storage;
+        manifest = await manifestStorage.readBlockManifest!(
           scope,
           selectedEntry.collectedAt,
           { generation: pinned.generation },
@@ -647,13 +661,7 @@ export function createMcpDataReadClient(
         }
         throw err;
       }
-      const { request, authResult } = await authorizeScopeRead({
-        scope,
-        grantId,
-        fileId: selectedEntry.fileId ?? undefined,
-        at: selectedEntry.collectedAt,
-        metadataOnly: true,
-      });
+      const { request, authResult } = admission;
       // Logged like any other grant-gated read, but never reported as a read
       // fulfillment: a table of contents carries no block values.
       await writeReadAccessLog(request, { scope, grantId, authResult });
@@ -667,7 +675,12 @@ export function createMcpDataReadClient(
           blockIndex: 0,
           representationId:
             manifest.representationId ??
-            blockRepresentationId(manifest, "grantee"),
+            blockRepresentationId(
+              manifest,
+              isOwnerView(authResult) ? "stored" : "grantee",
+              manifest.cursorView,
+            ),
+          ...(manifest.cursorView ? { view: manifest.cursorView } : {}),
         }),
         pinned,
       );

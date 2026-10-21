@@ -16,8 +16,30 @@ export function blockRepresentationId(
     serialization: "utf8-json-v2",
     representation,
     view: view ?? null,
-    manifest: { ...manifest, representationId: undefined },
+    manifest: {
+      ...manifest,
+      representationId: undefined,
+      cursorView: undefined,
+    },
   });
+}
+
+/** Identical identity and view evidence for tables of contents and payload pages. */
+export function blockRepresentationMetadata(
+  manifest: DataBlockManifest,
+  representation: BlockRepresentation,
+  cursorView?: string,
+): Pick<DataBlockManifest, "representationId" | "cursorView"> & {
+  representationId: string;
+} {
+  return {
+    representationId: blockRepresentationId(
+      manifest,
+      representation,
+      cursorView,
+    ),
+    ...(cursorView ? { cursorView } : {}),
+  };
 }
 
 /** Called only after the full stored block has passed its digest check. */
