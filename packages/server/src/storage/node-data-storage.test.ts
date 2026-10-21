@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { tmpdir } from "node:os";
 import type Database from "better-sqlite3";
 import { initializeDatabase } from "./index-schema.js";
@@ -103,6 +103,107 @@ describe("owner import deletion ordering", () => {
       });
     } finally {
       index2.close();
+      index.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("an unrecoverable prepared import", () => {
+  it("does not block writes, replays or startup for other scopes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "import-recovery-isolation-"));
+    const dataDir = join(root, "data");
+    const dbPath = join(root, "index.db");
+    const db = initializeDatabase(dbPath);
+    const index = createIndexManager(db);
+    const storage = createNodeDataStorage({
+      indexManager: index,
+      hierarchyOptions: { dataDir },
+    });
+    const intent = (value: string) => ({
+      authority: "local",
+      owner: "owner",
+      operation: value.repeat(64),
+      bodySha256: value.repeat(64),
+    });
+    const append = (scope: string, value: string) => ({
+      kind: "append" as const,
+      envelope: createDataFileEnvelope(scope, "2026-10-11T00:00:00Z", {
+        value,
+      }),
+      metadata: {},
+      import: intent(value),
+    });
+    let reopened: ReturnType<typeof createIndexManager> | undefined;
+    try {
+      const healthy = await storage.commitVersion!(
+        append("healthy.scope", "h"),
+      );
+      if (healthy.kind !== "stored") throw new Error("Import was not stored");
+
+      // A crash left scope "broken.scope" prepared, and its target path now
+      // holds different bytes, so publishing the prepared envelope throws.
+      const broken = createDataFileEnvelope(
+        "broken.scope",
+        "2026-10-11T00:00:00Z",
+        { value: "p" },
+      );
+      const brokenPath = buildDataFilePath(
+        dataDir,
+        broken.scope,
+        broken.collectedAt,
+      );
+      await mkdir(dirname(brokenPath), { recursive: true });
+      await writeFile(brokenPath, "different bytes");
+      db.prepare(
+        `INSERT INTO owner_import_operations (authority, owner, scope, operation, body_sha256, state, collected_at, path, envelope_bytes, metadata_json)
+        VALUES ('local', 'owner', @scope, @operation, @sha, 'prepared', @collectedAt, @path, @bytes, '{}')`,
+      ).run({
+        scope: broken.scope,
+        operation: "p".repeat(64),
+        sha: "p".repeat(64),
+        collectedAt: broken.collectedAt,
+        path: relative(dataDir, brokenPath),
+        bytes: Buffer.from(JSON.stringify(broken)),
+      });
+
+      expect(
+        await storage.commitVersion!(append("healthy.scope", "h")),
+      ).toMatchObject({
+        kind: "replay",
+        receipt: healthy.receipt,
+      });
+      expect(
+        await storage.commitVersion!(append("other.scope", "o")),
+      ).toMatchObject({ kind: "stored" });
+      expect(
+        await storage.commitVersion!({
+          kind: "replica",
+          envelope: createDataFileEnvelope(
+            "replica.scope",
+            "2026-10-12T00:00:00Z",
+            {
+              value: "r",
+            },
+          ),
+          metadata: { schemaId: null, dataPointId: "dp-1", version: 1 },
+        }),
+      ).toMatchObject({ kind: "stored" });
+
+      // The broken operation itself keeps failing visibly on retry.
+      await expect(
+        storage.commitVersion!(append("broken.scope", "p")),
+      ).rejects.toThrow("conflicts with publication");
+
+      reopened = createIndexManager(initializeDatabase(dbPath));
+      expect(() =>
+        createNodeDataStorage({
+          indexManager: reopened!,
+          hierarchyOptions: { dataDir },
+        }),
+      ).not.toThrow();
+    } finally {
+      reopened?.close();
       index.close();
       await rm(root, { recursive: true, force: true });
     }
