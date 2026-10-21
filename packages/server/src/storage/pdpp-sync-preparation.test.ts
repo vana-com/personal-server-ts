@@ -25,9 +25,8 @@ type Inspectable = PdppRecordStore & {
   };
 };
 
-/** SQLite with every statement's returned rows and SQL recorded. */
-function countingSqlite() {
-  const db = new Database(":memory:");
+/** SQLite with every statement's returned rows, writes and SQL recorded. */
+function countingSqlite(db = new Database(":memory:")) {
   const work = { rows: 0, statements: 0, sql: new Set<string>() };
   const prepare = db.prepare.bind(db);
   db.prepare = ((sql: string) => {
@@ -41,9 +40,17 @@ function countingSqlite() {
     };
     const get = statement.get.bind(statement);
     const all = statement.all.bind(statement);
+    const run = statement.run.bind(statement);
     const iterate = statement.iterate.bind(statement);
     return Object.assign(statement, {
       get: (...args: unknown[]) => count(get(...args)),
+      run: (...args: unknown[]) => {
+        const result = run(...args);
+        work.statements += 1;
+        work.sql.add(sql);
+        work.rows += result.changes;
+        return result;
+      },
       all: (...args: unknown[]) => count(all(...args)),
       iterate: function* (...args: unknown[]) {
         work.statements += 1;
@@ -92,13 +99,16 @@ function drain(
   const seen: string[] = [];
   let retries = 0;
   let cursor: string | undefined;
-  for (let n = 0; n < 10_000; n++) {
+  for (let n = 0; n < 2_000; n++) {
     between();
     try {
       const page = sync.read({ ...base, cursor });
       seen.push(...page.data.map((r) => `${r.recordKey}=${r.data?.v}`));
-      if (!page.nextCursor)
+      if (!page.nextCursor) {
+        // Measures the last request too.
+        between();
         return { seen, retries, checkpoint: page.nextChangesSince! };
+      }
       cursor = page.nextCursor;
     } catch (err) {
       if (!(err instanceof SyncRetryLaterError)) throw err;
@@ -374,6 +384,196 @@ for (const backend of ["memory", "sqlite"])
         expect(drain(sync, { ...request(), limit: 100 }).seen).toHaveLength(
           100,
         );
+      } finally {
+        store.close();
+      }
+    });
+  });
+
+/** CPU time one call takes, in microseconds. */
+function cpu(fn: () => void): number {
+  const start = process.cpuUsage();
+  fn();
+  const used = process.cpuUsage(start);
+  return used.user + used.system;
+}
+
+describe("sqlite physical sync work", () => {
+  it("costs the same per request whatever one key's version count", () => {
+    const perRequest = (versions: number) => {
+      const store = createTestBoundRecordStore(
+        new Database(":memory:"),
+      ) as unknown as Inspectable;
+      try {
+        put(store, ["a"], "1");
+        for (let n = 0; n < versions; n++) put(store, ["hot"], String(n));
+        put(store, ["z"], "1");
+        const sync = createPdppSyncSessionService(store, {
+          maxExaminedPerRequest: 20,
+        });
+        const costs: number[] = [];
+        let cursor: string | undefined;
+        for (let n = 0; n < 10_000; n++) {
+          let page;
+          const used = cpu(() => {
+            try {
+              page = sync.read({ ...request(), limit: 1, cursor });
+            } catch (err) {
+              if (!(err instanceof SyncRetryLaterError)) throw err;
+            }
+          });
+          costs.push(used);
+          if (page) {
+            cursor = (page as { nextCursor?: string }).nextCursor;
+            if (!cursor) break;
+          }
+        }
+        // The costliest request after the first, which also prepares the
+        // store's statements: the one that walks past the hot key.
+        return Math.max(...costs.slice(1));
+      } finally {
+        store.close();
+      }
+    };
+    const few = perRequest(200);
+    const many = perRequest(50_000);
+    // 250 times the versions; a bounded request costs about the same.
+    expect(many).toBeLessThan(few * 3);
+  }, 120_000);
+});
+
+for (const backend of ["memory", "sqlite"])
+  describe(`${backend} sync progress past what a grant does not read`, () => {
+    const create = (): Inspectable =>
+      (backend === "memory"
+        ? createMemoryRecordStore()
+        : createTestBoundRecordStore(
+            new Database(":memory:"),
+          )) as unknown as Inspectable;
+    const write = (store: PdppRecordStore, instance: string, key: string) =>
+      store.ingestBatch(
+        [
+          {
+            instance,
+            stream: "events",
+            key,
+            data: { id: key, v: "1" },
+            emitted_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+      );
+
+    for (const candidate of [false, true])
+      it.each(["asc", "desc"] as const)(
+        `finishes past long runs of another instance's keys (%s, ${candidate ? "candidate" : "current"})`,
+        (order) => {
+          const store = create();
+          try {
+            // Ten ungranted keys before, between and after the granted ones.
+            for (const [prefix, granted] of [
+              ["a", false],
+              ["b", true],
+              ["c", false],
+              ["d", true],
+              ["e", false],
+            ] as const)
+              for (let n = 0; n < 10; n++)
+                write(
+                  store,
+                  granted ? "inst_1" : "inst_other",
+                  `${prefix}${n}`,
+                );
+            const sync = createPdppSyncSessionService(store, {
+              maxExaminedPerRequest: 2,
+            });
+            const base = {
+              stream: "events",
+              owner: "owner-a",
+              instanceIds: ["inst_1"],
+              limit: 100,
+              ...(candidate && { candidate: { binding: "g", order } }),
+            };
+            const { seen } = drain(sync, base as never);
+            expect(seen).toHaveLength(20);
+          } finally {
+            store.close();
+          }
+        },
+      );
+
+    it("charges the one-record-per-key check across many instances to the budget", () => {
+      if (backend === "memory") return;
+      const { store, work } = countingSqlite();
+      try {
+        const instances = Array.from({ length: 30 }, (_, i) => `inst_${i}`);
+        for (const instance of instances)
+          for (let n = 0; n < 5; n++)
+            store.ingestBatch(
+              [
+                {
+                  instance,
+                  stream: "events",
+                  key: `${instance}-k${n}`,
+                  data: { id: `${instance}-k${n}` },
+                  emitted_at: "2026-01-01T00:00:00Z",
+                },
+              ],
+              () => "mutable_state",
+              () => ["id"],
+            );
+        const sync = createPdppSyncSessionService(store, {
+          maxExaminedPerRequest: 10,
+        });
+        // A probe that finds nothing returns no row: count statements.
+        const perRequest: number[] = [];
+        work.statements = 0;
+        drain(
+          sync,
+          {
+            stream: "events",
+            owner: "o",
+            instanceIds: instances,
+            limit: 100,
+            oneRecordPerKey: true,
+          } as never,
+          () => {
+            perRequest.push(work.statements);
+            work.statements = 0;
+          },
+        );
+        expect(Math.max(...perRequest)).toBeLessThanOrEqual(5 * 10 + 60);
+      } finally {
+        store.close();
+      }
+    });
+
+    it("refuses a finished preparation once it expires, even while a paused scan lives", () => {
+      const store = create();
+      try {
+        put(store, keys(30), "1");
+        const first = drain(createPdppSyncSessionService(store), {
+          ...request(),
+          limit: 100,
+        });
+        put(store, keys(30), "2");
+        let now = 1_000_000;
+        const sync = createPdppSyncSessionService(store, {
+          now: () => now,
+          pageTtlMs: 1_000,
+          scanTtlMs: 600_000,
+          maxExaminedPerRequest: 40,
+        });
+        const session = {
+          ...request(),
+          limit: 100,
+          changesSince: first.checkpoint,
+        };
+        // Preparation finishes; the walk pauses with its scan saved.
+        expect(() => sync.read(session)).toThrow(SyncRetryLaterError);
+        now += 2_000; // the preparation has expired; the paused scan has not
+        expect(() => sync.read(session)).toThrow(CursorExpiredError);
       } finally {
         store.close();
       }

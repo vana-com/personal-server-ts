@@ -1628,3 +1628,49 @@ describe("v15 sync session state table", () => {
     }
   });
 });
+
+describe("upgrade from v15 with live sync state", () => {
+  it("keeps outstanding session state and adds the preparation tables", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-v15-up-"));
+    const path = join(dir, "records.db");
+    try {
+      const before = new Database(path);
+      const store = createTestBoundRecordStore(before);
+      store.syncStates().put({
+        id: "live",
+        owner: "o",
+        state: '{"r":"checkpoint"}',
+        expiresAt: 10_000,
+        now: 1,
+        maxPerOwner: 10,
+      });
+      // A v15 database: no preparation tables or deletion index yet.
+      before.exec(`
+        DROP TABLE IF EXISTS pdpp_sync_candidate;
+        DROP TABLE IF EXISTS pdpp_sync_preparation;
+        DROP INDEX IF EXISTS idx_pdpp_record_changes_deleted;
+        UPDATE pdpp_schema_version SET version = 15;
+      `);
+      before.close();
+
+      const after = new Database(path);
+      try {
+        const upgraded = createSqliteRecordStore(after);
+        expect(upgraded.syncStates().get("live", 2)).toBe('{"r":"checkpoint"}');
+        expect(upgraded.inspectSyncState()).toMatchObject({
+          preparations: 0,
+          candidates: 0,
+        });
+        upgraded.close();
+        // Reopening at the current version changes nothing.
+        const again = createSqliteRecordStore(new Database(path));
+        expect(again.syncStates().get("live", 2)).toBe('{"r":"checkpoint"}');
+        again.close();
+      } finally {
+        if (after.open) after.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
