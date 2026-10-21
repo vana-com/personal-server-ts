@@ -157,9 +157,16 @@ function copy(input: {
   text: string;
   seed: number;
   fragments?: number;
+  blob?: Uint8Array;
 }) {
   const writer = input.writer ?? "w1";
   const connection = input.connection ?? "conn_x";
+  const blob = input.blob && {
+    blobId: `sha256:${createHash("sha256").update(input.blob).digest("hex")}`,
+    mimeType: "text/plain",
+    sizeBytes: input.blob.length,
+  };
+  const descriptor = blob && { ...blob, sha256: blob.blobId };
   const envelope = {
     format: "vana-pdpp-replica" as const,
     version: 1 as const,
@@ -167,7 +174,35 @@ function copy(input: {
     batchId: input.batch,
     operations: [
       registration(connection, writer),
-      upsert(connection, input.text, 10 + input.seed, writer),
+      ...(descriptor
+        ? [
+            {
+              ...registration(connection, writer),
+              kind: "blob-claim",
+              blob: descriptor,
+              revision: {
+                counter: 5 + input.seed,
+                writerId: writer,
+                operationId: `claim-${writer}-${input.text}`,
+              },
+            } as ReplicaOperation,
+          ]
+        : []),
+      descriptor
+        ? ({
+            ...upsert(connection, input.text, 10 + input.seed, writer),
+            blobs: [descriptor],
+            data: {
+              id: "a",
+              text: input.text,
+              blob_ref: {
+                blob_id: descriptor.blobId,
+                mime_type: "text/plain",
+                size_bytes: descriptor.sizeBytes,
+              },
+            },
+          } as ReplicaOperation)
+        : upsert(connection, input.text, 10 + input.seed, writer),
     ],
   };
   const fragments = Array.from({ length: input.fragments ?? 2 }, (_, i) => ({
@@ -175,6 +210,10 @@ function copy(input: {
     metadataHash: hex(input.seed * 1000 + i * 2 + 2),
   }));
   return {
+    blobBytes:
+      input.blob && blob
+        ? [{ blobId: blob.blobId, bytes: input.blob }]
+        : undefined,
     id: canonicalJson([writer, input.batch]),
     writer,
     batch: input.batch,
@@ -208,6 +247,7 @@ const stage = (d: ReturnType<typeof device>, c: Copy) =>
       envelope: c.envelope,
       fragments: c.fragments,
     },
+    blobs: c.blobBytes,
   });
 let block = 100n;
 /** A verified fact proving (or, with `of`, disproving) every fragment of `c`. */
@@ -276,6 +316,41 @@ describe("copy staging and the pending preview (§3, §7.2, B)", () => {
     });
     expect(d.read("conn_x", "owner")).toEqual([]);
     expect(d.read("conn_x", "grant")).toEqual([]);
+  });
+
+  it("the legacy pending table holds at most one row per id; a second valid copy withdraws it in the same transaction", () => {
+    const d = device();
+    const a = copy({ batch: "b1", text: "A", seed: 1 });
+    const b = copy({ batch: "b1", text: "B", seed: 2 });
+    const pendingRows = () =>
+      d.db
+        .prepare(
+          "SELECT id, state FROM pdpp_replica_pending_batches WHERE id=?",
+        )
+        .all(a.id);
+    stage(d, a);
+    stage(d, a);
+    expect(pendingRows()).toEqual([{ id: a.id, state: "pending" }]);
+    // A failure late in the second copy's transaction, after the preview row
+    // is withdrawn, rolls back the copy and the withdrawal together.
+    d.db.exec(
+      "CREATE TEMP TRIGGER interrupt AFTER UPDATE ON pdpp_replica_pending_batches WHEN NEW.state <> 'pending' BEGIN SELECT RAISE(ABORT,'interrupt'); END",
+    );
+    expect(() => stage(d, b)).toThrow("interrupt");
+    expect(pendingRows()).toEqual([{ id: a.id, state: "pending" }]);
+    expect(d.receiver.copies.list(a.id)).toHaveLength(1);
+    expect(d.read("conn_x", "owner")).toEqual(["A"]);
+    d.db.exec("DROP TRIGGER interrupt");
+    stage(d, b);
+    expect(pendingRows()).toEqual([{ id: a.id, state: "quarantined" }]);
+    expect(
+      d.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_replica_pending_batches WHERE state='pending' GROUP BY id HAVING n>1",
+        )
+        .all(),
+    ).toEqual([]);
+    expect(d.read("conn_x", "owner")).toEqual([]);
   });
 
   it("a bare promote with two retained copies is refused", () => {
@@ -710,5 +785,90 @@ describe("evidence authority (F2)", () => {
     expect(() => d.db.exec("DELETE FROM pdpp_replica_finalized_facts")).toThrow(
       "append-only",
     );
+  });
+});
+
+describe("terminal withdrawal hides by the quarantine predicate only", () => {
+  function terminalAfterPromotion(d: ReturnType<typeof device>, a: Copy) {
+    stage(d, a);
+    prove(d, a);
+    promote(d, a);
+    prove(d, a, { of: copy({ batch: "b1", text: "B", seed: 2 }) });
+    d.receiver.copies.apply({
+      credential,
+      id: a.id,
+      decision: d.receiver.copies.decide(a.id, { attempts: 0, budget: 5 }),
+    });
+  }
+
+  it("(a) no reader receives the withdrawn connection through point, page, changes (fresh or resumed), blob or completion reads", () => {
+    const d = device();
+    const bytes = new TextEncoder().encode("attachment");
+    const a = copy({ batch: "b1", text: "A", seed: 1, blob: bytes });
+    stage(d, a);
+    prove(d, a);
+    promote(d, a);
+    const blobId = a.blobBytes![0]!.blobId;
+    expect(
+      d.receiver.readStore({ reader: "grant" }).getBlobBytes(blobId),
+    ).toEqual(bytes);
+    const options = { instanceIds: ["conn_x"], limit: 100 };
+    const sessions = Object.fromEntries(
+      (["owner", "grant"] as const).map((reader) => [
+        reader,
+        d.receiver.readStore({ reader }).changesSince("messages", options)
+          .nextChangesSince,
+      ]),
+    );
+    prove(d, a, { of: copy({ batch: "b1", text: "B", seed: 2 }) });
+    d.receiver.copies.apply({
+      credential,
+      id: a.id,
+      decision: d.receiver.copies.decide(a.id, { attempts: 0, budget: 5 }),
+    });
+    for (const reader of ["owner", "grant"] as const) {
+      const read = d.receiver.readStore({ reader });
+      expect(read.getRecord("conn_x", "messages", "a")).toBeUndefined();
+      expect(read.listRecords("messages", options).data).toEqual([]);
+      expect(read.changesSince("messages", options).data).toEqual([]);
+      expect(() =>
+        read.changesSince("messages", {
+          ...options,
+          changesSince: sessions[reader],
+        }),
+      ).toThrow(CursorExpiredError);
+      expect(read.getBlobBytes(blobId)).toBeUndefined();
+      expect(read.listStreamCompletions("conn_x")).toEqual([]);
+    }
+  });
+
+  it("(b) the terminal transition writes no canonical tombstones, so a binding-conflicted owner's local rows survive it", () => {
+    const d = device();
+    const a = copy({ batch: "b1", text: "A", seed: 1 });
+    stage(d, a);
+    prove(d, a);
+    promote(d, a);
+    d.store.markReplicaBindingConflict({
+      connectionId: "conn_x",
+      reason: "source_binding_conflict",
+      evidence: {},
+    });
+    const history = d.db
+      .prepare("SELECT * FROM pdpp_record_changes ORDER BY rowid")
+      .all();
+    terminalAfterPromotion(d, copy({ batch: "b1", text: "A", seed: 1 }));
+    expect(
+      d.db
+        .prepare(
+          "SELECT deleted, json_extract(data,'$.text') AS text FROM pdpp_records WHERE instance='conn_x'",
+        )
+        .all(),
+    ).toEqual([{ deleted: 0, text: "A" }]);
+    expect(
+      d.db.prepare("SELECT * FROM pdpp_record_changes ORDER BY rowid").all(),
+    ).toEqual(history);
+    // Connection quarantine dominates the conflicted state for both readers.
+    expect(d.read("conn_x", "owner")).toEqual([]);
+    expect(d.read("conn_x", "grant")).toEqual([]);
   });
 });

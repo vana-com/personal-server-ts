@@ -1008,7 +1008,12 @@ export function createReplicaReceiver(deps: {
         })),
       });
     },
-    quarantineConnection: withdrawConnection,
+    // Contract A: withdrawal through the one eligibility predicate only.
+    // No canonical tombstones: they would destroy the rows a lifted
+    // quarantine, or a conflicted owner's local projection, still needs.
+    quarantineConnection(instance) {
+      quarantineConnection(instance);
+    },
     preview: {
       show(id, envelope, blobsJson) {
         const encoded = canonicalJson(envelope);
