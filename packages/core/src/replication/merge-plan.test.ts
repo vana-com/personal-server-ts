@@ -643,6 +643,50 @@ describe("replica policy v3 vectors", () => {
     expect(marker.erasedPayloads).toContainEqual(
       expect.objectContaining({ operationId: "resolution-payload" }),
     );
+    const alternateHash = `sha256:${"e".repeat(64)}`;
+    const markerWithoutFinality = {
+      ...marker,
+      erasedPayloads: marker.erasedPayloads
+        .map((payload) => ({
+          ...payload,
+          finalizedAt: null,
+        }))
+        .concat({
+          writerId: "A",
+          operationId: "old",
+          contentHash: alternateHash,
+          observedAt: old.emittedAt,
+          finalizedAt: null,
+        }),
+    };
+    const replayedWithFinality = planReplicaMerge(
+      {
+        ...context,
+        declarations: [declaration],
+        now: T0 + OWNER_DELETE_GRACE_PERIOD_MS + 2,
+        finalizedAt: () => T0,
+        suppressionMarkers: [markerWithoutFinality],
+      },
+      [registration, old, del],
+    );
+    expect(
+      replayedWithFinality.records[0].suppressionMarker?.erasedPayloads,
+    ).toContainEqual(
+      expect.objectContaining({
+        operationId: "old",
+        contentHash: old.contentHash,
+        finalizedAt: T0,
+      }),
+    );
+    expect(
+      replayedWithFinality.records[0].suppressionMarker?.erasedPayloads,
+    ).toContainEqual(
+      expect.objectContaining({
+        operationId: "old",
+        contentHash: alternateHash,
+        finalizedAt: null,
+      }),
+    );
     const compactedResolutionReload = planReplicaMerge(
       {
         ...context,

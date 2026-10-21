@@ -69,24 +69,19 @@ export interface MergedRecord {
   payloadRetained: boolean;
   suppressionMarker: SuppressionMarker | null;
 }
+type SuppressionPayloadEvidence = {
+  writerId: string;
+  operationId: string;
+  contentHash: string;
+  observedAt: string;
+  finalizedAt: number | null;
+};
 export interface SuppressionMarker {
   identity: RecordIdentity;
   /** Payload-bearing operations compacted by the retention transaction. */
   erasedOperations: OperationReference[];
-  erasedPayloads: {
-    writerId: string;
-    operationId: string;
-    contentHash: string;
-    observedAt: string;
-    finalizedAt: number | null;
-  }[];
-  observations: {
-    writerId: string;
-    operationId: string;
-    contentHash: string;
-    observedAt: string;
-    finalizedAt: number | null;
-  }[];
+  erasedPayloads: SuppressionPayloadEvidence[];
+  observations: SuppressionPayloadEvidence[];
   removals: {
     writerId: string;
     operationId: string;
@@ -1012,28 +1007,14 @@ function mergeRecord(
                   (other) => referenceKey(other) === referenceKey(reference),
                 ) === index,
             ),
-          erasedPayloads: [
-            ...(retainedMarker?.erasedPayloads ?? []),
-            ...newlyErasedPayloads,
-          ]
-            .sort((a, b) => text(referenceKey(a), referenceKey(b)))
-            .filter(
-              (payload, index, allPayloads) =>
-                allPayloads.findIndex(
-                  (other) => referenceKey(other) === referenceKey(payload),
-                ) === index,
-            ),
-          observations: [
-            ...(retainedMarker?.observations ?? []),
-            ...markerObservations,
-          ]
-            .sort((a, b) => text(referenceKey(a), referenceKey(b)))
-            .filter(
-              (observation, index, all) =>
-                all.findIndex(
-                  (other) => referenceKey(other) === referenceKey(observation),
-                ) === index,
-            ),
+          erasedPayloads: mergeSuppressionEvidence(
+            retainedMarker?.erasedPayloads ?? [],
+            newlyErasedPayloads,
+          ),
+          observations: mergeSuppressionEvidence(
+            retainedMarker?.observations ?? [],
+            markerObservations,
+          ),
           removals: [
             ...(retainedMarker?.removals ?? []),
             ...purgedDeletes.map((op) => ({
@@ -1353,6 +1334,48 @@ function payloadReferencesToErase(
     )
     .map(operationReferenceOf)
     .sort((a, b) => text(referenceKey(a), referenceKey(b)));
+}
+function mergeSuppressionEvidence(
+  ...groups: readonly (readonly SuppressionPayloadEvidence[])[]
+): SuppressionPayloadEvidence[] {
+  const byEvidence = new Map<
+    string,
+    {
+      evidence: Omit<SuppressionPayloadEvidence, "finalizedAt">;
+      finalizedAt: Set<number>;
+    }
+  >();
+  for (const item of groups.flat()) {
+    const key = canonicalJson([
+      referenceKey(item),
+      item.contentHash,
+      item.observedAt,
+    ]);
+    let entry = byEvidence.get(key);
+    if (!entry) {
+      entry = {
+        evidence: {
+          writerId: item.writerId,
+          operationId: item.operationId,
+          contentHash: item.contentHash,
+          observedAt: item.observedAt,
+        },
+        finalizedAt: new Set(),
+      };
+      byEvidence.set(key, entry);
+    }
+    if (item.finalizedAt !== null) entry.finalizedAt.add(item.finalizedAt);
+  }
+  const merged: SuppressionPayloadEvidence[] = [];
+  for (const { evidence, finalizedAt } of byEvidence.values()) {
+    if (finalizedAt.size) {
+      for (const value of finalizedAt)
+        merged.push({ ...evidence, finalizedAt: value });
+    } else {
+      merged.push({ ...evidence, finalizedAt: null });
+    }
+  }
+  return merged.sort((a, b) => text(canonicalJson(a), canonicalJson(b)));
 }
 function sameRecordScope(a: RecordOperation, b: ReplicaOperation): boolean {
   return (
