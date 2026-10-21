@@ -51,7 +51,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 3;
+const VIEW_SCHEMA = 4;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -125,6 +125,10 @@ export function createReplicaVisibilityView(deps: {
   // record operations outside this predicate cannot change the owner preview.
   const touches = (instance: string, stream: string, key: string) =>
     `(EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${instance} AND v.stream=${stream} AND v.record_key=${key}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_pending p WHERE p.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_conflicts c WHERE c.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=${instance} AND b.deleted_at IS NOT NULL))`;
+  // Upserts that reference any of `blobIds` (a SQL value list or subquery),
+  // restricted to keys that can have an overlay row.
+  const markBlobDependents = (blobIds: string) =>
+    `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT DISTINCT o.instance,o.stream,o.record_key FROM pdpp_replica_view_operations o WHERE o.blob_id IN (${blobIds}) AND o.kind='upsert' AND o.record_key IS NOT NULL AND ${touches("o.instance", "o.stream", "o.record_key")};`;
   const markKey = (alias: string) =>
     `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT ${alias}.instance,${alias}.stream,${alias}.record_key WHERE ${touches(`${alias}.instance`, `${alias}.stream`, `${alias}.record_key`)};`;
 
@@ -208,6 +212,20 @@ export function createReplicaVisibilityView(deps: {
         -- Binding and lifecycle changes expire every stream cursor of the connection.
         UPDATE pdpp_replica_view_streams SET revision=revision+1 WHERE instance=NEW.instance;
         INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections VALUES (NEW.instance);
+      END;
+      -- Blob bytes decide whether an upsert that references them is visible. Bytes
+      -- can arrive or leave without any new record operation (a replayed claim,
+      -- another connection's import, another pending batch), so their arrival
+      -- and removal mark every dependent key the view can reach.
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_received AFTER INSERT ON pdpp_replica_received_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_received_delete AFTER DELETE ON pdpp_replica_received_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_canonical AFTER INSERT ON pdpp_blob_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_canonical_delete AFTER DELETE ON pdpp_blob_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_pending AFTER INSERT ON pdpp_replica_pending_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_pending_delete AFTER DELETE ON pdpp_replica_pending_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
+      -- Pending bytes count only while their batch is pending.
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_batch AFTER UPDATE OF state ON pdpp_replica_pending_batches WHEN NEW.state IS NOT OLD.state BEGIN
+        ${markBlobDependents("SELECT blob_id FROM pdpp_replica_pending_bytes WHERE batch_id=NEW.id")}
       END;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_insert AFTER INSERT ON pdpp_replica_view BEGIN
         INSERT INTO pdpp_replica_view_streams VALUES (1,NEW.instance,NEW.stream,NEW.live-NEW.base_live,NEW.present-NEW.base_live,NEW.pending,NULL,1)

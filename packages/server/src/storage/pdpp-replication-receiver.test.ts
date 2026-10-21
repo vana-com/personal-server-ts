@@ -1503,6 +1503,189 @@ it("policy gates pending binary metadata, bytes and reverse references until pro
   ).toEqual([]);
 });
 
+for (const delivery of ["replayed claim", "unrelated connection"] as const)
+  it(`re-derives a pending blob record when its bytes arrive later (${delivery})`, () => {
+    const source = device(),
+      target = device();
+    for (const d of [source, target])
+      d.store.registerConnection({
+        instance: "conn_b",
+        sourceId,
+        method: "collector",
+        label: "B",
+      });
+    const bytes = new Uint8Array([4, 2, 4, 2]);
+    const store = (instance: string) =>
+      source.store.storeBlobBytesForInstance({
+        instance,
+        method: "collector",
+        generation: 1,
+        bytes,
+        mimeType: "application/octet-stream",
+      });
+    const blob = store("conn_a");
+    expect(store("conn_b")).toEqual(blob);
+    const ref = {
+      blob_id: blob.blobId,
+      sha256: blob.sha256,
+      size_bytes: blob.sizeBytes,
+      mime_type: blob.mimeType,
+    };
+    const ingest = (instance: string, rows: Record<string, unknown>[]) =>
+      source.store.ingestBatch(
+        rows.map((data) => ({
+          instance,
+          stream: "messages",
+          key: data.id as string,
+          emitted_at: at,
+          data,
+        })),
+        () => "mutable_state",
+        () => ["id"],
+        { method: "collector", generation: 1 },
+      );
+    ingest("conn_a", [
+      { id: "a", text: "binary", blob_ref: ref },
+      { id: "c1", text: "plain" },
+      { id: "c2", text: "plain" },
+    ]);
+    ingest("conn_b", [{ id: "b", text: "other", blob_ref: ref }]);
+    const ops = all(source);
+    const a = ops.filter((op) => op.connectionId === "conn_a");
+    const b = ops.filter((op) => op.connectionId === "conn_b");
+    const claimA = a.filter((op) => op.kind === "blob-claim");
+    expect(claimA).toHaveLength(1);
+    const receiver = pendingReceiver(target);
+    if (delivery === "replayed claim") {
+      // The claim is retained without bytes; only the upserts are pending.
+      receiver.import({
+        credential: "replica-secret",
+        envelope: batch(a.filter((op) => op.kind !== "upsert")),
+      });
+      receiver.stage({
+        credential: "replica-secret",
+        id: "late-bytes",
+        envelope: batch(a.filter((op) => op.kind === "upsert")),
+      });
+    } else
+      receiver.stage({
+        credential: "replica-secret",
+        id: "late-bytes",
+        envelope: batch(a),
+      });
+    const owner = receiver.readStore({ reader: "owner" }),
+      grant = receiver.readStore();
+    expect(owner.getRecord("conn_a", "messages", "a")).toBeUndefined();
+    expect(preview(receiver).map((row) => row.recordKey)).toEqual(["c1", "c2"]);
+    const page = (cursor?: string) =>
+      receiver.readRecords({
+        reader: "owner",
+        stream: "messages",
+        instanceIds: ["conn_a"],
+        limit: 1,
+        order: "asc",
+        cursor,
+      });
+    const before = page();
+    expect(before.data.map((row) => row.recordKey)).toEqual(["c1"]);
+    expect(before.nextCursor).toBeDefined();
+
+    receiver.import({
+      credential: "replica-secret",
+      envelope: batch(delivery === "replayed claim" ? claimA : b),
+      blobs: [{ blobId: blob.blobId, bytes }],
+    });
+    receiver.retry({ credential: "replica-secret" });
+
+    // copy-assertion-ok: User-required data-model confirmation value.
+    expect(owner.getRecord("conn_a", "messages", "a")).toMatchObject({
+      data: { id: "a", text: "binary" },
+      visibility: "pending",
+      confirmation: "not yet confirmed",
+    });
+    expect(preview(receiver).map((row) => row.recordKey)).toEqual([
+      "a",
+      "c1",
+      "c2",
+    ]);
+    expect(owner.findBlobReferences(blob.blobId)).toContainEqual({
+      instance: "conn_a",
+      stream: "messages",
+      recordKey: "a",
+    });
+    expect(grant.getRecord("conn_a", "messages", "a")).toBeUndefined();
+    // The page changed under the old cursor: it expires instead of skipping "a".
+    expect(() => page(before.nextCursor)).toThrow(/expired/);
+    const after = page();
+    expect(after.data.map((row) => row.recordKey)).toEqual(["a"]);
+    expect(page(after.nextCursor).data.map((row) => row.recordKey)).toEqual([
+      "c1",
+    ]);
+  });
+
+it("hides a pending blob record again when the only batch carrying its bytes is quarantined", () => {
+  const source = device(),
+    target = device();
+  for (const d of [source, target])
+    d.store.registerConnection({
+      instance: "conn_b",
+      sourceId,
+      method: "collector",
+      label: "B",
+    });
+  const bytes = new Uint8Array([6, 6, 6]);
+  for (const instance of ["conn_a", "conn_b"]) {
+    const blob = source.store.storeBlobBytesForInstance({
+      instance,
+      method: "collector",
+      generation: 1,
+      bytes,
+      mimeType: "application/octet-stream",
+    });
+    source.store.ingestBatch(
+      [
+        {
+          instance,
+          stream: "messages",
+          key: instance,
+          emitted_at: at,
+          data: { id: instance, blob_ref: { blob_id: blob.blobId } },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+  }
+  const ops = all(source);
+  const blobId = (
+    ops.find((op) => op.kind === "blob-claim") as { blob: { blobId: string } }
+  ).blob.blobId;
+  const receiver = pendingReceiver(target);
+  receiver.stage({
+    credential: "replica-secret",
+    id: "carrier",
+    envelope: batch(ops.filter((op) => op.connectionId === "conn_b")),
+    blobs: [{ blobId, bytes }],
+  });
+  receiver.stage({
+    credential: "replica-secret",
+    id: "dependent",
+    envelope: batch(ops.filter((op) => op.connectionId === "conn_a")),
+  });
+  const owner = receiver.readStore({ reader: "owner" });
+  expect(owner.getRecord("conn_a", "messages", "conn_a")).toMatchObject({
+    visibility: "pending",
+  });
+  receiver.quarantine({
+    credential: "replica-secret",
+    id: "carrier",
+    reason: "finalized commitment conflict",
+  });
+  expect(owner.getRecord("conn_a", "messages", "conn_a")).toBeUndefined();
+  expect(owner.getBlobBytes(blobId)).toBeUndefined();
+});
+
 it("quarantine removes owner binary access and malformed stage bytes never enter pending storage", () => {
   const source = device(),
     target = device();
