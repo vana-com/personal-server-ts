@@ -55,9 +55,13 @@ import {
   generationMismatch,
   readBoundedText,
   verifiedStream,
+  StoredEnvelopeReadError,
 } from "./verified-stream.js";
 
-export { StoredEnvelopeReadError } from "./verified-stream.js";
+export {
+  StoredEnvelopeReadError,
+  boundedJsonByteLength,
+} from "./verified-stream.js";
 
 declare const granteeRead: unique symbol;
 
@@ -201,7 +205,32 @@ function authorizedSource(raw: DataStoragePort): ProjectionSource {
         options.budget,
       );
     }
-    const envelope = await raw.readEnvelope(scope, collectedAt);
+    let envelope: DataFileEnvelope;
+    if (options?.budget) {
+      if (!raw.readEnvelopeBounded) {
+        throw new StoredEnvelopeReadError(
+          "bounded_read_unavailable",
+          "This storage adapter cannot bound a stored input before parsing it",
+        );
+      }
+      const input = await raw.readEnvelopeBounded(scope, collectedAt, {
+        maxBytes: options.budget.remaining,
+      });
+      if (
+        !Number.isSafeInteger(input.byteLength) ||
+        input.byteLength < 0 ||
+        input.byteLength > options.budget.remaining
+      ) {
+        throw new StoredEnvelopeReadError(
+          "too_large",
+          "The stored input exceeds this read's byte allowance",
+        );
+      }
+      options.budget.remaining -= input.byteLength;
+      envelope = input.envelope;
+    } else {
+      envelope = await raw.readEnvelope(scope, collectedAt);
+    }
     if (
       options?.pin?.generation !== undefined &&
       envelopeGeneration(envelope) !== options.pin.generation
@@ -421,7 +450,7 @@ async function readPinnedStream(
 export const GRANTEE_PROJECTION_MAX_BYTES = 64 * 1024 * 1024;
 
 /** Ports minted per storage port, so a projection keeps its caches. */
-const minted = new WeakMap<DataStoragePort, GranteeReadPort>();
+const minted = new WeakMap<DataStoragePort, Map<number, GranteeReadPort>>();
 
 /**
  * The grantee read port of `storage`. A served port (see
@@ -429,14 +458,23 @@ const minted = new WeakMap<DataStoragePort, GranteeReadPort>();
  * source, so the requested version and every joined sibling version are
  * authorized on their bytes; any other port is read as stored.
  */
-export function granteeReadPort(storage: DataStoragePort): GranteeReadPort {
-  const cached = minted.get(storage);
+export function granteeReadPort(
+  storage: DataStoragePort,
+  options: { maxProjectionBytes?: number } = {},
+): GranteeReadPort {
+  const maxBytes = options.maxProjectionBytes ?? GRANTEE_PROJECTION_MAX_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new RangeError(
+      "Projection byte limit must be a nonnegative safe integer",
+    );
+  }
+  const cached = minted.get(storage)?.get(maxBytes);
   if (cached) return cached;
   const projection = projectionInput(storage);
   const source = authorizedSource(projection?.raw ?? storage);
   const reads = projection
     ? projectedReads(source, projection.options, {
-        maxBytes: GRANTEE_PROJECTION_MAX_BYTES,
+        maxBytes,
       })
     : { ...source, readStoredEnvelope: source.readEnvelope };
   const port: Omit<GranteeReadPort, typeof granteeRead> = {
@@ -481,6 +519,8 @@ export function granteeReadPort(storage: DataStoragePort): GranteeReadPort {
     return manifest ? servedManifest(manifest) : null;
   };
   const branded = port as GranteeReadPort;
-  minted.set(storage, branded);
+  const ports = minted.get(storage) ?? new Map<number, GranteeReadPort>();
+  ports.set(maxBytes, branded);
+  minted.set(storage, ports);
   return branded;
 }

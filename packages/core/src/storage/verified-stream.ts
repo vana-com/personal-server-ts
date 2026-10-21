@@ -13,7 +13,8 @@ import { bytesToHex } from "@noble/hashes/utils";
  */
 export class StoredEnvelopeReadError extends Error {
   constructor(
-    readonly code: "too_large" | "generation_mismatch",
+    readonly code:
+      "too_large" | "generation_mismatch" | "bounded_read_unavailable",
     message: string,
   ) {
     super(message);
@@ -134,14 +135,15 @@ function jsonStringLength(text: string): number {
 }
 
 /**
- * `JSON.stringify(value)` as UTF-8, built piece by piece and refused as soon
- * as it would pass `maxBytes`: a value whose serialization expands (one
- * large string referenced many times) never allocates more than the cap.
- * Same output as `JSON.stringify` for JSON data (objects, arrays, strings,
- * numbers, booleans, null, `toJSON`); a cycle throws, as it does there.
+ * Count the UTF-8 bytes of JSON data and optionally collect its JSON pieces.
+ * Refuse before constructing a string or byte array above maxBytes. Without
+ * pieces, no JSON string is built. Cycles throw as in JSON.stringify.
  */
-export function boundedJsonBytes(value: unknown, maxBytes: number): Uint8Array {
-  const pieces: string[] = [];
+function boundedJsonLength(
+  value: unknown,
+  maxBytes: number,
+  pieces?: string[],
+): number {
   let total = 0;
   const ancestors = new Set<object>();
   const reserve = (bytes: number) => {
@@ -156,11 +158,11 @@ export function boundedJsonBytes(value: unknown, maxBytes: number): Uint8Array {
   // Punctuation and scalar JSON other than strings are ASCII.
   const emit = (piece: string) => {
     reserve(piece.length);
-    pieces.push(piece);
+    pieces?.push(piece);
   };
   const emitString = (text: string) => {
     reserve(jsonStringLength(text));
-    pieces.push(JSON.stringify(text));
+    pieces?.push(JSON.stringify(text));
   };
   // `toJSON` applied, as JSON.stringify applies it before deciding to omit.
   const resolve = (key: string, item: unknown): unknown =>
@@ -217,5 +219,19 @@ export function boundedJsonBytes(value: unknown, maxBytes: number): Uint8Array {
     throw new TypeError("The value has no JSON serialization");
   }
   write(root);
+  return total;
+}
+
+/** Count resident JSON under a limit, without serializing or hashing it. */
+export function boundedJsonByteLength(
+  value: unknown,
+  maxBytes: number,
+): number {
+  return boundedJsonLength(value, maxBytes);
+}
+
+export function boundedJsonBytes(value: unknown, maxBytes: number): Uint8Array {
+  const pieces: string[] = [];
+  boundedJsonLength(value, maxBytes, pieces);
   return new TextEncoder().encode(pieces.join(""));
 }

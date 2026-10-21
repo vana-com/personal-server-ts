@@ -115,6 +115,8 @@ interface Projected {
   view?: string;
   envelope: DataFileEnvelope;
   bytes: Uint8Array;
+  /** Cost of the verified stored inputs, independent of any caller's allowance. */
+  inputBytes?: number;
   built?: { manifest: DataBlockManifest; blocks: DataScopeBlock[] };
   /** Rows left out or join streams missing; absent for a complete view. */
   diagnostics?: ProjectionDiagnostic[];
@@ -315,11 +317,12 @@ export function projectedReads(
    * identity each input was verified against, so a hit is a view of exactly
    * those bytes; an input without an identity is never cached.
    */
-  async function resolve(
+  async function resolveValue(
     scope: string,
     collectedAt: string,
     read?: ProjectionRead,
   ): Promise<{ view: Projected | null; own?: DataFileEnvelope }> {
+    const inputAllowance = read?.budget.remaining;
     if (!isProjectedScope(scope)) return { view: null };
     const requestedEntry =
       read?.pin ?? raw.findEntry({ scope, at: collectedAt });
@@ -451,9 +454,38 @@ export function projectedReads(
       read?.maxOutputBytes,
       profileKey,
     );
-    if (value) value.view = key;
+    if (value) {
+      value.view = key;
+      if (read && inputAllowance !== undefined) {
+        value.inputBytes = inputAllowance - read.budget.remaining;
+      }
+    }
     if (cacheable) memo = { key, value };
     return { view: value, own };
+  }
+
+  /** Every result, including a cache hit, spends this call's allowance. */
+  async function resolve(
+    scope: string,
+    collectedAt: string,
+    read?: ProjectionRead,
+  ): Promise<{ view: Projected | null; own?: DataFileEnvelope }> {
+    const inputAllowance = read?.budget.remaining;
+    const result = await resolveValue(scope, collectedAt, read);
+    if (read && result.view && inputAllowance !== undefined) {
+      const inputBytes = result.view.inputBytes ?? 0;
+      if (
+        inputBytes > inputAllowance ||
+        result.view.bytes.byteLength > read.maxOutputBytes
+      ) {
+        throw new StoredEnvelopeReadError(
+          "too_large",
+          "The projection exceeds this read's input or output byte limit",
+        );
+      }
+      read.budget.remaining = inputAllowance - inputBytes;
+    }
+    return result;
   }
 
   async function projected(

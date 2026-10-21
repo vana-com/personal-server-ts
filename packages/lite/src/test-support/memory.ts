@@ -1,5 +1,6 @@
 import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import { envelopeGeneration } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import { boundedJsonByteLength } from "@opendatalabs/personal-server-ts-core/storage/disclosure-policy";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   DataBlockManifest,
@@ -177,6 +178,14 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
 
     async readEnvelope(scope, collectedAt) {
       return readEnvelopeFromMap(envelopes, envelopeKey(scope, collectedAt));
+    },
+    async readEnvelopeBounded(scope, collectedAt, { maxBytes }) {
+      const envelope = readEnvelopeFromMap(
+        envelopes,
+        envelopeKey(scope, collectedAt),
+      );
+      const byteLength = boundedJsonByteLength(envelope, maxBytes);
+      return { envelope: structuredClone(envelope), byteLength };
     },
 
     async readEnvelopePreview(scope, collectedAt, { maxBytes }) {
@@ -491,6 +500,12 @@ export function createMemoryPsLiteDataFileStore(
     kind,
     async readEnvelope(path) {
       return files.get(path) ?? null;
+    },
+    async readEnvelopeBounded(path, { maxBytes }) {
+      const envelope = files.get(path);
+      if (!envelope) return null;
+      const byteLength = boundedJsonByteLength(envelope, maxBytes);
+      return { envelope: structuredClone(envelope), byteLength };
     },
     async readEnvelopePreview(path, { maxBytes }) {
       const envelope = files.get(path);

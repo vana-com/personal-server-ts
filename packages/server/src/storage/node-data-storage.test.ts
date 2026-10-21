@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
@@ -15,6 +16,8 @@ import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataBlocks } from "@opendatalabs/personal-server-ts-core/storage/blocks/build";
+
+vi.mock("node:fs/promises", { spy: true });
 
 /**
  * An oracle for a generation that does not use the code under test:
@@ -527,6 +530,80 @@ describe("immutable PDPP version provenance", () => {
     ...legacy,
     data: { id: "native", $pdpp: { version: 1 } },
   };
+
+  it.each(["read error", "parse error"])(
+    "retains the recovery trigger after a transient %s following stat",
+    async (fault) => {
+      const { dataDir, index, close } = await openStorage();
+      const finalPath = buildDataFilePath(
+        dataDir,
+        legacy.scope,
+        legacy.collectedAt,
+      );
+      const stagePath = `${finalPath}.pending.read-retry`;
+      try {
+        await mkdir(dirname(finalPath), { recursive: true });
+        const kept = Buffer.from(
+          JSON.stringify({
+            data: legacy.data,
+            collectedAt: legacy.collectedAt,
+            scope: legacy.scope,
+            version: legacy.version,
+          }),
+        );
+        const staged = Buffer.from(JSON.stringify(legacy, null, 2));
+        const sha = (value: Buffer) =>
+          createHash("sha256").update(value).digest("hex");
+        await writeFile(finalPath, kept);
+        await writeFile(stagePath, staged);
+        index.insert({
+          fileId: null,
+          path: relative(dataDir, finalPath),
+          scope: legacy.scope,
+          collectedAt: legacy.collectedAt,
+          sizeBytes: staged.byteLength,
+          pdppOrigin: false,
+          generation: oracleGeneration(legacy),
+          contentDigest: sha(staged),
+        });
+        const read = vi.spyOn(fs, "readFile");
+        if (fault === "read error")
+          read.mockRejectedValueOnce(
+            Object.assign(new Error("transient EIO"), { code: "EIO" }),
+          );
+        else read.mockResolvedValueOnce(Buffer.from("{invalid json"));
+        const stat = vi.spyOn(fs, "stat");
+        const attempt = recoverStagedDataFiles({
+          indexManager: index,
+          hierarchyOptions: { dataDir },
+        }).then(
+          () => "resolved",
+          () => "retry",
+        );
+        expect(await attempt).toBe("retry");
+        expect(stat).toHaveBeenCalledWith(finalPath);
+        read.mockRestore();
+        stat.mockRestore();
+        expect(await readFile(stagePath)).toEqual(staged);
+        expect(
+          index.findByPath(relative(dataDir, finalPath))?.contentDigest,
+        ).toBe(sha(staged));
+        await recoverStagedDataFiles({
+          indexManager: index,
+          hierarchyOptions: { dataDir },
+        });
+        expect(
+          index.findByPath(relative(dataDir, finalPath))?.contentDigest,
+        ).toBe(sha(kept));
+        await expect(readFile(stagePath)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        vi.restoreAllMocks();
+        await close();
+      }
+    },
+  );
 
   it("refuses to replace a published version with different bytes", async () => {
     const { storage, dataDir, close } = await openStorage();

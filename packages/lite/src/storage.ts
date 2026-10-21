@@ -3,7 +3,14 @@ import {
   canonicalJson,
   envelopeGeneration,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type {
+  DataStoragePort,
+  BoundedEnvelopeRead,
+} from "@opendatalabs/personal-server-ts-core/ports";
+import {
+  boundedJsonByteLength,
+  StoredEnvelopeReadError,
+} from "@opendatalabs/personal-server-ts-core/storage/disclosure-policy";
 import type {
   DataBlockManifest,
   DataScopeBlock,
@@ -53,6 +60,11 @@ export type PsLiteFileStorageKind = "opfs" | "indexeddb" | "custom";
 export interface PsLiteDataFileStore {
   readonly kind: PsLiteFileStorageKind;
   readEnvelope(path: string): Promise<DataFileEnvelope | null>;
+  /** Enforce the byte bound before parsing or cloning a stored input. */
+  readEnvelopeBounded?(
+    path: string,
+    options: { maxBytes: number },
+  ): Promise<BoundedEnvelopeRead | null>;
   readEnvelopePreview?(
     path: string,
     options: { maxBytes: number },
@@ -168,6 +180,12 @@ export function createIndexedDbFallbackDataFileStore(
     async readEnvelope(path) {
       return envelopes.get(path) ?? null;
     },
+    async readEnvelopeBounded(path, { maxBytes }) {
+      const envelope = envelopes.get(path);
+      if (!envelope) return null;
+      const byteLength = boundedJsonByteLength(envelope, maxBytes);
+      return { envelope: structuredClone(envelope), byteLength };
+    },
     async readEnvelopePreview(path, { maxBytes }) {
       const envelope = envelopes.get(path);
       if (!envelope) return null;
@@ -268,6 +286,25 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
           return null;
         }
         throw err;
+      }
+    },
+    async readEnvelopeBounded(path, { maxBytes }) {
+      try {
+        const file = await (await getOpfsFileHandle(root, path)).getFile();
+        if (file.size > maxBytes) {
+          throw new StoredEnvelopeReadError(
+            "too_large",
+            "The stored input exceeds this read's byte allowance",
+          );
+        }
+        return {
+          envelope: JSON.parse(await file.text()) as DataFileEnvelope,
+          byteLength: file.size,
+        };
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "NotFoundError")
+          return null;
+        throw error;
       }
     },
     async readEnvelopePreview(path, { maxBytes }) {
@@ -646,6 +683,22 @@ export async function createPersistentPsLiteStorage(
         throw new Error("Envelope not found");
       }
       return envelope;
+    },
+    async readEnvelopeBounded(scope, collectedAt, limits) {
+      const path = envelopePath(scope, collectedAt);
+      if (!fileStore.readEnvelopeBounded) {
+        throw new StoredEnvelopeReadError(
+          "bounded_read_unavailable",
+          "The custom Lite file store has no bounded stored-input read",
+        );
+      }
+      const read =
+        (await fileStore.readEnvelopeBounded(path, limits)) ??
+        (fileStore === fallbackStore
+          ? null
+          : await fallbackStore.readEnvelopeBounded!(path, limits));
+      if (!read) throw new Error("Envelope not found");
+      return read;
     },
 
     /**

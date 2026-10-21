@@ -142,6 +142,12 @@ export interface EnvelopeStreamOptions {
   maxBytes?: number;
 }
 
+/** A stored input whose adapter enforced maxBytes before parsing or cloning. */
+export interface BoundedEnvelopeRead {
+  envelope: DataFileEnvelope;
+  byteLength: number;
+}
+
 export interface DataStoragePort extends RuntimeStoragePort {
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
@@ -159,6 +165,16 @@ export interface DataStoragePort extends RuntimeStoragePort {
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
+  /**
+   * Read stored JSON under maxBytes, before parsing, hashing or cloning it.
+   * Resident object stores count JSON bytes before making a read snapshot.
+   * This is a resource bound, not provenance/authorization evidence.
+   */
+  readEnvelopeBounded?(
+    scope: string,
+    collectedAt: string,
+    options: { maxBytes: number },
+  ): Promise<BoundedEnvelopeRead>;
   /**
    * The envelope exactly as stored, bypassing any read-time view. Only a
    * served port (see `withLegacyProjection`) has it; on a raw port

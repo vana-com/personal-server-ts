@@ -84,11 +84,16 @@ export async function recoverStagedDataFiles(
           published = false;
         }
         if (published) {
-          await repairKeptDigest(deps, indexed, finalPath);
+          requireCompletedRepair(
+            await repairKeptDigest(deps, indexed, finalPath),
+          );
           await unlink(path);
         } else {
           await publishStagedDataFile(path, finalPath, {
-            onKept: () => repairKeptDigest(deps, indexed, finalPath),
+            onKept: async () =>
+              requireCompletedRepair(
+                await repairKeptDigest(deps, indexed, finalPath),
+              ),
           });
         }
       }
@@ -229,29 +234,43 @@ function describesRow(
  * version (same provenance and generation) and only the digest differs: an
  * equal envelope kept in another key order.
  */
+type KeptDigestRepair =
+  | { kind: "verified" }
+  | { kind: "obsolete" }
+  | { kind: "retry"; cause: unknown };
+
+function requireCompletedRepair(result: KeptDigestRepair): void {
+  if (result.kind === "retry") {
+    throw new Error("Stored identity repair must be retried", {
+      cause: result.cause,
+    });
+  }
+}
+
 async function repairKeptDigest(
   deps: NodeDataStorageDeps,
   row: IndexEntry,
   finalPath: string,
-): Promise<void> {
+): Promise<KeptDigestRepair> {
   let bytes: Buffer;
   try {
     bytes = await readFile(finalPath);
-  } catch {
-    return;
+  } catch (cause) {
+    return { kind: "retry", cause };
   }
   let published: VersionIdentity;
   try {
     published = versionIdentity(JSON.parse(bytes.toString("utf8")), bytes);
-  } catch {
-    return;
+  } catch (cause) {
+    return { kind: "retry", cause };
   }
+  if (row.contentDigest === published.contentDigest)
+    return { kind: "verified" };
   if (
-    row.contentDigest === published.contentDigest ||
     row.pdppOrigin !== published.pdppOrigin ||
     row.generation !== published.generation
   ) {
-    return;
+    return { kind: "obsolete" };
   }
   const recorded = storedIdentity(row);
   if (
@@ -263,8 +282,12 @@ async function repairKeptDigest(
       published.contentDigest
   ) {
     // The row changed under the repair: keep the trigger for a later run.
-    throw new Error(`Could not repair the content digest of ${row.path}`);
+    return {
+      kind: "retry",
+      cause: new Error(`Could not repair the content digest of ${row.path}`),
+    };
   }
+  return { kind: "verified" };
 }
 
 export function createNodeDataStorage(
