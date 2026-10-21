@@ -1,0 +1,1861 @@
+{
+  "run": "4e829531-84ad-4ec7-9b5f-939a0b113278",
+  "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+  "gatewayUrl": "https://dp-rpc-dev.vana.org",
+  "storageUrl": "https://storage-dev.vana.org",
+  "rpcUrl": "https://rpc.moksha.vana.org",
+  "chainId": 14800,
+  "base": "723c4854ee5ee83d8e83baa20cc2b0d30b99fea3",
+  "head": "02f1694c3b6eae9bef5e6edf3b8ab136a0121176",
+  "harnessSha256": "f32c9d6e9950b4b0224240793197d8e92c90710cce6f07d31c7c973e805e1d86",
+  "oracleSha256": "721da1136b3f8a5fddd67841be8dcc2edffce432fb1085c43aa05572f1dedcdd",
+  "node": "v22.23.1",
+  "dirtyTree": "",
+  "retryableCycleErrors": {},
+  "hostHeapMiB": 2048,
+  "hostRssBudgetKiB": 3145728,
+  "chunkBytes": 4194304,
+  "cases": [
+    {
+      "case": 1,
+      "status": "passed",
+      "elapsedMs": 322688,
+      "A": {
+        "pid": 3049707,
+        "importedScopes": [
+          "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+          "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+          "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0"
+        ],
+        "receivedOperations": [
+          {
+            "blob": {
+              "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mimeType": "application/octet-stream",
+              "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "sizeBytes": 32768
+            },
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "blob-claim",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 3,
+              "operationId": "2d70c73e-bdb7-4125-a21f-fb8eccefb8de",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [],
+            "connectionId": "conn",
+            "data": {
+              "id": "a",
+              "text": "A to B"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.566Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "a",
+            "revision": {
+              "counter": 2,
+              "operationId": "e84d3d23-6ffe-4391-8636-c1a1d209d305",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [
+              {
+                "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mimeType": "application/octet-stream",
+                "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "sizeBytes": 32768
+              }
+            ],
+            "connectionId": "conn",
+            "data": {
+              "blob_ref": {
+                "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 32768
+              },
+              "id": "small"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.571Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "small",
+            "revision": {
+              "counter": 4,
+              "operationId": "0b027086-7675-48ce-a48e-969bacf202a6",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "5ef0d1da-e48a-4fbd-9428-f93c5a8d3166",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "621ef774-3461-48cc-91b2-35e5a691b229",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          }
+        ],
+        "staged": [],
+        "gets": [
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+            "attempts": 1
+          }
+        ],
+        "puts": [
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+            "sha256": "07bc9c7b81b6c666714a29172e413a89e4cc06bf4df16924400ccec1a20788a0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+            "sha256": "c139cff7b7348f16ed1fb8e2976cf2e08395ddc630666bd2d4febae0fc7736e0",
+            "attempts": 1
+          }
+        ],
+        "inboxErrors": [],
+        "quarantines": 0,
+        "evidence": [
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+              "version": "1",
+              "dataHash": "0x03de6b015c5beba6fc880399df954119230393fabbba630d277653854764e2eb",
+              "metadataHash": "0x3bfeb43a2a7c881972b786bd76c5f8d6dca457725fb4aabec136e605b4ac77f8",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0x3d1bf5e53c77e87241fd474785da1bcc22a246aea2f24eac27586bfea60f2bef",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+              "version": "1",
+              "dataHash": "0xe3aad21eb26fa109ac70d99deead629676cc88ade4269f910b9e0f02753bae2e",
+              "metadataHash": "0x46893d4ef94fb22ee2d73f0cea3e7617deb1ff80b8e9b05099c28e4866af2a25",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0xe1056ffab1be5a54a64646df93f8742028de932544a722a5d7ca27ed766949d5",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+              "version": "1",
+              "dataHash": "0xa945c480dbdec0857ff87249c55935f5f6c58b2688ece75dc261324ac0a68c1e",
+              "metadataHash": "0x9989541fcf9b56b8d7c62ef1fb635a6a89f3ac0d3f384071504d17bf5f0d87af",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0xe257dcb5e1a98baf881bedd5fac1cfe29c4b565976e55cf04952e57e57ad5d84",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566051",
+              "blockHash": "0x1b915ba116057db7a926c1724bac3bf38d10ea6e9c3cab9367cf5b026aa84c58",
+              "blockTimestamp": "1792554960"
+            },
+            "pending": false
+          }
+        ],
+        "records": {
+          "a": {
+            "id": "a",
+            "text": "A to B"
+          },
+          "small": {
+            "id": "small",
+            "blob_ref": {
+              "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mime_type": "application/octet-stream",
+              "size_bytes": 32768
+            }
+          }
+        },
+        "canonicalRecords": [
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "a",
+            "data": "{\"id\":\"a\",\"text\":\"A to B\"}",
+            "emitted_at": "2026-10-21T03:52:27.566Z",
+            "deleted": 0,
+            "blob_id": null
+          },
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "small",
+            "data": "{\"id\":\"small\",\"blob_ref\":{\"blob_id\":\"sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":32768}}",
+            "emitted_at": "2026-10-21T03:52:27.571Z",
+            "deleted": 0,
+            "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8"
+          }
+        ],
+        "blobs": {
+          "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8": {
+            "sha256": "8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+            "bytes": 32768
+          }
+        },
+        "published": 2,
+        "importedFragments": 3,
+        "stagedFragments": 0,
+        "importedBatches": 3,
+        "received": 5,
+        "journal": 4,
+        "history": 2,
+        "pending": 0,
+        "errors": [],
+        "peakRssKiB": 328180,
+        "generation": 1,
+        "writer": "f02dbd3ec39549fe966243e6cf4ded2b",
+        "operations": [
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "621ef774-3461-48cc-91b2-35e5a691b229",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [],
+            "connectionId": "conn",
+            "data": {
+              "id": "a",
+              "text": "A to B"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.566Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "a",
+            "revision": {
+              "counter": 2,
+              "operationId": "e84d3d23-6ffe-4391-8636-c1a1d209d305",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blob": {
+              "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mimeType": "application/octet-stream",
+              "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "sizeBytes": 32768
+            },
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "blob-claim",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 3,
+              "operationId": "2d70c73e-bdb7-4125-a21f-fb8eccefb8de",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [
+              {
+                "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mimeType": "application/octet-stream",
+                "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "sizeBytes": 32768
+              }
+            ],
+            "connectionId": "conn",
+            "data": {
+              "blob_ref": {
+                "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 32768
+              },
+              "id": "small"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.571Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "small",
+            "revision": {
+              "counter": 4,
+              "operationId": "0b027086-7675-48ce-a48e-969bacf202a6",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          }
+        ],
+        "wire": [
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+            "batch": "541fd4e4745546238ca7fab94c976950",
+            "state": "published",
+            "bytes": 1443
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+            "batch": "56b65f0b4a56478b90a00c4e8889eb3b",
+            "state": "published",
+            "bytes": 62566
+          }
+        ]
+      },
+      "B": {
+        "pid": 3050249,
+        "importedScopes": [
+          "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+          "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+          "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0"
+        ],
+        "receivedOperations": [
+          {
+            "blob": {
+              "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mimeType": "application/octet-stream",
+              "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "sizeBytes": 32768
+            },
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "blob-claim",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 3,
+              "operationId": "2d70c73e-bdb7-4125-a21f-fb8eccefb8de",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [],
+            "connectionId": "conn",
+            "data": {
+              "id": "a",
+              "text": "A to B"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.566Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "a",
+            "revision": {
+              "counter": 2,
+              "operationId": "e84d3d23-6ffe-4391-8636-c1a1d209d305",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [
+              {
+                "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mimeType": "application/octet-stream",
+                "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "sizeBytes": 32768
+              }
+            ],
+            "connectionId": "conn",
+            "data": {
+              "blob_ref": {
+                "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 32768
+              },
+              "id": "small"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.571Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "small",
+            "revision": {
+              "counter": 4,
+              "operationId": "0b027086-7675-48ce-a48e-969bacf202a6",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "5ef0d1da-e48a-4fbd-9428-f93c5a8d3166",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "621ef774-3461-48cc-91b2-35e5a691b229",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          }
+        ],
+        "staged": [],
+        "gets": [
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+            "attempts": 1
+          }
+        ],
+        "puts": [
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+            "sha256": "c5e72f9ba94f8ec18804244f087d130990c291fe7e94452e4748ecbf9031f1c8",
+            "attempts": 1
+          }
+        ],
+        "inboxErrors": [],
+        "quarantines": 0,
+        "evidence": [
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+              "version": "1",
+              "dataHash": "0x03de6b015c5beba6fc880399df954119230393fabbba630d277653854764e2eb",
+              "metadataHash": "0x3bfeb43a2a7c881972b786bd76c5f8d6dca457725fb4aabec136e605b4ac77f8",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0x3d1bf5e53c77e87241fd474785da1bcc22a246aea2f24eac27586bfea60f2bef",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+              "version": "1",
+              "dataHash": "0xe3aad21eb26fa109ac70d99deead629676cc88ade4269f910b9e0f02753bae2e",
+              "metadataHash": "0x46893d4ef94fb22ee2d73f0cea3e7617deb1ff80b8e9b05099c28e4866af2a25",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0xe1056ffab1be5a54a64646df93f8742028de932544a722a5d7ca27ed766949d5",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+              "version": "1",
+              "dataHash": "0xa945c480dbdec0857ff87249c55935f5f6c58b2688ece75dc261324ac0a68c1e",
+              "metadataHash": "0x9989541fcf9b56b8d7c62ef1fb635a6a89f3ac0d3f384071504d17bf5f0d87af",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0xe257dcb5e1a98baf881bedd5fac1cfe29c4b565976e55cf04952e57e57ad5d84",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          }
+        ],
+        "records": {
+          "a": {
+            "id": "a",
+            "text": "A to B"
+          },
+          "small": {
+            "blob_ref": {
+              "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mime_type": "application/octet-stream",
+              "size_bytes": 32768
+            },
+            "id": "small"
+          }
+        },
+        "canonicalRecords": [
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "a",
+            "data": "{\"id\":\"a\",\"text\":\"A to B\"}",
+            "emitted_at": "2026-10-21T03:52:27.566Z",
+            "deleted": 0,
+            "blob_id": null
+          },
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "small",
+            "data": "{\"blob_ref\":{\"blob_id\":\"sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":32768},\"id\":\"small\"}",
+            "emitted_at": "2026-10-21T03:52:27.571Z",
+            "deleted": 0,
+            "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8"
+          }
+        ],
+        "blobs": {
+          "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8": {
+            "sha256": "8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+            "bytes": 32768
+          }
+        },
+        "published": 1,
+        "importedFragments": 3,
+        "stagedFragments": 0,
+        "importedBatches": 3,
+        "received": 5,
+        "journal": 1,
+        "history": 2,
+        "pending": 0,
+        "errors": [],
+        "peakRssKiB": 305968,
+        "generation": 1,
+        "writer": "1012cf40cd184a108250c4108cb35123",
+        "operations": [
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "5ef0d1da-e48a-4fbd-9428-f93c5a8d3166",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          }
+        ],
+        "wire": [
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+            "batch": "4e86d7e691cc498282b3f01ddaafbb09",
+            "state": "published",
+            "bytes": 1443
+          }
+        ]
+      },
+      "blob": {
+        "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+        "sha256": "8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+        "bytes": 32768
+      }
+    },
+    {
+      "case": 2,
+      "status": "passed",
+      "elapsedMs": 163857,
+      "A": {
+        "pid": 3049707,
+        "importedScopes": [
+          "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+          "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+          "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+          "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0"
+        ],
+        "receivedOperations": [
+          {
+            "blob": {
+              "blobId": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+              "mimeType": "application/octet-stream",
+              "sha256": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+              "sizeBytes": 65536
+            },
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "blob-claim",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 6,
+              "operationId": "24ea3853-3e33-44a4-8a2b-45777a217627",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blob": {
+              "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mimeType": "application/octet-stream",
+              "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "sizeBytes": 32768
+            },
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "blob-claim",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 3,
+              "operationId": "2d70c73e-bdb7-4125-a21f-fb8eccefb8de",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [],
+            "connectionId": "conn",
+            "data": {
+              "id": "a",
+              "text": "A to B"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.566Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "a",
+            "revision": {
+              "counter": 2,
+              "operationId": "e84d3d23-6ffe-4391-8636-c1a1d209d305",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [],
+            "connectionId": "conn",
+            "data": {
+              "id": "b",
+              "text": "B to A"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:57:50.263Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "b",
+            "revision": {
+              "counter": 5,
+              "operationId": "2c5d7a12-c061-4688-8f49-4bc34d33573b",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [
+              {
+                "blobId": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+                "mimeType": "application/octet-stream",
+                "sha256": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+                "sizeBytes": 65536
+              }
+            ],
+            "connectionId": "conn",
+            "data": {
+              "blob_ref": {
+                "blob_id": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 65536
+              },
+              "id": "reverse"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:57:50.266Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "reverse",
+            "revision": {
+              "counter": 7,
+              "operationId": "87dad595-f179-4e69-a6eb-5d2ace20fe5c",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [
+              {
+                "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mimeType": "application/octet-stream",
+                "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "sizeBytes": 32768
+              }
+            ],
+            "connectionId": "conn",
+            "data": {
+              "blob_ref": {
+                "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 32768
+              },
+              "id": "small"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.571Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "small",
+            "revision": {
+              "counter": 4,
+              "operationId": "0b027086-7675-48ce-a48e-969bacf202a6",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "5ef0d1da-e48a-4fbd-9428-f93c5a8d3166",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "621ef774-3461-48cc-91b2-35e5a691b229",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          }
+        ],
+        "staged": [],
+        "gets": [
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0",
+            "attempts": 1
+          }
+        ],
+        "puts": [
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+            "sha256": "07bc9c7b81b6c666714a29172e413a89e4cc06bf4df16924400ccec1a20788a0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+            "sha256": "c139cff7b7348f16ed1fb8e2976cf2e08395ddc630666bd2d4febae0fc7736e0",
+            "attempts": 1
+          }
+        ],
+        "inboxErrors": [],
+        "quarantines": 0,
+        "evidence": [
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0",
+              "version": "1",
+              "dataHash": "0x72dde3827aa7524e81416472ceb4a3dcd1900dc8e43ccb6b95364514d87473d5",
+              "metadataHash": "0x9afffd19e827067d676e08418350da3b1828ae2e6ba86c82236ffb188149855e",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0x9f0fe8449c955d2c5914e4fcd12049dc0a632c8365b9aa7f5ab778edeb6482b7",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566075",
+              "blockHash": "0x2c1a52c4f1ba3f1fe48612d3f74afde34e19a83e98a4d660db47eaf572388c37",
+              "blockTimestamp": "1792555104"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+              "version": "1",
+              "dataHash": "0x03de6b015c5beba6fc880399df954119230393fabbba630d277653854764e2eb",
+              "metadataHash": "0x3bfeb43a2a7c881972b786bd76c5f8d6dca457725fb4aabec136e605b4ac77f8",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0x3d1bf5e53c77e87241fd474785da1bcc22a246aea2f24eac27586bfea60f2bef",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+              "version": "1",
+              "dataHash": "0xe3aad21eb26fa109ac70d99deead629676cc88ade4269f910b9e0f02753bae2e",
+              "metadataHash": "0x46893d4ef94fb22ee2d73f0cea3e7617deb1ff80b8e9b05099c28e4866af2a25",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0xe1056ffab1be5a54a64646df93f8742028de932544a722a5d7ca27ed766949d5",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+              "version": "1",
+              "dataHash": "0xa945c480dbdec0857ff87249c55935f5f6c58b2688ece75dc261324ac0a68c1e",
+              "metadataHash": "0x9989541fcf9b56b8d7c62ef1fb635a6a89f3ac0d3f384071504d17bf5f0d87af",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0xe257dcb5e1a98baf881bedd5fac1cfe29c4b565976e55cf04952e57e57ad5d84",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566051",
+              "blockHash": "0x1b915ba116057db7a926c1724bac3bf38d10ea6e9c3cab9367cf5b026aa84c58",
+              "blockTimestamp": "1792554960"
+            },
+            "pending": false
+          }
+        ],
+        "records": {
+          "a": {
+            "id": "a",
+            "text": "A to B"
+          },
+          "b": {
+            "id": "b",
+            "text": "B to A"
+          },
+          "reverse": {
+            "blob_ref": {
+              "blob_id": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+              "mime_type": "application/octet-stream",
+              "size_bytes": 65536
+            },
+            "id": "reverse"
+          },
+          "small": {
+            "id": "small",
+            "blob_ref": {
+              "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mime_type": "application/octet-stream",
+              "size_bytes": 32768
+            }
+          }
+        },
+        "canonicalRecords": [
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "a",
+            "data": "{\"id\":\"a\",\"text\":\"A to B\"}",
+            "emitted_at": "2026-10-21T03:52:27.566Z",
+            "deleted": 0,
+            "blob_id": null
+          },
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "b",
+            "data": "{\"id\":\"b\",\"text\":\"B to A\"}",
+            "emitted_at": "2026-10-21T03:57:50.263Z",
+            "deleted": 0,
+            "blob_id": null
+          },
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "reverse",
+            "data": "{\"blob_ref\":{\"blob_id\":\"sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":65536},\"id\":\"reverse\"}",
+            "emitted_at": "2026-10-21T03:57:50.266Z",
+            "deleted": 0,
+            "blob_id": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5"
+          },
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "small",
+            "data": "{\"id\":\"small\",\"blob_ref\":{\"blob_id\":\"sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":32768}}",
+            "emitted_at": "2026-10-21T03:52:27.571Z",
+            "deleted": 0,
+            "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8"
+          }
+        ],
+        "blobs": {
+          "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5": {
+            "sha256": "6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+            "bytes": 65536
+          },
+          "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8": {
+            "sha256": "8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+            "bytes": 32768
+          }
+        },
+        "published": 2,
+        "importedFragments": 4,
+        "stagedFragments": 0,
+        "importedBatches": 4,
+        "received": 8,
+        "journal": 4,
+        "history": 4,
+        "pending": 0,
+        "errors": [],
+        "peakRssKiB": 328180,
+        "generation": 1,
+        "writer": "f02dbd3ec39549fe966243e6cf4ded2b",
+        "operations": [
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "621ef774-3461-48cc-91b2-35e5a691b229",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [],
+            "connectionId": "conn",
+            "data": {
+              "id": "a",
+              "text": "A to B"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.566Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "a",
+            "revision": {
+              "counter": 2,
+              "operationId": "e84d3d23-6ffe-4391-8636-c1a1d209d305",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blob": {
+              "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mimeType": "application/octet-stream",
+              "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "sizeBytes": 32768
+            },
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "blob-claim",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 3,
+              "operationId": "2d70c73e-bdb7-4125-a21f-fb8eccefb8de",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [
+              {
+                "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mimeType": "application/octet-stream",
+                "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "sizeBytes": 32768
+              }
+            ],
+            "connectionId": "conn",
+            "data": {
+              "blob_ref": {
+                "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 32768
+              },
+              "id": "small"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.571Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "small",
+            "revision": {
+              "counter": 4,
+              "operationId": "0b027086-7675-48ce-a48e-969bacf202a6",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          }
+        ],
+        "wire": [
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+            "batch": "541fd4e4745546238ca7fab94c976950",
+            "state": "published",
+            "bytes": 1443
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+            "batch": "56b65f0b4a56478b90a00c4e8889eb3b",
+            "state": "published",
+            "bytes": 62566
+          }
+        ]
+      },
+      "B": {
+        "pid": 3050249,
+        "importedScopes": [
+          "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+          "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+          "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+          "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0"
+        ],
+        "receivedOperations": [
+          {
+            "blob": {
+              "blobId": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+              "mimeType": "application/octet-stream",
+              "sha256": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+              "sizeBytes": 65536
+            },
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "blob-claim",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 6,
+              "operationId": "24ea3853-3e33-44a4-8a2b-45777a217627",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blob": {
+              "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mimeType": "application/octet-stream",
+              "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "sizeBytes": 32768
+            },
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "blob-claim",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 3,
+              "operationId": "2d70c73e-bdb7-4125-a21f-fb8eccefb8de",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [],
+            "connectionId": "conn",
+            "data": {
+              "id": "a",
+              "text": "A to B"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.566Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "a",
+            "revision": {
+              "counter": 2,
+              "operationId": "e84d3d23-6ffe-4391-8636-c1a1d209d305",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [],
+            "connectionId": "conn",
+            "data": {
+              "id": "b",
+              "text": "B to A"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:57:50.263Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "b",
+            "revision": {
+              "counter": 5,
+              "operationId": "2c5d7a12-c061-4688-8f49-4bc34d33573b",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [
+              {
+                "blobId": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+                "mimeType": "application/octet-stream",
+                "sha256": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+                "sizeBytes": 65536
+              }
+            ],
+            "connectionId": "conn",
+            "data": {
+              "blob_ref": {
+                "blob_id": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 65536
+              },
+              "id": "reverse"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:57:50.266Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "reverse",
+            "revision": {
+              "counter": 7,
+              "operationId": "87dad595-f179-4e69-a6eb-5d2ace20fe5c",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [
+              {
+                "blobId": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mimeType": "application/octet-stream",
+                "sha256": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "sizeBytes": 32768
+              }
+            ],
+            "connectionId": "conn",
+            "data": {
+              "blob_ref": {
+                "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 32768
+              },
+              "id": "small"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:52:27.571Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "small",
+            "revision": {
+              "counter": 4,
+              "operationId": "0b027086-7675-48ce-a48e-969bacf202a6",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "5ef0d1da-e48a-4fbd-9428-f93c5a8d3166",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "621ef774-3461-48cc-91b2-35e5a691b229",
+              "writerId": "d326b8f8-747c-48c0-af20-12b4b74e3b97"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          }
+        ],
+        "staged": [],
+        "gets": [
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0",
+            "attempts": 1
+          }
+        ],
+        "puts": [
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0",
+            "sha256": "32a069d16dfcbdadd1497080bba2e60ec4c59663be351555f2de31f7cd9d2bae",
+            "attempts": 1
+          },
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+            "sha256": "c5e72f9ba94f8ec18804244f087d130990c291fe7e94452e4748ecbf9031f1c8",
+            "attempts": 1
+          }
+        ],
+        "inboxErrors": [],
+        "quarantines": 0,
+        "evidence": [
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0",
+              "version": "1",
+              "dataHash": "0x72dde3827aa7524e81416472ceb4a3dcd1900dc8e43ccb6b95364514d87473d5",
+              "metadataHash": "0x9afffd19e827067d676e08418350da3b1828ae2e6ba86c82236ffb188149855e",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0x9f0fe8449c955d2c5914e4fcd12049dc0a632c8365b9aa7f5ab778edeb6482b7",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566075",
+              "blockHash": "0x2c1a52c4f1ba3f1fe48612d3f74afde34e19a83e98a4d660db47eaf572388c37",
+              "blockTimestamp": "1792555104"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+              "version": "1",
+              "dataHash": "0x03de6b015c5beba6fc880399df954119230393fabbba630d277653854764e2eb",
+              "metadataHash": "0x3bfeb43a2a7c881972b786bd76c5f8d6dca457725fb4aabec136e605b4ac77f8",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0x3d1bf5e53c77e87241fd474785da1bcc22a246aea2f24eac27586bfea60f2bef",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+              "version": "1",
+              "dataHash": "0xe3aad21eb26fa109ac70d99deead629676cc88ade4269f910b9e0f02753bae2e",
+              "metadataHash": "0x46893d4ef94fb22ee2d73f0cea3e7617deb1ff80b8e9b05099c28e4866af2a25",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_541fd4e4745546238ca7fab94c976950.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0xe1056ffab1be5a54a64646df93f8742028de932544a722a5d7ca27ed766949d5",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          },
+          {
+            "head": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+              "version": "1",
+              "dataHash": "0xa945c480dbdec0857ff87249c55935f5f6c58b2688ece75dc261324ac0a68c1e",
+              "metadataHash": "0x9989541fcf9b56b8d7c62ef1fb635a6a89f3ac0d3f384071504d17bf5f0d87af",
+              "deleted": false
+            },
+            "chain": {
+              "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+              "scope": "pdpp_replica_v1.f02dbd3ec39549fe966243e6cf4ded2b_56b65f0b4a56478b90a00c4e8889eb3b.0",
+              "version": "1",
+              "currentVersion": "1",
+              "status": "Active",
+              "commitment": "0xe257dcb5e1a98baf881bedd5fac1cfe29c4b565976e55cf04952e57e57ad5d84",
+              "chainId": 14800,
+              "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+              "blockNumber": "9566027",
+              "blockHash": "0xf4248ffca50aece8b2d5fb4301537eb2be32d086712b5511f58b43c6ff707633",
+              "blockTimestamp": "1792554816"
+            },
+            "pending": false
+          }
+        ],
+        "records": {
+          "a": {
+            "id": "a",
+            "text": "A to B"
+          },
+          "b": {
+            "id": "b",
+            "text": "B to A"
+          },
+          "reverse": {
+            "id": "reverse",
+            "blob_ref": {
+              "blob_id": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+              "mime_type": "application/octet-stream",
+              "size_bytes": 65536
+            }
+          },
+          "small": {
+            "blob_ref": {
+              "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+              "mime_type": "application/octet-stream",
+              "size_bytes": 32768
+            },
+            "id": "small"
+          }
+        },
+        "canonicalRecords": [
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "a",
+            "data": "{\"id\":\"a\",\"text\":\"A to B\"}",
+            "emitted_at": "2026-10-21T03:52:27.566Z",
+            "deleted": 0,
+            "blob_id": null
+          },
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "b",
+            "data": "{\"id\":\"b\",\"text\":\"B to A\"}",
+            "emitted_at": "2026-10-21T03:57:50.263Z",
+            "deleted": 0,
+            "blob_id": null
+          },
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "reverse",
+            "data": "{\"id\":\"reverse\",\"blob_ref\":{\"blob_id\":\"sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":65536}}",
+            "emitted_at": "2026-10-21T03:57:50.266Z",
+            "deleted": 0,
+            "blob_id": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5"
+          },
+          {
+            "instance": "conn",
+            "stream": "messages",
+            "record_key": "small",
+            "data": "{\"blob_ref\":{\"blob_id\":\"sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8\",\"mime_type\":\"application/octet-stream\",\"size_bytes\":32768},\"id\":\"small\"}",
+            "emitted_at": "2026-10-21T03:52:27.571Z",
+            "deleted": 0,
+            "blob_id": "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8"
+          }
+        ],
+        "blobs": {
+          "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5": {
+            "sha256": "6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+            "bytes": 65536
+          },
+          "sha256:8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8": {
+            "sha256": "8c22d23adbfe591dff73fddfaa84a19d3c682e5cc76f798e165b5ff95bbf08d8",
+            "bytes": 32768
+          }
+        },
+        "published": 2,
+        "importedFragments": 4,
+        "stagedFragments": 0,
+        "importedBatches": 4,
+        "received": 8,
+        "journal": 4,
+        "history": 4,
+        "pending": 0,
+        "errors": [],
+        "peakRssKiB": 305968,
+        "generation": 1,
+        "writer": "1012cf40cd184a108250c4108cb35123",
+        "operations": [
+          {
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "connection-register",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 1,
+              "operationId": "5ef0d1da-e48a-4fbd-9428-f93c5a8d3166",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [],
+            "connectionId": "conn",
+            "data": {
+              "id": "b",
+              "text": "B to A"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:57:50.263Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "b",
+            "revision": {
+              "counter": 5,
+              "operationId": "2c5d7a12-c061-4688-8f49-4bc34d33573b",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blob": {
+              "blobId": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+              "mimeType": "application/octet-stream",
+              "sha256": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+              "sizeBytes": 65536
+            },
+            "connectionId": "conn",
+            "generation": 1,
+            "kind": "blob-claim",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "revision": {
+              "counter": 6,
+              "operationId": "24ea3853-3e33-44a4-8a2b-45777a217627",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          },
+          {
+            "blobs": [
+              {
+                "blobId": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+                "mimeType": "application/octet-stream",
+                "sha256": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+                "sizeBytes": 65536
+              }
+            ],
+            "connectionId": "conn",
+            "data": {
+              "blob_ref": {
+                "blob_id": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 65536
+              },
+              "id": "reverse"
+            },
+            "declaration": {
+              "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "primaryKey": [
+                "id"
+              ],
+              "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "semantics": "mutable_state",
+              "stream": "messages",
+              "version": "1"
+            },
+            "emittedAt": "2026-10-21T03:57:50.266Z",
+            "generation": 1,
+            "kind": "upsert",
+            "methodId": "export",
+            "owner": "0x1E3d4F5745Fd39E60f2C0aBFc03a0Cd223cB6b5f",
+            "recordKey": "reverse",
+            "revision": {
+              "counter": 7,
+              "operationId": "87dad595-f179-4e69-a6eb-5d2ace20fe5c",
+              "writerId": "1dc4030a-5820-4876-b3ce-7804fd470c63"
+            },
+            "sourceId": "https://replica-journey.invalid/declaration"
+          }
+        ],
+        "wire": [
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_4e86d7e691cc498282b3f01ddaafbb09.0",
+            "batch": "4e86d7e691cc498282b3f01ddaafbb09",
+            "state": "published",
+            "bytes": 1443
+          },
+          {
+            "scope": "pdpp_replica_v1.1012cf40cd184a108250c4108cb35123_0cc6aab586af476dbc55dd03124bf27d.0",
+            "batch": "0cc6aab586af476dbc55dd03124bf27d",
+            "state": "published",
+            "bytes": 120826
+          }
+        ]
+      },
+      "blob": {
+        "blobId": "sha256:6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+        "sha256": "6e810823ae874129a14269514ff84f0ff78eb410e89d8240b8924eae4de5b1a5",
+        "bytes": 65536
+      }
+    }
+  ],
+  "startedAt": "2026-10-21T03:52:22.454Z",
+  "status": "failed",
+  "error": "Remote test blob cleanup failed (A:delete, A:delete, A:delete, A:delete, A:delete, A:delete, B:delete, B:delete)",
+  "finishedAt": "2026-10-21T04:07:17.859Z",
+  "peakRssKiB": {
+    "parent": 290960,
+    "A": 2535428,
+    "B": 305968
+  },
+  "remoteBlobCleanup": {
+    "attempted": 38,
+    "deleted": 30,
+    "notFound": 0,
+    "errors": 8
+  },
+  "cleanupErrorCount": 8
+}
