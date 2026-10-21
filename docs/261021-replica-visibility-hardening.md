@@ -47,6 +47,10 @@ File surfaces read `DataStoragePort` (`createNodeDataStorage({indexManager, hier
 
 `empty` stays storage emptiness. A reader-aware value would disagree with the fence the store applies when binding a method: a pending-only connection would look non-empty, and a conflicted connection with stored rows would look empty.
 
+## Connection quarantine (copy contract v3 A, H, I)
+
+A terminal batch quarantines every connection it touched and moves the integrity epoch in the same transaction. On Node, the fact is `pdpp_replica_quarantined_connections`, written without withdrawing stored rows, claims or bytes. Point reads, pages, stream lists, summaries, `changes_since`, blob metadata and references, confirmed bytes and `/v1/data` already withheld the connection from both readers through the store's shared predicate. Confirmed bytes come from the host byte source only after the reader authorizes a visible reference. The one red case was the change feed: its page cursors and session tokens did not expire on an epoch move, and now do. Lite has no epoch. Its connection-quarantine facts are the binding-conflict record and equivocation markers, under which `reconcile` withdraws rows and advances both view revisions. The confirmed-blob path now refuses bytes that only quarantined connections claim. Red logs: `r3w-node-changes-epoch-red.log`, `r3w-lite-quarantine-red-final.log` and `r3w-lite-binding-conflict-blob-red.log` under `~/.tmp/ps438-relaunch-logs/`.
+
 ## Identity ambiguity
 
 The owner explicitly decided that a genuine received source-binding conflict hides the whole connection from grant readers, including stored local rows. Owners may see only known local writes, marked `visibility: "conflicted"` and `status: "account conflict"`. Received winners and pending payloads cannot supply those owner values. This is a visibility rule in the same core policy component, not a storage-withdrawal rule.
