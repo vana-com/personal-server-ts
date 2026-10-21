@@ -1,12 +1,29 @@
 import { afterEach, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  statSync,
+  readFileSync,
+} from "node:fs";
+import { createHash } from "node:crypto";
+import pino from "pino";
+import { createGatewayClient } from "@opendatalabs/vana-sdk/node";
+import {
+  createReplicaOwnerLegacyRoutes,
+  openReplicaOwnerLegacyStorage,
+} from "./pdpp-replica-owner-legacy-routes.js";
+import { createAccessLogWriter } from "../packages/server/src/logging/access-log.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
   createTestWallet,
   buildWeb3SignedHeader,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import { createOwnerComposition } from "./pdpp-replica-owner-composition.js";
+import {
+  createOwnerComposition,
+  loadCompositionSource,
+} from "./pdpp-replica-owner-composition.js";
 import {
   computeS256Challenge,
   PDPP_DATA_ACCESS_TYPE_V02,
@@ -37,6 +54,334 @@ async function setup() {
   return { host, owner };
 }
 const sourceId = "https://replica-journey.invalid/declaration";
+
+it("reuses the existing authority with an exact verified dynamic declaration and zero synthetic records", async () => {
+  const { host: previous, owner } = await setup();
+  const root = roots.at(-1)!;
+  const originalBody = JSON.stringify({ source_id: sourceId });
+  const proof = await buildWeb3SignedHeader({
+    wallet: owner,
+    aud: origin,
+    method: "POST",
+    uri: "/pdpp/v1/owner/token",
+    body: new TextEncoder().encode(originalBody),
+  });
+  const previousToken = (
+    await (
+      await previous.app.request("/pdpp/v1/owner/token", {
+        method: "POST",
+        headers: { authorization: proof, "content-type": "application/json" },
+        body: originalBody,
+      })
+    ).json()
+  ).access_token;
+  const authorityInode = statSync(join(root, "auth.sqlite")).ino;
+  await previous.close();
+  hosts.splice(hosts.indexOf(previous), 1);
+  const document = readFileSync(
+    new URL(
+      "./fixtures/strava-browser-source-declaration.json",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+  const declarationPath = join(root, "source-declaration.json");
+  writeFileSync(declarationPath, document);
+  const declarationSha256 = createHash("sha256").update(document).digest("hex");
+  expect(() =>
+    loadCompositionSource({
+      declarationPath,
+      declarationSha256: "0".repeat(64),
+      methodId: "strava-browser",
+      connectionId: "actual-owned-connection",
+    }),
+  ).toThrow();
+  const source = loadCompositionSource({
+    declarationPath,
+    declarationSha256,
+    methodId: "strava-browser",
+    connectionId: "actual-owned-connection",
+  });
+  await expect(
+    createOwnerComposition({
+      root: join(root, "missing-authority"),
+      owner: owner.address,
+      origin,
+      accountOrigin,
+      clientId: "exact-requester",
+      redirectUri: "http://localhost:3284/callback",
+      source,
+    }),
+  ).rejects.toThrow(/existing auth.sqlite/);
+  await expect(
+    createOwnerComposition({
+      root,
+      owner: createTestWallet(1).address,
+      origin,
+      accountOrigin,
+      clientId: "exact-requester",
+      redirectUri: "http://localhost:3284/callback",
+      source,
+    }),
+  ).rejects.toThrow(/configured owner/);
+  const real = await createOwnerComposition({
+    root,
+    owner: owner.address,
+    origin,
+    accountOrigin,
+    clientId: "exact-requester",
+    redirectUri: "http://localhost:3284/callback",
+    source,
+    legacyRoutesFactory: (ports) => {
+      const storage = openReplicaOwnerLegacyStorage({ root: ports.root });
+      return {
+        routes: createReplicaOwnerLegacyRoutes({
+          ...storage,
+          logger: pino({ level: "silent" }),
+          serverOwner: ports.serverOwner,
+          serverOrigin: ports.serverOrigin,
+          serverSigner: ports.serverSigner,
+          gatewayConfig: ports.gatewayConfig,
+          gateway: createGatewayClient("https://dp-rpc-dev.vana.org"),
+          accessLogWriter: createAccessLogWriter(join(ports.root, "logs")),
+          granteeAddress: "0x2222222222222222222222222222222222222222",
+        }),
+        close: () => storage.close(),
+      };
+    },
+  });
+  hosts.push(real);
+  const state = await (await real.app.request("/composition/state")).json();
+  expect(statSync(join(root, "auth.sqlite")).ino).toBe(authorityInode);
+  expect(state.source_id).toBe("https://registry.pdpp.dev/sources/strava");
+  expect(state.instances).toEqual([]);
+  expect(state.streams.map((stream: { name: string }) => stream.name)).toEqual([
+    "activities",
+  ]);
+  expect(state.window).toBeUndefined();
+  expect(state.mode).toBe("connector");
+  expect(state.ingestion.method).toBe("strava-browser");
+  expect(state.ingestion.binding_generation).toBeNull();
+  expect(state.canonical_records).toBe(0);
+  expect(state.confirmed).toBeUndefined();
+  expect(
+    (
+      await real.app.request(
+        "/pdpp/v1/streams/activities/records/ingest?method=strava-browser&binding_generation=1",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "[]",
+        },
+      )
+    ).status,
+  ).toBe(401);
+  expect(
+    (
+      await real.app.request("/composition/ingest", {
+        method: "POST",
+        headers: {
+          origin: "http://evil.invalid",
+          "content-type": "application/json",
+        },
+        body: "[]",
+      })
+    ).status,
+  ).toBe(403);
+  const introspection = await real.app.request("/pdpp/v1/introspect", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${previousToken}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({ token: previousToken }).toString(),
+  });
+  expect(introspection.status).toBe(200);
+  expect((await introspection.json()).active).toBe(true);
+  const { openReplicaRuntime, digest, serverAccount } =
+    await import("./pdpp-replica-live-journey.js");
+  const runtime = await openReplicaRuntime({
+    root: join(root, "offline-collector-A"),
+    owner: owner.address,
+    master: Array(32).fill(1),
+    serverKey: `0x${"01".repeat(32)}`,
+    scriptSha256: digest(
+      readFileSync(new URL("./pdpp-replica-live-journey.ts", import.meta.url)),
+    ),
+    source,
+  });
+  await real.attachCollector(runtime, serverAccount(`0x${"01".repeat(32)}`));
+  const mounted = await (await real.app.request("/composition/state")).json();
+  expect(mounted.connection_id).toBe("actual-owned-connection");
+  expect(mounted.binding_generation).toBe(1);
+  expect(mounted.instances).toEqual(["actual-owned-connection"]);
+  expect(mounted.canonical_records).toBe(0);
+  expect(
+    (
+      await real.app.request("/composition/ingest", {
+        method: "POST",
+        headers: { origin: accountOrigin, "content-type": "application/json" },
+        body: "[]",
+      })
+    ).status,
+  ).toBe(404);
+  const issueBody = JSON.stringify({
+    source_id: "https://registry.pdpp.dev/sources/strava",
+  });
+  async function issueSourceToken() {
+    const authorization = await buildWeb3SignedHeader({
+      wallet: owner,
+      aud: origin,
+      method: "POST",
+      uri: "/pdpp/v1/owner/token",
+      body: new TextEncoder().encode(issueBody),
+    });
+    const response = await real.app.request("/pdpp/v1/owner/token", {
+      method: "POST",
+      headers: { authorization, "content-type": "application/json" },
+      body: issueBody,
+    });
+    expect(response.status).toBe(200);
+    return (await response.json()).access_token as string;
+  }
+  const credential = await issueSourceToken();
+  expect((await real.app.request("/v1/data/strava.activities")).status).toBe(
+    401,
+  );
+  expect(
+    (
+      await real.app.request("/v1/grants", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${credential}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          granteeAddress: "0x2222222222222222222222222222222222222222",
+          scopes: ["strava.activities"],
+        }),
+      })
+    ).status,
+  ).toBe(401);
+  const readProof = await buildWeb3SignedHeader({
+    wallet: owner,
+    aud: origin,
+    method: "GET",
+    uri: "/v1/data/strava.activities",
+  });
+  expect(
+    (
+      await real.app.request("/v1/data/strava.activities", {
+        headers: { authorization: readProof },
+      })
+    ).status,
+  ).toBe(404);
+  const envelope = {
+    instance: "actual-owned-connection",
+    stream: "activities",
+    key: "offline-test-only",
+    data: {
+      id: "offline-test-only",
+      start_date: "2026-10-01",
+      start_time: "2026-10-01T08:30:00",
+      start_time_basis: "local",
+      freshness: "live",
+      exported_at: null,
+      distance_m: 1234.5,
+    },
+    emitted_at: "2026-10-21T01:00:00Z",
+  };
+  const ingestUrl = mounted.ingestion.streams[0].url;
+  expect(ingestUrl).toBe(
+    origin +
+      "/pdpp/v1/streams/activities/records/ingest?method=strava-browser&binding_generation=1",
+  );
+  const ingest = (token: string | undefined, input: unknown, url = ingestUrl) =>
+    real.app.request(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(token && { authorization: `Bearer ${token}` }),
+      },
+      body: JSON.stringify(input),
+    });
+  expect((await ingest(undefined, envelope)).status).toBe(401);
+  expect((await ingest(previousToken, envelope)).status).toBe(401);
+  expect(
+    (await ingest(credential, { ...envelope, instance: "unowned" })).status,
+  ).toBe(401);
+  expect(
+    (
+      await ingest(
+        credential,
+        envelope,
+        origin + "/pdpp/v1/streams/activities/records/ingest",
+      )
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await ingest(
+        credential,
+        envelope,
+        origin +
+          "/pdpp/v1/streams/activities/records/ingest?method=export&binding_generation=1",
+      )
+    ).status,
+  ).toBe(409);
+  expect(
+    (
+      await ingest(
+        credential,
+        envelope,
+        origin +
+          "/pdpp/v1/streams/activities/records/ingest?method=strava-browser&binding_generation=2",
+      )
+    ).status,
+  ).toBe(409);
+  const foreignOwnerProof = await buildWeb3SignedHeader({
+    wallet: createTestWallet(1),
+    aud: origin,
+    method: "POST",
+    uri: "/pdpp/v1/owner/token",
+    body: new TextEncoder().encode(issueBody),
+  });
+  expect(
+    (
+      await real.app.request("/pdpp/v1/owner/token", {
+        method: "POST",
+        headers: {
+          authorization: foreignOwnerProof,
+          "content-type": "application/json",
+        },
+        body: issueBody,
+      })
+    ).status,
+  ).toBe(401);
+  expect(
+    (await (await real.app.request("/composition/state")).json())
+      .canonical_records,
+  ).toBe(0);
+  const accepted = await ingest(credential, envelope);
+  expect(accepted.status).toBe(200);
+  expect((await accepted.json()).accepted).toBe(1);
+  expect(runtime.snapshot().canonicalRows).toEqual([
+    {
+      instance: envelope.instance,
+      stream: envelope.stream,
+      record_key: envelope.key,
+      data: envelope.data,
+      emitted_at: envelope.emitted_at,
+      deleted: 0,
+      blob_id: null,
+    },
+  ]);
+  await issueSourceToken();
+  expect(
+    (await (await real.app.request("/composition/state")).json())
+      .canonical_records,
+  ).toBe(1);
+});
 
 it("refuses owner token issuance without normal wallet proof and requires a signed source body", async () => {
   const { host, owner } = await setup();
