@@ -24,6 +24,11 @@ import {
   type GranteeReadPort,
 } from "./disclosure-policy.js";
 import { readDataContract } from "../contracts/data.js";
+import { withLegacyProjection } from "./legacy-projection.js";
+import {
+  loadSource,
+  type QuestionComputeDeps,
+} from "../derivatives/compute.js";
 
 const SCOPE = "acme.notes";
 const AT = "2026-09-01T00:00:00.000Z";
@@ -241,6 +246,84 @@ describe("granteeReadPort authorized versions", () => {
   });
 });
 
+describe("granteeReadPort projected blocks", () => {
+  // A semantic test that does not use `pinVersion`: an MCP-style block read
+  // of a projected scope, pinned by the generation it authorized.
+  const scope = "chatgpt.conversations";
+  const conversation = (title: string) =>
+    envelope({
+      records: [
+        {
+          id: "c",
+          title,
+          create_time: "2026-09-01T10:00:00Z",
+          update_time: "2026-09-01T10:05:00Z",
+          current_node: null,
+          message_count_on_current_branch: 0,
+        },
+      ],
+    });
+
+  function projectedStore() {
+    const authorized = { ...conversation("AUTHORIZED_A"), scope };
+    const state = { bytes: encode(authorized) };
+    const entry: IndexEntry = {
+      id: 1,
+      fileId: null,
+      schemaId: null,
+      path: "chatgpt/conversations/x.json",
+      scope,
+      collectedAt: AT,
+      createdAt: AT,
+      sizeBytes: state.bytes.byteLength,
+      version: 1,
+      dataPointId: null,
+      pdppOrigin: false,
+      generation: envelopeGeneration(authorized),
+      contentDigest: sha256(state.bytes),
+    };
+    const forScope = (lookup: { scope: string }) =>
+      lookup.scope === scope ? entry : undefined;
+    const raw = {
+      findEntry: forScope,
+      listVersions: (s: string) => (s === scope ? [entry] : []),
+      readEnvelope: async () =>
+        JSON.parse(new TextDecoder().decode(state.bytes)) as DataFileEnvelope,
+      readEnvelopeStream: async () => new Blob([state.bytes]).stream(),
+      readScopeBlocks: async () => {
+        throw new Error("a projected scope is not read from a sidecar");
+      },
+      readBlockManifest: async () => null,
+    } as unknown as DataStoragePort;
+    return { raw, entry, state, scope };
+  }
+
+  it("serves blocks of the version the row records", async () => {
+    const { raw, entry } = projectedStore();
+    const port = granteeReadPort(withLegacyProjection(raw));
+
+    const read = await port.readScopeBlocks!(scope, AT, {
+      maxBytes: 100_000,
+      generation: entry.generation!,
+    });
+
+    expect(JSON.stringify(read)).toContain("AUTHORIZED_A");
+  });
+
+  it("refuses blocks once the bytes are another version's", async () => {
+    const { raw, entry, state } = projectedStore();
+    state.bytes = encode({ ...conversation("REPLACED_B"), scope });
+    const port = granteeReadPort(withLegacyProjection(raw));
+
+    await expect(
+      port.readScopeBlocks!(scope, AT, {
+        maxBytes: 100_000,
+        generation: entry.generation!,
+      }),
+    ).rejects.toMatchObject({ code: "generation_mismatch" });
+  });
+});
+
 describe("granteeReadPort surface", () => {
   it("exposes reads only, never the raw port's writes or listings", () => {
     const { raw } = rawStore(legacy);
@@ -270,6 +353,7 @@ describe("granteeReadPort surface", () => {
 export function granteeReadPortTypeContract(
   raw: DataStoragePort,
   port: GranteeReadPort,
+  computeDeps: QuestionComputeDeps,
 ): void {
   const accept = (granted: GranteeReadPort) => granted;
   accept(port);
@@ -292,6 +376,12 @@ export function granteeReadPortTypeContract(
   const rawAsGrantee = { reader: "grantee" as const, storage: raw };
   // @ts-expect-error A non-owner read never takes a raw storage port.
   void readDataContract({ source: rawAsGrantee, scopeParam: "a.b" });
+
+  // The real derivative source reader takes a reader-specific port.
+  // MCP redaction is now a pure pager operation with no storage capability.
+  void loadSource(computeDeps, "a.b", granted);
+  // @ts-expect-error A non-owner's derivative source never reads a raw port.
+  void loadSource(computeDeps, "a.b", rawAsGrantee);
 }
 
 describe("granteeReadPort type", () => {
@@ -342,7 +432,7 @@ describe("granteeReadPort type", () => {
       source.replace(/\/\/ @ts-expect-error[^\n]*\n/g, "\n"),
     );
     expect(unguarded.map((d) => d.code).sort()).toEqual([
-      2322, 2345, 2345, 2345, 2551,
+      2322, 2345, 2345, 2345, 2345, 2551,
     ]);
   }, 120_000);
 });

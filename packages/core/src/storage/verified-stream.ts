@@ -108,3 +108,114 @@ export async function readBoundedText(
 export function generationMismatch(): StoredEnvelopeReadError {
   return changed();
 }
+
+/** UTF-8 length of a JSON string literal, without serializing it. */
+function jsonStringLength(text: string): number {
+  let bytes = 2;
+  for (let i = 0; i < text.length; i += 1) {
+    const unit = text.charCodeAt(i);
+    if (unit === 0x22 || unit === 0x5c) bytes += 2;
+    else if (unit < 0x20) {
+      bytes += [8, 9, 10, 12, 13].includes(unit) ? 2 : 6;
+    } else if (unit < 0x80) bytes += 1;
+    else if (unit < 0x800) bytes += 2;
+    else if (
+      unit >= 0xd800 &&
+      unit <= 0xdbff &&
+      text.charCodeAt(i + 1) >= 0xdc00 &&
+      text.charCodeAt(i + 1) <= 0xdfff
+    ) {
+      bytes += 4;
+      i += 1;
+    } else if (unit >= 0xd800 && unit <= 0xdfff) bytes += 6;
+    else bytes += 3;
+  }
+  return bytes;
+}
+
+/**
+ * `JSON.stringify(value)` as UTF-8, built piece by piece and refused as soon
+ * as it would pass `maxBytes`: a value whose serialization expands (one
+ * large string referenced many times) never allocates more than the cap.
+ * Same output as `JSON.stringify` for JSON data (objects, arrays, strings,
+ * numbers, booleans, null, `toJSON`); a cycle throws, as it does there.
+ */
+export function boundedJsonBytes(value: unknown, maxBytes: number): Uint8Array {
+  const pieces: string[] = [];
+  let total = 0;
+  const ancestors = new Set<object>();
+  const reserve = (bytes: number) => {
+    total += bytes;
+    if (total > maxBytes) {
+      throw new StoredEnvelopeReadError(
+        "too_large",
+        `The served envelope is larger than ${maxBytes} bytes`,
+      );
+    }
+  };
+  // Punctuation and scalar JSON other than strings are ASCII.
+  const emit = (piece: string) => {
+    reserve(piece.length);
+    pieces.push(piece);
+  };
+  const emitString = (text: string) => {
+    reserve(jsonStringLength(text));
+    pieces.push(JSON.stringify(text));
+  };
+  // `toJSON` applied, as JSON.stringify applies it before deciding to omit.
+  const resolve = (key: string, item: unknown): unknown =>
+    item !== null &&
+    typeof item === "object" &&
+    typeof (item as { toJSON?: unknown }).toJSON === "function"
+      ? (item as { toJSON(key: string): unknown }).toJSON(key)
+      : item;
+  // What JSON.stringify omits from an object and writes as null in an array.
+  const omitted = (item: unknown) =>
+    item === undefined ||
+    typeof item === "function" ||
+    typeof item === "symbol";
+  const write = (item: unknown): void => {
+    if (typeof item === "string") {
+      emitString(item);
+      return;
+    }
+    if (item === null || typeof item !== "object") {
+      emit(JSON.stringify(item));
+      return;
+    }
+    if (ancestors.has(item)) {
+      throw new TypeError("Converting circular structure to JSON");
+    }
+    ancestors.add(item);
+    if (Array.isArray(item)) {
+      emit("[");
+      for (let index = 0; index < item.length; index += 1) {
+        if (index > 0) emit(",");
+        const resolved = resolve(String(index), item[index]);
+        if (omitted(resolved)) emit("null");
+        else write(resolved);
+      }
+      emit("]");
+    } else {
+      emit("{");
+      let first = true;
+      for (const name of Object.keys(item)) {
+        const resolved = resolve(name, (item as Record<string, unknown>)[name]);
+        if (omitted(resolved)) continue;
+        if (!first) emit(",");
+        emitString(name);
+        emit(":");
+        first = false;
+        write(resolved);
+      }
+      emit("}");
+    }
+    ancestors.delete(item);
+  };
+  const root = resolve("", value);
+  if (omitted(root)) {
+    throw new TypeError("The value has no JSON serialization");
+  }
+  write(root);
+  return new TextEncoder().encode(pieces.join(""));
+}

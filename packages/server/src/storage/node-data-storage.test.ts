@@ -846,4 +846,109 @@ describe("immutable PDPP version provenance", () => {
       await close();
     }
   });
+
+  it("keeps the stricter provenance when a backfill is rolled back", async () => {
+    const { storage, index, close } = await openStorage();
+    try {
+      const written = await storage.writeEnvelope(legacy);
+      const row = index.insert({
+        fileId: null,
+        path: written.relativePath,
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        sizeBytes: written.sizeBytes,
+        pdppOrigin: false,
+      });
+      // The first read sees PDPP bytes; they become legacy again before the
+      // second read, so the backfill is rolled back.
+      await writeFile(written.path, JSON.stringify(nativeBytes, null, 2));
+      const swap = index.swapIdentity.bind(index);
+      let swaps = 0;
+      index.swapIdentity = (id, expected, next) => {
+        const swapped = swap(id, expected, next);
+        if (++swaps === 1) {
+          expect(next.pdppOrigin).toBe(true);
+          writeFileSync(written.path, JSON.stringify(legacy, null, 2));
+        }
+        return swapped;
+      };
+
+      await storage.backfillGeneration!(row);
+
+      expect(swaps).toBe(2);
+      expect(index.findByPath(written.relativePath)).toMatchObject({
+        pdppOrigin: true,
+      });
+      expect(
+        index.findByPath(written.relativePath)?.generation,
+      ).toBeUndefined();
+      expect(
+        index.findByPath(written.relativePath)?.contentDigest,
+      ).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+
+  it("keeps the stage until recovery has repaired the row, across a crash in recovery", async () => {
+    const { dataDir, index, close } = await openStorage();
+    const sha256 = (bytes: Buffer) =>
+      createHash("sha256").update(bytes).digest("hex");
+    try {
+      const finalPath = buildDataFilePath(
+        dataDir,
+        legacy.scope,
+        legacy.collectedAt,
+      );
+      await mkdir(dirname(finalPath), { recursive: true });
+      // The equal envelope kept at the path, in another key order; the row
+      // records the staged bytes' digest, as a commit that died does.
+      const kept = Buffer.from(
+        JSON.stringify({
+          data: legacy.data,
+          collectedAt: legacy.collectedAt,
+          scope: legacy.scope,
+          version: legacy.version,
+        }),
+      );
+      await writeFile(finalPath, kept);
+      const staged = Buffer.from(JSON.stringify(legacy, null, 2));
+      index.insert({
+        fileId: null,
+        path: relative(dataDir, finalPath),
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        sizeBytes: staged.byteLength,
+        pdppOrigin: false,
+        generation: oracleGeneration(legacy),
+        contentDigest: sha256(staged),
+      });
+      await writeFile(`${finalPath}.pending.crash`, staged);
+      const swap = index.swapIdentity.bind(index);
+      index.swapIdentity = () => {
+        throw new Error("process died in recovery");
+      };
+
+      await expect(
+        recoverStagedDataFiles({
+          indexManager: index,
+          hierarchyOptions: { dataDir },
+        }),
+      ).rejects.toThrow("process died in recovery");
+      index.swapIdentity = swap;
+      await recoverStagedDataFiles({
+        indexManager: index,
+        hierarchyOptions: { dataDir },
+      });
+
+      expect(
+        index.findByPath(relative(dataDir, finalPath))?.contentDigest,
+      ).toBe(sha256(kept));
+      await expect(
+        readFile(`${finalPath}.pending.crash`),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await close();
+    }
+  });
 });

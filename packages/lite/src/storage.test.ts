@@ -233,6 +233,62 @@ describe("createPersistentPsLiteStorage", () => {
     );
   });
 
+  it("keeps the stricter provenance when a backfill is rolled back", async () => {
+    const files = createMemoryPsLiteDataFileStore();
+    const persistence = createMemoryPsLitePersistence();
+    const first = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      files,
+    );
+    const envelope = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "legacy" },
+    );
+    const written = await first.writeEnvelope(envelope);
+    await first.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: written.sizeBytes,
+    });
+    const saved = (await persistence.read())!;
+    const old = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence({
+        ...saved,
+        entries: saved.entries.map(({ generation: _g, ...entry }) => entry),
+      }),
+      files,
+    );
+    const entry = old.findEntry({ scope: envelope.scope })!;
+    expect(entry.pdppOrigin).toBe(false);
+    // The first backfill read sees PDPP bytes, the second legacy bytes.
+    const readStored = files.readEnvelope.bind(files);
+    let reads = 0;
+    files.readEnvelope = async (path) => {
+      const stored = await readStored(path);
+      return ++reads === 1 && stored
+        ? ({
+            ...stored,
+            data: { id: "native", $pdpp: { version: 1 } },
+          } as typeof stored)
+        : stored;
+    };
+
+    await expect(old.backfillGeneration!(entry)).resolves.toBeUndefined();
+
+    expect(reads).toBe(2);
+    expect(old.findEntry({ scope: envelope.scope })).toMatchObject({
+      pdppOrigin: true,
+    });
+    expect(
+      old.findEntry({ scope: envelope.scope })?.generation,
+    ).toBeUndefined();
+  });
+
   it("P2-e: republishes the same envelope in another key order", async () => {
     const storage = await createPersistentPsLiteStorage(
       { kind: "custom" },

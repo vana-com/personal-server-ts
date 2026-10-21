@@ -952,7 +952,16 @@ export async function createPersistentPsLiteStorage(
         second.generation !== first.generation ||
         second.pdppOrigin !== first.pdppOrigin
       ) {
-        swap(after, before);
+        // Roll back the disputed generation, never the provenance to a
+        // looser value: if either read saw PDPP bytes, the row stays PDPP.
+        swap(after, {
+          pdppOrigin:
+            before.pdppOrigin === true ||
+            first.pdppOrigin === true ||
+            second.pdppOrigin === true
+              ? true
+              : before.pdppOrigin,
+        });
         await persist();
         return undefined;
       }

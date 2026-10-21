@@ -72,16 +72,25 @@ export async function recoverStagedDataFiles(
         // A leftover stage can share the final path of a prior committed
         // write after a restart. The existing final file wins: this stage
         // cannot be identified as the one that created the older index row.
+        // A commit that died before recording the kept bytes' digest left
+        // this stage too. The stage is the durable trigger for that repair,
+        // so it is removed only after the row is repaired and checked: a
+        // crash in between leaves it for the next boot.
+        let published = true;
         try {
           await stat(finalPath);
-          await unlink(path);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          await publishStagedDataFile(path, finalPath);
+          published = false;
         }
-        // A commit that died between publication and recording the kept
-        // bytes' digest left this stage: record it now.
-        await repairKeptDigest(deps, indexed, finalPath);
+        if (published) {
+          await repairKeptDigest(deps, indexed, finalPath);
+          await unlink(path);
+        } else {
+          await publishStagedDataFile(path, finalPath, {
+            onKept: () => repairKeptDigest(deps, indexed, finalPath),
+          });
+        }
       }
     }
   };
@@ -245,10 +254,17 @@ async function repairKeptDigest(
     return;
   }
   const recorded = storedIdentity(row);
-  deps.indexManager.swapIdentity(row.id, recorded, {
-    ...recorded,
-    contentDigest: published.contentDigest,
-  });
+  if (
+    !deps.indexManager.swapIdentity(row.id, recorded, {
+      ...recorded,
+      contentDigest: published.contentDigest,
+    }) &&
+    deps.indexManager.findByPath(row.path)?.contentDigest !==
+      published.contentDigest
+  ) {
+    // The row changed under the repair: keep the trigger for a later run.
+    throw new Error(`Could not repair the content digest of ${row.path}`);
+  }
 }
 
 export function createNodeDataStorage(
@@ -466,7 +482,16 @@ export function createNodeDataStorage(
       // is not recorded.
       const second = await identityOfPublishedBytes(row.path);
       if (!isComplete(second) || !sameIdentity(first, second)) {
-        deps.indexManager.swapIdentity(row.id, after, before);
+        // Roll back the disputed generation and digest, but never the
+        // provenance to a looser value: if either read saw PDPP bytes, the
+        // row stays PDPP.
+        deps.indexManager.swapIdentity(row.id, after, {
+          ...before,
+          pdppOrigin:
+            before.pdppOrigin === true || first.pdppOrigin || second.pdppOrigin
+              ? true
+              : before.pdppOrigin,
+        });
         return row.generation;
       }
       return first.generation;

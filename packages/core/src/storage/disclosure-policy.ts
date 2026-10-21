@@ -172,7 +172,7 @@ function servedManifest(manifest: DataBlockManifest): DataBlockManifest {
   } = manifest;
   return {
     ...served,
-    representationId: blockRepresentationId(manifest, "grantee"),
+    representationId: manifest.representationId ?? blockRepresentationId(manifest, "grantee"),
     blocks: blocks.map(({ digest: _blockDigest, ...ref }) => ref),
   };
 }
@@ -300,14 +300,12 @@ function authorizedSource(raw: DataStoragePort): ProjectionSource {
           kind: "stored-blocks",
           pdppOrigin: result.pdppOrigin,
         });
-        return servedBlocks(result);
+        return result;
       }
-      return servedBlocks(
-        await readBuiltScopeBlocks(
+      return readBuiltScopeBlocks(
           await readCheckedBlocks(scope, collectedAt, generation),
           readOptions,
-        ),
-      );
+        );
     };
   }
   if (raw.readBlockManifest) {
@@ -327,11 +325,9 @@ function authorizedSource(raw: DataStoragePort): ProjectionSource {
           kind: "stored-blocks",
           pdppOrigin: manifest.pdppOrigin,
         });
-        return servedManifest(manifest);
+        return manifest;
       }
-      return servedManifest(
-        (await readCheckedBlocks(scope, collectedAt, generation)).manifest,
-      );
+      return (await readCheckedBlocks(scope, collectedAt, generation)).manifest;
     };
   }
   return source;
@@ -417,6 +413,13 @@ async function readPinnedStream(
   });
 }
 
+/**
+ * The most stored input, and the most output, one non-owner projected read
+ * (envelope, blocks or table of contents) may take. A stream passes its own
+ * cap. The TEE job default budget is the same 64 MiB.
+ */
+export const GRANTEE_PROJECTION_MAX_BYTES = 64 * 1024 * 1024;
+
 /** Ports minted per storage port, so a projection keeps its caches. */
 const minted = new WeakMap<DataStoragePort, GranteeReadPort>();
 
@@ -432,7 +435,9 @@ export function granteeReadPort(storage: DataStoragePort): GranteeReadPort {
   const projection = projectionInput(storage);
   const source = authorizedSource(projection?.raw ?? storage);
   const reads = projection
-    ? projectedReads(source, projection.options)
+    ? projectedReads(source, projection.options, {
+        maxBytes: GRANTEE_PROJECTION_MAX_BYTES,
+      })
     : { ...source, readStoredEnvelope: source.readEnvelope };
   const port: Omit<GranteeReadPort, typeof granteeRead> = {
     findEntry: (lookup) => storage.findEntry(lookup),
@@ -467,8 +472,14 @@ export function granteeReadPort(storage: DataStoragePort): GranteeReadPort {
       return stream(named.scope, named.collectedAt, { pin: row, maxBytes });
     };
   }
-  if (reads.readScopeBlocks) port.readScopeBlocks = reads.readScopeBlocks;
-  if (reads.readBlockManifest) port.readBlockManifest = reads.readBlockManifest;
+  const readBlocks = reads.readScopeBlocks;
+  if (readBlocks) port.readScopeBlocks = async (scope, at, options) =>
+    servedBlocks(await readBlocks(scope, at, {...options, representation:"grantee"}));
+  const readManifest = reads.readBlockManifest;
+  if (readManifest) port.readBlockManifest = async (scope, at, options) => {
+    const manifest = await readManifest(scope, at, options);
+    return manifest ? servedManifest(manifest) : null;
+  };
   const branded = port as GranteeReadPort;
   minted.set(storage, branded);
   return branded;
