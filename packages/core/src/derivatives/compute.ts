@@ -18,6 +18,7 @@ import { uncoveredSourceScopes } from "./registration.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
+import { storageForReader } from "../storage/disclosure-policy.js";
 import { assertDerivedScopeNaming } from "../lineage/lineage.js";
 import type { StoredLineage } from "../lineage/lineage.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
@@ -427,12 +428,17 @@ async function loadSource(
     );
   }
   // The answer is disclosed to whoever registered the question, so each
-  // source passes the same disclosure policy as a read by that registrant.
-  authorizeLegacyRead(reader, { kind: "stored-version", entry });
+  // source passes the same disclosure policy as a read by that registrant:
+  // refused early on a row known to be PDPP, then decided on the bytes read.
+  authorizeLegacyRead(reader, { kind: "indexed-version", entry });
   let envelope;
   try {
-    envelope = await deps.storage.readEnvelope(scope, entry.collectedAt);
-  } catch {
+    envelope = await storageForReader(deps.storage, reader).readEnvelope(
+      scope,
+      entry.collectedAt,
+    );
+  } catch (err) {
+    if (err instanceof ProtocolError) throw err;
     throw new ComputeFailure(`source scope ${scope} could not be read`);
   }
   let lineageSources: string[] = [];

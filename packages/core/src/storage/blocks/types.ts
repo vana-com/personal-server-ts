@@ -8,6 +8,11 @@ export interface DataBlockManifest {
   schemaId?: string;
   contentKind: ContentKind;
   rawSizeBytes?: number;
+  /**
+   * Whether the envelope these blocks were built from has PDPP origin (see
+   * `hasPdppOrigin`). Absent on manifests written before this field.
+   */
+  pdppOrigin?: boolean;
   blocks: DataBlockRef[];
   warnings: DataBlockWarning[];
 }
@@ -50,6 +55,8 @@ export interface ReadScopeBlocksResponse {
   blocks: DataScopeBlock[];
   nextCursor?: string;
   warnings: DataBlockWarning[];
+  /** The manifest's `pdppOrigin`, for the disclosure policy; never served. */
+  pdppOrigin?: boolean;
 }
 
 export interface DataScopeBlock {

@@ -10,6 +10,7 @@ import {
   BINARY_MARKER,
   type BinaryEnvelopeData,
 } from "../../contracts/binary.js";
+import { hasPdppOrigin } from "../../sync/pdpp-import.js";
 
 export type {
   ContentKind,
@@ -132,6 +133,13 @@ function buildDataBlocksInternal(
     ...(input.schemaId ? { schemaId: input.schemaId } : {}),
     contentKind,
     rawSizeBytes,
+    ...(classified.kind === "vana-envelope" && isPlainObject(classified.value)
+      ? {
+          pdppOrigin: hasPdppOrigin(
+            classified.value as { data: unknown; producer?: unknown },
+          ),
+        }
+      : {}),
     blocks: blocksWithIds.map(({ id, path, mediaType, sizeBytes }) => ({
       id,
       path,

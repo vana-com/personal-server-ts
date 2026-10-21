@@ -38,6 +38,7 @@ const builder = createTestWallet(8);
 const GRANT_ID = "grant-lite-1";
 const SECRET = "pdpp-only-score-99";
 const LEGACY = "legacy-file-row";
+let duringAuth: (() => Promise<void>) | undefined;
 const gatewayConfig = {
   url: "https://gateway.test",
   chainId: 14800,
@@ -74,7 +75,14 @@ function gatewayFor(granteeAddress: `0x${string}`): GatewayClient {
   return {
     isRegisteredBuilder: vi.fn().mockResolvedValue(true),
     getBuilder: vi.fn().mockResolvedValue(registered),
-    getGrant: vi.fn().mockResolvedValue(grant),
+    // The chain grant check is a gateway round trip; storage can change
+    // while it is in flight.
+    getGrant: vi.fn(async () => {
+      const hook = duringAuth;
+      duringAuth = undefined;
+      await hook?.();
+      return grant;
+    }),
     listGrantsByUser: vi.fn().mockResolvedValue([]),
     getSchemaForScope: vi.fn().mockResolvedValue(null),
     getServer: vi.fn().mockResolvedValue(null),
@@ -318,5 +326,37 @@ describe("PS Lite MCP connection with a live chain grant", () => {
     const read = await call("read_scope", { scope: "instagram.posts" });
     expect(read).toContain("DATA_DELETED");
     expect(read).not.toContain(LEGACY);
+  });
+});
+
+describe("PS Lite GET /v1/data/:scope decides on the bytes it serves", () => {
+  it("P1-b: a PDPP version written while the grant is verified is not served", async () => {
+    const { runtime, storage } = await boot(builder.address);
+    const put = async (data: Record<string, unknown>) => {
+      const envelope = {
+        version: "1.0",
+        scope: "instagram.profile",
+        collectedAt: "2026-09-01T00:00:00.000Z",
+        data,
+      } as Parameters<typeof storage.writeEnvelope>[0];
+      const written = await storage.writeEnvelope(envelope);
+      await storage.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: written.sizeBytes,
+      });
+    };
+    duringAuth = () =>
+      put({ id: LEGACY, score: SECRET, $pdpp: { version: 1, sourceId: "x" } });
+    const read = await signedGet(runtime, builder, "instagram.profile");
+    const text = await read.text();
+    expect(read.status, text).toBe(403);
+    expect(text).not.toContain(SECRET);
+    // Control: the owner reads it.
+    const owned = await signedGet(runtime, owner, "instagram.profile");
+    expect(owned.status).toBe(200);
+    expect(await owned.text()).toContain(SECRET);
   });
 });

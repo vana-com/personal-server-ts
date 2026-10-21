@@ -27,9 +27,11 @@ export interface IndexEntry {
   /**
    * Whether this version's bytes came from PDPP: they carry native `$pdpp`
    * import metadata, or a PDPP producer stamped them as a canonical cache.
-   * Storage derives it from the published bytes, which never change at a
-   * version path. Undefined means not yet known (a row from before this
-   * field); the read policy treats unknown as PDPP until storage resolves it.
+   * Storage derives it from the published bytes when it indexes them. It is
+   * only an early refusal, so a read that will be refused fails before
+   * payment; the authority is the disclosure view, which decides on the bytes
+   * a non-owner read returns. Undefined (rows from before this field) means
+   * no early refusal.
    */
   pdppOrigin?: boolean;
   /** Server-stamped origin of a legacy cache version. Null for older/manual writes. */

@@ -44,6 +44,7 @@ import {
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
 import { authorizeLegacyRead } from "../policy/data-read.js";
+import { storageForReader } from "../storage/disclosure-policy.js";
 import type { IndexEntry } from "../storage/index/types.js";
 
 /**
@@ -493,6 +494,11 @@ export function createMcpDataReadClient(
   options: CreateMcpDataReadClientOptions,
 ): McpDataReadClient {
   const basePath = options.basePath ?? "/v1/data";
+  // Every body this client returns goes to a grantee.
+  const granteeStorage = storageForReader(
+    options.dataApiDeps.storage,
+    "grantee",
+  );
 
   /**
    * Same deletion gate as GET /v1/data/:scope, surfaced as the MCP error
@@ -573,14 +579,15 @@ export function createMcpDataReadClient(
   }
 
   /**
-   * The disclosure policy for the version a block read serves. This client
-   * reads only as a grantee (see the header), so the policy decides before
+   * Early refusal of a version whose row is known to be PDPP. This client
+   * reads only as a grantee (see the header), so it runs before
    * `authorizeScopeRead` may settle payment, right after the deletion gate,
-   * in the same order as `/v1/data`.
+   * in the same order as `/v1/data`. The blocks themselves are read through
+   * `granteeStorage`, which decides on what it actually read.
    */
   function authorizeGranteeVersion(entry: Pick<IndexEntry, "pdppOrigin">) {
     try {
-      authorizeLegacyRead("grantee", { kind: "stored-version", entry });
+      authorizeLegacyRead("grantee", { kind: "indexed-version", entry });
     } catch (err) {
       if (err instanceof ProtocolError) {
         throw new McpDataReadError(err.code, err.toJSON());
@@ -693,7 +700,7 @@ export function createMcpDataReadClient(
       blockIds,
       tool,
     }) {
-      const storage = options.dataApiDeps.storage;
+      const storage = granteeStorage;
       if (!storage.readScopeBlocks) {
         throw new McpDataReadError(503, {
           error: "BOUNDED_DATA_UNAVAILABLE",
@@ -805,7 +812,7 @@ export function createMcpDataReadClient(
     },
 
     async readBlockManifest({ scope, grantId }) {
-      const storage = options.dataApiDeps.storage;
+      const storage = granteeStorage;
       if (!storage.readBlockManifest) return null;
 
       const selectedEntry = storage.findEntry({ scope });

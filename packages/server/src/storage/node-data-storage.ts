@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import {
   deleteAllForScope,
@@ -25,10 +24,7 @@ import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/cont
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type {
-  IndexEntry,
-  IndexManager,
-} from "@opendatalabs/personal-server-ts-core/storage/index";
+import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type {
   DataStorageEntryLookup,
   DataStorageListOptions,
@@ -160,38 +156,24 @@ export function createNodeDataStorage(
   deps: NodeDataStorageDeps,
 ): DataStoragePort {
   const db = indexDatabase(deps.indexManager);
-  const stampOrigin = db?.prepare(
-    "UPDATE data_files SET pdpp_origin = ? WHERE path = ? AND pdpp_origin IS NULL",
-  );
   /**
    * PDPP provenance of the bytes at a version path, or undefined when they
-   * cannot be read. The bytes never change once published (see
-   * `publishStagedDataFile`), so the answer is stable.
+   * cannot be read. Read at insert, never on a read path: the row value only
+   * lets a read that will be refused fail before payment. The authority is
+   * the disclosure policy on the bytes each non-owner read returns.
    */
-  function originOfPublishedBytes(path: string): boolean | undefined {
+  async function originOfPublishedBytes(
+    path: string,
+  ): Promise<boolean | undefined> {
     try {
       return hasPdppOrigin(
         JSON.parse(
-          readFileSync(join(deps.hierarchyOptions.dataDir, path), "utf8"),
+          await readFile(join(deps.hierarchyOptions.dataDir, path), "utf8"),
         ),
       );
     } catch {
       return undefined;
     }
-  }
-  /**
-   * Resolve a row whose provenance is still unknown (written before the
-   * column existed, or inserted without it) from its published bytes, once.
-   * Unreadable bytes stay unknown, which the read policy refuses to grantees.
-   */
-  function withOrigin<T extends IndexEntry | undefined>(entry: T): T {
-    if (!entry || entry.pdppOrigin !== undefined) return entry;
-    const pdppOrigin = entry.producer
-      ? true
-      : originOfPublishedBytes(entry.path);
-    if (pdppOrigin === undefined) return entry;
-    stampOrigin?.run(Number(pdppOrigin), entry.path);
-    return { ...entry, pdppOrigin };
   }
   const operations = db
     ? createImportOperations(db, deps.indexManager, deps.hierarchyOptions)
@@ -216,17 +198,17 @@ export function createNodeDataStorage(
     },
     findEntry(lookup: DataStorageEntryLookup) {
       if (lookup.fileId) {
-        return withOrigin(deps.indexManager.findByFileId(lookup.fileId));
+        // A fileId names one version of one scope; never another scope's row.
+        const entry = deps.indexManager.findByFileId(lookup.fileId);
+        return entry?.scope === lookup.scope ? entry : undefined;
       }
       if (lookup.at) {
-        return withOrigin(
-          deps.indexManager.findClosestByScope(lookup.scope, lookup.at),
-        );
+        return deps.indexManager.findClosestByScope(lookup.scope, lookup.at);
       }
-      return withOrigin(deps.indexManager.findLatestByScope(lookup.scope));
+      return deps.indexManager.findLatestByScope(lookup.scope);
     },
     findByFileId(fileId: string) {
-      return withOrigin(deps.indexManager.findByFileId(fileId));
+      return deps.indexManager.findByFileId(fileId);
     },
     findByDataPointId(dataPointId: string) {
       return deps.indexManager.findByDataPointId(dataPointId);
@@ -334,10 +316,13 @@ export function createNodeDataStorage(
         blocks,
       );
     },
-    insertEntry(entry) {
-      // A writer that omits provenance leaves it unknown; `withOrigin`
-      // resolves it from the published bytes on first selection.
-      return deps.indexManager.insert(entry);
+    async insertEntry(entry) {
+      // Storage derives provenance from the bytes it published; a caller's
+      // value is never trusted.
+      return deps.indexManager.insert({
+        ...entry,
+        pdppOrigin: await originOfPublishedBytes(entry.path),
+      });
     },
     updateFileId(path: string, fileId: string) {
       return deps.indexManager.updateFileId(path, fileId);

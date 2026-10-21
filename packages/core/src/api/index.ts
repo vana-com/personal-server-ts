@@ -1,6 +1,7 @@
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import { authorizeLegacyRead } from "../policy/data-read.js";
+import { storageForReader } from "../storage/disclosure-policy.js";
 import {
   DataDeletedError,
   DeleteTombstoneFailedError,
@@ -1857,6 +1858,8 @@ export async function handlePersonalServerDataRequest(
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
         isVisible: discoveryVisibility(deps),
+        // An auth result here means a non-owner listing (owner: undefined).
+        forGrantee: Boolean(listAuth),
       });
       if (!result.ok) return contractErrorResponse(result);
       if (result.response.total === 0) {
@@ -2035,12 +2038,14 @@ export async function handlePersonalServerDataRequest(
       // Disclosure gate, before demand or payment: a chain grant reads actual
       // legacy files only, so a grantee never receives the canonical view (or
       // its refusal) or a version with PDPP origin.
+      // The body is decided again on its bytes when it is read, through the
+      // reader's storage below; this only refuses early, before payment.
       const reader = isOwnerView(authResult) ? "owner" : "grantee";
       if (latest !== undefined && latest.kind !== "file") {
         authorizeLegacyRead(reader, { kind: "canonical-view" });
       } else if (selectedEntry) {
         authorizeLegacyRead(reader, {
-          kind: "stored-version",
+          kind: "indexed-version",
           entry: selectedEntry,
         });
       }
@@ -2187,7 +2192,9 @@ export async function handlePersonalServerDataRequest(
         headers.ETag = `"${latest.revision}"`;
       } else {
         const result = await readDataContract({
-          storage: deps.storage,
+          // A non-owner reads through the disclosure policy, which decides
+          // on the bytes actually read, not on the row selected above.
+          storage: storageForReader(deps.storage, reader),
           scopeParam: scopeResult.scope,
           fileId: fileIdParam,
           at: atParam ?? selectedEntry?.collectedAt,

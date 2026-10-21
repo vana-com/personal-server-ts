@@ -36,6 +36,7 @@ import {
 import {
   buildDataFilePath,
   buildScopeDir,
+  canonicalJson,
   filenameToTimestamp,
   type HierarchyManagerOptions,
   type WriteResult,
@@ -288,13 +289,26 @@ function collectDirectorySyncPaths(finalDir: string): string[] {
   }
 }
 
+/** Two serialized envelopes with the same content, in any key order. */
+function sameEnvelope(a: Buffer, b: Buffer): boolean {
+  try {
+    return (
+      canonicalJson(JSON.parse(a.toString("utf8"))) ===
+      canonicalJson(JSON.parse(b.toString("utf8")))
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Publish a staged envelope at its version path without replacing one.
  *
  * A version path names immutable bytes. Readers authorize the version they
  * selected, including its PDPP provenance, and only then read the path, so
- * different bytes appearing there would bypass that decision. Identical bytes
- * republish idempotently; different bytes fail, as in `publishDataFile`.
+ * different bytes appearing there would bypass that decision. The same
+ * envelope (in any key order) republishes idempotently and keeps the stored
+ * bytes; a different envelope fails, as in `publishDataFile`.
  */
 export async function publishStagedDataFile(
   stagePath: string,
@@ -308,7 +322,7 @@ export async function publishStagedDataFile(
       readFile(finalPath),
       readFile(stagePath),
     ]);
-    if (!published.equals(staged)) {
+    if (!published.equals(staged) && !sameEnvelope(published, staged)) {
       throw new Error(
         `Stored envelope conflicts with publication at ${finalPath}`,
       );
@@ -501,6 +515,9 @@ export async function readScopeBlocks(
       collectedAt: manifest.collectedAt,
       ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
       contentKind: manifest.contentKind,
+      ...(manifest.pdppOrigin === undefined
+        ? {}
+        : { pdppOrigin: manifest.pdppOrigin }),
       blocks: selection.blocks,
       warnings: [...manifest.warnings, ...selection.warnings],
     };
@@ -556,6 +573,9 @@ export async function readScopeBlocks(
     collectedAt: manifest.collectedAt,
     ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
     contentKind: manifest.contentKind,
+    ...(manifest.pdppOrigin === undefined
+      ? {}
+      : { pdppOrigin: manifest.pdppOrigin }),
     blocks,
     ...(nextOffset !== undefined || nextIndex < manifest.blocks.length
       ? {

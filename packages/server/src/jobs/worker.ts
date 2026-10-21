@@ -52,6 +52,7 @@ import { isAddressEqual, type Address, type Hex } from "viem";
 import { publicKeyToAddress } from "viem/accounts";
 import type { JobExecuteResponse, JobFailureCode } from "./types.js";
 import { openRedactedEnvelopeStream } from "./raw-envelope-stream.js";
+import { storageForReader } from "@opendatalabs/personal-server-ts-core/storage/disclosure-policy";
 
 const RAW_READ = "raw_read";
 const EXECUTE_PATH = "/v1/jobs/execute";
@@ -287,11 +288,19 @@ async function executeJobUnsafe(
     version: selected.localVersion === 0 ? null : String(selected.localVersion),
     contentType: JSON_CONTENT_TYPE,
   };
-  const body = await openRawReadBodyStream(
-    deps.storage,
-    request.scope,
-    selected.entry,
-  );
+  // A job result goes to the builder: its body is read through the
+  // disclosure policy, which decides on the bytes actually read.
+  let body: ReadableStream<Uint8Array>;
+  try {
+    body = await openRawReadBodyStream(
+      storageForReader(deps.storage, "grantee"),
+      request.scope,
+      selected.entry,
+    );
+  } catch (error) {
+    if (error instanceof ProtocolError) throw mapPolicyFailure(error);
+    throw error;
+  }
   const sealed = await sealJobResultStream(
     result,
     request.builderPublicKey,
@@ -419,9 +428,10 @@ async function selectJobScope(
   if (!entry) {
     throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
   }
-  // A job result goes to the builder, never the owner.
+  // A job result goes to the builder, never the owner. A row known to be
+  // PDPP is refused here; the body read below decides on the bytes.
   try {
-    authorizeLegacyRead("grantee", { kind: "stored-version", entry });
+    authorizeLegacyRead("grantee", { kind: "indexed-version", entry });
   } catch (error) {
     throw mapPolicyFailure(error);
   }

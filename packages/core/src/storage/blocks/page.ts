@@ -35,6 +35,9 @@ export async function readBuiltScopeBlocks(
     collectedAt,
     ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
     contentKind: manifest.contentKind,
+    ...(manifest.pdppOrigin === undefined
+      ? {}
+      : { pdppOrigin: manifest.pdppOrigin }),
   };
   const byId = new Map(builtBlocks.map((block) => [block.id, block]));
 
