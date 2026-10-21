@@ -92,3 +92,4 @@ export {
   type PublicationFence,
   type PublicationRecord,
 } from "../publication/publish.js";
+export { hasPdppOrigin } from "./pdpp-import.js";

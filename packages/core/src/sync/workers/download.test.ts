@@ -305,6 +305,7 @@ describe("download worker", () => {
         sizeBytes: 128,
         version: 1,
         dataPointId: DATA_POINT_ID,
+        pdppOrigin: false,
       });
 
       // Verify result

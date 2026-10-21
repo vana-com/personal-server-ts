@@ -1122,6 +1122,9 @@ async function finalizeScopeImportAuthorized(
           afterTombstoneVersion,
           producer: null,
           producerProvenance: null,
+          // The validator refuses a `$pdpp` root key and imports carry no
+          // producer, so these bytes are legacy by construction.
+          pdppOrigin: false,
         },
         latestAtCommit
           ? {

@@ -1,3 +1,4 @@
+import { hasPdppOrigin } from "../sync/pdpp-import.js";
 /**
  * In-memory DataStoragePort for unit tests: envelopes in a Map, index rows
  * in an array, CAS revisions assigned max+1 per scope like the real index.
@@ -134,6 +135,9 @@ export function createMemoryDataStorage(): MemoryDataStorage {
       const version = entry.version ?? casRevision;
       const indexed: IndexEntry = {
         ...entry,
+        pdppOrigin: hasPdppOrigin(
+          envelopes.get(key(entry.scope, entry.collectedAt)),
+        ),
         id: nextId,
         schemaId: entry.schemaId ?? null,
         createdAt: new Date(0).toISOString(),

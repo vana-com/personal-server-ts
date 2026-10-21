@@ -1,3 +1,4 @@
+import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import { existsSync } from "node:fs";
 import type Database from "better-sqlite3";
 import type {
@@ -113,6 +114,7 @@ export function createImportOperations(
           fileId: null,
           schemaId: null,
           path: row.path,
+          pdppOrigin: hasPdppOrigin(envelope),
           scope: row.scope,
           collectedAt: row.collected_at,
           sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
@@ -282,6 +284,7 @@ export function createImportOperations(
           entry = index.insert({
             fileId: null,
             path: writeResult.relativePath,
+            pdppOrigin: hasPdppOrigin(envelope),
             scope: envelope.scope,
             collectedAt: envelope.collectedAt,
             sizeBytes:

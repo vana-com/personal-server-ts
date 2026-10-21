@@ -1,3 +1,4 @@
+import { hasPdppOrigin } from "../pdpp-import.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   DataFileEnvelopeSchema,
@@ -502,6 +503,7 @@ export async function downloadOne(
         collectedAt: envelope.collectedAt,
         sizeBytes,
         ...replicaMetadata,
+        pdppOrigin: hasPdppOrigin(envelope),
       });
     }
   } catch (err) {

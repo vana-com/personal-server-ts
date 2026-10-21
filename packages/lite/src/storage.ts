@@ -1,3 +1,4 @@
+import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   DataBlockManifest,
@@ -542,8 +543,63 @@ export async function createPersistentPsLiteStorage(
     await write;
   }
 
+  async function readPublishedEnvelope(
+    path: string,
+  ): Promise<DataFileEnvelope | null> {
+    return (
+      (await fileStore.readEnvelope(path)) ??
+      (fileStore === fallbackStore
+        ? null
+        : await fallbackStore.readEnvelope(path))
+    );
+  }
+
+  /** PDPP provenance of the bytes at a version path; undefined if unreadable. */
+  async function originOfPublishedBytes(
+    path: string,
+  ): Promise<boolean | undefined> {
+    try {
+      const envelope = await readPublishedEnvelope(path);
+      return envelope ? hasPdppOrigin(envelope) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // Versions indexed before provenance existed: resolve them from their
+  // bytes before the port is exposed. Unreadable ones stay unknown, which the
+  // read policy refuses to grantees; the next startup retries them.
+  let originsChanged = false;
+  for (const entry of state.entries) {
+    if (entry.pdppOrigin !== undefined) continue;
+    const pdppOrigin = entry.producer
+      ? true
+      : await originOfPublishedBytes(entry.path);
+    if (pdppOrigin === undefined) continue;
+    entry.pdppOrigin = pdppOrigin;
+    originsChanged = true;
+  }
+  if (originsChanged) await persist();
+
   function entriesForScope(scope: string): IndexEntry[] {
     return sortEntries(state.entries.filter((entry) => entry.scope === scope));
+  }
+
+  // One publication per version path at a time, so the existence check and
+  // the write below cannot interleave with another write to the same path.
+  const publications = new Map<string, Promise<unknown>>();
+  function serializePublication<T>(
+    path: string,
+    publish: () => Promise<T>,
+  ): Promise<T> {
+    const previous = publications.get(path) ?? Promise.resolve();
+    const next = previous.then(publish, publish);
+    const settled = next.catch(() => undefined);
+    publications.set(path, settled);
+    void settled.then(() => {
+      if (publications.get(path) === settled) publications.delete(path);
+    });
+    return next;
   }
 
   const storagePort: PsLiteStoragePort = {
@@ -584,18 +640,41 @@ export async function createPersistentPsLiteStorage(
       return envelope;
     },
 
+    /**
+     * Publish a version without replacing one. A version path names
+     * immutable bytes: readers authorize the version they selected, including
+     * its PDPP provenance, before reading the path. Identical bytes republish
+     * idempotently (this also moves an IndexedDB fallback copy into OPFS);
+     * different bytes fail.
+     */
     async writeEnvelope(envelope): Promise<WriteResult> {
       const path = envelopePath(envelope.scope, envelope.collectedAt);
-      const sizeBytes = await fileStore.writeEnvelope(path, envelope);
-      if (fileStore.kind !== "indexeddb") {
-        await fallbackStore.deleteEnvelope(path);
-      }
-      await persist();
-      return {
-        path,
-        relativePath: path,
-        sizeBytes,
-      };
+      return serializePublication(path, async () => {
+        const published = await readPublishedEnvelope(path);
+        // An index row whose bytes were lost still names its version: new
+        // bytes may restore it only with the provenance the row records.
+        const indexed = state.entries.find((entry) => entry.path === path);
+        if (
+          (published &&
+            JSON.stringify(published) !== JSON.stringify(envelope)) ||
+          (indexed?.pdppOrigin !== undefined &&
+            indexed.pdppOrigin !== hasPdppOrigin(envelope))
+        ) {
+          throw new Error(
+            `Stored envelope conflicts with publication at ${path}`,
+          );
+        }
+        const sizeBytes = await fileStore.writeEnvelope(path, envelope);
+        if (fileStore.kind !== "indexeddb") {
+          await fallbackStore.deleteEnvelope(path);
+        }
+        await persist();
+        return {
+          path,
+          relativePath: path,
+          sizeBytes,
+        };
+      });
     },
 
     async readScopeBlocks(scope, collectedAt, options) {
