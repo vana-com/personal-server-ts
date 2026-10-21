@@ -23,6 +23,8 @@ import {
   type ReplicaVisibilityPolicy,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import {
+  CursorExpiredError,
+  decodeCursor,
   type ListRecordsOptions,
   type ChangesSinceOptions,
   type PdppVisibleRecord,
@@ -38,7 +40,10 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_quarantined_connections (instance TEXT P
 CREATE TABLE IF NOT EXISTS pdpp_replica_received_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
 `;
 
-type Store = ReturnType<typeof createSqliteRecordStore>;
+type Store = ReturnType<typeof createSqliteRecordStore> & {
+  /** Synthesis-lane capability: advances when a connection's integrity facts change. */
+  replicaIntegrityEpoch?: (connectionKey: string) => number;
+};
 type Binding = {
   instance: string;
   source_id: string | null;
@@ -597,6 +602,7 @@ export function createReplicaReceiver(deps: {
     declarations: deps.declarations,
     blobsValid: previewBlobsValid,
     unquarantinedRecordSql: store.unquarantinedRecordSql,
+    integrityEpoch: store.replicaIntegrityEpoch,
   });
   store.setReplicaVisibilityObserver(view.flush);
   function includesPending(reader: ReplicaReader = "grant") {
@@ -824,8 +830,13 @@ export function createReplicaReceiver(deps: {
         if (
           !pendingEnabled &&
           !input.instanceIds.some((id) => view.connectionVisibility(id))
-        )
+        ) {
+          // A view cursor never continues on canonical pages: no mixed snapshots.
+          const cursor = input.cursor && decodeCursor(input.cursor);
+          if (cursor && cursor.kind === "list" && cursor.viewRevision)
+            throw new CursorExpiredError();
           return store.listRecords(input.stream, input);
+        }
         return view.listRecords(
           input.stream,
           input,

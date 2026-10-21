@@ -39,12 +39,35 @@ type CanonicalRow = {
   blob_id: string | null;
 };
 
+/** Bump when the derived view layout changes; construction then rebuilds it. */
+const VIEW_SCHEMA = 2;
+/** Cursor revision format. 70d52db0 cursors carry an untagged revision and expire. */
+const CURSOR_FORMAT = "v2";
+// Canonical triggers ignore rewrites that change no stored value.
+const recordChanged =
+  "(OLD.version IS NOT NEW.version OR OLD.data IS NOT NEW.data OR OLD.emitted_at IS NOT NEW.emitted_at OR OLD.deleted IS NOT NEW.deleted OR OLD.deleted_at IS NOT NEW.deleted_at OR OLD.blob_id IS NOT NEW.blob_id)";
+
+/** Drops only derived view objects. Canonical, retained and pending tables stay. */
+function dropViewObjects(db: Database) {
+  const objects = db
+    .prepare(
+      "SELECT type,name FROM sqlite_master WHERE (type='trigger' AND (name GLOB 'pdpp_replica_view*' OR name GLOB 'pdpp_replica_local*' OR name GLOB 'pdpp_records_summary_*')) OR (type='table' AND (name GLOB 'pdpp_replica_view*' OR name='pdpp_replica_local_view'))",
+    )
+    .all() as { type: "trigger" | "table"; name: string }[];
+  for (const { type, name } of objects.sort((a) =>
+    a.type === "trigger" ? -1 : 1,
+  ))
+    db.exec(`DROP ${type.toUpperCase()} IF EXISTS "${name}"`);
+}
+
 /** One durable current preview, reconciled at mutation time. Reads never run the reducer. */
 export function createReplicaVisibilityView(deps: {
   db: Database;
   owner: string;
   declarations: () => MergeContext["declarations"];
   unquarantinedRecordSql: (alias: string) => string;
+  /** Optional synthesis-lane capability; absent means the reset fence alone. */
+  integrityEpoch?: (connection: string) => number;
   blobsValid: (
     op: Extract<ReplicaOperation, { kind: "upsert" }>,
     evidence: ReplicaOperation[],
@@ -61,15 +84,20 @@ export function createReplicaVisibilityView(deps: {
   const localProjection = `SELECT j.connection_id,j.stream,j.record_key,json_extract(j.value_json,'$.emittedAt'),j.value_json,json_extract(j.value_json,'$.data.blob_ref.blob_id'),0,json_extract(j.value_json,'$.deleted'),NULL,j.sequence,j.generation,j.source_id,j.method FROM pdpp_mutation_journal j JOIN pdpp_instance_binding b ON b.instance=j.connection_id AND b.generation=j.generation AND b.source_id=j.source_id AND b.method=j.method WHERE b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL AND j.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND NOT EXISTS (SELECT 1 FROM pdpp_mutation_journal newer WHERE newer.connection_id=j.connection_id AND newer.generation=j.generation AND newer.stream=j.stream AND newer.record_key=j.record_key AND newer.source_id=j.source_id AND newer.method=j.method AND newer.writer_id=j.writer_id AND newer.sequence>j.sequence)`;
 
   db.transaction(() => {
-    const initialized = db
+    const schema = db
       .prepare(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_view_clock'",
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_view_schema'",
       )
-      .get();
+      .get()
+      ? (db.prepare("SELECT version FROM pdpp_replica_view_schema").get() as
+          { version: number } | undefined)
+      : undefined;
+    const initialized = schema?.version === VIEW_SCHEMA;
+    // Derived state only: an earlier view layout is dropped and rebuilt here, at
+    // construction inside this write transaction, never during a read.
+    if (!initialized) dropViewObjects(db);
     db.exec(`
-      CREATE TABLE IF NOT EXISTS pdpp_replica_view_clock (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
-      INSERT OR IGNORE INTO pdpp_replica_view_clock VALUES (1,0);
-      CREATE TABLE IF NOT EXISTS pdpp_replica_view_connection_clocks (instance TEXT PRIMARY KEY, canonical INTEGER NOT NULL DEFAULT 0, preview INTEGER NOT NULL DEFAULT 0, local INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS pdpp_replica_view_schema (version INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS pdpp_replica_view (
         instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL,
         emitted_at TEXT NOT NULL, row_json TEXT NOT NULL, blob_id TEXT, pending INTEGER NOT NULL,
@@ -77,7 +105,8 @@ export function createReplicaVisibilityView(deps: {
       );
       CREATE INDEX IF NOT EXISTS pdpp_replica_canonical_page ON pdpp_records(instance,stream,emitted_at,record_key) WHERE deleted=0;
       CREATE INDEX IF NOT EXISTS pdpp_replica_pending_blob ON pdpp_replica_pending_bytes(blob_id,batch_id);
-      CREATE TABLE IF NOT EXISTS pdpp_replica_view_streams (preview INTEGER NOT NULL, instance TEXT NOT NULL, stream TEXT NOT NULL, live_count INTEGER NOT NULL, row_count INTEGER NOT NULL, pending_count INTEGER NOT NULL, last_updated TEXT, PRIMARY KEY(preview,instance,stream));
+      -- One summary and one monotone cursor revision per (mode table, connection, stream).
+      CREATE TABLE IF NOT EXISTS pdpp_replica_view_streams (preview INTEGER NOT NULL, instance TEXT NOT NULL, stream TEXT NOT NULL, live_count INTEGER NOT NULL, row_count INTEGER NOT NULL, pending_count INTEGER NOT NULL, last_updated TEXT, revision INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(preview,instance,stream));
       CREATE INDEX IF NOT EXISTS pdpp_replica_view_page ON pdpp_replica_view(instance,stream,emitted_at,record_key);
       CREATE INDEX IF NOT EXISTS pdpp_replica_view_blob ON pdpp_replica_view(blob_id) WHERE blob_id IS NOT NULL;
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_evidence (
@@ -113,20 +142,18 @@ export function createReplicaVisibilityView(deps: {
         INSERT INTO pdpp_replica_view_evidence(operation_json,confirmed) VALUES (NEW.operation_json,1) ON CONFLICT(operation_json) DO UPDATE SET confirmed=1;
       END;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_insert AFTER INSERT ON pdpp_records BEGIN
-        INSERT INTO pdpp_replica_view_connection_clocks(instance,canonical) VALUES (NEW.instance,1) ON CONFLICT(instance) DO UPDATE SET canonical=canonical+1;
         INSERT INTO pdpp_replica_view_dirty_keys SELECT NEW.instance,NEW.stream,NEW.record_key WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_keys WHERE instance=NEW.instance AND stream=NEW.stream AND record_key=NEW.record_key);
       END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_update AFTER UPDATE ON pdpp_records BEGIN
-        INSERT INTO pdpp_replica_view_connection_clocks(instance,canonical) VALUES (NEW.instance,1) ON CONFLICT(instance) DO UPDATE SET canonical=canonical+1;
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_update AFTER UPDATE ON pdpp_records WHEN ${recordChanged} BEGIN
         INSERT INTO pdpp_replica_view_dirty_keys SELECT NEW.instance,NEW.stream,NEW.record_key WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_keys WHERE instance=NEW.instance AND stream=NEW.stream AND record_key=NEW.record_key);
       END;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_delete AFTER DELETE ON pdpp_records BEGIN
-        INSERT INTO pdpp_replica_view_connection_clocks(instance,canonical) VALUES (OLD.instance,1) ON CONFLICT(instance) DO UPDATE SET canonical=canonical+1;
         INSERT INTO pdpp_replica_view_dirty_keys SELECT OLD.instance,OLD.stream,OLD.record_key WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_keys WHERE instance=OLD.instance AND stream=OLD.stream AND record_key=OLD.record_key);
       END;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_binding AFTER UPDATE ON pdpp_instance_binding
       WHEN NEW.generation != OLD.generation OR NEW.deleted_at IS NOT OLD.deleted_at OR NEW.source_id IS NOT OLD.source_id OR NEW.method IS NOT OLD.method OR NEW.reset_clock IS NOT OLD.reset_clock BEGIN
-        INSERT INTO pdpp_replica_view_connection_clocks(instance,canonical) VALUES (NEW.instance,1) ON CONFLICT(instance) DO UPDATE SET canonical=canonical+1;
+        -- Binding and lifecycle changes expire every stream cursor of the connection.
+        UPDATE pdpp_replica_view_streams SET revision=revision+1 WHERE instance=NEW.instance;
         INSERT INTO pdpp_replica_view_dirty_connections SELECT NEW.instance WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_connections WHERE instance=NEW.instance);
       END;
     `);
@@ -153,15 +180,6 @@ export function createReplicaVisibilityView(deps: {
         INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id=NEW.instance;
       END;
     `);
-    if (hasBindingConflictFacts)
-      for (const [event, alias] of [
-        ["INSERT", "NEW"],
-        ["UPDATE", "NEW"],
-        ["DELETE", "OLD"],
-      ] as const)
-        db.exec(
-          `CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_clock_${event} AFTER ${event} ON pdpp_replica_local_view BEGIN INSERT INTO pdpp_replica_view_connection_clocks(instance,local) VALUES (${alias}.instance,1) ON CONFLICT(instance) DO UPDATE SET local=local+1; END;`,
-        );
     for (const [table, preview] of [
       ["pdpp_records", 0],
       ["pdpp_replica_view", 1],
@@ -176,18 +194,18 @@ export function createReplicaVisibilityView(deps: {
       const latest = `SELECT emitted_at FROM ${table} WHERE instance=OLD.instance AND stream=OLD.stream ${preview === 1 ? "" : "AND deleted=0"} ORDER BY emitted_at DESC,record_key DESC LIMIT 1`;
       db.exec(`
         CREATE TRIGGER IF NOT EXISTS ${table}_summary_insert AFTER INSERT ON ${table} BEGIN
-          INSERT INTO pdpp_replica_view_streams VALUES (${preview},NEW.instance,NEW.stream,1-NEW.deleted,${visible("NEW")},${pending("NEW")},CASE WHEN ${visible("NEW")} THEN NEW.emitted_at ELSE NULL END)
-          ON CONFLICT(preview,instance,stream) DO UPDATE SET
+          INSERT INTO pdpp_replica_view_streams VALUES (${preview},NEW.instance,NEW.stream,1-NEW.deleted,${visible("NEW")},${pending("NEW")},CASE WHEN ${visible("NEW")} THEN NEW.emitted_at ELSE NULL END,1)
+          ON CONFLICT(preview,instance,stream) DO UPDATE SET revision=revision+1,
             live_count=live_count+1-NEW.deleted,row_count=row_count+${visible("NEW")},pending_count=pending_count+${pending("NEW")},
             last_updated=CASE WHEN ${visible("NEW")} AND (last_updated IS NULL OR NEW.emitted_at>last_updated) THEN NEW.emitted_at ELSE last_updated END;
         END;
-        CREATE TRIGGER IF NOT EXISTS ${table}_summary_update AFTER UPDATE ON ${table} BEGIN
-          UPDATE pdpp_replica_view_streams SET live_count=live_count+OLD.deleted-NEW.deleted,
+        CREATE TRIGGER IF NOT EXISTS ${table}_summary_update AFTER UPDATE ON ${table} ${preview === 0 ? `WHEN ${recordChanged}` : ""} BEGIN
+          UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count+OLD.deleted-NEW.deleted,
             row_count=row_count+${visible("NEW")}-${visible("OLD")},pending_count=pending_count+${pending("NEW")}-${pending("OLD")},
             last_updated=(${latest}) WHERE preview=${preview} AND instance=OLD.instance AND stream=OLD.stream;
         END;
         CREATE TRIGGER IF NOT EXISTS ${table}_summary_delete AFTER DELETE ON ${table} BEGIN
-          UPDATE pdpp_replica_view_streams SET live_count=live_count-(1-OLD.deleted),row_count=row_count-${visible("OLD")},pending_count=pending_count-${pending("OLD")},last_updated=(${latest})
+          UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count-(1-OLD.deleted),row_count=row_count-${visible("OLD")},pending_count=pending_count-${pending("OLD")},last_updated=(${latest})
           WHERE preview=${preview} AND instance=OLD.instance AND stream=OLD.stream;
         END;
       `);
@@ -197,7 +215,7 @@ export function createReplicaVisibilityView(deps: {
     if (!initialized) {
       // One-time migration. Thereafter persisted dirty queues also cover downtime/restarts.
       db.exec(
-        `INSERT INTO pdpp_replica_view_streams SELECT 0,instance,stream,SUM(1-deleted),SUM(1-deleted),0,MAX(CASE WHEN deleted=0 THEN emitted_at END) FROM pdpp_records GROUP BY instance,stream;`,
+        `INSERT INTO pdpp_replica_view_streams SELECT 0,instance,stream,SUM(1-deleted),SUM(1-deleted),0,MAX(CASE WHEN deleted=0 THEN emitted_at END),1 FROM pdpp_records GROUP BY instance,stream;`,
       );
       db.exec(`INSERT INTO pdpp_replica_view_evidence(operation_json,confirmed)
         SELECT operation_json,1 FROM pdpp_replica_operations WHERE true ON CONFLICT(operation_json) DO UPDATE SET confirmed=1;
@@ -212,6 +230,10 @@ export function createReplicaVisibilityView(deps: {
         .all() as { id: string; envelope_json: string }[]) {
         addPending(row.id, JSON.parse(row.envelope_json).operations);
       }
+      db.exec("DELETE FROM pdpp_replica_view_schema");
+      db.prepare("INSERT INTO pdpp_replica_view_schema VALUES (?)").run(
+        VIEW_SCHEMA,
+      );
     }
   }).immediate();
 
@@ -272,7 +294,6 @@ export function createReplicaVisibilityView(deps: {
           .all() as { instance: string }[]
       ).map((row) => row.instance),
     );
-    let changed = dirtyOps.length > 0 || connections.size > 0;
     for (const op of dirtyOps) {
       const { writerId, operationId } = op.revision;
       const previous = db
@@ -345,25 +366,14 @@ export function createReplicaVisibilityView(deps: {
         `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT instance,stream,record_key FROM pdpp_replica_view_evidence WHERE instance=? AND record_key IS NOT NULL AND ${active}`,
       ).run(instance);
     }
-    const touched = new Set(connections);
+    // Cursor revisions advance in the summary triggers, only for rows that change.
     for (const row of db
       .prepare("SELECT * FROM pdpp_replica_view_dirty_keys")
-      .all() as { instance: string; stream: string; record_key: string }[]) {
-      changed = true;
-      touched.add(row.instance);
+      .all() as { instance: string; stream: string; record_key: string }[])
       reconcileKey(row.instance, row.stream, row.record_key);
-    }
     db.exec(
       "DELETE FROM pdpp_replica_view_dirty_operations; DELETE FROM pdpp_replica_view_dirty_keys; DELETE FROM pdpp_replica_view_dirty_connections;",
     );
-    for (const instance of touched)
-      db.prepare(
-        "INSERT INTO pdpp_replica_view_connection_clocks(instance,preview) VALUES (?,1) ON CONFLICT(instance) DO UPDATE SET preview=preview+1",
-      ).run(instance);
-    if (changed)
-      db.prepare(
-        "UPDATE pdpp_replica_view_clock SET revision=revision+1 WHERE id=1",
-      ).run();
   }
   function canonical(row: CanonicalRow): PdppVisibleRecord | undefined {
     return row.deleted
@@ -597,7 +607,8 @@ export function createReplicaVisibilityView(deps: {
       ).run(instance, stream, key);
     else
       db.prepare(
-        "INSERT INTO pdpp_replica_view VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(instance,stream,record_key) DO UPDATE SET emitted_at=excluded.emitted_at,row_json=excluded.row_json,blob_id=excluded.blob_id,pending=excluded.pending,deleted=excluded.deleted,blob_json=excluded.blob_json",
+        // An unchanged row is not rewritten, so it advances no cursor revision.
+        "INSERT INTO pdpp_replica_view VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(instance,stream,record_key) DO UPDATE SET emitted_at=excluded.emitted_at,row_json=excluded.row_json,blob_id=excluded.blob_id,pending=excluded.pending,deleted=excluded.deleted,blob_json=excluded.blob_json WHERE emitted_at IS NOT excluded.emitted_at OR row_json IS NOT excluded.row_json OR blob_id IS NOT excluded.blob_id OR pending IS NOT excluded.pending OR deleted IS NOT excluded.deleted OR blob_json IS NOT excluded.blob_json",
       ).run(
         instance,
         stream,
@@ -658,6 +669,56 @@ export function createReplicaVisibilityView(deps: {
       ? { ...value, ...replicaConflictMetadata() }
       : value;
   }
+  // Summary tables whose revisions bind a cursor in each read mode.
+  const revisionTables: Record<Mode, number[]> = {
+    canonical: [0],
+    preview: [0, 1],
+    local: [2],
+    hidden: [],
+  };
+  /**
+   * A cursor binds, per connection: read mode, reset fence, the host integrity
+   * epoch when the store provides one, and the revisions of this stream's rows
+   * in that mode. Other streams and hidden pending churn never move it.
+   */
+  function cursorRevision(
+    stream: string,
+    ids: string[],
+    modes: Map<string, Mode>,
+  ): string {
+    return JSON.stringify([
+      CURSOR_FORMAT,
+      ...ids.map((instance) => {
+        const mode = modes.get(instance)!;
+        const fence =
+          (
+            db
+              .prepare(
+                "SELECT reset_clock FROM pdpp_instance_binding WHERE instance=?",
+              )
+              .get(instance) as { reset_clock: number } | undefined
+          )?.reset_clock ?? 0;
+        const revisions = revisionTables[mode].map(
+          (table) =>
+            (
+              db
+                .prepare(
+                  "SELECT revision FROM pdpp_replica_view_streams WHERE preview=? AND instance=? AND stream=?",
+                )
+                .get(table, instance, stream) as
+                { revision: number } | undefined
+            )?.revision ?? 0,
+        );
+        return [
+          instance,
+          mode,
+          fence,
+          deps.integrityEpoch?.(instance) ?? null,
+          ...revisions,
+        ];
+      }),
+    ]);
+  }
   function getRecord(
     instance: string,
     stream: string,
@@ -696,34 +757,7 @@ export function createReplicaVisibilityView(deps: {
             readBranch(instance, reader, preview),
           ]),
         );
-        const clocks = ids.length
-          ? (db
-              .prepare(
-                `SELECT c.*,b.reset_clock AS fence FROM pdpp_replica_view_connection_clocks c LEFT JOIN pdpp_instance_binding b ON b.instance=c.instance WHERE c.instance IN (${ids.map(() => "?").join(",")})`,
-              )
-              .all(...ids) as {
-              instance: string;
-              canonical: number;
-              preview: number;
-              local: number;
-              fence: number;
-            }[])
-          : [];
-        const viewRevision = JSON.stringify(
-          ids.map((instance) => {
-            const clock = clocks.find((row) => row.instance === instance),
-              mode = modes.get(instance)!;
-            const revision =
-              mode === "hidden"
-                ? []
-                : mode === "local"
-                  ? [clock?.local ?? 0]
-                  : mode === "preview"
-                    ? [clock?.canonical ?? 0, clock?.preview ?? 0]
-                    : [clock?.canonical ?? 0];
-            return [instance, mode, clock?.fence ?? 0, ...revision];
-          }),
-        );
+        const viewRevision = cursorRevision(stream, ids, modes);
         const cursor = options.cursor
           ? decodeCursor(options.cursor)
           : undefined;
