@@ -85,3 +85,10 @@ export {
   TOMBSTONE_METADATA_HASH,
   isTombstoneRecord,
 } from "./tombstone.js";
+
+export {
+  NeedsFencedPublicationError,
+  type FencedPublicationPort,
+  type PublicationFence,
+  type PublicationRecord,
+} from "../publication/publish.js";

@@ -715,6 +715,11 @@ export async function createServer(
     serverSigner
   ) {
     additions = createDurableAdditions({
+      onPublicationBlocked: (error) =>
+        logger.warn(
+          { code: error.code, retryable: error.retryable },
+          error.message,
+        ),
       deleteSystemScope: async (scope) => {
         if (!syncManager)
           throw new Error("Durable system deletion capability unavailable");
