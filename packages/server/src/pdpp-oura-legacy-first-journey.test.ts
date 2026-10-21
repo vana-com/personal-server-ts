@@ -98,17 +98,28 @@ const T_LEGACY = "2026-10-14T00:00:00Z";
 const T_PDPP = "2026-10-15T00:00:00Z";
 const T_LEGACY_NEWER = "2026-10-16T00:00:00Z";
 
-/** The real oura-browser 0.1.2 stream field lists, as the declaration. */
-async function ouraBrowserDeclaration(): Promise<string> {
-  const profile = JSON.parse(
+/**
+ * The connector manifests of PDP-Connect/data-connectors 14ec4e7e1
+ * (oura-browser 0.1.41, oura 0.1.23), copied verbatim. Their readiness and
+ * activity streams declare `timestamp`, as the legacy collector's files do.
+ */
+const MANIFESTS: Record<string, string> = {
+  "oura-browser": "oura-browser.manifest.json",
+  oura: "oura.manifest.json",
+};
+
+/** A method's manifest stream field lists, as the declaration Desktop passes. */
+async function declarationFor(method: string): Promise<string> {
+  const manifest = JSON.parse(
     await readFile(
       new URL(
-        "../../core/src/legacy-projection/declarations/oura-browser.collection-profile.json",
+        `./__fixtures__/oura-14ec4e7e1/${MANIFESTS[method]}`,
         import.meta.url,
       ),
       "utf-8",
     ),
   ) as {
+    version: string;
     streams: {
       name: string;
       primary_key: string[];
@@ -118,8 +129,8 @@ async function ouraBrowserDeclaration(): Promise<string> {
   return JSON.stringify({
     source_id: OURA,
     source_kind: "connector",
-    version: "1",
-    streams: profile.streams.map((stream) => ({
+    version: manifest.version,
+    streams: manifest.streams.map((stream) => ({
       name: stream.name,
       fields: Object.keys(stream.schema.properties),
       required_fields: stream.schema.required,
@@ -168,8 +179,12 @@ async function boot(
 ) {
   const dir = join(tempDir, "declarations");
   await mkdir(dir, { recursive: true });
-  const path = join(dir, "declaration.json");
-  await writeFile(path, await ouraBrowserDeclaration(), "utf-8");
+  const paths = new Map<string, string>();
+  for (const method of methodIds) {
+    const path = join(dir, `${method}.json`);
+    await writeFile(path, await declarationFor(method), "utf-8");
+    paths.set(method, path);
+  }
   const gateway = {
     getBuilder: vi.fn().mockResolvedValue({
       id: BUILDER_ID,
@@ -187,10 +202,10 @@ async function boot(
       payment: { enabled: false },
       pdpp: {
         enabled: true,
-        declarationPaths: [path],
+        declarationPaths: [...paths.values()],
         methods: methodIds.map((method_id) => ({
           method_id,
-          declaration_path: path,
+          declaration_path: paths.get(method_id)!,
         })),
       },
     }),
@@ -459,11 +474,12 @@ const legacyReadiness = ({ n, score }: Day) => ({
   temperatureTrendDeviation: -0.05,
   contributors: READINESS_CONTRIB,
 });
-/** What oura-browser 0.1.2 stores for the same day. */
+/** What oura-browser 0.1.41 stores for the same day. */
 const pdppReadiness = ({ n, score }: Day) => ({
   id: `rd${n}`,
   day: date(n),
   score,
+  timestamp: ts(n),
   temperature_deviation: 0.12,
   temperature_trend_deviation: -0.05,
   contributors: READINESS_CONTRIB,
@@ -490,6 +506,7 @@ const pdppActivity = ({ n, score }: Day) => ({
   id: `ac${n}`,
   day: date(n),
   score,
+  timestamp: ts(n),
   active_calories: 400,
   total_calories: 2300,
   steps: 9000,
