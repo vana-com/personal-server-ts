@@ -313,6 +313,18 @@ async function fixture() {
     expect(response.status).toBe(200);
     return response.json();
   }
+  /**
+   * A terminal batch withdraws every connection it touched, so the control
+   * record on the same connection leaves too (contract v3.1 A: no partial
+   * per-batch un-import; fail closed at connection scope).
+   */
+  async function controlWithdrawn() {
+    expect((await read("/streams/messages/records/a-control")).status).toBe(
+      404,
+    );
+    const response = await read(`/blobs/${encodeURIComponent(controlId)}`);
+    expect(response.status).toBe(404);
+  }
   async function controlWorks() {
     expect((await json("/streams/messages/records/a-control")).data.text).toBe(
       controlText,
@@ -417,6 +429,7 @@ async function fixture() {
     publish,
     assertQuarantined,
     controlWorks,
+    controlWithdrawn,
     cycle: advance,
     withdrawDeclarations() {
       trustedBindings = [];
@@ -537,7 +550,7 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
       ),
     ).toBe(true);
     await f.assertQuarantined();
-    await f.controlWorks();
+    await f.controlWithdrawn();
   }, 30_000);
 
   it("pins legacy retained hash pairs only from the exact fragment and finalized commitment", async () => {
@@ -579,7 +592,7 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
     });
     await f.cycle();
     await f.assertQuarantined();
-    await f.controlWorks();
+    await f.controlWithdrawn();
   });
 
   it("retracts known immutable conflicts even after the original declaration is withdrawn", async () => {
@@ -614,7 +627,7 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
       },
     ],
   ])(
-    "P0 #6: revalidates an imported slot after %s and retracts only affected app data",
+    "P0 #6: revalidates an imported slot after %s and withdraws the batch's connection (contract v3.1 A)",
     async (_label, conflict) => {
       const f = await fixture();
       for (const part of f.targetParts) {
@@ -633,11 +646,11 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
           )
           .toBe("quarantined");
       await f.assertQuarantined();
-      await f.controlWorks();
+      await f.controlWithdrawn();
       await f.restart();
       await f.cycle();
       await f.assertQuarantined();
-      await f.controlWorks();
+      await f.controlWithdrawn();
     },
   );
 });

@@ -228,10 +228,12 @@ it.each(["key", "connection"] as const)(
         store.getRecord("conn", "messages", target.recordKey),
       ).toBeUndefined();
       // An unrelated pending batch must not revive retained, quarantined winners.
+      // It lives on another connection: a terminal batch withdraws every
+      // connection it touched (contract v3.1 A), so nothing on "conn" stays.
       const pending = {
         ...upsert("pending-control", 10),
         ...identity,
-        connectionId: scope === "connection" ? "conn-other" : "conn",
+        connectionId: "conn-other",
         recordKey: "pending-control",
         data: {
           id: "pending-control",

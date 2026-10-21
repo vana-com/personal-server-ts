@@ -565,19 +565,17 @@ describe("P0 adversarial public AS and app-read contracts", () => {
       );
       expect(page.has_more).toBe(true);
       expect(typeof page.next_cursor).toBe("string");
-      const reused = await payload(
+      // A cursor is bound to the connection set it was minted for: reused
+      // under another token's scope it is refused with no data (cursor
+      // binding, contract case 63c), never reinterpreted.
+      await noDisclosure(
         await request(
           rs.origin,
           `/streams/messages/records?cursor=${encodeURIComponent(String(page.next_cursor))}`,
           allowed.token,
         ),
-        200,
-      );
-      // A cursor positions a read; the current token still owns its scope.
-      const reusedRows = reused.data as { id: string; data: unknown }[];
-      expect(reusedRows).toEqual([]);
-      expect(JSON.stringify(reused).includes("C2_SECRET_COLLISION")).toBe(
-        false,
+        400,
+        ["C2_SECRET_COLLISION"],
       );
       await assertAppRead(rs.origin, allowed.token, f.expected, f.blob);
     }));
