@@ -1148,6 +1148,7 @@ export async function resolveReadDeletion(
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
   body: "file" | "canonical" = "file",
+  gatewayTimeoutMs?: number,
 ): Promise<{
   scope: string;
   dataPointId: string | null;
@@ -1156,6 +1157,7 @@ export async function resolveReadDeletion(
   if (!deps.scopeDeletions) return null;
   const verdict = await deps.scopeDeletions.resolve(scope, {
     consultGateway: entry ? "if-stale" : "always",
+    ...(gatewayTimeoutMs === undefined ? {} : { gatewayTimeoutMs }),
   });
   // A live DPv2 file cannot establish that a different canonical body was
   // re-added. Keep this refusal until a genuine canonical re-add seam exists.
@@ -1220,8 +1222,18 @@ function listingVisibility(
     PersonalServerDataApiDeps,
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
+  deadlineAtMs: number,
 ): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
-  const deletion = discoveryVisibility(deps);
+  const deletion = deps.scopeDeletions
+    ? async (scope: string, entry: ReadDeletionEntry) =>
+        (await resolveReadDeletion(
+          deps,
+          scope,
+          entry,
+          "file",
+          Math.max(0, deadlineAtMs - Date.now()),
+        )) === null
+    : undefined;
   const view = deps.legacyScopeView;
   if (!view) return deletion;
   return async (scope, entry) => {
@@ -1236,6 +1248,7 @@ function listingVisibility(
         scope,
         canonicalOwned ? undefined : entry,
         canonicalOwned ? "canonical" : "file",
+        Math.max(0, deadlineAtMs - Date.now()),
       )) === null
     );
   };
@@ -1251,6 +1264,7 @@ function canonicalOnlyScopes(
     PersonalServerDataApiDeps,
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
+  deadlineAtMs: number,
 ):
   | ((
       scopePrefix: string | undefined,
@@ -1266,8 +1280,13 @@ function canonicalOnlyScopes(
     )) {
       if (stored.has(scope)) continue;
       if (
-        (await resolveReadDeletion(deps, scope, undefined, "canonical")) !==
-        null
+        (await resolveReadDeletion(
+          deps,
+          scope,
+          undefined,
+          "canonical",
+          Math.max(0, deadlineAtMs - Date.now()),
+        )) !== null
       ) {
         continue;
       }
@@ -1682,16 +1701,18 @@ export async function handlePersonalServerDataRequest(
       const listAuth = await deps.auth.authorizeBuilderList(request, {
         grantId: selectedGrantId(request, url),
       });
+      // One budget for every stored and canonical-only scope, not per row.
+      const deletionDeadlineAtMs = Date.now() + 250;
       const result = await listDataScopesContract({
         storage: deps.storage,
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
-        isVisible: listingVisibility(deps),
+        isVisible: listingVisibility(deps, deletionDeadlineAtMs),
         isListable: (scope) =>
           !isSystemScope(scope) &&
           (!listAuth || listAuthCovers(listAuth, scope)),
-        extraScopes: canonicalOnlyScopes(deps),
+        extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs),
       });
       return jsonResponse({
         ...result.response,

@@ -187,6 +187,8 @@ export interface DataStoragePort extends RuntimeStoragePort {
     scope: string,
     collectedAt: string,
   ): Promise<DataBlockManifest | null>;
+  /** Metadata-only readiness hint. Must not read bodies or build/project blocks.
+   * Return false when readiness cannot be established cheaply. */
   hasScopeBlocks?(
     scope: string,
     collectedAt: string,
@@ -321,6 +323,8 @@ export interface DataPointFeedPort {
   getDataPoint(input: {
     ownerAddress: string;
     scope: string;
+    /** Cancel a deadline-bound discovery lookup when supported by the adapter. */
+    signal?: AbortSignal;
   }): Promise<DataPointFeedRecord | null>;
 }
 
