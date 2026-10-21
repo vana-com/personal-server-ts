@@ -37,6 +37,10 @@ import { createGatewayDataPointFeed } from "../packages/core/src/sync/data-point
 import { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-records-sqlite-store.js";
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../packages/server/src/storage/pdpp-replication-transport.js";
+import {
+  buildReplicaRuntimeSource,
+  type ReplicaRuntimeSource,
+} from "./pdpp-replica-runtime-source.js";
 
 export const gatewayUrl = "https://dp-rpc-dev.vana.org";
 export const storageUrl = "https://storage-dev.vana.org";
@@ -111,6 +115,7 @@ export type Init = {
   serverKey: Hex;
   scriptSha256: string;
   consent?: { issuerOrigin: string; credential: string };
+  source?: ReplicaRuntimeSource;
 };
 type HostRequest = {
   id: number;
@@ -118,6 +123,16 @@ type HostRequest = {
   args?: Record<string, unknown>;
 };
 export type Snapshot = {
+  /** Real-source rows retain their full identity; records remains the legacy fixture view. */
+  canonicalRows?: {
+    instance: string;
+    stream: string;
+    record_key: string;
+    data: unknown;
+    emitted_at: string;
+    deleted: number;
+    blob_id: string | null;
+  }[];
   ownerRows: PdppVisibleRecord[];
   appRows: PdppVisibleRecord[];
   records: Record<string, unknown>;
@@ -156,16 +171,26 @@ export type Snapshot = {
   wire: unknown[];
 };
 
-async function host() {
-  installHarnessSafety();
-  const init = await new Promise<Init>((resolve) =>
-    process.once("message", (m) => resolve(m as Init)),
-  );
+export async function openReplicaRuntime(init: Init) {
   assert.equal(
     digest(readFileSync(fileURLToPath(import.meta.url))),
     init.scriptSha256,
     "Harness changed during run",
   );
+  const source = init.source
+    ? buildReplicaRuntimeSource(init.source)
+    : undefined;
+  const runtimeSourceId = source?.sourceId ?? sourceId;
+  const connectionId = source?.connectionId ?? "conn";
+  const methodId = source?.methodId ?? "export";
+  const retainedDeclarations = source?.bindings ?? [
+    {
+      sourceId,
+      binding,
+      validateData: (data: Record<string, unknown>) =>
+        typeof data.id === "string",
+    },
+  ];
   mkdirSync(init.root, { recursive: true, mode: 0o700 });
   const db = new Database(join(init.root, "records.sqlite"));
   db.pragma("journal_mode = WAL");
@@ -173,16 +198,17 @@ async function host() {
   // Trusted host provisioning is explicit and local; replicated metadata never provisions authority.
   if (
     !db
-      .prepare("SELECT 1 FROM pdpp_instance_binding WHERE instance='conn'")
-      .get()
+      .prepare("SELECT 1 FROM pdpp_instance_binding WHERE instance=?")
+      .get(connectionId)
   )
     store.registerConnection({
-      instance: "conn",
-      sourceId,
-      method: "export",
+      instance: connectionId,
+      sourceId: runtimeSourceId,
+      method: methodId,
       label: "Ephemeral harness",
     });
   if (
+    !source &&
     init.consent &&
     !store.listConnections(sourceId).some((c) => c.instance === "conn-other")
   )
@@ -192,8 +218,30 @@ async function host() {
       method: "export",
       label: "Other account",
     });
-  if (init.consent) allowHarnessLoopback(init.consent.issuerOrigin);
-  const expected = { owner: init.owner, declarations: [{ sourceId, binding }] };
+  if (source) {
+    const connection = store.getInstanceBinding(connectionId);
+    if (
+      connection.sourceId !== runtimeSourceId ||
+      connection.method !== methodId ||
+      connection.deletedAt !== null ||
+      connection.generation < 1
+    ) {
+      db.close();
+      throw new Error(
+        "Real-source connection does not match local owner provisioning",
+      );
+    }
+  }
+  const disallowIssuer = init.consent
+    ? allowHarnessLoopback(init.consent.issuerOrigin)
+    : undefined;
+  const expected = {
+    owner: init.owner,
+    declarations: retainedDeclarations.map(({ sourceId, binding }) => ({
+      sourceId,
+      binding,
+    })),
+  };
   store.replication.beginBaseline(expected);
   const receiver = createReplicaReceiver({
     enabled: true,
@@ -201,13 +249,7 @@ async function host() {
     store,
     owner: init.owner,
     authenticate: (c) => (c === "isolated-harness" ? init.owner : undefined),
-    declarations: () => [
-      {
-        sourceId,
-        binding,
-        validateData: (data) => typeof data.id === "string",
-      },
-    ],
+    declarations: () => retainedDeclarations,
   });
   const resource = init.consent
     ? await (
@@ -216,6 +258,7 @@ async function host() {
         owner: init.owner,
         issuerOrigin: init.consent.issuerOrigin,
         credential: init.consent.credential,
+        source: init.source,
         reads: (reader) => receiver.readStore({ reader }),
       })
     : undefined;
@@ -223,26 +266,29 @@ async function host() {
   // The SDK captures global fetch at construction, so install before creating storage.
   let bodyBarrier: { url: string; scope: string } | undefined;
   const hostFetch = globalThis.fetch;
-  globalThis.fetch = async (input, init) => {
-    const response = await hostFetch(input, init);
-    const url = input instanceof Request ? input.url : String(input);
-    if (
-      bodyBarrier &&
-      url === bodyBarrier.url &&
-      (init?.method ?? "GET") === "GET"
-    ) {
-      assert(response.ok && response.body);
-      const first = await response.body.getReader().read();
-      assert(!first.done && first.value.length > 0);
-      process.send?.({
-        checkpoint: "download",
-        scope: bodyBarrier.scope,
-        bytesStarted: first.value.length,
-      });
-      await new Promise(() => {});
-    }
-    return response;
-  };
+  // Fault-injection fetch interception belongs only to the original fixture child.
+  // An in-process A shares the parent's AS and must never replace its fetch hook.
+  if (!source && process.argv.includes("--host"))
+    globalThis.fetch = async (input, init) => {
+      const response = await hostFetch(input, init);
+      const url = input instanceof Request ? input.url : String(input);
+      if (
+        bodyBarrier &&
+        url === bodyBarrier.url &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        assert(response.ok && response.body);
+        const first = await response.body.getReader().read();
+        assert(!first.done && first.value.length > 0);
+        process.send?.({
+          checkpoint: "download",
+          scope: bodyBarrier.scope,
+          bytesStarted: first.value.length,
+        });
+        await new Promise(() => {});
+      }
+      return response;
+    };
   const storage = createVanaSyncStorageAdapter({
     config,
     serverOwner: init.owner,
@@ -389,16 +435,40 @@ async function host() {
       }
     }
     return {
-      ownerRows: receiver.readVisibleRecords({
-        reader: "owner",
-        connectionId: "conn",
-        stream: "messages",
+      ...(source && {
+        canonicalRows: (
+          db
+            .prepare(
+              "SELECT instance,stream,record_key,data,emitted_at,deleted,blob_id FROM pdpp_records ORDER BY instance,stream,record_key",
+            )
+            .all() as {
+            instance: string;
+            stream: string;
+            record_key: string;
+            data: string;
+            emitted_at: string;
+            deleted: number;
+            blob_id: string | null;
+          }[]
+        ).map((row) => ({ ...row, data: JSON.parse(row.data) })),
       }),
-      appRows: receiver.readVisibleRecords({
-        reader: "grant",
-        connectionId: "conn",
-        stream: "messages",
-      }),
+      ownerRows: (
+        source?.declaration.streams ?? [{ name: "messages" }]
+      ).flatMap(({ name }) =>
+        receiver.readVisibleRecords({
+          reader: "owner",
+          connectionId,
+          stream: name,
+        }),
+      ),
+      appRows: (source?.declaration.streams ?? [{ name: "messages" }]).flatMap(
+        ({ name }) =>
+          receiver.readVisibleRecords({
+            reader: "grant",
+            connectionId,
+            stream: name,
+          }),
+      ),
       pid: process.pid,
       importedScopes: (
         db
@@ -455,7 +525,7 @@ async function host() {
         )
         .all() as Snapshot["errors"],
       peakRssKiB: process.resourceUsage().maxRSS,
-      generation: store.getInstanceBinding("conn").generation,
+      generation: store.getInstanceBinding(connectionId).generation,
       writer:
         (
           db.prepare("SELECT writer FROM pdpp_transport_state").get() as
@@ -473,73 +543,105 @@ async function host() {
         .all(),
     };
   }
+  async function call<T = Snapshot>(
+    command: string,
+    args: Record<string, unknown> = {},
+  ): Promise<T> {
+    if (source && ["put", "blob", "delete", "reset"].includes(command))
+      throw new Error(
+        "Real-source runtime refuses synthetic mutation commands",
+      );
+    let result: unknown;
+    if (command === "cycle") {
+      await worker.cycle();
+      result = snapshot();
+    } else if (command === "snapshot") result = snapshot();
+    else if (command === "resourceOrigin") result = resource?.origin;
+    else if (command === "put")
+      result = put(
+        String(args.id),
+        (args.data as Record<string, unknown>) ?? { text: args.text },
+        String(args.instance ?? "conn"),
+        args.emittedAt as string | undefined,
+      );
+    else if (command === "blob") {
+      const bytes = Buffer.alloc(Number(args.size));
+      for (let offset = 0; offset < bytes.length; offset += 65536)
+        bytes.set(randomBytes(Math.min(65536, bytes.length - offset)), offset);
+      const sha256 = digest(bytes);
+      const blob = store.storeBlobBytesForInstance({
+        instance: "conn",
+        method: "export",
+        generation: store.getInstanceBinding("conn").generation,
+        bytes,
+        mimeType: "application/octet-stream",
+      });
+      put(String(args.id), {
+        ...(args.data as Record<string, unknown> | undefined),
+        blob_ref: {
+          blob_id: blob.blobId,
+          mime_type: blob.mimeType,
+          size_bytes: bytes.length,
+        },
+      });
+      result = { blobId: blob.blobId, sha256, bytes: bytes.length };
+    } else if (command === "armKill") {
+      stopAtDownload = Number(args.after);
+      killScopes = new Set(args.scopes as string[]);
+      downloads = 0;
+      result = true;
+    } else if (command === "armPutKill") {
+      killPut = true;
+      result = true;
+    } else if (command === "armImportKill") {
+      killImportRecord = String(args.id);
+      result = true;
+    } else if (command === "delete")
+      result = store.deleteRecord(
+        "conn",
+        "messages",
+        String(args.id),
+        new Date().toISOString(),
+        "mutable_state",
+      );
+    else if (command === "reset")
+      result = store.resetInstanceBinding({
+        instance: "conn",
+        expectedMethod: "export",
+        expectedGeneration: store.getInstanceBinding("conn").generation,
+        nextMethod: "export",
+      });
+    else throw new Error("Unknown harness command");
+    return result as T;
+  }
+  let closed = false;
+  return {
+    store,
+    db,
+    receiver,
+    worker,
+    snapshot,
+    call,
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      await resource?.close();
+      disallowIssuer?.();
+      db.close();
+    },
+  };
+}
+
+async function host() {
+  installHarnessSafety();
+  const init = await new Promise<Init>((resolve) =>
+    process.once("message", (m) => resolve(m as Init)),
+  );
+  const runtime = await openReplicaRuntime(init);
   process.on("message", async (raw) => {
     const { id, command, args = {} } = raw as HostRequest;
     try {
-      let result: unknown;
-      if (command === "cycle") {
-        await worker.cycle();
-        result = snapshot();
-      } else if (command === "snapshot") result = snapshot();
-      else if (command === "resourceOrigin") result = resource?.origin;
-      else if (command === "put")
-        result = put(
-          String(args.id),
-          (args.data as Record<string, unknown>) ?? { text: args.text },
-          String(args.instance ?? "conn"),
-          args.emittedAt as string | undefined,
-        );
-      else if (command === "blob") {
-        const bytes = Buffer.alloc(Number(args.size));
-        for (let offset = 0; offset < bytes.length; offset += 65536)
-          bytes.set(
-            randomBytes(Math.min(65536, bytes.length - offset)),
-            offset,
-          );
-        const sha256 = digest(bytes);
-        const blob = store.storeBlobBytesForInstance({
-          instance: "conn",
-          method: "export",
-          generation: store.getInstanceBinding("conn").generation,
-          bytes,
-          mimeType: "application/octet-stream",
-        });
-        put(String(args.id), {
-          ...(args.data as Record<string, unknown> | undefined),
-          blob_ref: {
-            blob_id: blob.blobId,
-            mime_type: blob.mimeType,
-            size_bytes: bytes.length,
-          },
-        });
-        result = { blobId: blob.blobId, sha256, bytes: bytes.length };
-      } else if (command === "armKill") {
-        stopAtDownload = Number(args.after);
-        killScopes = new Set(args.scopes as string[]);
-        downloads = 0;
-        result = true;
-      } else if (command === "armPutKill") {
-        killPut = true;
-        result = true;
-      } else if (command === "armImportKill") {
-        killImportRecord = String(args.id);
-        result = true;
-      } else if (command === "delete")
-        result = store.deleteRecord(
-          "conn",
-          "messages",
-          String(args.id),
-          new Date().toISOString(),
-          "mutable_state",
-        );
-      else if (command === "reset")
-        result = store.resetInstanceBinding({
-          instance: "conn",
-          expectedMethod: "export",
-          expectedGeneration: store.getInstanceBinding("conn").generation,
-          nextMethod: "export",
-        });
-      else throw new Error("Unknown harness command");
+      const result = await runtime.call(command, args);
       process.send?.({ id, result });
     } catch (error) {
       process.send?.({
