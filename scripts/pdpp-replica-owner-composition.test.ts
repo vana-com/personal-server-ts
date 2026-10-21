@@ -682,22 +682,17 @@ describe("connector readiness receipt", () => {
   const blobs = { "blob-1": { sha256: "aa".repeat(32), bytes: 7 } };
   const stored = { record_key: "run-1" } as never;
   const active = { head: null, chain: { status: "Active" } } as never;
-  const oracleHash = "b".repeat(64);
   function evaluate(
     over: {
       a?: Record<string, unknown>;
       b?: Record<string, unknown>;
-      aCanonical?: unknown[];
-      oracle?: () => { B: string; fields: string[] };
+      sql?: { a?: unknown[]; b?: unknown[] };
     } = {},
   ) {
     const aRows = [row];
     return evaluateConnectorReadiness({
       sourceId: "https://registry.pdpp.dev/sources/strava",
-      aCanonical: over.aCanonical ?? aRows,
-      oracle:
-        over.oracle ??
-        (() => ({ B: oracleHash, fields: ["instance", "stream"] })),
+      sql: { a: over.sql?.a ?? aRows, b: over.sql?.b ?? [{ ...row }] },
       a: {
         ownerRows: [stored],
         pending: 0,
@@ -723,8 +718,18 @@ describe("connector readiness receipt", () => {
       ready: true,
       receipt: {
         canonical_rows: 1,
-        canonical_sha256: oracleHash,
-        canonical_fields: ["instance", "stream"],
+        canonical_sha256: createHash("sha256")
+          .update(JSON.stringify([row]))
+          .digest("hex"),
+        canonical_fields: [
+          "instance",
+          "stream",
+          "record_key",
+          "data",
+          "emitted_at",
+          "deleted",
+          "blob_id",
+        ],
         referenced_blobs: 1,
         records_sha256: createHash("sha256")
           .update(JSON.stringify([row]))
@@ -738,7 +743,7 @@ describe("connector readiness receipt", () => {
     expect(
       notReady(
         evaluate({
-          aCanonical: [],
+          sql: { a: [], b: [] },
           a: { ownerRows: [], canonicalRows: [] },
           b: { appRows: [], canonicalRows: [] },
         }),
@@ -776,16 +781,20 @@ describe("connector readiness receipt", () => {
     ).toBe("canonical_rows_differ");
   });
 
-  it("is not ready when the independent SQL oracle disagrees", () => {
-    expect(
-      notReady(
-        evaluate({
-          oracle: () => {
-            throw new Error("independent canonical SQL equality");
-          },
-        }),
-      ),
-    ).toBe("oracle_mismatch");
+  it.each([
+    ["data", { data: { id: "run-1", distance_m: 1 } }],
+    ["deleted", { deleted: 1 }],
+  ])(
+    "is not ready when the SQL tables differ in %s although the snapshots agree",
+    (_field, change) => {
+      expect(notReady(evaluate({ sql: { b: [{ ...row, ...change }] } }))).toBe(
+        "sql_rows_differ",
+      );
+    },
+  );
+
+  it("is not ready when B's SQL table is missing a row", () => {
+    expect(notReady(evaluate({ sql: { b: [] } }))).toBe("sql_rows_differ");
   });
 
   it("is not ready when a blob digest differs", () => {
@@ -811,17 +820,5 @@ describe("connector readiness receipt", () => {
         }),
       ),
     ).toBe("no_active_chain");
-  });
-
-  it("does not run the oracle until the in-memory snapshots agree", () => {
-    let called = false;
-    evaluate({
-      b: { canonicalRows: [{ ...row, data: {} }] },
-      oracle: () => {
-        called = true;
-        return { B: oracleHash, fields: [] };
-      },
-    });
-    expect(called).toBe(false);
   });
 });
