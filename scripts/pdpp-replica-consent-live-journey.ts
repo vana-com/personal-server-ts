@@ -42,6 +42,10 @@ import { pdppBlobsRoutes } from "../packages/server/src/routes/pdpp-blobs.js";
 import { createReplicaAuthorizationService } from "../packages/server/src/pdpp/replica-authorization.js";
 import type { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-records-sqlite-store.js";
 import {
+  buildReplicaRuntimeSource,
+  type ReplicaRuntimeSource,
+} from "./pdpp-replica-runtime-source.js";
+import {
   allowHarnessLoopback,
   config,
   Device,
@@ -169,38 +173,49 @@ export async function openReplicaResourceServer(
     owner: string;
     issuerOrigin: string;
     credential: string;
+    source?: ReplicaRuntimeSource;
     fetch?: typeof fetch;
     replicaReads?: (
       reader: "owner" | "grant",
     ) => ReturnType<ReturnType<typeof createReplicaReceiver>["readStore"]>;
   },
 ) {
+  const runtimeSource = options.source
+    ? buildReplicaRuntimeSource(options.source)
+    : undefined;
+  const resourceSourceId = runtimeSource?.sourceId ?? sourceId;
   const auth = createReplicaAuthorizationService({
     ...options,
     credential: async () => options.credential,
     connections: () =>
       store
-        .listConnections(sourceId)
-        .filter((c) => c.deletedAt === null)
+        .listConnections(resourceSourceId)
+        .filter(
+          (c) =>
+            c.deletedAt === null &&
+            (!runtimeSource || c.instance === runtimeSource.connectionId),
+        )
         .map((c) => ({
           owner: options.owner,
-          sourceId,
+          sourceId: resourceSourceId,
           connectionId: c.instance,
           issuerInstanceId: c.instance,
           localInstanceId: c.instance,
         })),
   });
-  const declarations = createStreamDeclarationRegistry([
-    {
-      name: "messages",
-      semantics: "mutable_state",
-      primaryKey: ["id"],
-      cursorField: "collected_at",
-      consentTimeField: "collected_at",
-      requiredFields: ["id", "private_note"],
-      declaredFields: snapshot.streams[0].fields,
-    },
-  ]);
+  const declarations =
+    runtimeSource?.declarations ??
+    createStreamDeclarationRegistry([
+      {
+        name: "messages",
+        semantics: "mutable_state",
+        primaryKey: ["id"],
+        cursorField: "collected_at",
+        consentTimeField: "collected_at",
+        requiredFields: ["id", "private_note"],
+        declaredFields: snapshot.streams[0].fields,
+      },
+    ]);
   const app = new Hono();
   app.route(
     "/pdpp/v1",
