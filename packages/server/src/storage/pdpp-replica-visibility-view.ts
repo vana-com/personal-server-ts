@@ -51,7 +51,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 5;
+const VIEW_SCHEMA = 6;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -125,10 +125,14 @@ export function createReplicaVisibilityView(deps: {
   // record operations outside this predicate cannot change the owner preview.
   const touches = (instance: string, stream: string, key: string) =>
     `(EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${instance} AND v.stream=${stream} AND v.record_key=${key}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_pending p WHERE p.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_replica_view_conflicts c WHERE c.instance=${instance}) OR EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=${instance} AND b.deleted_at IS NOT NULL))`;
+  // Trigger bodies use NOT EXISTS, not OR IGNORE: an outer statement's conflict
+  // clause, including an upsert's, overrides one inside a trigger.
+  const notDirtyKey = (alias: string) =>
+    `NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_keys d WHERE d.instance=${alias}.instance AND d.stream=${alias}.stream AND d.record_key=${alias}.record_key)`;
   // Upserts that reference any of `blobIds` (a SQL value list or subquery),
   // restricted to keys that can have an overlay row.
   const markBlobDependents = (blobIds: string) =>
-    `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT DISTINCT o.instance,o.stream,o.record_key FROM pdpp_replica_view_operations o WHERE o.blob_id IN (${blobIds}) AND o.kind='upsert' AND o.record_key IS NOT NULL AND ${touches("o.instance", "o.stream", "o.record_key")};`;
+    `INSERT INTO pdpp_replica_view_dirty_keys SELECT DISTINCT o.instance,o.stream,o.record_key FROM pdpp_replica_view_operations o WHERE o.blob_id IN (${blobIds}) AND o.kind='upsert' AND o.record_key IS NOT NULL AND ${touches("o.instance", "o.stream", "o.record_key")} AND ${notDirtyKey("o")};`;
   const markLatest = (alias: string) =>
     // NOT EXISTS, not OR IGNORE: an outer statement's conflict clause
     // overrides one inside a trigger.
@@ -136,7 +140,7 @@ export function createReplicaVisibilityView(deps: {
   const hasOverlaySummary = (alias: string) =>
     `EXISTS (SELECT 1 FROM pdpp_replica_view_streams s WHERE s.preview=1 AND s.instance=${alias}.instance AND s.stream=${alias}.stream)`;
   const markKey = (alias: string) =>
-    `INSERT OR IGNORE INTO pdpp_replica_view_dirty_keys SELECT ${alias}.instance,${alias}.stream,${alias}.record_key WHERE ${touches(`${alias}.instance`, `${alias}.stream`, `${alias}.record_key`)};`;
+    `INSERT INTO pdpp_replica_view_dirty_keys SELECT ${alias}.instance,${alias}.stream,${alias}.record_key WHERE ${touches(`${alias}.instance`, `${alias}.stream`, `${alias}.record_key`)} AND ${notDirtyKey(alias)};`;
 
   db.transaction(() => {
     const schema = db
@@ -219,7 +223,7 @@ export function createReplicaVisibilityView(deps: {
       WHEN NEW.generation != OLD.generation OR NEW.deleted_at IS NOT OLD.deleted_at OR NEW.source_id IS NOT OLD.source_id OR NEW.method IS NOT OLD.method OR NEW.reset_clock IS NOT OLD.reset_clock BEGIN
         -- Binding and lifecycle changes expire every stream cursor of the connection.
         UPDATE pdpp_replica_view_streams SET revision=revision+1 WHERE instance=NEW.instance;
-        INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections VALUES (NEW.instance);
+        INSERT INTO pdpp_replica_view_dirty_connections SELECT NEW.instance WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_connections d WHERE d.instance=NEW.instance);
       END;
       -- Blob bytes decide whether an upsert that references them is visible. Bytes
       -- can arrive or leave without any new record operation (a replayed claim,
