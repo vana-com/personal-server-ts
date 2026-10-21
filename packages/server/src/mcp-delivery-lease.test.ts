@@ -104,24 +104,27 @@ function gatewayFor(granteeAddress: `0x${string}`): GatewayClient {
   } as unknown as GatewayClient;
 }
 
-async function putLegacyVersion() {
+async function putLegacyVersion(
+  scope = SCOPE,
+  data: Record<string, unknown> = { id: "legacy-row" },
+) {
   const envelope = {
     version: "1.0",
-    scope: SCOPE,
+    scope,
     collectedAt: AT,
-    data: { id: "legacy-row" },
+    data,
   } as DataFileEnvelope;
   const written = await storage.writeEnvelope(envelope);
   const built = await buildDataBlocksAsync({
-    scope: SCOPE,
+    scope,
     collectedAt: AT,
     content: envelope,
   });
-  await storage.writeBlockManifest?.(SCOPE, AT, built.manifest, built.blocks);
+  await storage.writeBlockManifest?.(scope, AT, built.manifest, built.blocks);
   await storage.insertEntry({
     fileId: null,
     path: written.relativePath,
-    scope: SCOPE,
+    scope,
     collectedAt: AT,
     sizeBytes: written.sizeBytes,
   });
@@ -143,7 +146,10 @@ afterEach(async () => {
   await rm(dataDir, { recursive: true, force: true });
 });
 
-async function mcpClient(scopeDeletions: ScopeDeletionTracker) {
+async function mcpClient(
+  scopeDeletions: ScopeDeletionTracker,
+  onAccessLog: (scope: string) => void = () => undefined,
+) {
   const connections = createInMemoryMcpConnectionStore();
   const created = await createMcpConnection(
     { displayName: "Lease" },
@@ -167,7 +173,11 @@ async function mcpClient(scopeDeletions: ScopeDeletionTracker) {
       serverOwner: owner.address,
       gateway: gatewayFor(record.granteeAddress),
       gatewayConfig,
-      accessLogWriter: { write: async () => undefined },
+      accessLogWriter: {
+        write: async (entry) => {
+          onAccessLog(entry.scope);
+        },
+      },
       connectionStore: connections,
       indexManager,
       hierarchyOptions: { dataDir },
@@ -248,5 +258,48 @@ describe("MCP delivery when the scope is deleted during the grant check", () => 
     const call = await mcpClient(tracker);
     const text = await call("read_scope", { scope: SCOPE });
     expect(text).toContain("legacy-row");
+  });
+});
+
+describe("MCP search across scopes when one is deleted during another's read", () => {
+  it("does not release the deleted scope's preview", async () => {
+    const A = "oura.sleep";
+    const B = "oura.readiness";
+    await putLegacyVersion(A, { note: "needle alpha-private" });
+    await putLegacyVersion(B, { note: "needle beta" });
+    const tracker = createScopeDeletionTracker({ serverOwner: owner.address });
+    let deletedDuringB = false;
+    const call = await mcpClient(tracker, (scope) => {
+      // A has already been read and gated; B is being read now.
+      if (scope === B && !deletedDuringB) {
+        deletedDuringB = true;
+        tracker.markDeleted(A, {
+          deletedAt: "2099-01-01T00:00:00Z",
+          version: "9",
+        });
+      }
+    });
+    const text = await call("search_personal_context", {
+      query: "needle",
+      scopes: [A, B],
+    });
+    expect(deletedDuringB).toBe(true);
+    expect(text).not.toContain("alpha-private");
+    expect(text).toContain("DATA_DELETED");
+  });
+
+  it("releases both previews when nothing changes (positive control)", async () => {
+    const A = "oura.sleep";
+    const B = "oura.readiness";
+    await putLegacyVersion(A, { note: "needle alpha-private" });
+    await putLegacyVersion(B, { note: "needle beta" });
+    const tracker = createScopeDeletionTracker({ serverOwner: owner.address });
+    const call = await mcpClient(tracker);
+    const text = await call("search_personal_context", {
+      query: "needle",
+      scopes: [A, B],
+    });
+    expect(text).toContain("alpha-private");
+    expect(text).toContain("beta");
   });
 });

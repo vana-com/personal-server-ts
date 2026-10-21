@@ -1,8 +1,12 @@
 export {
   REMOTE_GRANT_REVERIFY_AFTER_MS,
   allDeliveryLeases,
-  remoteReverification,
+  collectDeliveryLeases,
+  deliver,
+  leasedStream,
+  remoteEvidence,
   type DeliveryLease,
+  type DeliveryLeaseCollector,
 } from "./delivery-lease.js";
 export {
   authorizeDataRead,

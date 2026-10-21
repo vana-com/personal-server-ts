@@ -1,6 +1,7 @@
 import { grantIsCandidate } from "../../pdpp/types.js";
 import { PdppError } from "../../errors/pdpp-catalog.js";
 import {
+  type PdppAuthorizationService,
   findStreamGrant,
   grantIsV02,
   withinTimeConstraint,
@@ -9,7 +10,7 @@ import {
 } from "../../ports/pdpp-auth.js";
 import type { StreamDeclaration } from "./stream-declaration.js";
 import {
-  remoteReverification,
+  remoteEvidence,
   type DeliveryLease,
 } from "../../policy/delivery-lease.js";
 
@@ -231,39 +232,89 @@ export function mapInactiveToError(context: PdppTokenContext): PdppError {
   }
 }
 
+/** What the chain said about a PDPP grant's permission, carried by the lease. */
+export interface PdppChainEvidence {
+  /** The permission's expiry (ISO 8601); absent or null when it has none. */
+  expiresAt?: string | null;
+}
+
+/** The delivery lease of a PDPP bearer read; see `pdppBearerReadLease`. */
+export interface PdppReadLease extends DeliveryLease {
+  /**
+   * Hold the read to these connections: once any of them is unavailable
+   * (deleted or unbound), the lease refuses with `instance_unavailable`.
+   */
+  requireConnections(instanceIds: readonly string[]): void;
+}
+
 /**
  * The delivery lease for a PDPP bearer read (records and blobs). See
- * `policy/delivery-lease.ts` for what a lease is.
+ * `policy/delivery-lease.ts` for what a lease is and its ordering rule.
  *
- * It re-resolves the same token through the token and grant store, which
- * reports a revoked or expired grant, a revoked or expired token, and a
- * revoked refresh family, and it holds the read to the grant it was admitted
- * under. Re-resolving is a local store read, so it runs on every call, cheap
- * enough to run before every part of a blob body.
+ * Remote half (`refresh`): when the deployment enforces a chain permission,
+ * the chain check runs again only when the last one is older than
+ * `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s); the check that admitted the read
+ * counts as the first. Its answer, with the permission's expiry, becomes the
+ * lease's chain evidence. An AS without local resolution
+ * (`resolveTokenNow`) is asked here too.
  *
- * `reverifyChain`, when the deployment enforces a chain permission, runs the
- * chain check again. It is a remote call, so it runs only when the last
- * verification is older than `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s); the
- * check that admitted the read counts as the first.
+ * Local half (`assertLocal`, synchronous, last): the same token resolved
+ * again through the token and grant store, which reports a revoked or expired
+ * grant, a revoked or expired token, and a revoked refresh family; the same
+ * grant the read was admitted under; the carried chain expiry; and every
+ * connection the read requires.
  */
 export function pdppBearerReadLease(
-  auth: { resolveToken(token: string): Promise<PdppTokenContext> },
+  auth: Pick<PdppAuthorizationService, "resolveToken" | "resolveTokenNow">,
   token: string,
   admitted: PdppTokenContext,
-  options: { reverifyChain?: () => Promise<void> } = {},
-): DeliveryLease {
+  options: {
+    chain?: {
+      admitted: PdppChainEvidence;
+      reverify: () => Promise<PdppChainEvidence>;
+    };
+    isConnectionAvailable?: (instance: string) => boolean;
+  } = {},
+): PdppReadLease {
   const grantId = admitted.grant?.grant_id;
-  const chain = options.reverifyChain
-    ? remoteReverification(options.reverifyChain)
+  const chain = options.chain
+    ? remoteEvidence(options.chain.admitted, options.chain.reverify)
     : undefined;
+  const connections = new Set<string>();
+  // Only for an AS without local resolution: its last answer.
+  let resolved = admitted;
   return {
-    async assertDeliverable() {
-      const current = await auth.resolveToken(token);
+    requireConnections(instanceIds) {
+      for (const instance of instanceIds) connections.add(instance);
+    },
+    async refresh() {
+      await chain?.refresh();
+      if (!auth.resolveTokenNow) resolved = await auth.resolveToken(token);
+    },
+    assertLocal() {
+      const current = auth.resolveTokenNow
+        ? auth.resolveTokenNow(token)
+        : resolved;
       if (!current.active) throw mapInactiveToError(current);
       if (current.grant?.grant_id !== grantId) {
         throw mapInactiveToError({ active: false, inactiveReason: "unknown" });
       }
-      await chain?.();
+      const now = Date.now();
+      if (current.expiresAt && Date.parse(current.expiresAt) <= now) {
+        throw mapInactiveToError({ active: false, inactiveReason: "expired" });
+      }
+      const chainExpiry = chain?.current.expiresAt;
+      if (chainExpiry && Date.parse(chainExpiry) <= now) {
+        throw new PdppError("grant_expired", "Chain permission has expired");
+      }
+      for (const instance of connections) {
+        if (options.isConnectionAvailable?.(instance) === false) {
+          throw new PdppError(
+            "instance_unavailable",
+            "The connection for this grant is unavailable",
+          );
+        }
+      }
     },
   };
 }

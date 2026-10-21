@@ -102,6 +102,14 @@ export interface PdppTokenContext {
  */
 export interface PdppAuthorizationService {
   resolveToken(accessToken: string): Promise<PdppTokenContext>;
+  /**
+   * The same resolution, synchronously, for an AS whose token and grant store
+   * is local (co-located). The delivery lease uses it as its last check, so
+   * nothing is awaited between that check and the release. An AS reached over
+   * the network omits it; the lease then resolves through `resolveToken` in
+   * its remote half and checks the answer, with its carried expiry, locally.
+   */
+  resolveTokenNow?(accessToken: string): PdppTokenContext;
 }
 
 /** Looks up the StreamGrant entry for a stream name, or undefined if not granted. */

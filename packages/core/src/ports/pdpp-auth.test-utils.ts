@@ -12,15 +12,16 @@ import type {
 export function createFixtureAuthorizationService(
   tokens: Record<string, PdppTokenContext>,
 ): PdppAuthorizationService {
+  const resolveTokenNow = (accessToken: string): PdppTokenContext =>
+    tokens[accessToken] ?? {
+      active: false,
+      tokenKind: "client",
+      subjectId: "",
+    };
   return {
+    resolveTokenNow,
     async resolveToken(accessToken: string): Promise<PdppTokenContext> {
-      return (
-        tokens[accessToken] ?? {
-          active: false,
-          tokenKind: "client",
-          subjectId: "",
-        }
-      );
+      return resolveTokenNow(accessToken);
     },
   };
 }

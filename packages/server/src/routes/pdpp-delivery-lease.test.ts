@@ -183,7 +183,56 @@ describe("admission: a bearer that ends while the chain check is in flight", () 
   }
 });
 
-describe("release: a grant revoked after admission, before the response leaves", () => {
+/**
+ * The record store, with `hook` run when a handler reads records: after
+ * admission and before the release, as slow storage or a concurrent owner
+ * action would land.
+ */
+function storeReading(hook: () => void): PdppRecordStore {
+  return new Proxy(records, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== "function") return value;
+      if (prop === "listRecords" || prop === "getRecord") {
+        return (...args: unknown[]) => {
+          hook();
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return (value as (...a: unknown[]) => unknown).bind(target);
+    },
+  });
+}
+
+/** A token that outlives a slow request. */
+function longToken(): string {
+  authStore.issueAccessToken({
+    token: "pdpp_at_long",
+    grantId: GRANT.grant_id,
+    subjectId: "sub_1",
+    clientId: "client_1",
+    tokenKind: "client",
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    consumeSingleUse: false,
+  });
+  return "pdpp_at_long";
+}
+
+describe("release: the bearer ends after admission, before the response leaves", () => {
+  it("refuses a grant revoked while the handler reads", async () => {
+    const app = routes({
+      store: storeReading(() => {
+        authStore.revokeGrant(GRANT.grant_id);
+      }),
+    });
+    const response = await app.request("/streams/media/records", { headers });
+    const text = await response.text();
+    expect(authStore.getGrant(GRANT.grant_id)?.revokedAt).toBeTruthy();
+    expect(response.status, text).toBe(403);
+    expect(JSON.parse(text).error.code).toBe("grant_revoked");
+    expect(text).not.toContain(SECRET);
+  });
+
   it("refuses a grant revoked during the chain check", async () => {
     const app = routes({
       chainEnforcement: {
@@ -195,32 +244,47 @@ describe("release: a grant revoked after admission, before the response leaves",
     });
     const response = await app.request("/streams/media/records", { headers });
     const text = await response.text();
-    expect(authStore.getGrant(GRANT.grant_id)?.revokedAt).toBeTruthy();
     expect(response.status, text).toBe(403);
     expect(JSON.parse(text).error.code).toBe("grant_revoked");
     expect(text).not.toContain(SECRET);
   });
 
-  it("refuses a grant revoked during the access-log write", async () => {
-    const recorded: string[] = [];
-    const app = routes({
-      accessLog: {
-        record: async (entry) => {
-          recorded.push(entry.outcome);
-          authStore.revokeGrant(GRANT.grant_id);
+  it("refuses a record whose connection is deleted while the handler reads", async () => {
+    const bindings = new Map([
+      [
+        "inst_1",
+        {
+          sourceId: "src_1" as string | null,
+          deletedAt: null as string | null,
         },
-      },
+      ],
+    ]);
+    const app = routes({
+      bindingStore: {
+        getInstanceBinding: (instance: string) =>
+          bindings.get(instance) ?? { sourceId: null, deletedAt: null },
+      } as unknown as PdppRecordsRouteDeps["bindingStore"],
+      store: storeReading(() => {
+        bindings.set("inst_1", {
+          sourceId: "src_1",
+          deletedAt: "2026-10-21T00:00:00Z",
+        });
+      }),
     });
-    const response = await app.request("/streams/media/records", { headers });
-    const text = await response.text();
-    // The handler built and logged the read; the release gate stopped it.
-    expect(recorded).toEqual(["completed"]);
-    expect(response.status, text).toBe(403);
-    expect(JSON.parse(text).error.code).toBe("grant_revoked");
-    expect(text).not.toContain(SECRET);
+    for (const path of [
+      "/streams/media/records",
+      `/streams/media/records/${SECRET}`,
+    ]) {
+      bindings.set("inst_1", { sourceId: "src_1", deletedAt: null });
+      const response = await app.request(path, { headers });
+      const text = await response.text();
+      expect(response.status, text).toBe(404);
+      expect(JSON.parse(text).error.code).toBe("instance_unavailable");
+      expect(text).not.toContain(`"id":"${SECRET}"`);
+    }
   });
 
-  it("still serves the read when the grant stays live (positive control)", async () => {
+  it("still serves the read when nothing changes (positive control)", async () => {
     const app = routes({
       chainEnforcement: { authorize: async () => ({ ok: true }) },
       accessLog: { record: async () => undefined },
@@ -231,29 +295,61 @@ describe("release: a grant revoked after admission, before the response leaves",
   });
 });
 
+describe("the owner access feed records the outcome the release gate decided", () => {
+  it("records a refused delivery as denied, never completed", async () => {
+    const recorded: string[] = [];
+    const app = routes({
+      accessLog: {
+        record: async (entry) => {
+          recorded.push(entry.outcome);
+        },
+      },
+      store: storeReading(() => {
+        authStore.revokeGrant(GRANT.grant_id);
+      }),
+    });
+    const response = await app.request("/streams/media/records", { headers });
+    expect(response.status).toBe(403);
+    await Promise.resolve();
+    expect(recorded).toEqual(["denied"]);
+  });
+
+  it("records a released read as completed", async () => {
+    const recorded: string[] = [];
+    const app = routes({
+      accessLog: {
+        record: async (entry) => {
+          recorded.push(entry.outcome);
+        },
+      },
+    });
+    const response = await app.request("/streams/media/records", { headers });
+    expect(response.status).toBe(200);
+    expect(recorded).toEqual(["completed"]);
+  });
+});
+
 describe("release-gate refusals follow the protocol profile", () => {
-  function revokedDuringAccessLog(
+  function revokedWhileReading(
     protocolProfile: PdppRecordsRouteDeps["protocolProfile"],
   ) {
     return routes({
       protocolProfile,
-      accessLog: {
-        record: async () => {
-          authStore.revokeGrant(GRANT.grant_id);
-        },
-      },
+      store: storeReading(() => {
+        authStore.revokeGrant(GRANT.grant_id);
+      }),
     }).request("http://rs.test/streams/media/records", { headers });
   }
 
   it("is 403 grant_revoked under current", async () => {
-    const response = await revokedDuringAccessLog("current");
+    const response = await revokedWhileReading("current");
     expect(response.status).toBe(403);
     expect((await response.json()).error.code).toBe("grant_revoked");
     expect(response.headers.get("WWW-Authenticate")).toBeNull();
   });
 
   it("is 401 invalid_token with the challenge under candidate-0.1.0", async () => {
-    const response = await revokedDuringAccessLog("candidate-0.1.0");
+    const response = await revokedWhileReading("candidate-0.1.0");
     expect(response.status).toBe(401);
     const body = await response.json();
     expect(body.error.code).toBe("invalid_token");
@@ -264,7 +360,7 @@ describe("release-gate refusals follow the protocol profile", () => {
   });
 });
 
-describe("chain re-verification at release", () => {
+describe("chain evidence at release", () => {
   it("makes no second chain call for a normal request", async () => {
     const authorize = vi.fn(async () => ({ ok: true }) as const);
     const app = routes({ chainEnforcement: { authorize } });
@@ -285,32 +381,64 @@ describe("chain re-verification at release", () => {
       },
     ];
     const authorize = vi.fn(async () => answers.shift()!);
+    const token = longToken();
     const app = routes({
       chainEnforcement: { authorize },
-      accessLog: {
-        record: async () => {
-          // A slow request: the release comes 31 s after admission.
-          vi.setSystemTime(Date.now() + 31_000);
-        },
-      },
-    });
-    // The token outlives the slow request.
-    authStore.issueAccessToken({
-      token: "pdpp_at_long",
-      grantId: GRANT.grant_id,
-      subjectId: "sub_1",
-      clientId: "client_1",
-      tokenKind: "client",
-      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
-      consumeSingleUse: false,
+      // A slow read: the release comes 31 s after admission.
+      store: storeReading(() => vi.setSystemTime(Date.now() + 31_000)),
     });
     const response = await app.request("/streams/media/records", {
-      headers: { Authorization: "Bearer pdpp_at_long" },
+      headers: { Authorization: `Bearer ${token}` },
     });
     const text = await response.text();
     expect(authorize).toHaveBeenCalledTimes(2);
     expect(response.status, text).toBe(403);
     expect(JSON.parse(text).error.code).toBe("grant_revoked");
+    expect(text).not.toContain(SECRET);
+  });
+
+  for (const [ending, end] of Object.entries(endings)) {
+    it(`refuses when ${ending} while the second chain call is pending`, async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      let calls = 0;
+      const app = routes({
+        chainEnforcement: {
+          authorize: async () => {
+            calls += 1;
+            // The re-verification at release: the bearer ends locally while
+            // it is in flight, then the chain answers that it is live.
+            if (calls === 2) end();
+            return { ok: true };
+          },
+        },
+        store: storeReading(() => vi.setSystemTime(Date.now() + 31_000)),
+      });
+      const response = await app.request("/streams/media/records", {
+        headers,
+      });
+      const text = await response.text();
+      expect(calls).toBe(2);
+      expect(response.status, text).toBeGreaterThanOrEqual(400);
+      expect(text).not.toContain(SECRET);
+    });
+  }
+
+  it("refuses at release once a carried chain expiry passes inside the 30 s window", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const authorize = vi.fn(async (): Promise<PdppChainDecision> => ({
+      ok: true,
+      expiresAt: new Date(Date.now() + 5_000).toISOString(),
+    }));
+    const app = routes({
+      chainEnforcement: { authorize },
+      // 10 s pass: the chain permission expires, the 30 s window does not.
+      store: storeReading(() => vi.setSystemTime(Date.now() + 10_000)),
+    });
+    const response = await app.request("/streams/media/records", { headers });
+    const text = await response.text();
+    expect(authorize).toHaveBeenCalledTimes(1);
+    expect(response.status, text).toBe(403);
+    expect(JSON.parse(text).error.code).toBe("grant_expired");
     expect(text).not.toContain(SECRET);
   });
 });

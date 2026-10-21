@@ -22,6 +22,8 @@ import {
   mapInactiveToError,
   pdppBearerReadLease,
   recordWithinGrantTimeConstraint,
+  type PdppChainEvidence,
+  type PdppReadLease,
   resolveReadScope,
   summarizeIngest,
   type IngestOutcome,
@@ -31,7 +33,7 @@ import {
   type StreamDeclaration,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
-import type { DeliveryLease } from "@opendatalabs/personal-server-ts-core/policy";
+import { deliver } from "@opendatalabs/personal-server-ts-core/policy";
 import { createRecordDataValidator } from "../pdpp/record-schema.js";
 import {
   StreamCompletionError,
@@ -316,7 +318,15 @@ export interface PdppChainEnforcementPort {
 }
 
 export type PdppChainDecision =
-  | { ok: true }
+  | {
+      ok: true;
+      /**
+       * The chain permission's expiry (ISO 8601), or null/absent when it has
+       * none. The read's delivery lease carries it and refuses at release
+       * once it passes, whatever the remote re-verification window.
+       */
+      expiresAt?: string | null;
+    }
   | {
       ok: false;
       retryable: true;
@@ -540,40 +550,84 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       // Intentionally swallowed; see the doc comment.
     }
   }
+  /**
+   * The delivery gate for every PDPP read endpoint, registered first so it is
+   * the outermost step of this router. A handler builds its whole response
+   * (records, chain check); this step then releases it only through the
+   * read's delivery lease, set by `authenticate` (see `deliver`: remote
+   * checks first, then the local checks, then the release, with no await
+   * between). A grant revoked or expired, a token or refresh family revoked,
+   * or a required connection removed while the handler ran replaces the
+   * response with the profile-aware bearer error, so no record of it is
+   * released.
+   *
+   * The owner access feed records the outcome this gate decided: `completed`
+   * for a released read, `denied` for a refused one. The write starts in the
+   * same tick as the decision and is not awaited, so it cannot open a window
+   * before the release; `logClientRead` never throws.
+   *
+   * Writes are not gated: their effect is already committed, and their
+   * response carries no read data.
+   */
+  app.use("*", async (c, next) => {
+    await next();
+    const gate = c.get("delivery" as never) as DeliveryGate | undefined;
+    if (!gate) return;
+    if (c.req.method !== "GET" && c.req.method !== "HEAD") return;
+    if (!c.res.ok) return;
+    const read = gate.read;
+    try {
+      await deliver(gate.lease, () => {
+        if (read) {
+          void logClientRead(
+            c,
+            read.context,
+            read.stream,
+            "completed",
+            read.reqId,
+          );
+        }
+      });
+    } catch (err) {
+      const reqId =
+        read?.reqId ??
+        (c.get("reqId" as never) as string | undefined) ??
+        requestId();
+      // Drop the built response whole, headers included, before the refusal
+      // replaces it.
+      c.res = undefined;
+      c.res = sendLeaseRefusal(c, err, reqId);
+      if (read) {
+        void logClientRead(c, read.context, read.stream, "denied", reqId);
+      }
+    }
+  });
+
   app.use("*", async (c, next) => {
     const reqId = requestId();
     c.set("reqId" as never, reqId as never);
     await next();
   });
 
-  /**
-   * The delivery gate for every PDPP read endpoint. A handler builds its
-   * whole response first (records, chain check, access-log write); this step
-   * then asks the read's delivery lease, set by `authenticate`, once more
-   * before the response is returned. A grant revoked or expired while the
-   * handler ran replaces the response with the profile-aware bearer error,
-   * so no record of it is released. Writes are not gated: their effect is
-   * already committed, and their response carries no read data.
-   */
-  app.use("*", async (c, next) => {
-    await next();
-    const lease = c.get("deliveryLease" as never) as DeliveryLease | undefined;
-    if (!lease || !c.res.ok) return;
-    if (c.req.method !== "GET" && c.req.method !== "HEAD") return;
-    try {
-      await lease.assertDeliverable();
-    } catch (err) {
-      const reqId =
-        (c.get("reqId" as never) as string | undefined) ?? requestId();
-      // Drop the built response whole, headers included, before the refusal
-      // replaces it.
-      c.res = undefined;
-      c.res = sendLeaseRefusal(c, err, reqId);
-    }
-  });
+  interface DeliveryGate {
+    lease: PdppReadLease;
+    /** A served client read, logged with the outcome the gate decides. */
+    read?: { context: PdppTokenContext; stream: string; reqId: string };
+  }
 
-  function setDeliveryLease(c: Context, lease: DeliveryLease): void {
-    c.set("deliveryLease" as never, lease as never);
+  function deliveryGate(c: Context): DeliveryGate | undefined {
+    return c.get("delivery" as never) as DeliveryGate | undefined;
+  }
+
+  /** Log this served read once the delivery gate has decided its outcome. */
+  function logReadAtDelivery(
+    c: Context,
+    context: PdppTokenContext | undefined,
+    stream: string,
+    reqId: string,
+  ): void {
+    const gate = deliveryGate(c);
+    if (gate && context) gate.read = { context, stream, reqId };
   }
 
   /** A failed delivery lease as the profile-aware bearer error. */
@@ -585,6 +639,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         headers: { "Retry-After": "5" },
       }),
     });
+  }
+
+  function isConnectionAvailable(instance: string): boolean {
+    if (!deps.bindingStore) return true;
+    const binding = deps.bindingStore.getInstanceBinding(instance);
+    return binding.sourceId !== null && binding.deletedAt === null;
   }
 
   async function authenticate(c: Context, reqId: string) {
@@ -603,6 +663,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       };
     }
     const context = await deps.auth.resolveToken(token);
+    let chainDecision: Extract<PdppChainDecision, { ok: true }> | undefined;
 
     // Chain enforcement, when the deployment configures it. Placed here so
     // EVERY endpoint is covered by one gate: a check added per-route is a
@@ -635,6 +696,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           clientId: context.clientId ?? "",
           pdppGrantId: grantId,
         });
+        if (decision.ok) chainDecision = decision;
 
         if (!decision.ok) {
           await logClientRead(c, context, "unknown", "denied", reqId);
@@ -644,27 +706,33 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     }
 
     if (context?.active) {
-      const chained = Boolean(
-        deps.chainEnforcement && context.tokenKind === "client",
-      );
+      const chained =
+        deps.chainEnforcement && context.tokenKind === "client"
+          ? chainDecision
+          : undefined;
       const lease = pdppBearerReadLease(deps.auth, token, context, {
-        reverifyChain: chained ? () => reverifyChain(context) : undefined,
+        ...(chained && {
+          chain: {
+            admitted: { expiresAt: chained.expiresAt },
+            reverify: () => reverifyChain(context),
+          },
+        }),
+        isConnectionAvailable,
       });
       // Admission re-check. The chain check above awaits the gateway, and the
       // bearer can end during that wait (the grant revoked, the token
       // expired, its refresh family revoked). The context resolved before the
-      // wait must not admit the read, so ask the read's lease before any
-      // read work. The chain verification just made counts as fresh, so this
-      // is a local store read only. The release gate below stays the last
-      // gate.
+      // wait must not admit the read, so ask the read's lease before any read
+      // work. The chain verification just made counts as fresh, so this is
+      // local only. The delivery gate stays the last gate.
       if (chained) {
         try {
-          await lease.assertDeliverable();
+          await deliver(lease, () => undefined);
         } catch (err) {
           return { error: sendLeaseRefusal(c, err, reqId) };
         }
       }
-      setDeliveryLease(c, lease);
+      c.set("delivery" as never, { lease } satisfies DeliveryGate as never);
     }
     return { context };
   }
@@ -703,12 +771,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   }
 
   /** The chain check again, for the delivery lease (see `pdppBearerReadLease`). */
-  async function reverifyChain(context: PdppTokenContext): Promise<void> {
+  async function reverifyChain(
+    context: PdppTokenContext,
+  ): Promise<PdppChainEvidence> {
     const decision = await deps.chainEnforcement!.authorize({
       clientId: context.clientId ?? "",
       pdppGrantId: context.grant?.grant_id ?? "",
     });
     if (!decision.ok) throw chainRefusal(decision);
+    return { expiresAt: decision.expiresAt };
   }
 
   // PDPP-Version negotiation: only PDPP_VERSION is supported in v0.1.
@@ -776,7 +847,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     return context.instanceIds.filter((instance) => current.includes(instance));
   }
 
-  function requireRegisteredConnections(instanceIds: string[]): void {
+  function requireRegisteredConnections(
+    c: Context,
+    instanceIds: string[],
+  ): void {
+    // The read holds these connections until its delivery.
+    deliveryGate(c)?.lease.requireConnections(instanceIds);
     if (!deps.bindingStore) return;
     if (
       instanceIds.some((instance) => {
@@ -1006,7 +1082,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const effectiveInstanceIds =
         context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
       if (context!.tokenKind === "client") {
-        requireRegisteredConnections(effectiveInstanceIds);
+        requireRegisteredConnections(c, effectiveInstanceIds);
       }
       if (context!.tokenKind === "owner" && effectiveInstanceIds.length === 0) {
         throw new PdppError(
@@ -1125,7 +1201,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
-      await logClientRead(c, context, stream, "completed", reqId);
+      logReadAtDelivery(c, context, stream, reqId);
       return response;
     } catch (err) {
       const mapped = mapAndLog(
@@ -1179,7 +1255,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const effectiveInstanceIds =
         context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
       if (context!.tokenKind === "client") {
-        requireRegisteredConnections(effectiveInstanceIds);
+        requireRegisteredConnections(c, effectiveInstanceIds);
       }
 
       if (!recordKeyWithinGrantResources(recordKey, scope.streamGrant)) {
@@ -1215,7 +1291,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
-      await logClientRead(c, context, stream, "completed", reqId);
+      logReadAtDelivery(c, context, stream, reqId);
       return response;
     } catch (err) {
       const mapped = mapAndLog(
