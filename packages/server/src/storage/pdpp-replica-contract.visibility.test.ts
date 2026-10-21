@@ -70,7 +70,9 @@ const C = identity.connectionId;
 const Y = "connection-y";
 const appendDecl: DeclarationBinding = { ...binding, semantics: "append_only" };
 const profilesDecl: DeclarationBinding = { ...binding, stream: "profiles" };
-const decls = (...bindings: DeclarationBinding[]): MergeContext["declarations"] =>
+const decls = (
+  ...bindings: DeclarationBinding[]
+): MergeContext["declarations"] =>
   bindings.map((entry) => ({
     sourceId: identity.sourceId,
     binding: entry,
@@ -124,22 +126,43 @@ const ao = (
   counter: number,
   text = `original-${key}`,
   connectionId = C,
-) => rec(key, operationId, counter, { text, declaration: appendDecl, connectionId });
+) =>
+  rec(key, operationId, counter, {
+    text,
+    declaration: appendDecl,
+    connectionId,
+  });
 const originals = (keys: string[], connectionId = C) =>
-  keys.map((key, i) => ao(key, `${key}-orig-${connectionId}`, 2 + i, undefined, connectionId));
+  keys.map((key, i) =>
+    ao(key, `${key}-orig-${connectionId}`, 2 + i, undefined, connectionId),
+  );
 const conflict = (key: string, connectionId = C) =>
-  ao(key, `${key}-conflict-${connectionId}`, 100, `conflicting-${key}`, connectionId);
+  ao(
+    key,
+    `${key}-conflict-${connectionId}`,
+    100,
+    `conflicting-${key}`,
+    connectionId,
+  );
 const resetOp = (generation: number, counter = 200): ReplicaOperation => ({
   ...identity,
   kind: "connection-reset",
   generation,
   previousGeneration: generation - 1,
-  revision: { counter, writerId: "device-a", operationId: `reset-${generation}` },
+  revision: {
+    counter,
+    writerId: "device-a",
+    operationId: `reset-${generation}`,
+  },
 });
 const deleteOp: ReplicaOperation = {
   ...identity,
   kind: "connection-delete",
-  revision: { counter: 300, writerId: "device-a", operationId: "delete-connection" },
+  revision: {
+    counter: 300,
+    writerId: "device-a",
+    operationId: "delete-connection",
+  },
 };
 
 // ---------------------------------------------------------------- assertions
@@ -168,7 +191,9 @@ type EpochReader = { replicaIntegrityEpoch?: (key: string) => number };
 function epochOf(store: object, connection: string): number {
   const read = (store as EpochReader).replicaIntegrityEpoch;
   if (typeof read !== "function")
-    throw new Error("store.replicaIntegrityEpoch is missing (CONTRACT-API section 3)");
+    throw new Error(
+      "store.replicaIntegrityEpoch is missing (CONTRACT-API section 3)",
+    );
   return read.call(store, connection);
 }
 function epochBase(store: object, connection: string): number {
@@ -179,7 +204,10 @@ function epochBase(store: object, connection: string): number {
   }
 }
 
-const SURFACE_METHOD: Record<Exclude<Surface, "point">, keyof CanonicalAdapter> = {
+const SURFACE_METHOD: Record<
+  Exclude<Surface, "point">,
+  keyof CanonicalAdapter
+> = {
   list: "list",
   changes: "changes",
   blob: "blob",
@@ -192,18 +220,28 @@ function assertSurfaceTruth(adapter: CanonicalAdapter) {
   expect(adapter.surfaces.point).toBe("supported");
   for (const [surface, method] of Object.entries(SURFACE_METHOD)) {
     const supported = adapter.surfaces[surface as Surface] === "supported";
-    expect(typeof adapter[method] === "function", `${adapter.name} ${surface}`).toBe(
-      supported,
-    );
+    expect(
+      typeof adapter[method] === "function",
+      `${adapter.name} ${surface}`,
+    ).toBe(supported);
   }
 }
-const visible = async (adapter: CanonicalAdapter, key: string, connection = C) => {
+const visible = async (
+  adapter: CanonicalAdapter,
+  key: string,
+  connection = C,
+) => {
   const row = await adapter.point(connection, STREAM, key);
   return row !== undefined && !row.deleted;
 };
-const visibleKeys = async (adapter: CanonicalAdapter, keys: string[], connection = C) => {
+const visibleKeys = async (
+  adapter: CanonicalAdapter,
+  keys: string[],
+  connection = C,
+) => {
   const out: string[] = [];
-  for (const key of keys) if (await visible(adapter, key, connection)) out.push(key);
+  for (const key of keys)
+    if (await visible(adapter, key, connection)) out.push(key);
   return out;
 };
 
@@ -220,7 +258,10 @@ async function openTwo(
   declaration: DeclarationBinding,
 ) {
   const adapter = await open(factory, declaration);
-  await adapter.provision(Y, { sourceId: identity.sourceId, methodId: identity.methodId });
+  await adapter.provision(Y, {
+    sourceId: identity.sourceId,
+    methodId: identity.methodId,
+  });
   return adapter;
 }
 const epochNow = (adapter: CanonicalAdapter, connection = C) =>
@@ -368,8 +409,13 @@ function nodeLocal(options: LocalOptions = {}) {
         { method: identity.methodId, generation: 1 },
       );
     },
-    ingestAll(keys: string[], semantics: Semantics = "append_only", connection = C) {
-      for (const key of keys) device.ingest(connection, key, `original-${key}`, semantics);
+    ingestAll(
+      keys: string[],
+      semantics: Semantics = "append_only",
+      connection = C,
+    ) {
+      for (const key of keys)
+        device.ingest(connection, key, `original-${key}`, semantics);
     },
     list(
       cursor?: string,
@@ -379,10 +425,22 @@ function nodeLocal(options: LocalOptions = {}) {
       stream = STREAM,
       fields?: string[],
     ) {
-      return store.listRecords(stream, { instanceIds, limit, order, cursor, fields });
+      return store.listRecords(stream, {
+        instanceIds,
+        limit,
+        order,
+        cursor,
+        fields,
+      });
     },
     changes(
-      options: { cursor?: string; changesSince?: string; limit?: number; instanceIds?: string[]; fields?: string[] } = {},
+      options: {
+        cursor?: string;
+        changesSince?: string;
+        limit?: number;
+        instanceIds?: string[];
+        fields?: string[];
+      } = {},
     ) {
       return store.changesSince(STREAM, {
         instanceIds: options.instanceIds ?? [C],
@@ -412,7 +470,11 @@ function nodeLocal(options: LocalOptions = {}) {
         .prepare(
           "SELECT version, deleted, data FROM pdpp_record_changes WHERE instance=? AND stream=? AND record_key=? ORDER BY version",
         )
-        .all(connection, STREAM, key) as { version: number; deleted: number; data: string | null }[];
+        .all(connection, STREAM, key) as {
+        version: number;
+        deleted: number;
+        data: string | null;
+      }[];
     },
     quarantinedKeys: (connection = C) =>
       (
@@ -463,8 +525,12 @@ function surfacesOf(d: Local, connection = C) {
   return {
     point: (key: string) => d.store.getRecord(connection, STREAM, key)?.data,
     list: d.list(undefined, 100, [connection]).data.map((row) => row.recordKey),
-    changes: d.changes({ instanceIds: [connection] }).data.map((row) => row.recordKey),
-    completions: d.store.listStreamCompletions(connection).map((row) => row.stream),
+    changes: d
+      .changes({ instanceIds: [connection] })
+      .data.map((row) => row.recordKey),
+    completions: d.store
+      .listStreamCompletions(connection)
+      .map((row) => row.stream),
   };
 }
 
@@ -491,8 +557,14 @@ for (const [name, factory] of Object.entries(adapterFactories))
         await send(a, [second]);
         for (const restart of [false, true]) {
           if (restart) a.reopen();
-          expect(await visibleKeys(a, ["k1", "k2", "k3"]), "neither competing value nor siblings leak").toEqual([]);
-          expect(await visible(a, "y1", Y), "unrelated connection stays eligible").toBe(true);
+          expect(
+            await visibleKeys(a, ["k1", "k2", "k3"]),
+            "neither competing value nor siblings leak",
+          ).toEqual([]);
+          expect(
+            await visible(a, "y1", Y),
+            "unrelated connection stays eligible",
+          ).toBe(true);
           if (a.list) {
             expect(keysOf(await a.list(C, STREAM))).toEqual([]);
             expect(keysOf(await a.list(Y, STREAM))).toEqual(["y1"]);
@@ -503,8 +575,14 @@ for (const [name, factory] of Object.entries(adapterFactories))
           } else expect(a.surfaces.changes).toBe("unsupported");
         }
         if (a.integrityEpoch) {
-          expect(epochNow(a), "write side: connection fence bumps the epoch").toBeGreaterThan(before);
-          expect(epochNow(a, Y), "unrelated connection epoch is untouched").toBe(beforeY);
+          expect(
+            epochNow(a),
+            "write side: connection fence bumps the epoch",
+          ).toBeGreaterThan(before);
+          expect(
+            epochNow(a, Y),
+            "unrelated connection epoch is untouched",
+          ).toBe(beforeY);
         } else expect(a.surfaces.integrityEpoch).toBe("unsupported");
       });
   });
@@ -521,7 +599,10 @@ describe("47h finding h (#426): equivocation must not erase source-binding confl
     revision: { counter: 9, writerId: "device-b", operationId: "register-b" },
   };
   const upA = rec("k", "a-op", 2);
-  const unrelated = [reg("connection-d"), rec("d1", "d-op", 2, { connectionId: "connection-d" })];
+  const unrelated = [
+    reg("connection-d"),
+    rec("d1", "d-op", 2, { connectionId: "connection-d" }),
+  ];
   const orders: Record<string, ReplicaOperation[][]> = {
     "A then B then b-prime": [[registration, upA], [regB], [regBPrime]],
     "b-prime then B then A": [[regBPrime], [regB], [registration, upA]],
@@ -534,9 +615,17 @@ describe("47h finding h (#426): equivocation must not erase source-binding confl
           await send(a, batch);
           a.reopen();
         }
-        await a.provision("connection-d", { sourceId: identity.sourceId, methodId: identity.methodId });
+        await a.provision("connection-d", {
+          sourceId: identity.sourceId,
+          methodId: identity.methodId,
+        });
         // The local mapping for C is established after the conflicting evidence was retained.
-        await a.provision(C, { sourceId: identity.sourceId, methodId: identity.methodId }).catch(() => undefined);
+        await a
+          .provision(C, {
+            sourceId: identity.sourceId,
+            methodId: identity.methodId,
+          })
+          .catch(() => undefined);
         return a;
       };
       it(`47h-1 [${name}] ${label}: a retained mapping disagreement is connection-scoped, not a global throw`, async () => {
@@ -544,7 +633,10 @@ describe("47h finding h (#426): equivocation must not erase source-binding confl
         assertSurfaceTruth(a);
         await send(a, unrelated);
         await a.retry();
-        expect(await visible(a, "d1", "connection-d"), "unrelated connection imports and retries").toBe(true);
+        expect(
+          await visible(a, "d1", "connection-d"),
+          "unrelated connection imports and retries",
+        ).toBe(true);
         expect(await visible(a, "k")).toBe(false);
       });
       it(`47h-2 [${name}] ${label}: connection stays hidden and the binding conflict stays true`, async () => {
@@ -556,10 +648,16 @@ describe("47h finding h (#426): equivocation must not erase source-binding confl
             a.reopen();
             await a.retry().catch(() => undefined);
           }
-          expect(await visible(a, "k"), "source A's value must not become visible").toBe(false);
+          expect(
+            await visible(a, "k"),
+            "source A's value must not become visible",
+          ).toBe(false);
           if (a.list) expect(keysOf(await a.list(C, STREAM))).toEqual([]);
           else expect(a.surfaces.list).toBe("unsupported");
-          if (a.bindingConflict) expect(a.bindingConflict(C), "durable fact, never erased").toBe(true);
+          if (a.bindingConflict)
+            expect(a.bindingConflict(C), "durable fact, never erased").toBe(
+              true,
+            );
           else expect(a.surfaces.bindingConflict).toBe("unsupported");
         }
       });
@@ -585,11 +683,15 @@ for (const [name, factory] of Object.entries(adapterFactories))
         const sent: ReplicaOperation[] = [registration];
         const expectWinner = async () => {
           const plan = planReplicaMerge(ctx(binding), sent);
-          const winner = plan.records.find((r) => r.identity.recordKey === "same-key")?.winner;
+          const winner = plan.records.find(
+            (r) => r.identity.recordKey === "same-key",
+          )?.winner;
           const row = await a.point(C, STREAM, "same-key");
           if (winner?.kind === "upsert") {
             expect(row?.deleted ?? false).toBe(false);
-            expect((row?.data as { text?: string } | undefined)?.text).toBe(winner.data.text);
+            expect((row?.data as { text?: string } | undefined)?.text).toBe(
+              winner.data.text,
+            );
           } else expect(row === undefined || row.deleted).toBe(true);
         };
         for (const index of order) {
@@ -602,7 +704,9 @@ for (const [name, factory] of Object.entries(adapterFactories))
         // Replay and reverse replay change nothing: receipt time and cursor are not policy.
         await send(a, [...mutableVectors].reverse());
         await expectWinner();
-        expect((await a.point(C, STREAM, "same-key"))?.data).toMatchObject({ text: "resurrect" });
+        expect((await a.point(C, STREAM, "same-key"))?.data).toMatchObject({
+          text: "resurrect",
+        });
       });
   });
 
@@ -619,7 +723,9 @@ for (const [name, factory] of Object.entries(adapterFactories))
     await send(a, [resetOp(3, 4), g3]);
     for (const restart of [false, true]) {
       if (restart) a.reopen();
-      expect((await a.point(C, STREAM, "same-key"))?.data).toMatchObject({ text: "gen1" });
+      expect((await a.point(C, STREAM, "same-key"))?.data).toMatchObject({
+        text: "gen1",
+      });
       if (a.list) expect(keysOf(await a.list(C, STREAM))).toEqual(["same-key"]);
       else expect(a.surfaces.list).toBe("unsupported");
     }
@@ -658,7 +764,14 @@ describe("50 [Node SQLite] verified blob readiness", () => {
           instance: C,
           stream: STREAM,
           key: "k",
-          data: { id: "k", blob_ref: { blob_id: blob.blobId, mime_type: blob.mimeType, size_bytes: 2 } },
+          data: {
+            id: "k",
+            blob_ref: {
+              blob_id: blob.blobId,
+              mime_type: blob.mimeType,
+              size_bytes: 2,
+            },
+          },
           emitted_at: at,
         },
       ],
@@ -676,7 +789,10 @@ describe("50 [Node SQLite] verified blob readiness", () => {
     expect(s.list).toEqual([]);
     expect(s.changes).toEqual([]);
     expect(d.store.getBlobBytes(blobId)).toBeUndefined();
-    expect(s.completions, "completion stays pending until verified bytes").toEqual([]);
+    expect(
+      s.completions,
+      "completion stays pending until verified bytes",
+    ).toEqual([]);
   };
   it("50 missing, then corrupt, then exact bytes: nothing is exposed until verified, then everything is", () => {
     const { operations, bytes, blobId } = blobSource();
@@ -685,7 +801,9 @@ describe("50 [Node SQLite] verified blob readiness", () => {
     hiddenEverywhere(target, blobId);
     target.reopen();
     hiddenEverywhere(target, blobId);
-    expect(() => target.send(operations, [{ blobId, bytes: new Uint8Array([1, 2]) }])).toThrow();
+    expect(() =>
+      target.send(operations, [{ blobId, bytes: new Uint8Array([1, 2]) }]),
+    ).toThrow();
     target.reopen();
     hiddenEverywhere(target, blobId);
     target.send(operations, [{ blobId, bytes }]);
@@ -698,17 +816,33 @@ describe("50 [Node SQLite] verified blob readiness", () => {
     expect(surfacesOf(target).completions).toEqual([STREAM]);
   });
   it("50 [Lite] adapters expose no list/changes/completion; a record needing missing bytes is hidden at the point read", async () => {
-    for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) => n.startsWith("Lite"))) {
+    for (const [name, factory] of Object.entries(adapterFactories).filter(
+      ([n]) => n.startsWith("Lite"),
+    )) {
       const a = await open(factory, binding);
       assertSurfaceTruth(a);
       expect(a.surfaces.list, name).toBe("unsupported");
       expect(a.surfaces.completion, name).toBe("unsupported");
       const hash = `sha256:${"1".repeat(64)}`;
-      const descriptor = { blobId: hash, sha256: hash, sizeBytes: 2, mimeType: "text/plain" };
+      const descriptor = {
+        blobId: hash,
+        sha256: hash,
+        sizeBytes: 2,
+        mimeType: "text/plain",
+      };
       await send(a, [
         registration,
-        { ...identity, kind: "blob-claim", blob: descriptor, revision: { counter: 2, writerId: "device-a", operationId: "claim" } },
-        { ...rec("k", "blob-op", 3), data: { id: "k", blob_ref: { blob_id: hash } }, blobs: [descriptor] },
+        {
+          ...identity,
+          kind: "blob-claim",
+          blob: descriptor,
+          revision: { counter: 2, writerId: "device-a", operationId: "claim" },
+        },
+        {
+          ...rec("k", "blob-op", 3),
+          data: { id: "k", blob_ref: { blob_id: hash } },
+          blobs: [descriptor],
+        },
       ]);
       expect(await visible(a, "k"), name).toBe(false);
       expect(await a.blob!(hash), name).toBeUndefined();
@@ -743,7 +877,8 @@ function completionSource() {
   });
   const operations = source.operations();
   const completion = operations.find((op) => op.kind === "stream-complete");
-  if (completion?.kind !== "stream-complete") throw new Error("source produced no completion");
+  if (completion?.kind !== "stream-complete")
+    throw new Error("source produced no completion");
   const records = operations.filter((op) => op.kind === "upsert");
   const lifecycle = operations.find((op) => op.kind === "connection-register");
   if (!lifecycle) throw new Error("source produced no registration");
@@ -772,9 +907,14 @@ describe("51 [Node SQLite] completion dependencies", () => {
     const { completion, records, lifecycle } = completionSource();
     const bad: ReplicaOperation = {
       ...completion,
-      revision: { ...completion.revision, operationId: "completion-wrong-dependency" },
+      revision: {
+        ...completion.revision,
+        operationId: "completion-wrong-dependency",
+      },
       dependencies: completion.dependencies.map((dep, i, all) =>
-        i === all.length - 1 ? { ...dep, digest: `sha256:${"0".repeat(64)}` as const } : dep,
+        i === all.length - 1
+          ? { ...dep, digest: `sha256:${"0".repeat(64)}` as const }
+          : dep,
       ),
     };
     const target = nodeLocal({ declarations: decls(binding) });
@@ -786,7 +926,9 @@ describe("51 [Node SQLite] completion dependencies", () => {
     expect(target.store.listStreamCompletions(C)).toEqual([]);
   });
   it("51c [Lite] has no completion surface and still hides the dependent record state", async () => {
-    for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) => n.startsWith("Lite"))) {
+    for (const [name, factory] of Object.entries(adapterFactories).filter(
+      ([n]) => n.startsWith("Lite"),
+    )) {
       const a = await open(factory, binding);
       assertSurfaceTruth(a);
       expect(a.surfaces.completion, name).toBe("unsupported");
@@ -822,16 +964,25 @@ describe("52 [Node SQLite] completion receipts", () => {
       method: identity.methodId,
       label: "unrelated",
     });
-    unrelatedOnly.ingest("conn_unrelated", "other", "unrelated", "mutable_state");
+    unrelatedOnly.ingest(
+      "conn_unrelated",
+      "other",
+      "unrelated",
+      "mutable_state",
+    );
     unrelatedOnly.send(operations);
     unrelatedOnly.reopen();
     unrelatedOnly.send(operations);
     expect(unrelatedOnly.store.listStreamCompletions(C)).toEqual(baseline);
     expect(surfacesOf(unrelatedOnly).list).toEqual(["a", "b"]);
-    expect(unrelatedOnly.store.getRecord("conn_unrelated", STREAM, "other")).toBeDefined();
+    expect(
+      unrelatedOnly.store.getRecord("conn_unrelated", STREAM, "other"),
+    ).toBeDefined();
   });
   it("52 [Lite] has no completion surface", async () => {
-    for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) => n.startsWith("Lite"))) {
+    for (const [name, factory] of Object.entries(adapterFactories).filter(
+      ([n]) => n.startsWith("Lite"),
+    )) {
       const a = await open(factory, binding);
       assertSurfaceTruth(a);
       expect(a.surfaces.completion, name).toBe("unsupported");
@@ -871,7 +1022,10 @@ for (const [name, factory] of Object.entries(adapterFactories))
             cursor = page.nextCursor;
             if (!cursor) break;
           }
-          expect(seen.sort(), "every clean key exactly once, victim never").toEqual(clean);
+          expect(
+            seen.sort(),
+            "every clean key exactly once, victim never",
+          ).toEqual(clean);
         } else {
           expect(a.surfaces.changes).toBe("unsupported");
           await send(a, [conflict(victim)]);
@@ -915,14 +1069,19 @@ describe("54-56 [Node SQLite] cursor position, ties and horizon", () => {
   const mutable = () => nodeLocal({ declarations: decls(binding) });
   it("54 changes hidden by field projection do not hide a later selected-field change", () => {
     const d = mutable();
-    for (const key of ["a", "b", "c", "d", "e"]) d.ingest(C, key, "t", "mutable_state", { other: "o1" });
+    for (const key of ["a", "b", "c", "d", "e"])
+      d.ingest(C, key, "t", "mutable_state", { other: "o1" });
     const token = d.changes().nextChangesSince;
     expect(token).toBeDefined();
     d.ingest(C, "a", "t", "mutable_state", { other: "o2" });
     d.ingest(C, "b", "t", "mutable_state", { other: "o2" });
     d.ingest(C, "c", "t2", "mutable_state", { other: "o1" });
     const historyBefore = d.historyRows(C, "a").length;
-    const selected = d.changes({ changesSince: token, fields: ["id", "text"], limit: 1 });
+    const selected = d.changes({
+      changesSince: token,
+      fields: ["id", "text"],
+      limit: 1,
+    });
     expect(selected.data.map((row) => row.recordKey)).toEqual(["c"]);
     expect(selected.hasMore).toBe(false);
     const all = d.changes({ changesSince: token, limit: 10 });
@@ -951,7 +1110,9 @@ describe("54-56 [Node SQLite] cursor position, ties and horizon", () => {
     const d = mutable();
     const keys = ["k1", "k2", "k3", "k4", "k5"];
     d.ingestAll(keys, "mutable_state");
-    expect(d.store.deleteRecord(C, STREAM, "k3", at, "mutable_state")).toBe(true);
+    expect(d.store.deleteRecord(C, STREAM, "k3", at, "mutable_state")).toBe(
+      true,
+    );
     const live = ["k1", "k2", "k4", "k5"];
     for (const order of ["asc", "desc"] as const) {
       const seen: string[] = [];
@@ -968,7 +1129,12 @@ describe("54-56 [Node SQLite] cursor position, ties and horizon", () => {
     let cursor: string | undefined;
     for (let i = 0; i < 8; i++) {
       const page = d.changes({ limit: 1, cursor });
-      seen.push(...page.data.map((row) => ({ key: row.recordKey, deleted: row.deleted ?? false })));
+      seen.push(
+        ...page.data.map((row) => ({
+          key: row.recordKey,
+          deleted: row.deleted ?? false,
+        })),
+      );
       cursor = page.nextCursor;
       if (!cursor) break;
     }
@@ -983,12 +1149,20 @@ describe("54-56 [Node SQLite] cursor position, ties and horizon", () => {
     const listPage = d.list(undefined, 1);
     d.ingest(C, "d", "new", "mutable_state");
     d.ingest(C, "b", "updated", "mutable_state");
-    expect(d.store.deleteRecord(C, STREAM, "c", at, "mutable_state")).toBe(true);
+    expect(d.store.deleteRecord(C, STREAM, "c", at, "mutable_state")).toBe(
+      true,
+    );
     const rest: { key: string; text?: unknown; deleted: boolean }[] = [];
     let cursor = page1.nextCursor;
     for (let i = 0; i < 5 && cursor; i++) {
       const page = d.changes({ limit: 1, cursor });
-      rest.push(...page.data.map((row) => ({ key: row.recordKey, text: "data" in row ? row.data.text : undefined, deleted: row.deleted ?? false })));
+      rest.push(
+        ...page.data.map((row) => ({
+          key: row.recordKey,
+          text: "data" in row ? row.data.text : undefined,
+          deleted: row.deleted ?? false,
+        })),
+      );
       cursor = page.nextCursor;
     }
     expect(rest).toEqual([
@@ -997,14 +1171,24 @@ describe("54-56 [Node SQLite] cursor position, ties and horizon", () => {
     ]);
     expect(() => d.list(listPage.nextCursor, 1)).not.toThrow();
     const fresh = d.changes({ limit: 100 });
-    expect(fresh.data.map((row) => row.recordKey)).toEqual(["a", "b", "c", "d"]);
+    expect(fresh.data.map((row) => row.recordKey)).toEqual([
+      "a",
+      "b",
+      "c",
+      "d",
+    ]);
     expect(fresh.data.find((row) => row.recordKey === "c")?.deleted).toBe(true);
   });
   it("54-56 [Lite] expose no list or changes cursor surface", async () => {
-    for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) => n.startsWith("Lite"))) {
+    for (const [name, factory] of Object.entries(adapterFactories).filter(
+      ([n]) => n.startsWith("Lite"),
+    )) {
       const a = await open(factory, binding);
       assertSurfaceTruth(a);
-      expect([a.surfaces.list, a.surfaces.changes], name).toEqual(["unsupported", "unsupported"]);
+      expect([a.surfaces.list, a.surfaces.changes], name).toEqual([
+        "unsupported",
+        "unsupported",
+      ]);
     }
   });
 });
@@ -1035,7 +1219,10 @@ for (const [name, factory] of Object.entries(adapterFactories))
             a.list(C, STREAM, { limit: 1, cursor }),
             "old cursor expires deterministically with no data",
           ).rejects.toBeInstanceOf(CursorExpiredError);
-          expect(keysOf(await a.list(C, STREAM, { limit: 100 }))).toEqual(["a", "c"]);
+          expect(keysOf(await a.list(C, STREAM, { limit: 100 }))).toEqual([
+            "a",
+            "c",
+          ]);
         }
       }
     });
@@ -1054,8 +1241,12 @@ for (const [name, factory] of Object.entries(adapterFactories))
         if (restart) a.reopen();
         expect(await visibleKeys(a, ["a", "b"])).toEqual(["b"]);
         if (a.list) {
-          await expect(a.list(C, STREAM, { limit: 1, cursor })).rejects.toBeInstanceOf(CursorExpiredError);
-          expect(keysOf(await a.list(C, STREAM, { limit: 100 }))).toEqual(["b"]);
+          await expect(
+            a.list(C, STREAM, { limit: 1, cursor }),
+          ).rejects.toBeInstanceOf(CursorExpiredError);
+          expect(keysOf(await a.list(C, STREAM, { limit: 100 }))).toEqual([
+            "b",
+          ]);
         }
       }
     });
@@ -1070,7 +1261,10 @@ for (const [name, factory] of Object.entries(adapterFactories))
         expect(after).toBeGreaterThan(before);
         await send(a, [conflict("b")]);
         a.reopen();
-        expect(epochNow(a), "replay and reopen leave the fence where it is").toBe(after);
+        expect(
+          epochNow(a),
+          "replay and reopen leave the fence where it is",
+        ).toBe(after);
       } else expect(a.surfaces.integrityEpoch).toBe("unsupported");
     });
   });
@@ -1094,7 +1288,10 @@ describe("59 [Node SQLite] finding e (#428 F1)", () => {
     probe.disarm();
     expect(points).toBeGreaterThan(0);
     expect(reference.quarantinedKeys()).toEqual(["b"]);
-    expect(epochOf(reference.store, C), "uncrashed run raises the epoch").toBeGreaterThan(0);
+    expect(
+      epochOf(reference.store, C),
+      "uncrashed run raises the epoch",
+    ).toBeGreaterThan(0);
     for (let i = 0; i < points; i++) {
       const crash = new CrashController();
       const d = seeded({ crash });
@@ -1125,18 +1322,27 @@ describe("59 [Node SQLite] finding e (#428 F1)", () => {
     d.send([conflict("b")]);
     for (const restart of [false, true]) {
       if (restart) d.reopen();
-      expect(() => d.changes({ limit: 1, cursor: page1.nextCursor })).toThrow(CursorExpiredError);
-      expect(() => d.changes({ changesSince: terminal })).toThrow(CursorExpiredError);
+      expect(() => d.changes({ limit: 1, cursor: page1.nextCursor })).toThrow(
+        CursorExpiredError,
+      );
+      expect(() => d.changes({ changesSince: terminal })).toThrow(
+        CursorExpiredError,
+      );
       const fresh = d.changes({ limit: 100 });
       expect(fresh.data.map((row) => row.recordKey)).toEqual(["a"]);
       expect(JSON.stringify(fresh)).not.toContain("original-b");
       expect(JSON.stringify(fresh)).not.toContain("conflicting-b");
       expect(d.store.getRecord(C, STREAM, "b")).toBeUndefined();
-      expect(d.historyRows(C, "b").filter((row) => row.deleted === 0), "evidence is retained, not deleted").toEqual(liveBefore);
+      expect(
+        d.historyRows(C, "b").filter((row) => row.deleted === 0),
+        "evidence is retained, not deleted",
+      ).toEqual(liveBefore);
     }
   });
   it("59c [Lite twins] have no changes surface; the same import sequence hides b at the point read", async () => {
-    for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) => n.startsWith("Lite"))) {
+    for (const [name, factory] of Object.entries(adapterFactories).filter(
+      ([n]) => n.startsWith("Lite"),
+    )) {
       const a = await open(factory, appendDecl);
       assertSurfaceTruth(a);
       expect(a.surfaces.changes, name).toBe("unsupported");
@@ -1173,7 +1379,9 @@ describe("60 [Node SQLite] a fence that commits between row selection and the re
     return { d, arm: () => (armed = true) };
   }
   it("60a list: the page is wholly pre-fence or expired, and its cursor is never labelled with the post-fence epoch", () => {
-    const { d, arm } = raced(/FROM pdpp_records\s+WHERE stream = \? AND deleted = 0/);
+    const { d, arm } = raced(
+      /FROM pdpp_records\s+WHERE stream = \? AND deleted = 0/,
+    );
     arm();
     let page: ReturnType<Local["list"]> | undefined;
     try {
@@ -1181,16 +1389,28 @@ describe("60 [Node SQLite] a fence that commits between row selection and the re
     } catch (error) {
       expect(error).toBeInstanceOf(CursorExpiredError);
     }
-    expect(d.store.getRecord(C, STREAM, "b"), "the fence committed").toBeUndefined();
+    expect(
+      d.store.getRecord(C, STREAM, "b"),
+      "the fence committed",
+    ).toBeUndefined();
     if (page && page.data.some((row) => row.recordKey === "b")) {
       // Linearized before the fence: legal, but its continuation must carry the old epoch.
       expect(page.nextCursor).toBeDefined();
-      expect(() => d.list(page.nextCursor, 2), "minted before the fence, so it expires").toThrow(CursorExpiredError);
-    } else if (page) expect(page.data.map((row) => row.recordKey)).toEqual(["a", "c"]);
-    expect(d.list(undefined, 100).data.map((row) => row.recordKey)).toEqual(["a", "c"]);
+      expect(
+        () => d.list(page.nextCursor, 2),
+        "minted before the fence, so it expires",
+      ).toThrow(CursorExpiredError);
+    } else if (page)
+      expect(page.data.map((row) => row.recordKey)).toEqual(["a", "c"]);
+    expect(d.list(undefined, 100).data.map((row) => row.recordKey)).toEqual([
+      "a",
+      "c",
+    ]);
   });
   it("60b changes: the page is wholly pre-fence or expired, and its terminal token expires", () => {
-    const { d, arm } = raced(/FROM pdpp_record_changes c\s+WHERE c\.stream = \?/);
+    const { d, arm } = raced(
+      /FROM pdpp_record_changes c\s+WHERE c\.stream = \?/,
+    );
     arm();
     let page: ReturnType<Local["changes"]> | undefined;
     try {
@@ -1202,15 +1422,26 @@ describe("60 [Node SQLite] a fence that commits between row selection and the re
     if (page && page.data.some((row) => row.recordKey === "b")) {
       // Linearized before the fence: legal, but its terminal token must carry the old epoch.
       expect(page.nextChangesSince).toBeDefined();
-      expect(() => d.changes({ changesSince: page.nextChangesSince })).toThrow(CursorExpiredError);
-    } else if (page) expect(page.data.map((row) => row.recordKey)).toEqual(["a", "c"]);
-    expect(d.changes({ limit: 100 }).data.map((row) => row.recordKey)).toEqual(["a", "c"]);
+      expect(() => d.changes({ changesSince: page.nextChangesSince })).toThrow(
+        CursorExpiredError,
+      );
+    } else if (page)
+      expect(page.data.map((row) => row.recordKey)).toEqual(["a", "c"]);
+    expect(d.changes({ limit: 100 }).data.map((row) => row.recordKey)).toEqual([
+      "a",
+      "c",
+    ]);
   });
   it("60 [Lite] has no list or changes surface to race", async () => {
-    for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) => n.startsWith("Lite"))) {
+    for (const [name, factory] of Object.entries(adapterFactories).filter(
+      ([n]) => n.startsWith("Lite"),
+    )) {
       const a = await open(factory, appendDecl);
       assertSurfaceTruth(a);
-      expect([a.surfaces.list, a.surfaces.changes], name).toEqual(["unsupported", "unsupported"]);
+      expect([a.surfaces.list, a.surfaces.changes], name).toEqual([
+        "unsupported",
+        "unsupported",
+      ]);
     }
   });
 });
@@ -1221,7 +1452,10 @@ describe("60 [Node SQLite] a fence that commits between row selection and the re
 
 describe("61 relevant versus unrelated fences", () => {
   it("61a [Node SQLite] write side: a Y fence moves only Y's epoch; an X fence moves only X's", () => {
-    const d = nodeLocal({ declarations: decls(appendDecl), connections: [C, Y] });
+    const d = nodeLocal({
+      declarations: decls(appendDecl),
+      connections: [C, Y],
+    });
     d.ingestAll(["a", "b", "c"]);
     d.ingestAll(["p", "q"], "append_only", Y);
     const x0 = epochBase(d.store, C);
@@ -1235,24 +1469,37 @@ describe("61 relevant versus unrelated fences", () => {
     expect(d.epoch(Y)).toBe(y1);
   });
   it("61b [Node SQLite] read side: a Y-only fence leaves an X-only cursor valid; an X fence expires it", () => {
-    const d = nodeLocal({ declarations: decls(appendDecl), connections: [C, Y] });
+    const d = nodeLocal({
+      declarations: decls(appendDecl),
+      connections: [C, Y],
+    });
     d.ingestAll(["a", "b", "c"]);
     d.ingestAll(["p", "q"], "append_only", Y);
     const page1 = d.list(undefined, 1);
     expect(page1.data.map((row) => row.recordKey)).toEqual(["a"]);
     d.send([conflict("q", Y)]);
     const page2 = d.list(page1.nextCursor, 1);
-    expect(page2.data.map((row) => row.recordKey), "Y fence does not expire an X-only cursor").toEqual(["b"]);
+    expect(
+      page2.data.map((row) => row.recordKey),
+      "Y fence does not expire an X-only cursor",
+    ).toEqual(["b"]);
     expect(page2.nextCursor).toBeDefined();
     d.send([conflict("c", C)]);
-    expect(() => d.list(page2.nextCursor, 1), "an X fence expires it").toThrow(CursorExpiredError);
+    expect(() => d.list(page2.nextCursor, 1), "an X fence expires it").toThrow(
+      CursorExpiredError,
+    );
     expect(() => d.list(page1.nextCursor, 1)).toThrow(CursorExpiredError);
   });
-  for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) => n.startsWith("Lite")))
+  for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) =>
+    n.startsWith("Lite"),
+  ))
     it(`61c [${name}] has no epoch or list surface; point reads of X are unaffected by a Y fence and lose only the X victim`, async () => {
       const a = await openTwo(factory, appendDecl);
       assertSurfaceTruth(a);
-      expect([a.surfaces.list, a.surfaces.integrityEpoch]).toEqual(["unsupported", "unsupported"]);
+      expect([a.surfaces.list, a.surfaces.integrityEpoch]).toEqual([
+        "unsupported",
+        "unsupported",
+      ]);
       await send(a, [registration, ...originals(["a", "b", "c"])]);
       await send(a, [reg(Y), ...originals(["p", "q"], Y)]);
       await send(a, [conflict("q", Y)]);
@@ -1269,11 +1516,12 @@ describe("61 relevant versus unrelated fences", () => {
 // ============================================================================
 
 describe("62 [Node SQLite] old cursors after each fence kind", () => {
-  const fences: Record<string, { apply: (d: Local) => void; fresh: string[] }> = {
-    reset: { apply: (d) => d.send([resetOp(2)]), fresh: [] },
-    delete: { apply: (d) => d.send([deleteOp]), fresh: [] },
-    quarantine: { apply: (d) => d.send([conflict("b")]), fresh: ["a", "c"] },
-  };
+  const fences: Record<string, { apply: (d: Local) => void; fresh: string[] }> =
+    {
+      reset: { apply: (d) => d.send([resetOp(2)]), fresh: [] },
+      delete: { apply: (d) => d.send([deleteOp]), fresh: [] },
+      quarantine: { apply: (d) => d.send([conflict("b")]), fresh: ["a", "c"] },
+    };
   const setup = () => {
     const d = nodeLocal({ declarations: decls(appendDecl) });
     d.send([registration]);
@@ -1297,16 +1545,33 @@ describe("62 [Node SQLite] old cursors after each fence kind", () => {
       const listCursor = d.list(undefined, 1).nextCursor;
       const pageCursor = d.changes({ limit: 1 }).nextCursor;
       const token = d.changes({ limit: 100 }).nextChangesSince;
-      expect([listCursor, pageCursor, token].every((c) => c !== undefined)).toBe(true);
+      expect(
+        [listCursor, pageCursor, token].every((c) => c !== undefined),
+      ).toBe(true);
       fence.apply(d);
       for (const phase of ["after fence", "after reopen", "after replay"]) {
         if (phase === "after reopen") d.reopen();
         if (phase === "after replay") fence.apply(d);
-        expect(() => d.list(listCursor, 1), `${phase}: list cursor`).toThrow(CursorExpiredError);
-        expect(() => d.changes({ limit: 1, cursor: pageCursor }), `${phase}: changes page cursor`).toThrow(CursorExpiredError);
-        expect(() => d.changes({ changesSince: token }), `${phase}: changes token`).toThrow(CursorExpiredError);
-        expect(d.list(undefined, 100).data.map((row) => row.recordKey)).toEqual(fence.fresh);
-        expect(d.changes({ limit: 100 }).data.filter((row) => !row.deleted).map((row) => row.recordKey)).toEqual(fence.fresh);
+        expect(() => d.list(listCursor, 1), `${phase}: list cursor`).toThrow(
+          CursorExpiredError,
+        );
+        expect(
+          () => d.changes({ limit: 1, cursor: pageCursor }),
+          `${phase}: changes page cursor`,
+        ).toThrow(CursorExpiredError);
+        expect(
+          () => d.changes({ changesSince: token }),
+          `${phase}: changes token`,
+        ).toThrow(CursorExpiredError);
+        expect(d.list(undefined, 100).data.map((row) => row.recordKey)).toEqual(
+          fence.fresh,
+        );
+        expect(
+          d
+            .changes({ limit: 100 })
+            .data.filter((row) => !row.deleted)
+            .map((row) => row.recordKey),
+        ).toEqual(fence.fresh);
       }
     });
   }
@@ -1317,7 +1582,13 @@ describe("62 [Node SQLite] old cursors after each fence kind", () => {
       context: () => ctx(binding),
       authenticateReplica: () => identity.owner,
     });
-    for (const method of ["listRecords", "changesSince", "listStreamCompletions", "replicaIntegrityEpoch", "replicaBindingConflict"])
+    for (const method of [
+      "listRecords",
+      "changesSince",
+      "listStreamCompletions",
+      "replicaIntegrityEpoch",
+      "replicaBindingConflict",
+    ])
       expect(method in store, method).toBe(false);
   });
 });
@@ -1328,7 +1599,10 @@ describe("62 [Node SQLite] old cursors after each fence kind", () => {
 
 describe("63 [Node SQLite] cursor binding", () => {
   const twoConnections = () => {
-    const d = nodeLocal({ declarations: decls(binding, profilesDecl), connections: [C, Y] });
+    const d = nodeLocal({
+      declarations: decls(binding, profilesDecl),
+      connections: [C, Y],
+    });
     d.ingestAll(["a", "b", "c"], "mutable_state");
     d.ingestAll(["a", "b", "c"], "mutable_state", Y);
     return d;
@@ -1336,9 +1610,15 @@ describe("63 [Node SQLite] cursor binding", () => {
   it("63a a valid cursor continues an unchanged query", () => {
     const d = twoConnections();
     const page1 = d.list(undefined, 1);
-    expect(d.list(page1.nextCursor, 1).data.map((row) => row.recordKey)).toEqual(["b"]);
+    expect(
+      d.list(page1.nextCursor, 1).data.map((row) => row.recordKey),
+    ).toEqual(["b"]);
     const changes1 = d.changes({ limit: 1 });
-    expect(d.changes({ limit: 1, cursor: changes1.nextCursor }).data.map((row) => row.recordKey)).toEqual(["b"]);
+    expect(
+      d
+        .changes({ limit: 1, cursor: changes1.nextCursor })
+        .data.map((row) => row.recordKey),
+    ).toEqual(["b"]);
   });
   it("63b a cursor reused on another stream or order is refused with no data", () => {
     const d = twoConnections();
@@ -1352,7 +1632,9 @@ describe("63 [Node SQLite] cursor binding", () => {
     expectRefused(() => d.list(cursor, 1, [Y]));
     expectRefused(() => d.list(cursor, 1, [C, Y]));
     const pageCursor = d.changes({ limit: 1 }).nextCursor;
-    expectRefused(() => d.changes({ limit: 1, cursor: pageCursor, instanceIds: [Y] }));
+    expectRefused(() =>
+      d.changes({ limit: 1, cursor: pageCursor, instanceIds: [Y] }),
+    );
   });
   it("63d a cursor reused under a different field projection is refused with no data", () => {
     const d = twoConnections();
@@ -1363,13 +1645,42 @@ describe("63 [Node SQLite] cursor binding", () => {
   it("63e legacy and malformed tokens without store binding or horizon are refused, never restarted at offset zero", () => {
     const d = twoConnections();
     const legacy = [
-      encodeCursor({ kind: "list", order: "asc", sortValue: at, recordKey: "a", horizon: "0" }),
-      encodeCursor({ kind: "list", order: "asc", sortValue: at, recordKey: "a" }),
+      encodeCursor({
+        kind: "list",
+        order: "asc",
+        sortValue: at,
+        recordKey: "a",
+        horizon: "0",
+      }),
+      encodeCursor({
+        kind: "list",
+        order: "asc",
+        sortValue: at,
+        recordKey: "a",
+      }),
       "not-a-cursor",
     ];
     for (const cursor of legacy) expectRefused(() => d.list(cursor, 5));
-    expectRefused(() => d.changes({ cursor: encodeCursor({ kind: "changes_since", horizon: "0", sinceHorizon: null, offset: 0 }) }));
-    expectRefused(() => d.changes({ changesSince: encodeCursor({ kind: "changes_since", horizon: "0", sinceHorizon: null, offset: 0 }) }));
+    expectRefused(() =>
+      d.changes({
+        cursor: encodeCursor({
+          kind: "changes_since",
+          horizon: "0",
+          sinceHorizon: null,
+          offset: 0,
+        }),
+      }),
+    );
+    expectRefused(() =>
+      d.changes({
+        changesSince: encodeCursor({
+          kind: "changes_since",
+          horizon: "0",
+          sinceHorizon: null,
+          offset: 0,
+        }),
+      }),
+    );
   });
   it("63f a cursor minted by another repository is refused with no data and mutates nothing", () => {
     const first = twoConnections();
@@ -1378,13 +1689,20 @@ describe("63 [Node SQLite] cursor binding", () => {
     const before = second.operations();
     expectRefused(() => second.list(cursor, 1));
     expect(second.operations()).toEqual(before);
-    expect(second.list(undefined, 1).data.map((row) => row.recordKey)).toEqual(["a"]);
+    expect(second.list(undefined, 1).data.map((row) => row.recordKey)).toEqual([
+      "a",
+    ]);
   });
   it("63g [Lite] has no cursor surface to bind", async () => {
-    for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) => n.startsWith("Lite"))) {
+    for (const [name, factory] of Object.entries(adapterFactories).filter(
+      ([n]) => n.startsWith("Lite"),
+    )) {
       const a = await open(factory, binding);
       assertSurfaceTruth(a);
-      expect([a.surfaces.list, a.surfaces.changes], name).toEqual(["unsupported", "unsupported"]);
+      expect([a.surfaces.list, a.surfaces.changes], name).toEqual([
+        "unsupported",
+        "unsupported",
+      ]);
     }
   });
 });
@@ -1401,7 +1719,15 @@ describe("64 [Node SQLite] fence dominance", () => {
       method: identity.methodId,
       generation: 1,
       emittedAt: at,
-      envelopes: [{ instance: C, stream: "profiles", key: "p1", data: { id: "p1" }, emitted_at: at }],
+      envelopes: [
+        {
+          instance: C,
+          stream: "profiles",
+          key: "p1",
+          data: { id: "p1" },
+          emitted_at: at,
+        },
+      ],
       primaryKey: ["id"],
       sourceCollectedAt: at,
     });
@@ -1423,7 +1749,11 @@ describe("64 [Node SQLite] fence dominance", () => {
       /* refusal is the contract; the durable state below is what is asserted */
     }
   };
-  const refusedEntryPoints = (d: Local, replayOp: ReplicaOperation, repair: () => unknown) => {
+  const refusedEntryPoints = (
+    d: Local,
+    replayOp: ReplicaOperation,
+    repair: () => unknown,
+  ) => {
     attempt(repair);
     attempt(() => emptyReplace(d));
     attempt(() => d.send([replayOp]));
@@ -1440,20 +1770,36 @@ describe("64 [Node SQLite] fence dominance", () => {
     const outbound = d.operations();
     for (const phase of ["live", "reopened"]) {
       if (phase === "reopened") d.reopen();
-      expect(() => d.ingest(C, "b", "collector-repair"), `${phase}: native ingest`).toThrow("replica_integrity_quarantine");
-      refusedEntryPoints(d, conflict("b"), () => d.ingest(C, "b", "collector-repair"));
+      expect(
+        () => d.ingest(C, "b", "collector-repair"),
+        `${phase}: native ingest`,
+      ).toThrow("replica_integrity_quarantine");
+      refusedEntryPoints(d, conflict("b"), () =>
+        d.ingest(C, "b", "collector-repair"),
+      );
       expect(d.store.getRecord(C, STREAM, "b"), phase).toBeUndefined();
-      expect(d.list(undefined, 100).data.map((row) => row.recordKey)).toEqual(["a"]);
-      expect(d.changes({ limit: 100 }).data.map((row) => row.recordKey)).toEqual(["a"]);
-      expect(d.store.listStreamCompletions(C).map((row) => row.stream), `${phase}: no completion for the fenced stream`).toEqual([]);
+      expect(d.list(undefined, 100).data.map((row) => row.recordKey)).toEqual([
+        "a",
+      ]);
+      expect(
+        d.changes({ limit: 100 }).data.map((row) => row.recordKey),
+      ).toEqual(["a"]);
+      expect(
+        d.store.listStreamCompletions(C).map((row) => row.stream),
+        `${phase}: no completion for the fenced stream`,
+      ).toEqual([]);
       expect(d.retained()).toEqual(expect.arrayContaining(evidence));
       expect(d.historyRows(C, "b")).toEqual(history);
       expect(d.operations()).toEqual(outbound);
     }
     profileRecord(d);
-    expect(d.store.listStreamCompletions(C).map((row) => row.stream)).toEqual(["profiles"]);
+    expect(d.store.listStreamCompletions(C).map((row) => row.stream)).toEqual([
+      "profiles",
+    ]);
     d.reopen();
-    expect(d.store.listStreamCompletions(C).map((row) => row.stream)).toEqual(["profiles"]);
+    expect(d.store.listStreamCompletions(C).map((row) => row.stream)).toEqual([
+      "profiles",
+    ]);
   });
   it("64a-w write side: the key fence raises the epoch once; refused entry points, replay and reopen never move it", () => {
     const d = nodeLocal({ declarations: decls(appendDecl, profilesDecl) });
@@ -1464,7 +1810,9 @@ describe("64 [Node SQLite] fence dominance", () => {
     expect(fenced).toBeGreaterThan(before);
     for (const phase of ["live", "reopened"]) {
       if (phase === "reopened") d.reopen();
-      refusedEntryPoints(d, conflict("b"), () => d.ingest(C, "b", "collector-repair"));
+      refusedEntryPoints(d, conflict("b"), () =>
+        d.ingest(C, "b", "collector-repair"),
+      );
       expect(d.epoch(), phase).toBe(fenced);
     }
   });
@@ -1480,11 +1828,18 @@ describe("64 [Node SQLite] fence dominance", () => {
   it("64b operation-ID equivocation quarantines the connection on every entry point; other connections stay mutable", () => {
     const { d, original } = equivocated();
     const evidence = d.retained();
-    expect(evidence.filter((json) => json.includes('"operationId":"dup"'))).toHaveLength(2);
+    expect(
+      evidence.filter((json) => json.includes('"operationId":"dup"')),
+    ).toHaveLength(2);
     for (const phase of ["live", "reopened"]) {
       if (phase === "reopened") d.reopen();
-      expect(() => d.ingest(C, "other", "collector-repair", "mutable_state"), phase).toThrow("replica_integrity_quarantine");
-      refusedEntryPoints(d, original, () => d.ingest(C, "other", "collector-repair", "mutable_state"));
+      expect(
+        () => d.ingest(C, "other", "collector-repair", "mutable_state"),
+        phase,
+      ).toThrow("replica_integrity_quarantine");
+      refusedEntryPoints(d, original, () =>
+        d.ingest(C, "other", "collector-repair", "mutable_state"),
+      );
       const s = surfacesOf(d);
       expect(s.point("same-key"), phase).toBeUndefined();
       expect(s.list).toEqual([]);
@@ -1492,7 +1847,9 @@ describe("64 [Node SQLite] fence dominance", () => {
       expect(s.completions).toEqual([]);
       expect(d.retained()).toEqual(expect.arrayContaining(evidence));
     }
-    expect(d.store.getRecord(Y, STREAM, "y1")?.data).toMatchObject({ text: "kept" });
+    expect(d.store.getRecord(Y, STREAM, "y1")?.data).toMatchObject({
+      text: "kept",
+    });
     d.ingest(Y, "y2", "still-mutable", "mutable_state");
     expect(d.store.getRecord(Y, STREAM, "y2")).toBeDefined();
   });
@@ -1500,18 +1857,28 @@ describe("64 [Node SQLite] fence dominance", () => {
     const { d, original, before } = equivocated();
     const fenced = d.epoch();
     expect(fenced).toBeGreaterThan(before);
-    expect(d.epoch(Y), "unrelated connection epoch is untouched").toBe(epochBase(d.store, Y));
+    expect(d.epoch(Y), "unrelated connection epoch is untouched").toBe(
+      epochBase(d.store, Y),
+    );
     for (const phase of ["live", "reopened"]) {
       if (phase === "reopened") d.reopen();
-      refusedEntryPoints(d, original, () => d.ingest(C, "other", "collector-repair", "mutable_state"));
+      refusedEntryPoints(d, original, () =>
+        d.ingest(C, "other", "collector-repair", "mutable_state"),
+      );
       expect(d.epoch(), phase).toBe(fenced);
     }
   });
-  for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) => n.startsWith("Lite")))
+  for (const [name, factory] of Object.entries(adapterFactories).filter(([n]) =>
+    n.startsWith("Lite"),
+  ))
     it(`64c [${name}] has no completion, list or epoch surface; both fences hide records at the point read after replay and reopen`, async () => {
       const a = await openTwo(factory, appendDecl);
       assertSurfaceTruth(a);
-      expect([a.surfaces.completion, a.surfaces.integrityEpoch, a.surfaces.list]).toEqual(["unsupported", "unsupported", "unsupported"]);
+      expect([
+        a.surfaces.completion,
+        a.surfaces.integrityEpoch,
+        a.surfaces.list,
+      ]).toEqual(["unsupported", "unsupported", "unsupported"]);
       await send(a, [registration, ...originals(["a", "b"])]);
       await send(a, [reg(Y), ...originals(["p"], Y)]);
       await send(a, [conflict("b")]);
@@ -1539,9 +1906,17 @@ describe("j.2 [Node SQLite transport] legacy NULL-pin slot after a finalized rep
     expect(b.get()).toEqual({ id: "a", text: "authentic" });
     const base = epochBase(b.store, b.instance);
     // An upgraded retained row: pins are NULL, so the commitment is not bound yet.
-    b.db.prepare("UPDATE pdpp_transport_inbox SET data_hash=NULL, metadata_hash=NULL").run();
+    b.db
+      .prepare(
+        "UPDATE pdpp_transport_inbox SET data_hash=NULL, metadata_hash=NULL",
+      )
+      .run();
     const scopes = (
-      b.db.prepare("SELECT scope FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL").all() as { scope: string }[]
+      b.db
+        .prepare(
+          "SELECT scope FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL",
+        )
+        .all() as { scope: string }[]
     ).map((row) => row.scope);
     expect(scopes.length).toBeGreaterThan(0);
     for (const scope of scopes) {
@@ -1553,10 +1928,19 @@ describe("j.2 [Node SQLite transport] legacy NULL-pin slot after a finalized rep
     await cycles([b], 6);
     return { b, base };
   }
-  const readSurfaces = (b: Awaited<ReturnType<typeof legacyWithReplacement>>["b"]) => ({
+  const readSurfaces = (
+    b: Awaited<ReturnType<typeof legacyWithReplacement>>["b"],
+  ) => ({
     point: b.store.getRecord(b.instance, "messages", "a"),
-    list: b.store.listRecords("messages", { instanceIds: [b.instance], limit: 10, order: "asc" }).data,
-    changes: b.store.changesSince("messages", { instanceIds: [b.instance], limit: 10 }).data,
+    list: b.store.listRecords("messages", {
+      instanceIds: [b.instance],
+      limit: 10,
+      order: "asc",
+    }).data,
+    changes: b.store.changesSince("messages", {
+      instanceIds: [b.instance],
+      limit: 10,
+    }).data,
   });
   it("j.2r read side: the legacy slot is ineligible on point, list and changes, across reopen", async () => {
     const { b } = await legacyWithReplacement();

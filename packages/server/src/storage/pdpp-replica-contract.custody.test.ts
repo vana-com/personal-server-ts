@@ -227,7 +227,8 @@ async function crashMatrix(
   const failures = new Map<number, Violation[]>();
   if (referenceViolations.length) failures.set(-1, referenceViolations);
   const add = (k: number, violations: Violation[]) => {
-    if (violations.length) failures.set(k, [...(failures.get(k) ?? []), ...violations]);
+    if (violations.length)
+      failures.set(k, [...(failures.get(k) ?? []), ...violations]);
   };
 
   // 2. One fresh process per trace index, killed exactly there.
@@ -296,7 +297,10 @@ async function crashMatrix(
     add(k, resumed);
     const T3 = performance.now();
     cleanupHarness();
-    if (process.env.PROF) console.error(`k=${k} build=${(T1-T0).toFixed(0)} rest=${(T3-T1).toFixed(0)} clean=${(performance.now()-T3).toFixed(0)}`);
+    if (process.env.PROF)
+      console.error(
+        `k=${k} build=${(T1 - T0).toFixed(0)} rest=${(T3 - T1).toFixed(0)} clean=${(performance.now() - T3).toFixed(0)}`,
+      );
   }
 
   const categories: Record<string, number> = {};
@@ -322,9 +326,10 @@ async function crashMatrix(
 }
 /** Fail with the summary and the first failures, never with a full diff. */
 function expectMatrix(report: MatrixReport, minimumPoints = 8) {
-  expect(report.points, `${report.summary}: trace too short`).toBeGreaterThanOrEqual(
-    minimumPoints,
-  );
+  expect(
+    report.points,
+    `${report.summary}: trace too short`,
+  ).toBeGreaterThanOrEqual(minimumPoints);
   expect(report.failures, report.summary).toEqual([]);
 }
 
@@ -353,10 +358,14 @@ async function sourceScenario(options: SourceOptions) {
   });
   const b = transportDevice(net, { chunk: options.chunk });
   const sourceValue = a.get();
-  const journalBefore = count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal");
+  const journalBefore = count(
+    b.db,
+    "SELECT count(*) AS n FROM pdpp_mutation_journal",
+  );
   net.faults.list = () => new Error("feed down");
   net.faults.evidence = () => new Error("rpc down");
-  let prelude: { outbox: Record<string, OutboxRow>; encrypts: number } | undefined;
+  let prelude:
+    { outbox: Record<string, OutboxRow>; encrypts: number } | undefined;
   if (options.window === "publish") {
     await settle(a.cycle()); // retain + prepare; publication fails and backs off
     net.faults.evidence = undefined;
@@ -369,7 +378,8 @@ async function sourceScenario(options: SourceOptions) {
   const scenario: Scenario = {
     crash,
     restart: () => a.crashReopen(),
-    invariants: () => transportInvariantViolations(a).map((v) => `[invariant] ${v}`),
+    invariants: () =>
+      transportInvariantViolations(a).map((v) => `[invariant] ${v}`),
     async run() {
       clock.advance(10_000);
       if (options.loseRegistrationResponse)
@@ -401,7 +411,10 @@ async function sourceScenario(options: SourceOptions) {
           )
           .all() as { n: number }[]
       ).map((r) => r.n),
-      destJournal: count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal"),
+      destJournal: count(
+        b.db,
+        "SELECT count(*) AS n FROM pdpp_mutation_journal",
+      ),
     }),
     checkCrashed({ label }) {
       const out: Violation[] = [];
@@ -410,7 +423,16 @@ async function sourceScenario(options: SourceOptions) {
         out.push(`[local-read] local value changed after ${label}`);
       capturedOutbox = outboxSnapshot(a.db);
       capturedBatches = batchSnapshot(a.db);
-      if (process.env.PROF) console.error(`DBG ${label} batches=${capturedBatches.length} outbox=${Object.values(capturedOutbox).map((r) => r.state).join(",")} regs=${net.calls.registrations.length} puts=${net.calls.puts.length} cp=${a.store.replication.getBaselineCheckpoint()}`);
+      if (process.env.PROF)
+        console.error(
+          `DBG ${label} batches=${capturedBatches.length} outbox=${Object.values(
+            capturedOutbox,
+          )
+            .map((r) => r.state)
+            .join(
+              ",",
+            )} regs=${net.calls.registrations.length} puts=${net.calls.puts.length} cp=${a.store.replication.getBaselineCheckpoint()}`,
+        );
       putsAtCrash = putsPerScope(net);
       // Export cursor and batch row commit together.
       const checkpoint = a.store.replication.getBaselineCheckpoint();
@@ -431,11 +453,21 @@ async function sourceScenario(options: SourceOptions) {
           capturedOutbox[scope] &&
           Buffer.from(bytes).toString("hex") !== capturedOutbox[scope].encrypted
         )
-          out.push(`[custody] stored bytes of ${scope} differ from the outbox ciphertext`);
-      if (prelude && !isDeepStrictEqual(stableOutbox(capturedOutbox), stableOutbox(prelude.outbox)))
+          out.push(
+            `[custody] stored bytes of ${scope} differ from the outbox ciphertext`,
+          );
+      if (
+        prelude &&
+        !isDeepStrictEqual(
+          stableOutbox(capturedOutbox),
+          stableOutbox(prelude.outbox),
+        )
+      )
         out.push("[custody] outbox ciphertext or hashes changed before resume");
       if (prelude && net.calls.encrypts !== prelude.encrypts)
-        out.push(`[custody] re-encrypted after custody (${net.calls.encrypts - prelude.encrypts} encrypt calls)`);
+        out.push(
+          `[custody] re-encrypted after custody (${net.calls.encrypts - prelude.encrypts} encrypt calls)`,
+        );
       return out;
     },
     checkResumed() {
@@ -446,18 +478,26 @@ async function sourceScenario(options: SourceOptions) {
         if (outbox[scope]?.encrypted !== row.encrypted)
           out.push(`[custody] ciphertext of ${scope} changed after resume`);
       if (prelude) {
-        if (!isDeepStrictEqual(stableOutbox(outbox), stableOutbox(prelude.outbox)))
-          out.push("[custody] outbox set or bytes differ from the pre-window snapshot");
+        if (
+          !isDeepStrictEqual(stableOutbox(outbox), stableOutbox(prelude.outbox))
+        )
+          out.push(
+            "[custody] outbox set or bytes differ from the pre-window snapshot",
+          );
       }
       // No regenerated batch identity.
       const batches = batchSnapshot(a.db);
       for (const old of capturedBatches) {
         const now = batches.find((x) => x.batch === old.batch);
         if (!now || now.sequence !== old.sequence || now.digest !== old.digest)
-          out.push(`[identity] batch ${old.batch} was regenerated or re-sequenced`);
+          out.push(
+            `[identity] batch ${old.batch} was regenerated or re-sequenced`,
+          );
       }
       if (batches.length !== 1)
-        out.push(`[identity] ${batches.length} batches retained for one local commit`);
+        out.push(
+          `[identity] ${batches.length} batches retained for one local commit`,
+        );
       // One registration per scope, never a rebase.
       for (const scope of Object.keys(outbox)) {
         const registrations = registrationsPerScope(net).get(scope) ?? 0;
@@ -467,16 +507,26 @@ async function sourceScenario(options: SourceOptions) {
         if (puts < 1 || puts > 2 || puts < (putsAtCrash.get(scope) ?? 0))
           out.push(`[publication] ${puts} PUTs for ${scope}`);
         const head = net.head.get(scope);
-        if (!head || head.version !== "1" || head.dataHash !== outbox[scope]!.dataHash)
-          out.push(`[publication] head of ${scope} is not version 1 with the persisted hash`);
+        if (
+          !head ||
+          head.version !== "1" ||
+          head.dataHash !== outbox[scope]!.dataHash
+        )
+          out.push(
+            `[publication] head of ${scope} is not version 1 with the persisted hash`,
+          );
         if (
           net.blobs.has(scope) &&
-          Buffer.from(net.blobs.get(scope)!).toString("hex") !== outbox[scope]!.encrypted
+          Buffer.from(net.blobs.get(scope)!).toString("hex") !==
+            outbox[scope]!.encrypted
         )
-          out.push(`[custody] remote bytes of ${scope} differ from the persisted ciphertext`);
+          out.push(
+            `[custody] remote bytes of ${scope} differ from the persisted ciphertext`,
+          );
       }
       if (
-        count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal") !== journalBefore
+        count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal") !==
+        journalBefore
       )
         out.push("[echo] receiver journal grew after replay");
       return out;
@@ -486,61 +536,45 @@ async function sourceScenario(options: SourceOptions) {
 }
 
 describe("section C: custody and crash boundaries", () => {
-  it(
-    "35 local commit to retain/enqueue: export cursor and batch row commit together, no regenerated identity",
-    async () => {
-      const report = await crashMatrix("35 retain", () =>
-        sourceScenario({ text: "local commit", window: "retain" }),
-      );
-      expectMatrix(report);
-    },
-    120_000,
-  );
+  it("35 local commit to retain/enqueue: export cursor and batch row commit together, no regenerated identity", async () => {
+    const report = await crashMatrix("35 retain", () =>
+      sourceScenario({ text: "local commit", window: "retain" }),
+    );
+    expectMatrix(report);
+  }, 120_000);
 
-  it(
-    "36 prepared ciphertext before external PUT: same address, same bytes after every crash point",
-    async () => {
-      const report = await crashMatrix("36 publish", () =>
-        sourceScenario({ text: "prepared ciphertext", window: "publish" }),
-      );
-      expect(
-        report.points,
-        "the publication window must contain a PUT and a registration",
-      ).toBeGreaterThan(0);
-      expectMatrix(report);
-    },
-    120_000,
-  );
+  it("36 prepared ciphertext before external PUT: same address, same bytes after every crash point", async () => {
+    const report = await crashMatrix("36 publish", () =>
+      sourceScenario({ text: "prepared ciphertext", window: "publish" }),
+    );
+    expect(
+      report.points,
+      "the publication window must contain a PUT and a registration",
+    ).toBeGreaterThan(0);
+    expectMatrix(report);
+  }, 120_000);
 
-  it(
-    "37 remote PUT accepted, local acknowledgment lost: multi-fragment batch, no rebase or second ciphertext",
-    async () => {
-      const report = await crashMatrix("37 multi-fragment publish", () =>
-        sourceScenario({
-          text: "x".repeat(1500),
-          chunk: 600,
-          window: "publish",
-        }),
-      );
-      expectMatrix(report);
-    },
-    120_000,
-  );
+  it("37 remote PUT accepted, local acknowledgment lost: multi-fragment batch, no rebase or second ciphertext", async () => {
+    const report = await crashMatrix("37 multi-fragment publish", () =>
+      sourceScenario({
+        text: "x".repeat(1500),
+        chunk: 600,
+        window: "publish",
+      }),
+    );
+    expectMatrix(report);
+  }, 120_000);
 
-  it(
-    "38 registration commits, response lost: one registration per scope, no replacement PUT",
-    async () => {
-      const report = await crashMatrix("38 lost registration response", () =>
-        sourceScenario({
-          text: "lost response",
-          window: "publish",
-          loseRegistrationResponse: true,
-        }),
-      );
-      expectMatrix(report);
-    },
-    120_000,
-  );
+  it("38 registration commits, response lost: one registration per scope, no replacement PUT", async () => {
+    const report = await crashMatrix("38 lost registration response", () =>
+      sourceScenario({
+        text: "lost response",
+        window: "publish",
+        loseRegistrationResponse: true,
+      }),
+    );
+    expectMatrix(report);
+  }, 120_000);
 });
 
 // -------------------------------------------- destination-side scenarios
@@ -605,13 +639,17 @@ async function destinationScenario(options: DestinationOptions) {
   await cycleAll([a], 4);
   if (options.pageSize) net.pageSize(options.pageSize);
   const b = transportDevice(net, { chunk, cap: 64 * 1024, crash });
-  const journalBefore = count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal");
+  const journalBefore = count(
+    b.db,
+    "SELECT count(*) AS n FROM pdpp_mutation_journal",
+  );
   let fetchedAtCrash = new Set<string>();
   let getsAtCrash = 0;
   const scenario: Scenario = {
     crash,
     restart: () => b.crashReopen(),
-    invariants: () => transportInvariantViolations(b).map((v) => `[invariant] ${v}`),
+    invariants: () =>
+      transportInvariantViolations(b).map((v) => `[invariant] ${v}`),
     async run() {
       clock.advance(10_000);
       await b.cycle();
@@ -628,7 +666,9 @@ async function destinationScenario(options: DestinationOptions) {
     digest: () => ({
       imported: (
         b.db
-          .prepare("SELECT count(*) AS n FROM pdpp_transport_imported GROUP BY batch")
+          .prepare(
+            "SELECT count(*) AS n FROM pdpp_transport_imported GROUP BY batch",
+          )
           .all() as { n: number }[]
       ).map((r) => r.n),
       inbox: (
@@ -645,8 +685,12 @@ async function destinationScenario(options: DestinationOptions) {
     }),
     checkReference() {
       // Every durable work item carries a typed outcome after a clean run.
-      const records = workRecords(b.db).filter((r) => r.table !== "pdpp_transport_outbox");
-      const untyped = records.filter((r) => r.outcome === undefined || r.outcome === null);
+      const records = workRecords(b.db).filter(
+        (r) => r.table !== "pdpp_transport_outbox",
+      );
+      const untyped = records.filter(
+        (r) => r.outcome === undefined || r.outcome === null,
+      );
       return untyped.length
         ? [`[outcome] ${untyped.length} work records without a typed outcome`]
         : [];
@@ -666,8 +710,7 @@ async function destinationScenario(options: DestinationOptions) {
       // Discovery: an admitted scope is never lost behind an advanced cursor.
       const cursor = (
         b.db.prepare("SELECT scan_cursor FROM pdpp_transport_state").get() as
-          | { scan_cursor: string | null }
-          | undefined
+          { scan_cursor: string | null } | undefined
       )?.scan_cursor;
       if (cursor) {
         const admitted = count(
@@ -677,22 +720,37 @@ async function destinationScenario(options: DestinationOptions) {
         );
         const listed = [...net.head.keys()].filter((k) => k <= cursor).length;
         if (admitted !== listed)
-          out.push(`[discovery] cursor ${cursor} advanced past ${listed - admitted} unadmitted scopes`);
+          out.push(
+            `[discovery] cursor ${cursor} advanced past ${listed - admitted} unadmitted scopes`,
+          );
       }
       // No receipt/progress without the evidence it claims.
       const imports = workRecords(b.db).filter(
-        (r) => r.table === "pdpp_transport_import_work" && r.outcome === "progress",
+        (r) =>
+          r.table === "pdpp_transport_import_work" && r.outcome === "progress",
       );
       for (const r of imports)
-        if (count(b.db, "SELECT count(*) AS n FROM pdpp_transport_imported WHERE writer||':'||batch=?", r.id) === 0 &&
-          count(b.db, "SELECT count(*) AS n FROM pdpp_transport_imported WHERE batch=?", r.id) === 0)
+        if (
+          count(
+            b.db,
+            "SELECT count(*) AS n FROM pdpp_transport_imported WHERE writer||':'||batch=?",
+            r.id,
+          ) === 0 &&
+          count(
+            b.db,
+            "SELECT count(*) AS n FROM pdpp_transport_imported WHERE batch=?",
+            r.id,
+          ) === 0
+        )
           out.push(`[outcome] import ${r.id} progress without a receipt`);
       const downloads = workRecords(b.db).filter(
         (r) => r.table === "pdpp_transport_inbox" && r.outcome === "progress",
       );
       for (const r of downloads)
         if (!fetchedAtCrash.has(r.id))
-          out.push(`[outcome] download ${r.id} progress without retained fragment`);
+          out.push(
+            `[outcome] download ${r.id} progress without retained fragment`,
+          );
       return out;
     },
     checkResumed() {
@@ -702,7 +760,10 @@ async function destinationScenario(options: DestinationOptions) {
       for (const scope of after)
         if (fetchedAtCrash.has(scope))
           out.push(`[download] re-fetched retained fragment ${scope}`);
-      if (count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal") !== journalBefore)
+      if (
+        count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal") !==
+        journalBefore
+      )
         out.push("[echo] receiver journal grew after replay");
       return out;
     },
@@ -711,36 +772,24 @@ async function destinationScenario(options: DestinationOptions) {
 }
 
 describe("section C: destination custody and crash boundaries", () => {
-  it(
-    "39 discovery pages: replay dedupes admissions and never skips a scope behind the cursor",
-    async () => {
-      const report = await crashMatrix("39 discovery", () =>
-        destinationScenario({ batches: 3, pageSize: 1 }),
-      );
-      expectMatrix(report);
-    },
-    300_000,
-  );
-  it(
-    "40 partial download: an incomplete batch never imports; resume fetches only missing fragments",
-    async () => {
-      const report = await crashMatrix("40 partial download", () =>
-        destinationScenario({ text: "f".repeat(2000), chunk: 600 }),
-      );
-      expectMatrix(report);
-    },
-    300_000,
-  );
-  it(
-    "41/42 verified staging and import receipt: no public blob or record without the committed receipt; no orphan staging",
-    async () => {
-      const report = await crashMatrix("41 staged blob import", () =>
-        destinationScenario({ blobBytes: 3000, chunk: 1500 }),
-      );
-      expectMatrix(report);
-    },
-    300_000,
-  );
+  it("39 discovery pages: replay dedupes admissions and never skips a scope behind the cursor", async () => {
+    const report = await crashMatrix("39 discovery", () =>
+      destinationScenario({ batches: 3, pageSize: 1 }),
+    );
+    expectMatrix(report);
+  }, 300_000);
+  it("40 partial download: an incomplete batch never imports; resume fetches only missing fragments", async () => {
+    const report = await crashMatrix("40 partial download", () =>
+      destinationScenario({ text: "f".repeat(2000), chunk: 600 }),
+    );
+    expectMatrix(report);
+  }, 300_000);
+  it("41/42 verified staging and import receipt: no public blob or record without the committed receipt; no orphan staging", async () => {
+    const report = await crashMatrix("41 staged blob import", () =>
+      destinationScenario({ blobBytes: 3000, chunk: 1500 }),
+    );
+    expectMatrix(report);
+  }, 300_000);
 });
 
 // ------------------------------------------------ quarantine atomicity (44)
@@ -759,7 +808,11 @@ const appendUpsert = (text: string, counter: number): ReplicaOperation => ({
   connectionId: "conn",
   methodId: "export",
   generation: 1,
-  revision: { counter, writerId: "f".repeat(32), operationId: `append-${text}` },
+  revision: {
+    counter,
+    writerId: "f".repeat(32),
+    operationId: `append-${text}`,
+  },
   declaration: appendBinding,
   recordKey: "log",
   emittedAt: at,
@@ -767,14 +820,25 @@ const appendUpsert = (text: string, counter: number): ReplicaOperation => ({
   blobs: [],
 });
 
-async function quarantineScenario(): Promise<Scenario & { epochBefore: number }> {
+async function quarantineScenario(): Promise<
+  Scenario & { epochBefore: number }
+> {
   const crash = new CrashController();
   const net = network({ crash });
   const b = transportDevice(net, { crash });
-  b.declarations([{ sourceId, binding }, { sourceId, binding: appendBinding }]);
+  b.declarations([
+    { sourceId, binding },
+    { sourceId, binding: appendBinding },
+  ]);
   b.reopen();
-  b.declarations([{ sourceId, binding }, { sourceId, binding: appendBinding }]);
-  b.receiver.import({ credential, envelope: envelope([appendUpsert("first", 50)], "q1") });
+  b.declarations([
+    { sourceId, binding },
+    { sourceId, binding: appendBinding },
+  ]);
+  b.receiver.import({
+    credential,
+    envelope: envelope([appendUpsert("first", 50)], "q1"),
+  });
   let epochBefore = 0;
   try {
     epochBefore = epochOf(b, "conn");
@@ -786,7 +850,10 @@ async function quarantineScenario(): Promise<Scenario & { epochBefore: number }>
     crash,
     restart: () => {
       b.crashReopen();
-      b.declarations([{ sourceId, binding }, { sourceId, binding: appendBinding }]);
+      b.declarations([
+        { sourceId, binding },
+        { sourceId, binding: appendBinding },
+      ]);
     },
     invariants: () => {
       // A committed key fence never coexists with a live projection of that key.
@@ -798,15 +865,23 @@ async function quarantineScenario(): Promise<Scenario & { epochBefore: number }>
         b.db,
         "SELECT count(*) AS n FROM pdpp_records WHERE instance='conn' AND record_key='log' AND deleted=0",
       );
-      return fenced && live ? ["[fence] fence committed with live data visible"] : [];
+      return fenced && live
+        ? ["[fence] fence committed with live data visible"]
+        : [];
     },
     async run() {
-      b.receiver.import({ credential, envelope: envelope([appendUpsert("second", 51)], "q2") });
+      b.receiver.import({
+        credential,
+        envelope: envelope([appendUpsert("second", 51)], "q2"),
+      });
     },
     async resume() {
       // Duplicate delivery of the conflicting batch is the replay.
       try {
-        b.receiver.import({ credential, envelope: envelope([appendUpsert("second", 51)], "q2") });
+        b.receiver.import({
+          credential,
+          envelope: envelope([appendUpsert("second", 51)], "q2"),
+        });
       } catch {
         /* the reference keeps the fence; a refused replay is acceptable */
       }
@@ -826,7 +901,9 @@ async function quarantineScenario(): Promise<Scenario & { epochBefore: number }>
       const epoch = safely("epoch", () => epochOf(b, "conn"));
       if (epoch.violation) return [epoch.violation];
       if (epoch.value !== epochBefore + 1)
-        out.push(`[epoch] epoch ${epoch.value} after one quarantine (was ${epochBefore})`);
+        out.push(
+          `[epoch] epoch ${epoch.value} after one quarantine (was ${epochBefore})`,
+        );
       return out;
     },
   };
@@ -834,29 +911,39 @@ async function quarantineScenario(): Promise<Scenario & { epochBefore: number }>
 }
 
 describe("section C: fences, outcomes and claims", () => {
-  it(
-    "44 quarantine transaction atomicity: old snapshot or fully fenced, epoch bumps exactly once across replay",
-    async () => {
-      const report = await crashMatrix("44 key quarantine", quarantineScenario);
-      expectMatrix(report, 2);
-    },
-    120_000,
-  );
+  it("44 quarantine transaction atomicity: old snapshot or fully fenced, epoch bumps exactly once across replay", async () => {
+    const report = await crashMatrix("44 key quarantine", quarantineScenario);
+    expectMatrix(report, 2);
+  }, 120_000);
 
   it("43 a quarantine committed between computing and applying a projection cannot resurrect fenced data", async () => {
     const net = network();
     const b = transportDevice(net);
-    b.declarations([{ sourceId, binding }, { sourceId, binding: appendBinding }]);
+    b.declarations([
+      { sourceId, binding },
+      { sourceId, binding: appendBinding },
+    ]);
     b.reopen();
-    b.declarations([{ sourceId, binding }, { sourceId, binding: appendBinding }]);
-    b.receiver.import({ credential, envelope: envelope([appendUpsert("first", 50)], "c1") });
+    b.declarations([
+      { sourceId, binding },
+      { sourceId, binding: appendBinding },
+    ]);
+    b.receiver.import({
+      credential,
+      envelope: envelope([appendUpsert("first", 50)], "c1"),
+    });
     const before = epochOf(b, "conn");
-    b.receiver.import({ credential, envelope: envelope([appendUpsert("second", 51)], "c2") });
+    b.receiver.import({
+      credential,
+      envelope: envelope([appendUpsert("second", 51)], "c2"),
+    });
     // A stale recomputation (plain retry) after the fence must keep the key hidden.
     b.receiver.retry({ credential });
     expect(epochOf(b, "conn")).toBe(before + 1);
     expect(b.store.getRecord("conn", "messages", "log")).toBeUndefined();
-    expect(count(b.db, "SELECT count(*) AS n FROM pdpp_replica_received")).toBe(2);
+    expect(count(b.db, "SELECT count(*) AS n FROM pdpp_replica_received")).toBe(
+      2,
+    );
   });
 
   it("45 work outcome atomicity: a progress receipt never pairs with retry/wait diagnostics of another execution", async () => {
@@ -871,7 +958,9 @@ describe("section C: fences, outcomes and claims", () => {
     fail = false;
     await cycleAll([a, b], 6);
     expect(b.get()).toEqual({ id: "a", text: "atomic outcome" });
-    const records = workRecords(a.db).filter((r) => r.table === "pdpp_transport_outbox");
+    const records = workRecords(a.db).filter(
+      (r) => r.table === "pdpp_transport_outbox",
+    );
     expect(records.length).toBeGreaterThan(0);
     for (const r of records) {
       expect(r.outcome).toBe("progress");
@@ -880,7 +969,9 @@ describe("section C: fences, outcomes and claims", () => {
       expect(r.error).toBeNull();
       expect(r.attempts).toBe(0);
     }
-    const imports = workRecords(b.db).filter((r) => r.table === "pdpp_transport_import_work");
+    const imports = workRecords(b.db).filter(
+      (r) => r.table === "pdpp_transport_import_work",
+    );
     expect(imports.map((r) => r.outcome)).toEqual(["progress"]);
   });
 
@@ -896,7 +987,10 @@ describe("section C: fences, outcomes and claims", () => {
     const alias = createReplicaTransportWorker({
       db: second,
       enabled: true,
-      expected: () => ({ owner, declarations: [{ sourceId, binding: appendBinding }] }),
+      expected: () => ({
+        owner,
+        declarations: [{ sourceId, binding: appendBinding }],
+      }),
       exporter: secondStore.replication,
       receiver: createReplicaReceiver({
         db: second,
@@ -929,16 +1023,27 @@ describe("section C: fences, outcomes and claims", () => {
       expect(net.calls.puts.length).toBe(putsBefore);
       // The bounded run must give up at its deadline, not hang the step.
       const outcome = await Promise.race([
-        running.then(() => "settled" as const, () => "settled" as const),
+        running.then(
+          () => "settled" as const,
+          () => "settled" as const,
+        ),
         sleep(1000).then(() => "hung" as const),
       ]);
       expect(outcome).toBe("settled");
-      const afterDeadline = workRecords(a.db).filter((r) => r.table === "pdpp_transport_outbox");
-      expect(afterDeadline.every((r) => r.outcome === "retry" && r.reason === "deadline_exceeded")).toBe(true);
+      const afterDeadline = workRecords(a.db).filter(
+        (r) => r.table === "pdpp_transport_outbox",
+      );
+      expect(
+        afterDeadline.every(
+          (r) => r.outcome === "retry" && r.reason === "deadline_exceeded",
+        ),
+      ).toBe(true);
       // The late completion of the abandoned run changes nothing durable.
       release();
       await sleep(20);
-      expect(workRecords(a.db).filter((r) => r.table === "pdpp_transport_outbox")).toEqual(afterDeadline);
+      expect(
+        workRecords(a.db).filter((r) => r.table === "pdpp_transport_outbox"),
+      ).toEqual(afterDeadline);
     } finally {
       release();
       await running.catch(() => undefined);

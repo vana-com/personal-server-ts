@@ -97,7 +97,8 @@ async function within<T>(ms: number, work: Promise<T>, label: string) {
 async function waitFor(done: () => boolean, ms: number, label: string) {
   const deadline = Date.now() + ms;
   while (!done()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    if (Date.now() > deadline)
+      throw new Error(`timed out waiting for ${label}`);
     await sleep(5);
   }
 }
@@ -113,13 +114,19 @@ const outboxScopes = (d: TransportDevice) =>
 const outboxCount = (d: TransportDevice) =>
   num(d, "SELECT count(*) AS n FROM pdpp_transport_outbox");
 const unpublished = (d: TransportDevice) =>
-  num(d, "SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state<>'published'");
+  num(
+    d,
+    "SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state<>'published'",
+  );
 const batchCount = (d: TransportDevice) =>
   num(d, "SELECT count(*) AS n FROM pdpp_transport_batches");
 const unpreparedBatches = (d: TransportDevice) =>
   num(d, "SELECT count(*) AS n FROM pdpp_transport_batches WHERE prepared<>1");
 const retained = (d: TransportDevice) =>
-  num(d, "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL");
+  num(
+    d,
+    "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL",
+  );
 const importedReceipts = (d: TransportDevice) =>
   num(d, "SELECT count(*) AS n FROM pdpp_transport_imported");
 const recordChanges = (d: TransportDevice) =>
@@ -132,8 +139,7 @@ const writerOf = (d: TransportDevice) =>
       .prepare("SELECT writer FROM pdpp_transport_state WHERE id=1")
       .get() as { writer: string }
   ).writer;
-const isFrom = (scope: string, writer: string) =>
-  scope.includes(`.${writer}_`);
+const isFrom = (scope: string, writer: string) => scope.includes(`.${writer}_`);
 const evidenceReads = (net: Network, scope: string) =>
   net.calls.evidence.filter((s) => s === scope).length;
 
@@ -173,7 +179,10 @@ const INBOX = "pdpp_transport_inbox";
 const BATCHES = "pdpp_transport_batches";
 
 /** Registration that never reaches finalized evidence until finalizeAll(). */
-function holdPending(net: Network, when: (scope: string) => boolean = () => true) {
+function holdPending(
+  net: Network,
+  when: (scope: string) => boolean = () => true,
+) {
   const put = net.port.put;
   net.port.put = async (part) => {
     if (when(part.scope)) net.pending.add(part.scope);
@@ -187,7 +196,10 @@ function verifiedHeight(net: Network, initial: bigint) {
   const evidence = net.port.evidence;
   net.port.evidence = async (scope) => {
     const e = await evidence(scope);
-    return { ...e, chain: e.chain && { ...e.chain, blockNumber: state.height } };
+    return {
+      ...e,
+      chain: e.chain && { ...e.chain, blockNumber: state.height },
+    };
   };
   return state;
 }
@@ -269,7 +281,8 @@ async function publishedWriter(
   fill(d);
   await stepUntil(
     d,
-    () => outboxCount(d) > 0 && unpublished(d) === 0 && unpreparedBatches(d) === 0,
+    () =>
+      outboxCount(d) > 0 && unpublished(d) === 0 && unpreparedBatches(d) === 0,
     20,
     10_000,
   );
@@ -288,14 +301,14 @@ async function twoBatchRemote(opts: { crash?: CrashController } = {}) {
   await stepUntil(
     a,
     () =>
-      batchCount(a) >= 2 &&
-      unpreparedBatches(a) === 0 &&
-      unpublished(a) === 0,
+      batchCount(a) >= 2 && unpreparedBatches(a) === 0 && unpublished(a) === 0,
     30,
     10_000,
   );
   const batches = a.db
-    .prepare("SELECT batch,sequence FROM pdpp_transport_batches ORDER BY sequence")
+    .prepare(
+      "SELECT batch,sequence FROM pdpp_transport_batches ORDER BY sequence",
+    )
     .all() as { batch: string; sequence: number }[];
   expect(batches).toHaveLength(2);
   const writer = writerOf(a);
@@ -357,7 +370,8 @@ async function failedOnceImport(withUnrelatedWriter: boolean) {
 }
 
 it("15 complete batch import fails transiently: no decode/stage/promote before B(1), deadline survives reopen, one import at the deadline", async () => {
-  const { b, a, writerA, tally, hooks, failedAt } = await failedOnceImport(false);
+  const { b, a, writerA, tally, hooks, failedAt } =
+    await failedOnceImport(false);
   expect(countFor(tally.promote, writerA)).toBe(1);
   expect(countFor(tally.stage, writerA)).toBe(1);
 
@@ -366,8 +380,14 @@ it("15 complete batch import fails transiently: no decode/stage/promote before B
     clock.advance(40);
     await step(b);
   }
-  expect(countFor(tally.stage, writerA), "stage re-ran inside the backoff").toBe(1);
-  expect(countFor(tally.promote, writerA), "promote re-ran inside the backoff").toBe(1);
+  expect(
+    countFor(tally.stage, writerA),
+    "stage re-ran inside the backoff",
+  ).toBe(1);
+  expect(
+    countFor(tally.promote, writerA),
+    "promote re-ran inside the backoff",
+  ).toBe(1);
   expect(importedReceipts(b)).toBe(0);
   expect(b.get("a")).toBeUndefined();
 
@@ -436,8 +456,16 @@ it("16 discovery duplicates and unrelated dependency wakes before the deadline k
 it("17a confirmation of many retained ready fragments is budgeted: evidence reads grow by at most k per step", async () => {
   const net = network();
   holdPending(net);
-  const a = transportDevice(net, { preexisting: "x".repeat(15000), chunk: 500 });
-  await stepUntil(a, () => outboxCount(a) > 0 && net.head.size === outboxCount(a), 12, 10_000);
+  const a = transportDevice(net, {
+    preexisting: "x".repeat(15000),
+    chunk: 500,
+  });
+  await stepUntil(
+    a,
+    () => outboxCount(a) > 0 && net.head.size === outboxCount(a),
+    12,
+    10_000,
+  );
   const total = outboxCount(a);
   expect(total).toBeGreaterThan(20);
   const b = transportDevice(net);
@@ -451,18 +479,19 @@ it("17a confirmation of many retained ready fragments is budgeted: evidence read
     const before = net.calls.evidence.length;
     await step(b, { units: k });
     const used = net.calls.evidence.length - before;
-    expect(used, `step ${i} read evidence ${used} times with k=${k}`).toBeLessThanOrEqual(k);
+    expect(
+      used,
+      `step ${i} read evidence ${used} times with k=${k}`,
+    ).toBeLessThanOrEqual(k);
   }
   expect(b.get("a")).toEqual(a.get("a"));
 });
 
 it("17b revalidation of many imported fragments is budgeted: evidence reads grow by at most k per step", async () => {
   const net = network();
-  const a = await publishedWriter(
-    net,
-    (d) => d.put("x".repeat(15000), "a"),
-    { chunk: 500 },
-  );
+  const a = await publishedWriter(net, (d) => d.put("x".repeat(15000), "a"), {
+    chunk: 500,
+  });
   const b = transportDevice(net);
   await stepUntil(b, () => b.get("a") !== undefined, 20, 10_000);
   const imported = num(
@@ -478,7 +507,10 @@ it("17b revalidation of many imported fragments is budgeted: evidence reads grow
     const before = net.calls.evidence.length;
     await step(b, { units: k });
     const used = net.calls.evidence.length - before;
-    expect(used, `step ${i} revalidated ${used} fragments with k=${k}`).toBeLessThanOrEqual(k);
+    expect(
+      used,
+      `step ${i} revalidated ${used} fragments with k=${k}`,
+    ).toBeLessThanOrEqual(k);
   }
 });
 
@@ -506,7 +538,10 @@ it("17c receiver.retry runs at most once per step and not on an idle step withou
     await step(b);
     expect(tally.retry - before).toBeLessThanOrEqual(1);
   }
-  expect(tally.retry, "no fallback reconciliation within 10 minutes").toBeGreaterThan(base);
+  expect(
+    tally.retry,
+    "no fallback reconciliation within 10 minutes",
+  ).toBeGreaterThan(base);
 });
 
 // ========================================================================= 18
@@ -541,7 +576,10 @@ it("18 per-phase isolation: a preparation backlog does not stop an independent r
   expect(b.get("a"), "remote batch starved by the preparation backlog").toEqual(
     a.get("a"),
   );
-  expect(unpreparedBatches(b), "the backlog was not a real backlog").toBeGreaterThan(0);
+  expect(
+    unpreparedBatches(b),
+    "the backlog was not a real backlog",
+  ).toBeGreaterThan(0);
   expect(report?.receipts.some((r) => r.phase === "import")).toBe(true);
 });
 
@@ -549,11 +587,9 @@ it("18 per-phase isolation: a preparation backlog does not stop an independent r
 
 async function fairnessFixture() {
   const net = network();
-  const a = await publishedWriter(
-    net,
-    (d) => d.put("x".repeat(30000), "a"),
-    { chunk: 500 },
-  );
+  const a = await publishedWriter(net, (d) => d.put("x".repeat(30000), "a"), {
+    chunk: 500,
+  });
   expect(outboxCount(a)).toBeGreaterThan(50);
   const c = await publishedWriter(net, (d) => d.put("from B", "b"));
   const b = transportDevice(net);
@@ -568,10 +604,16 @@ it("19 per-writer fairness: writer B's single batch imports within a bounded num
     clock.advance(10_000);
     const gets = net.calls.gets.length;
     await step(b, { units });
-    expect(net.calls.gets.length - gets, "downloads exceeded the step budget").toBeLessThanOrEqual(units);
+    expect(
+      net.calls.gets.length - gets,
+      "downloads exceeded the step budget",
+    ).toBeLessThanOrEqual(units);
     if (i === 1) b.reopen();
   }
-  expect(b.get("b"), `B starved after ${i} steps`).toEqual({ id: "b", text: "from B" });
+  expect(b.get("b"), `B starved after ${i} steps`).toEqual({
+    id: "b",
+    text: "from B",
+  });
 });
 
 it("21 repeated due failures of writer A cannot monopolize rounds: B is served, A keeps structured retry state", async () => {
@@ -585,7 +627,10 @@ it("21 repeated due failures of writer A cannot monopolize rounds: B is served, 
     await step(b, { units });
     if (i === 3) b.reopen();
   }
-  expect(b.get("b"), `B starved after ${i} steps`).toEqual({ id: "b", text: "from B" });
+  expect(b.get("b"), `B starved after ${i} steps`).toEqual({
+    id: "b",
+    text: "from B",
+  });
   const aRows = records(b, INBOX).filter((r) => isFrom(r.id, writerA));
   const failed = aRows.filter((r) => r.outcome === "retry");
   expect(failed.length).toBeGreaterThan(0);
@@ -605,16 +650,24 @@ it("20 parked finality waits are filtered before the runnable quota: a due item 
   const hold = { on: true };
   holdPending(net, () => hold.on);
   net.port.list = async () => ({ scopes: [], cursor: null }); // the writer must not read itself
-  const a = transportDevice(
-    net,
-    { preexisting: "x".repeat(60000), chunk: 500, worker: { quantum: { publish: 1 } } },
+  const a = transportDevice(net, {
+    preexisting: "x".repeat(60000),
+    chunk: 500,
+    worker: { quantum: { publish: 1 } },
+  });
+  await stepUntil(
+    a,
+    () => outboxCount(a) > 0 && net.head.size === outboxCount(a),
+    20,
   );
-  await stepUntil(a, () => outboxCount(a) > 0 && net.head.size === outboxCount(a), 20);
   const parked = outboxScopes(a);
   expect(parked.length).toBeGreaterThanOrEqual(100);
-  expect(num(a, "SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state='ready'")).toBe(
-    parked.length,
-  );
+  expect(
+    num(
+      a,
+      "SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state='ready'",
+    ),
+  ).toBe(parked.length);
   const parkedReads = () =>
     net.calls.evidence.filter((s) => parked.includes(s)).length;
   const readsBefore = parkedReads();
@@ -626,7 +679,9 @@ it("20 parked finality waits are filtered before the runnable quota: a due item 
     await step(a, { units: 3 });
   }
   const fresh = outboxScopes(a).filter((s) => !parked.includes(s));
-  expect(fresh.length, "the due item never reached the outbox").toBeGreaterThan(0);
+  expect(fresh.length, "the due item never reached the outbox").toBeGreaterThan(
+    0,
+  );
   expect(
     num(
       a,
@@ -702,7 +757,10 @@ it("22b zero-unit step on a device with remote work performs no network call, ch
 
 it("23 a unit larger than budget.bytes is deferred: nothing is uploaded, no partial receipt, and a sufficient budget later completes it", async () => {
   const net = network();
-  const a = transportDevice(net, { preexisting: "x".repeat(20000), chunk: 2000 });
+  const a = transportDevice(net, {
+    preexisting: "x".repeat(20000),
+    chunk: 2000,
+  });
   const report = await step(a, { units: 50, bytes: 300 });
   expect(report, "step returned no report").toBeDefined();
   expect(net.calls.puts).toHaveLength(0);
@@ -710,13 +768,22 @@ it("23 a unit larger than budget.bytes is deferred: nothing is uploaded, no part
   expect(report?.receipts.filter((r) => r.phase === "publish")).toEqual([]);
   expect(transportInvariantViolations(a)).toEqual([]);
   expect(
-    num(a, "SELECT count(*) AS n FROM pdpp_transport_batches WHERE prepared=-1"),
+    num(
+      a,
+      "SELECT count(*) AS n FROM pdpp_transport_batches WHERE prepared=-1",
+    ),
   ).toBe(0);
   // Resumable: a sufficient budget completes the same work, no truncation.
-  await stepUntil(a, () => outboxCount(a) > 0 && unpublished(a) === 0, 12, 10_000, {
-    units: 50,
-    bytes: 10_000_000,
-  });
+  await stepUntil(
+    a,
+    () => outboxCount(a) > 0 && unpublished(a) === 0,
+    12,
+    10_000,
+    {
+      units: 50,
+      bytes: 10_000_000,
+    },
+  );
   expect(net.calls.puts).toHaveLength(outboxCount(a));
   expect(transportInvariantViolations(a)).toEqual([]);
 });
@@ -736,21 +803,35 @@ it("24 a publication whose put never resolves becomes Retry(deadline_exceeded); 
   const reports: (ProgressReport | undefined)[] = [];
   for (let i = 0; i < 12 && d.get("r") === undefined; i++) {
     clock.advance(10);
-    reports.push(await within(3000, step(d, { units: 20 }), "step with a never-resolving put"));
+    reports.push(
+      await within(
+        3000,
+        step(d, { units: 20 }),
+        "step with a never-resolving put",
+      ),
+    );
   }
   expect(d.get("r")).toEqual(r.get("r"));
   const stalledRows = records(d, OUTBOX);
   expect(stalledRows.length).toBeGreaterThan(0);
   for (const row of stalledRows) {
-    expect(row).toMatchObject({ outcome: "retry", reason: "deadline_exceeded", attempts: 1 });
+    expect(row).toMatchObject({
+      outcome: "retry",
+      reason: "deadline_exceeded",
+      attempts: 1,
+    });
   }
   expect(unpublished(d)).toBe(outboxCount(d));
   expect(
-    reports.flatMap((x) => x?.problems ?? []).some(
-      (p) => p.phase === "publish" && p.problem === "deadline_exceeded",
-    ),
+    reports
+      .flatMap((x) => x?.problems ?? [])
+      .some((p) => p.phase === "publish" && p.problem === "deadline_exceeded"),
   ).toBe(true);
-  expect(reports.flatMap((x) => x?.receipts ?? []).filter((x) => x.phase === "publish")).toEqual([]);
+  expect(
+    reports
+      .flatMap((x) => x?.receipts ?? [])
+      .filter((x) => x.phase === "publish"),
+  ).toEqual([]);
   expect(net.head.size).toBe(outboxCount(r));
 });
 
@@ -781,14 +862,25 @@ it("25 host cancellation mid-step leaves only committed state; the cancelled run
   controller.abort();
   await within(3000, running, "aborted step");
 
-  const tables = ["pdpp_transport_batches", "pdpp_transport_outbox", "pdpp_transport_state"];
+  const tables = [
+    "pdpp_transport_batches",
+    "pdpp_transport_outbox",
+    "pdpp_transport_state",
+  ];
   const frozen = durableSnapshot(a.db, tables);
   expect(transportInvariantViolations(a)).toEqual([]);
   expect(unpublished(a)).toBe(outboxCount(a));
   expect(
-    workRecords(a.db).every((r) => r.outcome !== "quarantine" && r.outcome !== "unsupported"),
+    workRecords(a.db).every(
+      (r) => r.outcome !== "quarantine" && r.outcome !== "unsupported",
+    ),
   ).toBe(true);
-  expect(num(a, "SELECT count(*) AS n FROM pdpp_transport_batches WHERE prepared=-1")).toBe(0);
+  expect(
+    num(
+      a,
+      "SELECT count(*) AS n FROM pdpp_transport_batches WHERE prepared=-1",
+    ),
+  ).toBe(0);
   const bytes = a.db
     .prepare("SELECT scope,encrypted FROM pdpp_transport_outbox ORDER BY rowid")
     .all();
@@ -796,14 +888,19 @@ it("25 host cancellation mid-step leaves only committed state; the cancelled run
 
   release(); // the cancelled call finally returns
   await sleep(50);
-  expect(durableSnapshot(a.db, tables), "a cancelled run overwrote state").toEqual(frozen);
+  expect(
+    durableSnapshot(a.db, tables),
+    "a cancelled run overwrote state",
+  ).toEqual(frozen);
 
   a.reopen();
   net.port.put = put;
   await stepUntil(a, () => unpublished(a) === 0, 6, 10_000);
   expect(
     a.db
-      .prepare("SELECT scope,encrypted FROM pdpp_transport_outbox ORDER BY rowid")
+      .prepare(
+        "SELECT scope,encrypted FROM pdpp_transport_outbox ORDER BY rowid",
+      )
       .all(),
   ).toEqual(bytes);
 });
@@ -841,7 +938,9 @@ it("26 dependency events wake only matching waits: unrelated and duplicate event
   clock.advance(1000);
   await steps(fx.b, 2, 0);
   expect(rows(), "an unrelated event changed the wait").toEqual(initial);
-  expect(tally.stage.length, "an unrelated event re-evaluated the wait").toBe(staged);
+  expect(tally.stage.length, "an unrelated event re-evaluated the wait").toBe(
+    staged,
+  );
 
   // The matching event makes it due now. The predecessor is still absent:
   // it re-evaluates and Waits again from the new time.
@@ -898,17 +997,27 @@ async function mappingFixture(crash?: CrashController) {
   b.db.prepare("DELETE FROM pdpp_instance_binding WHERE instance='conn'").run();
   const reports = await steps(b, 4, 0);
   expect(b.get("a")).toBeUndefined();
-  expect(importedReceipts(b), "custody is retained and receipted").toBeGreaterThan(0);
+  expect(
+    importedReceipts(b),
+    "custody is retained and receipted",
+  ).toBeGreaterThan(0);
   return { net, a, b, reports };
 }
 const provision = (b: TransportDevice) =>
-  b.store.registerConnection({ instance: "conn", sourceId, method: "export", label: "C" });
+  b.store.registerConnection({
+    instance: "conn",
+    sourceId,
+    method: "export",
+    label: "C",
+  });
 
 it("27b a missing local mapping is reported as Wait(mapping), not as a failure", async () => {
   const { b, reports } = await mappingFixture();
   const waits = reports.flatMap((r) => r?.waits ?? []);
   expect(
-    waits.some((w) => w.dependency.kind === "mapping" && w.dependency.key === "conn"),
+    waits.some(
+      (w) => w.dependency.kind === "mapping" && w.dependency.key === "conn",
+    ),
     "no mapping wait was reported",
   ).toBe(true);
   expect(reports.flatMap((r) => r?.problems ?? [])).toEqual([]);
@@ -965,8 +1074,13 @@ it("28a process death between the predecessor's commit and the successor's notif
     journal: journalOperations(rehearsal.fx.b),
   };
   const trace = rehearsal.crash.trace;
-  const insert = trace.findIndex((l) => l.startsWith("after-insert:pdpp_transport_imported"));
-  expect(insert, "no import acknowledgement in the trace").toBeGreaterThanOrEqual(0);
+  const insert = trace.findIndex((l) =>
+    l.startsWith("after-insert:pdpp_transport_imported"),
+  );
+  expect(
+    insert,
+    "no import acknowledgement in the trace",
+  ).toBeGreaterThanOrEqual(0);
   const commit = trace.findIndex((l, i) => i > insert && l === "commit");
   expect(commit).toBeGreaterThan(insert);
   rehearsal.fx.b.close();
@@ -981,7 +1095,9 @@ it("28a process death between the predecessor's commit and the successor's notif
     clock.advance(5000); // no event is ever delivered: <= 70 s
     await step(fx.b);
   }
-  expect(both(fx.b), "the successor's wake was lost with the process").toBe(true);
+  expect(both(fx.b), "the successor's wake was lost with the process").toBe(
+    true,
+  );
   expect({
     imported: importedReceipts(fx.b),
     changes: recordChanges(fx.b),
@@ -1083,7 +1199,10 @@ it("30 finality hints are not evidence: verified height is monotone from verifie
   clock.advance(cooled.nextEligible! - clock.now());
   await steps(b, 2, 0);
   expect(evidenceReads(net, scope)).toBeGreaterThan(afterPoll);
-  expect(record(b, INBOX, scope)).toMatchObject({ outcome: "wait", checkedBlock: "124" });
+  expect(record(b, INBOX, scope)).toMatchObject({
+    outcome: "wait",
+    checkedBlock: "124",
+  });
 
   verified.height = 120n; // a regressing read never lowers the verified height
   clock.advance(30_000);
@@ -1125,7 +1244,8 @@ async function retryIsNotBypassedByHint(kind: "publish" | "confirm") {
   });
 
   // The RPC fails once the wait is due: Retry with deadline t + B(1).
-  net.faults.evidence = (s) => (s === scope ? new Error("RPC unavailable") : undefined);
+  net.faults.evidence = (s) =>
+    s === scope ? new Error("RPC unavailable") : undefined;
   clock.advance(2000);
   await steps(actor, 2, 0);
   const failedAt = clock.now();
@@ -1145,7 +1265,9 @@ async function retryIsNotBypassedByHint(kind: "publish" | "confirm") {
     notify(actor, `finality:${scope}`);
     await step(actor);
   }
-  expect(evidenceReads(net, scope), "a hint bypassed the Retry deadline").toBe(reads);
+  expect(evidenceReads(net, scope), "a hint bypassed the Retry deadline").toBe(
+    reads,
+  );
   expect(record(actor, table, scope)).toMatchObject({
     outcome: "retry",
     attempts: 1,
@@ -1232,9 +1354,13 @@ it("31b report.nextWake is the minimum relevant deadline, not A's wait deadline 
   const report = await step(d);
   const yBatch = records(d, BATCHES);
   expect(yBatch.length).toBeGreaterThan(0);
-  expect(yBatch.every((r) => r.outcome === "retry" && r.attempts === 1)).toBe(true);
+  expect(yBatch.every((r) => r.outcome === "retry" && r.attempts === 1)).toBe(
+    true,
+  );
   const tY = minDeadline(yBatch);
-  const tA = minDeadline(records(d, INBOX).filter((r) => isFrom(r.id, writerA)));
+  const tA = minDeadline(
+    records(d, INBOX).filter((r) => isFrom(r.id, writerA)),
+  );
   expect(tY).toBe(clock.now() + B1);
   expect(tY).toBeLessThan(tA);
   expect(d.get("b")).toBeDefined(); // B is independent of both
@@ -1261,15 +1387,31 @@ it("33 a temporarily inactive registration is a Wait, not a conflict: no quarant
     await step(a);
     await step(b);
   }
-  expect(record(a, OUTBOX, scope)).toMatchObject({ outcome: "wait", attempts: 0 });
-  expect(record(b, INBOX, scope)).toMatchObject({ outcome: "wait", attempts: 0 });
+  expect(record(a, OUTBOX, scope)).toMatchObject({
+    outcome: "wait",
+    attempts: 0,
+  });
+  expect(record(b, INBOX, scope)).toMatchObject({
+    outcome: "wait",
+    attempts: 0,
+  });
   expect(
     [...records(a, OUTBOX), ...records(b, INBOX)].every(
       (r) => r.outcome !== "quarantine" && r.outcome !== "retry",
     ),
   ).toBe(true);
-  expect(num(b, "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE state='quarantined'")).toBe(0);
-  expect(num(a, "SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state='quarantined'")).toBe(0);
+  expect(
+    num(
+      b,
+      "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE state='quarantined'",
+    ),
+  ).toBe(0);
+  expect(
+    num(
+      a,
+      "SELECT count(*) AS n FROM pdpp_transport_outbox WHERE state='quarantined'",
+    ),
+  ).toBe(0);
   expect(net.calls.puts.filter((s) => s === scope)).toHaveLength(puts);
   expect(b.get("a")).toBeUndefined();
 
@@ -1287,17 +1429,29 @@ it("33 a temporarily inactive registration is a Wait, not a conflict: no quarant
 // ========================================================================== 34
 
 /** Evidence port that reports an immutable-registration conflict for chosen scopes. */
-function conflictOn(net: Network, which: (scope: string, first: string) => boolean) {
+function conflictOn(
+  net: Network,
+  which: (scope: string, first: string) => boolean,
+) {
   let first: string | undefined;
   const evidence = net.port.evidence;
   net.port.evidence = async (scope) => {
     first ??= scope;
     const e = await evidence(scope);
     return which(scope, first)
-      ? { ...e, chain: e.chain && { ...e.chain, currentVersion: "9", status: "Active" as const } }
+      ? {
+          ...e,
+          chain: e.chain && {
+            ...e.chain,
+            currentVersion: "9",
+            status: "Active" as const,
+          },
+        }
       : e;
   };
-  return { conflicting: (scope: string) => first !== undefined && which(scope, first) };
+  return {
+    conflicting: (scope: string) => first !== undefined && which(scope, first),
+  };
 }
 
 it("34a report.nextWake comes from durable state: terminal work contributes nothing, and a reopened worker computes the same value", async () => {

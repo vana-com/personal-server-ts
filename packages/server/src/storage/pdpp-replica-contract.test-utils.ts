@@ -128,10 +128,13 @@ export class CrashController {
 }
 
 function mutationLabel(sql: string) {
-  const match = /^\s*(INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM|REPLACE\s+INTO)\s+(\w+)/i.exec(
-    sql,
-  );
-  return match ? `${match[1].split(/\s+/)[0].toLowerCase()}:${match[2]}` : undefined;
+  const match =
+    /^\s*(INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM|REPLACE\s+INTO)\s+(\w+)/i.exec(
+      sql,
+    );
+  return match
+    ? `${match[1].split(/\s+/)[0].toLowerCase()}:${match[2]}`
+    : undefined;
 }
 
 /**
@@ -412,8 +415,7 @@ export function network(
     finalizeAll(blockNumber = 124n) {
       for (const scope of pending) {
         const row = head.get(scope);
-        if (row)
-          chain.set(scope, { ...chainRow(scope, row), blockNumber });
+        if (row) chain.set(scope, { ...chainRow(scope, row), blockNumber });
       }
       pending.clear();
     },
@@ -612,8 +614,16 @@ export function workRecords(db: Database.Database): WorkRecord[] {
     const cols = columns(db, table);
     if (!cols.size) return;
     const pick = cols.has("fragment_json")
-      ? [...cols].filter((c) => c !== "fragment_json" && c !== "plaintext" && c !== "encrypted" && c !== "payload")
-      : [...cols].filter((c) => c !== "plaintext" && c !== "encrypted" && c !== "payload");
+      ? [...cols].filter(
+          (c) =>
+            c !== "fragment_json" &&
+            c !== "plaintext" &&
+            c !== "encrypted" &&
+            c !== "payload",
+        )
+      : [...cols].filter(
+          (c) => c !== "plaintext" && c !== "encrypted" && c !== "payload",
+        );
     const rows = db
       .prepare(`SELECT ${pick.join(",")} FROM ${table} ORDER BY rowid`)
       .all() as Record<string, unknown>[];
@@ -622,7 +632,9 @@ export function workRecords(db: Database.Database): WorkRecord[] {
         table,
         id: String(row[idColumn]),
         state: row.state as string | undefined,
-        outcome: cols.has("outcome") ? (row.outcome as string | null) : undefined,
+        outcome: cols.has("outcome")
+          ? (row.outcome as string | null)
+          : undefined,
         reason: cols.has("reason") ? (row.reason as string | null) : undefined,
         cause: cols.has("cause_json") ? parseJson(row.cause_json) : undefined,
         dependency: cols.has("dependency")
@@ -731,7 +743,9 @@ export function transportInvariantViolations(d: TransportDevice): string[] {
       .prepare("SELECT sequence FROM pdpp_transport_state WHERE id=1")
       .get() as { sequence: number } | undefined;
     const max = db
-      .prepare("SELECT coalesce(max(sequence),0) AS n FROM pdpp_transport_batches")
+      .prepare(
+        "SELECT coalesce(max(sequence),0) AS n FROM pdpp_transport_batches",
+      )
       .get() as { n: number };
     if (state && state.sequence !== max.n)
       violations.push(
@@ -768,14 +782,36 @@ export interface CanonicalAdapter {
   surfaces: SurfaceSupport;
   connectionId: string;
   declare(context: MergeContext): void;
-  provision(connectionId: string, mapping: { sourceId: string; methodId: string }): Promise<void>;
+  provision(
+    connectionId: string,
+    mapping: { sourceId: string; methodId: string },
+  ): Promise<void>;
   send(ops: ReplicaOperation[], id?: string): Promise<unknown>;
   retry(): Promise<unknown>;
   reopen(): void;
-  point(connectionId: string, stream: string, key: string): Promise<{ deleted: boolean; data?: unknown } | undefined>;
+  point(
+    connectionId: string,
+    stream: string,
+    key: string,
+  ): Promise<{ deleted: boolean; data?: unknown } | undefined>;
   /** Node only. Lite has no public list/changes/completion surfaces. */
-  list?(connectionId: string, stream: string, options?: { limit?: number; cursor?: string }): Promise<{ data: { recordKey: string; data: unknown }[]; nextCursor?: string }>;
-  changes?(connectionId: string, stream: string, options?: { limit?: number; cursor?: string; changesSince?: string }): Promise<{ data: unknown[]; nextCursor?: string; nextChangesSince?: string }>;
+  list?(
+    connectionId: string,
+    stream: string,
+    options?: { limit?: number; cursor?: string },
+  ): Promise<{
+    data: { recordKey: string; data: unknown }[];
+    nextCursor?: string;
+  }>;
+  changes?(
+    connectionId: string,
+    stream: string,
+    options?: { limit?: number; cursor?: string; changesSince?: string },
+  ): Promise<{
+    data: unknown[];
+    nextCursor?: string;
+    nextChangesSince?: string;
+  }>;
   blob?(blobId: string): Promise<Uint8Array | undefined>;
   completion?(connectionId: string, stream: string): Promise<unknown>;
   integrityEpoch?(connectionId: string): number;
@@ -806,8 +842,7 @@ function liteSqlitePort() {
             async get(key) {
               return (
                 db.prepare("SELECT value FROM kv WHERE key=?").get(key) as
-                  | { value: string }
-                  | undefined
+                  { value: string } | undefined
               )?.value;
             },
             async put(key, value) {
@@ -880,8 +915,7 @@ function liteSqlitePort() {
     },
     async *readBlob(id) {
       const row = db.prepare("SELECT bytes FROM blobs WHERE id=?").get(id) as
-        | { bytes: Buffer }
-        | undefined;
+        { bytes: Buffer } | undefined;
       if (!row) throw new Error("missing committed blob");
       yield new Uint8Array(row.bytes);
     },
@@ -1119,7 +1153,8 @@ export const adapterFactories: Record<
     provisioned?: { connectionId: string; sourceId: string; methodId: string },
   ) => Promise<CanonicalAdapter>
 > = {
-  "Node SQLite": async (context, provisioned) => nodeAdapter(context, provisioned),
+  "Node SQLite": async (context, provisioned) =>
+    nodeAdapter(context, provisioned),
   "Lite memory": (context, provisioned) =>
     liteAdapter("memory", context, provisioned),
   "Lite SQLite port": (context, provisioned) =>

@@ -59,7 +59,9 @@ const logical = (d: TransportDevice, table: string) =>
 const batchOf = (scope: string) => scope.split(".")[1]!.split("_")[1]!;
 const writerOf = (d: TransportDevice) =>
   (
-    d.db.prepare("SELECT writer FROM pdpp_transport_state WHERE id=1").get() as {
+    d.db
+      .prepare("SELECT writer FROM pdpp_transport_state WHERE id=1")
+      .get() as {
       writer: string;
     }
   ).writer;
@@ -92,9 +94,8 @@ async function at_(d: TransportDevice, ms: number) {
 }
 
 function wake(d: TransportDevice, key: string) {
-  const f = (
-    d.worker as { onDependencyChanged?: (key: string) => unknown }
-  ).onDependencyChanged;
+  const f = (d.worker as { onDependencyChanged?: (key: string) => unknown })
+    .onDependencyChanged;
   expect(typeof f, "worker.onDependencyChanged is part of the contract").toBe(
     "function",
   );
@@ -116,7 +117,10 @@ function instrumentPut(
   };
   net.port.put = async (part) => {
     log.calls++;
-    log.parts.push({ scope: part.scope, encrypted: new Uint8Array(part.encrypted) });
+    log.parts.push({
+      scope: part.scope,
+      encrypted: new Uint8Array(part.encrypted),
+    });
     const error = options.fail?.(log.calls);
     if (error) throw error;
     if (options.pending) net.pending.add(part.scope);
@@ -173,7 +177,9 @@ describe("01 Progress with retained custody, not premature availability", () => 
     await at_(a, 10000);
     const b = transportDevice(net);
     // Provisioning is a separate authority: transport must not invent the mapping.
-    b.db.prepare("DELETE FROM pdpp_instance_binding WHERE instance='conn'").run();
+    b.db
+      .prepare("DELETE FROM pdpp_instance_binding WHERE instance='conn'")
+      .run();
     const reports: (ProgressReport | undefined)[] = [];
     for (let i = 0; i < 4; i++) reports.push(await at_(b, 10000));
 
@@ -235,9 +241,13 @@ describe("01 Progress with retained custody, not premature availability", () => 
       const context = adapterContext();
       const adapter = await make(context);
       await adapter.send([registration(), upsert(20)]);
-      expect(visible(await adapter.point(CONN, "messages", "a"))).toBeUndefined();
+      expect(
+        visible(await adapter.point(CONN, "messages", "a")),
+      ).toBeUndefined();
       adapter.reopen();
-      expect(visible(await adapter.point(CONN, "messages", "a"))).toBeUndefined();
+      expect(
+        visible(await adapter.point(CONN, "messages", "a")),
+      ).toBeUndefined();
       await adapter.provision(CONN, { sourceId, methodId: METHOD });
       await adapter.retry();
       expect(visible(await adapter.point(CONN, "messages", "a"))).toEqual({
@@ -293,7 +303,9 @@ describe("02 Progress to the next phase is atomic", () => {
 
     for (const point of points) {
       const { crash, net, d } = await prepareRun(point);
-      expect(crash.dead, `crash point ${point} ${trace[point]} reached`).toBe(true);
+      expect(crash.dead, `crash point ${point} ${trace[point]} reached`).toBe(
+        true,
+      );
       d.crashReopen();
       crash.dead = false; // the network outlives the crashed process
       const where = `crash point ${point} (${trace[point]})`;
@@ -323,7 +335,10 @@ describe("02 Progress to the next phase is atomic", () => {
         const now = final.find((o) => o.scope === before.scope);
         expect(now?.data_hash, where).toEqual(before.data_hash);
         expect(now?.metadata_hash, where).toEqual(before.metadata_hash);
-        expect(Buffer.compare(now?.encrypted as Buffer, before.encrypted as Buffer), where).toBe(0);
+        expect(
+          Buffer.compare(now?.encrypted as Buffer, before.encrypted as Buffer),
+          where,
+        ).toBe(0);
       }
       const batchesAfter = batchRows(d);
       expect(batchesAfter, where).toHaveLength(1);
@@ -376,8 +391,7 @@ describe("03 Due to Wait and Wait to Progress", () => {
     for (let i = 0; i < 8; i++) await at_(b, 10000);
     expect(b.get()).toBeUndefined();
     const dependency = `predecessor:${writerOf(a)}:1`;
-    const waiting = () =>
-      importWork(b).find((r) => r.batch === second.batch);
+    const waiting = () => importWork(b).find((r) => r.batch === second.batch);
     expect(waiting()).toMatchObject({
       outcome: "wait",
       dependency,
@@ -472,11 +486,15 @@ describe("04 Wait to Wait with a new dependency", () => {
         methodId: METHOD,
       });
       await adapter.send([registration(), upsert(20, 3)]);
-      expect(visible(await adapter.point(CONN, "messages", "a"))).toBeUndefined();
+      expect(
+        visible(await adapter.point(CONN, "messages", "a")),
+      ).toBeUndefined();
       adapter.reopen();
       await adapter.send([reset(2), reset(3)]);
       await adapter.retry();
-      expect(visible(await adapter.point(CONN, "messages", "a"))).toBeUndefined();
+      expect(
+        visible(await adapter.point(CONN, "messages", "a")),
+      ).toBeUndefined();
       adapter.reopen();
       adapter.declare(adapterContext());
       await adapter.retry();
@@ -517,9 +535,13 @@ describe("05 Due to Retry and Retry to Progress", () => {
     expect(puts.calls).toBe(2);
     expect(puts.parts[1]!.scope).toBe(puts.parts[0]!.scope);
     expect(puts.parts[1]!.encrypted).toEqual(puts.parts[0]!.encrypted);
-    expect(net.blobs.get(puts.parts[0]!.scope)).toEqual(puts.parts[0]!.encrypted);
+    expect(net.blobs.get(puts.parts[0]!.scope)).toEqual(
+      puts.parts[0]!.encrypted,
+    );
     const done = outboxRows(d)[0]!;
-    expect(Buffer.compare(done.encrypted as Buffer, original.encrypted as Buffer)).toBe(0);
+    expect(
+      Buffer.compare(done.encrypted as Buffer, original.encrypted as Buffer),
+    ).toBe(0);
     expect(done.state).toBe("published");
     expect(logical(d, "pdpp_transport_outbox")[0]).toMatchObject({
       outcome: "progress",
@@ -575,7 +597,9 @@ describe("06 Retry to Retry preserves diagnostics and deadline", () => {
     const now = outboxRows(d)[0]!;
     expect(now.state).toBe("ready");
     expect(now.outcome).not.toBe("quarantine");
-    expect(Buffer.compare(now.encrypted as Buffer, checkpoint.encrypted as Buffer)).toBe(0);
+    expect(
+      Buffer.compare(now.encrypted as Buffer, checkpoint.encrypted as Buffer),
+    ).toBe(0);
     expect(now.data_hash).toBe(checkpoint.data_hash);
     clock.advance(1);
     await step(d);
@@ -690,7 +714,8 @@ describe("09 Quarantine only with proof", () => {
       const evidence = instrumentEvidence(net);
       const puts = instrumentPut(net, {
         pending: source === "wait",
-        fail: (n) => (source === "retry" && n === 1 ? new Error(LEAK) : undefined),
+        fail: (n) =>
+          source === "retry" && n === 1 ? new Error(LEAK) : undefined,
       });
       const d = transportDevice(net, { preexisting: "immutable" });
       if (source === "fresh") evidence.conflict = () => true;
@@ -739,12 +764,18 @@ describe("09 Quarantine only with proof", () => {
     const rows = logical(b, "pdpp_transport_inbox");
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.every((r) => r.outcome === "quarantine")).toBe(true);
-    expect(rows.every((r) => r.reason === "immutable_registration_conflict")).toBe(true);
+    expect(
+      rows.every((r) => r.reason === "immutable_registration_conflict"),
+    ).toBe(true);
     expect(net.calls.gets).toHaveLength(gets);
     expect(b.get()).toBeUndefined();
     b.reopen();
     for (let i = 0; i < 3; i++) await at_(b, 3_600_000);
-    expect(logical(b, "pdpp_transport_inbox").every((r) => r.outcome === "quarantine")).toBe(true);
+    expect(
+      logical(b, "pdpp_transport_inbox").every(
+        (r) => r.outcome === "quarantine",
+      ),
+    ).toBe(true);
     expect(net.calls.gets).toHaveLength(gets);
   });
 });
@@ -812,7 +843,9 @@ describe("10 Unsupported admission is not Quarantine", () => {
     expect(stuck.prepared).toBe(-1);
     expect(next.prepared).toBe(1);
     expect(outboxRows(a).every((r) => r.state === "published")).toBe(true);
-    expect(net.calls.registrations.every((s) => batchOf(s) !== stuck.batch)).toBe(true);
+    expect(
+      net.calls.registrations.every((s) => batchOf(s) !== stuck.batch),
+    ).toBe(true);
     expect(net.calls.registrations.length).toBeGreaterThan(0);
 
     const b = transportDevice(net);
@@ -845,7 +878,11 @@ describe("11 Terminal outcome replay is inert", () => {
     for (let i = 0; i < 3; i++) await at_(d, 10000); // batch 3: quarantine
 
     const batches = logical(d, "pdpp_transport_batches");
-    expect(batches.map((r) => r.outcome)).toEqual(["unsupported", "progress", "progress"]);
+    expect(batches.map((r) => r.outcome)).toEqual([
+      "unsupported",
+      "progress",
+      "progress",
+    ]);
     const outbox = logical(d, "pdpp_transport_outbox");
     expect(outbox.some((r) => r.outcome === "progress")).toBe(true);
     expect(outbox.some((r) => r.outcome === "quarantine")).toBe(true);
@@ -888,7 +925,12 @@ describe("11 Terminal outcome replay is inert", () => {
       });
       const first = upsert(20);
       await adapter.send([registration(), first]);
-      await adapter.send([{ ...first, data: { id: "a", text: "equivocated" } } as ReplicaOperation]);
+      await adapter.send([
+        {
+          ...first,
+          data: { id: "a", text: "equivocated" },
+        } as ReplicaOperation,
+      ]);
       const settled = await observe(adapter);
       expect(settled.point).toBeUndefined(); // withdrawn, not silently replaced
       for (let i = 0; i < 3; i++) {
@@ -1004,18 +1046,27 @@ describe("13 Transient RangeError", () => {
     await step(d); // before the deadline: the successor progresses, the stuck batch does not
     expect(encrypted.filter((s) => batchOf(s) === stuckBatch)).toHaveLength(1);
     expect(net.calls.registrations.length).toBeGreaterThan(0);
-    expect(net.calls.registrations.every((s) => batchOf(s) !== stuckBatch)).toBe(true);
-    expect(logical(d, "pdpp_transport_batches").find((r) => r.id === stuckBatch)?.prepared).toBe(0);
+    expect(
+      net.calls.registrations.every((s) => batchOf(s) !== stuckBatch),
+    ).toBe(true);
+    expect(
+      logical(d, "pdpp_transport_batches").find((r) => r.id === stuckBatch)
+        ?.prepared,
+    ).toBe(0);
 
     clock.advance(499);
     await step(d);
     expect(encrypted.filter((s) => batchOf(s) === stuckBatch)).toHaveLength(1);
     clock.advance(1);
     await step(d);
-    const recovered = logical(d, "pdpp_transport_batches").find((r) => r.id === stuckBatch)!;
+    const recovered = logical(d, "pdpp_transport_batches").find(
+      (r) => r.id === stuckBatch,
+    )!;
     expect(recovered.prepared).toBe(1);
     expect(recovered.outcome).toBe("progress");
-    expect(net.calls.registrations.some((s) => batchOf(s) === stuckBatch)).toBe(true);
+    expect(net.calls.registrations.some((s) => batchOf(s) === stuckBatch)).toBe(
+      true,
+    );
     expect(d.get()).toEqual({ id: "a", text: "first" });
   });
 });
@@ -1043,7 +1094,9 @@ describe("14 Similar error strings cannot choose disposition", () => {
         attempts: 1,
         nextEligible: t + 1000,
       });
-      expect(net.calls.encrypts, "no chunk halving on an untyped error").toBe(1);
+      expect(net.calls.encrypts, "no chunk halving on an untyped error").toBe(
+        1,
+      );
       expect(batch.admission ?? null).toBeNull();
       expect(outboxRows(d)).toHaveLength(0);
       expect(d.get()).toEqual({ id: "a", text: "record" });
@@ -1116,7 +1169,10 @@ function upsert(
     blobs: [],
   };
 }
-function registration(connectionId = CONN, methodId = METHOD): ReplicaOperation {
+function registration(
+  connectionId = CONN,
+  methodId = METHOD,
+): ReplicaOperation {
   return {
     kind: "connection-register",
     owner,
