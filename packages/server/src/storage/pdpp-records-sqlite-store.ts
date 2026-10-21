@@ -385,7 +385,7 @@ DROP INDEX IF EXISTS idx_pdpp_record_changes_snapshot_order;
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_key_order
   ON pdpp_record_changes (stream, emitted_key, record_key, instance, written_at);
 CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
-  ON pdpp_records (instance, stream, emitted_key)
+  ON pdpp_records (instance, stream, emitted_key, emitted_at)
   WHERE deleted = 0;
 `);
 }
