@@ -67,6 +67,10 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
         },
       },
       legacyScopeView: deps.legacyScopeView,
+      retainedCanonicalRecords: () =>
+        deps.pdpp?.bindingStore.readSnapshot(
+          () => retainedCanonicalHistory(deps)?.records,
+        ),
     }),
   );
   app.all("/", async (c) => {
@@ -121,9 +125,15 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
       })
     )
       return c.json({ ok: false, reason: "method_opt_in" }, 409);
-    const expectedCanonicalEpoch = canonicalEpoch(deps);
+    // One snapshot binds repair constraints and the epoch checked by the writer.
+    const preflight = deps.pdpp?.bindingStore.readSnapshot(() => ({
+      epoch: canonicalEpoch(deps),
+      history: retainedCanonicalHistory(deps),
+    }));
+    const expectedCanonicalEpoch = preflight?.epoch ?? "disabled";
     const result = await importOuraBrowserRecords(storage, body, {
       legacyScopeView: deps.legacyScopeView,
+      retainedCanonicalHistory: preflight?.history,
       scopeDeletions: deps.scopeDeletions,
       syncManager: deps.syncManager,
       additions: deps.additions,
@@ -147,6 +157,46 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
     return c.json(result, result.ok ? 200 : 409);
   });
   return app;
+}
+
+function retainedCanonicalHistory(deps: OuraRouteDeps) {
+  if (!deps.pdpp) return;
+  const store = deps.pdpp.bindingStore;
+  const sources = [...(deps.pdppConnections?.connectionMethods ?? [])]
+    .filter(([, methods]) => methods.includes("oura-browser"))
+    .map(([source]) => source);
+  if (sources.length !== 1) return;
+  const connections = store
+    .listConnections(sources[0]!)
+    .filter((connection) => connection.deletedAt === null);
+  if (connections.length !== 1) return;
+  const connection = connections[0]!;
+  const configured = deps.pdpp.configuredMethods.get(connection.instance);
+  if (
+    connection.method !== "oura-browser" ||
+    configured?.length !== 1 ||
+    configured[0] !== "oura-browser"
+  )
+    return;
+  const rows = SCOPES.flatMap((scope) => {
+    const stream = scope.slice("oura.".length);
+    return store
+      .listRetainedRecordData(connection.instance, stream)
+      .map((row) => ({ ...row, stream }));
+  });
+  const times = [
+    ...rows.map((row) => row.emittedAt),
+    ...store
+      .listStreamCompletions(connection.instance)
+      .map((receipt) => receipt.sourceCollectedAt),
+  ];
+  if (!times.length) return;
+  return {
+    records: rows.map(({ stream, data }) => ({ stream, data })),
+    collectedAt: new Date(
+      times.reduce((latest, time) => Math.max(latest, Date.parse(time)), 0),
+    ).toISOString(),
+  };
 }
 
 /** Synchronous snapshot before history reads and again immediately before P7. */

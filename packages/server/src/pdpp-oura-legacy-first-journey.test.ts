@@ -1344,6 +1344,70 @@ describe("Oura default admission cutover", () => {
       expect((await observe(scope)).owner.status).toBe(503);
   });
 
+  it("restores tombstone-refused history only through a complete guarded batch after restart", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    const token = await writePdpp(DAYS, T_PDPP);
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(CANON));
+    const complete = [...DAYS, { n: 3, score: 91 }];
+    await writePdpp(complete, T_PDPP, token);
+    await writePdpp(DAYS, T_PDPP, token);
+    await restartWithMethods(["oura-browser"], []);
+    for (const scope of SCOPES) {
+      const read = await observe(scope);
+      expect(read.owner.status).toBe(503);
+      expect(read.builder.status).toBe(503);
+    }
+    const requirements = await ctx!.app.request(
+      "/v1/import/oura-browser/requirements",
+      {
+        headers: { authorization: `Bearer ${token}` },
+      },
+    );
+    expect(requirements.status, await requirements.clone().text()).toBe(200);
+    expect(await requirements.json()).toMatchObject({ since: "2026-09-01" });
+    const restore = (days: typeof DAYS) =>
+      ctx!.app.request("/v1/import/oura-browser", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          collectedAt: T_LEGACY_NEWER,
+          records: SCOPES.flatMap((scope) =>
+            pdppRows(scope, days).map((data) => ({
+              stream: STREAM_OF[scope],
+              data,
+            })),
+          ),
+          completion: {
+            streams: SCOPES.map((scope) => ({
+              stream: STREAM_OF[scope],
+              status: "complete",
+              recordCount: pdppRows(scope, days).length,
+            })),
+          },
+        }),
+      });
+    expect((await restore(DAYS)).status).toBe(409);
+    for (const scope of SCOPES)
+      expect((await observe(scope)).owner.status).toBe(503);
+    const restored = await restore(complete);
+    expect(restored.status, await restored.clone().text()).toBe(200);
+    expect((await restored.json()).receipts).toHaveLength(3);
+    for (const scope of SCOPES) {
+      const read = await observe(scope);
+      expect(read.owner.status).toBe(200);
+      expect(read.builder.status).toBe(200);
+      expect(dayRows(read.owner, scope)).toHaveLength(3);
+      expect(dayRows(read.builder, scope)).toHaveLength(3);
+    }
+    await restartWithMethods(["oura-browser"], []);
+    for (const scope of SCOPES)
+      expect(dayRows((await observe(scope)).owner, scope)).toHaveLength(3);
+  });
+
   it("refuses truncated completed records after takeover instead of deleting retained history", async () => {
     await writeLegacy(DAYS, T_LEGACY);
     const token = await writePdpp(DAYS, T_PDPP);
@@ -1616,7 +1680,7 @@ describe("Oura collection requirements", () => {
       );
       try {
         const address = listener.address() as { port: number };
-        const invokeNative = async () => {
+        const invokeNative = async (collectedAt = T_PDPP) => {
           const native = spawn(
             process.env.F2_NATIVE_PUBLICATION_ORACLE!,
             [
@@ -1642,7 +1706,7 @@ describe("Oura collection requirements", () => {
             JSON.stringify({
               generation: 1,
               profile,
-              collectedAt: T_PDPP,
+              collectedAt,
               scope: {
                 streams: SCOPES.map((scope) => ({
                   name: STREAM_OF[scope],
@@ -1698,6 +1762,63 @@ describe("Oura collection requirements", () => {
           const read = await observe(scope);
           expect(JSON.stringify(read.builder.body)).toContain("2025-01-01");
           const receipt = result.ok.receipts.find(
+            (r: { scope: string }) => r.scope === scope,
+          );
+          expect(receipt.collectedAt).toBe(
+            (read.owner.body as { collectedAt: string }).collectedAt,
+          );
+          expect(receipt.plaintextBytes).toBe(
+            Buffer.byteLength(JSON.stringify(read.owner.body)),
+          );
+        }
+        // A direct replacement can damage canonical state; a real native retry
+        // must still plan and restore every retained entity after restart.
+        for (const scope of SCOPES)
+          await replace(
+            token,
+            STREAM_OF[scope],
+            historic(pdppRows(scope, DAYS.slice(1))),
+            T_PDPP,
+          );
+        await restartWithMethods(["oura-browser"], []);
+        for (const scope of SCOPES) {
+          const read = await observe(scope);
+          expect(read.owner.status).toBe(503);
+          expect(read.builder.status).toBe(503);
+        }
+        const retryPlan = await ctx!.app.request(
+          "/v1/import/oura-browser/requirements",
+          {
+            headers: { authorization: `Bearer ${token}` },
+          },
+        );
+        expect(retryPlan.status, await retryPlan.clone().text()).toBe(200);
+        expect(await retryPlan.json()).toMatchObject({ since });
+        await writeFile(
+          fixturePath,
+          JSON.stringify({ ...truncated, emittedAt: T_LEGACY_NEWER }),
+        );
+        expect((await invokeNative(T_LEGACY_NEWER)).result.err).toContain(
+          "returned 409",
+        );
+        for (const scope of SCOPES)
+          expect((await observe(scope)).owner.status).toBe(503);
+        await writeFile(
+          fixturePath,
+          JSON.stringify({ ...fixtures, emittedAt: T_LEGACY_NEWER }),
+        );
+        const restored = await invokeNative(T_LEGACY_NEWER);
+        expect(
+          restored.result.err,
+          restored.stdout + restored.stderr,
+        ).toBeUndefined();
+        expect(restored.result.ok.receipts).toHaveLength(3);
+        for (const scope of SCOPES) {
+          const read = await observe(scope);
+          expect(read.owner.status).toBe(200);
+          expect(read.builder.status).toBe(200);
+          expect(JSON.stringify(read.builder.body)).toContain("2025-01-01");
+          const receipt = restored.result.ok.receipts.find(
             (r: { scope: string }) => r.scope === scope,
           );
           expect(receipt.collectedAt).toBe(

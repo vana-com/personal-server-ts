@@ -572,6 +572,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   readSnapshot<T>(read: () => T): T;
   /** Validate history and commit under one SQLite write reservation. */
   writeTransaction<T>(write: () => T): T;
+  /** Last nondeleted data for every retained key; constraints for guarded repair, never disclosure. */
+  listRetainedRecordData(
+    instance: string,
+    stream: string,
+  ): { data: Record<string, unknown>; emittedAt: string }[];
   resetInstanceBinding(input: {
     instance: string;
     expectedMethod: string | null;
@@ -2009,6 +2014,34 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     deleteConnection,
     ingestBatch,
     getInstanceBinding,
+    listRetainedRecordData: (instance: string, stream: string) => {
+      const prior = db.prepare(`SELECT data FROM pdpp_record_changes
+        WHERE instance = ? AND stream = ? AND record_key = ? AND deleted = 0
+        ORDER BY version DESC LIMIT 1`);
+      const rows = db
+        .prepare(
+          `SELECT record_key, data, emitted_at FROM pdpp_records
+        WHERE instance = ? AND stream = ? ORDER BY record_key`,
+        )
+        .all(instance, stream) as {
+        record_key: string;
+        data: string | null;
+        emitted_at: string;
+      }[];
+      return rows.map((row) => {
+        const data =
+          row.data ??
+          (
+            prior.get(instance, stream, row.record_key) as
+              { data: string } | undefined
+          )?.data;
+        if (!data) throw new Error("Retained record history unavailable");
+        return {
+          data: JSON.parse(data) as Record<string, unknown>,
+          emittedAt: row.emitted_at,
+        };
+      });
+    },
     readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
     writeTransaction: <T>(write: () => T): T =>
       db.transaction(write).immediate(),

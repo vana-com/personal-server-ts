@@ -36,6 +36,8 @@ export type OuraBrowserImportOptions = Pick<
   | "onDataWritten"
   | "legacyScopeView"
 > & {
+  /** Current-generation retained rows, including deleted IDs, as coverage constraints only. */
+  retainedCanonicalHistory?: { records: PdppRecord[]; collectedAt: string };
   /** Node commits the validated current batch to its existing canonical store. */
   beforeCommit?: (
     input: OuraBrowserImportInput,
@@ -157,10 +159,40 @@ async function importLocked(
     if (!projection.ok || (projection.diagnostics?.length ?? 0) > 0) {
       return { ok: false, reason: "projection_incomplete", scope };
     }
+    const retained = options.retainedCanonicalHistory;
+    if (retained) {
+      if (Date.parse(input.collectedAt) < Date.parse(retained.collectedAt))
+        return { ok: false, reason: "stale_collection", scope };
+      const baseline = projectPdppRecordsToLegacyPayload(
+        scope,
+        retained.records,
+        {
+          profileKey: "oura-browser",
+          fetchedStreams: [...STREAMS],
+        },
+      );
+      if (!baseline.ok || (baseline.diagnostics?.length ?? 0) > 0)
+        return { ok: false, reason: "prior_projection_unavailable", scope };
+      const verdict = compareLegacyCoverage(
+        baseline.payload,
+        projection.payload,
+        {
+          scope,
+          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          projectionOmissions: projection.projectionOmissions,
+          canonicalNewer:
+            Date.parse(input.collectedAt) > Date.parse(retained.collectedAt),
+          ...OURA_BROWSER_HISTORY_POLICY,
+        },
+      );
+      if (!verdict.covered)
+        return { ok: false, reason: verdict.reason!, scope };
+    }
     const served = await options.legacyScopeView?.readLatest(scope);
     if (
       served?.kind === "refused" &&
-      !["no_connection", "no_synced_data"].includes(served.refusal.reason)
+      !["no_connection", "no_synced_data"].includes(served.refusal.reason) &&
+      !(retained && served.refusal.reason === "canonical_view_incomplete")
     )
       return { ok: false, reason: "canonical_view_unavailable", scope };
     if (served?.kind === "canonical") {
