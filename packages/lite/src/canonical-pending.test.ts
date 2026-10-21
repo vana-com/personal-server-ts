@@ -273,6 +273,101 @@ it("keeps pending blob bytes behind the same policy and hides quarantined bytes"
   ).rejects.toThrow("quarantined");
 });
 
+it.each(["delete", "equivocation"] as const)(
+  "serves pending blob bytes only while a visible pending record references them (%s)",
+  async (later) => {
+    const { sha256 } = await import("viem");
+    const { make } = device();
+    const store = make();
+    await provision(store);
+    const bytes = new TextEncoder().encode("pending bytes");
+    const hash = `sha256:${sha256(bytes).slice(2)}`;
+    const blob = {
+      blobId: hash,
+      sha256: hash,
+      mimeType: "text/plain",
+      sizeBytes: bytes.length,
+    };
+    const stagingId = await store.stageBlob(
+      blob,
+      (async function* () {
+        yield bytes;
+      })(),
+    );
+    const record = upsert("record", 3);
+    record.blobs = [blob];
+    record.data.blob_ref = { blob_id: hash };
+    const batch = (id: string, operations: unknown[]) => ({
+      id,
+      credential: "replica",
+      envelope: {
+        format: "vana-pdpp-replica",
+        version: 1,
+        owner: identity.owner,
+        batchId: id,
+        operations,
+      },
+    });
+    await store.stagePending({
+      ...batch("first", [
+        registration,
+        {
+          ...identity,
+          kind: "blob-claim",
+          revision: {
+            counter: 2,
+            writerId: "device-a",
+            operationId: "claim",
+          },
+          blob,
+        },
+        record,
+      ]),
+      blobs: [{ stagingId, descriptor: blob }],
+    });
+    const owner = async () => {
+      const parts: Uint8Array[] = [];
+      for await (const part of store.readBlob(hash, { reader: "owner" }))
+        parts.push(part);
+      return parts;
+    };
+    expect(await owner()).toEqual([bytes]);
+    // A winning pending deletion, or an operation-ID variant that hides the
+    // record, leaves the blob batch active but removes its only reference.
+    await store.stagePending(
+      batch("second", [
+        later === "delete"
+          ? {
+              ...identity,
+              kind: "delete",
+              declaration: binding,
+              recordKey: "same-key",
+              emittedAt: record.emittedAt,
+              deletedAt: record.emittedAt,
+              revision: {
+                counter: 4,
+                writerId: "device-a",
+                operationId: "delete",
+              },
+            }
+          : {
+              ...record,
+              data: { id: "same-key", text: "variant" },
+              blobs: [],
+            },
+      ]),
+    );
+    await expect(owner(), later).rejects.toThrow("missing committed blob");
+    // Withdrawing the later batch restores the reference and the bytes.
+    await store.quarantinePending({
+      id: "second",
+      credential: "replica",
+      reason: "later finalized version",
+    });
+    expect(await owner(), later).toEqual([bytes]);
+  },
+);
+
 it("atomically exposes pending blob bytes to grants on promotion", async () => {
   const { sha256 } = await import("viem");
   const { make } = device();

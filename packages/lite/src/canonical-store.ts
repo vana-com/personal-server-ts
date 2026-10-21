@@ -1401,11 +1401,34 @@ export function createLiteCanonicalStore(deps: {
           !replicaStateVisible("pending", options.reader, deps.visibilityPolicy)
         )
           return false;
-        await readView(tx, options);
-        return (
-          (await tx.scan(`pending-blob-active/${keyDigest(blobId)}/`)).entries
-            .length > 0
-        );
+        // Pending bytes need a live reference this reader sees, as on Node. An
+        // active batch alone is not one: a later pending deletion or an
+        // operation-ID variant can hide the only record that references them.
+        const view = await readView(tx, options);
+        for await (const active of scan(
+          tx,
+          `pending-blob-active/${keyDigest(blobId)}/`,
+        )) {
+          const batch = await get<PendingBatch>(
+            tx,
+            `pending-batches/${active.key.slice(active.key.lastIndexOf("/") + 1)}`,
+          );
+          for (const op of batch?.envelope.operations ?? []) {
+            if (
+              op.kind !== "upsert" ||
+              !op.blobs.some((blob) => blob.blobId === blobId)
+            )
+              continue;
+            const row = await get<PdppRecordRow>(
+              view,
+              rowKey(op.connectionId, op.declaration.stream, op.recordKey),
+            );
+            if (!row || row.deleted) continue;
+            const ref = row.data.blob_ref as { blob_id?: unknown } | undefined;
+            if (ref?.blob_id === blobId) return true;
+          }
+        }
+        return false;
       });
       if (!visible) throw new Error("missing committed blob");
       yield* persistence.readBlob(blobId);
