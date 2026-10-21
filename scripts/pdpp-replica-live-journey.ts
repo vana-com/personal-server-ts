@@ -37,6 +37,11 @@ import { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-rec
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../packages/server/src/storage/pdpp-replication-transport.js";
 
+// This Linux harness samples /proc and must not persist keys in a crash dump.
+if (process.platform !== "linux")
+  throw new Error("Live harness requires Linux");
+execFileSync("prlimit", ["--pid", String(process.pid), "--core=0:0"]);
+
 const gatewayUrl = "https://dp-rpc-dev.vana.org";
 const storageUrl = "https://storage-dev.vana.org";
 const rpcUrl = "https://rpc.moksha.vana.org";
@@ -84,7 +89,13 @@ function serverAccount(key: Hex) {
       ),
   };
 }
-type Init = { root: string; owner: Hex; master: number[]; serverKey: Hex };
+type Init = {
+  root: string;
+  owner: Hex;
+  master: number[];
+  serverKey: Hex;
+  scriptSha256: string;
+};
 type HostRequest = {
   id: number;
   command: string;
@@ -97,7 +108,17 @@ type Snapshot = {
   importedFragments: number;
   stagedFragments: number;
   pid: number;
-  evidence: unknown[];
+  evidence: {
+    head: { scope: string } | null;
+    chain: {
+      status: string;
+      currentVersion: string;
+      blockNumber: string;
+      blockHash: string;
+      commitment: string;
+    } | null;
+  }[];
+  importedScopes: string[];
   importedBatches: number;
   received: number;
   journal: number;
@@ -111,6 +132,7 @@ type Snapshot = {
   receivedOperations: ReplicaOperation[];
   staged: { scope: string; writer: string; batch: string }[];
   gets: { scope: string; attempts: number }[];
+  puts: { scope: string; sha256: string; attempts: number }[];
   inboxErrors: unknown[];
   quarantines: number;
   wire: unknown[];
@@ -119,6 +141,11 @@ type Snapshot = {
 async function host() {
   const init = await new Promise<Init>((resolve) =>
     process.once("message", (m) => resolve(m as Init)),
+  );
+  assert.equal(
+    digest(readFileSync(fileURLToPath(import.meta.url))),
+    init.scriptSha256,
+    "Harness changed during run",
   );
   mkdirSync(init.root, { recursive: true, mode: 0o700 });
   const db = new Database(join(init.root, "records.sqlite"));
@@ -192,6 +219,22 @@ async function host() {
   db.exec(
     "CREATE TABLE IF NOT EXISTS harness_gets (scope TEXT PRIMARY KEY, attempts INTEGER NOT NULL)",
   );
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS harness_puts (scope TEXT NOT NULL, sha256 TEXT NOT NULL)",
+  );
+  let killPut = false;
+  const putFragment = transport.put;
+  transport.put = async (part) => {
+    db.prepare("INSERT INTO harness_puts VALUES (?,?)").run(
+      part.scope,
+      digest(part.encrypted),
+    );
+    await putFragment(part);
+    if (killPut) {
+      process.send?.({ checkpoint: "put-complete", scope: part.scope });
+      await new Promise(() => {});
+    }
+  };
   let killImportRecord: string | undefined;
   const importReplica = receiver.import;
   receiver.import = (input) => {
@@ -204,6 +247,28 @@ async function host() {
     )
       process.kill(process.pid, "SIGKILL");
     return result;
+  };
+  let bodyBarrier: { url: string; scope: string } | undefined;
+  const hostFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const response = await hostFetch(input, init);
+    const url = input instanceof Request ? input.url : String(input);
+    if (
+      bodyBarrier &&
+      url === bodyBarrier.url &&
+      (init?.method ?? "GET") === "GET"
+    ) {
+      assert(response.ok && response.body);
+      const first = await response.body.getReader().read();
+      assert(!first.done && first.value.length > 0);
+      process.send?.({
+        checkpoint: "download",
+        scope: bodyBarrier.scope,
+        bytesStarted: first.value.length,
+      });
+      await new Promise(() => {});
+    }
+    return response;
   };
   let killScopes = new Set<string>();
   let stopAtDownload = 0,
@@ -218,16 +283,7 @@ async function host() {
       killScopes.has(scope) &&
       ++downloads === stopAtDownload
     ) {
-      const response = await boundedFetch(storage.urlForKey(`${scope}/1`));
-      assert(response.ok && response.body);
-      const first = await response.body.getReader().read();
-      assert(!first.done && first.value.length > 0);
-      process.send?.({
-        checkpoint: "download",
-        scope,
-        bytesStarted: first.value.length,
-      });
-      await new Promise(() => {}); // Parent sends real SIGKILL while a durable partial batch exists.
+      bodyBarrier = { url: storage.urlForKey(`${scope}/1`), scope };
     }
     return get(scope);
   };
@@ -287,6 +343,13 @@ async function host() {
     }
     return {
       pid: process.pid,
+      importedScopes: (
+        db
+          .prepare(
+            "SELECT scope FROM pdpp_transport_inbox WHERE state='imported'",
+          )
+          .all() as { scope: string }[]
+      ).map((r) => r.scope),
       receivedOperations: (
         db
           .prepare("SELECT operation_json FROM pdpp_replica_received")
@@ -298,6 +361,11 @@ async function host() {
         )
         .all() as Snapshot["staged"],
       gets: db.prepare("SELECT * FROM harness_gets").all() as Snapshot["gets"],
+      puts: db
+        .prepare(
+          "SELECT scope,sha256,COUNT(*) AS attempts FROM harness_puts GROUP BY scope,sha256",
+        )
+        .all() as Snapshot["puts"],
       inboxErrors: db
         .prepare(
           "SELECT state,error,COUNT(*) AS n FROM pdpp_transport_inbox WHERE error IS NOT NULL OR state='quarantined' GROUP BY state,error",
@@ -385,6 +453,9 @@ async function host() {
         stopAtDownload = Number(args.after);
         killScopes = new Set(args.scopes as string[]);
         downloads = 0;
+        result = true;
+      } else if (command === "armPutKill") {
+        killPut = true;
         result = true;
       } else if (command === "armImportKill") {
         killImportRecord = String(args.id);
@@ -550,6 +621,7 @@ async function main() {
         owner,
         master,
         serverKey: generatePrivateKey(),
+        scriptSha256: digest(readFileSync(fileURLToPath(import.meta.url))),
       }),
   );
   const [a, b] = devices;
@@ -566,6 +638,18 @@ async function main() {
     }).trim(),
     harnessSha256: digest(readFileSync(fileURLToPath(import.meta.url))),
     node: process.version,
+    dirtyTree: execFileSync(
+      "git",
+      [
+        "status",
+        "--porcelain",
+        "--",
+        "packages",
+        "scripts/pdpp-replica-live-journey.ts",
+      ],
+      { encoding: "utf8" },
+    ).trim(),
+    retryableCycleErrors: {} as Record<string, number>,
     hostHeapMiB: 2048,
     hostRssBudgetKiB: 3 * 1024 * 1024,
     chunkBytes: 4 * 1024 * 1024,
@@ -590,6 +674,9 @@ async function main() {
           await d.call("cycle");
         } catch (error) {
           if (!d.child.connected) throw error;
+          (report.retryableCycleErrors as Record<string, number>)[label] =
+            ((report.retryableCycleErrors as Record<string, number>)[label] ??
+              0) + 1;
           console.log(
             JSON.stringify({
               stage: label,
@@ -675,6 +762,55 @@ async function main() {
     }
     await a.start();
     await b.start();
+    if (process.argv.includes("--put-retry-only")) {
+      await a.call("put", {
+        id: "retry",
+        text: "exact durable ciphertext retry",
+      });
+      await a.call("armPutKill");
+      const checkpoint = new Promise<void>((resolve) => {
+        a.checkpoint = resolve;
+      });
+      const interrupted = a.call("cycle").catch((error: unknown) => error);
+      await Promise.race([
+        checkpoint,
+        interrupted.then(() => {
+          throw new Error("No PUT checkpoint");
+        }),
+      ]);
+      const before = await a.call("snapshot");
+      assert.equal(before.puts.length, 1);
+      assert.equal(before.puts[0].attempts, 1);
+      await a.kill();
+      await interrupted;
+      a.checkpoint = undefined;
+      await a.start();
+      const retained = await a.call("snapshot");
+      assert.notEqual(retained.pid, before.pid);
+      assert.equal(retained.writer, before.writer);
+      assert.deepEqual(retained.wire, before.wire);
+      const resumed = await settle(
+        "exact PUT retry",
+        (x, y) => !!y.records.retry && x.pending === 0,
+      );
+      const retried = resumed.A.puts.filter(
+        (row) => row.scope === before.puts[0].scope,
+      );
+      assert.equal(retried.length, 1);
+      assert.equal(retried[0].sha256, before.puts[0].sha256);
+      assert.equal(retried[0].attempts, 2);
+      assert.deepEqual(resumed.A.records, resumed.B.records);
+      cases.push({
+        case: "exact-byte-put-retry",
+        status: "passed",
+        killedPid: before.pid,
+        restartedPid: retained.pid,
+        retried,
+        ...resumed,
+      });
+      report.status = "passed";
+      return;
+    }
     await a.call("put", { id: "a", text: "A to B" });
     const blob = await a.call<{
       blobId: string;
@@ -776,7 +912,16 @@ async function main() {
     assert.equal(retained.history, partial.history);
     await b.call("armImportKill", { id: "large" });
     const transactionPid = b.child.pid;
-    await assert.rejects(b.call("cycle"), /Host exited \(SIGKILL\)/);
+    const importKillDeadline = Date.now() + 12 * 60_000;
+    while (b.child.connected && Date.now() < importKillDeadline) {
+      try {
+        await b.call("cycle");
+      } catch {
+        if (!b.child.connected) break;
+      }
+      if (b.child.connected) await pause(5000);
+    }
+    assert(!b.child.connected, "Import SIGKILL deadline exceeded");
     assert.equal(b.child.signalCode, "SIGKILL");
     await b.start();
     const rolledBack = await b.call("snapshot");
@@ -858,6 +1003,11 @@ async function main() {
       (op) => op.kind === "upsert" && op.recordKey === "conflict",
     );
     assert.equal(contenders.length, 2);
+    assert.equal(
+      contenders[0].revision.counter,
+      contenders[1].revision.counter,
+      "Writer tie-break must be exercised",
+    );
     contenders.sort((left, right) => {
       for (const key of ["counter", "writerId", "operationId"] as const) {
         if (left.revision[key] < right.revision[key]) return -1;
@@ -910,9 +1060,48 @@ async function main() {
         Object.keys(y.records).length === 0 &&
         y.pending === 0,
     );
-    cases.push({ case: 5, status: "passed", conflict, deletion, reset });
+    await a.call("cycle");
+    await b.call("cycle");
+    assert.deepEqual((await a.call("snapshot")).records, {});
+    assert.deepEqual((await b.call("snapshot")).records, {});
+    await a.call("put", { id: "generation2", text: "after reset" });
+    const generation2 = await settle(
+      "generation 2",
+      (x, y) => !!y.records.generation2 && x.pending === 0,
+    );
+    assert.deepEqual(generation2.A.records, generation2.B.records);
+    assert.deepEqual(Object.keys(generation2.A.records), ["generation2"]);
+    cases.push({
+      case: 5,
+      status: "passed",
+      resetClaim:
+        "Live canonical view and generation converge; retained transport/history bytes are not erased",
+      counterTie: true,
+      revisions: contenders.map((op) => op.revision),
+      winner: winner.revision,
+      conflict,
+      deletion,
+      reset,
+      generation2,
+    });
     for (const d of devices) {
       const final = await d.call("snapshot");
+      const scopes = [
+        ...final.importedScopes,
+        ...(final.wire as { scope: string; state: string }[])
+          .filter((r) => r.state === "published")
+          .map((r) => r.scope),
+      ];
+      for (const scope of scopes) {
+        const evidence = final.evidence.find(
+          (row) => row.head?.scope === scope,
+        );
+        assert(evidence?.chain);
+        assert.equal(evidence.chain.status, "Active");
+        assert.equal(evidence.chain.currentVersion, "1");
+        assert(/^\d+$/.test(evidence.chain.blockNumber));
+        assert(/^0x[0-9a-fA-F]{64}$/.test(evidence.chain.blockHash));
+      }
       assert.equal(final.quarantines, 0);
       assert.deepEqual(final.inboxErrors, []);
     }

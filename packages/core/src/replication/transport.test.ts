@@ -1,5 +1,9 @@
 import { expect, it } from "vitest";
-import { fragmentReplicaPayload, replicaScope } from "./transport.js";
+import {
+  fragmentReplicaPayload,
+  replicaScope,
+  fromBase64,
+} from "./transport.js";
 
 it("fragments a large export without changing bytes or exceeding encrypted cap", async () => {
   const bytes = new TextEncoder().encode("😺large JSON record".repeat(2000));
@@ -233,4 +237,40 @@ it("quarantines a finalized tombstone-at-version-1 against the durable replica h
       metadataHash: `0x${"b".repeat(64)}`,
     }),
   ).toBe("conflict");
+});
+
+it("decodes a binary replica payload within a 192 MiB Node heap", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const url = new URL("./transport.ts", import.meta.url).href;
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--max-old-space-size=192",
+      "--import",
+      "tsx",
+      "--input-type=module",
+      "-e",
+      `import {fromBase64} from ${JSON.stringify(url)};
+     import {createHash} from 'node:crypto';
+     const original = Buffer.alloc(16 * 1024 * 1024, 31);
+     const actual = fromBase64(original.toString('base64'));
+     const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+     if(hash(actual) !== hash(original)) throw new Error('binary digest changed');
+     console.log(JSON.stringify({bytes:actual.length,peakRssKiB:process.resourceUsage().maxRSS}));`,
+    ],
+    { encoding: "utf8", timeout: 30000, maxBuffer: 16384 },
+  );
+  expect(child.status, child.stderr.slice(-2000)).toBe(0);
+  const result = JSON.parse(child.stdout) as {
+    bytes: number;
+    peakRssKiB: number;
+  };
+  expect(result.bytes).toBe(16 * 1024 * 1024);
+  expect(result.peakRssKiB).toBeLessThan(512 * 1024);
+}, 35000);
+
+it("keeps canonical base64 validation when decoding binary payloads", () => {
+  expect(fromBase64("YQ==")).toEqual(new Uint8Array([97]));
+  for (const value of ["YQ", "YR==", "YQ==\n"])
+    expect(() => fromBase64(value)).toThrow("noncanonical base64");
 });

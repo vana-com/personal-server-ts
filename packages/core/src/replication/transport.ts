@@ -58,7 +58,10 @@ export function toBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 export function fromBase64(value: string): Uint8Array {
-  const bytes = Uint8Array.from(atob(value), (c) => c.charCodeAt(0));
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++)
+    bytes[index] = binary.charCodeAt(index);
   if (toBase64(bytes) !== value) throw new Error("noncanonical base64");
   return bytes;
 }
