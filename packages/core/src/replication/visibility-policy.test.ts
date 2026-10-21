@@ -41,3 +41,16 @@ it("defaults grants to confirmed-only and owners to pending preview", () => {
   expect(replicaStateVisible("pending")).toBe(false);
   expect(replicaStateVisible("pending", "owner")).toBe(true);
 });
+
+for (const policy of cases)
+  for (const reader of ["owner", "grant"] as const)
+    for (const origin of ["local", "received"] as const)
+      it(`${policy.owner}/${policy.grant}: conflicted ${reader} ${origin}`, () => {
+        expect(replicaStateVisible("conflicted", reader, policy, origin)).toBe(
+          reader === "owner" && origin === "local",
+        );
+      });
+
+it("does not infer local provenance for a conflicted record", () => {
+  expect(replicaStateVisible("conflicted", "owner")).toBe(false);
+});
