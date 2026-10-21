@@ -2012,3 +2012,64 @@ describe("i [Node SQLite] a canonical write validated against another declaratio
     expect(exported(d)).toBe(before + 1);
   });
 });
+
+// ============================================================================
+// Token binding: the store binds and validates canonical changes tokens
+// ============================================================================
+
+describe("token binding [Node SQLite transport]: a binding-conflict fact expires both changes tokens", () => {
+  for (const reader of ["owner", "grant"] as const)
+    it(`[${reader}] a page cursor and a session token each expire after markReplicaBindingConflict`, async () => {
+      const net = network();
+      const d = transportDevice(net);
+      for (const key of ["a", "b", "c"]) d.put(`text ${key}`, key);
+      const read = () => d.receiver.readStore({ reader });
+      const options = { instanceIds: [d.instance], limit: 1 };
+      const page = read().changesSince("messages", options);
+      expect(page.nextCursor).toBeDefined();
+      const session = read().changesSince("messages", {
+        ...options,
+        limit: 100,
+      }).nextChangesSince;
+      expect(session).toBeDefined();
+      // Both are valid before the fact.
+      expect(() =>
+        read().changesSince("messages", {
+          ...options,
+          cursor: page.nextCursor,
+        }),
+      ).not.toThrow();
+      d.store.markReplicaBindingConflict({
+        connectionId: d.instance,
+        reason: "source_binding_conflict",
+        evidence: {},
+      });
+      expect(() =>
+        read().changesSince("messages", {
+          ...options,
+          cursor: page.nextCursor,
+        }),
+      ).toThrow(CursorExpiredError);
+      expect(() =>
+        read().changesSince("messages", { ...options, changesSince: session }),
+      ).toThrow(CursorExpiredError);
+    });
+  it("the store's own tokens: an epoch bump between pages, and between session start and the first page", () => {
+    const net = network();
+    const d = transportDevice(net);
+    for (const key of ["a", "b", "c"]) d.put(`text ${key}`, key);
+    const options = { instanceIds: [d.instance], limit: 1 };
+    const page = d.store.changesSince("messages", options);
+    const session = d.store.changesSince("messages", {
+      ...options,
+      limit: 100,
+    }).nextChangesSince;
+    d.db.transaction(() => d.store.fenceReplicaConnection(d.instance))();
+    expect(() =>
+      d.store.changesSince("messages", { ...options, cursor: page.nextCursor }),
+    ).toThrow(CursorExpiredError);
+    expect(() =>
+      d.store.changesSince("messages", { ...options, changesSince: session }),
+    ).toThrow(CursorExpiredError);
+  });
+});
