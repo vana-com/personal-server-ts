@@ -770,3 +770,42 @@ it("keeps Unicode byte-edge names and literal hash-looking sources collision-sep
   );
   expect(additionsLedgerScope(long + " ")).not.toBe(hashed);
 });
+
+it.each(["confirmed", "pending"])(
+  "keeps the readable checkpoint when a %s tombstone is retained above the authoritative head and sources are pruned",
+  async (status) => {
+    const f = await fixture();
+    await f.source("1", T1, ["a"]);
+    const first = await f.actor().summarize(QUERY);
+    expect(first).toMatchObject({ coverage: "complete", total: 1 });
+    const ledgerScope = additionsLedgerScope(SOURCE);
+    const head = (await f.readRegistry())[ledgerScope]?.versions.at(-1);
+    if (!head) throw new Error("Fixture missing checkpoint");
+    const before = await f.document(ledgerScope);
+    // A rollback leaves the higher tombstone in the inventory but moves the head back.
+    await f.setSlot(
+      ledgerScope,
+      {
+        expectedVersion: String(BigInt(head.expectedVersion) + 1n),
+        dataHash:
+          "0x30c45ee72fe56d1927701316925ab7ceacd3b6f9267061735d59396f075c6222",
+        metadataHash:
+          "0xc5255a141acd6a2ae55971b62c0a85977c2511989dc114ad2abc2b7644f57d90",
+        status,
+        addedAt: T2,
+        isTombstone: true,
+      },
+      T2,
+    );
+    await f.setSlot(ledgerScope, head);
+    await rm(f.blobPath(`${SOURCE}/1`));
+    const next = await f.actor().summarize(QUERY);
+    expect(next).toMatchObject({
+      coverage: "complete",
+      total: 1,
+      through: { [SOURCE]: "1" },
+    });
+    expect(next.days.map((day) => day.added)).toEqual([1, 0, 0, 0]);
+    expect(await f.document(ledgerScope)).toEqual(before);
+  },
+);

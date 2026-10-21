@@ -329,9 +329,17 @@ export function createDurableAdditions(
     const systemScope = additionsLedgerScope(scope);
     const snapshot = await inventory.list(systemScope, budget.readOptions);
     if (!snapshot.head || snapshot.head.deletedAt !== null) return null;
+    // Same visibility as source recovery: only settled tombstones at or below the head delete history.
     const boundary =
-      snapshot.versions.filter((row) => row.isTombstone).at(-1)
-        ?.expectedVersion ?? "0";
+      snapshot.versions
+        .filter(
+          (row) =>
+            row.isTombstone &&
+            settled(row) &&
+            BigInt(row.expectedVersion) <=
+              BigInt(snapshot.head!.expectedVersion),
+        )
+        .at(-1)?.expectedVersion ?? "0";
     let inaccessible = false;
     for (const slot of [...snapshot.versions].reverse()) {
       if (
