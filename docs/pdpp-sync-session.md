@@ -118,7 +118,12 @@ a changed `limit`, retries, and a SQLite restart followed by a reset.
 - Paused scans are compare-and-set: a request saves or ends a scan only if no
   other request moved it since it was resumed, so a stale request cannot
   overwrite newer progress or revive a finished scan. Two identical requests
-  at once can still both do the same work.
+  at once can still both do the same work. Two cases stay open, and neither
+  serves wrong data: two requests that both start with no paused scan can
+  leave the slower one's pause behind after the faster finishes, and a later
+  identical request then resumes that older, still consistent scan; and a
+  stale request can overwrite a newer scan only when it is byte-identical,
+  which means the same scan at the same horizon.
 - A current-profile page that examines its whole work budget without filling
   still ends early with `has_more: true`, possibly empty. Moving current
   clients to `429` would be a visible change, so this stays a deliberate

@@ -340,6 +340,87 @@ for (const backend of ["memory", "sqlite"])
   });
 
 describe("sqlite sync session state", () => {
+  it("rejects a stale pause across two connections to one database", async () => {
+    const { mkdtemp, rm } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-sync-race-"));
+    const path = join(dir, "records.db");
+    const request = {
+      stream: "events",
+      owner: "owner-a",
+      instanceIds: ["inst_1"],
+      limit: 10,
+      candidate: { binding: "grant-1", order: "asc" as const },
+    };
+    const one = createTestBoundRecordStore(new Database(path));
+    const two = createTestBoundRecordStore(new Database(path));
+    try {
+      one.ingestBatch(
+        ["a", "b", "c", "d", "e", "f"].map((key) => ({
+          instance: "inst_1",
+          stream: "events",
+          key,
+          data: { id: key },
+          emitted_at: "2026-01-01T00:00:00Z",
+        })),
+        () => "mutable_state",
+        () => ["id"],
+      );
+      let interleave: (() => void) | undefined;
+      const racing: PdppRecordStore = {
+        ...one,
+        readSyncWindow: (stream, window, read) =>
+          one.readSyncWindow(stream, window, (w) => {
+            const other = interleave;
+            interleave = undefined;
+            other?.();
+            return read(w);
+          }),
+      };
+      const slow = createPdppSyncSessionService(racing, {
+        maxExaminedPerRequest: 2,
+      });
+      const other = createPdppSyncSessionService(two, {
+        maxExaminedPerRequest: 100,
+      });
+      expect(() => slow.read(request)).toThrow(SyncRetryLaterError);
+      // While connection one resumes the paused scan, connection two resumes
+      // the same scan from the shared table and finishes the session.
+      interleave = () => expect(other.read(request).data).toHaveLength(6);
+      expect(() => slow.read(request)).toThrow(SyncRetryLaterError);
+      // The stale pause wrote nothing: no paused scan is left to resume.
+      const left = new Database(path, { readonly: true });
+      try {
+        expect(
+          left
+            .prepare(
+              "SELECT COUNT(*) AS n FROM pdpp_sync_state WHERE id LIKE 'scan:%'",
+            )
+            .get(),
+        ).toEqual({ n: 0 });
+      } finally {
+        left.close();
+      }
+
+      const fresh = createPdppSyncSessionService(two, {
+        maxExaminedPerRequest: 100,
+      });
+      expect(fresh.read(request).data.map((r) => r.recordKey)).toEqual([
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+        "f",
+      ]);
+    } finally {
+      one.close();
+      two.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a candidate checkpoint usable across a store restart", async () => {
     const { mkdtemp, rm } = await import("node:fs/promises");
     const { join } = await import("node:path");

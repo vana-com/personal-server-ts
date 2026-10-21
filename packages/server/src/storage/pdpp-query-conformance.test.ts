@@ -429,52 +429,57 @@ it("expires a list cursor minted under timestamp-text order instead of resuming 
   }
 });
 
-it("does not count a same-key record erased after the horizon as a conflict", () => {
-  for (const store of stores()) {
-    try {
-      for (const [instance, key] of [
-        ["inst_1", "a"],
-        ["inst_1", "k"],
-        ["inst_2", "k"],
-      ] as const)
-        store.ingestBatch(
-          [
-            {
-              instance,
-              stream: "events",
-              key,
-              data: { id: key, from: instance },
-              emitted_at: "2026-04-01T00:00:00Z",
-            },
-          ],
-          () => "mutable_state",
-          () => ["id"],
+it.each(["asc", "desc"] as const)(
+  "does not count a same-key record erased after the horizon as a conflict (%s)",
+  (order) => {
+    for (const store of stores()) {
+      try {
+        for (const [instance, key] of [
+          ["inst_1", order === "asc" ? "a" : "z"],
+          ["inst_1", "k"],
+          ["inst_2", "k"],
+        ] as const)
+          store.ingestBatch(
+            [
+              {
+                instance,
+                stream: "events",
+                key,
+                data: { id: key, from: instance },
+                emitted_at: "2026-04-01T00:00:00Z",
+              },
+            ],
+            () => "mutable_state",
+            () => ["id"],
+          );
+        const options = {
+          instanceIds: ["inst_1", "inst_2"],
+          limit: 1,
+          order,
+          oneRecordPerKey: true,
+        };
+        const first = store.listRecords("events", options);
+        expect(first.data.map((r) => r.recordKey)).toEqual([
+          order === "asc" ? "a" : "z",
+        ]);
+        store.deleteRecord(
+          "inst_1",
+          "events",
+          "k",
+          "2026-04-02T00:00:00Z",
+          "mutable_state",
         );
-      const options = {
-        instanceIds: ["inst_1", "inst_2"],
-        limit: 1,
-        order: "asc" as const,
-        oneRecordPerKey: true,
-      };
-      const first = store.listRecords("events", options);
-      expect(first.data.map((r) => r.recordKey)).toEqual(["a"]);
-      store.deleteRecord(
-        "inst_1",
-        "events",
-        "k",
-        "2026-04-02T00:00:00Z",
-        "mutable_state",
-      );
-      // inst_1's k is withheld as erased, so inst_2's k names one record.
-      const second = store.listRecords("events", {
-        ...options,
-        cursor: first.nextCursor,
-      });
-      expect(second.data.map((r) => [r.instance, r.recordKey])).toEqual([
-        ["inst_2", "k"],
-      ]);
-    } finally {
-      store.close();
+        // inst_1's k is withheld as erased, so inst_2's k names one record.
+        const second = store.listRecords("events", {
+          ...options,
+          cursor: first.nextCursor,
+        });
+        expect(second.data.map((r) => [r.instance, r.recordKey])).toEqual([
+          ["inst_2", "k"],
+        ]);
+      } finally {
+        store.close();
+      }
     }
-  }
-});
+  },
+);
