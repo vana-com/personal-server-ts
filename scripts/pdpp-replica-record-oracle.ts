@@ -9,6 +9,11 @@ export type CanonicalRecord = {
   blob_id: string | null;
 };
 
+export type ReplicaBlobMap = Record<
+  string,
+  { sha256: string; bytes: number } | { unavailable: true }
+>;
+
 export const CANONICAL_RECORD_COLUMNS = [
   "instance",
   "stream",
@@ -195,4 +200,64 @@ export function canonicalRecordsEqual(
     JSON.stringify(sortCanonicalRecords(left)) ===
     JSON.stringify(sortCanonicalRecords(right))
   );
+}
+
+export function assertReplicaSnapshotsEqual(
+  expected: {
+    canonicalRecords: readonly CanonicalRecord[];
+    blobs: ReplicaBlobMap;
+  },
+  actual: {
+    canonicalRecords: readonly CanonicalRecord[];
+    blobs: ReplicaBlobMap;
+  },
+): void {
+  assertCanonicalRecordsEqual(
+    expected.canonicalRecords,
+    actual.canonicalRecords,
+  );
+  assertBlobBytesAvailable(expected.blobs);
+  assertBlobBytesAvailable(actual.blobs);
+  if (!blobMapsEqual(expected.blobs, actual.blobs)) {
+    throw new Error(
+      `Replica blob mismatch:\nexpected ${JSON.stringify(expected.blobs)}\nactual ${JSON.stringify(actual.blobs)}`,
+    );
+  }
+}
+
+export function assertBlobBytesAvailable(blobs: ReplicaBlobMap): void {
+  const unavailable = Object.entries(blobs)
+    .filter(([, value]) => "unavailable" in value)
+    .map(([blobId]) => blobId);
+  if (unavailable.length > 0) {
+    throw new Error(
+      `Referenced blob bytes failed verification: ${unavailable.join(", ")}`,
+    );
+  }
+}
+
+export function blobMapsEqual(
+  left: ReplicaBlobMap,
+  right: ReplicaBlobMap,
+): boolean {
+  const stable = (blobs: ReplicaBlobMap) =>
+    Object.fromEntries(
+      Object.entries(blobs).sort(([leftId], [rightId]) =>
+        compareText(leftId, rightId),
+      ),
+    );
+  return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
+}
+
+export function blobMatches(
+  blobs: ReplicaBlobMap,
+  blobId: string,
+  sha256: string,
+): boolean {
+  const blob = blobs[blobId];
+  return !!blob && "sha256" in blob && blob.sha256 === sha256;
+}
+
+export function blobsVerified(blobs: ReplicaBlobMap): boolean {
+  return Object.values(blobs).every((value) => !("unavailable" in value));
 }

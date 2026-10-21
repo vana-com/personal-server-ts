@@ -38,9 +38,12 @@ import { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-rec
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../packages/server/src/storage/pdpp-replication-transport.js";
 import {
-  assertCanonicalRecordsEqual,
+  assertReplicaSnapshotsEqual,
   CANONICAL_RECORD_COLUMNS,
   canonicalRecordsEqual,
+  blobMapsEqual,
+  blobMatches,
+  blobsVerified,
   projectCanonicalRecords,
   type CanonicalRecord,
 } from "./pdpp-replica-record-oracle.js";
@@ -150,46 +153,6 @@ type Snapshot = {
   quarantines: number;
   wire: unknown[];
 };
-
-function assertReplicaSnapshotsEqual(expected: Snapshot, actual: Snapshot) {
-  assertCanonicalRecordsEqual(
-    expected.canonicalRecords,
-    actual.canonicalRecords,
-  );
-  assertBlobBytesAvailable(expected.blobs);
-  assertBlobBytesAvailable(actual.blobs);
-  assert.deepEqual(expected.blobs, actual.blobs);
-}
-
-function assertBlobBytesAvailable(blobs: Snapshot["blobs"]) {
-  const unavailable = Object.entries(blobs)
-    .filter(([, value]) => "unavailable" in value)
-    .map(([blobId]) => blobId);
-  assert.deepEqual(
-    unavailable,
-    [],
-    "Referenced blob bytes failed verification",
-  );
-}
-
-function blobMapsEqual(left: Snapshot["blobs"], right: Snapshot["blobs"]) {
-  const stable = (blobs: Snapshot["blobs"]) =>
-    Object.fromEntries(
-      Object.entries(blobs).sort(([leftId], [rightId]) =>
-        leftId < rightId ? -1 : leftId > rightId ? 1 : 0,
-      ),
-    );
-  return JSON.stringify(stable(left)) === JSON.stringify(stable(right));
-}
-
-function blobMatches(blobs: Snapshot["blobs"], blobId: string, sha256: string) {
-  const blob = blobs[blobId];
-  return !!blob && "sha256" in blob && blob.sha256 === sha256;
-}
-
-function blobsVerified(blobs: Snapshot["blobs"]) {
-  return Object.values(blobs).every((value) => !("unavailable" in value));
-}
 
 async function host() {
   const init = await new Promise<Init>((resolve) =>

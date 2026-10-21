@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
   assertCanonicalRecordsEqual,
+  assertBlobBytesAvailable,
+  assertReplicaSnapshotsEqual,
   CANONICAL_RECORD_COLUMNS,
+  blobMapsEqual,
+  blobMatches,
+  blobsVerified,
   canonicalRecordsEqual,
   projectCanonicalRecords,
   type CanonicalRecord,
+  type ReplicaBlobMap,
 } from "./pdpp-replica-record-oracle.js";
 
 const record: CanonicalRecord = {
@@ -161,5 +167,68 @@ describe("canonical replica record equality", () => {
               : `${record[field] as string}-changed`,
     };
     expect(canonicalRecordsEqual([record], [changed])).toBe(false);
+  });
+});
+
+describe("replica blob byte equality", () => {
+  const blob = { sha256: "abc123", bytes: 4 };
+
+  it("rejects a hash or size mismatch", () => {
+    const expected = { canonicalRecords: [record], blobs: { blob } };
+    expect(
+      blobMapsEqual({ blob }, { blob: { ...blob, sha256: "other" } }),
+    ).toBe(false);
+    expect(blobMapsEqual({ blob }, { blob: { ...blob, bytes: 5 } })).toBe(
+      false,
+    );
+    expect(() =>
+      assertReplicaSnapshotsEqual(expected, {
+        ...expected,
+        blobs: { blob: { ...blob, sha256: "other" } },
+      }),
+    ).toThrow("Replica blob mismatch");
+    expect(() =>
+      assertReplicaSnapshotsEqual(expected, {
+        ...expected,
+        blobs: { blob: { ...blob, bytes: 5 } },
+      }),
+    ).toThrow("Replica blob mismatch");
+  });
+
+  it("rejects a blob missing from one replica", () => {
+    expect(blobMapsEqual({ blob: blob }, {})).toBe(false);
+    expect(() =>
+      assertReplicaSnapshotsEqual(
+        { canonicalRecords: [record], blobs: { blob } },
+        { canonicalRecords: [record], blobs: {} },
+      ),
+    ).toThrow("Replica blob mismatch");
+  });
+
+  it.each(["left", "right"] as const)(
+    "rejects unavailable bytes on the %s replica",
+    (side) => {
+      const left: ReplicaBlobMap =
+        side === "left" ? { blob: { unavailable: true } } : { blob };
+      const right: ReplicaBlobMap =
+        side === "right" ? { blob: { unavailable: true } } : { blob };
+      expect(blobsVerified(left)).toBe(side !== "left");
+      expect(blobsVerified(right)).toBe(side !== "right");
+      expect(() =>
+        assertBlobBytesAvailable(side === "left" ? left : right),
+      ).toThrow("Referenced blob bytes failed verification");
+      expect(() =>
+        assertReplicaSnapshotsEqual(
+          { canonicalRecords: [record], blobs: left },
+          { canonicalRecords: [record], blobs: right },
+        ),
+      ).toThrow("Referenced blob bytes failed verification");
+    },
+  );
+
+  it("rejects a verified blob with the wrong expected hash", () => {
+    expect(blobMatches({ blob }, "blob", "abc123")).toBe(true);
+    expect(blobMatches({ blob }, "blob", "wrong-hash")).toBe(false);
+    expect(blobMatches({}, "blob", "abc123")).toBe(false);
   });
 });
