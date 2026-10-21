@@ -25,6 +25,9 @@ import {
 import {
   CursorExpiredError,
   decodeCursor,
+  encodeCursor,
+  type ChangesSinceCursorPayload,
+  type ChangesSincePage,
   type ListRecordsOptions,
   type ChangesSinceOptions,
   type PdppVisibleRecord,
@@ -612,6 +615,55 @@ export function createReplicaReceiver(deps: {
       replicaStateVisible("pending", reader, deps.visibilityPolicy)
     );
   }
+  type IntegrityBoundChanges = ChangesSinceCursorPayload & {
+    integrity?: Record<string, number>;
+  };
+  /**
+   * Bind changes tokens to the integrity epoch of every requested connection,
+   * as page cursors are. A moved epoch (a quarantine, a terminal batch)
+   * expires both the page cursor and the session token, so a delta client
+   * resyncs instead of missing withdrawn rows. Without the store capability
+   * the store's reset fence alone applies. The field matches the one the
+   * synthesis lane's store binds into its own tokens.
+   */
+  function bindChangesIntegrity(
+    options: ChangesSinceOptions,
+    read: () => ChangesSincePage,
+  ): ChangesSincePage {
+    const epochOf = store.replicaIntegrityEpoch;
+    if (!epochOf) return read();
+    const integrity = JSON.stringify(
+      Object.fromEntries(
+        [...new Set(options.instanceIds)].sort().map((id) => [id, epochOf(id)]),
+      ),
+    );
+    for (const token of [options.cursor, options.changesSince]) {
+      if (!token) continue;
+      let payload: IntegrityBoundChanges;
+      try {
+        payload = decodeCursor(token) as IntegrityBoundChanges;
+      } catch {
+        continue; // The store refuses a malformed token as it does today.
+      }
+      if (
+        payload.kind === "changes_since" &&
+        JSON.stringify(payload.integrity ?? null) !== integrity
+      )
+        throw new CursorExpiredError();
+    }
+    const bind = (token: string | undefined) => {
+      if (!token) return token;
+      const payload = decodeCursor(token) as IntegrityBoundChanges;
+      payload.integrity = JSON.parse(integrity) as Record<string, number>;
+      return encodeCursor(payload);
+    };
+    const page = read();
+    return {
+      ...page,
+      nextCursor: bind(page.nextCursor),
+      nextChangesSince: bind(page.nextChangesSince),
+    };
+  }
   function readVisibleRecords(input: {
     reader?: ReplicaReader;
     connectionId: string;
@@ -894,7 +946,9 @@ export function createReplicaReceiver(deps: {
                   )
                 );
               });
-              return store.changesSinceForInstances(stream, options, visible);
+              return bindChangesIntegrity(options, () =>
+                store.changesSinceForInstances(stream, options, visible),
+              );
             })
             .immediate(),
         getBlobBytes: (id: string) =>

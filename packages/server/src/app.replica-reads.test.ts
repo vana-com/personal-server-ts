@@ -38,7 +38,10 @@ afterEach(() => {
   while (closers.length) closers.pop()!();
 });
 
-function host() {
+function host({
+  epoch,
+  conflictFacts = true,
+}: { epoch?: () => number; conflictFacts?: boolean } = {}) {
   const db = initializeDatabase(":memory:");
   const store = createSqliteRecordStore(db);
   store.registerConnection({ instance, sourceId, method, label: "A" });
@@ -47,12 +50,16 @@ function host() {
   ];
   store.replication.beginBaseline({ owner, declarations });
   // The durable source-conflict fact table belongs to the synthesis lane.
-  db.exec(
-    "CREATE TABLE pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY)",
-  );
+  if (conflictFacts)
+    db.exec(
+      "CREATE TABLE pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY)",
+    );
   const receiver = createReplicaReceiver({
     db,
-    store,
+    // The synthesis lane's integrity epoch is an optional store capability.
+    store: epoch
+      ? { ...store, replicaIntegrityEpoch: (_connection: string) => epoch() }
+      : store,
     owner,
     enabled: true,
     authenticate: () => owner,
@@ -186,6 +193,7 @@ function host() {
   });
   return {
     db,
+    store,
     receiver,
     get,
     envelope,
@@ -330,5 +338,179 @@ describe("createApp with an enabled replica receiver", () => {
       status: 503,
       body: { status: "unavailable", reason: "no_synced_data" },
     });
+  });
+
+  // Copy contract v3 A/H: a terminal batch quarantines every connection it
+  // touched. The write side inserts the existing connection-quarantine fact
+  // (`pdpp_replica_quarantined_connections`, the row `markReplicaBindingConflict`
+  // writes) and bumps the integrity epoch. It does not withdraw stored rows,
+  // claims or bytes, so every read surface must apply the predicate itself.
+  function quarantine(h: ReturnType<typeof host>) {
+    h.db
+      .prepare(
+        "INSERT OR IGNORE INTO pdpp_replica_quarantined_connections VALUES (?)",
+      )
+      .run(instance);
+  }
+  function importConfirmed(h: ReturnType<typeof host>) {
+    h.receiver.import({
+      credential: "x",
+      envelope: h.envelope("confirmed", [
+        h.registration,
+        h.claim("claim", 2),
+        h.row("confirmed-1", 3, "a1"),
+        h.row("confirmed-2", 4, "a2"),
+      ]),
+      blobs: [{ blobId: h.blobId, bytes: h.bytes }],
+    });
+  }
+
+  // Without the conflict-fact table the grant reader takes the canonical
+  // store's reference and byte paths, so cover both compositions.
+  it.each([true, false])(
+    "withdraws a quarantined connection's confirmed data from every surface for both readers (conflict facts: %s)",
+    async (conflictFacts) => {
+      const h = host({ conflictFacts });
+      importConfirmed(h);
+      // Control: both readers see the confirmed rows and canonical blob bytes.
+      for (const token of ["app", "owner"]) {
+        expect(
+          (await h.get(token, `/v1/streams/${stream}/records/a1`)).status,
+        ).toBe(200);
+        expect(await h.get(token, `/v1/blobs/${h.blobId}`)).toEqual({
+          status: 200,
+          body: "activity attachment",
+        });
+      }
+      expect(h.store.getBlobMeta(h.blobId)).toBeDefined();
+
+      quarantine(h);
+
+      for (const token of ["app", "owner"]) {
+        expect(
+          (await h.get(token, `/v1/streams/${stream}/records/a1`)).status,
+          `${token} point`,
+        ).toBe(404);
+        expect(
+          (await h.get(token, `/v1/streams/${stream}/records`)).body.data,
+          `${token} page`,
+        ).toEqual([]);
+        expect(
+          (await h.get(token, "/v1/streams")).body.data,
+          `${token} streams`,
+        ).toEqual([]);
+        expect(
+          (await h.get(token, `/v1/streams/${stream}/records?changes_since=`))
+            .body.data,
+          `${token} changes_since`,
+        ).toEqual([]);
+        // Metadata (HEAD), references and confirmed bytes (GET).
+        expect(
+          (await h.get(token, `/v1/blobs/${h.blobId}`, "HEAD")).status,
+          `${token} blob HEAD`,
+        ).toBe(404);
+        expect(
+          (await h.get(token, `/v1/blobs/${h.blobId}`)).status,
+          `${token} blob GET`,
+        ).toBe(404);
+      }
+      for (const read of ["owner", "grant"] as const) {
+        const reader = h.receiver.readStore({ reader: read });
+        expect(
+          reader.findBlobReferences(h.blobId),
+          `${read} references`,
+        ).toEqual([]);
+        expect(reader.listStreams([instance]), `${read} summaries`).toEqual([]);
+      }
+    },
+  );
+
+  it("withdraws a quarantined connection from legacy /v1/data", async () => {
+    const h = host();
+    // The legacy projection takes the declared Oura shape, without a blob.
+    h.receiver.import({
+      credential: "x",
+      envelope: h.envelope("confirmed", [
+        h.registration,
+        {
+          ...h.row("confirmed", 2, "a1"),
+          blobs: [],
+          data: {
+            id: "a1",
+            day: "2026-08-01",
+            score: 80,
+            steps: 1000,
+            contributors: {},
+          },
+        },
+      ]),
+    });
+    expect((await h.get("legacy-owner", "/v1/data")).body.scopes).toEqual([
+      expect.objectContaining({ scope: "oura.activity" }),
+    ]);
+    expect((await h.get("legacy-owner", "/v1/data/oura.activity")).status).toBe(
+      200,
+    );
+
+    quarantine(h);
+
+    expect((await h.get("legacy-owner", "/v1/data")).body.scopes).toEqual([]);
+    const after = await h.get("legacy-owner", "/v1/data/oura.activity");
+    expect(JSON.stringify(after.body)).not.toContain("2026-08-01");
+    expect(after).toMatchObject({
+      status: 503,
+      body: { status: "unavailable", reason: "no_synced_data" },
+    });
+  });
+
+  it("expires open page and changes cursors on every reader when the integrity epoch moves", async () => {
+    let epoch = 0;
+    const h = host({ epoch: () => epoch });
+    importConfirmed(h);
+    const open: [string, string][] = [];
+    for (const token of ["app", "owner"]) {
+      const page = await h.get(token, `/v1/streams/${stream}/records?limit=1`);
+      expect(page.body.next_cursor, `${token} page cursor`).toBeTruthy();
+      open.push([
+        token,
+        `/v1/streams/${stream}/records?limit=1&cursor=${encodeURIComponent(page.body.next_cursor)}`,
+      ]);
+      const changes = await h.get(
+        token,
+        `/v1/streams/${stream}/records?changes_since=&limit=1`,
+      );
+      expect(changes.body.next_cursor, `${token} changes cursor`).toBeTruthy();
+      open.push([
+        token,
+        `/v1/streams/${stream}/records?changes_since=&limit=1&cursor=${encodeURIComponent(changes.body.next_cursor)}`,
+      ]);
+      const session = await h.get(
+        token,
+        `/v1/streams/${stream}/records?changes_since=`,
+      );
+      expect(
+        session.body.next_changes_since,
+        `${token} changes session`,
+      ).toBeTruthy();
+      open.push([
+        token,
+        `/v1/streams/${stream}/records?changes_since=${encodeURIComponent(session.body.next_changes_since)}`,
+      ]);
+    }
+    const statuses = async () => {
+      const out: string[] = [];
+      for (const [token, path] of open)
+        out.push(
+          `${token} ${path.split("?")[1]!.split("&cursor")[0]}${path.includes("cursor=") ? " +cursor" : ""}: ${(await h.get(token, path)).status}`,
+        );
+      return out;
+    };
+    // Control: the cursors continue while the epoch is unchanged.
+    expect((await statuses()).every((s) => s.endsWith(": 200"))).toBe(true);
+
+    epoch += 1;
+
+    const after = await statuses();
+    expect(after).toEqual(after.map((s) => s.replace(/\d+$/, "410")));
   });
 });
