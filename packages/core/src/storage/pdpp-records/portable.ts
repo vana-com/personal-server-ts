@@ -1,5 +1,6 @@
 /** Record decisions and contracts shared by Node and browser runtimes. */
 export * from "./types.js";
+export * from "./replication-journal.js";
 export type { PdppRecordStore, BlobReference } from "./interface.js";
 export {
   encodeRecordKey,
