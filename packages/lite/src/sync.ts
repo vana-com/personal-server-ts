@@ -88,6 +88,9 @@ export interface PsLiteSyncOptions {
   /** Uses owner authority for Storage and AddData, without server registration. */
   ownerSyncSigner?: PsLiteOwnerSyncSigner;
   additionsWorkerFactory?: () => AdditionsWorkerPort;
+  /** Background recovery deadline, including lock wait. Defaults to 10 seconds;
+   * hosted owner signing may use up to two minutes. The byte cap is unchanged. */
+  additionsTimeBudgetMs?: number;
   /** Storage authentication origin, independent of its routing endpoint. */
   storageAudience?: string;
   gateway?: GatewayClient;
@@ -243,6 +246,14 @@ export async function createPsLiteSyncManager(
   dataPointFeed: DataPointFeedPort;
   scopeDeletions: ScopeDeletionTracker;
 }> {
+  const additionsTimeBudgetMs = options.additionsTimeBudgetMs ?? 10_000;
+  if (
+    !Number.isSafeInteger(additionsTimeBudgetMs) ||
+    additionsTimeBudgetMs < 1 ||
+    additionsTimeBudgetMs > 120_000
+  ) {
+    throw new RangeError("Additions recovery deadline must be 1..120000 ms");
+  }
   const serverOwner = await resolvePsLiteOwner({
     ownerAddress: options.ownerAddress,
     ownerSignature: options.ownerSignature,
@@ -296,7 +307,7 @@ export async function createPsLiteSyncManager(
             storageEndpoint: resolveVanaStorageEndpoint(options.config),
             masterKey,
             byteBudget: 8 * 1024 * 1024,
-            timeBudgetMs: 10_000,
+            timeBudgetMs: additionsTimeBudgetMs,
           },
           transport: createPsLiteAdditionsTransport({
             config: options.config,
