@@ -1839,6 +1839,158 @@ describe("legacy scope view over the real SQLite record store", () => {
     ).toEqual([{ superseded_path: "oura/activity/foreign.json" }]);
   });
 
+  function legacyHead(
+    scope: string,
+    path: string,
+    producer: string | null = null,
+  ) {
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path, producer)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(scope, 7, 9, "2026-01-01T00:00:00.000Z", path, producer);
+  }
+
+  describe("oura-browser does not take a scope over from a legacy file", () => {
+    it("keeps the file for a covered projection, and still owns the scope for deletion safety", async () => {
+      legacyHead("oura.activity", "oura/activity/old.json");
+      connect(store, "conn_b", "oura-browser");
+      replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+
+      expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+      expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
+      expect(view.listCanonicalScopes(undefined)).toEqual([]);
+      // The rows exist; a legacy-only deletion would resurface them.
+      expect(view.ownsScope("oura.activity")).toBe(true);
+      expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+        [],
+      );
+    });
+
+    it("keeps the file when two oura-browser accounts hold data (no ambiguity)", async () => {
+      connect(store, "conn_b", "oura-browser");
+      connect(store, "conn_c", "oura-browser");
+      replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+      replace(store, "conn_c", "sleep", ["s1"], { method: "oura-browser" });
+
+      for (const scope of ["oura.activity", "oura.sleep"]) {
+        legacyHead(scope, `${scope}/old.json`);
+        expect(await view.readLatest(scope)).toEqual({ kind: "file" });
+        expect(view.listingFor(scope)).toEqual({ kind: "file" });
+      }
+    });
+
+    it("serves the projection when there is no legacy head, and refuses two accounts", async () => {
+      connect(store, "conn_b", "oura-browser");
+      replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+      expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+      expect(view.listingFor("oura.activity").kind).toBe("canonical");
+
+      connect(store, "conn_c", "oura-browser");
+      replace(store, "conn_c", "activity", ["a2"], { method: "oura-browser" });
+      expect(await view.readLatest("oura.activity")).toEqual({
+        kind: "refused",
+        refusal: {
+          status: "unavailable",
+          reason: "ambiguous_connection",
+          candidates: 2,
+        },
+      });
+    });
+
+    it("yields to a legacy head that appears after the projection", async () => {
+      connect(store, "conn_b", "oura-browser");
+      replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+      expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+      legacyHead("oura.activity", "oura/activity/later.json");
+      expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+    });
+
+    it("keeps a takeover that was already recorded", async () => {
+      legacyHead("oura.activity", "oura/activity/old.json");
+      db.prepare(
+        `INSERT INTO legacy_scope_takeovers
+         (scope, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(
+        "oura.activity",
+        7,
+        9,
+        "2026-01-01T00:00:00.000Z",
+        "oura/activity/old.json",
+      );
+      connect(store, "conn_b", "oura-browser");
+      replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+      expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+    });
+
+    it("still refuses after the oura-browser connection is deleted", async () => {
+      legacyHead("oura.activity", "oura/activity/old.json");
+      connect(store, "conn_b", "oura-browser");
+      replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+      store.deleteConnection("conn_b");
+      expect(await view.readLatest("oura.activity")).toEqual({
+        kind: "refused",
+        refusal: {
+          status: "unavailable",
+          reason: "no_connection",
+          candidates: 0,
+        },
+      });
+    });
+  });
+
+  describe("every other binding keeps its automatic takeover of a legacy file", () => {
+    it.each([
+      {
+        name: "oura (PAT method)",
+        scope: "oura.activity",
+        seed: () => {
+          connect(store, "conn_a", "oura");
+          replace(store, "conn_a", "activity", ["a1"]);
+        },
+      },
+      {
+        name: "github-browser",
+        scope: "github.profile",
+        seed: () => {
+          connect(store, "github:owner", "github-browser", GITHUB);
+          store.replaceStream({
+            instance: "github:owner",
+            stream: "profile",
+            method: "github-browser",
+            generation: 1,
+            primaryKey: ["id"],
+            emittedAt: "2026-09-10T07:00:00.000Z",
+            sourceCollectedAt: "2026-09-09T07:00:00.000Z",
+            envelopes: [
+              {
+                instance: "github:owner",
+                stream: "profile",
+                key: "profile",
+                data: {
+                  id: "profile",
+                  username: "current-user",
+                  profileUrl: "https://github.com/current-user",
+                },
+                emitted_at: "2026-09-10T07:00:00.000Z",
+              },
+            ],
+          });
+        },
+      },
+    ])(
+      "$name: a legacy head with a complete projection goes canonical",
+      async ({ scope, seed }) => {
+        legacyHead(scope, `${scope}/old.json`);
+        seed();
+        expect((await view.readLatest(scope)).kind).toBe("canonical");
+        expect(
+          db.prepare("SELECT scope FROM legacy_scope_takeovers").all(),
+        ).toEqual([{ scope }]);
+      },
+    );
+  });
+
   it("writes nothing while deciding, reading or listing", async () => {
     connect(store, "conn_a", "oura");
     replace(store, "conn_a", "activity", ["a1"]);
