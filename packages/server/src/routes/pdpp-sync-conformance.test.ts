@@ -342,7 +342,10 @@ for (const backend of ["memory", "sqlite"]) {
         expect(second.body.has_more).toBe(false);
         // The next session reports the deletion.
         const next = await h.get(
-          records("s", { changes_since: second.body.next_changes_since }),
+          records("s", {
+            changes_since: second.body.next_changes_since,
+            order: "asc",
+          }),
         );
         expect(next.body.data).toEqual([
           expect.objectContaining({ id: "b", deleted: true }),
@@ -376,7 +379,10 @@ for (const backend of ["memory", "sqlite"]) {
           expect.objectContaining({ id: "b", data: { id: "b", name: "B1" } }),
         ]);
         const next = await h.get(
-          records("s", { changes_since: second.body.next_changes_since }),
+          records("s", {
+            changes_since: second.body.next_changes_since,
+            order: "asc",
+          }),
         );
         expect(ids(next.body).sort()).toEqual(["b", "c"]);
       });

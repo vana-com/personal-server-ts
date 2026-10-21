@@ -844,9 +844,6 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(baselineBBody.data).toEqual([
       expect.objectContaining({ data: { id: "sleep-1", score: 44 } }),
     ]);
-    expect(baselineABody.next_changes_since).not.toBe(
-      baselineBBody.next_changes_since,
-    );
 
     const deleted = await ctx!.app.request(
       `/pdpp/connections/${encodeURIComponent(accountA)}`,

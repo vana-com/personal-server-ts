@@ -68,9 +68,9 @@ and private-v0.2 tombstone and record wire shapes stay unchanged.
 - `listSnapshotPage` owns visible list pagination and cursor construction. Both
   stores supply ordered historical rows; HTTP never rebuilds a list cursor.
   `compareRecordIdentity` owns locale-independent identity ordering for list and sync.
-- `selectSyncChange` owns comparison of authorized historical projections.
-  Candidate time/resource eligibility runs before sync pagination in both stores.
-  Eligibility uses the grant projection; sparse response fields do not suppress changes.
+- The sync session owner (`docs/pdpp-sync-session.md`) compares authorized
+  historical projections and paginates the authorized result. Eligibility uses
+  the grant projection; sparse response fields do not suppress changes.
 
 Legacy list cursors without a horizon or complete identity return the existing
 `410 cursor_expired` restart signal. Their original traversal cannot be recovered

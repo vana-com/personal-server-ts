@@ -3,7 +3,6 @@ import {
   timeSortKey,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
-  selectSyncChange,
   decodeListCursor,
   decodeSyncPageCursor,
   listSnapshotPage,
@@ -12,22 +11,16 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { Database } from "better-sqlite3";
-import { createHash } from "node:crypto";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   encodeRecordKey,
   planIngest,
   RecordKeyError,
   summarizeIngest,
-  decodeCursor,
-  encodeCursor,
-  InvalidCursorSyntaxError,
   CursorExpiredError,
   InvalidCursorError,
   BlobConflictError,
   type PdppRecordStore,
-  type ChangesSinceOptions,
-  type ChangesSincePage,
   type IngestOutcome,
   type IngestResult,
   type ListRecordsOptions,
@@ -39,6 +32,10 @@ import {
   type RecordDataValidator,
   type StreamListing,
   type StreamSemantics,
+  type SyncTokenScope,
+  type SyncWindow,
+  type SyncWindowChange,
+  type SyncWindowRequest,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import {
   isCompletionTime,
@@ -313,9 +310,9 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_order
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
   ON pdpp_record_changes (instance, stream, record_key, written_at DESC, version DESC);
 `,
-  // v13: an `emitted_key` that orders emitted time by instant rather than by
-  // timestamp text, for list order, list seeks and the latest stream time.
-  // `migrateToV13` applies it.
+  // v13: secret that seals candidate-profile sync tokens. It lives beside the
+  // epoch, so a rebuilt records DB expires every token the old one issued.
+  // `addSyncTokenKey` applies it.
   "",
   // v14: one recoverable export-to-live transition per Claude connection.
   `CREATE TABLE IF NOT EXISTS pdpp_claude_transition (
@@ -359,33 +356,16 @@ function addCompletionProofColumns(db: Database): void {
   }
 }
 
-/** `emitted_key` is `timeSortKey(emitted_at)`, written by SQL on every insert. */
-function registerTimeKey(db: Database): void {
-  db.function("pdpp_time_key", { deterministic: true }, (value: unknown) =>
-    timeSortKey(String(value)),
-  );
-}
-
-function migrateToV13(db: Database): void {
-  for (const table of ["pdpp_records", "pdpp_record_changes"]) {
-    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as {
-      name: string;
-    }[];
-    if (!columns.some((c) => c.name === "emitted_key")) {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN emitted_key TEXT`);
-    }
-    db.exec(
-      `UPDATE ${table} SET emitted_key = pdpp_time_key(emitted_at) WHERE emitted_key IS NULL`,
-    );
+function addSyncTokenKey(db: Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(pdpp_store_metadata)")
+    .all() as { name: string }[];
+  if (!columns.some((column) => column.name === "sync_token_key")) {
+    db.exec("ALTER TABLE pdpp_store_metadata ADD COLUMN sync_token_key TEXT");
   }
-  db.exec(`
-DROP INDEX IF EXISTS idx_pdpp_record_changes_snapshot_order;
-CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_key_order
-  ON pdpp_record_changes (stream, emitted_key, record_key, instance, written_at);
-CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
-  ON pdpp_records (instance, stream, emitted_key, emitted_at)
-  WHERE deleted = 0;
-`);
+  db.prepare(
+    "UPDATE pdpp_store_metadata SET sync_token_key = ? WHERE id = 1 AND sync_token_key IS NULL",
+  ).run(randomBytes(32).toString("base64"));
 }
 
 function migrate(db: Database): void {
@@ -409,7 +389,7 @@ function migrate(db: Database): void {
           "INSERT OR IGNORE INTO pdpp_store_metadata (id, epoch) VALUES (1, ?)",
         ).run(randomUUID());
       }
-      if (v === 12) migrateToV13(db);
+      if (v === 12) addSyncTokenKey(db);
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -502,13 +482,6 @@ function parseHorizon(value: unknown): number {
     throw new InvalidCursorError();
   }
   return horizon;
-}
-
-function parseOffset(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new InvalidCursorError();
-  }
-  return value;
 }
 
 function instanceHasRecords(db: Database, instance: string): boolean {
@@ -1910,134 +1883,79 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     return result;
   }
 
-  function changesSince(
+  const wroteInWindowStmt = db.prepare(
+    `SELECT 1 FROM pdpp_record_changes
+     WHERE stream = ? AND instance = ? AND record_key = ?
+     AND written_at > ? AND written_at <= ? LIMIT 1`,
+  );
+  const versionAtStmt = db.prepare(
+    `SELECT * FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+     WHERE instance = ? AND stream = ? AND record_key = ? AND written_at <= ?
+     ORDER BY written_at DESC, version DESC LIMIT 1`,
+  );
+  const deletedAfterStmt =
+    db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+      WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
+
+  function readSyncWindow<T>(
     stream: string,
-    options: ChangesSinceOptions,
-  ): ChangesSincePage {
-    let horizon: number;
-    let sinceHorizon: number | null;
-    let offset = 0;
-
-    if (options.cursor) {
-      const payload = decodeSyncPageCursor(options.cursor);
-      assertCursorScope(payload, stream);
-      horizon = parseHorizon(payload.horizon);
-      sinceHorizon =
-        payload.sinceHorizon !== null
-          ? parseHorizon(payload.sinceHorizon)
-          : null;
-      offset = parseOffset(payload.offset);
-    } else if (options.changesSince) {
-      let payload;
-      try {
-        payload = decodeCursor(options.changesSince);
-      } catch (err) {
-        if (err instanceof InvalidCursorSyntaxError)
-          throw new CursorExpiredError();
-        throw err;
+    request: SyncWindowRequest,
+    read: (window: SyncWindow) => T,
+  ): T {
+    // One read transaction: the clock, the reset fence and every history
+    // lookup `read` makes belong to the same committed state.
+    return db.transaction(() => {
+      const clock = readWriteClock();
+      const high =
+        request.high === undefined ? clock : parseHorizon(request.high);
+      const low = request.low === null ? null : parseHorizon(request.low);
+      // A horizon past this store's clock was never issued by it.
+      if (high > clock || (low !== null && low > high)) {
+        throw new CursorExpiredError();
       }
-      if (payload.kind !== "changes_since") throw new InvalidCursorError();
-      assertCursorScope(payload, stream);
-      sinceHorizon = parseHorizon(payload.horizon);
-      horizon = (nextWriteSeq.get() as { value: number }).value;
-    } else {
-      sinceHorizon = null;
-      horizon = (nextWriteSeq.get() as { value: number }).value;
-    }
-
-    assertNotResetSince(options.instanceIds, [
-      horizon,
-      sinceHorizon ?? horizon,
-    ]);
-
-    const latestRows = snapshotRows(stream, options.instanceIds, horizon);
-
-    const changed: PdppRecordRow[] = [];
-    for (const entry of latestRows) {
-      if (sinceHorizon !== null) {
-        const wroteSincePrior = db
-          .prepare(
-            `SELECT 1 FROM pdpp_record_changes
-             WHERE stream = ? AND instance = ? AND record_key = ?
-             AND written_at > ? AND written_at <= ? LIMIT 1`,
-          )
-          .get(
-            entry.stream,
+      assertNotResetSince(request.instanceIds, [high, low ?? high]);
+      const changes: SyncWindowChange[] = [];
+      for (const entry of snapshotRows(stream, request.instanceIds, high)) {
+        const key = [entry.instance, stream, entry.record_key] as const;
+        if (
+          low !== null &&
+          !wroteInWindowStmt.get(
+            stream,
             entry.instance,
             entry.record_key,
-            sinceHorizon,
-            horizon,
-          );
-        if (!wroteSincePrior) continue;
+            low,
+            high,
+          )
+        ) {
+          continue;
+        }
+        changes.push({
+          after: toRow(entry),
+          before: () => {
+            if (low === null) return undefined;
+            const row = versionAtStmt.get(...key, low) as
+              RecordRowDb | undefined;
+            return row ? toRow(row) : undefined;
+          },
+          deletedLater: () =>
+            high < clock && deletedAfterStmt.get(...key, high) !== undefined,
+        });
       }
+      changes.sort((a, b) => compareRecordIdentity(a.after, b.after));
+      return read({ high: String(high), changes });
+    })();
+  }
 
-      const previous =
-        sinceHorizon === null
-          ? undefined
-          : (db
-              .prepare(
-                `
-        SELECT * FROM pdpp_record_changes
-        WHERE stream = ? AND instance = ? AND record_key = ? AND written_at <= ?
-        ORDER BY version DESC LIMIT 1
-      `,
-              )
-              .get(
-                entry.stream,
-                entry.instance,
-                entry.record_key,
-                sinceHorizon,
-              ) as RecordRowDb | undefined);
-      const selected = selectSyncChange(
-        toRow(entry as RecordRowDb),
-        previous ? toRow(previous) : undefined,
-        options,
-      );
-      if (selected) changed.push(selected);
-    }
-
-    changed.sort(compareRecordIdentity);
-    const page = changed.slice(offset, offset + options.limit);
-    const hasMore = offset + options.limit < changed.length;
-    if (options.expireOnErasure && horizon < readWriteClock()) {
-      const erasure =
-        db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
-        WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
-      if (
-        page.some(
-          (row) =>
-            !row.deleted &&
-            erasure.get(row.instance, stream, row.recordKey, horizon) !==
-              undefined,
-        )
+  function syncTokenScope(): SyncTokenScope {
+    const row = db
+      .prepare(
+        "SELECT epoch, sync_token_key FROM pdpp_store_metadata WHERE id = 1",
       )
-        throw new CursorExpiredError();
-    }
-
+      .get() as { epoch: string; sync_token_key: string | null } | undefined;
+    if (!row?.sync_token_key) throw new CursorExpiredError();
     return {
-      data: page,
-      hasMore,
-      nextCursor: hasMore
-        ? encodeCursor({
-            kind: "changes_since",
-            stream,
-            epoch: cursorEpoch(),
-            horizon: String(horizon),
-            sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
-            offset: offset + options.limit,
-            orderKey: "code-point",
-          })
-        : undefined,
-      nextChangesSince: hasMore
-        ? undefined
-        : encodeCursor({
-            kind: "changes_since",
-            stream,
-            epoch: cursorEpoch(),
-            horizon: String(horizon),
-            sinceHorizon: null,
-            offset: 0,
-          }),
+      epoch: row.epoch,
+      key: new Uint8Array(Buffer.from(row.sync_token_key, "base64")),
     };
   }
 
@@ -2220,7 +2138,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     getRecord,
     listRecords,
     deleteRecord,
-    changesSince,
+    readSyncWindow,
+    syncTokenScope,
     listStreams,
     putBlobMeta: (meta: PdppBlobMeta) =>
       putBlobStmt.run({

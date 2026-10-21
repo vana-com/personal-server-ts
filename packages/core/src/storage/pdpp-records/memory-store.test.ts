@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { createMemoryRecordStore } from "./memory-store.js";
+import { createPdppSyncSessionService } from "./sync-session.js";
 import { decodeCursor, encodeCursor, type CursorPayload } from "./cursor.js";
 import {
   CursorExpiredError,
@@ -376,7 +377,8 @@ describe("memory record store: changes_since", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const page = store.changesSince("playlists", {
+    const page = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 1,
     });
@@ -394,7 +396,8 @@ describe("memory record store: changes_since", () => {
       9007199254740992,
     ]) {
       expect(() =>
-        store.changesSince("playlists", {
+        createPdppSyncSessionService(store).read({
+          stream: "playlists",
           instanceIds: ["inst_1"],
           limit: 1,
           cursor: forgeOffset(offset),
@@ -402,7 +405,8 @@ describe("memory record store: changes_since", () => {
       ).toThrow(InvalidCursorError);
     }
     expect(
-      store.changesSince("playlists", {
+      createPdppSyncSessionService(store).read({
+        stream: "playlists",
         instanceIds: ["inst_1"],
         limit: 1,
         cursor: forgeOffset(1),
@@ -425,7 +429,8 @@ describe("memory record store: changes_since", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const page = store.changesSince("playlists", {
+    const page = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
     });
@@ -457,7 +462,8 @@ describe("memory record store: changes_since", () => {
       playlistsPk,
     );
 
-    const page1 = store.changesSince("playlists", {
+    const page1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 1,
     });
@@ -479,7 +485,8 @@ describe("memory record store: changes_since", () => {
       playlistsPk,
     );
 
-    const page2 = store.changesSince("playlists", {
+    const page2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
       cursor: page1.nextCursor,
@@ -503,7 +510,8 @@ describe("memory record store: changes_since", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session1 = store.changesSince("playlists", {
+    const session1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
     });
@@ -523,7 +531,8 @@ describe("memory record store: changes_since", () => {
       playlistsPk,
     );
 
-    const session2 = store.changesSince("playlists", {
+    const session2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
       changesSince: session1.nextChangesSince,
@@ -547,14 +556,16 @@ describe("memory record store: changes_since", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session1 = store.changesSince("playlists", {
+    const session1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
     });
     expect(session1.nextChangesSince).toBeDefined();
 
     expect(() =>
-      store.changesSince("messages", {
+      createPdppSyncSessionService(store).read({
+        stream: "messages",
         instanceIds: ["inst_1"],
         limit: 10,
         changesSince: session1.nextChangesSince,
@@ -565,7 +576,8 @@ describe("memory record store: changes_since", () => {
   it("rejects a changes_since token from another epoch", () => {
     const store = createMemoryRecordStore();
     expect(() =>
-      store.changesSince("playlists", {
+      createPdppSyncSessionService(store).read({
+        stream: "playlists",
         instanceIds: ["inst_1"],
         limit: 10,
         changesSince: encodeCursor({
@@ -595,10 +607,11 @@ describe("memory record store: changes_since", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session1 = store.changesSince("playlists", {
+    const session1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
-      fields: ["id", "a"],
+      eligibilityFields: ["id", "a"],
     });
 
     // Only field `c` (unauthorized) changes.
@@ -616,10 +629,11 @@ describe("memory record store: changes_since", () => {
       playlistsPk,
     );
 
-    const session2 = store.changesSince("playlists", {
+    const session2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
-      fields: ["id", "a"],
+      eligibilityFields: ["id", "a"],
       changesSince: session1.nextChangesSince,
     });
     expect(session2.data).toHaveLength(0);
@@ -640,7 +654,8 @@ describe("memory record store: changes_since", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session1 = store.changesSince("playlists", {
+    const session1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
     });
@@ -653,7 +668,8 @@ describe("memory record store: changes_since", () => {
       "mutable_state",
     );
 
-    const session2 = store.changesSince("playlists", {
+    const session2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
       changesSince: session1.nextChangesSince,
@@ -665,7 +681,8 @@ describe("memory record store: changes_since", () => {
   it("throws CursorExpiredError for a malformed changes_since token", () => {
     const store = createMemoryRecordStore();
     expect(() =>
-      store.changesSince("playlists", {
+      createPdppSyncSessionService(store).read({
+        stream: "playlists",
         instanceIds: ["inst_1"],
         limit: 10,
         changesSince: "not-a-real-cursor",

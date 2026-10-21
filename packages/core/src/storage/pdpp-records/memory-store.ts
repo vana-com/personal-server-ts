@@ -1,4 +1,3 @@
-import { selectSyncChange } from "./sync-selection.js";
 import {
   compareListRows,
   listSnapshotPage,
@@ -6,22 +5,17 @@ import {
   decodeListCursor,
   decodeSyncPageCursor,
 } from "./list-page.js";
-import { createHash } from "node:crypto";
-import { randomUUID } from "node:crypto";
-import { timeSortKey } from "../../pdpp/time.js";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { PdppRecordStore } from "./interface.js";
 import {
   planIngest,
   summarizeIngest,
   type RecordDataValidator,
 } from "./ingest-plan.js";
-import { decodeCursor, encodeCursor } from "./cursor.js";
 import {
   BlobConflictError,
   CursorExpiredError,
   InvalidCursorError,
-  type ChangesSinceOptions,
-  type ChangesSincePage,
   type IngestOutcome,
   type IngestResult,
   type ListRecordsOptions,
@@ -33,8 +27,10 @@ import {
   type PdppTombstoneRecord,
   type StreamListing,
   type StreamSemantics,
+  type SyncWindow,
+  type SyncWindowChange,
+  type SyncWindowRequest,
 } from "./types.js";
-import { InvalidCursorSyntaxError } from "./cursor.js";
 
 function blobIdForBytes(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -46,8 +42,13 @@ function rowKey(instance: string, stream: string, recordKey: string): RowKey {
   return `${instance}\0${stream}\0${recordKey}`;
 }
 
-function parseOffset(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+/** This store's horizons are the ISO form of its logical write clock. */
+function parseHorizon(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    Number.isNaN(Date.parse(value)) ||
+    new Date(value).toISOString() !== value
+  ) {
     throw new InvalidCursorError();
   }
   return value;
@@ -75,6 +76,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
   const blobs = new Map<string, PdppBlobMeta>();
   const blobBytes = new Map<string, Uint8Array>();
   const epoch = randomUUID();
+  const syncTokenKey = new Uint8Array(randomBytes(32));
   let listSnapshot:
     | {
         key: string;
@@ -323,139 +325,57 @@ export function createMemoryRecordStore(): PdppRecordStore {
     return true;
   }
 
-  function changesSince(
+  function readSyncWindow<T>(
     stream: string,
-    options: ChangesSinceOptions,
-  ): ChangesSincePage {
-    let horizon: string;
-    let sinceHorizon: string | null;
-    let offset = 0;
-
-    if (options.cursor) {
-      // Continuing an already-anchored session: horizon and sinceHorizon
-      // both come from the page cursor, not re-derived from changesSince.
-      const payload = decodeSyncPageCursor(options.cursor);
-      assertCursorScope(payload, stream);
-      horizon = payload.horizon;
-      sinceHorizon = payload.sinceHorizon;
-      offset = parseOffset(payload.offset);
-    } else if (options.changesSince) {
-      let payload;
-      try {
-        payload = decodeCursor(options.changesSince);
-      } catch (err) {
-        if (err instanceof InvalidCursorSyntaxError) {
-          throw new CursorExpiredError();
-        }
-        throw err;
-      }
-      if (payload.kind !== "changes_since") throw new InvalidCursorError();
-      assertCursorScope(payload, stream);
-      // The incoming token is the *previous* session's horizon. This
-      // session's page-1 horizon is anchored fresh at "now" so writes that
-      // land mid-session don't leak into this session's later pages.
-      sinceHorizon = payload.horizon;
-      horizon = nextWriteTimestamp();
-    } else {
-      // First-ever sync: no baseline, every current record is "changed".
-      sinceHorizon = null;
-      horizon = nextWriteTimestamp();
+    request: SyncWindowRequest,
+    read: (window: SyncWindow) => T,
+  ): T {
+    const clock = new Date(writeClock).toISOString();
+    const high =
+      request.high === undefined ? clock : parseHorizon(request.high);
+    const low = request.low === null ? null : parseHorizon(request.low);
+    // A horizon past this store's clock was never issued by it.
+    if (high > clock || (low !== null && low > high)) {
+      throw new CursorExpiredError();
     }
-
-    // Every write strictly after `horizon` is excluded from every page of
-    // this session (session-horizon anchoring) — new writes surface only
-    // via the next session's `changes_since`.
+    const instances = new Set(request.instanceIds);
     const relevant = history.filter(
       (entry) =>
         entry.stream === stream &&
-        options.instanceIds.includes(entry.instance) &&
-        entry.writtenAt <= horizon,
+        instances.has(entry.instance) &&
+        entry.writtenAt <= high,
     );
-
-    const latestAsOfHorizon = new Map<string, HistoryEntry>();
+    const latest = new Map<RowKey, HistoryEntry>();
+    const changed = new Set<RowKey>();
     for (const entry of relevant) {
-      const k = rowKey(entry.instance, entry.stream, entry.recordKey);
-      const prior = latestAsOfHorizon.get(k);
-      if (!prior || entry.version > prior.version) {
-        latestAsOfHorizon.set(k, entry);
-      }
+      const key = rowKey(entry.instance, entry.stream, entry.recordKey);
+      const prior = latest.get(key);
+      if (!prior || entry.version > prior.version) latest.set(key, entry);
+      if (low === null || entry.writtenAt > low) changed.add(key);
     }
-
-    const changed: PdppRecordRow[] = [];
-    for (const entry of latestAsOfHorizon.values()) {
-      if (sinceHorizon !== null) {
-        const wroteSincePrior = history.some(
-          (h) =>
-            h.stream === entry.stream &&
-            h.recordKey === entry.recordKey &&
-            h.instance === entry.instance &&
-            h.writtenAt > sinceHorizon &&
-            h.writtenAt <= horizon,
-        );
-        if (!wroteSincePrior) continue;
-      }
-
-      const previous =
-        sinceHorizon === null
-          ? undefined
-          : relevant
-              .filter(
-                (h) =>
-                  h.instance === entry.instance &&
-                  h.recordKey === entry.recordKey &&
-                  h.writtenAt <= sinceHorizon,
-              )
-              .at(-1)?.row;
-      const selected = selectSyncChange(entry.row, previous, options);
-      if (selected) changed.push(selected);
-    }
-
-    changed.sort(compareRecordIdentity);
-
-    const page = changed.slice(offset, offset + options.limit);
-    const hasMore = offset + options.limit < changed.length;
-    if (
-      options.expireOnErasure &&
-      page.some(
-        (row) =>
-          !row.deleted &&
+    const changes: SyncWindowChange[] = [];
+    for (const [key, entry] of latest) {
+      if (!changed.has(key)) continue;
+      const same = (h: HistoryEntry) =>
+        h.instance === entry.instance && h.recordKey === entry.recordKey;
+      changes.push({
+        after: entry.row,
+        before: () =>
+          low === null
+            ? undefined
+            : relevant.filter((h) => same(h) && h.writtenAt <= low).at(-1)?.row,
+        deletedLater: () =>
           history.some(
             (h) =>
-              h.row.deleted &&
-              h.writtenAt > horizon &&
-              h.instance === row.instance &&
               h.stream === stream &&
-              h.recordKey === row.recordKey,
+              same(h) &&
+              h.row.deleted &&
+              h.writtenAt > high,
           ),
-      )
-    )
-      throw new CursorExpiredError();
-
-    return {
-      data: page,
-      hasMore,
-      nextCursor: hasMore
-        ? encodeCursor({
-            kind: "changes_since",
-            stream,
-            epoch: cursorEpoch(),
-            horizon,
-            sinceHorizon,
-            offset: offset + options.limit,
-            orderKey: "code-point",
-          })
-        : undefined,
-      nextChangesSince: hasMore
-        ? undefined
-        : encodeCursor({
-            kind: "changes_since",
-            stream,
-            epoch: cursorEpoch(),
-            horizon,
-            sinceHorizon: null,
-            offset: 0,
-          }),
-    };
+      });
+    }
+    changes.sort((a, b) => compareRecordIdentity(a.after, b.after));
+    return read({ high, changes });
   }
 
   function listStreams(instanceIds: string[]): StreamListing[] {
@@ -579,7 +499,8 @@ export function createMemoryRecordStore(): PdppRecordStore {
     getRecord,
     listRecords,
     deleteRecord,
-    changesSince,
+    readSyncWindow,
+    syncTokenScope: () => ({ epoch, key: syncTokenKey }),
     listStreams,
     putBlobMeta: (meta: PdppBlobMeta) => blobs.set(meta.blobId, meta),
     getBlobMeta: (blobId: string) => blobs.get(blobId),

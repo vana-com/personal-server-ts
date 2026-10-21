@@ -15,6 +15,7 @@ import type {
   StreamGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
+  createPdppSyncSessionService,
   CursorExpiredError,
   InvalidCursorError,
   InvalidCursorSyntaxError,
@@ -515,6 +516,7 @@ function projectSchemaToFields(
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
   const validateData = createRecordDataValidator(deps.declarations);
+  const sync = createPdppSyncSessionService(deps.store);
 
   /**
    * Append one PDPP read to the owner access feed.
@@ -741,12 +743,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       return sendError(c, mapInactiveToError(context!), reqId);
     }
 
-    const instanceIds =
-      context.tokenKind === "owner"
-        ? ownerInstances(context)
-        : (context.grant?.streams.flatMap((s) => s.instance_ids) ?? []);
+    const ownerInstanceIds =
+      context.tokenKind === "owner" ? ownerInstances(context) : [];
 
-    if (context.tokenKind === "owner" && instanceIds.length === 0) {
+    if (context.tokenKind === "owner" && ownerInstanceIds.length === 0) {
       return sendError(
         c,
         mapAndLog(
@@ -762,39 +762,35 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
     }
 
-    const streams = deps.store.listStreams(instanceIds);
-
-    // A client token gets a closed projection: only the streams its grant
-    // names, and counts/recency computed over only the records the grant
-    // actually exposes. The store's raw listing counts every record in the
-    // instance, so returning it unchanged would leak the existence and
-    // recency of records outside the grant's time_constraint / resources.
+    // A client token lists exactly the streams its grant names, stored
+    // records or not: a stream that is empty, or whose last record was
+    // deleted, must stay discoverable so a client can start or finish its
+    // sync. Counts and recency cover only the records the grant exposes; the
+    // store's raw listing counts every record in the instance, so returning
+    // it would leak the existence and recency of records outside the grant's
+    // time_constraint / resources.
     const visibleStreams =
       context.tokenKind === "owner"
-        ? streams.map((s) => ({
+        ? deps.store.listStreams(ownerInstanceIds).map((s) => ({
             name: s.stream,
             recordCount: s.recordCount as number | null,
             lastUpdated: s.lastUpdated,
             budgetExhausted: false,
           }))
-        : streams
-            .filter((s) =>
-              context.grant?.streams.some((g) => g.name === s.stream),
+        : (context.grant?.streams ?? [])
+            .filter(
+              (streamGrant, index, all) =>
+                all.findIndex((g) => g.name === streamGrant.name) === index,
             )
-            .map((s) => {
-              const streamGrant = context.grant?.streams.find(
-                (g) => g.name === s.stream,
-              );
-              return {
-                name: s.stream,
-                ...summarizeGrantVisible(
-                  deps.store,
-                  s.stream,
-                  streamGrant?.instance_ids ?? [],
-                  streamGrant,
-                ),
-              };
-            });
+            .map((streamGrant) => ({
+              name: streamGrant.name,
+              ...summarizeGrantVisible(
+                deps.store,
+                streamGrant.name,
+                streamGrant.instance_ids,
+                streamGrant,
+              ),
+            }));
 
     // Report truncation explicitly rather than letting a capped count read as
     // exact. `meta.warnings` is the same shape the list endpoint uses for
@@ -944,52 +940,42 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const fields = scope.fields;
 
       if (query.changesSince !== undefined) {
-        // Eligibility compares the frozen candidate grant projection; sparse
-        // request fields shape only the response. Legacy profiles retain their
-        // existing request-field eligibility. The store returns raw rows.
-        // (spec §4:
-        // a record whose only change was to an unauthorized field must not
-        // appear as "changed" at all). The store returns each row's RAW,
-        // unprojected data regardless of `fields` — response-shaping
-        // projection happens only at toRecordJson below, after
-        // recordWithinGrantTimeConstraint has already run against the real
-        // field value. This split matters: if the store projected the
-        // returned data too, a grant whose fields exclude the
-        // time_constraint field would silently break that filter.
-        const page = deps.store.changesSince(stream, {
+        const candidate = grantIsCandidate(context!.grant);
+        const streamGrant = scope.streamGrant;
+        // The session owner decides disclosure, pagination and tokens; this
+        // route only states the grant and maps the page. Candidate
+        // eligibility compares the frozen grant projection; sparse request
+        // fields shape only the response.
+        const page = sync.read({
+          stream,
           instanceIds: effectiveInstanceIds,
-          changesSince:
-            grantIsCandidate(context!.grant) &&
-            query.changesSince === "beginning"
-              ? undefined
-              : query.changesSince,
+          changesSince: query.changesSince,
           cursor,
           limit,
-          fields: grantIsCandidate(context!.grant)
-            ? scope.streamGrant!.fields
-            : fields,
-          ...(grantIsCandidate(context!.grant) && {
-            expireOnErasure: true,
-            isVisible: (row: {
-              recordKey: string;
-              data: Record<string, unknown>;
-            }) =>
-              recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-              recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
+          eligibilityFields: candidate ? streamGrant!.fields : fields,
+          ...(streamGrant && {
+            access: {
+              canSeeKey: (recordKey) =>
+                recordKeyWithinGrantResources(recordKey, streamGrant),
+              canSeeRecord: (row) =>
+                recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
+                recordWithinGrantTimeConstraint(row.data, streamGrant),
+            },
           }),
-        });
-        const visible = page.data.filter((row) => {
-          if (grantIsCandidate(context!.grant)) return true; // store compared both authorized historical states
-          if (row.deleted) {
-            return recordKeyWithinGrantResources(
-              row.recordKey,
-              scope.streamGrant,
-            );
-          }
-          return (
-            recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-            recordWithinGrantTimeConstraint(row.data, scope.streamGrant)
-          );
+          ...(candidate && {
+            candidate: {
+              order,
+              binding: {
+                protocol: context!.grant!.version,
+                grant: context!.grant!.grant_id,
+                subject: context!.grant!.subject.id,
+                client: context!.grant!.client.client_id,
+                source: context!.grant!.source.id,
+                streamGrant,
+                fields: fields ? [...new Set(fields)].sort() : null,
+              },
+            },
+          }),
         });
         const meta = clamped
           ? {
@@ -1006,13 +992,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             ...(page.nextChangesSince && {
               next_changes_since: page.nextChangesSince,
             }),
-            data: visible.map((row) =>
-              toRecordJson(
-                stream,
-                row,
-                fields,
-                grantIsCandidate(context!.grant),
-              ),
+            data: page.data.map((row) =>
+              toRecordJson(stream, row, fields, candidate),
             ),
             ...(clamped && { meta }),
           },

@@ -982,7 +982,8 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
       method: "oura",
       generation: 2,
     });
-    expect(storeCounters()).toEqual({ clock: 4, changes: 0 });
+    // Two writes and the reset; a sync read does not advance the clock.
+    expect(storeCounters()).toEqual({ clock: 3, changes: 0 });
 
     const staleAAfterReset = await ingest(
       ctx,

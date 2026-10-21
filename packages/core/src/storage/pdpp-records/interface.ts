@@ -1,7 +1,5 @@
 import type { RecordDataValidator } from "./ingest-plan.js";
 import type {
-  ChangesSinceOptions,
-  ChangesSincePage,
   IngestResult,
   ListRecordsOptions,
   ListRecordsPage,
@@ -10,6 +8,9 @@ import type {
   PdppStoredRecord,
   StreamListing,
   StreamSemantics,
+  SyncTokenScope,
+  SyncWindow,
+  SyncWindowRequest,
 } from "./types.js";
 
 /**
@@ -67,7 +68,20 @@ export interface PdppRecordStore {
     streamSemantics: StreamSemantics,
   ): boolean;
 
-  changesSince(stream: string, options: ChangesSinceOptions): ChangesSincePage;
+  /**
+   * Runs `read` against one consistent view of the stream's history between
+   * two horizons. Throws `CursorExpiredError` when that history is no longer
+   * available (a reset since either horizon, or a horizon this store never
+   * reached) and `InvalidCursorError` for a malformed horizon. Sync policy
+   * lives in `createPdppSyncSessionService`, not here.
+   */
+  readSyncWindow<T>(
+    stream: string,
+    request: SyncWindowRequest,
+    read: (window: SyncWindow) => T,
+  ): T;
+
+  syncTokenScope(): SyncTokenScope;
 
   listStreams(instanceIds: string[]): StreamListing[];
 

@@ -90,24 +90,40 @@ export interface ListRecordsPage {
   horizon?: string;
 }
 
-export interface ChangesSinceOptions {
-  /** Candidate visibility policy, evaluated at BOTH historical horizons. */
-  isVisible?: (row: PdppStoredRecord) => boolean;
-  /**
-   * Candidate: a page that reaches a record deleted after the session horizon
-   * fails with `CursorExpiredError` instead of serving that record. Withholding
-   * it could lose it: the next session compares against this horizon, so a
-   * record deleted and recreated unchanged would never reach the client.
-   * The current contract serves every page at the session horizon.
-   */
-  expireOnErasure?: boolean;
+/**
+ * Raw history one sync page reads. Only the sync session owner
+ * (`sync-session.ts`) calls this; it holds no visibility, paging or token policy.
+ */
+export interface SyncWindowRequest {
   instanceIds: string[];
-  /** Absent = start a new session anchored at "now". */
-  changesSince?: string;
-  /** Page cursor within an already-anchored session. */
-  cursor?: string;
-  limit: number;
-  fields?: string[];
+  /** Earlier horizon of an incremental session; null for a first sync. */
+  low: string | null;
+  /** Fixed horizon of an anchored session. Absent captures the current one. */
+  high?: string;
+}
+
+/** One record key written in (low, high], or present at high for a first sync. */
+export interface SyncWindowChange {
+  /** The key's version at the high horizon. */
+  after: PdppRecordRow;
+  /** The key's version at the low horizon, if any. */
+  before(): PdppRecordRow | undefined;
+  /** True when a deletion of this key committed after the high horizon. */
+  deletedLater(): boolean;
+}
+
+export interface SyncWindow {
+  high: string;
+  /** Ordered by `compareRecordIdentity`, ascending. */
+  changes: SyncWindowChange[];
+}
+
+/** Store identity for sync tokens. Both change when the store is rebuilt. */
+export interface SyncTokenScope {
+  /** Store reset epoch carried by current-profile tokens. */
+  epoch: string;
+  /** 32-byte secret that seals candidate-profile tokens. */
+  key: Uint8Array;
 }
 
 export interface ChangesSincePage {

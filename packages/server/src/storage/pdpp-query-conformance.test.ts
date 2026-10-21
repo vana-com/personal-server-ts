@@ -2,8 +2,9 @@ import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import {
   createMemoryRecordStore,
+  createPdppSyncSessionService,
   type PdppRecordStore,
-  type ChangesSinceOptions,
+  type SyncRequest,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 
@@ -76,7 +77,9 @@ for (const backend of ["memory", "sqlite"])
             .data.map((r) => r.recordKey),
         ).toEqual(expected);
         expect(
-          store.changesSince("events", options).data.map((r) => r.recordKey),
+          createPdppSyncSessionService(store)
+            .read({ stream: "events", ...options })
+            .data.map((r) => r.recordKey),
         ).toEqual(expected);
       } finally {
         store.close();
@@ -110,14 +113,21 @@ for (const backend of ["memory", "sqlite"])
       try {
         write(store, "visible", 1);
         write(store, "hidden", 1, "2025-01-01");
-        const options = {
+        const options: SyncRequest = {
+          stream: "events",
           instanceIds: ["inst_1"],
           limit: 100,
-          fields: ["id"],
-          isVisible: (row: { data: Record<string, unknown> }) =>
-            row.data.at === "2026-01-02",
-        } as ChangesSinceOptions;
-        const baseline = store.changesSince("events", options);
+          eligibilityFields: ["id"],
+          access: {
+            canSeeKey: () => true,
+            canSeeRecord: (row) => row.data.at === "2026-01-02",
+          },
+          candidate: { binding: "test", order: "asc" },
+        };
+        const baseline = createPdppSyncSessionService(store).read({
+          stream: "events",
+          ...options,
+        });
         expect(baseline.data.map((r) => r.recordKey)).toEqual(["visible"]);
         for (const key of ["visible", "hidden"])
           store.deleteRecord(
@@ -127,14 +137,20 @@ for (const backend of ["memory", "sqlite"])
             "2026-04-02T00:00:00Z",
             "mutable_state",
           );
-        const changes = store.changesSince("events", {
+        const changes = createPdppSyncSessionService(store).read({
+          stream: "events",
           ...options,
           changesSince: baseline.nextChangesSince,
         });
         expect(
           changes.data.map((r) => ({ key: r.recordKey, deleted: r.deleted })),
         ).toEqual([{ key: "visible", deleted: true }]);
-        expect(store.changesSince("events", options).data).toEqual([]);
+        expect(
+          createPdppSyncSessionService(store).read({
+            stream: "events",
+            ...options,
+          }).data,
+        ).toEqual([]);
       } finally {
         store.close();
       }
@@ -144,17 +160,25 @@ for (const backend of ["memory", "sqlite"])
       try {
         write(store, "enter", 1, "2025-01-01");
         write(store, "leave", 1);
-        const options = {
+        const options: SyncRequest = {
+          stream: "events",
           instanceIds: ["inst_1"],
           limit: 100,
-          fields: ["id"],
-          isVisible: (row: { data: Record<string, unknown> }) =>
-            row.data.at === "2026-01-02",
-        } as ChangesSinceOptions;
-        const baseline = store.changesSince("events", options);
+          eligibilityFields: ["id"],
+          access: {
+            canSeeKey: () => true,
+            canSeeRecord: (row) => row.data.at === "2026-01-02",
+          },
+          candidate: { binding: "test", order: "asc" },
+        };
+        const baseline = createPdppSyncSessionService(store).read({
+          stream: "events",
+          ...options,
+        });
         write(store, "enter", 2);
         write(store, "leave", 2, "invalid");
-        const changes = store.changesSince("events", {
+        const changes = createPdppSyncSessionService(store).read({
+          stream: "events",
           ...options,
           changesSince: baseline.nextChangesSince,
         });

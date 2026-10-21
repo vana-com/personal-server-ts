@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createPdppSyncSessionService } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 import {
   CursorExpiredError,
@@ -524,7 +525,8 @@ describe("sqlite record store", () => {
       playlistsPk,
     );
 
-    const page1 = store.changesSince("playlists", {
+    const page1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 1,
     });
@@ -544,7 +546,8 @@ describe("sqlite record store", () => {
       playlistsPk,
     );
 
-    const page2 = store.changesSince("playlists", {
+    const page2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
       cursor: page1.nextCursor,
@@ -566,7 +569,8 @@ describe("sqlite record store", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session1 = store.changesSince("playlists", {
+    const session1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
     });
@@ -577,7 +581,8 @@ describe("sqlite record store", () => {
       "2026-04-02T00:00:00.000Z",
       "mutable_state",
     );
-    const session2 = store.changesSince("playlists", {
+    const session2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
       changesSince: session1.nextChangesSince,
@@ -600,10 +605,11 @@ describe("sqlite record store", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session1 = store.changesSince("playlists", {
+    const session1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
-      fields: ["id", "a"],
+      eligibilityFields: ["id", "a"],
     });
     store.ingestBatch(
       [
@@ -618,10 +624,11 @@ describe("sqlite record store", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session2 = store.changesSince("playlists", {
+    const session2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
-      fields: ["id", "a"],
+      eligibilityFields: ["id", "a"],
       changesSince: session1.nextChangesSince,
     });
     expect(session2.data).toHaveLength(0);
@@ -1335,14 +1342,16 @@ describe("sqlite record store", () => {
 
     it("expires a pre-reset changes_since page cursor", () => {
       seedA();
-      const page1 = store.changesSince("messages", {
+      const page1 = createPdppSyncSessionService(store).read({
+        stream: "messages",
         instanceIds: ["inst_a"],
         limit: 1,
       });
       expect(page1.nextCursor).toBeDefined();
       resetToB();
       expect(() =>
-        store.changesSince("messages", {
+        createPdppSyncSessionService(store).read({
+          stream: "messages",
           instanceIds: ["inst_a"],
           limit: 1,
           cursor: page1.nextCursor,
@@ -1352,7 +1361,8 @@ describe("sqlite record store", () => {
 
     it("expires a changes_since token from an earlier reset epoch", () => {
       seedA();
-      const session1 = store.changesSince("messages", {
+      const session1 = createPdppSyncSessionService(store).read({
+        stream: "messages",
         instanceIds: ["inst_a"],
         limit: 10,
       });
@@ -1360,7 +1370,8 @@ describe("sqlite record store", () => {
       resetToB();
 
       expect(() =>
-        store.changesSince("messages", {
+        createPdppSyncSessionService(store).read({
+          stream: "messages",
           instanceIds: ["inst_a"],
           limit: 10,
           changesSince: session1.nextChangesSince,
@@ -1370,14 +1381,16 @@ describe("sqlite record store", () => {
 
     it("rejects a changes_since token reused against a different stream", () => {
       seedA();
-      const session1 = store.changesSince("messages", {
+      const session1 = createPdppSyncSessionService(store).read({
+        stream: "messages",
         instanceIds: ["inst_a"],
         limit: 10,
       });
       expect(session1.nextChangesSince).toBeDefined();
 
       expect(() =>
-        store.changesSince("playlists", {
+        createPdppSyncSessionService(store).read({
+          stream: "playlists",
           instanceIds: ["inst_a"],
           limit: 10,
           changesSince: session1.nextChangesSince,
@@ -1410,7 +1423,8 @@ describe("sqlite record store", () => {
         offset: 0,
       });
       expect(() =>
-        store.changesSince("messages", {
+        createPdppSyncSessionService(store).read({
+          stream: "messages",
           instanceIds: ["inst_a"],
           limit: 10,
           changesSince: legacyChanges,
