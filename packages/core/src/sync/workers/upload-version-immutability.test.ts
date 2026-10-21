@@ -362,14 +362,13 @@ describe("upload worker against write-once storage", () => {
     }
   }
 
-  it("refuses an interrupted publication without a deletion fence", async () => {
-    const content = envelope("interrupted");
+  it("refuses another writer's interrupted publication without a deletion fence", async () => {
     const occupant = await encryptWithPassword(
-      plaintextOf(content),
+      plaintextOf(envelope("another writer")),
       scopeKeyHex,
     );
     blobs.blobs.set(blobs.keyFor(1), occupant);
-    const r = await replica(content, 1);
+    const r = await replica(envelope("interrupted"), 1);
 
     await expect(upload(r, { fenced: false })).rejects.toMatchObject({
       code: "NEEDS_FENCED_PUBLICATION",
@@ -378,6 +377,44 @@ describe("upload worker against write-once storage", () => {
     expect(registry.versions.size).toBe(0);
     expect(blobs.blobs.get(blobs.keyFor(1))).toEqual(occupant);
     expect(r.storage.entries[0]?.dataPointId).toBeNull();
+  });
+
+  // Production wiring today: the registry feed is wired, no fence adapter
+  // exists. A failure there leaves the scope unsynced until a gateway change.
+  const production = { fenced: false, feed: true } as const;
+
+  it("with production wiring, a retry after a failed registration publishes its own stored bytes", async () => {
+    const content = envelope("registration failed");
+    const r = await replica(content, 1);
+    registry.failNextRegistration = true;
+    await expect(upload(r, production)).rejects.toThrow("fetch failed");
+    const firstBytes = blobs.blobs.get(blobs.keyFor(1));
+
+    await upload(r, production);
+
+    expect(blobs.blobs.get(blobs.keyFor(1))).toEqual(firstBytes);
+    expect(registry.versions.get(1n)?.dataHash).toBe(hashOf(content));
+    expect(r.storage.entries[0]?.dataPointId).toBe(DATA_POINT_ID);
+    await expectCommittedBytesMatch();
+  });
+
+  it("with production wiring, a local version ahead of the registry leaves no blob at a future version", async () => {
+    const first = await replica(envelope("local ahead"), 3);
+    await upload(first, production);
+    expect(registry.versions.get(1n)?.dataHash).toBe(
+      hashOf(envelope("local ahead")),
+    );
+    expect(blobs.blobs.has(blobs.keyFor(3))).toBe(false);
+
+    await upload(await replica(envelope("second"), 2), production);
+    const third = await replica(envelope("third entry"), 3);
+    await upload(third, production);
+
+    expect(registry.versions.get(3n)?.dataHash).toBe(
+      hashOf(envelope("third entry")),
+    );
+    expect(third.storage.entries[0]?.dataPointId).toBe(DATA_POINT_ID);
+    await expectCommittedBytesMatch();
   });
 
   it("keeps a fresh uncontended upload working without the new capability", async () => {
@@ -442,13 +479,28 @@ describe("upload worker against write-once storage", () => {
     ).toEqual(plaintextOf(content));
   });
 
-  it("requires a fence before adopting a registered version even when bytes exist", async () => {
+  it("adopts a live registration of its own verified bytes without a fence or a write", async () => {
     const content = envelope("same");
     await upload(await replica(content, 1));
+    const putsBefore = blobs.puts.length;
     const r = await replica(content, 1);
-    await expect(
-      upload(r, { feed: true, fenced: false }),
-    ).rejects.toMatchObject({ code: "NEEDS_FENCED_PUBLICATION" });
+
+    await upload(r, production);
+
+    expect(blobs.puts.length).toBe(putsBefore);
+    expect(registry.versions.size).toBe(1);
+    expect(r.storage.entries[0]?.dataPointId).toBe(DATA_POINT_ID);
+  });
+
+  it("requires a fence before recreating the missing bytes of a registered version", async () => {
+    const content = envelope("same");
+    await upload(await replica(content, 1));
+    blobs.blobs.delete(blobs.keyFor(1));
+    const r = await replica(content, 1);
+    await expect(upload(r, production)).rejects.toMatchObject({
+      code: "NEEDS_FENCED_PUBLICATION",
+    });
+    expect(blobs.blobs.has(blobs.keyFor(1))).toBe(false);
     expect(r.storage.entries[0]?.dataPointId).toBeNull();
   });
 

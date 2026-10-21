@@ -420,9 +420,12 @@ describe("upload worker", () => {
     }
 
     it.each(["1", "7"])(
-      "requires fencing before adopting matching registered version %s",
+      "requires fencing before healing matching registered version %s whose bytes are missing",
       async (version) => {
         const deps = makeMockDeps();
+        (
+          deps.storageAdapter.exists as ReturnType<typeof vi.fn>
+        ).mockResolvedValue(false);
         (
           deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
         ).mockRejectedValueOnce(STALE_409);

@@ -226,8 +226,10 @@ export async function publishVersion(
       fence = result.fence;
       head = registered;
       id = result.dataPointId;
+    } else if (mode === "adopt") {
+      // No remote effect: the caller verified the live row's stored bytes.
+      id = head?.id;
     } else {
-      if (mode === "adopt") requireFence("adoption of prior publication");
       const result = lineageFields
         ? await options.lineageGateway!.registerDataPoint({
             ...request,
@@ -249,15 +251,21 @@ export async function publishVersion(
       metadataHash: value.metadataHash,
     };
   }
-  let version = options.preferredVersion;
+  // An observed head decides the next version. A local version ahead of the
+  // registry would leave our bytes at a future key that later wedges it.
+  let version =
+    head === undefined
+      ? options.preferredVersion
+      : BigInt(head?.expectedVersion ?? "0") + 1n;
   let rebased = false;
   for (let step = 0; step < 4; step++) {
     checkDeletion();
     if (head && !isDeleted(head) && sameHash(head.dataHash, wantedHash)) {
-      requireFence("adoption of prior publication");
       version = BigInt(head.expectedVersion);
       const url = keyUrl(version);
       if (!(await storageAdapter.exists(url))) {
+        // Recreating bytes can race a delete's cleanup; that needs the fence.
+        requireFence("healing a committed version's missing bytes");
         if (!sameHash(wanted.metadataHash, head.metadataHash))
           throw new Error(
             "Missing committed blob cannot be healed: metadata commitment mismatch",
@@ -284,8 +292,12 @@ export async function publishVersion(
       await storageAdapter.upload(`${scope}/${version}`, encrypted);
     } catch (error) {
       if (!(error instanceof StoredBlobConflictError)) throw error;
-      requireFence("resuming an occupied unregistered version");
       value = await readCandidate(version);
+      // Unfenced, resume only our own content: registering it is the same
+      // registration a fresh upload would make. A foreign occupant needs
+      // adopt-then-supersede, which needs the fence.
+      if (!sameHash(value.dataHash, wantedHash))
+        requireFence("resuming an occupied unregistered version");
     }
     try {
       const result = await commit(version, value, "register");
