@@ -1,84 +1,79 @@
 # PDPP replica operation profile v1
 
-This is an internal Vana implementation profile, not a normative PDPP addition.
-It defines pure operation decisions. It has no storage, receiver, publisher,
-cryptography, byte transfer, or authorization-state replication.
+This internal Vana profile defines immutable replication evidence and derives a
+current view from the complete retained operation set. It does not define
+transport, storage, cryptography, or authorization-state replication.
 
-## Provisional decisions
+## Observation order
 
-`REPLICA_POLICY` in `merge-plan.ts` is the decision index. The executable vectors
-pin these choices so a later policy revision must change its expected results.
+Source observations are immutable facts. A connector may declare one comparable
+source-version rule per stream: ordered integer, ordered RFC3339, or equality
+only. A comparable higher version dominates a lower version only inside the
+same domain and incarnation. Equality-only versions detect contradictory
+payloads but do not order different values. An undeclared version is rejected.
 
-1. Mutable records use the greatest persisted `(counter, writerId, operationId)`.
-   Strings compare by JavaScript UTF-16 code units, without locale collation.
-   Retain every losing operation, including tombstones. A later upsert can
-   resurrect a record. Convergence means equal retained evidence yields equal
-   results; it does not establish the freshest upstream truth from offline
-   scrapes. Emitted timestamps and local query versions do not select winners.
-2. Append-only different-content writes quarantine the entire key. Equal JSON
-   data and blob descriptors are equal content regardless of object-key order;
-   emitted timestamps are metadata. Quarantine has no winner and retains all
-   contenders. Ordinary upserts cannot repair it, even at a higher revision.
-   Repair requires a separately authorized explicit resolution protocol. Profile
-   v1 has no repair operation; quarantine remains until that protocol exists.
-   Other keys remain readable. Append-only record deletion is rejected.
-3. One existing issuer keeps grants, tokens and revocation. Only data and
-   connection evidence replicate. `resolveLocalInstance` uses an explicit,
-   verified logical-connection mapping for each device's local instance handle.
-   It does not map grants or confer token authority. Independent device-source
-   instances retain independent connection IDs. Grant/revocation replication
-   and acceptance of another issuer's handles are outside this profile.
+After version dominance, known causal order wins: a later observation by the
+same writer, or an observation whose batch frontier includes the earlier HLC.
+Remaining candidates use `min(observedAt, finalizedAt(batch))`; before finality,
+the observation time is uncapped. HLC logical value, writer id, and operation id
+form the deterministic final tie-break. The operation counter never selects the
+current value.
 
-## Identity and lifecycle
+Differing candidates within the five-minute policy window are `unsettled` and
+request a source re-observation. A non-reobservable stream promotes that
+disagreement to owner review. Equal comparable source versions with different
+content are also owner review. Append-only content conflicts remain quarantined.
+An unsettled disagreement involving a source deletion is hidden from apps.
 
-Each operation carries owner, producer source ID, logical connection ID,
-immutable acquisition method, generation, and persisted revision. Record
-identity adds stream and canonical record key. The trusted retained declaration
-binds its digest, version, schema digest, semantics and ordered primary key.
-The host supplies data validation against that exact retained schema; unknown
-declarations stay pending during merge. The decoder requires an exact known
-binding. It does not fetch declarations or verify their digest itself.
+## Owner removals and deletion erasure
 
-Connection registration starts generation 1. A reset advances exactly one
-generation and retains the method; incompatible methods or sources fail closed.
-Every intervening reset must be present before a newer generation becomes live.
-Old-generation records remain suppressed even if their counters are greater.
-Connection deletion dominates all writes and resets, including later revisions.
-Recreation requires a new logical connection ID. No missing batch implies delete.
+Source deletions are ordinary observations and may be superseded by later
+source observations. Owner hide and delete are separate remove-wins decisions.
+Only an explicit restore that names a removal operation clears that removal;
+concurrent removals remain active. Source observations never clear owner
+removals.
 
-Operation identity is `(writerId, operationId)`. Identical replay has no extra
-multiplicity. Different bytes for that identity quarantine all affected
-connections. Clone/restore must rotate writer identity before making new writes.
-`nextLamportCounter` advances past every observed counter; the host must persist
-it with its mutation. Slice 1 journal sequence and local record version are
-neither a Lamport counter nor evidence of cross-device ordering.
+`OWNER_DELETE_GRACE_PERIOD_MS` is the single delete-retention contract constant
+(30 days by default). The period starts at the delete batch's finality time. Once
+it expires, the derived record retains only a suppression marker with its key,
+operation ids, content hashes, observation times, and finality times. A later
+observation cannot restore erased payload. A restore after erasure waits for a
+new source observation.
 
-## Wire and execution boundary
+## Account identity
 
-`encodeReplicaEnvelope` emits canonical JSON: recursively sorted object keys,
-array order retained, finite JSON numbers and no whitespace. The decoder accepts
-only those exact canonical bytes, rejecting duplicate-member ambiguity, unknown
-versions, unknown fields, and changed authenticated-owner/declaration binding.
-Authentication, decryption and verification precede decode; the expected owner
-must come from that authenticated context. This codec is not a signature check.
-Transport sequences, predecessors, completion dependencies and fragmentation
-belong to later framing work; this operation envelope cannot yet be published.
+Every operation carries `upstreamAccount` as issuer plus stable subject. It must
+come from connector-declared identity evidence; login names and email addresses
+are not stable keys. A connection registration binds one principal. Mismatched
+operations are quarantined and never enter app views. The owner may keep the
+held observations as a separate connection by an explicit choice.
 
-`planReplicaMerge` takes the complete retained operation set. Preserve that set
-across calls, including lifecycle evidence, losers, pending evidence, conflicts
-and tombstones. Recompute after dependencies arrive. The result is a plan with
-normalized records, conflicts, pending, rejected and suppressed evidence. It does
-not mutate the input, allocate local versions, apply writes, or verify blob bytes.
-Blob descriptors alone never authorize a local byte claim or prove completion.
-Public PDPP record envelopes and local cursor tokens are untouched.
+## Operation and view contract
 
-## Executable vectors
+Every operation has a persisted HLC revision and writer id. Every observation
+has `emittedAt` (source observation time), a content hash, and its batch id.
+Every operation carries the writer frontier it had received. `MergeContext`
+supplies finalized batch times and the local retention clock. `now` affects only
+retention; it does not select current values.
 
-`__fixtures__/envelope-v1.json` pins independently serialized wire bytes and the
-corresponding decoded object. `envelope.test.ts` tests the golden, lifecycle and
-blob roundtrips, version rejection and each declaration-binding substitution.
-`fixtures.ts` defines the mutable conflict/delete/resurrection sequence.
-`merge-plan.test.ts` exhausts permutations with duplicate/reversed replay and
-checks concrete winners, retained losers, deletes and quarantine outcomes.
-`identity.test.ts` covers shared logical connections and refused account collapse.
-`revision.test.ts` covers total ordering, counter advance and exhaustion.
+The planner retains losing evidence and recomputes the view from operations. Its
+records expose current value, candidates, state, owner control, refresh request,
+flags, and payload retention. `appView` is the only app projection: it returns
+only an upsert that is not quarantined, hidden, deleted, erased, or an unsettled
+delete disagreement. Apps do not receive candidates or owner history.
+
+Connection deletion still dominates all evidence for that connection. A
+complete-scan deletion requires connector declaration and a confirming scan;
+absence from a partial scan is no operation. The receiver must preserve the
+complete operation set, including lifecycle facts, conflicts, pending records,
+quarantine evidence, and suppression markers.
+
+## Verification vectors
+
+`merge-plan.test.ts` covers the N01–N29 policy cases, including the explicit
+fixture 18 reversal, source-version order, clock capping, removal/restore,
+account quarantine, app projection, and complete-scan handling. Each logical
+vector is evaluated from the same retained set so arrival order does not change
+the result. `revision.test.ts` covers HLC creation and the receive guard.
+`envelope.test.ts` covers canonical encoding, exact declaration and owner binding,
+the stable upstream principal, HLC shape, and lifecycle operation roundtrips.
