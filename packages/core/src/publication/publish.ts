@@ -48,8 +48,11 @@ export interface FencedPublicationPort {
 
 export class NeedsFencedPublicationError extends Error {
   readonly code = "NEEDS_FENCED_PUBLICATION";
-  readonly retryable = true;
-  constructor(scope: string, reason: string) {
+  constructor(
+    readonly scope: string,
+    readonly reason: string,
+    readonly retryable: boolean = true,
+  ) {
     super(`Needs fenced publication for ${scope}: ${reason}`);
     this.name = "NeedsFencedPublicationError";
   }
@@ -89,24 +92,91 @@ function metadata(scope: string, collectedAt: string, sizeBytes: number) {
   );
 }
 
-/** Owns reserve/upload/register/recover policy for all full-host publishers.
- * No deletion/reclaim effect is permitted here. Retries derive evidence from
- * storage and the registry, never from an abandoned attempt's local URL. */
+/** Full-envelope preparation and verification for the shared publication owner. */
 export async function publishVersion(
   options: PublishOptions,
 ): Promise<PublicationResult> {
-  const { envelope, storageAdapter, fencedPublication, signer } = options;
+  const { envelope, storageAdapter } = options;
   const { scope } = envelope;
   const password = Array.from(
     deriveScopeKey(options.masterKey, scope),
     (byte) => byte.toString(16).padStart(2, "0"),
   ).join("");
   const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
-  const wantedHash = keccak256(plaintext);
+  const lineage = readStoredLineage(envelope.data as Record<string, unknown>);
+  function candidate(
+    env: DataFileEnvelope,
+    bytes: Uint8Array,
+    hash: `0x${string}`,
+  ): PublicationCandidate {
+    return {
+      dataHash: hash,
+      metadataHash: metadata(scope, env.collectedAt, bytes.byteLength),
+      sizeBytes: bytes.byteLength,
+      lineage: readStoredLineage(env.data as Record<string, unknown>),
+    };
+  }
+  return publishPreparedVersion({
+    ...options,
+    scope,
+    storageAdapter,
+    async prepare() {
+      const encrypted = await encryptWithPassword(plaintext, password);
+      return {
+        encrypted,
+        wanted: {
+          ...candidate(envelope, encrypted, keccak256(plaintext)),
+          lineage,
+        },
+        async verifyStored(bytes) {
+          const clear = await decryptWithPassword(bytes, password);
+          const env = DataFileEnvelopeSchema.parse(
+            JSON.parse(new TextDecoder().decode(clear)),
+          );
+          if (
+            env.scope !== scope ||
+            !Number.isFinite(Date.parse(env.collectedAt))
+          )
+            throw new Error("Publication envelope scope/timestamp mismatch");
+          return candidate(env, bytes, keccak256(clear));
+        },
+      };
+    },
+  });
+}
+
+export interface PublicationCandidate {
+  dataHash: `0x${string}`;
+  metadataHash: `0x${string}`;
+  sizeBytes: number;
+  lineage: ReturnType<typeof readStoredLineage>;
+}
+export interface PreparedPublication {
+  encrypted: Uint8Array;
+  wanted: PublicationCandidate;
+  /** Authenticate the complete stored envelope and derive its commitments.
+   * A bounded host may instead prove byte equality with its authenticated journal.
+   */
+  verifyStored(bytes: Uint8Array): Promise<PublicationCandidate>;
+}
+export interface PreparedPublishOptions extends Omit<
+  PublishOptions,
+  "envelope" | "masterKey"
+> {
+  scope: string;
+  /** Called only after the initial deletion/fence check. */
+  prepare(): Promise<PreparedPublication>;
+}
+
+/** Single reserve/upload/register/recover policy for full and bounded hosts.
+ * No deletion/reclaim effect is permitted here. Retries derive evidence from
+ * storage and the registry, never from an abandoned attempt's local URL. */
+export async function publishPreparedVersion(
+  options: PreparedPublishOptions,
+): Promise<PublicationResult> {
+  const { scope, storageAdapter, fencedPublication, signer } = options;
   const isDeleted = (row: PublicationRecord) =>
     Boolean(row.deletedAt) || isTombstoneRecord(row);
-  // Validate local lineage before leaving a reservation behind.
-  readStoredLineage(envelope.data as Record<string, unknown>);
   let fence = await fencedPublication?.read({
     ownerAddress: options.ownerAddress,
     scope,
@@ -127,42 +197,17 @@ export async function publishVersion(
       );
   }
   checkDeletion();
-  const encrypted = await encryptWithPassword(plaintext, password);
+  const { encrypted, wanted, verifyStored } = await options.prepare();
+  const wantedHash = wanted.dataHash;
   const keyUrl = (version: bigint) =>
     storageAdapter.urlForKey(`${scope}/${version}`);
-  type Candidate = {
-    envelope: DataFileEnvelope;
-    dataHash: `0x${string}`;
-    metadataHash: `0x${string}`;
-    sizeBytes: number;
-  };
-  function candidate(
-    env: DataFileEnvelope,
-    bytes: Uint8Array,
-    hash: `0x${string}`,
-  ): Candidate {
-    return {
-      envelope: env,
-      dataHash: hash,
-      metadataHash: metadata(scope, env.collectedAt, bytes.byteLength),
-      sizeBytes: bytes.byteLength,
-    };
-  }
-  const wanted = candidate(envelope, encrypted, wantedHash);
-  async function readCandidate(version: bigint): Promise<Candidate> {
+  async function readCandidate(version: bigint): Promise<PublicationCandidate> {
     const bytes = await storageAdapter.download(keyUrl(version));
-    const clear = await decryptWithPassword(bytes, password);
-    const env = DataFileEnvelopeSchema.parse(
-      JSON.parse(new TextDecoder().decode(clear)),
-    );
-    if (env.scope !== scope || !Number.isFinite(Date.parse(env.collectedAt)))
-      throw new Error("Publication envelope scope/timestamp mismatch");
-    readStoredLineage(env.data as Record<string, unknown>);
-    return candidate(env, bytes, keccak256(clear));
+    return verifyStored(bytes);
   }
   async function commit(
     version: bigint,
-    value: Candidate,
+    value: PublicationCandidate,
     mode: "register" | "adopt",
   ) {
     const request = {
@@ -179,9 +224,7 @@ export async function publishVersion(
         expectedVersion: version,
       }),
     };
-    const lineage = readStoredLineage(
-      value.envelope.data as Record<string, unknown>,
-    );
+    const lineage = value.lineage;
     let lineageFields:
       { lineage: readonly string[]; lineageSignature: string } | undefined;
     if (lineage) {
@@ -319,9 +362,12 @@ export async function publishVersion(
       checkDeletion();
       const next = parseGatewayNextVersion(error.message);
       if (!head && next === null) throw error;
-      version = BigInt(
-        Math.max(Number(head?.expectedVersion ?? "0") + 1, next ?? 0),
-      );
+      const observedNext = BigInt(head?.expectedVersion ?? "0") + 1n;
+      if (next !== null && BigInt(next) > observedNext)
+        requireFence(
+          "gateway version hint advances beyond the observed registry head",
+        );
+      version = observedNext;
     }
   }
   throw new Error(`Publication contention for ${scope}; retry next cycle`);
