@@ -423,6 +423,30 @@ for (const backend of ["memory", "sqlite"]) {
           expect(after.body.data).toEqual([]);
         });
 
+        it("measures the carry in UTF-8 bytes, so non-ASCII keys cannot exceed it", async () => {
+          const h = harness(backend, {
+            g1: grant(version, "G1", [streamGrant(version)]),
+          });
+          // About 820 UTF-16 code units of identity JSON, but about 2,460
+          // UTF-8 bytes: over the 2 KiB carry.
+          const wide = ["一", "二"].map((c) => c.repeat(400));
+          for (const key of ["0", ...wide])
+            h.put(key, { name: "N", t: INSIDE });
+          const session = {
+            changes_since: begin(version),
+            order: "asc",
+            limit: "1",
+          };
+          const first = await h.get(records("s", session));
+          expect(ids(first.body)).toEqual(["0"]);
+          for (const key of wide) h.remove(key);
+          const second = await h.get(
+            records("s", { ...session, cursor: first.body.next_cursor }),
+          );
+          expect(second.status).toBe(410);
+          expect(second.body.error?.code).toBe("cursor_expired");
+        });
+
         it("expires a session whose withheld records exceed what a token can carry", async () => {
           const h = harness(backend, {
             g1: grant(version, "G1", [streamGrant(version)]),
