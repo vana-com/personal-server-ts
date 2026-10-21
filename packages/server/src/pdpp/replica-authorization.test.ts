@@ -186,6 +186,7 @@ async function expectDenied(pending: Promise<Response> | Response) {
     "foreign-approved",
     "hidden",
     "other connection",
+    "C2-SECRET-SENTINEL",
   ])
     expect(JSON.stringify(body)).not.toContain(sentinel);
 }
@@ -194,6 +195,7 @@ it("reads only the issuer-approved connection through its explicit local handle,
   const { read, auth, tokens, grant, accessToken, decisions } = fixture();
   const response = await read();
   expect(response.status).toBe(200);
+  // copy-assertion-ok: exact cache policy protects token-authorized responses.
   expect(response.headers.get("Cache-Control")).toBe("private, no-store");
   const body = await response.json();
   expect(body.data).toHaveLength(1);
@@ -211,13 +213,21 @@ it("reads only the issuer-approved connection through its explicit local handle,
 });
 
 it("denies another owner's active token even when its handle matches", async () => {
-  const { read } = fixture("owner-b");
+  const { read, decisions } = fixture("owner-b");
   await expectDenied(read());
+  expect(decisions.at(-1)).toEqual({
+    outcome: "denied",
+    reason: "owner_mismatch",
+  });
 });
 
 it("denies an approved token routed to a different owner's replica with colliding local identifiers", async () => {
-  const { read } = fixture(owner, "owner-b");
+  const { read, decisions } = fixture(owner, "owner-b");
   await expectDenied(read());
+  expect(decisions.at(-1)).toEqual({
+    outcome: "denied",
+    reason: "owner_mismatch",
+  });
   const foreignControl = fixture("owner-b", "owner-b");
   expect((await foreignControl.read()).status).toBe(200);
 });
@@ -236,9 +246,13 @@ it("fails closed during a partition while the issuer revokes a previously workin
 });
 
 it("denies a token from an unconfigured issuer rather than selecting an authority from token content", async () => {
-  const { read } = fixture();
+  const { read, decisions } = fixture();
   expect((await read()).status).toBe(200);
   await expectDenied(read("pdpp_at_rogue-issuer-token"));
+  expect(decisions.at(-1)).toEqual({
+    outcome: "denied",
+    reason: "issuer_inactive",
+  });
 });
 
 it("never accepts the introspection owner's credential as an application token", async () => {
@@ -311,6 +325,13 @@ it.each([
   async (kind) => {
     const f = fixture();
     expect((await f.read()).status).toBe(200);
+    // Whitespace preserves the real issuer context while crossing the byte cap.
+    // Without the cap this is a valid, authorizing response, not a parse failure.
+    const oversized = JSON.stringify(f.wire()) + " ".repeat(1024 * 1024);
+    if (kind === "oversized") {
+      expect(Buffer.byteLength(oversized)).toBeGreaterThan(1024 * 1024);
+      expect(JSON.parse(oversized)).toEqual(f.wire());
+    }
     f.setResponse(() => {
       if (kind === "server-error") return new Response("", { status: 503 });
       if (kind === "expired-credential")
@@ -320,9 +341,7 @@ it.each([
           status: 302,
           headers: { location: "https://rogue.example" },
         });
-      return new Response(
-        kind === "non-json" ? "not-json" : "x".repeat(1024 * 1024 + 1),
-      );
+      return new Response(kind === "non-json" ? "not-json" : oversized);
     });
     const response = await f.read();
     expect(response.status).toBe(500);
@@ -393,7 +412,7 @@ it.each([
 ])(
   "denies %s connection evidence without guessing from the source",
   async (kind) => {
-    const { read, setConnections } = fixture();
+    const { read, setConnections, decisions } = fixture();
     const connection = {
       owner,
       sourceId,
@@ -430,5 +449,74 @@ it.each([
     };
     setConnections(variants[kind]);
     await expectDenied(read());
+    const reasons: Record<string, string> = {
+      missing: "mapping_missing",
+      "wrong-source": "mapping_missing",
+      "wrong-owner": "mapping_missing",
+      "ambiguous-logical": "mapping_ambiguous",
+      "ambiguous-local": "mapping_invalid",
+      "independent-collapse": "mapping_invalid",
+    };
+    expect(decisions.at(-1)).toEqual({
+      outcome: "denied",
+      reason: reasons[kind],
+    });
   },
 );
+
+it("denies a mismatched grant subject even when the context subject is the replica owner", async () => {
+  const f = fixture();
+  expect((await f.read()).status).toBe(200);
+  const wire = structuredClone(f.wire());
+  const entry = wire.authorization_details![0];
+  if (!("grant" in entry)) throw new Error("fixture must issue a v0.2 grant");
+  entry.grant.subject.id = "owner-b";
+  expect(wire.subject_id).toBe(owner);
+  f.setResponse(() => Response.json(wire));
+  await expectDenied(f.read());
+  expect(f.decisions.at(-1)).toEqual({
+    outcome: "denied",
+    reason: "owner_mismatch",
+  });
+});
+
+it("denies at grant expiry even while the issuer context token expiry remains in the future", async () => {
+  const f = fixture();
+  expect((await f.read()).status).toBe(200);
+  const wire = structuredClone(f.wire());
+  const expiry = wire.exp! * 1000 - 1000;
+  const entry = wire.authorization_details![0];
+  if (!("grant" in entry)) throw new Error("fixture must issue a v0.2 grant");
+  entry.grant.expires_at = new Date(expiry).toISOString();
+  f.setResponse(() => Response.json(wire));
+  f.setTime(expiry - 1);
+  expect((await f.read()).status).toBe(200);
+  f.setTime(expiry);
+  expect(wire.exp! * 1000).toBeGreaterThan(expiry);
+  await expectDenied(f.read());
+  expect(f.decisions.at(-1)).toEqual({ outcome: "denied", reason: "expired" });
+});
+
+it("denies two approved issuer handles mapped to the same logical connection and local handle", async () => {
+  const f = fixture();
+  expect((await f.read()).status).toBe(200);
+  const wire = structuredClone(f.wire());
+  const entry = wire.authorization_details![0];
+  if (!("grant" in entry)) throw new Error("fixture must issue a v0.2 grant");
+  entry.grant.streams[0].instance_ids.push("second-issuer-handle");
+  f.setResponse(() => Response.json(wire));
+  f.setConnections(
+    ["issuer-handle", "second-issuer-handle"].map((issuerInstanceId) => ({
+      owner,
+      sourceId,
+      connectionId: "logical-a",
+      issuerInstanceId,
+      localInstanceId: "replica-handle",
+    })),
+  );
+  await expectDenied(f.read());
+  expect(f.decisions.at(-1)).toEqual({
+    outcome: "denied",
+    reason: "mapping_collapsed",
+  });
+});
