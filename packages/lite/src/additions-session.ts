@@ -1,3 +1,4 @@
+import { NeedsFencedPublicationError } from "@opendatalabs/personal-server-ts-core/publication";
 import {
   AdditionsBudget,
   AdditionsBudgetExceeded,
@@ -180,6 +181,10 @@ export function createPsLiteAdditionsSession(
                   kind: "response",
                   id: message.id,
                   error: error instanceof Error ? error.message : String(error),
+                  publicationBlocked:
+                    error instanceof NeedsFencedPublicationError
+                      ? { scope: error.scope, reason: error.reason }
+                      : undefined,
                   budgetExceeded:
                     error instanceof AdditionsBudgetExceeded ||
                     budget.signal?.aborted,
