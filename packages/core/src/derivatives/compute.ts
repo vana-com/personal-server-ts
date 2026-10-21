@@ -13,6 +13,7 @@ import { resolveReadDeletion } from "../api/index.js";
 import { LOCAL_SCOPE_SCAN_PAGE } from "../lineage/lineage.js";
 import { uncoveredSourceScopes } from "./registration.js";
 import {
+  dependencyDataPointIds,
   readEvidence,
   redactEnvelopeForGrantee,
 } from "../storage/read-evidence.js";
@@ -366,22 +367,27 @@ function localScopesById(
 /**
  * Cycle guard on ACTUAL lineage, for cycles the per-store registration
  * check cannot see (two replicas each holding one half: B <- A here, A <- B
- * there, ping-ponging through sync). Walks `$lineage` from every source's
- * latest local version through the local index; reaching the derived data
- * point id means this question would consume its own output. Bounded by
- * the visited set.
+ * there, ping-ponging through sync). Walks inherited lineage and actual
+ * consumed input identities, including joins, through latest local versions.
+ * Reaching the derived data point id means this question would consume its
+ * own output. Bounded by the visited set.
  */
 async function assertNoLineageCycle(
   deps: QuestionComputeDeps,
   registration: QuestionRegistration,
   serverOwner: `0x${string}`,
-  sourceLineage: ReadonlyMap<string, readonly string[]>,
+  sourceDependencies: ReadonlyMap<string, readonly string[]>,
 ): Promise<void> {
   const derivedId = computeDataPointId(serverOwner, registration.derivedScope);
   let byId: Map<string, string> | null = null;
-  const visited = new Set<string>();
+  // Loaded roots already supplied their captured edges; do not reread them.
+  const visited = new Set<string>(
+    [...sourceDependencies.keys()].map((scope) =>
+      computeDataPointId(serverOwner, scope),
+    ),
+  );
   const stack: Array<{ id: string; path: string[] }> = [];
-  for (const [scope, sources] of sourceLineage) {
+  for (const [scope, sources] of sourceDependencies) {
     for (const id of sources) stack.push({ id, path: [scope] });
   }
   while (stack.length > 0) {
@@ -405,7 +411,7 @@ async function assertNoLineageCycle(
         scope,
         entry.collectedAt,
       );
-      sources = readEvidence(envelope).lineageSources;
+      sources = dependencyDataPointIds(readEvidence(envelope), serverOwner);
     } catch {
       throw new ComputeFailure(
         "source dependencies could not be read",
@@ -421,9 +427,10 @@ async function loadSource(
   deps: QuestionComputeDeps,
   scope: string,
   reader: LegacyReader,
+  serverOwner: string,
 ): Promise<{
   source: PromptSource;
-  lineageSources: readonly string[];
+  dependencyIds: readonly string[];
   pdppOrigin: boolean;
 }> {
   const entry = deps.storage.findEntry({ scope });
@@ -483,7 +490,7 @@ async function loadSource(
       total: trimmed.total,
       truncated: trimmed.truncated,
     },
-    lineageSources: evidence.lineageSources,
+    dependencyIds: dependencyDataPointIds(evidence, serverOwner),
     // The served envelope carries the provenance of every input it joined.
     pdppOrigin: evidence.pdppOrigin,
   };
@@ -563,19 +570,25 @@ export async function computeQuestion(
     );
 
     const sources: PromptSource[] = [];
-    const sourceLineage = new Map<string, readonly string[]>();
+    const sourceDependencies = new Map<string, readonly string[]>();
     let sourcesHavePdppOrigin = false;
     for (const scope of registration.sourceScopes) {
       const loaded = await loadSource(
         deps,
         scope,
         registration.registeredBy.kind === "owner" ? "owner" : "grantee",
+        serverOwner,
       );
       sources.push(loaded.source);
-      sourceLineage.set(scope, loaded.lineageSources);
+      sourceDependencies.set(scope, loaded.dependencyIds);
       sourcesHavePdppOrigin ||= loaded.pdppOrigin;
     }
-    await assertNoLineageCycle(deps, registration, serverOwner, sourceLineage);
+    await assertNoLineageCycle(
+      deps,
+      registration,
+      serverOwner,
+      sourceDependencies,
+    );
     const messages = buildQuestionMessages({
       question: registration.question,
       sources,
