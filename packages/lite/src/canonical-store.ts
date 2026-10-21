@@ -60,6 +60,9 @@ interface PendingBatch {
   blobs: LiteBlobDescriptor[];
 }
 const pendingKey = (id: string) => `pending-batches/${keyDigest(id)}`;
+/** Bump when a derived pending index changes; older databases need `retry`. */
+const PENDING_INDEX_VERSION = 3;
+const PREVIEW_BLOB_REFS = "preview-blob-refs/";
 const digest = (value: unknown) =>
   `sha256:${sha256(toBytes(canonicalJson(value))).slice(2)}`;
 // Fixed-size internal keys fit the existing native 512-character key bound.
@@ -105,6 +108,11 @@ async function* scan(tx: LiteCanonicalTransaction, prefix: string) {
       throw new Error("invalid native scan cursor");
     after = page.after;
   } while (after !== undefined);
+}
+/** Whether a prefix holds any entry, read through the validating page walker. */
+async function any(tx: LiteCanonicalTransaction, prefix: string) {
+  for await (const _ of scan(tx, prefix)) return true;
+  return false;
 }
 async function operations(
   tx: LiteCanonicalTransaction,
@@ -155,7 +163,7 @@ export function createLiteCanonicalStore(deps: {
     if (stored) return stored;
     const initial = { writerId: newId(), counter: 0, sequence: 0 };
     await put(tx, "clock", initial);
-    await put(tx, "pending-index-version", 2);
+    await put(tx, "pending-index-version", PENDING_INDEX_VERSION);
     return initial;
   }
   async function mapping(tx: LiteCanonicalTransaction, op: ReplicaOperation) {
@@ -833,12 +841,57 @@ export function createLiteCanonicalStore(deps: {
       },
       put: async (key, value) => {
         if (!key.startsWith("rows/")) return;
-        if (value === (await tx.get(key))) await tx.delete(`preview/${key}`);
-        else await tx.put(`preview/${key}`, value);
+        const before = await tx.get(`preview/${key}`);
+        if (value === (await tx.get(key))) {
+          await tx.delete(`preview/${key}`);
+          await indexPreviewBlobRef(tx, key, before, undefined);
+        } else {
+          await tx.put(`preview/${key}`, value);
+          await indexPreviewBlobRef(tx, key, before, value);
+        }
       },
-      delete: (key) => tx.delete(`preview/${key}`),
+      delete: async (key) => {
+        const before = await tx.get(`preview/${key}`);
+        await tx.delete(`preview/${key}`);
+        await indexPreviewBlobRef(tx, key, before, undefined);
+      },
       scan: (prefix, after) => mergedPage(tx, "pending-index/", prefix, after),
     };
+  }
+  /**
+   * Blob id -> preview rows that reference it, kept in the same write as the
+   * preview row. Only preview rows can reference pending-only bytes: a
+   * canonical upsert commits its bytes and marks the blob confirmed. So this
+   * index is the visible-reference set of every include-pending reader;
+   * confirmed-only readers never see pending bytes.
+   */
+  async function indexPreviewBlobRef(
+    tx: LiteCanonicalTransaction,
+    path: string,
+    before: string | undefined,
+    after: string | undefined,
+  ) {
+    const blobOf = (value: string | undefined) => {
+      if (value === undefined) return undefined;
+      const row = JSON.parse(value) as PdppRecordRow;
+      if (row.deleted) return undefined;
+      const id = (row.data.blob_ref as { blob_id?: unknown } | undefined)
+        ?.blob_id;
+      return typeof id === "string" ? id : undefined;
+    };
+    const old = blobOf(before);
+    const next = blobOf(after);
+    if (old === next) return;
+    if (old !== undefined)
+      await tx.delete(
+        `${PREVIEW_BLOB_REFS}${keyDigest(old)}/${keyDigest(path)}`,
+      );
+    if (next !== undefined)
+      await put(
+        tx,
+        `${PREVIEW_BLOB_REFS}${keyDigest(next)}/${keyDigest(path)}`,
+        path,
+      );
   }
   async function refreshPreview(
     tx: LiteCanonicalTransaction,
@@ -987,8 +1040,21 @@ export function createLiteCanonicalStore(deps: {
     tx: LiteCanonicalTransaction,
     context: MergeContext,
   ) {
-    if ((await get(tx, "pending-index-version")) === 2) return;
+    const version = await get<number>(tx, "pending-index-version");
+    if (version === PENDING_INDEX_VERSION) return;
     // One-time upgrade belongs to an authenticated writer, never a record read.
+    if (version === 2) {
+      // Version 3 adds the visible blob-reference index over existing rows.
+      for await (const entry of scan(tx, "preview/rows/"))
+        await indexPreviewBlobRef(
+          tx,
+          entry.key.slice("preview/".length),
+          undefined,
+          entry.value,
+        );
+      await put(tx, "pending-index-version", PENDING_INDEX_VERSION);
+      return;
+    }
     for await (const entry of scan(tx, "pending-batches/")) {
       const batch = JSON.parse(entry.value) as PendingBatch;
       if (batch.state === "pending")
@@ -1001,7 +1067,7 @@ export function createLiteCanonicalStore(deps: {
       "retained-connections/",
     ))
       await advanceCanonicalView(tx, JSON.parse(entry.value) as string);
-    await put(tx, "pending-index-version", 2);
+    await put(tx, "pending-index-version", PENDING_INDEX_VERSION);
   }
   async function readView(
     tx: LiteCanonicalTransaction,
@@ -1009,7 +1075,7 @@ export function createLiteCanonicalStore(deps: {
   ) {
     if (!replicaStateVisible("pending", options.reader, deps.visibilityPolicy))
       return tx;
-    if ((await get(tx, "pending-index-version")) !== 2)
+    if ((await get(tx, "pending-index-version")) !== PENDING_INDEX_VERSION)
       throw new Error(
         "pending preview requires reconciliation; call retry before owner reads",
       );
@@ -1401,34 +1467,16 @@ export function createLiteCanonicalStore(deps: {
           !replicaStateVisible("pending", options.reader, deps.visibilityPolicy)
         )
           return false;
-        // Pending bytes need a live reference this reader sees, as on Node. An
-        // active batch alone is not one: a later pending deletion or an
-        // operation-ID variant can hide the only record that references them.
-        const view = await readView(tx, options);
-        for await (const active of scan(
-          tx,
-          `pending-blob-active/${keyDigest(blobId)}/`,
-        )) {
-          const batch = await get<PendingBatch>(
-            tx,
-            `pending-batches/${active.key.slice(active.key.lastIndexOf("/") + 1)}`,
-          );
-          for (const op of batch?.envelope.operations ?? []) {
-            if (
-              op.kind !== "upsert" ||
-              !op.blobs.some((blob) => blob.blobId === blobId)
-            )
-              continue;
-            const row = await get<PdppRecordRow>(
-              view,
-              rowKey(op.connectionId, op.declaration.stream, op.recordKey),
-            );
-            if (!row || row.deleted) continue;
-            const ref = row.data.blob_ref as { blob_id?: unknown } | undefined;
-            if (ref?.blob_id === blobId) return true;
-          }
-        }
-        return false;
+        // Pending bytes need a live reference this reader sees, as on Node,
+        // and an active batch that carries them. The two are independent: one
+        // batch can stage the record and another the bytes, and a later
+        // deletion or operation-ID variant can hide the record while its
+        // carrier stays active.
+        await readView(tx, options); // throws until the writer upgraded the indexes
+        return (
+          (await any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`)) &&
+          (await any(tx, `pending-blob-active/${keyDigest(blobId)}/`))
+        );
       });
       if (!visible) throw new Error("missing committed blob");
       yield* persistence.readBlob(blobId);

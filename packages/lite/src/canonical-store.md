@@ -246,16 +246,21 @@ row page with one bounded preview row page: at most 200 native input entries and
 pending metadata. Pages reuse scanned values without row point re-reads. A
 byte-trimmed page continues after its last returned key, without skipping the
 unreturned rows. Reads do not load pending batches or
-reconstruct operation history. Pending blob bytes need a live reference that
-the reader sees, as on Node: `readBlob` walks the per-blob active-batch index and
-returns bytes only when an upsert in one of those batches still owns a visible,
-undeleted row whose `blob_ref` names the blob. An active batch alone does not
-authorize bytes, because a later pending deletion or an operation-ID variant can
-hide its record. Its work grows with the active batches that carry the blob, not
-with stored rows. Ordinary record writes reconcile affected keys; lifecycle, blob-claim,
+reconstruct operation history. Pending blob bytes need two independent facts: a live visible reference and an
+active batch that carries the bytes. The preview materializer keeps
+`preview-blob-refs/<blob>/<row>` in the same write as each preview row, for
+every live preview row whose `blob_ref` names a blob. Only preview rows can
+reference pending-only bytes, because a canonical upsert commits its bytes and
+marks the blob confirmed. `readBlob` authorizes against that index and then
+requires any active carrier in the per-blob active-batch index; one batch can
+stage the record and another the bytes. A pending deletion, an operation-ID
+variant or quarantine removes the reference or the carrier, and the bytes with
+it. Both checks are prefix lookups. Pending index version 3 adds the reference
+index; `retry` builds it from existing preview rows of a version-two database,
+and preview reads refuse until then. Ordinary record writes reconcile affected keys; lifecycle, blob-claim,
 equivocation and provisioning writes may fan out across a connection's keys.
 Native write latency and large-backlog write costs remain unmeasured. An older
-database without pending-index version two requires authenticated `retry`
+database below the current pending-index version requires authenticated `retry`
 (continue its pages) before preview-mode reads. Canonical point and connection-page
 reads remain available before upgrade. Canonical pages use revision zero until
 receipts are initialized; the first write-side upgrade expires those cursors.

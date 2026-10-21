@@ -368,6 +368,137 @@ it.each(["delete", "equivocation"] as const)(
   },
 );
 
+it("serves pending blob bytes that one batch carries to a record another batch stages", async () => {
+  const { sha256 } = await import("viem");
+  const { make } = device();
+  const store = make();
+  await provision(store);
+  const bytes = new TextEncoder().encode("pending bytes");
+  const hash = `sha256:${sha256(bytes).slice(2)}`;
+  const blob = {
+    blobId: hash,
+    sha256: hash,
+    mimeType: "text/plain",
+    sizeBytes: bytes.length,
+  };
+  const claim = (operationId: string, counter: number, writerId: string) => ({
+    ...identity,
+    kind: "blob-claim",
+    revision: { counter, writerId, operationId },
+    blob,
+  });
+  const record = upsert("record", 3);
+  record.blobs = [blob];
+  record.data.blob_ref = { blob_id: hash };
+  const batch = (id: string, operations: unknown[]) => ({
+    id,
+    credential: "replica",
+    envelope: {
+      format: "vana-pdpp-replica",
+      version: 1,
+      owner: identity.owner,
+      batchId: id,
+      operations,
+    },
+  });
+  // The record's batch carries no bytes; a second batch carries only them.
+  await store.stagePending(
+    batch("record", [registration, claim("claim", 2, "device-a"), record]),
+  );
+  const stagingId = await store.stageBlob(
+    blob,
+    (async function* () {
+      yield bytes;
+    })(),
+  );
+  await store.stagePending({
+    ...batch("carrier", [claim("carrier", 4, "device-b")]),
+    blobs: [{ stagingId, descriptor: blob }],
+  });
+  const owner = async (from = store) => {
+    const parts: Uint8Array[] = [];
+    for await (const part of from.readBlob(hash, { reader: "owner" }))
+      parts.push(part);
+    return parts;
+  };
+  expect(await read(store, "owner")).toMatchObject({
+    data: { blob_ref: { blob_id: hash } },
+    visibility: "pending",
+  });
+  expect(await owner()).toEqual([bytes]);
+  await expect(
+    (async () => {
+      for await (const _ of store.readBlob(hash)) void _;
+    })(),
+  ).rejects.toThrow("missing committed blob");
+
+  // Withdrawing the only carrier withdraws the bytes, not the reference.
+  await store.quarantinePending({
+    id: "carrier",
+    credential: "replica",
+    reason: "later finalized version",
+  });
+  await expect(owner()).rejects.toThrow("missing committed blob");
+  expect(await read(store, "owner")).toMatchObject({ visibility: "pending" });
+});
+
+it("builds the blob reference index of a version-two database on the write side", async () => {
+  const { sha256 } = await import("viem");
+  const { adapter, make } = device();
+  const store = make();
+  await provision(store);
+  const bytes = new TextEncoder().encode("pending bytes");
+  const hash = `sha256:${sha256(bytes).slice(2)}`;
+  const blob = {
+    blobId: hash,
+    sha256: hash,
+    mimeType: "text/plain",
+    sizeBytes: bytes.length,
+  };
+  const stagingId = await store.stageBlob(
+    blob,
+    (async function* () {
+      yield bytes;
+    })(),
+  );
+  const request = pending();
+  const record = upsert("blob", 3);
+  record.blobs = [blob];
+  record.data.blob_ref = { blob_id: hash };
+  request.envelope.operations = [
+    registration,
+    {
+      ...identity,
+      kind: "blob-claim",
+      revision: { counter: 2, writerId: "device-a", operationId: "claim" },
+      blob,
+    },
+    record,
+  ];
+  await store.stagePending({
+    ...request,
+    blobs: [{ stagingId, descriptor: blob }],
+  });
+  // A version-two database (9ab5e907) has preview rows and no reference index.
+  const isRef = (key: string) => key.startsWith("preview-blob-refs/");
+  expect([...adapter.disk.rows.keys()].filter(isRef)).toHaveLength(1);
+  for (const key of [...adapter.disk.rows.keys()].filter(isRef))
+    adapter.disk.rows.delete(key);
+  adapter.disk.rows.set("pending-index-version", "2");
+  const owner = async () => {
+    const parts: Uint8Array[] = [];
+    for await (const part of make().readBlob(hash, { reader: "owner" }))
+      parts.push(part);
+    return parts;
+  };
+  await expect(owner()).rejects.toThrow("requires reconciliation");
+  expect([...adapter.disk.rows.keys()].filter(isRef)).toHaveLength(0);
+  await make().retry({ credential: "replica" });
+  expect(adapter.disk.rows.get("pending-index-version")).toBe("3");
+  expect([...adapter.disk.rows.keys()].filter(isRef)).toHaveLength(1);
+  expect(await owner()).toEqual([bytes]);
+});
+
 it("atomically exposes pending blob bytes to grants on promotion", async () => {
   const { sha256 } = await import("viem");
   const { make } = device();
@@ -755,7 +886,7 @@ it("requires write-side reconciliation of older pending databases without rebuil
     data: { text: "pending" },
     visibility: "pending",
   });
-  expect(adapter.disk.rows.get("pending-index-version")).toBe("2");
+  expect(adapter.disk.rows.get("pending-index-version")).toBe("3");
   for (const prefix of ["preview-revision/", "canonical-view-revision/"])
     expect(
       [...adapter.disk.rows].some(
@@ -1482,7 +1613,7 @@ it("upgrades version-one derived indexes and global revisions to connection snap
     [],
   );
   await make().retry({ credential: "replica" });
-  expect(adapter.disk.rows.get("pending-index-version")).toBe("2");
+  expect(adapter.disk.rows.get("pending-index-version")).toBe("3");
   expect(await read(make(), "owner")).toMatchObject({
     data: { text: "pending" },
   });
