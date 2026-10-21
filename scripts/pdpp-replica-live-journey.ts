@@ -192,15 +192,6 @@ async function host() {
       label: "Other account",
     });
   if (init.consent) allowHarnessLoopback(init.consent.issuerOrigin);
-  const resource = init.consent
-    ? await (
-        await import("./pdpp-replica-consent-live-journey.js")
-      ).openReplicaResourceServer(store, {
-        owner: init.owner,
-        issuerOrigin: init.consent.issuerOrigin,
-        credential: init.consent.credential,
-      })
-    : undefined;
   const expected = { owner: init.owner, declarations: [{ sourceId, binding }] };
   store.replication.beginBaseline(expected);
   const receiver = createReplicaReceiver({
@@ -217,6 +208,16 @@ async function host() {
       },
     ],
   });
+  const resource = init.consent
+    ? await (
+        await import("./pdpp-replica-consent-live-journey.js")
+      ).openReplicaResourceServer(store, {
+        owner: init.owner,
+        issuerOrigin: init.consent.issuerOrigin,
+        credential: init.consent.credential,
+        replicaReads: (reader) => receiver.readStore({ reader }),
+      })
+    : undefined;
   const account = serverAccount(init.serverKey);
   // The SDK captures global fetch at construction, so install before creating storage.
   let bodyBarrier: { url: string; scope: string } | undefined;
