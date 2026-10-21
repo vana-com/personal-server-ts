@@ -1,3 +1,4 @@
+import { readBinary } from "./pdpp-binary-chunks.js";
 import Database from "better-sqlite3";
 import { keccak256, stringToHex } from "viem";
 import { afterEach, expect, it, vi } from "vitest";
@@ -433,9 +434,10 @@ it("fragments large JSON and resumes a partial download in reverse/duplicate lis
   expect(b.get()).toEqual(a.get());
   const payload = a.db
     .prepare(
-      "SELECT payload FROM pdpp_transport_batches ORDER BY sequence LIMIT 1",
+      "SELECT batch FROM pdpp_transport_batches ORDER BY sequence LIMIT 1",
     )
-    .get() as { payload: Buffer };
+    .get() as { batch: string };
+  const payloadBytes = readBinary(a.db, "payload", payload.batch)!;
   const chunks = inbox(b)
     .filter((r) => r.fragment_json)
     .map((r) => JSON.parse(r.fragment_json!) as ReplicaFragment)
@@ -443,7 +445,7 @@ it("fragments large JSON and resumes a partial download in reverse/duplicate lis
       (f) =>
         f.batch ===
         (
-          JSON.parse(new TextDecoder().decode(payload.payload)) as {
+          JSON.parse(new TextDecoder().decode(payloadBytes)) as {
             envelope: { batchId: string };
           }
         ).envelope.batchId,
@@ -451,7 +453,7 @@ it("fragments large JSON and resumes a partial download in reverse/duplicate lis
     .sort((x, y) => x.index - y.index);
   expect(
     Buffer.concat(chunks.map((c) => Buffer.from(c.content, "base64"))),
-  ).toEqual(payload.payload);
+  ).toEqual(Buffer.from(payloadBytes));
   expect(net.puts.every((p) => p.bytes.length <= 8192)).toBe(true);
 });
 
@@ -671,7 +673,9 @@ it("reassembles binary bytes with their content digest, MIME and generation-boun
     { method: "export", generation: 1 },
   );
   await cycles([a, b], 6);
-  expect(b.store.getBlobBytes(blob.blobId)).toEqual(bytes);
+  expect(
+    Buffer.from(b.store.getBlobBytes(blob.blobId)!).equals(Buffer.from(bytes)),
+  ).toBe(true);
   expect(b.store.getBlobMeta(blob.blobId)).toEqual(
     a.store.getBlobMeta(blob.blobId),
   );
@@ -895,4 +899,333 @@ it("quarantines a finalized version-1 commitment mismatch including a tombstone 
     expect(net.puts).toHaveLength(putCount);
     expect(net.registrations.filter((s) => s === scope)).toHaveLength(1);
   }
+});
+
+it("finality waits survive restart without inflating a later transient error delay", async () => {
+  const net = network();
+  const a = device(net);
+  net.beforePut((scope) => net.pending.add(scope));
+  await a.cycle();
+  for (let i = 0; i < 16; i++) {
+    time += 10000;
+    await a.cycle();
+  }
+  a.reopen();
+  expect(outbox(a).every((r) => r.attempts === 0)).toBe(true);
+  const original = net.port.evidence;
+  net.port.evidence = async () => {
+    throw new Error("transient RPC");
+  };
+  time += 10000;
+  await a.cycle();
+  const rows = a.db
+    .prepare("SELECT attempts,next_attempt FROM pdpp_transport_outbox")
+    .all() as { attempts: number; next_attempt: number }[];
+  expect(
+    rows.every((r) => r.attempts === 1 && r.next_attempt <= time + 1000),
+  ).toBe(true);
+  net.port.evidence = original;
+  for (const scope of net.pending)
+    net.chain.set(scope, net.chainRow(scope, net.head.get(scope)!));
+  net.pending.clear();
+  time += 1000;
+  await a.cycle();
+  expect(outbox(a).every((r) => r.state === "published")).toBe(true);
+});
+
+it("uses advancing finalized-head hints to wake waiting rows but still verifies evidence", async () => {
+  const net = network();
+  let finalized = 123n;
+  net.port.finality = { head: vi.fn(async () => finalized) };
+  const original = net.port.evidence;
+  const evidence = vi.fn(original);
+  net.port.evidence = evidence;
+  const a = device(net),
+    b = device(net);
+  a.put("head wake");
+  net.beforePut((scope) => net.pending.add(scope));
+  await a.cycle();
+  await b.cycle();
+  time += 2000;
+  await a.cycle();
+  await b.cycle(); // records inclusion hints without checking unchanged finalized slots
+  const count = evidence.mock.calls.length;
+  for (let i = 0; i < 5; i++) {
+    time += 2000;
+    await a.cycle();
+    await b.cycle();
+  }
+  expect(evidence.mock.calls.length).toBe(count);
+  a.reopen();
+  b.reopen();
+  finalized = 140n;
+  time += 2000;
+  await a.cycle();
+  await b.cycle();
+  // A lying scheduling hint is insufficient to download, publish or import.
+  expect(b.get()).toBeUndefined();
+  expect(net.gets).toHaveLength(0);
+  expect(outbox(a).every((r) => r.state === "ready")).toBe(true);
+  for (const scope of net.pending) {
+    const row = net.chainRow(scope, net.head.get(scope)!);
+    net.chain.set(scope, { ...row, blockNumber: 148n });
+  }
+  net.pending.clear();
+  finalized = 148n;
+  time += 30000;
+  await a.cycle();
+  await b.cycle();
+  expect(b.get()).toEqual({ id: "a", text: "head wake" });
+  expect(outbox(a).every((r) => r.state === "published")).toBe(true);
+});
+
+it("finality hints never shorten a genuine RPC error retry", async () => {
+  const net = network();
+  net.port.finality = { head: async () => 1000n };
+  const a = device(net);
+  const evidence = vi.fn(async () => {
+    throw new Error("RPC unavailable");
+  });
+  net.port.evidence = evidence;
+  await a.cycle();
+  for (let i = 0; i < 5; i++) {
+    time += 100000;
+    await a.cycle();
+  }
+  const count = evidence.mock.calls.length;
+  time += 2000;
+  await a.cycle();
+  expect(evidence.mock.calls.length).toBe(count);
+});
+
+it("filters parked finality waits before the fifty-row budget", async () => {
+  const net = network();
+  net.port.finality = { head: async () => 123n };
+  const a = device(net, { preexisting: "x".repeat(40000), chunk: 500 });
+  net.beforePut((scope) => net.pending.add(scope));
+  await a.cycle();
+  const first = net.registrations.length;
+  expect(first).toBe(50);
+  time += 2000;
+  await a.cycle();
+  expect(net.registrations.length).toBeGreaterThan(first);
+  expect(
+    outbox(a)
+      .slice(0, 50)
+      .every((r) => r.attempts === 0),
+  ).toBe(true);
+});
+
+it("migrates existing delivery rows without losing immutable ciphertext", async () => {
+  const net = network();
+  const a = device(net);
+  net.beforePut((scope) => net.pending.add(scope));
+  await a.cycle();
+  const bytes = outbox(a).map((r) => r.encrypted);
+  for (const table of ["pdpp_transport_outbox", "pdpp_transport_inbox"])
+    for (const column of ["wait_since", "checked_block"])
+      a.db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+  a.reopen();
+  expect(outbox(a).map((r) => r.encrypted)).toEqual(bytes);
+  time += 2000;
+  await a.cycle();
+  expect(outbox(a).every((r) => r.attempts === 0)).toBe(true);
+});
+
+it("a receiver download error after many finality waits starts at one second", async () => {
+  const net = network();
+  const a = device(net, { preexisting: "late download" }),
+    b = device(net);
+  net.beforePut((scope) => net.pending.add(scope));
+  await a.cycle();
+  for (let i = 0; i < 16; i++) {
+    time += 2000;
+    await b.cycle();
+  }
+  const waiting = b.db
+    .prepare("SELECT attempts FROM pdpp_transport_inbox")
+    .all() as { attempts: number }[];
+  expect(waiting.length).toBeGreaterThan(0);
+  expect(waiting.every((r) => r.attempts === 0)).toBe(true);
+  for (const scope of net.pending)
+    net.chain.set(scope, net.chainRow(scope, net.head.get(scope)!));
+  net.pending.clear();
+  net.failDownloadsAfter(0);
+  time += 2000;
+  await b.cycle();
+  const errors = b.db
+    .prepare(
+      "SELECT attempts,next_attempt FROM pdpp_transport_inbox WHERE error IS NOT NULL",
+    )
+    .all() as { attempts: number; next_attempt: number }[];
+  expect(errors.length).toBeGreaterThan(0);
+  expect(
+    errors.every((r) => r.attempts === 1 && r.next_attempt === time + 1000),
+  ).toBe(true);
+  net.failDownloadsAfter(Infinity);
+  time += 1000;
+  await b.cycle();
+  expect(b.get()).toEqual({ id: "a", text: "late download" });
+});
+
+it("rolls staged binary and import acknowledgement back together, then retries without trusting cached bytes", async () => {
+  const net = network(false, 8 * 1024 * 1024);
+  const a = device(net, { cap: 8 * 1024 * 1024, chunk: 1024 * 1024 });
+  const b = device(net, { cap: 8 * 1024 * 1024, chunk: 1024 * 1024 });
+  const bytes = new Uint8Array(2 * 1024 * 1024).fill(31);
+  const blob = a.store.storeBlobBytesForInstance({
+    instance: "conn",
+    method: "export",
+    generation: 1,
+    bytes,
+    mimeType: "application/octet-stream",
+  });
+  a.store.ingestBatch(
+    [
+      {
+        instance: "conn",
+        stream: "messages",
+        key: "binary",
+        data: {
+          id: "binary",
+          blob_ref: {
+            blob_id: blob.blobId,
+            mime_type: blob.mimeType,
+            size_bytes: bytes.length,
+          },
+        },
+        emitted_at: at,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "export", generation: 1 },
+  );
+  await cycles([a], 2);
+  b.db.exec(
+    "CREATE TRIGGER reject_binary BEFORE INSERT ON pdpp_records WHEN NEW.record_key='binary' BEGIN SELECT RAISE(ABORT,'fault after binary staging'); END",
+  );
+  await cycles([b], 3);
+  expect(b.get("binary")).toBeUndefined();
+  expect(b.store.getBlobBytes(blob.blobId)).toBeUndefined();
+  expect(
+    (
+      b.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace IN ('received','canonical','staging')",
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
+  expect(inbox(b).filter((row) => row.error !== null).length).toBeGreaterThan(
+    0,
+  );
+  b.db.exec("DROP TRIGGER reject_binary");
+  await b.cycle();
+  expect(
+    Buffer.from(b.store.getBlobBytes(blob.blobId)!).equals(Buffer.from(bytes)),
+  ).toBe(true);
+  b.db
+    .prepare(
+      "UPDATE pdpp_binary_chunks SET bytes=zeroblob(length(bytes)) WHERE namespace='canonical' AND blob_id=? AND position=0",
+    )
+    .run(blob.blobId);
+  // retry rehashes current rows, detecting replacement/corruption without a verification cache.
+  await expect(b.cycle()).rejects.toThrow("Replica transport cycle incomplete");
+  expect(b.store.getBlobBytes(blob.blobId)).toBeUndefined();
+}, 30000);
+
+it("reclaims only hidden crash staging on restart and preserves committed payloads", async () => {
+  const net = network();
+  const a = device(net);
+  a.put("retained");
+  await a.cycle();
+  const { binaryWriter } = await import("./pdpp-binary-chunks.js");
+  for (const namespace of ["staging", "payload"] as const) {
+    const writer = binaryWriter(a.db, namespace, "orphan");
+    writer.write(new Uint8Array([1, 2, 3]));
+    writer.finish();
+  }
+  a.db
+    .prepare("INSERT INTO pdpp_transport_preparing VALUES (?,?,?,?,?,?,?)")
+    .run(
+      "orphan",
+      "orphan",
+      "orphan",
+      new Uint8Array([1]),
+      new Uint8Array([1]),
+      "hash",
+      "hash",
+    );
+  a.reopen();
+  await a.cycle();
+  expect(
+    (
+      a.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_binary_chunks WHERE blob_id='orphan'",
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
+  expect(
+    (
+      a.db
+        .prepare("SELECT count(*) AS n FROM pdpp_transport_preparing")
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
+  expect(
+    (
+      a.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace='payload'",
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBeGreaterThan(0);
+});
+
+it("bounds repeated high hints and never regresses the verified checked height", async () => {
+  const net = network();
+  net.port.finality = { head: async () => 1000n };
+  const a = device(net, { preexisting: "pending" });
+  net.beforePut((scope) => net.pending.add(scope));
+  const original = net.port.evidence;
+  let verified = 123n;
+  const evidence = vi.fn(async (scope: string) => {
+    const e = await original(scope);
+    return { ...e, chain: e.chain && { ...e.chain, blockNumber: verified } };
+  });
+  net.port.evidence = evidence;
+  await a.cycle();
+  time += 2000;
+  await a.cycle(); // high hint, unchanged verified head: durable cooldown
+  const count = evidence.mock.calls.length;
+  for (let i = 0; i < 14; i++) {
+    time += 2000;
+    await a.cycle();
+  }
+  expect(evidence.mock.calls.length).toBe(count);
+  verified = 120n;
+  time += 2000;
+  await a.cycle();
+  const rows = a.db
+    .prepare(
+      "SELECT checked_block,attempts,next_attempt FROM pdpp_transport_outbox",
+    )
+    .all() as {
+    checked_block: string;
+    attempts: number;
+    next_attempt: number;
+  }[];
+  expect(
+    rows.every(
+      (r) =>
+        r.checked_block === "123" &&
+        r.attempts === 0 &&
+        r.next_attempt === time + 30000,
+    ),
+  ).toBe(true);
+  expect(net.gets).toHaveLength(0);
 });

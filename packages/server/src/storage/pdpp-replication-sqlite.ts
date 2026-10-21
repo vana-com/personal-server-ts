@@ -1,3 +1,10 @@
+import {
+  BINARY_CHUNKS_MIGRATION,
+  binaryLength,
+  readBinaryChunks,
+  verifyBinary,
+  copyBinary,
+} from "./pdpp-binary-chunks.js";
 import type { Database } from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -14,7 +21,9 @@ import {
 import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 
 /** Inert until beginBaseline commits. Never wired into production bootstrap. */
-export const REPLICATION_MIGRATION = `
+export const REPLICATION_MIGRATION =
+  BINARY_CHUNKS_MIGRATION +
+  `
 CREATE TABLE IF NOT EXISTS pdpp_replica_settings (id INTEGER PRIMARY KEY CHECK(id = 1), config_json TEXT NOT NULL, watermark INTEGER NOT NULL, checkpoint INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS pdpp_replica_clock (id INTEGER PRIMARY KEY CHECK(id = 1), counter INTEGER NOT NULL);
 INSERT OR IGNORE INTO pdpp_replica_clock VALUES (1, 0);
@@ -47,6 +56,7 @@ export interface ReplicationExport {
   /** CAS acknowledgment after the page is durable at its consumer; retry is idempotent. */
   acknowledgeBaselinePage(expected: number, next: number): void;
   readPinnedBlobBytes(blobId: string): Uint8Array | undefined;
+  readPinnedBlobChunks(blobId: string): Iterable<Uint8Array>;
 }
 type Binding = {
   instance: string;
@@ -152,19 +162,12 @@ export function createReplicationJournal(db: Database, writerId: string) {
     if (claimed?.generation !== identity.generation)
       throw new Error("missing current blob claim");
     const blob = blobDescriptor(blobId);
-    const row = db
-      .prepare("SELECT bytes FROM pdpp_blob_bytes WHERE blob_id = ?")
-      .get(blobId) as { bytes: Buffer } | undefined;
-    if (
-      !row ||
-      row.bytes.length !== blob.sizeBytes ||
-      `sha256:${createHash("sha256").update(row.bytes).digest("hex")}` !==
-        blob.sha256
-    )
+    if (!verifyBinary(db, "canonical", blobId, blob.sha256, blob.sizeBytes))
       throw new Error("unverified replication blob bytes");
-    db.prepare(
-      "INSERT OR IGNORE INTO pdpp_replica_blob_bytes VALUES (?, ?)",
-    ).run(blobId, row.bytes);
+    if (binaryLength(db, "pinned", blobId) === undefined)
+      copyBinary(db, "canonical", blobId, "pinned");
+    else if (!verifyBinary(db, "pinned", blobId, blob.sha256, blob.sizeBytes))
+      throw new Error("corrupt pinned replica bytes");
     const previous = allOperations().some(
       (op) =>
         op.kind === "blob-claim" &&
@@ -480,11 +483,19 @@ export function createReplicationJournal(db: Database, writerId: string) {
         ).run(next);
       }).immediate();
     },
+    readPinnedBlobChunks(blobId) {
+      return readBinaryChunks(db, "pinned", blobId);
+    },
     readPinnedBlobBytes(blobId) {
-      const row = db
-        .prepare("SELECT bytes FROM pdpp_replica_blob_bytes WHERE blob_id = ?")
-        .get(blobId) as { bytes: Buffer } | undefined;
-      return row ? new Uint8Array(row.bytes) : undefined;
+      const size = binaryLength(db, "pinned", blobId);
+      if (size === undefined) return undefined;
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of readBinaryChunks(db, "pinned", blobId)) {
+        bytes.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return bytes;
     },
   };
   return {

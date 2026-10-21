@@ -1,3 +1,10 @@
+import {
+  BINARY_CHUNKS_MIGRATION,
+  binaryLength,
+  binaryWriter,
+  readBinary,
+  verifyBinary,
+} from "./pdpp-binary-chunks.js";
 import { RECEIVER_MIGRATION } from "./pdpp-replication-receiver.js";
 import {
   createReplicationJournal,
@@ -341,6 +348,8 @@ BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
 `,
   REPLICATION_MIGRATION,
   RECEIVER_MIGRATION,
+  BINARY_CHUNKS_MIGRATION +
+    `CREATE TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END;`,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -797,9 +806,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   );
   const insertBlobBytesStmt = db.prepare(
     "INSERT INTO pdpp_blob_bytes (blob_id, bytes) VALUES (@blob_id, @bytes)",
-  );
-  const getBlobBytesStmt = db.prepare(
-    "SELECT bytes FROM pdpp_blob_bytes WHERE blob_id = ?",
   );
   const dropCompletionStmt = db.prepare(
     "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
@@ -2124,12 +2130,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
 
   /** True only when a stored bytes row actually hash/size-matches `meta`. */
   function storedBytesVerify(meta: PdppBlobMeta): boolean {
-    const row = getBlobBytesStmt.get(meta.blobId) as
-      { bytes: Buffer } | undefined;
-    if (!row) return false;
-    const stored = new Uint8Array(row.bytes);
-    if (stored.byteLength !== meta.sizeBytes) return false;
-    return createHash("sha256").update(stored).digest("hex") === meta.sha256;
+    return verifyBinary(
+      db,
+      "canonical",
+      meta.blobId,
+      `sha256:${meta.sha256}`,
+      meta.sizeBytes,
+    );
   }
 
   function storeBlobBytes(bytes: Uint8Array, mimeType: string): PdppBlobMeta {
@@ -2140,6 +2147,16 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       mimeType,
       sizeBytes: bytes.byteLength,
       sha256,
+    };
+
+    const retainBytes = () => {
+      if (bytes.length <= 1024 * 1024)
+        insertBlobBytesStmt.run({ blob_id: blobId, bytes: Buffer.from(bytes) });
+      else {
+        const writer = binaryWriter(db, "canonical", blobId);
+        writer.write(bytes);
+        writer.finish();
+      }
     };
 
     // The existing-row read and the write both happen inside one
@@ -2158,16 +2175,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         ) {
           throw new BlobConflictError(blobId, existing);
         }
-        const bytesRow = getBlobBytesStmt.get(blobId) as
-          { bytes: Buffer } | undefined;
-        if (!bytesRow) {
+        if (binaryLength(db, "canonical", blobId) === undefined) {
           // Metadata-only row (legacy/test fixture via putBlobMeta, or a
           // prior write that never got this far): complete it with real
           // bytes now instead of reporting a false "already stored" no-op.
-          insertBlobBytesStmt.run({
-            blob_id: existing.blobId,
-            bytes: Buffer.from(bytes),
-          });
+          retainBytes();
           return existing;
         }
         if (!storedBytesVerify(existing)) {
@@ -2187,10 +2199,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         size_bytes: candidate.sizeBytes,
         sha256: candidate.sha256,
       });
-      insertBlobBytesStmt.run({
-        blob_id: candidate.blobId,
-        bytes: Buffer.from(bytes),
-      });
+      retainBytes();
       return candidate;
     });
 
@@ -2230,15 +2239,15 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   }
 
   function getBlobBytes(blobId: string): Uint8Array<ArrayBuffer> | undefined {
-    const meta = getBlobMeta(blobId);
-    if (!meta) return undefined;
-    const row = getBlobBytesStmt.get(blobId) as { bytes: Buffer } | undefined;
-    if (!row) return undefined;
-    const bytes = new Uint8Array(row.bytes);
-    if (bytes.byteLength !== meta.sizeBytes) return undefined;
-    const actualHash = createHash("sha256").update(bytes).digest("hex");
-    if (actualHash !== meta.sha256) return undefined;
-    return bytes as Uint8Array<ArrayBuffer>;
+    return db
+      .transaction(() => {
+        const meta = getBlobMeta(blobId);
+        if (!meta || !storedBytesVerify(meta)) return undefined;
+        // Verification and assembly share a snapshot. A forged/incomplete manifest
+        // cannot force a whole-value allocation, and concurrent writes cannot swap it.
+        return readBinary(db, "canonical", blobId);
+      })
+      .deferred();
   }
 
   return {
