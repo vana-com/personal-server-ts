@@ -156,6 +156,8 @@ export function createPsLiteDerivativeCompute(
             lineageSources: event.lineageSources,
           }),
         runtimeAvailability: options.runtimeAvailability,
+        // Lite has no PDPP surface.
+        pdppEnabled: false,
         storage: options.storage,
         store: options.store,
         provider,

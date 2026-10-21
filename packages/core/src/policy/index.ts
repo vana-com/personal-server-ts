@@ -28,4 +28,8 @@ export {
   type WriteFeeVerifierPort,
 } from "./data-write.js";
 
+export {
+  nonOwnerPublicationIsPdpp,
+  type PdppEnabled,
+} from "./publication-origin.js";
 export { isSystemScope } from "./reserved-scopes.js";

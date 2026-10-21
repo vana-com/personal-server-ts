@@ -56,17 +56,6 @@ describe("createSqlitePdppGrantBindingStore", () => {
     expect(store.getBindingsForPermission(PERMISSION)).toEqual([binding]);
   });
 
-  it("reports whether a grantee was ever bound, case-insensitively", () => {
-    const store = createSqlitePdppGrantBindingStore(new Database(":memory:"));
-    store.putBinding(makeBinding());
-    expect(
-      store.hasBindingForGrantee("0x00000000000000000000000000000000000000c1"),
-    ).toBe(true);
-    expect(
-      store.hasBindingForGrantee("0x00000000000000000000000000000000000000d2"),
-    ).toBe(false);
-  });
-
   it("returns null / empty for an unknown binding rather than throwing", () => {
     const db = new Database(":memory:");
     const store = createSqlitePdppGrantBindingStore(db);

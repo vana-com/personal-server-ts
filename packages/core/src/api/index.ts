@@ -1,6 +1,6 @@
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
-import { authorizeLegacyRead } from "../policy/data-read.js";
+import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
 import { storageForReader } from "../storage/disclosure-policy.js";
 import {
   DataDeletedError,
@@ -95,9 +95,9 @@ import {
   type StoredLineage,
 } from "../lineage/lineage.js";
 import {
-  writerHasPdppExposure,
-  type WriterExposurePolicy,
-} from "../grants/writer-exposure.js";
+  nonOwnerPublicationIsPdpp,
+  type PdppEnabled,
+} from "../policy/publication-origin.js";
 import { citedSourcesHavePdppOrigin } from "../lineage/cited-origin.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import type {
@@ -413,11 +413,11 @@ export interface PersonalServerDataApiDeps {
    */
   lineageGateway?: LineageGatewayPort;
   /**
-   * How to tell whether a non-owner writer was ever exposed to PDPP data.
-   * Absent means exposure cannot be determined, so every non-owner write is
-   * PDPP-origin; a server without any PDPP surface sets `pdpp-disabled`.
+   * Whether this server has a PDPP surface. Every non-owner publication is
+   * PDPP-origin unless this is explicitly `false` (see
+   * `nonOwnerPublicationIsPdpp`); absent fails closed.
    */
-  writerExposure?: WriterExposurePolicy;
+  pdppEnabled?: PdppEnabled;
   /**
    * Called after a write is committed (owner or builder, JSON or binary).
    * The derivative compute layer uses it to mark questions that read the
@@ -1596,12 +1596,10 @@ async function prepareWriteLineage(
 
 /**
  * Origin of a write's inputs, decided once per write (see `inputsPdppOrigin`
- * on the ingest contract). A non-owner's lineage list is only a claim, so the
- * writer is classified first: one that ever held a PDPP grant, or whose
- * exposure cannot be determined, writes PDPP-origin whatever it cites (with or
- * without lineage, JSON or binary). Only an unexposed writer falls through to
- * the cited sources. The owner's own derivatives keep cited-source
- * classification; `undefined` is an ordinary owner root write.
+ * on the ingest contract). A non-owner's output is classified by the server's
+ * publication policy, not by what it cites (see `nonOwnerPublicationIsPdpp`).
+ * The owner's own derivatives are classified by their cited sources;
+ * `undefined` is an ordinary owner root write.
  */
 async function writeInputsPdppOrigin(
   deps: PersonalServerDataApiDeps,
@@ -1609,9 +1607,7 @@ async function writeInputsPdppOrigin(
   prepared: { sourceScopes: string[] } | undefined,
 ): Promise<boolean | undefined> {
   if (writeAuth) {
-    if (await writerHasPdppExposure(deps.writerExposure, writeAuth.builder)) {
-      return true;
-    }
+    if (nonOwnerPublicationIsPdpp(deps.pdppEnabled)) return true;
   } else if (!prepared) {
     return undefined;
   }
@@ -2075,7 +2071,11 @@ export async function handlePersonalServerDataRequest(
       // its refusal) or a version with PDPP origin.
       // The body is decided again on its bytes when it is read, through the
       // reader's storage below; this only refuses early, before payment.
-      const reader = isOwnerView(authResult) ? "owner" : "grantee";
+      const reader: LegacyReader = isOwnerView(authResult)
+        ? "owner"
+        : typeof authResult?.builder === "string"
+          ? { builder: authResult.builder }
+          : "grantee";
       if (latest !== undefined && latest.kind !== "file") {
         authorizeLegacyRead(reader, { kind: "canonical-view" });
       } else if (selectedEntry) {

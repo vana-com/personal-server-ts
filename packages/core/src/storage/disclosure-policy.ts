@@ -50,11 +50,11 @@ export function isGuarded(storage: DataStoragePort): boolean {
   return (storage as { [GUARDED]?: true })[GUARDED] === true;
 }
 
-function authorizeEnvelope(envelope: {
-  data: unknown;
-  producer?: unknown;
-}): void {
-  authorizeLegacyRead("grantee", { kind: "stored-envelope", envelope });
+function authorizeEnvelope(
+  envelope: { data: unknown; producer?: unknown },
+  reader: LegacyReader,
+): void {
+  authorizeLegacyRead(reader, { kind: "stored-envelope", envelope });
 }
 
 /** Binding and provenance are for the policy; a non-owner never sees them. */
@@ -89,15 +89,19 @@ function servedManifest(manifest: DataBlockManifest): DataBlockManifest {
  * Wrap a raw storage port for a non-owner reader. Metadata (index lookups,
  * listings) passes through; every body is authorized on the bytes read.
  */
-export function withDisclosurePolicy(raw: DataStoragePort): DataStoragePort {
+export function withDisclosurePolicy(
+  raw: DataStoragePort,
+  reader: LegacyReader = "grantee",
+): DataStoragePort {
   if (isGuarded(raw)) return raw;
 
   async function readAuthorized(
     scope: string,
     collectedAt: string,
+    as: LegacyReader = reader,
   ): Promise<DataFileEnvelope> {
     const envelope = await raw.readEnvelope(scope, collectedAt);
-    authorizeEnvelope(envelope);
+    authorizeEnvelope(envelope, as);
     return envelope;
   }
 
@@ -109,7 +113,7 @@ export function withDisclosurePolicy(raw: DataStoragePort): DataStoragePort {
     const rawBytes = raw.readEnvelopeBytes.bind(raw);
     overrides.readEnvelopeBytes = async (scope, collectedAt) => {
       const bytes = await rawBytes(scope, collectedAt);
-      authorizeEnvelope(JSON.parse(textDecoder.decode(bytes)));
+      authorizeEnvelope(JSON.parse(textDecoder.decode(bytes)), reader);
       return bytes;
     };
   }
@@ -119,9 +123,9 @@ export function withDisclosurePolicy(raw: DataStoragePort): DataStoragePort {
     // what is served is that checked copy, not a second read.
     overrides.readEnvelopeStream = async (scope, collectedAt) => {
       const chunks: Uint8Array[] = [];
-      const reader = (await rawStream(scope, collectedAt)).getReader();
+      const chunkReader = (await rawStream(scope, collectedAt)).getReader();
       for (;;) {
-        const { done, value } = await reader.read();
+        const { done, value } = await chunkReader.read();
         if (done) break;
         chunks.push(value);
       }
@@ -133,7 +137,7 @@ export function withDisclosurePolicy(raw: DataStoragePort): DataStoragePort {
         bytes.set(chunk, offset);
         offset += chunk.byteLength;
       }
-      authorizeEnvelope(JSON.parse(textDecoder.decode(bytes)));
+      authorizeEnvelope(JSON.parse(textDecoder.decode(bytes)), reader);
       return new ReadableStream<Uint8Array>({
         start(controller) {
           for (const chunk of chunks) controller.enqueue(chunk);
@@ -177,7 +181,8 @@ export function withDisclosurePolicy(raw: DataStoragePort): DataStoragePort {
         `The stored version of ${scope} at ${collectedAt} changed after the read was authorized`,
       );
     }
-    authorizeEnvelope(envelope);
+    // Blocks never take the own-write exception: a plain grantee.
+    authorizeEnvelope(envelope, "grantee");
     const schemaId = (envelope as { schemaId?: unknown }).schemaId;
     const built = await buildDataBlocksAsync({
       scope,
@@ -278,9 +283,9 @@ export function storageForReader(
   reader: LegacyReader,
 ): DataStoragePort {
   if (reader === "owner") return storage;
-  const view = (storage as { [GRANTEE_VIEW]?: () => DataStoragePort })[
-    GRANTEE_VIEW
-  ];
-  if (view) return view();
-  return withDisclosurePolicy(storage);
+  const view = (
+    storage as { [GRANTEE_VIEW]?: (reader: LegacyReader) => DataStoragePort }
+  )[GRANTEE_VIEW];
+  if (view) return view(reader);
+  return withDisclosurePolicy(storage, reader);
 }

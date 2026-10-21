@@ -16,6 +16,10 @@ import {
 } from "../lineage/lineage.js";
 import { uncoveredSourceScopes } from "./registration.js";
 import { inputHasPdppOrigin } from "../sync/pdpp-import.js";
+import {
+  nonOwnerPublicationIsPdpp,
+  type PdppEnabled,
+} from "../policy/publication-origin.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
@@ -71,6 +75,13 @@ export interface QuestionComputeDeps {
   storage: DataStoragePort;
   store: QuestionStore;
   provider: InferenceProvider;
+  /**
+   * Whether the server has a PDPP surface. On a PDPP-enabled server (or when
+   * this is absent) a builder-registered question's output is PDPP-origin
+   * whatever its sources, because the question text is builder-supplied input
+   * copied into the output. See `nonOwnerPublicationIsPdpp`.
+   */
+  pdppEnabled?: PdppEnabled;
   /** Required: lineage ids are keccak256(owner, scope). */
   serverOwner: `0x${string}` | undefined;
   /** Newest-first items kept per source scope (default 50). */
@@ -623,7 +634,10 @@ export async function computeQuestion(
       lineage,
       // Handed to the publication point, which stamps the output: an answer
       // computed from PDPP data must not be readable by a legacy chain grant.
-      inputsPdppOrigin: sourcesHavePdppOrigin,
+      inputsPdppOrigin:
+        sourcesHavePdppOrigin ||
+        (registration.registeredBy.kind === "builder" &&
+          nonOwnerPublicationIsPdpp(deps.pdppEnabled)),
       afterTombstoneVersion: await tombstoneMarker(
         deps.scopeDeletions,
         registration.derivedScope,

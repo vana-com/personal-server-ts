@@ -46,6 +46,7 @@
  *     makes a JSON-vs-binary switch of the same bytes fail verification.
  */
 
+import { WRITER_ATTRIBUTION_KEY } from "./attribution-key.js";
 import {
   computeBodyHash,
   parseWeb3SignedHeader,
@@ -175,11 +176,7 @@ function signedNonce(payloadBase64: string): string | undefined {
   return nonce;
 }
 
-/**
- * Reserved key inside the envelope's `data` record for builder attribution.
- * Mirrors the `$binary` marker convention (contracts/binary.ts).
- */
-export const WRITER_ATTRIBUTION_KEY = "$writtenBy" as const;
+export { WRITER_ATTRIBUTION_KEY };
 
 export interface WriterAttribution {
   /** The builder address the proof recovered to. */

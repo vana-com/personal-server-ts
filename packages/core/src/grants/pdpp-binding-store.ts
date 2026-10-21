@@ -62,13 +62,6 @@ export interface PdppGrantBindingStore {
    * this permission still live" must check every entry themselves.
    */
   getBindingsForPermission(permission: ChainPermissionRef): PdppGrantBinding[];
-  /**
-   * Whether ANY binding was ever recorded for this grantee wallet. Bindings
-   * are append-only and never carry revocation, so a revoked or expired grant
-   * still counts: the answer is durable history of PDPP exposure, not current
-   * permission.
-   */
-  hasBindingForGrantee(granteeAddress: string): boolean;
 }
 
 /**
@@ -157,14 +150,6 @@ export function createInMemoryPdppGrantBindingStore(): PdppGrantBindingStore {
 
     getByPdppGrantId(pdppGrantId: string): PdppGrantBinding | null {
       return byGrantId.get(pdppGrantId) ?? null;
-    },
-
-    hasBindingForGrantee(granteeAddress: string): boolean {
-      const wanted = granteeAddress.toLowerCase();
-      for (const binding of byGrantId.values()) {
-        if (binding.granteeAddress.toLowerCase() === wanted) return true;
-      }
-      return false;
     },
 
     getBindingsForPermission(

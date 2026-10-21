@@ -36,14 +36,12 @@ import {
   type LineageGatewayPort,
   type LineageView,
 } from "@opendatalabs/personal-server-ts-core/lineage";
-import {
-  createInMemoryPdppGrantBindingStore,
-  writerExposureFromBindings,
-} from "@opendatalabs/personal-server-ts-core/grants";
 import { dataRoutes, type DataRouteDeps } from "./data.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const builderWallet = createTestWallet(0);
+// A second app: holds its own legacy read grant, never wrote the data.
+const otherWallet = createTestWallet(2);
 const ownerWallet = createTestWallet(9);
 
 const BUILDER_ID = "0xbuilder1";
@@ -112,6 +110,7 @@ function makeGrant(
 }
 
 const READ_REPORT_GRANT_ID = "grant-r-2";
+const CHAT_READ_GRANT_ID = "grant-r-chat";
 const REPORT_SCOPE = "spine.health.report";
 
 const grants: Record<string, GatewayGrantResponse> = {
@@ -213,7 +212,7 @@ describe("derivative data routes", () => {
       writeSessionStore,
       lineageGateway,
       // Most tests are about lineage, not exposure: no PDPP surface here.
-      writerExposure: { kind: "pdpp-disabled" },
+      pdppEnabled: false,
     };
     app = dataRoutes(deps);
     cleanup = () => indexManager.close();
@@ -223,6 +222,27 @@ describe("derivative data routes", () => {
     cleanup();
     await rm(dataDir, { recursive: true, force: true });
   });
+
+  function appFor(wallet: ReturnType<typeof createTestWallet>) {
+    grants[CHAT_READ_GRANT_ID] = makeGrant({
+      id: CHAT_READ_GRANT_ID,
+      scopes: ["chatgpt.conversations"],
+    });
+    return dataRoutes({
+      ...deps,
+      gateway: createMockGateway({
+        getBuilder: vi.fn().mockResolvedValue({
+          id: BUILDER_ID,
+          ownerAddress: ownerWallet.address,
+          granteeAddress: wallet.address,
+          publicKey: "0x04key",
+          appUrl: "https://app.example.com",
+          addedAt: "2026-01-21T10:00:00.000Z",
+        } satisfies Builder),
+        getGrant: vi.fn(async (id: string) => grants[id] ?? null),
+      }),
+    });
+  }
 
   async function ownerHeader(method: string, uri: string, body?: string) {
     return buildWeb3SignedHeader({
@@ -1096,10 +1116,10 @@ describe("derivative data routes", () => {
       ).toBeUndefined();
     }
     async function builderRead(scope: string, grantId: string) {
-      return app.request(`/${scope}`, {
+      return appFor(otherWallet).request(`/${scope}`, {
         headers: {
           Authorization: await buildWeb3SignedHeader({
-            wallet: builderWallet,
+            wallet: otherWallet,
             aud: SERVER_ORIGIN,
             method: "GET",
             uri: `/${scope}`,
@@ -1220,56 +1240,18 @@ describe("derivative data routes", () => {
     });
   });
 
-  describe("a non-owner write is classified by the writer's PDPP exposure", () => {
+  describe("a non-owner publication on a PDPP-enabled server is PDPP-origin", () => {
     const MARKER = "exposure-synthetic-marker";
 
-    function bindingFor(grantee: `0x${string}`, permissionId = "perm-1") {
-      return {
-        pdppGrantId: `pdpp-grant-${permissionId}`,
-        permission: {
-          chainId: 14800,
-          contractAddress:
-            "0x0000000000000000000000000000000000000001" as const,
-          permissionId,
-        },
-        ownerAddress: ownerWallet.address,
-        granteeAddress: grantee,
-        pdppClientId: "client-1",
-        granteeId: BUILDER_ID,
-        grantVersion: "1",
-        boundAt: "2026-09-01T00:00:00.000Z",
-      };
-    }
-    function useExposure(policy: DataRouteDeps["writerExposure"]) {
-      deps.writerExposure = policy;
+    function usePdppEnabled(value: DataRouteDeps["pdppEnabled"]) {
+      deps.pdppEnabled = value;
       app = dataRoutes(deps);
     }
-    function exposedBuilder(revokedGrant = false) {
-      const store = createInMemoryPdppGrantBindingStore();
-      store.putBinding(bindingFor(builderWallet.address));
-      if (revokedGrant) {
-        // The binding carries no revocation: the chain grant is dead, the
-        // exposure is not.
-        grants["perm-1"] = {
-          ...grants[READ_GRANT_ID]!,
-          id: "perm-1",
-          revokedAt: "2026-09-02T00:00:00.000Z",
-        } as GatewayGrantResponse;
-      }
-      useExposure(writerExposureFromBindings(store));
-    }
-    function unexposedBuilder() {
-      const store = createInMemoryPdppGrantBindingStore();
-      store.putBinding(
-        bindingFor("0x00000000000000000000000000000000000000aa", "perm-other"),
-      );
-      useExposure(writerExposureFromBindings(store));
-    }
     async function builderRead(scope: string, grantId: string) {
-      return app.request(`/${scope}`, {
+      return appFor(otherWallet).request(`/${scope}`, {
         headers: {
           Authorization: await buildWeb3SignedHeader({
-            wallet: builderWallet,
+            wallet: otherWallet,
             aud: SERVER_ORIGIN,
             method: "GET",
             uri: `/${scope}`,
@@ -1318,10 +1300,10 @@ describe("derivative data routes", () => {
     ];
 
     it.each(jsonVariants)(
-      "an exposed builder's JSON write that %s is PDPP-origin and refused to a legacy grant",
+      "a builder's JSON write that %s is PDPP-origin and refused to a legacy grant",
       async (_name, body) => {
         await seedSource(OTHER_SOURCE_SCOPE);
-        exposedBuilder();
+        usePdppEnabled(true);
         expect((await sessionWrite(DERIVED_SCOPE, body())).status).toBe(201);
         const read = await builderRead(DERIVED_SCOPE, READ_GRANT_ID);
         const text = await read.text();
@@ -1338,10 +1320,10 @@ describe("derivative data routes", () => {
       ["cites an empty list", () => ({ lineage: [] })],
       ["omits lineage", () => undefined],
     ])(
-      "an exposed builder's binary write that %s is PDPP-origin and refused",
+      "a builder's binary write that %s is PDPP-origin and refused",
       async (_name, metadata) => {
         await seedSource(OTHER_SOURCE_SCOPE);
-        exposedBuilder();
+        usePdppEnabled(true);
         expect((await binaryWrite(metadata())).status).toBe(201);
         const read = await builderRead(REPORT_SCOPE, READ_REPORT_GRANT_ID);
         const text = await read.text();
@@ -1350,9 +1332,9 @@ describe("derivative data routes", () => {
       },
     );
 
-    it("positive control: an unexposed builder citing legacy-only sources stays readable (JSON and binary)", async () => {
+    it("positive control: on a PDPP-disabled server a builder citing legacy-only sources stays readable (JSON and binary)", async () => {
       await seedSource(OTHER_SOURCE_SCOPE);
-      unexposedBuilder();
+      usePdppEnabled(false);
       expect(
         (
           await sessionWrite(DERIVED_SCOPE, {
@@ -1370,9 +1352,9 @@ describe("derivative data routes", () => {
       expect(binary.status, await binary.text()).toBe(200);
     });
 
-    it("an exposed builder whose only grant was revoked is still exposed", async () => {
+    it("a builder with no PDPP binding of any kind is not exempt (no lookup exists to exempt it)", async () => {
       await seedSource(OTHER_SOURCE_SCOPE);
-      exposedBuilder(true);
+      usePdppEnabled(true);
       expect(
         (
           await sessionWrite(DERIVED_SCOPE, {
@@ -1386,7 +1368,7 @@ describe("derivative data routes", () => {
       );
     });
 
-    it("fails closed to PDPP when exposure cannot be determined", async () => {
+    it("fails closed to PDPP when the PDPP-enabled state is unknown", async () => {
       await seedSource(OTHER_SOURCE_SCOPE);
       const write = () =>
         sessionWrite(DERIVED_SCOPE, {
@@ -1394,18 +1376,15 @@ describe("derivative data routes", () => {
           lineage: [OTHER_SOURCE_ID],
         });
       // A failing lookup.
-      useExposure({
-        kind: "lookup",
-        hasExposure: () => {
-          throw new Error("mapping store unavailable");
-        },
+      usePdppEnabled(() => {
+        throw new Error("config unavailable");
       });
       expect((await write()).status).toBe(201);
       expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
         403,
       );
-      // PDPP enabled but no mapping store wired.
-      useExposure(undefined);
+      // Not supplied at all.
+      usePdppEnabled(undefined);
       expect((await write()).status).toBe(201);
       expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
         403,
@@ -1414,7 +1393,7 @@ describe("derivative data routes", () => {
 
     it("a server with PDPP disabled stays legacy", async () => {
       await seedSource(OTHER_SOURCE_SCOPE);
-      useExposure({ kind: "pdpp-disabled" });
+      usePdppEnabled(false);
       expect(
         (await sessionWrite(DERIVED_SCOPE, { summary: MARKER, lineage: [] }))
           .status,
@@ -1424,8 +1403,8 @@ describe("derivative data routes", () => {
       );
     });
 
-    it("an exposed builder is refused even when the cited scope's PDPP version is no longer the latest", async () => {
-      // V1 PDPP, V2 legacy: citation checking would certify V2. Exposure does not.
+    it("a builder is refused even when the cited scope's PDPP version is no longer the latest", async () => {
+      // V1 PDPP, V2 legacy: citation checking would certify V2; the publication policy does not look.
       const raw = reviewNodeStorage({
         indexManager: deps.indexManager,
         hierarchyOptions,
@@ -1456,7 +1435,7 @@ describe("derivative data routes", () => {
           sizeBytes: written.sizeBytes,
         });
       }
-      exposedBuilder();
+      usePdppEnabled(true);
       expect(
         (
           await sessionWrite(DERIVED_SCOPE, {
@@ -1468,6 +1447,173 @@ describe("derivative data routes", () => {
       expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
         403,
       );
+    });
+  });
+
+  describe("the writing app can read its own write back; no other legacy grant can", () => {
+    const MARKER = "own-write-synthetic-marker";
+    const OTHER_TOKEN = "vana_write_other_token";
+
+    async function readAs(
+      wallet: ReturnType<typeof createTestWallet>,
+      path: string,
+      grantId = READ_GRANT_ID,
+    ) {
+      const [pathname] = path.split("?");
+      return appFor(wallet).request(path, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: pathname!,
+            grantId,
+          }),
+        },
+      });
+    }
+    async function writeAs(
+      wallet: ReturnType<typeof createTestWallet>,
+      token: string,
+      scope: string,
+      body: unknown,
+    ) {
+      const raw = JSON.stringify(body);
+      return appFor(wallet).request(`/${scope}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+            wallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: `/${scope}`,
+            body: new TextEncoder().encode(raw),
+            grantId: WRITE_GRANT_ID,
+          }),
+        },
+        body: raw,
+      });
+    }
+    beforeEach(async () => {
+      deps.pdppEnabled = true;
+      await writeSessionStore.create({
+        tokenHash: await hashWriteSessionToken(OTHER_TOKEN),
+        builderAddress: otherWallet.address,
+        grantId: WRITE_GRANT_ID,
+        writeScopes: ["spine.*", "chatgpt.*"],
+        createdAt: new Date().toISOString(),
+        expiresAtMs: Date.now() + 60_000,
+      });
+    });
+
+    it("app A reads its own write back through its own legacy grant; app B cannot", async () => {
+      expect(
+        (
+          await writeAs(builderWallet, SESSION_TOKEN, DERIVED_SCOPE, {
+            v: MARKER,
+          })
+        ).status,
+      ).toBe(201);
+      const own = await readAs(builderWallet, `/${DERIVED_SCOPE}`);
+      const ownText = await own.text();
+      expect(own.status, ownText).toBe(200);
+      expect(ownText).toContain(MARKER);
+      // The server-stamped writer field still never reaches a grantee.
+      expect(ownText).not.toContain("$writtenBy");
+
+      const other = await readAs(otherWallet, `/${DERIVED_SCOPE}`);
+      const otherText = await other.text();
+      expect(other.status, otherText).toBe(403);
+      expect(otherText).not.toContain(MARKER);
+    });
+
+    it("a newer version by another writer is judged on its own bytes", async () => {
+      expect(
+        (
+          await writeAs(builderWallet, SESSION_TOKEN, DERIVED_SCOPE, {
+            v: MARKER,
+          })
+        ).status,
+      ).toBe(201);
+      const first = (await (await ownerRead(DERIVED_SCOPE)).json())
+        .collectedAt as string;
+      await new Promise((r) => setTimeout(r, 1100));
+      expect(
+        (await writeAs(otherWallet, OTHER_TOKEN, DERIVED_SCOPE, { v: "later" }))
+          .status,
+      ).toBe(201);
+      const latest = await readAs(builderWallet, `/${DERIVED_SCOPE}`);
+      expect(latest.status, await latest.text()).toBe(403);
+      const mine = await readAs(
+        builderWallet,
+        `/${DERIVED_SCOPE}?at=${encodeURIComponent(first)}`,
+      );
+      const mineText = await mine.text();
+      expect(mine.status, mineText).toBe(200);
+      expect(mineText).toContain(MARKER);
+    });
+
+    it("a projection that joins the app's write with another scope is refused", async () => {
+      const conv = {
+        records: [
+          {
+            id: "conv-1",
+            title: "Trip",
+            create_time: "2026-09-01T00:00:00Z",
+            update_time: "2026-09-01T00:00:00Z",
+            current_node: "m1",
+            message_count_on_current_branch: 1,
+          },
+        ],
+      };
+      expect(
+        (await writeAs(builderWallet, SESSION_TOKEN, SOURCE_SCOPE, conv))
+          .status,
+      ).toBe(201);
+      // A PDPP-stamped sibling the app did not write.
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      const messages = {
+        version: "1.0",
+        scope: "chatgpt.messages",
+        collectedAt: "2026-09-01T00:00:00Z",
+        producer: "pdpp-projector",
+        data: {
+          records: [
+            {
+              id: "m1",
+              conversation_id: "conv-1",
+              parent_id: null,
+              role: "user",
+              content: MARKER,
+              content_type: "text",
+              model_slug: null,
+              create_time: "2026-09-01T00:00:00Z",
+              on_current_branch: true,
+            },
+          ],
+        },
+      };
+      const written = await raw.writeEnvelope(messages as never);
+      await raw.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: messages.scope,
+        collectedAt: messages.collectedAt,
+        sizeBytes: written.sizeBytes,
+      });
+      const read = await readAs(
+        builderWallet,
+        `/${SOURCE_SCOPE}`,
+        CHAT_READ_GRANT_ID,
+      );
+      const text = await read.text();
+      expect(read.status, text).toBe(403);
+      expect(text).not.toContain(MARKER);
     });
   });
 });
