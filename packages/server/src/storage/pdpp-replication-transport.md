@@ -49,9 +49,10 @@ imported batch identities. One worker per database is the host contract.
    be configured lower than the vana-storage 100 MiB default. Adaptive splitting
    handles both large JSON records and binary payloads.
 3. Before every upload attempt, reconcile the exact address. Confirmed evidence
-   must agree across owner/scope/version-1 head, version history and finalized
-   chain commitments. Absence retries the same address/bytes; pending settlement
-   waits; inconsistent commitments, deletion or any later version quarantine.
+   must match the owner/scope/version-1 head to a finalized DataRegistryV2
+   version-1 commitment and Active status. Absence retries the same address
+   and bytes; pending settlement waits. Only finalized later versions or a
+   commitment mismatch against the durable expected hash pair quarantine. Gateway disagreement stays pending.
    Registration responses alone do not acknowledge publication.
 4. Repeated paginated owner scans retain discovered addresses before advancing
    their scan cursor. End-of-scan restarts at page one. Independently retry due
@@ -74,31 +75,99 @@ retirement or sole-history deletion is implemented.
 ## Host integration and remaining promotion gates
 
 `createDpv2ReplicaTransport` uses the existing SDK gateway, feed, signer and
-storage ports. Its mandatory `evidence(scope)` port is deliberately stronger
-than `getDataPoint`: the host must fetch authoritative version history and
-finalized chain evidence, including absence, and distinguish pending settlement
-from contradictions. The current SDK's head-only lookup cannot supply that
-proof. There is no fabricated production implementation or head-only fallback.
-The evidence adapter and production scheduling remain promotion work. During
-history/chain propagation lag, the adapter must return `pending: true` or throw;
-a partial evidence set with `pending: false` is a permanent conflict. Live
-acceptance must verify repeated PUT of identical ciphertext at an existing key
-after registration failure. Preparation currently quarantines any `RangeError`,
-including a possible allocation failure; distinguish retryable runtime errors
-from impossible framing before production promotion.
+storage ports. Supply `createReplicaEvidenceAdapter` from
+`@opendatalabs/personal-server-ts-core/replication/evidence` as its mandatory
+`evidence(scope)` port:
+
+```ts
+const evidence = createReplicaEvidenceAdapter({
+  owner,
+  registry,
+  chainId,
+  rpc,
+  gatewayUrl,
+  maxFinalizedAgeSeconds: 1800,
+});
+```
+
+`rpc` can be a viem PublicClient or the exported `ReplicaEvidenceRpc` port.
+`fetch` and millisecond `now` are injectable. The adapter checks configured
+chain identity, reads a `finalized` block with number/hash/timestamp, and pins
+`currentVersion(owner, scope)`, `dataCommitment(owner, scope, 1)` and the exact
+nine-field `dataPoints(owner, scope)` tuple to that block number. It rechecks
+the block hash and freshness after I/O. The default freshness limit is 1,800
+seconds, including normal chain finality lag; hosts can choose a tighter bound
+that fits their chain. There is no `latest` fallback. Wrong chain, bad config,
+unavailable/stale finality, inconsistent registry reads, malformed responses
+and network failures throw `ReplicaEvidenceUnavailableError` with
+`retryable: true`. They never become absence.
+
+The Gateway supplies only the current head, fetched explicitly with
+`includeDeleted=true`. A 410 body is decoded and retained as deletion evidence;
+a bare/malformed 410 remains retryable. No versions/history HTTP API is used.
+Chain evidence carries the actual bytes32 commitment, current version, status,
+configured chain/registry, and finalized block coordinates. It never invents
+`dataHash` or `metadataHash` preimages.
+
+Confirmation requires a live version-1 head, finalized currentVersion 1,
+Active chain status, and exact
+`keccak256(abi.encode(bytes32 dataHash, bytes32 metadataHash))` equality.
+Only finalized immutable-slot facts quarantine: currentVersion greater than 1,
+or a version-1 commitment that differs from the commitment of the known
+durable expected hash pair. This includes a finalized tombstone-at-version-1
+pair that differs from the prepared replica. Gateway-only contradictions remain pending:
+wrong owner/scope, version 9 while chain is still 1, mismatched hashes,
+missing head, tombstones, or lifecycle refusal (`inactive`, `unavailable`,
+or a `deleted` signal). They can roll back or heal and never cause PUT or
+registration refresh fights. Non-Active chain status also remains pending
+because status can reactivate. A downloader without local expected hashes
+holds a head/chain mismatch pending rather than quarantining it.
+
+Only a missing head together with currentVersion 0, zero commitment and the
+contract's default None tuple is absent. Any head with chain version 0 stays
+pending. Unavailable finalized evidence stays pending or throws retryably;
+explicit `pending: true` prevents confirmation or absence.
+
+The trust boundary is the configured RPC, chain identity, registry deployment,
+and freshness policy. Gateway HEAD proof verification is unnecessary for
+hash-pair authenticity: the independent chain commitment binds the exact
+head preimages. The Gateway remains trusted for discovery availability and
+can withhold a head or report an optimistic mutation to delay progress.
+The finalized snapshot does not prove that no mutation occurred after that
+block. The downloader retains the verified head and compares downloaded
+plaintext plus scope/collectedAt/encrypted-size metadata to that exact head.
+Before import it also combines the downloaded hash pair and compares it
+directly to the finalized chain commitment; the chain is the authority.
+A registration timeout reuses durable ciphertext and scope/version 1; it
+never rebases or treats the registration response as settlement.
+
+The read-only dev prerequisite check uses a random in-memory owner and reads
+no `.env` or account files:
+
+```sh
+./node_modules/.bin/tsx scripts/pdpp-replica-dev-preflight.ts
+```
+
+It checks dev Gateway/storage health and finalized registry absence. It does
+not publish, write storage, register data, or verify the complete two-device
+journey. Live acceptance must still verify repeated PUT of identical
+ciphertext at an existing key after registration failure. Preparation currently
+quarantines any `RangeError`, including a possible allocation failure;
+distinguish runtime errors from impossible framing before promotion.
+Runtime scheduling and Lite publisher wiring remain outside this change.
 
 The in-process oracle uses two file-backed SQLite stores and real receiver
 imports, an encrypted storage fake with a size cap, and independent fake
-head/history/chain stores with the contiguous-version guard. Real SDK OpenPGP
-and signing-adapter behavior are exercised; high-cardinality fault tests use a
-fast authenticated codec. Tests cover byte-exact resumed retries, fragmented
+head and finalized-chain stores with the contiguous-version guard. Real SDK
+OpenPGP and signing-adapter behavior are exercised; high-cardinality fault
+tests use a fast authenticated codec. Tests cover byte-exact resumed retries, fragmented
 JSON/binary reassembly, reversed/duplicate/tampered fragments, predecessor and
 local-authority delays, late feed entries, false heads, pending/deleted
 registrations, starvation and atomic import checkpoints.
 
-Live gateway/storage acceptance, finalized-chain evidence acquisition, 100 MiB
-boundary memory use, registry cardinality/cost, real process termination during
-I/O, and mobile persistence are unproven. Pages and reassembled payloads are
+Live gateway/storage write acceptance, 100 MiB boundary memory use, registry
+cardinality/cost, real process termination during I/O, and mobile persistence
+are unproven. Pages and reassembled payloads are
 buffered in memory; large-device/phone memory measurements are required before
 promotion. A restored or cloned database must rotate its persisted writer
 identity before producing new batches; automated clone detection is not part
