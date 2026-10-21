@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type { DeliveryLease } from "@opendatalabs/personal-server-ts-core/policy";
 import {
   bearerErrorResponse,
   type PdppProtocolProfile,
@@ -12,7 +13,6 @@ import {
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
-  type PdppReadLease,
   type PdppRecordStore,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
@@ -45,7 +45,7 @@ export const BLOB_DELIVERY_CHUNK_BYTES = 64 * 1024;
  */
 function leasedBlobBody(
   bytes: Uint8Array<ArrayBuffer>,
-  lease: PdppReadLease,
+  lease: DeliveryLease,
 ): ReadableStream<Uint8Array> {
   let offset = 0;
   return new ReadableStream<Uint8Array>(
@@ -56,7 +56,7 @@ function leasedBlobBody(
           return;
         }
         try {
-          await lease.assertStillAuthorized();
+          await lease.assertDeliverable();
         } catch (err) {
           controller.error(err);
           return;
@@ -98,7 +98,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   async function authorizeBlobAccess(
     c: Context,
     blobId: string,
-  ): Promise<{ error: Response } | { ok: true; lease: PdppReadLease }> {
+  ): Promise<{ error: Response } | { ok: true; lease: DeliveryLease }> {
     const reqId = requestId();
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];

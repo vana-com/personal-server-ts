@@ -1,4 +1,11 @@
 export {
+  REMOTE_GRANT_REVERIFY_AFTER_MS,
+  allDeliveryLeases,
+  remoteReverification,
+  type DeliveryLease,
+} from "./delivery-lease.js";
+export {
+  authorizeDataRead,
   verifyDataReadPolicy,
   authorizeLegacyRead,
   resolveDataListGrantScopes,

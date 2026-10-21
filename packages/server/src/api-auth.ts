@@ -12,7 +12,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/api";
 import {
   resolveDataListGrantScopes,
-  verifyDataReadPolicy,
+  authorizeDataRead,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import {
   createInMemoryWriteProofReplayStore,
@@ -390,7 +390,7 @@ export function createServerApiAuth(
         fileId: input.fileId,
         at: input.at,
       });
-      const grant = await verifyDataReadPolicy(
+      const { grant, lease } = await authorizeDataRead(
         {
           signer: result.auth.signer,
           grantId: result.auth.payload.grantId ?? input.grantId,
@@ -404,7 +404,7 @@ export function createServerApiAuth(
           runtimeAvailability: deps.runtimeAvailability,
         },
       );
-      return { builder: result.auth.signer, grantId: grant.id };
+      return { builder: result.auth.signer, grantId: grant.id, lease };
     },
   };
 }

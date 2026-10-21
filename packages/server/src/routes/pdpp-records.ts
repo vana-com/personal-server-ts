@@ -20,6 +20,7 @@ import {
   InvalidCursorSyntaxError,
   recordKeyWithinGrantResources,
   mapInactiveToError,
+  pdppBearerReadLease,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
   summarizeIngest,
@@ -30,6 +31,7 @@ import {
   type StreamDeclaration,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import type { DeliveryLease } from "@opendatalabs/personal-server-ts-core/policy";
 import { createRecordDataValidator } from "../pdpp/record-schema.js";
 import {
   StreamCompletionError,
@@ -544,6 +546,47 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     await next();
   });
 
+  /**
+   * The delivery gate for every PDPP read endpoint. A handler builds its
+   * whole response first (records, chain check, access-log write); this step
+   * then asks the read's delivery lease, set by `authenticate`, once more
+   * before the response is returned. A grant revoked or expired while the
+   * handler ran replaces the response with the profile-aware bearer error,
+   * so no record of it is released. Writes are not gated: their effect is
+   * already committed, and their response carries no read data.
+   */
+  app.use("*", async (c, next) => {
+    await next();
+    const lease = c.get("deliveryLease" as never) as DeliveryLease | undefined;
+    if (!lease || !c.res.ok) return;
+    if (c.req.method !== "GET" && c.req.method !== "HEAD") return;
+    try {
+      await lease.assertDeliverable();
+    } catch (err) {
+      const reqId =
+        (c.get("reqId" as never) as string | undefined) ?? requestId();
+      // Drop the built response whole, headers included, before the refusal
+      // replaces it.
+      c.res = undefined;
+      c.res = sendLeaseRefusal(c, err, reqId);
+    }
+  });
+
+  function setDeliveryLease(c: Context, lease: DeliveryLease): void {
+    c.set("deliveryLease" as never, lease as never);
+  }
+
+  /** A failed delivery lease as the profile-aware bearer error. */
+  function sendLeaseRefusal(c: Context, err: unknown, reqId: string) {
+    const refusal = toPdppError(err);
+    return sendError(c, refusal, reqId, {
+      inactiveBearer: refusal.code === "authentication_error",
+      ...(refusal.code === "api_error" && {
+        headers: { "Retry-After": "5" },
+      }),
+    });
+  }
+
   async function authenticate(c: Context, reqId: string) {
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -595,44 +638,77 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
 
         if (!decision.ok) {
           await logClientRead(c, context, "unknown", "denied", reqId);
-
-          // A retryable failure is NOT reported as a denial. The grant may be
-          // perfectly valid and the chain merely unreachable, so answering
-          // `grant_revoked` would send a good client off to re-consent over an
-          // outage. §8 defines no 503 code and inventing one would be a spec
-          // extension, so this maps to `api_error` (500) -- which is honest:
-          // the failure is on our side, not in the client's request. The
-          // `Retry-After` hint costs nothing and tells a well-behaved client
-          // to come back rather than give up.
-          if (decision.retryable) {
-            c.header("Retry-After", "5");
-            return {
-              error: sendError(
-                c,
-                new PdppError(
-                  "api_error",
-                  "Chain authorization could not be verified",
-                ),
-                reqId,
-              ),
-            };
-          }
-          return {
-            error: sendError(
-              c,
-              chainDenialError(
-                decision.cause,
-                decision.reason,
-                deps.protocolProfile,
-              ),
-              reqId,
-            ),
-          };
+          return { error: sendChainRefusal(c, decision, reqId) };
         }
       }
     }
 
+    if (context?.active) {
+      const chained = Boolean(
+        deps.chainEnforcement && context.tokenKind === "client",
+      );
+      const lease = pdppBearerReadLease(deps.auth, token, context, {
+        reverifyChain: chained ? () => reverifyChain(context) : undefined,
+      });
+      // Admission re-check. The chain check above awaits the gateway, and the
+      // bearer can end during that wait (the grant revoked, the token
+      // expired, its refresh family revoked). The context resolved before the
+      // wait must not admit the read, so ask the read's lease before any
+      // read work. The chain verification just made counts as fresh, so this
+      // is a local store read only. The release gate below stays the last
+      // gate.
+      if (chained) {
+        try {
+          await lease.assertDeliverable();
+        } catch (err) {
+          return { error: sendLeaseRefusal(c, err, reqId) };
+        }
+      }
+      setDeliveryLease(c, lease);
+    }
     return { context };
+  }
+
+  /**
+   * A chain refusal as the route's error. A retryable failure is NOT reported
+   * as a denial: the grant may be valid and the chain merely unreachable, so
+   * `grant_revoked` would send a good client to re-consent over an outage.
+   * §8 defines no 503 code, so it is `api_error` (500), which is honest (the
+   * failure is ours) with a `Retry-After` hint.
+   */
+  function chainRefusal(
+    decision: Exclude<PdppChainDecision, { ok: true }>,
+  ): PdppError {
+    if (decision.retryable) {
+      return new PdppError(
+        "api_error",
+        "Chain authorization could not be verified",
+      );
+    }
+    return chainDenialError(
+      decision.cause,
+      decision.reason,
+      deps.protocolProfile,
+    );
+  }
+
+  function sendChainRefusal(
+    c: Context,
+    decision: Exclude<PdppChainDecision, { ok: true }>,
+    reqId: string,
+  ): Response {
+    return sendError(c, chainRefusal(decision), reqId, {
+      ...(decision.retryable && { headers: { "Retry-After": "5" } }),
+    });
+  }
+
+  /** The chain check again, for the delivery lease (see `pdppBearerReadLease`). */
+  async function reverifyChain(context: PdppTokenContext): Promise<void> {
+    const decision = await deps.chainEnforcement!.authorize({
+      clientId: context.clientId ?? "",
+      pdppGrantId: context.grant?.grant_id ?? "",
+    });
+    if (!decision.ok) throw chainRefusal(decision);
   }
 
   // PDPP-Version negotiation: only PDPP_VERSION is supported in v0.1.

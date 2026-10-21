@@ -45,7 +45,7 @@ import {
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import {
   resolveDataListGrantScopes,
-  verifyDataReadPolicy,
+  authorizeDataRead,
   type DataListPolicyPorts,
   type DataWritePolicyPorts,
 } from "@opendatalabs/personal-server-ts-core/policy";
@@ -659,7 +659,7 @@ export function createWeb3SignedPsLiteAuth(
       if (!options.dataReadPolicyPorts) {
         throw dataReadPolicyPortsRequired();
       }
-      const grant = await verifyDataReadPolicy(
+      const { grant, lease } = await authorizeDataRead(
         {
           signer: auth.auth.signer,
           grantId: auth.auth.payload.grantId ?? input.grantId,
@@ -671,7 +671,7 @@ export function createWeb3SignedPsLiteAuth(
         },
         options.dataReadPolicyPorts,
       );
-      return { builder: auth.auth.signer, grantId: grant.id };
+      return { builder: auth.auth.signer, grantId: grant.id, lease };
     },
   };
 }

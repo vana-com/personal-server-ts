@@ -36,6 +36,7 @@ import {
   handlePersonalServerDataRequest,
   isOwnerView,
   reportPersonalServerReadFulfillment,
+  readDeliveryLease,
   resolveReadDeletion,
   type PersonalServerDataApiDeps,
   type ReadDeletionEntry,
@@ -548,6 +549,28 @@ export function createMcpDataReadClient(
 
         const { logId, timestamp, ipAddress, userAgent } =
           await writeReadAccessLog(request, { scope, grantId, authResult });
+        const delivered = isOwnerView(authResult) || result.representationId !== undefined
+          ? { status: 200, ...result }
+          : {
+              status: 200,
+              ...result,
+              blocks: redactBlockPayloadsForGrantee(
+                result.blocks,
+                await resolveBlockRedactionContext(
+                  storage,
+                  scope,
+                  selectedEntry.collectedAt,
+                  result.blocks,
+                ),
+              ),
+            };
+        // Delivery gate, after every await of this read: a grant revoked or
+        // a scope deleted while it ran stops it, the same as `/v1/data`.
+        await readDeliveryLease(options.dataApiDeps, {
+          grant: authResult?.lease,
+          scope,
+          entry: selectedEntry,
+        }).assertDeliverable();
         // A block-addressed read serves a hand-picked subset, so it never
         // completes the scope the way an uncursored full read does; reporting
         // fulfillment for it would settle the read on partial data.
@@ -572,21 +595,7 @@ export function createMcpDataReadClient(
             userAgent,
           });
         }
-        return isOwnerView(authResult) || result.representationId !== undefined
-          ? { status: 200, ...result }
-          : {
-              status: 200,
-              ...result,
-              blocks: redactBlockPayloadsForGrantee(
-                result.blocks,
-                await resolveBlockRedactionContext(
-                  storage,
-                  scope,
-                  selectedEntry.collectedAt,
-                  result.blocks,
-                ),
-              ),
-            };
+        return delivered;
       } catch (err) {
         if (err instanceof ProtocolError) {
           throw new McpDataReadError(err.code, err.toJSON());
@@ -666,41 +675,56 @@ export function createMcpDataReadClient(
       // Logged like any other grant-gated read, but never reported as a read
       // fulfillment: a table of contents carries no block values.
       await writeReadAccessLog(request, { scope, grantId, authResult });
-      if (!manifest) return manifest;
-      // Selection by these block ids reads this version only when the
-      // caller passes this cursor with them.
-      const versionCursor = cursorFor(
-        encodeDataBlockCursor({
-          scope,
-          collectedAt: selectedEntry.collectedAt,
-          blockIndex: 0,
-          representationId:
-            manifest.representationId ??
-            blockRepresentationId(
-              manifest,
-              isOwnerView(authResult) ? "stored" : "grantee",
-              manifest.cursorView,
-            ),
-          ...(manifest.cursorView ? { view: manifest.cursorView } : {}),
-        }),
-        pinned,
-      );
-      if (!isOwnerView(authResult)) {
-        return {
-          ...manifest,
-          versionCursor,
-          blocks: redactBlockRefsForGrantee(
-            manifest.blocks,
-            await resolveBlockRedactionContext(
-              storage,
-              scope,
-              selectedEntry.collectedAt,
-              manifest.blocks,
-            ),
-          ),
-        };
+      let delivered: typeof manifest = manifest;
+      if (manifest) {
+        // Selection by these block ids reads this version only when the
+        // caller passes this cursor with them.
+        const versionCursor = cursorFor(
+          encodeDataBlockCursor({
+            scope,
+            collectedAt: selectedEntry.collectedAt,
+            blockIndex: 0,
+            representationId:
+              manifest.representationId ??
+              blockRepresentationId(
+                manifest,
+                isOwnerView(authResult) ? "stored" : "grantee",
+                manifest.cursorView,
+              ),
+            ...(manifest.cursorView ? { view: manifest.cursorView } : {}),
+          }),
+          pinned,
+        );
+        delivered = isOwnerView(authResult)
+          ? { ...manifest, versionCursor }
+          : {
+              ...manifest,
+              versionCursor,
+              blocks: redactBlockRefsForGrantee(
+                manifest.blocks,
+                await resolveBlockRedactionContext(
+                  storage,
+                  scope,
+                  selectedEntry.collectedAt,
+                  manifest.blocks,
+                ),
+              ),
+            };
       }
-      return { ...manifest, versionCursor };
+      // Delivery gate, as for block values above.
+      try {
+        await readDeliveryLease(options.dataApiDeps, {
+          grant: authResult?.lease,
+          scope,
+          entry: selectedEntry,
+        }).assertDeliverable();
+      } catch (err) {
+        if (err instanceof ProtocolError) {
+          throw new McpDataReadError(err.code, err.toJSON());
+        }
+        throw err;
+      }
+      return delivered;
     },
 
     async readRawScopeFile({ scope, grantId, at, fileId, payment }) {

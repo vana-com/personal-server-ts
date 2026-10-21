@@ -7,6 +7,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
   assertScopeNotDeleted,
+  readDeliveryLease,
   redactEnvelopeForGrantee,
   redactJsonEnvelopeBytesForGrantee,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -27,7 +28,7 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
-  verifyDataReadPolicy,
+  authorizeDataRead,
   authorizeLegacyRead,
   verifySignedArtifacts,
 } from "@opendatalabs/personal-server-ts-core/policy";
@@ -163,8 +164,9 @@ async function executeJobUnsafe(
   }
 
   let grant;
+  let grantLease;
   try {
-    grant = await verifyDataReadPolicy(
+    ({ grant, lease: grantLease } = await authorizeDataRead(
       {
         signer: request.builder,
         grantId: request.grantId,
@@ -172,7 +174,7 @@ async function executeJobUnsafe(
         serverOwner: deps.serverOwner,
       },
       { authSessionVerifier: deps.gateway, grantVerifier: deps.gateway },
-    );
+    ));
   } catch (error) {
     throw mapPolicyFailure(error);
   }
@@ -366,6 +368,21 @@ async function executeJobUnsafe(
       byteLength: resultSize,
       bodyHash: `sha256:${digest}`,
     });
+    // Delivery gate, immediately before the sealed result leaves this
+    // server: a grant revoked (or past expiry) or a scope deleted while the
+    // job read and sealed it stops the upload. A job can outlast the 30 s
+    // remote window, in which case the lease re-verifies the grant.
+    try {
+      await readDeliveryLease(
+        { scopeDeletions: deps.scopeDeletions, serverOwner: deps.serverOwner },
+        { grant: grantLease, scope: request.scope, entry: selected.entry },
+      ).assertDeliverable();
+    } catch (error) {
+      if (error instanceof DataDeletedError) {
+        throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
+      }
+      throw mapPolicyFailure(error);
+    }
     logExecutionStep(deps, jobId, "upload", executionStartedAt);
     await uploadResult(requestFetch, {
       storageEndpoint: deps.resultUpload.storageEndpoint,

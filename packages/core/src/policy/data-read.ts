@@ -28,6 +28,7 @@ import {
   type GrantVerifierPort,
   type RuntimeAvailabilityPort,
 } from "../ports/index.js";
+import { type DeliveryLease, remoteReverification } from "./delivery-lease.js";
 import { verifyPdppGrantBinding } from "../grants/pdpp-binding.js";
 import type { PdppGrantBindingStore } from "../grants/pdpp-binding-store.js";
 
@@ -198,6 +199,40 @@ export async function verifyDataReadPolicy(
   }
 
   return grant;
+}
+
+/**
+ * `verifyDataReadPolicy`, plus the delivery lease the read must hold when its
+ * body is released. The lease checks the grant's known expiry on every call
+ * (no network) and runs the whole policy again, gateway included, only when
+ * the verification that admitted the read is older than
+ * `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s). A normal request therefore makes
+ * no extra gateway call.
+ */
+export async function authorizeDataRead(
+  input: DataReadPolicyInput,
+  ports: DataReadPolicyPorts,
+): Promise<{ grant: GatewayGrantResponse; lease: DeliveryLease }> {
+  const grant = await verifyDataReadPolicy(input, ports);
+  const expiresAtSec = parseGrantExpiresAtSeconds(grant.expiresAt);
+  const reverify = remoteReverification(async () => {
+    await verifyDataReadPolicy(input, ports);
+  });
+  return {
+    grant,
+    lease: {
+      async assertDeliverable() {
+        if (
+          expiresAtSec !== null &&
+          expiresAtSec > 0 &&
+          expiresAtSec < Math.floor(Date.now() / 1000)
+        ) {
+          throw new GrantExpiredError({ expiresAt: expiresAtSec });
+        }
+        await reverify();
+      },
+    },
+  };
 }
 
 /**
