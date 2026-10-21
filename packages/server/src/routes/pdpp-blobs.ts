@@ -9,6 +9,7 @@ import type {
 import {
   deliver,
   leasedStream,
+  type DeliveryLease,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import {
   bearerErrorResponse,
@@ -17,7 +18,6 @@ import {
 import {
   pdppBearerReadLease,
   recordKeyWithinGrantResources,
-  type PdppReadLease,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
   type PdppRecordStore,
@@ -90,19 +90,13 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   }
   const app = new Hono();
 
-  /** The read's lease, held to the grant's connections like admission is. */
-  function blobLease(token: string, context: PdppTokenContext): PdppReadLease {
-    const lease = pdppBearerReadLease(deps.auth, token, context, {
+  /** The read's lease; it holds the read to the grant's connections. */
+  function blobLease(token: string, context: PdppTokenContext): DeliveryLease {
+    return pdppBearerReadLease(deps.auth, token, context, {
       ...(deps.isConnectionAvailable && {
         isConnectionAvailable: deps.isConnectionAvailable,
       }),
     });
-    if (context.tokenKind !== "owner") {
-      lease.requireConnections(
-        (context.grant?.streams ?? []).flatMap((stream) => stream.instance_ids),
-      );
-    }
-    return lease;
   }
 
   /**
@@ -112,7 +106,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
    */
   async function release(
     c: Context,
-    lease: PdppReadLease,
+    lease: DeliveryLease,
     reqId: string,
     build: () => Response,
   ): Promise<Response> {
@@ -136,7 +130,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   async function authorizeBlobAccess(
     c: Context,
     blobId: string,
-  ): Promise<{ error: Response } | { ok: true; lease: PdppReadLease }> {
+  ): Promise<{ error: Response } | { ok: true; lease: DeliveryLease }> {
     const reqId = requestId();
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];

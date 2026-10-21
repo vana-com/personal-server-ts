@@ -301,7 +301,11 @@ async function authorize(): Promise<{ accessToken: string; grant: Grant }> {
  */
 function rs(): Hono {
   const auth: PdppAuthorizationService = {
-    async resolveToken(accessToken) {
+    locality: "local" as const,
+    async resolveToken(token: string) {
+      return this.resolveTokenNow(token);
+    },
+    resolveTokenNow(accessToken) {
       const context = tokens.resolveToken(accessToken);
       if (!context.active) {
         return {

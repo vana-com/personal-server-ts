@@ -442,3 +442,99 @@ describe("chain evidence at release", () => {
     expect(text).not.toContain(SECRET);
   });
 });
+
+describe("discovery and metadata hold the bearer's connections", () => {
+  for (const path of ["/streams", "/streams/media"]) {
+    it(`refuses ${path} when the client's connection is deleted`, async () => {
+      let bindingChecks = 0;
+      const app = routes({
+        bindingStore: {
+          getInstanceBinding: () => {
+            bindingChecks += 1;
+            return { sourceId: "src_1", deletedAt: "2026-10-21T00:00:00Z" };
+          },
+        } as unknown as PdppRecordsRouteDeps["bindingStore"],
+      });
+      const response = await app.request(path, { headers });
+      const text = await response.text();
+      expect(bindingChecks).toBeGreaterThan(0);
+      expect(response.status, text).toBe(404);
+      expect(JSON.parse(text).error.code).toBe("instance_unavailable");
+      expect(text).not.toContain("stream_metadata");
+    });
+  }
+});
+
+describe("the authorization server's locality decides the release check", () => {
+  const local = () =>
+    coLocatedAuthorizationService({ tokens } as PdppAuthRouteDeps);
+
+  it("a co-located AS: a revocation after the bearer was resolved refuses at release", async () => {
+    const as = local();
+    const app = routes({
+      auth: {
+        ...as,
+        async resolveToken(token: string) {
+          const context = await as.resolveToken(token);
+          queueMicrotask(() => authStore.revokeGrant(GRANT.grant_id));
+          return context;
+        },
+      },
+    });
+    const response = await app.request("/streams/media/records", { headers });
+    const text = await response.text();
+    expect(response.status, text).toBe(403);
+    expect(text).not.toContain(SECRET);
+  });
+
+  it("an AS with no declared locality fails closed instead of falling back", async () => {
+    const as = local();
+    const app = routes({
+      // Neither "local" nor "remote": the lease cannot know how to re-check.
+      auth: {
+        resolveToken: (token: string) => as.resolveToken(token),
+      } as never,
+    });
+    const response = await app.request("/streams/media/records", { headers });
+    const text = await response.text();
+    expect(response.status, text).toBe(500);
+    expect(text).not.toContain(SECRET);
+  });
+
+  describe("a remote AS (introspection), under the remote-staleness policy", () => {
+    function remoteApp(after: () => void) {
+      const as = local();
+      return routes({
+        auth: {
+          locality: "remote",
+          resolveToken: (token: string) => as.resolveToken(token),
+        },
+        store: storeReading(after),
+      });
+    }
+
+    it("serves a revocation newer than its last answer within 30 s", async () => {
+      const app = remoteApp(() => authStore.revokeGrant(GRANT.grant_id));
+      const response = await app.request("/streams/media/records", {
+        headers,
+      });
+      // Documented: the remote answer is at most 30 s old at release.
+      expect(response.status).toBe(200);
+    });
+
+    it("asks again, and refuses, once its answer is older than 30 s", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const token = longToken();
+      const app = remoteApp(() => {
+        authStore.revokeGrant(GRANT.grant_id);
+        vi.setSystemTime(Date.now() + 31_000);
+      });
+      const response = await app.request("/streams/media/records", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const text = await response.text();
+      expect(response.status, text).toBe(403);
+      expect(text).not.toContain(SECRET);
+    });
+  });
+});

@@ -44,7 +44,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import {
-  resolveDataListGrantScopes,
+  authorizeDataList,
   authorizeDataRead,
   type DataListPolicyPorts,
   type DataWritePolicyPorts,
@@ -638,7 +638,7 @@ export function createWeb3SignedPsLiteAuth(
         throw dataReadPolicyPortsRequired();
       }
       // A builder lists only what its grants from this PS's owner cover.
-      const grantedScopes = await resolveDataListGrantScopes(
+      const { grantedScopes, lease: listLease } = await authorizeDataList(
         {
           signer: auth.auth.signer,
           grantId: auth.auth.payload.grantId ?? listOptions?.grantId,
@@ -646,7 +646,7 @@ export function createWeb3SignedPsLiteAuth(
         },
         options.dataReadPolicyPorts,
       );
-      return { grantedScopes };
+      return { grantedScopes, lease: listLease };
     },
     async authorizeBuilderRead(input) {
       const auth = await authenticatePsLiteRequest(input.request, options);

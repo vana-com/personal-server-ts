@@ -3,7 +3,9 @@ import { isSystemScope } from "../policy/reserved-scopes.js";
 import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
 import {
   allDeliveryLeases,
+  collectDeliveryLeases,
   deliver,
+  localLease,
   type DeliveryLease,
 } from "../policy/delivery-lease.js";
 import { storageForReader } from "../storage/disclosure-policy.js";
@@ -253,6 +255,8 @@ export interface PersonalServerReadFulfillmentReporter {
  */
 export interface PersonalServerListAuthResult {
   grantedScopes: readonly string[];
+  /** The listing's delivery lease (see `authorizeDataList`). */
+  lease?: DeliveryLease;
 }
 
 export interface PersonalServerApiAuthPort {
@@ -330,6 +334,14 @@ export interface PersonalServerIngestSyncManager {
 }
 
 export interface PersonalServerDataApiDeps {
+  /**
+   * Set per request by `trackDeliveryDependencies`, never by a host: the
+   * collector that every read dependency of this request (grant leases from
+   * the auth port, the deletion state of every scope and version the request
+   * reads or lists) is added to. The request's result is released only
+   * through it.
+   */
+  deliveryDependencies?: DeliveryDependencies;
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
   /**
@@ -1179,11 +1191,43 @@ async function parseProducerProvenance(
  * last known state, which is the documented offline behaviour.
  */
 export async function resolveReadDeletion(
-  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  deps: Pick<
+    PersonalServerDataApiDeps,
+    "scopeDeletions" | "serverOwner" | "deliveryDependencies"
+  >,
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
   body: "file" | "canonical" = "file",
   gatewayTimeoutMs?: number,
+): Promise<{
+  scope: string;
+  dataPointId: string | null;
+  deletedAt: string;
+} | null> {
+  if (!deps.scopeDeletions) return null;
+  const deletion = await resolveTrackerDeletion(
+    deps,
+    scope,
+    entry,
+    body,
+    gatewayTimeoutMs,
+  );
+  // A visible scope or version is a release dependency of this request: a
+  // deletion that lands before the release refuses it.
+  if (!deletion) {
+    deps.deliveryDependencies?.add(
+      scopeDeletionLease(deps, { scope, entry, body }),
+    );
+  }
+  return deletion;
+}
+
+async function resolveTrackerDeletion(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  scope: string,
+  entry: ReadDeletionEntry | null | undefined,
+  body: "file" | "canonical",
+  gatewayTimeoutMs: number | undefined,
 ): Promise<{
   scope: string;
   dataPointId: string | null;
@@ -1236,13 +1280,50 @@ export async function assertScopeNotDeleted(
 }
 
 /**
- * The delivery lease for a `/v1/data`-family read (HTTP, MCP, jobs): the
- * read's grant lease from its authorization, and the scope's deletion state
- * in the same tracker `/v1/data` uses. The deletion half is local evidence:
- * it reads what this process knows (`knownDeletion`, the deletion history),
- * synchronously, with no gateway call. The early gate already consulted the
- * gateway; the release gate catches what this process learned since (a sync
- * tombstone, a local delete). It refuses with `DataDeletedError`.
+ * The deletion half of a read's delivery lease: the scope's deletion state in
+ * the tracker `/v1/data` uses, as local evidence. It reads what this process
+ * knows (`knownDeletion`, the deletion history), synchronously, with no
+ * gateway call: the early gate already consulted the gateway, and the release
+ * catches what this process learned since (a sync tombstone, a local
+ * delete). It refuses with `DataDeletedError`.
+ */
+export function scopeDeletionLease(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  read: {
+    scope: string;
+    entry: ReadDeletionEntry | null | undefined;
+    body?: "file" | "canonical";
+  },
+): DeliveryLease {
+  return localLease(() => {
+    const tracker = deps.scopeDeletions;
+    if (!tracker) return;
+    const known = tracker.knownDeletion(read.scope);
+    const tombstone =
+      read.body === "canonical"
+        ? (tracker.deletionHistory?.get(read.scope) ?? known)
+        : known;
+    if (!tombstone) return;
+    if (
+      read.body !== "canonical" &&
+      read.entry &&
+      !isEntryCoveredByTombstone(read.entry, tombstone)
+    ) {
+      return;
+    }
+    throw new DataDeletedError({
+      scope: read.scope,
+      dataPointId: deps.serverOwner
+        ? computeDataPointId(deps.serverOwner, read.scope)
+        : null,
+      deletedAt: tombstone.deletedAt,
+    });
+  });
+}
+
+/**
+ * The delivery lease for a read made outside the data API dispatcher (a TEE
+ * job): its grant lease and the deletion state of the version it reads.
  */
 export function readDeliveryLease(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
@@ -1253,33 +1334,7 @@ export function readDeliveryLease(
     body?: "file" | "canonical";
   },
 ): DeliveryLease {
-  return allDeliveryLeases(read.grant, {
-    async refresh() {},
-    assertLocal() {
-      const tracker = deps.scopeDeletions;
-      if (!tracker) return;
-      const known = tracker.knownDeletion(read.scope);
-      const tombstone =
-        read.body === "canonical"
-          ? (tracker.deletionHistory?.get(read.scope) ?? known)
-          : known;
-      if (!tombstone) return;
-      if (
-        read.body !== "canonical" &&
-        read.entry &&
-        !isEntryCoveredByTombstone(read.entry, tombstone)
-      ) {
-        return;
-      }
-      throw new DataDeletedError({
-        scope: read.scope,
-        dataPointId: deps.serverOwner
-          ? computeDataPointId(deps.serverOwner, read.scope)
-          : null,
-        deletedAt: tombstone.deletedAt,
-      });
-    },
-  });
+  return allDeliveryLeases(read.grant, scopeDeletionLease(deps, read));
 }
 
 /**
@@ -1728,10 +1783,102 @@ export { redactEnvelopeForGrantee };
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
 
+/** Where one request's release dependencies and release effects go. */
+export interface DeliveryDependencies {
+  add(lease: DeliveryLease): void;
+  /** Run `effect` only once the result is released (a fulfillment report). */
+  afterRelease(effect: () => void): void;
+}
+
+/**
+ * The data API (`/v1/data`), shared by Node, Lite and the MCP read client.
+ *
+ * Every read result, whatever the route (a body, raw content, lineage, a
+ * scope or version listing), is released at this one point, through the
+ * delivery lease of everything the request read (see
+ * `trackDeliveryDependencies` and `policy/delivery-lease.ts`). A route does
+ * not opt in: its auth port calls and deletion checks register themselves.
+ * Writes are not gated here; their effect is already committed.
+ */
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
   options: PersonalServerApiDispatchOptions = {},
+): Promise<Response> {
+  return releaseDataResult(request, deps, options, (tracked) =>
+    dispatchDataRequest(request, tracked, options),
+  );
+}
+
+/**
+ * The data API's one release point. `handle` produces the result with deps
+ * whose every read dependency is tracked (`trackDeliveryDependencies`); a
+ * read result (GET or HEAD) is then released only through all of them, and
+ * the effects the handler deferred to release (a fulfillment report) run
+ * only once it is. A write result is returned as is: its effect is already
+ * committed.
+ */
+export async function releaseDataResult(
+  request: Request,
+  deps: PersonalServerDataApiDeps,
+  options: Pick<PersonalServerApiDispatchOptions, "onDeliveryLease">,
+  handle: (tracked: PersonalServerDataApiDeps) => Promise<Response>,
+): Promise<Response> {
+  const release = collectDeliveryLeases();
+  const effects: Array<() => void> = [];
+  const response = await handle(
+    trackDeliveryDependencies(deps, {
+      add: (lease) => release.add(lease),
+      afterRelease: (effect) => effects.push(effect),
+    }),
+  );
+  const released = () => {
+    for (const effect of effects) effect();
+    return response;
+  };
+  if (request.method !== "GET" && request.method !== "HEAD") return released();
+  options.onDeliveryLease?.(release);
+  return withApiErrors(() => deliver(release, released));
+}
+
+/**
+ * `deps` for one request, with every release dependency the request incurs
+ * added to `release`: the lease of every grant the auth port verifies
+ * (reads, listings, version listings) and, through `resolveReadDeletion`,
+ * the deletion state of every scope and version found visible.
+ */
+export function trackDeliveryDependencies(
+  deps: PersonalServerDataApiDeps,
+  release: DeliveryDependencies,
+): PersonalServerDataApiDeps {
+  const keep = <T>(result: T): T => {
+    const lease = (result as { lease?: DeliveryLease } | undefined)?.lease;
+    if (lease) release.add(lease);
+    return result;
+  };
+  const auth = new Proxy(deps.auth, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== "function") return value;
+      const call = (...args: unknown[]) =>
+        (value as (...a: unknown[]) => unknown).apply(target, args);
+      if (
+        prop === "authorizeBuilderRead" ||
+        prop === "authorizeBuilderList" ||
+        prop === "authorizeScopeVersions"
+      ) {
+        return async (...args: unknown[]) => keep(await call(...args));
+      }
+      return call;
+    },
+  });
+  return { ...deps, auth, deliveryDependencies: release };
+}
+
+async function dispatchDataRequest(
+  request: Request,
+  deps: PersonalServerDataApiDeps,
+  options: PersonalServerApiDispatchOptions,
 ): Promise<Response> {
   // Filled in as the dispatch narrows, so a 500 thrown deep in a read is
   // logged against the route that served it rather than a generic label. It
@@ -2292,74 +2439,67 @@ export async function handlePersonalServerDataRequest(
         ipAddress,
         userAgent,
       });
-      // Delivery gate, after every await this read makes: a grant revoked or
-      // a scope deleted while the read was in progress stops it here. The
-      // response is built inside `deliver`, in the same tick as the check.
-      const lease = readDeliveryLease(deps, {
-        grant: authResult?.lease,
-        scope: scopeResult.scope,
-        entry: canonicalOwned ? undefined : selectedEntry,
-        body: canonicalOwned ? "canonical" : "file",
-      });
-      options.onDeliveryLease?.(lease);
-      return deliver(lease, (): Response => {
-        const reportReadFulfillment = () => {
-          if (!authResult?.grantId || !authResult.builder) return;
-          reportPersonalServerReadFulfillment(deps, {
-            builder: authResult.builder,
-            fileId: servedFileId,
-            grantId: authResult.grantId,
-            ipAddress,
-            logId,
-            outcome: "served",
-            scope: scopeResult.scope,
-            servedAt: timestamp,
-            source: "api",
-            userAgent,
-          });
-        };
+      const reportReadFulfillment = () => {
+        if (!authResult?.grantId || !authResult.builder) return;
+        reportPersonalServerReadFulfillment(deps, {
+          builder: authResult.builder,
+          fileId: servedFileId,
+          grantId: authResult.grantId,
+          ipAddress,
+          logId,
+          outcome: "served",
+          scope: scopeResult.scope,
+          servedAt: timestamp,
+          source: "api",
+          userAgent,
+        });
+      };
 
-        if (paymentResponseHeader) {
-          headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
+      if (paymentResponseHeader) {
+        headers["X-PAYMENT-RESPONSE"] = paymentResponseHeader;
+      }
+
+      const wantsRawContent = url.searchParams.get("content") === "raw";
+
+      // `?content=raw` streams the decoded bytes of a binary envelope with its
+      // original media type, so a builder can download the file directly. The
+      // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
+      if (wantsRawContent) {
+        if (!isBinaryEnvelope(servedEnvelope)) {
+          return jsonResponse(
+            {
+              error: "NOT_BINARY_SCOPE",
+              message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
+            },
+            { status: 400, headers },
+          );
         }
-
-        const wantsRawContent = url.searchParams.get("content") === "raw";
-
-        // `?content=raw` streams the decoded bytes of a binary envelope with its
-        // original media type, so a builder can download the file directly. The
-        // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
-        if (wantsRawContent) {
-          if (!isBinaryEnvelope(servedEnvelope)) {
-            return jsonResponse(
-              {
-                error: "NOT_BINARY_SCOPE",
-                message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
-              },
-              { status: 400, headers },
-            );
-          }
-          const decoded = decodeBinaryEnvelope(servedEnvelope);
-          headers["Content-Type"] = decoded.mimeType;
-          headers["Content-Length"] = String(decoded.bytes.length);
-          if (decoded.filename) {
-            headers["Content-Disposition"] =
-              `attachment; filename="${decoded.filename}"`;
-          }
-          if (decoded.metadata !== undefined) {
-            headers["X-Vana-Metadata"] = stringifyMetadataHeader(
-              decoded.metadata,
-            );
-          }
-          const response = new Response(decoded.bytes as unknown as BodyInit, {
-            status: 200,
-            headers,
-          });
-          return response;
+        const decoded = decodeBinaryEnvelope(servedEnvelope);
+        headers["Content-Type"] = decoded.mimeType;
+        headers["Content-Length"] = String(decoded.bytes.length);
+        if (decoded.filename) {
+          headers["Content-Disposition"] =
+            `attachment; filename="${decoded.filename}"`;
         }
-        const response = jsonResponse(servedEnvelope, { headers });
-        reportReadFulfillment();
+        if (decoded.metadata !== undefined) {
+          headers["X-Vana-Metadata"] = stringifyMetadataHeader(
+            decoded.metadata,
+          );
+        }
+        const response = new Response(decoded.bytes as unknown as BodyInit, {
+          status: 200,
+          headers,
+        });
         return response;
-      });
+      }
+      const response = jsonResponse(servedEnvelope, { headers });
+      // Reported as served only once the dispatcher releases it.
+      if (deps.deliveryDependencies) {
+        deps.deliveryDependencies.afterRelease(reportReadFulfillment);
+      } else {
+        reportReadFulfillment();
+      }
+      return response;
     }
 
     if (request.method === "POST") {

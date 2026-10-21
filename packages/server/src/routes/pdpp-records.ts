@@ -23,7 +23,6 @@ import {
   pdppBearerReadLease,
   recordWithinGrantTimeConstraint,
   type PdppChainEvidence,
-  type PdppReadLease,
   resolveReadScope,
   summarizeIngest,
   type IngestOutcome,
@@ -33,7 +32,10 @@ import {
   type StreamDeclaration,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
-import { deliver } from "@opendatalabs/personal-server-ts-core/policy";
+import {
+  deliver,
+  type DeliveryLease,
+} from "@opendatalabs/personal-server-ts-core/policy";
 import { createRecordDataValidator } from "../pdpp/record-schema.js";
 import {
   StreamCompletionError,
@@ -610,7 +612,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   });
 
   interface DeliveryGate {
-    lease: PdppReadLease;
+    lease: DeliveryLease;
     /** A served client read, logged with the outcome the gate decides. */
     read?: { context: PdppTokenContext; stream: string; reqId: string };
   }
@@ -664,6 +666,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     }
     const context = await deps.auth.resolveToken(token);
     let chainDecision: Extract<PdppChainDecision, { ok: true }> | undefined;
+    let chainVerifiedAt: number | undefined;
 
     // Chain enforcement, when the deployment configures it. Placed here so
     // EVERY endpoint is covered by one gate: a check added per-route is a
@@ -692,6 +695,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           };
         }
 
+        chainVerifiedAt = Date.now();
         const decision = await deps.chainEnforcement.authorize({
           clientId: context.clientId ?? "",
           pdppGrantId: grantId,
@@ -715,6 +719,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           chain: {
             admitted: { expiresAt: chained.expiresAt },
             reverify: () => reverifyChain(context),
+            verifiedAt: chainVerifiedAt,
           },
         }),
         isConnectionAvailable,
@@ -847,12 +852,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     return context.instanceIds.filter((instance) => current.includes(instance));
   }
 
-  function requireRegisteredConnections(
-    c: Context,
-    instanceIds: string[],
-  ): void {
-    // The read holds these connections until its delivery.
-    deliveryGate(c)?.lease.requireConnections(instanceIds);
+  function requireRegisteredConnections(instanceIds: string[]): void {
     if (!deps.bindingStore) return;
     if (
       instanceIds.some((instance) => {
@@ -1082,7 +1082,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const effectiveInstanceIds =
         context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
       if (context!.tokenKind === "client") {
-        requireRegisteredConnections(c, effectiveInstanceIds);
+        requireRegisteredConnections(effectiveInstanceIds);
       }
       if (context!.tokenKind === "owner" && effectiveInstanceIds.length === 0) {
         throw new PdppError(
@@ -1255,7 +1255,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const effectiveInstanceIds =
         context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
       if (context!.tokenKind === "client") {
-        requireRegisteredConnections(c, effectiveInstanceIds);
+        requireRegisteredConnections(effectiveInstanceIds);
       }
 
       if (!recordKeyWithinGrantResources(recordKey, scope.streamGrant)) {

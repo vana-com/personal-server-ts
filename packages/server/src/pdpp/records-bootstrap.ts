@@ -40,6 +40,7 @@ import {
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type {
+  LocalPdppAuthorizationService,
   PdppAuthorizationService,
   PdppTokenContext,
   Grant as PdppPortGrant,
@@ -334,7 +335,7 @@ export function createPdppRecordsDeps(
  */
 export function coLocatedAuthorizationService(
   pdppAuth: PdppAuthRouteDeps,
-): PdppAuthorizationService {
+): LocalPdppAuthorizationService {
   const resolveTokenNow = (accessToken: string): PdppTokenContext => {
     const context = pdppAuth.tokens.resolveToken(accessToken);
     if (!context.active) {
@@ -357,6 +358,7 @@ export function coLocatedAuthorizationService(
     };
   };
   return {
+    locality: "local",
     resolveTokenNow,
     async resolveToken(accessToken: string) {
       return resolveTokenNow(accessToken);

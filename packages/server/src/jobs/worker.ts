@@ -803,27 +803,31 @@ interface WatchedLease extends DeliveryLease {
 
 function watchedLease(lease: DeliveryLease): WatchedLease {
   let refusal: unknown;
-  const watch = <T>(check: () => T): T => {
-    try {
-      return check();
-    } catch (error) {
-      refusal ??= error;
-      throw error;
-    }
+  const remember = (error: unknown) => {
+    refusal ??= error;
+    return error;
   };
   return {
     get refusal() {
       return refusal;
     },
-    async refresh() {
+    evidence: () =>
+      lease.evidence().map((piece) => ({
+        get verifiedAt() {
+          return piece.verifiedAt;
+        },
+        refresh: () =>
+          piece.refresh().catch((error: unknown) => {
+            throw remember(error);
+          }),
+      })),
+    assertLocal() {
       try {
-        await lease.refresh();
+        lease.assertLocal();
       } catch (error) {
-        refusal ??= error;
-        throw error;
+        throw remember(error);
       }
     },
-    assertLocal: () => watch(() => lease.assertLocal()),
   };
 }
 
