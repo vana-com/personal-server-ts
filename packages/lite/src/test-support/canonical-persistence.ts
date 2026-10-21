@@ -155,6 +155,9 @@ export function createFakeCanonicalPersistence(disk = fakeCanonicalDisk()) {
       staged.set(id, value);
       return id;
     },
+    async discardStagedBlob(id) {
+      staged.delete(id);
+    },
     async *readBlob(id) {
       const value = disk.blobs.get(id);
       if (!value) throw new Error("missing committed blob");
@@ -168,5 +171,10 @@ export function createFakeCanonicalPersistence(disk = fakeCanonicalDisk()) {
       failure = point;
     },
     disk,
+    get unpublishedStagedCount() {
+      return [...staged.values()].filter(
+        (value) => disk.blobs.get(value.descriptor.blobId) !== value,
+      ).length;
+    },
   };
 }

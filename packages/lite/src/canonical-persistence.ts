@@ -39,4 +39,6 @@ export interface LiteCanonicalPersistence {
   ): Promise<string>;
   /** Internal bytes, not a grant-authorized read API. Missing/uncommitted blobs throw. */
   readBlob(blobId: string): AsyncIterable<Uint8Array>;
+  /** Abort unpublished staging after a failed import; committed references must survive. */
+  discardStagedBlob?(stagingId: string): Promise<void>;
 }

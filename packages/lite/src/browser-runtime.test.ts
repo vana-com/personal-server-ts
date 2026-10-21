@@ -9,7 +9,10 @@ import { IDBFactory } from "fake-indexeddb";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { privateKeyToAccount } from "viem/accounts";
 import { buildPersonalServerLiteOwnerBindingMessage } from "@opendatalabs/vana-sdk/protocol/personal-server-lite-owner-binding";
-import { createIndexedDbPsLiteRuntime } from "./browser-runtime.js";
+import {
+  createIndexedDbPsLiteRuntime,
+  type IndexedDbPsLiteRuntimeOptions,
+} from "./browser-runtime.js";
 import { startPersonalServer } from "./client.js";
 import { createBearerTokenPsLiteAuth } from "./runtime.js";
 import type { PsLitePersistenceBundle } from "./persistence.js";
@@ -61,11 +64,16 @@ function memoryBundle(): PsLitePersistenceBundle {
   };
 }
 
-function build(bundle: PsLitePersistenceBundle) {
+function build(
+  bundle: PsLitePersistenceBundle,
+  replication?: IndexedDbPsLiteRuntimeOptions["replication"],
+  overrides: Partial<IndexedDbPsLiteRuntimeOptions> = {},
+) {
   return createIndexedDbPsLiteRuntime({
     ownerAddress,
     ownerSignature,
     persistence: bundle,
+    replication,
     gateway: createMockPsLiteGateway(),
     auth: createBearerTokenPsLiteAuth({
       ownerToken: "owner-token",
@@ -76,10 +84,99 @@ function build(bundle: PsLitePersistenceBundle) {
       gateway: { url: "https://gateway.local" },
       sync: { enabled: false },
     },
+    ...overrides,
   });
 }
 
 describe("createIndexedDbPsLiteRuntime persistence injection", () => {
+  it("refuses a mismatched replica owner signer even when legacy sync is disabled", async () => {
+    const bind = vi.fn(async () => {});
+    await expect(
+      build(
+        memoryBundle(),
+        { enabled: true, bind },
+        {
+          ownerSyncSigner: {
+            address: privateKeyToAccount(`0x${"22".repeat(32)}`).address,
+            signMessage: vi.fn(),
+            signAddData: vi.fn(),
+            signLineageAttestation: vi.fn(),
+          },
+        },
+      ),
+    ).rejects.toThrow("Owner sync signer must match the verified data owner");
+    expect(bind).not.toHaveBeenCalled();
+  });
+
+  it("preserves the supplied feed, owner signer and storage audience in the replica bind", async () => {
+    const messages: string[] = [];
+    const owner = privateKeyToAccount(`0x${"11".repeat(32)}`);
+    const signer = {
+      address: owner.address,
+      signMessage: async (message: string) => {
+        messages.push(message);
+        return owner.signMessage({ message });
+      },
+      signAddData: vi.fn(),
+      signLineageAttestation: vi.fn(),
+    };
+    const feed = {
+      listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      getDataPoint: async () => null,
+    };
+    vi.stubGlobal("fetch", async () => new Response(null, { status: 200 }));
+    await build(
+      memoryBundle(),
+      {
+        enabled: true,
+        bind: async (ports) => {
+          expect(ports.signer === signer).toBe(true);
+          expect(ports.feed === feed).toBe(true);
+          await ports.storage.upload("audience/1", new Uint8Array([1]));
+        },
+      },
+      {
+        ownerSyncSigner: signer,
+        dataPointFeed: feed,
+        storageAudience: "https://audience.fixture.test",
+      },
+    );
+    expect(
+      messages.some(
+        (message) =>
+          JSON.parse(Buffer.from(message, "base64url").toString("utf8")).aud ===
+          "https://audience.fixture.test",
+      ),
+    ).toBe(true);
+  });
+
+  it.each([undefined, false])(
+    "does not bind a replica sidecar unless enabled is true (%s)",
+    async (enabled) => {
+      const bind = vi.fn(async () => {
+        throw new Error("disabled sidecar invoked");
+      });
+      await build(memoryBundle(), { enabled, bind });
+      expect(bind).not.toHaveBeenCalled();
+    },
+  );
+
+  it("binds an explicitly enabled native sidecar to the existing owner and sync capabilities", async () => {
+    let count = 0;
+    await build(memoryBundle(), {
+      enabled: true,
+      bind: async (ports) => {
+        count++;
+        expect(ports.owner).toBe(ownerAddress);
+        expect(ports.masterKey.length).toBe(65);
+        expect(typeof ports.signer.signAddData).toBe("function");
+        expect(typeof ports.storage.downloadBounded).toBe("function");
+        expect(typeof ports.feed.listDataPointsByOwner).toBe("function");
+      },
+    });
+    expect(count).toBe(1);
+  });
+
   it("rejects a partial bundle instead of mixing native and IndexedDB stores", async () => {
     await expect(
       createIndexedDbPsLiteRuntime({
