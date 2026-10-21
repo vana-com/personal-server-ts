@@ -6,6 +6,12 @@
 
 export interface ListCursorPayload {
   kind: "list";
+  /** Current-view revision. A changed view expires rather than mixes pages. */
+  viewRevision?: string;
+  view?: "owner" | "grant";
+  instanceIds?: string[];
+  /** Final tuple component when records from several connections share time and key. */
+  instance?: string;
   /** Stream this token was minted for. Absent only on legacy cursors. */
   stream?: string;
   /** Store reset epoch this token was minted in. Absent only on legacy cursors. */

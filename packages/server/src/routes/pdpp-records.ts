@@ -28,6 +28,7 @@ import {
   type PdppRecordEnvelopeInput,
   type PdppRecordRow,
   type PdppRecordStore,
+  type PdppReplicaReadStore,
   type StreamDeclaration,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
@@ -53,6 +54,7 @@ function rebindListCursor(
     order,
     sortValue: last.emittedAt,
     recordKey: last.recordKey,
+    ...(bound.instance !== undefined && { instance: last.instance }),
   });
 }
 /** 512 MiB — max body size for PDPP record ingest and replace routes. */
@@ -213,9 +215,7 @@ function parseIngestBody(bytes: Uint8Array): unknown {
 export interface PdppRecordsRouteDeps {
   store: PdppRecordStore;
   /** Trusted reader classification; the receiver owns visibility and provisional markers. */
-  replicaReads?: (
-    reader: ReplicaReader,
-  ) => Pick<PdppRecordStore, "getRecord" | "listRecords" | "listStreams">;
+  replicaReads?: (reader: ReplicaReader) => PdppReplicaReadStore;
   bindingStore?: {
     getInstanceBinding(instance: string): {
       sourceId: string | null;
@@ -918,6 +918,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       context.tokenKind === "owner"
         ? streams.map((s) => ({
             name: s.stream,
+            confirmation: s.confirmation,
+            visibility: s.visibility,
+            status: s.status,
             recordCount: s.recordCount as number | null,
             lastUpdated: s.lastUpdated,
             budgetExhausted: false,
@@ -932,6 +935,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
               );
               return {
                 name: s.stream,
+                confirmation: undefined,
+                visibility: undefined,
+                status: undefined,
                 ...summarizeGrantVisible(
                   reads(context),
                   s.stream,
@@ -956,6 +962,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           name: s.name,
           record_count: s.recordCount,
           last_updated: s.lastUpdated,
+          ...(s.confirmation && { confirmation: s.confirmation }),
+          ...(s.status && { visibility: s.visibility, status: s.status }),
         })),
         ...(cappedStreams.length > 0 && {
           meta: {
@@ -1114,7 +1122,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         // field value. This split matters: if the store projected the
         // returned data too, a grant whose fields exclude the
         // time_constraint field would silently break that filter.
-        const page = deps.store.changesSince(stream, {
+        const reader = reads(context!);
+        const changesSince =
+          reader.changesSince?.bind(reader) ??
+          deps.store.changesSince.bind(deps.store);
+        const page = changesSince(stream, {
           instanceIds: effectiveInstanceIds,
           changesSince: c.req.query("changes_since"),
           cursor: c.req.query("cursor"),
@@ -1185,7 +1197,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         for (const row of page.data) {
           if (
             recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-            recordWithinGrantTimeConstraint(row.data, scope.streamGrant)
+            ((row.deleted && context!.tokenKind === "owner") ||
+              recordWithinGrantTimeConstraint(row.data, scope.streamGrant))
           ) {
             visible.push(row);
           }
@@ -1290,7 +1303,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       }
       if (
         !found ||
-        !recordWithinGrantTimeConstraint(found.data, scope.streamGrant)
+        (!(found.deleted && context!.tokenKind === "owner") &&
+          !recordWithinGrantTimeConstraint(found.data, scope.streamGrant))
       ) {
         throw new PdppError("not_found", "Record not found");
       }
@@ -1314,20 +1328,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             )
           : (requestedFields ?? scope.fields);
 
-      const data = projectFields(found.data, fields);
-
-      const response = c.json(
-        {
-          object: "record",
-          id: recordKey,
-          stream,
-          data,
-          emitted_at: found.emittedAt,
-          ...(found.confirmation && { confirmation: found.confirmation }),
-        },
-        200,
-        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
-      );
+      const response = c.json(toRecordJson(stream, found, fields), 200, {
+        "Request-Id": reqId,
+        "PDPP-Version": PDPP_VERSION,
+      });
       await logClientRead(c, context, stream, "completed", reqId);
       return response;
     } catch (err) {
@@ -2135,13 +2139,12 @@ interface GrantVisibleSummary {
  * against the record's real value, not a projected one.
  */
 function summarizeGrantVisible(
-  store: Pick<PdppRecordStore, "listRecords">,
+  store: Pick<PdppReplicaReadStore, "listRecords">,
   stream: string,
   instanceIds: string[],
   streamGrant: StreamGrant | undefined,
 ): GrantVisibleSummary {
-  // `listRecords` already excludes tombstones, so a deleted row should not
-  // appear here; the guard keeps the narrowing honest rather than asserting.
+  // A pending removal has no current grant-visible value to summarize.
   const visible = (row: PdppRecordRow) =>
     !row.deleted &&
     recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
@@ -2228,6 +2231,8 @@ function toRecordJson(
       deleted: true,
       deleted_at: row.deletedAt,
       emitted_at: row.emittedAt,
+      ...(row.confirmation && { confirmation: row.confirmation }),
+      ...(row.status && { visibility: row.visibility, status: row.status }),
     };
   }
   return {
@@ -2237,5 +2242,6 @@ function toRecordJson(
     data: projectFields(row.data, fields),
     emitted_at: row.emittedAt,
     ...(row.confirmation && { confirmation: row.confirmation }),
+    ...(row.status && { visibility: row.visibility, status: row.status }),
   };
 }

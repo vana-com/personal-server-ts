@@ -177,8 +177,16 @@ loser deletion, ordering-policy change or issuer-topology change is authorized.
 `readConnectionPage(connectionId, after?)` returns `{rows, after}` from current
 canonical rows for exactly that connection, including tombstones. It uses the
 persistence port's bounded keyset scan and rejects a cursor from another
-connection. Continue until `after` is absent; a page boundary is not stream
-completion. The caller filters streams/tombstones and owns its read budget.
+connection. Version-two cursors bind the connection, read mode and its durable
+view revision. Canonical commits, provisioning and reconciliation advance the
+canonical and preview revisions of affected connections. Pending-only
+stage/quarantine advances affected preview revisions, so grant cursors survive
+pending churn. Changes to an unrelated connection preserve both modes' cursors.
+Global operation-id collisions also invalidate every connection whose canonical
+or preview view is affected. A changed revision expires the cursor explicitly;
+restart the listing from its first page. Continue until `after` is absent; a page
+boundary is not stream completion. The caller filters streams/tombstones and owns
+its read budget.
 This is an internal trusted-host API, not a grant-relative PDPP list route,
 public query cursor or completion proof. It makes no identity/issuer decisions.
 
@@ -206,18 +214,54 @@ chain evidence themselves; the Lite publisher/receiver host is not wired here.
 `reader: "owner"`. Store-level `visibilityPolicy` uses the shared core policy:
 owner includes pending and grant sees confirmed only by default. Both classes can
 be changed to either mode through that one policy. Quarantined batches are hidden
-in every mode. Preview-derived rows carry `confirmation: "not yet confirmed"`.
+in every mode. Preview-derived rows, including record-delete, reset and
+connection-delete tombstones, carry `confirmation: "not yet confirmed"` and
+`visibility: "pending"` from core's `replicaPendingMetadata()` helper.
 
-Owner preview runs the existing retained-operation materializer through a sparse
-transaction overlay, discards derived writes and never advances the canonical
-clock. It uses canonical lifecycle evidence together with active pending
-operations, so local resets/deletes and concurrent edits retain #426 ordering.
-It does not clone the database or copy blob bytes. It does scan active pending
-batch metadata and can reconcile all keys for an affected connection; native
-latency and large pending backlogs remain unmeasured. Journal, mutation and outbox
-export methods read canonical state only.
+Pending operation partitions and batch references are durable indexes. Stage,
+promotion and quarantine update them and the affected preview rows in the same
+transaction. Canonical commits, host provisioning and declaration reconciliation
+also refresh those rows. Each refresh uses the current canonical baseline and
+the existing record reducer over canonical plus active pending evidence; local
+resets/deletes and concurrent edits retain #426 ordering. For a provisional
+lifecycle removal of pending-only data, the same reducer derives the eligible
+source value from active evidence before that removal, preserving canonical
+lifecycle suppression. Quarantining the source withdraws the marker; quarantining
+the removal restores the source. No stale preview row is used as source evidence.
+Multiple batches can retain the same operation until their last active reference
+is removed. Withdrawing an equivocation variant clears its connection's marker
+when that connection no longer participates, even if two other variants remain.
+
+Point reads use direct row lookups. Connection pages merge one bounded canonical
+row page with one bounded preview row page: at most 200 native input entries and
+1 MiB of input values. Visible output is at most 100 rows and 512 KiB, including
+pending metadata. Pages reuse scanned values without row point re-reads. A
+byte-trimmed page continues after its last returned key, without skipping the
+unreturned rows. Reads do not load pending batches or
+reconstruct operation history. Blob visibility checks use a per-blob active-batch
+index. Ordinary record writes reconcile affected keys; lifecycle, blob-claim,
+equivocation and provisioning writes may fan out across a connection's keys.
+Native write latency and large-backlog write costs remain unmeasured. An older
+database without pending-index version two requires authenticated `retry`
+(continue its pages) before owner preview or connection-page reads. Grant point
+reads continue to use canonical rows. A first state-changing hook also upgrades
+it atomically. The upgrade initializes per-connection canonical and preview
+revision receipts, including when version-one derived indexes already exist.
+This one-time write-side upgrade reads retained pending-batch metadata; owner
+preview and connection-page reads fail explicitly until it completes.
+Pending work never advances the canonical clock. Journal, mutation and outbox
+exports read canonical state only.
 
 The pending tests exercise the public store API with the crash fake, including
 reopen, interrupted promotion rollback, all four reader policy combinations,
 local edits/reset/delete, quarantine, blob visibility and disabled operation.
-They do not prove native mobile persistence or actual process-kill durability.
+Cardinality checks bound point/page read scans at 1 and 120 active batches,
+including mixed canonical/preview pages at entry and byte boundaries. Ordinary
+one-key stage/commit cases assert equal row work, native scan calls and scanned
+entry counts with 1 versus 120 unrelated pending keys.
+Further cases cover two-device tuple ordering in both arrival orders, provisional
+tombstone markers, shared operation references, atomic stage/quarantine rollback,
+and cursor expiry on affected writes, cursor stability across other-connection
+writes, global operation-id collision invalidation, and version-one snapshot
+receipt migration. They do not prove native mobile persistence or actual
+process-kill durability.

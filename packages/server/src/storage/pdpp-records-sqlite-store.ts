@@ -570,7 +570,20 @@ function projectFields(
  * A readonly database must already have the current schema; no migration,
  * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
+// Shared read predicate for canonical, replica-preview, and known-local projections.
+function unquarantinedRecordSql(alias: string): string {
+  return `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_connections q WHERE q.instance = ${alias}.instance) AND NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_keys q JOIN pdpp_instance_binding b ON b.instance=q.instance AND b.generation=q.generation WHERE q.instance=${alias}.instance AND q.stream=${alias}.stream AND q.record_key=${alias}.record_key)`;
+}
+
 export function createSqliteRecordStore(db: Database): PdppRecordStore & {
+  /** Internal synchronous observer, called after journal capture in the write transaction. */
+  setReplicaVisibilityObserver(observer: () => void): void;
+  unquarantinedRecordSql(alias: string): string;
+  changesSinceForInstances(
+    stream: string,
+    options: ChangesSinceOptions,
+    visibleInstanceIds: string[],
+  ): ChangesSincePage;
   replication: ReplicationExport;
   listConnections(sourceId: string): PdppInstanceBinding[];
   registerConnection(input: {
@@ -666,6 +679,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             @stream, @record_key, @operation, @value_json, @blob_ids_json)
   `);
 
+  let replicaVisibilityObserver: (() => void) | undefined;
   // Called only inside the canonical write transaction, after current/history writes.
   function journalMutation(
     instance: string,
@@ -699,6 +713,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       blob_ids_json: JSON.stringify(blobId ? [blobId] : []),
     });
     replica.captureRecord(instance, stream, recordKey, semantics, primaryKey);
+    replicaVisibilityObserver?.();
   }
 
   function readMutationJournalPage(
@@ -793,7 +808,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   `);
   const getBlobStmt = db.prepare("SELECT * FROM pdpp_blobs WHERE blob_id = ?");
   const findBlobRefsStmt = db.prepare(
-    "SELECT instance, stream, record_key FROM pdpp_records WHERE blob_id = ? AND deleted = 0",
+    `SELECT r.instance, r.stream, r.record_key FROM pdpp_records r WHERE r.blob_id = ? AND r.deleted = 0 AND ${unquarantinedRecordSql("r")}`,
   );
   const insertBlobBytesStmt = db.prepare(
     "INSERT INTO pdpp_blob_bytes (blob_id, bytes) VALUES (@blob_id, @bytes)",
@@ -1405,6 +1420,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         input.instance,
       );
       replica.captureLifecycle(input.instance, "connection-reset");
+      replicaVisibilityObserver?.();
       return {
         binding: toBinding(ensureBinding(db, input.instance)),
         alreadyReset: false,
@@ -1447,6 +1463,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       ).run(input.sourceId, input.method, input.label, input.instance);
       if (current.source_id === null)
         replica.captureLifecycle(input.instance, "connection-register");
+      replicaVisibilityObserver?.();
       return getInstanceBinding(input.instance);
     })();
   }
@@ -1462,6 +1479,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         "UPDATE pdpp_instance_binding SET deleted_at = ?, generation = generation + 1, reset_clock = ? WHERE instance = ?",
       ).run(deletedAt, resetClock, instance);
       replica.captureLifecycle(instance, "connection-delete");
+      replicaVisibilityObserver?.();
       return getInstanceBinding(instance);
     })();
   }
@@ -1753,8 +1771,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     stream: string,
     recordKey: string,
   ): PdppStoredRecord | undefined {
-    const row = getCurrentStmt.get(instance, stream, recordKey) as
-      RecordRowDb | undefined;
+    const row = db
+      .prepare(
+        `SELECT r.* FROM pdpp_records r WHERE r.instance=? AND r.stream=? AND r.record_key=? AND ${unquarantinedRecordSql("r")}`,
+      )
+      .get(instance, stream, recordKey) as RecordRowDb | undefined;
     if (!row || row.deleted) return undefined;
     return toRow(row) as PdppStoredRecord;
   }
@@ -1829,8 +1850,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     const cmp = options.order === "asc" ? ">" : "<";
 
     let sql = `
-      SELECT * FROM pdpp_records
-      WHERE stream = ? AND deleted = 0 AND instance IN (${placeholders})
+      SELECT r.* FROM pdpp_records r
+      WHERE stream = ? AND deleted = 0 AND instance IN (${placeholders}) AND ${unquarantinedRecordSql("r")}
     `;
     const params: unknown[] = [stream, ...options.instanceIds];
     if (startAfter) {
@@ -1917,6 +1938,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   function changesSince(
     stream: string,
     options: ChangesSinceOptions,
+    visibleInstanceIds: string[] = options.instanceIds,
   ): ChangesSincePage {
     let horizon: number;
     let sinceHorizon: number | null;
@@ -1955,32 +1977,37 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       sinceHorizon ?? horizon,
     ]);
 
-    const placeholders = options.instanceIds.map(() => "?").join(",");
+    const visibleIds = [...new Set(visibleInstanceIds)].filter((id) =>
+      options.instanceIds.includes(id),
+    );
+    const placeholders = visibleIds.map(() => "?").join(",");
 
     // Latest history row per key, as of the horizon.
-    const latestRows = db
-      .prepare(
-        `
+    const latestRows = visibleIds.length
+      ? (db
+          .prepare(
+            `
         SELECT c.* FROM pdpp_record_changes c
-        WHERE c.stream = ? AND c.instance IN (${placeholders}) AND c.written_at <= ?
+        WHERE c.stream = ? AND c.instance IN (${placeholders}) AND c.written_at <= ? AND ${unquarantinedRecordSql("c")}
         AND c.version = (
           SELECT MAX(c2.version) FROM pdpp_record_changes c2
           WHERE c2.stream = c.stream AND c2.instance = c.instance
             AND c2.record_key = c.record_key AND c2.written_at <= ?
         )
       `,
-      )
-      .all(stream, ...options.instanceIds, horizon, horizon) as Array<{
-      instance: string;
-      stream: string;
-      record_key: string;
-      version: number;
-      data: string | null;
-      emitted_at: string;
-      deleted: number;
-      deleted_at: string | null;
-      written_at: number;
-    }>;
+          )
+          .all(stream, ...visibleIds, horizon, horizon) as Array<{
+          instance: string;
+          stream: string;
+          record_key: string;
+          version: number;
+          data: string | null;
+          emitted_at: string;
+          deleted: number;
+          deleted_at: string | null;
+          written_at: number;
+        }>)
+      : [];
 
     const changed: PdppRecordRow[] = [];
     for (const entry of latestRows) {
@@ -2089,7 +2116,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     const rows = db
       .prepare(
         `SELECT stream, COUNT(*) as count, MAX(emitted_at) as last_updated
-         FROM pdpp_records WHERE deleted = 0 AND instance IN (${placeholders})
+         FROM pdpp_records r WHERE deleted = 0 AND instance IN (${placeholders}) AND ${unquarantinedRecordSql("r")}
          GROUP BY stream`,
       )
       .all(...instanceIds) as Array<{
@@ -2225,6 +2252,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
          ON CONFLICT (blob_id, instance) DO UPDATE SET generation = excluded.generation`,
       ).run(meta.blobId, input.instance, input.generation);
       replica.captureBlob(input.instance, meta.blobId);
+      replicaVisibilityObserver?.();
       return meta;
     })();
   }
@@ -2242,6 +2270,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   }
 
   return {
+    unquarantinedRecordSql,
+    setReplicaVisibilityObserver: (observer: () => void) => {
+      replicaVisibilityObserver = observer;
+    },
     replication: replica.exporter,
     getInstallationWriterId: () => writerId,
     readMutationJournalPage,
@@ -2260,7 +2292,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     getRecord,
     listRecords,
     deleteRecord,
-    changesSince,
+    changesSince: (stream, options) => changesSince(stream, options),
+    changesSinceForInstances: changesSince,
     listStreams,
     putBlobMeta: (meta: PdppBlobMeta) =>
       putBlobStmt.run({

@@ -22,6 +22,7 @@ import {
   serverRegistrationDomain,
   SERVER_REGISTRATION_TYPES,
 } from "@opendatalabs/vana-sdk/node";
+import type { PdppVisibleRecord } from "../packages/core/src/storage/pdpp-records/types.js";
 import type {
   ReplicaOperation,
   ReplicaEnvelope,
@@ -102,8 +103,8 @@ type HostRequest = {
   args?: Record<string, unknown>;
 };
 type Snapshot = {
-  ownerRows: import("../packages/core/src/storage/pdpp-records/types.js").PdppStoredRecord[];
-  appRows: import("../packages/core/src/storage/pdpp-records/types.js").PdppStoredRecord[];
+  ownerRows: PdppVisibleRecord[];
+  appRows: PdppVisibleRecord[];
   records: Record<string, unknown>;
   blobs: Record<string, { sha256: string; bytes: number }>;
   published: number;

@@ -19,6 +19,7 @@ import { sha256, toBytes } from "viem";
 import { createReplicaRecordReducer } from "@opendatalabs/personal-server-ts-core/replication/record-reducer";
 import {
   replicaStateVisible,
+  replicaPendingMetadata,
   type ReplicaReader,
   type ReplicaVisibilityPolicy,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
@@ -49,9 +50,7 @@ export interface LiteCommitReceipt {
 export interface LiteReplicaReadOptions {
   reader?: ReplicaReader;
 }
-export type LiteVisibleRecord = PdppRecordRow & {
-  confirmation?: "not yet confirmed";
-};
+export type LiteVisibleRecord = PdppRecordRow;
 interface PendingBatch {
   id: string;
   fingerprint: string;
@@ -71,6 +70,17 @@ const connectionPrefix = (id: string) => `entries/${keyDigest(id)}/`;
 const recordId = (stream: string, key: string) => keyDigest([stream, key]);
 const rowKey = (connection: string, stream: string, key: string) =>
   `rows/${keyDigest(connection)}/${recordId(stream, key)}`;
+const operationPath = (op: ReplicaOperation) => {
+  const suffix =
+    op.kind === "upsert" || op.kind === "delete"
+      ? `records/${recordId(op.declaration.stream, op.recordKey)}/`
+      : op.kind === "blob-claim"
+        ? `claims/${keyDigest(op.blob.blobId)}/`
+        : op.kind === "stream-complete" || op.kind === "stream-invalidate"
+          ? "completions/"
+          : "lifecycle/";
+  return `${connectionPrefix(op.connectionId)}${suffix}${digest(op)}`;
+};
 const maxWindowBytes = 4 * 1024 * 1024;
 const encoder = new TextEncoder();
 
@@ -145,6 +155,7 @@ export function createLiteCanonicalStore(deps: {
     if (stored) return stored;
     const initial = { writerId: newId(), counter: 0, sequence: 0 };
     await put(tx, "clock", initial);
+    await put(tx, "pending-index-version", 2);
     return initial;
   }
   async function mapping(tx: LiteCanonicalTransaction, op: ReplicaOperation) {
@@ -164,7 +175,6 @@ export function createLiteCanonicalStore(deps: {
     op: ReplicaOperation,
     dirty: Set<string>,
   ) {
-    const base = connectionPrefix(op.connectionId);
     await put(
       tx,
       `retained-connections/${keyDigest(op.connectionId)}`,
@@ -179,15 +189,7 @@ export function createLiteCanonicalStore(deps: {
     ) {
       await put(tx, `binding-conflicts/${keyDigest(op.connectionId)}`, true);
     } else await put(tx, bindingPath, binding);
-    const suffix =
-      op.kind === "upsert" || op.kind === "delete"
-        ? `records/${recordId(op.declaration.stream, op.recordKey)}/`
-        : op.kind === "blob-claim"
-          ? `claims/${keyDigest(op.blob.blobId)}/`
-          : op.kind === "stream-complete" || op.kind === "stream-invalidate"
-            ? "completions/"
-            : "lifecycle/";
-    const opKey = `${base}${suffix}${digest(op)}`;
+    const opKey = operationPath(op);
     await put(tx, opKey, op);
     if (op.kind === "upsert" || op.kind === "delete") {
       await put(
@@ -261,6 +263,7 @@ export function createLiteCanonicalStore(deps: {
     id: string,
     context: MergeContext,
     only?: readonly { stream: string; key: string }[],
+    canonical?: LiteCanonicalTransaction,
   ) {
     const lifecycle = await operations(tx, `${connectionPrefix(id)}lifecycle/`);
     const mapped = await get<Connection>(tx, `connections/${keyDigest(id)}`);
@@ -289,6 +292,21 @@ export function createLiteCanonicalStore(deps: {
       (await get<number>(tx, `connection-generation/${keyDigest(id)}`)) ?? 1;
     const reset =
       !blocked && !pendingLifecycle && generation > activeGeneration;
+    // Keep canonical lifecycle suppression in the source view. Only provisional
+    // removals are omitted when deriving the value they would provisionally remove.
+    const sourceLifecycle: ReplicaOperation[] = [];
+    const provisionalResets: ReplicaOperation[] = [];
+    let provisionalRemoval = false;
+    if (canonical && !blocked && !pendingLifecycle && (deleted || reset))
+      for (const op of lifecycle) {
+        if (
+          (op.kind === "connection-reset" || op.kind === "connection-delete") &&
+          !(await canonical.get(operationPath(op)))
+        ) {
+          provisionalRemoval = true;
+          if (op.kind === "connection-reset") provisionalResets.push(op);
+        } else sourceLifecycle.push(op);
+      }
     const keys = only
       ? only.map((key) => ({ value: canonicalJson(key) }))
       : scan(tx, `keys/${keyDigest(id)}/`);
@@ -298,7 +316,10 @@ export function createLiteCanonicalStore(deps: {
         key: string;
       };
       const reducer = createReplicaRecordReducer(context, lifecycle);
-      if (!blocked && !deleted && !pendingLifecycle) {
+      let sourceReducer:
+        ReturnType<typeof createReplicaRecordReducer> | undefined;
+      let sourceGeneration = 0;
+      if (!blocked && !pendingLifecycle && (!deleted || provisionalRemoval)) {
         for await (const variant of scan(
           tx,
           `${connectionPrefix(id)}records/${recordId(stream, key)}/`,
@@ -306,7 +327,25 @@ export function createLiteCanonicalStore(deps: {
           const op = replicaOperationSchema.parse(JSON.parse(variant.value));
           if (op.kind !== "upsert" && op.kind !== "delete")
             throw new Error("invalid record partition");
-          reducer.push(op);
+          if (!deleted) reducer.push(op);
+          if (provisionalRemoval && op.generation >= sourceGeneration) {
+            // As in the planner, a newer eligible generation supersedes older
+            // evidence. Retain just that generation's bounded reducer state.
+            const candidate =
+              op.generation === sourceGeneration
+                ? sourceReducer!
+                : createReplicaRecordReducer(context, [
+                    ...sourceLifecycle,
+                    ...provisionalResets.filter(
+                      (reset) => reset.generation <= op.generation,
+                    ),
+                  ]);
+            candidate.push(op);
+            if (candidate.record !== undefined) {
+              sourceGeneration = op.generation;
+              sourceReducer = candidate;
+            }
+          }
         }
       }
       const record = reducer.record;
@@ -318,7 +357,24 @@ export function createLiteCanonicalStore(deps: {
             ? winner
             : null;
       const path = rowKey(id, stream, key);
+      if (canonical) await tx.delete(path);
       let prior = await get<PdppRecordRow>(tx, path);
+      const source = mapped ? sourceReducer?.record?.winner : undefined;
+      if (
+        !prior &&
+        !materialized &&
+        source?.kind === "upsert" &&
+        (await blobReady(tx, source))
+      )
+        prior = {
+          instance: id,
+          stream,
+          recordKey: key,
+          version: 1,
+          emittedAt: source.emittedAt,
+          deleted: false,
+          data: source.data,
+        };
       const priorGeneration = await get<number>(tx, `row-generation/${path}`);
       // A validated reset withdraws live rows before applying its generation,
       // even when the new winner has identical content and emitted time.
@@ -428,6 +484,7 @@ export function createLiteCanonicalStore(deps: {
           throw new Error("pending promotion conflict");
       }
       const current = await clock(tx, context);
+      await ensurePendingIndex(tx, context);
       const receiptKey = `${local ? "local" : "import"}/${keyDigest(input.id)}`;
       const prior = await get<{
         fingerprint: string;
@@ -657,7 +714,23 @@ export function createLiteCanonicalStore(deps: {
         await put(tx, path, { ...batch, state: "confirmed" });
         for (const blob of batch.blobs)
           await put(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`, true);
+        await indexPending(tx, batch, false, context);
       }
+      const previewDirty = new Set(dirty);
+      for (const op of accepted) {
+        if (await refreshPendingRevision(tx, op, previewDirty))
+          for (const id of previewDirty) full.add(id);
+      }
+      for (const id of previewDirty)
+        await refreshPreview(
+          tx,
+          id,
+          context,
+          full.has(id) ? undefined : [...(changed.get(id)?.values() ?? [])],
+        );
+      for (const id of dirty) await advanceCanonicalView(tx, id);
+      for (const id of previewDirty)
+        if (!dirty.has(id)) await advancePreview(tx, id);
       return receipt;
     });
   }
@@ -670,84 +743,277 @@ export function createLiteCanonicalStore(deps: {
       throw new Error("replica authority required for owner");
     return context;
   }
-  async function pendingBatches(tx: LiteCanonicalTransaction) {
-    const batches: PendingBatch[] = [];
+  // Merge two native keyset pages. The earlier continuation boundary limits
+  // both inputs, so no unconsumed entry can be skipped on the next page.
+  async function mergedPage(
+    tx: LiteCanonicalTransaction,
+    namespace: string,
+    prefix: string,
+    after?: string,
+    formatExtra?: (value: string) => string,
+  ) {
+    const [base, extra] = await Promise.all([
+      tx.scan(prefix, after),
+      tx.scan(
+        `${namespace}${prefix}`,
+        after === undefined ? undefined : `${namespace}${after}`,
+      ),
+    ]);
+    const boundaries = [base.after, extra.after?.slice(namespace.length)]
+      .filter((key): key is string => key !== undefined)
+      .sort();
+    const boundary = boundaries[0];
+    const entries = new Map(
+      base.entries.map((entry) => [entry.key, entry.value]),
+    );
+    for (const entry of extra.entries)
+      entries.set(
+        entry.key.slice(namespace.length),
+        formatExtra ? formatExtra(entry.value) : entry.value,
+      );
+    const sorted = [...entries]
+      .filter(([key]) => boundary === undefined || key <= boundary)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const page: { key: string; value: string }[] = [];
+    let bytes = 0;
+    for (const [key, value] of sorted) {
+      const size = encoder.encode(value).length;
+      if (page.length && (page.length === 100 || bytes + size > 512 * 1024))
+        break;
+      page.push({ key, value });
+      bytes += size;
+    }
+    return {
+      entries: page,
+      ...(boundary !== undefined || page.length < sorted.length
+        ? { after: page.at(-1)!.key }
+        : {}),
+    };
+  }
+  function previewRows(tx: LiteCanonicalTransaction): LiteCanonicalTransaction {
+    return {
+      ...tx,
+      get: async (key) => (await tx.get(`preview/${key}`)) ?? tx.get(key),
+      scan: (prefix, after) =>
+        mergedPage(tx, "preview/", prefix, after, (value) =>
+          canonicalJson({ ...JSON.parse(value), ...replicaPendingMetadata() }),
+        ),
+    };
+  }
+  // Only writers use this view. Retained canonical and active pending partitions
+  // feed the same reducer; derived rows are durable but never enter canonical data.
+  function pendingMaterializer(
+    tx: LiteCanonicalTransaction,
+  ): LiteCanonicalTransaction {
+    return {
+      ...tx,
+      get: async (key) => {
+        if (
+          key.startsWith("binding-evidence/") ||
+          key.startsWith("binding-conflicts/")
+        ) {
+          const id = key.slice(key.indexOf("/") + 1);
+          const canonical = await get<Connection>(tx, `binding-evidence/${id}`);
+          const bindings = new Set<string>(
+            canonical ? [canonicalJson(canonical)] : [],
+          );
+          for await (const entry of scan(tx, `pending-bindings/${id}/`))
+            bindings.add(
+              canonicalJson(
+                (JSON.parse(entry.value) as { binding: Connection }).binding,
+              ),
+            );
+          if (key.startsWith("binding-evidence/"))
+            return bindings.values().next().value;
+          return (
+            (await tx.get(key)) ?? (bindings.size > 1 ? "true" : undefined)
+          );
+        }
+        return tx.get(key);
+      },
+      put: async (key, value) => {
+        if (!key.startsWith("rows/")) return;
+        if (value === (await tx.get(key))) await tx.delete(`preview/${key}`);
+        else await tx.put(`preview/${key}`, value);
+      },
+      delete: (key) => tx.delete(`preview/${key}`),
+      scan: (prefix, after) => mergedPage(tx, "pending-index/", prefix, after),
+    };
+  }
+  async function refreshPreview(
+    tx: LiteCanonicalTransaction,
+    id: string,
+    context: MergeContext,
+    only?: readonly { stream: string; key: string }[],
+  ) {
+    // Each key starts from canonical rows, never yesterday's preview. Reconcile
+    // streams native key pages on lifecycle fanout instead of collecting a scope.
+    await reconcile(pendingMaterializer(tx), id, context, only, tx);
+  }
+  async function advancePreview(tx: LiteCanonicalTransaction, id: string) {
+    const path = `preview-revision/${keyDigest(id)}`;
+    await put(tx, path, ((await get<number>(tx, path)) ?? 0) + 1);
+  }
+  async function advanceCanonicalView(
+    tx: LiteCanonicalTransaction,
+    id: string,
+  ) {
+    const path = `canonical-view-revision/${keyDigest(id)}`;
+    await put(tx, path, ((await get<number>(tx, path)) ?? 0) + 1);
+    await advancePreview(tx, id);
+  }
+  async function refreshPendingRevision(
+    tx: LiteCanonicalTransaction,
+    op: ReplicaOperation,
+    dirty: Set<string>,
+  ) {
+    const prefix = `revisions/${operationId(op)}/`;
+    const variants: { connectionId: string; opKey: string }[] = [];
+    for await (const entry of scan(pendingMaterializer(tx), prefix))
+      variants.push(JSON.parse(entry.value));
+    for (const id of new Set([
+      op.connectionId,
+      ...variants.map((v) => v.connectionId),
+    ])) {
+      const key = `pending-index/equivocations/${keyDigest(id)}/${operationId(op)}`;
+      if (
+        variants.length > 1 &&
+        variants.some((variant) => variant.connectionId === id)
+      )
+        await put(tx, key, variants);
+      else await tx.delete(key);
+      dirty.add(id);
+    }
+    return variants.length > 1;
+  }
+  async function indexPending(
+    tx: LiteCanonicalTransaction,
+    batch: PendingBatch,
+    active: boolean,
+    context: MergeContext,
+  ) {
+    const dirty = new Set<string>();
+    const full = new Set<string>();
+    const changed = new Map<
+      string,
+      Map<string, { stream: string; key: string }>
+    >();
+    for (const op of batch.envelope.operations) {
+      await put(
+        tx,
+        `pending-index/retained-connections/${keyDigest(op.connectionId)}`,
+        op.connectionId,
+      );
+      const path = operationPath(op);
+      const refs = `pending-refs/${digest(op)}/`;
+      const ref = `${refs}${keyDigest(batch.id)}`;
+      const existed = await tx.get(`pending-index/${path}`);
+      if (active) await put(tx, ref, true);
+      else await tx.delete(ref);
+      const remains = (await tx.scan(refs)).entries.length > 0;
+      if (remains) await put(tx, `pending-index/${path}`, op);
+      else await tx.delete(`pending-index/${path}`);
+      const binding = { sourceId: op.sourceId, methodId: op.methodId };
+      const bindingKey = `pending-bindings/${keyDigest(op.connectionId)}/${keyDigest(binding)}`;
+      const priorBinding = await get<{ count: number; binding: Connection }>(
+        tx,
+        bindingKey,
+      );
+      const count =
+        (priorBinding?.count ?? 0) + (remains ? 1 : 0) - (existed ? 1 : 0);
+      if (count) await put(tx, bindingKey, { count, binding });
+      else await tx.delete(bindingKey);
+      const revisionKey = `pending-index/revisions/${operationId(op)}/${digest(op)}`;
+      if (remains)
+        await put(tx, revisionKey, {
+          connectionId: op.connectionId,
+          opKey: path,
+        });
+      else await tx.delete(revisionKey);
+      const wasCollision = !!(await tx.get(
+        `pending-index/equivocations/${keyDigest(op.connectionId)}/${operationId(op)}`,
+      ));
+      const collision = await refreshPendingRevision(tx, op, dirty);
+      if (collision || wasCollision) for (const id of dirty) full.add(id);
+      if (op.kind === "upsert" || op.kind === "delete") {
+        const address = { stream: op.declaration.stream, key: op.recordKey };
+        await put(
+          tx,
+          `pending-index/keys/${keyDigest(op.connectionId)}/${recordId(address.stream, address.key)}`,
+          address,
+        );
+        const keys = changed.get(op.connectionId) ?? new Map();
+        keys.set(recordId(address.stream, address.key), address);
+        changed.set(op.connectionId, keys);
+      } else full.add(op.connectionId);
+    }
+    for (const id of dirty)
+      await refreshPreview(
+        tx,
+        id,
+        context,
+        full.has(id) ? undefined : [...(changed.get(id)?.values() ?? [])],
+      );
+    if (!active) {
+      for (const [id, keys] of changed)
+        for (const { stream, key } of keys.values())
+          if (
+            !(
+              await tx.scan(
+                `pending-index/${connectionPrefix(id)}records/${recordId(stream, key)}/`,
+              )
+            ).entries.length
+          )
+            await tx.delete(
+              `pending-index/keys/${keyDigest(id)}/${recordId(stream, key)}`,
+            );
+      for (const id of dirty)
+        if (
+          !(await tx.scan(`pending-index/${connectionPrefix(id)}`)).entries
+            .length
+        )
+          await tx.delete(
+            `pending-index/retained-connections/${keyDigest(id)}`,
+          );
+    }
+    for (const blob of batch.blobs) {
+      const path = `pending-blob-active/${keyDigest(blob.blobId)}/${keyDigest(batch.id)}`;
+      if (active) await put(tx, path, true);
+      else await tx.delete(path);
+    }
+    for (const id of dirty) await advancePreview(tx, id);
+  }
+  async function ensurePendingIndex(
+    tx: LiteCanonicalTransaction,
+    context: MergeContext,
+  ) {
+    if ((await get(tx, "pending-index-version")) === 2) return;
+    // One-time upgrade belongs to an authenticated writer, never a record read.
     for await (const entry of scan(tx, "pending-batches/")) {
       const batch = JSON.parse(entry.value) as PendingBatch;
-      if (batch.state === "pending") batches.push(batch);
+      if (batch.state === "pending")
+        await indexPending(tx, batch, true, context);
     }
-    return batches;
+    // Version 2 receipts bind each connection's canonical and pending snapshots.
+    // Initialize them during this one-time writer upgrade, never during a read.
+    for await (const entry of scan(
+      pendingMaterializer(tx),
+      "retained-connections/",
+    ))
+      await advanceCanonicalView(tx, JSON.parse(entry.value) as string);
+    await put(tx, "pending-index-version", 2);
   }
-  // The ordinary materializer runs over an ephemeral transaction overlay. Even
-  // conflict indexes and lifecycle withdrawals follow the canonical path, while
-  // every derived write is discarded and no clock is advanced.
-  async function preview(
+  async function readView(
     tx: LiteCanonicalTransaction,
-    connection: string,
     options: LiteReplicaReadOptions,
   ) {
     if (!replicaStateVisible("pending", options.reader, deps.visibilityPolicy))
       return tx;
-    const batches = await pendingBatches(tx);
-    if (!batches.length) return tx;
-    const writes = new Map<string, string>();
-    const removed = new Set<string>();
-    const overlay: LiteCanonicalTransaction = {
-      get: async (key) =>
-        removed.has(key) ? undefined : (writes.get(key) ?? tx.get(key)),
-      put: async (key, value) => {
-        writes.set(key, value);
-        removed.delete(key);
-      },
-      delete: async (key) => {
-        writes.delete(key);
-        removed.add(key);
-      },
-      scan: async (prefix, after) => {
-        const base = await tx.scan(prefix, after);
-        const entries = new Map(
-          base.entries
-            .filter((entry) => !removed.has(entry.key))
-            .map((entry) => [entry.key, entry.value]),
-        );
-        const boundary = base.after;
-        for (const [key, value] of writes)
-          if (
-            key.startsWith(prefix) &&
-            (after === undefined || key > after) &&
-            (boundary === undefined || key <= boundary)
-          )
-            entries.set(key, value);
-        const sorted = [...entries].sort(([a], [b]) =>
-          a < b ? -1 : a > b ? 1 : 0,
-        );
-        const page: { key: string; value: string }[] = [];
-        let bytes = 0;
-        for (const [key, value] of sorted) {
-          const size = encoder.encode(value).length;
-          if (page.length && (page.length === 100 || bytes + size > 512 * 1024))
-            break;
-          page.push({ key, value });
-          bytes += size;
-        }
-        const more = boundary !== undefined || page.length < sorted.length;
-        return {
-          entries: page,
-          ...(more ? { after: page.at(-1)?.key ?? boundary } : {}),
-        };
-      },
-      blob: (id) => tx.blob(id),
-      attachBlob: async () => {
-        throw new Error("preview cannot attach blobs");
-      },
-    };
-    const dirty = new Set<string>();
-    for (const batch of batches)
-      for (const op of batch.envelope.operations)
-        await retain(overlay, op, dirty);
-    if (dirty.has(connection))
-      await reconcile(overlay, connection, deps.context());
-    return overlay;
+    if ((await get(tx, "pending-index-version")) !== 2)
+      throw new Error(
+        "pending preview requires reconciliation; call retry before owner reads",
+      );
+    return previewRows(tx);
   }
   async function visibleRow(
     tx: LiteCanonicalTransaction,
@@ -757,7 +1023,7 @@ export function createLiteCanonicalStore(deps: {
     const row = await get<PdppRecordRow>(view, path);
     if (!row || view === tx || (await tx.get(path)) === (await view.get(path)))
       return row;
-    return { ...row, confirmation: "not yet confirmed" };
+    return { ...row, ...replicaPendingMetadata() };
   }
   return {
     /** Host hook: caller authenticates/decrypts transport and verifies its hash before staging. */
@@ -784,6 +1050,7 @@ export function createLiteCanonicalStore(deps: {
       const fingerprint = digest(envelope);
       return persistence.transaction(async (tx) => {
         await clock(tx, context);
+        await ensurePendingIndex(tx, context);
         const path = pendingKey(input.id);
         const prior = await get<PendingBatch>(tx, path);
         if (prior && prior.fingerprint !== fingerprint)
@@ -827,13 +1094,15 @@ export function createLiteCanonicalStore(deps: {
             ].map((blob) => [blob.blobId, blob]),
           ).values(),
         ];
-        await put(tx, path, {
+        const batch: PendingBatch = {
           id: input.id,
           envelope,
           fingerprint,
           state: "pending",
           blobs,
-        } satisfies PendingBatch);
+        };
+        await put(tx, path, batch);
+        await indexPending(tx, batch, true, context);
         return { fingerprint, state: "pending" as const };
       });
     },
@@ -844,9 +1113,10 @@ export function createLiteCanonicalStore(deps: {
       fingerprint: string;
     }) {
       enabled();
-      authenticate(input.credential);
+      const context = authenticate(input.credential);
       const batch = await persistence.transaction(async (tx) => {
-        await clock(tx);
+        await clock(tx, context);
+        await ensurePendingIndex(tx, context);
         const path = pendingKey(input.id);
         const value = await get<PendingBatch>(tx, path);
         if (!value) throw new Error("unknown pending batch");
@@ -863,6 +1133,7 @@ export function createLiteCanonicalStore(deps: {
             state: "quarantined",
             reason: "divergent finalized commitment",
           });
+          await indexPending(tx, value, false, context);
           return undefined;
         }
         if (value.state === "quarantined")
@@ -883,9 +1154,10 @@ export function createLiteCanonicalStore(deps: {
       reason: string;
     }) {
       enabled();
-      authenticate(input.credential);
+      const context = authenticate(input.credential);
       await persistence.transaction(async (tx) => {
-        await clock(tx);
+        await clock(tx, context);
+        await ensurePendingIndex(tx, context);
         const path = pendingKey(input.id);
         const value = await get<PendingBatch>(tx, path);
         if (!value) throw new Error("unknown pending batch");
@@ -898,6 +1170,7 @@ export function createLiteCanonicalStore(deps: {
           state: "quarantined",
           reason: input.reason,
         });
+        await indexPending(tx, value, false, context);
       });
     },
     /** Trusted host provisioning only; never called by replica or collector input. */
@@ -908,6 +1181,7 @@ export function createLiteCanonicalStore(deps: {
       await persistence.transaction(async (tx) => {
         const context = deps.context();
         const current = await clock(tx, context);
+        await ensurePendingIndex(tx, context);
         const prior = await get<Connection>(tx, `connections/${keyDigest(id)}`);
         if (prior && canonicalJson(prior) !== canonicalJson(connection))
           throw new Error("immutable connection binding");
@@ -922,6 +1196,8 @@ export function createLiteCanonicalStore(deps: {
           throw new Error("retained connection source or method mismatch");
         await put(tx, `connections/${keyDigest(id)}`, connection);
         await reconcile(tx, id, context);
+        await refreshPreview(tx, id, context);
+        await advanceCanonicalView(tx, id);
         await put(tx, "clock", current);
       });
     },
@@ -947,9 +1223,19 @@ export function createLiteCanonicalStore(deps: {
         throw new Error("replica authority required for owner");
       return persistence.transaction(async (tx) => {
         await clock(tx, context);
-        const page = await tx.scan("retained-connections/", input.after);
-        for (const entry of page.entries)
-          await reconcile(tx, JSON.parse(entry.value) as string, context);
+        await ensurePendingIndex(tx, context);
+        const page = await mergedPage(
+          tx,
+          "pending-index/",
+          "retained-connections/",
+          input.after,
+        );
+        for (const entry of page.entries) {
+          const id = JSON.parse(entry.value) as string;
+          await reconcile(tx, id, context);
+          await refreshPreview(tx, id, context);
+          await advanceCanonicalView(tx, id);
+        }
         return { after: page.after };
       });
     },
@@ -962,7 +1248,7 @@ export function createLiteCanonicalStore(deps: {
       enabled();
       return persistence.transaction(async (tx) => {
         await clock(tx);
-        const view = await preview(tx, connection, options);
+        const view = await readView(tx, options);
         return visibleRow(tx, view, rowKey(connection, stream, key));
       });
     },
@@ -979,16 +1265,48 @@ export function createLiteCanonicalStore(deps: {
         throw new Error("invalid canonical connection cursor");
       return persistence.transaction(async (tx) => {
         await clock(tx);
-        const view = await preview(tx, connection, options);
-        const page = await view.scan(prefix, after);
+        const view = await readView(tx, options);
+        if ((await get(tx, "pending-index-version")) !== 2)
+          throw new Error(
+            "connection snapshots require reconciliation; call retry before page reads",
+          );
+        const mode = view === tx ? "canonical" : "pending";
+        const revision =
+          (await get<number>(
+            tx,
+            `${mode === "canonical" ? "canonical-view-revision" : "preview-revision"}/${keyDigest(connection)}`,
+          )) ?? 0;
+        const cursorPrefix = `${prefix}cursor/v2/${revision}/${mode}/`;
+        if (after !== undefined && !after.startsWith(cursorPrefix))
+          throw new Error("canonical connection cursor expired");
+        const page = await view.scan(
+          prefix,
+          after === undefined
+            ? undefined
+            : `${prefix}${after.slice(cursorPrefix.length)}`,
+        );
+        const visible = page.entries.map(
+          (entry) => JSON.parse(entry.value) as LiteVisibleRecord,
+        );
+        const rows: LiteVisibleRecord[] = [];
+        let bytes = 2; // JSON array delimiters; pending metadata counts too.
+        for (const row of visible) {
+          const size =
+            encoder.encode(canonicalJson(row)).length + (rows.length ? 1 : 0);
+          if (rows.length && bytes + size > 512 * 1024) break;
+          rows.push(row);
+          bytes += size;
+        }
+        const next =
+          rows.length < page.entries.length
+            ? page.entries[rows.length - 1].key
+            : page.after;
         return {
-          rows: await Promise.all(
-            page.entries.map(
-              (entry) =>
-                visibleRow(tx, view, entry.key) as Promise<LiteVisibleRecord>,
-            ),
-          ),
-          after: page.after,
+          rows,
+          after:
+            next === undefined
+              ? undefined
+              : `${cursorPrefix}${next.slice(prefix.length)}`,
         };
       });
     },
@@ -1087,8 +1405,10 @@ export function createLiteCanonicalStore(deps: {
           !replicaStateVisible("pending", options.reader, deps.visibilityPolicy)
         )
           return false;
-        return (await pendingBatches(tx)).some((batch) =>
-          batch.blobs.some((blob) => blob.blobId === blobId),
+        await readView(tx, options);
+        return (
+          (await tx.scan(`pending-blob-active/${keyDigest(blobId)}/`)).entries
+            .length > 0
         );
       });
       if (!visible) throw new Error("missing committed blob");

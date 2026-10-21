@@ -1,3 +1,4 @@
+import { createReplicaVisibilityView } from "./pdpp-replica-visibility-view.js";
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import {
@@ -22,10 +23,10 @@ import {
   type ReplicaVisibilityPolicy,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import {
-  decodeCursor,
-  encodeCursor,
   type ListRecordsOptions,
-  type PdppStoredRecord,
+  type ChangesSinceOptions,
+  type PdppVisibleRecord,
+  type ListVisibleRecordsPage,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 export const RECEIVER_MIGRATION = `
@@ -36,12 +37,6 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_quarantined_keys (instance TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS pdpp_replica_quarantined_connections (instance TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS pdpp_replica_received_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
 `;
-
-// SQLite's default BINARY collation compares UTF-8 bytes. Locale collation and
-// JavaScript UTF-16 ordering both differ for some valid Unicode record keys.
-function compareSqliteText(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
-}
 
 type Store = ReturnType<typeof createSqliteRecordStore>;
 type Binding = {
@@ -90,12 +85,6 @@ export function createReplicaReceiver(deps: {
     blobs_json: string;
     state: string;
   };
-  const pendingBatches = () =>
-    db
-      .prepare(
-        "SELECT * FROM pdpp_replica_pending_batches WHERE state='pending' ORDER BY id",
-      )
-      .all() as PendingBatch[];
   function authorize(credential: unknown) {
     if (!owner || deps.authenticate(credential) !== owner)
       throw new Error("replica authority required for owner");
@@ -403,6 +392,10 @@ export function createReplicaReceiver(deps: {
         db.prepare(
           "INSERT OR IGNORE INTO pdpp_replica_quarantined_keys VALUES (?, ?, ?, ?)",
         ).run(connectionId, generation, stream, recordKey);
+      if (isRecordQuarantined(connectionId, stream, recordKey)) {
+        write(connectionId, stream, recordKey, null);
+        continue;
+      }
       const winner = record.winner;
       if (winner?.kind === "upsert" && !materializeBlob(winner, eligible)) {
         plan.pending.push({
@@ -411,6 +404,32 @@ export function createReplicaReceiver(deps: {
         });
         write(connectionId, stream, recordKey, null);
       } else write(connectionId, stream, recordKey, winner);
+    }
+    const materialized = new Set(
+      plan.records.map((record) => canonicalJson(record.identity)),
+    );
+    for (const issue of [...plan.pending, ...plan.rejected]) {
+      if (
+        issue.reason !== "missing_declaration" &&
+        issue.reason !== "invalid_record_data"
+      )
+        continue;
+      for (const op of issue.operations) {
+        if (op.kind !== "upsert" && op.kind !== "delete") continue;
+        const identity = {
+          owner: op.owner,
+          sourceId: op.sourceId,
+          connectionId: op.connectionId,
+          generation: op.generation,
+          stream: op.declaration.stream,
+          recordKey: op.recordKey,
+        };
+        if (
+          binding(op.connectionId)?.generation === op.generation &&
+          !materialized.has(canonicalJson(identity))
+        )
+          write(op.connectionId, op.declaration.stream, op.recordKey, null);
+      }
     }
     reconcileCompletions(eligible, plan);
     return plan;
@@ -558,135 +577,51 @@ export function createReplicaReceiver(deps: {
       }
     }
   }
-  function pendingOperations(): ReplicaOperation[] {
-    return pendingBatches().flatMap(
-      (row) =>
-        replicaEnvelopeSchema.parse(JSON.parse(row.envelope_json)).operations,
+  function isRecordQuarantined(
+    instance: string,
+    stream: string,
+    key: string,
+  ): boolean {
+    return !db
+      .prepare(
+        `SELECT 1 FROM (SELECT ? AS instance,? AS stream,? AS record_key) r WHERE ${store.unquarantinedRecordSql("r")}`,
+      )
+      .get(instance, stream, key);
+  }
+  const view = createReplicaVisibilityView({
+    db,
+    owner,
+    declarations: deps.declarations,
+    blobsValid: previewBlobsValid,
+    unquarantinedRecordSql: store.unquarantinedRecordSql,
+  });
+  store.setReplicaVisibilityObserver(view.flush);
+  function includesPending(reader: ReplicaReader = "grant") {
+    return (
+      pendingEnabled &&
+      replicaStateVisible("pending", reader, deps.visibilityPolicy)
     );
   }
   function readVisibleRecords(input: {
     reader?: ReplicaReader;
     connectionId: string;
     stream: string;
-  }): PdppStoredRecord[] {
-    const canonical: PdppStoredRecord[] = [];
+  }): PdppVisibleRecord[] {
+    const rows: PdppVisibleRecord[] = [];
     let cursor: string | undefined;
     do {
-      const page = store.listRecords(input.stream, {
+      const page = api.readRecords({
+        reader: input.reader,
         instanceIds: [input.connectionId],
+        stream: input.stream,
         limit: 1000,
         order: "asc",
         cursor,
       });
-      canonical.push(...page.data);
+      rows.push(...page.data);
       cursor = page.nextCursor;
     } while (cursor);
-    if (
-      !pendingEnabled ||
-      !replicaStateVisible(
-        "pending",
-        input.reader ?? "grant",
-        deps.visibilityPolicy,
-      )
-    )
-      return canonical;
-    // Operation identity is global across connections. Partition only after
-    // the merge planner has checked equivocation across the complete evidence.
-    const pending = pendingOperations();
-    if (!pending.length) return canonical;
-    const local = binding(input.connectionId);
-    if (!local?.source_id || local.deleted_at) return [];
-    const confirmed = retained();
-    const confirmedJson = new Set(confirmed.map((op) => canonicalJson(op)));
-    const pendingJson = new Set(pending.map((op) => canonicalJson(op)));
-    const operations = [...confirmed, ...pending];
-    const plan = planReplicaMerge(
-      { owner, declarations: deps.declarations() },
-      operations,
-    );
-    const lifecycleConflict = plan.conflicts.some(
-      (issue) =>
-        issue.operations.some((op) => op.connectionId === input.connectionId) &&
-        ![
-          "append_only_content_conflict",
-          "incompatible_record_declaration",
-        ].includes(issue.reason),
-    );
-    if (
-      lifecycleConflict ||
-      plan.suppressed.some(
-        (issue) =>
-          issue.reason === "connection_deleted" &&
-          issue.operations.some((op) => op.connectionId === input.connectionId),
-      )
-    )
-      return [];
-    const generation = Math.max(
-      local.generation,
-      ...operations
-        .filter(
-          (op) =>
-            op.kind === "connection-reset" &&
-            op.connectionId === input.connectionId,
-        )
-        .map((op) => op.generation),
-    );
-    const missingReset = plan.pending.some(
-      (issue) =>
-        issue.reason === "missing_generation_reset" &&
-        issue.operations.some(
-          (op) =>
-            op.kind === "connection-reset" &&
-            op.connectionId === input.connectionId,
-        ),
-    );
-    const rows = new Map(
-      (generation > local.generation && !missingReset ? [] : canonical).map(
-        (row) => [row.recordKey, row],
-      ),
-    );
-    for (const record of plan.records) {
-      if (
-        record.identity.connectionId !== input.connectionId ||
-        record.identity.stream !== input.stream ||
-        record.identity.generation !== generation
-      )
-        continue;
-      const winner = record.winner;
-      if (!winner || winner.kind === "delete") {
-        rows.delete(record.identity.recordKey);
-        continue;
-      }
-      // A preview can only expose complete, hash-verified binary claims.
-      if (!previewBlobsValid(winner, operations)) {
-        rows.delete(record.identity.recordKey);
-        continue;
-      }
-      const previous = rows.get(record.identity.recordKey);
-      const provisional =
-        pendingJson.has(canonicalJson(winner)) &&
-        !confirmedJson.has(canonicalJson(winner));
-      rows.set(record.identity.recordKey, {
-        instance: input.connectionId,
-        stream: input.stream,
-        recordKey: record.identity.recordKey,
-        data: winner.data,
-        emittedAt: winner.emittedAt,
-        deleted: false,
-        version: previous?.version ?? 0,
-        ...(provisional
-          ? {
-              confirmation: "not yet confirmed" as const,
-              visibility: "pending" as const,
-            }
-          : {}),
-      });
-    }
-    return [...rows.values()].sort(
-      (a, b) =>
-        compareSqliteText(a.emittedAt, b.emittedAt) ||
-        compareSqliteText(a.recordKey, b.recordKey),
-    );
+    return rows;
   }
   function pendingBlob(blobId: string): Uint8Array | undefined {
     const row = db
@@ -695,6 +630,14 @@ export function createReplicaReceiver(deps: {
       )
       .get(blobId) as { bytes: Buffer } | undefined;
     return row?.bytes;
+  }
+  function rawVisibleBlob(id: string): Uint8Array | undefined {
+    const row = db
+      .prepare(
+        "SELECT bytes FROM pdpp_blob_bytes WHERE blob_id=? UNION ALL SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id=? LIMIT 1",
+      )
+      .get(id, id) as { bytes: Buffer } | undefined;
+    return row?.bytes ?? pendingBlob(id);
   }
   function previewBlobsValid(
     op: Extract<ReplicaOperation, { kind: "upsert" }>,
@@ -717,6 +660,18 @@ export function createReplicaReceiver(deps: {
         (ref.mime_type !== undefined && ref.mime_type !== blob.mimeType)
       )
         return false;
+      const meta = store.getBlobMeta(blob.blobId);
+      if (
+        meta &&
+        (meta.sha256 !== blob.sha256.slice(7) ||
+          meta.mimeType !== blob.mimeType ||
+          meta.sizeBytes !== blob.sizeBytes)
+      )
+        return false;
+      const canonicalBytes = db
+        .prepare("SELECT 1 FROM pdpp_blob_bytes WHERE blob_id=?")
+        .get(blob.blobId);
+      if (canonicalBytes && !store.getBlobBytes(blob.blobId)) return false;
       const bytes = verifiedBytes(blob) ?? pendingBlob(blob.blobId);
       return (
         bytes?.length === blob.sizeBytes &&
@@ -779,6 +734,8 @@ export function createReplicaReceiver(deps: {
           db.prepare(
             "UPDATE pdpp_replica_pending_batches SET state='quarantined',reason='batch equivocation' WHERE id=?",
           ).run(input.id);
+          view.removePending(input.id);
+          view.flush();
           return;
         }
         db.prepare(
@@ -789,13 +746,19 @@ export function createReplicaReceiver(deps: {
             db.prepare(
               "INSERT INTO pdpp_replica_pending_bytes VALUES (?,?,?)",
             ).run(input.id, blob.blobId, blob.bytes);
+        if (!previous) view.addPending(input.id, envelope.operations);
+        view.flush();
       }).immediate();
     },
     quarantine(input: { credential: unknown; id: string; reason: string }) {
       authorize(input.credential);
-      db.prepare(
-        "UPDATE pdpp_replica_pending_batches SET state='quarantined',reason=? WHERE id=? AND state='pending'",
-      ).run(input.reason, input.id);
+      db.transaction(() => {
+        db.prepare(
+          "UPDATE pdpp_replica_pending_batches SET state='quarantined',reason=? WHERE id=? AND state='pending'",
+        ).run(input.reason, input.id);
+        view.removePending(input.id);
+        view.flush();
+      }).immediate();
     },
     /** Trusted host hook: caller must verify every fragment against finalized #433 evidence first. */
     promote(input: { credential: unknown; id: string }) {
@@ -826,191 +789,80 @@ export function createReplicaReceiver(deps: {
           db.prepare(
             "DELETE FROM pdpp_replica_pending_bytes WHERE batch_id=?",
           ).run(input.id);
+          view.removePending(input.id);
+          view.flush();
           return result;
         })
         .immediate();
     },
+    connectionVisibility: view.connectionVisibility,
     readVisibleRecords,
     readRecords(
       input: ListRecordsOptions & { stream: string; reader?: ReplicaReader },
-    ) {
-      // Always validate canonical cursor epoch/order/reset horizon, even if the
-      // selected view adds provisional rows. Flag-off pages remain byte-identical.
-      const canonical = store.listRecords(input.stream, input);
+    ): ListVisibleRecordsPage {
       if (
-        !pendingEnabled ||
-        !replicaStateVisible(
-          "pending",
-          input.reader ?? "grant",
-          deps.visibilityPolicy,
-        ) ||
-        pendingOperations().length === 0
+        !pendingEnabled &&
+        !input.instanceIds.some((id) => view.connectionVisibility(id))
       )
-        return canonical;
-      let rows = input.instanceIds.flatMap((connectionId) =>
-        readVisibleRecords({
-          reader: input.reader,
-          connectionId,
-          stream: input.stream,
-        }),
+        return store.listRecords(input.stream, input);
+      return view.listRecords(
+        input.stream,
+        input,
+        input.reader ?? "grant",
+        includesPending(input.reader),
       );
-      rows.sort(
-        (a, b) =>
-          compareSqliteText(a.emittedAt, b.emittedAt) ||
-          compareSqliteText(a.recordKey, b.recordKey),
-      );
-      if (input.order === "desc") rows.reverse();
-      if (input.cursor) {
-        const cursor = decodeCursor(input.cursor);
-        if (cursor.kind !== "list") throw new Error("invalid preview cursor");
-        rows = rows.filter((row) => {
-          const order =
-            compareSqliteText(row.emittedAt, cursor.sortValue ?? "") ||
-            compareSqliteText(row.recordKey, cursor.recordKey);
-          return input.order === "asc" ? order > 0 : order < 0;
-        });
-      }
-      const data = rows.slice(0, input.limit).map((row) =>
-        input.fields
-          ? {
-              ...row,
-              data: Object.fromEntries(
-                input.fields
-                  .filter((field) => field in row.data)
-                  .map((field) => [field, row.data[field]]),
-              ),
-            }
-          : row,
-      );
-      const hasMore = data.length < rows.length;
-      const last = data[data.length - 1];
-      const epoch = (
-        db
-          .prepare("SELECT epoch FROM pdpp_store_metadata WHERE id=1")
-          .get() as { epoch: string }
-      ).epoch;
-      return {
-        data,
-        hasMore,
-        horizon: canonical.horizon,
-        ...(hasMore && last
-          ? {
-              nextCursor: encodeCursor({
-                kind: "list",
-                stream: input.stream,
-                epoch,
-                order: input.order,
-                sortValue: last.emittedAt,
-                recordKey: last.recordKey,
-                horizon: canonical.horizon,
-              }),
-            }
-          : {}),
-      };
     },
     readStore(input: { reader?: ReplicaReader } = {}) {
       const reader = input.reader ?? "grant";
-      const mayPreview = () =>
-        pendingEnabled &&
-        replicaStateVisible("pending", reader, deps.visibilityPolicy) &&
-        pendingBatches().length > 0;
-      const refs = (id: string) => {
-        const ids = new Set(
-          [...retained(), ...(mayPreview() ? pendingOperations() : [])].map(
-            (op) => op.connectionId,
-          ),
-        );
-        return [...ids].flatMap((connectionId) => {
-          const streams = new Set(
-            [...retained(), ...(mayPreview() ? pendingOperations() : [])]
-              .filter(
-                (op) =>
-                  op.connectionId === connectionId &&
-                  (op.kind === "upsert" || op.kind === "delete"),
-              )
-              .map((op) => ("declaration" in op ? op.declaration.stream : "")),
-          );
-          return [...streams].flatMap((stream) =>
-            readVisibleRecords({ reader, connectionId, stream })
-              .filter(
-                (row) =>
-                  (row.data.blob_ref as { blob_id?: string } | undefined)
-                    ?.blob_id === id,
-              )
-              .map((row) => ({
-                instance: connectionId,
-                stream,
-                recordKey: row.recordKey,
-              })),
-          );
-        });
-      };
+      const hasPreview = () => includesPending(reader);
+      const needsReferenceGate = () =>
+        hasPreview() || view.hasBindingConflictFacts;
+      const refs = (id: string) =>
+        needsReferenceGate()
+          ? view.findBlobReferences(id, reader, hasPreview())
+          : store.findBlobReferences(id);
+      const canReadBlob = (id: string) =>
+        view.hasBlobReference(id, reader, hasPreview());
       return {
+        connectionVisibility: view.connectionVisibility,
         getRecord: (instance: string, stream: string, key: string) =>
-          !mayPreview()
-            ? store.getRecord(instance, stream, key)
-            : readVisibleRecords({
-                reader,
-                connectionId: instance,
-                stream,
-              }).find((row) => row.recordKey === key),
+          hasPreview() || view.connectionVisibility(instance)
+            ? view.getRecord(instance, stream, key, reader, hasPreview())
+            : store.getRecord(instance, stream, key),
         listRecords: (stream: string, options: ListRecordsOptions) =>
           api.readRecords({ ...options, stream, reader }),
-        listStreams: (ids: string[]) => {
-          if (!mayPreview() || pendingOperations().length === 0)
-            return store.listStreams(ids);
-          const streams = new Set(
-            store.listStreams(ids).map((row) => row.stream),
-          );
-          if (mayPreview())
-            for (const op of pendingOperations())
-              if (ids.includes(op.connectionId) && "declaration" in op)
-                streams.add(op.declaration.stream);
-          return [...streams].flatMap((stream) => {
-            const rows = ids.flatMap((connectionId) =>
-              readVisibleRecords({ reader, connectionId, stream }),
+        listStreams: (ids: string[]) =>
+          pendingEnabled || ids.some((id) => view.connectionVisibility(id))
+            ? view.listStreams(ids, hasPreview(), reader)
+            : store.listStreams(ids),
+        changesSince: (stream: string, options: ChangesSinceOptions) => {
+          const visible = options.instanceIds.filter((instance) => {
+            const visibility = view.connectionVisibility(instance);
+            return (
+              !visibility ||
+              replicaStateVisible(
+                visibility.state,
+                reader,
+                deps.visibilityPolicy,
+                "received",
+              )
             );
-            return rows.length
-              ? [
-                  {
-                    stream,
-                    recordCount: rows.length,
-                    lastUpdated: rows.reduce(
-                      (latest, row) =>
-                        row.emittedAt > latest ? row.emittedAt : latest,
-                      rows[0].emittedAt,
-                    ),
-                  },
-                ]
-              : [];
           });
+          return store.changesSinceForInstances(stream, options, visible);
         },
         getBlobBytes: (id: string) =>
-          !mayPreview()
+          !needsReferenceGate()
             ? store.getBlobBytes(id)
-            : refs(id).length
-              ? (store.getBlobBytes(id) ?? pendingBlob(id))
+            : canReadBlob(id)
+              ? rawVisibleBlob(id)
               : undefined,
-        getBlobMeta: (id: string) => {
-          if (!mayPreview()) return store.getBlobMeta(id);
-          if (!refs(id).length) return undefined;
-          const op = pendingOperations().find(
-            (op) => op.kind === "blob-claim" && op.blob.blobId === id,
-          );
-          return (
-            store.getBlobMeta(id) ??
-            (op?.kind === "blob-claim"
-              ? {
-                  blobId: id,
-                  mimeType: op.blob.mimeType,
-                  sizeBytes: op.blob.sizeBytes,
-                  sha256: op.blob.sha256.slice(7),
-                }
-              : undefined)
-          );
-        },
-        findBlobReferences: (id: string) =>
-          mayPreview() ? refs(id) : store.findBlobReferences(id),
+        getBlobMeta: (id: string) =>
+          !needsReferenceGate()
+            ? store.getBlobMeta(id)
+            : canReadBlob(id)
+              ? (store.getBlobMeta(id) ?? view.getBlobMeta(id))
+              : undefined,
+        findBlobReferences: refs,
       };
     },
     import(input: {
@@ -1054,13 +906,21 @@ export function createReplicaReceiver(deps: {
               "UPDATE pdpp_replica_clock SET counter = MAX(counter, ?) WHERE id = 1",
             ).run(op.revision.counter);
           }
-          return reconcile();
+          const plan = reconcile();
+          view.flush();
+          return plan;
         })
         .immediate();
     },
     retry(input: { credential: unknown }): ReplicaMergePlan {
       authorize(input.credential);
-      return db.transaction(reconcile).immediate();
+      return db
+        .transaction(() => {
+          const plan = reconcile();
+          view.reconcileAll();
+          return plan;
+        })
+        .immediate();
     },
   };
   return api;
