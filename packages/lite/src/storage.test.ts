@@ -1,3 +1,4 @@
+import { createMcpDataReadClient } from "@opendatalabs/personal-server-ts-core/mcp";
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type {
@@ -13,6 +14,7 @@ import {
 } from "./test-support/memory.js";
 import {
   createPersistentPsLiteStorage,
+  createIndexedDbFallbackDataFileStore,
   type PsLiteDataFileStore,
 } from "./storage.js";
 import { previewEnvelopeValue } from "./storage-utils.js";
@@ -1080,3 +1082,77 @@ function blockFixture(
     blocks,
   };
 }
+
+it("keeps the verified Lite block snapshot through payment-capable authorization", async () => {
+  const payloads = new Map<string, DataScopeBlock>();
+  const files = createIndexedDbFallbackDataFileStore(
+    new Map(),
+    new Map(),
+    payloads,
+  );
+  const storage = await createPersistentPsLiteStorage(
+    { kind: "custom" },
+    createMemoryPsLitePersistence(),
+    files,
+  );
+  const envelope = createDataFileEnvelope(
+    "test.snapshot",
+    "2026-10-01T00:00:00Z",
+    { nested: { message: "verified-original" } },
+  );
+  const written = await storage.writeEnvelope(envelope);
+  await storage.insertEntry({
+    fileId: null,
+    path: written.relativePath,
+    scope: envelope.scope,
+    collectedAt: envelope.collectedAt,
+    sizeBytes: written.sizeBytes,
+  });
+  const built = await buildDataBlocksAsync({
+    scope: envelope.scope,
+    collectedAt: envelope.collectedAt,
+    content: envelope,
+  });
+  await storage.writeBlockManifest!(
+    envelope.scope,
+    envelope.collectedAt,
+    built.manifest,
+    built.blocks,
+  );
+  const auth = vi.fn(async ({ metadataOnly }: { metadataOnly?: boolean }) => {
+    if (!metadataOnly) {
+      const data = [...payloads.values()].find((b) => b.path === "$.data")!;
+      (data.value as { nested: { message: string } }).nested.message =
+        "mutated-after-verification";
+    }
+    return { grantId: "grant", builder: "0x2222" };
+  });
+  const client = createMcpDataReadClient({
+    serverOrigin: "https://server.test",
+    granteeAccount: {
+      address: "0x1111111111111111111111111111111111111111",
+      publicKey: "0x04deadbeef",
+      signTypedData: vi.fn(),
+      signMessage: vi.fn().mockResolvedValue(`0x${"11".repeat(65)}`),
+    },
+    dataApiDeps: {
+      storage,
+      auth: {
+        authorizeOwner: vi.fn(),
+        authorizeBuilderList: vi.fn(),
+        authorizeBuilderRead: auth,
+      },
+      accessLogWriter: { write: vi.fn() },
+    },
+  });
+  const result = await client.readScopeBlocks({
+    scope: envelope.scope,
+    grantId: "grant",
+    maxBytes: 4096,
+  });
+  expect(auth).toHaveBeenCalledTimes(2);
+  expect(JSON.stringify(result.blocks)).toContain("verified-original");
+  expect(JSON.stringify(result.blocks)).not.toContain(
+    "mutated-after-verification",
+  );
+});
