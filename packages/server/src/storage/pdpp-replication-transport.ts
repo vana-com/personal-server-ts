@@ -1,6 +1,5 @@
 import type { Database } from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { keccak256 } from "viem";
 import { z } from "zod";
 import {
   canonicalJson,
@@ -11,23 +10,21 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
   assembleReplicaPayload,
-  decodeReplicaFragment,
   fragmentReplicaPayload,
   fromBase64,
   isReplicaScope,
   replicaDigest,
-  replicaMetadataHash,
   toBase64,
   REPLICA_MAX_BLOB_BYTES,
   type PreparedFragment,
   type ReplicaFragment,
   type Predecessor,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
+import type { ReplicaTransportPort } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import {
-  replicaRegistrationState,
-  replicaChainCommitment,
-  type ReplicaTransportPort,
-} from "@opendatalabs/personal-server-ts-core/replication/dpv2";
+  publishReplicaFragment,
+  downloadReplicaFragment,
+} from "@opendatalabs/personal-server-ts-core/replication/delivery";
 import type { ReplicationExport } from "./pdpp-replication-sqlite.js";
 import type { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
@@ -296,28 +293,11 @@ export function createReplicaTransportWorker(deps: {
         metadataHash: row.metadata_hash,
       };
       try {
-        let status = replicaRegistrationState(
-          await transport.evidence(row.scope),
-          {
-            owner: state().owner,
-            scope: row.scope,
-            dataHash: row.data_hash,
-            metadataHash: row.metadata_hash,
-          },
+        const status = await publishReplicaFragment(
+          transport,
+          state().owner,
+          part,
         );
-        if (status === "absent") {
-          await transport.put(part);
-          await transport.register(part);
-          status = replicaRegistrationState(
-            await transport.evidence(row.scope),
-            {
-              owner: state().owner,
-              scope: row.scope,
-              dataHash: row.data_hash,
-              metadataHash: row.metadata_hash,
-            },
-          );
-        }
         if (status === "conflict")
           retry(
             "pdpp_transport_outbox",
@@ -356,12 +336,13 @@ export function createReplicaTransportWorker(deps: {
       .all(now()) as Inbox[];
     for (const row of rows) {
       try {
-        const evidence = await transport.evidence(row.scope);
-        const status = replicaRegistrationState(evidence, {
-          owner: state().owner,
-          scope: row.scope,
-        });
-        if (status === "conflict") {
+        const result = await downloadReplicaFragment(
+          transport,
+          state().owner,
+          row.scope,
+          cap,
+        );
+        if (result.status === "conflict") {
           retry(
             "pdpp_transport_inbox",
             row,
@@ -370,35 +351,11 @@ export function createReplicaTransportWorker(deps: {
           );
           continue;
         }
-        if (status !== "confirmed") {
+        if (result.status !== "confirmed") {
           retry("pdpp_transport_inbox", row, "registration not confirmed");
           continue;
         }
-        // Retain the exact head whose hash-pair preimage was verified against the chain.
-        const head = evidence.head!;
-        const encrypted = await transport.get(row.scope);
-        if (encrypted.length > cap)
-          throw new Error("replica ciphertext exceeds storage cap");
-        const plaintext = await transport.decrypt(row.scope, encrypted);
-        const fragment = decodeReplicaFragment(
-          plaintext,
-          row.scope,
-          state().owner,
-        );
-        const dataHash = keccak256(plaintext);
-        const metadataHash = replicaMetadataHash(
-          row.scope,
-          fragment.collectedAt,
-          encrypted.length,
-        );
-        // The chain is the authority even when the Gateway head matches the downloaded bytes.
-        if (
-          replicaChainCommitment(dataHash, metadataHash).toLowerCase() !==
-            evidence.chain!.commitment.toLowerCase() ||
-          dataHash !== head.dataHash ||
-          metadataHash !== head.metadataHash
-        )
-          throw new Error("replica commitment mismatch");
+        const fragment = result.fragment;
         db.prepare(
           "UPDATE pdpp_transport_inbox SET fragment_json=?,error=NULL WHERE scope=?",
         ).run(canonicalJson(fragment), row.scope);
