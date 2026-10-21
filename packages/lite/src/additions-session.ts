@@ -100,7 +100,7 @@ export function createPsLiteAdditionsSession(
           if (finished) return;
           const message = event.data;
           if (message.kind === "diagnostic") {
-            options.diagnostics?.push({
+            options.diagnostics?.observe({
               phase: "unknown",
               scope: message.event.scope,
               fileId: message.event.version,

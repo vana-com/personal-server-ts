@@ -330,6 +330,8 @@ it.each(["metadata_hash_mismatch", "compressed_packet"] as const)(
     if (code === "metadata_hash_mismatch")
       slots.get("github.profile")![0]!.metadataHash = `0x${"ab".repeat(32)}`;
     const diagnostics = new DiagnosticsRecorder();
+    diagnostics.beginOperation("indexing", "github.profile");
+    diagnostics.setScopeReadyAfterIndex("github.profile");
     const summary = await (
       await session(32 * 1024 * 1024, diagnostics)
     ).summarize(query);
@@ -349,6 +351,13 @@ it.each(["metadata_hash_mismatch", "compressed_packet"] as const)(
     expect(JSON.stringify(diagnostics.snapshot())).not.toContain(
       "private-diagnostic-sentinel",
     );
+    expect(diagnostics.snapshot().scopes).toContainEqual(
+      expect.objectContaining({ scope: "github.profile", status: "ready" }),
+    );
+    expect(diagnostics.snapshot()).toMatchObject({
+      currentPhase: "indexing",
+      activeOperation: { phase: "indexing", scope: "github.profile" },
+    });
   },
   30_000,
 );
