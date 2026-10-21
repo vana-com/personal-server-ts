@@ -8,7 +8,10 @@ import { createHash } from "node:crypto";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
-import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import {
+  CursorExpiredError,
+  createStreamDeclarationRegistry,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import type { Grant } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { pdppRecordsRoutes } from "../routes/pdpp-records.js";
@@ -1185,7 +1188,8 @@ it("does not reveal quarantined append-only content through a pre-conflict pagin
       cursor: first.nextCursor,
     });
   } catch (error) {
-    expect((error as Error).name).toContain("CursorExpired");
+    // The key quarantine raised the connection's integrity epoch.
+    expect(error).toBeInstanceOf(CursorExpiredError);
   }
   expect(continued?.data.some((row) => row.recordKey === "b") ?? false).toBe(
     false,
@@ -1390,7 +1394,7 @@ it("keeps conflict clauses out of every view trigger body", () => {
   const d = device();
   // With the conflict-fact table the view also installs its local projection.
   d.db.exec(
-    "CREATE TABLE pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY)",
+    "CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL)",
   );
   const before = new Set(
     (
@@ -2667,11 +2671,13 @@ it.each(["pending", "confirmed"] as const)(
 // composes its read seam without implementing source-identity decisions here.
 function installBindingConflictFixture(d: ReturnType<typeof device>) {
   d.db
-    .exec(`CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY);
+    .exec(`CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_pdpp_mutation_journal_local_key ON pdpp_mutation_journal(connection_id,generation,stream,record_key,sequence DESC);`);
   return (instance = "conn_a") => {
     d.db
-      .prepare("INSERT INTO pdpp_replica_binding_conflicts VALUES (?)")
+      .prepare(
+        "INSERT INTO pdpp_replica_binding_conflicts VALUES (?, 'source_binding_conflict', '{}')",
+      )
       .run(instance);
   };
 }
@@ -3304,7 +3310,7 @@ it.each(["point", "page", "streams", "changes"] as const)(
               other.transaction(() => {
                 other
                   .prepare(
-                    "INSERT INTO pdpp_replica_binding_conflicts VALUES ('conn_a')",
+                    "INSERT INTO pdpp_replica_binding_conflicts VALUES ('conn_a', 'source_binding_conflict', '{}')",
                   )
                   .run();
                 const clock = other

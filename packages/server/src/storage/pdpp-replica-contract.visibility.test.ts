@@ -46,6 +46,7 @@ import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import {
   CrashController,
   adapterFactories,
+  binding as retainedBinding,
   cleanupHarness,
   credential,
   crashableDatabase,
@@ -1380,7 +1381,7 @@ describe("60 [Node SQLite] a fence that commits between row selection and the re
   }
   it("60a list: the page is wholly pre-fence or expired, and its cursor is never labelled with the post-fence epoch", () => {
     const { d, arm } = raced(
-      /FROM pdpp_records\s+WHERE stream = \? AND deleted = 0/,
+      /FROM pdpp_records(?: r)?\s+WHERE stream = \? AND deleted = 0/,
     );
     arm();
     let page: ReturnType<Local["list"]> | undefined;
@@ -1958,5 +1959,56 @@ describe("j.2 [Node SQLite transport] legacy NULL-pin slot after a finalized rep
     expect(after).toBeGreaterThan(base);
     b.reopen();
     expect(epochOf(b.store, b.instance)).toBe(after);
+  });
+});
+
+// ============================================================================
+// i. #427 A: the canonical write validator is bound to the retained declaration
+// ============================================================================
+
+describe("i [Node SQLite] a canonical write validated against another declaration", () => {
+  const write = (
+    d: ReturnType<typeof transportDevice>,
+    key: string,
+    declaration: typeof retainedBinding,
+  ) =>
+    d.store.ingestBatch(
+      [
+        {
+          instance: d.instance,
+          stream: "messages",
+          key,
+          data: { id: key, text: key },
+          emitted_at: "2026-10-20T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "export", generation: 1 },
+      () => null,
+      () => declaration,
+    );
+  const exported = (d: ReturnType<typeof transportDevice>) =>
+    (
+      d.db
+        .prepare("SELECT count(*) AS n FROM pdpp_replica_operations")
+        .get() as { n: number }
+    ).n;
+  it("i.1 is refused atomically instead of being exported under the retained declaration", () => {
+    const d = transportDevice(network());
+    const before = exported(d);
+    const v2 = {
+      ...retainedBinding,
+      digest: `sha256:${"c".repeat(64)}`,
+      version: "2",
+    };
+    expect(() => write(d, "v2", v2)).toThrow(
+      "replication declaration mismatch",
+    );
+    expect(d.get("v2"), "nothing was written").toBeUndefined();
+    expect(exported(d), "nothing was exported").toBe(before);
+    write(d, "v1", retainedBinding);
+    expect(d.get("v1")).toEqual({ id: "v1", text: "v1" });
+    expect(exported(d)).toBe(before + 1);
   });
 });

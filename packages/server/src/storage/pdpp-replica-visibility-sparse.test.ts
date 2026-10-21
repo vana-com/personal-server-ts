@@ -109,8 +109,11 @@ it.each([100, 1000])(
     const { db, receiver } = device(size);
     receiver();
     expect(overlayRows(db)).toBe(0);
-    // A handful of 4 KiB pages, never a copy of rows or operation JSON.
-    expect(viewBytes(db)).toBeLessThan(25 * 4096);
+    // A handful of 4 KiB pages, never a copy of rows or operation JSON. The
+    // binding-conflict fact table now always exists (write side, migration
+    // v16), so the empty local-journal projection and its indexes are
+    // always created: a fixed few pages more, still independent of rows.
+    expect(viewBytes(db)).toBeLessThan(32 * 4096);
   },
 );
 
@@ -188,11 +191,11 @@ it("keeps the local journal projection only for conflicted connections", () => {
   });
   ingest(rows("b", 50, "connection-b"));
   db.exec(
-    "CREATE TABLE pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY)",
+    "CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL)",
   );
-  db.prepare("INSERT INTO pdpp_replica_binding_conflicts VALUES (?)").run(
-    "connection-b",
-  );
+  db.prepare(
+    "INSERT INTO pdpp_replica_binding_conflicts VALUES (?, 'source_binding_conflict', '{}')",
+  ).run("connection-b");
   const replica = createReplicaReceiver({
     db,
     store,
@@ -216,9 +219,9 @@ it("keeps the local journal projection only for conflicted connections", () => {
       order: "asc",
     }).data,
   ).toHaveLength(50);
-  db.prepare("INSERT INTO pdpp_replica_binding_conflicts VALUES (?)").run(
-    identity.connectionId,
-  );
+  db.prepare(
+    "INSERT INTO pdpp_replica_binding_conflicts VALUES (?, 'source_binding_conflict', '{}')",
+  ).run(identity.connectionId);
   expect(
     owner.listRecords(binding.stream, {
       instanceIds: [identity.connectionId],

@@ -53,7 +53,7 @@ function fixture(
   // Compose the hardening lane's fact seam without owning its migration/policy.
   if (local)
     db.exec(
-      "CREATE TABLE pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY)",
+      "CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL)",
     );
   // The synthesis lane's integrity epoch is an optional store capability.
   const host = epoch
@@ -87,9 +87,9 @@ function fixture(
       () => ["id"],
       { method: identity.methodId, generation: 1 },
     );
-    db.prepare("INSERT INTO pdpp_replica_binding_conflicts VALUES (?)").run(
-      identity.connectionId,
-    );
+    db.prepare(
+      "INSERT INTO pdpp_replica_binding_conflicts VALUES (?, 'source_binding_conflict', '{}')",
+    ).run(identity.connectionId);
   } else {
     receiver.import({
       credential: "secret",

@@ -74,6 +74,8 @@ export function planReplicaMerge(
     operations: ReplicaOperation[],
   ) => bucket.push({ reason, operations });
   const byId = new Map<string, Map<string, ReplicaOperation>>();
+  /** Every owned operation, equivocated variants included. */
+  const evidence: ReplicaOperation[] = [];
   for (const raw of input) {
     const operation = replicaOperationSchema.parse(raw);
     if (operation.owner !== context.owner) {
@@ -84,6 +86,7 @@ export function planReplicaMerge(
       operation.revision.writerId,
       operation.revision.operationId,
     ]);
+    evidence.push(operation);
     const variants = byId.get(id) ?? new Map();
     variants.set(canonicalJson(operation), operation);
     byId.set(id, variants);
@@ -105,11 +108,13 @@ export function planReplicaMerge(
     list.push(operation);
     connections.set(key, list);
   }
-  // A logical id cannot be rebound to another producer, even when its source differs.
+  // A logical id cannot be rebound to another producer, even when its source
+  // differs. Equivocated variants still count as source evidence: dropping
+  // them must not make a source-binding conflict disappear (#426).
   for (const entries of connections.values()) {
     const first = entries[0];
     const sources = new Set(
-      operations
+      evidence
         .filter((op) => op.connectionId === first.connectionId)
         .map((op) => op.sourceId),
     );

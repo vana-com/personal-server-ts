@@ -1283,7 +1283,7 @@ it("29 a wake flood on one shared declaration is bounded per step and every wait
   expect(importedFrom(b, writerA)).toBe(batches);
   expect(b.get(`r${total - 1}`)).toBeDefined();
   expect(hasWake(b), "worker.onDependencyChanged is missing").toBe(true);
-});
+}, 30_000); // 25 published batches, then up to 40 import steps
 
 // ========================================================================== 30
 

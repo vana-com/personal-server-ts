@@ -5,7 +5,11 @@ import {
   readBinary,
   verifyBinary,
 } from "./pdpp-binary-chunks.js";
-import { RECEIVER_MIGRATION } from "./pdpp-replication-receiver.js";
+import type { DeclarationBinding } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import {
+  RECEIVER_MIGRATION,
+  REPLICA_INTEGRITY_MIGRATION,
+} from "./pdpp-replication-receiver.js";
 import {
   createReplicationJournal,
   REPLICATION_MIGRATION,
@@ -350,6 +354,8 @@ BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
   RECEIVER_MIGRATION,
   BINARY_CHUNKS_MIGRATION +
     `CREATE TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END;`,
+  // Replica family: integrity fences and binding-conflict facts (replica tables only).
+  REPLICA_INTEGRITY_MIGRATION,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -609,6 +615,22 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    * bindings, listings and pages it sees belong to one point in time.
    */
   readSnapshot<T>(read: () => T): T;
+  /** Replica integrity epoch of a connection (0 when never fenced). */
+  replicaIntegrityEpoch(connectionKey: string): number;
+  /** Raise a connection's integrity epoch inside the hiding transaction. */
+  fenceReplicaConnection(connectionKey: string): void;
+  /** True once replica evidence disagreed with the connection's binding. */
+  replicaBindingConflict(connectionId: string): boolean;
+  markReplicaBindingConflict(input: {
+    connectionId: string;
+    reason: "source_binding_conflict" | "local_mapping_conflict";
+    evidence: unknown;
+  }): boolean;
+  /** Query and integrity binding a list cursor of these connections must carry. */
+  cursorBinding(
+    instanceIds: string[],
+    fields: string[] | undefined,
+  ): { query: string; integrity: Record<string, number> };
   resetInstanceBinding(input: {
     instance: string;
     expectedMethod: string | null;
@@ -631,6 +653,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     envelopes: PdppRecordEnvelopeInput[];
     primaryKey: string[];
     validateData?: RecordDataValidator;
+    /** The declaration `validateData` validates against (see ingestBatch). */
+    declaration?: DeclarationBinding;
     sourceCollectedAt?: string;
     completionPolicy?: "preserve_if_unchanged";
   }): ReplaceStreamResult;
@@ -696,6 +720,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     recordKey: string,
     semantics?: StreamSemantics,
     primaryKey?: string[],
+    declaration?: DeclarationBinding,
   ): void {
     // Do not use getInstanceBinding's synthetic defaults for a missing legacy row.
     const binding = db
@@ -721,7 +746,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       value_json: JSON.stringify(record),
       blob_ids_json: JSON.stringify(blobId ? [blobId] : []),
     });
-    replica.captureRecord(instance, stream, recordKey, semantics, primaryKey);
+    replica.captureRecord(
+      instance,
+      stream,
+      recordKey,
+      semantics,
+      primaryKey,
+      declaration,
+    );
     replicaVisibilityObserver?.();
   }
 
@@ -878,6 +910,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     primaryKeyFields: (stream: string, instance: string) => string[],
     binding?: { method: string; generation: number },
     validateData?: RecordDataValidator,
+    declarationFor?: (
+      stream: string,
+      instance: string,
+    ) => DeclarationBinding | undefined,
   ): IngestResult {
     const results: IngestOutcome[] = [];
 
@@ -975,6 +1011,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           recordKey,
           semantics,
           primaryKey,
+          declarationFor?.(envelope.stream, envelope.instance),
         );
         if (data === null) {
           forgetArrivalStmt.run(envelope.instance, envelope.stream, recordKey);
@@ -1072,6 +1109,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     envelopes: PdppRecordEnvelopeInput[];
     primaryKey: string[];
     validateData?: RecordDataValidator;
+    declaration?: DeclarationBinding;
     sourceCollectedAt?: string;
     completionPolicy?: "preserve_if_unchanged";
   }): ReplaceStreamResult {
@@ -1174,6 +1212,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           write.recordKey,
           "mutable_state",
           input.primaryKey,
+          input.declaration,
         );
       }
       const missing = (
@@ -1197,6 +1236,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           record_key,
           "mutable_state",
           input.primaryKey,
+          input.declaration,
         );
       }
       // Desktop rebuilt a fully refreshed stream in emit order, unchanged
@@ -1772,6 +1812,98 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     return rows.map((row) => row.record_key);
   }
 
+  /**
+   * Integrity epoch of one connection: its replica fences plus its reset
+   * fence. Both only grow, so every write that can hide the connection's data
+   * (key or connection quarantine, binding conflict, reset, delete) moves it.
+   * Readers compare it inside their read snapshot.
+   */
+  function replicaIntegrityEpoch(connectionKey: string): number {
+    return (
+      db
+        .prepare(
+          `SELECT coalesce((SELECT fences FROM pdpp_replica_integrity_fences WHERE instance = ?), 0)
+           + coalesce((SELECT reset_clock FROM pdpp_instance_binding WHERE instance = ?), 0) AS epoch`,
+        )
+        .get(connectionKey, connectionKey) as { epoch: number }
+    ).epoch;
+  }
+  /** Raise the epoch. Call inside the transaction that hides the connection's data. */
+  function fenceReplicaConnection(connectionKey: string): void {
+    if (!db.inTransaction)
+      throw new Error("an integrity fence requires the hiding transaction");
+    db.prepare(
+      "INSERT INTO pdpp_replica_integrity_fences VALUES (?, 1) ON CONFLICT(instance) DO UPDATE SET fences = fences + 1",
+    ).run(connectionKey);
+  }
+  function replicaBindingConflict(connectionId: string): boolean {
+    return !!db
+      .prepare(
+        "SELECT 1 FROM pdpp_replica_binding_conflicts WHERE instance = ?",
+      )
+      .get(connectionId);
+  }
+  /**
+   * Record that a connection's evidence disagrees with its binding. The fact
+   * is append-only and puts the connection in the conflicted state (the
+   * visibility view hides it from apps; the owner sees local rows), and it
+   * raises the integrity epoch in the same transaction. Idempotent: returns
+   * true only when this call recorded it.
+   */
+  function markReplicaBindingConflict(input: {
+    connectionId: string;
+    reason: "source_binding_conflict" | "local_mapping_conflict";
+    evidence: unknown;
+  }): boolean {
+    return db.transaction(() => {
+      const recorded =
+        db
+          .prepare(
+            "INSERT OR IGNORE INTO pdpp_replica_binding_conflicts VALUES (?, ?, ?)",
+          )
+          .run(input.connectionId, input.reason, JSON.stringify(input.evidence))
+          .changes > 0;
+      if (!recorded) return false;
+      fenceReplicaConnection(input.connectionId);
+      return true;
+    })();
+  }
+  /**
+   * What a list or changes token is bound to besides its stream and store.
+   * Page cursors bind the field projection too; a terminal changes token
+   * (`fields` undefined here) may start the next session under another one.
+   */
+  function cursorBinding(instanceIds: string[], fields: string[] | undefined) {
+    const ids = [...new Set(instanceIds)].sort();
+    return {
+      query: createHash("sha256")
+        .update(JSON.stringify([ids, fields ? [...fields].sort() : null]))
+        .digest("hex"),
+      integrity: Object.fromEntries(
+        ids.map((id) => [id, replicaIntegrityEpoch(id)]),
+      ),
+    };
+  }
+  /**
+   * A token is refused for another connection set or projection, and expires
+   * when any read connection's integrity epoch moved since page 1. A token
+   * minted before integrity binding expires: it may span a quarantine.
+   */
+  function assertCursorIntegrity(
+    payload: { query?: string; integrity?: Record<string, number> },
+    instanceIds: string[],
+    fields: string[] | undefined,
+  ): void {
+    const current = cursorBinding(instanceIds, fields);
+    if (payload.query !== undefined && payload.query !== current.query)
+      throw new InvalidCursorError();
+    if (
+      payload.query === undefined ||
+      JSON.stringify(payload.integrity) !== JSON.stringify(current.integrity)
+    )
+      throw new CursorExpiredError();
+  }
+
   function getRecord(
     instance: string,
     stream: string,
@@ -1833,6 +1965,16 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
+    // One read snapshot: a fence that commits meanwhile cannot mix into the
+    // page or label its cursor with the post-fence epoch.
+    return db
+      .transaction(() => listRecordsInSnapshot(stream, options))
+      .deferred();
+  }
+  function listRecordsInSnapshot(
+    stream: string,
+    options: ListRecordsOptions,
+  ): ListRecordsPage {
     let startAfter: { val: string; key: string } | null = null;
     let horizon: number;
     if (options.cursor) {
@@ -1840,8 +1982,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       if (payload.kind !== "list") throw new InvalidCursorError();
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
+      // Syntax first (400), then binding and integrity (410).
       const cursorHorizon =
         payload.horizon === undefined ? null : parseHorizon(payload.horizon);
+      assertCursorIntegrity(payload, options.instanceIds, options.fields);
       assertNotResetSince(options.instanceIds, [cursorHorizon]);
       // A legacy cursor that survives the fence read no reset instance; it
       // is anchored at the current clock from here on.
@@ -1884,6 +2028,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
               kind: "list",
               stream,
               epoch: cursorEpoch(),
+              ...cursorBinding(options.instanceIds, options.fields),
               order: options.order,
               sortValue: last.emitted_at,
               recordKey: last.record_key,
@@ -1946,6 +2091,23 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     options: ChangesSinceOptions,
     visibleInstanceIds: string[] = options.instanceIds,
   ): ChangesSincePage {
+    // A new session allocates its horizon first, in its own write. The rest
+    // reads one snapshot, so a concurrent fence is wholly before or after it.
+    const fresh = options.cursor
+      ? undefined
+      : (nextWriteSeq.get() as { value: number }).value;
+    return db
+      .transaction(() =>
+        changesSinceInSnapshot(stream, options, visibleInstanceIds, fresh),
+      )
+      .deferred();
+  }
+  function changesSinceInSnapshot(
+    stream: string,
+    options: ChangesSinceOptions,
+    visibleInstanceIds: string[],
+    freshHorizon: number | undefined,
+  ): ChangesSincePage {
     let horizon: number;
     let sinceHorizon: number | null;
     let offset = 0;
@@ -1960,6 +2122,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           ? parseHorizon(payload.sinceHorizon)
           : null;
       offset = parseOffset(payload.offset);
+      assertCursorIntegrity(payload, options.instanceIds, options.fields);
     } else if (options.changesSince) {
       let payload;
       try {
@@ -1972,10 +2135,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       if (payload.kind !== "changes_since") throw new InvalidCursorError();
       assertCursorScope(payload, stream);
       sinceHorizon = parseHorizon(payload.horizon);
-      horizon = (nextWriteSeq.get() as { value: number }).value;
+      assertCursorIntegrity(payload, options.instanceIds, undefined);
+      horizon = freshHorizon!;
     } else {
       sinceHorizon = null;
-      horizon = (nextWriteSeq.get() as { value: number }).value;
+      horizon = freshHorizon!;
     }
 
     assertNotResetSince(options.instanceIds, [
@@ -2099,6 +2263,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             kind: "changes_since",
             stream,
             epoch: cursorEpoch(),
+            ...cursorBinding(options.instanceIds, options.fields),
             horizon: String(horizon),
             sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
             offset: offset + options.limit,
@@ -2110,6 +2275,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             kind: "changes_since",
             stream,
             epoch: cursorEpoch(),
+            ...cursorBinding(options.instanceIds, undefined),
             horizon: String(horizon),
             sinceHorizon: null,
             offset: 0,
@@ -2292,6 +2458,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     ingestBatch,
     getInstanceBinding,
     readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
+    replicaIntegrityEpoch,
+    fenceReplicaConnection,
+    replicaBindingConflict,
+    markReplicaBindingConflict,
+    cursorBinding,
     resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,

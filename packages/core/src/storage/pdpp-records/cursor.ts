@@ -4,7 +4,18 @@
  * implementations need a shared wire format to stay behaviorally identical.
  */
 
-export interface ListCursorPayload {
+/**
+ * Binding of a token to the query and to the replica integrity fences of the
+ * connections it reads. A backend without replica fences omits both.
+ */
+interface IntegrityBinding {
+  /** Digest of the connection set and field projection the token was minted for. */
+  query?: string;
+  /** Integrity epoch of each read connection when page 1 was served. */
+  integrity?: Record<string, number>;
+}
+
+export interface ListCursorPayload extends IntegrityBinding {
   kind: "list";
   /** Current-view revision. A changed view expires rather than mixes pages. */
   viewRevision?: string;
@@ -27,7 +38,7 @@ export interface ListCursorPayload {
   horizon?: string;
 }
 
-export interface ChangesSinceCursorPayload {
+export interface ChangesSinceCursorPayload extends IntegrityBinding {
   kind: "changes_since";
   /** Stream this token was minted for. Absent only on legacy cursors. */
   stream?: string;

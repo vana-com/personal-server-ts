@@ -1275,14 +1275,28 @@ export function createReplicaTransportWorker(deps: {
           fragment.collectedAt,
           encrypted.length,
         );
-        if (
-          replicaRegistrationState(evidence, {
-            owner: state().owner,
-            scope: row.scope,
-            dataHash,
-            metadataHash,
-          }) !== "confirmed"
-        )
+        const pinned = replicaRegistrationState(evidence, {
+          owner: state().owner,
+          scope: row.scope,
+          dataHash,
+          metadataHash,
+        });
+        // The exact retained bytes disagree with the finalized commitment: the
+        // legacy slot is not the registered data. Withdraw it (finding j).
+        if (pinned === "conflict")
+          return runOutcome(
+            "revalidate",
+            row.scope,
+            {
+              tag: "quarantine",
+              proof: {
+                reason: "immutable_registration_conflict",
+                key: row.scope,
+              },
+            },
+            await quarantineRetained(row.scope),
+          );
+        if (pinned !== "confirmed")
           throw new ReplicaProblemError("commitment_mismatch");
         return runOutcome("revalidate", row.scope, checked, () =>
           db

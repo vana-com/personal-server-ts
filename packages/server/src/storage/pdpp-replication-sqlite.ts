@@ -183,6 +183,8 @@ export function createReplicationJournal(db: Database, writerId: string) {
     recordKey: string,
     semantics?: StreamSemantics,
     primaryKey?: string[],
+    /** The declaration the canonical write was validated against, when known. */
+    validatedAgainst?: DeclarationBinding,
   ) {
     if (!settings()) return;
     const identity = {
@@ -190,6 +192,13 @@ export function createReplicationJournal(db: Database, writerId: string) {
       declaration: declaration(instance, stream),
       recordKey,
     };
+    // The exported operation asserts the retained declaration. A write
+    // validated against any other one must not be labelled with it (#427 A).
+    if (
+      validatedAgainst !== undefined &&
+      canonicalJson(validatedAgainst) !== canonicalJson(identity.declaration)
+    )
+      throw new Error("replication declaration mismatch");
     if (
       (semantics !== undefined &&
         semantics !== identity.declaration.semantics) ||

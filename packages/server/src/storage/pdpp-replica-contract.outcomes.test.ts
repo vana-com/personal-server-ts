@@ -1225,3 +1225,63 @@ async function observe(adapter: CanonicalAdapter) {
   expect(adapter.changes).toBeUndefined();
   return { point };
 }
+
+// ================================================== g (#429 F1): authority
+
+describe("g One validated authority context precedes every phase", () => {
+  const traffic = (net: ReturnType<typeof network>) =>
+    JSON.stringify({
+      puts: net.calls.puts.length,
+      gets: net.calls.gets.length,
+      registrations: net.calls.registrations.length,
+      evidence: net.calls.evidence.length,
+      lists: net.calls.lists,
+      encrypts: net.calls.encrypts,
+    });
+  const durable = (d: TransportDevice) =>
+    JSON.stringify([
+      batchRows(d),
+      outboxRows(d),
+      tableRows(d.db, "pdpp_transport_inbox"),
+      importWork(d),
+    ]);
+  async function rejectsBeforeAnyPhase(d: TransportDevice, net: Network) {
+    const calls = { retry: 0, stage: 0, import: 0 };
+    const receiver = d.receiver;
+    for (const name of ["retry", "stage", "import"] as const) {
+      const original = receiver[name].bind(receiver) as (input: never) => never;
+      (receiver as unknown as Record<string, unknown>)[name] = (
+        input: never,
+      ) => {
+        calls[name]++;
+        return original(input);
+      };
+    }
+    const before = { traffic: traffic(net), durable: durable(d) };
+    await expect(step(d)).rejects.toMatchObject({
+      code: "replica_authority_mismatch",
+    });
+    expect(traffic(net), "no network or encryption call").toBe(before.traffic);
+    expect(durable(d), "no phase state").toBe(before.durable);
+    expect(calls).toEqual({ retry: 0, stage: 0, import: 0 });
+  }
+  it("g.1 a transport port for another owner is refused before any phase", async () => {
+    const net = network();
+    const other = "0x0000000000000000000000000000000000000002";
+    const d = transportDevice(net, {
+      preexisting: "record",
+      worker: { transport: { ...net.port, owner: other } },
+    });
+    await rejectsBeforeAnyPhase(d, net);
+  });
+  it("g.2 a persisted binding to another owner is refused before any phase", async () => {
+    const net = network();
+    const d = transportDevice(net, { preexisting: "record" });
+    await step(d);
+    d.db
+      .prepare("UPDATE pdpp_transport_state SET owner=? WHERE id=1")
+      .run("0x0000000000000000000000000000000000000002");
+    d.reopen();
+    await rejectsBeforeAnyPhase(d, net);
+  });
+});

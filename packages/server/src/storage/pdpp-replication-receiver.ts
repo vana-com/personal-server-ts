@@ -53,10 +53,23 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_quarantined_connections (instance TEXT P
 CREATE TABLE IF NOT EXISTS pdpp_replica_received_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
 `;
 
-type Store = ReturnType<typeof createSqliteRecordStore> & {
-  /** Synthesis-lane capability: advances when a connection's integrity facts change. */
-  replicaIntegrityEpoch?: (connectionKey: string) => number;
-};
+/**
+ * Replica integrity facts. Only replica tables: no main table changes.
+ * - integrity fences: how many times replica evidence hid data of a
+ *   connection (key or connection quarantine, binding conflict). With the
+ *   binding's reset_clock it forms the connection's integrity epoch.
+ * - binding conflicts: a connection whose evidence names another source or
+ *   method than its local mapping, or two sources. Append-only: later
+ *   evidence, equivocation included, can never erase the fact.
+ */
+export const REPLICA_INTEGRITY_MIGRATION = `
+CREATE TABLE IF NOT EXISTS pdpp_replica_integrity_fences (instance TEXT PRIMARY KEY, fences INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS pdpp_binding_conflicts_no_update BEFORE UPDATE ON pdpp_replica_binding_conflicts BEGIN SELECT RAISE(ABORT, 'binding conflicts are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS pdpp_binding_conflicts_no_delete BEFORE DELETE ON pdpp_replica_binding_conflicts BEGIN SELECT RAISE(ABORT, 'binding conflicts are append-only'); END;
+`;
+
+type Store = ReturnType<typeof createSqliteRecordStore>;
 type Binding = {
   instance: string;
   source_id: string | null;
@@ -132,6 +145,77 @@ export function createReplicaReceiver(deps: {
         local.method !== operation.methodId)
     )
       throw new Error("replica connection source or method mismatch");
+  }
+  /** Hide one key. Raises the connection's integrity epoch only when newly hidden. */
+  function quarantineKey(
+    instance: string,
+    generation: number,
+    stream: string,
+    recordKey: string,
+  ) {
+    if (
+      db
+        .prepare(
+          "INSERT OR IGNORE INTO pdpp_replica_quarantined_keys VALUES (?, ?, ?, ?)",
+        )
+        .run(instance, generation, stream, recordKey).changes > 0
+    )
+      store.fenceReplicaConnection(instance);
+  }
+  /** Hide a connection. Returns true, with a raised epoch, only when newly hidden. */
+  function quarantineConnection(instance: string): boolean {
+    const hidden =
+      db
+        .prepare(
+          "INSERT OR IGNORE INTO pdpp_replica_quarantined_connections VALUES (?)",
+        )
+        .run(instance).changes > 0;
+    if (hidden) store.fenceReplicaConnection(instance);
+    return hidden;
+  }
+  /**
+   * Durable binding-conflict facts from retained evidence, before planning:
+   * two sources or methods for one connection id (equivocated variants
+   * count), or evidence that disagrees with the local mapping. Each fact
+   * quarantines only its connection; other connections keep importing.
+   */
+  function recordBindingConflicts(all: ReplicaOperation[]) {
+    const byConnection = new Map<string, ReplicaOperation[]>();
+    for (const op of all)
+      byConnection.set(op.connectionId, [
+        ...(byConnection.get(op.connectionId) ?? []),
+        op,
+      ]);
+    for (const [id, ops] of byConnection) {
+      const local = binding(id);
+      const disagreeing = local?.source_id
+        ? ops.find(
+            (op) =>
+              op.sourceId !== local.source_id || op.methodId !== local.method,
+          )
+        : undefined;
+      if (disagreeing)
+        store.markReplicaBindingConflict({
+          connectionId: id,
+          reason: "local_mapping_conflict",
+          evidence: {
+            sourceId: disagreeing.sourceId,
+            methodId: disagreeing.methodId,
+            revision: disagreeing.revision,
+          },
+        });
+      else if (
+        new Set(ops.map((op) => op.sourceId)).size > 1 ||
+        new Set(ops.map((op) => op.methodId)).size > 1
+      )
+        store.markReplicaBindingConflict({
+          connectionId: id,
+          reason: "source_binding_conflict",
+          evidence: [...new Set(ops.map((op) => `${op.sourceId} ${op.methodId}`))]
+            .sort()
+            .slice(0, 8),
+        });
+    }
   }
   function retained(): ReplicaOperation[] {
     return (
@@ -304,14 +388,17 @@ export function createReplicaReceiver(deps: {
   function reconcile(): ReplicaMergePlan {
     const all = retained();
     const context = { owner, declarations: deps.declarations() };
+    // A retained disagreement is a connection-scoped fact, never a throw that
+    // would block every import and retry (#428 F2).
+    recordBindingConflicts(all);
     const unavailable: ReplicaOperation[] = [];
     const eligible = all.filter((op) => {
-      validateMapping(op);
-      if (!binding(op.connectionId)?.source_id) {
+      const local = binding(op.connectionId);
+      if (!local?.source_id) {
         unavailable.push(op);
         return false;
       }
-      return true;
+      return !store.replicaBindingConflict(op.connectionId);
     });
     const plan = planReplicaMerge(context, eligible);
     if (unavailable.length)
@@ -354,13 +441,7 @@ export function createReplicaReceiver(deps: {
           .filter((op) => op.kind === "connection-reset")
           .map((op) => op.generation),
       );
-      const newlyBlocked =
-        blocked &&
-        db
-          .prepare(
-            "INSERT OR IGNORE INTO pdpp_replica_quarantined_connections VALUES (?)",
-          )
-          .run(id).changes > 0;
+      const newlyBlocked = blocked && quarantineConnection(id);
       const reset =
         !blocked && !missingLifecycle && generation > local.generation;
       // A receiver-derived deletion can become equivocated later. Retract only
@@ -410,9 +491,7 @@ export function createReplicaReceiver(deps: {
       const local = binding(connectionId)!;
       if (local.deleted_at || generation !== local.generation) continue;
       if (record.quarantined)
-        db.prepare(
-          "INSERT OR IGNORE INTO pdpp_replica_quarantined_keys VALUES (?, ?, ?, ?)",
-        ).run(connectionId, generation, stream, recordKey);
+        quarantineKey(connectionId, generation, stream, recordKey);
       if (isRecordQuarantined(connectionId, stream, recordKey)) {
         write(connectionId, stream, recordKey, null);
         continue;
@@ -1111,9 +1190,7 @@ export function createReplicaReceiver(deps: {
             .map((op) => op.connectionId),
         );
         for (const instance of connections) {
-          db.prepare(
-            "INSERT OR IGNORE INTO pdpp_replica_quarantined_connections VALUES (?)",
-          ).run(instance);
+          quarantineConnection(instance);
           for (const row of db
             .prepare(
               "SELECT stream,record_key FROM pdpp_records WHERE instance = ? AND deleted = 0",
@@ -1128,9 +1205,7 @@ export function createReplicaReceiver(deps: {
           ).run(instance);
         }
         for (const op of records) {
-          db.prepare(
-            "INSERT OR IGNORE INTO pdpp_replica_quarantined_keys VALUES (?, ?, ?, ?)",
-          ).run(
+          quarantineKey(
             op.connectionId,
             op.generation,
             op.declaration.stream,
@@ -1139,8 +1214,11 @@ export function createReplicaReceiver(deps: {
           if (binding(op.connectionId)?.generation === op.generation)
             write(op.connectionId, op.declaration.stream, op.recordKey, null);
         }
-        // Rare and broad: re-derive every overlay under the new quarantine facts.
-        view.reconcileAll();
+        // Incremental: each new quarantine fact raised its connection's
+        // integrity epoch in this transaction, so saved cursors expire, and
+        // reads apply the quarantine predicate. The record withdrawals above
+        // marked their keys dirty; flush re-derives only those.
+        view.flush();
       }).immediate();
     },
     import(input: {

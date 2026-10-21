@@ -340,8 +340,11 @@ async function fixture() {
   expect(changes.next_cursor).toBeTypeOf("string");
   const allChanges = await json("/streams/messages/records?changes_since=");
   expect(allChanges.next_changes_since).toBeTypeOf("string");
-  async function assertQuarantined({ savedCursorsExpired = false } = {}) {
-    const savedCursorStatus = savedCursorsExpired ? 410 : 200;
+  // Every quarantine raises the connection's integrity epoch, so a saved
+  // cursor expires instead of continuing over a shifted, filtered page set
+  // (finding k: offset pagination skipped clean rows after a withdrawal).
+  async function assertQuarantined() {
+    const savedCursorStatus = 410;
     const paths = [
       ["/streams/messages/records/z-quarantined", 404],
       ["/streams/messages/records", 200],
@@ -489,9 +492,9 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
       { ...f.target, data: { ...f.target.data, text: substituted } },
     ]);
     expect(f.quarantinedConnections()).toEqual([{ instance: "conn" }]);
-    await f.assertQuarantined({ savedCursorsExpired: true });
+    await f.assertQuarantined();
     await f.restart();
-    await f.assertQuarantined({ savedCursorsExpired: true });
+    await f.assertQuarantined();
   });
 
   // Publishes and revalidates 55 slots: about 3-4 s alone, more under full-suite load.

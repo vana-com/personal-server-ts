@@ -52,7 +52,7 @@ function host({
   // The durable source-conflict fact table belongs to the synthesis lane.
   if (conflictFacts)
     db.exec(
-      "CREATE TABLE pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY)",
+      "CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL)",
     );
   const receiver = createReplicaReceiver({
     db,
@@ -277,7 +277,9 @@ describe("createApp with an enabled replica receiver", () => {
     expect((await h.get("app", `/v1/blobs/${h.blobId}`)).status).toBe(200);
 
     h.db
-      .prepare("INSERT INTO pdpp_replica_binding_conflicts VALUES (?)")
+      .prepare(
+        "INSERT INTO pdpp_replica_binding_conflicts VALUES (?, 'source_binding_conflict', '{}')",
+      )
       .run(instance);
 
     for (const token of ["app", "owner"]) {
@@ -329,7 +331,9 @@ describe("createApp with an enabled replica receiver", () => {
     ]);
 
     h.db
-      .prepare("INSERT INTO pdpp_replica_binding_conflicts VALUES (?)")
+      .prepare(
+        "INSERT INTO pdpp_replica_binding_conflicts VALUES (?, 'source_binding_conflict', '{}')",
+      )
       .run(instance);
     expect((await h.get("legacy-owner", "/v1/data")).body.scopes).toEqual([]);
     const after = await h.get("legacy-owner", "/v1/data/oura.activity");

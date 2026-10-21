@@ -1,3 +1,4 @@
+import type { DeclarationBinding } from "../../replication/envelope.js";
 import type { RecordDataValidator } from "./ingest-plan.js";
 import type {
   ChangesSinceOptions,
@@ -44,6 +45,15 @@ export interface PdppRecordStore {
     primaryKeyFields: (stream: string, instance: string) => string[],
     binding?: { method: string; generation: number },
     validateData?: RecordDataValidator,
+    /**
+     * The declaration `validateData` validates against. When replication
+     * captures the write, it must equal the retained binding, or the whole
+     * batch is refused.
+     */
+    declarationFor?: (
+      stream: string,
+      instance: string,
+    ) => DeclarationBinding | undefined,
   ): IngestResult;
 
   getRecord(

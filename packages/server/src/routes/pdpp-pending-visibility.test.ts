@@ -388,7 +388,7 @@ it("uses local journal values for conflicted owners and hides the whole connecti
     const store = createSqliteRecordStore(db);
     // The hardening lane owns migration 18 and its monotone fact writer.
     db.exec(
-      "CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts(instance TEXT PRIMARY KEY); CREATE INDEX IF NOT EXISTS local_journal_lookup ON pdpp_mutation_journal(connection_id,generation,stream,record_key,sequence DESC)",
+      "CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts(instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS local_journal_lookup ON pdpp_mutation_journal(connection_id,generation,stream,record_key,sequence DESC)",
     );
     store.registerConnection({
       instance: identity.connectionId,
@@ -575,9 +575,9 @@ it("uses local journal values for conflicted owners and hides the whole connecti
       .get();
     // Simulate the agreed external fact writer and its existing cursor fence.
     db.transaction(() => {
-      db.prepare("INSERT INTO pdpp_replica_binding_conflicts VALUES (?)").run(
-        identity.connectionId,
-      );
+      db.prepare(
+        "INSERT INTO pdpp_replica_binding_conflicts VALUES (?, 'source_binding_conflict', '{}')",
+      ).run(identity.connectionId);
       db.prepare("UPDATE pdpp_write_clock SET value=value+1 WHERE id=1").run();
       db.prepare(
         "UPDATE pdpp_instance_binding SET reset_clock=(SELECT value FROM pdpp_write_clock WHERE id=1) WHERE instance=?",
