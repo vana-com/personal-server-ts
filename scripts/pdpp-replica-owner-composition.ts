@@ -400,22 +400,32 @@ export async function createOwnerComposition(options: CompositionOptions) {
     c.json({ error: "composition_request_failed" }, 500),
   );
   app.use("*", async (c, next) => {
-    c.header("Cache-Control", "no-store");
     const origin = c.req.header("origin");
     if (origin && origin !== options.accountOrigin)
-      return c.json({ error: "origin_refused" }, 403);
+      return c.json({ error: "origin_refused" }, 403, {
+        "Cache-Control": "no-store",
+      });
+    if (c.req.method !== "OPTIONS") await next();
+    // Forwarded sub-app responses (legacy grants/data, owner ingest, B reads)
+    // are foreign Response objects, so headers go on the final response.
+    const res =
+      c.req.method === "OPTIONS"
+        ? new Response(null, { status: 204 })
+        : new Response(c.res.body, c.res);
+    res.headers.set("Cache-Control", "no-store");
     if (origin) {
-      c.header("Access-Control-Allow-Origin", options.accountOrigin);
-      c.header("Vary", "Origin");
-      c.header(
+      res.headers.set("Access-Control-Allow-Origin", options.accountOrigin);
+      res.headers.set("Vary", "Origin");
+      res.headers.set(
         "Access-Control-Allow-Headers",
         "authorization,content-type,pdpp-version",
       );
-      c.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-      c.header("Access-Control-Allow-Private-Network", "true");
+      res.headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+      res.headers.set("Access-Control-Allow-Private-Network", "true");
     }
-    if (c.req.method === "OPTIONS") return c.body(null, 204);
-    await next();
+    // Clear first so Hono does not merge the stale response headers back in.
+    c.res = undefined;
+    c.res = res;
   });
   app.all("/v1/*", (c) =>
     legacyRoutes

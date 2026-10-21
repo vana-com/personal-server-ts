@@ -264,6 +264,24 @@ it("reuses the existing authority with an exact verified dynamic declaration and
       })
     ).status,
   ).toBe(401);
+  // Account's browser must be able to read forwarded legacy responses; an
+  // opaque CORS failure hides a grant the gateway did register.
+  const fromAccount = await real.app.request("/v1/grants", {
+    method: "POST",
+    headers: {
+      origin: accountOrigin,
+      authorization: `Bearer ${credential}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      granteeAddress: "0x2222222222222222222222222222222222222222",
+      scopes: ["strava.activities"],
+    }),
+  });
+  expect(fromAccount.status).toBe(401);
+  expect(fromAccount.headers.get("access-control-allow-origin")).toBe(
+    accountOrigin,
+  );
   const readProof = await buildWeb3SignedHeader({
     wallet: owner,
     aud: origin,
@@ -307,6 +325,19 @@ it("reuses the existing authority with an exact verified dynamic declaration and
       body: JSON.stringify(input),
     });
   expect((await ingest(undefined, envelope)).status).toBe(401);
+  const accountIngest = await real.app.request(ingestUrl, {
+    method: "POST",
+    headers: {
+      origin: accountOrigin,
+      authorization: `Bearer ${credential}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ ...envelope, instance: "unowned" }),
+  });
+  expect(accountIngest.status).toBe(401);
+  expect(accountIngest.headers.get("access-control-allow-origin")).toBe(
+    accountOrigin,
+  );
   expect((await ingest(previousToken, envelope)).status).toBe(401);
   expect(
     (await ingest(credential, { ...envelope, instance: "unowned" })).status,
