@@ -177,6 +177,12 @@ export interface DataStoragePort extends RuntimeStoragePort {
        * still applies and any ids it cuts off are reported as warnings.
        */
       blockIds?: readonly string[];
+      /**
+       * The generation of the index row the read was authorized for. A
+       * non-owner view serves only blocks bound to it, and refuses rather
+       * than serve another version's bytes. A raw port ignores it.
+       */
+      generation?: string;
     },
   ): Promise<ReadScopeBlocksResponse>;
   /**
@@ -186,6 +192,8 @@ export interface DataStoragePort extends RuntimeStoragePort {
   readBlockManifest?(
     scope: string,
     collectedAt: string,
+    /** As for `readScopeBlocks`. */
+    options?: { generation?: string },
   ): Promise<DataBlockManifest | null>;
   /** Metadata-only readiness hint. Must not read bodies or build/project blocks.
    * Return false when readiness cannot be established cheaply. */

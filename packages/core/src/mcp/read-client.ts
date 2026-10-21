@@ -744,6 +744,11 @@ export function createMcpDataReadClient(
             cursor,
             maxBytes: maxBytes ?? 16_384,
             ...(blockIds?.length ? { blockIds } : {}),
+            // Pin the version authorized above: the view serves only its
+            // bytes, never a version published later at the same path.
+            ...(selectedEntry.generation
+              ? { generation: selectedEntry.generation }
+              : {}),
           },
         );
         const { logId, timestamp, ipAddress, userAgent } =
@@ -837,6 +842,9 @@ export function createMcpDataReadClient(
         manifest = await storage.readBlockManifest(
           scope,
           selectedEntry.collectedAt,
+          selectedEntry.generation
+            ? { generation: selectedEntry.generation }
+            : undefined,
         );
       } catch (err) {
         if (err instanceof ProtocolError) {

@@ -44,8 +44,10 @@ import {
 import {
   DataBlockStorageError,
   encodeDataBlockCursor,
+  manifestBinding,
   selectScopeBlocksByIds,
   validateDataBlockCursor,
+  verifyStoredBlock,
   type DataBlockManifest,
   type DataScopeBlock,
   type ReadScopeBlocksResponse,
@@ -515,9 +517,7 @@ export async function readScopeBlocks(
       collectedAt: manifest.collectedAt,
       ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
       contentKind: manifest.contentKind,
-      ...(manifest.pdppOrigin === undefined
-        ? {}
-        : { pdppOrigin: manifest.pdppOrigin }),
+      ...manifestBinding(manifest),
       blocks: selection.blocks,
       warnings: [...manifest.warnings, ...selection.warnings],
     };
@@ -553,7 +553,10 @@ export async function readScopeBlocks(
     )
       break;
 
-    const block = await readBlockPayload(options, scope, collectedAt, ref.id);
+    const block = verifyStoredBlock(
+      ref,
+      await readBlockPayload(options, scope, collectedAt, ref.id),
+    );
     const page = pageBlock(block, offset, maxBytes - totalBytes);
     blocks.push(page.block);
     totalBytes += page.block.sizeBytes;
@@ -573,9 +576,7 @@ export async function readScopeBlocks(
     collectedAt: manifest.collectedAt,
     ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
     contentKind: manifest.contentKind,
-    ...(manifest.pdppOrigin === undefined
-      ? {}
-      : { pdppOrigin: manifest.pdppOrigin }),
+    ...manifestBinding(manifest),
     blocks,
     ...(nextOffset !== undefined || nextIndex < manifest.blocks.length
       ? {

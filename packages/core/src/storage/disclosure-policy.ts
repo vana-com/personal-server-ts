@@ -6,8 +6,11 @@
  * lookup by another key, a version written after the row was chosen, or one
  * deleted and written again at the same scope and collectedAt. Deciding on
  * the row therefore cannot be the authority. This view decides on what it
- * returns: the envelope it read, or the block manifest the blocks were read
- * from, which records the provenance of the envelope it was built from.
+ * returns: the envelope it read, or blocks bound to the version the read was
+ * authorized for. Blocks are served from a sidecar only when its manifest
+ * records the pinned generation of that row and storage matched every block
+ * to the manifest's digests; otherwise from one full read of the envelope,
+ * checked on its bytes.
  *
  * `/v1/data`, MCP, TEE jobs and derivative questions read a non-owner's body
  * only through `storageForReader(storage, "grantee")`. The owner gets the
@@ -21,6 +24,16 @@ import {
 } from "../policy/legacy-disclosure.js";
 import type { DataStoragePort } from "../ports/index.js";
 import { previewEnvelopeValue } from "./preview.js";
+import { buildDataBlocksAsync } from "./blocks/build.js";
+import { boundEnvelopeDigest } from "./blocks/digest.js";
+import { DataBlockStorageError } from "./blocks/errors.js";
+import { readBuiltScopeBlocks } from "./blocks/page.js";
+import type {
+  DataBlockManifest,
+  DataScopeBlock,
+  ReadScopeBlocksResponse,
+} from "./blocks/types.js";
+import { envelopeGeneration } from "./hierarchy/generation.js";
 
 /** A served port's own non-owner view (see `withLegacyProjection`). */
 export const GRANTEE_VIEW = Symbol.for(
@@ -41,6 +54,27 @@ function authorizeEnvelope(envelope: {
   producer?: unknown;
 }): void {
   authorizeLegacyRead("grantee", { kind: "stored-envelope", envelope });
+}
+
+/** Binding and provenance are for the policy; a non-owner never sees them. */
+function servedBlocks(
+  result: ReadScopeBlocksResponse,
+): ReadScopeBlocksResponse {
+  const { pdppOrigin: _origin, envelopeDigest: _digest, ...served } = result;
+  return served;
+}
+
+function servedManifest(manifest: DataBlockManifest): DataBlockManifest {
+  const {
+    pdppOrigin: _origin,
+    envelopeDigest: _digest,
+    blocks,
+    ...served
+  } = manifest;
+  return {
+    ...served,
+    blocks: blocks.map(({ digest: _blockDigest, ...ref }) => ref),
+  };
 }
 
 /**
@@ -107,40 +141,102 @@ export function withDisclosurePolicy(raw: DataStoragePort): DataStoragePort {
         options.maxBytes,
       );
   }
+  /**
+   * Blocks served from one full read of the envelope, checked on those
+   * bytes: the fallback when a sidecar is not bound to the pinned generation
+   * (a sidecar from before binding, or a row with no generation). The blocks
+   * are built in memory from the same bytes that were checked, so no later
+   * change at the version path can reach the response.
+   */
+  async function readCheckedBlocks(
+    scope: string,
+    collectedAt: string,
+    generation: string | undefined,
+  ): Promise<{ manifest: DataBlockManifest; blocks: DataScopeBlock[] }> {
+    // The generation is computed on the stored JSON as storage computed it
+    // when it indexed the row, not on a schema-parsed copy.
+    const envelope = raw.readEnvelopeBytes
+      ? (JSON.parse(
+          textDecoder.decode(await raw.readEnvelopeBytes(scope, collectedAt)),
+        ) as DataFileEnvelope)
+      : await raw.readEnvelope(scope, collectedAt);
+    if (
+      generation !== undefined &&
+      envelopeGeneration(envelope) !== generation
+    ) {
+      throw new DataBlockStorageError(
+        "generation_mismatch",
+        `The stored version of ${scope} at ${collectedAt} changed after the read was authorized`,
+      );
+    }
+    authorizeEnvelope(envelope);
+    const schemaId = (envelope as { schemaId?: unknown }).schemaId;
+    const built = await buildDataBlocksAsync({
+      scope,
+      collectedAt,
+      ...(typeof schemaId === "string" ? { schemaId } : {}),
+      content: envelope,
+    });
+    // Best effort: rebind the sidecar so later reads skip this full read.
+    // Readers check the binding, so a repair that loses a race is harmless.
+    if (generation !== undefined && raw.writeBlockManifest) {
+      await raw
+        .writeBlockManifest(scope, collectedAt, built.manifest, built.blocks)
+        .catch(() => undefined);
+    }
+    return built;
+  }
+
   if (raw.readScopeBlocks) {
     const rawBlocks = raw.readScopeBlocks.bind(raw);
     overrides.readScopeBlocks = async (scope, collectedAt, options) => {
-      const result = await rawBlocks(scope, collectedAt, options);
-      // The manifest these blocks came from records the provenance of the
-      // envelope it was built from. A manifest written before that field
-      // existed is decided on the envelope instead.
-      if (result.pdppOrigin === undefined) {
-        await readAuthorized(scope, collectedAt);
-      } else {
+      const { generation, ...readOptions } = options;
+      // Storage checks each block against the manifest read in the same
+      // call, and reports the manifest's binding only when every served
+      // block matched. The pinned generation, not the provenance bit, is the
+      // authority that these are the authorized version's bytes. A missing
+      // sidecar fails here as it does for the owner.
+      const result = await rawBlocks(scope, collectedAt, readOptions);
+      if (
+        generation !== undefined &&
+        result.envelopeDigest === generation &&
+        result.pdppOrigin !== undefined
+      ) {
         authorizeLegacyRead("grantee", {
           kind: "stored-blocks",
           pdppOrigin: result.pdppOrigin,
         });
+        return servedBlocks(result);
       }
-      const { pdppOrigin: _origin, ...served } = result;
-      return served;
+      return servedBlocks(
+        await readBuiltScopeBlocks(
+          await readCheckedBlocks(scope, collectedAt, generation),
+          readOptions,
+        ),
+      );
     };
   }
   if (raw.readBlockManifest) {
     const rawManifest = raw.readBlockManifest.bind(raw);
-    overrides.readBlockManifest = async (scope, collectedAt) => {
+    overrides.readBlockManifest = async (scope, collectedAt, options) => {
+      const generation = options?.generation;
       const manifest = await rawManifest(scope, collectedAt);
-      if (!manifest) return manifest;
-      if (manifest.pdppOrigin === undefined) {
-        await readAuthorized(scope, collectedAt);
-      } else {
+      // A version with no sidecar has no table of contents, as for the owner.
+      if (!manifest) return null;
+      if (
+        generation !== undefined &&
+        boundEnvelopeDigest(manifest) === generation &&
+        manifest.pdppOrigin !== undefined
+      ) {
         authorizeLegacyRead("grantee", {
           kind: "stored-blocks",
           pdppOrigin: manifest.pdppOrigin,
         });
+        return servedManifest(manifest);
       }
-      const { pdppOrigin: _origin, ...served } = manifest;
-      return served;
+      return servedManifest(
+        (await readCheckedBlocks(scope, collectedAt, generation)).manifest,
+      );
     };
   }
 

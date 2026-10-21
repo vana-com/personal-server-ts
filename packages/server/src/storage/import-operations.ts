@@ -10,6 +10,7 @@ import type {
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
   buildDataFilePath,
+  envelopeGeneration,
   type HierarchyManagerOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
@@ -115,6 +116,7 @@ export function createImportOperations(
           schemaId: null,
           path: row.path,
           pdppOrigin: hasPdppOrigin(envelope),
+          generation: envelopeGeneration(envelope),
           scope: row.scope,
           collectedAt: row.collected_at,
           sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
@@ -285,6 +287,7 @@ export function createImportOperations(
             fileId: null,
             path: writeResult.relativePath,
             pdppOrigin: hasPdppOrigin(envelope),
+            generation: envelopeGeneration(envelope),
             scope: envelope.scope,
             collectedAt: envelope.collectedAt,
             sizeBytes:

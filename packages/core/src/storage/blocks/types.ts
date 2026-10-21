@@ -13,6 +13,12 @@ export interface DataBlockManifest {
    * `hasPdppOrigin`). Absent on manifests written before this field.
    */
   pdppOrigin?: boolean;
+  /**
+   * The generation (`envelopeGeneration`) of the envelope these blocks were
+   * built from. With a `digest` on every block, it binds the sidecar to one
+   * published version. Absent on manifests written before this field.
+   */
+  envelopeDigest?: string;
   blocks: DataBlockRef[];
   warnings: DataBlockWarning[];
 }
@@ -24,6 +30,11 @@ export interface DataBlockRef {
   sizeBytes: number;
   itemCount?: number;
   truncated?: boolean;
+  /**
+   * `canonicalDigest` of the full stored block payload. Storage checks it on
+   * every read of the payload, before paging. Absent on old manifests.
+   */
+  digest?: string;
 }
 
 export interface DataBlockWarning {
@@ -57,6 +68,12 @@ export interface ReadScopeBlocksResponse {
   warnings: DataBlockWarning[];
   /** The manifest's `pdppOrigin`, for the disclosure policy; never served. */
   pdppOrigin?: boolean;
+  /**
+   * The manifest's `envelopeDigest`, only when every block is bound by a
+   * digest and every served block matched it. For the disclosure policy;
+   * never served.
+   */
+  envelopeDigest?: string;
 }
 
 export interface DataScopeBlock {

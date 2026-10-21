@@ -34,6 +34,14 @@ export interface IndexEntry {
    * no early refusal.
    */
   pdppOrigin?: boolean;
+  /**
+   * The immutable generation of this version: `envelopeGeneration` of the
+   * published bytes, which storage computes when it indexes them and never
+   * takes from the caller. A non-owner read pins it and serves only bytes of
+   * this generation. Undefined (rows from before this field, or unreadable
+   * bytes) means a non-owner read decides on one full read of the envelope.
+   */
+  generation?: string;
   /** Server-stamped origin of a legacy cache version. Null for older/manual writes. */
   producer?: "pdpp-projector" | "pdpp-import-projection" | null;
   /** JSON provenance stored outside the grantee-visible data object. */

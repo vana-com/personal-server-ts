@@ -91,7 +91,10 @@ access. The decision is made on the bytes a non-owner read returns: such
 reads go through a storage view that checks every body (envelope, blocks,
 and each sibling scope a legacy projection joins). A version path never
 changes its content once published, and non-owner version listings omit PDPP
-producer provenance.
+producer provenance. Each version has an immutable generation (a digest of its
+published envelope). A non-owner block read serves only blocks bound to the
+generation it was authorized for, and refuses rather than serve a version
+published later at the same path.
 
 ### Server Registration
 

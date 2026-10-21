@@ -160,6 +160,7 @@ describe("mcp/read-client", () => {
               fileId: "file-1",
               sizeBytes: 10,
               pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -211,6 +212,7 @@ describe("mcp/read-client", () => {
               fileId: "file-1",
               sizeBytes: 10,
               pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -259,6 +261,9 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json",
+      // A sidecar bound to the selected version.
+      pdppOrigin: false,
+      envelopeDigest: "gen-1",
       blocks: [
         {
           id: "block-42",
@@ -287,6 +292,7 @@ describe("mcp/read-client", () => {
               fileId: "file-1",
               sizeBytes: 10,
               pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -336,12 +342,15 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json" as const,
+      pdppOrigin: false,
+      envelopeDigest: "gen-1",
       blocks: [
         {
           id: "block-1",
           path: "$.items[0]",
           mediaType: "application/json",
           sizeBytes: 18,
+          digest: "block-digest-1",
         },
       ],
       warnings: [],
@@ -363,6 +372,7 @@ describe("mcp/read-client", () => {
               fileId: "file-1",
               sizeBytes: 10,
               pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -412,6 +422,9 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json",
+      // A sidecar bound to the selected version.
+      pdppOrigin: false,
+      envelopeDigest: "gen-1",
       blocks: [
         {
           id: "block-1",
@@ -440,6 +453,7 @@ describe("mcp/read-client", () => {
               fileId: "file-1",
               sizeBytes: 10,
               pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -525,6 +539,9 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json",
+      // A sidecar bound to the selected version.
+      pdppOrigin: false,
+      envelopeDigest: "gen-1",
       blocks: [],
       nextCursor,
       warnings: [],
@@ -546,6 +563,7 @@ describe("mcp/read-client", () => {
               fileId: "file-1",
               sizeBytes: 10,
               pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -594,6 +612,9 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json",
+      // A sidecar bound to the selected version.
+      pdppOrigin: false,
+      envelopeDigest: "gen-1",
       blocks: [],
       warnings: [],
     });
@@ -614,6 +635,7 @@ describe("mcp/read-client", () => {
               fileId: "file-1",
               sizeBytes: 10,
               pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -668,12 +690,17 @@ describe("mcp/read-client", () => {
           fileId: at === oldCollectedAt ? "file-old" : "file-latest",
           sizeBytes: 10,
           pdppOrigin: false,
+          generation: at === oldCollectedAt ? "gen-old" : "gen-latest",
         }) as never,
     );
     const readScopeBlocks = vi.fn().mockResolvedValue({
       scope: "instagram.profile",
       collectedAt: oldCollectedAt,
       contentKind: "json",
+      // A sidecar bound to the cursor's version: served only if that
+      // version's generation is the one pinned.
+      pdppOrigin: false,
+      envelopeDigest: "gen-old",
       blocks: [],
       warnings: [],
     });
@@ -729,6 +756,105 @@ describe("mcp/read-client", () => {
     );
   });
 
+  it("refuses blocks and manifests bound to a version other than the one authorized", async () => {
+    const collectedAt = "2026-06-05T00:00:00Z";
+    const storage = {
+      kind: "custom" as const,
+      listScopes: () => ({ scopes: [], total: 0 }),
+      listVersions: vi.fn(),
+      countVersions: vi.fn(),
+      findEntry: () =>
+        ({
+          scope: "instagram.profile",
+          collectedAt,
+          fileId: "file-1",
+          sizeBytes: 10,
+          pdppOrigin: false,
+          generation: "gen-authorized",
+        }) as never,
+      findByFileId: vi.fn(),
+      findUnsynced: vi.fn(),
+      // The bytes now at the path are another version.
+      readEnvelope: vi.fn().mockResolvedValue({
+        version: "1.0",
+        scope: "instagram.profile",
+        collectedAt,
+        data: { id: "republished" },
+      }),
+      readScopeBlocks: vi.fn().mockResolvedValue({
+        scope: "instagram.profile",
+        collectedAt,
+        contentKind: "json",
+        pdppOrigin: false,
+        envelopeDigest: "gen-republished",
+        blocks: [
+          {
+            id: "block-1",
+            path: "$.data",
+            mediaType: "application/json",
+            value: { id: "republished" },
+            sizeBytes: 18,
+          },
+        ],
+        warnings: [],
+      }),
+      readBlockManifest: vi.fn().mockResolvedValue({
+        version: 1 as const,
+        scope: "instagram.profile",
+        collectedAt,
+        contentKind: "json" as const,
+        pdppOrigin: false,
+        envelopeDigest: "gen-republished",
+        blocks: [
+          {
+            id: "block-1",
+            path: "$.data",
+            mediaType: "application/json",
+            sizeBytes: 18,
+            digest: "block-digest-1",
+          },
+        ],
+        warnings: [],
+      }),
+      writeEnvelope: vi.fn(),
+      insertEntry: vi.fn(),
+      updateFileId: vi.fn(),
+      deleteScope: vi.fn(),
+      deleteByFileId: vi.fn(),
+    };
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi
+            .fn()
+            .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" }),
+        },
+        accessLogWriter: { write: vi.fn() },
+      },
+    });
+
+    await expect(
+      client.readScopeBlocks({
+        scope: "instagram.profile",
+        grantId: "grant-1",
+      }),
+    ).rejects.toMatchObject({
+      status: 503,
+      body: { reason: "generation_mismatch" },
+    });
+    await expect(
+      client.readBlockManifest?.({
+        scope: "instagram.profile",
+        grantId: "grant-1",
+      }),
+    ).rejects.toMatchObject({ code: "generation_mismatch" });
+  });
+
   it("reads raw binary scopes through the grant-gated data API path", async () => {
     const bytes = new Uint8Array([0x25, 0x50, 0x44, 0x46]);
     const authorizeBuilderRead = vi
@@ -751,6 +877,7 @@ describe("mcp/read-client", () => {
               fileId: "file-1",
               sizeBytes: bytes.byteLength,
               pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -1010,6 +1137,7 @@ describe("mcp/read-client deletion gate", () => {
                 fileId: "file-1",
                 sizeBytes: 10,
                 pdppOrigin: false,
+                generation: "gen-1",
               }) as never,
             findByFileId: vi.fn(),
             findUnsynced: vi.fn(),
@@ -1020,8 +1148,9 @@ describe("mcp/read-client deletion gate", () => {
               contentKind: "vana-envelope",
               blocks: structuredClone(options.blocks ?? STAMPED_BLOCKS),
               warnings: [],
-              // Sidecars record their envelope's provenance.
+              // Sidecars record their envelope's provenance and version.
               pdppOrigin: false,
+              envelopeDigest: "gen-1",
             }),
             readBlockManifest: vi.fn().mockResolvedValue({
               version: 1 as const,
@@ -1029,11 +1158,13 @@ describe("mcp/read-client deletion gate", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               contentKind: "vana-envelope" as const,
               pdppOrigin: false,
+              envelopeDigest: "gen-1",
               blocks: STAMPED_BLOCKS.map(({ id, path, sizeBytes }) => ({
                 id,
                 path,
                 mediaType: "application/json",
                 sizeBytes,
+                digest: `digest-${id}`,
               })),
               warnings: [],
             }),
