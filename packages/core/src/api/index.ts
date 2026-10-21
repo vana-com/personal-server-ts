@@ -34,6 +34,7 @@ import {
   type ScopeDeletionTracker,
 } from "../sync/scope-deletions.js";
 import type { ScopeSummary } from "../storage/index/types.js";
+import { PdppError } from "../errors/pdpp-catalog.js";
 import {
   isPermanentRejection,
   type PdppImporter,
@@ -246,15 +247,19 @@ export interface PersonalServerReadFulfillmentReporter {
 }
 
 /**
- * What a non-owner caller may see in a data listing: the scope patterns of
- * the grants it holds from this server's owner. Only scopes they cover are
- * listed, and versions of any other scope are refused.
+ * Permitted scopes, presentation and delivery authority for a data listing.
+ * A grantee sees its grants' scopes; a scoped owner bridge retains owner
+ * presentation without dropping the bearer lease.
  */
-export interface PersonalServerListAuthResult {
+export type PersonalServerListAuthResult = {
   grantedScopes: readonly string[];
-  /** The listing's delivery lease (see `authorizeDataList`). */
-  lease?: DeliveryLease;
-}
+} &
+  // Scoped bearer owners carry a lease without losing owner presentation.
+  (
+    | { view: "owner"; lease: DeliveryLease }
+    // Omitted view retains compatibility with existing grantee auth ports.
+    | { view?: "grantee"; lease?: DeliveryLease }
+  );
 
 export interface PersonalServerApiAuthPort {
   authorizeOwner(request: Request): Promise<void>;
@@ -277,8 +282,9 @@ export interface PersonalServerApiAuthPort {
   /**
    * Authorize listing versions for one legacy scope. Optional so auth ports
    * without scoped owner-token support keep the `authorizeBuilderList` gate.
-   * Returns what `authorizeBuilderList` does: void is a full listing, a
-   * result names the scopes a non-owner may see.
+   * A result retains permitted scopes, presentation and release authority.
+   * A scoped bearer owner returns an explicit owner view with its lease;
+   * void remains the existing full-listing owner contract.
    */
   authorizeScopeVersions?(
     input: PersonalServerScopeAuthInput,
@@ -668,6 +674,11 @@ async function withApiErrors(
   } catch (err) {
     if (err instanceof ProtocolError) {
       return protocolErrorResponse(err);
+    }
+    if (err instanceof PdppError) {
+      return protocolErrorResponse(
+        new ProtocolError(err.status, err.code.toUpperCase(), err.message),
+      );
     }
     if (context) {
       context.logger?.error?.(
@@ -1294,7 +1305,7 @@ export function scopeDeletionLease(
     if (!tracker) return;
     const known = tracker.knownDeletion(read.scope);
     const tombstone =
-      read.body === "canonical"
+      read.body === "canonical" || read.entry
         ? (tracker.deletionHistory?.get(read.scope) ?? known)
         : known;
     if (!tombstone) return;
@@ -2147,8 +2158,7 @@ async function dispatchDataRequest(
         isVisible: discoveryVisibility(deps, (dependency) =>
           selection.add(dependency),
         ),
-        // An auth result here means a non-owner listing (owner: undefined).
-        forGrantee: Boolean(listAuth),
+        forGrantee: listAuth ? listAuth.view !== "owner" : false,
       });
       if (!result.ok) return contractErrorResponse(result);
       if (result.response.total === 0) {

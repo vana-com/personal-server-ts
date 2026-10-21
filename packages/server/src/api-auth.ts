@@ -1,4 +1,14 @@
 import {
+  admitBearer,
+  connectionsLease,
+  type BearerAdmission,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import {
+  allDeliveryLeases,
+  localLease,
+} from "@opendatalabs/personal-server-ts-core/policy";
+import { admitPdppRead } from "./pdpp/read-admission.js";
+import {
   authenticateRequest,
   type AuthenticatedRequest,
   type SessionTokenVerifierPort,
@@ -160,15 +170,15 @@ export function createServerApiAuth(
 
   async function authorizePdppOwnerBearerForScope(
     input: PersonalServerScopeAuthInput,
-  ): Promise<boolean> {
-    if (!deps.pdppOwnerBearer) return false;
+  ): Promise<BearerAdmission | undefined> {
+    if (!deps.pdppOwnerBearer) return undefined;
     const token = bearerToken(input.request);
-    if (!token) return false;
+    if (!token) return undefined;
 
-    const context = await deps.pdppOwnerBearer.auth.resolveToken(token);
-    if (!context.active) return false;
-    assertPdppOwnerBearerForScope(context, input.scope, deps);
-    return true;
+    const admission = await admitBearer(deps.pdppOwnerBearer.auth, token);
+    if (!admission.context.active) return undefined;
+    assertPdppOwnerBearerForScope(admission.context, input.scope, deps);
+    return admission;
   }
 
   function assertPdppOwnerBearerForScope(
@@ -331,7 +341,7 @@ export function createServerApiAuth(
         runtimeAvailability: deps.runtimeAvailability,
       },
     );
-    return { grantedScopes, lease: listLease };
+    return { grantedScopes, view: "grantee", lease: listLease };
   }
 
   return {
@@ -344,7 +354,34 @@ export function createServerApiAuth(
     },
 
     async authorizeScopeVersions(input) {
-      if (await authorizePdppOwnerBearerForScope(input)) return;
+      const owner = await authorizePdppOwnerBearerForScope(input);
+      if (owner) {
+        const bridge = deps.pdppOwnerBearer!;
+        const read = await admitPdppRead({ auth: bridge.auth }, owner);
+        const { subjectId, sourceId } = read.context;
+        const currentInstances = () =>
+          sourceId
+            ? (bridge.instancesForSource?.(subjectId!, sourceId) ?? [])
+            : (bridge.instancesForSubject?.(subjectId!) ?? []);
+        const instances =
+          read.context.instanceIds ?? (sourceId ? currentInstances() : []);
+        const lease = allDeliveryLeases(
+          read.lease,
+          connectionsLease(instances, (instance) =>
+            currentInstances().includes(instance),
+          ),
+          localLease(() => {
+            if (instances.length === 0) {
+              throw pdppBridgeError(
+                "PDPP_OWNER_BEARER_FOREIGN",
+                "Owner read has no available connection",
+              );
+            }
+            assertPdppOwnerBearerForScope(read.context, input.scope, deps);
+          }),
+        );
+        return { grantedScopes: [input.scope], view: "owner" as const, lease };
+      }
       // Any other credential is held to the listing rules: a builder sees the
       // versions of a scope only when one of its grants covers it.
       return authorizeBuilderList(input.request, { grantId: input.grantId });

@@ -327,3 +327,58 @@ describe("lineage", () => {
     expect(text).not.toContain("graph");
   });
 });
+
+for (const version of [5, 7]) {
+  it(`F3: deletion6 followed by live7 only releases genuinely newer selected version${version}`, async () => {
+    const storage = createMemoryDataStorage();
+    const tracker = createScopeDeletionTracker({ serverOwner: OWNER });
+    const envelope = {
+      version: "1.0",
+      scope: SCOPE,
+      collectedAt: "2026-01-01T00:00:00Z",
+      data: { private: "selected-file-body" },
+    };
+    const written = await storage.writeEnvelope(envelope as never);
+    storage.insertEntry({
+      scope: SCOPE,
+      collectedAt: envelope.collectedAt,
+      path: written.path!,
+      sizeBytes: written.sizeBytes,
+      fileId: "private-file",
+      version,
+      dataPointId: "registry",
+    });
+    const reading = {
+      ...storage,
+      async readEnvelope(...args: Parameters<typeof storage.readEnvelope>) {
+        const value = await storage.readEnvelope(...args);
+        tracker.markDeleted(SCOPE, {
+          deletedAt: "2026-02-01T00:00:00Z",
+          version: "6",
+        });
+        tracker.markLive(SCOPE);
+        return value;
+      },
+    };
+    const response = await handlePersonalServerDataRequest(
+      new Request(`http://ps/v1/data/${SCOPE}`),
+      {
+        storage: reading,
+        scopeDeletions: tracker,
+        serverOwner: OWNER,
+        accessLogWriter: { write: async () => undefined },
+        auth: {
+          authorizeBuilderRead: async () => ({
+            builder: OWNER,
+            grantId: "owner",
+          }),
+        },
+      } as unknown as PersonalServerDataApiDeps,
+      { basePath: "/v1/data" },
+    );
+    const text = await response.text();
+    expect(response.status, text).toBe(version === 5 ? 410 : 200);
+    if (version === 5) expect(text).not.toContain("selected-file-body");
+    else expect(text).toContain("selected-file-body");
+  });
+}

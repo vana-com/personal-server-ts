@@ -1,3 +1,11 @@
+import {
+  admitPdppRead,
+  type PdppChainEnforcementPort,
+} from "../pdpp/read-admission.js";
+export type {
+  PdppChainEnforcementPort,
+  PdppChainDecision,
+} from "../pdpp/read-admission.js";
 import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { parseRecordQuery } from "./pdpp-record-query.js";
 import { Hono, type Context } from "hono";
@@ -22,9 +30,7 @@ import {
   mapInactiveToError,
   admitBearer,
   connectionsLease,
-  pdppBearerReadLease,
   recordWithinGrantTimeConstraint,
-  type PdppChainEvidence,
   resolveReadScope,
   summarizeIngest,
   type IngestOutcome,
@@ -37,9 +43,7 @@ import {
 import {
   allDeliveryLeases,
   deliver,
-  evidenceTime,
   type DeliveryLease,
-  type EvidenceTime,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import { createRecordDataValidator } from "../pdpp/record-schema.js";
 import {
@@ -49,8 +53,6 @@ import {
 
 import {
   bearerErrorResponse,
-  chainDenialError,
-  type PdppChainDenialCause,
   type PdppProtocolProfile,
 } from "../pdpp/bearer-response.js";
 export { resourceMetadataUrlFor } from "../pdpp/bearer-response.js";
@@ -279,73 +281,6 @@ export interface PdppRecordsRouteDeps {
 export interface PdppRouteLogger {
   error(payload: Record<string, unknown>, message: string): void;
 }
-
-/**
- * The chain check a client read must pass, when a deployment enforces one.
- *
- * ## Why this is a port and not a direct chain call
- *
- * The route must not import a chain SDK: PDPP Core is chain-neutral, and a
- * deployment with no chain must still serve reads. Keeping the dependency as
- * an injected port is what lets standalone PDPP stay standalone while a Vana
- * deployment enforces the ledger, without two code paths through the route.
- *
- * ## Fail closed, and the three outcomes are NOT interchangeable
- *
- * `authorize` answers one of three things, and the distinction matters
- * because two of them deny while only one of those is worth retrying:
- *
- *   - `{ ok: true }` — a binding exists, the live chain grant is unrevoked,
- *     the owner matches, and the grantee is this client's app.
- *   - `{ ok: false, retryable: false }` — a definite denial. No binding, or
- *     a revoked/mismatched one. The answer will not change by asking again.
- *   - `{ ok: false, retryable: true }` — the chain or gateway could not be
- *     reached, so we do not KNOW the answer.
- *
- * The third case is the one that decides whether this design is honest. Not
- * knowing is not permission. Serving a read because the gateway was down
- * would make an outage into an authorization bypass, and it would do so
- * silently, which is worse than refusing. So an unknown answer denies, and
- * is reported as `503` with `Retry-After` rather than `403`, because the
- * client's grant may be perfectly valid and a permanent-looking refusal
- * would send them to re-consent for no reason.
- *
- * This also means a binding is never accepted as nullable: a deployment that
- * enforces the chain and cannot resolve a grant denies the read. There is no
- * "no binding yet, allow it" state, because that state is indistinguishable
- * from "never bound".
- */
-export interface PdppChainEnforcementPort {
-  authorize(input: {
-    /** The PDPP grant presented by the client token. */
-    pdppGrantId: string;
-    /** The OAuth client the token was issued to. */
-    clientId: string;
-  }): Promise<PdppChainDecision>;
-}
-
-export type PdppChainDecision =
-  | {
-      ok: true;
-      /**
-       * The chain permission's expiry (ISO 8601), or null/absent when it has
-       * none. The read's delivery lease carries it and refuses at release
-       * once it passes, whatever the remote re-verification window.
-       */
-      expiresAt?: string | null;
-    }
-  | {
-      ok: false;
-      retryable: true;
-      reason: string;
-    }
-  | {
-      ok: false;
-      retryable: false;
-      reason: string;
-      /** Why the chain refused; never inferred from `reason`. */
-      cause: PdppChainDenialCause;
-    };
 
 /**
  * The slice of the owner access feed a PDPP read can populate.
@@ -724,129 +659,20 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         ),
       };
     }
-    // Admission is dated before the resolution is awaited: a remote AS's
-    // answer is as old as the moment its introspection started.
     const admission = await admitBearer(deps.auth, token);
-    const context = admission.context;
-    let chainDecision: Extract<PdppChainDecision, { ok: true }> | undefined;
-    let chainVerifiedAt: EvidenceTime | undefined;
-
-    // Chain enforcement, when the deployment configures it. Placed here so
-    // EVERY endpoint is covered by one gate: a check added per-route is a
-    // check that a later route forgets, and an unenforced read path is
-    // exactly the defect this closes.
-    //
-    // Only client tokens are gated. An owner token is the owner reading their
-    // own data, which no chain permission mediates -- requiring a grantee
-    // permission for it would lock owners out of their own server.
-    if (deps.chainEnforcement && context?.active) {
-      if (context.tokenKind === "client") {
-        const grantId = context.grant?.grant_id;
-        if (!grantId) {
-          // An active client token with no grant cannot be bound to anything,
-          // so there is nothing to verify and nothing to allow.
-          return {
-            error: sendError(
-              c,
-              chainDenialError(
-                "invalid",
-                "No chain binding for this grant",
-                deps.protocolProfile,
-              ),
-              reqId,
-            ),
-          };
-        }
-
-        chainVerifiedAt = evidenceTime();
-        const decision = await deps.chainEnforcement.authorize({
-          clientId: context.clientId ?? "",
-          pdppGrantId: grantId,
-        });
-        if (decision.ok) chainDecision = decision;
-
-        if (!decision.ok) {
-          await logClientRead(c, context, "unknown", "denied", reqId);
-          return { error: sendChainRefusal(c, decision, reqId) };
-        }
-      }
-    }
-
-    if (context?.active) {
-      const chained =
-        deps.chainEnforcement && context.tokenKind === "client"
-          ? chainDecision
-          : undefined;
-      const lease = pdppBearerReadLease(deps.auth, admission, {
-        ...(chained && {
-          chain: {
-            admitted: { expiresAt: chained.expiresAt },
-            reverify: () => reverifyChain(context),
-            verifiedAt: chainVerifiedAt,
-          },
-        }),
-      });
-      // Admission re-check. The chain check above awaits the gateway, and the
-      // bearer can end during that wait (the grant revoked, the token
-      // expired, its refresh family revoked). The context resolved before the
-      // wait must not admit the read, so ask the read's lease before any read
-      // work. The chain verification just made counts as fresh, so this is
-      // local only. The delivery gate stays the last gate.
-      if (chained) {
-        try {
-          await deliver(lease, () => undefined);
-        } catch (err) {
-          return { error: sendLeaseRefusal(c, err, reqId) };
-        }
-      }
-      c.set("delivery" as never, { lease } satisfies DeliveryGate as never);
-    }
-    return { context };
-  }
-
-  /**
-   * A chain refusal as the route's error. A retryable failure is NOT reported
-   * as a denial: the grant may be valid and the chain merely unreachable, so
-   * `grant_revoked` would send a good client to re-consent over an outage.
-   * §8 defines no 503 code, so it is `api_error` (500), which is honest (the
-   * failure is ours) with a `Retry-After` hint.
-   */
-  function chainRefusal(
-    decision: Exclude<PdppChainDecision, { ok: true }>,
-  ): PdppError {
-    if (decision.retryable) {
-      return new PdppError(
-        "api_error",
-        "Chain authorization could not be verified",
+    try {
+      const read = await admitPdppRead(deps, admission);
+      c.set(
+        "delivery" as never,
+        { lease: read.lease } satisfies DeliveryGate as never,
       );
+      return { context: read.context };
+    } catch (err) {
+      if (admission.context.active) {
+        await logClientRead(c, admission.context, "unknown", "denied", reqId);
+      }
+      return { error: sendLeaseRefusal(c, err, reqId) };
     }
-    return chainDenialError(
-      decision.cause,
-      decision.reason,
-      deps.protocolProfile,
-    );
-  }
-
-  function sendChainRefusal(
-    c: Context,
-    decision: Exclude<PdppChainDecision, { ok: true }>,
-    reqId: string,
-  ): Response {
-    return sendError(c, chainRefusal(decision), reqId, {
-      ...(decision.retryable && { headers: { "Retry-After": "5" } }),
-    });
-  }
-
-  /** The chain check again, for the delivery lease (see `pdppBearerReadLease`). */
-  async function reverifyChain(
-    context: PdppTokenContext,
-  ): Promise<PdppChainEvidence> {
-    const decision = await deps.chainEnforcement!.authorize({
-      clientId: context.clientId ?? "",
-      pdppGrantId: context.grant?.grant_id ?? "",
-    });
-    if (!decision.ok) throw chainRefusal(decision);
-    return { expiresAt: decision.expiresAt };
   }
 
   // PDPP-Version negotiation: only PDPP_VERSION is supported in v0.1.

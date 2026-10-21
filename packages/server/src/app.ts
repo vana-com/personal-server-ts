@@ -88,7 +88,7 @@ import {
 import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
 import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
 import type { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
-import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type { PdppReadAuthority } from "./pdpp/read-admission.js";
 import type { LegacyScopeViewPort } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type {
   PdppRecordStore,
@@ -239,11 +239,10 @@ export interface AppDeps {
    * present, all three must be present together (record store, token
    * resolution, and stream declarations are mutually required).
    */
-  pdpp?: {
+  pdpp?: PdppReadAuthority & {
     store: PdppRecordStore;
     bindingStore: ReturnType<typeof createSqliteRecordStore>;
     configuredMethods: Map<string, string[]>;
-    auth: PdppAuthorizationService;
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
     instancesForSource?: (subjectId: string, sourceId: string) => string[];
@@ -341,12 +340,18 @@ export function createApp(deps: AppDeps): Hono {
         configuredMethods: deps.pdpp.configuredMethods,
       }),
     );
+    // One deployment authority for record, metadata and blob reads. Omission
+    // of chainEnforcement retains the explicit chain-neutral contract.
+    const readAuthority = {
+      auth: deps.pdpp.auth,
+      chainEnforcement: deps.pdpp.chainEnforcement,
+      protocolProfile: deps.pdppAuth?.protocolProfile,
+    };
     app.route(
       "/v1",
       pdppRecordsRoutes({
-        protocolProfile: deps.pdppAuth?.protocolProfile,
+        ...readAuthority,
         store: deps.pdpp.store,
-        auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
@@ -388,9 +393,8 @@ export function createApp(deps: AppDeps): Hono {
     app.route(
       "/v1/blobs",
       pdppBlobsRoutes({
-        protocolProfile: deps.pdppAuth?.protocolProfile,
+        ...readAuthority,
         store: deps.pdpp.store,
-        auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,
         instancesForSource: deps.pdpp.instancesForSource,
