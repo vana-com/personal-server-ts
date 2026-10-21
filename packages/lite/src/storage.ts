@@ -1,4 +1,5 @@
 import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
+import { canonicalJson } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   DataBlockManifest,
@@ -566,21 +567,6 @@ export async function createPersistentPsLiteStorage(
     }
   }
 
-  // Versions indexed before provenance existed: resolve them from their
-  // bytes before the port is exposed. Unreadable ones stay unknown, which the
-  // read policy refuses to grantees; the next startup retries them.
-  let originsChanged = false;
-  for (const entry of state.entries) {
-    if (entry.pdppOrigin !== undefined) continue;
-    const pdppOrigin = entry.producer
-      ? true
-      : await originOfPublishedBytes(entry.path);
-    if (pdppOrigin === undefined) continue;
-    entry.pdppOrigin = pdppOrigin;
-    originsChanged = true;
-  }
-  if (originsChanged) await persist();
-
   function entriesForScope(scope: string): IndexEntry[] {
     return sortEntries(state.entries.filter((entry) => entry.scope === scope));
   }
@@ -643,9 +629,9 @@ export async function createPersistentPsLiteStorage(
     /**
      * Publish a version without replacing one. A version path names
      * immutable bytes: readers authorize the version they selected, including
-     * its PDPP provenance, before reading the path. Identical bytes republish
-     * idempotently (this also moves an IndexedDB fallback copy into OPFS);
-     * different bytes fail.
+     * its PDPP provenance, before reading the path. The same envelope, in any
+     * key order, republishes idempotently (this also moves an IndexedDB
+     * fallback copy into OPFS); a different envelope fails.
      */
     async writeEnvelope(envelope): Promise<WriteResult> {
       const path = envelopePath(envelope.scope, envelope.collectedAt);
@@ -655,8 +641,7 @@ export async function createPersistentPsLiteStorage(
         // bytes may restore it only with the provenance the row records.
         const indexed = state.entries.find((entry) => entry.path === path);
         if (
-          (published &&
-            JSON.stringify(published) !== JSON.stringify(envelope)) ||
+          (published && canonicalJson(published) !== canonicalJson(envelope)) ||
           (indexed?.pdppOrigin !== undefined &&
             indexed.pdppOrigin !== hasPdppOrigin(envelope))
         ) {
@@ -733,6 +718,9 @@ export async function createPersistentPsLiteStorage(
           collectedAt: manifest.collectedAt,
           ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
           contentKind: manifest.contentKind,
+          ...(manifest.pdppOrigin === undefined
+            ? {}
+            : { pdppOrigin: manifest.pdppOrigin }),
           blocks: selection.blocks,
           warnings: [...manifest.warnings, ...selection.warnings],
         };
@@ -814,6 +802,9 @@ export async function createPersistentPsLiteStorage(
         collectedAt: manifest.collectedAt,
         ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
         contentKind: manifest.contentKind,
+        ...(manifest.pdppOrigin === undefined
+          ? {}
+          : { pdppOrigin: manifest.pdppOrigin }),
         blocks,
         ...(nextOffset !== undefined || nextIndex < manifest.blocks.length
           ? {
@@ -917,6 +908,10 @@ export async function createPersistentPsLiteStorage(
     },
 
     async insertEntry(entry) {
+      // Storage derives provenance from the bytes it published; a caller's
+      // value is never trusted. The row is indexed first, synchronously, so
+      // index writes keep their order; its provenance follows from the read.
+      const { pdppOrigin: _callerOrigin, ...callerEntry } = entry;
       const version =
         entry.version ??
         state.entries.reduce(
@@ -925,7 +920,7 @@ export async function createPersistentPsLiteStorage(
           0,
         ) + 1;
       const indexed: IndexEntry = {
-        ...entry,
+        ...callerEntry,
         schemaId: entry.schemaId ?? null,
         version,
         dataPointId: entry.dataPointId ?? null,
@@ -941,8 +936,19 @@ export async function createPersistentPsLiteStorage(
           indexed,
         ],
       };
+      const pdppOrigin = await originOfPublishedBytes(entry.path);
+      if (pdppOrigin !== undefined) {
+        state = {
+          ...state,
+          entries: state.entries.map((item) =>
+            item.path === entry.path && item.id === indexed.id
+              ? { ...item, pdppOrigin }
+              : item,
+          ),
+        };
+      }
       await persist();
-      return indexed;
+      return pdppOrigin === undefined ? indexed : { ...indexed, pdppOrigin };
     },
 
     async updateFileId(path, fileId) {

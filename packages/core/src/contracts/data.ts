@@ -1,5 +1,4 @@
 import { isSystemScope } from "../policy/reserved-scopes.js";
-import { hasPdppOrigin } from "../sync/pdpp-import.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import {
   type DataStoragePort,
@@ -129,6 +128,12 @@ export interface ListDataVersionsContractInput {
   limit?: number;
   offset?: number;
   isVisible?: DataVisibilityFilter;
+  /**
+   * The listing goes to a non-owner. PDPP producer provenance (payload
+   * digest, declaration digest, change tokens) describes PDPP data, so it is
+   * withheld; the producer name stays, since it is what marks the version.
+   */
+  forGrantee?: boolean;
 }
 
 export interface ListDataVersionsContractResult {
@@ -205,9 +210,6 @@ async function commitWrittenEnvelope(
   entry: Omit<NewIndexEntry, "path" | "sizeBytes"> & { sizeBytes?: number },
   precondition?: LegacyPrecondition,
 ): Promise<{ ok: true; writeResult: WriteResult } | DataContractError> {
-  // Publication never replaces a version path with different bytes, so the
-  // provenance of this envelope is the provenance of the bytes indexed.
-  entry = { ...entry, pdppOrigin: hasPdppOrigin(envelope) };
   if (storage.commitEnvelope) {
     const result = await storage.commitEnvelope(envelope, entry, precondition);
     if (!result.ok) {
@@ -508,9 +510,10 @@ export async function listDataVersionsContract(
         collectedAt: entry.collectedAt,
         version: entry.casRevision ?? entry.version,
         producer: entry.producer ?? null,
-        producer_provenance: entry.producerProvenance
-          ? (JSON.parse(entry.producerProvenance) as LegacyProducerProvenance)
-          : null,
+        producer_provenance:
+          entry.producerProvenance && !input.forGrantee
+            ? (JSON.parse(entry.producerProvenance) as LegacyProducerProvenance)
+            : null,
       })),
       total,
       limit,
@@ -595,7 +598,9 @@ export async function readDataContract(
     at: input.at,
   });
 
-  if (!entry) {
+  // A fileId names one version of one scope: a row of another scope is not
+  // this scope's data, whatever the storage lookup answered.
+  if (!entry || entry.scope !== scopeResult.scope) {
     return {
       ok: false,
       status: 404,

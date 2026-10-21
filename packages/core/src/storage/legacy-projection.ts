@@ -33,6 +33,11 @@ import { buildDataBlocksAsync } from "./blocks/build.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
 import type { DataBlockManifest, DataScopeBlock } from "./blocks/types.js";
 import { previewEnvelopeValue } from "./preview.js";
+import {
+  GRANTEE_VIEW,
+  isGuarded,
+  withDisclosurePolicy,
+} from "./disclosure-policy.js";
 
 /** Keys the server stamps into `data`; they are not part of the body. */
 const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
@@ -456,7 +461,7 @@ export function withLegacyProjection(
       (await projected(scope, collectedAt)) !== null;
   }
 
-  return new Proxy(raw, {
+  const served: DataStoragePort = new Proxy(raw, {
     get(target, property) {
       if (Object.prototype.hasOwnProperty.call(overrides, property)) {
         return overrides[property as keyof typeof overrides];
@@ -471,6 +476,18 @@ export function withLegacyProjection(
       );
     },
   });
+  // A non-owner's view projects from the guarded raw port, so the requested
+  // version and every joined sibling version are authorized on their bytes.
+  // Built once per served port, so it keeps its own projection caches.
+  let granteeView: DataStoragePort | undefined;
+  (overrides as Record<symbol, unknown>)[GRANTEE_VIEW] = isGuarded(raw)
+    ? () => served
+    : () =>
+        (granteeView ??= withLegacyProjection(
+          withDisclosurePolicy(raw),
+          options,
+        ));
+  return served;
 }
 
 /**

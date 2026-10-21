@@ -1020,12 +1020,15 @@ describe("mcp/read-client deletion gate", () => {
               contentKind: "vana-envelope",
               blocks: structuredClone(options.blocks ?? STAMPED_BLOCKS),
               warnings: [],
+              // Sidecars record their envelope's provenance.
+              pdppOrigin: false,
             }),
             readBlockManifest: vi.fn().mockResolvedValue({
               version: 1 as const,
               scope: "spine.health.summary",
               collectedAt: "2026-06-05T00:00:00Z",
               contentKind: "vana-envelope" as const,
+              pdppOrigin: false,
               blocks: STAMPED_BLOCKS.map(({ id, path, sizeBytes }) => ({
                 id,
                 path,

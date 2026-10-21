@@ -825,6 +825,38 @@ describe("PS-Lite legacy projection", () => {
     });
   });
 
+  it("P2-b: refuses a grantee a projection that joins a PDPP-stamped sibling", async () => {
+    const { runtime } = createRuntime();
+    const stamped = await runtime.fetch(
+      new Request("https://ps.local/v1/data/chatgpt.messages", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer owner-token",
+          "Content-Type": "application/json",
+          "Vana-Producer": "pdpp-projector",
+        },
+        body: JSON.stringify(messages),
+      }),
+    );
+    expect(stamped.status).toBe(201);
+    await post(runtime, "chatgpt.conversations", conversations);
+
+    const res = await get(
+      runtime,
+      "/v1/data/chatgpt.conversations?grantId=grant-1",
+      "builder-token",
+    );
+    const text = await res.text();
+    expect(res.status, text).toBe(403);
+    expect(text).not.toContain("message_count");
+    // Control: the owner reads the same projection.
+    const owner = await get(runtime, "/v1/data/chatgpt.conversations");
+    expect(owner.status).toBe(200);
+    expect(((await owner.json()) as { data: unknown }).data).toMatchObject({
+      conversations: [{ id: "conv-1", message_count: 1 }],
+    });
+  });
+
   it("serves a grantee the projected body", async () => {
     const { runtime } = createRuntime();
     await post(runtime, "chatgpt.messages", messages);

@@ -1,4 +1,10 @@
 import { isSystemScope } from "./reserved-scopes.js";
+
+export {
+  authorizeLegacyRead,
+  type LegacyReadBody,
+  type LegacyReader,
+} from "./legacy-disclosure.js";
 import type {
   Builder,
   GatewayGrantResponse,
@@ -24,7 +30,6 @@ import {
 } from "../ports/index.js";
 import { verifyPdppGrantBinding } from "../grants/pdpp-binding.js";
 import type { PdppGrantBindingStore } from "../grants/pdpp-binding-store.js";
-import type { IndexEntry } from "../storage/index/types.js";
 
 export interface DataReadPolicyInput {
   signer: `0x${string}`;
@@ -193,46 +198,6 @@ export async function verifyDataReadPolicy(
   }
 
   return grant;
-}
-
-/**
- * Who receives a read served by the legacy data surfaces: `/v1/data` (Node
- * and Lite), MCP, derivative questions and TEE jobs. `owner` is the owner or
- * the server-internal policy-bypass sentinel; every other caller, including
- * one holding a PDPP-bound chain grant, is a `grantee`.
- */
-export type LegacyReader = "owner" | "grantee";
-
-/** The body a legacy-surface read is about to disclose. */
-export type LegacyReadBody =
-  /** The canonical view, or its refusal, of a scope the PDPP store owns. */
-  | { kind: "canonical-view" }
-  /** One stored version, selected from the index. */
-  | { kind: "stored-version"; entry: Pick<IndexEntry, "pdppOrigin"> };
-
-/**
- * The one decision for disclosing PDPP data through the legacy surfaces.
- *
- * A legacy chain grant authorizes actual legacy files only, with or without a
- * PDPP grant binding. The canonical view and every stored version with PDPP
- * origin reach a non-owner only through the PDPP resource server, which
- * applies the PDPP grant's selection, projection and time constraints. There
- * is deliberately no chain-to-PDPP bridge here. A version whose origin
- * storage has not resolved yet is treated as PDPP, so the decision fails
- * closed. The owner keeps full authority over their own data.
- */
-export function authorizeLegacyRead(
-  reader: LegacyReader,
-  body: LegacyReadBody,
-): void {
-  if (reader === "owner") return;
-  if (body.kind === "stored-version" && body.entry.pdppOrigin === false) {
-    return;
-  }
-  throw new GrantRequiredError({
-    reason:
-      "PDPP data is readable only with a PDPP access token at the PDPP resource server",
-  });
 }
 
 /**

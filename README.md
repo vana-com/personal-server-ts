@@ -87,7 +87,11 @@ PDPP origin (native `$pdpp` import metadata, or a `pdpp-projector` /
 `pdpp-import-projection` producer stamp), reach a non-owner only through the
 PDPP resource server with a PDPP access token. This applies to `/v1/data`
 (Node and Lite), MCP, derivative questions and TEE jobs. The owner keeps full
-access. A version path never changes its bytes once published.
+access. The decision is made on the bytes a non-owner read returns: such
+reads go through a storage view that checks every body (envelope, blocks,
+and each sibling scope a legacy projection joins). A version path never
+changes its content once published, and non-owner version listings omit PDPP
+producer provenance.
 
 ### Server Registration
 
