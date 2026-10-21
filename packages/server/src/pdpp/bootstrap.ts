@@ -403,8 +403,8 @@ async function readDeclarations(
  * retained declarations, no owner) still counts, since PDPP data may exist.
  */
 export function pdppIsConfigured(
-  config: { pdpp: { enabled: boolean } },
+  config: { pdpp: { enabled: boolean } } | undefined,
   mounted: unknown,
-): boolean {
-  return config.pdpp.enabled || mounted !== undefined;
+): boolean | undefined {
+  return mounted !== undefined ? true : config?.pdpp.enabled;
 }

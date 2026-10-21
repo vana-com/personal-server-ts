@@ -675,7 +675,7 @@ export async function createServer(
   // routes mounted: a configured service that failed to mount (no retained
   // declarations, say) still counts, because PDPP data may still exist.
   // Read lazily; `pdppAuth` is resolved further down.
-  const pdppConfigured = () => pdppIsConfigured(config, pdppAuth);
+  const pdppConfigured = () => pdppIsConfigured(config, pdppAuth) ?? true;
   const derivativeScheduler: RecomputeScheduler = createRecomputeScheduler({
     store: questionStore,
     debounceMs: config.inference.recomputeDebounceMs,
