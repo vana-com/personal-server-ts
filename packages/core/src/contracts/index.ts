@@ -1,3 +1,4 @@
+export { canonicalJsonBytes } from "../derivatives/e2ee/jcs.js";
 export {
   deleteDataScopeContract,
   IngestPersistedError,

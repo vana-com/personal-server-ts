@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import ouraProfileProvenance from "../../core/src/legacy-projection/declarations/oura-browser.provenance.json";
+import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
+import { describe, expect, it, vi } from "vitest";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   createMemoryPsLiteStorage,
@@ -40,7 +42,11 @@ function input(collectedAt = newTime): OuraBrowserImportInput {
     },
   };
 }
-async function setup(extraDay = false, storage = createMemoryPsLiteStorage()) {
+async function setup(
+  extraDay = false,
+  storage = createMemoryPsLiteStorage(),
+  runtimeOptions: Partial<Parameters<typeof createPsLiteRuntime>[0]> = {},
+) {
   const envelope = createDataFileEnvelope("oura.activity", oldTime, {
     days: [
       { id: "activity-1", day: "2026-10-13", score: 60 },
@@ -69,6 +75,7 @@ async function setup(extraDay = false, storage = createMemoryPsLiteStorage()) {
       ownerToken: "owner",
       builderToken: "builder",
     }),
+    ...runtimeOptions,
   });
   const post = (body: unknown, token = "owner") =>
     runtime.fetch(
@@ -326,5 +333,63 @@ describe("Lite Oura browser takeover", () => {
         .scopes.map((entry) => entry.scope)
         .sort(),
     ).toEqual(streams.map((stream) => `oura.${stream}`).sort());
+  });
+
+  it("uses ordinary ingest provenance, tombstone ordering, derivative invalidation and sync notifications", async () => {
+    const tracker = createScopeDeletionTracker({
+      serverOwner: "0x0000000000000000000000000000000000000001",
+    });
+    tracker.markDeleted("oura.activity", {
+      deletedAt: "2026-10-14T01:00:00.000Z",
+      version: "7",
+    });
+    const trigger = vi.fn().mockResolvedValue(undefined);
+    const markSourceChanged = vi.fn();
+    const { storage, post, runtime } = await setup(
+      false,
+      createMemoryPsLiteStorage(),
+      {
+        scopeDeletions: tracker,
+        syncManager: { trigger, getStatus: vi.fn() },
+        derivatives: {
+          store: {} as never,
+          scheduler: { markSourceChanged } as never,
+        },
+      },
+    );
+    expect((await post(input())).status).toBe(200);
+    for (const stream of streams) {
+      const scope = `oura.${stream}`;
+      const head = storage.findEntry({ scope })!;
+      const envelope = (await storage.readEnvelope(
+        scope,
+        head.collectedAt,
+      )) as unknown as Record<string, unknown>;
+      expect.soft(envelope.producer).toBe("pdpp-import-projection");
+      expect.soft(envelope.producer_provenance).toMatchObject({
+        method: "oura-browser",
+        sourceCollectedAt: newTime,
+        declaration_digest:
+          ouraProfileProvenance.outputs["collection-profile.json"],
+      });
+      expect
+        .soft(envelope.producer_provenance)
+        .toEqual(JSON.parse(head.producerProvenance!));
+      expect
+        .soft(markSourceChanged)
+        .toHaveBeenCalledWith(scope, { lineageSources: undefined });
+    }
+    expect
+      .soft(
+        storage.findEntry({ scope: "oura.activity" })!.afterTombstoneVersion,
+      )
+      .toBe(7);
+    expect.soft(trigger).toHaveBeenCalledTimes(3);
+    const read = await runtime.fetch(
+      new Request("https://ps.test/v1/data/oura.activity", {
+        headers: { authorization: "Bearer owner" },
+      }),
+    );
+    expect.soft(read.status).toBe(200);
   });
 });

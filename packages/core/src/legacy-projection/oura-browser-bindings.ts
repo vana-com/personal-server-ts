@@ -14,6 +14,10 @@ const source = "https://registry.pdpp.dev/connectors/oura-browser";
 const digest =
   "sha256:ddc901015996e4ae67030bcd9ec809aa368b1b69d94b8ed5515d1be0a886975d";
 
+/** Digest of the frozen projection collection profile, distinct from its OCI image. */
+export const OURA_BROWSER_DECLARATION_DIGEST =
+  "sha256:0b149898fceb3aa16e6e97b170273a7660d23ed567a905d465ddd8274bc58ed7";
+
 export const OURA_BROWSER_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
   new Map(
     ["activity", "readiness", "sleep"].map(

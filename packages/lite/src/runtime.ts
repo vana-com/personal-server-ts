@@ -1129,6 +1129,18 @@ export function createPsLiteRuntime(
           const result = await importOuraBrowserRecords(
             toDataStoragePort(options.storage),
             body,
+            {
+              additions: options.additions,
+              scopeDeletions: options.scopeDeletions,
+              syncManager: options.syncManager ?? null,
+              onDataWritten: options.derivatives
+                ? (event) =>
+                    options.derivatives?.scheduler.markSourceChanged(
+                      event.scope,
+                      { lineageSources: event.lineageSources },
+                    )
+                : undefined,
+            },
           );
           return jsonResponse(result, { status: result.ok ? 200 : 409 });
         }

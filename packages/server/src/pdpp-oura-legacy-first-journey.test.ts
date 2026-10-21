@@ -1233,6 +1233,38 @@ describe("a takeover that oura-browser did not earn", () => {
 });
 
 describe("Oura default admission cutover", () => {
+  it("keeps earned canonical reads available after a partial refresh without completion receipts", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    const token = await writePdpp(DAYS, T_PDPP);
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(CANON));
+    const refreshedDays = [...DAYS, { n: 3, score: 91 }];
+    await replace(
+      token,
+      "activity",
+      pdppRows("oura.activity", refreshedDays),
+      T_PDPP,
+      { complete: false },
+    );
+    const refreshed = await observe("oura.activity");
+    expect(refreshed.owner.status).toBe(200);
+    expect(refreshed.owner.source).toBe("canonical");
+    expect(
+      dayRows(refreshed.builder, "oura.activity").map((row) => row.score),
+    ).toEqual(refreshedDays.map((day) => day.score));
+    for (const scope of ["oura.sleep", "oura.readiness"] as const) {
+      await replace(token, STREAM_OF[scope], pdppRows(scope, DAYS), T_PDPP);
+      expect((await observe("oura.activity")).owner.status).toBe(200);
+    }
+    const stored = await ctx!.app.request(
+      "/v1/data/oura.activity?view=stored",
+      { headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` } },
+    );
+    expect((await stored.json()).data).toEqual(
+      legacyBody("oura.activity", DAYS),
+    );
+  });
+
   it("keeps every legacy scope at each mixed-run boundary until all three streams complete the same run", async () => {
     await writeLegacy(DAYS, T_LEGACY);
     await restartWithMethods(["oura-browser"], []);

@@ -58,7 +58,7 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 7;
+const COVERAGE_RULE_VERSION = 8;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the
@@ -818,11 +818,12 @@ export function createLegacyScopeView(
       scope,
       selection: decision.selection,
       profileBy: "method",
-      // A completed checkpoint window may be compared for coverage, but an
-      // unfinished Oura run must never become the legacy scope's authority.
+      // Completion proves initial Oura admission. Once a takeover is earned,
+      // partial refreshes still face coverage checks without requiring receipts.
       requireCompletionReceipts:
         legacyHead !== null &&
-        (!input.readLegacyHead || decision.selection.method === "oura-browser"),
+        (!input.readLegacyHead ||
+          (decision.selection.method === "oura-browser" && !hasTakeover)),
       allowUnprovenEmptyStreams: legacyHead !== null && !!input.readLegacyHead,
       includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
       requireClaudeRawBlobs: legacyHead !== null && !!input.readLegacyHead,

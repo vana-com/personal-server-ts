@@ -1,8 +1,16 @@
-import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import {
+  handlePersonalServerDataRequest,
+  type PersonalServerDataApiDeps,
+} from "@opendatalabs/personal-server-ts-core/api";
+import {
+  canonicalJsonBytes,
+  sha256Hex,
+} from "@opendatalabs/personal-server-ts-core/contracts";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   projectPdppRecordsToLegacyPayload,
+  OURA_BROWSER_DECLARATION_DIGEST,
   type PdppRecord,
 } from "@opendatalabs/personal-server-ts-core/legacy-projection";
 import { compareLegacyCoverage } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-coverage";
@@ -20,6 +28,12 @@ export interface OuraBrowserImportInput {
     }[];
   };
 }
+/** Ordinary owner-ingest effects supplied by the runtime after owner authentication. */
+export type OuraBrowserImportOptions = Pick<
+  PersonalServerDataApiDeps,
+  "syncManager" | "scopeDeletions" | "additions" | "onDataWritten"
+>;
+
 export type OuraBrowserImportResult =
   | { ok: true; scopes: string[] }
   | { ok: false; reason: string; scope?: string };
@@ -32,6 +46,7 @@ function object(value: unknown): value is Record<string, unknown> {
 export async function importOuraBrowserRecords(
   storage: DataStoragePort,
   input: OuraBrowserImportInput,
+  options: OuraBrowserImportOptions = {},
 ): Promise<OuraBrowserImportResult> {
   // This public boundary also receives untrusted JSON from the owner route.
   if (
@@ -105,16 +120,17 @@ export async function importOuraBrowserRecords(
   }
   // Snapshot caller-owned input before awaiting locks/reads.
   const snapshot = structuredClone(input);
-  return withScopeLock("oura.activity", () =>
-    withScopeLock("oura.readiness", () =>
-      withScopeLock("oura.sleep", () => importLocked(storage, snapshot)),
-    ),
+  // Ingest updates the per-scope first-seen ledger under its own scope lock.
+  // Serialize imports with a distinct mutex; those locks are not re-entrant.
+  return withScopeLock("ps-lite:oura-browser-import", () =>
+    importLocked(storage, snapshot, options),
   );
 }
 
 async function importLocked(
   storage: DataStoragePort,
   input: OuraBrowserImportInput,
+  options: OuraBrowserImportOptions,
 ): Promise<OuraBrowserImportResult> {
   // Current connector records have no trusted upstream account identity.
   // Compare this complete batch alone; never union raw windows across requests.
@@ -184,7 +200,8 @@ async function importLocked(
     plans.push({
       scope,
       head,
-      envelope: createDataFileEnvelope(scope, storedAt, projection.payload),
+      collectedAt: storedAt,
+      payload: projection.payload,
     });
   }
   // Recheck the selected heads after asynchronous reads, before touching any file.
@@ -195,20 +212,59 @@ async function importLocked(
   ) {
     return { ok: false, reason: "head_changed" };
   }
-  for (const { scope, envelope } of plans) {
-    const write = await storage.writeEnvelope(envelope);
-    await storage.insertEntry({
-      scope,
-      collectedAt: envelope.collectedAt,
-      path: write.relativePath,
-      sizeBytes: write.sizeBytes,
-      fileId: null,
-      producer: "pdpp-import-projection",
-      producerProvenance: JSON.stringify({
-        method: "oura-browser",
-        sourceCollectedAt: input.collectedAt,
-      }),
+  for (const { scope, collectedAt, payload, head } of plans) {
+    const provenance = {
+      method: "oura-browser",
+      sourceCollectedAt: input.collectedAt,
+      projector_version: "oura-browser-lite/1",
+      declaration_digest: OURA_BROWSER_DECLARATION_DIGEST,
+      inputs: [], // This batch has no durable canonical change cursor.
+      payload_sha256: await sha256Hex(canonicalJsonBytes(payload)),
+    };
+    const encodedProvenance = btoa(JSON.stringify(provenance))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    const headers = new Headers({
+      "content-type": "application/json",
+      "vana-producer": "pdpp-import-projection",
+      "vana-producer-provenance": encodedProvenance,
     });
+    if (storage.commitEnvelope) {
+      if (head)
+        headers.set("if-match", `"${head.casRevision ?? head.version}"`);
+      else headers.set("if-none-match", "*");
+    }
+    // The public runtime authorizes the owner before entering this helper.
+    // This in-process call runs the same body/provenance validation, tombstone
+    // ordering, commit, additions ledger, derivative hook and sync path as POST.
+    const response = await handlePersonalServerDataRequest(
+      new Request(`https://ps-lite.internal/v1/data/${scope}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      }),
+      {
+        ...options,
+        storage,
+        auth: {
+          authorizeOwner: async () => {},
+          authorizeBuilderList: async () => {
+            throw new Error("Owner ingest only");
+          },
+          authorizeBuilderRead: async () => {
+            throw new Error("Owner ingest only");
+          },
+        },
+        accessLogWriter: { write: async () => {} },
+        now: () => new Date(collectedAt),
+      },
+      { basePath: "/v1/data" },
+    );
+    if (!response.ok) {
+      const failure = (await response.json()) as { error?: string };
+      return { ok: false, reason: failure.error ?? "ingest_failed", scope };
+    }
   }
   return { ok: true, scopes: STREAMS.map((stream) => `oura.${stream}`) };
 }

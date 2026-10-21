@@ -189,5 +189,6 @@ export {
 export {
   importOuraBrowserRecords,
   type OuraBrowserImportInput,
+  type OuraBrowserImportOptions,
   type OuraBrowserImportResult,
 } from "./oura-import.js";
