@@ -310,10 +310,13 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_order
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
   ON pdpp_record_changes (instance, stream, record_key, written_at DESC, version DESC);
 `,
-  // v13: the secret that seals sync tokens, beside the epoch so a rebuilt
-  // records DB expires every token the old one issued; an `emitted_key` that
-  // orders emitted time by instant rather than by timestamp text; and the
-  // identity-ordered history index sync pages seek in. `migrateToV13`
+  // v13: an `emitted_key` that orders emitted time by instant rather than by
+  // timestamp text, for list order, list seeks and the latest stream time.
+  // `migrateToV13` applies it.
+  "",
+  // v14: the secret that seals sync tokens, beside the epoch so a rebuilt
+  // records DB expires every token the old one issued, and the
+  // identity-ordered history index sync pages seek in. `migrateToV14`
   // applies it.
   "",
   // v14: one recoverable export-to-live transition per Claude connection.
@@ -366,20 +369,13 @@ function registerTimeKey(db: Database): void {
 }
 
 function migrateToV13(db: Database): void {
-  const addColumn = (table: string, column: string) => {
+  for (const table of ["pdpp_records", "pdpp_record_changes"]) {
     const columns = db.prepare(`PRAGMA table_info(${table})`).all() as {
       name: string;
     }[];
-    if (!columns.some((c) => c.name === column)) {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    if (!columns.some((c) => c.name === "emitted_key")) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN emitted_key TEXT`);
     }
-  };
-  addColumn("pdpp_store_metadata", "sync_token_key");
-  db.prepare(
-    "UPDATE pdpp_store_metadata SET sync_token_key = ? WHERE id = 1 AND sync_token_key IS NULL",
-  ).run(randomBytes(32).toString("base64"));
-  for (const table of ["pdpp_records", "pdpp_record_changes"]) {
-    addColumn(table, "emitted_key");
     db.exec(
       `UPDATE ${table} SET emitted_key = pdpp_time_key(emitted_at) WHERE emitted_key IS NULL`,
     );
@@ -388,11 +384,25 @@ function migrateToV13(db: Database): void {
 DROP INDEX IF EXISTS idx_pdpp_record_changes_snapshot_order;
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_key_order
   ON pdpp_record_changes (stream, emitted_key, record_key, instance, written_at);
-CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_sync_identity
-  ON pdpp_record_changes (stream, record_key, instance, written_at);
 CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
   ON pdpp_records (instance, stream, emitted_key)
   WHERE deleted = 0;
+`);
+}
+
+function migrateToV14(db: Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(pdpp_store_metadata)")
+    .all() as { name: string }[];
+  if (!columns.some((c) => c.name === "sync_token_key")) {
+    db.exec("ALTER TABLE pdpp_store_metadata ADD COLUMN sync_token_key TEXT");
+  }
+  db.prepare(
+    "UPDATE pdpp_store_metadata SET sync_token_key = ? WHERE id = 1 AND sync_token_key IS NULL",
+  ).run(randomBytes(32).toString("base64"));
+  db.exec(`
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_sync_identity
+  ON pdpp_record_changes (stream, record_key, instance, written_at);
 `);
 }
 
@@ -418,6 +428,7 @@ function migrate(db: Database): void {
         ).run(randomUUID());
       }
       if (v === 12) migrateToV13(db);
+      if (v === 13) migrateToV14(db);
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,

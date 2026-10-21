@@ -42,6 +42,7 @@ function streamGrant(
     name: "s",
     instance_ids: ["i"],
     fields: ["id", "name"],
+    ...(version === CANDIDATE ? { required_fields: ["id"] } : {}),
     time_constraint: {
       field: "t",
       ...(version === CANDIDATE ? { type: "date-time" as const } : {}),
@@ -646,7 +647,13 @@ for (const backend of ["memory", "sqlite"]) {
       h.put("a", { name: "A", t: OUTSIDE });
       const sync = await h.get(records("s", { changes_since: baseline }));
       expect(sync.body.data).toEqual([
-        { object: "record", id: "a", stream: "s", deleted: true },
+        {
+          object: "record",
+          id: "a",
+          instance_id: "i",
+          stream: "s",
+          deleted: true,
+        },
       ]);
     });
 
@@ -668,7 +675,13 @@ for (const backend of ["memory", "sqlite"]) {
       h.put("a", { name: "Secret", t: OUTSIDE });
       const sync = await h.get(records("s", { changes_since: baseline }));
       expect(sync.body.data).toEqual([
-        { object: "record", id: "a", stream: "s", deleted: true },
+        {
+          object: "record",
+          id: "a",
+          instance_id: "i",
+          stream: "s",
+          deleted: true,
+        },
       ]);
     });
 

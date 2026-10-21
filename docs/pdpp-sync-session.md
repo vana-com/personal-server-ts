@@ -21,7 +21,7 @@ them.
 | History at a horizon, reset fence, horizon validation | Each store's `readSyncWindow`, inside one read transaction. Its window yields changes lazily in identity order from a seek boundary.           |
 | One record per id on the wire                         | `assertOnlyHolder` in the session service and `listSnapshotPage` for lists; the detail route for single reads.                                 |
 | Order of emitted time                                 | `timeSortKey` in `pdpp/time.ts`, from the same parser as `compareTime`. SQLite stores it as `emitted_key`.                                     |
-| Sealing key and epoch                                 | Each store's `syncTokenScope`. SQLite keeps both in `pdpp_store_metadata` (schema v13).                                                        |
+| Sealing key and epoch                                 | Each store's `syncTokenScope`. SQLite keeps both in `pdpp_store_metadata` (schema v14).                                                        |
 | Stream discovery for a client token                   | The grant. `GET /v1/streams` lists every stream the grant names.                                                                               |
 
 Stores no longer mint cursors, bump the write clock for a sync read, or
@@ -78,7 +78,7 @@ read, alter or reuse its own current-profile tokens.
   because a sync read no longer advances the clock.
 - Changing `order` between candidate sessions invalidates the checkpoint, as
   the candidate binds `order` into the query context.
-- Schema v13 adds a column. As with earlier migrations, an older build refuses
+- Schema v14 adds a column. As with earlier migrations, an older build refuses
   to open the upgraded database.
 - Error precedence is unchanged: a deleted connection answers
   `404 instance_unavailable` before any `410`.
@@ -116,5 +116,5 @@ a changed `limit`, retries, and a SQLite restart followed by a reset.
   `400 invalid_cursor` and must start again from `beginning`.
 - Owner tokens always use the current profile; the candidate's owner-scope
   token rules are not implemented here.
-- Schema v13 is a one-way step, like the v12 migration this stack already
+- Schema v14 is a one-way step, like the v12 and v13 migrations this stack already
   adds.

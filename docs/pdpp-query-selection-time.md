@@ -89,8 +89,9 @@ for why a candidate sync page expires instead.
 
 SQLite lists use the `snapshotRows` primitive, with explicit indexes for
 ordered traversal and latest-version lookup; sync reads its own identity-ordered
-window (`docs/pdpp-sync-session.md`). Schema v12 adds those indexes, and v13
-orders traversal by emitted instant (`emitted_key`).
+window (`docs/pdpp-sync-session.md`). Schema v12 adds those indexes. Schema v13
+adds `emitted_key` (`timeSortKey(emitted_at)`) to live and history rows,
+backfills it, and orders list traversal and `last_updated` by it.
 SQLite iterates the ordered snapshot until one extra visible row establishes
 continuation; it does not copy the entire list into JavaScript memory. The memory
 backend reconstructs its snapshot from retained history and keeps one bounded

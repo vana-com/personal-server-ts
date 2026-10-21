@@ -206,6 +206,8 @@ export {
   parseTime,
   compareTime,
   timeSortKey,
+  legacyTimeBound,
+  compareLegacyTimeBounds,
   declaredTimeType,
   type TimeType,
 } from "./time.js";

@@ -984,7 +984,7 @@ describe("sqlite record store", () => {
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
         ).toEqual({ version: 14 });
-        // v13 gives the upgraded store a 32-byte sync token key.
+        // v14 gives the upgraded store a 32-byte sync token key.
         expect(upgraded.syncTokenScope().key).toHaveLength(32);
         expect(
           dbAfterUpgrade

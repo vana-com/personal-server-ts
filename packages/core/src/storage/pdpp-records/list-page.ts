@@ -111,9 +111,10 @@ export function listSnapshotPage(
     (!options.isVisible || options.isVisible(row));
   for (const row of rows) {
     if (!visible(row)) continue;
-    // Erasure overrides historical membership. Expire explicitly rather than
-    // resurrect deleted data or silently call an incomplete traversal complete.
-    if (wasErased?.(row)) throw new CursorExpiredError();
+    // Erasure overrides historical membership for that record only: a list
+    // is not a sync session, so withholding it loses nothing a later read
+    // could have relied on, and the rest of the snapshot stays readable.
+    if (wasErased?.(row)) continue;
     if (data.length === options.limit) {
       hasMore = true;
       break;
