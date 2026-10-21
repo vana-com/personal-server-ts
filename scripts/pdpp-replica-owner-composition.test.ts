@@ -382,6 +382,59 @@ it("reuses the existing authority with an exact verified dynamic declaration and
     (await (await real.app.request("/composition/state")).json())
       .canonical_records,
   ).toBe(1);
+
+  // Offline transport proof: the row A accepted through its normal owner
+  // ingest must be exportable by A and importable by an independent B that
+  // is bound to the same declaration, with no network transport involved.
+  const receiverB = await openReplicaRuntime({
+    root: join(root, "offline-receiver-B"),
+    owner: owner.address,
+    master: Array(32).fill(1),
+    serverKey: `0x${"02".repeat(32)}`,
+    scriptSha256: digest(
+      readFileSync(new URL("./pdpp-replica-live-journey.ts", import.meta.url)),
+    ),
+    source,
+  });
+  try {
+    expect(receiverB.snapshot().canonicalRows).toEqual([]);
+    const operations = [
+      ...runtime.store.replication.readBaselinePage({ limit: 1000 }).operations,
+      ...runtime.store.replication.readTailPage({ limit: 1000 }).operations,
+    ];
+    expect(operations.filter((op) => op.kind === "upsert")).toHaveLength(1);
+    const plan = receiverB.receiver.import({
+      credential: "isolated-harness",
+      envelope: {
+        format: "vana-pdpp-replica",
+        version: 1,
+        owner: owner.address,
+        batchId: "offline-ingest-to-import",
+        operations,
+      },
+    });
+    expect(plan.rejected).toEqual([]);
+    expect(plan.conflicts).toEqual([]);
+    expect(plan.pending).toEqual([]);
+    expect(plan.records).toHaveLength(1);
+    const fields = [
+      "instance",
+      "stream",
+      "record_key",
+      "data",
+      "emitted_at",
+      "deleted",
+      "blob_id",
+    ] as const;
+    const project = (rows: readonly Record<string, unknown>[] | undefined) =>
+      rows?.map((r) => Object.fromEntries(fields.map((f) => [f, r[f]])));
+    expect(project(receiverB.snapshot().canonicalRows)).toEqual(
+      project(runtime.snapshot().canonicalRows),
+    );
+    expect(receiverB.snapshot().canonicalRows).toHaveLength(1);
+  } finally {
+    await receiverB.close();
+  }
 });
 
 it("refuses owner token issuance without normal wallet proof and requires a signed source body", async () => {

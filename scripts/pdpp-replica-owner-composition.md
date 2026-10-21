@@ -68,6 +68,8 @@ PATH=/home/tnunamak/.local/lib/qwen-code/node/bin:$PATH TMPDIR=$HOME/.tmp \
 node_modules/.bin/tsc -p scripts/tsconfig.json --pretty false
 ```
 
+The tests also cover `evaluateConnectorReadiness`, the fail-closed predicate behind the connector `ready` receipt: each refusal (no rows, pending outbound work, a missing or unconfirmed B row, a differing `data`, `emitted_at` or `blob_id`, an oracle mismatch, a blob digest mismatch, no `Active` chain) returns not-ready with a reason. A second test takes the row A accepts through its normal owner ingest, exports A's replication operations and imports them into a separate B runtime with the same source binding. It asserts that B accepts the operation and holds the same seven canonical fields.
+
 Tests use the checked-in exact public declaration and labelled offline rows. They cover authority inode/token survival; missing-root and wrong-owner refusal; dynamic zero-row startup; genuine owner ingest; auth/method/generation refusal; renewal without record loss; signing/CORS/replay; exact callback/PKCE; and production legacy 401/404. They do not prove live collection or C1's consent/read journey.
 
 Preserve the old public receipt before restart. Hold port 3286 until parent review/commit and the reviewed #438 prerequisite are complete. SIGINT/SIGTERM closes owned listeners, workers and file ports without revoking consent or deleting authority/data. No remote cleanup is claimed without API confirmation.
