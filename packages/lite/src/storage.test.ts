@@ -80,6 +80,36 @@ describe("createPersistentPsLiteStorage", () => {
     ).toEqual({ id: "first" });
   });
 
+  it("refuses different simultaneous publications across storage instances", async () => {
+    // Two instances (tabs) over one file store and one persistence.
+    const files = createMemoryPsLiteDataFileStore();
+    const persistence = createMemoryPsLitePersistence();
+    const a = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      files,
+    );
+    const b = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      files,
+    );
+    const first = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "legacy" },
+    );
+    const second = { ...first, data: { id: "pdpp", $pdpp: { version: 1 } } };
+    const results = await Promise.allSettled([
+      a.writeEnvelope(first),
+      b.writeEnvelope(second),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect((await a.readEnvelope(first.scope, first.collectedAt)).data).toEqual(
+      { id: "legacy" },
+    );
+  });
+
   it("P2-d: derives provenance from the published bytes, not the caller", async () => {
     const storage = await createPersistentPsLiteStorage(
       { kind: "custom" },
