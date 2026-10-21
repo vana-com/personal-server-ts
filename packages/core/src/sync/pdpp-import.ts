@@ -292,6 +292,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Producer stamps that mark an envelope as PDPP-origin. The first two are
+ * asserted by the owner's PDPP pipelines over HTTP. `pdpp-derivative` is
+ * server-only: the derivative compute stamps it on an answer whose sources
+ * include PDPP-origin data, so the answer cannot leave through a legacy grant.
+ */
+export const PDPP_PRODUCERS = [
+  "pdpp-projector",
+  "pdpp-import-projection",
+  "pdpp-derivative",
+] as const;
+export type PdppProducer = (typeof PDPP_PRODUCERS)[number];
+
+export function isPdppProducer(value: unknown): value is PdppProducer {
+  return (PDPP_PRODUCERS as readonly unknown[]).includes(value);
+}
+
+/**
  * Immutable PDPP provenance at storage publication. Native metadata (including
  * malformed claims) and owner-stamped PDPP cache producers require grant-bound
  * reads. Nested phone `{records}` metadata is ordinary legacy compatibility.
@@ -306,9 +323,7 @@ export function hasPdppOrigin(
 ): boolean {
   return (
     envelope !== undefined &&
-    (envelope.producer === "pdpp-projector" ||
-      envelope.producer === "pdpp-import-projection" ||
-      readMetadata(envelope.data) !== null)
+    (isPdppProducer(envelope.producer) || readMetadata(envelope.data) !== null)
   );
 }
 

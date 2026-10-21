@@ -1,3 +1,4 @@
+import type { PdppProducer } from "../../sync/pdpp-import.js";
 export interface IndexEntry {
   id: number;
   fileId: string | null; // null until synced on-chain (Phase 4)
@@ -43,7 +44,7 @@ export interface IndexEntry {
    */
   generation?: string;
   /** Server-stamped origin of a legacy cache version. Null for older/manual writes. */
-  producer?: "pdpp-projector" | "pdpp-import-projection" | null;
+  producer?: PdppProducer | null;
   /** JSON provenance stored outside the grantee-visible data object. */
   producerProvenance?: string | null;
 }

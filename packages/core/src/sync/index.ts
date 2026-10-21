@@ -86,4 +86,9 @@ export {
   isTombstoneRecord,
 } from "./tombstone.js";
 
-export { hasPdppOrigin } from "./pdpp-import.js";
+export {
+  hasPdppOrigin,
+  isPdppProducer,
+  PDPP_PRODUCERS,
+  type PdppProducer,
+} from "./pdpp-import.js";

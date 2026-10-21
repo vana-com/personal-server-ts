@@ -1,3 +1,4 @@
+import type { PdppProducer } from "../sync/pdpp-import.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import {
@@ -55,7 +56,7 @@ export type DataContractErrorCode =
   | "DATA_FILE_MISSING"
   | "PRECONDITION_FAILED";
 
-export type LegacyProducer = "pdpp-projector" | "pdpp-import-projection";
+export type LegacyProducer = PdppProducer;
 export interface LegacyProducerProvenance {
   projector_version: string;
   declaration_digest: string;

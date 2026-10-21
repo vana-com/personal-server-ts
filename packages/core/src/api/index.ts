@@ -1053,6 +1053,8 @@ function parseProducerHeader(
   const encodedProvenance =
     request.headers.get("vana-producer-provenance") ?? undefined;
   if (producer === null && !encodedProvenance) return {};
+  // `pdpp-derivative` is deliberately absent: only the server's derivative
+  // compute may stamp it, never a request.
   if (producer !== "pdpp-projector" && producer !== "pdpp-import-projection") {
     return errorResponse(
       400,

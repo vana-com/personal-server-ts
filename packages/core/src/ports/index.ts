@@ -1,3 +1,4 @@
+import type { PdppProducer } from "../sync/pdpp-import.js";
 import type {
   Builder,
   DataFileEnvelope,
@@ -112,7 +113,7 @@ export type VersionCommit =
         schemaId: string | null;
         dataPointId: string;
         version: number;
-        producer?: "pdpp-projector" | "pdpp-import-projection";
+        producer?: PdppProducer;
         producerProvenance?: string;
       };
     };
