@@ -181,10 +181,6 @@ function hashOf(env: DataFileEnvelope): string {
   return keccak256(plaintextOf(env));
 }
 
-async function decryptedHash(bytes: Uint8Array): Promise<string> {
-  return keccak256(await decryptWithPassword(bytes, scopeKeyHex));
-}
-
 const logger = {
   info: vi.fn(),
   warn: vi.fn(),
@@ -274,12 +270,25 @@ describe("upload worker against write-once storage", () => {
     );
   }
 
-  /** Every registered version's stored bytes decrypt to its committed hash. */
+  /** Every registered version's stored bytes match both its commitments. */
   async function expectCommittedBytesMatch() {
     for (const [version, record] of registry.versions) {
       const stored = blobs.blobs.get(blobs.keyFor(version));
       expect(stored, `blob for committed version ${version}`).toBeDefined();
-      expect(await decryptedHash(stored!)).toBe(record.dataHash);
+      const plaintext = await decryptWithPassword(stored!, scopeKeyHex);
+      expect(keccak256(plaintext)).toBe(record.dataHash);
+      const { collectedAt } = JSON.parse(new TextDecoder().decode(plaintext));
+      expect(record.metadataHash).toBe(
+        keccak256(
+          stringToHex(
+            JSON.stringify({
+              scope: SCOPE,
+              collectedAt,
+              sizeBytes: stored!.length,
+            }),
+          ),
+        ),
+      );
     }
   }
 
@@ -401,8 +410,9 @@ describe("upload worker against write-once storage", () => {
   });
 
   it("with the registry feed wired, never writes to a version the registry committed", async () => {
-    // Pre-BUI-911 storage overwrites, so only the worker protects history
-    // here: this is the order in which the two fixes can roll out.
+    // Pre-BUI-911 storage overwrites, so only the worker's head check
+    // protects history here. Sequential only: concurrent writers on such
+    // storage can still race, so this is a mitigation, not a rollout proof.
     blobs = new WriteOnceStorage(false);
     const original = envelope("original");
     await upload(await replica(original, 1), { feed: true });
