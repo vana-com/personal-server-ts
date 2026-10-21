@@ -58,6 +58,7 @@ import {
   serverAccount,
   sourceId,
   storageUrl,
+  type Snapshot,
 } from "./pdpp-replica-live-journey.js";
 import {
   assertCanonicalEquality,
@@ -155,6 +156,72 @@ export function loadCompositionSource(options: {
   };
   buildReplicaRuntimeSource(descriptor);
   return descriptor;
+}
+
+export type ConnectorReceipt = {
+  canonical_rows: number;
+  canonical_sha256: string;
+  canonical_fields: string[];
+  referenced_blobs: number;
+  records_sha256: string;
+  source_id: string;
+};
+export type ConnectorNotReady =
+  | "no_rows"
+  | "outbound_pending"
+  | "rows_unconfirmed"
+  | "canonical_rows_differ"
+  | "oracle_mismatch"
+  | "blobs_differ"
+  | "no_active_chain";
+
+/**
+ * Decides whether device B has confirmed device A's real-source records.
+ * Fails closed: every mismatch is "not ready" with a reason, never a throw.
+ * `oracle` runs the independent SQL comparison only once the in-memory
+ * snapshots already agree; its throw is a mismatch.
+ */
+export function evaluateConnectorReadiness(input: {
+  a: Pick<Snapshot, "ownerRows" | "pending" | "canonicalRows" | "blobs">;
+  b: Pick<Snapshot, "appRows" | "canonicalRows" | "blobs" | "evidence">;
+  aCanonical: readonly unknown[];
+  sourceId: string;
+  oracle: () => { B: string; fields: string[] };
+}):
+  | { ready: true; receipt: ConnectorReceipt }
+  | { ready: false; reason: ConnectorNotReady } {
+  const { a, b } = input;
+  const no = (reason: ConnectorNotReady) => ({ ready: false as const, reason });
+  if (input.aCanonical.length === 0) return no("no_rows");
+  if (a.pending !== 0) return no("outbound_pending");
+  if (
+    a.ownerRows.length === 0 ||
+    b.appRows.length !== a.ownerRows.length ||
+    b.appRows.some((row) => row.confirmation !== undefined)
+  )
+    return no("rows_unconfirmed");
+  if (!b.canonicalRows || !isDeepStrictEqual(a.canonicalRows, b.canonicalRows))
+    return no("canonical_rows_differ");
+  let oracle: { B: string; fields: string[] };
+  try {
+    oracle = input.oracle();
+  } catch {
+    return no("oracle_mismatch");
+  }
+  if (!isDeepStrictEqual(a.blobs, b.blobs)) return no("blobs_differ");
+  if (!b.evidence.some((entry) => entry.chain?.status === "Active"))
+    return no("no_active_chain");
+  return {
+    ready: true,
+    receipt: {
+      canonical_rows: input.aCanonical.length,
+      canonical_sha256: oracle.B,
+      canonical_fields: oracle.fields,
+      referenced_blobs: Object.keys(b.blobs).length,
+      records_sha256: digest(JSON.stringify(b.canonicalRows)),
+      source_id: input.sourceId,
+    },
+  };
 }
 
 export async function createOwnerComposition(options: CompositionOptions) {
@@ -322,16 +389,7 @@ export async function createOwnerComposition(options: CompositionOptions) {
         blob_bytes: number;
       }
     | undefined;
-  let connectorConfirmed:
-    | {
-        canonical_rows: number;
-        canonical_sha256: string;
-        canonical_fields: string[];
-        referenced_blobs: number;
-        records_sha256: string;
-        source_id: string;
-      }
-    | undefined;
+  let connectorConfirmed: ConnectorReceipt | undefined;
   const devices: Device[] = [];
   let collector: Awaited<ReturnType<typeof openReplicaRuntime>> | undefined;
   let collectorRoutes: Hono | undefined;
@@ -652,7 +710,7 @@ export async function createOwnerComposition(options: CompositionOptions) {
                   : null,
               })),
             },
-            referenced_blobs: 0,
+            referenced_blobs: connectorConfirmed?.referenced_blobs ?? 0,
             legacy: {
               ready: Boolean(legacyRoutes),
               grant_endpoint: `${options.origin}/v1/grants`,
@@ -774,39 +832,26 @@ export async function createOwnerComposition(options: CompositionOptions) {
             if (result.status === "rejected") cycleRetries++;
           const left = a.snapshot();
           const right = await b.call("snapshot");
-          const actual = canonicalRows(join(dataRoot, "A/records.sqlite"));
-          const allRowsConfirmed =
-            left.ownerRows.length > 0 &&
-            right.appRows.length === left.ownerRows.length &&
-            right.appRows.every((row) => row.confirmation === undefined);
-          if (
-            actual.length > 0 &&
-            left.pending === 0 &&
-            allRowsConfirmed &&
-            right.canonicalRows &&
-            isDeepStrictEqual(left.canonicalRows, right.canonicalRows)
-          ) {
-            const oracle = assertCanonicalEquality(
-              join(dataRoot, "A/records.sqlite"),
-              join(dataRoot, "B/records.sqlite"),
-            );
-            assert.deepEqual(left.blobs, right.blobs);
-            assert(
-              right.evidence.some((entry) => entry.chain?.status === "Active"),
-              "No confirmed chain evidence",
-            );
-            connectorConfirmed = {
-              canonical_rows: actual.length,
-              canonical_sha256: oracle.B,
-              canonical_fields: oracle.fields,
-              referenced_blobs: Object.keys(right.blobs).length,
-              records_sha256: digest(JSON.stringify(right.canonicalRows)),
-              source_id: sourceId,
-            };
+          const readiness = evaluateConnectorReadiness({
+            a: left,
+            b: right,
+            aCanonical: canonicalRows(join(dataRoot, "A/records.sqlite")),
+            sourceId,
+            oracle: () =>
+              assertCanonicalEquality(
+                join(dataRoot, "A/records.sqlite"),
+                join(dataRoot, "B/records.sqlite"),
+              ),
+          });
+          if (readiness.ready) {
+            connectorConfirmed = readiness.receipt;
             phase = "ready";
           } else {
             connectorConfirmed = undefined;
-            phase = actual.length ? "replicating" : "awaiting_records";
+            phase =
+              readiness.reason === "no_rows"
+                ? "awaiting_records"
+                : "replicating";
           }
           await pause(2000);
         }

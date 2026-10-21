@@ -1,4 +1,4 @@
-import { afterEach, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   mkdtempSync,
   rmSync,
@@ -22,6 +22,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import {
   createOwnerComposition,
+  evaluateConnectorReadiness,
   loadCompositionSource,
 } from "./pdpp-replica-owner-composition.js";
 import {
@@ -613,4 +614,161 @@ it("uses one configured issuer, exact registered callback and PKCE; never proxie
     (await authorize({ ...request, code_challenge: undefined })).status,
   ).toBe(400);
   expect((await authorize(request)).status).toBe(201);
+});
+
+describe("connector readiness receipt", () => {
+  const row = {
+    instance: "actual-owned-connection",
+    stream: "activities",
+    record_key: "run-1",
+    data: { id: "run-1", distance_m: 1234.5 },
+    emitted_at: "2026-10-21T01:00:00Z",
+    deleted: 0,
+    blob_id: "blob-1" as string | null,
+  };
+  const blobs = { "blob-1": { sha256: "aa".repeat(32), bytes: 7 } };
+  const stored = { record_key: "run-1" } as never;
+  const active = { head: null, chain: { status: "Active" } } as never;
+  const oracleHash = "b".repeat(64);
+  function evaluate(
+    over: {
+      a?: Record<string, unknown>;
+      b?: Record<string, unknown>;
+      aCanonical?: unknown[];
+      oracle?: () => { B: string; fields: string[] };
+    } = {},
+  ) {
+    const aRows = [row];
+    return evaluateConnectorReadiness({
+      sourceId: "https://registry.pdpp.dev/sources/strava",
+      aCanonical: over.aCanonical ?? aRows,
+      oracle:
+        over.oracle ??
+        (() => ({ B: oracleHash, fields: ["instance", "stream"] })),
+      a: {
+        ownerRows: [stored],
+        pending: 0,
+        canonicalRows: aRows,
+        blobs,
+        ...over.a,
+      },
+      b: {
+        appRows: [stored],
+        canonicalRows: [{ ...row }],
+        blobs: { ...blobs },
+        evidence: [active],
+        ...over.b,
+      },
+    });
+  }
+  const notReady = (result: ReturnType<typeof evaluate>) =>
+    result.ready ? "ready" : result.reason;
+
+  it("is ready only on an exact match, with the receipt the evidence claim rests on", () => {
+    const result = evaluate();
+    expect(result).toEqual({
+      ready: true,
+      receipt: {
+        canonical_rows: 1,
+        canonical_sha256: oracleHash,
+        canonical_fields: ["instance", "stream"],
+        referenced_blobs: 1,
+        records_sha256: createHash("sha256")
+          .update(JSON.stringify([row]))
+          .digest("hex"),
+        source_id: "https://registry.pdpp.dev/sources/strava",
+      },
+    });
+  });
+
+  it("is not ready with zero rows, even if everything else agrees", () => {
+    expect(
+      notReady(
+        evaluate({
+          aCanonical: [],
+          a: { ownerRows: [], canonicalRows: [] },
+          b: { appRows: [], canonicalRows: [] },
+        }),
+      ),
+    ).toBe("no_rows");
+  });
+
+  it("is not ready while A still has unpublished outbound work", () => {
+    expect(notReady(evaluate({ a: { pending: 1 } }))).toBe("outbound_pending");
+  });
+
+  it("is not ready when B holds one row fewer than A", () => {
+    expect(notReady(evaluate({ b: { appRows: [], canonicalRows: [] } }))).toBe(
+      "rows_unconfirmed",
+    );
+  });
+
+  it("is not ready while a B row still carries a pending confirmation", () => {
+    expect(
+      notReady(
+        evaluate({
+          b: { appRows: [{ record_key: "run-1", confirmation: "pending" }] },
+        }),
+      ),
+    ).toBe("rows_unconfirmed");
+  });
+
+  it.each([
+    ["data", { data: { id: "run-1", distance_m: 1 } }],
+    ["emitted_at", { emitted_at: "2026-10-21T02:00:00Z" }],
+    ["blob_id", { blob_id: "blob-2" }],
+  ])("is not ready when B differs from A in %s only", (_field, change) => {
+    expect(
+      notReady(evaluate({ b: { canonicalRows: [{ ...row, ...change }] } })),
+    ).toBe("canonical_rows_differ");
+  });
+
+  it("is not ready when the independent SQL oracle disagrees", () => {
+    expect(
+      notReady(
+        evaluate({
+          oracle: () => {
+            throw new Error("independent canonical SQL equality");
+          },
+        }),
+      ),
+    ).toBe("oracle_mismatch");
+  });
+
+  it("is not ready when a blob digest differs", () => {
+    expect(
+      notReady(
+        evaluate({
+          b: { blobs: { "blob-1": { sha256: "cc".repeat(32), bytes: 7 } } },
+        }),
+      ),
+    ).toBe("blobs_differ");
+  });
+
+  it("is not ready without Active chain evidence", () => {
+    expect(
+      notReady(
+        evaluate({
+          b: {
+            evidence: [
+              { head: null, chain: { status: "Pending" } },
+              { head: null, chain: null },
+            ],
+          },
+        }),
+      ),
+    ).toBe("no_active_chain");
+  });
+
+  it("does not run the oracle until the in-memory snapshots agree", () => {
+    let called = false;
+    evaluate({
+      b: { canonicalRows: [{ ...row, data: {} }] },
+      oracle: () => {
+        called = true;
+        return { B: oracleHash, fields: [] };
+      },
+    });
+    expect(called).toBe(false);
+  });
 });
