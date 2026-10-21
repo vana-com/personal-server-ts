@@ -4173,3 +4173,153 @@ type PdppVisibleRecordLike = {
   deleted: boolean;
   data: Record<string, unknown>;
 };
+
+/**
+ * The agreed generation-aware predicate (synthesis lane): a key fact for
+ * generation g hides rows of generation g only. Rows that carry their own
+ * generation pass it as `generationSql`; canonical rows use the binding's
+ * current generation.
+ */
+function generationAwareUnquarantined(alias: string, generationSql?: string) {
+  const generation =
+    generationSql ??
+    `(SELECT b.generation FROM pdpp_instance_binding b WHERE b.instance=${alias}.instance)`;
+  return `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_connections qc WHERE qc.instance=${alias}.instance) AND NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_keys q WHERE q.instance=${alias}.instance AND q.stream=${alias}.stream AND q.record_key=${alias}.record_key AND q.generation = ${generation})`;
+}
+/**
+ * The binding is at generation 1 and a pending batch resets the connection to
+ * generation 2 with a value for key "a". A key fact for generation 2 (Codex's
+ * repro) must hide that value; a fact for generation 1 must not, because the
+ * value stays visible once the reset is promoted.
+ */
+function pendingResetUnderQuarantine(
+  predicate: "store" | "contract",
+  factGeneration: 1 | 2,
+) {
+  const d = device();
+  put(d, "local");
+  const reset: ReplicaOperation = {
+    kind: "connection-reset",
+    owner: "owner",
+    sourceId,
+    connectionId: "conn_a",
+    methodId: "collector",
+    generation: 2,
+    previousGeneration: 1,
+    revision: { counter: 30, writerId: "remote", operationId: "reset-pending" },
+  };
+  const next = { ...upsert(31), generation: 2 } as ReplicaOperation;
+  const receiver = createReplicaReceiver({
+    db: d.db,
+    store:
+      predicate === "store"
+        ? d.store
+        : { ...d.store, unquarantinedRecordSql: generationAwareUnquarantined },
+    owner: "owner",
+    enabled: true,
+    authenticate: (c) => (c === "replica-secret" ? "owner" : undefined),
+    declarations: () => declarations,
+  });
+  const quarantine = () =>
+    receiver.quarantineImported({
+      credential: "replica-secret",
+      envelope: batch([factGeneration === 2 ? next : upsert(20)]),
+    });
+  if (factGeneration === 1) quarantine();
+  receiver.stage({
+    credential: "replica-secret",
+    id: "pending",
+    envelope: batch([registration(), reset, next]),
+  });
+  if (factGeneration === 2) quarantine();
+  expect(d.store.getInstanceBinding("conn_a").generation).toBe(1);
+  const owner = receiver.readStore({ reader: "owner" });
+  const shown = {
+    point: owner.getRecord("conn_a", "messages", "a")?.data.text,
+    page: owner
+      .listRecords("messages", {
+        instanceIds: ["conn_a"],
+        limit: 10,
+        order: "asc",
+      })
+      .data.map((row) => row.data.text),
+    streams: owner.listStreams(["conn_a"]).map((row) => row.recordCount),
+  };
+  expect(shown).toEqual(
+    factGeneration === 2
+      ? { point: undefined, page: [], streams: [] }
+      : { point: "remote-31", page: ["remote-31"], streams: [1] },
+  );
+}
+
+// Expected to fail until the store's unquarantinedRecordSql takes the
+// generation argument (synthesis lane); until then the binding's current
+// generation (1) applies to every row. Flip to `it.each` when it lands.
+it.fails.each([1, 2] as const)(
+  "applies a generation-%i key fact to a pending reset's value by the value's generation (store predicate)",
+  (generation) => pendingResetUnderQuarantine("store", generation),
+);
+it.each([1, 2] as const)(
+  "applies a generation-%i key fact to a pending reset's value by the value's generation (agreed predicate contract)",
+  (generation) => pendingResetUnderQuarantine("contract", generation),
+);
+
+/** A generation-2 key fact while the binding, canonical and local rows are at 1. */
+function futureFactOverCurrentRows(predicate: "store" | "contract") {
+  const d = device();
+  put(d, "local");
+  const receiver = createReplicaReceiver({
+    db: d.db,
+    store:
+      predicate === "store"
+        ? d.store
+        : { ...d.store, unquarantinedRecordSql: generationAwareUnquarantined },
+    owner: "owner",
+    enabled: true,
+    authenticate: (c) => (c === "replica-secret" ? "owner" : undefined),
+    declarations: () => declarations,
+  });
+  d.db.transaction(() => {
+    d.db
+      .prepare(
+        "INSERT INTO pdpp_replica_quarantined_keys VALUES ('conn_a', 2, 'messages', 'a')",
+      )
+      .run();
+    d.store.fenceReplicaConnection("conn_a");
+  })();
+  const shown = (reader: "owner" | "grant") => {
+    const read = receiver.readStore({ reader });
+    return {
+      point: read.getRecord("conn_a", "messages", "a")?.data.text,
+      page: read
+        .listRecords("messages", {
+          instanceIds: ["conn_a"],
+          limit: 10,
+          order: "asc",
+        })
+        .data.map((row) => row.data.text),
+      streams: read.listStreams(["conn_a"]).map((row) => row.recordCount),
+    };
+  };
+  const local = { point: "local", page: ["local"], streams: [1] };
+  // Canonical generation-1 row, for both readers.
+  expect(shown("owner")).toEqual(local);
+  expect(shown("grant")).toEqual(local);
+  // A binding conflict switches the owner to the local journal projection.
+  d.store.markReplicaBindingConflict({
+    connectionId: "conn_a",
+    reason: "source_binding_conflict",
+    evidence: {},
+  });
+  expect(shown("owner")).toEqual(local);
+  expect(
+    receiver
+      .readStore({ reader: "owner" })
+      .getRecord("conn_a", "messages", "a"),
+  ).toMatchObject({ visibility: "conflicted" });
+}
+
+it.each(["store", "contract"] as const)(
+  "a generation-2 key fact hides no generation-1 canonical or local row (%s predicate)",
+  (predicate) => futureFactOverCurrentRows(predicate),
+);

@@ -48,10 +48,11 @@ type OverlayRow = {
   live: number;
   pending: number;
   base_live: number;
+  generation: number;
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 8;
+const VIEW_SCHEMA = 9;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -104,7 +105,12 @@ export function createReplicaVisibilityView(deps: {
   db: Database;
   owner: string;
   declarations: () => MergeContext["declarations"];
-  unquarantinedRecordSql: (alias: string) => string;
+  /**
+   * The store's shared quarantine predicate. `generationSql` is the
+   * generation of the aliased row's value; without it, the binding's current
+   * generation applies, as for canonical rows.
+   */
+  unquarantinedRecordSql: (alias: string, generationSql?: string) => string;
   /** Optional synthesis-lane capability; absent means the reset fence alone. */
   integrityEpoch?: (connection: string) => number;
   blobsValid: (
@@ -167,6 +173,9 @@ export function createReplicaVisibilityView(deps: {
         instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL,
         emitted_at TEXT NOT NULL, row_json TEXT, blob_id TEXT, blob_json TEXT,
         present INTEGER NOT NULL, live INTEGER NOT NULL, pending INTEGER NOT NULL, base_live INTEGER NOT NULL,
+        -- Generation of the value this row shows: a pending reset's winner can
+        -- be newer than the binding. Quarantine is applied by it.
+        generation INTEGER NOT NULL,
         PRIMARY KEY(instance,stream,record_key)
       );
       CREATE INDEX IF NOT EXISTS pdpp_replica_view_page ON pdpp_replica_view(instance,stream,emitted_at,record_key) WHERE present=1;
@@ -663,7 +672,9 @@ export function createReplicaVisibilityView(deps: {
         }
       | undefined;
     const base = current && canonical(current);
+    const baseGeneration = local?.generation ?? 0;
     let row = base;
+    let generation = baseGeneration;
     let blobId = row ? current!.blob_id : null;
     let blobMeta: PdppBlobMeta | undefined;
     if (
@@ -733,7 +744,7 @@ export function createReplicaVisibilityView(deps: {
           issue.operations.some((op) => op.connectionId === instance),
       );
       const deletion = lifecycle.find((op) => op.kind === "connection-delete");
-      const generation = Math.max(
+      const effective = Math.max(
         local.generation,
         1,
         ...lifecycle
@@ -773,7 +784,7 @@ export function createReplicaVisibilityView(deps: {
       if (blocked) {
         row = undefined;
         blobId = null;
-      } else if (deletion || (generation > local.generation && !missingReset)) {
+      } else if (deletion || (effective > local.generation && !missingReset)) {
         // Recompute the value withdrawn by this lifecycle transition. In particular,
         // pending-only records have no canonical row to use as a removal marker.
         const before = planReplicaMerge(
@@ -783,7 +794,7 @@ export function createReplicaVisibilityView(deps: {
               op.kind !== "connection-delete" &&
               !(
                 op.kind === "connection-reset" &&
-                op.generation === generation &&
+                op.generation === effective &&
                 !deletion
               ),
           ),
@@ -805,6 +816,8 @@ export function createReplicaVisibilityView(deps: {
                 withdrawn?.emittedAt ?? row!.emittedAt,
               )
             : undefined;
+        // The marker withdraws the value of the generation being left.
+        generation = withdrawn?.generation ?? local.generation;
         blobId = null;
       }
       if (!blocked && !deletion) {
@@ -813,9 +826,10 @@ export function createReplicaVisibilityView(deps: {
             r.identity.connectionId === instance &&
             r.identity.stream === stream &&
             r.identity.recordKey === key &&
-            r.identity.generation === generation,
+            r.identity.generation === effective,
         );
         if (record) {
+          generation = effective;
           const winner = record.winner;
           const state = winner && evidenceRows.get(canonicalJson(winner));
           const pending = !!state && !state.confirmed && state.pending > 0;
@@ -858,7 +872,19 @@ export function createReplicaVisibilityView(deps: {
       row = undefined;
       blobId = null;
     }
-    writeOverlay(instance, stream, key, current, base, row, blobId, blobMeta);
+    writeOverlay(
+      instance,
+      stream,
+      key,
+      current,
+      base,
+      row,
+      blobId,
+      blobMeta,
+      // A hidden key hides the canonical value, of the binding's generation.
+      row ? generation : baseGeneration,
+      baseGeneration,
+    );
   }
   /** Persist the difference from canonical, or nothing when there is none. */
   function writeOverlay(
@@ -870,13 +896,16 @@ export function createReplicaVisibilityView(deps: {
     row: PdppVisibleRecord | undefined,
     blobId: string | null,
     blobMeta: PdppBlobMeta | undefined,
+    generation: number,
+    baseGeneration: number,
   ) {
     const same =
       row === undefined
         ? base === undefined
         : base !== undefined &&
           canonicalJson(row) === canonicalJson(base) &&
-          blobId === current!.blob_id;
+          blobId === current!.blob_id &&
+          generation === baseGeneration;
     if (same) {
       db.prepare(
         "DELETE FROM pdpp_replica_view WHERE instance=? AND stream=? AND record_key=?",
@@ -893,6 +922,7 @@ export function createReplicaVisibilityView(deps: {
           live: row.deleted ? 0 : 1,
           pending: row.visibility === "pending" ? 1 : 0,
           base_live: base ? 1 : 0,
+          generation,
         }
       : {
           // A hidden key: canonical shows it, the owner preview must not.
@@ -904,12 +934,13 @@ export function createReplicaVisibilityView(deps: {
           live: 0,
           pending: 0,
           base_live: 1,
+          generation,
         };
     // An unchanged row is not rewritten, so it advances no cursor revision.
     db.prepare(
-      `INSERT INTO pdpp_replica_view VALUES (@instance,@stream,@key,@emitted_at,@row_json,@blob_id,@blob_json,@present,@live,@pending,@base_live)
-       ON CONFLICT(instance,stream,record_key) DO UPDATE SET emitted_at=excluded.emitted_at,row_json=excluded.row_json,blob_id=excluded.blob_id,blob_json=excluded.blob_json,present=excluded.present,live=excluded.live,pending=excluded.pending,base_live=excluded.base_live
-       WHERE emitted_at IS NOT excluded.emitted_at OR row_json IS NOT excluded.row_json OR blob_id IS NOT excluded.blob_id OR blob_json IS NOT excluded.blob_json OR present IS NOT excluded.present OR live IS NOT excluded.live OR pending IS NOT excluded.pending OR base_live IS NOT excluded.base_live`,
+      `INSERT INTO pdpp_replica_view VALUES (@instance,@stream,@key,@emitted_at,@row_json,@blob_id,@blob_json,@present,@live,@pending,@base_live,@generation)
+       ON CONFLICT(instance,stream,record_key) DO UPDATE SET emitted_at=excluded.emitted_at,row_json=excluded.row_json,blob_id=excluded.blob_id,blob_json=excluded.blob_json,present=excluded.present,live=excluded.live,pending=excluded.pending,base_live=excluded.base_live,generation=excluded.generation
+       WHERE emitted_at IS NOT excluded.emitted_at OR row_json IS NOT excluded.row_json OR blob_id IS NOT excluded.blob_id OR blob_json IS NOT excluded.blob_json OR present IS NOT excluded.present OR live IS NOT excluded.live OR pending IS NOT excluded.pending OR base_live IS NOT excluded.base_live OR generation IS NOT excluded.generation`,
     ).run({ instance, stream, key, ...overlay });
   }
   function connectionVisibility(instance: string) {
@@ -936,6 +967,9 @@ export function createReplicaVisibilityView(deps: {
     return preview ? "preview" : "canonical";
   }
   const unquarantined = (alias = "r") => deps.unquarantinedRecordSql(alias);
+  // Overlay and local-projection rows carry the generation of their value.
+  const ownUnquarantined = (alias = "r") =>
+    deps.unquarantinedRecordSql(alias, `${alias}.generation`);
   const overlaid = (alias = "r") =>
     `EXISTS (SELECT 1 FROM pdpp_replica_view v WHERE v.instance=${alias}.instance AND v.stream=${alias}.stream AND v.record_key=${alias}.record_key)`;
   const notOverlaid = (alias = "r") => `NOT ${overlaid(alias)}`;
@@ -975,7 +1009,7 @@ export function createReplicaVisibilityView(deps: {
           "pdpp_replica_local_view",
           `${alias}.row_json`,
           "local",
-          `${unquarantined(alias)} AND ${alias}.deleted=0 AND ${localIdentitySql(alias)}`,
+          `${ownUnquarantined(alias)} AND ${alias}.deleted=0 AND ${localIdentitySql(alias)}`,
         ),
       ];
     return [
@@ -984,7 +1018,7 @@ export function createReplicaVisibilityView(deps: {
         "pdpp_replica_view",
         `${alias}.row_json`,
         "preview",
-        `${unquarantined(alias)} AND ${alias}.present=1`,
+        `${ownUnquarantined(alias)} AND ${alias}.present=1`,
       ),
     ];
   }
@@ -1059,7 +1093,7 @@ export function createReplicaVisibilityView(deps: {
     if (mode === "preview") {
       const overlay = db
         .prepare(
-          `SELECT r.row_json,r.present,(${unquarantined()}) AS visible FROM pdpp_replica_view r WHERE r.instance=? AND r.stream=? AND r.record_key=?`,
+          `SELECT r.row_json,r.present,(${ownUnquarantined()}) AS visible FROM pdpp_replica_view r WHERE r.instance=? AND r.stream=? AND r.record_key=?`,
         )
         .get(instance, stream, key) as
         | { row_json: string | null; present: number; visible: number }
@@ -1221,15 +1255,26 @@ export function createReplicaVisibilityView(deps: {
     instance: string,
     stream: string,
   ) {
+    // Driven by the stream's quarantine facts (CROSS JOIN keeps them the
+    // outer loop), so the work grows with the facts, not the rows. Overlay rows are judged by their own generation;
+    // a canonical row without an overlay row by the binding's.
+    const canonicalHidden = `SELECT c.record_key,1 AS present,1 AS live,0 AS pending FROM pdpp_replica_quarantined_keys q CROSS JOIN pdpp_records c ON c.instance=q.instance AND c.stream=q.stream AND c.record_key=q.record_key WHERE q.instance=@instance AND q.stream=@stream AND c.deleted=0 AND NOT (${unquarantined("c")})`;
     const effective =
       mode === "preview"
-        ? `SELECT DISTINCT q.record_key,COALESCE(v.present,1) AS present,COALESCE(v.live,1) AS live,COALESCE(v.pending,0) AS pending FROM pdpp_replica_quarantined_keys q LEFT JOIN pdpp_replica_view v ON v.instance=q.instance AND v.stream=q.stream AND v.record_key=q.record_key LEFT JOIN pdpp_records c ON c.instance=q.instance AND c.stream=q.stream AND c.record_key=q.record_key AND c.deleted=0 WHERE q.instance=? AND q.stream=? AND (v.record_key IS NOT NULL OR c.record_key IS NOT NULL) AND NOT (${unquarantined("q")})`
-        : `SELECT DISTINCT r.record_key,1 AS present,1 AS live,0 AS pending FROM pdpp_replica_quarantined_keys q JOIN ${mode === "local" ? "pdpp_replica_local_view" : "pdpp_records"} r ON r.instance=q.instance AND r.stream=q.stream AND r.record_key=q.record_key WHERE q.instance=? AND r.stream=? AND r.deleted=0 AND NOT (${unquarantined("r")})`;
+        ? `SELECT v.record_key,v.present,v.live,v.pending FROM pdpp_replica_quarantined_keys q CROSS JOIN pdpp_replica_view v ON v.instance=q.instance AND v.stream=q.stream AND v.record_key=q.record_key WHERE q.instance=@instance AND q.stream=@stream AND NOT (${ownUnquarantined("v")})
+           UNION ${canonicalHidden} AND ${notOverlaid("c")}`
+        : mode === "local"
+          ? `SELECT r.record_key,1 AS present,1 AS live,0 AS pending FROM pdpp_replica_quarantined_keys q CROSS JOIN pdpp_replica_local_view r ON r.instance=q.instance AND r.stream=q.stream AND r.record_key=q.record_key WHERE q.instance=@instance AND q.stream=@stream AND r.deleted=0 AND NOT (${ownUnquarantined("r")})`
+          : canonicalHidden;
     return db
       .prepare(
-        `SELECT COALESCE(SUM(present),0) AS rows,COALESCE(SUM(live),0) AS live,COALESCE(SUM(pending),0) AS pending FROM (${effective})`,
+        `SELECT COALESCE(SUM(present),0) AS rows,COALESCE(SUM(live),0) AS live,COALESCE(SUM(pending),0) AS pending FROM (SELECT DISTINCT * FROM (${effective}))`,
       )
-      .get(instance, stream) as { rows: number; live: number; pending: number };
+      .get({ instance, stream }) as {
+      rows: number;
+      live: number;
+      pending: number;
+    };
   }
   function latestVisible(
     mode: Exclude<Mode, "hidden">,
@@ -1350,7 +1395,7 @@ export function createReplicaVisibilityView(deps: {
     const args = [id];
     if (preview) {
       branches.push(
-        `SELECT ${selection} FROM pdpp_replica_view r WHERE r.blob_id=? AND r.live=1 AND ${unquarantined()} ${normalFact}`,
+        `SELECT ${selection} FROM pdpp_replica_view r WHERE r.blob_id=? AND r.live=1 AND ${ownUnquarantined()} ${normalFact}`,
       );
       args.push(id);
     }
@@ -1392,7 +1437,7 @@ export function createReplicaVisibilityView(deps: {
   function getBlobMeta(id: string): PdppBlobMeta | undefined {
     const row = db
       .prepare(
-        `SELECT r.blob_json FROM pdpp_replica_view r WHERE r.blob_id=? AND r.blob_json IS NOT NULL AND r.live=1 AND ${unquarantined()} ${hasBindingConflictFacts ? "AND NOT EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=r.instance)" : ""} LIMIT 1`,
+        `SELECT r.blob_json FROM pdpp_replica_view r WHERE r.blob_id=? AND r.blob_json IS NOT NULL AND r.live=1 AND ${ownUnquarantined()} ${hasBindingConflictFacts ? "AND NOT EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=r.instance)" : ""} LIMIT 1`,
       )
       .get(id) as { blob_json: string } | undefined;
     return row ? JSON.parse(row.blob_json) : undefined;
