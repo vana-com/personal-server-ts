@@ -453,7 +453,8 @@ it("expires a sync page cursor minted under the earlier identity order", async (
     await import("@opendatalabs/personal-server-ts-core/storage/pdpp-records");
   for (const store of stores()) {
     try {
-      // localeCompare put "a" before "A"; code-point order puts "A" first.
+      // localeCompare put "a" before "A" and "é" before "f"; code-point
+      // order puts "A" first and "é" last.
       for (const key of ["a", "A"]) put(store, key, "2026-04-01T00:00:00Z");
       const options = { instanceIds: ["inst_1"], limit: 1 };
       const fresh = store.changesSince("events", options);
@@ -484,7 +485,19 @@ it("expires a sync page cursor minted under the earlier identity order", async (
         "A",
         "a",
       ]);
-      expect(next.nextChangesSince).toBeTruthy();
+      // A completed checkpoint carries no position: one minted without the
+      // order revision still returns exactly the later changes.
+      const checkpoint = decodeCursor(next.nextChangesSince!);
+      if (checkpoint.kind !== "changes_since")
+        throw Error("expected checkpoint");
+      delete checkpoint.orderKey;
+      for (const key of ["é", "f"]) put(store, key, "2026-04-02T00:00:00Z");
+      const later = store.changesSince("events", {
+        ...options,
+        limit: 10,
+        changesSince: encodeCursor(checkpoint),
+      });
+      expect(later.data.map((r) => r.recordKey)).toEqual(["f", "é"]);
     } finally {
       store.close();
     }
