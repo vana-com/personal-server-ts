@@ -203,6 +203,7 @@ export async function createIndexedDbPsLiteRuntime(
   // /v1/derivatives answers 503: the browser never calls a provider
   // directly with no key.
   let derivatives = options.derivatives ?? null;
+  let syncStartsAfterReplicaBind = false;
   if (
     derivatives === null &&
     options.derivatives === undefined &&
@@ -251,6 +252,7 @@ export async function createIndexedDbPsLiteRuntime(
       diagnostics,
       logger: options.logger,
       lineageGateway,
+      start: options.replication?.enabled !== true,
       onDataPointIndexed: (event) =>
         derivatives?.scheduler.markSourceChanged(event.scope, {
           lineageSources: event.lineageSources,
@@ -260,6 +262,7 @@ export async function createIndexedDbPsLiteRuntime(
     syncManager = sync.syncManager;
     scopeDeletions = sync.scopeDeletions;
     replicaPorts = sync.replicaPorts;
+    syncStartsAfterReplicaBind = options.replication?.enabled === true;
   }
   const runtimeAvailability = {
     isAvailable: () => runtimeRef?.isAvailable() ?? Boolean(options.active),
@@ -359,6 +362,7 @@ export async function createIndexedDbPsLiteRuntime(
     ).replicaPorts;
     await options.replication.bind(replicaPorts);
   }
+  if (syncStartsAfterReplicaBind) syncManager?.start?.();
 
   return {
     runtime,

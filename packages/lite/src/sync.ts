@@ -107,6 +107,8 @@ export interface PsLiteSyncOptions {
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   /** Post-index download hook (marks derivative questions stale). */
   onDataPointIndexed?: DownloadWorkerDeps["onDataPointIndexed"];
+  /** Keep owned workers stopped until an opt-in runtime handshake succeeds. */
+  start?: boolean;
 }
 
 function createBrowserLogger(logger?: Logger): Logger {
@@ -452,7 +454,7 @@ export async function createPsLiteSyncManager(
       },
     },
   );
-  syncManager.start();
+  if (options.start !== false) syncManager.start();
   return {
     syncManager,
     additions,

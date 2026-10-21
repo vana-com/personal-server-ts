@@ -177,6 +177,39 @@ describe("createIndexedDbPsLiteRuntime persistence injection", () => {
     expect(count).toBe(1);
   });
 
+  it("does not start legacy sync when replica bind fails, then starts once on retry", async () => {
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+    const overrides = {
+      configDefaults: {
+        gateway: { url: "https://gateway.local" },
+        sync: { enabled: true },
+      },
+    } satisfies Partial<IndexedDbPsLiteRuntimeOptions>;
+
+    await expect(
+      build(
+        memoryBundle(),
+        {
+          enabled: true,
+          bind: async () => {
+            throw new Error("persistence initialization failed");
+          },
+        },
+        overrides,
+      ),
+    ).rejects.toThrow("persistence initialization failed");
+    expect(setIntervalSpy).not.toHaveBeenCalled();
+
+    const runtime = await build(
+      memoryBundle(),
+      { enabled: true, bind: async () => {} },
+      overrides,
+    );
+    expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+    await runtime.syncManager?.stop?.();
+    setIntervalSpy.mockRestore();
+  });
+
   it("rejects a partial bundle instead of mixing native and IndexedDB stores", async () => {
     await expect(
       createIndexedDbPsLiteRuntime({

@@ -717,6 +717,16 @@ export function createLiteReplicaWorker(deps: {
       }
     }
   }
+  async function retryRetainedConnections() {
+    const after = await read<string>("work/retry-connections");
+    const page = await store.retry({ credential: deps.credential, after });
+    await transaction(async (tx) => {
+      await state(tx);
+      if (page.after === undefined)
+        await tx.delete(root + "work/retry-connections");
+      else await put(tx, "work/retry-connections", page.after);
+    });
+  }
   let running = false;
   return {
     async status() {
@@ -796,7 +806,7 @@ export function createLiteReplicaWorker(deps: {
           discover,
           download,
           importReady,
-          () => store.retry({ credential: deps.credential }),
+          retryRetainedConnections,
         ]) {
           try {
             await phase();
