@@ -58,11 +58,30 @@ export function toBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 export function fromBase64(value: string): Uint8Array {
+  if (typeof value !== "string") throw new Error("noncanonical base64");
   const binary = atob(value);
+  // atob validates the alphabet and padding placement, but accepts whitespace,
+  // omitted padding and nonzero unused bits. Reject those without re-encoding
+  // the whole decoded object into another binary string and base64 string.
+  if (
+    value.length !== 4 * Math.ceil(binary.length / 3) ||
+    /[\t\n\f\r ]/.test(value)
+  )
+    throw new Error("noncanonical base64");
+  const remainder = binary.length % 3;
+  if (remainder) {
+    const padding = 3 - remainder;
+    const last =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".indexOf(
+        value[value.length - padding - 1]!,
+      );
+    // Two '=' leave four unused bits; one '=' leaves two unused bits.
+    if ((last & (padding === 2 ? 15 : 3)) !== 0)
+      throw new Error("noncanonical base64");
+  }
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index++)
     bytes[index] = binary.charCodeAt(index);
-  if (toBase64(bytes) !== value) throw new Error("noncanonical base64");
   return bytes;
 }
 export function replicaMetadataHash(
