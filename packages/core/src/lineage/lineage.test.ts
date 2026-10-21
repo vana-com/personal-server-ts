@@ -297,7 +297,7 @@ describe("prepareLineage", () => {
   const now = () => new Date("2026-08-31T09:12:44.000Z");
 
   it("produces the $lineage record for valid sources", async () => {
-    const { lineage, inputsPdppOrigin } = await prepareLineage({
+    const { lineage, sourceScopes } = await prepareLineage({
       scope: DERIVED_SCOPE,
       field: [SOURCE_ID.toUpperCase().replace("0X", "0x"), OTHER_SOURCE_ID],
       serverOwner: OWNER,
@@ -308,28 +308,7 @@ describe("prepareLineage", () => {
       sources: [SOURCE_ID, OTHER_SOURCE_ID],
       writtenAt: "2026-08-31T09:12:44.000Z",
     });
-    expect(inputsPdppOrigin).toBe(false);
-  });
-
-  it("reports PDPP-origin inputs, and treats a source with no local row as PDPP", async () => {
-    const base = storageWithScopes(SOURCE_SCOPE, OTHER_SOURCE_SCOPE);
-    const field = [SOURCE_ID, OTHER_SOURCE_ID];
-    const origin = async (
-      findEntry: (arg: { scope: string }) => unknown,
-    ): Promise<boolean> =>
-      (
-        await prepareLineage({
-          scope: DERIVED_SCOPE,
-          field,
-          serverOwner: OWNER,
-          storage: { ...base, findEntry } as typeof base,
-          now,
-        })
-      ).inputsPdppOrigin;
-    expect(
-      await origin(({ scope }) => ({ pdppOrigin: scope === SOURCE_SCOPE })),
-    ).toBe(true);
-    expect(await origin(() => undefined)).toBe(true);
+    expect(sourceScopes).toEqual([SOURCE_SCOPE, OTHER_SOURCE_SCOPE]);
   });
 
   it("keeps an explicit empty list as a root statement (stamped, distinct from absent)", async () => {
@@ -343,7 +322,7 @@ describe("prepareLineage", () => {
       }),
     ).resolves.toEqual({
       lineage: { sources: [], writtenAt: "2026-08-31T09:12:44.000Z" },
-      inputsPdppOrigin: false,
+      sourceScopes: [],
     });
   });
 

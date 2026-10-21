@@ -92,8 +92,9 @@ import {
   extractLineageField,
   LINEAGE_KEY,
   prepareLineage,
-  type PreparedLineage,
+  type StoredLineage,
 } from "../lineage/lineage.js";
+import { sourcesHavePdppOrigin } from "../lineage/input-origin.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import {
   deletionHistoryOf,
@@ -1572,9 +1573,9 @@ async function prepareWriteLineage(
   deps: PersonalServerDataApiDeps,
   scope: string,
   field: unknown,
-): Promise<PreparedLineage | undefined> {
+): Promise<{ lineage: StoredLineage; inputsPdppOrigin: boolean } | undefined> {
   if (field === undefined || field === null) return undefined;
-  return prepareLineage({
+  const prepared = await prepareLineage({
     scope,
     field,
     serverOwner: deps.serverOwner,
@@ -1582,6 +1583,13 @@ async function prepareWriteLineage(
     gateway: deps.lineageGateway,
     now: deps.now ?? (() => new Date()),
   });
+  return {
+    lineage: prepared.lineage,
+    inputsPdppOrigin: await sourcesHavePdppOrigin(
+      deps.storage,
+      prepared.sourceScopes,
+    ),
+  };
 }
 
 /**

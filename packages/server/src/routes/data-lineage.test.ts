@@ -1,3 +1,4 @@
+import { createNodeDataStorage as reviewNodeStorage } from "../storage/node-data-storage.js";
 /**
  * Derivative data through the data routes: lineage on write (session and
  * owner, JSON and binary), the proxied lineage read, and cascade delete.
@@ -982,6 +983,234 @@ describe("derivative data routes", () => {
       expect(accessLogWriter.write).not.toHaveBeenCalledWith(
         expect.objectContaining({ action: "lineage" }),
       );
+    });
+  });
+
+  describe("HTTP lineage stamps the origin of the exact input consumed", () => {
+    it("positive control: a builder derivative citing a legacy-only, non-joined source stays readable", async () => {
+      await seedSource();
+      const write = await sessionWrite(DERIVED_SCOPE, {
+        summary: "legacy-only-summary",
+        lineage: [SOURCE_ID],
+      });
+      expect(write.status).toBe(201);
+      const stored = await (await ownerRead(DERIVED_SCOPE)).json();
+      expect(stored.data.$lineage.origin).toBe("legacy");
+      const read = await app.request(`/${DERIVED_SCOPE}`, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: `/${DERIVED_SCOPE}`,
+            grantId: READ_GRANT_ID,
+          }),
+        },
+      });
+      const text = await read.text();
+      expect(read.status, text).toBe(200);
+      expect(text).toContain("legacy-only-summary");
+    });
+
+    it("stamps an attested root (empty sources) legacy", async () => {
+      const res = await ownerWrite("notes.entries", {
+        note: "root",
+        lineage: [],
+      });
+      expect(res.status).toBe(201);
+      const envelope = await (await ownerRead("notes.entries")).json();
+      expect(envelope.data.$lineage.origin).toBe("legacy");
+    });
+  });
+  describe("round2 independent HTTP origin probes", () => {
+    async function seedJoinedPdpp() {
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      for (const envelope of [
+        {
+          version: "1.0",
+          scope: SOURCE_SCOPE,
+          collectedAt: "2026-09-01T00:00:00Z",
+          data: {
+            records: [
+              {
+                id: "conv-1",
+                title: "Trip",
+                create_time: "2026-09-01T00:00:00Z",
+                update_time: "2026-09-01T00:00:00Z",
+                current_node: "m1",
+                message_count_on_current_branch: 1,
+              },
+            ],
+          },
+        },
+        {
+          version: "1.0",
+          scope: "chatgpt.messages",
+          collectedAt: "2026-09-01T00:00:00Z",
+          producer: "pdpp-projector",
+          data: {
+            records: [
+              {
+                id: "m1",
+                conversation_id: "conv-1",
+                parent_id: null,
+                role: "user",
+                content: "review-synthetic-marker",
+                content_type: "text",
+                model_slug: null,
+                create_time: "2026-09-01T00:00:00Z",
+                on_current_branch: true,
+              },
+            ],
+          },
+        },
+      ]) {
+        const written = await raw.writeEnvelope(envelope as never);
+        await raw.insertEntry({
+          fileId: null,
+          path: written.relativePath,
+          scope: envelope.scope,
+          collectedAt: envelope.collectedAt,
+          sizeBytes: written.sizeBytes,
+        });
+      }
+      const served = await (await ownerRead(SOURCE_SCOPE)).json();
+      expect(served.producer).toBe("pdpp-projector");
+      expect(JSON.stringify(served)).toContain("review-synthetic-marker");
+      expect(raw.findEntry({ scope: SOURCE_SCOPE })?.pdppOrigin).toBe(false);
+      const stored = await raw.readEnvelope(
+        SOURCE_SCOPE,
+        "2026-09-01T00:00:00Z",
+      );
+      expect(
+        (stored as unknown as { producer?: string }).producer,
+      ).toBeUndefined();
+    }
+    async function builderRead(scope: string, grantId: string) {
+      return app.request(`/${scope}`, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: `/${scope}`,
+            grantId,
+          }),
+        },
+      });
+    }
+    it("does not launder a joined projection through a builder JSON lineage write", async () => {
+      await seedJoinedPdpp();
+      const write = await sessionWrite(DERIVED_SCOPE, {
+        summary: "review-synthetic-marker",
+        lineage: [SOURCE_ID],
+      });
+      expect(write.status).toBe(201);
+      const output = await (await ownerRead(DERIVED_SCOPE)).json();
+      const read = await builderRead(DERIVED_SCOPE, READ_GRANT_ID);
+      const text = await read.text();
+      const leaked =
+        text.includes("review-synthetic-marker") ||
+        text.includes(
+          Buffer.from("review-synthetic-marker").toString("base64"),
+        );
+      console.log(
+        JSON.stringify({
+          probe: "http-json-joined",
+          origin: output.data.$lineage.origin,
+          status: read.status,
+          leakedSyntheticMarker: leaked,
+        }),
+      );
+      expect(read.status).toBe(403);
+    });
+    it("does not launder a joined projection through a builder binary lineage write", async () => {
+      await seedJoinedPdpp();
+      const bytes = new TextEncoder().encode("review-synthetic-marker");
+      const representation = {
+        contentType: "application/pdf",
+        filename: "report.pdf",
+        metadataHeader: JSON.stringify({ lineage: [SOURCE_ID] }),
+      };
+      const write = await app.request(`/${REPORT_SCOPE}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": representation.contentType,
+          "X-Filename": representation.filename,
+          "X-Vana-Metadata": representation.metadataHeader,
+          Authorization: `Bearer ${SESSION_TOKEN}`,
+          [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: `/${REPORT_SCOPE}`,
+            body: await binaryWriteSignedBytes({ bytes, ...representation }),
+            grantId: WRITE_GRANT_ID,
+          }),
+        },
+        body: bytes,
+      });
+      expect(write.status).toBe(201);
+      const output = await (await ownerRead(REPORT_SCOPE)).json();
+      const read = await builderRead(REPORT_SCOPE, READ_REPORT_GRANT_ID);
+      const text = await read.text();
+      const leaked =
+        text.includes("review-synthetic-marker") ||
+        text.includes(
+          Buffer.from("review-synthetic-marker").toString("base64"),
+        );
+      console.log(
+        JSON.stringify({
+          probe: "http-binary-joined",
+          origin: output.data.$lineage.origin,
+          status: read.status,
+          leakedSyntheticMarker: leaked,
+        }),
+      );
+      expect(read.status).toBe(403);
+    });
+    it("does not trust a pre-upgrade false provenance row on a builder lineage write", async () => {
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      const scope = "archive.answer";
+      const envelope = {
+        version: "1.0",
+        scope,
+        collectedAt: "2026-09-01T00:00:00Z",
+        data: {
+          answer: "review-synthetic-marker",
+          $lineage: { sources: [], writtenAt: "2026-09-01T00:00:00Z" },
+        },
+      };
+      const written = await raw.writeEnvelope(envelope);
+      deps.indexManager.insert({
+        fileId: null,
+        path: written.relativePath,
+        scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: written.sizeBytes,
+        pdppOrigin: false,
+      });
+      const write = await sessionWrite(DERIVED_SCOPE, {
+        summary: "review-synthetic-marker",
+        lineage: [computeDataPointId(ownerWallet.address, scope)],
+      });
+      expect(write.status).toBe(201);
+      const output = await (await ownerRead(DERIVED_SCOPE)).json();
+      const read = await builderRead(DERIVED_SCOPE, READ_GRANT_ID);
+      console.log(
+        JSON.stringify({
+          probe: "http-preupgrade-row",
+          origin: output.data.$lineage.origin,
+          status: read.status,
+        }),
+      );
+      expect(read.status).toBe(403);
     });
   });
 });

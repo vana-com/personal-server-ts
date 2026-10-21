@@ -60,7 +60,7 @@ import type {
 } from "../storage/pdpp-records/index.js";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { Logger } from "../logger/index.js";
-import { LINEAGE_KEY } from "../lineage/lineage.js";
+import { LINEAGE_KEY, readStoredLineage } from "../lineage/lineage.js";
 
 /** The reserved key carrying PDPP import metadata inside `data`. */
 export const PDPP_METADATA_KEY = "$pdpp";
@@ -317,8 +317,12 @@ export function isPdppProducer(value: unknown): value is PdppProducer {
  */
 function derivativeLacksLegacyOrigin(data: unknown): boolean {
   if (!isRecord(data) || !(LINEAGE_KEY in data)) return false;
-  const lineage = data[LINEAGE_KEY];
-  return !(isRecord(lineage) && lineage.origin === "legacy");
+  try {
+    // A well-formed stamp only: a marker on a malformed `$lineage` fails closed.
+    return readStoredLineage(data)?.origin !== "legacy";
+  } catch {
+    return true;
+  }
 }
 
 /**

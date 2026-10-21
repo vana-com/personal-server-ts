@@ -350,19 +350,15 @@ export interface PrepareLineageInput {
   /** The raw caller value (`body.lineage` / `metadata.lineage`). */
   field: unknown;
   serverOwner: `0x${string}` | undefined;
-  storage: Pick<DataStoragePort, "listScopes" | "findEntry">;
+  storage: Pick<DataStoragePort, "listScopes">;
   gateway?: LineageSourceLookup;
   now: () => Date;
 }
 
 export interface PreparedLineage {
   lineage: StoredLineage;
-  /**
-   * True unless every source is a local scope whose latest version is known
-   * legacy. A source with no local row is unknown, so it counts as PDPP.
-   * `ingestDataContract` turns this into the output's origin stamp.
-   */
-  inputsPdppOrigin: boolean;
+  /** The local scope of every cited source, for the origin decision. */
+  sourceScopes: string[];
 }
 
 /**
@@ -393,12 +389,8 @@ export async function prepareLineage(
     input.scope,
     resolved.map((source) => source.scope),
   );
-  const inputsPdppOrigin = !resolved.every((source) => {
-    const entry = input.storage.findEntry({ scope: source.scope });
-    return entry !== undefined && entry.pdppOrigin !== true;
-  });
   return {
     lineage: { sources, writtenAt: input.now().toISOString() },
-    inputsPdppOrigin,
+    sourceScopes: resolved.map((source) => source.scope),
   };
 }
