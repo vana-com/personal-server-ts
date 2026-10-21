@@ -6,6 +6,10 @@
  * that module serves existing non-PDPP callers and is left untouched.
  */
 
+import type { ReplicaReader } from "../../replication/visibility-policy.js";
+import type { CanonicalStreamCompletion } from "../canonical-legacy-projection.js";
+import type { BlobReference } from "./interface.js";
+
 export type StreamSemantics = "append_only" | "mutable_state";
 
 export type EnvelopeKey = string | string[];
@@ -175,9 +179,16 @@ export type PdppVisibleRecord = PdppStoredRecord | PdppPendingRemoval;
 export interface ListVisibleRecordsPage extends Omit<ListRecordsPage, "data"> {
   data: PdppVisibleRecord[];
 }
+/**
+ * Every canonical-derived read one reader class may make. The trusted host
+ * selects the reader from the authenticated token, never from request input.
+ * Without a replica receiver the canonical store itself is this port for
+ * every reader; with one, the receiver's reader-specific view is. All methods
+ * are required, so a host cannot leave one surface on the raw store.
+ */
 export interface PdppReplicaReadStore {
   /** Confirmed history only; an identity conflict cannot establish row provenance. */
-  changesSince?(stream: string, options: ChangesSinceOptions): ChangesSincePage;
+  changesSince(stream: string, options: ChangesSinceOptions): ChangesSincePage;
   getRecord(
     instance: string,
     stream: string,
@@ -188,4 +199,17 @@ export interface PdppReplicaReadStore {
     options: ListRecordsOptions,
   ): ListVisibleRecordsPage;
   listStreams(instanceIds: string[]): StreamListing[];
+  getBlobMeta(blobId: string): PdppBlobMeta | undefined;
+  /** Verified bytes of a blob this reader can reach through a visible reference. */
+  getBlobBytes(blobId: string): Uint8Array | undefined;
+  findBlobReferences(blobId: string): BlobReference[];
+  /**
+   * Completion receipts of one connection. A receipt describes canonical
+   * rows, so a reader that does not see that connection's canonical rows
+   * as stored gets none.
+   */
+  listStreamCompletions(instance: string): CanonicalStreamCompletion[];
 }
+
+/** The host's reader capability: one complete read port per reader class. */
+export type PdppReplicaReads = (reader: ReplicaReader) => PdppReplicaReadStore;

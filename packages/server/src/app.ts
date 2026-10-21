@@ -92,6 +92,7 @@ import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-
 import type { LegacyScopeViewPort } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type {
   PdppRecordStore,
+  PdppReplicaReads,
   StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
@@ -241,6 +242,16 @@ export interface AppDeps {
    */
   pdpp?: {
     store: PdppRecordStore;
+    /**
+     * Required reader capability for every canonical-derived response:
+     * record streams, pages, point reads, change feeds and blobs. The app
+     * selects the reader from the authenticated token class. A host without
+     * a replica receiver passes the canonical store for every reader; one
+     * with a receiver passes `receiver.readStore`. The legacy `/v1/data` view
+     * is composed by the host from the same capability
+     * (`legacyScopeRecords`).
+     */
+    reads: PdppReplicaReads;
     bindingStore: ReturnType<typeof createSqliteRecordStore>;
     configuredMethods: Map<string, string[]>;
     auth: PdppAuthorizationService;
@@ -323,6 +334,9 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   if (deps.pdpp) {
+    // Not a reader surface: `empty` is the binding/reset precondition the
+    // store itself enforces (no canonical row or history), so it reads the
+    // store, never `reads`. A pending or conflict-hidden row does not change it.
     app.route(
       "/",
       pdppInstanceBindingRoutes({
@@ -338,6 +352,7 @@ export function createApp(deps: AppDeps): Hono {
       "/v1",
       pdppRecordsRoutes({
         store: deps.pdpp.store,
+        reads: deps.pdpp.reads,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         ownerSubjectId: deps.serverOwner,
@@ -381,6 +396,7 @@ export function createApp(deps: AppDeps): Hono {
       "/v1/blobs",
       pdppBlobsRoutes({
         store: deps.pdpp.store,
+        reads: deps.pdpp.reads,
         auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,

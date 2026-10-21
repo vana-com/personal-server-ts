@@ -212,10 +212,18 @@ function parseIngestBody(bytes: Uint8Array): unknown {
   return body;
 }
 
+/** The record routes read everything a reader serves except completion receipts. */
+type RouteReadStore = Omit<PdppReplicaReadStore, "listStreamCompletions">;
+
 export interface PdppRecordsRouteDeps {
+  /** Writes and write-side lookups. Reads go through `reads`. */
   store: PdppRecordStore;
-  /** Trusted reader classification; the receiver owns visibility and provisional markers. */
-  replicaReads?: (reader: ReplicaReader) => PdppReplicaReadStore;
+  /**
+   * Reader capability for every read. The app host (`createApp`) always
+   * supplies it. Absent only when the route runs without a host, in tests:
+   * then every token class reads `store`.
+   */
+  reads?: (reader: ReplicaReader) => RouteReadStore;
   bindingStore?: {
     getInstanceBinding(instance: string): {
       sourceId: string | null;
@@ -654,11 +662,10 @@ function projectSchemaToFields(
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
   const validateData = createRecordDataValidator(deps.declarations);
-  function reads(context: PdppTokenContext) {
-    return (
-      deps.replicaReads?.(context.tokenKind === "owner" ? "owner" : "grant") ??
-      deps.store
-    );
+  const readsFor = deps.reads ?? (() => deps.store);
+  /** The token class selects the reader; request input never does. */
+  function reads(context: PdppTokenContext): RouteReadStore {
+    return readsFor(context.tokenKind === "owner" ? "owner" : "grant");
   }
 
   /**
@@ -1122,11 +1129,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         // field value. This split matters: if the store projected the
         // returned data too, a grant whose fields exclude the
         // time_constraint field would silently break that filter.
-        const reader = reads(context!);
-        const changesSince =
-          reader.changesSince?.bind(reader) ??
-          deps.store.changesSince.bind(deps.store);
-        const page = changesSince(stream, {
+        const page = reads(context!).changesSince(stream, {
           instanceIds: effectiveInstanceIds,
           changesSince: c.req.query("changes_since"),
           cursor: c.req.query("cursor"),

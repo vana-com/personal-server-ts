@@ -35,6 +35,8 @@ import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/
 import {
   createSourceStreamDeclarationRegistry,
   type PdppRecordStore,
+  type ListRecordsPage,
+  type PdppReplicaReads,
   type SourceStreamDeclarations,
   type StreamDeclaration,
   type StreamDeclarationRegistry,
@@ -48,6 +50,7 @@ import {
   type PdppImporter,
   type RetainedDeclaration,
 } from "@opendatalabs/personal-server-ts-core/sync";
+import type { CanonicalLegacyReadStore } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
 import type { PdppAuthRouteDeps } from "../routes/pdpp-auth.js";
 import {
   createSqliteRecordStore,
@@ -56,6 +59,8 @@ import {
 
 export interface PdppRecordsDeps {
   store: PdppRecordStore;
+  /** See `AppDeps.pdpp.reads`. This boot has no replica receiver. */
+  reads: PdppReplicaReads;
   bindingStore: ReturnType<typeof createSqliteRecordStore>;
   configuredMethods: Map<string, string[]>;
   auth: PdppAuthorizationService;
@@ -67,6 +72,45 @@ export interface PdppRecordsDeps {
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
   resource: string;
   authorizationServers?: string[];
+}
+
+/**
+ * Canonical rows the legacy compatibility view (`/v1/data`) projects, read
+ * through the confirmed (grant) reader for every caller. The view cannot tell
+ * owner from grantee, and its coverage verdicts and takeover receipts are
+ * durable, so they must never be derived from pending preview rows. Registry
+ * facts (binding, connections, arrival order) stay on the store: they decide
+ * which connection a scope reads, not what it shows.
+ */
+export function legacyScopeRecords(
+  pdpp: Pick<PdppRecordsDeps, "bindingStore" | "reads">,
+): CanonicalLegacyReadStore {
+  const store = pdpp.bindingStore;
+  const confirmed = pdpp.reads("grant");
+  return {
+    readSnapshot: (read) => store.readSnapshot(read),
+    getInstanceBinding: (instance) => store.getInstanceBinding(instance),
+    listConnections: (sourceId) => store.listConnections(sourceId),
+    listArrivalOrder: (instance, stream) =>
+      store.listArrivalOrder(instance, stream),
+    listRecords: (stream, options) => {
+      const page = confirmed.listRecords(stream, options);
+      // Only a preview reader shows pending removals; this one never does.
+      if (page.data.some((row) => row.deleted))
+        throw new Error("confirmed reader returned a removal row");
+      return page as ListRecordsPage;
+    },
+    listStreams: (instanceIds) => confirmed.listStreams(instanceIds),
+    listStreamCompletions: (instance) =>
+      confirmed.listStreamCompletions(instance),
+    getBlobMeta: (blobId) => confirmed.getBlobMeta(blobId),
+    getBlobBytes: (blobId) => {
+      const bytes = confirmed.getBlobBytes(blobId);
+      return bytes === undefined || bytes.buffer instanceof ArrayBuffer
+        ? (bytes as Uint8Array<ArrayBuffer> | undefined)
+        : new Uint8Array(bytes);
+    },
+  };
 }
 
 export interface CreatePdppRecordsDepsOptions {
@@ -284,6 +328,8 @@ export function createPdppRecordsDeps(
 
   return {
     store,
+    // No replica receiver on this boot: every reader reads the canonical store.
+    reads: () => store,
     bindingStore: store,
     configuredMethods,
     auth: coLocatedAuthorizationService(pdppAuth),

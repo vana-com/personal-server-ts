@@ -90,6 +90,7 @@ import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
 import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
 import {
   createPdppRecordsDeps,
+  legacyScopeRecords,
   coLocatedAuthorizationService,
   createPdppSyncImporter,
   registerLegacyDataConnections,
@@ -1063,7 +1064,7 @@ export async function createServer(
     // file, on a boot that does not mount the RS.
     legacyScopeView: createLegacyScopeView({
       authority: createLegacyScopeAuthority(db),
-      records: pdppRecords?.bindingStore,
+      records: pdppRecords && legacyScopeRecords(pdppRecords),
       // Reuse the source-scoped declarations selected by the record server.
       // Declaration schema identity participates in projection revisions and
       // takeover cache keys; staging an upgrade takes effect on the next boot.

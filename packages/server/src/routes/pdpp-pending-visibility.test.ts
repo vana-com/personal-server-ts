@@ -88,8 +88,7 @@ it("serves owner pending markers while the same grant sees nothing until promoti
       declarations,
       bindingStore: store,
       instancesForSubject: () => [identity.connectionId],
-      replicaReads: (reader: "owner" | "grant") =>
-        receiver.readStore({ reader }),
+      reads: (reader: "owner" | "grant") => receiver.readStore({ reader }),
     };
     const app = pdppRecordsRoutes(deps as PdppRecordsRouteDeps);
     let confirmedBlobReads = 0;
@@ -359,7 +358,7 @@ it("keeps the visible row's instance when rebinding a multi-connection page curs
       declarations,
       bindingStore: store,
       instancesForSubject: () => ids,
-      replicaReads: (reader) => receiver.readStore({ reader }),
+      reads: (reader) => receiver.readStore({ reader }),
     });
     const seen: string[] = [];
     let cursor: string | undefined;
@@ -530,8 +529,7 @@ it("uses local journal values for conflicted owners and hides the whole connecti
       declarations,
       bindingStore: store,
       instancesForSubject: () => [identity.connectionId],
-      replicaReads: (reader: "owner" | "grant") =>
-        receiver.readStore({ reader }),
+      reads: (reader: "owner" | "grant") => receiver.readStore({ reader }),
     };
     const app = pdppRecordsRoutes(deps);
     const blobs = pdppBlobsRoutes({

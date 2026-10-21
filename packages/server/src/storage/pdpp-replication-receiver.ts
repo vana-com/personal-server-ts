@@ -29,6 +29,7 @@ import {
   type ChangesSinceOptions,
   type PdppVisibleRecord,
   type ListVisibleRecordsPage,
+  type PdppReplicaReadStore,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 export const RECEIVER_MIGRATION = `
@@ -845,7 +846,9 @@ export function createReplicaReceiver(deps: {
         );
       });
     },
-    readStore(input: { reader?: ReplicaReader } = {}) {
+    readStore(input: { reader?: ReplicaReader } = {}): PdppReplicaReadStore & {
+      connectionVisibility: typeof view.connectionVisibility;
+    } {
       const reader = input.reader ?? "grant";
       const hasPreview = () => includesPending(reader);
       const needsReferenceGate = () =>
@@ -911,6 +914,14 @@ export function createReplicaReceiver(deps: {
                 : undefined,
           ),
         findBlobReferences: refs,
+        // Receipts describe canonical rows as stored: a preview or a hidden or
+        // local-only connection shows other rows, so it gets none.
+        listStreamCompletions: (instance: string) =>
+          readSnapshot(() =>
+            hasPreview() || view.connectionVisibility(instance)
+              ? []
+              : store.listStreamCompletions(instance),
+          ),
       };
     },
     import(input: {

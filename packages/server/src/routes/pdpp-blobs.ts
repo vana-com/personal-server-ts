@@ -15,15 +15,18 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 type BlobReadStore = Pick<
-  PdppRecordStore,
-  "getBlobMeta" | "findBlobReferences"
-> &
-  Pick<PdppReplicaReadStore, "getRecord"> & {
-    getBlobBytes(blobId: string): Uint8Array | undefined;
-  };
+  PdppReplicaReadStore,
+  "getBlobMeta" | "findBlobReferences" | "getRecord" | "getBlobBytes"
+>;
 export interface PdppBlobsRouteDeps {
+  /** The canonical store: decides whether bytes come from `readBlobBytes`. */
   store: PdppRecordStore;
-  replicaReads?: (reader: ReplicaReader) => BlobReadStore;
+  /**
+   * Reader capability that authorizes every blob read. The app host
+   * (`createApp`) always supplies it. Absent only when the route runs without
+   * a host, in tests: then every token class reads `store`.
+   */
+  reads?: (reader: ReplicaReader) => BlobReadStore;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
@@ -64,6 +67,7 @@ function jsonError(
 
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
+  const readsFor = deps.reads ?? (() => deps.store);
 
   /**
    * Authorizes a blob fetch through the same path a record read uses (spec §8): finds every
@@ -117,9 +121,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       }
     }
 
-    const store =
-      deps.replicaReads?.(context.tokenKind === "owner" ? "owner" : "grant") ??
-      deps.store;
+    const store = readsFor(context.tokenKind === "owner" ? "owner" : "grant");
     const meta = store.getBlobMeta(blobId);
     if (!meta) {
       const err = new PdppError(
@@ -234,7 +236,9 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
 
     let bytes: Uint8Array<ArrayBuffer> | undefined;
     try {
-      if (deps.replicaReads && !deps.store.getBlobMeta(blobId)) {
+      // The reader authorized this blob. Bytes it holds only as a replica
+      // (no canonical row) come from the reader; canonical bytes from the host.
+      if (!deps.store.getBlobMeta(blobId)) {
         const payload = authz.store.getBlobBytes(blobId);
         bytes = payload === undefined ? undefined : new Uint8Array(payload);
       } else bytes = await deps.readBlobBytes?.(blobId);
