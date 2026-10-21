@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import { ingestDataContract } from "../contracts/data.js";
-import { sourcesHavePdppOrigin } from "./input-origin.js";
+import { citedSourcesHavePdppOrigin } from "./cited-origin.js";
 
 async function seed(
   storage: ReturnType<typeof createMemoryDataStorage>,
@@ -20,19 +20,23 @@ async function seed(
   if (!r.ok) throw new Error("seed failed");
 }
 
-describe("sourcesHavePdppOrigin", () => {
+describe("citedSourcesHavePdppOrigin", () => {
   it("is false for no sources and for legacy-only sources", async () => {
     const storage = createMemoryDataStorage();
     await seed(storage, "oura.sleep", { score: 1 });
-    expect(await sourcesHavePdppOrigin(storage, [])).toBe(false);
-    expect(await sourcesHavePdppOrigin(storage, ["oura.sleep"])).toBe(false);
+    expect(await citedSourcesHavePdppOrigin(storage, [])).toBe(false);
+    expect(await citedSourcesHavePdppOrigin(storage, ["oura.sleep"])).toBe(
+      false,
+    );
   });
 
   it("is true when the row says PDPP even if the bytes look legacy", async () => {
     const storage = createMemoryDataStorage();
     await seed(storage, "oura.sleep", { score: 1 });
     storage.findEntry({ scope: "oura.sleep" })!.pdppOrigin = true;
-    expect(await sourcesHavePdppOrigin(storage, ["oura.sleep"])).toBe(true);
+    expect(await citedSourcesHavePdppOrigin(storage, ["oura.sleep"])).toBe(
+      true,
+    );
   });
 
   it("is true when the bytes say PDPP even if the row says legacy (pre-upgrade row)", async () => {
@@ -45,7 +49,7 @@ describe("sourcesHavePdppOrigin", () => {
       { sources: [], writtenAt: "2026-09-01T00:00:00Z" },
     );
     expect(
-      await sourcesHavePdppOrigin(
+      await citedSourcesHavePdppOrigin(
         {
           ...storage,
           findEntry: (q) => ({ ...storage.findEntry(q)!, pdppOrigin: false }),
@@ -58,10 +62,12 @@ describe("sourcesHavePdppOrigin", () => {
 
   it("is true for a source with no row or that cannot be read", async () => {
     const storage = createMemoryDataStorage();
-    expect(await sourcesHavePdppOrigin(storage, ["nothing.here"])).toBe(true);
+    expect(await citedSourcesHavePdppOrigin(storage, ["nothing.here"])).toBe(
+      true,
+    );
     await seed(storage, "oura.sleep", { score: 1 });
     expect(
-      await sourcesHavePdppOrigin(
+      await citedSourcesHavePdppOrigin(
         {
           findEntry: storage.findEntry.bind(storage),
           readEnvelope: async () => {

@@ -30,6 +30,10 @@ import {
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import { derivativesRoutes } from "./routes/derivatives.js";
+import {
+  writerExposureFromBindings,
+  type PdppGrantBindingStore,
+} from "@opendatalabs/personal-server-ts-core/grants";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
@@ -248,6 +252,12 @@ export interface AppDeps {
    * present, all three must be present together (record store, token
    * resolution, and stream declarations are mutually required).
    */
+  /**
+   * Retained PDPP grant bindings, the durable history of which apps were ever
+   * granted PDPP access. Needed to tell an unexposed app from an exposed one
+   * when `pdpp` is enabled.
+   */
+  pdppGrantBindings?: PdppGrantBindingStore;
   pdpp?: {
     store: PdppRecordStore;
     bindingStore: ReturnType<typeof createSqliteRecordStore>;
@@ -508,6 +518,14 @@ export function createApp(deps: AppDeps): Hono {
         deps.gatewayUrl ?? deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       paymentEnabled: deps.paymentEnabled,
       lineageGateway: deps.lineageGateway,
+      // No PDPP surface: no PDPP data exists, so no writer can be exposed.
+      // With PDPP, exposure is answered from the retained grant bindings; an
+      // unwired store leaves it undeterminable and writes count as PDPP.
+      writerExposure: deps.pdpp
+        ? deps.pdppGrantBindings
+          ? writerExposureFromBindings(deps.pdppGrantBindings)
+          : undefined
+        : { kind: "pdpp-disabled" },
       writeSessionStore,
       writeProofReplayStore,
       pdppOwnerBearer: deps.pdpp

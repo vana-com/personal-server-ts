@@ -623,7 +623,7 @@ export async function computeQuestion(
       lineage,
       // Handed to the publication point, which stamps the output: an answer
       // computed from PDPP data must not be readable by a legacy chain grant.
-      lineageInputsPdppOrigin: sourcesHavePdppOrigin,
+      inputsPdppOrigin: sourcesHavePdppOrigin,
       afterTombstoneVersion: await tombstoneMarker(
         deps.scopeDeletions,
         registration.derivedScope,

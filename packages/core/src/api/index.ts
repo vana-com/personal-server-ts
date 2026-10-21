@@ -94,7 +94,11 @@ import {
   prepareLineage,
   type StoredLineage,
 } from "../lineage/lineage.js";
-import { sourcesHavePdppOrigin } from "../lineage/input-origin.js";
+import {
+  writerHasPdppExposure,
+  type WriterExposurePolicy,
+} from "../grants/writer-exposure.js";
+import { citedSourcesHavePdppOrigin } from "../lineage/cited-origin.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import {
   deletionHistoryOf,
@@ -409,6 +413,12 @@ export interface PersonalServerDataApiDeps {
    * only cite local scopes and the lineage read answers 503.
    */
   lineageGateway?: LineageGatewayPort;
+  /**
+   * How to tell whether a non-owner writer was ever exposed to PDPP data.
+   * Absent means exposure cannot be determined, so every non-owner write is
+   * PDPP-origin; a server without any PDPP surface sets `pdpp-disabled`.
+   */
+  writerExposure?: WriterExposurePolicy;
   /**
    * Called after a write is committed (owner or builder, JSON or binary).
    * The derivative compute layer uses it to mark questions that read the
@@ -1573,9 +1583,9 @@ async function prepareWriteLineage(
   deps: PersonalServerDataApiDeps,
   scope: string,
   field: unknown,
-): Promise<{ lineage: StoredLineage; inputsPdppOrigin: boolean } | undefined> {
+): Promise<{ lineage: StoredLineage; sourceScopes: string[] } | undefined> {
   if (field === undefined || field === null) return undefined;
-  const prepared = await prepareLineage({
+  return prepareLineage({
     scope,
     field,
     serverOwner: deps.serverOwner,
@@ -1583,13 +1593,30 @@ async function prepareWriteLineage(
     gateway: deps.lineageGateway,
     now: deps.now ?? (() => new Date()),
   });
-  return {
-    lineage: prepared.lineage,
-    inputsPdppOrigin: await sourcesHavePdppOrigin(
-      deps.storage,
-      prepared.sourceScopes,
-    ),
-  };
+}
+
+/**
+ * Origin of a write's inputs, decided once per write (see `inputsPdppOrigin`
+ * on the ingest contract). A non-owner's lineage list is only a claim, so the
+ * writer is classified first: one that ever held a PDPP grant, or whose
+ * exposure cannot be determined, writes PDPP-origin whatever it cites (with or
+ * without lineage, JSON or binary). Only an unexposed writer falls through to
+ * the cited sources. The owner's own derivatives keep cited-source
+ * classification; `undefined` is an ordinary owner root write.
+ */
+async function writeInputsPdppOrigin(
+  deps: PersonalServerDataApiDeps,
+  writeAuth: PersonalServerWriteAuthResult | undefined,
+  prepared: { sourceScopes: string[] } | undefined,
+): Promise<boolean | undefined> {
+  if (writeAuth) {
+    if (await writerHasPdppExposure(deps.writerExposure, writeAuth.builder)) {
+      return true;
+    }
+  } else if (!prepared) {
+    return undefined;
+  }
+  return citedSourcesHavePdppOrigin(deps.storage, prepared?.sourceScopes ?? []);
 }
 
 /**
@@ -2467,7 +2494,11 @@ export async function handlePersonalServerDataRequest(
             status,
             attribution: writeAuth?.attribution,
             lineage,
-            lineageInputsPdppOrigin: prepared?.inputsPdppOrigin,
+            inputsPdppOrigin: await writeInputsPdppOrigin(
+              deps,
+              writeAuth,
+              prepared,
+            ),
             afterTombstoneVersion,
             precondition: parsedPrecondition,
           });
@@ -2522,7 +2553,11 @@ export async function handlePersonalServerDataRequest(
           status,
           attribution: writeAuth?.attribution,
           lineage,
-          lineageInputsPdppOrigin: prepared?.inputsPdppOrigin,
+          inputsPdppOrigin: await writeInputsPdppOrigin(
+            deps,
+            writeAuth,
+            prepared,
+          ),
           afterTombstoneVersion,
           precondition: parsedPrecondition,
           producer: producerHeader.producer,

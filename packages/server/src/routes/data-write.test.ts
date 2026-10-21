@@ -195,6 +195,8 @@ describe("POST /v1/data/:scope with a write session", () => {
     });
 
     app = dataRoutes({
+      // These tests are not about PDPP: no PDPP surface, so no writer is exposed.
+      writerExposure: { kind: "pdpp-disabled" },
       indexManager,
       hierarchyOptions,
       logger,
