@@ -58,7 +58,50 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 5;
+const COVERAGE_RULE_VERSION = 6;
+
+/** Live Claude omits some account metadata. Preserve known fields from the
+ * same organization's saved head; never borrow entities or another identity. */
+async function retainClaudeProfile(
+  read: CanonicalLegacyReadOk,
+  legacy: DataFileEnvelope,
+): Promise<void> {
+  const current = read.envelope.data;
+  const previous = legacy.data;
+  if (
+    current.source !== "live-session" ||
+    typeof current.organizationId !== "string" ||
+    current.organizationId !== previous.organizationId
+  )
+    return;
+  const isObject = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!isObject(current.profile) || !isObject(previous.profile)) return;
+  const profile = { ...current.profile };
+  let retained = false;
+  for (const field of ["name", "plan"] as const) {
+    if (
+      profile[field] === null &&
+      typeof previous.profile[field] === "string"
+    ) {
+      profile[field] = previous.profile[field];
+      retained = true;
+    }
+  }
+  if (retained) {
+    read.envelope = { ...read.envelope, data: { ...current, profile } };
+    // The stored metadata contributes to the response even when live rows do not change.
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(
+        `${read.revision}:profile:${JSON.stringify(profile)}`,
+      ),
+    );
+    read.revision = Array.from(new Uint8Array(digest), (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
+  }
+}
 
 function scopeDeclarationCursor(scope: string): string {
   return JSON.stringify(
@@ -693,7 +736,7 @@ export function createLegacyScopeView(
       if (legacyHead !== null && input.readLegacyHead) {
         let coverage = cachedCoverage;
         const cached = coverage !== null;
-        if (!coverage) {
+        if (!coverage || decision.selection.method === "anthropic-live") {
           let legacy: DataFileEnvelope;
           try {
             legacy = await input.readLegacyHead(legacyHead);
@@ -718,6 +761,12 @@ export function createLegacyScopeView(
                 detail: "indexed legacy head has another scope",
               },
             };
+          }
+          if (
+            scope === "claude.conversations" &&
+            decision.selection.method === "anthropic-live"
+          ) {
+            await retainClaudeProfile(read, legacy);
           }
           coverage = compareLegacyCoverage(legacy.data, read.envelope.data, {
             scope,
