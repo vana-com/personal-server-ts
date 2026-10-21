@@ -334,21 +334,36 @@ async function fixture() {
   expect(changes.next_cursor).toBeTypeOf("string");
   const allChanges = await json("/streams/messages/records?changes_since=");
   expect(allChanges.next_changes_since).toBeTypeOf("string");
-  async function assertQuarantined() {
+  async function assertQuarantined({ savedCursorsExpired = false } = {}) {
+    const savedCursorStatus = savedCursorsExpired ? 410 : 200;
     const paths = [
-      "/streams/messages/records/z-quarantined",
-      "/streams/messages/records",
-      "/streams/messages/records?changes_since=",
-      `/streams/messages/records?order=asc&limit=1&cursor=${encodeURIComponent(list.next_cursor)}`,
+      ["/streams/messages/records/z-quarantined", 404],
+      ["/streams/messages/records", 200],
+      ["/streams/messages/records?changes_since=", 200],
+      // A page cursor binds the reader's view revision for this connection
+      // and stream. Retraction changes that revision, so the saved page
+      // cursor always expires instead of continuing past the retracted key.
+      [
+        `/streams/messages/records?order=asc&limit=1&cursor=${encodeURIComponent(list.next_cursor)}`,
+        410,
+      ],
       // This is the supported retained-history read; there is no invented
       // historical-revision endpoint in this API.
-      `/streams/messages/records?changes_since=&limit=1&cursor=${encodeURIComponent(changes.next_cursor)}`,
-      `/streams/messages/records?changes_since=${encodeURIComponent(allChanges.next_changes_since)}`,
-    ];
-    for (const path of paths) {
+      [
+        `/streams/messages/records?changes_since=&limit=1&cursor=${encodeURIComponent(changes.next_cursor)}`,
+        savedCursorStatus,
+      ],
+      [
+        `/streams/messages/records?changes_since=${encodeURIComponent(allChanges.next_changes_since)}`,
+        savedCursorStatus,
+      ],
+    ] as const;
+    for (const [path, expectedStatus] of paths) {
       const response = await read(path);
       const body = await response.text();
-      expect.soft(response.status, path).toBeLessThan(500);
+      expect.soft(response.status, path).toBe(expectedStatus);
+      if (expectedStatus === 410)
+        expect.soft(JSON.parse(body).error.code, path).toBe("cursor_expired");
       expect.soft(body, path).not.toContain(secret);
       expect.soft(body, path).not.toContain(substituted);
       expect.soft(body, path).not.toContain("z-quarantined");
@@ -468,12 +483,12 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
       { ...f.target, data: { ...f.target.data, text: substituted } },
     ]);
     expect(f.quarantinedConnections()).toEqual([{ instance: "conn" }]);
-    await f.assertQuarantined();
+    await f.assertQuarantined({ savedCursorsExpired: true });
     await f.restart();
-    await f.assertQuarantined();
+    await f.assertQuarantined({ savedCursorsExpired: true });
   });
 
-  it("revalidates at most 50 retained slots per cycle without starving later imports", async () => {
+  it("revalidates at most 50 retained slots per cycle and reaches all 55 staged slots", async () => {
     const f = await fixture();
     const staged: PreparedFragment[] = [];
     for (let index = 0; index < 55; index++)
