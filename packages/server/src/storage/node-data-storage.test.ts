@@ -109,6 +109,90 @@ describe("owner import deletion ordering", () => {
   });
 });
 
+describe("scope deletion racing a replica at a retired import path", () => {
+  it("keeps the replica committed between the two deletion transactions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "import-scope-replica-"));
+    const dataDir = join(root, "data");
+    const db = initializeDatabase(join(root, "index.db"));
+    const index = createIndexManager(db);
+    const storage = createNodeDataStorage({
+      indexManager: index,
+      hierarchyOptions: { dataDir },
+    });
+    const db2 = initializeDatabase(join(root, "index.db"));
+    const index2 = createIndexManager(db2);
+    const concurrent = createNodeDataStorage({
+      indexManager: index2,
+      hierarchyOptions: { dataDir },
+    });
+    const scope = "github.events";
+    try {
+      const imported = await storage.commitVersion!({
+        kind: "append",
+        envelope: createDataFileEnvelope(scope, "2026-10-11T00:00:00Z", {
+          value: "a",
+        }),
+        metadata: {},
+        import: {
+          authority: "local",
+          owner: "owner",
+          operation: "a".repeat(64),
+          bodySha256: "a".repeat(64),
+        },
+      });
+      if (imported.kind !== "stored") throw new Error("Import was not stored");
+      const original = db.transaction.bind(db);
+      let injected = false;
+      let replica: ReturnType<NonNullable<DataStoragePort["commitVersion"]>>;
+      db.transaction = (run) => {
+        const transaction = original(run);
+        const wrapped = (...args: Parameters<typeof transaction>) =>
+          transaction(...args);
+        return Object.assign(wrapped, {
+          default: transaction.default,
+          deferred: transaction.deferred,
+          exclusive: transaction.exclusive,
+          immediate: (...args: Parameters<typeof transaction>) => {
+            const result = transaction.immediate(...args);
+            if (
+              !injected &&
+              db
+                .prepare<[string], { state: string }>(
+                  "SELECT state FROM owner_import_operations WHERE operation = ?",
+                )
+                .get("a".repeat(64))?.state === "deleted"
+            ) {
+              injected = true;
+              replica = concurrent.commitVersion!({
+                kind: "replica",
+                envelope: createDataFileEnvelope(
+                  scope,
+                  imported.envelope.collectedAt,
+                  { value: "replica" },
+                ),
+                metadata: { schemaId: null, dataPointId: "dp-1", version: 7 },
+              });
+            }
+            return result;
+          },
+        });
+      };
+      expect(await storage.deleteScope(scope)).toBe(1);
+      db.transaction = original;
+      const stored = await replica!;
+      expect(stored.kind).toBe("stored");
+      expect(storage.countVersions(scope)).toBe(1);
+      expect(
+        await storage.readEnvelope(scope, imported.envelope.collectedAt),
+      ).toMatchObject({ data: { value: "replica" } });
+    } finally {
+      index2.close();
+      index.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("createNodeDataStorage.deleteByFileId", () => {
   let db: Database.Database;
   let dataDir: string;

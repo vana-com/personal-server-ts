@@ -22,7 +22,7 @@ import {
   PublishedDataFileError,
   snapshotScopeFiles,
 } from "./hierarchy.js";
-import { relative } from "node:path";
+import { relative, resolve } from "node:path";
 
 interface OperationRow {
   authority: string;
@@ -291,7 +291,22 @@ export function createImportOperations(
       });
       return immediate(() => {
         recover();
-        deleteScopeFilesSync(snapshot.files);
+        // A write committed between the two transactions can reuse a captured
+        // path; its file belongs to a row the snapshot never saw.
+        const captured = new Set(snapshot.entries.map(({ id }) => id));
+        const later = new Set(
+          (
+            db
+              .prepare("SELECT id, path FROM data_files WHERE scope = ?")
+              .all(scope) as { id: number; path: string }[]
+          )
+            .filter(({ id }) => !captured.has(id))
+            .map(({ path }) => resolve(options.dataDir, path)),
+        );
+        deleteScopeFilesSync({
+          ...snapshot.files,
+          files: snapshot.files.files.filter((file) => !later.has(file)),
+        });
         const remove = db.prepare(
           "DELETE FROM data_files WHERE id = @id AND path = @path",
         );
