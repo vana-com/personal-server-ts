@@ -104,7 +104,11 @@ export async function handleOuraCollectionRequirementsRequest(
     );
     return result.ok
       ? Response.json(
-          { ...result, contract: OURA_LEGACY_TAKEOVER_CONTRACT },
+          {
+            ...result,
+            contract: OURA_LEGACY_TAKEOVER_CONTRACT,
+            takeoverSelection: "unrestricted-three-streams-v1",
+          },
           { headers },
         )
       : Response.json(

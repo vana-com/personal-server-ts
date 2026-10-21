@@ -13,10 +13,15 @@ import {
 } from "../legacy-projection/index.js";
 import { compareLegacyCoverage } from "../storage/legacy-scope-coverage.js";
 import { LEGACY_SCOPE_ENTITY_KEYS } from "../storage/legacy-scope-entity-keys.js";
-import { OURA_BROWSER_HISTORY_POLICY } from "./history-policy.js";
+import {
+  OURA_BROWSER_HISTORY_POLICY,
+  isOuraTakeoverSelection,
+} from "./history-policy.js";
 
 const STREAMS = ["sleep", "readiness", "activity"] as const;
 export interface OuraBrowserImportInput {
+  /** Prepared run selection. Required unless Node supplies validated native proof. */
+  selection?: { streams: unknown[] };
   records: PdppRecord[];
   collectedAt: string;
   completion: {
@@ -36,6 +41,8 @@ export type OuraBrowserImportOptions = Pick<
   | "onDataWritten"
   | "legacyScopeView"
 > & {
+  /** Node's fixed artifact-bound producer already validates its current START selection. */
+  artifactBoundNativeCompletion?: boolean;
   /** Current-generation retained rows, including deleted IDs, as coverage constraints only. */
   retainedCanonicalHistory?: { records: PdppRecord[]; collectedAt: string };
   /** Node commits the validated current batch to its existing canonical store. */
@@ -85,6 +92,13 @@ export async function importOuraBrowserRecords(
     return { ok: false, reason: "invalid_completion" };
   }
   const counts = new Map<string, number>(STREAMS.map((stream) => [stream, 0]));
+  if (
+    input.selection === undefined
+      ? options.artifactBoundNativeCompletion !== true
+      : !isOuraTakeoverSelection(input.selection)
+  ) {
+    return { ok: false, reason: "selection_not_eligible" };
+  }
   const ids = new Set<string>();
   for (const record of input.records) {
     if (

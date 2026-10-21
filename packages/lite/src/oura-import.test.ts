@@ -21,6 +21,7 @@ const newTime = "2026-10-15T00:00:00.000Z";
 const streams = ["sleep", "readiness", "activity"] as const;
 function input(collectedAt = newTime): OuraBrowserImportInput {
   return {
+    selection: { streams: streams.map((name) => ({ name })) },
     collectedAt,
     records: streams.map((stream) => ({
       stream,
@@ -92,6 +93,30 @@ async function setup(
 }
 
 describe("Lite Oura browser takeover", () => {
+  it("refuses a restricted all-stream batch even when it covers every retained ID", async () => {
+    const { storage, post } = await setup();
+    const body = input();
+    body.selection = {
+      streams: streams.map((name) => ({
+        name,
+        time_range: { since: "2026-10-13", until: "2026-10-14" },
+      })),
+    };
+    const before = storage.findEntry({ scope: "oura.activity" });
+    const response = await post(body);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      reason: "selection_not_eligible",
+    });
+    expect(storage.findEntry({ scope: "oura.activity" })).toEqual(before);
+    const missing = {
+      ...input(),
+      selection: undefined,
+      artifactBoundNativeCompletion: true,
+    };
+    expect((await post(missing)).status).toBe(409);
+    expect(storage.findEntry({ scope: "oura.activity" })).toEqual(before);
+  });
   it("refuses incomplete evidence through the public helper before replacing a legacy head", async () => {
     const { storage } = await setup();
     const body = input();
@@ -456,6 +481,7 @@ describe("Lite Oura browser takeover", () => {
     expect(await empty.json()).toEqual({
       ok: true,
       contract: "oura-legacy-takeover-v1",
+      takeoverSelection: "unrestricted-three-streams-v1",
       since: null,
     });
   });
@@ -473,6 +499,7 @@ describe("Lite Oura browser takeover", () => {
     expect(await required.json()).toEqual({
       ok: true,
       contract: "oura-legacy-takeover-v1",
+      takeoverSelection: "unrestricted-three-streams-v1",
       since: "2025-01-01",
     });
     expect((await post(input())).status).toBe(409);

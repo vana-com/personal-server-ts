@@ -134,6 +134,7 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
     const result = await importOuraBrowserRecords(storage, body, {
       legacyScopeView: deps.legacyScopeView,
       retainedCanonicalHistory: preflight?.history,
+      artifactBoundNativeCompletion: body.native !== undefined,
       scopeDeletions: deps.scopeDeletions,
       syncManager: deps.syncManager,
       additions: deps.additions,

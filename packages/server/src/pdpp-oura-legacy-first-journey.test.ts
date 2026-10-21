@@ -1381,6 +1381,7 @@ describe("Oura default admission cutover", () => {
               data,
             })),
           ),
+          selection: { streams: SCOPES.map((name) => ({ name })) },
           completion: {
             streams: SCOPES.map((scope) => ({
               stream: STREAM_OF[scope],
@@ -1567,6 +1568,138 @@ describe("Oura default admission cutover", () => {
 });
 
 describe("Oura collection requirements", () => {
+  it.skipIf(!process.env.F2_NATIVE_PUBLICATION_ORACLE)(
+    "recollects after empty native success and saved checkpoints with no retained history date",
+    async () => {
+      await restartWithMethods(["oura-browser"], []);
+      const profile = JSON.parse(
+        await readFile(
+          join(
+            process.env.F2_DESKTOP_SOURCE!,
+            "src-tauri/tests/fixtures/oura-browser-0.1.41.collection-profile.json",
+          ),
+          "utf8",
+        ),
+      );
+      const fixturePath = join(tempDir, "empty-native-upstream.json");
+      const listener = createHttpServer(async (incoming, outgoing) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
+        const response = await ctx!.app.fetch(
+          new Request(`http://localhost${incoming.url}`, {
+            method: incoming.method,
+            headers: incoming.headers as HeadersInit,
+            ...(chunks.length ? { body: Buffer.concat(chunks) } : {}),
+          }),
+        );
+        outgoing.writeHead(
+          response.status,
+          Object.fromEntries(response.headers),
+        );
+        outgoing.end(Buffer.from(await response.arrayBuffer()));
+      });
+      await new Promise<void>((resolve) =>
+        listener.listen(0, "127.0.0.1", resolve),
+      );
+      try {
+        const address = listener.address() as { port: number };
+        const token = await ownerPdppToken();
+        let state: unknown = {};
+        const empty = {
+          sleep: [],
+          daily_sleep: [],
+          daily_readiness: [],
+          daily_activity: [],
+        };
+        const populated = {
+          daily_sleep: DAYS.map(({ n, score }) => ({
+            id: `ds${n}`,
+            day: date(n),
+            score,
+            timestamp: ts(n),
+            contributors: SLEEP_CONTRIB,
+          })),
+          sleep: pdppSleep(DAYS).filter(
+            (row) => row.record_type === "sleep_session",
+          ),
+          daily_readiness: DAYS.map(pdppReadiness),
+          daily_activity: DAYS.map(pdppActivity),
+        };
+        for (const [index, upstream] of [empty, empty, populated].entries()) {
+          const requirements = await ctx!.app.request(
+            "/v1/import/oura-browser/requirements",
+            { headers: { authorization: `Bearer ${token}` } },
+          );
+          expect(requirements.status).toBe(200);
+          const since = (await requirements.json()).since;
+          expect(since).toBeNull();
+          const at = `2026-10-${15 + index}T00:00:00.000Z`;
+          await writeFile(
+            fixturePath,
+            JSON.stringify({ ...upstream, emittedAt: at }),
+          );
+          const child = spawn(
+            process.env.F2_NATIVE_PUBLICATION_ORACLE!,
+            [
+              `http://127.0.0.1:${address.port}`,
+              ctx!.devToken!,
+              owner,
+              process.execPath,
+              join(
+                process.env.F2_NATIVE_ORACLE_ROOT!,
+                "signed-collector-runner.mjs",
+              ),
+              process.env.F2_OURA_SIGNED_CODE!,
+              fixturePath,
+            ],
+            { stdio: ["pipe", "pipe", "pipe"] },
+          );
+          let stdout = "",
+            stderr = "";
+          child.stdout.on("data", (chunk) => {
+            stdout += chunk;
+          });
+          child.stderr.on("data", (chunk) => {
+            stderr += chunk;
+          });
+          child.stdin.end(
+            JSON.stringify({
+              generation: 1,
+              profile,
+              collectedAt: at,
+              historySince: since,
+              scope: {
+                streams: SCOPES.map((scope) => ({ name: STREAM_OF[scope] })),
+              },
+              state,
+            }),
+          );
+          const exit = await new Promise<number | null>((resolve, reject) => {
+            child.once("error", reject);
+            child.once("close", resolve);
+          });
+          expect(exit, stderr).toBe(0);
+          const result = JSON.parse(stdout);
+          expect(result.err, stdout + stderr).toBeUndefined();
+          expect(result.ok.start.state).toBeNull();
+          expect(result.ok.receipts).toHaveLength(3);
+          expect(result.ok.records).toBe(index === 2 ? 8 : 0);
+          state = result.ok.checkpoints;
+          expect(Object.keys(state as object)).toHaveLength(3);
+          if (index < 2) await restartWithMethods(["oura-browser"], []);
+        }
+        for (const scope of SCOPES) {
+          const read = await observe(scope);
+          expect(read.owner.status).toBe(200);
+          expect(read.builder.status).toBe(200);
+          expect(dayRows(read.owner, scope)).toHaveLength(2);
+          expect(dayRows(read.builder, scope)).toHaveLength(2);
+        }
+      } finally {
+        await new Promise<void>((resolve) => listener.close(() => resolve()));
+      }
+    },
+  );
   it("accepts a minted source owner token for requirements before the first connection and after registration", async () => {
     const db = new Database(join(tempDir, "index.db"));
     try {
@@ -1587,6 +1720,7 @@ describe("Oura collection requirements", () => {
     expect(await initial.json()).toEqual({
       ok: true,
       contract: "oura-legacy-takeover-v1",
+      takeoverSelection: "unrestricted-three-streams-v1",
       since: null,
     });
     await registerAccount(token, accountOne, "oura-browser");
@@ -1706,6 +1840,7 @@ describe("Oura collection requirements", () => {
             JSON.stringify({
               generation: 1,
               profile,
+              historySince: since,
               collectedAt,
               scope: {
                 streams: SCOPES.map((scope) => ({
@@ -1856,6 +1991,7 @@ describe("Oura collection requirements", () => {
           data,
         })),
       ),
+      selection: { streams: SCOPES.map((name) => ({ name })) },
       completion: {
         streams: SCOPES.map((scope) => ({
           stream: STREAM_OF[scope],
@@ -1900,6 +2036,7 @@ describe("Oura collection requirements", () => {
           data,
         })),
       ),
+      selection: { streams: SCOPES.map((name) => ({ name })) },
       completion: {
         streams: SCOPES.map((scope) => ({
           stream: STREAM_OF[scope],
@@ -1956,6 +2093,7 @@ describe("Oura collection requirements", () => {
           data,
         })),
       ),
+      selection: { streams: SCOPES.map((name) => ({ name })) },
       completion: {
         streams: SCOPES.map((scope) => ({
           stream: STREAM_OF[scope],
@@ -1995,6 +2133,7 @@ describe("Oura collection requirements", () => {
     expect(await (await requirements()).json()).toEqual({
       ok: true,
       contract: "oura-legacy-takeover-v1",
+      takeoverSelection: "unrestricted-three-streams-v1",
       since: null,
     });
     await legacyWrite("oura.activity", {
@@ -2027,6 +2166,7 @@ describe("Oura collection requirements", () => {
           data,
         })),
       ),
+      selection: { streams: SCOPES.map((name) => ({ name })) },
       completion: {
         streams: SCOPES.map((scope) => ({
           stream: STREAM_OF[scope],
@@ -2221,6 +2361,7 @@ describe("Oura collection requirements", () => {
     expect(await (await requirements()).json()).toEqual({
       ok: true,
       contract: "oura-legacy-takeover-v1",
+      takeoverSelection: "unrestricted-three-streams-v1",
       since: "2026-09-01",
     });
     await writePdpp(DAYS, T_PDPP);
