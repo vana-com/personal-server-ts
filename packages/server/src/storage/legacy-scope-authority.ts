@@ -277,6 +277,25 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
 
     confirmRead(scope, expectedHead, selectionIsCurrent, method, verdict) {
       if (!hasTable("data_files")) return expectedHead === null;
+      // A cached proof for a takeover recorded without its method names it.
+      // Checked before the transaction so the read-only case never writes.
+      const upgradesUnknownMethod =
+        verdict?.cached === true &&
+        verdict.coverage.covered &&
+        expectedHead !== null &&
+        hasTable("legacy_scope_takeovers") &&
+        db
+          .prepare(
+            `SELECT 1 FROM legacy_scope_takeovers
+             WHERE scope = ? AND instance = ? AND generation = ?
+               AND superseded_path = ? AND method = ''`,
+          )
+          .get(
+            scope,
+            verdict.instance,
+            verdict.generation,
+            expectedHead.path,
+          ) !== undefined;
       const validate = () => {
         if (isReset(scope)) return false;
         const currentHead = readEligibleLegacyHead(scope);
@@ -308,8 +327,10 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
         if (expectedHead === null) return true;
         if (verdict?.cached) {
           // The same proof as when the takeover was recorded: it also names
-          // the method of a record written before takeovers did.
-          if (verdict.coverage.covered && hasTable("legacy_scope_takeovers"))
+          // the method of a record written before takeovers did. Only then
+          // does a cached confirmation write, under the writer lock taken
+          // below; otherwise it stays a read.
+          if (upgradesUnknownMethod)
             db.prepare(
               `UPDATE legacy_scope_takeovers SET method = ?
                WHERE scope = ? AND instance = ? AND generation = ?
@@ -411,7 +432,8 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
         return true;
       };
       try {
-        return expectedHead === null || verdict?.cached
+        return expectedHead === null ||
+          (verdict?.cached && !upgradesUnknownMethod)
           ? db.transaction(validate).deferred()
           : db.transaction(validate).immediate();
       } catch (error) {
@@ -420,7 +442,9 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           typeof error === "object" &&
           error !== null &&
           "code" in error &&
-          (error.code === "SQLITE_BUSY" || error.code === "SQLITE_LOCKED")
+          (error.code === "SQLITE_BUSY" ||
+            error.code === "SQLITE_BUSY_SNAPSHOT" ||
+            error.code === "SQLITE_LOCKED")
         ) {
           return false;
         }

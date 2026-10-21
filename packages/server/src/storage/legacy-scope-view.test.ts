@@ -234,6 +234,135 @@ describe("legacy scope view over the real SQLite record store", () => {
     }
   });
 
+  describe("a cached confirmation while another connection commits", () => {
+    const covered: LegacyCoverageVerdict = {
+      covered: true,
+      comparisonCase: "same_time",
+      reason: null,
+      reasonCounts: {
+        no_stable_key: 0,
+        missing_entity: 0,
+        missing_field: 0,
+        field_mismatch: 0,
+        type_mismatch: 0,
+        timestamp_format: 0,
+        identity_mismatch: 0,
+        creation_mismatch: 0,
+        array_order: 0,
+        payload_growth: 0,
+        missing_raw_blob: 0,
+        projection_unavailable: 0,
+      },
+      appliedExceptions: [],
+      missingEntityCount: 0,
+      mismatchedFieldPaths: [],
+      legacyBytes: 100,
+      canonicalBytes: 100,
+      byteDelta: 0,
+    };
+
+    function twoConnections() {
+      const dir = mkdtempSync(join(tmpdir(), "legacy-authority-"));
+      const path = join(dir, "index.db");
+      const reader = initializeDatabase(path);
+      const readerStore = createSqliteRecordStore(reader);
+      const writer = initializeDatabase(path);
+      reader
+        .prepare(
+          "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+        )
+        .run(
+          "oura/sleep/old.json",
+          "oura.sleep",
+          "2026-06-08T18:05:53.547Z",
+          1,
+        );
+      const authority = createLegacyScopeAuthority(reader);
+      const head = authority.eligibleLegacyHead("oura.sleep")!;
+      const verdict = (cached: boolean) => ({
+        instance: "conn_a",
+        generation: 1,
+        writeClock: authority.writeClock(),
+        arrivalRevision: authority.arrivalRevision(),
+        canonicalCursor: "0:0:receipt:revision:1",
+        coverage: covered,
+        cached,
+      });
+      // Commits an unrelated scope from the other connection, after the
+      // confirmation has taken its read snapshot.
+      const commitElsewhere = () => {
+        writer
+          .prepare(
+            "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+          )
+          .run(
+            `other/${Math.random()}.json`,
+            "other.scope",
+            "2026-06-09T00:00:00.000Z",
+            1,
+          );
+        return true;
+      };
+      const close = () => {
+        readerStore.close();
+        writer.close();
+        rmSync(dir, { recursive: true, force: true });
+      };
+      return { reader, authority, head, verdict, commitElsewhere, close };
+    }
+
+    it("confirms a takeover that already names its method", () => {
+      const t = twoConnections();
+      try {
+        expect(
+          t.authority.confirmRead(
+            "oura.sleep",
+            t.head,
+            () => true,
+            "oura",
+            t.verdict(false),
+          ),
+        ).toBe(true);
+        expect(
+          t.authority.confirmRead(
+            "oura.sleep",
+            t.head,
+            t.commitElsewhere,
+            "oura",
+            t.verdict(true),
+          ),
+        ).toBe(true);
+      } finally {
+        t.close();
+      }
+    });
+
+    it("names the method of an older unknown record without a snapshot conflict", () => {
+      const t = twoConnections();
+      try {
+        t.reader
+          .prepare(
+            `INSERT INTO legacy_scope_takeovers
+              (scope, instance, generation, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+              VALUES ('oura.sleep', 'conn_a', 1, 1, 1, '2026-06-08T18:05:53.547Z', 'oura/sleep/old.json')`,
+          )
+          .run();
+        expect(
+          t.authority.confirmRead(
+            "oura.sleep",
+            t.head,
+            () => true,
+            "oura",
+            t.verdict(true),
+          ),
+        ).toBe(true);
+        expect(t.authority.hasMethodTakeover("oura.sleep", "oura")).toBe(true);
+      } finally {
+        t.close();
+      }
+    });
+  });
+
   it("persists provenance-backed omission evidence in the verdict ledger", () => {
     db.prepare(
       "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
