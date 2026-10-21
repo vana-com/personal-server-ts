@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import { readStoredLineage } from "../lineage/lineage.js";
+import { withLegacyProjection } from "../storage/legacy-projection.js";
+import { withDisclosurePolicy } from "../storage/disclosure-policy.js";
+import { readEvidence } from "../storage/read-evidence.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { computeQuestion, type QuestionComputeDeps } from "./compute.js";
 import {
@@ -144,6 +147,7 @@ describe("computeQuestion", () => {
       computeDataPointId(OWNER, "chatgpt.conversations"),
     ];
     expect(readStoredLineage(envelope.data)).toEqual({
+      kind: "computed-question",
       sources: expectedIds,
       writtenAt: "2026-08-27T12:00:00.000Z",
       origin: "legacy",
@@ -564,6 +568,231 @@ describe("computeQuestion", () => {
     const ok = deps({ store: selfSourcing() });
     await withLineage(ok.storage, "spine.summary", "oura.sleep");
     expect((await computeQuestion("q-1", ok)).status).toBe("ready");
+  });
+
+  it.each([
+    "requested",
+    "joined",
+    "intermediate",
+    "joined-intermediate",
+    "acyclic",
+    "unused-sibling",
+    "malformed",
+    "unreadable",
+  ])(
+    "cycle guard uses stored dependencies behind a projected %s source",
+    async (kind) => {
+      const raw = createMemoryDataStorage();
+      const at = "2026-08-21T00:00:00Z";
+      const put = async (
+        scope: string,
+        data: Record<string, unknown>,
+        from?: string,
+      ) => {
+        const envelope = {
+          version: "1.0",
+          scope,
+          collectedAt: at,
+          data: {
+            ...data,
+            ...(from
+              ? {
+                  $lineage: {
+                    sources: [computeDataPointId(OWNER, from)],
+                    writtenAt: at,
+                    origin: "legacy",
+                  },
+                }
+              : {}),
+          },
+        };
+        const written = await raw.writeEnvelope(envelope);
+        await raw.insertEntry({
+          fileId: null,
+          path: written.relativePath,
+          scope,
+          collectedAt: at,
+          sizeBytes: written.sizeBytes,
+        });
+      };
+      await put("coach.weekly", { answer: "previous-output" });
+      const joined = kind === "joined" || kind === "joined-intermediate";
+      const intermediate =
+        kind === "intermediate" ||
+        kind === "joined-intermediate" ||
+        kind === "unreadable";
+      const from =
+        kind === "acyclic" || kind === "unused-sibling"
+          ? "bank.transactions"
+          : "coach.weekly";
+      await put(
+        "chatgpt.conversations",
+        {
+          records: [
+            {
+              id: "conv-1",
+              title: "Trip",
+              create_time: at,
+              update_time: at,
+              current_node: "m1",
+              message_count_on_current_branch: 1,
+            },
+          ],
+        },
+        joined ? undefined : from,
+      );
+      await put(
+        "chatgpt.messages",
+        {
+          records: [
+            {
+              id: "m1",
+              conversation_id: "conv-1",
+              parent_id: null,
+              role: "user",
+              content: "joined-input",
+              content_type: "text",
+              model_slug: null,
+              create_time: at,
+              on_current_branch: true,
+            },
+          ],
+        },
+        joined ? from : undefined,
+      );
+      if (intermediate)
+        await put(
+          "spine.summary",
+          { answer: "intermediate" },
+          "chatgpt.conversations",
+        );
+      if (kind === "unused-sibling") {
+        const message = await raw.readEnvelope("chatgpt.messages", at);
+        message.data = {
+          notRecords: "unused legacy sibling",
+          $lineage: {
+            sources: [computeDataPointId(OWNER, "coach.weekly")],
+            writtenAt: at,
+            origin: "legacy",
+          },
+        };
+      }
+      if (kind === "malformed") {
+        (await raw.readEnvelope("chatgpt.conversations", at)).data.$lineage = {
+          sources: ["not-an-id"],
+          writtenAt: at,
+        };
+      }
+      if (kind === "unreadable") {
+        const read = raw.readEnvelope.bind(raw);
+        raw.readEnvelope = async (scope, collectedAt) => {
+          if (scope === "chatgpt.conversations")
+            throw new Error("unreadable internal dependency");
+          return read(scope, collectedAt);
+        };
+      }
+      const served = withLegacyProjection(raw);
+      if (kind === "acyclic" || kind === "unused-sibling") {
+        const approved = await withDisclosurePolicy(served).readEnvelope(
+          "chatgpt.conversations",
+          at,
+        );
+        const facts = readEvidence(approved);
+        expect(facts.lineageSources).toEqual([
+          computeDataPointId(OWNER, "bank.transactions"),
+        ]);
+        expect(
+          facts.inputVersions.map((version) => version.scope).sort(),
+        ).toEqual(
+          kind === "unused-sibling"
+            ? ["chatgpt.conversations"]
+            : ["chatgpt.conversations", "chatgpt.messages"],
+        );
+        expect(Object.isFrozen(facts)).toBe(true);
+        expect(Object.isFrozen(facts.lineageSources)).toBe(true);
+        expect(Object.isFrozen(facts.inputVersions)).toBe(true);
+        expect(JSON.stringify(approved)).not.toContain(
+          computeDataPointId(OWNER, "bank.transactions"),
+        );
+      }
+      const d = deps({
+        storage: served,
+        store: createInMemoryQuestionStore({
+          initial: [
+            registration({
+              sourceScopes: [
+                intermediate ? "spine.summary" : "chatgpt.conversations",
+              ],
+            }),
+          ],
+        }),
+      });
+      const outcome = await computeQuestion("q-1", d);
+      console.log(
+        JSON.stringify({
+          probe: "projected-cycle",
+          kind,
+          status: outcome.status,
+          error: (await d.store.get("q-1"))?.error,
+          inferenceCalls: fakeCalls(d).length,
+          versions: raw.countVersions("coach.weekly"),
+        }),
+      );
+      if (kind === "acyclic" || kind === "unused-sibling") {
+        expect(outcome.status).toBe("ready");
+        expect(fakeCalls(d)).toHaveLength(1);
+      } else {
+        expect(outcome.status).toBe("failed");
+        if (kind === "malformed" || kind === "unreadable")
+          expect((await d.store.get("q-1"))?.error).toBeTruthy();
+        else
+          expect((await d.store.get("q-1"))?.error).toMatch(
+            /^DERIVATIVE_CYCLE/,
+          );
+        expect(fakeCalls(d)).toHaveLength(0);
+        expect(raw.countVersions("coach.weekly")).toBe(1);
+      }
+    },
+  );
+
+  it("builder compute receives the grantee presentation of a generated source", async () => {
+    const raw = createMemoryDataStorage();
+    await seed(raw, "bank.transactions", { value: "authorized answer input" });
+    const ownerDeps = deps({
+      storage: raw,
+      store: createInMemoryQuestionStore({
+        initial: [registration({ sourceScopes: ["bank.transactions"] })],
+      }),
+    });
+    expect((await computeQuestion("q-1", ownerDeps)).status).toBe("ready");
+    const d = deps({
+      storage: raw,
+      pdppEnabled: false,
+      store: createInMemoryQuestionStore({
+        initial: [
+          registration({
+            derivedScope: "summary.daily",
+            sourceScopes: ["coach.weekly"],
+            registeredBy: { kind: "builder", builder: BUILDER, grantId: "g-1" },
+          }),
+        ],
+      }),
+      writePolicyPorts: policyPorts(["coach.*", "write:summary.daily"]),
+    });
+    const outcome = await computeQuestion("q-1", d);
+    const prompt = JSON.stringify(fakeCalls(d));
+    console.log(
+      JSON.stringify({
+        probe: "generated-compute-presentation",
+        status: outcome.status,
+        hiddenCoordinates: prompt.includes("bank.transactions"),
+      }),
+    );
+    expect(outcome.status).toBe("ready");
+    expect(prompt).not.toContain("bank.transactions");
+    expect(prompt).not.toContain(
+      computeDataPointId(OWNER, "bank.transactions"),
+    );
   });
 
   it("skips (status untouched) while the runtime is unavailable", async () => {

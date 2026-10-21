@@ -2,6 +2,7 @@ import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
 import { storageForReader } from "../storage/disclosure-policy.js";
+import { redactEnvelopeForGrantee } from "../storage/read-evidence.js";
 import {
   DataDeletedError,
   DeleteTombstoneFailedError,
@@ -84,13 +85,9 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
-import {
-  WRITER_ATTRIBUTION_KEY,
-  type WriterAttribution,
-} from "../write/attribution.js";
+import type { WriterAttribution } from "../write/attribution.js";
 import {
   extractLineageField,
-  LINEAGE_KEY,
   prepareLineage,
   type StoredLineage,
 } from "../lineage/lineage.js";
@@ -1662,59 +1659,7 @@ export function isOwnerView(
   );
 }
 
-/**
- * The envelope view a grantee read is entitled to. The server-stamped
- * `$writtenBy` (writing builder's address, grantId, signature) and
- * `$lineage` (the owner's source data-point ids, dictionary-attackable back
- * to scopes since dataPointId = keccak(owner, scope)) never leave the server
- * on a grantee read: the owner reads them from storage, and grantees get the
- * graph only through the grant-redacted lineage endpoint. When `$lineage` is
- * present, the caller-supplied lineage field it mirrors (top-level `lineage`
- * on a JSON record, `metadata.lineage` on a binary one) carries the same ids
- * and is dropped with it; without the stamp such a field is ordinary user
- * data and stays. Redaction is at serve time only — the stored envelope, its
- * dataHash commitment, and the owner's view are unchanged.
- */
-export function redactEnvelopeForGrantee(
-  envelope: DataFileEnvelope,
-): DataFileEnvelope {
-  const {
-    [WRITER_ATTRIBUTION_KEY]: attribution,
-    [LINEAGE_KEY]: storedLineage,
-    ...rest
-  } = envelope.data;
-  if (attribution === undefined && storedLineage === undefined) {
-    return envelope;
-  }
-  let data: Record<string, unknown> = rest;
-  if (storedLineage !== undefined) {
-    if (isBinaryEnvelope(envelope)) {
-      const metadata = data["metadata"];
-      if (
-        metadata !== null &&
-        typeof metadata === "object" &&
-        !Array.isArray(metadata)
-      ) {
-        const { lineage: _consumed, ...metadataRest } = metadata as Record<
-          string,
-          unknown
-        >;
-        if (Object.keys(metadataRest).length === 0) {
-          // The lineage was the whole metadata object; leaving `{}` behind
-          // would still disclose that a metadata object existed.
-          const { metadata: _emptied, ...dataRest } = data;
-          data = dataRest;
-        } else {
-          data = { ...data, metadata: metadataRest };
-        }
-      }
-    } else {
-      const { lineage: _consumed, ...dataRest } = data;
-      data = dataRest;
-    }
-  }
-  return { ...envelope, data };
-}
+export { redactEnvelopeForGrantee };
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
 

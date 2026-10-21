@@ -24,6 +24,11 @@ import {
 } from "../policy/legacy-disclosure.js";
 import type { DataStoragePort } from "../ports/index.js";
 import { previewEnvelopeValue } from "./preview.js";
+import { ownReadEnvelope } from "./read-evidence.js";
+import {
+  isCurrentBlockRedactionContext,
+  redactBlockRefsForGrantee,
+} from "./blocks/redaction.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
 import { blockRepresentationId } from "./blocks/representation.js";
 import { boundEnvelopeDigest, trustedPdppOrigin } from "./blocks/digest.js";
@@ -82,7 +87,13 @@ function servedManifest(manifest: DataBlockManifest): DataBlockManifest {
   return {
     ...served,
     representationId: blockRepresentationId(manifest, "grantee"),
-    blocks: blocks.map(({ digest: _blockDigest, ...ref }) => ref),
+    blocks: redactBlockRefsForGrantee(
+      blocks,
+      manifest.redaction ?? {
+        dropTopLevelLineage: true,
+        dropMetadataLineage: true,
+      },
+    ).map(({ digest: _blockDigest, ...ref }) => ref),
   };
 }
 
@@ -103,7 +114,7 @@ export function withDisclosurePolicy(
   ): Promise<DataFileEnvelope> {
     // Object adapters may lend a retained value. Own it before policy so
     // callers keep the approved body across later demand or payment awaits.
-    const envelope = structuredClone(
+    const envelope = ownReadEnvelope(
       await raw.readEnvelope(scope, collectedAt),
     );
     authorizeEnvelope(envelope, as);
@@ -178,7 +189,7 @@ export function withDisclosurePolicy(
       ? (JSON.parse(
           textDecoder.decode(await raw.readEnvelopeBytes(scope, collectedAt)),
         ) as DataFileEnvelope)
-      : structuredClone(await raw.readEnvelope(scope, collectedAt));
+      : ownReadEnvelope(await raw.readEnvelope(scope, collectedAt));
     if (
       generation !== undefined &&
       envelopeGeneration(envelope) !== generation
@@ -210,7 +221,11 @@ export function withDisclosurePolicy(
   if (raw.readScopeBlocks) {
     const rawBlocks = raw.readScopeBlocks.bind(raw);
     overrides.readScopeBlocks = async (scope, collectedAt, options) => {
-      const { generation, ...readOptions } = options;
+      const { generation, ...requestedOptions } = options;
+      const readOptions = {
+        ...requestedOptions,
+        representation: "grantee" as const,
+      };
       // Storage checks each block against the manifest read in the same
       // call, and reports the manifest's binding only when every served
       // block matched. The pinned generation, not the provenance bit, is the
@@ -221,7 +236,7 @@ export function withDisclosurePolicy(
         generation !== undefined &&
         result.envelopeDigest === generation &&
         result.pdppOrigin !== undefined &&
-        result.redaction !== undefined
+        isCurrentBlockRedactionContext(result.redaction)
       ) {
         authorizeLegacyRead("grantee", {
           kind: "stored-blocks",
@@ -249,7 +264,7 @@ export function withDisclosurePolicy(
         generation !== undefined &&
         boundEnvelopeDigest(manifest) === generation &&
         pdppOrigin !== undefined &&
-        manifest.redaction !== undefined
+        isCurrentBlockRedactionContext(manifest.redaction)
       ) {
         authorizeLegacyRead("grantee", {
           kind: "stored-blocks",

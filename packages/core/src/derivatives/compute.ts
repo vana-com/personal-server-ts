@@ -10,12 +10,12 @@ import {
   ProtocolError,
 } from "../errors/catalog.js";
 import { resolveReadDeletion } from "../api/index.js";
-import {
-  LOCAL_SCOPE_SCAN_PAGE,
-  readStoredLineage,
-} from "../lineage/lineage.js";
+import { LOCAL_SCOPE_SCAN_PAGE } from "../lineage/lineage.js";
 import { uncoveredSourceScopes } from "./registration.js";
-import { inputHasPdppOrigin } from "../sync/pdpp-import.js";
+import {
+  readEvidence,
+  redactEnvelopeForGrantee,
+} from "../storage/read-evidence.js";
 import {
   nonOwnerPublicationIsPdpp,
   type PdppEnabled,
@@ -405,9 +405,12 @@ async function assertNoLineageCycle(
         scope,
         entry.collectedAt,
       );
-      sources = readStoredLineage(envelope.data)?.sources ?? [];
+      sources = readEvidence(envelope).lineageSources;
     } catch {
-      // Unreadable or malformed lineage: nothing further to walk here.
+      throw new ComputeFailure(
+        "source dependencies could not be read",
+        "source_missing",
+      );
     }
     for (const next of sources)
       stack.push({ id: next, path: [...path, scope] });
@@ -420,7 +423,7 @@ async function loadSource(
   reader: LegacyReader,
 ): Promise<{
   source: PromptSource;
-  lineageSources: string[];
+  lineageSources: readonly string[];
   pdppOrigin: boolean;
 }> {
   const entry = deps.storage.findEntry({ scope });
@@ -457,18 +460,15 @@ async function loadSource(
     if (err instanceof ProtocolError) throw err;
     throw new ComputeFailure(`source scope ${scope} could not be read`);
   }
-  let lineageSources: string[] = [];
-  try {
-    lineageSources = readStoredLineage(envelope.data)?.sources ?? [];
-  } catch {
-    // Malformed stored lineage: treated as a root for the cycle walk.
-  }
-  const raw = isBinaryEnvelope(envelope)
+  const evidence = readEvidence(envelope, entry);
+  const presentation =
+    reader === "owner" ? envelope : redactEnvelopeForGrantee(envelope);
+  const raw = isBinaryEnvelope(presentation)
     ? {
         binary: true,
         note: "binary record; its content is not included in the prompt",
       }
-    : envelope.data;
+    : presentation.data;
   const trimmed = trimSourceData(raw, {
     maxItems: deps.maxSourceItems,
     maxChars: deps.maxSourceChars,
@@ -483,9 +483,9 @@ async function loadSource(
       total: trimmed.total,
       truncated: trimmed.truncated,
     },
-    lineageSources,
+    lineageSources: evidence.lineageSources,
     // The served envelope carries the provenance of every input it joined.
-    pdppOrigin: inputHasPdppOrigin(entry, envelope),
+    pdppOrigin: evidence.pdppOrigin,
   };
 }
 
@@ -613,6 +613,7 @@ export async function computeQuestion(
         : {}),
     };
     const lineage: StoredLineage = {
+      kind: "computed-question",
       sources: lineageIds,
       writtenAt: computedAt,
     };

@@ -1,4 +1,5 @@
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
+import { privateProvenanceFields } from "../storage/read-evidence.js";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -58,9 +59,19 @@ export function redactJsonEnvelopeBytesForGrantee(
 
 function dataFlags(bytes: Uint8Array, start: number, end: number) {
   let storedLineage = false;
+  let privateDataFields: readonly string[] = [];
   let binary = false;
   visitObject(bytes, start, end, (property) => {
-    if (property.key === "$lineage") storedLineage = true;
+    if (property.key === "$lineage") {
+      storedLineage = true;
+      privateDataFields = privateProvenanceFields(
+        JSON.parse(
+          decoder.decode(
+            bytes.subarray(property.valueStart, property.valueEnd),
+          ),
+        ),
+      );
+    }
     if (
       property.key === "$binary" &&
       decoder.decode(bytes.subarray(property.valueStart, property.valueEnd)) ===
@@ -69,7 +80,7 @@ function dataFlags(bytes: Uint8Array, start: number, end: number) {
       binary = true;
     }
   });
-  return { storedLineage, binary };
+  return { storedLineage, binary, privateDataFields };
 }
 
 function writeDataObject(
@@ -77,7 +88,11 @@ function writeDataObject(
   start: number,
   end: number,
   outputStart: number,
-  flags: { storedLineage: boolean; binary: boolean },
+  flags: {
+    storedLineage: boolean;
+    binary: boolean;
+    privateDataFields: readonly string[];
+  },
 ): number {
   let output = outputStart;
   let wroteProperty = false;
@@ -91,6 +106,7 @@ function writeDataObject(
     const omit =
       property.key === "$writtenBy" ||
       property.key === "$lineage" ||
+      flags.privateDataFields.includes(property.key) ||
       (flags.storedLineage && !flags.binary && property.key === "lineage") ||
       (redactMetadata &&
         !hasKeptProperty(bytes, property.valueStart, property.valueEnd));

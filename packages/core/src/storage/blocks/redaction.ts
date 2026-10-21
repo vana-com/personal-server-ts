@@ -1,6 +1,7 @@
 import type { DataStoragePort } from "../../ports/index.js";
 import { isBinaryEnvelope } from "../../contracts/binary.js";
 import { LINEAGE_KEY } from "../../lineage/lineage.js";
+import { privateProvenanceFields } from "../read-evidence.js";
 
 /**
  * Block sidecars are built from the FULL stored envelope, so they carry the
@@ -16,7 +17,11 @@ import { LINEAGE_KEY } from "../../lineage/lineage.js";
  * stamped-ness; if that read fails, both locations are dropped (fail
  * closed).
  */
+export const BLOCK_REDACTION_POLICY_VERSION = 2;
+
 export interface BlockRedactionContext {
+  policyVersion?: number;
+  privateDataFields?: readonly string[];
   dropTopLevelLineage: boolean;
   dropMetadataLineage: boolean;
 }
@@ -135,6 +140,7 @@ function redactedBlockPathPrefixes(ctx: BlockRedactionContext): string[] {
   return [
     "$.data.$writtenBy",
     "$.data.$lineage",
+    ...(ctx.privateDataFields ?? []).map((key) => `$.data.${key}`),
     ...(ctx.dropTopLevelLineage ? ["$.data.lineage"] : []),
     ...(ctx.dropMetadataLineage ? ["$.data.metadata.lineage"] : []),
   ];
@@ -164,6 +170,7 @@ function isRedactedKeyName(
     return (
       key === "$writtenBy" ||
       key === "$lineage" ||
+      (ctx.privateDataFields ?? []).includes(key) ||
       (ctx.dropTopLevelLineage && key === "lineage")
     );
   }
@@ -204,7 +211,11 @@ function stripDataLevelKeys(
   ctx: BlockRedactionContext,
 ): Record<string, unknown> {
   const { $writtenBy: _writtenBy, $lineage: _lineage, ...rest } = value;
-  let data: Record<string, unknown> = rest;
+  let data: Record<string, unknown> = Object.fromEntries(
+    Object.entries(rest).filter(
+      ([key]) => !(ctx.privateDataFields ?? []).includes(key),
+    ),
+  );
   if (ctx.dropTopLevelLineage) {
     const { lineage: _callerLineage, ...dataRest } = data;
     data = dataRest;
@@ -268,9 +279,24 @@ export function blockRedactionContext(content: unknown): BlockRedactionContext {
     !isPlainObject(content.data) ||
     !(LINEAGE_KEY in content.data)
   ) {
-    return { dropTopLevelLineage: false, dropMetadataLineage: false };
+    return {
+      policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+      privateDataFields: [],
+      dropTopLevelLineage: false,
+      dropMetadataLineage: false,
+    };
   }
+  const context = {
+    policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+    privateDataFields: privateProvenanceFields(content.data[LINEAGE_KEY]),
+  };
   return isBinaryEnvelope(content as never)
-    ? { dropTopLevelLineage: false, dropMetadataLineage: true }
-    : { dropTopLevelLineage: true, dropMetadataLineage: false };
+    ? { ...context, dropTopLevelLineage: false, dropMetadataLineage: true }
+    : { ...context, dropTopLevelLineage: true, dropMetadataLineage: false };
+}
+
+export function isCurrentBlockRedactionContext(
+  context: BlockRedactionContext | undefined,
+): boolean {
+  return context?.policyVersion === BLOCK_REDACTION_POLICY_VERSION;
 }
