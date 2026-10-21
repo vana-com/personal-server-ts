@@ -109,7 +109,7 @@ export interface SyncWindowChange {
   /** The key's version at the low horizon, if any. */
   before(): PdppRecordRow | undefined;
   /** True when a deletion of this key committed after the high horizon. */
-  deletedLater(): boolean;
+  deletedAfterHigh(): boolean;
 }
 
 export interface SyncWindow {

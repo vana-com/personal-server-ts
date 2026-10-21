@@ -1937,7 +1937,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
               RecordRowDb | undefined;
             return row ? toRow(row) : undefined;
           },
-          deletedLater: () =>
+          deletedAfterHigh: () =>
             high < clock && deletedAfterStmt.get(...key, high) !== undefined,
         });
       }

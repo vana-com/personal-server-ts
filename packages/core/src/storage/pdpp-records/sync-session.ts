@@ -63,8 +63,8 @@ export interface SyncRequest {
  *   requested direction, sealed tokens bound to grant and query context.
  *
  * Both profiles paginate over the authorized result only, so hidden records
- * never shape a page, and neither serves a record deleted after the session's
- * fixed horizon; the next session reports that deletion.
+ * never shape a page. Only the candidate refuses to serve a record deleted
+ * after the session's fixed horizon; it expires that session instead.
  */
 export function createPdppSyncSessionService(
   store: Pick<PdppRecordStore, "readSyncWindow" | "syncTokenScope">,
@@ -105,11 +105,19 @@ export function createPdppSyncSessionService(
         const data: PdppRecordRow[] = [];
         let hasMore = false;
         for (; index >= 0 && index < changes.length; index += step) {
-          const row = disclose(changes[index], position.low, request);
+          const change = changes[index];
+          const row = disclose(change, position.low, request);
           if (!row) continue;
           if (data.length === request.limit) {
             hasMore = true;
             break;
+          }
+          // Candidate deletion exception: never serve a record deleted after
+          // the session's first page. Withholding it silently could lose it,
+          // since the next session compares against this horizon, so the
+          // session fails and the client restarts, as a list read does.
+          if (request.candidate && !row.deleted && change.deletedAfterHigh()) {
+            throw new CursorExpiredError();
           }
           data.push(row);
         }
@@ -158,7 +166,7 @@ function disclose(
     const wasVisible = visible(before);
     if (!visible(after)) return wasVisible ? removal(after) : undefined;
     if (wasVisible && sameProjection(before!, after, fields)) return undefined;
-    return change.deletedLater() ? undefined : after;
+    return after;
   }
   if (after.deleted) {
     return !access || access.canSeeKey(after.recordKey) ? after : undefined;
@@ -168,7 +176,9 @@ function disclose(
   if (fields && before && sameProjection(before, after, fields)) {
     return undefined;
   }
-  return change.deletedLater() ? undefined : after;
+  // The current contract fixes every page at the session horizon, with no
+  // deletion exception: the next session carries the tombstone.
+  return after;
 }
 
 /** A minimal removal: never the now-hidden payload. */

@@ -364,7 +364,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
           low === null
             ? undefined
             : relevant.filter((h) => same(h) && h.writtenAt <= low).at(-1)?.row,
-        deletedLater: () =>
+        deletedAfterHigh: () =>
           history.some(
             (h) =>
               h.stream === stream &&

@@ -314,42 +314,85 @@ for (const backend of ["memory", "sqlite"]) {
         ]);
       });
 
-      it(`deletion exception: a later page never serves a record deleted after page 1 (${version})`, async () => {
+      const deleteBetweenPages = async (recreate: boolean) => {
         const h = harness(backend, {
           g1: grant(version, "G1", [streamGrant(version)]),
         });
         h.put("a", { name: "A", t: INSIDE });
         h.put("b", { name: "B", t: INSIDE });
-        const first = await h.get(
-          records("s", {
-            changes_since: begin(version),
-            limit: "1",
-            order: "asc",
-          }),
-        );
+        const session = { changes_since: begin(version), order: "asc" };
+        const first = await h.get(records("s", { ...session, limit: "1" }));
         expect(ids(first.body)).toEqual(["a"]);
         h.remove("b");
+        if (recreate) h.put("b", { name: "B", t: INSIDE });
         const second = await h.get(
           records("s", {
-            changes_since: begin(version),
+            ...session,
             limit: "1",
-            order: "asc",
             cursor: first.body.next_cursor,
           }),
         );
-        expect(second.status).toBe(200);
-        expect(second.body.data).toEqual([]);
-        expect(second.body.has_more).toBe(false);
-        // The next session reports the deletion.
-        const next = await h.get(
-          records("s", {
-            changes_since: second.body.next_changes_since,
-            order: "asc",
-          }),
-        );
-        expect(next.body.data).toEqual([
-          expect.objectContaining({ id: "b", deleted: true }),
-        ]);
+        const next = second.body.next_changes_since
+          ? await h.get(
+              records("s", {
+                changes_since: second.body.next_changes_since,
+                order: "asc",
+              }),
+            )
+          : undefined;
+        return { second, next };
+      };
+
+      for (const recreate of [false, true])
+        it(`a record deleted${recreate ? " and recreated" : ""} after page 1 follows the profile's rule (${version})`, async () => {
+          const { second, next } = await deleteBetweenPages(recreate);
+          if (version === CANDIDATE) {
+            // Never served after its deletion. Withholding it instead could
+            // lose it: the next session compares against this horizon.
+            expect(second.status).toBe(410);
+            expect(second.body.error?.code).toBe("cursor_expired");
+            return;
+          }
+          // Current: the page stays at the session horizon, as the current
+          // contract requires, and the next session carries the change.
+          expect(second.body.data).toEqual([
+            expect.objectContaining({ id: "b", data: { id: "b", name: "B" } }),
+          ]);
+          expect(second.body.has_more).toBe(false);
+          expect(next!.body.data).toEqual(
+            recreate
+              ? []
+              : [expect.objectContaining({ id: "b", deleted: true })],
+          );
+        });
+
+      it(`pages through one key held by two instances (${version})`, async () => {
+        const h = harness(backend, {
+          g1: grant(version, "G1", [
+            streamGrant(version, { instance_ids: ["i", "j"] }),
+          ]),
+        });
+        for (const instance of ["i", "j"])
+          h.put("a", { name: instance, t: INSIDE }, { instance });
+        const orders = version === CANDIDATE ? ["asc", "desc"] : ["asc"];
+        for (const order of orders) {
+          const seen: unknown[] = [];
+          let cursor: string | undefined;
+          do {
+            const page = await h.get(
+              records("s", {
+                changes_since: begin(version),
+                limit: "1",
+                order,
+                cursor,
+              }),
+            );
+            expect(page.status).toBe(200);
+            seen.push(...page.body.data.map((row) => row.data?.name));
+            cursor = page.body.next_cursor;
+          } while (cursor);
+          expect(seen).toEqual(order === "asc" ? ["i", "j"] : ["j", "i"]);
+        }
       });
 
       it(`fixed horizon: writes after page 1 wait for the next session (${version})`, async () => {
@@ -406,6 +449,28 @@ for (const backend of ["memory", "sqlite"]) {
       const sync = await h.get(records("s", { changes_since: forged }));
       expect(sync.status).toBe(410);
       expect(sync.body.error?.code).toBe("cursor_expired");
+    });
+
+    it("(current) a page cursor issued before authorized boundaries expires", async () => {
+      const h = harness(backend, {
+        g1: grant(CURRENT, "G1", [streamGrant(CURRENT)]),
+      });
+      for (const key of ["a", "b", "c"]) h.put(key, { name: key, t: INSIDE });
+      const first = await h.get(
+        records("s", { changes_since: "", limit: "1" }),
+      );
+      const payload = JSON.parse(
+        Buffer.from(first.body.next_cursor!, "base64url").toString("utf8"),
+      );
+      delete payload.after;
+      const old = Buffer.from(
+        JSON.stringify({ ...payload, offset: 1 }),
+      ).toString("base64url");
+      const resumed = await h.get(
+        records("s", { changes_since: "", limit: "1", cursor: old }),
+      );
+      expect(resumed.status).toBe(410);
+      expect(resumed.body.error?.code).toBe("cursor_expired");
     });
 
     it("current profile keeps its readable checkpoint format", async () => {

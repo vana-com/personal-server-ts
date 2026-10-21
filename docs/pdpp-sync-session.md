@@ -31,20 +31,20 @@ The current profile serves every current and private-v0.2 grant and every
 owner token. The candidate profile serves `0.1.0-candidate` grants, which the
 AS issues only when `pdpp.protocolProfile` is `candidate-0.1.0`.
 
-| Finding (design test)                                              | Class | Result                                                                                                                                                         |
-| ------------------------------------------------------------------ | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Hidden rows consume pages or add empty pages (04–08)               | A     | A page holds only disclosed items. A session with only hidden changes is one empty terminal page.                                                              |
-| Empty or tombstone-only granted stream is not discoverable (23–24) | A     | A client token lists every granted stream, with `record_count: 0` when it holds no visible record.                                                             |
-| Record deleted after page 1 is served on a later page              | A     | Not served. The next session reports the deletion.                                                                                                             |
-| Checkpoint horizon ahead of the store clock (18, current part)     | A     | `410 cursor_expired`.                                                                                                                                          |
-| A sync read advances the write clock                               | A     | It no longer does. A read-only SQLite store can now serve sync.                                                                                                |
-| Hidden-field or time-window visibility transitions (01–03)         | B     | Visibility at both horizons; removals carry no payload. The query slice built this; it now lives in the owner.                                                 |
-| Readable tokens and clock oracle (09, 10, 25)                      | B     | AES-256-GCM sealed tokens with fresh randomness, fixed-width horizons and padded length.                                                                       |
-| Token reuse across grant, instances, resources, fields (11–16)     | B     | `400 invalid_cursor`. The binding digest covers the grant id, subject, client, source, stream grant, response fields, instances, eligibility fields and order. |
-| Altered tokens, stream rebinding (17–19)                           | B     | `400 invalid_cursor`. A token sealed by another or a rebuilt store is `410 cursor_expired`.                                                                    |
-| Baseline conflict and role confusion (20–22)                       | B     | A page cursor is bound to its session's `changes_since` input; page cursors and checkpoints are distinct roles.                                                |
-| Order (26)                                                         | B     | Candidate sessions order by key in the `order` direction (default `desc`) and bind it. Current sessions keep ascending key order and ignore `order`.           |
-| Empty `changes_since`                                              | B     | Candidate: `400 invalid_cursor`; start with `beginning`. Current: still begins a session.                                                                      |
+| Finding (design test)                                              | Class | Result                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------------ | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hidden rows consume pages or add empty pages (04–08)               | A     | A page holds only disclosed items. A session with only hidden changes is one empty terminal page.                                                                                                                                                                                         |
+| Empty or tombstone-only granted stream is not discoverable (23–24) | A     | A client token lists every granted stream, with `record_count: 0` when it holds no visible record.                                                                                                                                                                                        |
+| Checkpoint horizon ahead of the store clock (18, current part)     | A     | `410 cursor_expired`.                                                                                                                                                                                                                                                                     |
+| A sync read advances the write clock                               | A     | It no longer does.                                                                                                                                                                                                                                                                        |
+| Hidden-field or time-window visibility transitions (01–03)         | B     | Visibility at both horizons; removals carry no payload. The query slice built this; it now lives in the owner.                                                                                                                                                                            |
+| Readable tokens and clock oracle (09, 10, 25)                      | B     | AES-256-GCM sealed tokens with fresh randomness, fixed-width horizons and padded length.                                                                                                                                                                                                  |
+| Token reuse across grant, instances, resources, fields (11–16)     | B     | `400 invalid_cursor`. The binding digest covers the grant id, subject, client, source, stream grant, response fields, instances, eligibility fields and order.                                                                                                                            |
+| Altered tokens, stream rebinding (17–19)                           | B     | `400 invalid_cursor`. A token sealed by another or a rebuilt store is `410 cursor_expired`.                                                                                                                                                                                               |
+| Baseline conflict and role confusion (20–22)                       | B     | A page cursor is bound to its session's `changes_since` input; page cursors and checkpoints are distinct roles.                                                                                                                                                                           |
+| Record deleted after page 1                                        | B     | Candidate: the page fails with `410 cursor_expired` instead of serving it, as a list read does. Withholding it could lose the record, because the next session compares against this session's horizon. Current: the page stays at the session horizon, as the current contract requires. |
+| Order (26)                                                         | B     | Candidate sessions order by key in the `order` direction (default `desc`) and bind it. Current sessions keep ascending key order and ignore `order`.                                                                                                                                      |
+| Empty `changes_since`                                              | B     | Candidate: `400 invalid_cursor`; start with `beginning`. Current: still begins a session.                                                                                                                                                                                                 |
 
 The B rules change the wire for clients that store checkpoints. Applying them
 to the current profile would invalidate every stored checkpoint, which is a
@@ -74,9 +74,10 @@ read, alter or reuse its own current-profile tokens.
 `packages/server/src/routes/pdpp-sync-conformance.test.ts` drives the public
 HTTP surface on both stores. All of its class A and B cases failed against
 #441's head, except 01–08 under the candidate profile, which #441 had already
-fixed. Controls cover fixed horizons, the deletion exception, a fresh access
-token for the same grant, a changed `limit`, retries, and a SQLite restart
-followed by a reset.
+fixed. Controls cover fixed horizons, the deletion rule in each profile with and
+without a recreate, one key held by two instances, a
+pre-change current-profile page cursor, a fresh access token for the same grant,
+a changed `limit`, retries, and a SQLite restart followed by a reset.
 
 - No store prunes history yet, so `410` for pruned history is covered only by
   the reset fence, rebuilt stores and horizons ahead of the clock.
@@ -86,3 +87,12 @@ followed by a reset.
 - The sealing key does not rotate. Rebuilding the records database expires
   every outstanding token.
 - Transport timing is outside this contract.
+- A candidate session keeps expiring while records on its later pages keep
+  being deleted, as a list read does. No test covers that loop or its recovery.
+- The candidate binds `order` into checkpoints, as spec-core requires for the
+  query context. A client that changes `order` between sessions gets
+  `400 invalid_cursor` and must start again from `beginning`.
+- Owner tokens always use the current profile; the candidate's owner-scope
+  token rules are not implemented here.
+- Schema v13 is a one-way step, like the v12 migration this stack already
+  adds.
