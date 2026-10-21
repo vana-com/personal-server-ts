@@ -96,6 +96,17 @@ function viewBytes(db: Database.Database) {
       .get() as { bytes: number }
   ).bytes;
 }
+/** Derived view tables and indexes; each is one b-tree of at least a page. */
+const viewObjects = (db: Database.Database) =>
+  (
+    db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type IN ('table','index') AND (tbl_name GLOB 'pdpp_replica_view*' OR tbl_name='pdpp_replica_local_view')",
+      )
+      .get() as { n: number }
+  ).n;
+const pageSize = (db: Database.Database) =>
+  db.pragma("page_size", { simple: true }) as number;
 const overlayRows = (db: Database.Database) =>
   (
     db.prepare("SELECT COUNT(*) AS n FROM pdpp_replica_view").get() as {
@@ -109,11 +120,10 @@ it.each([100, 1000])(
     const { db, receiver } = device(size);
     receiver();
     expect(overlayRows(db)).toBe(0);
-    // A handful of 4 KiB pages, never a copy of rows or operation JSON. The
-    // binding-conflict fact table now always exists (write side, migration
-    // v16), so the empty local-journal projection and its indexes are
-    // always created: a fixed few pages more, still independent of rows.
-    expect(viewBytes(db)).toBeLessThan(32 * 4096);
+    // Each derived table and index holds only its root page, never a copy of
+    // rows or operation JSON: 28 pages at 100, 1,000 and 5,000 rows, four of
+    // them the empty local projection that the conflict-fact table enables.
+    expect(viewBytes(db)).toBeLessThanOrEqual(viewObjects(db) * pageSize(db));
   },
 );
 

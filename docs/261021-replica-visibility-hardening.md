@@ -88,6 +88,12 @@ The r2 relaunch recorded these red before each production edit (logs `r2-*-red*.
 - Lite pending blob bytes: after a winning pending deletion, and after an operation-ID variant, Lite still returned all 13 bytes.
 - Bounded reads: with pending overwrites masking every canonical row, a `limit=1` owner HTTP page visited 504 rows at 100 masked keys and 15,004 at 3,000; an owner stream summary visited 102 and 3,002.
 
+The r4 coordinator-branch lane recorded these before each production edit (logs `r4c-*.log` under `~/.tmp/ps438-relaunch-logs/`):
+
+- Chunked bytes: with 1 MiB + 4 KiB blobs, a pending record stayed hidden after its bytes arrived as received chunks (replayed claim), as received and canonical chunks (another connection's import) or as pending chunks (another pending batch). A forced full re-derive made it visible, and then losing the received chunks or quarantining the carrier left it visible.
+- Byte source: a corrupt retained received copy still left the pending record visible, with bytes the route could not serve (legacy and chunks); a corrupt first pending copy hid the record or its bytes although a second pending copy verified; a forged chunk-manifest size threw `RangeError: Array buffer allocation failed`; staging a pending record over a 1 MiB canonical blob read the whole blob through the store.
+- Quarantine at read time was already correct: the key and connection tests passed before any edit, and removing the predicate from overlay rows, or the latest-row recompute, failed them.
+
 A differential run forced the full reducer for every key that the sparse fast path skips and logged any disagreement with canonical. Across 1,651 storage and route tests it logged none.
 
 Local raw logs are `~/.tmp/438-red.log`, `~/.tmp/438-node-strengthened-red.log`, `~/.tmp/438-http-red.log`, `~/.tmp/438-http-red-summary.log`, `~/.tmp/438-http-cursor-red.log`, `packages/lite/.evidence/pending-cardinality-red.log`, and the r1 logs under `~/.tmp/ps438-relaunch-logs/`. The evidence directory is ignored; this document records the failure mechanisms rather than checking generated logs into source control.
