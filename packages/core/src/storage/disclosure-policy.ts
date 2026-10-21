@@ -101,7 +101,11 @@ export function withDisclosurePolicy(
     collectedAt: string,
     as: LegacyReader = reader,
   ): Promise<DataFileEnvelope> {
-    const envelope = await raw.readEnvelope(scope, collectedAt);
+    // Object adapters may lend a retained value. Own it before policy so
+    // callers keep the approved body across later demand or payment awaits.
+    const envelope = structuredClone(
+      await raw.readEnvelope(scope, collectedAt),
+    );
     authorizeEnvelope(envelope, as);
     return envelope;
   }
