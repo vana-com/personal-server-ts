@@ -3445,6 +3445,296 @@ it.each([
   },
 );
 
+/** conn_a's "a" and conn_b's "b" reference one blob; legacy rows hold up to 1 MiB. */
+function sharedBlob(form: "legacy" | "chunks") {
+  const source = device(),
+    target = device();
+  for (const d of [source, target])
+    d.store.registerConnection({
+      instance: "conn_b",
+      sourceId,
+      method: "collector",
+      label: "B",
+    });
+  const size = form === "legacy" ? 3 : 1024 * 1024 + 4096;
+  const bytes = new Uint8Array(size).map((_, i) => (i + 1) % 251);
+  let blob!: ReturnType<typeof source.store.storeBlobBytesForInstance>;
+  for (const [instance, key] of [
+    ["conn_a", "a"],
+    ["conn_b", "b"],
+  ]) {
+    blob = source.store.storeBlobBytesForInstance({
+      instance,
+      method: "collector",
+      generation: 1,
+      bytes,
+      mimeType: "application/octet-stream",
+    });
+    source.store.ingestBatch(
+      [
+        {
+          instance,
+          stream: "messages",
+          key,
+          emitted_at: at,
+          data: {
+            id: key,
+            blob_ref: {
+              blob_id: blob.blobId,
+              sha256: blob.sha256,
+              size_bytes: blob.sizeBytes,
+              mime_type: blob.mimeType,
+            },
+          },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+  }
+  const ops = all(source);
+  const receiver = pendingReceiver(target);
+  return {
+    target,
+    receiver,
+    owner: receiver.readStore({ reader: "owner" }),
+    bytes,
+    blob,
+    a: ops.filter((op) => op.connectionId === "conn_a"),
+    b: ops.filter((op) => op.connectionId === "conn_b"),
+    /** Stage conn_b's batch as a carrier of the bytes, as a legacy row or chunks. */
+    carry(id: string) {
+      if (form === "legacy")
+        receiver.stage({
+          credential: "replica-secret",
+          id,
+          envelope: batch(this.b),
+          blobs: [{ blobId: blob.blobId, bytes }],
+        });
+      else {
+        const writer = binaryWriter(target.db, "staging", `${id}-stage`);
+        writer.write(bytes);
+        writer.finish();
+        receiver.stage({
+          credential: "replica-secret",
+          id,
+          envelope: batch(this.b),
+          stagedBlobs: [
+            { blobId: blob.blobId, key: `${id}-stage`, sizeBytes: size },
+          ],
+        });
+      }
+    },
+    rederive() {
+      receiver.reconcileDeclarations({ credential: "replica-secret" });
+    },
+  };
+}
+/** Flip one byte of a stored copy, keeping its length; returns the restore. */
+function tamper(
+  d: ReturnType<typeof device>,
+  copy:
+    | { table: "pdpp_replica_received_bytes"; blobId: string }
+    | { table: "pdpp_replica_pending_bytes"; blobId: string; batchId: string }
+    | { table: "pdpp_binary_chunks"; namespace: string; id: string },
+) {
+  const [select, update, args] =
+    copy.table === "pdpp_binary_chunks"
+      ? [
+          "SELECT bytes FROM pdpp_binary_chunks WHERE namespace=? AND blob_id=? AND position=0",
+          "UPDATE pdpp_binary_chunks SET bytes=? WHERE namespace=? AND blob_id=? AND position=0",
+          [copy.namespace, copy.id],
+        ]
+      : copy.table === "pdpp_replica_pending_bytes"
+        ? [
+            "SELECT bytes FROM pdpp_replica_pending_bytes WHERE blob_id=? AND batch_id=?",
+            "UPDATE pdpp_replica_pending_bytes SET bytes=? WHERE blob_id=? AND batch_id=?",
+            [copy.blobId, copy.batchId],
+          ]
+        : [
+            "SELECT bytes FROM pdpp_replica_received_bytes WHERE blob_id=?",
+            "UPDATE pdpp_replica_received_bytes SET bytes=? WHERE blob_id=?",
+            [copy.blobId],
+          ];
+  const { bytes } = d.db.prepare(select).get(...args) as { bytes: Buffer };
+  const changed = Buffer.from(bytes);
+  changed[0] ^= 0xff;
+  expect(d.db.prepare(update).run(changed, ...args).changes).toBe(1);
+  return () => d.db.prepare(update).run(bytes, ...args);
+}
+
+it.each(["legacy", "chunks"] as const)(
+  "hides a pending blob record and its bytes when its retained received copy is corrupt, as promotion would (%s)",
+  (form) => {
+    const f = sharedBlob(form);
+    f.receiver.import({
+      credential: "replica-secret",
+      envelope: batch(f.a.filter((op) => op.kind !== "upsert")),
+      blobs: [{ blobId: f.blob.blobId, bytes: f.bytes }],
+    });
+    f.receiver.stage({
+      credential: "replica-secret",
+      id: "dependent",
+      envelope: batch(f.a.filter((op) => op.kind === "upsert")),
+    });
+    // Another pending batch holds a valid copy.
+    f.carry("carrier");
+    expect(f.owner.getRecord("conn_a", "messages", "a")).toBeDefined();
+    expect(f.owner.getBlobBytes(f.blob.blobId)?.byteLength).toBe(
+      f.bytes.length,
+    );
+    const restore = tamper(
+      f.target,
+      form === "legacy"
+        ? { table: "pdpp_replica_received_bytes", blobId: f.blob.blobId }
+        : {
+            table: "pdpp_binary_chunks",
+            namespace: "received",
+            id: f.blob.blobId,
+          },
+    );
+    f.rederive();
+    // Promotion refuses a corrupt retained copy, so the preview must not
+    // show the record; nor may it advertise bytes it cannot serve.
+    expect(f.owner.getRecord("conn_a", "messages", "a")).toBeUndefined();
+    expect(f.owner.getBlobBytes(f.blob.blobId)).toBeUndefined();
+    restore();
+    f.rederive();
+    expect(f.owner.getRecord("conn_a", "messages", "a")).toBeDefined();
+    expect(Array.from(f.owner.getBlobBytes(f.blob.blobId)!)).toEqual(
+      Array.from(f.bytes),
+    );
+  },
+);
+
+it.each(["legacy", "chunks"] as const)(
+  "serves pending custody from a copy that verifies when another pending copy is corrupt (%s)",
+  (form) => {
+    const f = sharedBlob(form);
+    f.receiver.stage({
+      credential: "replica-secret",
+      id: "dependent",
+      envelope: batch(f.a),
+    });
+    f.carry("carrier-1");
+    f.carry("carrier-2");
+    tamper(
+      f.target,
+      form === "legacy"
+        ? {
+            table: "pdpp_replica_pending_bytes",
+            blobId: f.blob.blobId,
+            batchId: "carrier-1",
+          }
+        : {
+            table: "pdpp_binary_chunks",
+            namespace: "pending",
+            id: JSON.stringify(["carrier-1", f.blob.blobId]),
+          },
+    );
+    f.rederive();
+    expect(f.owner.getRecord("conn_a", "messages", "a")).toBeDefined();
+    expect(Array.from(f.owner.getBlobBytes(f.blob.blobId)!)).toEqual(
+      Array.from(f.bytes),
+    );
+  },
+);
+
+it("refuses a forged chunk manifest size before allocating it", () => {
+  const f = sharedBlob("chunks");
+  f.receiver.import({
+    credential: "replica-secret",
+    envelope: batch(f.a.filter((op) => op.kind !== "upsert")),
+    blobs: [{ blobId: f.blob.blobId, bytes: f.bytes }],
+  });
+  f.receiver.stage({
+    credential: "replica-secret",
+    id: "dependent",
+    envelope: batch(f.a.filter((op) => op.kind === "upsert")),
+  });
+  expect(f.owner.getBlobBytes(f.blob.blobId)?.byteLength).toBe(f.bytes.length);
+  f.target.db
+    .prepare(
+      "UPDATE pdpp_binary_manifests SET size_bytes=? WHERE namespace='received' AND blob_id=?",
+    )
+    .run(2 ** 40, f.blob.blobId);
+  // The visible descriptor claims the real size; the read fails closed.
+  expect(f.owner.getBlobBytes(f.blob.blobId)).toBeUndefined();
+});
+
+it("never reads a whole blob value through its store to decide preview visibility", () => {
+  const d = device();
+  const bytes = new Uint8Array(1024 * 1024 + 4096).map((_, i) => i % 13);
+  const blob = d.store.storeBlobBytesForInstance({
+    instance: "conn_a",
+    method: "collector",
+    generation: 1,
+    bytes,
+    mimeType: "application/octet-stream",
+  });
+  const ref = {
+    blob_id: blob.blobId,
+    sha256: blob.sha256,
+    size_bytes: blob.sizeBytes,
+    mime_type: blob.mimeType,
+  };
+  d.store.ingestBatch(
+    [
+      {
+        instance: "conn_a",
+        stream: "messages",
+        key: "b",
+        emitted_at: at,
+        data: { id: "b", blob_ref: ref },
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 1 },
+  );
+  const wholeReads: string[] = [];
+  const receiver = createReplicaReceiver({
+    db: d.db,
+    store: {
+      ...d.store,
+      getBlobBytes: (id: string) => {
+        wholeReads.push(id);
+        return d.store.getBlobBytes(id);
+      },
+    },
+    owner: "owner",
+    enabled: true,
+    authenticate: (c) => (c === "replica-secret" ? "owner" : undefined),
+    declarations: () => declarations,
+  });
+  receiver.stage({
+    credential: "replica-secret",
+    id: "pending",
+    envelope: batch([
+      registration(),
+      {
+        ...upsert(50),
+        data: { id: "a", blob_ref: ref },
+        blobs: [
+          {
+            blobId: blob.blobId,
+            sha256: `sha256:${blob.sha256}`,
+            mimeType: blob.mimeType,
+            sizeBytes: blob.sizeBytes,
+          },
+        ],
+      } as ReplicaOperation,
+    ]),
+  });
+  expect(
+    receiver
+      .readStore({ reader: "owner" })
+      .getRecord("conn_a", "messages", "a"),
+  ).toMatchObject({ visibility: "pending" });
+  expect(wholeReads).toEqual([]);
+});
+
 it.each(["point", "page", "streams", "changes"] as const)(
   "selects conflict policy and %s values from one SQLite snapshot",
   (surface) => {
