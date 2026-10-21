@@ -655,6 +655,14 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
       ).toHaveLength(3);
     });
 
+    it("when the collector re-delivers an identical file after the projection arrived", async () => {
+      LEGACY_TS = false;
+      await writeLegacy(DAYS, T_LEGACY);
+      await writePdpp(DAYS, T_PDPP);
+      await writeLegacy(DAYS, T_LEGACY_NEWER);
+      expect(await readAll()).toEqual(ALL(FILE));
+    });
+
     it("with a second oura-browser connection that also holds data (no 409)", async () => {
       await writeLegacy(DAYS, T_LEGACY);
       const token = await writePdpp(DAYS, T_PDPP);
