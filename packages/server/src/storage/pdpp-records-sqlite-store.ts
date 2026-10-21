@@ -10,6 +10,7 @@ import {
   RECEIVER_MIGRATION,
   REPLICA_INTEGRITY_MIGRATION,
 } from "./pdpp-replication-receiver.js";
+import { REPLICA_COPY_MIGRATION } from "./pdpp-replica-copies.js";
 import {
   createReplicationJournal,
   REPLICATION_MIGRATION,
@@ -356,6 +357,8 @@ BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
     `CREATE TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END;`,
   // Replica family: integrity fences and binding-conflict facts (replica tables only).
   REPLICA_INTEGRITY_MIGRATION,
+  // Replica family: batch copies, finalized facts, dispositions, receipts.
+  REPLICA_COPY_MIGRATION,
 ];
 
 function addCompletionProofColumns(db: Database): void {

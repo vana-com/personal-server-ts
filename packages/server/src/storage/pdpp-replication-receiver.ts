@@ -9,6 +9,17 @@ import {
   type BinaryNamespace,
 } from "./pdpp-binary-chunks.js";
 import type { Database } from "better-sqlite3";
+import {
+  createReplicaCopies,
+  REPLICA_REFETCH_BUDGET,
+  ReplicaCopyRefused,
+  type CopyPromotion,
+  type StagedCopy,
+} from "./pdpp-replica-copies.js";
+import type {
+  CopyDecision,
+  FinalizedFact,
+} from "@opendatalabs/personal-server-ts-core/replication/copy-promotion";
 import { createHash } from "node:crypto";
 import {
   canonicalJson,
@@ -211,7 +222,9 @@ export function createReplicaReceiver(deps: {
         store.markReplicaBindingConflict({
           connectionId: id,
           reason: "source_binding_conflict",
-          evidence: [...new Set(ops.map((op) => `${op.sourceId} ${op.methodId}`))]
+          evidence: [
+            ...new Set(ops.map((op) => `${op.sourceId} ${op.methodId}`)),
+          ]
             .sort()
             .slice(0, 8),
         });
@@ -888,9 +901,286 @@ export function createReplicaReceiver(deps: {
       );
     });
   }
+  /**
+   * Withdraw a connection from every reader: the quarantine fact (raises the
+   * integrity epoch), canonical tombstones, claims and completion. Caller
+   * holds the transaction and flushes the view.
+   */
+  function withdrawConnection(instance: string) {
+    quarantineConnection(instance);
+    for (const row of db
+      .prepare(
+        "SELECT stream,record_key FROM pdpp_records WHERE instance = ? AND deleted = 0",
+      )
+      .all(instance) as { stream: string; record_key: string }[])
+      write(instance, row.stream, row.record_key, null);
+    db.prepare("DELETE FROM pdpp_blob_claims WHERE instance = ?").run(instance);
+    db.prepare("DELETE FROM pdpp_stream_completion WHERE instance = ?").run(
+      instance,
+    );
+  }
+  type ImportBlobs = {
+    blobs?: { blobId: string; bytes: Uint8Array }[];
+    stagedBlobs?: {
+      blobId: string;
+      key: string;
+      sizeBytes: number;
+      namespace?: "staging" | "pending";
+    }[];
+  };
+  /** Import a validated, owner-checked envelope. Caller holds the transaction. */
+  function importParsed(
+    envelope: ReturnType<typeof replicaEnvelopeSchema.parse>,
+    input: ImportBlobs,
+  ): ReplicaMergePlan {
+    for (const op of envelope.operations) validateMapping(op);
+    for (const blob of input.blobs ?? []) {
+      if (hash(blob.bytes) !== blob.blobId)
+        throw new Error("corrupt replica blob bytes");
+      if (binaryLength(db, "received", blob.blobId) !== undefined) {
+        if (
+          !verifyBinary(
+            db,
+            "received",
+            blob.blobId,
+            blob.blobId,
+            blob.bytes.length,
+          )
+        )
+          throw new Error("corrupt retained replica bytes");
+      } else if (blob.bytes.length <= 1024 * 1024) {
+        db.prepare("INSERT INTO pdpp_replica_received_bytes VALUES (?, ?)").run(
+          blob.blobId,
+          blob.bytes,
+        );
+      } else {
+        const writer = binaryWriter(db, "received", blob.blobId);
+        writer.write(blob.bytes);
+        writer.finish();
+      }
+    }
+    for (const blob of input.stagedBlobs ?? []) {
+      const from = blob.namespace ?? "staging";
+      if (!verifyBinary(db, from, blob.key, blob.blobId, blob.sizeBytes))
+        throw new Error("corrupt replica blob bytes");
+      if (binaryLength(db, "received", blob.blobId) !== undefined) {
+        if (
+          !verifyBinary(
+            db,
+            "received",
+            blob.blobId,
+            blob.blobId,
+            blob.sizeBytes,
+          )
+        )
+          throw new Error("corrupt retained replica bytes");
+      } else copyBinary(db, from, blob.key, "received", blob.blobId);
+    }
+    for (const op of envelope.operations) {
+      db.prepare(
+        "INSERT OR IGNORE INTO pdpp_replica_received VALUES (?, ?)",
+      ).run(canonicalJson(op), replicaOperationDigest(op));
+      db.prepare(
+        "UPDATE pdpp_replica_clock SET counter = MAX(counter, ?) WHERE id = 1",
+      ).run(op.revision.counter);
+    }
+    const plan = reconcile();
+    view.flush();
+    return plan;
+  }
+  /**
+   * Batch copies (contract v3.1). The legacy pending row of an id mirrors its
+   * single `pending` copy, so #438's preview view and its triggers keep one
+   * key per id. Pending bytes stay keyed (id, blobId): a blob id is its
+   * content hash, so copies that share a blob share identical bytes, and a
+   * blob is released only when no other retained copy of the id names it.
+   */
+  const copies = createReplicaCopies({
+    db,
+    owner,
+    importEnvelope(envelope, blobs, id) {
+      importParsed(envelope, {
+        stagedBlobs: blobs.map((b) => ({
+          blobId: b.blobId,
+          key: pendingBlobKey(id, b.blobId),
+          sizeBytes: b.size,
+          namespace: "pending" as const,
+        })),
+      });
+    },
+    quarantineConnection: withdrawConnection,
+    preview: {
+      show(id, envelope, blobsJson) {
+        const encoded = canonicalJson(envelope);
+        const row = db
+          .prepare(
+            "SELECT state,envelope_json,blobs_json FROM pdpp_replica_pending_batches WHERE id=?",
+          )
+          .get(id) as PendingBatch | undefined;
+        if (
+          row?.state === "pending" &&
+          row.envelope_json === encoded &&
+          row.blobs_json === blobsJson
+        )
+          return;
+        if (row?.state === "pending") view.removePending(id);
+        db.prepare(
+          "INSERT INTO pdpp_replica_pending_batches VALUES (?,?,?,'pending',NULL) ON CONFLICT(id) DO UPDATE SET envelope_json=excluded.envelope_json,blobs_json=excluded.blobs_json,state='pending',reason=NULL",
+        ).run(id, encoded, blobsJson);
+        view.addPending(id, envelope.operations);
+      },
+      hide(id, state) {
+        if (
+          db
+            .prepare(
+              "UPDATE pdpp_replica_pending_batches SET state=?,reason=? WHERE id=? AND state='pending'",
+            )
+            .run(state, state === "quarantined" ? "copy conflict" : null, id)
+            .changes > 0
+        )
+          view.removePending(id);
+      },
+    },
+    releaseBytes(id, blobIds) {
+      for (const blobId of blobIds)
+        deleteBinary(db, "pending", pendingBlobKey(id, blobId));
+    },
+    now: () => Date.now(),
+  });
+  const hasCopies = (id: string) =>
+    db
+      .prepare("SELECT 1 FROM pdpp_replica_copies WHERE id=? LIMIT 1")
+      .get(id) !== undefined;
+  /** Copy-path mutation: authenticated, one transaction, view flushed inside it. */
+  function copyTransaction<T>(credential: unknown, effect: () => T): T {
+    authorize(credential);
+    return db
+      .transaction(() => {
+        const result = effect();
+        view.flush();
+        return result;
+      })
+      .immediate();
+  }
   const api = {
     setPendingEnabled(enabled: boolean) {
       pendingEnabled = enabled;
+    },
+    /**
+     * Batch-copy custody and promotion (contract v3.1). Trusted host hooks:
+     * the caller verified every fragment's bytes against its own hash pair.
+     */
+    copies: {
+      stage(input: {
+        credential: unknown;
+        copy: Omit<StagedCopy, "envelope" | "blobs"> & { envelope: unknown };
+        blobs?: { blobId: string; bytes: Uint8Array }[];
+        /** Verified transport staging, copied into pending custody. */
+        stagedBlobs?: { blobId: string; key: string; sizeBytes: number }[];
+        refetch?: { attempts: number; budget: number };
+      }) {
+        authorize(input.credential);
+        const envelope = replicaEnvelopeSchema.parse(input.copy.envelope);
+        if (
+          envelope.owner !== owner ||
+          envelope.operations.some((op) => op.owner !== owner)
+        )
+          throw new Error("wrong replica owner");
+        for (const op of envelope.operations) validateMapping(op);
+        for (const blob of input.blobs ?? [])
+          if (hash(blob.bytes) !== blob.blobId)
+            throw new Error("corrupt replica blob bytes");
+        for (const blob of input.stagedBlobs ?? [])
+          if (
+            !verifyBinary(db, "staging", blob.key, blob.blobId, blob.sizeBytes)
+          )
+            throw new Error("corrupt replica blob bytes");
+        const id = input.copy.id;
+        return copyTransaction(input.credential, () => {
+          const held = (blobId: string, size: number) =>
+            verifyBinary(
+              db,
+              "pending",
+              pendingBlobKey(id, blobId),
+              blobId,
+              size,
+            );
+          for (const blob of input.blobs ?? [])
+            if (!held(blob.blobId, blob.bytes.length)) {
+              const writer = binaryWriter(
+                db,
+                "pending",
+                pendingBlobKey(id, blob.blobId),
+              );
+              writer.write(blob.bytes);
+              writer.finish();
+            }
+          for (const blob of input.stagedBlobs ?? [])
+            if (!held(blob.blobId, blob.sizeBytes))
+              copyBinary(
+                db,
+                "staging",
+                blob.key,
+                "pending",
+                pendingBlobKey(id, blob.blobId),
+              );
+          return copies.stage(
+            {
+              ...input.copy,
+              envelope,
+              blobs: [
+                ...(input.blobs ?? []).map((b) => ({
+                  blobId: b.blobId,
+                  size: b.bytes.length,
+                })),
+                ...(input.stagedBlobs ?? []).map((b) => ({
+                  blobId: b.blobId,
+                  size: b.sizeBytes,
+                })),
+              ],
+            },
+            input.refetch ?? { attempts: 0, budget: REPLICA_REFETCH_BUDGET },
+          );
+        });
+      },
+      /** Append one verified finalized fact (F2). Returns true when new. */
+      recordFact(input: {
+        credential: unknown;
+        id: string;
+        scope: string;
+        fragmentIndex: number;
+        fact: FinalizedFact;
+      }): boolean {
+        return copyTransaction(input.credential, () =>
+          copies.recordFact(input),
+        );
+      },
+      decide: copies.decide,
+      disposition: copies.disposition,
+      list: copies.copies,
+      apply(input: {
+        credential: unknown;
+        id: string;
+        decision: CopyDecision;
+      }) {
+        copyTransaction(input.credential, () =>
+          copies.apply(input.id, input.decision),
+        );
+      },
+      promote(input: {
+        credential: unknown;
+        id: string;
+        copyKey?: string;
+      }): CopyPromotion {
+        return copyTransaction(input.credential, () =>
+          copies.promote({ id: input.id, copyKey: input.copyKey }),
+        );
+      },
+      terminate(input: { credential: unknown; id: string; reason: string }) {
+        copyTransaction(input.credential, () =>
+          copies.terminate(input.id, input.reason),
+        );
+      },
     },
     stage(input: {
       credential: unknown;
@@ -901,6 +1191,9 @@ export function createReplicaReceiver(deps: {
       stagedBlobs?: { blobId: string; key: string; sizeBytes: number }[];
     }) {
       authorize(input.credential);
+      // A batch with retained copies changes only through the copy path.
+      if (hasCopies(input.id))
+        throw new ReplicaCopyRefused("copy_path_required");
       if (!pendingEnabled) return;
       const envelope = replicaEnvelopeSchema.parse(input.envelope);
       if (
@@ -914,9 +1207,7 @@ export function createReplicaReceiver(deps: {
           throw new Error("corrupt replica blob bytes");
       const encoded = canonicalJson(envelope);
       for (const blob of input.stagedBlobs ?? [])
-        if (
-          !verifyBinary(db, "staging", blob.key, blob.blobId, blob.sizeBytes)
-        )
+        if (!verifyBinary(db, "staging", blob.key, blob.blobId, blob.sizeBytes))
           throw new Error("corrupt replica blob bytes");
       const blobs = canonicalJson([
         ...(input.blobs ?? []).map((b) => ({
@@ -979,12 +1270,14 @@ export function createReplicaReceiver(deps: {
       const row = db
         .prepare("SELECT state FROM pdpp_replica_pending_batches WHERE id=?")
         .get(id) as
-        | { state: "pending" | "confirmed" | "quarantined" }
-        | undefined;
+        { state: "pending" | "confirmed" | "quarantined" } | undefined;
       return row?.state;
     },
     quarantine(input: { credential: unknown; id: string; reason: string }) {
       authorize(input.credential);
+      // A copy-backed batch fails closed through the terminal transition.
+      if (hasCopies(input.id))
+        return api.copies.terminate({ ...input, reason: "finalized_conflict" });
       db.transaction(() => {
         db.prepare(
           "UPDATE pdpp_replica_pending_batches SET state='quarantined',reason=? WHERE id=? AND state='pending'",
@@ -996,6 +1289,15 @@ export function createReplicaReceiver(deps: {
     /** Trusted host hook: caller must verify every fragment against finalized #433 evidence first. */
     promote(input: { credential: unknown; id: string }) {
       authorize(input.credential);
+      // Bare promote of a copy-backed batch: refused unless exactly one copy.
+      if (hasCopies(input.id)) {
+        const result = api.copies.promote(input);
+        if (result.kind !== "promoted")
+          throw new ReplicaCopyRefused(
+            result.kind === "terminal" ? result.reason : "wait_predecessor",
+          );
+        return;
+      }
       return db
         .transaction(() => {
           const row = db
@@ -1017,8 +1319,11 @@ export function createReplicaReceiver(deps: {
           ).filter(
             (b) =>
               !legacy.some((l) => l.blobId === b.blobId) &&
-              binaryLength(db, "pending", pendingBlobKey(input.id, b.blobId)) !==
-                undefined,
+              binaryLength(
+                db,
+                "pending",
+                pendingBlobKey(input.id, b.blobId),
+              ) !== undefined,
           );
           const result = api.import({
             credential: input.credential,
@@ -1189,21 +1494,7 @@ export function createReplicaReceiver(deps: {
             )
             .map((op) => op.connectionId),
         );
-        for (const instance of connections) {
-          quarantineConnection(instance);
-          for (const row of db
-            .prepare(
-              "SELECT stream,record_key FROM pdpp_records WHERE instance = ? AND deleted = 0",
-            )
-            .all(instance) as { stream: string; record_key: string }[])
-            write(instance, row.stream, row.record_key, null);
-          db.prepare("DELETE FROM pdpp_blob_claims WHERE instance = ?").run(
-            instance,
-          );
-          db.prepare(
-            "DELETE FROM pdpp_stream_completion WHERE instance = ?",
-          ).run(instance);
-        }
+        for (const instance of connections) withdrawConnection(instance);
         for (const op of records) {
           quarantineKey(
             op.connectionId,
@@ -1239,71 +1530,7 @@ export function createReplicaReceiver(deps: {
         envelope.operations.some((op) => op.owner !== owner)
       )
         throw new Error("wrong replica owner");
-      return db
-        .transaction(() => {
-          for (const op of envelope.operations) validateMapping(op);
-          for (const blob of input.blobs ?? []) {
-            if (hash(blob.bytes) !== blob.blobId)
-              throw new Error("corrupt replica blob bytes");
-            if (binaryLength(db, "received", blob.blobId) !== undefined) {
-              if (
-                !verifyBinary(
-                  db,
-                  "received",
-                  blob.blobId,
-                  blob.blobId,
-                  blob.bytes.length,
-                )
-              )
-                throw new Error("corrupt retained replica bytes");
-            } else if (blob.bytes.length <= 1024 * 1024) {
-              db.prepare(
-                "INSERT INTO pdpp_replica_received_bytes VALUES (?, ?)",
-              ).run(blob.blobId, blob.bytes);
-            } else {
-              const writer = binaryWriter(db, "received", blob.blobId);
-              writer.write(blob.bytes);
-              writer.finish();
-            }
-          }
-          for (const blob of input.stagedBlobs ?? []) {
-            const from = blob.namespace ?? "staging";
-            if (
-              !verifyBinary(
-                db,
-                from,
-                blob.key,
-                blob.blobId,
-                blob.sizeBytes,
-              )
-            )
-              throw new Error("corrupt replica blob bytes");
-            if (binaryLength(db, "received", blob.blobId) !== undefined) {
-              if (
-                !verifyBinary(
-                  db,
-                  "received",
-                  blob.blobId,
-                  blob.blobId,
-                  blob.sizeBytes,
-                )
-              )
-                throw new Error("corrupt retained replica bytes");
-            } else copyBinary(db, from, blob.key, "received", blob.blobId);
-          }
-          for (const op of envelope.operations) {
-            db.prepare(
-              "INSERT OR IGNORE INTO pdpp_replica_received VALUES (?, ?)",
-            ).run(canonicalJson(op), replicaOperationDigest(op));
-            db.prepare(
-              "UPDATE pdpp_replica_clock SET counter = MAX(counter, ?) WHERE id = 1",
-            ).run(op.revision.counter);
-          }
-          const plan = reconcile();
-          view.flush();
-          return plan;
-        })
-        .immediate();
+      return db.transaction(() => importParsed(envelope, input)).immediate();
     },
     /** Trusted host notification after declaration documents or validators change. */
     reconcileDeclarations(input: { credential: unknown }): ReplicaMergePlan {
