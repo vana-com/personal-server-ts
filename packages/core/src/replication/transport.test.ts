@@ -252,7 +252,7 @@ it("decodes a binary replica payload within a 192 MiB Node heap", async () => {
       "-e",
       `import {fromBase64} from ${JSON.stringify(url)};
      import {createHash} from 'node:crypto';
-     const original = Buffer.alloc(16 * 1024 * 1024, 31);
+     const original = Buffer.alloc(64 * 1024 * 1024, 31);
      const actual = fromBase64(original.toString('base64'));
      const hash = bytes => createHash('sha256').update(bytes).digest('hex');
      if(hash(actual) !== hash(original)) throw new Error('binary digest changed');
@@ -265,7 +265,7 @@ it("decodes a binary replica payload within a 192 MiB Node heap", async () => {
     bytes: number;
     peakRssKiB: number;
   };
-  expect(result.bytes).toBe(16 * 1024 * 1024);
+  expect(result.bytes).toBe(64 * 1024 * 1024);
   expect(result.peakRssKiB).toBeLessThan(512 * 1024);
 }, 35000);
 
@@ -273,4 +273,64 @@ it("keeps canonical base64 validation when decoding binary payloads", () => {
   expect(fromBase64("YQ==")).toEqual(new Uint8Array([97]));
   for (const value of ["YQ", "YR==", "YQ==\n"])
     expect(() => fromBase64(value)).toThrow("noncanonical base64");
+});
+
+it("preserves canonical base64 for every final byte and rejects all nonzero pad bits", () => {
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  expect(fromBase64("")).toEqual(new Uint8Array());
+  for (let lastByte = 0; lastByte < 256; lastByte++) {
+    for (const input of [[lastByte], [0, lastByte]]) {
+      const encoded = Buffer.from(input).toString("base64");
+      expect(fromBase64(encoded)).toEqual(new Uint8Array(input));
+      const padding = input.length === 1 ? 2 : 1;
+      const index = encoded.length - padding - 1;
+      const canonical = alphabet.indexOf(encoded[index]!);
+      for (let bits = 1; bits < (padding === 2 ? 16 : 4); bits++) {
+        const malformed =
+          encoded.slice(0, index) +
+          alphabet[canonical | bits] +
+          encoded.slice(index + 1);
+        expect(() => fromBase64(malformed)).toThrow("noncanonical base64");
+      }
+    }
+  }
+});
+
+it("rejects atob's optional padding and whitespace forms", () => {
+  // These have zero pad bits, and whitespace replaces padding without changing
+  // the canonical encoded length. Each independent grammar check must reject.
+  for (const value of [
+    "YQ  ",
+    "YWI ",
+    "YQ\n\n",
+    "YQ\t\t",
+    "YQ\r\r",
+    "YQ\f\f",
+    "AAA",
+    "QUE",
+  ]) {
+    expect(btoa(atob(value))).not.toBe(value);
+    expect(() => fromBase64(value)).toThrow("noncanonical base64");
+  }
+  for (const input of [[], [0], [0, 255], [0, 255, 127]]) {
+    const encoded = Buffer.from(input).toString("base64");
+    expect(fromBase64(encoded)).toEqual(new Uint8Array(input));
+    for (const whitespace of [" ", "\t", "\n", "\r", "\f"]) {
+      for (let position = 0; position <= encoded.length; position++) {
+        const malformed =
+          encoded.slice(0, position) + whitespace + encoded.slice(position);
+        expect(() => fromBase64(malformed)).toThrow("noncanonical base64");
+      }
+    }
+    if (encoded.endsWith("="))
+      expect(() => fromBase64(encoded.replace(/=+$/, ""))).toThrow(
+        "noncanonical base64",
+      );
+  }
+});
+
+it("continues to reject non-string runtime arguments", () => {
+  for (const value of [null, undefined, [], ["YQ=="], {}, 1234, true])
+    expect(() => Reflect.apply(fromBase64, null, [value])).toThrow();
 });
