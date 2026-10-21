@@ -54,7 +54,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/8";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/9";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -364,6 +364,7 @@ export async function readCanonicalLegacyScope(
           result: inconsistent("the connection selection changed"),
         }
       : collectSnapshot(
+          scope,
           store,
           selection,
           streams,
@@ -411,6 +412,7 @@ interface Snapshot {
 
 /** Everything the view needs from the store, read inside one snapshot. */
 function collectSnapshot(
+  scope: string,
   store: CanonicalLegacyReadStore,
   selection: CanonicalConnectionSelection,
   streams: string[],
@@ -486,7 +488,12 @@ function collectSnapshot(
     (stream) =>
       !completions.has(stream) &&
       (requireCompletionReceipts ||
+        // A missing panel is projectable; a missing part of the ordered
+        // product inventory is not. SKIP_RESULT inventory_not_proven_complete
+        // leaves upserts without a full-replace receipt for order_items.
+        (scope === "wholefoods.nutrition" && stream === "order_items") ||
         (!allowUnprovenEmptyStreams &&
+          !(scope === "wholefoods.nutrition" && stream === "nutrition") &&
           (rowsByStream.get(stream)?.length ?? 0) === 0)),
   );
   if (unprovenStreams.length > 0) {

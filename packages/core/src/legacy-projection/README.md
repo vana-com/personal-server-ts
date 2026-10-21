@@ -16,6 +16,32 @@ Personal Server, which projects. The source was lifted from `unity-surfaces`
 `packages/app-runtime/src/legacy-scope-adapter` at `origin/dev` b227e8ce1;
 this module is now the single source of truth.
 
+## Whole Foods panel absence and inventory completeness
+
+The frozen `wholefoods.nutrition.json` contract represents unavailable nutrition
+with `source: "not_found"`. The projection supplies that item for each ordered
+product without a nutrition row, using its order-line name, URL and image.
+It adds no nutrients, confidence or USDA match. Existing stored nutrition rows,
+including historical USDA outcomes, still project as recorded.
+
+The connector at [data-connectors fe25d7a12](https://github.com/PDP-Connect/data-connectors/blob/fe25d7a12a053642dbe5ca99fa19a0c44e7b51e0/connectors/wholefoods/index.ts#L1014-L1042)
+logs `nutrition_lookup_coverage` with `read`, `no_panel`, `unread` and per-cause
+counts. No panel produces no row; an unread page also emits retryable
+`SKIP_RESULT` with reason `wholefoods_nutrition_unread` for `nutrition`.
+Neither is evidence that orders are missing. Separately, an unread or unproven
+order inventory emits retryable `inventory_not_proven_complete` for every
+requested order-derived stream (`orders`, `order_items`, `nutrition`) and no
+finishing state ([same source, lines 1084–1130](https://github.com/PDP-Connect/data-connectors/blob/fe25d7a12a053642dbe5ca99fa19a0c44e7b51e0/connectors/wholefoods/index.ts#L1084-L1130)).
+At this revision the connector always reports unproven inventory because the
+source provides no owner-bound total or end evidence.
+
+The pure projector receives rows, not run events. The canonical reader owns
+inventory proof: it requires a current full-replace completion receipt for
+`order_items` before serving `wholefoods.nutrition`, even for parity reads that
+allow other unproven empty streams. A missing nutrition receipt alone does not
+block the default read. Explicit `requireCompletionReceipts` still requires all
+stream receipts. Observed partial upserts cannot establish an inventory receipt.
+
 ## Declaration-driven text and blob projection
 
 The pure projector accepts trusted per-stream JSON schemas in

@@ -10,6 +10,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
 import type { PdppRecordEnvelopeInput } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import wholefoodsSparse from "../../../core/src/legacy-projection/__fixtures__/wholefoods-sparse-nutrition.json";
 
 const SRC = (name: string) => `https://registry.pdpp.dev/sources/${name}`;
 const METHOD = "test_method";
@@ -1118,6 +1119,106 @@ describe("canonical legacy projection over the real SQLite record store", () => 
           "SELECT instance, stream, method, generation, source_collected_at FROM pdpp_stream_completion ORDER BY instance, stream",
         )
         .all();
+
+    it("serves an ordered product with no panel receipt after a proven item inventory", async () => {
+      const selection = connect("wf", "wholefoods");
+      expect(
+        replace(
+          "wf",
+          "order_items",
+          [wholefoodsSparse.orderItems[0]],
+          COLLECTED,
+        ).applied,
+      ).toBe(true);
+      // A no-panel lookup writes no nutrition row. An unread lookup also
+      // emits wholefoods_nutrition_unread, scoped only to nutrition.
+      expect(wholefoodsSparse.nutritionSkip.stream).toBe("nutrition");
+      const read = await readCanonicalLegacyScope({
+        store,
+        scope: "wholefoods.nutrition",
+        selection,
+      });
+      expect(read).toMatchObject({
+        ok: true,
+        envelope: {
+          data: {
+            items: { B000000001: { name: "Sea Salt", source: "not_found" } },
+            coverage: { total: 1, found: 0, foundUSDA: 0, percentCovered: 0 },
+          },
+        },
+      });
+    });
+
+    it("refuses an unproven Whole Foods item inventory even when every observed product has a panel", async () => {
+      const selection = connect("wf", "wholefoods");
+      // SKIP_RESULT inventory_not_proven_complete applies to order_items,
+      // orders and nutrition. The observed records are upserts, not a full
+      // replace, and therefore cannot create completion receipts.
+      expect(
+        wholefoodsSparse.inventorySkips.map((event) => event.stream),
+      ).toEqual(["orders", "order_items", "nutrition"]);
+      put("wf", "order_items", [wholefoodsSparse.orderItems[1]]);
+      put("wf", "nutrition", wholefoodsSparse.nutrition);
+      expect(store.listStreamCompletions("wf")).toEqual([]);
+      expect(
+        await readCanonicalLegacyScope({
+          store,
+          scope: "wholefoods.nutrition",
+          selection,
+          allowUnprovenEmptyStreams: true,
+        }),
+      ).toMatchObject({
+        ok: false,
+        reason: "stream_completion_unknown",
+        streams: ["order_items"],
+      });
+    });
+
+    it("keeps mixed Whole Foods panel coverage and refuses a later partial item refresh", async () => {
+      const selection = connect("wf", "wholefoods");
+      expect(
+        replace("wf", "order_items", wholefoodsSparse.orderItems, COLLECTED)
+          .applied,
+      ).toBe(true);
+      put("wf", "nutrition", wholefoodsSparse.nutrition);
+      const read = await readCanonicalLegacyScope({
+        store,
+        scope: "wholefoods.nutrition",
+        selection,
+      });
+      expect(read).toMatchObject({
+        ok: true,
+        envelope: {
+          data: {
+            items: {
+              B000000001: { source: "not_found" },
+              B000000002: { source: "wholefoods_product_page", calories: 150 },
+              B000000003: { source: "not_found" },
+            },
+            coverage: { total: 3, found: 1, foundUSDA: 0, percentCovered: 33 },
+          },
+        },
+      });
+      // An incomplete run delivers observed rows as upserts. A changed row
+      // invalidates the old inventory receipt, even though stored rows remain.
+      put(
+        "wf",
+        "order_items",
+        [{ ...wholefoodsSparse.orderItems[0], quantity: 3 }],
+        "2026-09-11T00:00:00.000Z",
+      );
+      expect(
+        await readCanonicalLegacyScope({
+          store,
+          scope: "wholefoods.nutrition",
+          selection,
+        }),
+      ).toMatchObject({
+        ok: false,
+        reason: "stream_completion_unknown",
+        streams: ["order_items"],
+      });
+    });
 
     const readOura = (selection: {
       instance: string;

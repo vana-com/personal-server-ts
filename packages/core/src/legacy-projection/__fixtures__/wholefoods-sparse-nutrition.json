@@ -1,0 +1,98 @@
+{
+  "provenance": "Synthetic records and run events shaped against PDP-Connect/data-connectors fe25d7a12 connectors/wholefoods/{schemas.ts,index.ts}; not captured owner data. A no-panel product and an unread product both lack rows. The frozen nutrition contract permits source:not_found with name and no facts.",
+  "orderItems": [
+    {
+      "id": "111-1234567-1234567#B000000001",
+      "order_id": "111-1234567-1234567",
+      "product_id": "B000000001",
+      "name": "Sea Salt",
+      "product_url": "https://www.amazon.com/dp/B000000001",
+      "image_url": null,
+      "quantity": 1,
+      "unit_price_cents": 299
+    },
+    {
+      "id": "111-1234567-1234567#B000000002",
+      "order_id": "111-1234567-1234567",
+      "product_id": "B000000002",
+      "name": "Oats",
+      "product_url": "https://www.amazon.com/dp/B000000002",
+      "image_url": "https://images.example.test/oats.jpg",
+      "quantity": 1,
+      "unit_price_cents": 499
+    },
+    {
+      "id": "111-1234567-1234567#B000000003",
+      "order_id": "111-1234567-1234567",
+      "product_id": "B000000003",
+      "name": "Apples",
+      "product_url": null,
+      "image_url": null,
+      "quantity": 2,
+      "unit_price_cents": null
+    }
+  ],
+  "nutrition": [
+    {
+      "id": "B000000002",
+      "product_id": "B000000002",
+      "name": "Oats",
+      "source": "wholefoods_product_page",
+      "confidence": "high",
+      "type": "https://schema.org/NutritionInformation",
+      "calories": 150,
+      "protein_g": 5,
+      "carbs_g": 27,
+      "fat_g": 3,
+      "sodium_mg": 0,
+      "fiber_g": 4,
+      "sugar_g": 1,
+      "serving_size": "40 g",
+      "servings_per_container": 10,
+      "saturated_fat_g": 0.5,
+      "trans_fat_g": 0,
+      "cholesterol_mg": 0,
+      "added_sugar_g": 0,
+      "potassium_mg": null,
+      "calcium_mg": null,
+      "iron_mg": null,
+      "vitamin_d_mcg": null,
+      "ingredients": "Whole grain oats",
+      "allergens": null,
+      "highlights": [],
+      "category": [],
+      "upc": null,
+      "raw_nutrition_text": null
+    }
+  ],
+  "nutritionSkip": {
+    "type": "SKIP_RESULT",
+    "stream": "nutrition",
+    "reason": "wholefoods_nutrition_unread",
+    "message": "The nutrition panel of 1 product(s) could not be read; they have no nutrition row.",
+    "recovery_hint": { "action": "retry_by_runtime", "retryable": true }
+  },
+  "inventorySkips": [
+    {
+      "type": "SKIP_RESULT",
+      "stream": "orders",
+      "reason": "inventory_not_proven_complete",
+      "message": "Whole Foods has no owner-bound source inventory total or end evidence",
+      "recovery_hint": { "action": "retry_by_runtime", "retryable": true }
+    },
+    {
+      "type": "SKIP_RESULT",
+      "stream": "order_items",
+      "reason": "inventory_not_proven_complete",
+      "message": "Whole Foods has no owner-bound source inventory total or end evidence",
+      "recovery_hint": { "action": "retry_by_runtime", "retryable": true }
+    },
+    {
+      "type": "SKIP_RESULT",
+      "stream": "nutrition",
+      "reason": "inventory_not_proven_complete",
+      "message": "Whole Foods has no owner-bound source inventory total or end evidence",
+      "recovery_hint": { "action": "retry_by_runtime", "retryable": true }
+    }
+  ]
+}

@@ -1026,11 +1026,10 @@ describe("grocery legacy scope projections", () => {
     validates(wholefoodsNutritionSchema, payload);
   });
 
-  it("fails closed when Whole Foods nutrition omits, duplicates, or invents a product outcome", () => {
+  it("fails closed when Whole Foods nutrition duplicates or invents a product outcome", () => {
     const binding = LEGACY_SCOPE_BINDINGS.get("wholefoods.nutrition");
     const records = pendingOutcomes.wholefoods as PdppRecord[];
     for (const incomplete of [
-      records.slice(0, -1),
       [...records, records.at(-1)!],
       [
         ...records,

@@ -4445,6 +4445,7 @@ const wholefoodsNutrition: LegacyScopeBinding = {
     "error and pageTitle, which the legacy connector set on failed lookups, are not declared by the nutrition stream and are not emitted.",
     "The product-page hero image the legacy connector used when an order line had no image is not declared by any stream; images.thumbnail is empty then.",
     'name, productUrl and images come from the first order line that lists the product, as in the legacy connector; a later line never replaces them. "First" is the order the records are supplied in.',
+    'An ordered product without a nutrition row uses the legacy source "not_found", with no nutrient facts or confidence. This does not distinguish an unread page from a page with no panel; run diagnostics retain that distinction.',
   ],
   provenance: [
     {
@@ -4618,15 +4619,21 @@ const wholefoodsNutrition: LegacyScopeBinding = {
       if (n.source === "blocked") blocked++;
     }
     const total = orderedProducts.size;
-    if (seenNutrition.size !== total)
-      return {
-        ok: false,
-        error: {
-          kind: "incomplete_scope",
-          scope: "wholefoods.nutrition",
-          reason: "nutrition outcomes do not cover every ordered product",
-        },
+    // Connectors collect facts; the legacy projection supplies the absence
+    // representation. Inventory completeness is checked by the canonical
+    // reader, independently of whether individual panels were readable.
+    for (const [productId, ordered] of orderedProducts) {
+      if (seenNutrition.has(productId)) continue;
+      items[productId] = {
+        name: ordered.name,
+        source: "not_found",
+        ...(ordered.productUrl !== undefined
+          ? { productUrl: ordered.productUrl }
+          : {}),
+        images: { thumbnail: ordered.imageUrl ?? "", full: "" },
+        "@type": "https://schema.org/NutritionInformation",
       };
+    }
     return {
       ok: true,
       payload: {

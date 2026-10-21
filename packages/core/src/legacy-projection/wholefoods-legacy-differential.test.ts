@@ -685,12 +685,12 @@ describe("Whole Foods projection against the legacy connector", () => {
     expect(observed).toEqual(reviewed);
   });
 
-  it("fails the nutrition scope closed when the connector withholds a failed lookup's row", async () => {
+  it("represents a product without a panel row using the legacy not_found contract", async () => {
     // The data connector emits no nutrition row for a product whose lookup
     // ends in not_found, error or blocked (data-connectors#499), but the
-    // binding requires one outcome per ordered product. Until one side
-    // changes, a single unmatched product makes the whole scope incomplete.
-    // Legacy delivered such a product as an ordinary row.
+    // projection supplies the frozen contract's absence representation.
+    // Legacy delivered such a product as an ordinary row, but the projection
+    // cannot claim that an unread page or a page with no panel supplied facts.
     const world: World = {
       ...WORLD,
       orders: WORLD.orders.map((order, index) =>
@@ -716,10 +716,9 @@ describe("Whole Foods projection against the legacy connector", () => {
 
     expect(projectScope("wholefoods.orders", records).ok).toBe(true);
     expect(projectScope("wholefoods.nutrition", records)).toMatchObject({
-      ok: false,
-      error: {
-        kind: "incomplete_scope",
-        reason: "nutrition outcomes do not cover every ordered product",
+      ok: true,
+      payload: {
+        items: { [SALT]: { name: UNMATCHED_ITEM.name, source: "not_found" } },
       },
     });
   });

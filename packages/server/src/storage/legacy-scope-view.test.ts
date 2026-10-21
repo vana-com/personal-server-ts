@@ -11,6 +11,7 @@ import {
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { initializeDatabase } from "./index-schema.js";
+import { CANONICAL_LEGACY_VIEW_CONTRACT } from "@opendatalabs/personal-server-ts-core/storage/canonical-legacy-projection";
 
 const OURA = "https://registry.pdpp.dev/sources/oura";
 const GITHUB = "https://registry.pdpp.dev/sources/github";
@@ -815,7 +816,9 @@ describe("legacy scope view over the real SQLite record store", () => {
         "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
       )
       .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/8");
+    expect(storedCursor.canonical_cursor).toContain(
+      CANONICAL_LEGACY_VIEW_CONTRACT,
+    );
     const callsAfterFirstRead = listRecords.mock.calls.length;
     expect(callsAfterFirstRead).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
@@ -1020,8 +1023,8 @@ describe("legacy scope view over the real SQLite record store", () => {
 
     // Model an upgrade with a verdict written by the previous contract.
     db.prepare(
-      "UPDATE legacy_scope_takeover_verdicts SET canonical_cursor = replace(canonical_cursor, 'canonical-legacy-view/8', 'canonical-legacy-view/7') WHERE scope = ?",
-    ).run("oura.activity");
+      "UPDATE legacy_scope_takeover_verdicts SET canonical_cursor = replace(canonical_cursor, ?, 'canonical-legacy-view/8') WHERE scope = ?",
+    ).run(CANONICAL_LEGACY_VIEW_CONTRACT, "oura.activity");
     legacyData = projected.envelope.data;
     const upgradedView = createLegacyScopeView({
       authority: createLegacyScopeAuthority(db),
