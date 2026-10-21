@@ -100,6 +100,7 @@ interface RawRow {
   producer: "pdpp-projector" | "pdpp-import-projection" | null;
   producer_provenance: string | null;
   pdpp_origin: number | null;
+  generation: string | null;
 }
 
 const databases = new WeakMap<IndexManager, Database.Database>();
@@ -127,6 +128,7 @@ function rowToEntry(row: RawRow): IndexEntry {
     producer: row.producer,
     producerProvenance: row.producer_provenance,
     pdppOrigin: row.pdpp_origin === null ? undefined : row.pdpp_origin !== 0,
+    ...(row.generation === null ? {} : { generation: row.generation }),
   };
 }
 
@@ -289,9 +291,10 @@ export function createIndexManager(
     producer: string | null;
     producer_provenance: string | null;
     pdpp_origin: number | null;
+    generation: string | null;
   }>(
-    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes, version, cas_revision, data_point_id, after_tombstone_version, producer, producer_provenance, pdpp_origin)
-     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes, @version, @cas_revision, @data_point_id, @after_tombstone_version, @producer, @producer_provenance, @pdpp_origin)`,
+    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes, version, cas_revision, data_point_id, after_tombstone_version, producer, producer_provenance, pdpp_origin, generation)
+     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes, @version, @cas_revision, @data_point_id, @after_tombstone_version, @producer, @producer_provenance, @pdpp_origin, @generation)`,
   );
 
   const maxVersionByScopeStmt = db.prepare<{ scope: string }>(
@@ -431,6 +434,7 @@ export function createIndexManager(
       producer_provenance: entry.producerProvenance ?? null,
       pdpp_origin:
         entry.pdppOrigin === undefined ? null : Number(entry.pdppOrigin),
+      generation: entry.generation ?? null,
     });
     const row = db
       .prepare("SELECT * FROM data_files WHERE id = ?")

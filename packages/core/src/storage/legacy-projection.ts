@@ -447,11 +447,11 @@ export function withLegacyProjection(
   }
   if (raw.readBlockManifest) {
     const rawManifest = raw.readBlockManifest.bind(raw);
-    overrides.readBlockManifest = async (scope, collectedAt) => {
+    overrides.readBlockManifest = async (scope, collectedAt, options) => {
       const view = await projected(scope, collectedAt);
       return view
         ? (await builtBlocks(scope, view)).manifest
-        : rawManifest(scope, collectedAt);
+        : rawManifest(scope, collectedAt, options);
     };
   }
   // Inventory inherits raw metadata readiness. Projection belongs to reads.

@@ -23,6 +23,15 @@ export {
 export { buildDataBlocksAsync } from "./build.js";
 
 export {
+  blockDigest,
+  boundEnvelopeDigest,
+  manifestBinding,
+  verifyStoredBlock,
+} from "./digest.js";
+
+export { readBuiltScopeBlocks } from "./page.js";
+
+export {
   MAX_SELECTED_BLOCK_IDS,
   selectScopeBlocksByIds,
   type SelectScopeBlocksResult,

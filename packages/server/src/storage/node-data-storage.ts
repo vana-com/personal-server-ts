@@ -21,7 +21,10 @@ import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
-import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import {
+  buildDataFilePath,
+  envelopeGeneration,
+} from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -135,6 +138,7 @@ export async function reindexLegacyDataFiles(
             ? envelope.producer
             : null,
         pdppOrigin: hasPdppOrigin(envelope),
+        generation: envelopeGeneration(raw),
         producerProvenance:
           envelope.producer_provenance &&
           typeof envelope.producer_provenance === "object"
@@ -157,22 +161,25 @@ export function createNodeDataStorage(
 ): DataStoragePort {
   const db = indexDatabase(deps.indexManager);
   /**
-   * PDPP provenance of the bytes at a version path, or undefined when they
-   * cannot be read. Read at insert, never on a read path: the row value only
-   * lets a read that will be refused fail before payment. The authority is
-   * the disclosure policy on the bytes each non-owner read returns.
+   * PDPP provenance and generation of the bytes at a version path, both from
+   * one read, or undefined when they cannot be read. Read at insert, never on
+   * a read path. Provenance only lets a read that will be refused fail before
+   * payment; the generation is what a non-owner read pins, so it serves only
+   * these bytes.
    */
-  async function originOfPublishedBytes(
+  async function identityOfPublishedBytes(
     path: string,
-  ): Promise<boolean | undefined> {
+  ): Promise<{ pdppOrigin?: boolean; generation?: string }> {
     try {
-      return hasPdppOrigin(
-        JSON.parse(
-          await readFile(join(deps.hierarchyOptions.dataDir, path), "utf8"),
-        ),
-      );
+      const envelope = JSON.parse(
+        await readFile(join(deps.hierarchyOptions.dataDir, path), "utf8"),
+      ) as { data: unknown; producer?: unknown };
+      return {
+        pdppOrigin: hasPdppOrigin(envelope),
+        generation: envelopeGeneration(envelope),
+      };
     } catch {
-      return undefined;
+      return {};
     }
   }
   const operations = db
@@ -281,6 +288,7 @@ export function createNodeDataStorage(
           {
             ...entry,
             pdppOrigin: hasPdppOrigin(envelope),
+            generation: envelopeGeneration(envelope),
             path: staged.relativePath,
             sizeBytes: entry.sizeBytes ?? staged.sizeBytes,
           },
@@ -317,11 +325,16 @@ export function createNodeDataStorage(
       );
     },
     async insertEntry(entry) {
-      // Storage derives provenance from the bytes it published; a caller's
-      // value is never trusted.
+      // Storage derives provenance and generation from the bytes it
+      // published; a caller's values are never trusted.
+      const {
+        pdppOrigin: _callerOrigin,
+        generation: _callerGeneration,
+        ...callerEntry
+      } = entry;
       return deps.indexManager.insert({
-        ...entry,
-        pdppOrigin: await originOfPublishedBytes(entry.path),
+        ...callerEntry,
+        ...(await identityOfPublishedBytes(entry.path)),
       });
     },
     updateFileId(path: string, fileId: string) {

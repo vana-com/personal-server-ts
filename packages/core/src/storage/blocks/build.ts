@@ -11,6 +11,8 @@ import {
   type BinaryEnvelopeData,
 } from "../../contracts/binary.js";
 import { hasPdppOrigin } from "../../sync/pdpp-import.js";
+import { envelopeGeneration } from "../hierarchy/generation.js";
+import { blockDigest } from "./digest.js";
 
 export type {
   ContentKind,
@@ -138,14 +140,16 @@ function buildDataBlocksInternal(
           pdppOrigin: hasPdppOrigin(
             classified.value as { data: unknown; producer?: unknown },
           ),
+          envelopeDigest: envelopeGeneration(classified.value),
         }
       : {}),
-    blocks: blocksWithIds.map(({ id, path, mediaType, sizeBytes }) => ({
-      id,
-      path,
-      mediaType,
-      sizeBytes,
-      ...itemCountForPath(path),
+    blocks: blocksWithIds.map((block) => ({
+      id: block.id,
+      path: block.path,
+      mediaType: block.mediaType,
+      sizeBytes: block.sizeBytes,
+      ...itemCountForPath(block.path),
+      digest: blockDigest(block),
     })),
     warnings,
   };

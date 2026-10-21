@@ -3,6 +3,8 @@ import type {
   DataBlockManifest,
   DataScopeBlock,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { envelopeGeneration } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   createMemoryPsLiteStorage,
@@ -132,6 +134,44 @@ describe("createPersistentPsLiteStorage", () => {
     });
     expect(inserted.pdppOrigin).toBe(true);
     expect(storage.findEntry({ scope: native.scope })?.pdppOrigin).toBe(true);
+  });
+
+  it("derives the version generation from the published bytes, not the caller", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore(),
+    );
+    const envelope = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "legacy", nested: { b: 1, a: 2 } },
+    );
+    const written = await storage.writeEnvelope(envelope);
+    const inserted = await storage.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: written.sizeBytes,
+      generation: "caller-value",
+    });
+    const reordered = {
+      data: { nested: { a: 2, b: 1 }, id: "legacy" },
+      collectedAt: envelope.collectedAt,
+      scope: envelope.scope,
+      version: envelope.version,
+    };
+    expect(inserted.generation).toBe(envelopeGeneration(reordered));
+    expect(storage.findEntry({ scope: envelope.scope })?.generation).toBe(
+      inserted.generation,
+    );
+    const built = await buildDataBlocksAsync({
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      content: envelope,
+    });
+    expect(built.manifest.envelopeDigest).toBe(inserted.generation);
   });
 
   it("P2-e: republishes the same envelope in another key order", async () => {

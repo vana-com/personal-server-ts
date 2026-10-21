@@ -9,7 +9,10 @@ import { createIndexManager } from "./index-manager.js";
 import { createNodeDataStorage } from "./node-data-storage.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
-import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import {
+  buildDataFilePath,
+  envelopeGeneration,
+} from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataBlocks } from "@opendatalabs/personal-server-ts-core/storage/blocks/build";
 
 describe("owner import deletion ordering", () => {
@@ -582,6 +585,53 @@ describe("immutable PDPP version provenance", () => {
       expect(
         (await storage.readEnvelope(fresh.scope, fresh.collectedAt)).data,
       ).toEqual(winner);
+    } finally {
+      await close();
+    }
+  });
+
+  it("derives the version generation from the published bytes, not the caller", async () => {
+    const { storage, index, close } = await openStorage();
+    try {
+      const written = await storage.writeEnvelope(legacy);
+      const inserted = await storage.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        sizeBytes: written.sizeBytes,
+        generation: "caller-value",
+      });
+      // Key order does not change a generation; the stored bytes decide it.
+      const reordered = {
+        data: { id: "legacy" },
+        collectedAt: legacy.collectedAt,
+        scope: legacy.scope,
+        version: legacy.version,
+      };
+      expect(inserted.generation).toBe(envelopeGeneration(reordered));
+      expect(index.findByPath(written.relativePath)?.generation).toBe(
+        inserted.generation,
+      );
+      // The sidecar built from the same envelope is bound to that generation.
+      const built = buildDataBlocks({
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        content: legacy,
+      });
+      expect(built.manifest.envelopeDigest).toBe(inserted.generation);
+
+      // commitEnvelope derives it from the envelope it publishes.
+      const committed = { ...legacy, collectedAt: "2026-10-04T00:00:00Z" };
+      await storage.commitEnvelope!(committed, {
+        fileId: null,
+        scope: committed.scope,
+        collectedAt: committed.collectedAt,
+        generation: "caller-value",
+      });
+      expect(storage.findEntry({ scope: committed.scope })?.generation).toBe(
+        envelopeGeneration(committed),
+      );
     } finally {
       await close();
     }

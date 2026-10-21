@@ -8,6 +8,7 @@
  * here instead of being copied into each of them.
  */
 
+import { verifyStoredBlock } from "./digest.js";
 import type {
   DataBlockManifest,
   DataBlockWarning,
@@ -84,7 +85,7 @@ export async function selectScopeBlocksByIds(
       missingIds.push(blockId);
       continue;
     }
-    const page = pageBlock(block, maxBytes - bytes);
+    const page = pageBlock(verifyStoredBlock(ref, block), maxBytes - bytes);
     blocks.push(page.block);
     bytes += page.block.sizeBytes;
     if (page.truncated) {

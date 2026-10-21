@@ -21,9 +21,13 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import { encodeDataBlockCursor } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import {
+  buildDataBlocksAsync,
+  encodeDataBlockCursor,
+} from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import { createPsLiteRuntime, createWeb3SignedPsLiteAuth } from "./runtime.js";
 import { createPersistentPsLiteStorage } from "./storage.js";
 import {
@@ -39,6 +43,8 @@ const GRANT_ID = "grant-lite-1";
 const SECRET = "pdpp-only-score-99";
 const LEGACY = "legacy-file-row";
 let duringAuth: (() => Promise<void>) | undefined;
+/** Runs after the file store returns a block manifest, before blocks are read. */
+let afterManifestRead: ((path: string) => Promise<void>) | undefined;
 const gatewayConfig = {
   url: "https://gateway.test",
   chainId: 14800,
@@ -103,10 +109,20 @@ async function boot(
   extra: Partial<Parameters<typeof createPsLiteRuntime>[0]> = {},
 ) {
   const gateway = gatewayFor(granteeAddress);
+  const files = createMemoryPsLiteDataFileStore();
   const storage = await createPersistentPsLiteStorage(
     { kind: "custom" },
     createMemoryPsLitePersistence(),
-    createMemoryPsLiteDataFileStore(),
+    {
+      ...files,
+      async readBlockManifest(path) {
+        const manifest = await files.readBlockManifest!(path);
+        const hook = afterManifestRead;
+        afterManifestRead = undefined;
+        await hook?.(path);
+        return manifest;
+      },
+    },
   );
   const mcpConnectionStore = createInMemoryMcpConnectionStore();
   const runtime = createPsLiteRuntime({
@@ -326,6 +342,55 @@ describe("PS Lite MCP connection with a live chain grant", () => {
     const read = await call("read_scope", { scope: "instagram.posts" });
     expect(read).toContain("DATA_DELETED");
     expect(read).not.toContain(LEGACY);
+  });
+
+  it("block window a: a version republished as PDPP after the manifest read is refused", async () => {
+    const { runtime, storage, call } = await connection();
+    await ownerWrite(runtime, "instagram.posts", { rows: [{ id: LEGACY }] });
+    // Control: the legacy version is readable before the swap.
+    expect(await call("read_scope", { scope: "instagram.posts" })).toContain(
+      LEGACY,
+    );
+    const legacy = storage.findEntry({ scope: "instagram.posts" })!;
+    let fired = false;
+    afterManifestRead = async () => {
+      fired = true;
+      // Delete the version and publish PDPP bytes at the same path, with the
+      // same ordinal block ids, as sync would.
+      await storage.deleteVersion(legacy.scope, legacy.collectedAt);
+      const native = {
+        version: "1.0",
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        data: {
+          rows: [{ id: LEGACY, score: SECRET }],
+          $pdpp: { version: 1, sourceId: "https://registry.pdpp.dev/ig" },
+        },
+      } as DataFileEnvelope;
+      const written = await storage.writeEnvelope(native);
+      const built = await buildDataBlocksAsync({
+        scope: native.scope,
+        collectedAt: native.collectedAt,
+        content: native,
+      });
+      await storage.writeBlockManifest!(
+        native.scope,
+        native.collectedAt,
+        built.manifest,
+        built.blocks,
+      );
+      await storage.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: native.scope,
+        collectedAt: native.collectedAt,
+        sizeBytes: written.sizeBytes,
+      });
+    };
+    const read = await call("read_scope", { scope: "instagram.posts" });
+    expect(fired).toBe(true);
+    expect(read).not.toContain(SECRET);
+    expect(read).toContain("block_digest_mismatch");
   });
 });
 
