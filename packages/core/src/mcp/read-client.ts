@@ -754,7 +754,11 @@ export function createMcpDataReadClient(
       });
 
       try {
-        const generation = await versionGeneration(storage, selectedEntry);
+        const pinned = pinnedVersion(
+          scope,
+          await establishVersion(storage, selectedEntry),
+        );
+        const generation = pinned.generation;
         assertSameVersion(scope, cursorGeneration, generation);
         const read = await storage.readScopeBlocks(
           scope,
@@ -765,12 +769,12 @@ export function createMcpDataReadClient(
             ...(blockIds?.length ? { blockIds } : {}),
             // Pin the version authorized above: the view serves only its
             // bytes, never a version published later at the same path.
-            ...(generation ? { generation } : {}),
+            generation,
           },
         );
         // The next page continues this version only.
         const result = read.nextCursor
-          ? { ...read, nextCursor: cursorFor(read.nextCursor, generation) }
+          ? { ...read, nextCursor: cursorFor(read.nextCursor, pinned) }
           : read;
         const { logId, timestamp, ipAddress, userAgent } =
           await writeReadAccessLog(request, { scope, grantId, authResult });
@@ -860,13 +864,16 @@ export function createMcpDataReadClient(
         metadataOnly: true,
       });
       let manifest;
-      let generation: string | undefined;
+      let pinned: PinnedVersion;
       try {
-        generation = await versionGeneration(storage, selectedEntry);
+        pinned = pinnedVersion(
+          scope,
+          await establishVersion(storage, selectedEntry),
+        );
         manifest = await storage.readBlockManifest(
           scope,
           selectedEntry.collectedAt,
-          generation ? { generation } : undefined,
+          { generation: pinned.generation },
         );
       } catch (err) {
         if (err instanceof ProtocolError) {
@@ -886,7 +893,7 @@ export function createMcpDataReadClient(
           collectedAt: selectedEntry.collectedAt,
           blockIndex: 0,
         }),
-        generation,
+        pinned,
       );
       if (!isOwnerView(authResult)) {
         return {
@@ -1032,24 +1039,58 @@ function assertSameVersion(
   });
 }
 
-/** A cursor that also names the version it reads. */
-function cursorFor(cursor: string, generation: string | undefined): string {
-  if (generation === undefined) return cursor;
-  const decoded = decodeDataBlockCursor(cursor);
-  if (!decoded.ok) return cursor;
-  const { version: _version, ...fields } = decoded.cursor;
-  return encodeDataBlockCursor({ ...fields, generation });
-}
+declare const PINNED: unique symbol;
 
 /**
- * The generation a logical read pins: the row's, or for a row from before
- * rows recorded one, the value storage backfills from the published bytes.
+ * The version a logical read is pinned to. Only `establishVersion` makes
+ * one, so a cursor (which needs one) cannot name no version.
  */
-async function versionGeneration(
+type PinnedVersion = { readonly generation: string; readonly [PINNED]: true };
+
+type VersionIdentity =
+  | { ok: true; version: PinnedVersion }
+  | { ok: false; reason: "identity_unavailable" };
+
+/**
+ * Establish the generation a logical read pins: the row's, or for a row
+ * from before rows recorded one, the value storage backfills from the
+ * published bytes. Fails explicitly when storage cannot establish it, for
+ * example when the row was replaced while it was being backfilled.
+ */
+async function establishVersion(
   storage: PersonalServerDataApiDeps["storage"],
   entry: IndexEntry,
-): Promise<string | undefined> {
-  return entry.generation ?? (await storage.backfillGeneration?.(entry));
+): Promise<VersionIdentity> {
+  const generation =
+    entry.generation ?? (await storage.backfillGeneration?.(entry));
+  return generation
+    ? { ok: true, version: { generation } as PinnedVersion }
+    : { ok: false, reason: "identity_unavailable" };
+}
+
+/** The pinned version, or a retryable refusal: never an unpinned read. */
+function pinnedVersion(
+  scope: string,
+  identity: VersionIdentity,
+): PinnedVersion {
+  if (identity.ok) return identity.version;
+  throw new McpDataReadError(409, {
+    error: "VERSION_CHANGED",
+    message: "The version changed while this read started. Retry the read.",
+    scope,
+    reason: identity.reason,
+    retryable: true,
+  });
+}
+
+/** A cursor that also names the version it reads. */
+function cursorFor(cursor: string, version: PinnedVersion): string {
+  const decoded = decodeDataBlockCursor(cursor);
+  if (!decoded.ok) {
+    throw new Error("Storage returned a cursor that does not decode");
+  }
+  const { version: _version, ...fields } = decoded.cursor;
+  return encodeDataBlockCursor({ ...fields, generation: version.generation });
 }
 
 function collectedAtFromCursor(

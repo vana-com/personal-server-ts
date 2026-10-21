@@ -551,6 +551,82 @@ describe("one logical read keeps the version it started on", () => {
   });
 });
 
+describe("a read whose version identity cannot be established is refused, retryably", () => {
+  /** Replace a pre-v16 row while storage backfills its generation. */
+  function replaceDuringBackfill(scope: string) {
+    let fired = false;
+    race.afterRead = async (path) => {
+      if (path !== dataFile(scope)) return;
+      race.afterRead = undefined;
+      fired = true;
+      await replaceAt({
+        ...legacyEnvelope(scope),
+        data: { id: "replacement-B" },
+      } as DataFileEnvelope);
+    };
+    return () => fired;
+  }
+
+  it("refuses a page, and issues no cursor, when the backfill loses to a replacement", async () => {
+    const scope = "oura.activity";
+    await put(legacyEnvelope(scope), true);
+    const fired = replaceDuringBackfill(scope);
+    const first = await (
+      await mcpTool("read_scope", { scope, maxBytes: 83 })
+    )();
+    expect(fired()).toBe(true);
+    expect(first).toContain("identity_unavailable");
+    expect(first).not.toContain("nextCursor");
+    // A retry pins the replacement, and its cursor never reaches a later one.
+    const retry = structured(
+      await (
+        await mcpTool("read_scope", { scope, maxBytes: 83 })
+      )(),
+    );
+    const cursor = (retry.page as { nextCursor?: string }).nextCursor;
+    expect(cursor).toBeTruthy();
+    await replaceAt({
+      ...legacyEnvelope(scope),
+      data: { id: "replacement-C" },
+    } as DataFileEnvelope);
+    const resumed = await (
+      await mcpTool("read_scope", { scope, cursor, maxBytes: 4096 })
+    )();
+    expect(resumed).not.toContain("replacement-C");
+    expect(resumed).toContain("VERSION_CHANGED");
+  });
+
+  it("refuses a table of contents, and issues no versionCursor, when the backfill loses to a replacement", async () => {
+    const scope = "oura.activity";
+    await put(legacyEnvelope(scope), true);
+    const fired = replaceDuringBackfill(scope);
+    const toc = await (await mcpTool("list_scope_blocks", { scope }))();
+    expect(fired()).toBe(true);
+    expect(toc).toContain("identity_unavailable");
+    expect(toc).not.toContain("versionCursor");
+    const retry = structured(
+      await (
+        await mcpTool("list_scope_blocks", { scope })
+      )(),
+    );
+    const versionCursor = retry.versionCursor as string;
+    expect(versionCursor).toBeTruthy();
+    await replaceAt({
+      ...legacyEnvelope(scope),
+      data: { id: "replacement-C" },
+    } as DataFileEnvelope);
+    const selected = await (
+      await mcpTool("read_scope", {
+        scope,
+        cursor: versionCursor,
+        blockIds: ["block-000002"],
+      })
+    )();
+    expect(selected).not.toContain("replacement-C");
+    expect(selected).toContain("VERSION_CHANGED");
+  });
+});
+
 describe("storage derives identity once, from what it publishes", () => {
   it("commitEnvelope records the generation of the bytes it staged, even if its caller mutates its object", async () => {
     const envelope = legacyEnvelope("oura.activity");
