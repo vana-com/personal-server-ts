@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   createMemoryRecordStore,
   createPdppSyncSessionService,
+  SyncRetryLaterError,
   type PdppRecordStore,
+  type PdppSyncSessionService,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 
@@ -174,6 +176,163 @@ for (const backend of ["memory", "sqlite"])
         // can see the end, so a sixth, empty page ends the session.
         expect(pages).toBe(6);
         take();
+      } finally {
+        store.close();
+      }
+    });
+  });
+
+for (const backend of ["memory", "sqlite"])
+  describe(`${backend} candidate sync session state`, () => {
+    const create = (): PdppRecordStore =>
+      backend === "memory"
+        ? createMemoryRecordStore()
+        : createTestBoundRecordStore(new Database(":memory:"));
+    const fill = (store: PdppRecordStore, keys: string[]) =>
+      store.ingestBatch(
+        keys.map((key) => ({
+          instance: "inst_1",
+          stream: "events",
+          key,
+          data: { id: key },
+          emitted_at: "2026-01-01T00:00:00Z",
+        })),
+        () => "mutable_state",
+        () => ["id"],
+      );
+    const request = {
+      stream: "events",
+      owner: "owner-a",
+      instanceIds: ["inst_1"],
+      candidate: { binding: "grant-1", order: "asc" as const },
+    };
+    /** Retries a request through SyncRetryLaterError. */
+    function served(read: () => ReturnType<PdppSyncSessionService["read"]>) {
+      for (let attempt = 0; attempt < 50; attempt++) {
+        try {
+          return read();
+        } catch (err) {
+          if (!(err instanceof SyncRetryLaterError)) throw err;
+        }
+      }
+      throw new Error("never served");
+    }
+
+    it("writes session state only after the store's read has ended", () => {
+      const store = create();
+      try {
+        fill(store, ["a", "b", "c"]);
+        let reading = false;
+        const states = store.syncStates();
+        const guarded: PdppRecordStore = {
+          ...store,
+          readSyncWindow: (stream, window, read) =>
+            store.readSyncWindow(stream, window, (w) => {
+              reading = true;
+              try {
+                return read(w);
+              } finally {
+                reading = false;
+              }
+            }),
+          syncStates: () => ({
+            ...states,
+            put: (entry) => {
+              expect(reading).toBe(false);
+              return states.put(entry);
+            },
+            delete: (id, expected) => {
+              expect(reading).toBe(false);
+              return states.delete(id, expected);
+            },
+          }),
+        };
+        const sync = createPdppSyncSessionService(guarded, {
+          maxExaminedPerRequest: 1,
+        });
+        const first = served(() => sync.read({ ...request, limit: 1 }));
+        const rest = served(() =>
+          sync.read({ ...request, limit: 5, cursor: first.nextCursor }),
+        );
+        expect([...first.data, ...rest.data].map((r) => r.recordKey)).toEqual([
+          "a",
+          "b",
+          "c",
+        ]);
+      } finally {
+        store.close();
+      }
+    });
+
+    it("makes progress on every retry even when its time budget is already spent", () => {
+      const store = create();
+      try {
+        fill(store, ["a", "b", "c", "d"]);
+        let now = 0;
+        // Every clock read is ten seconds later: the deadline has always passed.
+        const sync = createPdppSyncSessionService(store, {
+          maxScanMillis: 1000,
+          now: () => (now += 10_000),
+        });
+        const page = served(() => sync.read({ ...request, limit: 10 }));
+        expect(page.data.map((r) => r.recordKey)).toEqual(["a", "b", "c", "d"]);
+      } finally {
+        store.close();
+      }
+    });
+
+    it("lets no stale request overwrite newer scan progress or revive a finished scan", () => {
+      const store = create();
+      try {
+        fill(store, ["a", "b", "c", "d", "e", "f"]);
+        const states = store.syncStates();
+        const writes: boolean[] = [];
+        let interleave: (() => void) | undefined;
+        const racing: PdppRecordStore = {
+          ...store,
+          readSyncWindow: (stream, window, read) =>
+            store.readSyncWindow(stream, window, (w) => {
+              // A second request runs to completion while this one reads.
+              const other = interleave;
+              interleave = undefined;
+              other?.();
+              return read(w);
+            }),
+          syncStates: () => ({
+            ...states,
+            put: (entry) => {
+              const written = states.put(entry);
+              if (entry.id.startsWith("scan:")) writes.push(written);
+              return written;
+            },
+          }),
+        };
+        const sync = createPdppSyncSessionService(racing, {
+          maxExaminedPerRequest: 2,
+        });
+        const limit = { ...request, limit: 10 };
+        // Request 0 pauses after two changes.
+        expect(() => sync.read(limit)).toThrow(SyncRetryLaterError);
+        // Request A resumes it; meanwhile request B resumes the same scan and
+        // finishes the session with a larger budget.
+        const finisher = createPdppSyncSessionService(racing, {
+          maxExaminedPerRequest: 100,
+        });
+        interleave = () => {
+          expect(finisher.read(limit).data).toHaveLength(6);
+        };
+        expect(() => sync.read(limit)).toThrow(SyncRetryLaterError);
+        // A's pause found the scan finished and wrote nothing.
+        expect(writes).toEqual([true, false]);
+        // So the next identical request starts a new session from the start.
+        expect(finisher.read(limit).data.map((r) => r.recordKey)).toEqual([
+          "a",
+          "b",
+          "c",
+          "d",
+          "e",
+          "f",
+        ]);
       } finally {
         store.close();
       }
