@@ -99,6 +99,64 @@ export function decodeReplicaFragment(
   return fragment;
 }
 
+/** The single wire encoder shared by buffered and streaming publishers. */
+export async function prepareReplicaFragment(input: {
+  owner: string;
+  writer: string;
+  batch: string;
+  sequence: number;
+  previous: Predecessor | null;
+  collectedAt: string;
+  digest: string;
+  totalBytes: number;
+  count: number;
+  index: number;
+  offset: number;
+  chunk: Uint8Array;
+  encrypt: (scope: string, bytes: Uint8Array) => Promise<Uint8Array>;
+}): Promise<PreparedFragment> {
+  const scope = replicaScope(input.writer, input.batch, input.index);
+  const fragment = replicaFragmentSchema.parse({
+    format: "vana-pdpp-replica-fragment",
+    version: 1,
+    owner: input.owner,
+    writer: input.writer,
+    batch: input.batch,
+    sequence: input.sequence,
+    previous: input.previous,
+    collectedAt: input.collectedAt,
+    digest: input.digest,
+    totalBytes: input.totalBytes,
+    count: input.count,
+    index: input.index,
+    offset: input.offset,
+    chunkDigest: replicaDigest(input.chunk),
+    content: toBase64(input.chunk),
+  });
+  const plaintext = new TextEncoder().encode(
+    canonicalJson({
+      version: "1.0",
+      scope,
+      collectedAt: input.collectedAt,
+      data: { fragment },
+    }),
+  );
+  // Validate writer/address/order grammar even for locally prepared inputs.
+  decodeReplicaFragment(plaintext, scope, input.owner);
+  const encrypted = await input.encrypt(scope, plaintext);
+  return {
+    scope,
+    plaintext,
+    encrypted,
+    dataHash: keccak256(plaintext),
+    metadataHash: replicaMetadataHash(
+      scope,
+      input.collectedAt,
+      encrypted.length,
+    ),
+  };
+}
+
 /** A batch address is reserved by its caller; all returned bytes must be committed before I/O. */
 export async function fragmentReplicaPayload(input: {
   owner: string;
@@ -132,50 +190,21 @@ export async function fragmentReplicaPayload(input: {
     for (let index = 0; index < count; index++) {
       const offset = index * chunkSize;
       const chunk = input.bytes.subarray(offset, offset + chunkSize);
-      const scope = replicaScope(input.writer, input.batch, index);
-      const fragment = replicaFragmentSchema.parse({
-        format: "vana-pdpp-replica-fragment",
-        version: 1,
-        owner: input.owner,
-        writer: input.writer,
-        batch: input.batch,
-        sequence: input.sequence,
-        previous: input.previous,
-        collectedAt: input.collectedAt,
+      const prepared = await prepareReplicaFragment({
+        ...input,
         digest,
         totalBytes: input.bytes.length,
         count,
         index,
         offset,
-        chunkDigest: replicaDigest(chunk),
-        content: toBase64(chunk),
+        chunk,
       });
-      const plaintext = new TextEncoder().encode(
-        canonicalJson({
-          version: "1.0",
-          scope,
-          collectedAt: input.collectedAt,
-          data: { fragment },
-        }),
-      );
-      // Validate writer/address/order grammar even for locally prepared inputs.
-      decodeReplicaFragment(plaintext, scope, input.owner);
-      const encrypted = await input.encrypt(scope, plaintext);
+      const { encrypted } = prepared;
       if (encrypted.length > cap) {
         oversized = true;
         break;
       }
-      parts.push({
-        scope,
-        plaintext,
-        encrypted,
-        dataHash: keccak256(plaintext),
-        metadataHash: replicaMetadataHash(
-          scope,
-          input.collectedAt,
-          encrypted.length,
-        ),
-      });
+      parts.push(prepared);
     }
     if (!oversized) return parts;
     if (chunkSize === 1)
