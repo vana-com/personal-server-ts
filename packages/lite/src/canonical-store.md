@@ -191,6 +191,13 @@ streams/tombstones and owns its read budget.
 This is an internal trusted-host API, not a grant-relative PDPP list route,
 public query cursor or completion proof. It makes no identity/issuer decisions.
 
+Compared with the Node receiver's grant-relative pages: a Lite connection page
+spans every stream of one connection, so its revision is scoped to the
+connection and read mode rather than to a stream. Lite has no integrity-epoch
+capability; its cursors bind the connection's revisions only. Like Node, the
+preview is a sparse overlay on canonical rows, and only write-side calls build
+or upgrade it.
+
 ## Pending replica visibility hooks
 
 `stagePending({id, envelope, credential, blobs?})` retains an authenticated,
