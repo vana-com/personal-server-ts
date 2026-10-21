@@ -588,3 +588,161 @@ for (const backend of ["memory", "sqlite"])
       }
     });
   });
+
+for (const backend of ["memory", "sqlite"])
+  describe(`${backend} recovery after a preparation dies`, () => {
+    const create = (): Inspectable =>
+      (backend === "memory"
+        ? createMemoryRecordStore()
+        : createTestBoundRecordStore(
+            new Database(":memory:"),
+          )) as unknown as Inspectable;
+
+    it("retires a paused scan whose preparation went over the row cap, so a restart starts fresh", () => {
+      const store = create();
+      try {
+        put(store, keys(2, "x"), "1");
+        let now = 1_000_000;
+        const options = {
+          maxPreparedRowsPerOwner: 3,
+          pageTtlMs: 1_000,
+          scanTtlMs: 600_000,
+          now: () => now,
+        };
+        // Session X holds two candidate rows for its page lifetime.
+        drain(createPdppSyncSessionService(store, options), {
+          ...request("x"),
+          limit: 100,
+        });
+        // Session A prepares one row (three in all) and pauses.
+        const slow = createPdppSyncSessionService(store, {
+          ...options,
+          maxExaminedPerRequest: 1,
+        });
+        const a = { ...request("a"), limit: 100 };
+        expect(() => slow.read(a)).toThrow(SyncRetryLaterError);
+        // Its next row makes four: over the cap.
+        expect(() => slow.read(a)).toThrow(CursorExpiredError);
+        // X's preparation expires and frees its rows; A restarts from beginning.
+        now += 2_000;
+        expect(
+          drain(createPdppSyncSessionService(store, options), a).seen,
+        ).toHaveLength(2);
+      } finally {
+        store.close();
+      }
+    });
+  });
+
+describe("sync request scope", () => {
+  it("refuses a request over more instances than one sync request serves", () => {
+    const store = createMemoryRecordStore();
+    try {
+      const sync = createPdppSyncSessionService(store);
+      expect(() =>
+        sync.read({
+          ...request(),
+          instanceIds: Array.from({ length: 65 }, (_, i) => `inst_${i}`),
+          limit: 10,
+        }),
+      ).toThrow(RangeError);
+      // A candidate record carries its instance; the one-record-per-key
+      // check belongs to the current profile alone.
+      expect(() =>
+        sync.read({ ...request(), limit: 10, oneRecordPerKey: true }),
+      ).toThrow(RangeError);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("sqlite deterministic work per request", () => {
+  /** The most rows plus statements one request of a first sync needs. */
+  const worst = (
+    fill: (store: PdppRecordStore) => void,
+    instanceIds: string[],
+  ) => {
+    const { store, work } = countingSqlite();
+    try {
+      fill(store);
+      const sync = createPdppSyncSessionService(store, {
+        maxExaminedPerRequest: 20,
+      });
+      const perRequest: number[] = [];
+      work.rows = 0;
+      work.statements = 0;
+      drain(
+        sync,
+        // The current profile: candidate records carry instance_id and
+        // need no one-record-per-key check.
+        {
+          stream: "events",
+          owner: "owner-a",
+          instanceIds,
+          limit: 100,
+          oneRecordPerKey: true,
+        } as never,
+        () => {
+          perRequest.push(work.rows + work.statements);
+          work.rows = 0;
+          work.statements = 0;
+        },
+      );
+      return Math.max(...perRequest);
+    } finally {
+      store.close();
+    }
+  };
+  const ingest = (
+    store: PdppRecordStore,
+    instance: string,
+    key: string,
+    v: string,
+  ) =>
+    store.ingestBatch(
+      [
+        {
+          instance,
+          stream: "events",
+          key,
+          data: { id: key, v },
+          emitted_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+
+  it("does not grow with one key's version count", () => {
+    const versions = (n: number) => (store: PdppRecordStore) => {
+      ingest(store, "inst_1", "a", "1");
+      for (let i = 0; i < n; i++) ingest(store, "inst_1", "hot", String(i));
+      ingest(store, "inst_1", "z", "1");
+    };
+    const few = worst(versions(10), ["inst_1"]);
+    const many = worst(versions(20_000), ["inst_1"]);
+    expect(many).toBeLessThanOrEqual(few + 10);
+  }, 180_000);
+
+  it("stays within the budget plus a fixed overhead as the instance scope grows", () => {
+    const scope = (n: number) => {
+      const instances = Array.from({ length: n }, (_, i) => `inst_${i}`);
+      return {
+        instances,
+        fill: (store: PdppRecordStore) => {
+          for (const instance of instances)
+            for (let k = 0; k < 3; k++)
+              ingest(store, instance, `${instance}-${k}`, "1");
+        },
+      };
+    };
+    const small = scope(2);
+    const large = scope(64);
+    const a = worst(small.fill, small.instances);
+    const b = worst(large.fill, large.instances);
+    // The budget is 20 units; each sibling probe is one statement. A request
+    // may finish one identity past the budget: 64 instances of fixed overhead.
+    expect(b).toBeLessThanOrEqual(a + 4 * 64 + 50);
+  }, 180_000);
+});
