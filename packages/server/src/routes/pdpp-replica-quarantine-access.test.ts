@@ -488,6 +488,7 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
     await f.assertQuarantined({ savedCursorsExpired: true });
   });
 
+  // Publishes and revalidates 55 slots: about 3-4 s alone, more under full-suite load.
   it("revalidates at most 50 retained slots per cycle and reaches all 55 staged slots", async () => {
     const f = await fixture();
     const staged: PreparedFragment[] = [];
@@ -523,7 +524,7 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
     ).toBe(true);
     await f.assertQuarantined();
     await f.controlWorks();
-  });
+  }, 30_000);
 
   it("pins legacy retained hash pairs only from the exact fragment and finalized commitment", async () => {
     const f = await fixture();
