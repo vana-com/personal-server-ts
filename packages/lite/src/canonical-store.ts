@@ -137,6 +137,9 @@ async function operations(
  * a scope's record bodies are never loaded together. Native transactions hide all
  * intermediate rows, blob references, journal entries, outbox and import receipts.
  */
+/** Absorbing terminal-batch fact per connection (contract v3.1 A, H). */
+const CONNECTION_QUARANTINE = "connection-quarantine/";
+
 export function createLiteCanonicalStore(deps: {
   persistence: LiteCanonicalPersistence;
   context: () => MergeContext;
@@ -266,6 +269,33 @@ export function createLiteCanonicalStore(deps: {
     }
     return true;
   }
+  /**
+   * Reconcile's whole blocking decision for one connection, shared with the
+   * confirmed-blob gate so the two cannot drift: the terminal-batch fact,
+   * binding conflicts, equivocations, lifecycle-plan conflicts, and retained
+   * binding evidence that disagrees with the local mapping. A blocked
+   * connection is withdrawn from every reader.
+   */
+  async function blocking(
+    tx: LiteCanonicalTransaction,
+    id: string,
+    context: MergeContext,
+  ) {
+    const lifecycle = await operations(tx, `${connectionPrefix(id)}lifecycle/`);
+    const lifecyclePlan = planReplicaMerge(context, lifecycle);
+    const mapped = await get<Connection>(tx, `connections/${keyDigest(id)}`);
+    const binding = await get<Connection>(
+      tx,
+      `binding-evidence/${keyDigest(id)}`,
+    );
+    const blocked =
+      !!(await get(tx, `${CONNECTION_QUARANTINE}${keyDigest(id)}`)) ||
+      !!(await get(tx, `binding-conflicts/${keyDigest(id)}`)) ||
+      (await any(tx, `equivocations/${keyDigest(id)}/`)) ||
+      lifecyclePlan.conflicts.length > 0 ||
+      !!(mapped && binding && canonicalJson(mapped) !== canonicalJson(binding));
+    return { lifecycle, lifecyclePlan, mapped, blocked };
+  }
   async function reconcile(
     tx: LiteCanonicalTransaction,
     id: string,
@@ -273,19 +303,11 @@ export function createLiteCanonicalStore(deps: {
     only?: readonly { stream: string; key: string }[],
     canonical?: LiteCanonicalTransaction,
   ) {
-    const lifecycle = await operations(tx, `${connectionPrefix(id)}lifecycle/`);
-    const mapped = await get<Connection>(tx, `connections/${keyDigest(id)}`);
-    const binding = await get<Connection>(
+    const { lifecycle, lifecyclePlan, mapped, blocked } = await blocking(
       tx,
-      `binding-evidence/${keyDigest(id)}`,
+      id,
+      context,
     );
-    const equivocations = await tx.scan(`equivocations/${keyDigest(id)}/`);
-    const lifecyclePlan = planReplicaMerge(context, lifecycle);
-    const blocked =
-      !!(await get(tx, `binding-conflicts/${keyDigest(id)}`)) ||
-      equivocations.entries.length > 0 ||
-      lifecyclePlan.conflicts.length > 0 ||
-      !!(mapped && binding && canonicalJson(mapped) !== canonicalJson(binding));
     const pendingLifecycle = lifecyclePlan.pending.length > 0;
     const deleted = lifecyclePlan.suppressed.some(
       (issue) => issue.reason === "connection_deleted",
@@ -1084,8 +1106,8 @@ export function createLiteCanonicalStore(deps: {
   /**
    * True when connections claim the blob and every one of them is
    * quarantined. A quarantined connection's confirmed bytes are not served,
-   * as on Node; bytes another live connection claims still are. The facts are
-   * the durable ones `reconcile` treats as blocking the whole connection.
+   * as on Node; bytes another live connection claims still are. Quarantined
+   * means `blocking`, the decision `reconcile` withdraws a connection on.
    */
   async function claimedOnlyByQuarantined(
     tx: LiteCanonicalTransaction,
@@ -1098,11 +1120,7 @@ export function createLiteCanonicalStore(deps: {
         !(await any(tx, `${connectionPrefix(id)}claims/${keyDigest(blobId)}/`))
       )
         continue;
-      if (
-        !(await get(tx, `binding-conflicts/${keyDigest(id)}`)) &&
-        !(await any(tx, `equivocations/${keyDigest(id)}/`))
-      )
-        return false;
+      if (!(await blocking(tx, id, deps.context())).blocked) return false;
       claimed = true;
     }
     return claimed;
@@ -1304,6 +1322,46 @@ export function createLiteCanonicalStore(deps: {
       credential: unknown;
       blobs?: { stagingId: string; descriptor: LiteBlobDescriptor }[];
     }) => commit(input),
+    /** True when reconcile withdraws this connection from every reader. */
+    async isConnectionQuarantined(connectionId: string): Promise<boolean> {
+      enabled();
+      return persistence.transaction(
+        async (tx) =>
+          (await blocking(tx, connectionId, deps.context())).blocked,
+      );
+    },
+    /**
+     * Trusted host hook for a terminal batch (contract v3.1 A, H): record
+     * the absorbing connection-quarantine fact and withdraw the connection
+     * from every reader in the same transaction. The view revisions advance,
+     * so open page cursors expire. Rows stay retained; nothing is deleted.
+     */
+    async quarantineConnection(input: {
+      credential: unknown;
+      connectionId: string;
+      reason: string;
+    }) {
+      enabled();
+      const context = deps.context();
+      if (
+        !context.owner ||
+        deps.authenticateReplica(input.credential) !== context.owner
+      )
+        throw new Error("replica authority required for owner");
+      const id = input.connectionId;
+      if (!id || !input.reason)
+        throw new Error("invalid connection quarantine");
+      await persistence.transaction(async (tx) => {
+        await clock(tx, context);
+        await ensurePendingIndex(tx, context);
+        const path = `${CONNECTION_QUARANTINE}${keyDigest(id)}`;
+        if (await get(tx, path)) return;
+        await put(tx, path, { reason: input.reason });
+        await reconcile(tx, id, context);
+        await refreshPreview(tx, id, context);
+        await advanceCanonicalView(tx, id);
+      });
+    },
     /** Invoke after trusted declaration/validator changes. Continue until after is absent. */
     async retry(input: { credential: unknown; after?: string }) {
       enabled();
