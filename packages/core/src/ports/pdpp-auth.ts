@@ -16,6 +16,20 @@
  *   (`StreamGrant`), not grant-wide.
  */
 
+import { PdppError } from "../errors/pdpp-catalog.js";
+
+/** A remote authority cannot decide; this is not an inactive-token decision. */
+export class PdppAuthorizationUnavailableError extends PdppError {
+  readonly retryAfterSeconds = 5;
+  constructor() {
+    super(
+      "api_error",
+      "Authorization server could not be reached or validated",
+    );
+    this.name = "PdppAuthorizationUnavailableError";
+  }
+}
+
 export type PdppTokenKind = "owner" | "client";
 export type AccessMode = "single_use" | "continuous";
 export type SourceKind = "connector" | "provider_native";
