@@ -185,3 +185,9 @@ export {
   type PsLitePersistenceBundle,
   type PsLitePersistenceRuntimeOptions,
 } from "./persistence.js";
+
+export {
+  importOuraBrowserRecords,
+  type OuraBrowserImportInput,
+  type OuraBrowserImportResult,
+} from "./oura-import.js";

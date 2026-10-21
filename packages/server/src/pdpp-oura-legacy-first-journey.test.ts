@@ -290,7 +290,7 @@ async function replace(
   stream: string,
   rows: Record<string, unknown>[],
   sourceCollectedAt: string,
-  { instance = accountOne, method = "oura-browser" } = {},
+  { instance = accountOne, method = "oura-browser", complete = true } = {},
 ) {
   const response = await ctx!.app.request(
     `/v1/streams/${stream}/records/replace?method=${method}&binding_generation=1`,
@@ -303,7 +303,7 @@ async function replace(
       body: JSON.stringify({
         instance,
         emitted_at: sourceCollectedAt,
-        source_collected_at: sourceCollectedAt,
+        ...(complete ? { source_collected_at: sourceCollectedAt } : {}),
         records: rows.map((data) => ({
           key: String(data.id),
           data,
@@ -1229,5 +1229,110 @@ describe("a takeover that oura-browser did not earn", () => {
     // Unknown provenance does not let oura-browser serve; the recorded
     // takeover still marks the file superseded, so the read refuses.
     expect(await readAll()).toEqual(ALL("503 no_connection"));
+  });
+});
+
+describe("Oura default admission cutover", () => {
+  it("keeps every legacy scope at each mixed-run boundary until all three streams complete the same run", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(FILE));
+    vi.setSystemTime(new Date(T_PDPP));
+    const token = await ownerPdppToken();
+    for (const scope of SCOPES) {
+      await replace(token, STREAM_OF[scope], pdppRows(scope, DAYS), T_PDPP, {
+        complete: false,
+      });
+      expect(await readAll(), `rows arrived for ${scope}`).toEqual(ALL(FILE));
+    }
+    for (const [index, scope] of SCOPES.entries()) {
+      await replace(token, STREAM_OF[scope], pdppRows(scope, DAYS), T_PDPP);
+      if (index === 0) {
+        // Old receipts on untouched streams cannot complete this new run.
+        for (const olderScope of SCOPES.slice(1)) {
+          await replace(
+            token,
+            STREAM_OF[olderScope],
+            pdppRows(olderScope, DAYS),
+            T_LEGACY,
+          );
+          expect(
+            await readAll(),
+            `old completion arrived for ${olderScope}`,
+          ).toEqual(ALL(FILE));
+        }
+      }
+      expect(await readAll(), `completion arrived for ${scope}`).toEqual(
+        ALL(index === SCOPES.length - 1 ? CANON : FILE),
+      );
+    }
+    for (const scope of SCOPES) {
+      const stored = await ctx!.app.request(`/v1/data/${scope}?view=stored`, {
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      expect((await stored.json()).data).toEqual(legacyBody(scope, DAYS));
+    }
+  });
+
+  it("automatically gives OpenPet all three complete scopes when opt-in admission is promoted", async () => {
+    LEGACY_TS = true;
+    await writeLegacy(DAYS, T_LEGACY);
+    await writePdpp(DAYS, T_PDPP);
+    expect(await readAll()).toEqual(ALL(FILE));
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(CANON));
+    for (const scope of SCOPES) {
+      const stored = await ctx!.app.request(`/v1/data/${scope}?view=stored`, {
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      expect(stored.status).toBe(200);
+      expect((await stored.json()).data).toEqual(legacyBody(scope, DAYS));
+    }
+  });
+
+  it("keeps all legacy scopes after promotion when the run has no completion receipts", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    vi.setSystemTime(new Date(T_PDPP));
+    const token = await ownerPdppToken();
+    for (const scope of SCOPES) {
+      await replace(token, STREAM_OF[scope], pdppRows(scope, DAYS), T_PDPP, {
+        complete: false,
+      });
+    }
+    expect(await readAll()).toEqual(ALL(FILE));
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(FILE));
+  });
+
+  it("covers the real legacy fractional HRV defect while retaining integer projection", async () => {
+    vi.setSystemTime(new Date(T_LEGACY));
+    for (const scope of SCOPES) {
+      const body = legacyBody(scope, DAYS) as Record<string, any>;
+      if (scope === "oura.sleep") {
+        for (const period of body.sleepPeriods) period.averageHrv = 48.6;
+      }
+      await legacyWrite(scope, body);
+    }
+    vi.setSystemTime(new Date(T_PDPP));
+    const token = await ownerPdppToken();
+    for (const scope of SCOPES) {
+      const rows = pdppRows(scope, DAYS);
+      if (scope === "oura.sleep") {
+        for (const row of rows)
+          if (row.record_type === "sleep_session") row.average_hrv = 48.6;
+      }
+      await replace(token, STREAM_OF[scope], rows, T_PDPP);
+    }
+    expect(await readAll()).toEqual(ALL(FILE));
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(CANON));
+    const data = (
+      (await observe("oura.sleep")).builder.body as {
+        data: { sleepPeriods: { averageHrv: number }[] };
+      }
+    ).data;
+    expect(data.sleepPeriods.every((period) => period.averageHrv === 49)).toBe(
+      true,
+    );
   });
 });

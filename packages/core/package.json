@@ -199,6 +199,14 @@
     "./storage/pdpp-records/memory": {
       "types": "./dist/storage/pdpp-records/memory-store.d.ts",
       "import": "./dist/storage/pdpp-records/memory-store.js"
+    },
+    "./storage/legacy-scope-coverage": {
+      "types": "./dist/storage/legacy-scope-coverage.d.ts",
+      "import": "./dist/storage/legacy-scope-coverage.js"
+    },
+    "./storage/legacy-scope-entity-keys": {
+      "types": "./dist/storage/legacy-scope-entity-keys.d.ts",
+      "import": "./dist/storage/legacy-scope-entity-keys.js"
     }
   },
   "scripts": {

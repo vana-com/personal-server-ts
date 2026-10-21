@@ -58,7 +58,8 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 6;
+const COVERAGE_RULE_VERSION = 7;
+const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the
  * same organization's saved head; never borrow entities or another identity. */
@@ -582,6 +583,9 @@ export function createLegacyScopeView(
     }
     if (decision.kind !== "canonical") return { kind: decision.kind };
     const hasLegacyHead = legacyHead !== null;
+    if (hasLegacyHead && !hasTakeover && !initialOuraRunComplete(decision)) {
+      return { kind: "file" };
+    }
     if (hasLegacyHead && input.readLegacyHead) {
       const verdict = authority
         .verdictFor(scope)
@@ -637,6 +641,8 @@ export function createLegacyScopeView(
           decision.kind === "canonical" ? decision.generation : undefined,
         ),
         canServeLegacy: canServeLegacyBeforeTakeover(scope),
+        initialOuraRunComplete:
+          decision.kind !== "canonical" || initialOuraRunComplete(decision),
         writeClock: authority.writeClock(),
         arrivalRevision: authority.arrivalRevision(),
         receiptCursor:
@@ -663,6 +669,13 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return decision;
+    if (
+      legacyHead !== null &&
+      !hasTakeover &&
+      !initial.initialOuraRunComplete
+    ) {
+      return { kind: "file" };
+    }
     const canonicalCursor = legacyHead
       ? [
           initial.writeClock,
@@ -805,7 +818,11 @@ export function createLegacyScopeView(
       scope,
       selection: decision.selection,
       profileBy: "method",
-      requireCompletionReceipts: legacyHead !== null && !input.readLegacyHead,
+      // A completed checkpoint window may be compared for coverage, but an
+      // unfinished Oura run must never become the legacy scope's authority.
+      requireCompletionReceipts:
+        legacyHead !== null &&
+        (!input.readLegacyHead || decision.selection.method === "oura-browser"),
       allowUnprovenEmptyStreams: legacyHead !== null && !!input.readLegacyHead,
       includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
       requireClaudeRawBlobs: legacyHead !== null && !!input.readLegacyHead,
@@ -1104,6 +1121,36 @@ export function createLegacyScopeView(
   };
 }
 
+/** Initial Oura admission is one completed three-stream run, never a mix of windows. */
+function initialOuraRunComplete(
+  decision: Extract<Decision, { kind: "canonical" }>,
+): boolean {
+  if (decision.selection.method !== "oura-browser") return true;
+  const binding = decision.records.getInstanceBinding(
+    decision.selection.instance,
+  );
+  const listings = decision.records.listStreams([decision.selection.instance]);
+  const receipts = decision.records.listStreamCompletions(
+    decision.selection.instance,
+  );
+  let horizon: number | undefined;
+  return OURA_RUN_STREAMS.every((stream) => {
+    const count =
+      listings.find((entry) => entry.stream === stream)?.recordCount ?? 0;
+    const receipt = receipts.find(
+      (entry) =>
+        entry.stream === stream &&
+        entry.method === binding.method &&
+        entry.generation === binding.generation &&
+        entry.liveCount === count,
+    );
+    const time = Date.parse(receipt?.sourceCollectedAt ?? "");
+    if (!Number.isFinite(time)) return false;
+    horizon ??= time;
+    return time === horizon;
+  });
+}
+
 function missingCompletionReceipts(
   decision: Extract<Decision, { kind: "canonical" }>,
 ): string[] {
@@ -1147,7 +1194,12 @@ function receiptCursor(
 ): string {
   const receipts = decision.records
     .listStreamCompletions(decision.selection.instance)
-    .filter((receipt) => decision.streams.includes(receipt.stream))
+    .filter((receipt) =>
+      (decision.selection.method === "oura-browser"
+        ? OURA_RUN_STREAMS
+        : decision.streams
+      ).includes(receipt.stream),
+    )
     .map((receipt) => [
       receipt.stream,
       receipt.method,
