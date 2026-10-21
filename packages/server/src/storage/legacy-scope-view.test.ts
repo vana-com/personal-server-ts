@@ -1965,13 +1965,19 @@ describe("legacy scope view over the real SQLite record store", () => {
       legacyHead("oura.activity", "oura/activity/old.json");
       connect(store, "conn_b", "oura-browser");
       replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
+      expect(view.ownsScope("oura.activity")).toBe(true);
       store.deleteConnection("conn_b");
       expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
       expect(view.listingFor("oura.activity")).toEqual({ kind: "file" });
+      // The deleted connection's rows are gone: nothing blocks a legacy delete.
+      expect(view.ownsScope("oura.activity")).toBe(false);
+      expect(view.servesLegacyFirst("oura.activity")).toBe(false);
 
       connect(store, "conn_c", "oura-browser");
       replace(store, "conn_c", "activity", ["a2"], { method: "oura-browser" });
       expect(await view.readLatest("oura.activity")).toEqual({ kind: "file" });
+      expect(view.ownsScope("oura.activity")).toBe(true);
+      expect(view.servesLegacyFirst("oura.activity")).toBe(true);
     });
 
     it("still refuses a deleted oura-browser connection when there is no legacy file", async () => {

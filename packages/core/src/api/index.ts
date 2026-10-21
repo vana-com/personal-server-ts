@@ -1239,7 +1239,9 @@ function listingVisibility(
   return async (scope, entry) => {
     const listing = view.listingFor(scope);
     if (listing.kind === "refused") return false;
-    const canonicalOwned = view.ownsScope(scope);
+    // The file is what a gated scope lists and reads; its history is the file's.
+    const canonicalOwned =
+      view.ownsScope(scope) && !view.servesLegacyFirst(scope);
     // A file's re-add marker cannot revive the canonical body this row
     // describes. Canonical re-adds have no registered version yet.
     return (
@@ -2015,9 +2017,12 @@ export async function handlePersonalServerDataRequest(
         fileIdParam === undefined && atParam === undefined && view === null
           ? await deps.legacyScopeView?.readLatest(scopeResult.scope)
           : undefined;
+      // A scope whose file is kept over an opted-out method serves the file,
+      // so a tombstone is judged against that file, not the unserved rows.
       const canonicalOwned =
         latest !== undefined &&
-        deps.legacyScopeView?.ownsScope(scopeResult.scope);
+        deps.legacyScopeView?.ownsScope(scopeResult.scope) &&
+        !deps.legacyScopeView.servesLegacyFirst(scopeResult.scope);
 
       // Deletion gate, after auth (so unauthenticated callers learn nothing)
       // and before payment (so nobody is charged for deleted data). Covers
@@ -2593,7 +2598,7 @@ export async function handlePersonalServerDataRequest(
         return jsonResponse(
           {
             error: "CANONICAL_DELETE_UNSUPPORTED",
-            message: `Scope "${parsed.scope}" is served from the owner's connector records, which this route cannot delete. Nothing was deleted; delete the connection to erase its records.`,
+            message: `Scope "${parsed.scope}" has connector records that this route cannot delete. Nothing was deleted; delete the connection to erase its records.`,
             scope: parsed.scope,
           },
           { status: 409 },

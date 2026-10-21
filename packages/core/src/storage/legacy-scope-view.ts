@@ -260,6 +260,13 @@ export interface LegacyScopeViewPort {
   ): { scope: string; collectedAt: string }[];
   /** True when canonical history makes a legacy-only deletion unsafe. */
   ownsScope(scope: string): boolean;
+  /**
+   * True when connection rows exist for the scope but a method that opts out
+   * of takeover leaves the legacy file as the body every read serves. Its
+   * deletion history is then the file's, not the rows'. `ownsScope` stays
+   * true: deleting the file would otherwise let the rows appear.
+   */
+  servesLegacyFirst(scope: string): boolean;
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
   resetTakeover(scope: string): void;
   isReset(scope: string): boolean;
@@ -281,6 +288,10 @@ export interface CreateLegacyScopeViewInput {
   readLegacyHead?(head: LegacyScopeHead): Promise<DataFileEnvelope>;
   /** Optional payload growth limits for the takeover check. */
   coverageThresholds?: { maxPayloadRatio?: number; maxExtraBytes?: number };
+  /** Reports when the legacy file is kept over a method that holds synced rows. */
+  logger?: {
+    info(payload: Record<string, unknown>, message: string): void;
+  };
 }
 
 type Decision =
@@ -305,9 +316,12 @@ export function createLegacyScopeView(
 
   /**
    * The scope's methods, minus those whose binding opts out of takeover while
-   * the legacy file is still the owner's latest body: an eligible legacy head,
-   * no recorded takeover, and no deleted connection of those methods (a
-   * deletion erased rows that would show ownership; it keeps refusing).
+   * the legacy file is still the owner's latest body: an eligible legacy head
+   * and no recorded takeover. Such a method never served this scope, so its
+   * deleted, reset or replaced connections are not ownership evidence: the
+   * file was the served body all along. Once a takeover is recorded (the
+   * method did serve) this returns every method, and deletion refuses as for
+   * any other binding.
    */
   function withoutOptedOutMethods(
     scope: string,
@@ -315,16 +329,64 @@ export function createLegacyScopeView(
     const methods = scopeMethods(scope);
     const optedOut = optedOutMethods(scope);
     if (optedOut.size === 0) return methods;
-    if (
-      authority.hasTakeover(scope) ||
-      authority.eligibleLegacyHead(scope) === null ||
-      authority
-        .listMethodConnections([...optedOut])
-        .some((connection) => connection.deletedAt !== null)
-    ) {
-      return methods;
-    }
+    const head = authority.eligibleLegacyHead(scope);
+    if (head === null || authority.hasTakeover(scope)) return methods;
+    reportKeptLegacyFile(scope, head, optedOut);
     return new Map([...methods].filter(([method]) => !optedOut.has(method)));
+  }
+
+  /**
+   * Deletion safety asks the ungated question: do connection rows exist that
+   * a legacy-only deletion would let appear? Where the gate keeps the file
+   * over an opted-out method, only live rows of that method count: a deleted,
+   * reset or replaced connection erased its rows, and a connection that never
+   * held data has none.
+   */
+  function ownership(scope: string): { owns: boolean; legacyFirst: boolean } {
+    const ungated = decide(scope, false);
+    if (ungated.kind === "file") return { owns: false, legacyFirst: false };
+    if (decide(scope).kind !== "file")
+      return { owns: true, legacyFirst: false };
+    const rows = authority
+      .listMethodConnections([...optedOutMethods(scope)])
+      .some(
+        (connection) =>
+          connection.deletedAt === null &&
+          authority.hasHeldData(connection.instance, null),
+      );
+    return { owns: rows, legacyFirst: rows };
+  }
+
+  /**
+   * One line per (scope, legacy head, number of connections holding rows), so
+   * an operator can see a stalled collector keeping a fresh projection gated.
+   */
+  const reportedKept = new Set<string>();
+  function reportKeptLegacyFile(
+    scope: string,
+    head: LegacyScopeHead,
+    optedOut: ReadonlySet<string>,
+  ): void {
+    if (!input.logger) return;
+    const held = authority
+      .listMethodConnections([...optedOut])
+      .filter(
+        (connection) =>
+          connection.deletedAt === null &&
+          authority.hasHeldData(connection.instance, null),
+      ).length;
+    if (held === 0) return;
+    const key = `${scope}:${head.id}:${held}`;
+    if (reportedKept.has(key)) return;
+    reportedKept.add(key);
+    input.logger.info(
+      {
+        scope,
+        legacyHeadCollectedAt: head.collectedAt,
+        heldConnections: held,
+      },
+      "Legacy file kept as the latest body; a method that opts out of takeover holds synced rows",
+    );
   }
 
   /**
@@ -937,7 +999,10 @@ export function createLegacyScopeView(
     },
 
     ownsScope(scope) {
-      return authority.readSnapshot(() => decide(scope, false)).kind !== "file";
+      return authority.readSnapshot(() => ownership(scope).owns);
+    },
+    servesLegacyFirst(scope) {
+      return authority.readSnapshot(() => ownership(scope).legacyFirst);
     },
     verdictFor: (scope) => authority.verdictFor(scope),
     resetTakeover: (scope) => authority.resetTakeover(scope),

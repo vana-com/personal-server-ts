@@ -853,6 +853,22 @@ describe("an owner who disconnects or reconnects oura-browser while the legacy f
     },
   );
 
+  it("lets the owner delete the legacy scope once the connection that held rows is gone", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    const token = await writePdpp(DAYS, T_PDPP);
+    const blocked = await ctx!.app.request("/v1/data/oura.sleep", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(blocked.status).toBe(409);
+    await disconnect(token);
+    const deleted = await ctx!.app.request("/v1/data/oura.sleep", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+    });
+    expect(deleted.status).toBe(200);
+  });
+
   it("still refuses (503) a deleted connection when there is no legacy file", async () => {
     const token = await writePdpp(DAYS, T_PDPP);
     await disconnect(token);
