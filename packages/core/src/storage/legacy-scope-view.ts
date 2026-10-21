@@ -951,8 +951,12 @@ export function createLegacyScopeView(
             decision.streams,
             legacyHead.collectedAt,
           ),
+          // A partial row is present, only short of detail, so it does not
+          // weaken the receipts' proof that a missing entity was deleted. A
+          // dropped row would look deleted, so omissions still block it.
           allowProvenDeletion:
-            read.complete &&
+            read.diagnostics.omissions.length === 0 &&
+            (read.diagnostics.unproven?.length ?? 0) === 0 &&
             allStreamsProvenAfter(
               read,
               decision.streams,

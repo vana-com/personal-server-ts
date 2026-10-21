@@ -701,6 +701,69 @@ describe("legacy scope view over the real SQLite record store", () => {
         });
       }
     });
+
+    it("keeps a proven message deletion after takeover when the count becomes unknown", async () => {
+      seed(1);
+      const first = await makeView().readLatest("claude.conversations");
+      expect(first.kind).toBe("canonical");
+      legacyData = first.kind === "canonical" ? first.envelope.data : {};
+      db.prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+      ).run(
+        "claude/conversations/same.json",
+        "claude.conversations",
+        "2026-09-02T00:00:00.000Z",
+        1,
+      );
+      expect(await makeView().readLatest("claude.conversations")).toMatchObject(
+        { kind: "canonical" },
+      );
+      // A later, receipt-backed full replacement drops the message and does
+      // not know the conversation's count. A partial row is still present,
+      // so it does not undo the receipts' proof of the deletion.
+      const later = "2026-09-20T00:00:00.000Z";
+      for (const [stream, rows] of [
+        [
+          "account_plan",
+          [{ id: "account_plan", account_id: "org", plan_display_name: null }],
+        ],
+        [
+          "conversations",
+          [{ id: "existing", title: "Existing chat", message_count: null }],
+        ],
+        ["messages", []],
+      ] as const) {
+        store.replaceStream({
+          instance: "live",
+          stream,
+          method: "anthropic-live",
+          generation: 1,
+          primaryKey: ["id"],
+          emittedAt: later,
+          sourceCollectedAt: later,
+          envelopes: rows.map((data) => ({
+            instance: "live",
+            stream,
+            key: data.id,
+            data,
+            emitted_at: later,
+          })),
+        });
+      }
+      const view = makeView();
+      for (const current of [view, view, makeView()]) {
+        expect(await current.readLatest("claude.conversations")).toMatchObject({
+          kind: "canonical",
+          envelope: {
+            data: {
+              conversations: [
+                { id: "existing", messageCount: 0, messages: [] },
+              ],
+            },
+          },
+        });
+      }
+    });
   });
 
   it("compares the projected Claude conversation joined from three streams", async () => {
