@@ -328,19 +328,15 @@ for (const backend of ["memory", "sqlite"]) {
         const h = harness(backend, {
           g1: grant(version, "G1", [streamGrant(version)]),
         });
-        h.put("a", { name: "A", t: INSIDE });
-        h.put("b", { name: "B", t: INSIDE });
+        for (const key of ["a", "b", "c"])
+          h.put(key, { name: key.toUpperCase(), t: INSIDE });
         const session = { changes_since: begin(version), order: "asc" };
         const first = await h.get(records("s", { ...session, limit: "1" }));
         expect(ids(first.body)).toEqual(["a"]);
         h.remove("b");
         if (recreate) h.put("b", { name: "B", t: INSIDE });
         const second = await h.get(
-          records("s", {
-            ...session,
-            limit: "1",
-            cursor: first.body.next_cursor,
-          }),
+          records("s", { ...session, cursor: first.body.next_cursor }),
         );
         const next = second.body.next_changes_since
           ? await h.get(
@@ -356,25 +352,100 @@ for (const backend of ["memory", "sqlite"]) {
       for (const recreate of [false, true])
         it(`a record deleted${recreate ? " and recreated" : ""} after page 1 follows the profile's rule (${version})`, async () => {
           const { second, next } = await deleteBetweenPages(recreate);
+          expect(second.status).toBe(200);
+          expect(second.body.has_more).toBe(false);
           if (version === CANDIDATE) {
-            // Never served after its deletion. Withholding it instead could
-            // lose it: the next session compares against this horizon.
-            expect(second.status).toBe(410);
-            expect(second.body.error?.code).toBe("cursor_expired");
+            // Never served after its deletion, and the rest of the session
+            // continues. The next session returns it as of its own horizon,
+            // even when a recreate left its projection unchanged.
+            expect(ids(second.body)).toEqual(["c"]);
+            expect(next!.body.data).toEqual([
+              recreate
+                ? expect.objectContaining({
+                    id: "b",
+                    data: { id: "b", name: "B" },
+                  })
+                : expect.objectContaining({ id: "b", deleted: true }),
+            ]);
             return;
           }
           // Current: the page stays at the session horizon, as the current
           // contract requires, and the next session carries the change.
           expect(second.body.data).toEqual([
             expect.objectContaining({ id: "b", data: { id: "b", name: "B" } }),
+            expect.objectContaining({ id: "c" }),
           ]);
-          expect(second.body.has_more).toBe(false);
           expect(next!.body.data).toEqual(
             recreate
               ? []
               : [expect.objectContaining({ id: "b", deleted: true })],
           );
         });
+
+      if (version === CANDIDATE) {
+        it("a withheld record is carried through later pages into the checkpoint", async () => {
+          const h = harness(backend, {
+            g1: grant(version, "G1", [streamGrant(version)]),
+          });
+          for (const key of ["a", "b", "c", "d"])
+            h.put(key, { name: key.toUpperCase(), t: INSIDE });
+          const session = {
+            changes_since: begin(version),
+            order: "asc",
+            limit: "1",
+          };
+          let page = await h.get(records("s", session));
+          h.remove("b");
+          h.put("b", { name: "B", t: INSIDE });
+          const seen = ids(page.body);
+          while (page.body.next_cursor) {
+            page = await h.get(
+              records("s", { ...session, cursor: page.body.next_cursor }),
+            );
+            expect(page.status).toBe(200);
+            seen.push(...ids(page.body));
+          }
+          expect(seen).toEqual(["a", "c", "d"]);
+          const next = await h.get(
+            records("s", {
+              changes_since: page.body.next_changes_since!,
+              order: "asc",
+            }),
+          );
+          expect(ids(next.body)).toEqual(["b"]);
+          // Carried once: the session after that compares projections again.
+          const after = await h.get(
+            records("s", {
+              changes_since: next.body.next_changes_since!,
+              order: "asc",
+            }),
+          );
+          expect(after.body.data).toEqual([]);
+        });
+
+        it("expires a session whose withheld records exceed what a token can carry", async () => {
+          const h = harness(backend, {
+            g1: grant(version, "G1", [streamGrant(version)]),
+          });
+          const keys = Array.from(
+            { length: 200 },
+            (_, i) => `key-${String(i).padStart(4, "0")}-${"x".repeat(40)}`,
+          );
+          for (const key of keys) h.put(key, { name: "N", t: INSIDE });
+          const session = {
+            changes_since: begin(version),
+            order: "asc",
+            limit: "1",
+          };
+          const first = await h.get(records("s", session));
+          for (const key of keys.slice(1)) h.remove(key);
+          const second = await h.get(
+            records("s", { ...session, cursor: first.body.next_cursor }),
+          );
+          expect(second.status).toBe(410);
+          expect(second.body.error?.code).toBe("cursor_expired");
+        });
+      }
 
       it(`F1 refuses to serve one key from two instances under one id (${version})`, async () => {
         const h = harness(backend, {
