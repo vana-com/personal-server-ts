@@ -517,4 +517,48 @@ describe("createApp with an enabled replica receiver", () => {
     const after = await statuses();
     expect(after).toEqual(after.map((s) => s.replace(/\d+$/, "410")));
   });
+
+  it.each(["key", "connection"] as const)(
+    "a %s quarantine hides an owner's pending-only row and its blob on every surface",
+    async (scope) => {
+      const h = host();
+      const pending = h.row("pending", 5, "pending-key");
+      h.receiver.stage({
+        credential: "x",
+        id: "pending",
+        envelope: h.envelope("pending", [
+          h.registration,
+          h.claim("pending-claim", 4),
+          pending,
+        ]),
+        blobs: [{ blobId: h.blobId, bytes: h.bytes }],
+      });
+      expect(
+        (await h.get("owner", `/v1/streams/${stream}/records/pending-key`))
+          .status,
+      ).toBe(200);
+      expect((await h.get("owner", `/v1/blobs/${h.blobId}`)).status).toBe(200);
+
+      // The key has no canonical row, so no withdrawal marks it for the view.
+      h.receiver.quarantineImported({
+        credential: "x",
+        envelope: h.envelope(
+          "terminal",
+          scope === "key" ? [pending] : [h.registration],
+        ),
+      });
+
+      for (const token of ["owner", "app"]) {
+        expect(
+          (await h.get(token, `/v1/streams/${stream}/records/pending-key`))
+            .status,
+        ).toBe(404);
+        expect(
+          (await h.get(token, `/v1/streams/${stream}/records`)).body.data,
+        ).toEqual([]);
+        expect((await h.get(token, "/v1/streams")).body.data).toEqual([]);
+        expect((await h.get(token, `/v1/blobs/${h.blobId}`)).status).toBe(404);
+      }
+    },
+  );
 });
