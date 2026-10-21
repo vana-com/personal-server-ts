@@ -1,5 +1,6 @@
 import type { DurableAdditionsService } from "../additions/durable.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
+import { authorizeLegacyRead } from "../policy/data-read.js";
 import {
   DataDeletedError,
   DeleteTombstoneFailedError,
@@ -2005,7 +2006,7 @@ export async function handlePersonalServerDataRequest(
         scope: scopeResult.scope,
         grantId,
         fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
-        at: atParam,
+        at: atParam ?? selectedEntry?.collectedAt,
       });
 
       // Select the body after auth and before deletion or payment. A file's
@@ -2030,6 +2031,19 @@ export async function handlePersonalServerDataRequest(
         canonicalOwned ? undefined : selectedEntry,
         canonicalOwned ? "canonical" : "file",
       );
+
+      // Disclosure gate, before demand or payment: a chain grant reads actual
+      // legacy files only, so a grantee never receives the canonical view (or
+      // its refusal) or a version with PDPP origin.
+      const reader = isOwnerView(authResult) ? "owner" : "grantee";
+      if (latest !== undefined && latest.kind !== "file") {
+        authorizeLegacyRead(reader, { kind: "canonical-view" });
+      } else if (selectedEntry) {
+        authorizeLegacyRead(reader, {
+          kind: "stored-version",
+          entry: selectedEntry,
+        });
+      }
 
       if (view === "stored" && !isOwnerView(authResult)) {
         return errorResponse(
@@ -2176,7 +2190,7 @@ export async function handlePersonalServerDataRequest(
           storage: deps.storage,
           scopeParam: scopeResult.scope,
           fileId: fileIdParam,
-          at: atParam,
+          at: atParam ?? selectedEntry?.collectedAt,
           ...(view === "stored" ? { view } : {}),
         });
         if (!result.ok) {

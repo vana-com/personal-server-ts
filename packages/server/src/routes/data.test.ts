@@ -1630,7 +1630,7 @@ describe("GET /v1/data/:scope", () => {
     expect(json.data).toEqual({ username: "test_user" });
   });
 
-  it("serves an attributed projection to a grantee without changing data bytes", async () => {
+  it("refuses an attributed projection to a grantee and serves the owner its unchanged bytes", async () => {
     const app = createApp();
     const data = { username: "test_user" };
     const provenance = {
@@ -1651,7 +1651,21 @@ describe("GET /v1/data/:scope", () => {
     });
     expect(ingest.status).toBe(201);
 
-    const response = await getWithAuth(app, "instagram.profile");
+    // A PDPP projector cache is PDPP data: a chain grant cannot read it.
+    const grantee = await getWithAuth(app, "instagram.profile");
+    expect(grantee.status).toBe(403);
+    expect((await grantee.json()).error.errorCode).toBe("GRANT_REQUIRED");
+
+    const response = await app.request("/instagram.profile", {
+      headers: {
+        Authorization: await buildWeb3SignedHeader({
+          wallet: ownerWallet,
+          aud: SERVER_ORIGIN,
+          method: "GET",
+          uri: "/instagram.profile",
+        }),
+      },
+    });
     expect(response.status).toBe(200);
     const envelope = await response.json();
     expect(JSON.stringify(envelope.data)).toBe(JSON.stringify(data));

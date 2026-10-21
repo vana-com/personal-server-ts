@@ -644,6 +644,7 @@ export function createApp(deps: AppDeps): Hono {
     indexManager: deps.indexManager,
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,
+    scopeDeletions: deps.scopeDeletions,
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,

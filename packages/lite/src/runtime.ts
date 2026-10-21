@@ -1330,6 +1330,7 @@ export function createPsLiteRuntime(
             dataStorage,
             accessLogWriter,
             readFulfillmentReporter: options.readFulfillmentReporter,
+            scopeDeletions: options.scopeDeletions,
             now,
             runtimeAvailability: { isAvailable: () => active },
             serverOrigin: url.origin,
@@ -1372,6 +1373,8 @@ async function handleMcpRoute(input: {
   dataStorage: DataStoragePort;
   accessLogWriter: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
+  /** The tracker `/v1/data` reads with; MCP reads refuse deleted scopes too. */
+  scopeDeletions?: ScopeDeletionTracker;
   now: () => Date;
   runtimeAvailability: RuntimeAvailabilityPort;
   serverOrigin: string;
@@ -1967,6 +1970,8 @@ async function handleMcpRoute(input: {
         accessLogWriter: input.accessLogWriter,
         readFulfillmentReporter: input.readFulfillmentReporter,
         runtimeAvailability: input.runtimeAvailability,
+        scopeDeletions: input.scopeDeletions,
+        serverOwner: input.serverOwner,
         now: input.now,
         createLogId,
       },

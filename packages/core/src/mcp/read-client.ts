@@ -43,6 +43,8 @@ import {
   type ReadDeletionEntry,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
+import { authorizeLegacyRead } from "../policy/data-read.js";
+import type { IndexEntry } from "../storage/index/types.js";
 
 /**
  * Block sidecars are built from the FULL stored envelope, so they carry the
@@ -570,6 +572,23 @@ export function createMcpDataReadClient(
     }
   }
 
+  /**
+   * The disclosure policy for the version a block read serves. This client
+   * reads only as a grantee (see the header), so the policy decides before
+   * `authorizeScopeRead` may settle payment, right after the deletion gate,
+   * in the same order as `/v1/data`.
+   */
+  function authorizeGranteeVersion(entry: Pick<IndexEntry, "pdppOrigin">) {
+    try {
+      authorizeLegacyRead("grantee", { kind: "stored-version", entry });
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        throw new McpDataReadError(err.code, err.toJSON());
+      }
+      throw err;
+    }
+  }
+
   async function writeReadAccessLog(
     request: Request,
     params: {
@@ -698,6 +717,7 @@ export function createMcpDataReadClient(
       // Before authorizeScopeRead: a payment-enforcing auth port settles
       // x402 there, and deleted data must never be charged for.
       await assertScopeReadable(scope, selectedEntry);
+      authorizeGranteeVersion(selectedEntry);
 
       const { request, authResult } = await authorizeScopeRead({
         scope,
@@ -796,11 +816,13 @@ export function createMcpDataReadClient(
         });
       }
       await assertScopeReadable(scope, selectedEntry);
+      authorizeGranteeVersion(selectedEntry);
 
       const { request, authResult } = await authorizeScopeRead({
         scope,
         grantId,
         fileId: selectedEntry.fileId ?? undefined,
+        at: selectedEntry.collectedAt,
         metadataOnly: true,
       });
       let manifest;

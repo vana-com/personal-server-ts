@@ -17,6 +17,7 @@ import {
 import { uncoveredSourceScopes } from "./registration.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
+import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
 import { assertDerivedScopeNaming } from "../lineage/lineage.js";
 import type { StoredLineage } from "../lineage/lineage.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
@@ -403,6 +404,7 @@ async function assertNoLineageCycle(
 async function loadSource(
   deps: QuestionComputeDeps,
   scope: string,
+  reader: LegacyReader,
 ): Promise<{ source: PromptSource; lineageSources: string[] }> {
   const entry = deps.storage.findEntry({ scope });
   // The same deletion gate a read applies: a tombstoned scope is refused
@@ -424,6 +426,9 @@ async function loadSource(
       "source_missing",
     );
   }
+  // The answer is disclosed to whoever registered the question, so each
+  // source passes the same disclosure policy as a read by that registrant.
+  authorizeLegacyRead(reader, { kind: "stored-version", entry });
   let envelope;
   try {
     envelope = await deps.storage.readEnvelope(scope, entry.collectedAt);
@@ -536,7 +541,11 @@ export async function computeQuestion(
     const sources: PromptSource[] = [];
     const sourceLineage = new Map<string, readonly string[]>();
     for (const scope of registration.sourceScopes) {
-      const loaded = await loadSource(deps, scope);
+      const loaded = await loadSource(
+        deps,
+        scope,
+        registration.registeredBy.kind === "owner" ? "owner" : "grantee",
+      );
       sources.push(loaded.source);
       sourceLineage.set(scope, loaded.lineageSources);
     }
