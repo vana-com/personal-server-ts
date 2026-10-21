@@ -330,6 +330,19 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
     snapshots_json TEXT NOT NULL,
     conversations_covered INTEGER NOT NULL DEFAULT 0
   );`,
+  // v15: sync session state behind opaque handles (`sync-session.ts`).
+  `
+CREATE TABLE IF NOT EXISTS pdpp_sync_state (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  state TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_owner
+  ON pdpp_sync_state (owner);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_expires
+  ON pdpp_sync_state (expires_at);
+`,
 ];
 
 function addCompletionProofColumns(db: Database): void {
