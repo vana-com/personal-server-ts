@@ -3697,6 +3697,66 @@ it.each(["legacy", "chunks"] as const)(
   },
 );
 
+// A legacy row's size is length(bytes), so only a chunk manifest can hold a
+// malformed size. It must count as a present, failing copy, never as absent.
+it.each([
+  ["received", -1],
+  ["received", 1.5],
+  ["received", 2 ** 53],
+  ["canonical", -1],
+  ["canonical", 1.5],
+  ["canonical", 2 ** 53],
+] as const)(
+  "a retained %s manifest with malformed size %s vetoes a valid pending copy",
+  (namespace, malformed) => {
+    const f = sharedBlob("chunks");
+    if (namespace === "received") {
+      f.receiver.import({
+        credential: "replica-secret",
+        envelope: batch(f.a.filter((op) => op.kind !== "upsert")),
+        blobs: [{ blobId: f.blob.blobId, bytes: f.bytes }],
+      });
+      f.receiver.stage({
+        credential: "replica-secret",
+        id: "dependent",
+        envelope: batch(f.a.filter((op) => op.kind === "upsert")),
+      });
+    } else {
+      // Canonical chunks only: the store's own write of a blob over 1 MiB.
+      f.target.store.storeBlobBytesForInstance({
+        instance: "conn_a",
+        method: "collector",
+        generation: 1,
+        bytes: f.bytes,
+        mimeType: f.blob.mimeType,
+      });
+      f.receiver.stage({
+        credential: "replica-secret",
+        id: "dependent",
+        envelope: batch(f.a),
+      });
+    }
+    f.carry("carrier");
+    expect(f.owner.getRecord("conn_a", "messages", "a")).toBeDefined();
+    const size = (value: number) =>
+      f.target.db
+        .prepare(
+          "UPDATE pdpp_binary_manifests SET size_bytes=? WHERE namespace=? AND blob_id=?",
+        )
+        .run(value, namespace, f.blob.blobId).changes;
+    expect(size(malformed)).toBe(1);
+    f.rederive();
+    expect(f.owner.getRecord("conn_a", "messages", "a")).toBeUndefined();
+    expect(f.owner.getBlobBytes(f.blob.blobId)).toBeUndefined();
+    size(f.bytes.length);
+    f.rederive();
+    expect(f.owner.getRecord("conn_a", "messages", "a")).toBeDefined();
+    expect(f.owner.getBlobBytes(f.blob.blobId)?.byteLength).toBe(
+      f.bytes.length,
+    );
+  },
+);
+
 it("refuses a forged chunk manifest size before allocating it", () => {
   const f = sharedBlob("chunks");
   f.receiver.import({
