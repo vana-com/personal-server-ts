@@ -6,6 +6,7 @@ import {
 export type { LegacyCoverageVerdict } from "./legacy-scope-coverage.js";
 import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
 import {
+  ANTHROPIC_LIVE_BINDINGS,
   GITHUB_BROWSER_BINDINGS,
   LEGACY_SCOPE_BINDINGS,
   legacyBindingsForProfile,
@@ -51,6 +52,7 @@ import {
 /** Every declaration profile the pure module serves a scope from. */
 const BINDING_PROFILES = [
   LEGACY_SCOPE_BINDINGS,
+  ANTHROPIC_LIVE_BINDINGS,
   GITHUB_BROWSER_BINDINGS,
   META_040_BINDINGS,
   OURA_BROWSER_BINDINGS,

@@ -54,7 +54,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/7";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/8";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -703,6 +703,7 @@ async function projectSnapshot(
   const expanded = [];
   const canExpandClaude =
     selection.sourceId === CLAUDE_SOURCE_ID &&
+    selection.method === "anthropic" &&
     (scope === "claude.conversations" || scope === "claude.projects");
   if (canExpandClaude && input.requireClaudeRawBlobs) {
     const parentStream =
@@ -1222,7 +1223,11 @@ export function legacyConnectorKey(pdppSource: string): string {
 
 /** Most connector keys match their public source; Anthropic collects Claude. */
 function canonicalSourceId(pdppSource: string): string {
-  if (pdppSource === ANTHROPIC_CONNECTOR_ID) return CLAUDE_SOURCE_ID;
+  if (
+    pdppSource === ANTHROPIC_CONNECTOR_ID ||
+    pdppSource === "https://registry.pdpp.dev/connectors/anthropic-live"
+  )
+    return CLAUDE_SOURCE_ID;
   return pdppSource.startsWith(CONNECTOR_ID_PREFIX)
     ? SOURCE_ID_PREFIX + pdppSource.slice(CONNECTOR_ID_PREFIX.length)
     : pdppSource;
