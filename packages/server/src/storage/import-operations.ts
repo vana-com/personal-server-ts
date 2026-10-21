@@ -83,52 +83,71 @@ export function createImportOperations(
     }
   }
 
-  function recover(): void {
+  /**
+   * Finish interrupted work. A row that cannot finish stays as it is, so every
+   * later call retries it, and it fails only the caller that owns it.
+   */
+  function recover(own?: ReturnType<typeof key>): void {
     const rows = db
       .prepare(
         "SELECT * FROM owner_import_operations WHERE state = 'prepared' OR (state IN ('deleted', 'cancelled') AND metadata_json IS NOT NULL) ORDER BY rowid",
       )
       .all() as OperationRow[];
     for (const row of rows) {
-      if (row.state !== "prepared") {
-        deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
-        index.deleteByPath(row.path);
-        db.prepare(
-          `UPDATE owner_import_operations SET envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
-        ).run(row);
-        continue;
+      try {
+        recoverRow(row);
+      } catch (err) {
+        if (
+          own &&
+          row.scope === own.scope &&
+          row.authority === own.authority &&
+          row.owner === own.owner &&
+          row.operation === own.operation
+        )
+          throw err;
       }
-      const bytes = row.envelope_bytes!;
-      const envelope = JSON.parse(bytes.toString("utf8")) as DataFileEnvelope;
-      const metadata = JSON.parse(
-        row.metadata_json!,
-      ) as VersionCommit["metadata"] & {
-        sizeBytes?: number;
-        afterTombstoneVersion?: number | null;
-      };
-      const written = publishDataFile(options, envelope, bytes, row.operation);
-      const entry =
-        index.findByPath(row.path) ??
-        index.insert({
-          fileId: null,
-          schemaId: null,
-          path: row.path,
-          scope: row.scope,
-          collectedAt: row.collected_at,
-          sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
-          afterTombstoneVersion: metadata.afterTombstoneVersion ?? null,
-        });
-      const receipt: ImportReceipt = {
-        operation: row.operation,
-        bodySha256: row.body_sha256,
-        scope: row.scope,
-        collectedAt: entry.collectedAt,
-        acceptedAt: new Date().toISOString(),
-      };
-      db.prepare(
-        `UPDATE owner_import_operations SET state = 'accepted', receipt_json = @receipt, envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
-      ).run({ ...row, receipt: JSON.stringify(receipt) });
     }
+  }
+
+  function recoverRow(row: OperationRow): void {
+    if (row.state !== "prepared") {
+      deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
+      index.deleteByPath(row.path);
+      db.prepare(
+        `UPDATE owner_import_operations SET envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
+      ).run(row);
+      return;
+    }
+    const bytes = row.envelope_bytes!;
+    const envelope = JSON.parse(bytes.toString("utf8")) as DataFileEnvelope;
+    const metadata = JSON.parse(
+      row.metadata_json!,
+    ) as VersionCommit["metadata"] & {
+      sizeBytes?: number;
+      afterTombstoneVersion?: number | null;
+    };
+    const written = publishDataFile(options, envelope, bytes, row.operation);
+    const entry =
+      index.findByPath(row.path) ??
+      index.insert({
+        fileId: null,
+        schemaId: null,
+        path: row.path,
+        scope: row.scope,
+        collectedAt: row.collected_at,
+        sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
+        afterTombstoneVersion: metadata.afterTombstoneVersion ?? null,
+      });
+    const receipt: ImportReceipt = {
+      operation: row.operation,
+      bodySha256: row.body_sha256,
+      scope: row.scope,
+      collectedAt: entry.collectedAt,
+      acceptedAt: new Date().toISOString(),
+    };
+    db.prepare(
+      `UPDATE owner_import_operations SET state = 'accepted', receipt_json = @receipt, envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
+    ).run({ ...row, receipt: JSON.stringify(receipt) });
   }
 
   function reserve(envelope: DataFileEnvelope): DataFileEnvelope {
@@ -167,7 +186,7 @@ export function createImportOperations(
       const admitted = immediate(() => {
         const prior = find(command.envelope.scope, intent);
         check(prior, intent);
-        recover();
+        recover(key(command.envelope.scope, intent));
         if (prior) return false;
         const envelope = reserve(command.envelope);
         const path = relative(
@@ -192,7 +211,7 @@ export function createImportOperations(
         return true;
       });
       return immediate(() => {
-        recover();
+        recover(key(command.envelope.scope, intent));
         const row = find(command.envelope.scope, intent)!;
         check(row, intent);
         const receipt = JSON.parse(row.receipt_json!) as ImportReceipt;
