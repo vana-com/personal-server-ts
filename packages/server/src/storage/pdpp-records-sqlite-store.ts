@@ -1748,15 +1748,31 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     return rows.map((row) => row.record_key);
   }
 
+  // Quarantine is independent of the historical write horizon. Retention must
+  // never turn an old cursor into authority to read a now-untrusted key.
+  function unquarantinedRecordSql(alias: string): string {
+    return `NOT EXISTS (
+      SELECT 1 FROM pdpp_replica_quarantined_connections q
+      WHERE q.instance = ${alias}.instance
+    ) AND NOT EXISTS (
+      SELECT 1 FROM pdpp_replica_quarantined_keys q
+      JOIN pdpp_instance_binding b ON b.instance = q.instance AND b.generation = q.generation
+      WHERE q.instance = ${alias}.instance AND q.stream = ${alias}.stream
+        AND q.record_key = ${alias}.record_key
+    )`;
+  }
+
   function getRecord(
     instance: string,
     stream: string,
     recordKey: string,
   ): PdppStoredRecord | undefined {
-    const row = getCurrentStmt.get(instance, stream, recordKey) as
-      RecordRowDb | undefined;
-    if (!row || row.deleted) return undefined;
-    return toRow(row) as PdppStoredRecord;
+    const row = db
+      .prepare(
+        `SELECT * FROM pdpp_records r WHERE r.instance = ? AND r.stream = ? AND r.record_key = ? AND r.deleted = 0 AND ${unquarantinedRecordSql("r")}`,
+      )
+      .get(instance, stream, recordKey) as RecordRowDb | undefined;
+    return row ? (toRow(row) as PdppStoredRecord) : undefined;
   }
 
   // P10c: a token whose horizon is below the reset_clock of any instance it
@@ -1831,6 +1847,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     let sql = `
       SELECT * FROM pdpp_records
       WHERE stream = ? AND deleted = 0 AND instance IN (${placeholders})
+      AND ${unquarantinedRecordSql("pdpp_records")}
     `;
     const params: unknown[] = [stream, ...options.instanceIds];
     if (startAfter) {
@@ -1963,6 +1980,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         `
         SELECT c.* FROM pdpp_record_changes c
         WHERE c.stream = ? AND c.instance IN (${placeholders}) AND c.written_at <= ?
+        AND ${unquarantinedRecordSql("c")}
         AND c.version = (
           SELECT MAX(c2.version) FROM pdpp_record_changes c2
           WHERE c2.stream = c.stream AND c2.instance = c.instance
