@@ -306,12 +306,27 @@ function identityKey(id: RecordIdentity): string {
 }
 
 /**
- * The most identity text one token carries for each of `carried` and
- * `withheld`. Beyond it the session expires, so a token stays a usable query
- * parameter. Reaching it needs that many visible records deleted between
- * pages of one session.
+ * The most UTF-8 bytes of identity JSON one token carries for `carried` and
+ * `withheld` together. Beyond it the session expires, so a token stays a
+ * usable query parameter. Reaching it needs that many visible records deleted
+ * between pages of one session.
  */
 export const MAX_SYNC_CARRY_BYTES = 2048;
+
+/** Both identity lists as token pairs, or 410 when they exceed the carry. */
+function carryPairs(
+  carried: RecordIdentity[],
+  withheld: RecordIdentity[],
+): { c?: [string, string][]; w?: [string, string][] } {
+  const c = toPairs(carried),
+    w = toPairs(withheld);
+  if (
+    Buffer.byteLength(JSON.stringify([c, w]), "utf8") > MAX_SYNC_CARRY_BYTES
+  ) {
+    throw new CursorExpiredError();
+  }
+  return { ...(c.length > 0 && { c }), ...(w.length > 0 && { w }) };
+}
 
 const SEALED_VERSION = 1;
 const KEY_ID_BYTES = 4;
@@ -467,8 +482,7 @@ function sessionTokens(
       ...(low !== null && { l: low.padStart(HORIZON_WIDTH) }),
       h: high.padStart(HORIZON_WIDTH),
       a: [after.recordKey, after.instance],
-      ...(carried.length > 0 && { c: toPairs(carried) }),
-      ...(withheld.length > 0 && { w: toPairs(withheld) }),
+      ...carryPairs(carried, withheld),
     });
 
   if (request.candidate) {
@@ -494,7 +508,7 @@ function sessionTokens(
           r: "checkpoint",
           b: context,
           h: high.padStart(HORIZON_WIDTH),
-          ...(withheld.length > 0 && { w: toPairs(withheld) }),
+          ...carryPairs([], withheld),
         }),
     };
   }
@@ -537,11 +551,7 @@ function sessionTokens(
 }
 
 function toPairs(ids: RecordIdentity[]): [string, string][] {
-  const pairs = ids.map((id): [string, string] => [id.recordKey, id.instance]);
-  if (JSON.stringify(pairs).length > MAX_SYNC_CARRY_BYTES) {
-    throw new CursorExpiredError();
-  }
-  return pairs;
+  return ids.map((id): [string, string] => [id.recordKey, id.instance]);
 }
 
 function fromPairs(pairs: [string, string][] | undefined): RecordIdentity[] {

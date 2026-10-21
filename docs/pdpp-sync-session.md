@@ -110,8 +110,8 @@ a changed `limit`, retries, and a SQLite restart followed by a reset.
 - The sealing key does not rotate. Rebuilding the records database expires
   every outstanding token.
 - Transport timing is outside this contract.
-- A candidate token carries at most `MAX_SYNC_CARRY_BYTES` (2 KiB) of
-  withheld and of carried identities. A session that withholds more, which
+- A candidate token carries at most `MAX_SYNC_CARRY_BYTES` (2 KiB of UTF-8
+  identity JSON) of withheld and carried identities together. A session that withholds more, which
   takes that many visible records deleted between its pages, expires with
   `410 cursor_expired`.
 - The candidate binds `order` into checkpoints, as spec-core requires for the
