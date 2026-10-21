@@ -17,6 +17,8 @@
  */
 
 import Database from "better-sqlite3";
+import { createServer as createHttpServer } from "node:http";
+import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -1233,6 +1235,137 @@ describe("a takeover that oura-browser did not earn", () => {
 });
 
 describe("Oura default admission cutover", () => {
+  it("retains distinct 2025 history when a completed truncated opt-in snapshot is promoted", async () => {
+    vi.setSystemTime(new Date(T_LEGACY));
+    for (const scope of SCOPES) {
+      const body = JSON.parse(
+        JSON.stringify(legacyBody(scope, DAYS)).replaceAll(
+          "2026-09-01",
+          "2025-01-01",
+        ),
+      );
+      await legacyWrite(scope, body);
+    }
+    await writePdpp(DAYS.slice(1), T_PDPP);
+    expect(await readAll()).toEqual(ALL(FILE));
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(FILE));
+    for (const scope of SCOPES) {
+      const read = await observe(scope);
+      expect(JSON.stringify(read.owner.body)).toContain("2025-01-01");
+      expect(JSON.stringify(read.builder.body)).toContain("2025-01-01");
+    }
+  });
+
+  it.each([false, true])(
+    "revalidates persisted version-8 proven-deletion verdicts after restart (takeover=%s)",
+    async (withTakeover) => {
+      await writeLegacy(DAYS, T_LEGACY);
+      await writePdpp(DAYS.slice(1), T_PDPP);
+      await restartWithMethods(["oura-browser"], []);
+      await readAll();
+      // Model the exact old persisted verdict, without changing records/receipts.
+      const db = new Database(join(tempDir, "index.db"));
+      try {
+        db.prepare("DELETE FROM legacy_scope_takeovers").run();
+        const rows = db
+          .prepare(
+            "SELECT scope, canonical_cursor FROM legacy_scope_takeover_verdicts",
+          )
+          .all() as { scope: string; canonical_cursor: string }[];
+        expect(rows).toHaveLength(3);
+        for (const row of rows) {
+          const oldCursor = row.canonical_cursor.replace(
+            /:[0-9]+:1\.5:262144$/,
+            ":8:1.5:262144",
+          );
+          db.prepare(
+            "UPDATE legacy_scope_takeover_verdicts SET canonical_cursor = ?, verdict = 'covered', reason_json = ? WHERE scope = ?",
+          ).run(
+            oldCursor,
+            JSON.stringify({
+              reason: "proven_deletion",
+              missingEntityCount: 1,
+              mismatchedFieldPaths: [],
+            }),
+            row.scope,
+          );
+        }
+        if (withTakeover)
+          db.prepare(
+            `INSERT INTO legacy_scope_takeovers
+        (scope, instance, generation, method, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+        SELECT scope, ?, 1, 'oura-browser', version, cas_revision, collected_at, path FROM data_files`,
+          ).run(accountOne);
+      } finally {
+        db.close();
+      }
+      await restartWithMethods(["oura-browser"], []);
+      const listing = await ctx!.app.request("/v1/data", {
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      const listed = (await listing.json()).scopes as { scope: string }[];
+      expect(
+        listed.some((entry) =>
+          (SCOPES as readonly string[]).includes(entry.scope),
+        ),
+      ).toBe(false);
+      expect(await readAll()).toEqual(
+        ALL(withTakeover ? "503 canonical_view_incomplete" : FILE),
+      );
+      const verified = new Database(join(tempDir, "index.db"));
+      try {
+        expect(
+          verified
+            .prepare("SELECT verdict FROM legacy_scope_takeover_verdicts")
+            .all(),
+        ).toEqual(SCOPES.map(() => ({ verdict: "not_covered" })));
+      } finally {
+        verified.close();
+      }
+    },
+  );
+
+  it("retains newly acquired canonical IDs across a later completed replacement and restart", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    const token = await writePdpp(DAYS, T_PDPP);
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(CANON));
+    await writePdpp([...DAYS, { n: 3, score: 91 }], T_PDPP, token);
+    expect(await readAll()).toEqual(ALL(CANON));
+    await writePdpp(DAYS, T_PDPP, token);
+    for (const scope of SCOPES) {
+      const read = await observe(scope);
+      expect(read.owner.status).toBe(503);
+      expect(read.builder.status).toBe(503);
+    }
+    await restartWithMethods(["oura-browser"], []);
+    for (const scope of SCOPES)
+      expect((await observe(scope)).owner.status).toBe(503);
+  });
+
+  it("refuses truncated completed records after takeover instead of deleting retained history", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    const token = await writePdpp(DAYS, T_PDPP);
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(CANON));
+    for (const scope of SCOPES) {
+      await replace(
+        token,
+        STREAM_OF[scope],
+        pdppRows(scope, DAYS.slice(1)),
+        T_PDPP,
+      );
+      const read = await observe(scope);
+      expect(read.owner.status).toBe(503);
+      expect(read.builder.status).toBe(503);
+      const stored = await ctx!.app.request(`/v1/data/${scope}?view=stored`, {
+        headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` },
+      });
+      expect((await stored.json()).data).toEqual(legacyBody(scope, DAYS));
+    }
+  });
+
   it("keeps earned canonical reads available after a partial refresh without completion receipts", async () => {
     await writeLegacy(DAYS, T_LEGACY);
     const token = await writePdpp(DAYS, T_PDPP);
@@ -1411,6 +1544,285 @@ describe("Oura collection requirements", () => {
       body: "{}",
     });
     expect(importResponse.status).toBe(401);
+  });
+
+  it.skipIf(!process.env.F2_NATIVE_PUBLICATION_ORACLE)(
+    "publishes the immutable signed collector through native supervision and HTTP before OpenPet takeover",
+    async () => {
+      const desktop = process.env.F2_DESKTOP_SOURCE!;
+      const root = process.env.F2_NATIVE_ORACLE_ROOT!;
+      const profile = JSON.parse(
+        await readFile(
+          join(
+            desktop,
+            "src-tauri/tests/fixtures/oura-browser-0.1.41.collection-profile.json",
+          ),
+          "utf8",
+        ),
+      );
+      const historic = <T>(value: T): T =>
+        JSON.parse(
+          JSON.stringify(value).replaceAll("2026-09-01", "2025-01-01"),
+        );
+      vi.setSystemTime(new Date(T_LEGACY));
+      for (const scope of SCOPES)
+        await legacyWrite(scope, historic(legacyBody(scope, DAYS)));
+      await restartWithMethods(["oura-browser"], []);
+      expect(await readAll()).toEqual(ALL(FILE));
+      const token = await ownerPdppToken();
+      const requirements = await ctx!.app.request(
+        "/v1/import/oura-browser/requirements",
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      const since = (await requirements.json()).since;
+      expect(since).toBe("2025-01-01");
+      const fixtures = {
+        emittedAt: T_PDPP,
+        daily_sleep: historic(
+          DAYS.map(({ n, score }) => ({
+            id: `ds${n}`,
+            day: date(n),
+            score,
+            timestamp: ts(n),
+            contributors: SLEEP_CONTRIB,
+          })),
+        ),
+        sleep: historic(
+          pdppSleep(DAYS).filter((row) => row.record_type === "sleep_session"),
+        ),
+        daily_readiness: historic(DAYS.map(pdppReadiness)),
+        daily_activity: historic(DAYS.map(pdppActivity)),
+      };
+      const fixturePath = join(tempDir, "upstream.json");
+      await writeFile(fixturePath, JSON.stringify(fixtures));
+      const listener = createHttpServer(async (incoming, outgoing) => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of incoming) chunks.push(Buffer.from(chunk));
+        const response = await ctx!.app.fetch(
+          new Request(`http://localhost${incoming.url}`, {
+            method: incoming.method,
+            headers: incoming.headers as HeadersInit,
+            ...(chunks.length ? { body: Buffer.concat(chunks) } : {}),
+          }),
+        );
+        outgoing.writeHead(
+          response.status,
+          Object.fromEntries(response.headers),
+        );
+        outgoing.end(Buffer.from(await response.arrayBuffer()));
+      });
+      await new Promise<void>((resolve) =>
+        listener.listen(0, "127.0.0.1", resolve),
+      );
+      try {
+        const address = listener.address() as { port: number };
+        const invokeNative = async () => {
+          const native = spawn(
+            process.env.F2_NATIVE_PUBLICATION_ORACLE!,
+            [
+              `http://127.0.0.1:${address.port}`,
+              ctx!.devToken!,
+              owner,
+              process.execPath,
+              join(root, "signed-collector-runner.mjs"),
+              process.env.F2_OURA_SIGNED_CODE!,
+              fixturePath,
+            ],
+            { stdio: ["pipe", "pipe", "pipe"] },
+          );
+          let stdout = "",
+            stderr = "";
+          native.stdout.on("data", (chunk) => {
+            stdout += chunk;
+          });
+          native.stderr.on("data", (chunk) => {
+            stderr += chunk;
+          });
+          native.stdin.end(
+            JSON.stringify({
+              generation: 1,
+              profile,
+              collectedAt: T_PDPP,
+              scope: {
+                streams: SCOPES.map((scope) => ({
+                  name: STREAM_OF[scope],
+                  time_range: { since },
+                })),
+              },
+              state: Object.fromEntries(
+                SCOPES.map((scope) => [
+                  STREAM_OF[scope],
+                  {
+                    api_v2: true,
+                    account: "fixture-account",
+                    next_day: "2026-10-21",
+                    refresh_from: "2026-10-19",
+                  },
+                ]),
+              ),
+            }),
+          );
+          const exit = await new Promise<number | null>((resolve, reject) => {
+            native.once("error", reject);
+            native.once("close", resolve);
+          });
+          expect(exit, stderr).toBe(0);
+          const result = JSON.parse(stdout);
+          return { result, stdout, stderr };
+        };
+        const truncated = structuredClone(fixtures);
+        for (const stream of [
+          "daily_sleep",
+          "sleep",
+          "daily_readiness",
+          "daily_activity",
+        ] as const)
+          truncated[stream] = truncated[stream].filter(
+            (row) => row.day !== "2025-01-01",
+          ) as (typeof truncated)[typeof stream];
+        await writeFile(fixturePath, JSON.stringify(truncated));
+        const refused = await invokeNative();
+        expect(refused.result.err).toContain("returned 409");
+        expect(await readAll()).toEqual(ALL(FILE));
+        await writeFile(fixturePath, JSON.stringify(fixtures));
+        const { result, stdout, stderr } = await invokeNative();
+        expect(result.err, stdout + stderr).toBeUndefined();
+        expect(result.ok.receipts).toHaveLength(3);
+        expect(result.ok.records).toBe(8);
+        for (const checkpoint of Object.values(result.ok.checkpoints) as {
+          requested_since: string;
+        }[])
+          expect(checkpoint.requested_since).toBe("2025-01-01");
+        expect(await readAll()).toEqual(ALL(CANON));
+        for (const scope of SCOPES) {
+          const read = await observe(scope);
+          expect(JSON.stringify(read.builder.body)).toContain("2025-01-01");
+          const receipt = result.ok.receipts.find(
+            (r: { scope: string }) => r.scope === scope,
+          );
+          expect(receipt.collectedAt).toBe(
+            (read.owner.body as { collectedAt: string }).collectedAt,
+          );
+          expect(receipt.plaintextBytes).toBe(
+            Buffer.byteLength(JSON.stringify(read.owner.body)),
+          );
+        }
+      } finally {
+        await new Promise<void>((resolve) => listener.close(() => resolve()));
+      }
+    },
+  );
+
+  it("refuses a guarded batch if canonical history advances during asynchronous preflight", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    const token = await writePdpp(DAYS, T_PDPP);
+    await restartWithMethods(["oura-browser"], []);
+    expect(await readAll()).toEqual(ALL(CANON));
+    const concurrent = [...DAYS, { n: 3, score: 91 }];
+    const afterRead = async (scope: string) => {
+      if (scope !== "oura.activity") {
+        barrier.afterReadLatest = afterRead;
+        return;
+      }
+      await writePdpp(concurrent, T_PDPP, token);
+    };
+    barrier.afterReadLatest = afterRead;
+    const body = {
+      collectedAt: T_PDPP,
+      records: SCOPES.flatMap((scope) =>
+        pdppRows(scope, DAYS).map((data) => ({
+          stream: STREAM_OF[scope],
+          data,
+        })),
+      ),
+      completion: {
+        streams: SCOPES.map((scope) => ({
+          stream: STREAM_OF[scope],
+          status: "complete",
+          recordCount: pdppRows(scope, DAYS).length,
+        })),
+      },
+    };
+    const response = await ctx!.app.request("/v1/import/oura-browser", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CONTROL_PLANE_TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      reason: "canonical_history_changed",
+    });
+    for (const scope of SCOPES)
+      expect(dayRows((await observe(scope)).owner, scope)).toHaveLength(3);
+  });
+
+  it("accepts a complete current native batch with only its Oura source owner token", async () => {
+    await writeLegacy(DAYS, T_LEGACY);
+    await restartWithMethods(["oura-browser"], []);
+    const token = await mintSourceToken();
+    const body = {
+      native: {
+        sourceId: OURA,
+        instance: accountOne,
+        method: "oura-browser",
+        generation: 1,
+        artifactDigest:
+          "sha256:45d044af6e263a5121033df51f7ad5eaed1e19f1263cffe95ae63737259888c5",
+      },
+      collectedAt: T_PDPP,
+      records: SCOPES.flatMap((scope) =>
+        pdppRows(scope, DAYS).map((data) => ({
+          stream: STREAM_OF[scope],
+          data,
+        })),
+      ),
+      completion: {
+        streams: SCOPES.map((scope) => ({
+          stream: STREAM_OF[scope],
+          status: "complete",
+          recordCount: pdppRows(scope, DAYS).length,
+        })),
+      },
+    };
+    for (const patch of [
+      { generation: 2 },
+      { method: "oura" },
+      { artifactDigest: "sha256:changed" },
+      { sourceId: "https://example.invalid/sources/oura" },
+    ]) {
+      const refused = await ctx!.app.request("/v1/import/oura-browser", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ ...body, native: { ...body.native, ...patch } }),
+      });
+      expect(refused.status).toBe("sourceId" in patch ? 403 : 409);
+      expect(await readAll()).toEqual(ALL(FILE));
+    }
+    const response = await ctx!.app.request("/v1/import/oura-browser", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    expect(response.status, await response.clone().text()).toBe(200);
+    expect((await response.json()).receipts).toHaveLength(3);
+    expect(await readAll()).toEqual(ALL(CANON));
+    expect(
+      (
+        await ctx!.app.request("/v1/data/oura.activity", {
+          method: "DELETE",
+          headers: { authorization: `Bearer ${token}` },
+        })
+      ).status,
+    ).toBe(401);
   });
 
   it("keeps opt-in and incomplete phone batches on legacy, then admits one complete batch through canonical reads", async () => {

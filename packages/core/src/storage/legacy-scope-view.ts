@@ -5,6 +5,7 @@ import {
 } from "./legacy-scope-coverage.js";
 export type { LegacyCoverageVerdict } from "./legacy-scope-coverage.js";
 import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
+import { OURA_BROWSER_HISTORY_POLICY } from "../oura/history-policy.js";
 import {
   ANTHROPIC_LIVE_BINDINGS,
   GITHUB_BROWSER_BINDINGS,
@@ -58,7 +59,7 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 8;
+const COVERAGE_RULE_VERSION = 9;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the
@@ -133,6 +134,8 @@ export interface LegacyScopeAuthority {
    * `streams`, or holds a completion receipt for one. Null `streams`: any.
    */
   hasHeldData(instance: string, streams: readonly string[] | null): boolean;
+  /** Current-generation record tombstones, including IDs acquired after takeover. */
+  hasRetainedTombstones(instance: string, streams: readonly string[]): boolean;
   /** See `CanonicalLegacyReadStore.readSnapshot`. Same database connection. */
   readSnapshot<T>(read: () => T): T;
   writeClock(): number;
@@ -582,6 +585,8 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return { kind: decision.kind };
+    if (ouraHasRetainedEntityLoss(decision))
+      return { kind: hasTakeover || legacyHead === null ? "refused" : "file" };
     const hasLegacyHead = legacyHead !== null;
     if (hasLegacyHead && !hasTakeover && !initialOuraRunComplete(decision)) {
       return { kind: "file" };
@@ -600,8 +605,13 @@ export function createLegacyScopeView(
         return { kind: coveredHead ? "refused" : "file" };
       }
       if (
-        !verdict.canonicalCursor.startsWith(
-          `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(decision, input.declarations)}:`,
+        verdict.canonicalCursor !==
+        coverageCursor(
+          scope,
+          decision,
+          authority.writeClock(),
+          authority.arrivalRevision(),
+          receiptCursor(decision, input.declarations),
         )
       ) {
         return { kind: "refused" };
@@ -625,6 +635,39 @@ export function createLegacyScopeView(
       : { kind: "canonical", collectedAt };
   }
 
+  function ouraHasRetainedEntityLoss(
+    decision: Extract<Decision, { kind: "canonical" }>,
+  ): boolean {
+    return (
+      decision.selection.method === "oura-browser" &&
+      OURA_BROWSER_HISTORY_POLICY.preserveRetainedEntities &&
+      authority.hasRetainedTombstones(
+        decision.selection.instance,
+        decision.streams,
+      )
+    );
+  }
+
+  function coverageCursor(
+    scope: string,
+    decision: Extract<Decision, { kind: "canonical" }>,
+    writeClock: number,
+    arrivalRevision: number,
+    receipts: string,
+  ): string {
+    return [
+      writeClock,
+      arrivalRevision,
+      receipts,
+      decision.generation,
+      CANONICAL_LEGACY_VIEW_CONTRACT,
+      scopeDeclarationCursor(scope),
+      COVERAGE_RULE_VERSION,
+      input.coverageThresholds?.maxPayloadRatio ?? 1.5,
+      input.coverageThresholds?.maxExtraBytes ?? 256 * 1024,
+    ].join(":");
+  }
+
   /** One snapshot: the decision and the evidence the read is judged by. */
   function readDecision(scope: string) {
     return authority.readSnapshot(() => {
@@ -632,6 +675,8 @@ export function createLegacyScopeView(
       return {
         reset: authority.isReset(scope),
         decision,
+        retainedEntityLoss:
+          decision.kind === "canonical" && ouraHasRetainedEntityLoss(decision),
         legacyHead: authority.eligibleLegacyHead(scope),
         hasTakeover: authority.hasTakeover(
           scope,
@@ -669,6 +714,18 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return decision;
+    if (initial.retainedEntityLoss) {
+      return hasTakeover || legacyHead === null
+        ? {
+            kind: "refused",
+            refusal: {
+              status: "incomplete",
+              reason: "canonical_view_incomplete",
+              diagnostics: [],
+            },
+          }
+        : { kind: "file" };
+    }
     if (
       legacyHead !== null &&
       !hasTakeover &&
@@ -677,17 +734,13 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     const canonicalCursor = legacyHead
-      ? [
+      ? coverageCursor(
+          scope,
+          decision,
           initial.writeClock,
           initial.arrivalRevision,
           initial.receiptCursor,
-          decision.generation,
-          CANONICAL_LEGACY_VIEW_CONTRACT,
-          scopeDeclarationCursor(scope),
-          COVERAGE_RULE_VERSION,
-          input.coverageThresholds?.maxPayloadRatio ?? 1.5,
-          input.coverageThresholds?.maxExtraBytes ?? 256 * 1024,
-        ].join(":")
+        )
       : "";
     const projectionKey = legacyHead
       ? JSON.stringify([
@@ -973,6 +1026,9 @@ export function createLegacyScopeView(
           // weaken the receipts' proof that a missing entity was deleted. A
           // dropped row would look deleted, so omissions still block it.
           allowProvenDeletion:
+            (decision.selection.method === "oura-browser"
+              ? OURA_BROWSER_HISTORY_POLICY.allowProvenDeletion
+              : true) &&
             read.diagnostics.omissions.length === 0 &&
             (read.diagnostics.unproven?.length ?? 0) === 0 &&
             allStreamsProvenAfter(

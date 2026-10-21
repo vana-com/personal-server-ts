@@ -570,6 +570,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    * bindings, listings and pages it sees belong to one point in time.
    */
   readSnapshot<T>(read: () => T): T;
+  /** Validate history and commit under one SQLite write reservation. */
+  writeTransaction<T>(write: () => T): T;
   resetInstanceBinding(input: {
     instance: string;
     expectedMethod: string | null;
@@ -2008,6 +2010,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     ingestBatch,
     getInstanceBinding,
     readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
+    writeTransaction: <T>(write: () => T): T =>
+      db.transaction(write).immediate(),
     resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,

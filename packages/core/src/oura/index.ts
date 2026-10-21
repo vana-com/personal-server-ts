@@ -13,6 +13,7 @@ import {
 } from "../legacy-projection/index.js";
 import { compareLegacyCoverage } from "../storage/legacy-scope-coverage.js";
 import { LEGACY_SCOPE_ENTITY_KEYS } from "../storage/legacy-scope-entity-keys.js";
+import { OURA_BROWSER_HISTORY_POLICY } from "./history-policy.js";
 
 const STREAMS = ["sleep", "readiness", "activity"] as const;
 export interface OuraBrowserImportInput {
@@ -177,7 +178,7 @@ async function importLocked(
           canonicalNewer:
             Date.parse(input.collectedAt) >
             Date.parse(served.envelope.collectedAt),
-          allowProvenDeletion: false,
+          ...OURA_BROWSER_HISTORY_POLICY,
         },
       );
       if (!verdict.covered)
@@ -226,7 +227,7 @@ async function importLocked(
         entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
         projectionOmissions: projection.projectionOmissions,
         canonicalNewer: Date.parse(input.collectedAt) > priorTime,
-        allowProvenDeletion: false,
+        ...OURA_BROWSER_HISTORY_POLICY,
       });
       if (!verdict.covered)
         return { ok: false, reason: verdict.reason!, scope };
