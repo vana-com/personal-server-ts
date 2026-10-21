@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalJson,
   replicaOperationSchema,
+  type OperationReference,
   type ReplicaOperation,
 } from "./envelope.js";
 import { binding, identity, registration, T0 } from "./fixtures.js";
@@ -594,6 +595,13 @@ const contextFor = (
   order: DeclarationBinding["sourceVersionOrder"],
 ): Parameters<typeof planReplicaMerge>[0] => ({
   owner: identity.owner,
+  connectorPrincipals: [
+    {
+      sourceId: identity.sourceId,
+      connectionId: identity.connectionId,
+      upstreamAccount: identity.upstreamAccount,
+    },
+  ],
   declarations: [
     {
       sourceId: identity.sourceId,
@@ -784,13 +792,49 @@ function buildOperations(
       } as ReplicaOperation;
     }
     const extra = symbol.extra ?? {};
+    if (extra.admission === "unmapped-instance")
+      operation = { ...operation, connectionId: "unmapped-instance" };
     if (extra.finalizedAt !== undefined)
       finality.set(operation.batchId, Number(extra.finalizedAt));
     else finality.set(operation.batchId, sourceTime(symbol));
     known.set(symbol.id, operation);
     seen.get(symbol.w)!.set(symbol.w, operation);
   }
-  return [registration, ...known.values()];
+  const values = [...known.values()];
+  const reference = (
+    value: string | OperationReference,
+  ): OperationReference => {
+    const operationId = typeof value === "string" ? value : value.operationId;
+    const target = values.find(
+      (operation) => operation.revision.operationId === operationId,
+    );
+    if (!target) return { writerId: "missing", operationId };
+    return {
+      writerId: target.revision.writerId,
+      operationId: target.revision.operationId,
+    };
+  };
+  const withReferences = values.map((operation) => {
+    if (
+      operation.kind === "owner-hide" ||
+      operation.kind === "owner-delete" ||
+      operation.kind === "owner-restore"
+    )
+      return { ...operation, parents: operation.parents.map(reference) };
+    if (operation.kind === "owner-resolve")
+      return {
+        ...operation,
+        candidates: operation.candidates.map(reference),
+        choice: reference(operation.choice),
+      };
+    if (operation.kind === "source-delete" && operation.confirmationOf)
+      return {
+        ...operation,
+        confirmationOf: reference(operation.confirmationOf),
+      };
+    return operation;
+  });
+  return [registration, ...withReferences];
 }
 function summarize(
   operations: ReplicaOperation[],
@@ -930,6 +974,9 @@ function permutations<T>(values: T[]): T[][] {
     ),
   );
 }
+function canonicalPlan(value: unknown): string {
+  return canonicalJson(JSON.parse(JSON.stringify(value)));
+}
 
 describe.each(fixtures)(
   "three-device ordering fixture %s",
@@ -954,6 +1001,7 @@ describe.each(fixtures)(
         expect(unsafe && replicaOperationSchema.safeParse(unsafe).success).toBe(
           false,
         );
+        expect(() => summarize(operations, order)).toThrow();
         return;
       }
       const adjustedDisplay = changedDisplays[id] ?? expected.sourceDisplay;
@@ -967,6 +1015,18 @@ describe.each(fixtures)(
       if (id === "55") {
         expect(result.quarantine).toContain("b");
         expect(result.plan.records).toHaveLength(0);
+        const ids = new Map(
+          operations.map((op) => [
+            canonicalJson([op.revision.writerId, op.revision.operationId]),
+            op,
+          ]),
+        );
+        const unique = [...ids.values()];
+        const expectedPlan = canonicalPlan(result.plan);
+        for (const delivery of [unique, [...unique].reverse()])
+          expect(
+            canonicalPlan(summarize([registration, ...delivery], order).plan),
+          ).toBe(expectedPlan);
         return;
       }
       expect(result.display).toBe(adjustedDisplay);
@@ -989,43 +1049,24 @@ describe.each(fixtures)(
 
       const unique = [
         ...new Map(
-          operations.map((op) => [op.revision.operationId, op]),
+          operations.map((op) => [
+            canonicalJson([op.revision.writerId, op.revision.operationId]),
+            op,
+          ]),
         ).values(),
       ];
-      const expectedView = canonicalJson({
-        display: result.display,
-        state: result.record?.state,
-        ownerControl: result.record?.ownerControl,
-        quarantine: result.quarantine,
-        pending: result.pending,
-      });
+      const expectedView = canonicalPlan(result.plan);
       const allOrders = permutations(unique);
       for (let index = 0; index < allOrders.length; index++) {
         const delivery = allOrders[index];
         const permuted = summarize([registration, ...delivery], order);
-        expect(
-          canonicalJson({
-            display: permuted.display,
-            state: permuted.record?.state,
-            ownerControl: permuted.record?.ownerControl,
-            quarantine: permuted.quarantine,
-            pending: permuted.pending,
-          }),
-        ).toBe(expectedView);
+        expect(canonicalPlan(permuted.plan)).toBe(expectedView);
         if (index < 3) {
           const replayed = summarize(
             [registration, ...delivery, ...delivery],
             order,
           );
-          expect(
-            canonicalJson({
-              display: replayed.display,
-              state: replayed.record?.state,
-              ownerControl: replayed.record?.ownerControl,
-              quarantine: replayed.quarantine,
-              pending: replayed.pending,
-            }),
-          ).toBe(expectedView);
+          expect(canonicalPlan(replayed.plan)).toBe(expectedView);
         }
       }
     });

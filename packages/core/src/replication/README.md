@@ -24,7 +24,8 @@ request a source re-observation. A non-reobservable stream promotes that
 disagreement to owner review. Equal comparable source versions with different
 content and conflicting concurrent owner resolutions also need owner review.
 Append-only content conflicts remain quarantined. An unsettled disagreement
-involving a source deletion is hidden from apps.
+involving a source deletion is hidden from apps. Refresh throttling only limits
+repeat work; it does not change state or visibility.
 
 ## Owner removals and deletion erasure
 
@@ -39,29 +40,44 @@ frontier shows it received the resolution.
 `OWNER_DELETE_GRACE_PERIOD_MS` is the single delete-retention contract constant
 (30 days by default). The period starts at the delete batch's finality time. Once
 it expires, the derived record retains only a suppression marker with its key,
-operation ids, content hashes, observation times, and finality times. A later
-observation cannot restore erased payload. A restore after erasure waits for a
-new source observation.
+writer-qualified operation ids, content hashes, observation times, and finality
+times. The planner omits expired payload from candidates and diagnostic
+operation lists and returns `payloadErasures` with writer-qualified operation
+references and the marker. Storage must apply each erasure and persist its marker
+atomically. A later observation cannot restore erased payload. A restore after
+erasure waits for a new source observation that causally follows the restore;
+remote wall-clock values do not establish this.
 
 ## Account identity
 
 Every operation carries `upstreamAccount` as issuer plus stable subject. It must
 come from connector-declared identity evidence; login names and email addresses
-are not stable keys. A connection registration binds one principal. Mismatched
-operations are quarantined and never enter app views. The owner may keep the
-held observations as a separate connection by an explicit choice.
+are not stable keys. The host supplies the connector-verified principal for each
+source and connection in `MergeContext.connectorPrincipals`; a connection
+registration must match it. Mismatched or unbound operations are quarantined and
+never enter app views. The owner may keep held observations as a separate
+connection only after the connector binding is changed for that connection.
 
 ## Operation and view contract
 
 Every operation has a persisted HLC revision and writer id. Every observation
 has `emittedAt` (source observation time), a content hash, and its batch id.
 Every operation carries the writer frontier it had received. `MergeContext`
-supplies finalized batch times and the local retention clock. `now` affects only
-retention; it does not select current values.
+supplies finalized batch times, fully qualified records whose refresh is
+throttled, and the local retention clock. Throttling only changes
+`refreshRequested`. `now` affects only retention; it does not select current
+values.
 
-The planner retains losing evidence and recomputes the view from operations. Its
-records expose current value, candidates, state, owner control, refresh request,
-flags, and payload retention. `appView` is the only app projection: it returns
+References in `parents`, `candidates`, `choice`, and `confirmationOf` use the
+`(writerId, operationId)` pair. A restore clears only the named removals. A
+resolution only uses dependencies admitted for the same owner, source,
+connection, generation, account, declaration, and record key. Resolved upsert
+values pass the same key and schema checks as source upserts.
+
+Before the grace period, the planner retains losing evidence and recomputes the
+view from operations. After expiry, it returns only the suppression marker for
+the erased record. Records expose current value, candidates, state, owner
+control, refresh request, flags, and payload retention. `appView` is the only app projection: it returns
 only an upsert that is not quarantined, hidden, deleted, erased, or an unsettled
 delete disagreement. Apps do not receive candidates or owner history.
 

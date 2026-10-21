@@ -46,6 +46,8 @@ export function nextHlc(
       .filter((revision) => revision.wallMs === wallMs)
       .reduce((maximum, revision) => Math.max(maximum, revision.logical), -1) +
     1;
+  if (!Number.isSafeInteger(logical))
+    throw new Error("HLC logical counter exhausted");
   return { wallMs, logical };
 }
 
@@ -58,7 +60,19 @@ export function receiveHlc(
   revision: Pick<ReplicaRevision, "wallMs" | "logical">;
   clockAhead: boolean;
 } {
+  if (
+    !Number.isSafeInteger(now) ||
+    now < 0 ||
+    !Number.isSafeInteger(uncertaintyWindowMs) ||
+    uncertaintyWindowMs < 0 ||
+    !Number.isSafeInteger(remote.wallMs) ||
+    remote.wallMs < 0 ||
+    !Number.isSafeInteger(remote.logical) ||
+    remote.logical < 0
+  )
+    throw new Error("invalid received HLC revision");
   const maximum = now + uncertaintyWindowMs;
+  if (!Number.isSafeInteger(maximum)) throw new Error("invalid HLC window");
   const wallMs = Math.min(remote.wallMs, maximum);
   return {
     revision: {

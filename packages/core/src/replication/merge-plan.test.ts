@@ -5,10 +5,19 @@ import {
   planReplicaMerge,
 } from "./merge-plan.js";
 import { binding, identity, registration, T0, upsert } from "./fixtures.js";
+import { receiveHlc } from "./revision.js";
+import { resolveLocalInstance } from "./identity.js";
 import type { RecordOperation, ReplicaOperation } from "./envelope.js";
 
 const context = {
   owner: identity.owner,
+  connectorPrincipals: [
+    {
+      sourceId: identity.sourceId,
+      connectionId: identity.connectionId,
+      upstreamAccount: identity.upstreamAccount,
+    },
+  ],
   declarations: [
     {
       sourceId: identity.sourceId,
@@ -40,6 +49,10 @@ const observedMs = (
 ) => ({
   ...upsert(id, logical, value, device, T0 + offsetMs),
   batchId: `batch-${id}`,
+});
+const ref = (operationId: string, writerId: string) => ({
+  writerId,
+  operationId,
 });
 const sourceDelete = (
   id: string,
@@ -244,12 +257,17 @@ describe("replica policy v3 vectors", () => {
       contentHash: expect.stringMatching(/^sha256:/),
     });
     expect(erased.suppressionMarker?.removals).toEqual([
-      { operationId: "owner-delete", deletedAt: T0, finalizedAt: T0 },
+      {
+        writerId: "A",
+        operationId: "owner-delete",
+        deletedAt: T0,
+        finalizedAt: T0,
+      },
     ]);
     const restore = {
       ...hide,
       kind: "owner-restore" as const,
-      parents: ["hide"],
+      parents: [ref("hide", "A")],
       revision: { ...hide.revision, operationId: "restore" },
     };
     expect(plan([item, hide, restore]).records[0].ownerControl).toBe("visible");
@@ -261,20 +279,19 @@ describe("replica policy v3 vectors", () => {
     const postPurgeRestore = {
       ...hide,
       kind: "owner-restore" as const,
-      parents: ["owner-delete"],
+      parents: [ref("owner-delete", "A")],
       revision: {
         ...hide.revision,
         wallMs: T0 + 31 * day,
         operationId: "restore-after-purge",
       },
     };
+    const afterPurgeObservation = {
+      ...observed("after-purge", "C", "new", 32),
+      frontier: { A: { wallMs: T0 + 31 * day, logical: 0 } },
+    };
     const afterPurge = plan(
-      [
-        item,
-        deleteOp,
-        postPurgeRestore,
-        observed("after-purge", "C", "new", 32),
-      ],
+      [item, deleteOp, postPurgeRestore, afterPurgeObservation],
       { now: T0 + 31 * day, finalizedAt: () => T0 },
     );
     expect(afterPurge.records[0].current?.revision.operationId).toBe(
@@ -302,8 +319,8 @@ describe("replica policy v3 vectors", () => {
     const resolution = {
       ...base,
       kind: "owner-resolve" as const,
-      candidates: ["a", "b"],
-      choice: "a",
+      candidates: [ref("a", "A"), ref("b", "B")],
+      choice: ref("a", "A"),
       resolvedValue: {
         kind: "upsert" as const,
         data: a.data,
@@ -314,7 +331,13 @@ describe("replica policy v3 vectors", () => {
     };
     const chosen = plan([a, b, resolution]);
     expect(chosen.records[0].current?.revision.operationId).toBe("resolve-a");
-    const pending = plan([a, { ...resolution, candidates: ["a", "missing"] }]);
+    const pending = plan([
+      a,
+      {
+        ...resolution,
+        candidates: [ref("a", "A"), ref("missing", "B")],
+      },
+    ]);
     expect(pending.pending[0].reason).toBe("resolution_dependency_missing");
     expect(pending.records[0].current?.revision.operationId).toBe("a");
     const competing = plan([
@@ -323,7 +346,7 @@ describe("replica policy v3 vectors", () => {
       resolution,
       {
         ...resolution,
-        choice: "b",
+        choice: ref("b", "B"),
         resolvedValue: {
           kind: "upsert" as const,
           data: b.data,
@@ -338,9 +361,53 @@ describe("replica policy v3 vectors", () => {
       },
     ]);
     expect(competing.records[0].state).toBe("conflict");
+    const settleCompeting = {
+      ...resolution,
+      candidates: [ref("resolve-a", "A"), ref("resolve-b", "device-c")],
+      choice: ref("resolve-a", "A"),
+      resolvedValue: resolution.resolvedValue,
+      frontier: {
+        A: {
+          wallMs: resolution.revision.wallMs,
+          logical: resolution.revision.logical,
+        },
+        "device-c": {
+          wallMs: resolution.revision.wallMs,
+          logical: resolution.revision.logical,
+        },
+      },
+      revision: {
+        ...resolution.revision,
+        operationId: "resolve-settled",
+        writerId: "device-e",
+      },
+    };
+    expect(
+      plan([
+        a,
+        b,
+        resolution,
+        {
+          ...resolution,
+          choice: ref("b", "B"),
+          revision: {
+            ...resolution.revision,
+            operationId: "resolve-b",
+            writerId: "device-c",
+          },
+          resolvedValue: {
+            kind: "upsert" as const,
+            data: b.data,
+            blobs: b.blobs,
+            contentHash: b.contentHash,
+          },
+        },
+        settleCompeting,
+      ]).records[0].state,
+    ).toBe("settled");
     const samePayloadChoice = {
       ...resolution,
-      candidates: ["a", "b", "same-x"],
+      candidates: [ref("a", "A"), ref("b", "B"), ref("same-x", "device-c")],
       resolvedValue: {
         kind: "upsert" as const,
         data: a.data,
@@ -355,7 +422,7 @@ describe("replica policy v3 vectors", () => {
       samePayloadChoice,
       {
         ...samePayloadChoice,
-        choice: "same-x",
+        choice: ref("same-x", "device-c"),
         revision: {
           ...samePayloadChoice.revision,
           operationId: "resolve-same-x",
@@ -364,6 +431,361 @@ describe("replica policy v3 vectors", () => {
       },
     ]);
     expect(equivalent.records[0].state).toBe("settled");
+  });
+  it("validates resolution payloads and record-scoped dependencies before materializing", () => {
+    const a = observed("a", "A", "X");
+    const b = observed("b", "B", "Y", 1);
+    const {
+      emittedAt: _emittedAt,
+      contentHash: _contentHash,
+      data: _data,
+      blobs: _blobs,
+      ...base
+    } = a;
+    const resolution = {
+      ...base,
+      kind: "owner-resolve" as const,
+      candidates: [ref("a", "A"), ref("b", "B")],
+      choice: ref("a", "A"),
+      resolvedValue: {
+        kind: "upsert" as const,
+        data: { id: "other-key", text: "bad" },
+        blobs: [],
+        contentHash: a.contentHash,
+      },
+      revision: { ...a.revision, operationId: "resolve-invalid" },
+    };
+    expect(plan([a, b, resolution]).rejected).toContainEqual(
+      expect.objectContaining({ reason: "invalid_resolution_data" }),
+    );
+    const otherRecord = {
+      ...observed("other", "C", "Z"),
+      connectionId: "other-connection",
+    };
+    const outOfScope = {
+      ...resolution,
+      candidates: [ref("a", "A"), ref("other", "C")],
+      choice: ref("a", "A"),
+      resolvedValue: {
+        kind: "upsert" as const,
+        data: a.data,
+        blobs: a.blobs,
+        contentHash: a.contentHash,
+      },
+    };
+    expect(plan([a, otherRecord, outOfScope]).pending).toContainEqual(
+      expect.objectContaining({ reason: "resolution_dependency_out_of_scope" }),
+    );
+  });
+  it("keeps removal references writer-qualified when operation ids collide", () => {
+    const item = observed("item", "A", "X");
+    const {
+      emittedAt: _emittedAt,
+      contentHash: _contentHash,
+      data: _data,
+      blobs: _blobs,
+      ...base
+    } = item;
+    const removalA = {
+      ...base,
+      kind: "owner-hide" as const,
+      revision: {
+        ...base.revision,
+        operationId: "shared-removal",
+        writerId: "A",
+      },
+      parents: [],
+    };
+    const removalB = {
+      ...removalA,
+      revision: { ...removalA.revision, writerId: "B" },
+    };
+    const restoreA = {
+      ...removalA,
+      kind: "owner-restore" as const,
+      revision: { ...removalA.revision, operationId: "restore", writerId: "C" },
+      parents: [ref("shared-removal", "A")],
+    };
+    expect(
+      plan([item, removalA, removalB, restoreA]).records[0].ownerControl,
+    ).toBe("hidden");
+  });
+  it("retains no expired payload in conflict diagnostics or restores skewed old writes", () => {
+    const versionBinding = {
+      ...binding,
+      sourceVersionOrder: "ordered-integer" as const,
+    };
+    const declaration = { ...context.declarations[0], binding: versionBinding };
+    const old = {
+      ...observed("old", "A", "X"),
+      declaration: versionBinding,
+      sourceVersion: { domain: "cursor", incarnation: "e1", value: "1" },
+    };
+    const variant = {
+      ...observed("variant", "B", "Y"),
+      declaration: versionBinding,
+      sourceVersion: { domain: "cursor", incarnation: "e1", value: "1" },
+    };
+    const {
+      emittedAt: _emittedAt,
+      contentHash: _contentHash,
+      data: _data,
+      blobs: _blobs,
+      sourceVersion: _sourceVersion,
+      ...base
+    } = old;
+    const del = {
+      ...base,
+      kind: "owner-delete" as const,
+      parents: [],
+      batchId: "erase-batch",
+      revision: { ...old.revision, operationId: "erase" },
+    };
+    const expired = planReplicaMerge(
+      {
+        ...context,
+        declarations: [declaration],
+        now: T0 + OWNER_DELETE_GRACE_PERIOD_MS + 1,
+        finalizedAt: () => T0,
+      },
+      [registration, old, variant, del],
+    );
+    expect(expired.conflicts[0]?.operations).toEqual([]);
+    expect(expired.records[0].candidates).toEqual([]);
+    expect(expired.payloadErasures[0].operationReferences).toEqual([
+      ref("old", "A"),
+      ref("variant", "B"),
+    ]);
+    const marker = expired.records[0].suppressionMarker!;
+    const replayedAfterCompaction = planReplicaMerge(
+      {
+        ...context,
+        declarations: [declaration],
+        now: T0 + OWNER_DELETE_GRACE_PERIOD_MS + 1,
+        finalizedAt: () => T0,
+        suppressionMarkers: [marker],
+      },
+      [registration, old, variant, del],
+    );
+    expect(replayedAfterCompaction.records[0].candidates).toEqual([]);
+    const late = {
+      ...observed("late-after-delete", "C", "late"),
+      declaration: versionBinding,
+    };
+    const latePlan = planReplicaMerge(
+      {
+        ...context,
+        declarations: [declaration],
+        now: T0 + OWNER_DELETE_GRACE_PERIOD_MS + 2,
+        finalizedAt: () => T0,
+        suppressionMarkers: [marker],
+      },
+      [registration, del, late],
+    );
+    expect(latePlan.records[0].candidates).toEqual([]);
+    expect(latePlan.records[0].suppressionMarker?.observations).toContainEqual(
+      expect.objectContaining({
+        operationId: "late-after-delete",
+        writerId: "C",
+      }),
+    );
+    expect(latePlan.payloadErasures[0].operationReferences).toContainEqual(
+      ref("late-after-delete", "C"),
+    );
+
+    const skewedOld = {
+      ...old,
+      revision: { ...old.revision, writerId: "B", wallMs: T0 + 100 * day },
+    };
+    const restore = {
+      ...del,
+      kind: "owner-restore" as const,
+      revision: {
+        ...del.revision,
+        operationId: "restore",
+        wallMs: T0 + 31 * day,
+      },
+      parents: [ref("erase", old.revision.writerId)],
+    };
+    const restored = planReplicaMerge(
+      {
+        ...context,
+        declarations: [declaration],
+        now: T0 + 31 * day,
+        finalizedAt: () => T0,
+      },
+      [registration, skewedOld, del, restore],
+    ).records[0];
+    expect(restored.payloadRetained).toBe(false);
+    expect(restored.current).toBeNull();
+    expect(restored.suppressionMarker?.identity).toEqual(restored.identity);
+    const observedAfterRestore = {
+      ...observed("new-after-restore", "C", "fresh", 32),
+      declaration: versionBinding,
+      frontier: {
+        A: {
+          wallMs: restore.revision.wallMs,
+          logical: restore.revision.logical,
+        },
+      },
+    };
+    const restoredWithNewEvidence = planReplicaMerge(
+      {
+        ...context,
+        declarations: [declaration],
+        now: T0 + 31 * day,
+        finalizedAt: () => T0,
+        suppressionMarkers: [marker],
+      },
+      [registration, del, restore, observedAfterRestore],
+    ).records[0];
+    expect(restoredWithNewEvidence.ownerControl).toBe("visible");
+    expect(restoredWithNewEvidence.current?.revision.operationId).toBe(
+      "new-after-restore",
+    );
+    expect(restoredWithNewEvidence.payloadRetained).toBe(true);
+  });
+  it("confirms versioned complete-scan deletes before they participate in source ordering", () => {
+    const versionBinding = {
+      ...binding,
+      sourceVersionOrder: "ordered-integer" as const,
+    };
+    const declaration = { ...context.declarations[0], binding: versionBinding };
+    const current = {
+      ...observed("current", "B", "X"),
+      declaration: versionBinding,
+      sourceVersion: { domain: "cursor", incarnation: "e1", value: "11" },
+    };
+    const first = {
+      ...sourceDelete("scan-first", "A", 1),
+      declaration: versionBinding,
+      origin: "complete-scan" as const,
+      sourceVersion: { domain: "cursor", incarnation: "e1", value: "12" },
+    };
+    const pending = plan([current, first], { declarations: [declaration] })
+      .records[0];
+    expect(pending.current?.revision.operationId).toBe("current");
+    expect(pending.state).toBe("unsettled");
+    const second = {
+      ...sourceDelete("scan-second", "A", 2),
+      declaration: versionBinding,
+      origin: "complete-scan" as const,
+      confirmationOf: ref("scan-first", "A"),
+      sourceVersion: { domain: "cursor", incarnation: "e1", value: "12" },
+    };
+    const confirmed = plan([current, first, second], {
+      declarations: [declaration],
+    }).records[0];
+    expect(confirmed.current?.kind).toBe("source-delete");
+    expect(confirmed.state).toBe("settled");
+    expect(confirmed.refreshRequested).toBe(false);
+  });
+  it("compares declared RFC3339 versions and resolution observations by instant", () => {
+    const rfcBinding = {
+      ...binding,
+      sourceVersionOrder: "ordered-rfc3339" as const,
+    };
+    const declaration = { ...context.declarations[0], binding: rfcBinding };
+    const a = {
+      ...observed("rfc-a", "A", "X"),
+      declaration: rfcBinding,
+      sourceVersion: {
+        domain: "cursor",
+        incarnation: "e1",
+        value: "2026-10-21T10:00:00+02:00",
+      },
+    };
+    const b = {
+      ...observed("rfc-b", "B", "Y"),
+      declaration: rfcBinding,
+      sourceVersion: {
+        domain: "cursor",
+        incarnation: "e1",
+        value: "2026-10-21T07:30:00Z",
+      },
+    };
+    expect(
+      plan([a, b], { declarations: [declaration] }).records[0].current?.revision
+        .operationId,
+    ).toBe("rfc-a");
+    const invalid = {
+      ...a,
+      revision: { ...a.revision, operationId: "invalid-rfc" },
+      sourceVersion: { ...a.sourceVersion, value: "October 21 2026" },
+    };
+    expect(
+      plan([invalid], { declarations: [declaration] }).rejected,
+    ).toContainEqual(
+      expect.objectContaining({ reason: "invalid_source_version" }),
+    );
+
+    const {
+      emittedAt: _emittedAt,
+      contentHash: _contentHash,
+      data: _data,
+      blobs: _blobs,
+      sourceVersion: _sourceVersion,
+      ...base
+    } = a;
+    const resolution = {
+      ...base,
+      kind: "owner-resolve" as const,
+      candidates: [ref("rfc-a", "A"), ref("rfc-b", "B")],
+      choice: ref("rfc-a", "A"),
+      resolvedValue: {
+        kind: "upsert" as const,
+        data: a.data,
+        blobs: a.blobs,
+        contentHash: a.contentHash,
+      },
+      revision: { ...a.revision, operationId: "rfc-resolution" },
+    };
+    const timeA = "2026-10-21T10:00:00+02:00";
+    const timeB = "2026-10-21T07:30:00Z";
+    const resolved = plan(
+      [{ ...a, emittedAt: timeA }, { ...b, emittedAt: timeB }, resolution],
+      { declarations: [declaration] },
+    ).records[0].current;
+    expect(resolved?.kind).toBe("upsert");
+    expect(Date.parse(resolved!.emittedAt)).toBe(Date.parse(timeA));
+  });
+  it("preserves append-only deletion rejection and full-history conflict quarantine", () => {
+    const appendOnly = { ...binding, semantics: "append_only" as const };
+    const declaration = { ...context.declarations[0], binding: appendOnly };
+    const deleted = {
+      ...sourceDelete("append-delete", "A", 0),
+      declaration: appendOnly,
+    };
+    expect(
+      plan([deleted], { declarations: [declaration] }).rejected,
+    ).toContainEqual(expect.objectContaining({ reason: "append_only_delete" }));
+    const orderedBinding = {
+      ...appendOnly,
+      sourceVersionOrder: "ordered-integer" as const,
+    };
+    const orderedDeclaration = { ...declaration, binding: orderedBinding };
+    const old = {
+      ...observed("append-old", "A", "X"),
+      declaration: orderedBinding,
+    };
+    const newer = {
+      ...observed("append-new", "B", "Y", 1),
+      declaration: orderedBinding,
+      sourceVersion: { domain: "cursor", incarnation: "e1", value: "2" },
+    };
+    expect(
+      plan(
+        [
+          {
+            ...old,
+            declaration: orderedBinding,
+            sourceVersion: { domain: "cursor", incarnation: "e1", value: "1" },
+          },
+          newer,
+        ],
+        { declarations: [orderedDeclaration] },
+      ).records[0].state,
+    ).toBe("quarantined");
   });
   it("N17-N19: partial absence is no event and stable account ids ignore login changes", () => {
     expect(plan([observed("a", "A", "X")]).records[0].current?.kind).toBe(
@@ -403,7 +825,16 @@ describe("replica policy v3 vectors", () => {
     expect(appView({ ...visible, payloadRetained: false })).toBeNull();
   });
   it("N21: received clock advancement is bounded and reports skew", () => {
-    // receiveHlc is exercised in revision.test.ts; planning never lets it alter candidate order.
+    expect(
+      receiveHlc(
+        { wallMs: 1_000_000, logical: 4, writerId: "remote", operationId: "r" },
+        10,
+        300_000,
+      ),
+    ).toEqual({
+      revision: { wallMs: 300_010, logical: 0 },
+      clockAhead: true,
+    });
     expect(plan([observed("a", "A", "X")]).records[0].flags).toEqual([]);
   });
   it("N22-N25: held mismatched data, explicit account separation, and unmapped identity fail closed", () => {
@@ -412,6 +843,14 @@ describe("replica policy v3 vectors", () => {
       upstreamAccount: { issuer: "https://github.com", subject: "gh:2002" },
     };
     expect(plan([held]).quarantined).toHaveLength(1);
+    const unboundPrincipal = planReplicaMerge(
+      { ...context, connectorPrincipals: [] },
+      [registration, observed("unmapped", "A", "X")],
+    );
+    expect(unboundPrincipal.quarantined[0]?.reason).toBe(
+      "missing_connector_principal_binding",
+    );
+    expect(unboundPrincipal.records).toEqual([]);
     const separateConnection = { ...held, connectionId: "connection-b" };
     const separateRegister = {
       ...registration,
@@ -419,14 +858,24 @@ describe("replica policy v3 vectors", () => {
       upstreamAccount: separateConnection.upstreamAccount,
       revision: { ...registration.revision, operationId: "register-b" },
     };
-    expect(
-      planReplicaMerge(context, [
-        registration,
-        separateRegister,
-        separateConnection,
-      ]).records,
-    ).toHaveLength(1);
+    const separate = planReplicaMerge(
+      {
+        ...context,
+        connectorPrincipals: [
+          ...context.connectorPrincipals,
+          {
+            sourceId: identity.sourceId,
+            connectionId: "connection-b",
+            upstreamAccount: separateConnection.upstreamAccount,
+          },
+        ],
+      },
+      [registration, separateRegister, separateConnection],
+    );
+    expect(separate.records).toHaveLength(1);
+    expect(appView(separate.records[0])).not.toBeNull();
     expect(plan([observed("a", "A", "X")]).records).toHaveLength(1);
+    expect(resolveLocalInstance(identity, [])).toBeUndefined();
   });
   it("N26: source version incarnation prevents a reset version from dominating old deletion", () => {
     const versionBinding = {
@@ -458,7 +907,7 @@ describe("replica policy v3 vectors", () => {
     const confirmed = {
       ...sourceDelete("scan-confirmed", "A", 1),
       origin: "complete-scan" as const,
-      confirmationOf: "scan",
+      confirmationOf: ref("scan", "A"),
     };
     expect(plan([scan, confirmed]).records[0].current?.kind).toBe(
       "source-delete",
@@ -473,10 +922,12 @@ describe("replica policy v3 vectors", () => {
       plan([observed("a", "A", "X"), observed("b", "B", "Y", 0, 1)]).records[0]
         .refreshRequested,
     ).toBe(true);
-    expect(
-      plan([observed("a", "A", "X"), observed("b", "B", "Y", 0, 1)], {
-        reobservedRecordKeys: ["same-key"],
-      }).records[0].refreshRequested,
-    ).toBe(false);
+    const close = [observed("a", "A", "X"), sourceDelete("b", "B", 0, 1)];
+    const first = plan(close).records[0];
+    const throttled = plan(close, { reobservedRecords: [first.identity] })
+      .records[0];
+    expect(throttled.refreshRequested).toBe(false);
+    expect(throttled.state).toBe("unsettled");
+    expect(appView(throttled)).toBeNull();
   });
 });

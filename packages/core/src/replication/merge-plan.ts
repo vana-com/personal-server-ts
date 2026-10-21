@@ -2,6 +2,7 @@ import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js"
 import { canonicalJson, replicaOperationSchema } from "./envelope.js";
 import type {
   DeclarationBinding,
+  OperationReference,
   RecordOperation,
   ReplicaOperation,
   SourceObservation,
@@ -9,6 +10,7 @@ import type {
 } from "./envelope.js";
 import { connectionKey } from "./identity.js";
 import { compareRevisions } from "./revision.js";
+import { operationReferenceOf } from "./envelope.js";
 
 export const OWNER_DELETE_GRACE_PERIOD_MS = 30 * 24 * 60 * 60 * 1000;
 export const REPLICA_POLICY = {
@@ -24,6 +26,12 @@ export const REPLICA_POLICY = {
 
 export interface MergeContext {
   owner: string;
+  /** Connector-verified stable principal selected for each logical connection. */
+  connectorPrincipals: readonly {
+    sourceId: string;
+    connectionId: string;
+    upstreamAccount: UpstreamAccount;
+  }[];
   declarations: readonly {
     sourceId: string;
     binding: DeclarationBinding;
@@ -32,23 +40,26 @@ export interface MergeContext {
   /** Finalized block time by batch; missing means the batch is still unfinalized. */
   finalizedAt?: (batchId: string) => number | undefined;
   now?: number;
-  /** Record keys already re-observed during the current daily refresh window. */
-  reobservedRecordKeys?: readonly string[];
+  /** Fully qualified records whose next refresh was throttled in the daily window. */
+  reobservedRecords?: readonly RecordIdentity[];
+  /** Durable payload-free markers returned by a prior retention pass. */
+  suppressionMarkers?: readonly SuppressionMarker[];
 }
 export interface MergeIssue {
   reason: string;
   operations: ReplicaOperation[];
 }
+export interface RecordIdentity {
+  owner: string;
+  sourceId: string;
+  connectionId: string;
+  generation: number;
+  stream: string;
+  recordKey: string;
+}
 export type RecordState = "settled" | "unsettled" | "conflict" | "quarantined";
 export interface MergedRecord {
-  identity: {
-    owner: string;
-    sourceId: string;
-    connectionId: string;
-    generation: number;
-    stream: string;
-    recordKey: string;
-  };
+  identity: RecordIdentity;
   current: RecordOperation | null;
   candidates: RecordOperation[];
   state: RecordState;
@@ -56,20 +67,28 @@ export interface MergedRecord {
   refreshRequested: boolean;
   flags: string[];
   payloadRetained: boolean;
-  suppressionMarker: {
-    recordKey: string;
-    observations: {
-      operationId: string;
-      contentHash: string;
-      observedAt: string;
-      finalizedAt: number | null;
-    }[];
-    removals: {
-      operationId: string;
-      deletedAt: number;
-      finalizedAt: number;
-    }[];
-  } | null;
+  suppressionMarker: SuppressionMarker | null;
+}
+export interface SuppressionMarker {
+  identity: RecordIdentity;
+  observations: {
+    writerId: string;
+    operationId: string;
+    contentHash: string;
+    observedAt: string;
+    finalizedAt: number | null;
+  }[];
+  removals: {
+    writerId: string;
+    operationId: string;
+    deletedAt: number;
+    finalizedAt: number;
+  }[];
+}
+export interface PayloadErasure {
+  identity: RecordIdentity;
+  operationReferences: OperationReference[];
+  suppressionMarker: SuppressionMarker;
 }
 export interface ReplicaMergePlan {
   records: MergedRecord[];
@@ -78,6 +97,8 @@ export interface ReplicaMergePlan {
   pending: MergeIssue[];
   suppressed: MergeIssue[];
   quarantined: MergeIssue[];
+  /** Storage applies these erasures atomically with persisting their markers. */
+  payloadErasures: PayloadErasure[];
 }
 
 /** Recompute the derived view from the complete retained operation set. */
@@ -92,6 +113,7 @@ export function planReplicaMerge(
     pending: [],
     suppressed: [],
     quarantined: [],
+    payloadErasures: [],
   };
   const issue = (
     bucket: MergeIssue[],
@@ -122,17 +144,21 @@ export function planReplicaMerge(
       issue(result.quarantined, "operation_id_equivocation", colliding);
     } else operations.push([...variants.values()][0]);
   }
-  const operationIds = new Set(operations.map((op) => op.revision.operationId));
+  const operationIds = new Set(operations.map(operationKey));
+  const operationByKey = new Map(
+    operations.map((op) => [operationKey(op), op]),
+  );
   const incompleteResolutions = new Set<string>();
   const resolutionById = new Map(
     operations
       .filter((op) => op.kind === "owner-resolve")
-      .map((op) => [op.revision.operationId, op]),
+      .map((op) => [operationKey(op), op]),
   );
   const resolutionPath: string[] = [];
   const resolutionCycles = new Set<string>();
   const visitedResolutions = new Set<string>();
-  const visitResolution = (id: string): void => {
+  const visitResolution = (reference: OperationReference): void => {
+    const id = referenceKey(reference);
     const pathIndex = resolutionPath.indexOf(id);
     if (pathIndex >= 0) {
       resolutionPath
@@ -148,7 +174,9 @@ export function planReplicaMerge(
     resolutionPath.pop();
     visitedResolutions.add(id);
   };
-  resolutionById.forEach((_resolution, id) => visitResolution(id));
+  resolutionById.forEach((resolution) =>
+    visitResolution(operationReferenceOf(resolution)),
+  );
   for (const id of resolutionCycles) {
     const resolution = resolutionById.get(id);
     if (resolution) {
@@ -157,12 +185,42 @@ export function planReplicaMerge(
     }
   }
   for (const op of operations) {
-    if (
-      op.kind === "owner-resolve" &&
-      op.candidates.some((candidate) => !operationIds.has(candidate))
-    ) {
-      incompleteResolutions.add(op.revision.operationId);
-      issue(result.pending, "resolution_dependency_missing", [op]);
+    if (op.kind !== "owner-resolve") continue;
+    const missing = op.candidates.some(
+      (candidate) => !operationIds.has(referenceKey(candidate)),
+    );
+    const choiceIncluded = op.candidates.some(
+      (candidate) => referenceKey(candidate) === referenceKey(op.choice),
+    );
+    const outOfScope = [...op.candidates, op.choice]
+      .map((reference) => operationByKey.get(referenceKey(reference)))
+      .some((dependency) => dependency && !sameRecordScope(op, dependency));
+    if (missing || !choiceIncluded || outOfScope) {
+      incompleteResolutions.add(operationKey(op));
+      issue(
+        result.pending,
+        missing
+          ? "resolution_dependency_missing"
+          : "resolution_dependency_out_of_scope",
+        [op],
+      );
+    }
+  }
+  let dependencyChanged = true;
+  while (dependencyChanged) {
+    dependencyChanged = false;
+    for (const op of operations) {
+      if (
+        op.kind === "owner-resolve" &&
+        !incompleteResolutions.has(operationKey(op)) &&
+        op.candidates.some((ref) =>
+          incompleteResolutions.has(referenceKey(ref)),
+        )
+      ) {
+        incompleteResolutions.add(operationKey(op));
+        issue(result.pending, "resolution_dependency_incomplete", [op]);
+        dependencyChanged = true;
+      }
     }
   }
   const connections = new Map<string, ReplicaOperation[]>();
@@ -185,6 +243,38 @@ export function planReplicaMerge(
     ) {
       issue(result.quarantined, "incompatible_connection_binding", entries);
       continue;
+    }
+    const connectorBindings = context.connectorPrincipals.filter(
+      (binding) =>
+        binding.sourceId === entries[0].sourceId &&
+        binding.connectionId === entries[0].connectionId,
+    );
+    const expectedPrincipal =
+      connectorBindings.length === 1
+        ? connectorBindings[0].upstreamAccount
+        : undefined;
+    const principalMismatches = expectedPrincipal
+      ? entries.filter(
+          (op) => !sameAccount(op.upstreamAccount, expectedPrincipal),
+        )
+      : entries.slice();
+    if (connectorBindings.length !== 1 || principalMismatches.length > 0) {
+      issue(
+        result.quarantined,
+        connectorBindings.length === 0
+          ? "missing_connector_principal_binding"
+          : "upstream_account_mismatch",
+        principalMismatches.length > 0 ? principalMismatches : entries.slice(),
+      );
+      const expected = expectedPrincipal;
+      if (!expected) continue;
+      entries.splice(
+        0,
+        entries.length,
+        ...entries.filter((op) => sameAccount(op.upstreamAccount, expected)),
+      );
+      if (connectorBindings.length !== 1) continue;
+      if (entries.length === 0) continue;
     }
     const registrations = entries.filter(
       (op) => op.kind === "connection-register",
@@ -244,7 +334,7 @@ export function planReplicaMerge(
     for (const op of entries) {
       if (
         op.kind === "owner-resolve" &&
-        incompleteResolutions.has(op.revision.operationId)
+        incompleteResolutions.has(operationKey(op))
       )
         continue;
       if (!("declaration" in op)) continue;
@@ -274,6 +364,13 @@ export function planReplicaMerge(
         continue;
       }
       if (
+        op.kind === "source-delete" &&
+        declared.binding.semantics === "append_only"
+      ) {
+        issue(result.rejected, "append_only_delete", [op]);
+        continue;
+      }
+      if (
         (op.kind === "upsert" || op.kind === "source-delete") &&
         op.sourceVersion
       ) {
@@ -282,10 +379,39 @@ export function planReplicaMerge(
           order === "ordered-integer"
             ? /^\d+$/.test(op.sourceVersion.value)
             : order === "ordered-rfc3339"
-              ? !Number.isNaN(Date.parse(op.sourceVersion.value))
+              ? parseRFC3339Instant(op.sourceVersion.value) !== null
               : order === "equality-only";
         if (!validVersion) {
           issue(result.rejected, "invalid_source_version", [op]);
+          continue;
+        }
+      }
+      if (op.kind === "owner-resolve" && op.version) {
+        const order = declared.binding.sourceVersionOrder;
+        const validVersion =
+          order === "ordered-integer"
+            ? /^\d+$/.test(op.version.value)
+            : order === "ordered-rfc3339"
+              ? parseRFC3339Instant(op.version.value) !== null
+              : order === "equality-only";
+        if (!validVersion) {
+          issue(result.rejected, "invalid_source_version", [op]);
+          continue;
+        }
+      }
+      if (op.kind === "owner-resolve" && op.resolvedValue.kind === "upsert") {
+        let valid = false;
+        try {
+          valid =
+            computeRecordKeyFromData(
+              op.resolvedValue.data,
+              declared.binding.primaryKey,
+            ) === op.recordKey && declared.validateData(op.resolvedValue.data);
+        } catch {
+          /* invalid resolved payload */
+        }
+        if (!valid) {
+          issue(result.rejected, "invalid_resolution_data", [op]);
           continue;
         }
       }
@@ -311,7 +437,20 @@ export function planReplicaMerge(
       groups.set(recordId, [...(groups.get(recordId) ?? []), op]);
     }
     for (const values of groups.values()) {
-      const record = mergeRecord(context, values);
+      const first = values[0];
+      const identity: RecordIdentity = {
+        owner: first.owner,
+        sourceId: first.sourceId,
+        connectionId: first.connectionId,
+        generation: first.generation,
+        stream: first.declaration.stream,
+        recordKey: first.recordKey,
+      };
+      const marker = context.suppressionMarkers?.find(
+        (candidate) =>
+          recordScopeKey(candidate.identity) === recordScopeKey(identity),
+      );
+      const record = mergeRecord(context, values, marker);
       result.records.push(record);
       if (record.state === "conflict")
         issue(result.conflicts, "source_observation_conflict", values);
@@ -323,6 +462,87 @@ export function planReplicaMerge(
             : "append_only_content_conflict",
           values,
         );
+    }
+  }
+  for (const marker of context.suppressionMarkers ?? []) {
+    if (
+      result.records.some(
+        (record) =>
+          recordScopeKey(record.identity) === recordScopeKey(marker.identity),
+      )
+    )
+      continue;
+    result.records.push({
+      identity: marker.identity,
+      current: null,
+      candidates: [],
+      state: "settled",
+      ownerControl: "deleted",
+      refreshRequested: false,
+      flags: [],
+      payloadRetained: false,
+      suppressionMarker: marker,
+    });
+  }
+  for (const record of result.records) {
+    if (!record.suppressionMarker) continue;
+    const operationReferences = [...byId.values()]
+      .flatMap((variants) => [...variants.values()])
+      .filter(
+        (operation) =>
+          operation.kind === "upsert" &&
+          "declaration" in operation &&
+          !record.candidates.some(
+            (candidate) => operationKey(candidate) === operationKey(operation),
+          ) &&
+          recordScopeKey({
+            owner: operation.owner,
+            sourceId: operation.sourceId,
+            connectionId: operation.connectionId,
+            generation: operation.generation,
+            stream: operation.declaration.stream,
+            recordKey: operation.recordKey,
+          }) === recordScopeKey(record.identity),
+      )
+      .map(operationReferenceOf)
+      .sort((a, b) => text(referenceKey(a), referenceKey(b)));
+    if (operationReferences.length)
+      result.payloadErasures.push({
+        identity: record.identity,
+        operationReferences,
+        suppressionMarker: record.suppressionMarker,
+      });
+  }
+  result.payloadErasures.sort((a, b) =>
+    text(recordScopeKey(a.identity), recordScopeKey(b.identity)),
+  );
+  const erasedRecords = new Set(
+    result.records
+      .filter((record) => !record.payloadRetained)
+      .map((record) => recordScopeKey(record.identity)),
+  );
+  for (const bucket of [
+    result.conflicts,
+    result.rejected,
+    result.pending,
+    result.suppressed,
+    result.quarantined,
+  ]) {
+    for (const item of bucket) {
+      item.operations = item.operations.filter(
+        (operation) =>
+          !("declaration" in operation) ||
+          !erasedRecords.has(
+            recordScopeKey({
+              owner: operation.owner,
+              sourceId: operation.sourceId,
+              connectionId: operation.connectionId,
+              generation: operation.generation,
+              stream: operation.declaration.stream,
+              recordKey: operation.recordKey,
+            }),
+          ),
+      );
     }
   }
   normalizeIssues(result);
@@ -352,8 +572,11 @@ export function appView(record: MergedRecord): RecordOperation | null {
 function mergeRecord(
   context: MergeContext,
   input: RecordOperation[],
+  retainedMarker?: SuppressionMarker,
 ): MergedRecord {
-  const all = dedupe(input);
+  const all = dedupe(input).sort((a, b) =>
+    text(operationKey(a), operationKey(b)),
+  );
   const observations = all.filter(
     (op): op is SourceObservation =>
       op.kind === "upsert" || op.kind === "source-delete",
@@ -366,14 +589,28 @@ function mergeRecord(
         !ownerOps.some(
           (restore) =>
             restore.kind === "owner-restore" &&
-            restore.parents.includes(remove.revision.operationId),
+            restore.parents.some(
+              (parent) => referenceKey(parent) === operationKey(remove),
+            ),
         ),
     );
-  const ownerControl = activeRemovals.some((op) => op.kind === "owner-delete")
-    ? "deleted"
-    : activeRemovals.length
-      ? "hidden"
-      : "visible";
+  const retainedDeleteActive = retainedMarker?.removals.some(
+    (removal) =>
+      !ownerOps.some(
+        (restore) =>
+          restore.kind === "owner-restore" &&
+          restore.parents.some(
+            (parent) => referenceKey(parent) === referenceKey(removal),
+          ),
+      ),
+  );
+  const ownerControl =
+    activeRemovals.some((op) => op.kind === "owner-delete") ||
+    retainedDeleteActive
+      ? "deleted"
+      : activeRemovals.length
+        ? "hidden"
+        : "visible";
   const finalizedAt = (op: RecordOperation) =>
     op.batchId ? context.finalizedAt?.(op.batchId) : undefined;
   const purgedDeletes = ownerOps.filter(
@@ -383,24 +620,26 @@ function mergeRecord(
       finalizedAt(op) !== undefined &&
       context.now >= finalizedAt(op)! + OWNER_DELETE_GRACE_PERIOD_MS,
   );
-  const erased = purgedDeletes.length > 0;
-  const purgedRemovalIds = new Set(
-    purgedDeletes.map((op) => op.revision.operationId),
-  );
-  const purgedRestoreTimes = ownerOps
+  const erased = purgedDeletes.length > 0 || retainedMarker !== undefined;
+  const purgedRemovalIds = new Set([
+    ...purgedDeletes.map(operationKey),
+    ...(retainedMarker?.removals.map(referenceKey) ?? []),
+  ]);
+  const purgedRestores = ownerOps
     .filter(
       (op) =>
         op.kind === "owner-restore" &&
-        op.parents.some((id) => purgedRemovalIds.has(id)),
+        op.parents.some((id) => purgedRemovalIds.has(referenceKey(id))),
     )
-    .map((op) => op.revision.wallMs);
+    .filter((op) => op.kind === "owner-restore");
   const declaration = all[0].declaration;
   const incompatibleDeclaration =
     new Set(all.map((op) => canonicalJson(op.declaration))).size > 1;
   const resolutions = ownerOps.filter((op) => op.kind === "owner-resolve");
-  const byOperationId = new Map(all.map((op) => [op.revision.operationId, op]));
+  const byOperationId = new Map(all.map((op) => [operationKey(op), op]));
   const resolvedIds = new Set<string>();
-  const markResolved = (id: string): void => {
+  const markResolved = (reference: OperationReference): void => {
+    const id = referenceKey(reference);
     if (resolvedIds.has(id)) return;
     resolvedIds.add(id);
     const nested = byOperationId.get(id);
@@ -410,35 +649,67 @@ function mergeRecord(
   resolutions.forEach((op) => {
     if (op.kind === "owner-resolve") op.candidates.forEach(markResolved);
   });
-  let candidates: SourceObservation[] = [
-    ...observations.filter((op) => !resolvedIds.has(op.revision.operationId)),
-    ...resolutions
-      .filter((op) => !resolvedIds.has(op.revision.operationId))
-      .map((op) => materializeResolution(op, byOperationId))
-      .filter((op): op is SourceObservation => op !== null),
-  ];
-  const dominance = sourceDominance(candidates, declaration.sourceVersionOrder);
+  const scanConfirms = (scan: SourceObservation) =>
+    scan.kind === "source-delete" &&
+    scan.origin === "complete-scan" &&
+    scan.confirmationOf !== undefined &&
+    observations.some(
+      (prior) =>
+        prior.kind === "source-delete" &&
+        prior.origin === "complete-scan" &&
+        operationKey(prior) === referenceKey(scan.confirmationOf!) &&
+        prior.recordKey === scan.recordKey &&
+        prior.sourceId === scan.sourceId &&
+        prior.connectionId === scan.connectionId &&
+        sameAccount(prior.upstreamAccount, scan.upstreamAccount) &&
+        prior.generation === scan.generation &&
+        canonicalJson(prior.declaration) === canonicalJson(scan.declaration) &&
+        prior.revision.wallMs < scan.revision.wallMs,
+    );
+  const confirmedScanIds = new Set(
+    observations
+      .filter(scanConfirms)
+      .flatMap((scan) =>
+        scan.kind === "source-delete" && scan.confirmationOf
+          ? [referenceKey(scan.confirmationOf)]
+          : [],
+      ),
+  );
   const unconfirmedScans = observations.filter(
     (op) =>
       op.kind === "source-delete" &&
       op.origin === "complete-scan" &&
-      (!op.confirmationOf ||
-        !observations.some(
-          (prior) =>
-            prior.kind === "source-delete" &&
-            prior.origin === "complete-scan" &&
-            prior.revision.operationId === op.confirmationOf &&
-            prior.recordKey === op.recordKey &&
-            canonicalJson(prior.declaration) ===
-              canonicalJson(op.declaration) &&
-            prior.revision.wallMs < op.revision.wallMs,
-        )),
+      !scanConfirms(op) &&
+      !confirmedScanIds.has(operationKey(op)),
   );
+  let candidates: SourceObservation[] = [
+    ...observations.filter(
+      (op) =>
+        !resolvedIds.has(operationKey(op)) &&
+        !retainedMarker?.observations.some(
+          (stored) => referenceKey(stored) === operationKey(op),
+        ),
+    ),
+    ...resolutions
+      .filter((op) => !resolvedIds.has(operationKey(op)))
+      .map((op) => materializeResolution(op, byOperationId))
+      .filter((op): op is SourceObservation => op !== null),
+  ];
+  const admitted = candidates.filter(
+    (op) =>
+      op.kind !== "source-delete" ||
+      op.origin !== "complete-scan" ||
+      !unconfirmedScans.includes(op),
+  );
+  const dominance = sourceDominance(admitted, declaration.sourceVersionOrder);
   candidates = candidates.filter(
-    (op) => !dominance.dominated.has(op) && !unconfirmedScans.includes(op),
+    (op) => admitted.includes(op) && !dominance.dominated.has(op),
   );
-  const ownerResolutionConflict = resolutions.some((left, index) =>
-    resolutions
+  const liveResolutions = resolutions.filter(
+    (op) => !resolvedIds.has(operationKey(op)),
+  );
+  const ownerResolutionConflict = liveResolutions.some((left, index) =>
+    liveResolutions
       .slice(index + 1)
       .some(
         (right) =>
@@ -446,12 +717,16 @@ function mergeRecord(
             resolutionPayload(right, byOperationId) &&
           !knownBefore(left, right) &&
           !knownBefore(right, left) &&
-          left.candidates.some((id) => right.candidates.includes(id)),
+          left.candidates.some((id) =>
+            right.candidates.some(
+              (other) => referenceKey(id) === referenceKey(other),
+            ),
+          ),
       ),
   );
-  if (purgedRestoreTimes.length)
+  if (purgedRestores.length)
     candidates = candidates.filter((op) =>
-      purgedRestoreTimes.some((time) => op.revision.wallMs > time),
+      purgedRestores.some((restore) => knownBefore(restore, op)),
     );
   const effective = (op: SourceObservation) => {
     const observedAt = Date.parse(op.emittedAt);
@@ -460,7 +735,10 @@ function mergeRecord(
       : observedAt;
     return Math.min(observationTime, finalizedAt(op) ?? observationTime);
   };
-  const uniquePayloads = new Set(candidates.map(payloadIdentity));
+  const appendOnlyEvidence = observations.filter(
+    (op) => !resolvedIds.has(operationKey(op)),
+  );
+  const uniquePayloads = new Set(appendOnlyEvidence.map(payloadIdentity));
   const maxima = candidates.filter(
     (candidate) =>
       !candidates.some(
@@ -485,8 +763,18 @@ function mergeRecord(
   const unobservable = declaration.reobservable === false;
   const appendOnlyConflict =
     declaration.semantics === "append_only" && uniquePayloads.size > 1;
+  const recordIdentity: RecordIdentity = {
+    owner: all[0].owner,
+    sourceId: all[0].sourceId,
+    connectionId: all[0].connectionId,
+    generation: all[0].generation,
+    stream: declaration.stream,
+    recordKey: all[0].recordKey,
+  };
   const alreadyReobserved =
-    context.reobservedRecordKeys?.includes(all[0].recordKey) ?? false;
+    context.reobservedRecords?.some(
+      (identity) => canonicalJson(identity) === canonicalJson(recordIdentity),
+    ) ?? false;
   const state =
     incompatibleDeclaration || appendOnlyConflict
       ? "quarantined"
@@ -494,53 +782,70 @@ function mergeRecord(
           ownerResolutionConflict ||
           (closeDisagreement && unobservable)
         ? "conflict"
-        : (closeDisagreement && !alreadyReobserved) || unconfirmedScans.length
+        : closeDisagreement || unconfirmedScans.length
           ? "unsettled"
           : "settled";
+  const activePurgedDeletion = [...purgedRemovalIds].some(
+    (removeId) =>
+      !ownerOps.some(
+        (restore) =>
+          restore.kind === "owner-restore" &&
+          restore.parents.some((parent) => referenceKey(parent) === removeId),
+      ),
+  );
   const retainedAfterRestore =
-    purgedRestoreTimes.length > 0 &&
+    !activePurgedDeletion &&
+    purgedRestores.length > 0 &&
     candidates.some(
       (op) =>
         op.kind === "upsert" &&
-        purgedRestoreTimes.some((time) => op.revision.wallMs > time),
+        purgedRestores.some((restore) => knownBefore(restore, op)),
     );
   const suppressionMarker = erased
     ? {
-        recordKey: all[0].recordKey,
-        observations: observations.map((op) => ({
-          operationId: op.revision.operationId,
-          contentHash: op.contentHash,
-          observedAt: op.emittedAt,
-          finalizedAt: finalizedAt(op) ?? null,
-        })),
-        removals: purgedDeletes.map((op) => ({
-          operationId: op.revision.operationId,
-          deletedAt: op.revision.wallMs,
-          finalizedAt: finalizedAt(op)!,
-        })),
+        identity: recordIdentity,
+        observations: [
+          ...(retainedMarker?.observations ?? []),
+          ...observations.map((op) => ({
+            writerId: op.revision.writerId,
+            operationId: op.revision.operationId,
+            contentHash: op.contentHash,
+            observedAt: op.emittedAt,
+            finalizedAt: finalizedAt(op) ?? null,
+          })),
+        ]
+          .sort((a, b) => text(referenceKey(a), referenceKey(b)))
+          .filter(
+            (observation, index, all) =>
+              all.findIndex(
+                (other) => referenceKey(other) === referenceKey(observation),
+              ) === index,
+          ),
+        removals: [
+          ...(retainedMarker?.removals ?? []),
+          ...purgedDeletes.map((op) => ({
+            writerId: op.revision.writerId,
+            operationId: op.revision.operationId,
+            deletedAt: op.revision.wallMs,
+            finalizedAt: finalizedAt(op)!,
+          })),
+        ]
+          .sort((a, b) => text(referenceKey(a), referenceKey(b)))
+          .filter(
+            (removal, index, all) =>
+              all.findIndex(
+                (other) => referenceKey(other) === referenceKey(removal),
+              ) === index,
+          ),
       }
     : null;
-  if (erased)
-    candidates = candidates.map((op) =>
-      op.kind === "upsert" &&
-      !purgedRestoreTimes.some((time) => op.revision.wallMs > time)
-        ? { ...op, data: {}, blobs: [] }
-        : op,
-    );
   return {
-    identity: {
-      owner: all[0].owner,
-      sourceId: all[0].sourceId,
-      connectionId: all[0].connectionId,
-      generation: all[0].generation,
-      stream: declaration.stream,
-      recordKey: all[0].recordKey,
-    },
+    identity: recordIdentity,
     current:
       erased && !retainedAfterRestore && current?.kind === "upsert"
         ? null
         : current,
-    candidates,
+    candidates: erased && !retainedAfterRestore ? [] : candidates,
     state,
     ownerControl,
     refreshRequested: state === "unsettled" && !alreadyReobserved,
@@ -594,10 +899,20 @@ function compareVersion(
       return null;
     }
   }
-  const left = Date.parse(a);
-  const right = Date.parse(b);
-  if (Number.isNaN(left) || Number.isNaN(right)) return null;
+  const left = parseRFC3339Instant(a);
+  const right = parseRFC3339Instant(b);
+  if (left === null || right === null) return null;
   return left < right ? -1 : left > right ? 1 : 0;
+}
+function parseRFC3339Instant(value: string): number | null {
+  if (
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+      value,
+    )
+  )
+    return null;
+  const instant = Date.parse(value);
+  return Number.isFinite(instant) ? instant : null;
 }
 function payloadIdentity(op: RecordOperation): string {
   return canonicalJson(
@@ -609,9 +924,10 @@ function materializeResolution(
   byOperationId: Map<string, RecordOperation>,
   path = new Set<string>(),
 ): SourceObservation | null {
-  if (path.has(resolution.revision.operationId)) return null;
-  const nextPath = new Set(path).add(resolution.revision.operationId);
-  const selected = byOperationId.get(resolution.choice);
+  const resolutionKey = operationKey(resolution);
+  if (path.has(resolutionKey)) return null;
+  const nextPath = new Set(path).add(resolutionKey);
+  const selected = byOperationId.get(referenceKey(resolution.choice));
   const selectedObservation =
     selected?.kind === "owner-resolve"
       ? materializeResolution(selected, byOperationId, nextPath)
@@ -619,7 +935,7 @@ function materializeResolution(
         ? selected
         : null;
   const evidence = resolution.candidates
-    .map((id) => byOperationId.get(id))
+    .map((id) => byOperationId.get(referenceKey(id)))
     .flatMap((candidate): SourceObservation[] => {
       if (!candidate) return [];
       if (candidate.kind === "owner-resolve") {
@@ -639,7 +955,7 @@ function materializeResolution(
   const emittedAt =
     evidence
       .map((op) => op.emittedAt)
-      .sort()
+      .sort((a, b) => Date.parse(a) - Date.parse(b))
       .at(-1) ?? template.emittedAt;
   const version = resolution.version ?? selectedObservation?.sourceVersion;
   const common = {
@@ -692,6 +1008,28 @@ function knownBefore(a: RecordOperation, b: RecordOperation): boolean {
 }
 function sameAccount(a: UpstreamAccount, b: UpstreamAccount): boolean {
   return a.issuer === b.issuer && a.subject === b.subject;
+}
+function referenceKey(reference: OperationReference): string {
+  return canonicalJson([reference.writerId, reference.operationId]);
+}
+function operationKey(operation: ReplicaOperation): string {
+  return referenceKey(operationReferenceOf(operation));
+}
+function sameRecordScope(a: RecordOperation, b: ReplicaOperation): boolean {
+  return (
+    "declaration" in b &&
+    a.owner === b.owner &&
+    a.sourceId === b.sourceId &&
+    a.connectionId === b.connectionId &&
+    a.generation === b.generation &&
+    a.recordKey === b.recordKey &&
+    a.upstreamAccount.issuer === b.upstreamAccount.issuer &&
+    a.upstreamAccount.subject === b.upstreamAccount.subject &&
+    canonicalJson(a.declaration) === canonicalJson(b.declaration)
+  );
+}
+function recordScopeKey(identity: RecordIdentity): string {
+  return canonicalJson(identity);
 }
 function dedupe<T extends RecordOperation>(ops: T[]): T[] {
   return [...new Map(ops.map((op) => [canonicalJson(op), op])).values()];

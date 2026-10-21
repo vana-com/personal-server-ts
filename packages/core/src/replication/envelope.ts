@@ -10,6 +10,20 @@ const revision = z.strictObject({
   writerId: token,
   operationId: token,
 });
+/** References stay unambiguous when two writers reuse an operation id. */
+const operationReference = z.strictObject({
+  writerId: token,
+  operationId: token,
+});
+export type OperationReference = z.infer<typeof operationReference>;
+export function operationReferenceOf(operation: {
+  revision: { writerId: string; operationId: string };
+}): OperationReference {
+  return {
+    writerId: operation.revision.writerId,
+    operationId: operation.revision.operationId,
+  };
+}
 const upstreamAccount = z.strictObject({ issuer: token, subject: token });
 export type UpstreamAccount = z.infer<typeof upstreamAccount>;
 export const declarationBindingSchema = z.strictObject({
@@ -83,29 +97,29 @@ export const replicaOperationSchema = z.discriminatedUnion("kind", [
     ...record,
     kind: z.literal("source-delete"),
     origin: z.enum(["source-event", "complete-scan"]),
-    confirmationOf: token.optional(),
+    confirmationOf: operationReference.optional(),
     sourceVersion: sourceVersion.optional(),
   }),
   z.strictObject({
     ...ownerRecord,
     kind: z.literal("owner-hide"),
-    parents: z.array(token),
+    parents: z.array(operationReference),
   }),
   z.strictObject({
     ...ownerRecord,
     kind: z.literal("owner-delete"),
-    parents: z.array(token),
+    parents: z.array(operationReference),
   }),
   z.strictObject({
     ...ownerRecord,
     kind: z.literal("owner-restore"),
-    parents: z.array(token),
+    parents: z.array(operationReference),
   }),
   z.strictObject({
     ...ownerRecord,
     kind: z.literal("owner-resolve"),
-    candidates: z.array(token),
-    choice: token,
+    candidates: z.array(operationReference),
+    choice: operationReference,
     version: sourceVersion.optional(),
     resolvedValue,
   }),
