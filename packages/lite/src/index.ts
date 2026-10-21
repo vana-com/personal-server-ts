@@ -189,6 +189,8 @@ export {
 export {
   createLiteCanonicalStore,
   type LiteCommitReceipt,
+  type LiteReplicaReadOptions,
+  type LiteVisibleRecord,
   type LiteOperationDraft,
 } from "./canonical-store.js";
 export type {

@@ -1,3 +1,4 @@
+import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
@@ -12,8 +13,15 @@ import {
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
+type BlobReadStore = Pick<
+  PdppRecordStore,
+  "getRecord" | "getBlobMeta" | "findBlobReferences"
+> & {
+  getBlobBytes(blobId: string): Uint8Array | undefined;
+};
 export interface PdppBlobsRouteDeps {
   store: PdppRecordStore;
+  replicaReads?: (reader: ReplicaReader) => BlobReadStore;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
@@ -65,7 +73,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   async function authorizeBlobAccess(
     c: Context,
     blobId: string,
-  ): Promise<{ error: Response } | { ok: true }> {
+  ): Promise<{ error: Response } | { ok: true; store: BlobReadStore }> {
     const reqId = requestId();
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -107,7 +115,10 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       }
     }
 
-    const meta = deps.store.getBlobMeta(blobId);
+    const store =
+      deps.replicaReads?.(context.tokenKind === "owner" ? "owner" : "grant") ??
+      deps.store;
+    const meta = store.getBlobMeta(blobId);
     if (!meta) {
       const err = new PdppError(
         "blob_not_found",
@@ -127,7 +138,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     // record or instance (e.g. re-ingested via a different stream). Access
     // is granted if ANY visible reference passes its authorization check —
     // an inaccessible reference must never hide an accessible one.
-    const references = deps.store.findBlobReferences(blobId);
+    const references = store.findBlobReferences(blobId);
     if (references.length === 0) return { error: notFound() };
 
     if (context.tokenKind === "owner") {
@@ -153,7 +164,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         ownedInstances.includes(reference.instance),
       );
       if (!visible) return { error: notFound() };
-      return { ok: true };
+      return { ok: true, store };
     }
 
     // Client token: the blob must be referenced by a record this exact
@@ -179,7 +190,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       }
       if (!scope.fields?.includes("blob_ref")) continue;
 
-      const record = deps.store.getRecord(
+      const record = store.getRecord(
         reference.instance,
         reference.stream,
         reference.recordKey,
@@ -191,7 +202,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         continue;
       }
 
-      return { ok: true };
+      return { ok: true, store };
     }
 
     return { error: notFound() };
@@ -204,7 +215,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     const authz = await authorizeBlobAccess(c, blobId);
     if ("error" in authz) return authz.error;
 
-    const meta = deps.store.getBlobMeta(blobId)!;
+    const meta = authz.store.getBlobMeta(blobId)!;
     const reqId = requestId();
     const headers: Record<string, string> = {
       "Request-Id": reqId,
@@ -220,7 +231,10 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
 
     let bytes: Uint8Array<ArrayBuffer> | undefined;
     try {
-      bytes = await deps.readBlobBytes?.(blobId);
+      if (deps.replicaReads) {
+        const payload = authz.store.getBlobBytes(blobId);
+        bytes = payload === undefined ? undefined : new Uint8Array(payload);
+      } else bytes = await deps.readBlobBytes?.(blobId);
     } catch {
       // A throwing reader must not leak past this route to app.ts's generic
       // handler, which returns a different (legacy) error shape. Map it to

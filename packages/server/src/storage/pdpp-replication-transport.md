@@ -178,3 +178,15 @@ promotion. A restored or cloned database must rotate its persisted writer
 identity before producing new batches; automated clone detection is not part
 of this experimental worker. Hosts must keep owner identity encoding consistent
 between baseline configuration and authoritative evidence.
+
+## Retained inbox upgrade
+
+When an enabled worker opens an older inbox, a ready row with retained
+`fragment_json` but a missing `data_hash` or `metadata_hash` is requeued for
+validation. Startup clears the fragment, both hash preimages, finality flag,
+retry deadline and old error. Normal download/decrypt/hash/structure checks
+regenerate the preimages; every fragment still needs finalized commitment
+verification before promotion. Imported and quarantined rows are untouched.
+A disabled worker does not requeue these rows. The upgrade deliberately requires
+storage to be available again; old decoded JSON alone cannot establish the
+missing commitment preimages.

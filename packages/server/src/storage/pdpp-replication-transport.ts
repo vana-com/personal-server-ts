@@ -25,7 +25,6 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import {
   replicaRegistrationState,
-  replicaChainCommitment,
   type ReplicaTransportPort,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import type { ReplicationExport } from "./pdpp-replication-sqlite.js";
@@ -93,6 +92,9 @@ type Inbox = {
   state: string;
   attempts: number;
   next_attempt: number;
+  data_hash: `0x${string}` | null;
+  metadata_hash: `0x${string}` | null;
+  finalized: number;
 };
 
 /** Internal experiment only. No bootstrap wiring; false by default, no runtime scheduling. */
@@ -115,6 +117,26 @@ export function createReplicaTransportWorker(deps: {
   if (!Number.isSafeInteger(cap) || cap < 1 || cap > REPLICA_MAX_BLOB_BYTES)
     throw new RangeError("invalid storage cap");
   db.exec(migration);
+  const columns = db
+    .prepare("PRAGMA table_info(pdpp_transport_inbox)")
+    .all() as { name: string }[];
+  for (const [name, type] of [
+    ["data_hash", "TEXT"],
+    ["metadata_hash", "TEXT"],
+    ["finalized", "INTEGER NOT NULL DEFAULT 0"],
+  ])
+    if (!columns.some((column) => column.name === name))
+      db.exec(`ALTER TABLE pdpp_transport_inbox ADD COLUMN ${name} ${type}`);
+  // Older workers retained decoded fragments without their verified hash-pair
+  // preimages. Re-download those ready rows; never infer finality from the old JSON.
+  if (deps.enabled === true)
+    db.prepare(
+      `UPDATE pdpp_transport_inbox
+      SET fragment_json=NULL,data_hash=NULL,metadata_hash=NULL,finalized=0,next_attempt=0,error=NULL
+      WHERE state='ready' AND fragment_json IS NOT NULL
+        AND (data_hash IS NULL OR metadata_hash IS NULL)`,
+    ).run();
+  deps.receiver.setPendingEnabled(deps.enabled === true);
   const enabled = () => deps.enabled === true;
   const state = () =>
     db.prepare("SELECT * FROM pdpp_transport_state WHERE id=1").get() as State;
@@ -370,12 +392,19 @@ export function createReplicaTransportWorker(deps: {
           );
           continue;
         }
-        if (status !== "confirmed") {
-          retry("pdpp_transport_inbox", row, "registration not confirmed");
+        // Gateway heads may be optimistic. They bind cheap decrypt/hash validation,
+        // but only pinned finalized evidence below permits canonical promotion.
+        const head = evidence.head;
+        if (
+          !head ||
+          head.owner.toLowerCase() !== state().owner.toLowerCase() ||
+          head.scope !== row.scope ||
+          head.version !== "1" ||
+          head.deleted
+        ) {
+          retry("pdpp_transport_inbox", row, "replica head unavailable");
           continue;
         }
-        // Retain the exact head whose hash-pair preimage was verified against the chain.
-        const head = evidence.head!;
         const encrypted = await transport.get(row.scope);
         if (encrypted.length > cap)
           throw new Error("replica ciphertext exceeds storage cap");
@@ -392,19 +421,64 @@ export function createReplicaTransportWorker(deps: {
           encrypted.length,
         );
         // The chain is the authority even when the Gateway head matches the downloaded bytes.
-        if (
-          replicaChainCommitment(dataHash, metadataHash).toLowerCase() !==
-            evidence.chain!.commitment.toLowerCase() ||
-          dataHash !== head.dataHash ||
-          metadataHash !== head.metadataHash
-        )
+        if (dataHash !== head.dataHash || metadataHash !== head.metadataHash)
           throw new Error("replica commitment mismatch");
         db.prepare(
-          "UPDATE pdpp_transport_inbox SET fragment_json=?,error=NULL WHERE scope=?",
-        ).run(canonicalJson(fragment), row.scope);
+          "UPDATE pdpp_transport_inbox SET fragment_json=?,data_hash=?,metadata_hash=?,error=NULL WHERE scope=?",
+        ).run(canonicalJson(fragment), dataHash, metadataHash, row.scope);
       } catch (error) {
         // Network and unavailable bytes are retryable; authenticated malformed bytes remain visible and backed off.
         retry("pdpp_transport_inbox", row, error);
+      }
+    }
+  }
+  async function confirmRetained() {
+    const rows = db
+      .prepare(
+        "SELECT * FROM pdpp_transport_inbox WHERE state='ready' AND fragment_json IS NOT NULL",
+      )
+      .all() as Inbox[];
+    for (const row of rows) {
+      try {
+        const status = replicaRegistrationState(
+          await transport.evidence(row.scope),
+          {
+            owner: state().owner,
+            scope: row.scope,
+            dataHash: row.data_hash ?? undefined,
+            metadataHash: row.metadata_hash ?? undefined,
+          },
+        );
+        if (status === "conflict") {
+          const fragment = JSON.parse(row.fragment_json!) as ReplicaFragment;
+          db.transaction(() => {
+            deps.receiver.quarantine({
+              credential: deps.credential,
+              id: canonicalJson([fragment.writer, fragment.batch]),
+              reason: "finalized commitment conflict",
+            });
+            retry(
+              "pdpp_transport_inbox",
+              row,
+              "immutable registration conflict",
+              true,
+            );
+          }).immediate();
+        } else
+          db.prepare(
+            "UPDATE pdpp_transport_inbox SET finalized=? WHERE scope=?",
+          ).run(
+            status === "confirmed" &&
+              row.data_hash !== null &&
+              row.metadata_hash !== null
+              ? 1
+              : 0,
+            row.scope,
+          );
+      } catch (error) {
+        db.prepare(
+          "UPDATE pdpp_transport_inbox SET finalized=0,error=? WHERE scope=?",
+        ).run(String(error), row.scope);
       }
     }
   }
@@ -432,19 +506,6 @@ export function createReplicaTransportWorker(deps: {
         )
         .get(first.writer, first.batch) as
         { digest: string; sequence: number } | undefined;
-      if (!imported && first.previous) {
-        const previous = db
-          .prepare(
-            "SELECT * FROM pdpp_transport_imported WHERE writer=? AND batch=? AND sequence=? AND digest=?",
-          )
-          .get(
-            first.writer,
-            first.previous.batch,
-            first.sequence - 1,
-            first.previous.digest,
-          );
-        if (!previous) continue;
-      }
       try {
         const bytes = assembleReplicaPayload(entries.map((e) => e.fragment));
         const encoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -476,6 +537,27 @@ export function createReplicaTransportWorker(deps: {
             throw new Error("unbound replica binary");
           return { blobId: blob.blobId, bytes };
         });
+        const pendingId = canonicalJson([first.writer, first.batch]);
+        deps.receiver.stage({
+          credential: deps.credential,
+          id: pendingId,
+          envelope: payload.envelope,
+          blobs,
+        });
+        if (entries.some((entry) => !entry.row.finalized)) continue;
+        if (!imported && first.previous) {
+          const previous = db
+            .prepare(
+              "SELECT * FROM pdpp_transport_imported WHERE writer=? AND batch=? AND sequence=? AND digest=?",
+            )
+            .get(
+              first.writer,
+              first.previous.batch,
+              first.sequence - 1,
+              first.previous.digest,
+            );
+          if (!previous) continue;
+        }
         db.transaction(() => {
           if (
             imported &&
@@ -484,11 +566,7 @@ export function createReplicaTransportWorker(deps: {
           )
             throw new Error("replica batch equivocation");
           // Nested receiver transaction shares this DB: import and durable acknowledgement are atomic.
-          deps.receiver.import({
-            credential: deps.credential,
-            envelope: payload.envelope,
-            blobs,
-          });
+          deps.receiver.promote({ credential: deps.credential, id: pendingId });
           if (!imported)
             db.prepare(
               "INSERT INTO pdpp_transport_imported VALUES (?,?,?,?)",
@@ -521,6 +599,7 @@ export function createReplicaTransportWorker(deps: {
           publish,
           discover,
           download,
+          confirmRetained,
           importReady,
           () => deps.receiver.retry({ credential: deps.credential }),
         ]) {
