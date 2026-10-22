@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import type { Database } from "better-sqlite3";
 import {
   canonicalJson,
+  replicaEnvelopeSchema,
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
@@ -12,6 +14,10 @@ import {
   replicaConflictMetadata,
   replicaConnectionVisibility,
   replicaStateVisible,
+  replicaCopyConflictMetadata,
+  OWNER_VISIBLE_COPY_REASONS,
+  REPLICA_COPY_CONFLICT_POLICY,
+  type ReplicaCopyConflictReason,
   type ReplicaReader,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import {
@@ -26,6 +32,68 @@ import {
   type StreamListing,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { replicaOperationDigest } from "./pdpp-replication-sqlite.js";
+
+/** One owner projection supplies discovery, diagnostics and stream counts. */
+export interface ReplicaCopyConflict {
+  id: string;
+  copyKey: string;
+  reason: ReplicaCopyConflictReason;
+  visibility: "conflicted";
+  status: "copy conflict" | "integrity conflict";
+  connections: string[];
+  streams: string[];
+  values?: ReplicaOperation[];
+  valuesOmitted?: true;
+  valuesOmittedReason?: "operation_limit" | "byte_limit";
+}
+export interface CopyConflictQuery {
+  instanceIds?: readonly string[];
+  id?: string;
+  connection?: string;
+  stream?: string;
+  limit?: number;
+  cursor?: string;
+}
+export interface CopyConflictPage {
+  data: ReplicaCopyConflict[];
+  hasMore: boolean;
+  nextCursor?: string;
+}
+export interface ReplicaCopyConflictReader {
+  readCopyConflicts(
+    id: string,
+    instanceIds?: readonly string[],
+    page?: Pick<CopyConflictQuery, "limit" | "cursor">,
+  ): CopyConflictPage;
+  listCopyConflicts(query: CopyConflictQuery): CopyConflictPage;
+}
+export const COPY_CONFLICT_READ_LIMITS = {
+  copies: 100,
+  operations: 512,
+  envelopeBytes: 8 * 1024 * 1024,
+  valueBytes: 4 * 1024 * 1024,
+  totalBytes: 8 * 1024 * 1024,
+  cursorBytes: 4096,
+} as const;
+type CopyEffects = [connection: string, stream: string | null][];
+type CopyFacts = { reason: ReplicaCopyConflictReason; effects: string };
+type CopyProjectionRow = CopyFacts & {
+  id: string;
+  copy_key: string;
+  operation_count: number;
+  envelope_bytes: number;
+  copy_rowid: number;
+};
+const compareCopyText = (a: string, b: string) =>
+  Buffer.compare(Buffer.from(a), Buffer.from(b));
+const compareCopies = (
+  a: { id: string; copy_key: string },
+  b: { id: string; copy_key: string },
+) => compareCopyText(a.id, b.id) || compareCopyText(a.copy_key, b.copy_key);
+const copyCursorAnchor = (row: { id: string; copy_key: string }) =>
+  createHash("sha256")
+    .update(canonicalJson([row.id, row.copy_key]))
+    .digest("hex");
 
 type Evidence = { op: ReplicaOperation; confirmed: boolean; pending: number };
 type CanonicalRow = {
@@ -51,7 +119,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 9;
+const VIEW_SCHEMA = 10;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -323,92 +391,69 @@ export function createReplicaVisibilityView(deps: {
       `);
     }
     if (hasCopyFacts) {
-      // A copy contributes once per stream, regardless of operation count or
-      // connections. Counts share a group for identical connection sets.
+      // Derive operation effects once per copy. NULL stream denotes an operation
+      // on the connection as a whole; reads expand it using current declarations.
+      const visibleReasons = `(${OWNER_VISIBLE_COPY_REASONS.map((reason) => `'${reason}'`).join(",")})`;
       const conflict = (alias: string) =>
-        `${alias}.state='quarantined' AND ${alias}.reason IN ('copy_conflict','finalized_conflict')`;
-      const streamGroups = (
+        `${alias}.state='quarantined' AND ${alias}.reason IN ${visibleReasons}`;
+      const project = (
         alias: string,
-      ) => `SELECT stream,json_group_array(instance) AS instances
-        FROM (SELECT DISTINCT json_extract(value,'$.declaration.stream') AS stream,
-          json_extract(value,'$.connectionId') AS instance
-          FROM json_each(${alias}.envelope_json,'$.operations')
-          WHERE json_extract(value,'$.declaration.stream') IS NOT NULL
-          ORDER BY stream,instance) GROUP BY stream`;
-      const addCopy = (alias: string) => `
-        INSERT INTO pdpp_replica_view_copy_counts
-        SELECT stream,instances,0 FROM (${streamGroups(alias)}) groups
-        WHERE ${conflict(alias)} AND NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_counts c
-          WHERE c.stream=groups.stream AND c.instances=groups.instances);
-        UPDATE pdpp_replica_view_copy_counts SET n=n+1
-        WHERE ${conflict(alias)} AND (stream,instances) IN (${streamGroups(alias)});
-        INSERT INTO pdpp_replica_view_copy_connections
-        SELECT DISTINCT ${alias}.id,${alias}.copy_key,json_extract(value,'$.connectionId')
-        FROM json_each(${alias}.envelope_json,'$.operations') op WHERE ${conflict(alias)}
-        AND NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_connections c
-          WHERE c.id=${alias}.id AND c.copy_key=${alias}.copy_key AND c.instance=json_extract(op.value,'$.connectionId'));
-      `;
-      const removeCopy = (alias: string) => `
-        UPDATE pdpp_replica_view_copy_counts SET n=n-1
-        WHERE ${conflict(alias)} AND (stream,instances) IN (${streamGroups(alias)});
-        DELETE FROM pdpp_replica_view_copy_counts WHERE n=0 AND ${conflict(alias)}
-        AND (stream,instances) IN (${streamGroups(alias)});
-        DELETE FROM pdpp_replica_view_copy_connections WHERE id=${alias}.id AND copy_key=${alias}.copy_key;
-      `;
+      ) => `SELECT ${alias}.id,${alias}.copy_key,${alias}.reason,
+        (SELECT json_group_array(json_array(instance,stream) ORDER BY instance,stream)
+          FROM (SELECT DISTINCT json_extract(value,'$.connectionId') AS instance,
+            json_extract(value,'$.declaration.stream') AS stream
+            FROM json_each(${alias}.envelope_json,'$.operations'))),
+        json_array_length(${alias}.envelope_json,'$.operations'),length(CAST(${alias}.envelope_json AS BLOB)),${alias}.rowid`;
+      const addCopy = (
+        alias: string,
+      ) => `INSERT INTO pdpp_replica_view_copy_projection
+        ${project(alias)} WHERE ${conflict(alias)}
+        AND NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_projection p WHERE p.id=${alias}.id AND p.copy_key=${alias}.copy_key);`;
       db.exec(`
-        -- Composite primary keys are the only access paths. WITHOUT ROWID
-        -- avoids a second B-tree and keeps even the empty layout sparse.
-        CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_connections (
-          id TEXT NOT NULL,copy_key TEXT NOT NULL,instance TEXT NOT NULL,
-          PRIMARY KEY(id,copy_key,instance)
+        CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_projection (
+          id TEXT NOT NULL,copy_key TEXT NOT NULL,reason TEXT NOT NULL,effects TEXT NOT NULL,
+          operation_count INTEGER NOT NULL,envelope_bytes INTEGER NOT NULL,copy_rowid INTEGER NOT NULL,
+          PRIMARY KEY(id,copy_key)
         ) WITHOUT ROWID;
+        -- Each eligible effect group is a bounded keyset seek, never a copy scan.
+        CREATE INDEX IF NOT EXISTS pdpp_replica_view_copy_catalog ON pdpp_replica_view_copy_projection(reason,effects,id,copy_key);
         CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_counts (
-          stream TEXT NOT NULL,instances TEXT NOT NULL,n INTEGER NOT NULL,
-          PRIMARY KEY(stream,instances)
+          reason TEXT NOT NULL,effects TEXT NOT NULL,n INTEGER NOT NULL,PRIMARY KEY(reason,effects)
         ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_groups (
-          instance TEXT NOT NULL,stream TEXT NOT NULL,instances TEXT NOT NULL,
-          PRIMARY KEY(instance,stream,instances)
+          instance TEXT NOT NULL,reason TEXT NOT NULL,effects TEXT NOT NULL,PRIMARY KEY(instance,reason,effects)
         ) WITHOUT ROWID;
-        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_group_insert
-        AFTER INSERT ON pdpp_replica_view_copy_counts BEGIN
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_group_insert AFTER INSERT ON pdpp_replica_view_copy_counts BEGIN
           INSERT INTO pdpp_replica_view_copy_groups
-          SELECT value,NEW.stream,NEW.instances FROM json_each(NEW.instances)
-          WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_groups g
-            WHERE g.instance=value AND g.stream=NEW.stream AND g.instances=NEW.instances);
+          SELECT DISTINCT json_extract(value,'$[0]'),NEW.reason,NEW.effects FROM json_each(NEW.effects) op
+          WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_groups g WHERE g.instance=json_extract(op.value,'$[0]') AND g.reason=NEW.reason AND g.effects=NEW.effects);
         END;
-        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_group_delete
-        AFTER DELETE ON pdpp_replica_view_copy_counts BEGIN
-          DELETE FROM pdpp_replica_view_copy_groups WHERE stream=OLD.stream AND instances=OLD.instances;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_group_delete AFTER DELETE ON pdpp_replica_view_copy_counts BEGIN
+          DELETE FROM pdpp_replica_view_copy_groups WHERE reason=OLD.reason AND effects=OLD.effects;
         END;
-        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_insert AFTER INSERT ON pdpp_replica_copies BEGIN
-          ${addCopy("NEW")}
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_projection_insert AFTER INSERT ON pdpp_replica_view_copy_projection BEGIN
+          INSERT INTO pdpp_replica_view_copy_counts SELECT NEW.reason,NEW.effects,0
+          WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_counts c WHERE c.reason=NEW.reason AND c.effects=NEW.effects);
+          UPDATE pdpp_replica_view_copy_counts SET n=n+1 WHERE reason=NEW.reason AND effects=NEW.effects;
         END;
-        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_update
-        AFTER UPDATE OF state,reason,envelope_json ON pdpp_replica_copies
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_projection_delete AFTER DELETE ON pdpp_replica_view_copy_projection BEGIN
+          UPDATE pdpp_replica_view_copy_counts SET n=n-1 WHERE reason=OLD.reason AND effects=OLD.effects;
+          DELETE FROM pdpp_replica_view_copy_counts WHERE reason=OLD.reason AND effects=OLD.effects AND n=0;
+        END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_insert AFTER INSERT ON pdpp_replica_copies BEGIN ${addCopy("NEW")} END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_update AFTER UPDATE OF state,reason,envelope_json ON pdpp_replica_copies
         WHEN OLD.state IS NOT NEW.state OR OLD.reason IS NOT NEW.reason OR OLD.envelope_json IS NOT NEW.envelope_json BEGIN
-          ${removeCopy("OLD")}
+          DELETE FROM pdpp_replica_view_copy_projection WHERE id=OLD.id AND copy_key=OLD.copy_key;
           ${addCopy("NEW")}
         END;
         CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_delete AFTER DELETE ON pdpp_replica_copies BEGIN
-          ${removeCopy("OLD")}
+          DELETE FROM pdpp_replica_view_copy_projection WHERE id=OLD.id AND copy_key=OLD.copy_key;
         END;
       `);
       if (!initialized)
-        db.exec(`
-        INSERT INTO pdpp_replica_view_copy_counts
-        SELECT stream,instances,COUNT(*) FROM (
-          SELECT id,copy_key,stream,json_group_array(instance) AS instances
-          FROM (SELECT DISTINCT c.id,c.copy_key,json_extract(op.value,'$.declaration.stream') AS stream,
-            json_extract(op.value,'$.connectionId') AS instance
-            FROM pdpp_replica_copies c,json_each(c.envelope_json,'$.operations') op
-            WHERE ${conflict("c")} AND json_extract(op.value,'$.declaration.stream') IS NOT NULL
-            ORDER BY c.id,c.copy_key,stream,instance)
-          GROUP BY id,copy_key,stream) GROUP BY stream,instances;
-        INSERT INTO pdpp_replica_view_copy_connections
-        SELECT DISTINCT c.id,c.copy_key,json_extract(op.value,'$.connectionId')
-        FROM pdpp_replica_copies c,json_each(c.envelope_json,'$.operations') op WHERE ${conflict("c")};
-      `);
+        db.exec(
+          `INSERT INTO pdpp_replica_view_copy_projection ${project("c")} FROM pdpp_replica_copies c WHERE ${conflict("c")};`,
+        );
     }
     if (hasBindingConflictFacts && !localInitialized)
       db.exec(
@@ -1340,30 +1385,260 @@ export function createReplicaVisibilityView(deps: {
         null,
       );
   }
+  /** A scoped owner projection is the sole interpretation of a copy's effects. */
+  function ownerCopyProjection(facts: CopyFacts, query: CopyConflictQuery) {
+    if (
+      !replicaStateVisible(
+        "quarantined",
+        "owner",
+        undefined,
+        "received",
+        facts.reason,
+      )
+    )
+      return undefined;
+    const effects = JSON.parse(facts.effects) as CopyEffects;
+    const connections = [
+      ...new Set(effects.map(([connection]) => connection)),
+    ].sort(compareCopyText);
+    const allowed = query.instanceIds && new Set(query.instanceIds);
+    if (allowed && connections.some((connection) => !allowed.has(connection)))
+      return undefined;
+    const affected = new Map<string, Set<string>>();
+    for (const [connection, stream] of effects) {
+      const streams = affected.get(connection) ?? new Set<string>();
+      affected.set(connection, streams);
+      if (stream !== null) streams.add(stream);
+      else {
+        const binding = db
+          .prepare(
+            "SELECT source_id FROM pdpp_instance_binding WHERE instance=?",
+          )
+          .get(connection) as { source_id: string | null } | undefined;
+        for (const declaration of deps.declarations())
+          if (declaration.sourceId === binding?.source_id)
+            streams.add(declaration.binding.stream);
+      }
+    }
+    if (query.connection && !affected.has(query.connection)) return undefined;
+    const streams = [
+      ...new Set([...affected.values()].flatMap((streams) => [...streams])),
+    ].sort(compareCopyText);
+    if (
+      query.stream &&
+      !(query.connection
+        ? affected.get(query.connection)?.has(query.stream)
+        : streams.includes(query.stream))
+    )
+      return undefined;
+    const metadata = {
+      reason: facts.reason,
+      ...replicaCopyConflictMetadata(facts.reason),
+      connections,
+      streams,
+    };
+    return {
+      metadata,
+      values(
+        row: CopyProjectionRow,
+      ): Pick<
+        ReplicaCopyConflict,
+        "values" | "valuesOmitted" | "valuesOmittedReason"
+      > {
+        if (!REPLICA_COPY_CONFLICT_POLICY[facts.reason].values) return {};
+        if (row.operation_count > COPY_CONFLICT_READ_LIMITS.operations)
+          return {
+            valuesOmitted: true,
+            valuesOmittedReason: "operation_limit",
+          };
+        if (row.envelope_bytes > COPY_CONFLICT_READ_LIMITS.envelopeBytes)
+          return { valuesOmitted: true, valuesOmittedReason: "byte_limit" };
+        const stored = db
+          .prepare(
+            "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
+          )
+          .get(row.id, row.copy_key) as { envelope_json: string };
+        const values = replicaEnvelopeSchema.parse(
+          JSON.parse(stored.envelope_json),
+        ).operations;
+        return Buffer.byteLength(JSON.stringify(values)) >
+          COPY_CONFLICT_READ_LIMITS.valueBytes
+          ? { valuesOmitted: true, valuesOmittedReason: "byte_limit" }
+          : { values };
+      },
+    };
+  }
+  function ownerCopyGroups(query: CopyConflictQuery) {
+    if (!hasCopyFacts || query.instanceIds?.length === 0) return [];
+    const groups = (
+      query.instanceIds
+        ? db
+            .prepare(
+              `SELECT DISTINCT c.reason,c.effects,c.n FROM json_each(?) requested
+          JOIN pdpp_replica_view_copy_groups g ON g.instance=requested.value
+          JOIN pdpp_replica_view_copy_counts c ON c.reason=g.reason AND c.effects=g.effects`,
+            )
+            .all(JSON.stringify([...new Set(query.instanceIds)]))
+        : db
+            .prepare(
+              "SELECT reason,effects,n FROM pdpp_replica_view_copy_counts",
+            )
+            .all()
+    ) as (CopyFacts & { n: number })[];
+    return groups.flatMap((facts) => {
+      const projection = ownerCopyProjection(facts, query);
+      return projection ? [{ facts, projection }] : [];
+    });
+  }
+  function readOwnerCopyConflicts(
+    query: CopyConflictQuery,
+    includeValues: boolean,
+  ): CopyConflictPage {
+    const limit = query.limit ?? 25;
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > COPY_CONFLICT_READ_LIMITS.copies
+    )
+      throw new InvalidCursorError();
+    const scope = createHash("sha256")
+      .update(
+        canonicalJson({
+          ids: query.instanceIds
+            ? [...new Set(query.instanceIds)].sort(compareCopyText)
+            : null,
+          id: query.id ?? null,
+          connection: query.connection ?? null,
+          stream: query.stream ?? null,
+          includeValues,
+          declarations: deps
+            .declarations()
+            .map(({ sourceId, binding }) => [
+              sourceId,
+              binding.digest,
+              binding.stream,
+            ])
+            .sort((a, b) =>
+              compareCopyText(JSON.stringify(a), JSON.stringify(b)),
+            ),
+        }),
+      )
+      .digest("hex");
+    let after = { id: "", copy_key: "" };
+    if (query.cursor) {
+      if (
+        query.cursor.length > COPY_CONFLICT_READ_LIMITS.cursorBytes ||
+        !/^[a-zA-Z0-9_-]+$/.test(query.cursor)
+      )
+        throw new InvalidCursorError();
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(
+          Buffer.from(query.cursor, "base64url").toString("utf8"),
+        );
+      } catch {
+        throw new InvalidCursorError();
+      }
+      if (!decoded || typeof decoded !== "object")
+        throw new InvalidCursorError();
+      const cursor = decoded as {
+        schema?: number;
+        scope?: string;
+        after?: unknown;
+        anchor?: unknown;
+      };
+      if (cursor.schema !== VIEW_SCHEMA) throw new CursorExpiredError();
+      if (
+        cursor.scope !== scope ||
+        typeof cursor.after !== "number" ||
+        !Number.isSafeInteger(cursor.after) ||
+        cursor.after < 1 ||
+        typeof cursor.anchor !== "string" ||
+        !/^[a-f0-9]{64}$/.test(cursor.anchor)
+      )
+        throw new InvalidCursorError();
+      // Retained copy rowids give even arbitrarily long batch IDs a fixed-size
+      // cursor. Bind the anchor to its key so a deleted/reused row cannot move it.
+      const retained = db
+        .prepare("SELECT id,copy_key FROM pdpp_replica_copies WHERE rowid=?")
+        .get(cursor.after) as { id: string; copy_key: string } | undefined;
+      if (!retained || copyCursorAnchor(retained) !== cursor.anchor)
+        throw new CursorExpiredError();
+      after = retained;
+      if (query.id !== undefined && after.id !== query.id)
+        throw new InvalidCursorError();
+    }
+    type Candidate = {
+      row: CopyProjectionRow;
+      projection: NonNullable<ReturnType<typeof ownerCopyProjection>>;
+    };
+    const candidates: Candidate[] = [];
+    for (const { facts, projection } of ownerCopyGroups(query)) {
+      // Bound each group's seek before merging. Do not ORDER/LIMIT an unbounded
+      // join of all matching copies, or a cheap catalog read becomes a scan.
+      const rows = db
+        .prepare(
+          `SELECT * FROM pdpp_replica_view_copy_projection
+        WHERE reason=? AND effects=? AND ${query.id === undefined ? "(id,copy_key)>(?,?)" : "id=? AND copy_key>?"}
+        ORDER BY id,copy_key LIMIT ?`,
+        )
+        .all(
+          facts.reason,
+          facts.effects,
+          query.id ?? after.id,
+          after.copy_key,
+          limit + 1,
+        ) as CopyProjectionRow[];
+      candidates.push(...rows.map((row) => ({ row, projection })));
+      candidates.sort((a, b) => compareCopies(a.row, b.row));
+      candidates.splice(limit + 1);
+    }
+    const data: ReplicaCopyConflict[] = [];
+    let bytes = 0;
+    let last: CopyProjectionRow | undefined;
+    // Reserve the maximum cursor, list wrapper and separators for either wire
+    // shape, so values that fit individually cannot overfill a response page.
+    const entryBudget =
+      COPY_CONFLICT_READ_LIMITS.totalBytes -
+      COPY_CONFLICT_READ_LIMITS.cursorBytes -
+      256;
+    for (const { row, projection } of candidates.slice(0, limit)) {
+      const entry: ReplicaCopyConflict = {
+        id: row.id,
+        copyKey: row.copy_key,
+        ...projection.metadata,
+        ...(includeValues ? projection.values(row) : {}),
+      };
+      const size = Buffer.byteLength(JSON.stringify(entry));
+      if (data.length && bytes + size > entryBudget) break;
+      data.push(entry);
+      bytes += size;
+      last = row;
+    }
+    const hasMore = candidates.length > data.length;
+    const nextCursor =
+      hasMore && last
+        ? Buffer.from(
+            JSON.stringify({
+              schema: VIEW_SCHEMA,
+              scope,
+              after: last.copy_rowid,
+              anchor: copyCursorAnchor(last),
+            }),
+          ).toString("base64url")
+        : undefined;
+    return { data, hasMore, ...(nextCursor ? { nextCursor } : {}) };
+  }
   function listStreams(
     ids: string[],
     preview = true,
     reader: ReplicaReader = "owner",
   ): (StreamListing & { copyConflicts?: number })[] {
     const copyCounts = new Map<string, number>();
-    if (reader === "owner" && hasCopyFacts && ids.length) {
-      // Indexed by the requested connections, then deduplicate groups before
-      // summing: a copy on two requested connections still counts only once.
-      const groups = db
-        .prepare(
-          `SELECT DISTINCT g.stream,g.instances,c.n
-        FROM json_each(?) requested
-        JOIN pdpp_replica_view_copy_groups g ON g.instance=requested.value
-        JOIN pdpp_replica_view_copy_counts c ON c.stream=g.stream AND c.instances=g.instances`,
-        )
-        .all(JSON.stringify([...new Set(ids)])) as {
-        stream: string;
-        instances: string;
-        n: number;
-      }[];
-      for (const { stream, n } of groups)
-        copyCounts.set(stream, (copyCounts.get(stream) ?? 0) + n);
-    }
+    if (reader === "owner")
+      for (const { facts, projection } of ownerCopyGroups({ instanceIds: ids }))
+        for (const stream of projection.metadata.streams)
+          copyCounts.set(stream, (copyCounts.get(stream) ?? 0) + facts.n);
     const combined = new Map<
       string,
       {
@@ -1530,6 +1805,7 @@ export function createReplicaVisibilityView(deps: {
     getRecord,
     listRecords,
     listStreams,
+    readOwnerCopyConflicts,
     findBlobReferences,
     hasBlobReference,
     getBlobMeta,

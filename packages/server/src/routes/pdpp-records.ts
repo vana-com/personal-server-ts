@@ -1,5 +1,5 @@
 import {
-  ReplicaCopyConflictLimitError,
+  COPY_CONFLICT_READ_LIMITS,
   type ReplicaCopyConflictReader,
 } from "../storage/pdpp-replication-receiver.js";
 import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
@@ -896,59 +896,105 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     }
   }
 
-  // Owner diagnostics use the same mandatory host reader as record/blob reads.
-  // Never fall back to raw storage for this optional capability.
-  app.get("/replica/copy-conflicts/:id", async (c) => {
-    const reqId = requestId();
-    const { context, error } = await authenticate(c, reqId);
-    if (error) return error;
-    if (!context?.active)
-      return sendError(c, mapInactiveToError(context!), reqId);
-    try {
-      if (
-        context.tokenKind !== "owner" ||
-        !context.subjectId ||
-        !deps.ownerSubjectId ||
-        context.subjectId.toLowerCase() !== deps.ownerSubjectId.toLowerCase()
-      )
-        throw new PdppError(
-          "insufficient_scope",
-          "Copy conflict diagnostics require the server owner",
-        );
-      const instanceIds = ownerInstances(context);
-      if (!instanceIds.length)
-        throw new PdppError(
-          "insufficient_scope",
-          "No currently owned instance is in scope",
-        );
-      const reader = deps.reads?.("owner");
-      if (!reader?.readCopyConflicts)
-        throw new PdppError(
-          "not_found",
-          "Copy conflict diagnostics are unavailable",
-        );
-      return c.json(
-        {
-          object: "list",
-          data: reader.readCopyConflicts(c.req.param("id"), instanceIds),
-        },
-        200,
-        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
-      );
-    } catch (err) {
-      if (err instanceof ReplicaCopyConflictLimitError)
+  // Both owner copy surfaces use the same projection and current token scope.
+  function ownerCopyConflictsRoute(mode: "catalog" | "values") {
+    return async (c: Context) => {
+      const reqId = requestId();
+      const { context, error } = await authenticate(c, reqId);
+      if (error) return error;
+      if (!context?.active)
+        return sendError(c, mapInactiveToError(context!), reqId);
+      try {
+        if (
+          context.tokenKind !== "owner" ||
+          !context.subjectId ||
+          !deps.ownerSubjectId ||
+          context.subjectId.toLowerCase() !== deps.ownerSubjectId.toLowerCase()
+        )
+          throw new PdppError(
+            "insufficient_scope",
+            "Copy conflict diagnostics require the server owner",
+          );
+        const instanceIds = ownerInstances(context);
+        if (!instanceIds.length)
+          throw new PdppError(
+            "insufficient_scope",
+            "No currently owned instance is in scope",
+          );
+        const reader = deps.reads?.("owner");
+        if (!reader?.readCopyConflicts || !reader.listCopyConflicts)
+          throw new PdppError(
+            "not_found",
+            "Copy conflict diagnostics are unavailable",
+          );
+        const params = c.req.query();
+        const allowed =
+          mode === "catalog"
+            ? ["connection", "stream", "limit", "cursor"]
+            : ["limit", "cursor"];
+        if (Object.keys(params).some((key) => !allowed.includes(key)))
+          throw new PdppError(
+            "invalid_request",
+            "Unknown copy conflict query parameter",
+          );
+        const limit = params.limit === undefined ? 25 : Number(params.limit);
+        if (
+          !Number.isSafeInteger(limit) ||
+          limit < 1 ||
+          limit > COPY_CONFLICT_READ_LIMITS.copies ||
+          (params.limit !== undefined && !/^[1-9][0-9]*$/.test(params.limit))
+        )
+          throw new PdppError(
+            "invalid_request",
+            `limit must be between 1 and ${COPY_CONFLICT_READ_LIMITS.copies}`,
+          );
+        if (
+          (params.connection !== undefined && !params.connection) ||
+          (params.stream !== undefined && !params.stream)
+        )
+          throw new PdppError(
+            "invalid_request",
+            "connection and stream must be nonempty",
+          );
+        const page =
+          mode === "values"
+            ? reader.readCopyConflicts(c.req.param("id")!, instanceIds, {
+                limit,
+                cursor: params.cursor,
+              })
+            : reader.listCopyConflicts({
+                instanceIds,
+                connection: params.connection,
+                stream: params.stream,
+                limit,
+                cursor: params.cursor,
+              });
         return c.json(
-          new PdppError("invalid_request", err.message).toJSON(reqId),
-          413,
+          {
+            object: "list",
+            data: page.data,
+            has_more: page.hasMore,
+            ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
+          },
+          200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
         );
-      return sendError(
-        c,
-        mapAndLog(deps, "GET /v1/replica/copy-conflicts/:id", reqId, err),
-        reqId,
-      );
-    }
-  });
+      } catch (err) {
+        return sendError(
+          c,
+          mapAndLog(
+            deps,
+            `GET /v1/replica/copy-conflicts${mode === "values" ? "/:id" : ""}`,
+            reqId,
+            err,
+          ),
+          reqId,
+        );
+      }
+    };
+  }
+  app.get("/replica/copy-conflicts", ownerCopyConflictsRoute("catalog"));
+  app.get("/replica/copy-conflicts/:id", ownerCopyConflictsRoute("values"));
 
   app.get("/streams", async (c) => {
     const reqId = requestId();

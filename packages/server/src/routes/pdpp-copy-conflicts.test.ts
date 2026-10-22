@@ -28,6 +28,12 @@ function host(f: ReturnType<typeof copyReadFixture>, capability = true) {
       subjectId: identity.owner,
       instanceIds: [identity.connectionId],
     },
+    wide: {
+      active: true,
+      tokenKind: "owner",
+      subjectId: identity.owner,
+      instanceIds: [identity.connectionId, "another-connection"],
+    },
     foreign: {
       active: true,
       tokenKind: "owner",
@@ -82,6 +88,7 @@ function host(f: ReturnType<typeof copyReadFixture>, capability = true) {
       bindingStore: f.store,
       auth,
       resource: "http://localhost:8080",
+      configuredMethods: new Map(),
       instancesForSubject: () => [identity.connectionId, "another-connection"],
       declarations: createStreamDeclarationRegistry([
         {
@@ -155,18 +162,24 @@ it("createApp serves bounded owner copy diagnostics and summary, never values or
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       object: "list",
+      has_more: false,
       data: [a.copyKey, b.copyKey].sort().map((copyKey) => ({
+        id: a.id,
         copyKey,
+        connections: [identity.connectionId],
+        streams: ["messages"],
         reason: "copy_conflict",
         visibility: "conflicted",
         status: "copy conflict",
-        values: [copyKey === a.copyKey ? record : b.record],
+        values:
+          copyKey === a.copyKey ? a.envelope.operations : b.envelope.operations,
       })),
     });
     expect((await get("app", path)).status).toBe(403);
     expect((await get("foreign", path)).status).toBe(403);
     expect((await get("narrow", path)).body).toEqual({
       object: "list",
+      has_more: false,
       data: [],
     });
     expect((await get("owner", "/v1/streams")).body.data).toEqual([
@@ -214,7 +227,10 @@ it("createApp serves bounded owner copy diagnostics and summary, never values or
   const terminal = async () => {
     expect((await get("owner", path)).body.data).toEqual(
       [a.copyKey, b.copyKey].sort().map((copyKey) => ({
+        id: a.id,
         copyKey,
+        connections: [identity.connectionId],
+        streams: ["messages"],
         reason: "finalized_conflict",
         visibility: "conflicted",
         status: "integrity conflict",
@@ -232,21 +248,100 @@ it("createApp serves bounded owner copy diagnostics and summary, never values or
   expect((await host(f, false)("owner", path)).status).toBe(404);
 });
 
-it("createApp refuses an over-limit diagnostic as 413 without partial values", async () => {
+it("returns an oversized copy as an explicit marker without hiding its sibling", async () => {
   const f = copyReadFixture();
-  const a = f.copy("A".repeat(300_000), 1);
+  const a = f.copy("large", 1, [
+      registration,
+      {
+        ...upsert("large", 10),
+        data: { id: "a", text: "x".repeat(5 * 1024 * 1024) },
+      },
+    ]),
+    b = f.copy("small", 2);
   f.stage(a);
-  f.stage(f.copy("B", 2));
-  const get = host(f);
-  const path = `/v1/replica/copy-conflicts/${encodeURIComponent(a.id)}`;
+  f.stage(b);
+  const get = host(f),
+    path = `/v1/replica/copy-conflicts/${encodeURIComponent(a.id)}`;
   const res = await get("owner", path);
-  expect(res.status).toBe(413);
-  expect(res.body.error).toMatchObject({
-    code: "invalid_request",
-    message: "Copy conflict diagnostics exceed the read limit",
-  });
-  expect(res.body).not.toHaveProperty("data");
+  expect(res.status).toBe(200);
+  expect(
+    res.body.data.find(
+      (copy: { copyKey: string }) => copy.copyKey === a.copyKey,
+    ),
+  ).toMatchObject({ valuesOmitted: true, valuesOmittedReason: "byte_limit" });
+  expect(
+    res.body.data.find(
+      (copy: { copyKey: string }) => copy.copyKey === b.copyKey,
+    ).values,
+  ).toEqual(b.envelope.operations);
   expect(
     (await get("app", `${path}?reader=owner&include_pending=true`)).status,
   ).toBe(403);
+});
+
+it("lets a scoped owner discover conflicting batch ids through bounded keyset pages", async () => {
+  const f = copyReadFixture();
+  const a = f.copy("A", 1),
+    b = f.copy("B", 2);
+  f.stage(a);
+  f.stage(b);
+  const get = host(f);
+  const path = `/v1/replica/copy-conflicts?connection=${encodeURIComponent(identity.connectionId)}&stream=messages&limit=1`;
+  const first = await get("owner", path);
+  expect(first.status).toBe(200);
+  expect(first.body.data).toHaveLength(1);
+  expect(first.body.has_more).toBe(true);
+  expect(first.body.data[0]).toMatchObject({
+    id: a.id,
+    reason: "copy_conflict",
+    status: "copy conflict",
+    connections: [identity.connectionId],
+    streams: ["messages"],
+  });
+  expect(first.body.data[0]).not.toHaveProperty("values");
+  const second = await get("owner", `${path}&cursor=${first.body.next_cursor}`);
+  expect(second.status).toBe(200);
+  expect(second.body.data).toHaveLength(1);
+  expect(second.body.has_more).toBe(false);
+  expect(second.body.data[0].copyKey).not.toBe(first.body.data[0].copyKey);
+  expect((await get("app", path)).status).toBe(403);
+  expect((await get("foreign", path)).status).toBe(403);
+  expect((await get("narrow", path)).body.data).toEqual([]);
+});
+
+it("uses the same token scope for counts, discovery and complete values", async () => {
+  const f = copyReadFixture(),
+    other = "another-connection";
+  f.store.registerConnection({
+    instance: other,
+    sourceId: identity.sourceId,
+    method: identity.methodId,
+    label: other,
+  });
+  const a = f.copy("local", 1),
+    b = f.copy("cross", 2, [
+      ...f.copy("cross", 2).envelope.operations,
+      { ...registration, connectionId: other },
+    ]);
+  f.stage(a);
+  f.stage(b);
+  const get = host(f);
+  const path = `/v1/replica/copy-conflicts/${encodeURIComponent(a.id)}`;
+  for (const [token, n] of [
+    ["owner", 1],
+    ["wide", 2],
+  ] as const) {
+    expect((await get(token, "/v1/streams")).body.data[0].copy_conflicts).toBe(
+      n,
+    );
+    expect(
+      (await get(token, "/v1/replica/copy-conflicts?stream=messages")).body
+        .data,
+    ).toHaveLength(n);
+    expect((await get(token, path)).body.data).toHaveLength(n);
+  }
+  expect((await get("narrow", "/v1/streams")).body.data).toEqual([]);
+  expect((await get("narrow", "/v1/replica/copy-conflicts")).body.data).toEqual(
+    [],
+  );
 });

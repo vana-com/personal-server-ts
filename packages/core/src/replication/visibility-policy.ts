@@ -4,6 +4,31 @@ export type ReplicaVisibilityState =
   "confirmed" | "pending" | "quarantined" | "conflicted";
 export type ReplicaQuarantineReason =
   "copy_conflict" | "finalized_conflict" | "corruption";
+/** Only the separate owner copy projection may show quarantined copy values. */
+export const REPLICA_COPY_CONFLICT_POLICY = {
+  copy_conflict: {
+    visibility: "conflicted",
+    status: "copy conflict",
+    values: true,
+  },
+  finalized_conflict: {
+    visibility: "conflicted",
+    status: "integrity conflict",
+    values: false,
+  },
+  corruption: null,
+} as const;
+export type ReplicaCopyConflictReason = {
+  [
+    R in ReplicaQuarantineReason
+  ]: (typeof REPLICA_COPY_CONFLICT_POLICY)[R] extends null ? never : R;
+}[ReplicaQuarantineReason];
+export const OWNER_VISIBLE_COPY_REASONS = Object.keys(
+  REPLICA_COPY_CONFLICT_POLICY,
+).filter(
+  (reason): reason is ReplicaCopyConflictReason =>
+    REPLICA_COPY_CONFLICT_POLICY[reason as ReplicaQuarantineReason] !== null,
+);
 export type ReplicaRecordOrigin = "local" | "received";
 export interface ReplicaVisibilityPolicy {
   owner: "confirmed-only" | "include-pending";
@@ -24,7 +49,8 @@ export function replicaStateVisible(
   if (state === "quarantined")
     return (
       reader === "owner" &&
-      (reason === "copy_conflict" || reason === "finalized_conflict")
+      reason !== undefined &&
+      REPLICA_COPY_CONFLICT_POLICY[reason] !== null
     );
   if (state === "conflicted") return reader === "owner" && origin === "local";
   return (
@@ -57,14 +83,7 @@ export function replicaConnectionVisibility(bindingConflict: boolean) {
 }
 
 /** Copy values remain on the separate owner diagnostic path, never in the reducer. */
-export function replicaCopyConflictMetadata(
-  reason: "copy_conflict" | "finalized_conflict",
-) {
-  return {
-    visibility: "conflicted" as const,
-    status:
-      reason === "copy_conflict"
-        ? ("copy conflict" as const)
-        : ("integrity conflict" as const),
-  };
+export function replicaCopyConflictMetadata(reason: ReplicaCopyConflictReason) {
+  const { visibility, status } = REPLICA_COPY_CONFLICT_POLICY[reason];
+  return { visibility, status };
 }

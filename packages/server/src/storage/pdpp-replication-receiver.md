@@ -103,54 +103,82 @@ The replica read port also owns `changesSince`. Canonical history lacks authorit
 
 ## Owner copy-conflict diagnostics
 
-`readStore({ reader: "owner" }).readCopyConflicts(id)` returns a copy-key-ordered
-array of `{ copyKey, reason, visibility: "conflicted", status, values? }`.
-For `copy_conflict`, `status` is `"copy conflict"` and `values` contains only the
-copy's decoded record operations (`upsert` and `delete`). For
-`finalized_conflict`, `status` is `"integrity conflict"` and `values` is absent.
-Corrupt rejects are separate from retained copies and never appear. Grant
-readers do not have this method, at runtime or in the owner/grant literal types.
-Each call runs in the same SQLite read-snapshot boundary as the other adapter
-reads.
+The owner reader exposes two paginated methods:
 
-The owner HTTP route is `GET /v1/replica/copy-conflicts/:id`; URL-encode the batch
-identity as one path segment. It returns `{ object: "list", data: [...] }` with
-the entries above. It uses `AppDeps.pdpp.reads("owner")`; a host without that
-reader's diagnostic capability returns 404. An active client/grant token or a
-foreign owner gets 403. Missing or inactive authentication uses the existing
-PDPP authentication errors. The route restricts results to the token's currently
-owned connections: every operation in a copy must be in scope, or that copy is
-omitted. A missing batch or a batch outside that scope returns an empty list.
-There is no raw-store fallback or query parameter that selects owner authority.
+- `listCopyConflicts({ instanceIds?, connection?, stream?, limit?, cursor? })`
+  discovers conflicts without decoding values.
+- `readCopyConflicts(id, instanceIds?, { limit?, cursor? })` reads one batch's
+  conflicts with bounded values.
 
-Diagnostics fail as a whole, with no partial response, when a bound is exceeded:
-100 conflicting copies per batch, 256 record operations per copy, 256 KiB of
-UTF-8 JSON record values per copy, 1 MiB of encoded envelope per value-bearing
-copy, and 4 MiB of encoded envelopes across the response. The adapter throws
-`ReplicaCopyConflictLimitError`; HTTP returns 413 with `invalid_request` and no
-`data`. Envelope lengths are checked before fetching or decoding values. A
-finalized marker consumes only the copy-count bound; even a large former
-payload does not prevent a marker or require its values to be decoded.
+Both return `{ data, hasMore, nextCursor? }`. Each entry has
+`{ id, copyKey, reason, visibility: "conflicted", status, connections, streams }`.
+Connections and streams are sorted, distinct arrays. For `copy_conflict`, status
+is `"copy conflict"` and diagnostic `values` contains every decoded operation,
+including connection lifecycle, blob claims, stream invalidation and completion,
+and record upserts and deletes. For `finalized_conflict`, status is
+`"integrity conflict"`; values and omission flags are absent. Corrupt rejects are
+separate and never appear. Grant readers expose neither method at runtime.
+Grant and union reader types expose neither method. Each call uses the adapter's
+SQLite read snapshot.
+
+The owner HTTP routes are:
+
+- `GET /v1/replica/copy-conflicts?connection=…&stream=…&limit=…&cursor=…`
+- `GET /v1/replica/copy-conflicts/:id?limit=…&cursor=…`
+
+URL-encode the batch identity as one path segment. Both return
+`{ object: "list", data: [...], has_more, next_cursor? }`. Filters are optional.
+Every connection touched by a copy must be within the token's currently owned
+scope, for discovery, diagnostics and counts alike. A connection filter does not
+narrow this whole-copy authorization check. Paired connection and stream filters
+must match the same connection's effects. A missing or out-of-scope batch returns
+an empty page. Both routes require `AppDeps.pdpp.reads("owner")` with both methods;
+a host without that capability returns 404. Client/grant and foreign-owner tokens
+get 403. Missing or inactive authentication uses the existing PDPP errors.
+
+Pages default to 25 entries, with limits from 1 to 100. Ordering is by
+`(id, copyKey)` using SQLite binary text order. The bounded keyset cursor is at
+most 4096 bytes and binds the query, endpoint, whole token scope, declarations and
+view layout. Invalid or mismatched cursors get HTTP 400; an expired layout gets 410. Authorization is checked anew on every page. This is a live catalog, not a
+snapshot across requests: new keys before the cursor require a new walk, and
+state changes can remove entries between pages. Cursors contain a retained-row
+anchor and a hash of its key, so even a long batch identity cannot enlarge them.
+If that retained anchor is removed, continuation expires with HTTP 410.
+
+Each value-bearing copy is limited to 512 operations, 4 MiB of UTF-8 JSON values,
+and an 8 MiB encoded envelope. A normal fifty-record batch with 6 KiB records fits.
+An oversized copy keeps its marker with `valuesOmitted: true` and
+`valuesOmittedReason: "operation_limit" | "byte_limit"`; it does not cause a 413
+or hide other copies. Operation and envelope sizes are checked before loading
+values. Diagnostic pages use an 8 MiB response budget, reserving space for the
+cursor and wrapper; full values continue on the next page. Finalized markers
+never load former payloads.
 
 Owner `listStreams` entries have `copyConflicts: n` (HTTP: `copy_conflicts`). This
-is the number of distinct quarantined copies with `copy_conflict` or
-`finalized_conflict` whose operations name that stream in any requested
-connection. A copy touching several requested connections or containing several
-operations for the stream counts once. Conflicts can therefore produce a stream
-entry with zero records and null recency. Ordinary streams report zero. Grant
-entries never contain the field. Disabling pending previews does not disable
-owner diagnostics.
+counts distinct whole copies visible to the same token whose effects touch that
+stream. A connection-level operation affects every currently declared stream of
+that connection. A copy with several operations or connections for one stream
+counts once. This is the number of distinct discovery entries returned by a walk
+filtered to that stream, including finalized markers and omitted-value markers.
+A connection with no declared streams still has discoverable copies through the
+unfiltered or connection-filtered catalog; no stream is invented for its count.
+Conflicts can produce a stream entry with zero records and null recency. Ordinary
+streams report zero; grants never receive this field. Disabling pending previews
+does not disable diagnostics.
 
-View layout 9 derives connection scope facts and per-stream copy counts
-inside the write transaction. Counts are grouped by stream and the sorted set
-of connections touched by that copy's stream operations. Indexed connection
-lookups read each relevant group once, so stream listing does not scan retained
-copies or decode their envelopes, and repeated copies on the same connection set
-do not add read work. Work grows with requested connections, distinct connection
-sets, and listed streams. Construction rebuilds these derived facts from retained
-copies when upgrading an older view. The three copy-summary tables use composite
-primary keys without duplicate rowid indexes to preserve the sparse storage budget. State/reason changes, promotion, and terminal
-transitions update them through triggers with `NOT EXISTS` insertion guards.
+View layout 10 stores one per-copy projection of sorted `(connection, stream)`
+effects, using a null stream for connection-level operations, plus reason and
+size facts. One owner projection interprets these facts for scope, paired filters,
+markers, values and counts. The visibility policy supplies the SQL reason list and
+the production visibility decision. Triggers maintain grouped counts and reverse
+connection indexes in the write transaction, with `NOT EXISTS` insertion guards.
+Listing uses bounded indexed seeks per eligible effect group; counts read each
+group once. Neither scans retained copies nor decodes envelopes for discovery or
+counts. Work grows with requested connections and distinct effect groups, not
+repeated copies in a group. Construction rebuilds the projection from retained
+copies when upgrading. Composite primary keys avoid duplicate rowid indexes. The
+catalog index adds one fixed 4 KiB page to the empty sparse view (32 pages total),
+independent of the canonical record count.
 
 Conflicting values never enter the reducer or canonical materialization. Page and
 point reads retain the confirmed predecessor until promotion. A terminal batch

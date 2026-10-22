@@ -93,3 +93,16 @@ it("maps copy quarantine reasons to distinct owner markers", async () => {
     status: "integrity conflict",
   });
 });
+
+it("declares owner copy reasons and value access in one policy", async () => {
+  const policy = await import("./visibility-policy.js");
+  expect(policy.OWNER_VISIBLE_COPY_REASONS).toEqual([
+    "copy_conflict",
+    "finalized_conflict",
+  ]);
+  expect(policy.REPLICA_COPY_CONFLICT_POLICY.copy_conflict.values).toBe(true);
+  expect(policy.REPLICA_COPY_CONFLICT_POLICY.finalized_conflict.values).toBe(
+    false,
+  );
+  expect(policy.REPLICA_COPY_CONFLICT_POLICY.corruption).toBeNull();
+});

@@ -5,6 +5,7 @@ import {
   identity,
 } from "@opendatalabs/personal-server-ts-core/replication/fixtures";
 import { copyReadFixture } from "./pdpp-replica-copy-reads.test-utils.js";
+import { COPY_CONFLICT_READ_LIMITS } from "./pdpp-replication-receiver.js";
 
 it("owners read both marked copies separately while page and point reads retain the confirmed predecessor, across promotion and restart", () => {
   const f = copyReadFixture();
@@ -29,15 +30,18 @@ it("owners read both marked copies separately while page and point reads retain 
     const owner = f.receiver.readStore({ reader: "owner" });
     const grant = f.receiver.readStore({ reader: "grant" });
     expect("readCopyConflicts" in grant).toBe(false);
-    // @ts-expect-error Grant readers have no owner diagnostic capability.
-    if (false) grant.readCopyConflicts(a.id);
-    expect(owner.readCopyConflicts(a.id)).toEqual(
+    expect("listCopyConflicts" in grant).toBe(false);
+    expect(owner.readCopyConflicts(a.id).data).toEqual(
       keys.sort().map((copyKey) => ({
+        id: a.id,
         copyKey,
+        connections: [identity.connectionId],
+        streams: ["messages"],
         reason: "copy_conflict",
         visibility: "conflicted",
         status: "copy conflict",
-        values: [copyKey === a.copyKey ? a.record : b.record],
+        values:
+          copyKey === a.copyKey ? a.envelope.operations : b.envelope.operations,
       })),
     );
     for (const read of [owner, grant]) {
@@ -49,6 +53,7 @@ it("owners read both marked copies separately while page and point reads retain 
           .listRecords("messages", {
             instanceIds: [identity.connectionId],
             limit: 100,
+            order: "asc",
           })
           .data.map((r) => r.data.text),
       ).toEqual([winner]);
@@ -74,10 +79,13 @@ it("owners read both marked copies separately while page and point reads retain 
   });
   const terminal = () => {
     expect(
-      f.receiver.readStore({ reader: "owner" }).readCopyConflicts(a.id),
+      f.receiver.readStore({ reader: "owner" }).readCopyConflicts(a.id).data,
     ).toEqual(
       [a.copyKey, b.copyKey].sort().map((copyKey) => ({
+        id: a.id,
         copyKey,
+        connections: [identity.connectionId],
+        streams: ["messages"],
         reason: "finalized_conflict",
         visibility: "conflicted",
         status: "integrity conflict",
@@ -124,14 +132,8 @@ it("counts distinct conflicting copies per stream at write time, including copie
         copyConflicts: 2,
       },
     ]);
-    expect(owner.listStreams([other])).toEqual([
-      {
-        stream: "messages",
-        recordCount: 0,
-        lastUpdated: null,
-        copyConflicts: 1,
-      },
-    ]);
+    // A copy also touching another connection is outside this token's scope.
+    expect(owner.listStreams([other])).toEqual([]);
     expect(
       f.receiver
         .readStore({ reader: "grant" })
@@ -166,15 +168,23 @@ it("counts distinct conflicting copies per stream at write time, including copie
   ).not.toHaveProperty("copyConflicts");
 });
 
-it("refuses oversized values without returning a partial conflict list", () => {
+it("includes a normal Node batch of fifty 6 KiB records with every operation", () => {
   const f = copyReadFixture();
-  const a = f.copy("A".repeat(300_000), 1),
-    b = f.copy("B", 2);
+  const records = Array.from({ length: 50 }, (_, i) => ({
+    ...upsert(`op-${i}`, i + 10),
+    recordKey: `key-${i}`,
+    data: { id: `key-${i}`, text: "x".repeat(6 * 1024) },
+  }));
+  const a = f.copy("normal", 1, [registration, ...records]);
   f.stage(a);
-  f.stage(b);
-  expect(() =>
-    f.receiver.readStore({ reader: "owner" }).readCopyConflicts(a.id),
-  ).toThrow("Copy conflict diagnostics exceed the read limit");
+  f.stage(f.copy("small", 2));
+  const page = f.receiver
+    .readStore({ reader: "owner" })
+    .readCopyConflicts(a.id);
+  expect(page.data.find((copy) => copy.copyKey === a.copyKey)?.values).toEqual(
+    a.envelope.operations,
+  );
+  expect(page.data.every((copy) => !("valuesOmitted" in copy))).toBe(true);
 });
 
 it("keeps owner conflict counts when pending preview is disabled and rebuilds them from retained copies on a view upgrade", () => {
@@ -198,147 +208,181 @@ it("keeps owner conflict counts when pending preview is disabled and rebuilds th
   ).toBe(2);
 });
 
-it("hides corrupt rejects and reads copy diagnostics inside one snapshot", () => {
+it("hides corrupt rejects while valid scoped diagnostics survive reopening", () => {
   const f = copyReadFixture();
   const a = f.copy("A", 1),
     b = f.copy("B", 2);
   f.stage({ ...a, fragments: [{ dataHash: "0xZZ", metadataHash: "0x00" }] });
   expect(
-    f.receiver.readStore({ reader: "owner" }).readCopyConflicts(a.id),
+    f.receiver.readStore({ reader: "owner" }).readCopyConflicts(a.id).data,
   ).toEqual([]);
   f.stage(a);
   f.stage(b);
-  const prepare = f.db.prepare.bind(f.db);
-  const queries: string[] = [];
-  f.db.prepare = ((sql: string) => {
-    if (sql.includes("pdpp_replica_copies")) {
-      expect(f.db.inTransaction).toBe(true);
-      queries.push(sql);
-    }
-    return prepare(sql);
-  }) as typeof f.db.prepare;
-  try {
-    expect(
-      f.receiver.readStore({ reader: "owner" }).readCopyConflicts(a.id),
-    ).toHaveLength(2);
-    expect(queries.length).toBeGreaterThan(0);
-  } finally {
-    f.db.prepare = prepare;
-  }
+  const before = f.receiver
+    .readStore({ reader: "owner" })
+    .readCopyConflicts(a.id, [identity.connectionId]);
+  f.reopen();
+  expect(
+    f.receiver
+      .readStore({ reader: "owner" })
+      .readCopyConflicts(a.id, [identity.connectionId]),
+  ).toEqual(before);
 });
 
-it("limits record operations per copy without partial output", () => {
-  const operations = copyReadFixture();
-  const many = Array.from({ length: 257 }, (_, i) => ({
+it("omits an over-limit copy's operations without hiding its normal sibling", () => {
+  const f = copyReadFixture();
+  const many = Array.from({ length: 513 }, (_, i) => ({
     ...upsert(`op-${i}`, i + 10),
     recordKey: `key-${i}`,
   }));
-  const a = operations.copy("A", 1, [registration, ...many]);
-  operations.stage(a);
-  operations.stage(operations.copy("B", 2));
-  expect(() =>
-    operations.receiver.readStore({ reader: "owner" }).readCopyConflicts(a.id),
-  ).toThrow("Copy conflict diagnostics exceed the read limit");
-});
-
-it("limits encoded envelopes while retaining scoped terminal markers", () => {
-  const envelope = copyReadFixture();
-  const large = envelope.copy("A", 1, [
-    registration,
-    { ...upsert("large", 10), data: { id: "a", text: "x".repeat(1_100_000) } },
-  ]);
-  envelope.stage(large);
-  envelope.stage(envelope.copy("B", 2));
-  expect(() =>
-    envelope.receiver
-      .readStore({ reader: "owner" })
-      .readCopyConflicts(large.id),
-  ).toThrow("Copy conflict diagnostics exceed the read limit");
-  envelope.receiver.copies.terminate({
-    credential: "test",
-    id: large.id,
-    reason: "finalized_conflict",
+  const a = f.copy("large", 1, [registration, ...many]),
+    b = f.copy("small", 2);
+  f.stage(a);
+  f.stage(b);
+  const page = f.receiver
+    .readStore({ reader: "owner" })
+    .readCopyConflicts(a.id);
+  expect(page.data).toHaveLength(2);
+  expect(page.data.find((copy) => copy.copyKey === a.copyKey)).toMatchObject({
+    valuesOmitted: true,
+    valuesOmittedReason: "operation_limit",
   });
-  // Terminal diagnostics never read values, so large envelopes do not hide markers.
   expect(
-    envelope.receiver
-      .readStore({ reader: "owner" })
-      .readCopyConflicts(large.id),
-  ).toHaveLength(2);
-  expect(
-    envelope.receiver
-      .readStore({ reader: "owner" })
-      .readCopyConflicts(large.id, [identity.connectionId]),
-  ).toHaveLength(2);
+    page.data.find((copy) => copy.copyKey === a.copyKey),
+  ).not.toHaveProperty("values");
+  expect(page.data.find((copy) => copy.copyKey === b.copyKey)?.values).toEqual(
+    b.envelope.operations,
+  );
 });
 
-it("limits the aggregate diagnostic bytes without partial output", () => {
-  const total = copyReadFixture();
-  for (let seed = 1; seed <= 21; seed++)
-    total.stage(
-      total.copy("A", seed, [
+it.each([5, 9])(
+  "omits a %i MiB copy's values but retains its scoped finalized marker",
+  (mib) => {
+    const f = copyReadFixture();
+    const a = f.copy("large", 1, [
+      registration,
+      {
+        ...upsert("large", 10),
+        data: { id: "a", text: "x".repeat(mib * 1024 * 1024) },
+      },
+    ]);
+    f.stage(a);
+    f.stage(f.copy("small", 2));
+    const owner = f.receiver.readStore({ reader: "owner" });
+    expect(
+      owner
+        .readCopyConflicts(a.id)
+        .data.find((copy) => copy.copyKey === a.copyKey),
+    ).toMatchObject({ valuesOmitted: true, valuesOmittedReason: "byte_limit" });
+    f.receiver.copies.terminate({
+      credential: "test",
+      id: a.id,
+      reason: "finalized_conflict",
+    });
+    for (const scope of [undefined, [identity.connectionId]]) {
+      const markers = owner.readCopyConflicts(a.id, scope).data;
+      expect(markers).toHaveLength(2);
+      expect(
+        markers.every(
+          (copy) =>
+            copy.reason === "finalized_conflict" &&
+            !("values" in copy) &&
+            !("valuesOmitted" in copy),
+        ),
+      ).toBe(true);
+    }
+  },
+);
+
+it("pages complete diagnostic values within a total byte budget without skipping a copy", () => {
+  const f = copyReadFixture();
+  for (let seed = 1; seed <= 3; seed++)
+    f.stage(
+      f.copy("page", seed, [
         registration,
         {
-          ...upsert(`total-${seed}`, seed + 10),
-          data: { id: "a", text: "x".repeat(210_000) },
+          ...upsert(`page-${seed}`, seed + 10),
+          data: { id: "a", text: "x".repeat(3 * 1024 * 1024) },
         },
       ]),
     );
-  expect(() =>
-    total.receiver
-      .readStore({ reader: "owner" })
-      .readCopyConflicts(total.copy("A", 1).id),
-  ).toThrow("Copy conflict diagnostics exceed the read limit");
-});
-
-it("limits marker count after scope filtering while stream counts stay exact", () => {
-  const count = copyReadFixture();
-  for (let seed = 1; seed <= 101; seed++)
-    count.stage(count.copy(`copy-${seed}`, seed));
-  expect(() =>
-    count.receiver
-      .readStore({ reader: "owner" })
-      .readCopyConflicts(count.copy("A", 1).id),
-  ).toThrow("Copy conflict diagnostics exceed the read limit");
-  expect(
-    count.receiver
-      .readStore({ reader: "owner" })
-      .listStreams([identity.connectionId])[0].copyConflicts,
-  ).toBe(101);
-  expect(
-    count.receiver
-      .readStore({ reader: "owner" })
-      .readCopyConflicts(count.copy("A", 1).id, ["out-of-scope"]),
-  ).toEqual([]);
-});
-
-it("does not fetch the envelope column for finalized markers, including scoped reads", () => {
-  const f = copyReadFixture();
-  const a = f.copy("A", 1);
-  f.stage(a);
-  f.stage(f.copy("B", 2));
-  f.receiver.copies.terminate({
-    credential: "test",
-    id: a.id,
-    reason: "finalized_conflict",
-  });
-  // Fault the payload column while keeping real SQLite metadata and scope facts.
-  // A marker-only read must succeed even if the payload source cannot be read.
-  f.db.function("forbidden_copy_payload", () => {
-    throw new Error("finalized payload was fetched");
-  });
-  f.db.exec(`ALTER TABLE pdpp_replica_copies RENAME TO retained_copy_rows;
-    CREATE VIEW pdpp_replica_copies AS SELECT id,copy_key,state,reason,
-    forbidden_copy_payload() AS envelope_json FROM retained_copy_rows;`);
   const owner = f.receiver.readStore({ reader: "owner" });
-  for (const scope of [undefined, [identity.connectionId]]) {
-    const markers = owner.readCopyConflicts(a.id, scope);
-    expect(markers).toHaveLength(2);
-    expect(
-      markers.every(
-        (marker) =>
-          marker.reason === "finalized_conflict" && !("values" in marker),
-      ),
-    ).toBe(true);
-  }
+  const first = owner.readCopyConflicts(f.copy("page", 1).id);
+  expect(first.hasMore).toBe(true);
+  expect(first.data).toHaveLength(2);
+  const second = owner.readCopyConflicts(f.copy("page", 1).id, undefined, {
+    cursor: first.nextCursor,
+  });
+  expect(second.hasMore).toBe(false);
+  expect(second.data).toHaveLength(1);
+  expect(
+    new Set([...first.data, ...second.data].map((copy) => copy.copyKey)).size,
+  ).toBe(3);
+  expect(
+    [...first.data, ...second.data].every(
+      (copy) => copy.values?.length === 2 && !copy.valuesOmitted,
+    ),
+  ).toBe(true);
+});
+
+it("pages more than a hundred markers while preserving exact scoped counts", () => {
+  const f = copyReadFixture();
+  for (let seed = 1; seed <= 101; seed++) f.stage(f.copy(`copy-${seed}`, seed));
+  const owner = f.receiver.readStore({ reader: "owner" });
+  const id = f.copy("A", 1).id;
+  const first = owner.readCopyConflicts(id, undefined, { limit: 100 });
+  expect(first.data).toHaveLength(100);
+  expect(first.hasMore).toBe(true);
+  const second = owner.readCopyConflicts(id, undefined, {
+    limit: 100,
+    cursor: first.nextCursor,
+  });
+  expect(second.data).toHaveLength(1);
+  expect(second.hasMore).toBe(false);
+  expect(owner.listStreams([identity.connectionId])[0].copyConflicts).toBe(101);
+  expect(owner.readCopyConflicts(id, ["out-of-scope"]).data).toEqual([]);
+});
+
+it("includes page metadata and cursors in the response byte budget", () => {
+  const f = copyReadFixture();
+  const targetEntryBytes = COPY_CONFLICT_READ_LIMITS.totalBytes / 2 - 10;
+  const copies = [1, 2].map((seed) => {
+    const empty = f.copy("page", seed);
+    const entry = {
+      id: empty.id,
+      copyKey: empty.copyKey,
+      reason: "copy_conflict",
+      visibility: "conflicted",
+      status: "copy conflict",
+      connections: [identity.connectionId],
+      streams: ["messages"],
+      values: empty.envelope.operations,
+    };
+    const text = "x".repeat(
+      targetEntryBytes -
+        Buffer.byteLength(JSON.stringify(entry)) +
+        empty.record.data.text.length,
+    );
+    return f.copy("page", seed, [
+      registration,
+      { ...empty.record, data: { id: "a", text } },
+    ]);
+  });
+  copies.forEach((copy) => f.stage(copy));
+  const owner = f.receiver.readStore({ reader: "owner" });
+  const first = owner.readCopyConflicts(copies[0].id);
+  expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(
+    COPY_CONFLICT_READ_LIMITS.totalBytes,
+  );
+  expect(first.hasMore).toBe(true);
+  const second = owner.readCopyConflicts(copies[0].id, undefined, {
+    cursor: first.nextCursor,
+  });
+  expect(Buffer.byteLength(JSON.stringify(second))).toBeLessThanOrEqual(
+    COPY_CONFLICT_READ_LIMITS.totalBytes,
+  );
+  expect(second.hasMore).toBe(false);
+  expect(
+    [...first.data, ...second.data].map((copy) => copy.copyKey).sort(),
+  ).toEqual(copies.map((copy) => copy.copyKey).sort());
 });
