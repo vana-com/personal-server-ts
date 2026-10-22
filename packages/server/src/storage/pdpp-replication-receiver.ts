@@ -822,23 +822,32 @@ export function createReplicaReceiver(deps: {
   type ByteCopy = { size: number; chunks: () => Iterable<Uint8Array> };
   /**
    * A stored copy, "absent", or "invalid": a published manifest whose size is
-   * not a safe non-negative integer. binaryLength reports both of the last
-   * two as undefined; a legacy row's size is length(bytes) and is always valid.
+   * not a safe non-negative integer. The manifest is checked on its own,
+   * because binaryLength reports a legacy row first and would mask it; a
+   * legacy row's size is length(bytes) and is always valid.
    */
   function namespaceCopy(
     namespace: BinaryNamespace,
     id: string,
   ): ByteCopy | "absent" | "invalid" {
-    const size = binaryLength(db, namespace, id);
-    if (size !== undefined)
-      return { size, chunks: () => readBinaryChunks(db, namespace, id) };
-    return db
+    const manifest = db
       .prepare(
-        "SELECT 1 FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
+        "SELECT size_bytes AS size FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
       )
-      .get(namespace, id)
-      ? "invalid"
-      : "absent";
+      .get(namespace, id) as { size: unknown } | undefined;
+    if (
+      manifest &&
+      !(
+        typeof manifest.size === "number" &&
+        Number.isSafeInteger(manifest.size) &&
+        manifest.size >= 0
+      )
+    )
+      return "invalid";
+    const size = binaryLength(db, namespace, id);
+    return size === undefined
+      ? "absent"
+      : { size, chunks: () => readBinaryChunks(db, namespace, id) };
   }
   /** Custody of batches still pending: legacy rows, then chunks, by batch. */
   function* pendingCopies(blobId: string): Generator<ByteCopy> {
