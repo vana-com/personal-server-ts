@@ -89,7 +89,8 @@ export interface SyncSessionOptions {
   maxStateBytes?: number;
   /**
    * Candidate rows one owner's prepared sessions may hold. A window over it
-   * expires (410); the client restarts from `beginning`, which needs none.
+   * expires (410); the client restarts from `beginning`, which prepares the
+   * first-sync candidate set too.
    */
   maxPreparedRowsPerOwner?: number;
 }
@@ -440,8 +441,10 @@ export type PdppSyncSessionService = ReturnType<
 
 /**
  * One request's budget: `units` of store work, and for a candidate request a
- * deadline. The first unit is always granted, so every request makes
- * progress and a session always finishes.
+ * deadline. The first logical unit is always granted, so every request makes
+ * progress. A session can finish when its data is within the supported
+ * envelope, its state remains retained, and retries arrive before expiry or
+ * eviction.
  */
 function requestBudget(
   units: number,

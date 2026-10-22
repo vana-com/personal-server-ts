@@ -16,7 +16,7 @@ them.
 | Invariant                                                          | Owner                                                                                                                                                                                                                                                                                                                                                                                             |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Which change a session discloses                                   | `disclose` in the session service. Profiles differ only in policy.                                                                                                                                                                                                                                                                                                                                |
-| Page boundaries, `has_more` and work per request                   | The session service. It counts only disclosed items and owns one budget per request: `maxExaminedPerRequest` units (default 10,000), where a unit is one history row read or one index seek, and for a candidate request `maxScanMillis` (default 2 s). Until a request has finished one unit of work, the budget always grants, so every request makes progress.                                 |
+| Page boundaries, `has_more` and work per request                   | Pages count disclosed items. The session service owns a per-request `maxExaminedPerRequest` budget (10,000 logical units): one per history row or prepared identity. An identity may use several indexed seeks; the budget does not count each seek. Candidate requests also have `maxScanMillis` (2 s). The first unit is always granted, so every request makes progress.                       |
 | Token format, role, binding and integrity                          | The session service: fixed-length handles for every page cursor and every candidate checkpoint, naming server-side state; readable checkpoints for the current profile.                                                                                                                                                                                                                           |
 | History at a horizon, reset fence, horizon validation, preparation | Each store. `prepareSyncWindow` builds the session's candidate set in budgeted steps: the keys of the request's instances written in the window, or held at the horizon for a first sync. It stores its own progress in the same transaction as the candidates. `readSyncWindow` then seeks the candidate set's primary key one identity at a time. No step groups, sorts or skips over versions. |
 | One record per id on the wire                                      | `assertOnlyHolder` in the session service and `listSnapshotPage` for lists; the detail route for single reads.                                                                                                                                                                                                                                                                                    |
@@ -35,7 +35,7 @@ AS issues only when `pdpp.protocolProfile` is `candidate-0.1.0`.
 
 | Finding (design test)                                              | Class | Result                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------------------------------------------------------ | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Hidden rows consume pages or add empty pages (04–08)               | A     | A page holds only disclosed items. A session with only hidden changes is one empty terminal page.                                                                                                                                                                                                                                                                                                                                             |
+| Hidden rows consume pages or add empty pages (04–08)               | A     | Both disclose visible items. Candidate: hidden-only preparation or scanning may return `429` before the terminal empty page. Current: preparation or budget exhaustion may return an empty `has_more: true` page early (deliberate compatibility exception).                                                                                                                                                                                  |
 | Empty or tombstone-only granted stream is not discoverable (23–24) | A     | A client token lists every granted stream, with `record_count: 0` when it holds no visible record.                                                                                                                                                                                                                                                                                                                                            |
 | Checkpoint horizon ahead of the store clock (18, current part)     | A     | `410 cursor_expired`.                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | A sync read advances the write clock                               | A     | It no longer does.                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -107,20 +107,24 @@ a changed `limit`, retries, and a SQLite restart followed by a reset.
   hidden changes or a slow store caused it. This is the chosen trade-off, not
   non-interference: with the same visible records, enough hidden changes turn
   a `200` into one or more `429`s. A request whose budget runs out exactly at
-  the end pays one extra `429`. Every retry examines at least one new change,
-  so a session always finishes.
-- Store work per request is bounded in SQLite. Every session, a first sync
-  included, first prepares its candidate set: each history row of the
-  request's instances is read once, one at a time from the horizon index
-  (each `written_at` is unique), costs one unit, and adds its key once. A
-  key with many versions costs one unit per version, spread over requests,
-  never one unbounded seek. A candidate request answers `429` until
-  preparation is done; a current-profile request returns its early, possibly
-  empty page with `has_more`. Pages then seek the candidate set's primary key,
-  so each seek visits one index entry, and the set holds only granted
-  instances, so there is nothing to skip. Tests compare the median SQLite time
-  per request for keys with 2 and with 300 versions, the most rows one request
-  reads or writes for 1,000 and 4,000 keys, and every sync read's plan.
+  the end pays one extra `429`. Each retry makes progress. A session can finish
+  when its data is within the supported envelope, its state remains retained,
+  and retries arrive before expiry or eviction.
+- Store work per request is bounded in SQLite by logical history rows and
+  prepared identities. Every session, including a first sync, prepares its
+  candidate set: each history row of the request's instances is read once,
+  one at a time from the horizon index (each `written_at` is unique), costs
+  one unit, and adds its key once. A key with many versions costs one unit per
+  version, spread over requests. Reading one prepared identity may also use a
+  constant-factor bundle of indexed seeks: the candidate seek and lookups at
+  the high and before horizons, plus a deletion-after-high lookup when needed.
+  These physical seeks are not separate budget units. A candidate request
+  answers `429` until preparation is done; a current-profile request may
+  return its early, possibly empty page with `has_more`. Pages seek the
+  candidate set's primary key, and the set holds only granted instances, so
+  there is nothing to skip. Tests compare the median SQLite time per request
+  for keys with 2 and with 300 versions, the most rows one request reads or
+  writes for 1,000 and 4,000 keys, and every sync read's plan.
 - One request reads at most 64 instances (`MAX_SYNC_INSTANCES`); a stream
   spanning more connections answers `403 disclosure_unavailable`. The
   one-record-per-key check runs for the current profile only, since candidate
