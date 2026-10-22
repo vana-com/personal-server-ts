@@ -4291,7 +4291,7 @@ function generationAwareUnquarantined(alias: string, generationSql?: string) {
  * value stays visible once the reset is promoted.
  */
 function pendingResetUnderQuarantine(
-  predicate: "store" | "contract",
+  predicate: "store" | "contract" | "defaulted",
   factGeneration: 1 | 2,
 ) {
   const d = device();
@@ -4312,7 +4312,17 @@ function pendingResetUnderQuarantine(
     store:
       predicate === "store"
         ? d.store
-        : { ...d.store, unquarantinedRecordSql: generationAwareUnquarantined },
+        : {
+            ...d.store,
+            unquarantinedRecordSql:
+              predicate === "contract"
+                ? generationAwareUnquarantined
+                : // A conforming store may default the optional argument.
+                  (
+                    alias: string,
+                    generationSql: string | undefined = undefined,
+                  ) => generationAwareUnquarantined(alias, generationSql),
+          },
     owner: "owner",
     enabled: true,
     authenticate: (c) => (c === "replica-secret" ? "owner" : undefined),
@@ -4360,6 +4370,10 @@ it.fails.each([1, 2] as const)(
 it.each([1, 2] as const)(
   "applies a generation-%i key fact to a pending reset's value by the value's generation (agreed predicate contract)",
   (generation) => pendingResetUnderQuarantine("contract", generation),
+);
+it.each([1, 2] as const)(
+  "applies a generation-%i key fact to a pending reset's value by the value's generation (contract with a default parameter)",
+  (generation) => pendingResetUnderQuarantine("defaulted", generation),
 );
 
 /** A generation-2 key fact while the binding, canonical and local rows are at 1. */
