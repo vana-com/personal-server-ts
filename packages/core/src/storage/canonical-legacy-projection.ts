@@ -54,7 +54,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/8";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/9";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -375,6 +375,7 @@ export async function readCanonicalLegacyScope(
             : MAX_BLOB_READ_BYTES,
           input.requireCompletionReceipts === true,
           input.allowUnprovenEmptyStreams === true,
+          new Set(binding.ancillaryBlobStreams),
           input.declarations,
         ),
   );
@@ -419,6 +420,7 @@ function collectSnapshot(
   blobByteBudget: number,
   requireCompletionReceipts: boolean,
   allowUnprovenEmptyStreams: boolean,
+  ancillaryBlobStreams: ReadonlySet<string>,
   declarations?: Pick<StreamDeclarationRegistry, "forInstance">,
 ): Snapshot | { ok: false; result: CanonicalLegacyReadResult } {
   const { instance } = selection;
@@ -505,6 +507,8 @@ function collectSnapshot(
   let requiredBytes = 0;
   const declaredBlobIds = new Set<string>();
   for (const stream of streams) {
+    // The binding projects these rows from their typed fields alone.
+    if (ancillaryBlobStreams.has(stream)) continue;
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (blobBacked.length === 0) continue;
     const projectedField = declaredBlobField(streamSchemas[stream]);
@@ -719,6 +723,7 @@ async function projectSnapshot(
     }
   }
   for (const stream of streams) {
+    if (binding.ancillaryBlobStreams?.includes(stream)) continue;
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (
       canExpandClaude &&
@@ -1025,22 +1030,10 @@ function rejection(
   error: ProjectionError,
   sourceRowCounts: Record<string, number>,
 ): CanonicalLegacyReadResult {
-  if (
-    error.kind === "unknown_scope" ||
-    error.kind === "unsupported_profile" ||
-    error.kind === "gap"
-  ) {
+  if (error.kind === "unknown_scope" || error.kind === "unsupported_profile") {
     return unavailable({
       reason: "unbound_scope",
-      lookup:
-        error.kind === "gap"
-          ? {
-              kind: "gap",
-              scope: error.scope,
-              reason: error.reason,
-              provenanceChecked: [],
-            }
-          : error,
+      lookup: error,
     });
   }
   return {

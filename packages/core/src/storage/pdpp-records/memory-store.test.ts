@@ -673,3 +673,83 @@ describe("memory record store: changes_since", () => {
     ).toThrow();
   });
 });
+
+describe("list snapshot completeness", () => {
+  it.each(["asc", "desc"] as const)(
+    "keeps each original row once after mutations (%s)",
+    (order) => {
+      const store = createMemoryRecordStore();
+      const write = (key: string, day: number) =>
+        store.ingestBatch(
+          [
+            {
+              instance: "inst_1",
+              stream: "playlists",
+              key,
+              data: { id: key, name: `day-${day}` },
+              emitted_at: `2026-04-0${day}T00:00:00.000Z`,
+            },
+          ],
+          playlistsSemantics,
+          playlistsPk,
+        );
+      ["a", "b", "c"].forEach((key, i) => write(key, i + 1));
+      const first = store.listRecords("playlists", {
+        instanceIds: ["inst_1"],
+        limit: 1,
+        order,
+      });
+      write("a", 4);
+      write("b", 5);
+      write("d", 6);
+
+      const rows = [...first.data];
+      let cursor = first.nextCursor;
+      for (let n = 0; cursor && n < 10; n++) {
+        const page = store.listRecords("playlists", {
+          instanceIds: ["inst_1"],
+          limit: 1,
+          order,
+          cursor,
+        });
+        rows.push(...page.data);
+        cursor = page.nextCursor;
+      }
+      expect(rows.map((r) => r.recordKey)).toEqual(
+        order === "asc" ? ["a", "b", "c"] : ["c", "b", "a"],
+      );
+      expect(rows.find((r) => r.recordKey === "b")?.data.name).toBe("day-2");
+    },
+  );
+  it("continues tied timestamps and keys across distinct instances", () => {
+    const store = createMemoryRecordStore();
+    for (const instance of ["inst_1", "inst_2"])
+      store.ingestBatch(
+        [
+          {
+            instance,
+            stream: "playlists",
+            key: "a",
+            data: { id: "a" },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        playlistsSemantics,
+        playlistsPk,
+      );
+    const opts = {
+      instanceIds: ["inst_1", "inst_2"],
+      limit: 1,
+      order: "asc" as const,
+    };
+    const first = store.listRecords("playlists", opts);
+    const second = store.listRecords("playlists", {
+      ...opts,
+      cursor: first.nextCursor,
+    });
+    expect([...first.data, ...second.data].map((r) => r.instance)).toEqual([
+      "inst_1",
+      "inst_2",
+    ]);
+  });
+});

@@ -2230,6 +2230,9 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
     lossy: [
       "href is reconstructed from the retained Claude route convention; rawContent and unavailable fetchError are omitted.",
     ],
+    // The live declaration's conversation blob_ref is the raw envelope; its
+    // typed record and messages are complete without it.
+    ...(live ? { ancillaryBlobStreams: ["conversations"] } : {}),
     provenance: live
       ? [
           {
@@ -2282,6 +2285,7 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
           },
         };
       const projected = [];
+      let unknownMessageCounts = 0;
       for (const conversation of conversations) {
         if (
           typeof conversation.id !== "string" ||
@@ -2339,11 +2343,15 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
               attachments: message.attachments ?? [],
             };
           });
-        const messageCount =
-          typeof conversation.message_count === "number"
-            ? conversation.message_count
-            : messages.length;
-        if (messageCount !== messages.length)
+        // Only the source's own count proves the fetched messages are the
+        // whole conversation. Without one (anthropic-live writes null when
+        // the run did not read the detail) the conversation is reported
+        // partial, never certified complete. messageCount stays the number
+        // of messages collected, as the legacy schema defines it.
+        const sourceCount = conversation.message_count ?? null;
+        const messageCount = messages.length;
+        if (sourceCount === null) unknownMessageCounts += 1;
+        else if (sourceCount !== messageCount)
           return {
             ok: false,
             error: {
@@ -2365,16 +2373,22 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
           messages,
         });
       }
+      const diagnostics = partialRows(
+        scope,
+        "conversations",
+        "message_count_unknown",
+        unknownMessageCounts,
+      );
       return {
         ok: true,
+        ...(diagnostics.length > 0 ? { diagnostics } : {}),
         payload: {
           profile: metadata.profile,
           organizationId: metadata.organizationId,
           conversations: projected,
           total: projected.length,
           messageTotal: projected.reduce(
-            (total, conversation) =>
-              total + (conversation.messageCount as number),
+            (total, conversation) => total + conversation.messageCount,
             0,
           ),
           source: live ? "live-session" : "official-export",
@@ -4604,10 +4618,6 @@ const wholefoodsNutrition: LegacyScopeBinding = {
   },
 };
 
-// amazon.profile is a documented GAP: no `profile` stream exists on the
-// amazon collection-profile.json at all (verified: exactly 2 streams,
-// orders and order_items) — legacy's `name`/`isPrime` have no PDPP source.
-
 // iCloud Notes is bound to the signed 0.1.0 collection profile. Desktop
 // admission and ingest projection are separate gates.
 const icloudNoteFolders: LegacyScopeBinding = {
@@ -4910,10 +4920,3 @@ export const LEGACY_SCOPE_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
       "strava.coverage_diagnostics": stravaCoverageDiagnostics,
     }),
   );
-
-/** Known legacy contracts checked against signed declarations but not
- * projectable without fabricating fields or changing the retained contract. */
-export const LEGACY_SCOPE_GAPS: ReadonlyMap<
-  string,
-  { reason: string; provenanceChecked: LegacyScopeBindingProvenance[] }
-> = new Map([]);

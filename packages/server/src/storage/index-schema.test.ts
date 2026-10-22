@@ -154,6 +154,7 @@ describe("initializeDatabase", () => {
       "scope",
       "instance",
       "generation",
+      "method",
       "superseded_version",
       "superseded_cas_revision",
       "superseded_collected_at",
@@ -161,6 +162,45 @@ describe("initializeDatabase", () => {
       "taken_over_at",
     ]);
     db.close();
+  });
+
+  it("adds the takeover method to a v14 ledger without changing its version", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "legacy-takeover-schema-"));
+    try {
+      const path = join(dir, "index.db");
+      // A v14 ledger as a runtime pinned before the method column wrote it.
+      const old = new Database(path);
+      old.exec(`CREATE TABLE legacy_scope_takeovers (
+        scope TEXT NOT NULL,
+        instance TEXT NOT NULL DEFAULT '',
+        generation INTEGER NOT NULL DEFAULT 1,
+        superseded_version INTEGER NOT NULL,
+        superseded_cas_revision INTEGER NOT NULL,
+        superseded_collected_at TEXT NOT NULL,
+        superseded_path TEXT NOT NULL,
+        taken_over_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (scope, instance, generation, superseded_path)
+      )`);
+      old
+        .prepare(
+          `INSERT INTO legacy_scope_takeovers
+            (scope, instance, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+            VALUES ('oura.sleep', 'oura:owner', 1, 1, '2026-01-01T00:00:00Z', 'oura/sleep/old.json')`,
+        )
+        .run();
+      old.pragma("user_version = 14");
+      old.close();
+
+      const db = initializeDatabase(path);
+      // The version stays 14, so a runtime pinned before this can still open it.
+      expect(db.pragma("user_version", { simple: true })).toBe(14);
+      expect(
+        db.prepare("SELECT instance, method FROM legacy_scope_takeovers").all(),
+      ).toEqual([{ instance: "oura:owner", method: "" }]);
+      db.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("migrates a v8 takeover ledger without losing its recorded file", async () => {
@@ -289,6 +329,7 @@ describe("initializeDatabase", () => {
           scope: "oura.activity",
           instance: "bound-owner",
           generation: 4,
+          method: "",
           superseded_version: 22,
           superseded_cas_revision: 31,
           superseded_collected_at: "2026-01-01T00:00:00Z",
@@ -299,6 +340,7 @@ describe("initializeDatabase", () => {
           scope: "strava.activities",
           instance: "unbound-owner",
           generation: 1,
+          method: "",
           superseded_version: 8,
           superseded_cas_revision: 9,
           superseded_collected_at: "2026-03-01T00:00:00Z",

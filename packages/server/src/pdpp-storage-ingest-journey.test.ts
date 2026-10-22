@@ -1710,7 +1710,7 @@ describe("P10c and method authority over HTTP", () => {
     expect(bindingRows()).toBe(2);
   });
 
-  it("keeps a keyset cursor valid across later writes without a reset", async () => {
+  it("keeps a keyset snapshot valid and excludes later writes without a reset", async () => {
     const { token } = await bootSwitchable();
     const instance = `oura:${owner}`;
     await seedEvents(token, instance, ["a1", "a2"]);
@@ -1726,7 +1726,7 @@ describe("P10c and method authority over HTTP", () => {
       `/v1/streams/events/records?order=asc&limit=5&cursor=${encodeURIComponent(page1.body.next_cursor)}`,
     );
     expect(page2.status).toBe(200);
-    expect(page2.body.data.map((r: any) => r.id)).toEqual(["a2", "a3"]);
+    expect(page2.body.data.map((r: any) => r.id)).toEqual(["a2"]);
   });
 
   it("rejects an unknown method and another source's method as method_inactive", async () => {

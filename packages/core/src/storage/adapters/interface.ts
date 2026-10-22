@@ -7,6 +7,11 @@ import type { ByteBudget } from "../../additions/budget.js";
 export interface StorageAdapter {
   /**
    * Upload an encrypted blob to the storage backend.
+   *
+   * A key names one data version, so a backend that can refuse to replace
+   * stored bytes (vana-storage keys are write-once) must do so: re-sending
+   * identical bytes succeeds, and different bytes throw
+   * {@link StoredBlobConflictError} with the stored bytes left unchanged.
    * @param key - unique storage key / path
    * @param data - encrypted binary data
    * @returns URL where the blob is accessible
@@ -63,4 +68,16 @@ export interface StorageAdapter {
    * @returns count of blobs deleted
    */
   deleteAll?(): Promise<number>;
+}
+
+/**
+ * The upload key already holds different bytes, which the backend kept.
+ * Callers decide whether those bytes are theirs (same plaintext, different
+ * ciphertext) or another writer's.
+ */
+export class StoredBlobConflictError extends Error {
+  constructor(readonly key: string) {
+    super(`Storage key ${key} already holds different bytes`);
+    this.name = "StoredBlobConflictError";
+  }
 }

@@ -25,6 +25,7 @@ import pino from "pino";
 import {
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
+  PDPP_DATA_ACCESS_TYPE_CANDIDATE,
   PDPP_API_VERSION,
   AuthorizationSessionStore,
   openPdppAuthStore,
@@ -35,7 +36,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pdppAsMetadataHandler, pdppAuthRoutes } from "./pdpp-auth.js";
 
-function harness() {
+function harness(protocolProfile: "current" | "candidate-0.1.0" = "current") {
   const dir = mkdtempSync(join(tmpdir(), "pdpp-md-"));
   const store = openPdppAuthStore(join(dir, "auth.db"));
   const app = new Hono();
@@ -43,11 +44,12 @@ function harness() {
   // RFC 8414 location at the root, which lies outside that prefix.
   app.get(
     "/.well-known/oauth-authorization-server/pdpp/v1",
-    pdppAsMetadataHandler("https://ps.example.com"),
+    pdppAsMetadataHandler("https://ps.example.com", protocolProfile),
   );
   app.route(
     "/pdpp/v1",
     pdppAuthRoutes({
+      protocolProfile,
       logger: pino({ level: "silent" }),
       store,
       tokens: new PdppTokenService(store),
@@ -68,8 +70,8 @@ function harness() {
 }
 
 describe("PDPP AS metadata", () => {
-  it("advertises both PDPP authorization-details types", async () => {
-    const { app, cleanup } = harness();
+  it("advertises current, private-v0.2 and explicit candidate profiles", async () => {
+    const { app, cleanup } = harness("candidate-0.1.0");
     try {
       const response = await app.request(
         "/pdpp/v1/.well-known/oauth-authorization-server",
@@ -83,6 +85,7 @@ describe("PDPP AS metadata", () => {
       expect(body.authorization_details_types_supported).toEqual([
         PDPP_DATA_ACCESS_TYPE,
         PDPP_DATA_ACCESS_TYPE_V02,
+        PDPP_DATA_ACCESS_TYPE_CANDIDATE,
       ]);
     } finally {
       cleanup();
@@ -192,4 +195,18 @@ describe("PDPP AS metadata: RFC 8414 discovery location", () => {
       cleanup();
     }
   });
+});
+
+it("hides the candidate type unless the deployment opts into its profile", async () => {
+  const { app, cleanup } = harness();
+  try {
+    const res = await app.request(
+      "/pdpp/v1/.well-known/oauth-authorization-server",
+    );
+    expect(
+      (await res.json()).authorization_details_types_supported,
+    ).not.toContain(PDPP_DATA_ACCESS_TYPE_CANDIDATE);
+  } finally {
+    cleanup();
+  }
 });

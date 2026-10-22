@@ -51,19 +51,52 @@ describe("sqlite record store", () => {
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
   });
 
+  it("serves the first historical list page without scanning each record's whole instance history", () => {
+    for (let version = 1; version <= 2; version++) {
+      const envelopes = Array.from({ length: 5000 }, (_, i) => ({
+        instance: "inst_1",
+        stream: "playlists",
+        key: `r${i}`,
+        data: { id: `r${i}`, value: version },
+        emitted_at: `2026-04-0${version}T00:00:00.${String(i).padStart(6, "0")}Z`,
+      }));
+      expect(
+        store.ingestBatch(envelopes, playlistsSemantics, playlistsPk).accepted,
+      ).toBe(5000);
+    }
+    const started = performance.now();
+    const page = store.listRecords("playlists", {
+      instanceIds: ["inst_1"],
+      limit: 100,
+      order: "asc",
+    });
+    expect(page.data).toHaveLength(100);
+    // A large margin above an indexed seek; the faulty correlated scan takes
+    // seconds even for this small history, before a client can get page one.
+    expect(performance.now() - started).toBeLessThan(1000);
+  }, 30_000);
+
   it("uses a covering index for per-instance stream summaries", () => {
+    // Plan the exact SELECT `listStreams` prepares, not a copy of it.
+    const prepared: string[] = [];
+    const prepare = db.prepare.bind(db);
+    db.prepare = ((sql: string) => {
+      prepared.push(sql);
+      return prepare(sql);
+    }) as typeof db.prepare;
+    try {
+      store.listStreams(["inst_1"]);
+    } finally {
+      db.prepare = prepare as typeof db.prepare;
+    }
+    const summary = prepared.find((sql) => /GROUP BY stream/.test(sql));
+    expect(summary).toBeDefined();
     const plan = db
-      .prepare(
-        `EXPLAIN QUERY PLAN
-         SELECT stream, COUNT(*) as count, MAX(emitted_at) as last_updated
-         FROM pdpp_records
-         WHERE deleted = 0 AND instance IN (?)
-         GROUP BY stream`,
-      )
+      .prepare(`EXPLAIN QUERY PLAN ${summary}`)
       .all("inst_1") as Array<{ detail: string }>;
 
-    expect(plan.map((row) => row.detail).join("\n")).toContain(
-      "idx_pdpp_records_live_instance_stream_emitted_at",
+    expect(plan.map((row) => row.detail).join("\n")).toMatch(
+      /USING COVERING INDEX idx_pdpp_records_live_instance_stream_emitted_key/,
     );
   });
 
@@ -943,7 +976,7 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 12 });
+        ).toEqual({ version: 14 });
         expect(
           dbAfterUpgrade
             .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
@@ -1229,7 +1262,7 @@ describe("sqlite record store", () => {
       expect(fresh.data.map((r) => r.recordKey)).toEqual(["b1"]);
     });
 
-    it("keeps list cursors valid across writes and resets of instances they do not read", () => {
+    it("keeps list snapshots valid across writes and unrelated instance resets", () => {
       seedA();
       store.registerConnection({
         instance: "inst_c",
@@ -1264,7 +1297,7 @@ describe("sqlite record store", () => {
         order: "asc",
         cursor: page1.nextCursor,
       });
-      expect(page2.data.map((r) => r.recordKey)).toEqual(["c2", "c3"]);
+      expect(page2.data.map((r) => r.recordKey)).toEqual(["c2"]);
     });
 
     it("rejects a minted list cursor reused against a different stream", () => {
@@ -1434,5 +1467,66 @@ describe("sqlite record store", () => {
       expect(store.getBlobBytes(blob.blobId)).toBeUndefined();
       expect(store.getBlobMeta(blob.blobId)).toBeUndefined();
     });
+  });
+});
+
+describe("v13 emitted-time order key", () => {
+  it("backfills the key on upgrade so existing rows list and summarize by instant", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-v13-"));
+    const path = join(dir, "records.db");
+    try {
+      const before = new Database(path);
+      const store = createTestBoundRecordStore(before);
+      store.ingestBatch(
+        [
+          ["late", "2026-01-01T09:00:00Z"],
+          ["early", "2026-01-01T10:00:00+02:00"],
+        ].map(([key, emitted_at]) => ({
+          instance: "inst_1",
+          stream: "events",
+          key: key!,
+          data: { id: key },
+          emitted_at: emitted_at!,
+        })),
+        () => "mutable_state",
+        () => ["id"],
+      );
+      // Rewind to a v12 database: no key on any row.
+      before.exec(`
+        UPDATE pdpp_records SET emitted_key = NULL;
+        UPDATE pdpp_record_changes SET emitted_key = NULL;
+        UPDATE pdpp_schema_version SET version = 12;
+      `);
+      before.close();
+
+      const after = new Database(path);
+      try {
+        const upgraded = createSqliteRecordStore(after);
+        expect(
+          after.prepare("SELECT version FROM pdpp_schema_version").get(),
+        ).toEqual({ version: 14 });
+        expect(
+          upgraded
+            .listRecords("events", {
+              instanceIds: ["inst_1"],
+              limit: 10,
+              order: "asc",
+            })
+            .data.map((r) => r.recordKey),
+        ).toEqual(["early", "late"]);
+        // The latest emitted time is the latest instant, in its stored spelling.
+        expect(upgraded.listStreams(["inst_1"])).toEqual([
+          {
+            stream: "events",
+            recordCount: 2,
+            lastUpdated: "2026-01-01T09:00:00Z",
+          },
+        ]);
+      } finally {
+        after.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
