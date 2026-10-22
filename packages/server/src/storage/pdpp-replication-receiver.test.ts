@@ -3757,6 +3757,104 @@ it.each([
   },
 );
 
+// A repair write can add a legacy row beside a malformed manifest in the same
+// namespace. The legacy row's length must not mask the manifest.
+it.each([
+  ["received", -1],
+  ["received", 1.5],
+  ["received", 2 ** 53],
+  ["canonical", -1],
+  ["canonical", 1.5],
+  ["canonical", 2 ** 53],
+] as const)(
+  "a malformed %s manifest (size %s) still vetoes after a repair write adds a legacy row",
+  (namespace, malformed) => {
+    const source = device(),
+      target = device();
+    const bytes = new Uint8Array([1, 2, 3]);
+    const blob = source.store.storeBlobBytesForInstance({
+      instance: "conn_a",
+      method: "collector",
+      generation: 1,
+      bytes,
+      mimeType: "application/octet-stream",
+    });
+    source.store.ingestBatch(
+      [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          emitted_at: at,
+          data: {
+            id: "a",
+            blob_ref: {
+              blob_id: blob.blobId,
+              sha256: blob.sha256,
+              size_bytes: blob.sizeBytes,
+              mime_type: blob.mimeType,
+            },
+          },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const ops = all(source);
+    const receiver = pendingReceiver(target);
+    // Transport import: staged chunks become received and canonical chunks.
+    const writer = binaryWriter(target.db, "staging", "transport");
+    writer.write(bytes);
+    writer.finish();
+    receiver.import({
+      credential: "replica-secret",
+      envelope: batch(ops),
+      stagedBlobs: [{ blobId: blob.blobId, key: "transport", sizeBytes: 3 }],
+    });
+    const served = () =>
+      (["owner", "grant"] as const).map(
+        (reader) =>
+          receiver.readStore({ reader }).getBlobBytes(blob.blobId)?.length,
+      );
+    expect(served()).toEqual([3, 3]);
+    const size = (value: number) =>
+      target.db
+        .prepare(
+          "UPDATE pdpp_binary_manifests SET size_bytes=? WHERE namespace=? AND blob_id=?",
+        )
+        .run(value, namespace, blob.blobId).changes;
+    expect(size(malformed)).toBe(1);
+    expect(served()).toEqual([undefined, undefined]);
+    // Supported writes of the same valid bytes add a legacy row and keep the
+    // malformed manifest.
+    if (namespace === "received")
+      receiver.import({
+        credential: "replica-secret",
+        envelope: batch(ops),
+        blobs: [{ blobId: blob.blobId, bytes }],
+      });
+    else
+      target.store.storeBlobBytesForInstance({
+        instance: "conn_a",
+        method: "collector",
+        generation: 1,
+        bytes,
+        mimeType: "application/octet-stream",
+      });
+    expect(
+      target.db
+        .prepare(
+          `SELECT count(*) AS n FROM ${namespace === "received" ? "pdpp_replica_received_bytes" : "pdpp_blob_bytes"} WHERE blob_id=?`,
+        )
+        .get(blob.blobId),
+    ).toEqual({ n: 1 });
+    expect(served()).toEqual([undefined, undefined]);
+    size(3);
+    expect(served()).toEqual([3, 3]);
+  },
+);
+
 it("refuses a forged chunk manifest size before allocating it", () => {
   const f = sharedBlob("chunks");
   f.receiver.import({
