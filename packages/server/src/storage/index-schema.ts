@@ -34,7 +34,7 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 14;
+export const INDEX_SCHEMA_VERSION = 15;
 
 const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
   superseded_cas_revision INTEGER NOT NULL,
   superseded_collected_at TEXT NOT NULL,
   superseded_path TEXT NOT NULL,
+  replacement_cursor TEXT,
   taken_over_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   PRIMARY KEY (scope, instance, generation, superseded_path)
 )`;
@@ -236,6 +237,14 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
         FROM legacy_scope_takeover_verdicts_old`);
       db.exec("DROP TABLE legacy_scope_takeover_verdicts_old");
     })();
+  }
+  if (
+    currentVersion < 15 &&
+    !hasColumn(db, "legacy_scope_takeovers", "replacement_cursor")
+  ) {
+    db.exec(
+      "ALTER TABLE legacy_scope_takeovers ADD COLUMN replacement_cursor TEXT",
+    );
   }
 }
 

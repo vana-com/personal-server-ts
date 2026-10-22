@@ -283,6 +283,43 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       }).immediate();
     },
 
+    hasCompletedReplacement(
+      scope,
+      head,
+      instance,
+      generation,
+      method,
+      canonicalCursor,
+    ) {
+      if (
+        !hasTable("legacy_scope_takeovers") ||
+        !(
+          db.pragma("table_info(legacy_scope_takeovers)") as { name: string }[]
+        ).some((column) => column.name === "replacement_cursor")
+      )
+        return false;
+      return (
+        db
+          .prepare(
+            `SELECT 1 FROM legacy_scope_takeovers
+        WHERE scope = ? AND instance = ? AND generation = ? AND method = ?
+          AND superseded_path = ? AND superseded_version = ? AND superseded_cas_revision = ?
+          AND superseded_collected_at = ? AND replacement_cursor = ?`,
+          )
+          .get(
+            scope,
+            instance,
+            generation,
+            method,
+            head.path,
+            head.version,
+            head.casRevision,
+            head.collectedAt,
+            `${head.id}:${canonicalCursor}`,
+          ) !== undefined
+      );
+    },
+
     eligibleLegacyHead(scope) {
       return readEligibleLegacyHead(scope);
     },
@@ -357,6 +394,39 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           return true;
         }
         if (!hasTable("legacy_scope_takeovers")) return false;
+
+        if (verdict?.completion) {
+          if (
+            !(
+              db.pragma("table_info(legacy_scope_takeovers)") as {
+                name: string;
+              }[]
+            ).some((column) => column.name === "replacement_cursor")
+          )
+            return false;
+          db.prepare(
+            `INSERT INTO legacy_scope_takeovers
+            (scope, instance, generation, method, superseded_version, superseded_cas_revision,
+             superseded_collected_at, superseded_path, replacement_cursor)
+            SELECT scope, ?, ?, ?, version, cas_revision, collected_at, path,
+              CASE WHEN id = ? THEN ? ELSE NULL END
+            FROM data_files WHERE scope = ?
+              AND (producer IS NULL OR producer NOT IN ('pdpp-projector', 'pdpp-import-projection'))
+            ON CONFLICT(scope, instance, generation, superseded_path) DO UPDATE SET
+              method = excluded.method, superseded_version = excluded.superseded_version,
+              superseded_cas_revision = excluded.superseded_cas_revision,
+              superseded_collected_at = excluded.superseded_collected_at,
+              replacement_cursor = COALESCE(excluded.replacement_cursor, legacy_scope_takeovers.replacement_cursor)`,
+          ).run(
+            verdict.instance,
+            verdict.generation,
+            method,
+            expectedHead.id,
+            `${expectedHead.id}:${verdict.canonicalCursor}`,
+            scope,
+          );
+          return true;
+        }
 
         if (verdict) {
           if (!hasTable("legacy_scope_takeover_verdicts")) return false;

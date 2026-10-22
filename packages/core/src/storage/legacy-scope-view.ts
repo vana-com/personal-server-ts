@@ -59,7 +59,7 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 9;
+const COVERAGE_RULE_VERSION = 10;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the
@@ -177,6 +177,15 @@ export interface LegacyScopeAuthority {
     head: LegacyScopeHead,
     instance?: string,
   ): boolean;
+  /** Exact current receipt-backed replacement, independent of historical parity. */
+  hasCompletedReplacement?(
+    scope: string,
+    head: LegacyScopeHead,
+    instance: string,
+    generation: number,
+    method: string,
+    canonicalCursor: string,
+  ): boolean;
   isReset(scope: string): boolean;
   cachedVerdict(
     scope: string,
@@ -207,9 +216,10 @@ export interface LegacyScopeAuthority {
       writeClock: number;
       arrivalRevision: number;
       canonicalCursor: string;
-      coverage: LegacyCoverageVerdict;
-      cached: boolean;
-    },
+    } & (
+      | { coverage: LegacyCoverageVerdict; cached: boolean; completion?: false }
+      | { completion: true; coverage?: never; cached?: false }
+    ),
   ): boolean;
 }
 
@@ -615,7 +625,23 @@ export function createLegacyScopeView(
     if (hasLegacyHead && !hasTakeover && !initialOuraRunComplete(decision)) {
       return { kind: "file" };
     }
-    if (hasLegacyHead && input.readLegacyHead) {
+    const completedReplacement =
+      legacyHead !== null &&
+      authority.hasCompletedReplacement?.(
+        scope,
+        legacyHead,
+        decision.selection.instance,
+        decision.generation,
+        decision.selection.method,
+        coverageCursor(
+          scope,
+          decision,
+          authority.writeClock(),
+          authority.arrivalRevision(),
+          receiptCursor(decision, input.declarations),
+        ),
+      ) === true;
+    if (hasLegacyHead && input.readLegacyHead && !completedReplacement) {
       const verdict = authority
         .verdictFor(scope)
         .find(
@@ -710,6 +736,9 @@ export function createLegacyScopeView(
           decision.kind === "canonical" ? decision.generation : undefined,
         ),
         canServeLegacy: canServeLegacyBeforeTakeover(scope),
+        hasCompletion:
+          decision.kind === "canonical" &&
+          missingCompletionReceipts(decision).length === 0,
         initialOuraRunComplete:
           decision.kind !== "canonical" || initialOuraRunComplete(decision),
         writeClock: authority.writeClock(),
@@ -757,6 +786,9 @@ export function createLegacyScopeView(
     ) {
       return { kind: "file" };
     }
+    const replacementEligible =
+      initial.hasCompletion &&
+      typeof authority.hasCompletedReplacement === "function";
     const canonicalCursor = legacyHead
       ? coverageCursor(
           scope,
@@ -899,7 +931,8 @@ export function createLegacyScopeView(
       // partial refreshes still face coverage checks without requiring receipts.
       requireCompletionReceipts:
         legacyHead !== null &&
-        (!input.readLegacyHead ||
+        (replacementEligible ||
+          !input.readLegacyHead ||
           (decision.selection.method === "oura-browser" && !hasTakeover)),
       allowUnprovenEmptyStreams: legacyHead !== null && !!input.readLegacyHead,
       includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
@@ -992,6 +1025,51 @@ export function createLegacyScopeView(
       }
       const { ok: _ok, ...refusal } = read;
       return { kind: "refused", refusal };
+    }
+    if (legacyHead !== null && replacementEligible && read.complete) {
+      const confirmed = authority.confirmRead(
+        scope,
+        legacyHead,
+        () =>
+          sameSelection(decide(scope), decision) &&
+          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
+        {
+          instance: decision.selection.instance,
+          generation: decision.generation,
+          writeClock: initial.writeClock,
+          arrivalRevision: initial.arrivalRevision,
+          canonicalCursor,
+          completion: true,
+        },
+      );
+      if (!confirmed) {
+        if (authority.isReset(scope)) return { kind: "file" };
+        const canKeepFile = authority.readSnapshot(
+          () =>
+            canServeLegacyBeforeTakeover(scope) &&
+            !authority.hasTakeover(
+              scope,
+              decision.selection.instance,
+              decision.generation,
+            ),
+        );
+        if (canKeepFile) return { kind: "file" };
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail:
+              "legacy head or canonical snapshot changed during replacement",
+          },
+        };
+      }
+      return {
+        kind: "canonical",
+        envelope: read.envelope,
+        revision: read.revision,
+      };
     }
     if (legacyHead !== null && input.readLegacyHead) {
       // Coverage compares against the old file, so it cannot see rows the
