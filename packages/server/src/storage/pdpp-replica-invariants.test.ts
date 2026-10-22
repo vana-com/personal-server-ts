@@ -152,10 +152,24 @@ it("(2) with the row's generation, a key fact hides rows of exactly its generati
   expect([preview(), current(), canonical()]).toEqual([0, 0, 0]);
 });
 
-it("(2) the predicate declares generationSql as a plain optional parameter: adapters detect support through Function.length", () => {
-  const { store } = device();
-  // A default value would drop length to 1 and silently disable the generation.
-  expect(store.unquarantinedRecordSql.length).toBe(2);
+it("(2) a row-generation lookup of key facts is a primary-key search", () => {
+  const { db, store } = device();
+  db.exec(
+    "CREATE TEMP TABLE plan_rows (instance TEXT, stream TEXT, record_key TEXT, generation INTEGER)",
+  );
+  const plan = (
+    db
+      .prepare(
+        `EXPLAIN QUERY PLAN SELECT 1 FROM plan_rows r WHERE ${store.unquarantinedRecordSql("r", "r.generation")}`,
+      )
+      .all() as { detail: string }[]
+  )
+    .map((row) => row.detail)
+    .join("\n");
+  // (instance, generation, stream, record_key): no extra index is needed.
+  expect(plan).toContain(
+    "sqlite_autoindex_pdpp_replica_quarantined_keys_1 (instance=? AND generation=? AND stream=? AND record_key=?)",
+  );
 });
 
 it("(3) every reader-visible blob namespace has manifest insert and delete triggers in the visibility view", () => {
