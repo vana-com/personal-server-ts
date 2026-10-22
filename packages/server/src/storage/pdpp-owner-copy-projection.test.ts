@@ -8,6 +8,142 @@ import { copyReadFixture } from "./pdpp-replica-copy-reads.test-utils.js";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { createHash } from "node:crypto";
 
+it("counts a mail writer batch only on the stream it changed", () => {
+  const f = copyReadFixture({
+    declarations: ["messages", "notes", "labels"].map((stream) => ({
+      sourceId: identity.sourceId,
+      binding: { ...binding, stream },
+      validateData: () => true,
+    })),
+  });
+  const claim = {
+    ...registration,
+    kind: "blob-claim" as const,
+    blob: {
+      blobId: "blob",
+      sha256: `sha256:${"0".repeat(64)}`,
+      mimeType: "text/plain",
+      sizeBytes: 0,
+    },
+  };
+  for (const seed of [1, 2]) {
+    const copy = f.copy(`mail-${seed}`, seed);
+    f.stage(f.copy(`mail-${seed}`, seed, [registration, claim, copy.record]));
+  }
+  const owner = f.receiver.readStore({ reader: "owner" });
+  expect(
+    owner
+      .listStreams([identity.connectionId])
+      .map((s) => [s.stream, s.copyConflicts]),
+  ).toEqual([["messages", 2]]);
+  expect(
+    owner
+      .listCopyConflicts({ instanceIds: [identity.connectionId] })
+      .data.map((c) => c.streams),
+  ).toEqual([["messages"], ["messages"]]);
+  for (const stream of ["notes", "labels"])
+    expect(
+      owner.listCopyConflicts({ instanceIds: [identity.connectionId], stream })
+        .data,
+    ).toEqual([]);
+});
+
+it("lists registration copies under connections without counting streams", () => {
+  const f = copyReadFixture();
+  f.stage(f.copy("register-a", 1, [registration]));
+  f.stage(f.copy("register-b", 2, [registration]));
+  const owner = f.receiver.readStore({ reader: "owner" });
+  expect(owner.listStreams([identity.connectionId])).toEqual([]);
+  const query = {
+    instanceIds: [identity.connectionId],
+    connection: identity.connectionId,
+  };
+  expect(owner.listCopyConflicts(query).data).toHaveLength(2);
+  expect(
+    owner
+      .listCopyConflicts(query)
+      .data.every(
+        (c) =>
+          c.streams.length === 0 && c.connections[0] === identity.connectionId,
+      ),
+  ).toBe(true);
+});
+
+it("keeps counts equal to discovery when a copy write skips flush", () => {
+  const f = copyReadFixture();
+  const a = f.copy("A", 1);
+  f.stage(a);
+  // Exercise the real SQLite triggers independently of the receiver's flush.
+  f.db
+    .prepare(
+      "UPDATE pdpp_replica_copies SET state='quarantined',reason='copy_conflict' WHERE id=? AND copy_key=?",
+    )
+    .run(a.id, a.copyKey);
+  const check = () => {
+    const owner = f.receiver.readStore({ reader: "owner" });
+    const found = owner.listCopyConflicts({
+      instanceIds: [identity.connectionId],
+      stream: "messages",
+    }).data.length;
+    const count =
+      owner
+        .listStreams([identity.connectionId])
+        .find((s) => s.stream === "messages")?.copyConflicts ?? 0;
+    expect(count).toBe(found);
+    return found;
+  };
+  expect(check()).toBe(0);
+  f.reopen();
+  expect(check()).toBe(1);
+});
+
+it("omits oversized stored values before attempting to decode their envelope", () => {
+  const f = copyReadFixture();
+  const a = f.copy("A", 1);
+  f.stage(a);
+  f.stage(f.copy("B", 2));
+  // A retained oversized envelope need not be decoded to return its marker.
+  const oversized = {
+    ...a.envelope,
+    format: "unreadable",
+    operations: [{ ...a.record, data: { text: "x".repeat(5 * 1024 * 1024) } }],
+  };
+  f.db
+    .prepare(
+      "UPDATE pdpp_replica_copies SET envelope_json=? WHERE id=? AND copy_key=?",
+    )
+    .run(JSON.stringify(oversized), a.id, a.copyKey);
+  f.reopen();
+  const page = f.receiver
+    .readStore({ reader: "owner" })
+    .readCopyConflicts(a.id);
+  expect(page.data.find((c) => c.copyKey === a.copyKey)).toMatchObject({
+    valuesOmitted: true,
+    valuesOmittedReason: "byte_limit",
+  });
+});
+
+it("matches the full batch id even if a different stored id has the same digest", () => {
+  const f = copyReadFixture();
+  const a = f.copy("A", 1, undefined, "first"),
+    b = f.copy("B", 2, undefined, "second");
+  for (const copy of [a, b]) {
+    f.stage(copy);
+    f.stage(f.copy("sibling", 3, undefined, copy.batch));
+  }
+  const digest = createHash("sha256").update(a.id).digest("hex");
+  f.db
+    .prepare(
+      "UPDATE pdpp_replica_view_copy_projection SET id_digest=? WHERE id=?",
+    )
+    .run(digest, b.id);
+  const page = f.receiver
+    .readStore({ reader: "owner" })
+    .readCopyConflicts(a.id);
+  expect(page.data).toHaveLength(2);
+  expect(page.data.every((c) => c.id === a.id)).toBe(true);
+});
+
 it("uses one whole-copy scope for owner counts and complete diagnostic values", () => {
   const f = copyReadFixture();
   const other = "conn-other";
@@ -267,13 +403,14 @@ it("matches connection and stream filters as a pair without narrowing a wide tok
   expect(owner.listStreams([identity.connectionId])).toEqual([]);
 });
 
-it("uses current declarations for connection-level counts and metadata and expires prior declaration cursors", () => {
+it("uses current declarations for connection-level counts and metadata and rejects prior declaration cursors", () => {
   const declarations = [
     { sourceId: identity.sourceId, binding, validateData: () => true },
   ];
   const f = copyReadFixture({ declarations });
-  const a = f.copy("A", 1, [registration]),
-    b = f.copy("B", 2, [registration]);
+  const deletion = { ...registration, kind: "connection-delete" as const };
+  const a = f.copy("A", 1, [deletion]),
+    b = f.copy("B", 2, [deletion]);
   f.stage(a);
   f.stage(b);
   const owner = f.receiver.readStore({ reader: "owner" }),
@@ -555,7 +692,11 @@ it("bounds every listed identifier and the number of metadata identifiers withou
     label: "long",
   });
   const ops = [
-    { ...registration, connectionId: connection },
+    {
+      ...registration,
+      kind: "connection-delete" as const,
+      connectionId: connection,
+    },
     {
       ...f.copy("record", 1).record,
       connectionId: connection,

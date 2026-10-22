@@ -74,9 +74,10 @@ type ReplicaReaderStore<R extends ReplicaReader> = Omit<
   connectionVisibility: (
     instance: string,
   ) => { state: "conflicted"; reason: "source_binding" } | undefined;
-  listStreams(ids: string[]): (ReturnType<
-    PdppReplicaReadStore["listStreams"]
-  >[number] & {
+  listStreams(
+    ids: string[],
+    includeCopyConflicts?: boolean,
+  ): (ReturnType<PdppReplicaReadStore["listStreams"]>[number] & {
     copyConflicts?: number;
   })[];
 } & (R extends "owner" ? ReplicaCopyConflictReader : object);
@@ -1450,12 +1451,17 @@ export function createReplicaReceiver(deps: {
           ),
         listRecords: (stream: string, options: ListRecordsOptions) =>
           api.readRecords({ ...options, stream, reader }),
-        listStreams: (ids: string[]) =>
+        listStreams: (ids: string[], includeCopyConflicts = true) =>
           readSnapshot(() =>
             reader === "owner" ||
             pendingEnabled ||
             ids.some((id) => view.connectionVisibility(id))
-              ? view.listStreams(ids, hasPreview(), reader)
+              ? view.listStreams(
+                  ids,
+                  hasPreview(),
+                  reader,
+                  includeCopyConflicts,
+                )
               : store.listStreams(ids),
           ),
         // Changes sessions allocate a canonical horizon. Reserve the writer before

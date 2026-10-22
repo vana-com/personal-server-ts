@@ -1,3 +1,35 @@
+import type { DeclarationBinding, ReplicaOperation } from "./envelope.js";
+
+/** The persisted projection retains only the operation fields this rule needs. */
+export type ReplicaStreamEffectOperation<
+  T extends ReplicaOperation = ReplicaOperation,
+> = T extends { declaration: DeclarationBinding }
+  ? Pick<T, "kind"> & { declaration: Pick<DeclarationBinding, "stream"> }
+  : Pick<T, "kind">;
+
+/** Connection metadata and blob ownership do not change stream contents. */
+export function replicaOperationAffectedStreams(
+  op: ReplicaStreamEffectOperation,
+): readonly string[] | "all" {
+  switch (op.kind) {
+    case "upsert":
+    case "delete":
+    case "stream-invalidate":
+    case "stream-complete":
+      return [op.declaration.stream];
+    case "connection-reset":
+    case "connection-delete":
+      return "all";
+    case "blob-claim":
+    case "connection-register":
+      return [];
+    default: {
+      const unknown: never = op;
+      throw new Error(`Unknown replica operation: ${JSON.stringify(unknown)}`);
+    }
+  }
+}
+
 /** One policy for every replica read surface. Reader identity is supplied by the trusted host. */
 export type ReplicaReader = "owner" | "grant";
 export type ReplicaVisibilityState =

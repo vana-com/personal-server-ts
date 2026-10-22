@@ -223,9 +223,10 @@ type RouteReadStore = Omit<
   "listStreamCompletions" | "listStreams"
 > &
   Partial<ReplicaCopyConflictReader> & {
-    listStreams(ids: string[]): (ReturnType<
-      PdppReplicaReadStore["listStreams"]
-    >[number] & {
+    listStreams(
+      ids: string[],
+      includeCopyConflicts?: boolean,
+    ): (ReturnType<PdppReplicaReadStore["listStreams"]>[number] & {
       copyConflicts?: number;
     })[];
   };
@@ -685,6 +686,15 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   function reads(context: PdppTokenContext): RouteReadStore {
     return readsFor(context.tokenKind === "owner" ? "owner" : "grant");
   }
+  /** Counts and diagnostics reveal conflicts only to the server owner. */
+  function mayReadCopyConflicts(context: PdppTokenContext): boolean {
+    return (
+      context.tokenKind === "owner" &&
+      !!context.subjectId &&
+      !!deps.ownerSubjectId &&
+      context.subjectId.toLowerCase() === deps.ownerSubjectId.toLowerCase()
+    );
+  }
 
   /**
    * Append one PDPP read to the owner access feed.
@@ -905,12 +915,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       if (!context?.active)
         return sendError(c, mapInactiveToError(context!), reqId);
       try {
-        if (
-          context.tokenKind !== "owner" ||
-          !context.subjectId ||
-          !deps.ownerSubjectId ||
-          context.subjectId.toLowerCase() !== deps.ownerSubjectId.toLowerCase()
-        )
+        if (!mayReadCopyConflicts(context))
           throw new PdppError(
             "insufficient_scope",
             "Copy conflict diagnostics require the server owner",
@@ -992,7 +997,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             deps,
             `GET /v1/replica/copy-conflicts${mode === "values" ? "/:id" : ""}`,
             reqId,
-            err,
+            err instanceof CursorExpiredError
+              ? new PdppError(
+                  "cursor_expired",
+                  "Copy conflict cursor has expired",
+                )
+              : err,
           ),
           reqId,
         );
@@ -1046,7 +1056,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
     }
 
-    const streams = reads(context).listStreams(instanceIds);
+    const canReadCopyConflicts = mayReadCopyConflicts(context);
+    const streams = reads(context).listStreams(
+      instanceIds,
+      canReadCopyConflicts,
+    );
 
     // A client token gets a closed projection: only the streams its grant
     // names, and counts/recency computed over only the records the grant
@@ -1060,7 +1074,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             confirmation: s.confirmation,
             visibility: s.visibility,
             status: s.status,
-            copyConflicts: s.copyConflicts,
+            copyConflicts: canReadCopyConflicts ? s.copyConflicts : undefined,
             recordCount: s.recordCount as number | null,
             lastUpdated: s.lastUpdated,
             budgetExhausted: false,

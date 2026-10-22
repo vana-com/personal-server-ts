@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import type { Database } from "better-sqlite3";
 import {
   canonicalJson,
@@ -17,6 +18,8 @@ import {
   replicaCopyConflictMetadata,
   OWNER_VISIBLE_COPY_REASONS,
   REPLICA_COPY_CONFLICT_POLICY,
+  replicaOperationAffectedStreams,
+  type ReplicaStreamEffectOperation,
   type ReplicaCopyConflictReason,
   type ReplicaReader,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
@@ -84,13 +87,17 @@ export const COPY_CONFLICT_READ_LIMITS = {
   identifierBytes: 1024,
   metadataItems: 64,
 } as const;
-type CopyEffects = [connection: string, stream: string | null][];
+type CopyEffects = [
+  connection: string,
+  operation: ReplicaStreamEffectOperation,
+][];
 type CopyFacts = { reason: ReplicaCopyConflictReason; effects: string };
 type CopyProjectionRow = CopyFacts & {
   id: string | null;
   copy_key: string;
   operation_count: number;
   envelope_bytes: number;
+  values_bytes: number;
   id_digest: string;
 };
 const compareCopyText = (a: string, b: string) =>
@@ -126,7 +133,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 11;
+const VIEW_SCHEMA = 12;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -398,28 +405,39 @@ export function createReplicaVisibilityView(deps: {
       `);
     }
     if (hasCopyFacts) {
-      // Derive operation effects once per copy. NULL stream denotes an operation
-      // on the connection as a whole; reads expand it using current declarations.
+      // Retain operation kind and stream once per copy. Core owns their meaning;
+      // this SQL only removes fields that the effect rule does not need.
       const visibleReasons = `(${OWNER_VISIBLE_COPY_REASONS.map((reason) => `'${reason}'`).join(",")})`;
       const conflict = (alias: string) =>
         `${alias}.state='quarantined' AND ${alias}.reason IN ${visibleReasons}`;
       const project = (
         alias: string,
       ) => `SELECT ${alias}.id,${alias}.copy_key,${alias}.reason,
-        (SELECT json_group_array(json_array(instance,stream) ORDER BY instance,stream)
+        (SELECT json_group_array(json_array(instance,json(operation)) ORDER BY instance,operation)
           FROM (SELECT DISTINCT json_extract(value,'$.connectionId') AS instance,
-            json_extract(value,'$.declaration.stream') AS stream
+            CASE WHEN json_type(value,'$.declaration') IS NULL
+              THEN json_object('kind',json_extract(value,'$.kind'))
+              ELSE json_object('kind',json_extract(value,'$.kind'),'declaration',
+                json_object('stream',json_extract(value,'$.declaration.stream'))) END AS operation
             FROM json_each(${alias}.envelope_json,'$.operations'))),
-        json_array_length(${alias}.envelope_json,'$.operations'),length(CAST(${alias}.envelope_json AS BLOB)),NULL`;
+        json_array_length(${alias}.envelope_json,'$.operations'),length(CAST(${alias}.envelope_json AS BLOB)),
+        length(CAST(json_extract(${alias}.envelope_json,'$.operations') AS BLOB)),NULL`;
       const addCopy = (
         alias: string,
       ) => `INSERT INTO pdpp_replica_view_copy_projection
         ${project(alias)} WHERE ${conflict(alias)}
         AND NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_projection p WHERE p.id=${alias}.id AND p.copy_key=${alias}.copy_key);`;
+      const countCopy = `
+        INSERT INTO pdpp_replica_view_copy_counts SELECT NEW.reason,NEW.effects,0
+        WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_counts c WHERE c.reason=NEW.reason AND c.effects=NEW.effects);
+        UPDATE pdpp_replica_view_copy_counts SET n=n+1 WHERE reason=NEW.reason AND effects=NEW.effects;`;
+      const uncountCopy = `
+        UPDATE pdpp_replica_view_copy_counts SET n=n-1 WHERE reason=OLD.reason AND effects=OLD.effects;
+        DELETE FROM pdpp_replica_view_copy_counts WHERE reason=OLD.reason AND effects=OLD.effects AND n=0;`;
       db.exec(`
         CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_projection (
           id TEXT NOT NULL,copy_key TEXT NOT NULL,reason TEXT NOT NULL,effects TEXT NOT NULL,
-          operation_count INTEGER NOT NULL,envelope_bytes INTEGER NOT NULL,
+          operation_count INTEGER NOT NULL,envelope_bytes INTEGER NOT NULL,values_bytes INTEGER NOT NULL,
           id_digest TEXT,
           PRIMARY KEY(id,copy_key)
         ) WITHOUT ROWID;
@@ -441,15 +459,14 @@ export function createReplicaVisibilityView(deps: {
         CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_group_delete AFTER DELETE ON pdpp_replica_view_copy_counts BEGIN
           DELETE FROM pdpp_replica_view_copy_groups WHERE reason=OLD.reason AND effects=OLD.effects;
         END;
-        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_projection_insert AFTER INSERT ON pdpp_replica_view_copy_projection BEGIN
-          INSERT INTO pdpp_replica_view_copy_counts SELECT NEW.reason,NEW.effects,0
-          WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_copy_counts c WHERE c.reason=NEW.reason AND c.effects=NEW.effects);
-          UPDATE pdpp_replica_view_copy_counts SET n=n+1 WHERE reason=NEW.reason AND effects=NEW.effects;
-        END;
-        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_projection_delete AFTER DELETE ON pdpp_replica_view_copy_projection BEGIN
-          UPDATE pdpp_replica_view_copy_counts SET n=n-1 WHERE reason=OLD.reason AND effects=OLD.effects;
-          DELETE FROM pdpp_replica_view_copy_counts WHERE reason=OLD.reason AND effects=OLD.effects AND n=0;
-        END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_projection_insert AFTER INSERT ON pdpp_replica_view_copy_projection
+        WHEN NEW.id_digest IS NOT NULL BEGIN ${countCopy} END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_projection_ready AFTER UPDATE OF id_digest ON pdpp_replica_view_copy_projection
+        WHEN OLD.id_digest IS NULL AND NEW.id_digest IS NOT NULL BEGIN ${countCopy} END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_projection_unready AFTER UPDATE OF id_digest ON pdpp_replica_view_copy_projection
+        WHEN OLD.id_digest IS NOT NULL AND NEW.id_digest IS NULL BEGIN ${uncountCopy} END;
+        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_projection_delete AFTER DELETE ON pdpp_replica_view_copy_projection
+        WHEN OLD.id_digest IS NOT NULL BEGIN ${uncountCopy} END;
         CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_insert AFTER INSERT ON pdpp_replica_copies BEGIN ${addCopy("NEW")} END;
         CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_copy_update AFTER UPDATE OF state,reason,envelope_json ON pdpp_replica_copies
         WHEN OLD.state IS NOT NEW.state OR OLD.reason IS NOT NEW.reason OR OLD.envelope_json IS NOT NEW.envelope_json BEGIN
@@ -1433,10 +1450,11 @@ export function createReplicaVisibilityView(deps: {
     if (allowed && connections.some((connection) => !allowed.has(connection)))
       return undefined;
     const affected = new Map<string, Set<string>>();
-    for (const [connection, stream] of effects) {
+    for (const [connection, operation] of effects) {
       const streams = affected.get(connection) ?? new Set<string>();
       affected.set(connection, streams);
-      if (stream !== null) streams.add(stream);
+      const effect = replicaOperationAffectedStreams(operation);
+      if (effect !== "all") for (const stream of effect) streams.add(stream);
       else {
         const binding = db
           .prepare(
@@ -1477,13 +1495,20 @@ export function createReplicaVisibilityView(deps: {
           valuesOmitted: true,
           valuesOmittedReason: "operation_limit",
         };
-      if (row.envelope_bytes > COPY_CONFLICT_READ_LIMITS.envelopeBytes)
+      if (
+        row.envelope_bytes > COPY_CONFLICT_READ_LIMITS.envelopeBytes ||
+        row.values_bytes > COPY_CONFLICT_READ_LIMITS.valueBytes
+      )
         return { valuesOmitted: true, valuesOmittedReason: "byte_limit" };
       const stored = db
         .prepare(
-          "SELECT c.envelope_json FROM pdpp_replica_view_copy_projection p JOIN pdpp_replica_copies c ON c.id=p.id AND c.copy_key=p.copy_key WHERE p.id_digest=? AND p.copy_key=?",
+          `SELECT c.envelope_json FROM pdpp_replica_view_copy_projection p JOIN pdpp_replica_copies c ON c.id=p.id AND c.copy_key=p.copy_key WHERE p.id_digest=? AND p.copy_key=? ${query.id === undefined ? "" : "AND p.id=?"}`,
         )
-        .get(row.id_digest, row.copy_key) as { envelope_json: string };
+        .get(
+          row.id_digest,
+          row.copy_key,
+          ...(query.id === undefined ? [] : [query.id]),
+        ) as { envelope_json: string };
       const values = replicaEnvelopeSchema.parse(
         JSON.parse(stored.envelope_json),
       ).operations;
@@ -1571,7 +1596,10 @@ export function createReplicaVisibilityView(deps: {
     if (query.reference) {
       const { idDigest, copyKey } = query.reference;
       if (!/^[a-f0-9]{64}$/.test(idDigest) || !/^0x[a-f0-9]{64}$/.test(copyKey))
-        throw new InvalidCursorError();
+        throw new PdppError(
+          "invalid_request",
+          "Copy reference requires a SHA-256 id digest and copy key",
+        );
     }
     const limit = query.limit ?? 25;
     if (
@@ -1657,8 +1685,9 @@ export function createReplicaVisibilityView(deps: {
       const rows = db
         .prepare(
           `SELECT CASE WHEN length(CAST(id AS BLOB))<=? THEN id ELSE NULL END AS id,
-          id_digest,copy_key,reason,effects,operation_count,envelope_bytes FROM pdpp_replica_view_copy_projection
+          id_digest,copy_key,reason,effects,operation_count,envelope_bytes,values_bytes FROM pdpp_replica_view_copy_projection
         WHERE reason=? AND effects=? AND ${idDigest === undefined ? "(id_digest,copy_key)>(?,?)" : "id_digest=? AND copy_key>?"} ${query.reference ? "AND copy_key=?" : ""}
+        ${query.id === undefined ? "" : "AND id=?"}
         ORDER BY id_digest,copy_key LIMIT ?`,
         )
         .all(
@@ -1668,6 +1697,7 @@ export function createReplicaVisibilityView(deps: {
           idDigest ?? after.id_digest,
           after.copy_key,
           ...(query.reference ? [query.reference.copyKey] : []),
+          ...(query.id === undefined ? [] : [query.id]),
           limit + 1,
         ) as CopyProjectionRow[];
       candidates.push(...rows.map((row) => ({ row, projection })));
@@ -1708,9 +1738,10 @@ export function createReplicaVisibilityView(deps: {
     ids: string[],
     preview = true,
     reader: ReplicaReader = "owner",
+    includeCopyConflicts = true,
   ): (StreamListing & { copyConflicts?: number })[] {
     const copyCounts = new Map<string, number>();
-    if (reader === "owner")
+    if (reader === "owner" && includeCopyConflicts)
       for (const { facts, projection } of ownerCopyGroups({ instanceIds: ids }))
         for (const stream of projection.metadata.streams)
           copyCounts.set(stream, (copyCounts.get(stream) ?? 0) + facts.n);

@@ -439,3 +439,64 @@ it("accepts a copy key and batch-id digest reference alongside the full id with 
   ]);
   expect(terminal.body.data[0]).not.toHaveProperty("values");
 });
+
+it("uses the server-owner gate for both stream counts and discovery", async () => {
+  const f = copyReadFixture();
+  f.stage(f.copy("A", 1));
+  f.stage(f.copy("B", 2));
+  const get = host(f);
+  expect((await get("owner", "/v1/streams")).body.data[0].copy_conflicts).toBe(
+    2,
+  );
+  const foreign = await get("foreign", "/v1/streams");
+  expect(foreign.status).toBe(200);
+  expect(foreign.body.data).toEqual([]);
+  expect((await get("foreign", "/v1/replica/copy-conflicts")).status).toBe(403);
+  expect(
+    (
+      await get(
+        "foreign",
+        `/v1/replica/copy-conflicts/${encodeURIComponent(f.copy("A", 1).id)}`,
+      )
+    ).status,
+  ).toBe(403);
+});
+
+it("reports malformed references as invalid requests", async () => {
+  const f = copyReadFixture();
+  const a = f.copy("A", 1);
+  f.stage(a);
+  f.stage(f.copy("B", 2));
+  const get = host(f);
+  const digest = createHash("sha256").update(a.id).digest("hex");
+  for (const reference of [
+    `${digest}?copyKey=invalid`,
+    `invalid?copyKey=${a.copyKey}`,
+    `${encodeURIComponent(a.id)}?copyKey=${a.copyKey}`,
+  ]) {
+    const response = await get(
+      "owner",
+      `/v1/replica/copy-conflicts/${reference}`,
+    );
+    expect(response.status).toBe(400);
+    expect(response.body.error.code).toBe("invalid_request");
+  }
+});
+
+it("reports expired copy cursors without changes_since text", async () => {
+  const f = copyReadFixture();
+  f.stage(f.copy("A", 1));
+  f.stage(f.copy("B", 2));
+  const get = host(f);
+  const first = await get("owner", "/v1/replica/copy-conflicts?limit=1");
+  const cursor = JSON.parse(
+    Buffer.from(first.body.next_cursor, "base64url").toString("utf8"),
+  );
+  cursor.schema = 0;
+  const expired = await get(
+    "owner",
+    `/v1/replica/copy-conflicts?limit=1&cursor=${Buffer.from(JSON.stringify(cursor)).toString("base64url")}`,
+  );
+  expect(expired.status).toBe(410);
+  expect(expired.body.error.message).toBe("Copy conflict cursor has expired");
+});

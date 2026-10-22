@@ -1,6 +1,26 @@
 import { expect, it } from "vitest";
 import { replicaStateVisible } from "./visibility-policy.js";
 
+it("names the stream effect of every replica operation kind", async () => {
+  const policy = await import("./visibility-policy.js");
+  for (const kind of [
+    "upsert",
+    "delete",
+    "stream-invalidate",
+    "stream-complete",
+  ] as const)
+    expect(
+      policy.replicaOperationAffectedStreams({
+        kind,
+        declaration: { stream: "messages" },
+      }),
+    ).toEqual(["messages"]);
+  for (const kind of ["connection-reset", "connection-delete"] as const)
+    expect(policy.replicaOperationAffectedStreams({ kind })).toBe("all");
+  for (const kind of ["blob-claim", "connection-register"] as const)
+    expect(policy.replicaOperationAffectedStreams({ kind })).toEqual([]);
+});
+
 const cases = [
   {
     owner: "confirmed-only",

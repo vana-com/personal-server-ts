@@ -139,11 +139,15 @@ must match the same connection's effects. A missing or out-of-scope batch return
 an empty page. Both routes require `AppDeps.pdpp.reads("owner")` with both methods;
 a host without that capability returns 404. Client/grant and foreign-owner tokens
 get 403. Missing or inactive authentication uses the existing PDPP errors.
+The same server-owner gate controls stream counts, including stream entries that
+exist only because of conflicting copies.
 
 Pages default to 25 entries, with limits from 1 to 100. Ordering is by
 `(idDigest, copyKey)` using SQLite binary text order. The bounded keyset cursor is at
 most 4096 bytes and binds the query, endpoint, whole token scope, declarations and
-view layout. Invalid or mismatched cursors get HTTP 400; an expired layout gets 410. Authorization is checked anew on every page. This is a live catalog, not a
+view layout. Invalid or mismatched cursors get HTTP 400; an expired layout gets 410
+with `"Copy conflict cursor has expired"`. Malformed digest references get HTTP 400
+`invalid_request`. Authorization is checked anew on every page. This is a live catalog, not a
 snapshot across requests: new keys before the cursor require a new walk, and
 state changes can remove entries between pages. Cursors contain only the two
 fixed-size hashes, so even a long batch identity cannot enlarge them. The digest
@@ -163,30 +167,37 @@ Each value-bearing copy is limited to 512 operations, 4 MiB of UTF-8 JSON values
 and an 8 MiB encoded envelope. A normal fifty-record batch with 6 KiB records fits.
 An oversized copy keeps its marker with `valuesOmitted: true` and
 `valuesOmittedReason: "operation_limit" | "byte_limit"`; it does not cause a 413
-or hide other copies. Operation and envelope sizes are checked before loading
+or hide other copies. Operation count, stored values size and envelope size are checked before loading or parsing
 values. Diagnostic pages use an 8 MiB response budget, reserving space for the
 cursor and wrapper; full values continue on the next page. Finalized markers
 never load former payloads.
 
 Owner `listStreams` entries have `copyConflicts: n` (HTTP: `copy_conflicts`). This
 counts distinct whole copies visible to the same token whose effects touch that
-stream. A connection-level operation affects every currently declared stream of
-that connection. A copy with several operations or connections for one stream
+stream. Core's `replicaOperationAffectedStreams` defines the effect of each kind:
+record upserts/deletes and stream invalidation/completion affect their own stream;
+connection reset/delete affect every currently declared stream of that connection;
+blob claims and connection registration affect no stream for counting. All kinds
+remain listed under their connection. A copy with several operations or connections for one stream
 counts once. This is the number of distinct discovery entries returned by a walk
 filtered to that stream, including finalized markers and omitted-value markers.
 A connection with no declared streams still has discoverable copies through the
 unfiltered or connection-filtered catalog; no stream is invented for its count.
 Conflicts can produce a stream entry with zero records and null recency. Ordinary
-streams report zero; grants never receive this field. Disabling pending previews
+streams report zero; grants and non-server-owner tokens never receive this field. Disabling pending previews
 does not disable diagnostics.
 
-View layout 11 stores one per-copy projection of sorted `(connection, stream)`
-effects, using a null stream for connection-level operations, plus reason and
+View layout 12 stores one per-copy projection of sorted `(connection, operation)`
+effects, retaining only kind and declaration stream, plus reason and
 size facts. One owner projection interprets these facts for scope, paired filters,
 markers, values and counts. The visibility policy supplies the SQL reason list and
 the production visibility decision. Triggers maintain grouped counts and reverse
 connection indexes in the write transaction, with `NOT EXISTS` insertion guards.
-The same receiver transaction fills new ID digests through `view.flush`; the digest
+Counts include only projections with non-null ID digests, exactly the set that
+catalog seeks can return. A digest becoming available adds the copy to its count;
+deleting an unready projection does not decrement it. Thus a write that skips
+flush cannot create a counted but undiscoverable copy.
+The receiver transaction fills new ID digests through `view.flush`; the digest
 index also serves its null-digest work queue. Construction fills rebuilt digests
 before exposing the reader. No read hashes retained IDs or mutates the projection.
 Listing uses bounded indexed seeks per eligible effect group; counts read each
