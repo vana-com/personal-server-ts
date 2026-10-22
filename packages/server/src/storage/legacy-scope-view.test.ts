@@ -1794,6 +1794,108 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(view.listCanonicalScopes("github.")).toEqual([]);
   });
 
+  it("does not rebind a non-head replacement cursor when legacy metadata changes", async () => {
+    const scope = "oura.activity";
+    const authority = createLegacyScopeAuthority(db);
+    const insert = db.prepare(
+      "INSERT INTO data_files (scope, path, collected_at, version, cas_revision) VALUES (?, ?, ?, ?, ?)",
+    );
+    insert.run(scope, "oura/activity/a.json", "2026-01-01T00:00:00.000Z", 7, 9);
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["fresh-only"]);
+    const current = createLegacyScopeView({
+      authority,
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => {
+        throw new Error("Complete replacement must not read historical bodies");
+      },
+    });
+    const canonicalSnapshot = () => ({
+      rows: db.prepare("SELECT * FROM pdpp_records").all(),
+      receipts: db.prepare("SELECT * FROM pdpp_stream_completion").all(),
+      writeClock: authority.writeClock(),
+      arrivalRevision: authority.arrivalRevision(),
+    });
+    const originalCanonical = canonicalSnapshot();
+    expect((await current.readLatest(scope)).kind).toBe("canonical");
+    const headA = authority.eligibleLegacyHead(scope);
+    if (!headA) throw new Error("Missing original head");
+    const originalProof = db
+      .prepare(
+        "SELECT replacement_cursor FROM legacy_scope_takeovers WHERE superseded_path = ?",
+      )
+      .get(headA.path) as { replacement_cursor: string | null } | undefined;
+    if (!originalProof?.replacement_cursor)
+      throw new Error("Actual completed read did not persist proof");
+    expect(originalProof.replacement_cursor.startsWith(`${headA.id}:`)).toBe(
+      true,
+    );
+    const cursor = originalProof.replacement_cursor.slice(
+      String(headA.id).length + 1,
+    );
+    const proved = (
+      head: NonNullable<ReturnType<typeof authority.eligibleLegacyHead>>,
+    ) =>
+      authority.hasCompletedReplacement?.(
+        scope,
+        head,
+        "conn_a",
+        1,
+        "oura",
+        cursor,
+      );
+    expect(proved(headA)).toBe(true);
+
+    insert.run(
+      scope,
+      "oura/activity/b.json",
+      "2026-02-01T00:00:00.000Z",
+      8,
+      10,
+    );
+    db.prepare(
+      "UPDATE data_files SET version = version + 1, cas_revision = cas_revision + 1 WHERE path = ?",
+    ).run(headA.path);
+    const indexedBeforeBRead = db
+      .prepare("SELECT * FROM data_files ORDER BY id")
+      .all();
+    expect((await current.readLatest(scope)).kind).toBe("canonical");
+    const headB = authority.eligibleLegacyHead(scope);
+    if (!headB) throw new Error("Missing newer head");
+    expect(headB.path).toBe("oura/activity/b.json");
+    expect(proved(headB)).toBe(true);
+    expect(current.listingFor(scope).kind).toBe("canonical");
+    expect(db.prepare("SELECT * FROM data_files ORDER BY id").all()).toEqual(
+      indexedBeforeBRead,
+    );
+    expect(canonicalSnapshot()).toEqual(originalCanonical);
+
+    // Simulate removing only B from the legacy index; A's changed revision remains.
+    db.prepare("DELETE FROM data_files WHERE path = ?").run(headB.path);
+    const changedA = authority.eligibleLegacyHead(scope);
+    if (!changedA) throw new Error("Historical A did not remain indexed");
+    expect(changedA.id).toBe(headA.id);
+    expect(changedA.version).toBe(headA.version + 1);
+    expect(changedA.casRevision).toBe(headA.casRevision + 1);
+    const beforeReearning = db
+      .prepare("SELECT * FROM data_files ORDER BY id")
+      .all();
+    expect({
+      validProof: proved(changedA),
+      canonicalListing: current.listingFor(scope).kind === "canonical",
+    }).toEqual({ validProof: false, canonicalListing: false });
+    expect(current.verdictFor(scope)).toEqual([]);
+    expect((await current.readLatest(scope)).kind).toBe("canonical");
+    expect(proved(changedA)).toBe(true);
+    expect(current.listingFor(scope).kind).toBe("canonical");
+    expect(db.prepare("SELECT * FROM data_files ORDER BY id").all()).toEqual(
+      beforeReearning,
+    );
+    expect(canonicalSnapshot()).toEqual(originalCanonical);
+    expect(current.verdictFor(scope)).toEqual([]);
+  });
+
   it("automatically replaces a keyless duplicate legacy body after an accepted fresh sync", async () => {
     legacyHead("oura.activity", "oura/activity/old.json");
     const indexed = db.prepare("SELECT * FROM data_files").all();

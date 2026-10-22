@@ -416,7 +416,7 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
               method = excluded.method, superseded_version = excluded.superseded_version,
               superseded_cas_revision = excluded.superseded_cas_revision,
               superseded_collected_at = excluded.superseded_collected_at,
-              replacement_cursor = COALESCE(excluded.replacement_cursor, legacy_scope_takeovers.replacement_cursor)`,
+              replacement_cursor = excluded.replacement_cursor`,
           ).run(
             verdict.instance,
             verdict.generation,
