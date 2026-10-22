@@ -41,6 +41,7 @@
 
 import { Hono, type Context } from "hono";
 import type { Logger } from "pino";
+import { readNamedQueryValues } from "./pdpp-auth-query-keys.js";
 import type {
   ClientIdentityResult,
   ClientIdMetadataDocument,
@@ -1430,12 +1431,14 @@ function asString(value: unknown): string | null {
 function parseInstanceChoices(
   c: Context,
 ): Record<string, string[]> | undefined {
-  const choices: Record<string, string[]> = {};
   const url = new URL(c.req.url);
-  for (const [key, value] of url.searchParams.entries()) {
-    const match = /^instance\[(.+)\]$/.exec(key);
-    if (!match || value.length === 0) continue;
-    (choices[match[1]] ??= []).push(value);
+  const choices: Record<string, string[]> = Object.create(null);
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "instance",
+  )) {
+    const nonemptyValues = values.filter((value) => value.length > 0);
+    if (nonemptyValues.length > 0) choices[name] = nonemptyValues;
   }
   return Object.keys(choices).length > 0 ? choices : undefined;
 }
@@ -1488,36 +1491,47 @@ function parseOwnerChoices(
 ): OwnerChoices | undefined | "invalid" {
   const declined: string[] = [];
   const approved: string[] = [];
-  const fields: Record<string, string[]> = {};
-  const windows: Record<string, { since?: string; until?: string }> = {};
-
   const url = new URL(c.req.url);
-  for (const [key, value] of url.searchParams.entries()) {
-    const approval = /^approve\[(.+)\]$/.exec(key);
-    if (approval && strict && value !== "true") return "invalid";
-    if (approval && value === "true") {
-      approved.push(approval[1]);
-      continue;
-    }
-    const decline = /^decline\[(.+)\]$/.exec(key);
-    if (decline) {
-      declined.push(decline[1]);
-      continue;
-    }
-    const field = /^field\[(.+)\]$/.exec(key);
-    if (field && value.length > 0) {
-      (fields[field[1]] ??= []).push(value);
-      continue;
-    }
-    const since = /^since\[(.+)\]$/.exec(key);
-    if (since && value.length > 0) {
-      (windows[since[1]] ??= {}).since = value;
-      continue;
-    }
-    const until = /^until\[(.+)\]$/.exec(key);
-    if (until && value.length > 0) {
-      (windows[until[1]] ??= {}).until = value;
-    }
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "decline",
+  )) {
+    declined.push(...values.map(() => name));
+  }
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "approve",
+  )) {
+    if (strict && values.some((value) => value !== "true")) return "invalid";
+    approved.push(
+      ...values.filter((value) => value === "true").map(() => name),
+    );
+  }
+
+  const fields: Record<string, string[]> = Object.create(null);
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "field",
+  )) {
+    const nonemptyValues = values.filter((value) => value.length > 0);
+    if (nonemptyValues.length > 0) fields[name] = nonemptyValues;
+  }
+
+  const windows: Record<string, { since?: string; until?: string }> =
+    Object.create(null);
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "since",
+  )) {
+    const value = values.filter((entry) => entry.length > 0).at(-1);
+    if (value !== undefined) (windows[name] ??= {}).since = value;
+  }
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "until",
+  )) {
+    const value = values.filter((entry) => entry.length > 0).at(-1);
+    if (value !== undefined) (windows[name] ??= {}).until = value;
   }
 
   const choices: OwnerChoices = {
