@@ -4,6 +4,7 @@ import {
   CLAUDE_SOURCE_ID,
 } from "../legacy-projection/bindings.js";
 import {
+  everyItemRowDropped,
   hasAlternateLegacyProfile,
   LEGACY_SCOPE_BINDINGS,
   legacyBindingsForProfile,
@@ -871,22 +872,21 @@ async function projectSnapshot(
   // survived, a "successful empty" would read as an empty history.
   const itemStream = streams[0];
   const sourceRows = itemStream ? (sourceRowCounts[itemStream] ?? 0) : 0;
-  const itemOmissions = omissions.filter(
-    (entry) => entry.stream === itemStream,
-  );
-  const itemDropped = itemOmissions.reduce(
-    (sum, entry) => sum + entry.count,
-    0,
-  );
-  if (itemStream && sourceRows > 0 && itemDropped >= sourceRows) {
+  const rejected = itemStream
+    ? everyItemRowDropped(itemStream, sourceRows, [
+        ...decodeDiagnostics,
+        ...(projected.diagnostics ?? []),
+      ])
+    : null;
+  if (itemStream && rejected) {
     return {
       ok: false,
       status: "incomplete",
       reason: "all_rows_rejected",
       stream: itemStream,
       sourceRows,
-      dropped: itemDropped,
-      reasons: [...new Set(itemOmissions.flatMap((entry) => entry.reasons))],
+      dropped: rejected.dropped,
+      reasons: rejected.reasons,
       sourceRowCounts,
     };
   }

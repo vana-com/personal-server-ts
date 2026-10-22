@@ -6,6 +6,7 @@ import { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
 import amazonDeclaration from "./declarations/amazon.collection-profile.json";
 import chatgptDeclaration from "./declarations/chatgpt.collection-profile.json";
 import chatgpt020Declaration from "./declarations/chatgpt-0.2.0.collection-profile.json";
+import chatgpt031Declaration from "./declarations/chatgpt-0.3.1.collection-profile.json";
 import githubDeclaration from "./declarations/github.collection-profile.json";
 import githubProvenance from "./declarations/github.provenance.json";
 import hebDeclaration from "./declarations/heb.collection-profile.json";
@@ -89,6 +90,7 @@ const DECLARATIONS: Record<string, CollectionProfile> = {
   amazon: amazonDeclaration as CollectionProfile,
   chatgpt: chatgptDeclaration as CollectionProfile,
   "chatgpt-0.2.0": chatgpt020Declaration as CollectionProfile,
+  "chatgpt-0.3.1": chatgpt031Declaration as CollectionProfile,
   github: githubDeclaration as CollectionProfile,
   heb: hebDeclaration as CollectionProfile,
   "icloud-notes": icloudNotesDeclaration as CollectionProfile,
@@ -176,7 +178,12 @@ function collectionProfileDigest(fileName: string): string {
  */
 const SOURCE_ID_TO_KEY: Record<string, string> = Object.fromEntries(
   Object.entries(DECLARATIONS)
-    .filter(([key]) => key !== "chatgpt-0.2.0" && key !== "icloud-notes-0.1.24")
+    .filter(
+      ([key]) =>
+        !["chatgpt-0.2.0", "chatgpt-0.3.1", "icloud-notes-0.1.24"].includes(
+          key,
+        ),
+    )
     .map(([key, decl]) => [decl.connector_id, key]),
 );
 

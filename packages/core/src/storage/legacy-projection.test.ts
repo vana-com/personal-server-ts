@@ -289,6 +289,65 @@ describe("withLegacyProjection", () => {
     ]);
   });
 
+  it("rejects the served read when no stored conversation can be projected", async () => {
+    const raw = createMemoryDataStorage();
+    const onIssue = vi.fn();
+    await store(raw, "chatgpt.messages", "2026-10-01T00:00:01.000Z", {
+      records: messages,
+    });
+    // Its branch should hold three messages; two arrived.
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", {
+      records: [{ ...conversation, message_count_on_current_branch: 3 }],
+    });
+    const served = withLegacyProjection(raw, { onIssue });
+
+    // An empty list would read as an account with no conversations.
+    await expect(
+      served.readEnvelope("chatgpt.conversations", "2026-10-01T00:00:01.000Z"),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+    });
+    expect(onIssue).toHaveBeenCalledWith({
+      kind: "projection_failed",
+      scope: "chatgpt.conversations",
+      collectedAt: "2026-10-01T00:00:01.000Z",
+      error: {
+        kind: "incomplete_scope",
+        scope: "chatgpt.conversations",
+        reason: "No stored conversations row could be projected",
+        diagnostics: [
+          {
+            kind: "records_dropped",
+            scope: "chatgpt.conversations",
+            stream: "conversations",
+            count: 1,
+            reasons: [
+              "Current branch message count does not match conversation",
+            ],
+          },
+        ],
+      },
+    });
+  });
+
+  it("serves an empty stored conversations stream as an empty history", async () => {
+    const raw = createMemoryDataStorage();
+    await store(raw, "chatgpt.messages", "2026-10-01T00:00:01.000Z", {
+      records: [],
+    });
+    await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", {
+      records: [],
+    });
+    const served = withLegacyProjection(raw);
+
+    const { data } = await served.readEnvelope(
+      "chatgpt.conversations",
+      "2026-10-01T00:00:01.000Z",
+    );
+    expect(data).toEqual({ conversations: [], total: 0 });
+  });
+
   it("projects conversations with empty threads when no messages stream is stored", async () => {
     const raw = createMemoryDataStorage();
     await store(raw, "chatgpt.conversations", "2026-10-01T00:00:01.000Z", {
@@ -1026,7 +1085,7 @@ describe("supersedeLegacyVersions", () => {
     const { message_count_on_current_branch: _count, ...countless } =
       conversation;
     await store(raw, "chatgpt.conversations", "2026-10-01T00:00:00.000Z", {
-      records: [countless],
+      records: [conversation, { ...countless, id: "conv-countless" }],
     });
 
     expect(
