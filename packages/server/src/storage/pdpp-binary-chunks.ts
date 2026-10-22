@@ -145,6 +145,34 @@ export function deleteBinary(
   ).run(namespace, id);
 }
 
+/**
+ * A repair write is about to give `id` a verified copy in `namespace`.
+ * Remove a published manifest whose size is not a safe non-negative
+ * integer, with its chunks, in the caller's transaction. Readers veto a
+ * namespace on such a manifest even beside a legacy row, so without this a
+ * repair would never take effect.
+ */
+export function clearMalformedManifest(
+  db: Database,
+  namespace: BinaryNamespace,
+  id: string,
+): void {
+  const row = db
+    .prepare(
+      "SELECT size_bytes AS size FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
+    )
+    .get(namespace, id) as { size: unknown } | undefined;
+  if (
+    row &&
+    !(
+      typeof row.size === "number" &&
+      Number.isSafeInteger(row.size) &&
+      row.size >= 0
+    )
+  )
+    deleteBinary(db, namespace, id);
+}
+
 /** Publish the manifest only after EOF. Callers own transaction/visibility and cleanup. */
 export function binaryWriter(
   db: Database,

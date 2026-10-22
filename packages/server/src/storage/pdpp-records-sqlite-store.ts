@@ -1,6 +1,7 @@
 import {
   BINARY_CHUNKS_MIGRATION,
   binaryLength,
+  clearMalformedManifest,
   binaryWriter,
   readBinary,
   verifyBinary,
@@ -597,8 +598,6 @@ function projectFields(
 // the row's own generation, for overlay and local rows that can belong to a
 // generation a pending reset introduces. Both halves use equality, so an
 // overlay row and the canonical row of one generation always agree.
-// Keep `generationSql` a plain optional parameter, never a default value:
-// the receiver adapter detects support through Function.length >= 2.
 function unquarantinedRecordSql(alias: string, generationSql?: string): string {
   const connection = `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_connections q WHERE q.instance = ${alias}.instance)`;
   const key = (scope: string) =>
@@ -2376,6 +2375,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     // row" and race to insert, or one could complete a metadata-only row
     // while another concurrently overwrites it.
     const run = db.transaction((): PdppBlobMeta => {
+      // A malformed manifest vetoes every reader; this write repairs it.
+      clearMalformedManifest(db, "canonical", blobId);
       const existing = getBlobMeta(blobId);
 
       if (existing) {

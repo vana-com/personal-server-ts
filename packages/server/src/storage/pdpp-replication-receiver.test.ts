@@ -3757,8 +3757,9 @@ it.each([
   },
 );
 
-// A repair write can add a legacy row beside a malformed manifest in the same
-// namespace. The legacy row's length must not mask the manifest.
+// A repair write adds a legacy row in a namespace whose manifest is
+// malformed. The read side vetoes on the manifest even beside a legacy row,
+// so the write clears the malformed manifest in its own transaction.
 it.each([
   ["received", -1],
   ["received", 1.5],
@@ -3767,7 +3768,7 @@ it.each([
   ["canonical", 1.5],
   ["canonical", 2 ** 53],
 ] as const)(
-  "a malformed %s manifest (size %s) still vetoes after a repair write adds a legacy row",
+  "a repair write over a malformed %s manifest (size %s) clears it in the same transaction, so the repaired bytes serve",
   (namespace, malformed) => {
     const source = device(),
       target = device();
@@ -3826,7 +3827,7 @@ it.each([
         .run(value, namespace, blob.blobId).changes;
     expect(size(malformed)).toBe(1);
     expect(served()).toEqual([undefined, undefined]);
-    // Supported writes of the same valid bytes add a legacy row and keep the
+    // Supported writes of the same valid bytes add a legacy row and clear the
     // malformed manifest.
     if (namespace === "received")
       receiver.import({
@@ -3849,8 +3850,7 @@ it.each([
         )
         .get(blob.blobId),
     ).toEqual({ n: 1 });
-    expect(served()).toEqual([undefined, undefined]);
-    size(3);
+    expect(size(3)).toBe(0);
     expect(served()).toEqual([3, 3]);
   },
 );

@@ -1,6 +1,7 @@
 import { createReplicaVisibilityView } from "./pdpp-replica-visibility-view.js";
 import {
   binaryLength,
+  clearMalformedManifest,
   binaryWriter,
   verifyBinary,
   copyBinary,
@@ -1012,6 +1013,7 @@ export function createReplicaReceiver(deps: {
     for (const blob of input.blobs ?? []) {
       if (hash(blob.bytes) !== blob.blobId)
         throw new Error("corrupt replica blob bytes");
+      clearMalformedManifest(db, "received", blob.blobId);
       if (binaryLength(db, "received", blob.blobId) !== undefined) {
         if (
           !verifyBinary(
@@ -1038,6 +1040,7 @@ export function createReplicaReceiver(deps: {
       const from = blob.namespace ?? "staging";
       if (!verifyBinary(db, from, blob.key, blob.blobId, blob.sizeBytes))
         throw new Error("corrupt replica blob bytes");
+      clearMalformedManifest(db, "received", blob.blobId);
       if (binaryLength(db, "received", blob.blobId) !== undefined) {
         if (
           !verifyBinary(
