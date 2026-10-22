@@ -1,6 +1,7 @@
 import {
   createReplicaVisibilityView,
   type ReplicaCopyConflictReader,
+  type CopyConflictReference,
 } from "./pdpp-replica-visibility-view.js";
 export { COPY_CONFLICT_READ_LIMITS } from "./pdpp-replica-visibility-view.js";
 export type {
@@ -8,6 +9,7 @@ export type {
   ReplicaCopyConflictReader,
   CopyConflictQuery,
   CopyConflictPage,
+  CopyConflictReference,
 } from "./pdpp-replica-visibility-view.js";
 import {
   binaryLength,
@@ -1417,13 +1419,17 @@ export function createReplicaReceiver(deps: {
         ...(reader === "owner"
           ? {
               readCopyConflicts: (
-                id: string,
+                id: string | CopyConflictReference,
                 instanceIds?: readonly string[],
                 page?: { limit?: number; cursor?: string },
               ) =>
                 readSnapshot(() =>
                   view.readOwnerCopyConflicts(
-                    { ...page, id, instanceIds },
+                    {
+                      ...page,
+                      ...(typeof id === "string" ? { id } : { reference: id }),
+                      instanceIds,
+                    },
                     true,
                   ),
                 ),

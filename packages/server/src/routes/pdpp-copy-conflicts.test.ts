@@ -345,3 +345,97 @@ it("uses the same token scope for counts, discovery and complete values", async 
     [],
   );
 });
+
+it("accepts a copy key and batch-id digest reference alongside the full id with the same owner scope", async () => {
+  const f = copyReadFixture(),
+    batch = "batch-" + "x".repeat(2000);
+  const a = f.copy("A", 1, undefined, batch),
+    b = f.copy("B", 2, undefined, batch);
+  f.stage(a);
+  f.stage(b);
+  const get = host(f),
+    idDigest = createHash("sha256").update(a.id).digest("hex");
+  const catalog = await get("owner", "/v1/replica/copy-conflicts");
+  expect(
+    catalog.body.data.every(
+      (row: { id: string; idTruncated?: true }) =>
+        row.id === idDigest && row.idTruncated,
+    ),
+  ).toBe(true);
+  const path = `/v1/replica/copy-conflicts/${idDigest}?copyKey=${a.copyKey}`;
+  const result = await get("owner", path);
+  expect(result.status).toBe(200);
+  expect(result.body.data).toEqual([
+    expect.objectContaining({
+      id: idDigest,
+      idTruncated: true,
+      copyKey: a.copyKey,
+      values: a.envelope.operations,
+    }),
+  ]);
+  expect(
+    (
+      await get(
+        "owner",
+        `/v1/replica/copy-conflicts/${encodeURIComponent(a.id)}`,
+      )
+    ).body.data,
+  ).toHaveLength(2);
+  expect((await get("narrow", path)).body.data).toEqual([]);
+  expect((await get("app", path)).status).toBe(403);
+  expect(
+    (
+      await get(
+        "owner",
+        `/v1/replica/copy-conflicts/${"0".repeat(64)}?copyKey=${a.copyKey}`,
+      )
+    ).body.data,
+  ).toEqual([]);
+  expect(
+    (
+      await get(
+        "owner",
+        `/v1/replica/copy-conflicts/${idDigest}?copyKey=invalid`,
+      )
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await get(
+        "owner",
+        `/v1/replica/copy-conflicts/invalid?copyKey=${a.copyKey}`,
+      )
+    ).status,
+  ).toBe(400);
+  f.prove(b);
+  f.receiver.copies.promote({
+    credential: "test",
+    id: b.id,
+    copyKey: b.copyKey,
+  });
+  expect((await get("owner", path)).body.data).toHaveLength(1);
+  expect(
+    (
+      await get(
+        "owner",
+        `/v1/replica/copy-conflicts/${idDigest}?copyKey=${b.copyKey}`,
+      )
+    ).body.data,
+  ).toEqual([]);
+  f.receiver.copies.terminate({
+    credential: "test",
+    id: b.id,
+    reason: "finalized_conflict",
+  });
+  f.reopen();
+  const terminal = await host(f)("owner", path);
+  expect(terminal.body.data).toEqual([
+    expect.objectContaining({
+      id: idDigest,
+      idTruncated: true,
+      copyKey: a.copyKey,
+      status: "integrity conflict",
+    }),
+  ]);
+  expect(terminal.body.data[0]).not.toHaveProperty("values");
+});

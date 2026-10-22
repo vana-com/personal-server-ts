@@ -112,10 +112,10 @@ it.each([100, 1000])(
     // A handful of 4 KiB pages, never a copy of rows or operation JSON. The
     // binding-conflict fact table now always exists (write side, migration
     // v16), so the empty local-journal projection and its indexes are
-    // always created. Owner conflict discovery adds one 4 KiB catalog index
-    // for bounded seeks by effect group; the empty layout is still fixed at
-    // 32 pages and does not copy canonical rows or operation JSON.
-    expect(viewBytes(db)).toBeLessThanOrEqual(32 * 4096);
+    // always created. Owner conflict discovery and compact references add two
+    // 4 KiB indexes for bounded seeks; the empty layout is still fixed at
+    // 33 pages and does not copy canonical rows or operation JSON.
+    expect(viewBytes(db)).toBeLessThanOrEqual(33 * 4096);
   },
 );
 

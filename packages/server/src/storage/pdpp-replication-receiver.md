@@ -109,6 +109,9 @@ The owner reader exposes two paginated methods:
   discovers conflicts without decoding values.
 - `readCopyConflicts(id, instanceIds?, { limit?, cursor? })` reads one batch's
   conflicts with bounded values.
+  It also accepts `{ idDigest, copyKey }` instead of the full `id`, returning that
+  one conflicting copy. `idDigest` is the lowercase SHA-256 hex digest of the full
+  ID's UTF-8 bytes; `copyKey` is the existing fixed-size copy hash.
 
 Both return `{ data, hasMore, nextCursor? }`. Each entry has
 `{ id, copyKey, reason, visibility: "conflicted", status, connections, streams }`.
@@ -125,6 +128,7 @@ The owner HTTP routes are:
 
 - `GET /v1/replica/copy-conflicts?connection=…&stream=…&limit=…&cursor=…`
 - `GET /v1/replica/copy-conflicts/:id?limit=…&cursor=…`
+- `GET /v1/replica/copy-conflicts/:idDigest?copyKey=…`
 
 URL-encode the batch identity as one path segment. Both return
 `{ object: "list", data: [...], has_more, next_cursor? }`. Filters are optional.
@@ -137,13 +141,23 @@ a host without that capability returns 404. Client/grant and foreign-owner token
 get 403. Missing or inactive authentication uses the existing PDPP errors.
 
 Pages default to 25 entries, with limits from 1 to 100. Ordering is by
-`(id, copyKey)` using SQLite binary text order. The bounded keyset cursor is at
+`(idDigest, copyKey)` using SQLite binary text order. The bounded keyset cursor is at
 most 4096 bytes and binds the query, endpoint, whole token scope, declarations and
 view layout. Invalid or mismatched cursors get HTTP 400; an expired layout gets 410. Authorization is checked anew on every page. This is a live catalog, not a
 snapshot across requests: new keys before the cursor require a new walk, and
-state changes can remove entries between pages. Cursors contain a retained-row
-anchor and a hash of its key, so even a long batch identity cannot enlarge them.
-If that retained anchor is removed, continuation expires with HTTP 410.
+state changes can remove entries between pages. Cursors contain only the two
+fixed-size hashes, so even a long batch identity cannot enlarge them. The digest
+index supports direct reference lookup and continuation without loading long IDs
+into the reader.
+
+Every listed identifier is limited to 1024 UTF-8 bytes. A longer batch ID is
+represented by `id: idDigest` with `idTruncated: true`; use that `id` and the listed
+`copyKey` on the reference route. The same owner scope check applies to both forms.
+Connection and stream arrays contain at most 64 names each. A longer name keeps a
+UTF-8-safe prefix plus an ellipsis within the same byte limit, and truncated names
+or arrays set `metadataTruncated: true`. These are display limits: whole-copy
+authorization, stream filters and counts use the complete effects. Decoded values
+retain complete operations under their separate per-copy byte limit.
 
 Each value-bearing copy is limited to 512 operations, 4 MiB of UTF-8 JSON values,
 and an 8 MiB encoded envelope. A normal fifty-record batch with 6 KiB records fits.
@@ -166,18 +180,21 @@ Conflicts can produce a stream entry with zero records and null recency. Ordinar
 streams report zero; grants never receive this field. Disabling pending previews
 does not disable diagnostics.
 
-View layout 10 stores one per-copy projection of sorted `(connection, stream)`
+View layout 11 stores one per-copy projection of sorted `(connection, stream)`
 effects, using a null stream for connection-level operations, plus reason and
 size facts. One owner projection interprets these facts for scope, paired filters,
 markers, values and counts. The visibility policy supplies the SQL reason list and
 the production visibility decision. Triggers maintain grouped counts and reverse
 connection indexes in the write transaction, with `NOT EXISTS` insertion guards.
+The same receiver transaction fills new ID digests through `view.flush`; the digest
+index also serves its null-digest work queue. Construction fills rebuilt digests
+before exposing the reader. No read hashes retained IDs or mutates the projection.
 Listing uses bounded indexed seeks per eligible effect group; counts read each
 group once. Neither scans retained copies nor decodes envelopes for discovery or
 counts. Work grows with requested connections and distinct effect groups, not
 repeated copies in a group. Construction rebuilds the projection from retained
 copies when upgrading. Composite primary keys avoid duplicate rowid indexes. The
-catalog index adds one fixed 4 KiB page to the empty sparse view (32 pages total),
+catalog and digest indexes add two fixed 4 KiB pages to the empty sparse view (33 pages total),
 independent of the canonical record count.
 
 Conflicting values never enter the reducer or canonical materialization. Page and

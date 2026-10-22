@@ -6,6 +6,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/fixtures";
 import { copyReadFixture } from "./pdpp-replica-copy-reads.test-utils.js";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import { createHash } from "node:crypto";
 
 it("uses one whole-copy scope for owner counts and complete diagnostic values", () => {
   const f = copyReadFixture();
@@ -424,9 +425,34 @@ it("walks different batch ids with the same copy keys and a normalized token sco
     expect(page.hasMore).toBe(cursor !== undefined);
   } while (cursor && seen.length < 5);
   expect(seen).toEqual(
-    copies.map((copy) => JSON.stringify([copy.id, copy.copyKey])).sort(),
+    [...copies]
+      .sort((a, b) => {
+        const digest = (id: string) =>
+          createHash("sha256").update(id).digest("hex");
+        return (
+          digest(a.id).localeCompare(digest(b.id)) ||
+          a.copyKey.localeCompare(b.copyKey)
+        );
+      })
+      .map((copy) => JSON.stringify([copy.id, copy.copyKey])),
   );
   expect(owner.listStreams([identity.connectionId])[0].copyConflicts).toBe(4);
+  for (const copy of copies) {
+    const page = owner.readCopyConflicts(
+      {
+        idDigest: createHash("sha256").update(copy.id).digest("hex"),
+        copyKey: copy.copyKey,
+      },
+      [identity.connectionId],
+    );
+    expect(page.data).toEqual([
+      expect.objectContaining({
+        id: copy.id,
+        copyKey: copy.copyKey,
+        values: copy.envelope.operations,
+      }),
+    ]);
+  }
 });
 
 it("keeps continuation cursors bounded even for a long retained batch id", () => {
@@ -446,4 +472,123 @@ it("keeps continuation cursors bounded even for a long retained batch id", () =>
   expect(
     new Set([...first.data, ...second.data].map((copy) => copy.copyKey)).size,
   ).toBe(2);
+});
+
+it("bounds a single oversized marker without stranding normal siblings", () => {
+  const f = copyReadFixture();
+  const batch = "x".repeat(9 * 1024 * 1024);
+  const a = f.copy("A", 1, [registration], batch);
+  f.stage(a);
+  f.stage(f.copy("B", 2, [registration], batch));
+  f.stage(f.copy("small A", 3, undefined, "z-small"));
+  f.stage(f.copy("small B", 4, undefined, "z-small"));
+  const owner = f.receiver.readStore({ reader: "owner" });
+  const first = owner.listCopyConflicts({ limit: 1 });
+  expect(first.data).toHaveLength(1);
+  expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(
+    8 * 1024 * 1024,
+  );
+  const oversized = owner.readCopyConflicts(a.id, [identity.connectionId], {
+    limit: 1,
+  });
+  expect(Buffer.byteLength(JSON.stringify(oversized))).toBeLessThanOrEqual(
+    8 * 1024 * 1024,
+  );
+  const reference = {
+    idDigest: createHash("sha256").update(a.id).digest("hex"),
+    copyKey: oversized.data[0].copyKey,
+  };
+  expect(oversized.data[0]).toMatchObject({
+    id: reference.idDigest,
+    idTruncated: true,
+  });
+  const diagnostic = owner.readCopyConflicts(reference, [
+    identity.connectionId,
+  ]);
+  expect(diagnostic.data).toHaveLength(1);
+  expect(diagnostic.data[0]).toMatchObject({
+    id: reference.idDigest,
+    idTruncated: true,
+    copyKey: reference.copyKey,
+    valuesOmitted: true,
+    valuesOmittedReason: "byte_limit",
+  });
+  expect(Buffer.byteLength(JSON.stringify(diagnostic))).toBeLessThanOrEqual(
+    8 * 1024 * 1024,
+  );
+  const seen = [...first.data];
+  let cursor = first.nextCursor;
+  while (cursor && seen.length < 5) {
+    const page = owner.listCopyConflicts({ limit: 1, cursor });
+    expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(
+      8 * 1024 * 1024,
+    );
+    seen.push(...page.data);
+    cursor = page.nextCursor;
+  }
+  expect(seen).toHaveLength(4);
+  expect(seen.filter((copy) => copy.id.includes("z-small"))).toHaveLength(2);
+  f.reopen();
+  expect(
+    f.receiver
+      .readStore({ reader: "owner" })
+      .readCopyConflicts(reference, [identity.connectionId]),
+  ).toEqual(diagnostic);
+}, 20_000);
+
+it("bounds every listed identifier and the number of metadata identifiers without changing full scope or stream effects", () => {
+  const connection = "conn-" + "😀".repeat(600);
+  const declarations = Array.from({ length: 70 }, (_, i) => ({
+    sourceId: identity.sourceId,
+    binding: {
+      ...binding,
+      stream: `stream-${i}-` + (i === 0 ? "😀".repeat(600) : "short"),
+      digest: `sha256:${i.toString(16).padStart(64, "0")}`,
+    },
+    validateData: () => true,
+  }));
+  const f = copyReadFixture({ declarations });
+  f.store.registerConnection({
+    instance: connection,
+    sourceId: identity.sourceId,
+    method: identity.methodId,
+    label: "long",
+  });
+  const ops = [
+    { ...registration, connectionId: connection },
+    {
+      ...f.copy("record", 1).record,
+      connectionId: connection,
+      declaration: declarations[0].binding,
+    },
+  ];
+  f.stage(f.copy("A", 1, ops));
+  f.stage(f.copy("B", 2, ops));
+  const owner = f.receiver.readStore({ reader: "owner" });
+  expect(
+    owner.listCopyConflicts({ instanceIds: [identity.connectionId] }).data,
+  ).toEqual([]);
+  const page = owner.listCopyConflicts({
+    instanceIds: [connection],
+    connection,
+    stream: declarations[69].binding.stream,
+  });
+  expect(page.data).toHaveLength(2);
+  for (const entry of page.data) {
+    expect(entry).toMatchObject({ metadataTruncated: true });
+    expect(entry.streams.length).toBeLessThanOrEqual(64);
+    for (const value of [
+      entry.id,
+      entry.copyKey,
+      ...entry.connections,
+      ...entry.streams,
+    ])
+      expect(Buffer.byteLength(value)).toBeLessThanOrEqual(1024);
+  }
+  expect(owner.listStreams([connection])).toHaveLength(70);
+  expect(
+    owner
+      .listStreams([connection])
+      .every((stream) => stream.copyConflicts === 2),
+  ).toBe(true);
 });

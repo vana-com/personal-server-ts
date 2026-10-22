@@ -931,7 +931,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         const allowed =
           mode === "catalog"
             ? ["connection", "stream", "limit", "cursor"]
-            : ["limit", "cursor"];
+            : ["limit", "cursor", "copyKey"];
         if (Object.keys(params).some((key) => !allowed.includes(key)))
           throw new PdppError(
             "invalid_request",
@@ -958,10 +958,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           );
         const page =
           mode === "values"
-            ? reader.readCopyConflicts(c.req.param("id")!, instanceIds, {
-                limit,
-                cursor: params.cursor,
-              })
+            ? reader.readCopyConflicts(
+                params.copyKey === undefined
+                  ? c.req.param("id")!
+                  : { idDigest: c.req.param("id")!, copyKey: params.copyKey },
+                instanceIds,
+                {
+                  limit,
+                  cursor: params.cursor,
+                },
+              )
             : reader.listCopyConflicts({
                 instanceIds,
                 connection: params.connection,

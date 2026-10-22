@@ -42,6 +42,8 @@ export interface ReplicaCopyConflict {
   status: "copy conflict" | "integrity conflict";
   connections: string[];
   streams: string[];
+  idTruncated?: true;
+  metadataTruncated?: true;
   values?: ReplicaOperation[];
   valuesOmitted?: true;
   valuesOmittedReason?: "operation_limit" | "byte_limit";
@@ -53,6 +55,11 @@ export interface CopyConflictQuery {
   stream?: string;
   limit?: number;
   cursor?: string;
+  reference?: CopyConflictReference;
+}
+export interface CopyConflictReference {
+  idDigest: string;
+  copyKey: string;
 }
 export interface CopyConflictPage {
   data: ReplicaCopyConflict[];
@@ -61,7 +68,7 @@ export interface CopyConflictPage {
 }
 export interface ReplicaCopyConflictReader {
   readCopyConflicts(
-    id: string,
+    id: string | CopyConflictReference,
     instanceIds?: readonly string[],
     page?: Pick<CopyConflictQuery, "limit" | "cursor">,
   ): CopyConflictPage;
@@ -74,26 +81,26 @@ export const COPY_CONFLICT_READ_LIMITS = {
   valueBytes: 4 * 1024 * 1024,
   totalBytes: 8 * 1024 * 1024,
   cursorBytes: 4096,
+  identifierBytes: 1024,
+  metadataItems: 64,
 } as const;
 type CopyEffects = [connection: string, stream: string | null][];
 type CopyFacts = { reason: ReplicaCopyConflictReason; effects: string };
 type CopyProjectionRow = CopyFacts & {
-  id: string;
+  id: string | null;
   copy_key: string;
   operation_count: number;
   envelope_bytes: number;
-  copy_rowid: number;
+  id_digest: string;
 };
 const compareCopyText = (a: string, b: string) =>
   Buffer.compare(Buffer.from(a), Buffer.from(b));
 const compareCopies = (
-  a: { id: string; copy_key: string },
-  b: { id: string; copy_key: string },
-) => compareCopyText(a.id, b.id) || compareCopyText(a.copy_key, b.copy_key);
-const copyCursorAnchor = (row: { id: string; copy_key: string }) =>
-  createHash("sha256")
-    .update(canonicalJson([row.id, row.copy_key]))
-    .digest("hex");
+  a: { id_digest: string; copy_key: string },
+  b: { id_digest: string; copy_key: string },
+) =>
+  compareCopyText(a.id_digest, b.id_digest) ||
+  compareCopyText(a.copy_key, b.copy_key);
 
 type Evidence = { op: ReplicaOperation; confirmed: boolean; pending: number };
 type CanonicalRow = {
@@ -119,7 +126,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 10;
+const VIEW_SCHEMA = 11;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -403,7 +410,7 @@ export function createReplicaVisibilityView(deps: {
           FROM (SELECT DISTINCT json_extract(value,'$.connectionId') AS instance,
             json_extract(value,'$.declaration.stream') AS stream
             FROM json_each(${alias}.envelope_json,'$.operations'))),
-        json_array_length(${alias}.envelope_json,'$.operations'),length(CAST(${alias}.envelope_json AS BLOB)),${alias}.rowid`;
+        json_array_length(${alias}.envelope_json,'$.operations'),length(CAST(${alias}.envelope_json AS BLOB)),NULL`;
       const addCopy = (
         alias: string,
       ) => `INSERT INTO pdpp_replica_view_copy_projection
@@ -412,11 +419,14 @@ export function createReplicaVisibilityView(deps: {
       db.exec(`
         CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_projection (
           id TEXT NOT NULL,copy_key TEXT NOT NULL,reason TEXT NOT NULL,effects TEXT NOT NULL,
-          operation_count INTEGER NOT NULL,envelope_bytes INTEGER NOT NULL,copy_rowid INTEGER NOT NULL,
+          operation_count INTEGER NOT NULL,envelope_bytes INTEGER NOT NULL,
+          id_digest TEXT,
           PRIMARY KEY(id,copy_key)
         ) WITHOUT ROWID;
         -- Each eligible effect group is a bounded keyset seek, never a copy scan.
-        CREATE INDEX IF NOT EXISTS pdpp_replica_view_copy_catalog ON pdpp_replica_view_copy_projection(reason,effects,id,copy_key);
+        CREATE INDEX IF NOT EXISTS pdpp_replica_view_copy_catalog ON pdpp_replica_view_copy_projection(reason,effects,id_digest,copy_key);
+        -- NULL digests are the write-time dirty queue as well as the reference index.
+        CREATE INDEX IF NOT EXISTS pdpp_replica_view_copy_reference ON pdpp_replica_view_copy_projection(id_digest,copy_key);
         CREATE TABLE IF NOT EXISTS pdpp_replica_view_copy_counts (
           reason TEXT NOT NULL,effects TEXT NOT NULL,n INTEGER NOT NULL,PRIMARY KEY(reason,effects)
         ) WITHOUT ROWID;
@@ -597,6 +607,24 @@ export function createReplicaVisibilityView(deps: {
   }
   function flush(): void {
     if (!db.inTransaction) return db.transaction(flush).immediate();
+    if (hasCopyFacts) {
+      // Receiver copy mutations call flush in the same transaction; construction
+      // also fills rebuilt facts. No hashing function is required by SQL writers.
+      const unhashed = db
+        .prepare(
+          "SELECT id,copy_key FROM pdpp_replica_view_copy_projection WHERE id_digest IS NULL",
+        )
+        .all() as { id: string; copy_key: string }[];
+      const update = db.prepare(
+        "UPDATE pdpp_replica_view_copy_projection SET id_digest=? WHERE id=? AND copy_key=?",
+      );
+      for (const row of unhashed)
+        update.run(
+          createHash("sha256").update(row.id).digest("hex"),
+          row.id,
+          row.copy_key,
+        );
+    }
     const dirtyOps = (
       db
         .prepare(
@@ -1437,34 +1465,80 @@ export function createReplicaVisibilityView(deps: {
       connections,
       streams,
     };
+    function values(
+      row: CopyProjectionRow,
+    ): Pick<
+      ReplicaCopyConflict,
+      "values" | "valuesOmitted" | "valuesOmittedReason"
+    > {
+      if (!REPLICA_COPY_CONFLICT_POLICY[facts.reason].values) return {};
+      if (row.operation_count > COPY_CONFLICT_READ_LIMITS.operations)
+        return {
+          valuesOmitted: true,
+          valuesOmittedReason: "operation_limit",
+        };
+      if (row.envelope_bytes > COPY_CONFLICT_READ_LIMITS.envelopeBytes)
+        return { valuesOmitted: true, valuesOmittedReason: "byte_limit" };
+      const stored = db
+        .prepare(
+          "SELECT c.envelope_json FROM pdpp_replica_view_copy_projection p JOIN pdpp_replica_copies c ON c.id=p.id AND c.copy_key=p.copy_key WHERE p.id_digest=? AND p.copy_key=?",
+        )
+        .get(row.id_digest, row.copy_key) as { envelope_json: string };
+      const values = replicaEnvelopeSchema.parse(
+        JSON.parse(stored.envelope_json),
+      ).operations;
+      return Buffer.byteLength(JSON.stringify(values)) >
+        COPY_CONFLICT_READ_LIMITS.valueBytes
+        ? { valuesOmitted: true, valuesOmittedReason: "byte_limit" }
+        : { values };
+    }
     return {
       metadata,
-      values(
+      entry(
         row: CopyProjectionRow,
-      ): Pick<
-        ReplicaCopyConflict,
-        "values" | "valuesOmitted" | "valuesOmittedReason"
-      > {
-        if (!REPLICA_COPY_CONFLICT_POLICY[facts.reason].values) return {};
-        if (row.operation_count > COPY_CONFLICT_READ_LIMITS.operations)
-          return {
-            valuesOmitted: true,
-            valuesOmittedReason: "operation_limit",
-          };
-        if (row.envelope_bytes > COPY_CONFLICT_READ_LIMITS.envelopeBytes)
-          return { valuesOmitted: true, valuesOmittedReason: "byte_limit" };
-        const stored = db
-          .prepare(
-            "SELECT envelope_json FROM pdpp_replica_copies WHERE id=? AND copy_key=?",
-          )
-          .get(row.id, row.copy_key) as { envelope_json: string };
-        const values = replicaEnvelopeSchema.parse(
-          JSON.parse(stored.envelope_json),
-        ).operations;
-        return Buffer.byteLength(JSON.stringify(values)) >
-          COPY_CONFLICT_READ_LIMITS.valueBytes
-          ? { valuesOmitted: true, valuesOmittedReason: "byte_limit" }
-          : { values };
+        includeValues: boolean,
+      ): ReplicaCopyConflict {
+        let metadataTruncated = false;
+        const identifiers = (names: string[]) => {
+          if (names.length > COPY_CONFLICT_READ_LIMITS.metadataItems)
+            metadataTruncated = true;
+          return names
+            .slice(0, COPY_CONFLICT_READ_LIMITS.metadataItems)
+            .map((name) => {
+              if (
+                Buffer.byteLength(name) <=
+                COPY_CONFLICT_READ_LIMITS.identifierBytes
+              )
+                return name;
+              metadataTruncated = true;
+              let prefix = "",
+                bytes = 0;
+              for (const character of name) {
+                const size = Buffer.byteLength(character);
+                if (
+                  bytes + size >
+                  COPY_CONFLICT_READ_LIMITS.identifierBytes - 3
+                )
+                  break;
+                prefix += character;
+                bytes += size;
+              }
+              return prefix + "…";
+            });
+        };
+        const connections = identifiers(metadata.connections),
+          streams = identifiers(metadata.streams);
+        const idTruncated = row.id === null;
+        return {
+          id: row.id ?? row.id_digest,
+          copyKey: row.copy_key,
+          ...metadata,
+          connections,
+          streams,
+          ...(idTruncated ? { idTruncated: true as const } : {}),
+          ...(metadataTruncated ? { metadataTruncated: true as const } : {}),
+          ...(includeValues ? values(row) : {}),
+        };
       },
     };
   }
@@ -1494,6 +1568,11 @@ export function createReplicaVisibilityView(deps: {
     query: CopyConflictQuery,
     includeValues: boolean,
   ): CopyConflictPage {
+    if (query.reference) {
+      const { idDigest, copyKey } = query.reference;
+      if (!/^[a-f0-9]{64}$/.test(idDigest) || !/^0x[a-f0-9]{64}$/.test(copyKey))
+        throw new InvalidCursorError();
+    }
     const limit = query.limit ?? 25;
     if (
       !Number.isSafeInteger(limit) ||
@@ -1501,16 +1580,22 @@ export function createReplicaVisibilityView(deps: {
       limit > COPY_CONFLICT_READ_LIMITS.copies
     )
       throw new InvalidCursorError();
+    const idDigest =
+      query.reference?.idDigest ??
+      (query.id === undefined
+        ? undefined
+        : createHash("sha256").update(query.id).digest("hex"));
     const scope = createHash("sha256")
       .update(
         canonicalJson({
           ids: query.instanceIds
             ? [...new Set(query.instanceIds)].sort(compareCopyText)
             : null,
-          id: query.id ?? null,
+          idDigest: idDigest ?? null,
           connection: query.connection ?? null,
           stream: query.stream ?? null,
           includeValues,
+          reference: query.reference ?? null,
           declarations: deps
             .declarations()
             .map(({ sourceId, binding }) => [
@@ -1524,7 +1609,7 @@ export function createReplicaVisibilityView(deps: {
         }),
       )
       .digest("hex");
-    let after = { id: "", copy_key: "" };
+    let after = { id_digest: "", copy_key: "" };
     if (query.cursor) {
       if (
         query.cursor.length > COPY_CONFLICT_READ_LIMITS.cursorBytes ||
@@ -1545,27 +1630,20 @@ export function createReplicaVisibilityView(deps: {
         schema?: number;
         scope?: string;
         after?: unknown;
-        anchor?: unknown;
       };
       if (cursor.schema !== VIEW_SCHEMA) throw new CursorExpiredError();
       if (
         cursor.scope !== scope ||
-        typeof cursor.after !== "number" ||
-        !Number.isSafeInteger(cursor.after) ||
-        cursor.after < 1 ||
-        typeof cursor.anchor !== "string" ||
-        !/^[a-f0-9]{64}$/.test(cursor.anchor)
+        !Array.isArray(cursor.after) ||
+        cursor.after.length !== 2 ||
+        typeof cursor.after[0] !== "string" ||
+        !/^[a-f0-9]{64}$/.test(cursor.after[0]) ||
+        typeof cursor.after[1] !== "string" ||
+        !/^0x[a-f0-9]{64}$/.test(cursor.after[1])
       )
         throw new InvalidCursorError();
-      // Retained copy rowids give even arbitrarily long batch IDs a fixed-size
-      // cursor. Bind the anchor to its key so a deleted/reused row cannot move it.
-      const retained = db
-        .prepare("SELECT id,copy_key FROM pdpp_replica_copies WHERE rowid=?")
-        .get(cursor.after) as { id: string; copy_key: string } | undefined;
-      if (!retained || copyCursorAnchor(retained) !== cursor.anchor)
-        throw new CursorExpiredError();
-      after = retained;
-      if (query.id !== undefined && after.id !== query.id)
+      after = { id_digest: cursor.after[0], copy_key: cursor.after[1] };
+      if (idDigest !== undefined && after.id_digest !== idDigest)
         throw new InvalidCursorError();
     }
     type Candidate = {
@@ -1578,15 +1656,18 @@ export function createReplicaVisibilityView(deps: {
       // join of all matching copies, or a cheap catalog read becomes a scan.
       const rows = db
         .prepare(
-          `SELECT * FROM pdpp_replica_view_copy_projection
-        WHERE reason=? AND effects=? AND ${query.id === undefined ? "(id,copy_key)>(?,?)" : "id=? AND copy_key>?"}
-        ORDER BY id,copy_key LIMIT ?`,
+          `SELECT CASE WHEN length(CAST(id AS BLOB))<=? THEN id ELSE NULL END AS id,
+          id_digest,copy_key,reason,effects,operation_count,envelope_bytes FROM pdpp_replica_view_copy_projection
+        WHERE reason=? AND effects=? AND ${idDigest === undefined ? "(id_digest,copy_key)>(?,?)" : "id_digest=? AND copy_key>?"} ${query.reference ? "AND copy_key=?" : ""}
+        ORDER BY id_digest,copy_key LIMIT ?`,
         )
         .all(
+          COPY_CONFLICT_READ_LIMITS.identifierBytes,
           facts.reason,
           facts.effects,
-          query.id ?? after.id,
+          idDigest ?? after.id_digest,
           after.copy_key,
+          ...(query.reference ? [query.reference.copyKey] : []),
           limit + 1,
         ) as CopyProjectionRow[];
       candidates.push(...rows.map((row) => ({ row, projection })));
@@ -1603,14 +1684,9 @@ export function createReplicaVisibilityView(deps: {
       COPY_CONFLICT_READ_LIMITS.cursorBytes -
       256;
     for (const { row, projection } of candidates.slice(0, limit)) {
-      const entry: ReplicaCopyConflict = {
-        id: row.id,
-        copyKey: row.copy_key,
-        ...projection.metadata,
-        ...(includeValues ? projection.values(row) : {}),
-      };
+      const entry = projection.entry(row, includeValues);
       const size = Buffer.byteLength(JSON.stringify(entry));
-      if (data.length && bytes + size > entryBudget) break;
+      if (bytes + size > entryBudget) break;
       data.push(entry);
       bytes += size;
       last = row;
@@ -1622,8 +1698,7 @@ export function createReplicaVisibilityView(deps: {
             JSON.stringify({
               schema: VIEW_SCHEMA,
               scope,
-              after: last.copy_rowid,
-              anchor: copyCursorAnchor(last),
+              after: [last.id_digest, last.copy_key],
             }),
           ).toString("base64url")
         : undefined;
