@@ -1877,3 +1877,151 @@ describe("configured methods that share one public source", () => {
     expect(ids(read.text)).toEqual(["b1"]);
   });
 });
+
+// These are fixture regression checks, not new captures from the named apps.
+// The route must keep the same body when ownership moves off the legacy file.
+describe.each([
+  "linkedin.connections",
+  "github.repositories",
+  "github.starred",
+  "github.profile",
+  "spotify.playlists",
+  "spotify.savedTracks",
+  "linkedin.profile",
+  "spotify.profile",
+  "instagram.profile",
+])("owner coverage decision for %s", (scope) => {
+  it.each([false, true])(
+    "serves canonical only when its PDPP read covers the old file (complete=%s)",
+    async (complete) => {
+      const fixture: {
+        profileKey?: string;
+        streams: Record<string, Record<string, unknown>[]>;
+        legacyBody: Record<string, unknown>;
+      } =
+        scope === "spotify.savedTracks"
+          ? {
+              streams: {
+                saved_tracks: [
+                  {
+                    id: "track-a",
+                    name: "Song",
+                    artist_names: [],
+                    album_name: "Album",
+                    album_artist_names: [],
+                    uri: "spotify:track:track-a",
+                  },
+                ],
+              },
+              legacyBody: {
+                savedTracks: [
+                  {
+                    name: "Song",
+                    artists: [],
+                    album: { name: "Album", artists: [] },
+                    uri: "spotify:track:track-a",
+                    added_at: "",
+                    duration_ms: 0,
+                    explicit: false,
+                  },
+                ],
+                total: 1,
+              },
+            }
+          : JSON.parse(
+              await readFile(
+                new URL(
+                  `../../core/src/legacy-projection/__fixtures__/parity/${scope}.json`,
+                  import.meta.url,
+                ),
+                "utf8",
+              ),
+            );
+      const canonicalBody = structuredClone(fixture.legacyBody);
+      if (scope === "spotify.playlists") {
+        // No old track entities need an identity. The newer complete read can
+        // add real tracks, including local tracks and nonempty artist lists.
+        for (const playlist of fixture.legacyBody.playlists as {
+          tracks: unknown[];
+          tracks_total: number;
+        }[]) {
+          playlist.tracks = [];
+          playlist.tracks_total = 0;
+        }
+      }
+      const method = fixture.profileKey ?? scope.split(".")[0]!;
+      const source = `https://registry.pdpp.dev/sources/${method}`;
+      // A profile fixture may include other scopes' input streams.
+      const streams = scope.endsWith("profile")
+        ? { profile: fixture.streams.profile! }
+        : fixture.streams;
+      const declaration = JSON.stringify({
+        source_id: source,
+        source_kind: "connector",
+        version: "1",
+        streams: Object.entries(streams).map(([name, rows]) => ({
+          name,
+          fields: [...new Set(rows.flatMap((row) => Object.keys(row)))],
+          required_fields: ["id"],
+          primary_key: ["id"],
+        })),
+      });
+      await ctx!.cleanup();
+      ctx = await boot(method, { declaration });
+      // Store the old file before registering the canonical owner.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-10-09T00:00:00.000Z"));
+        await legacyWrite(scope, fixture.legacyBody);
+      } finally {
+        vi.useRealTimers();
+      }
+      const token = await registerTestConnection(
+        ctx.app,
+        ctx.devToken!,
+        owner,
+        source,
+        method,
+      );
+      const instance = `${method}:${owner}`;
+      for (const [stream, rows] of Object.entries(streams)) {
+        const response = await ctx.app.request(
+          `/v1/streams/${stream}/records/replace?method=${method}&binding_generation=1`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              instance,
+              emitted_at: "2026-10-21T00:00:00.000Z",
+              ...(complete
+                ? { source_collected_at: "2026-10-21T00:00:00.000Z" }
+                : {}),
+              records: (complete ? rows : []).map((data) => ({
+                key: String(data.id),
+                data,
+                emitted_at: "2026-10-21T00:00:00.000Z",
+              })),
+            }),
+          },
+        );
+        expect(response.status, await response.text()).toBe(200);
+      }
+      const read = await ownerGet(`/v1/data/${scope}`);
+      expect(read.status).toBe(200);
+      const hasUnkeyedEntities = [
+        "linkedin.connections",
+        "github.repositories",
+        "github.starred",
+        "spotify.savedTracks",
+      ].includes(scope);
+      const canonical = complete && !hasUnkeyedEntities;
+      expect(read.dataSource).toBe(canonical ? "canonical" : "legacy");
+      expect(JSON.parse(read.text).data).toEqual(
+        canonical ? canonicalBody : fixture.legacyBody,
+      );
+    },
+  );
+});
