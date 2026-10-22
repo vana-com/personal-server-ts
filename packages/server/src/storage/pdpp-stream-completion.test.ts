@@ -1051,7 +1051,7 @@ describe("stream completion over the real SQLite record store", () => {
 
   // --- schema upgrade ----------------------------------------------------
 
-  describe("schema v8 to v11", () => {
+  describe("schema v8 to v12", () => {
     it("keeps old receipts null-labelled and P7 behavior unchanged", () => {
       const dir = mkdtempSync(join(tmpdir(), "stream-completion-v8-"));
       try {
@@ -1085,7 +1085,7 @@ describe("stream completion over the real SQLite record store", () => {
         const upgraded = createSqliteRecordStore(upgradedDb);
         expect(
           upgradedDb.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 13 });
+        ).toEqual({ version: 14 });
         expect(
           upgradedDb.prepare("SELECT epoch FROM pdpp_store_metadata").get(),
         ).toEqual(epoch);
@@ -1390,7 +1390,7 @@ describe("stream completion over the real SQLite record store", () => {
         const upgraded = createSqliteRecordStore(genuine);
         expect(
           genuine.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 13 });
+        ).toEqual({ version: 14 });
         expect(
           genuine
             .prepare(

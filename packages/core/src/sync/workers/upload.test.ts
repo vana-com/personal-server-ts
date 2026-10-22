@@ -419,154 +419,28 @@ describe("upload worker", () => {
       };
     }
 
-    it("adopts the registered data point when its content matches", async () => {
-      const deps = makeMockDeps();
-      const entry = makeEntry();
-      (
-        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
-      ).mockRejectedValueOnce(STALE_409);
-      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeRecord(),
-      );
-
-      const result = await uploadOne(deps, entry);
-
-      expect(deps.gateway.getDataPoint).toHaveBeenCalledWith(REGISTRY_ID);
-      expect(result.dataPointId).toBe(REGISTRY_ID);
-      expect(deps.storage.updateDataPointId).toHaveBeenCalledWith(
-        entry.path,
-        REGISTRY_ID,
-      );
-      // No second registration, no extra blob; the local version already
-      // matches the registry's, so no version rewrite either.
-      expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
-      expect(deps.storage.updateEntryVersion).not.toHaveBeenCalled();
-      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
-    });
-
-    it("aligns the local version with the adopted registry version", async () => {
-      const deps = makeMockDeps();
-      const entry = makeEntry(); // local version 1
-      (
-        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
-      ).mockRejectedValueOnce(STALE_409);
-      // Same content, but the registry sequence has moved on to 7 (e.g. a
-      // replica re-registered identical bytes at a higher version).
-      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeRecord({ expectedVersion: "7" }),
-      );
-
-      const result = await uploadOne(deps, entry);
-
-      expect(result.dataPointId).toBe(REGISTRY_ID);
-      // Downstream consumers (x402 RecordDataAccess) sign from the local
-      // row's version — it must follow the adopted registry version.
-      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
-        entry.path,
-        7,
-      );
-      expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
-    });
-
-    it("heals a missing blob when adopting a cross-replica version", async () => {
-      const deps = makeMockDeps();
-      const entry = makeEntry(); // local version 1
-      (
-        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
-      ).mockRejectedValueOnce(STALE_409);
-      // Same content registered by another replica at version 7 — but that
-      // replica never landed the blob (crashed between register and upload,
-      // or wrote to storage this reader can't reach).
-      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeRecord({ expectedVersion: "7" }),
-      );
-      (
-        deps.storageAdapter.exists as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(false);
-
-      const result = await uploadOne(deps, entry);
-
-      // Probed the adopted version's blob URL, found it missing, and healed
-      // it from our identical plaintext (dataHash matched).
-      expect(deps.storageAdapter.exists).toHaveBeenCalledWith(
-        `https://storage.vana.com/v1/blobs/${OWNER}/${SCOPE}/7`,
-      );
-      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
-        `${SCOPE}/7`,
-        expect.any(Uint8Array),
-      );
-      expect(result.dataPointId).toBe(REGISTRY_ID);
-      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
-        entry.path,
-        7,
-      );
-    });
-
-    it("does not re-upload when the adopted cross-replica blob is present", async () => {
-      const deps = makeMockDeps();
-      const entry = makeEntry(); // local version 1
-      (
-        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
-      ).mockRejectedValueOnce(STALE_409);
-      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeRecord({ expectedVersion: "7" }),
-      );
-      // exists defaults to true in makeMockDeps.
-
-      await uploadOne(deps, entry);
-
-      expect(deps.storageAdapter.exists).toHaveBeenCalledWith(
-        `https://storage.vana.com/v1/blobs/${OWNER}/${SCOPE}/7`,
-      );
-      // Only the initial step-5 upload to {scope}/1 — no heal upload.
-      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
-      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
-        `${SCOPE}/${VERSION}`,
-        expect.any(Uint8Array),
-      );
-    });
-
-    it("leaves the entry unsynced when the existence probe fails transiently", async () => {
-      const deps = makeMockDeps();
-      const entry = makeEntry(); // local version 1
-      (
-        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
-      ).mockRejectedValueOnce(STALE_409);
-      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeRecord({ expectedVersion: "7" }),
-      );
-      // Transient storage error — the adapter rethrows instead of answering.
-      (
-        deps.storageAdapter.exists as ReturnType<typeof vi.fn>
-      ).mockRejectedValue(
-        new Error("vana-storage download failed: 503 Service Unavailable"),
-      );
-
-      await expect(uploadOne(deps, entry)).rejects.toThrow("503");
-
-      // A failed heal must not stamp the entry synced or move its version —
-      // the next cycle retries the whole adopt from a clean slate.
-      expect(deps.storage.updateEntryVersion).not.toHaveBeenCalled();
-      expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
-    });
-
-    it("skips the existence probe when adopting at the local version", async () => {
-      const deps = makeMockDeps();
-      const entry = makeEntry(); // local version 1, record also version 1
-      (
-        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
-      ).mockRejectedValueOnce(STALE_409);
-      (deps.gateway.getDataPoint as ReturnType<typeof vi.fn>).mockResolvedValue(
-        makeRecord(),
-      );
-
-      await uploadOne(deps, entry);
-
-      // Our own step-5 upload just landed the bytes at {scope}/1 — probing
-      // would be redundant.
-      expect(deps.storageAdapter.exists).not.toHaveBeenCalled();
-      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
-    });
+    it.each(["1", "7"])(
+      "requires fencing before healing matching registered version %s whose bytes are missing",
+      async (version) => {
+        const deps = makeMockDeps();
+        (
+          deps.storageAdapter.exists as ReturnType<typeof vi.fn>
+        ).mockResolvedValue(false);
+        (
+          deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+        ).mockRejectedValueOnce(STALE_409);
+        (
+          deps.gateway.getDataPoint as ReturnType<typeof vi.fn>
+        ).mockResolvedValue(makeRecord({ expectedVersion: version }));
+        await expect(uploadOne(deps, makeEntry())).rejects.toMatchObject({
+          code: "NEEDS_FENCED_PUBLICATION",
+          retryable: true,
+        });
+        expect(deps.storage.updateEntryVersion).not.toHaveBeenCalled();
+        expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+        expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
+      },
+    );
 
     it("rebases onto the registry's version + 1 when content differs", async () => {
       const deps = makeMockDeps();
@@ -796,32 +670,20 @@ describe("upload worker", () => {
       );
     });
 
-    it("registers a re-ingest newer than the deletion strictly after the tombstone version", async () => {
+    it("requires fencing for a deliberate re-add after an observed tombstone", async () => {
       const deps = withFeed(makeMockDeps(), {
         deletedAt: DELETED_AT,
         expectedVersion: "4",
       });
-      // Ingested with knowledge of tombstone 4: a deliberate re-add.
-      const entry = makeEntry({ afterTombstoneVersion: 4 });
-
-      const result = await uploadOne(deps, entry);
-
+      await expect(
+        uploadOne(deps, makeEntry({ afterTombstoneVersion: 4 })),
+      ).rejects.toMatchObject({
+        code: "NEEDS_FENCED_PUBLICATION",
+        retryable: true,
+      });
       expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
-      expect(deps.storageAdapter.upload).toHaveBeenCalledWith(
-        `${SCOPE}/5`,
-        ENCRYPTED_BYTES,
-      );
-      expect(deps.signer.signAddData).toHaveBeenCalledWith(
-        expect.objectContaining({ expectedVersion: 5n }),
-      );
-      expect(deps.gateway.registerDataPoint).toHaveBeenCalledWith(
-        expect.objectContaining({ expectedVersion: "5" }),
-      );
-      expect(deps.storage.updateEntryVersion).toHaveBeenCalledWith(
-        entry.path,
-        5,
-      );
-      expect(result.dataPointId).toBe(DATA_POINT_ID);
+      expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+      expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
     });
 
     it("drops a pre-deletion entry even when this replica's clock is ahead of the gateway", async () => {
@@ -887,8 +749,8 @@ describe("upload worker", () => {
     });
 
     it("drops the entry when a 409 reveals a tombstone that landed after the guard ran", async () => {
-      // Step 1b saw a live row; another replica deleted the scope before
-      // this worker registered. The 409 path must apply the same rule
+      // Step 1b saw a live row below this entry's version; another replica
+      // deleted the scope before this worker registered. The 409 path must apply the same rule
       // instead of rebasing past the tombstone (which would resurrect it).
       const deps = withFeed(makeMockDeps(), {
         deletedAt: null,
@@ -900,7 +762,7 @@ describe("upload worker", () => {
         scope: SCOPE,
         dataHash: "0x" + "33".repeat(32),
         metadataHash: "0x" + "44".repeat(32),
-        expectedVersion: "2",
+        expectedVersion: "3",
         addedAt: DELETED_AT,
         deletedAt: DELETED_AT,
       };
@@ -912,7 +774,7 @@ describe("upload worker", () => {
         deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
       ).mockRejectedValueOnce(
         new Error(
-          "Gateway error: 409 Stale expectedVersion 1: must be strictly greater than the stored value 2",
+          "Gateway error: 409 Stale expectedVersion 2: must be strictly greater than the stored value 3",
         ),
       );
       const scopeDeletions = {
@@ -926,7 +788,10 @@ describe("upload worker", () => {
       };
       deps.scopeDeletions = scopeDeletions;
       deps.storageAdapter.delete = vi.fn(async () => true);
-      const entry = makeEntry({ createdAt: "2026-01-21T10:00:00Z" });
+      const entry = makeEntry({
+        createdAt: "2026-01-21T10:00:00Z",
+        version: 2,
+      });
 
       await expect(uploadOne(deps, entry)).rejects.toMatchObject({
         name: "DeletedScopeEntryError",
@@ -934,14 +799,9 @@ describe("upload worker", () => {
 
       expect(deps.gateway.registerDataPoint).toHaveBeenCalledTimes(1);
       expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
-      // The ciphertext already uploaded for the abandoned entry is removed
-      // from storage: dropping the row alone would leave deleted data behind.
-      const uploadedUrl = (
-        deps.storageAdapter.upload as ReturnType<typeof vi.fn>
-      ).mock.results[0].value;
-      expect(deps.storageAdapter.delete).toHaveBeenCalledWith(
-        await uploadedUrl,
-      );
+      // Cleanup belongs to the fenced deletion pipeline: a registry refusal
+      // cannot prove that another replica did not commit these same bytes.
+      expect(deps.storageAdapter.delete).not.toHaveBeenCalled();
       expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
         SCOPE,
         COLLECTED_AT,
@@ -950,7 +810,7 @@ describe("upload worker", () => {
       expect(scopeDeletions.markLive).not.toHaveBeenCalled();
     });
 
-    it("queues guarded cleanup when the abandoned upload's blob cannot be deleted", async () => {
+    it("does not enqueue an unfenced reclaim after a registry refusal", async () => {
       const deps = withFeed(makeMockDeps(), {
         deletedAt: null,
         expectedVersion: "1",
@@ -964,7 +824,7 @@ describe("upload worker", () => {
         scope: SCOPE,
         dataHash: "0x" + "33".repeat(32),
         metadataHash: "0x" + "44".repeat(32),
-        expectedVersion: "2",
+        expectedVersion: "3",
         addedAt: DELETED_AT,
         deletedAt: DELETED_AT,
       });
@@ -972,7 +832,7 @@ describe("upload worker", () => {
         deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
       ).mockRejectedValueOnce(
         new Error(
-          "Gateway error: 409 Stale expectedVersion 1: must be strictly greater than the stored value 2",
+          "Gateway error: 409 Stale expectedVersion 2: must be strictly greater than the stored value 3",
         ),
       );
       deps.storageAdapter.delete = vi.fn(async () => {
@@ -985,20 +845,17 @@ describe("upload worker", () => {
       };
       deps.pendingBlobDeletions = pendingBlobDeletions;
 
-      await expect(uploadOne(deps, makeEntry())).rejects.toMatchObject({
+      await expect(
+        uploadOne(deps, makeEntry({ version: 2 })),
+      ).rejects.toMatchObject({
         name: "DeletedScopeEntryError",
       });
 
-      expect(pendingBlobDeletions.add).toHaveBeenCalledWith([
-        { scope: SCOPE, version: "1" },
-      ]);
+      expect(pendingBlobDeletions.add).not.toHaveBeenCalled();
+      expect(deps.storageAdapter.delete).not.toHaveBeenCalled();
       expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
         SCOPE,
         COLLECTED_AT,
-      );
-      expect(deps.logger.warn).toHaveBeenCalledWith(
-        expect.objectContaining({ scope: SCOPE, queuedForCleanup: true }),
-        expect.stringContaining("Could not delete the ciphertext"),
       );
     });
 
@@ -1025,9 +882,9 @@ describe("upload worker", () => {
         deletedAt: null,
         expectedVersion: "1",
       });
-      await uploadOne(live, makeEntry());
+      await uploadOne(live, makeEntry({ version: 2 }));
       expect(live.gateway.registerDataPoint).toHaveBeenCalledWith(
-        expect.objectContaining({ expectedVersion: "1" }),
+        expect.objectContaining({ expectedVersion: "2" }),
       );
 
       const none = withFeed(makeMockDeps(), null);

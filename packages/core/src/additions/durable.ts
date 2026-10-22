@@ -4,16 +4,21 @@ import {
   type ByteBudget,
 } from "./budget.js";
 import { z } from "zod";
-import { getAddress, keccak256, stringToHex } from "viem";
+import { keccak256, stringToHex } from "viem";
 import {
   createDataFileEnvelope,
   DataFileEnvelopeSchema,
   decryptWithPassword,
   deriveScopeKey,
-  encryptWithPassword,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
 import type { StorageAdapter } from "../storage/adapters/interface.js";
+import {
+  publishVersion,
+  type FencedPublicationPort,
+  NeedsFencedPublicationError,
+} from "../publication/publish.js";
+import { computeDataPointId } from "../sync/data-point-id.js";
 import type { ServerSigner } from "../signing/signer.js";
 import {
   foldVersion,
@@ -78,6 +83,9 @@ export interface DurableAdditionsOptions {
   masterKey: Uint8Array;
   signer: Pick<ServerSigner, "signAddData">;
   gateway: Pick<GatewayClient, "registerDataPoint">;
+  fencedPublication?: FencedPublicationPort;
+  /** Summaries remain behind; hosts can expose the retryable recovery reason. */
+  onPublicationBlocked?: (error: NeedsFencedPublicationError) => void;
   /** Full PS defaults remain unlimited. Bounded hosts must also supply boundedWork. */
   byteBudget?: number;
   /** Host operations must cancel and settle all work before returning on abort.
@@ -332,7 +340,7 @@ export function createDurableAdditions(
     scope: string,
     data: Record<string, unknown>,
     budget: ReadBudget,
-  ) {
+  ): Promise<void> {
     budget.check();
     if (budget.limited) {
       if (!options.boundedWork)
@@ -358,52 +366,42 @@ export function createDurableAdditions(
       return;
     }
     const snapshot = await inventory.list(scope, budget.readOptions);
-    const version =
-      BigInt(snapshot.versions.at(-1)?.expectedVersion ?? "0") + 1n;
-    const envelope = createDataFileEnvelope(
-      scope,
-      new Date().toISOString(),
-      data,
-    );
-    const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
-    const encrypted = await encryptWithPassword(
-      plaintext,
-      hex(deriveScopeKey(options.masterKey, scope)),
-    );
-    const dataHash = keccak256(plaintext);
-    const metadataHash = keccak256(
-      stringToHex(
-        JSON.stringify({
-          scope,
-          collectedAt: envelope.collectedAt,
-          sizeBytes: encrypted.byteLength,
-        }),
-      ),
-    );
-    await storageAdapter.upload(`${scope}/${version}`, encrypted);
-    const signature = await options.signer.signAddData({
-      ownerAddress: getAddress(owner),
-      scope,
-      dataHash,
-      metadataHash,
-      expectedVersion: version,
-    });
-    await options.gateway.registerDataPoint({
+    const toHead = (state: VersionInventory) =>
+      state.head
+        ? {
+            ...state.head,
+            id: computeDataPointId(owner, scope),
+          }
+        : null;
+    const proof = await publishVersion({
       ownerAddress: owner,
-      scope,
-      dataHash,
-      metadataHash,
-      expectedVersion: String(version),
-      signature,
+      envelope: createDataFileEnvelope(scope, new Date().toISOString(), data),
+      preferredVersion:
+        BigInt(snapshot.versions.at(-1)?.expectedVersion ?? "0") + 1n,
+      masterKey: options.masterKey,
+      storageAdapter,
+      signer: options.signer,
+      gateway: options.gateway,
+      fencedPublication: options.fencedPublication,
+      head: toHead(snapshot),
+      readHead: async () =>
+        toHead(await inventory.list(scope, budget.readOptions)),
+      // Rebuilding an explicitly deleted system document is a deliberate re-add.
+      acknowledgedDeletionVersion: snapshot.head?.deletedAt
+        ? BigInt(snapshot.head.expectedVersion)
+        : undefined,
+    }).catch((error: unknown) => {
+      if (error instanceof NeedsFencedPublicationError)
+        options.onPublicationBlocked?.(error);
+      throw error;
     });
-    // A concurrent upload can replace the bytes at this shared version key
-    // independently of registration. Never claim durability without checking.
     const check = await inventory.list(scope, budget.readOptions);
     const registered = check.versions.find(
       (slot) =>
-        slot.expectedVersion === String(version) &&
-        slot.dataHash === dataHash &&
-        slot.metadataHash === metadataHash,
+        slot.expectedVersion === String(proof.version) &&
+        slot.dataHash === proof.dataHash &&
+        slot.metadataHash === proof.metadataHash &&
+        !slot.isTombstone,
     );
     if (!registered)
       throw new Error(

@@ -1,4 +1,5 @@
 import { ouraRoutes } from "./routes/oura.js";
+import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono } from "hono";
@@ -299,6 +300,16 @@ export function createApp(deps: AppDeps): Hono {
       : cors(c, next),
   );
 
+  const claudeTransition =
+    deps.pdpp && deps.legacyScopeView && deps.dataStorage
+      ? createClaudeMethodTransition(
+          deps.pdpp.bindingStore,
+          deps.legacyScopeView,
+          deps.dataStorage,
+        )
+      : undefined;
+  const legacyScopeView = claudeTransition?.view ?? deps.legacyScopeView;
+
   // Mount health route
   app.route(
     "/",
@@ -333,6 +344,7 @@ export function createApp(deps: AppDeps): Hono {
         instancesForSubject: deps.pdpp.instancesForSubject!,
         instancesForSource: deps.pdpp.instancesForSource,
         configuredMethods: deps.pdpp.configuredMethods,
+        transitionClaude: claudeTransition?.transition,
       }),
     );
     app.route(
@@ -435,7 +447,7 @@ export function createApp(deps: AppDeps): Hono {
       scopeDeletions: deps.scopeDeletions,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
-      legacyScopeView: deps.legacyScopeView,
+      legacyScopeView,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,
