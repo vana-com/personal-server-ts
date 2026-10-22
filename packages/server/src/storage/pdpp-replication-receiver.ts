@@ -92,7 +92,17 @@ CREATE TRIGGER IF NOT EXISTS pdpp_quarantined_keys_removal_fence AFTER DELETE ON
 CREATE TRIGGER IF NOT EXISTS pdpp_quarantined_connections_removal_fence AFTER DELETE ON pdpp_replica_quarantined_connections BEGIN INSERT INTO pdpp_replica_integrity_fences VALUES (OLD.instance, 1) ON CONFLICT(instance) DO UPDATE SET fences = fences + 1; END;
 `;
 
-type Store = ReturnType<typeof createSqliteRecordStore>;
+type Store = Omit<
+  ReturnType<typeof createSqliteRecordStore>,
+  "unquarantinedRecordSql"
+> & {
+  /**
+   * The shared quarantine predicate. `generationSql` is the generation of the
+   * aliased row's value; without it the binding's current generation applies.
+   * A store that takes one argument ignores the second.
+   */
+  unquarantinedRecordSql(alias: string, generationSql?: string): string;
+};
 type Binding = {
   instance: string;
   source_id: string | null;
@@ -719,26 +729,12 @@ export function createReplicaReceiver(deps: {
       )
       .get(instance, stream, key);
   }
-  /**
-   * The shared quarantine predicate. A store that takes the row's generation
-   * as a second argument gets it; an older store applies the binding's
-   * current generation to every row.
-   */
-  function unquarantinedRecordSql(alias: string, generationSql?: string) {
-    const predicate = store.unquarantinedRecordSql as (
-      alias: string,
-      generationSql?: string,
-    ) => string;
-    return generationSql !== undefined && predicate.length >= 2
-      ? predicate(alias, generationSql)
-      : predicate(alias);
-  }
   const view = createReplicaVisibilityView({
     db,
     owner,
     declarations: deps.declarations,
     blobsValid: previewBlobsValid,
-    unquarantinedRecordSql,
+    unquarantinedRecordSql: store.unquarantinedRecordSql,
     integrityEpoch: store.replicaIntegrityEpoch,
   });
   store.setReplicaVisibilityObserver(view.flush);
