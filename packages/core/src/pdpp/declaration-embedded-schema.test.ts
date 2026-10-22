@@ -31,7 +31,7 @@
 import { describe, expect, it } from "vitest";
 import { parseDeclaration } from "./declaration.js";
 
-const SOURCE_ID = "https://registry.pdpp.dev/connectors/conformance";
+const SOURCE_ID = "https://registry.pdpp.dev/sources/conformance";
 const DIALECT = "https://json-schema.org/draft/2020-12/schema";
 
 function documentWithSchema(schema: Record<string, unknown>): string {

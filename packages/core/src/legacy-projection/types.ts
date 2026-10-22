@@ -166,7 +166,7 @@ export interface LegacyScopeBinding {
    * implemented", the permanent, documented shape of this projection.
    */
   lossy: string[];
-  /** The PDPP source id (`connector_id`), e.g. "https://registry.pdpp.dev/connectors/meta" — never the short connector key. */
+  /** The declaration's `connector_id`, e.g. "https://registry.pdpp.dev/connectors/meta": the connector that collected the records, not the `/sources/` id the store keys connections by, and never the short connector key. */
   pdppSource: string;
   pdppStreams: string[];
   /**

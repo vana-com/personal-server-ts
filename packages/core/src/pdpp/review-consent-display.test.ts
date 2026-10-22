@@ -32,7 +32,7 @@ import {
 } from "./types.js";
 
 const snapshot: DeclarationSnapshot = {
-  source_id: "https://registry.pdpp.dev/connectors/instagram",
+  source_id: "https://registry.pdpp.dev/sources/instagram",
   source_kind: "connector",
   version: "0.1.0-local",
   digest: "d".repeat(64),
@@ -98,7 +98,7 @@ describe("review payload carries §5 consent display copy", () => {
     // the label for it. Replacing one with the other would hide which source
     // was actually resolved (6.1-5).
     expect(model.data.source.id).toBe(
-      "https://registry.pdpp.dev/connectors/instagram",
+      "https://registry.pdpp.dev/sources/instagram",
     );
   });
 

@@ -5,7 +5,7 @@ import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js
 import { pdppConnectionRoutes } from "./pdpp-connections.js";
 
 const OWNER = "0xowner";
-const SOURCE = "https://registry.pdpp.dev/connectors/spotify";
+const SOURCE = "https://registry.pdpp.dev/sources/spotify";
 const A = "spotify:0xowner";
 const B = "conn_123e4567-e89b-42d3-a456-426614174000";
 

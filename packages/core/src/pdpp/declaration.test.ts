@@ -18,7 +18,7 @@ import {
   type DeclarationTrustPolicy,
 } from "./declaration.js";
 
-const SOURCE_ID = "https://registry.pdpp.dev/connectors/spotify";
+const SOURCE_ID = "https://registry.pdpp.dev/sources/spotify";
 
 const openPolicy: DeclarationTrustPolicy = { allowAnyHttpsHost: true };
 
@@ -166,7 +166,7 @@ describe("§5 — declaration acceptance", () => {
     // Otherwise a trusted host could serve authority for a source it does not own.
     const result = parseDeclaration(
       validDocument({
-        source_id: "https://registry.pdpp.dev/connectors/other",
+        source_id: "https://registry.pdpp.dev/sources/other",
       }),
       SOURCE_ID,
     );
