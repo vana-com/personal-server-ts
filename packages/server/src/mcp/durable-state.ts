@@ -13,6 +13,8 @@ import {
   type McpConnectionStore,
   type McpOAuthAuthorizationRecord,
   type McpOAuthAuthorizationStore,
+  type McpOAuthClientRecord,
+  type McpOAuthClientStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { Address } from "viem";
 import type { ClaimResponse } from "@opendatalabs/vana-sdk/protocol/jobs";
@@ -83,6 +85,8 @@ interface State {
   };
   connections: Record<string, McpConnectionRecord>;
   authorizations: Record<string, McpOAuthAuthorizationRecord>;
+  /** Absent in files and snapshots written before clients were kept. */
+  clients: Record<string, McpOAuthClientRecord>;
   owners: Record<string, McpOwnerBinding>;
   identities: Record<string, McpWakeupIdentity>;
 }
@@ -122,6 +126,7 @@ export interface McpDurableState {
    */
   ownerConnections(owner: Address): Promise<McpConnectionRecord[]>;
   authorizations: McpOAuthAuthorizationStore;
+  clients: McpOAuthClientStore;
   bindOwner(connectionId: string, binding: McpOwnerBinding): Promise<void>;
   getOwner(connectionId: string): Promise<McpOwnerBinding | null>;
   rememberIdentity(identity: McpWakeupIdentity): Promise<void>;
@@ -147,6 +152,7 @@ export async function openMcpDurableState(options: {
   let state: State = {
     connections: {},
     authorizations: {},
+    clients: {},
     owners: {},
     identities: {},
   };
@@ -172,6 +178,7 @@ export async function openMcpDurableState(options: {
     try {
       state = JSON.parse(plaintext.toString("utf8")) as State;
       state.identities ??= {};
+      state.clients ??= {};
       if (!state.connections || !state.authorizations || !state.owners) {
         throw new Error("Invalid MCP state");
       }
@@ -416,6 +423,7 @@ export async function openMcpDurableState(options: {
           )
             throw new Error("Invalid fenced MCP snapshot");
           const draft = incoming.state;
+          draft.clients ??= {};
           draft.writer = {
             fenced: false,
             importedId: migrationId,
@@ -495,6 +503,13 @@ export async function openMcpDurableState(options: {
         mutate((draft) => {
           delete draft.authorizations[id];
         }),
+    },
+    clients: {
+      create: (record) =>
+        mutate((draft) => {
+          draft.clients[record.clientId] = structuredClone(record);
+        }),
+      getById: (id) => read((current) => current.clients[id] ?? null),
     },
     bindOwner: (connectionId, binding) =>
       mutate((draft) => {

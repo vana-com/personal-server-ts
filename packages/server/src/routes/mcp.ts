@@ -34,6 +34,7 @@ import {
   buildMcpUrl,
   buildStableMcpUrl,
   createInMemoryMcpOAuthAuthorizationStore,
+  createInMemoryMcpOAuthClientStore,
   createMcpConnection,
   createMcpOAuthAuthorization,
   createInMemoryMcpConnectionStore,
@@ -72,6 +73,8 @@ import {
   type McpConnectionStore,
   type McpSessionStore,
   type McpOAuthAuthorizationStore,
+  type McpOAuthClientRecord,
+  type McpOAuthClientStore,
   type McpActivityRecorder,
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
@@ -158,6 +161,8 @@ export interface McpRouteDeps {
    * `/mcp/oauth/token`, and the owner approval endpoint.
    */
   oauthAuthorizationStore?: McpOAuthAuthorizationStore;
+  /** DCR client metadata, read back at authorize to name the connection. */
+  oauthClientStore?: McpOAuthClientStore;
   /** Activity recorder for live MCP call visibility. */
   activityRecorder?: McpActivityRecorder;
   /**
@@ -251,6 +256,34 @@ function isSupportedGrantType(
   value: string,
 ): value is (typeof SUPPORTED_GRANT_TYPES)[number] {
   return (SUPPORTED_GRANT_TYPES as readonly string[]).includes(value);
+}
+
+/** Longest DCR client_name kept, in code points; it labels the connection. */
+const MAX_CLIENT_NAME_CHARS = 64;
+const MAX_CLIENT_URI_CHARS = 2048;
+/** Control and format chars: NUL, newlines, bidi overrides, zero-width. */
+const INVISIBLE_CHARS = /[\p{Cc}\p{Cf}]/gu;
+const WEB_PROTOCOLS = new Set(["https:", "http:"]);
+
+/** A printable label from an untrusted string, e.g. " Maple\u202e " → "Maple". */
+function cleanClientName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const visible = value.replace(INVISIBLE_CHARS, "").trim();
+  const capped = Array.from(visible).slice(0, MAX_CLIENT_NAME_CHARS).join("");
+  return capped.trim() || undefined;
+}
+
+/** An http(s) URL or nothing: the owner may be shown it as a link. */
+function cleanClientUri(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > MAX_CLIENT_URI_CHARS) {
+    return undefined;
+  }
+  try {
+    const url = new URL(value.trim());
+    return WEB_PROTOCOLS.has(url.protocol) ? url.href : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function authorizationServerMetadata(origin: string) {
@@ -652,6 +685,7 @@ export type McpOAuthRouteDeps = Pick<
   McpRouteDeps,
   | "connectionStore"
   | "oauthAuthorizationStore"
+  | "oauthClientStore"
   | "oauthApprovalUrl"
   | "serverOrigin"
   | "serverOwner"
@@ -673,6 +707,8 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
     deps.connectionStore ?? createInMemoryMcpConnectionStore();
   const authorizationStore =
     deps.oauthAuthorizationStore ?? createInMemoryMcpOAuthAuthorizationStore();
+  const clientStore =
+    deps.oauthClientStore ?? createInMemoryMcpOAuthClientStore();
 
   const ownerAuth: PersonalServerApiAuthPort = createServerApiAuth({
     serverOrigin: deps.serverOrigin,
@@ -732,7 +768,11 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
         404,
       );
     }
-    let body: { client_name?: string; redirect_uris?: string[] } = {};
+    let body: {
+      client_name?: unknown;
+      client_uri?: unknown;
+      redirect_uris?: string[];
+    } = {};
     try {
       body = (await c.req.json()) as typeof body;
     } catch {
@@ -750,10 +790,21 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
         400,
       );
     }
+    // Kept so /authorize can name the connection after the client.
+    const clientName = cleanClientName(body.client_name);
+    const clientUri = cleanClientUri(body.client_uri);
+    const client: McpOAuthClientRecord = {
+      clientId: `mcp-client-${crypto.randomUUID()}`,
+      ...(clientName ? { clientName } : {}),
+      ...(clientUri ? { clientUri } : {}),
+      createdAt: new Date().toISOString(),
+    };
+    await clientStore.create(client);
     return c.json(
       {
-        client_id: `mcp-client-${crypto.randomUUID()}`,
-        client_name: body.client_name ?? "Claude",
+        client_id: client.clientId,
+        ...(clientName ? { client_name: clientName } : {}),
+        ...(clientUri ? { client_uri: clientUri } : {}),
         redirect_uris: Array.isArray(body.redirect_uris)
           ? body.redirect_uris
           : [],
@@ -797,9 +848,13 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
     }
 
     try {
+      // Unknown ids (registered elsewhere or before) get the default name.
+      const client = clientId ? await clientStore.getById(clientId) : null;
       const created = await createMcpOAuthAuthorization(
         {
           clientId,
+          clientName: client?.clientName,
+          clientUri: client?.clientUri,
           redirectUri,
           codeChallenge,
           codeChallengeMethod,
