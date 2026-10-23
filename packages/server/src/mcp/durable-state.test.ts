@@ -3,7 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCipheriv, randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import { createMcpConnection } from "@opendatalabs/personal-server-ts-core/mcp";
+import {
+  createMcpConnection,
+  MAX_MCP_OAUTH_CLIENTS,
+} from "@opendatalabs/personal-server-ts-core/mcp";
 import {
   openMcpDurableState,
   McpStateRequiredError,
@@ -405,5 +408,37 @@ describe("MCP OAuth clients", () => {
     expect(await state.clients.getById(client.clientId)).toBeNull();
     await state.clients.create(client);
     expect(await state.clients.getById(client.clientId)).toEqual(client);
+  });
+
+  it("persists at most the newest MAX_MCP_OAUTH_CLIENTS clients", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-clients-cap-"));
+    directories.push(directory);
+    const path = join(directory, "state.sealed");
+    const key = randomBytes(32);
+    const base = Date.parse(client.createdAt);
+    const nth = (i: number) => ({
+      clientId: `mcp-client-${i}`,
+      createdAt: new Date(base + i).toISOString(),
+    });
+    // A full store, sealed directly: one encrypted write per client is slow.
+    const full = Array.from({ length: MAX_MCP_OAUTH_CLIENTS }, (_, i) =>
+      nth(i),
+    );
+    await sealLegacyState(path, key, {
+      connections: {},
+      authorizations: {},
+      clients: Object.fromEntries(full.map((c) => [c.clientId, c])),
+      owners: {},
+      identities: {},
+    });
+
+    const state = await openMcpDurableState({ path, key });
+    await state.clients.create(nth(MAX_MCP_OAUTH_CLIENTS));
+    const reopened = await openMcpDurableState({ path, key });
+
+    expect(await reopened.clients.getById(nth(0).clientId)).toBeNull();
+    expect(await reopened.clients.getById(nth(1).clientId)).toEqual(nth(1));
+    const last = nth(MAX_MCP_OAUTH_CLIENTS);
+    expect(await reopened.clients.getById(last.clientId)).toEqual(last);
   });
 });
