@@ -986,12 +986,24 @@ export async function createPersistentPsLiteStorage(
       });
     },
 
-    async deleteVersion(scope, collectedAt) {
-      const entry = state.entries.find(
-        (e) => e.scope === scope && e.collectedAt === collectedAt,
-      );
-      if (!entry) return false;
-      return removeEntry(entry);
+    async deleteVersion(scope, collectedAt, fence) {
+      if (!fence) {
+        const entry = state.entries.find(
+          (e) => e.scope === scope && e.collectedAt === collectedAt,
+        );
+        if (!entry) return false;
+        return removeEntry(entry);
+      }
+      // Fenced: the row is checked under the scope lock, before its blob goes.
+      return withScopeLock(scope, async () => {
+        const entry = state.entries.find(
+          (e) => e.scope === scope && e.collectedAt === collectedAt,
+        );
+        if (!entry || entry.id !== fence.id || entry.path !== fence.path) {
+          return false;
+        }
+        return removeEntryLocked(entry);
+      });
     },
 
     async deleteByFileId(fileId) {
