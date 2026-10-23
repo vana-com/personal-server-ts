@@ -19,7 +19,10 @@ import {
 const oldTime = "2026-10-14T00:00:00.000Z";
 const newTime = "2026-10-15T00:00:00.000Z";
 const streams = ["sleep", "readiness", "activity"] as const;
-function input(collectedAt = newTime): OuraBrowserImportInput {
+function input(
+  collectedAt = newTime,
+  day = "2026-10-13",
+): OuraBrowserImportInput {
   return {
     selection: { streams: streams.map((name) => ({ name })) },
     collectedAt,
@@ -27,7 +30,7 @@ function input(collectedAt = newTime): OuraBrowserImportInput {
       stream,
       data: {
         id: `${stream}-1`,
-        day: "2026-10-13",
+        day,
         score: 80,
         ...(stream === "sleep"
           ? { record_type: "daily_score", sleep_score: 80 }
@@ -64,6 +67,13 @@ async function setup(
     collectedAt: oldTime,
     sizeBytes: write.sizeBytes,
   });
+  return { storage, ...runtimeFor(storage, runtimeOptions) };
+}
+
+function runtimeFor(
+  storage: ReturnType<typeof createMemoryPsLiteStorage>,
+  runtimeOptions: Partial<Parameters<typeof createPsLiteRuntime>[0]> = {},
+) {
   const accessLogs = createMemoryPsLiteAccessLogStore();
   const runtime = createPsLiteRuntime({
     storage,
@@ -89,7 +99,7 @@ async function setup(
         body: JSON.stringify(body),
       }),
     );
-  return { storage, post, runtime };
+  return { post, runtime };
 }
 
 describe("Lite Oura browser takeover", () => {
@@ -600,4 +610,234 @@ describe("fresh complete Oura replacement", () => {
       }
     },
   );
+});
+
+/** January history is the required boundary: a later since-only window would drop it. */
+async function seedJanuaryHistory(
+  storage: ReturnType<typeof createMemoryPsLiteStorage>,
+) {
+  const legacy = {
+    "oura.sleep": {
+      dailyScores: [{ id: "sleep-january", day: "2026-01-01", score: 70 }],
+    },
+    "oura.readiness": {
+      days: [{ id: "readiness-january", day: "2026-01-01", score: 70 }],
+    },
+    "oura.activity": {
+      days: [{ id: "activity-january", day: "2026-01-01", score: 70 }],
+    },
+  };
+  for (const [scope, data] of Object.entries(legacy)) {
+    const write = await storage.writeEnvelope(
+      createDataFileEnvelope(scope, oldTime, data),
+    );
+    await storage.insertEntry({
+      fileId: `legacy-${scope}`,
+      path: write.relativePath,
+      scope,
+      collectedAt: oldTime,
+      sizeBytes: write.sizeBytes,
+    });
+  }
+}
+
+function sinceOnly(
+  body: OuraBrowserImportInput,
+  since: string,
+): OuraBrowserImportInput {
+  return {
+    ...body,
+    selection: {
+      streams: streams.map((name) => ({ name, time_range: { since } })),
+    },
+  };
+}
+
+function emptied(body: OuraBrowserImportInput): OuraBrowserImportInput {
+  return {
+    ...body,
+    records: [],
+    completion: {
+      streams: body.completion.streams.map((proof) => ({
+        ...proof,
+        recordCount: 0,
+      })),
+    },
+  };
+}
+
+async function requiredSince(runtime: ReturnType<typeof createPsLiteRuntime>) {
+  const response = await runtime.fetch(
+    new Request("https://ps.test/v1/import/oura-browser/requirements", {
+      headers: { authorization: "Bearer owner" },
+    }),
+  );
+  expect(response.status).toBe(200);
+  return (await response.json()).since as string | null;
+}
+
+/** Heads, version counts, and owner and builder reads: what a refusal must leave untouched. */
+async function stateOf(
+  storage: ReturnType<typeof createMemoryPsLiteStorage>,
+  runtime: ReturnType<typeof createPsLiteRuntime>,
+) {
+  const served = [];
+  for (const stream of streams) {
+    for (const token of ["owner", "builder"]) {
+      const response = await runtime.fetch(
+        new Request(`https://ps.test/v1/data/oura.${stream}?grantId=openpet`, {
+          headers: { authorization: `Bearer ${token}` },
+        }),
+      );
+      served.push({ status: response.status, body: await response.json() });
+    }
+  }
+  return {
+    heads: streams.map((stream) =>
+      storage.findEntry({ scope: `oura.${stream}` }),
+    ),
+    versions: streams.map((stream) => storage.countVersions(`oura.${stream}`)),
+    served,
+  };
+}
+
+describe("Oura required history boundary", () => {
+  it.each([
+    ["nonempty", sinceOnly(input(), "2026-10-01")],
+    ["empty", sinceOnly(emptied(input()), "2026-10-01")],
+  ])(
+    "refuses a since-only October %s batch over January history before any write",
+    async (_name, body) => {
+      const storage = createMemoryPsLiteStorage();
+      await seedJanuaryHistory(storage);
+      const { post, runtime } = runtimeFor(storage);
+      expect(await requiredSince(runtime)).toBe("2026-01-01");
+      const before = await stateOf(storage, runtime);
+      expect(before.served.map((read) => read.status)).toEqual(
+        Array(6).fill(200),
+      );
+      const response = await post(body);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        ok: false,
+        reason: "selection_narrower_than_history",
+      });
+      expect(await stateOf(storage, runtime)).toEqual(before);
+    },
+  );
+
+  it("runs no commit, sync trigger, derivative hook or receipt for a refused October batch", async () => {
+    const storage = createMemoryPsLiteStorage();
+    await seedJanuaryHistory(storage);
+    const beforeCommit = vi.fn().mockResolvedValue(undefined);
+    const trigger = vi.fn().mockResolvedValue(undefined);
+    const onDataWritten = vi.fn();
+    const result = await importOuraBrowserRecords(
+      storage,
+      sinceOnly(input(), "2026-10-01"),
+      {
+        beforeCommit,
+        onDataWritten,
+        syncManager: { trigger, getStatus: vi.fn() } as never,
+      },
+    );
+    expect(result).toEqual({
+      ok: false,
+      reason: "selection_narrower_than_history",
+    });
+    expect(beforeCommit).not.toHaveBeenCalled();
+    expect(onDataWritten).not.toHaveBeenCalled();
+    expect(trigger).not.toHaveBeenCalled();
+    expect(storage.countVersions("oura.activity")).toBe(1);
+  });
+
+  it("reads January history under the lock, so a window prepared before it became current is refused", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const { post, runtime } = runtimeFor(storage);
+    expect(await requiredSince(runtime)).toBeNull();
+    const prepared = sinceOnly(input("2026-10-16T00:00:00.000Z"), "2026-10-01");
+    const january = input("2026-10-15T00:00:00.000Z", "2026-01-01");
+    expect((await post(january)).status).toBe(200);
+    expect(await requiredSince(runtime)).toBe("2026-01-01");
+    const before = await stateOf(storage, runtime);
+    const response = await post(prepared);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      ok: false,
+      reason: "selection_narrower_than_history",
+    });
+    expect(await stateOf(storage, runtime)).toEqual(before);
+  });
+
+  it("admits a since-only October batch when no January history exists", async () => {
+    const storage = createMemoryPsLiteStorage();
+    const { post, runtime } = runtimeFor(storage);
+    expect(await requiredSince(runtime)).toBeNull();
+    const response = await post(sinceOnly(input(), "2026-10-01"));
+    expect(response.status, await response.clone().text()).toBe(200);
+  });
+
+  it("admits a since-only batch that starts exactly at the required January boundary", async () => {
+    const storage = createMemoryPsLiteStorage();
+    await seedJanuaryHistory(storage);
+    const { post } = runtimeFor(storage);
+    const response = await post(sinceOnly(input(), "2026-01-01"));
+    expect(response.status, await response.clone().text()).toBe(200);
+  });
+
+  it.each([
+    ["nonempty", input()],
+    ["empty", emptied(input())],
+  ])(
+    "keeps eligible complete unrestricted %s replacement over January history",
+    async (_name, body) => {
+      const storage = createMemoryPsLiteStorage();
+      await seedJanuaryHistory(storage);
+      const { post } = runtimeFor(storage);
+      const response = await post(body);
+      expect(response.status, await response.clone().text()).toBe(200);
+      expect(storage.countVersions("oura.activity")).toBe(2);
+      const januaryFile = await storage.readEnvelope("oura.activity", oldTime);
+      expect(januaryFile.data).toMatchObject({
+        days: [{ id: "activity-january" }],
+      });
+    },
+  );
+
+  it("refuses an artifact-bound batch whose START is unproven while January history is current", async () => {
+    const storage = createMemoryPsLiteStorage();
+    await seedJanuaryHistory(storage);
+    const beforeCommit = vi.fn().mockResolvedValue(undefined);
+    const unproven = {
+      ...input("2026-10-16T00:00:00.000Z"),
+      selection: undefined,
+    };
+    expect(
+      await importOuraBrowserRecords(storage, unproven, {
+        artifactBoundNativeCompletion: true,
+        beforeCommit,
+      }),
+    ).toEqual({ ok: false, reason: "native_start_unproven" });
+    // A native batch that carries its START selection is checked like any takeover.
+    expect(
+      await importOuraBrowserRecords(
+        storage,
+        sinceOnly(input("2026-10-16T00:00:00.000Z"), "2026-10-01"),
+        { artifactBoundNativeCompletion: true, beforeCommit },
+      ),
+    ).toEqual({ ok: false, reason: "selection_narrower_than_history" });
+    expect(beforeCommit).not.toHaveBeenCalled();
+    expect(storage.countVersions("oura.activity")).toBe(1);
+  });
+
+  it("admits an artifact-bound batch when no January history exists", async () => {
+    const storage = createMemoryPsLiteStorage();
+    expect(
+      await importOuraBrowserRecords(
+        storage,
+        { ...input(), selection: undefined },
+        { artifactBoundNativeCompletion: true },
+      ),
+    ).toMatchObject({ ok: true });
+  });
 });

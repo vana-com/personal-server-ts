@@ -2236,6 +2236,66 @@ describe("Oura collection requirements", () => {
     expect(await readAll()).toEqual(ALL(CANON));
   });
 
+  it("refuses a since-only owner batch that starts after the history it would replace", async () => {
+    const signer = createTestWallet(12);
+    await ctx!.cleanup();
+    vi.stubEnv(
+      "VANA_MASTER_KEY_SIGNATURE",
+      await signer.signMessage("vana-master-key-v1"),
+    );
+    owner = signer.address.toLowerCase();
+    accountOne = `oura:${owner}`;
+    await freshBoot(["oura-browser"], []);
+    await writeLegacy(DAYS, T_LEGACY);
+    await writePdpp(DAYS, T_PDPP);
+    expect(await readAll()).toEqual(ALL(CANON));
+    const requirements = await ctx!.app.request(
+      "/v1/import/oura-browser/requirements",
+      { headers: { authorization: `Bearer ${CONTROL_PLANE_TOKEN}` } },
+    );
+    expect(await requirements.json()).toMatchObject({ since: "2026-09-01" });
+    const before = await Promise.all(SCOPES.map((scope) => observe(scope)));
+    // Completed and empty: the batch would replace every current head with nothing.
+    const body = {
+      collectedAt: "2026-10-16T00:00:00.000Z",
+      records: [],
+      selection: {
+        streams: SCOPES.map((name) => ({
+          name,
+          time_range: { since: "2026-10-01" },
+        })),
+      },
+      completion: {
+        streams: SCOPES.map((scope) => ({
+          stream: STREAM_OF[scope],
+          status: "complete",
+          recordCount: 0,
+        })),
+      },
+    };
+    const uri = "/v1/import/oura-browser";
+    const authorization = await buildWeb3SignedHeader({
+      wallet: signer,
+      aud: ctx!.config.server.origin,
+      method: "POST",
+      uri,
+      body: new TextEncoder().encode(JSON.stringify(body)),
+    });
+    const refused = await ctx!.app.request(uri, {
+      method: "POST",
+      headers: { authorization, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    expect(refused.status, await refused.clone().text()).toBe(409);
+    expect(await refused.json()).toEqual({
+      ok: false,
+      reason: "selection_narrower_than_history",
+    });
+    expect(await Promise.all(SCOPES.map((scope) => observe(scope)))).toEqual(
+      before,
+    );
+  });
+
   it("returns null only without history and refuses malformed Node history", async () => {
     const requirements = () =>
       ctx!.app.request("/v1/import/oura-browser/requirements", {

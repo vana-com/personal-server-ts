@@ -13,9 +13,11 @@ import {
 } from "../legacy-projection/index.js";
 import { compareLegacyCoverage } from "../storage/legacy-scope-coverage.js";
 import { LEGACY_SCOPE_ENTITY_KEYS } from "../storage/legacy-scope-entity-keys.js";
+import { readOuraCollectionRequirements } from "../api/oura-collection-requirements.js";
 import {
   OURA_BROWSER_HISTORY_POLICY,
   isOuraTakeoverSelection,
+  ouraTakeoverSelectionSince,
 } from "./history-policy.js";
 
 const STREAMS = ["sleep", "readiness", "activity"] as const;
@@ -156,11 +158,46 @@ export async function importOuraBrowserRecords(
   );
 }
 
+/**
+ * A window must reach back to the earliest day of the history it would replace.
+ * Reads run under the import lock, so a stale preparation cannot authorize truncation.
+ */
+async function narrowerThanHistory(
+  storage: DataStoragePort,
+  input: OuraBrowserImportInput,
+  options: OuraBrowserImportOptions,
+): Promise<Extract<OuraBrowserImportResult, { ok: false }> | undefined> {
+  // Native publications carry no selection; their START is proven only when present.
+  // A present selection was already validated before the lock.
+  const authorized =
+    input.selection === undefined
+      ? undefined
+      : ouraTakeoverSelectionSince(input.selection)!.since;
+  // Full history cannot be narrower than what it replaces.
+  if (authorized === null) return;
+  const required = await readOuraCollectionRequirements(
+    storage,
+    options.legacyScopeView,
+    options.retainedCanonicalHistory?.records,
+  ).catch(() => undefined);
+  if (!required) return { ok: false, reason: "prior_projection_unavailable" };
+  if (!required.ok)
+    return { ok: false, reason: required.reason, scope: required.scope };
+  // Absent or empty history has no day that a narrower window could drop.
+  if (required.since === null) return;
+  if (authorized === undefined)
+    return { ok: false, reason: "native_start_unproven" };
+  if (authorized > required.since)
+    return { ok: false, reason: "selection_narrower_than_history" };
+}
+
 async function importLocked(
   storage: DataStoragePort,
   input: OuraBrowserImportInput,
   options: OuraBrowserImportOptions,
 ): Promise<OuraBrowserImportResult> {
+  const narrower = await narrowerThanHistory(storage, input, options);
+  if (narrower) return narrower;
   // Current connector records have no trusted upstream account identity.
   // Compare this complete batch alone; never union raw windows across requests.
   const plans = [];
