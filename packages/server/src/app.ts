@@ -2,6 +2,7 @@ import { createClaudeMethodTransition } from "./storage/claude-method-transition
 import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -15,7 +16,11 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
-import { requireLoopbackListener } from "./middleware/local-listener.js";
+import {
+  arrivedOnLoopbackListener,
+  isSameOriginLoopbackRequest,
+  requireLoopbackListener,
+} from "./middleware/local-listener.js";
 import { dataRoutes } from "./routes/data.js";
 import { writeSessionRoutes } from "./routes/write-session.js";
 import {
@@ -257,6 +262,21 @@ export interface AppDeps {
   };
 }
 
+/** MCP endpoint and its OAuth discovery documents, served on both listeners. */
+const MCP_PATH = "/mcp";
+const MCP_WELL_KNOWN_PATHS = new Set([
+  "/.well-known/oauth-protected-resource/mcp",
+  "/.well-known/oauth-authorization-server",
+]);
+
+function isMcpPath(path: string): boolean {
+  return (
+    path === MCP_PATH ||
+    path.startsWith(`${MCP_PATH}/`) ||
+    MCP_WELL_KNOWN_PATHS.has(path)
+  );
+}
+
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
 
@@ -285,6 +305,23 @@ export function createApp(deps: AppDeps): Hono {
   app.use("/ui", uiLoopbackOnly);
   app.use("/ui/*", uiLoopbackOnly);
 
+  // Local MCP gate. On the loopback listener, MCP answers only a loopback
+  // Host with no foreign browser origin (DNS rebinding, another page probing
+  // the port), and skips the wildcard CORS below: native clients need none.
+  // Tunnel requests on the main listener pass untouched.
+  const listeners = {
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
+  };
+  const isLoopbackMcp = (c: Context) =>
+    isMcpPath(c.req.path) && arrivedOnLoopbackListener(c, listeners);
+  app.use("*", async (c, next) => {
+    if (isLoopbackMcp(c) && !isSameOriginLoopbackRequest(c)) {
+      return c.notFound();
+    }
+    await next();
+  });
+
   // The whole /auth/device subtree stays out of the wildcard CORS: no other
   // origin may read the approval page or the approve/initiate responses
   // (which carry session ids). That includes /auth/device/token (the
@@ -294,7 +331,9 @@ export function createApp(deps: AppDeps): Hono {
   // so a cross-origin preflight for them must fail.
   const cors = corsMiddleware();
   app.use("*", (c, next) =>
-    c.req.path === "/auth/device" || c.req.path.startsWith("/auth/device/")
+    c.req.path === "/auth/device" ||
+    c.req.path.startsWith("/auth/device/") ||
+    isLoopbackMcp(c)
       ? next()
       : cors(c, next),
   );
