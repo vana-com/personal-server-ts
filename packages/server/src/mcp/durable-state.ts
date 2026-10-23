@@ -7,6 +7,7 @@ import {
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
+  evictableMcpClient,
   isMcpTokenExpired,
   matchesMcpRefreshHash,
   type McpConnectionRecord,
@@ -507,6 +508,8 @@ export async function openMcpDurableState(options: {
     clients: {
       create: (record) =>
         mutate((draft) => {
+          const evicted = evictableMcpClient(Object.values(draft.clients));
+          if (evicted) delete draft.clients[evicted];
           draft.clients[record.clientId] = structuredClone(record);
         }),
       getById: (id) => read((current) => current.clients[id] ?? null),
