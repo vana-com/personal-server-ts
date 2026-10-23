@@ -19,6 +19,7 @@ const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource/mcp";
 const REDIRECT_URI = "http://127.0.0.1:33418/callback";
 const ACCESS_TOKEN = "local-mcp-owner-token";
 const VERIFIER = "local-mcp-pkce-verifier";
+const CLIENT_NAME = "Local agent";
 
 interface LocalServer {
   /** `config.server.origin`: what tunnel clients are told today. */
@@ -27,12 +28,13 @@ interface LocalServer {
   main: string;
   /** Loopback auth listener. */
   loopback: string;
+  stop: () => Promise<void>;
 }
 
 let cleanupFns: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
-  await Promise.all(cleanupFns.map((cleanup) => cleanup()));
+  for (const cleanup of cleanupFns) await cleanup();
   cleanupFns = [];
   vi.unstubAllEnvs();
 });
@@ -81,8 +83,15 @@ async function freePorts(count: number): Promise<number[]> {
   return ports;
 }
 
-async function startLocalServer(): Promise<LocalServer> {
+async function tempRoot(): Promise<string> {
   const rootPath = await mkdtemp(join(tmpdir(), "ps-local-mcp-"));
+  cleanupFns.push(() => rm(rootPath, { recursive: true, force: true }));
+  return rootPath;
+}
+
+/** Pass `rootPath` to restart over the same persisted state. */
+async function startLocalServer(rootPath?: string): Promise<LocalServer> {
+  const root = rootPath ?? (await tempRoot());
   const [port, loopbackPort] = await freePorts(2);
   vi.stubEnv("LOCAL_AUTH_PORT", String(loopbackPort));
   vi.stubEnv("PS_ACCESS_TOKEN", ACCESS_TOKEN);
@@ -95,22 +104,28 @@ async function startLocalServer(): Promise<LocalServer> {
     tunnel: { enabled: false },
   });
   const ps = await startPersonalServer({
-    rootPath,
+    rootPath: root,
     config,
     ownerSignature: await ownerWallet.signMessage("vana-master-key-v1"),
     gatewayClient: createGateway(),
     mcpOAuthApprovalUrl: APPROVAL_URL,
     startBackgroundServices: false,
   });
-  cleanupFns.push(async () => {
-    await ps.stop();
-    await rm(rootPath, { recursive: true, force: true });
-  });
+  // First, so every server stops before its root is removed.
+  cleanupFns.unshift(() => ps.stop());
   return {
     publicOrigin,
     main: `http://127.0.0.1:${port}`,
     loopback: `http://127.0.0.1:${loopbackPort}`,
+    stop: () => ps.stop(),
   };
+}
+
+async function ownerGet(listener: string, path: string) {
+  const response = await fetch(`${listener}${path}`, {
+    headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+  });
+  return response.json();
 }
 
 async function pkceChallenge(verifier: string): Promise<string> {
@@ -121,23 +136,29 @@ async function pkceChallenge(verifier: string): Promise<string> {
   return Buffer.from(digest).toString("base64url");
 }
 
-/** DCR + authorize on one listener; returns the owner approval redirect. */
-async function authorize(
-  listener: string,
-): Promise<{ clientId: string; approval: URL }> {
+async function register(listener: string): Promise<string> {
   const registered = await (
     await fetch(`${listener}/mcp/oauth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        client_name: "Local agent",
+        client_name: CLIENT_NAME,
         redirect_uris: [REDIRECT_URI],
       }),
     })
   ).json();
+  return registered.client_id;
+}
+
+/** Authorize on one listener (registering first unless given a client); returns the owner approval redirect. */
+async function authorize(
+  listener: string,
+  registeredClientId?: string,
+): Promise<{ clientId: string; approval: URL }> {
+  const clientId = registeredClientId ?? (await register(listener));
   const query = new URLSearchParams({
     response_type: "code",
-    client_id: registered.client_id,
+    client_id: clientId,
     redirect_uri: REDIRECT_URI,
     code_challenge: await pkceChallenge(VERIFIER),
     code_challenge_method: "S256",
@@ -146,7 +167,7 @@ async function authorize(
     redirect: "manual",
   });
   return {
-    clientId: registered.client_id,
+    clientId,
     approval: new URL(response.headers.get("location")!),
   };
 }
@@ -333,6 +354,31 @@ describe("local MCP over the loopback listener", () => {
 
     expect(await listTools(`${server.main}/mcp`, token)).toBe(200);
     expect(await listTools(`${server.loopback}/mcp`, token)).toBe(401);
+  });
+
+  it("names the connection after a client registered before a restart", async () => {
+    const rootPath = await tempRoot();
+    const before = await startLocalServer(rootPath);
+    const clientId = await register(before.loopback);
+    await before.stop();
+
+    const server = await startLocalServer(rootPath);
+    const { approval } = await authorize(server.loopback, clientId);
+    const view = await ownerGet(
+      server.loopback,
+      `/v1/mcp/oauth/authorizations/${approval.searchParams.get("mcp_authorization")}`,
+    );
+    const { connections } = await ownerGet(
+      server.loopback,
+      "/v1/mcp/connections",
+    );
+
+    expect(view.clientName).toBe(CLIENT_NAME);
+    expect(
+      connections.find(
+        (connection: { id: string }) => connection.id === view.connectionId,
+      )?.displayName,
+    ).toBe(CLIENT_NAME);
   });
 
   // Native clients need no CORS and the gate refuses every foreign origin,

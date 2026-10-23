@@ -49,6 +49,7 @@ import {
   createInMemoryMcpOAuthAuthorizationStore,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
+  type McpOAuthClientStore,
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { uiConfigRoutes } from "./routes/ui-config.js";
@@ -201,6 +202,8 @@ export interface AppDeps {
    */
   mcpConnectionStore?: McpConnectionStore;
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
+  /** DCR client names; defaults to in-memory (lost on restart). */
+  mcpOAuthClientStore?: McpOAuthClientStore;
   mcpOAuthApprovalUrl?: string | (() => string);
   /**
    * PDPP Core v0.1 Authorization Server. Absent = the `/pdpp/v1` surface is
@@ -647,6 +650,7 @@ export function createApp(deps: AppDeps): Hono {
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,
+    oauthClientStore: deps.mcpOAuthClientStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
     scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
     activityRecorder: mcpActivityRecorder,

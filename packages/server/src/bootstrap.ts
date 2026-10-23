@@ -1112,6 +1112,7 @@ export async function createServer(
     mcpGrantTtlSeconds: options?.mcpGrantTtlSeconds,
     mcpConnectionStore: mcpState?.connections,
     mcpOAuthAuthorizationStore: mcpState?.authorizations,
+    mcpOAuthClientStore: mcpState?.clients,
     onServerRegistered: (serverId) => notifyServerRegistered(serverId),
     profile: options?.profile,
     jobWorker,
