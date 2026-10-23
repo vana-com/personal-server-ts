@@ -25,6 +25,7 @@ import { Hono } from "hono";
 import {
   approveMcpConnection,
   MCP_TOKEN_TTL_MS,
+  MAX_MCP_OAUTH_CLIENTS,
   createInMemoryMcpConnectionStore,
   createInMemoryMcpOAuthAuthorizationStore,
   createMcpConnection,
@@ -1432,6 +1433,28 @@ describe("MCP OAuth routes", () => {
 
       expect(view.clientName).toBe("x".repeat(MAX_CLIENT_NAME_CHARS));
       expect(view).not.toHaveProperty("clientUri");
+    });
+
+    // Registration is unauthenticated, so the store evicts the oldest client.
+    it("keeps only the newest registered clients; authorized ones keep their name", async () => {
+      const first = await registerClient({ client_name: "Maple AI" });
+      const { view: pending } = await authorizationFor(first.client_id);
+
+      let newest = first;
+      for (let i = 0; i < MAX_MCP_OAUTH_CLIENTS; i++) {
+        newest = await registerClient({ client_name: `Client ${i}` });
+      }
+
+      expect((await authorizationFor(first.client_id)).displayName).toBe(
+        "MCP client",
+      );
+      expect((await authorizationFor(newest.client_id)).displayName).toBe(
+        `Client ${MAX_MCP_OAUTH_CLIENTS - 1}`,
+      );
+      const stillPending = await (
+        await ownerRequest("GET", `/v1/mcp/oauth/authorizations/${pending.id}`)
+      ).json();
+      expect(stillPending.clientName).toBe("Maple AI");
     });
 
     // Claude.ai may reuse a client_id this server never registered.
