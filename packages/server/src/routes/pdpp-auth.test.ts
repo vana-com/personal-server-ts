@@ -179,9 +179,11 @@ afterEach(() => {
 });
 
 /** Walk authorize → review, returning the session and the owner's digest. */
-async function openSessionAndReview(body = selectionBody()) {
-  const ownerToken = scopedOwnerToken();
-  const created = await post("/pdpp/v1/authorize", body);
+async function openSessionAndReview(
+  body = selectionBody(),
+  ownerToken = scopedOwnerToken(),
+) {
+  const created = await post("/pdpp/v1/authorize", body, ownerAuth(ownerToken));
   expect(created.status).toBe(201);
   const { session_id } = (await created.json()) as { session_id: string };
 
@@ -384,7 +386,13 @@ describe("staleness (§7 / §9 AS item 15)", () => {
   });
 
   it("requires a new review when a second instance connects", async () => {
-    const { sessionId, ownerToken, digest } = await openSessionAndReview();
+    // A second connected account is a source-wide change, so the review and the
+    // approval both use a source-wide owner token.
+    const ownerToken = sourceOwnerToken();
+    const { sessionId, digest } = await openSessionAndReview(
+      selectionBody(),
+      ownerToken,
+    );
     eligible = ["spotify-account-a", "spotify-account-b"];
 
     const response = await post(
@@ -1268,6 +1276,191 @@ describe("§6 — instance choice over the wire", () => {
       ownerAuth(ownerToken),
     );
     expect(approved.status).toBe(409);
+  });
+});
+
+describe("owner instance ceiling — a scoped owner token stays inside its instances", () => {
+  const ACCOUNT_B = "spotify-account-b";
+
+  it("refuses to open an authorization that explicitly names an instance outside the token", async () => {
+    eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    const response = await post(
+      "/pdpp/v1/authorize",
+      selectionBody({
+        streams: [{ name: "top_artists", instance_ids: [ACCOUNT_B] }],
+      }),
+      ownerAuth(scopedOwnerToken()),
+    );
+    expect(response.status).toBe(403);
+    expect((await response.json()).error).toBe("access_denied");
+  });
+
+  it("refuses an instance choice outside the token at review, and never shows it", async () => {
+    eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    const ownerToken = scopedOwnerToken();
+    const created = await post(
+      "/pdpp/v1/authorize",
+      selectionBody(),
+      ownerAuth(ownerToken),
+    );
+    expect(created.status).toBe(201);
+    const { session_id } = (await created.json()) as { session_id: string };
+
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review?instance%5Btop_artists%5D=${ACCOUNT_B}`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(reviewed.status).toBe(403);
+    expect(await reviewed.text()).not.toContain(ACCOUNT_B);
+  });
+
+  it("refuses an approval that names an instance outside the token, persisting no grant", async () => {
+    eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    const source = sourceOwnerToken();
+    const created = await post(
+      "/pdpp/v1/authorize",
+      selectionBody(),
+      ownerAuth(source),
+    );
+    const { session_id } = (await created.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review?instance%5Btop_artists%5D=${ACCOUNT_B}`,
+      { headers: ownerAuth(source) },
+    );
+    const { review } = (await reviewed.json()) as {
+      review: { review_digest: string };
+    };
+
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      {
+        review_digest: review.review_digest,
+        instance_choices: { top_artists: [ACCOUNT_B] },
+      },
+      ownerAuth(scopedOwnerToken()),
+    );
+    expect(approved.status).toBe(403);
+    expect(store.listGrantsForSubject(OWNER)).toEqual([]);
+  });
+
+  it("does not issue a source-wide review's out-of-token instance to a narrower approval", async () => {
+    eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    const source = sourceOwnerToken();
+    const created = await post(
+      "/pdpp/v1/authorize",
+      selectionBody(),
+      ownerAuth(source),
+    );
+    const { session_id } = (await created.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review?instance%5Btop_artists%5D=${ACCOUNT_B}`,
+      { headers: ownerAuth(source) },
+    );
+    const { review } = (await reviewed.json()) as {
+      review: { review_digest: string };
+    };
+
+    // The owner reviewed account B; a narrower token approves the same digest
+    // without naming anything. It must not issue a grant over B.
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      { review_digest: review.review_digest },
+      ownerAuth(scopedOwnerToken()),
+    );
+    expect(approved.status).not.toBe(200);
+    const grants = store.listGrantsForSubject(OWNER);
+    expect(
+      grants.some((stored) =>
+        stored.grant.streams.some((stream) =>
+          stream.instance_ids.includes(ACCOUNT_B),
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not issue an explicitly named out-of-token instance to a narrower approval", async () => {
+    eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    const source = sourceOwnerToken();
+    const created = await post(
+      "/pdpp/v1/authorize",
+      selectionBody({
+        streams: [{ name: "top_artists", instance_ids: [ACCOUNT_B] }],
+      }),
+      ownerAuth(source),
+    );
+    expect(created.status).toBe(201);
+    const { session_id } = (await created.json()) as { session_id: string };
+    const reviewed = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(source) },
+    );
+    expect(reviewed.status).toBe(200);
+    const { review } = (await reviewed.json()) as {
+      review: { review_digest: string };
+    };
+
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      { review_digest: review.review_digest },
+      ownerAuth(scopedOwnerToken()),
+    );
+    expect(approved.status).toBe(403);
+    expect(store.listGrantsForSubject(OWNER)).toEqual([]);
+  });
+
+  it("still lets an instance-scoped owner authorize its own account while another exists", async () => {
+    eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    const ownerToken = scopedOwnerToken();
+    const { sessionId, digest } = await openSessionAndReview(
+      selectionBody({
+        streams: [{ name: "top_artists", instance_ids: [OWNER_INSTANCE] }],
+      }),
+      ownerToken,
+    );
+
+    const approved = await post(
+      `/pdpp/v1/authorize/${sessionId}/approve`,
+      { review_digest: digest },
+      ownerAuth(ownerToken),
+    );
+    expect(approved.status).toBe(200);
+    const { grant_id } = (await approved.json()) as { grant_id: string };
+    expect(store.getGrant(grant_id)!.grant.streams[0].instance_ids).toEqual([
+      OWNER_INSTANCE,
+    ]);
+  });
+
+  it("answers a malformed stream list with 400, not a crash, for every token", async () => {
+    eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    for (const streams of [[null], "top_artists", [42]]) {
+      const scoped = await post(
+        "/pdpp/v1/authorize",
+        selectionBody({ streams }),
+        ownerAuth(scopedOwnerToken()),
+      );
+      expect(scoped.status).toBe(400);
+      const sourceWide = await post(
+        "/pdpp/v1/authorize",
+        selectionBody({ streams }),
+        ownerAuth(sourceOwnerToken()),
+      );
+      expect(sourceWide.status).toBe(400);
+    }
+  });
+
+  it("refuses an empty instance list, which covers no instance rather than the whole source", async () => {
+    eligible = [OWNER_INSTANCE, ACCOUNT_B];
+    const emptyToken = tokens.issueOwnerToken({
+      subjectId: OWNER,
+      sourceId: SOURCE_ID,
+      instanceIds: [],
+    }).access_token;
+    const response = await post(
+      "/pdpp/v1/authorize",
+      selectionBody(),
+      ownerAuth(emptyToken),
+    );
+    expect(response.status).toBe(403);
   });
 });
 

@@ -47,6 +47,20 @@ function isConnectionId(id: string, owner: string, sourceId?: string): boolean {
   );
 }
 
+/**
+ * Whether an owner token may see or act on one connection instance. An absent
+ * instance list is source-wide; a present one is the whole universe, so an
+ * empty list covers no connection.
+ */
+function coversInstance(
+  scope: { instanceIds?: string[] },
+  instance: string,
+): boolean {
+  return (
+    scope.instanceIds === undefined || scope.instanceIds.includes(instance)
+  );
+}
+
 function connectionJson(
   binding: PdppInstanceBinding,
   sourceId = binding.sourceId,
@@ -64,7 +78,9 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
 
   async function owner(
     request: Request,
-  ): Promise<{ subjectId: string; sourceId: string } | Response> {
+  ): Promise<
+    { subjectId: string; sourceId: string; instanceIds?: string[] } | Response
+  > {
     const token = request.headers
       .get("authorization")
       ?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -80,7 +96,11 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
     ) {
       return jsonError("authentication_error", "Owner token required", 401);
     }
-    return { subjectId: context.subjectId, sourceId: context.sourceId };
+    return {
+      subjectId: context.subjectId,
+      sourceId: context.sourceId,
+      ...(context.instanceIds && { instanceIds: context.instanceIds }),
+    };
   }
 
   app.get("/pdpp/capabilities", (c) =>
@@ -107,6 +127,7 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
     return c.json({
       connections: deps.store
         .listConnections(sourceId)
+        .filter((connection) => coversInstance(ownerScope, connection.instance))
         .map((connection) => connectionJson(connection, requestedSourceId)),
     });
   });
@@ -145,6 +166,15 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
       return jsonError(
         "access_denied",
         "Owner token has a different source scope",
+        403,
+      );
+    }
+    // Checked before any write, and before any lookup, so a connection outside
+    // the token's instances is refused the same way whether or not it exists.
+    if (!coversInstance(ownerScope, connectionId)) {
+      return jsonError(
+        "access_denied",
+        "Owner token is not scoped to this connection",
         403,
       );
     }
@@ -187,6 +217,15 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
     const connectionId = c.req.param("connectionId");
     const ownerScope = await owner(c.req.raw);
     if (ownerScope instanceof Response) return ownerScope;
+    // Refused before the binding is read or anything is deleted, and the same
+    // whether or not the connection exists.
+    if (!coversInstance(ownerScope, connectionId)) {
+      return jsonError(
+        "access_denied",
+        "Owner token is not scoped to this connection",
+        403,
+      );
+    }
     const current = deps.store.getInstanceBinding(connectionId);
     if (
       !current.sourceId ||
