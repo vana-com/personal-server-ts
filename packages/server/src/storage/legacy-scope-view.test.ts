@@ -1079,7 +1079,9 @@ describe("legacy scope view over the real SQLite record store", () => {
 
   it("keeps replacement proof and parity verdicts isolated by connection instance", async () => {
     connect(store, "conn_a", "oura");
-    replace(store, "conn_a", "activity", ["a1"]);
+    replace(store, "conn_a", "activity", ["a1"], {
+      collectedAt: "2026-10-02T00:00:00.000Z",
+    });
     const projected = await view.readLatest("oura.activity");
     expect(projected.kind).toBe("canonical");
     if (projected.kind !== "canonical") return;
@@ -1102,14 +1104,16 @@ describe("legacy scope view over the real SQLite record store", () => {
     );
     db.prepare(
       "UPDATE pdpp_stream_completion SET source_collected_at = ? WHERE instance = ? AND stream = ?",
-    ).run("2026-09-12T00:00:00.000Z", "conn_a", "activity");
+    ).run("2026-10-03T00:00:00.000Z", "conn_a", "activity");
     expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
       "canonical",
     );
     store.deleteConnection("conn_a");
     connect(store, "conn_b", "oura");
-    replace(store, "conn_b", "activity", ["a1"]);
+    replace(store, "conn_b", "activity", ["a1"], {
+      collectedAt: "2026-10-04T00:00:00.000Z",
+    });
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
       "canonical",
     );
@@ -1135,7 +1139,9 @@ describe("legacy scope view over the real SQLite record store", () => {
 
   it("requires fresh completion after generation replacement before replacing the unchanged head", async () => {
     connect(store, "conn_a", "oura");
-    replace(store, "conn_a", "activity", ["a1"]);
+    replace(store, "conn_a", "activity", ["a1"], {
+      collectedAt: "2026-10-02T00:00:00.000Z",
+    });
     const projected = await view.readLatest("oura.activity");
     expect(projected.kind).toBe("canonical");
     if (projected.kind !== "canonical") return;
@@ -1169,6 +1175,16 @@ describe("legacy scope view over the real SQLite record store", () => {
       score: 91,
       generation: 2,
     });
+    expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
+    const staleVerdicts = parityView.verdictFor("oura.activity");
+    expect(staleVerdicts).toMatchObject([
+      { instance: "conn_a", generation: 2, verdict: "not_covered" },
+    ]);
+    replace(store, "conn_a", "activity", ["a1"], {
+      score: 91,
+      generation: 2,
+      collectedAt: "2026-10-03T00:00:00.000Z",
+    });
 
     const fresh = await parityView.readLatest("oura.activity");
     expect(fresh.kind).toBe("canonical");
@@ -1177,7 +1193,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(fresh.envelope.data).toMatchObject({
       days: [{ id: "a1", score: 91 }],
     });
-    expect(parityView.verdictFor("oura.activity")).toEqual([]);
+    expect(parityView.verdictFor("oura.activity")).toEqual(staleVerdicts);
     expect(
       db
         .prepare(
@@ -1189,7 +1205,9 @@ describe("legacy scope view over the real SQLite record store", () => {
 
   it("requires the replacement account to complete its own sync before replacing the old head", async () => {
     connect(store, "conn_a", "oura");
-    replace(store, "conn_a", "activity", ["a1"]);
+    replace(store, "conn_a", "activity", ["a1"], {
+      collectedAt: "2026-10-02T00:00:00.000Z",
+    });
     const projected = await view.readLatest("oura.activity");
     expect(projected.kind).toBe("canonical");
     if (projected.kind !== "canonical") return;
@@ -1216,6 +1234,15 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
     expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
     replace(store, "conn_b", "activity", ["a1"], { score: 91 });
+    expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
+    const staleVerdicts = parityView.verdictFor("oura.activity");
+    expect(staleVerdicts).toMatchObject([
+      { instance: "conn_b", generation: 1, verdict: "not_covered" },
+    ]);
+    replace(store, "conn_b", "activity", ["a1"], {
+      score: 91,
+      collectedAt: "2026-10-03T00:00:00.000Z",
+    });
 
     const fresh = await parityView.readLatest("oura.activity");
     expect(fresh.kind).toBe("canonical");
@@ -1224,7 +1251,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(fresh.envelope.data).toMatchObject({
       days: [{ id: "a1", score: 91 }],
     });
-    expect(parityView.verdictFor("oura.activity")).toEqual([]);
+    expect(parityView.verdictFor("oura.activity")).toEqual(staleVerdicts);
     expect(
       db
         .prepare(
@@ -1233,6 +1260,66 @@ describe("legacy scope view over the real SQLite record store", () => {
         .all(),
     ).toEqual([{ instance: "conn_a" }, { instance: "conn_b" }]);
   });
+
+  it.each([false, true])(
+    "refuses stale completion without a legacy reader (prior takeover: %s)",
+    async (priorTakeover) => {
+      connect(store, "conn_a", "oura");
+      db.prepare(
+        "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+      ).run(
+        "oura/activity/newer.json",
+        "oura.activity",
+        "2026-10-14T22:00:00.000Z",
+        1,
+      );
+      if (priorTakeover) {
+        replace(store, "conn_a", "activity", ["a1"], {
+          collectedAt: "2026-10-15T00:00:00.000Z",
+        });
+        expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+      }
+      replace(store, "conn_a", "activity", ["a1"], {
+        collectedAt: "2026-09-10T06:00:00.000Z",
+      });
+      expect((await view.readLatest("oura.activity")).kind).toBe(
+        priorTakeover ? "refused" : "file",
+      );
+      const takeovers = db
+        .prepare(
+          "SELECT instance, generation, replacement_cursor FROM legacy_scope_takeovers",
+        )
+        .all();
+      expect(takeovers).toEqual(
+        priorTakeover
+          ? [
+              {
+                instance: "conn_a",
+                generation: 1,
+                replacement_cursor: expect.any(String),
+              },
+            ]
+          : [],
+      );
+      replace(store, "conn_a", "activity", ["a1"], {
+        collectedAt: "2026-10-16T00:00:00.000Z",
+      });
+      expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+      expect(
+        db
+          .prepare(
+            "SELECT instance, generation, replacement_cursor FROM legacy_scope_takeovers",
+          )
+          .all(),
+      ).toEqual([
+        {
+          instance: "conn_a",
+          generation: 1,
+          replacement_cursor: expect.any(String),
+        },
+      ]);
+    },
+  );
 
   it("honors a reset that commits while a cache-miss evaluation is in flight", async () => {
     connect(store, "conn_a", "oura");

@@ -59,7 +59,8 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 10;
+// Invalidate persisted witnesses created before completion-horizon fencing.
+const COVERAGE_RULE_VERSION = 11;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the
@@ -961,7 +962,7 @@ export function createLegacyScopeView(
           !input.readLegacyHead ||
           (decision.selection.method === "oura-browser" && !hasTakeover)),
       allowUnprovenEmptyStreams: legacyHead !== null && !!input.readLegacyHead,
-      includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
+      includeStreamTimes: legacyHead !== null,
       requireClaudeRawBlobs: legacyHead !== null && !!input.readLegacyHead,
       // The rows must come from a state in which this is still the one
       // connection: a second account appearing between the decision and
@@ -1069,7 +1070,14 @@ export function createLegacyScopeView(
         },
       };
     }
-    if (legacyHead !== null && replacementEligible && read.complete) {
+    // Whole-dataset replacement needs a fresh completion for every input.
+    // Equal/older horizons retain the existing parity path, not deletion authority.
+    if (
+      legacyHead !== null &&
+      replacementEligible &&
+      read.complete &&
+      allStreamsProvenAfter(read, decision.streams, legacyHead.collectedAt)
+    ) {
       const confirmed = authority.confirmRead(
         scope,
         legacyHead,
@@ -1112,6 +1120,22 @@ export function createLegacyScopeView(
         kind: "canonical",
         envelope: read.envelope,
         revision: read.revision,
+      };
+    }
+    // Without the old body, only a newer complete import can prove replacement.
+    // Do not fall through to confirmation that records an unscoped takeover.
+    if (legacyHead !== null && !input.readLegacyHead) {
+      const stillLegacyOwned = authority.readSnapshot(() =>
+        canServeLegacyBeforeTakeover(scope),
+      );
+      if (stillLegacyOwned) return { kind: "file" };
+      return {
+        kind: "refused",
+        refusal: {
+          status: "incomplete",
+          reason: "canonical_view_incomplete",
+          diagnostics: incompleteness(read),
+        },
       };
     }
     if (legacyHead !== null && input.readLegacyHead) {
