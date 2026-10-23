@@ -2296,6 +2296,95 @@ describe("Oura collection requirements", () => {
     );
   });
 
+  it("accepts a native batch with its START selection and refuses narrower or unselected ones", async () => {
+    const signer = createTestWallet(12);
+    await ctx!.cleanup();
+    vi.stubEnv(
+      "VANA_MASTER_KEY_SIGNATURE",
+      await signer.signMessage("vana-master-key-v1"),
+    );
+    owner = signer.address.toLowerCase();
+    accountOne = `oura:${owner}`;
+    await freshBoot(["oura-browser"], []);
+    await writeLegacy(DAYS, T_LEGACY);
+    await writePdpp(DAYS, T_PDPP);
+    expect(await readAll()).toEqual(ALL(CANON));
+    const changed = DAYS.map((day) => ({ ...day, score: day.score + 1 }));
+    const native = {
+      sourceId: OURA,
+      instance: accountOne,
+      method: "oura-browser",
+      generation: 1,
+      artifactDigest:
+        "sha256:45d044af6e263a5121033df51f7ad5eaed1e19f1263cffe95ae63737259888c5",
+    };
+    const startAt = (since: string) => ({
+      streams: SCOPES.map((scope) => ({
+        name: STREAM_OF[scope],
+        time_range: { since },
+      })),
+    });
+    // The native batch forwards the START selection the collector ran with.
+    const batch = (selection?: { streams: unknown[] }) => ({
+      native,
+      collectedAt: "2026-10-16T00:00:00.000Z",
+      ...(selection ? { selection } : {}),
+      records: SCOPES.flatMap((scope) =>
+        pdppRows(scope, changed).map((data) => ({
+          stream: STREAM_OF[scope],
+          data,
+        })),
+      ),
+      completion: {
+        streams: SCOPES.map((scope) => ({
+          stream: STREAM_OF[scope],
+          status: "complete",
+          recordCount: pdppRows(scope, changed).length,
+        })),
+      },
+    });
+    const post = async (body: unknown) => {
+      const uri = "/v1/import/oura-browser";
+      const authorization = await buildWeb3SignedHeader({
+        wallet: signer,
+        aud: ctx!.config.server.origin,
+        method: "POST",
+        uri,
+        body: new TextEncoder().encode(JSON.stringify(body)),
+      });
+      return ctx!.app.request(uri, {
+        method: "POST",
+        headers: { authorization, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    };
+    const before = await Promise.all(SCOPES.map((scope) => observe(scope)));
+    const narrower = await post(batch(startAt("2026-10-01")));
+    expect(narrower.status, await narrower.clone().text()).toBe(409);
+    expect(await narrower.json()).toEqual({
+      ok: false,
+      reason: "selection_narrower_than_history",
+    });
+    const unselected = await post(batch());
+    expect(unselected.status, await unselected.clone().text()).toBe(409);
+    expect(await unselected.json()).toEqual({
+      ok: false,
+      reason: "selection_not_eligible",
+    });
+    expect(await Promise.all(SCOPES.map((scope) => observe(scope)))).toEqual(
+      before,
+    );
+    const admitted = await post(batch(startAt("2026-09-01")));
+    expect(admitted.status, await admitted.clone().text()).toBe(200);
+    expect((await admitted.json()).receipts).toHaveLength(3);
+    for (const scope of SCOPES) {
+      const current = await observe(scope);
+      expect(dayRows(current.builder, scope).map((day) => day.score)).toEqual(
+        changed.map((day) => day.score),
+      );
+    }
+  });
+
   it("returns null only without history and refuses malformed Node history", async () => {
     const requirements = () =>
       ctx!.app.request("/v1/import/oura-browser/requirements", {

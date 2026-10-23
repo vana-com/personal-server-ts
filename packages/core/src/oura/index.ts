@@ -22,7 +22,7 @@ import {
 
 const STREAMS = ["sleep", "readiness", "activity"] as const;
 export interface OuraBrowserImportInput {
-  /** Prepared run selection. Required unless Node supplies validated native proof. */
+  /** The START selection the batch was collected with. Required for every batch. */
   selection?: { streams: unknown[] };
   records: PdppRecord[];
   collectedAt: string;
@@ -34,6 +34,11 @@ export interface OuraBrowserImportInput {
     }[];
   };
 }
+/** Current-generation retained rows, including deleted IDs, as coverage constraints only. */
+export interface OuraRetainedHistory {
+  records: PdppRecord[];
+  collectedAt: string;
+}
 /** Ordinary owner-ingest effects supplied by the runtime after owner authentication. */
 export type OuraBrowserImportOptions = Pick<
   PersonalServerDataApiDeps,
@@ -43,10 +48,8 @@ export type OuraBrowserImportOptions = Pick<
   | "onDataWritten"
   | "legacyScopeView"
 > & {
-  /** Node's fixed artifact-bound producer already validates its current START selection. */
-  artifactBoundNativeCompletion?: boolean;
-  /** Current-generation retained rows, including deleted IDs, as coverage constraints only. */
-  retainedCanonicalHistory?: { records: PdppRecord[]; collectedAt: string };
+  /** Read once by the importer under its import lock, never before it. */
+  retainedCanonicalHistory?: () => OuraRetainedHistory | undefined;
   /** Node commits the validated current batch to its existing canonical store. */
   beforeCommit?: (
     input: OuraBrowserImportInput,
@@ -94,11 +97,8 @@ export async function importOuraBrowserRecords(
     return { ok: false, reason: "invalid_completion" };
   }
   const counts = new Map<string, number>(STREAMS.map((stream) => [stream, 0]));
-  if (
-    input.selection === undefined
-      ? options.artifactBoundNativeCompletion !== true
-      : !isOuraTakeoverSelection(input.selection)
-  ) {
+  // Native and browser batches alike must carry the START selection they ran with.
+  if (!isOuraTakeoverSelection(input.selection)) {
     return { ok: false, reason: "selection_not_eligible" };
   }
   const ids = new Set<string>();
@@ -160,33 +160,29 @@ export async function importOuraBrowserRecords(
 
 /**
  * A window must reach back to the earliest day of the history it would replace.
- * Reads run under the import lock, so a stale preparation cannot authorize truncation.
+ * The caller reads the retained rows under the import lock, so a stale preparation
+ * cannot authorize truncation.
  */
 async function narrowerThanHistory(
   storage: DataStoragePort,
   input: OuraBrowserImportInput,
   options: OuraBrowserImportOptions,
+  retained: OuraRetainedHistory | undefined,
 ): Promise<Extract<OuraBrowserImportResult, { ok: false }> | undefined> {
-  // Native publications carry no selection; their START is proven only when present.
-  // A present selection was already validated before the lock.
-  const authorized =
-    input.selection === undefined
-      ? undefined
-      : ouraTakeoverSelectionSince(input.selection)!.since;
+  // The selection was validated before the lock.
+  const authorized = ouraTakeoverSelectionSince(input.selection)!.since;
   // Full history cannot be narrower than what it replaces.
   if (authorized === null) return;
   const required = await readOuraCollectionRequirements(
     storage,
     options.legacyScopeView,
-    options.retainedCanonicalHistory?.records,
+    retained?.records,
   ).catch(() => undefined);
   if (!required) return { ok: false, reason: "prior_projection_unavailable" };
   if (!required.ok)
     return { ok: false, reason: required.reason, scope: required.scope };
   // Absent or empty history has no day that a narrower window could drop.
   if (required.since === null) return;
-  if (authorized === undefined)
-    return { ok: false, reason: "native_start_unproven" };
   if (authorized > required.since)
     return { ok: false, reason: "selection_narrower_than_history" };
 }
@@ -196,7 +192,9 @@ async function importLocked(
   input: OuraBrowserImportInput,
   options: OuraBrowserImportOptions,
 ): Promise<OuraBrowserImportResult> {
-  const narrower = await narrowerThanHistory(storage, input, options);
+  // One read under the lock: the boundary, stale and parity checks share this snapshot.
+  const retained = options.retainedCanonicalHistory?.();
+  const narrower = await narrowerThanHistory(storage, input, options, retained);
   if (narrower) return narrower;
   // Current connector records have no trusted upstream account identity.
   // Compare this complete batch alone; never union raw windows across requests.
@@ -210,7 +208,6 @@ async function importLocked(
     if (!projection.ok || (projection.diagnostics?.length ?? 0) > 0) {
       return { ok: false, reason: "projection_incomplete", scope };
     }
-    const retained = options.retainedCanonicalHistory;
     if (retained) {
       if (Date.parse(input.collectedAt) < Date.parse(retained.collectedAt))
         return { ok: false, reason: "stale_collection", scope };

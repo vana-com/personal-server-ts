@@ -804,40 +804,53 @@ describe("Oura required history boundary", () => {
     },
   );
 
-  it("refuses an artifact-bound batch whose START is unproven while January history is current", async () => {
-    const storage = createMemoryPsLiteStorage();
-    await seedJanuaryHistory(storage);
-    const beforeCommit = vi.fn().mockResolvedValue(undefined);
-    const unproven = {
-      ...input("2026-10-16T00:00:00.000Z"),
-      selection: undefined,
-    };
-    expect(
-      await importOuraBrowserRecords(storage, unproven, {
-        artifactBoundNativeCompletion: true,
-        beforeCommit,
-      }),
-    ).toEqual({ ok: false, reason: "native_start_unproven" });
-    // A native batch that carries its START selection is checked like any takeover.
-    expect(
-      await importOuraBrowserRecords(
-        storage,
-        sinceOnly(input("2026-10-16T00:00:00.000Z"), "2026-10-01"),
-        { artifactBoundNativeCompletion: true, beforeCommit },
-      ),
-    ).toEqual({ ok: false, reason: "selection_narrower_than_history" });
-    expect(beforeCommit).not.toHaveBeenCalled();
-    expect(storage.countVersions("oura.activity")).toBe(1);
-  });
+  it.each([false, true])(
+    "refuses a batch without its START selection (January history seeded: %s)",
+    async (seeded) => {
+      const storage = createMemoryPsLiteStorage();
+      if (seeded) await seedJanuaryHistory(storage);
+      const beforeCommit = vi.fn().mockResolvedValue(undefined);
+      const unselected = {
+        ...input("2026-10-16T00:00:00.000Z"),
+        selection: undefined,
+      };
+      expect(
+        await importOuraBrowserRecords(storage, unselected, { beforeCommit }),
+      ).toEqual({ ok: false, reason: "selection_not_eligible" });
+      expect(beforeCommit).not.toHaveBeenCalled();
+      expect(storage.countVersions("oura.activity")).toBe(seeded ? 1 : 0);
+    },
+  );
 
-  it("admits an artifact-bound batch when no January history exists", async () => {
+  it("reads retained history under the import lock, after an earlier batch commits", async () => {
     const storage = createMemoryPsLiteStorage();
-    expect(
-      await importOuraBrowserRecords(
-        storage,
-        { ...input(), selection: undefined },
-        { artifactBoundNativeCompletion: true },
-      ),
-    ).toMatchObject({ ok: true });
+    const january = input("2026-10-14T00:00:00.000Z", "2026-01-01");
+    let retained:
+      | { records: OuraBrowserImportInput["records"]; collectedAt: string }
+      | undefined;
+    // The earlier batch makes January history current while the later one waits for the lock.
+    const earlier = importOuraBrowserRecords(
+      storage,
+      input("2026-10-15T00:00:00.000Z"),
+      {
+        beforeCommit: async () => {
+          retained = {
+            records: january.records,
+            collectedAt: january.collectedAt,
+          };
+        },
+      },
+    );
+    const later = importOuraBrowserRecords(
+      storage,
+      sinceOnly(input("2026-10-16T00:00:00.000Z"), "2026-10-01"),
+      { retainedCanonicalHistory: () => retained },
+    );
+    expect(await earlier).toMatchObject({ ok: true });
+    expect(await later).toEqual({
+      ok: false,
+      reason: "selection_narrower_than_history",
+    });
+    expect(storage.countVersions("oura.activity")).toBe(1);
   });
 });
