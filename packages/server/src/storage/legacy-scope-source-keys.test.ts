@@ -213,7 +213,7 @@ describe("completed replacement and unreceipted historical comparison", () => {
             ? githubProfile()
             : fixture(scope);
       input.legacyBody = { oldOnly: [{ arbitrary: "no historical key" }] };
-      const view = setup(input, true, collectedAt, true);
+      const view = setup(input, true, "2026-10-09T00:00:00.000Z", true);
       const indexed = db.prepare("SELECT * FROM data_files").all();
       const read = await view.readLatest(scope);
       expect(read.kind).toBe("canonical");
@@ -227,6 +227,21 @@ describe("completed replacement and unreceipted historical comparison", () => {
           .prepare("SELECT replacement_cursor FROM legacy_scope_takeovers")
           .all(),
       ).toEqual([{ replacement_cursor: expect.any(String) }]);
+      expect(db.prepare("SELECT * FROM data_files").all()).toEqual(indexed);
+    },
+  );
+
+  it.each([collectedAt, "2026-10-11T00:00:00.000Z"])(
+    "keeps keyless history when its head at %s is not older than the completed import",
+    async (legacyCollectedAt) => {
+      const input = fixture("linkedin.connections");
+      input.legacyBody = { oldOnly: [{ arbitrary: "no historical key" }] };
+      const view = setup(input, true, legacyCollectedAt, true);
+      const indexed = db.prepare("SELECT * FROM data_files").all();
+      expect((await view.readLatest(input.scope)).kind).toBe("file");
+      expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+        [],
+      );
       expect(db.prepare("SELECT * FROM data_files").all()).toEqual(indexed);
     },
   );
