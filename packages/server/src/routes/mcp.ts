@@ -82,6 +82,7 @@ import type {
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
 import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
+import { arrivedOnLoopbackListener } from "../middleware/local-listener.js";
 import {
   authenticateRequest,
   isWeb3SignedLifetimeError,
@@ -169,10 +170,34 @@ export interface McpRouteDeps {
    * user. Absent: the agent is told to wait for approval in Vana.
    */
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** Loopback auth listener port; requests on it are local MCP clients. */
+  localApprovalPort?: number;
+  /** Main (tunneled) port; a collision with `localApprovalPort` disables local MCP. */
+  serverPort?: number;
 }
 
 function resolveOrigin(origin: string | (() => string)): string {
   return typeof origin === "function" ? origin() : origin;
+}
+
+/**
+ * The origin every OAuth/discovery URL in this response must name. A local
+ * client on the loopback listener gets the exact origin it called (RFC 9728:
+ * the advertised resource must match the URL the client used, so `localhost`
+ * and `127.0.0.1` differ); everyone else gets the public origin.
+ */
+function requestOrigin(
+  c: Context,
+  deps: Pick<McpRouteDeps, "serverOrigin" | "localApprovalPort" | "serverPort">,
+): string {
+  const listeners = {
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
+  };
+  if (!arrivedOnLoopbackListener(c, listeners)) {
+    return resolveOrigin(deps.serverOrigin);
+  }
+  return new URL(c.req.url).origin;
 }
 
 function jsonError(status: number, errorCode: string, message: string) {
@@ -627,6 +652,8 @@ export type McpOAuthRouteDeps = Pick<
   | "gatewayConfig"
   | "serverSigner"
   | "mcpGrantTtlSeconds"
+  | "localApprovalPort"
+  | "serverPort"
 >;
 
 export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
@@ -660,7 +687,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
 
   app.get("/.well-known/oauth-protected-resource/mcp", (c) =>
     resolveApprovalUrl(deps)
-      ? c.json(protectedResourceMetadata(resolveOrigin(deps.serverOrigin)))
+      ? c.json(protectedResourceMetadata(requestOrigin(c, deps)))
       : c.json(
           jsonError(
             404,
@@ -673,7 +700,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
 
   app.get("/.well-known/oauth-authorization-server", (c) =>
     resolveApprovalUrl(deps)
-      ? c.json(authorizationServerMetadata(resolveOrigin(deps.serverOrigin)))
+      ? c.json(authorizationServerMetadata(requestOrigin(c, deps)))
       : c.json(
           jsonError(
             404,
@@ -739,7 +766,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
         404,
       );
     }
-    const origin = resolveOrigin(deps.serverOrigin);
+    const origin = requestOrigin(c, deps);
     const url = new URL(c.req.url);
     const responseType = url.searchParams.get("response_type");
     const clientId = url.searchParams.get("client_id") ?? "";
@@ -1142,7 +1169,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
           401,
         );
       }
-      return mcpUnauthorized(resolveOrigin(deps.serverOrigin));
+      return mcpUnauthorized(requestOrigin(c, deps));
     }
     const tokenHash = await hashConnectionToken(rawToken);
     const record = await store.getByTokenHash(tokenHash);
@@ -1156,7 +1183,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       );
     }
     return mcpUnauthorized(
-      resolveOrigin(deps.serverOrigin),
+      requestOrigin(c, deps),
       "Unknown or revoked MCP connection",
     );
   }
