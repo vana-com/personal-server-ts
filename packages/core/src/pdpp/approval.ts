@@ -34,6 +34,7 @@ import {
   type RequesterIdentity,
 } from "./review.js";
 import { issueGrant, type ConsentEvidence } from "./issuance.js";
+import { ownValue } from "./named.js";
 import {
   expandSelections,
   streamIsOmitted,
@@ -305,7 +306,7 @@ function withInstanceChoices(
   return {
     eligibleFor(streamName: string): string[] {
       const eligible = inventory.eligibleFor(streamName);
-      const chosen = choices[streamName];
+      const chosen = ownValue(choices, streamName);
       if (!chosen || chosen.length === 0) return eligible;
       return chosen.filter((handle) => eligible.includes(handle));
     },
@@ -743,7 +744,7 @@ function requestsFanIn(
 ): boolean {
   return expandSelections(request, snapshot).some((stream) => {
     if (streamIsOmitted(request, stream, ownerChoices)) return false;
-    const ids = choices?.[stream.name] ?? stream.instance_ids ?? [];
+    const ids = ownValue(choices, stream.name) ?? stream.instance_ids ?? [];
     return new Set(ids).size > 1;
   });
 }

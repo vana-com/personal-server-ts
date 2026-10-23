@@ -76,7 +76,15 @@ function grantCandidate(
   };
 }
 
-function buildApp(grant: Grant) {
+function buildApp(
+  grant: Grant,
+  data: Record<string, unknown> = {
+    id: "t1",
+    date: "2026-01-02",
+    amount: 12,
+    private_note: "the owner never approved this",
+  },
+) {
   const store = createMemoryRecordStore();
   const tokens: Record<string, PdppTokenContext> = {
     "client-tok": {
@@ -93,12 +101,7 @@ function buildApp(grant: Grant) {
         instance: "inst_1",
         stream: "transactions",
         key: "t1",
-        data: {
-          id: "t1",
-          date: "2026-01-02",
-          amount: 12,
-          private_note: "the owner never approved this",
-        },
+        data,
         emitted_at: "2026-01-02T00:00:00Z",
         op: "upsert",
       },
@@ -251,4 +254,37 @@ it("candidate sync eligibility uses grant fields even when the response is spars
   const body = await res.json();
   expect(body.data).toHaveLength(1);
   expect(body.data[0].data).toEqual({ date: "2026-01-02" });
+});
+
+describe("field names are data on the read path", () => {
+  // JSON.parse makes `__proto__` an own property, as a stored record does.
+  const record = JSON.parse(
+    '{"id":"t1","date":"2026-01-02","__proto__":"own proto field","constructor":"own constructor field"}',
+  ) as Record<string, unknown>;
+
+  it("discloses a granted field named __proto__ or constructor when the record has it", async () => {
+    const { app } = buildApp(
+      grantV02(["date", "__proto__", "constructor"]),
+      record,
+    );
+    const data = await listData(app);
+    expect(Object.keys(data).sort()).toEqual([
+      "__proto__",
+      "constructor",
+      "date",
+    ]);
+    expect(Object.getOwnPropertyDescriptor(data, "__proto__")?.value).toBe(
+      "own proto field",
+    );
+    expect(data.constructor).toBe("own constructor field");
+  });
+
+  it("does not invent a granted field the record lacks because Object.prototype has it", async () => {
+    const { app } = buildApp(
+      grantV02(["date", "toString", "hasOwnProperty", "__proto__"]),
+      JSON.parse('{"id":"t1","date":"2026-01-02"}'),
+    );
+    const data = await listData(app);
+    expect(Object.keys(data)).toEqual(["date"]);
+  });
 });
