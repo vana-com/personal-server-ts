@@ -15,6 +15,7 @@ import { startPersonalServer } from "./client.js";
 const ownerWallet = createTestWallet(8);
 const APPROVAL_URL = "https://app.vana.org/mcp/approve";
 const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource/mcp";
+const REDIRECT_URI = "http://127.0.0.1:33418/callback";
 
 interface LocalServer {
   /** `config.server.origin`: what tunnel clients are told today. */
@@ -108,6 +109,39 @@ async function startLocalServer(): Promise<LocalServer> {
   };
 }
 
+async function pkceChallenge(verifier: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(verifier),
+  );
+  return Buffer.from(digest).toString("base64url");
+}
+
+/** DCR + authorize on one listener; returns the owner approval redirect. */
+async function authorize(listener: string, verifier: string): Promise<URL> {
+  const registered = await (
+    await fetch(`${listener}/mcp/oauth/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Local agent",
+        redirect_uris: [REDIRECT_URI],
+      }),
+    })
+  ).json();
+  const query = new URLSearchParams({
+    response_type: "code",
+    client_id: registered.client_id,
+    redirect_uri: REDIRECT_URI,
+    code_challenge: await pkceChallenge(verifier),
+    code_challenge_method: "S256",
+  });
+  const response = await fetch(`${listener}/mcp/oauth/authorize?${query}`, {
+    redirect: "manual",
+  });
+  return new URL(response.headers.get("location")!);
+}
+
 /** Every URL an MCP client learns from discovery, as one comparable shape. */
 async function discoveredUrls(listener: string) {
   const challenge = await fetch(`${listener}/mcp`, { method: "POST" });
@@ -117,6 +151,7 @@ async function discoveredUrls(listener: string) {
   const authServer = await (
     await fetch(`${listener}/.well-known/oauth-authorization-server`)
   ).json();
+  const approval = await authorize(listener, "discovery-verifier");
   return {
     challenge: challenge.headers.get("www-authenticate"),
     resource: resource.resource,
@@ -125,6 +160,7 @@ async function discoveredUrls(listener: string) {
     authorizationEndpoint: authServer.authorization_endpoint,
     tokenEndpoint: authServer.token_endpoint,
     registrationEndpoint: authServer.registration_endpoint,
+    approvalPsOrigin: approval.searchParams.get("ps_origin"),
   };
 }
 
@@ -137,6 +173,7 @@ function expectedUrls(origin: string) {
     authorizationEndpoint: `${origin}/mcp/oauth/authorize`,
     tokenEndpoint: `${origin}/mcp/oauth/token`,
     registrationEndpoint: `${origin}/mcp/oauth/register`,
+    approvalPsOrigin: origin,
   };
 }
 
@@ -149,15 +186,19 @@ describe("local MCP over the loopback listener", () => {
     );
   });
 
-  // Baseline: discovery ignores the listener and names the public origin.
-  it.fails(
-    "tells loopback clients the loopback origin in every discovery URL",
-    async () => {
-      const server = await startLocalServer();
+  it("tells loopback clients the loopback origin in every discovery URL", async () => {
+    const server = await startLocalServer();
 
-      expect(await discoveredUrls(server.loopback)).toEqual(
-        expectedUrls(server.loopback),
-      );
-    },
-  );
+    expect(await discoveredUrls(server.loopback)).toEqual(
+      expectedUrls(server.loopback),
+    );
+  });
+
+  // RFC 9728: the advertised resource must equal the URL the client used.
+  it("names the loopback host the client used (localhost or 127.0.0.1)", async () => {
+    const server = await startLocalServer();
+    const localhost = server.loopback.replace("127.0.0.1", "localhost");
+
+    expect(await discoveredUrls(localhost)).toEqual(expectedUrls(localhost));
+  });
 });
