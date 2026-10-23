@@ -191,9 +191,29 @@ export interface McpConnectionStore {
 export type McpOAuthAuthorizationStatus =
   "pending" | "approved" | "redeemed" | "denied" | "expired";
 
+/**
+ * What an MCP client said about itself at dynamic client registration
+ * (RFC 7591). Self-asserted and unauthenticated: a label for the owner, never
+ * a proof of identity.
+ */
+export interface McpOAuthClientRecord {
+  clientId: string;
+  clientName?: string;
+  clientUri?: string;
+  createdAt: string;
+}
+
+export interface McpOAuthClientStore {
+  create(record: McpOAuthClientRecord): Promise<void>;
+  getById(clientId: string): Promise<McpOAuthClientRecord | null>;
+}
+
 export interface McpOAuthAuthorizationRecord {
   id: string;
   clientId: string;
+  /** Registered name of `clientId`, if this server registered it. */
+  clientName?: string;
+  clientUri?: string;
   redirectUri: string;
   codeChallenge: string;
   codeChallengeMethod: "S256";
