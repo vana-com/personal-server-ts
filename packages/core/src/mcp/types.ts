@@ -22,6 +22,18 @@
  */
 
 export type McpConnectionStatus = "pending" | "approved" | "revoked";
+
+/**
+ * Listener an OAuth connection was authorized through. Its bearer resolves
+ * only on that listener, so a token minted for a local client is useless
+ * through the tunnel and the reverse.
+ */
+export enum McpIngress {
+  /** The server's loopback auth listener: a client on this machine. */
+  Loopback = "loopback",
+  /** The main listener the tunnel forwards to. */
+  Public = "public",
+}
 export const MCP_SCOPE_ACCESS_REQUEST_LIMIT = 20;
 
 export interface McpConnectionGrant {
@@ -123,6 +135,8 @@ export interface McpConnectionRecord {
   approvedAt?: string;
   revokedAt?: string;
   lastUsedAt?: string;
+  /** Absent on records written before listeners were told apart: Public. */
+  ingress?: McpIngress;
 }
 
 export interface McpConnectionStore {
