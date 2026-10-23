@@ -1054,6 +1054,12 @@ export function createLegacyScopeView(
     }
     // Receipt presence cannot make a lossy/partial projection complete.
     if (initial.retainedEntityLoss && !read.complete) {
+      if (legacyHead !== null && !hasTakeover) {
+        const stillLegacyOwned = authority.readSnapshot(() =>
+          canServeLegacyBeforeTakeover(scope),
+        );
+        if (stillLegacyOwned) return { kind: "file" };
+      }
       return {
         kind: "refused",
         refusal: {

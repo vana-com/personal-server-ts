@@ -2932,6 +2932,118 @@ describe("one snapshot for the selection and the rows", () => {
 });
 
 describe("Oura completed wholesale snapshots with retained tombstones", () => {
+  for (const [takenOver, removedHead] of [
+    [false, false],
+    [true, false],
+    [false, true],
+  ] as const) {
+    it(`keeps incomplete replacement legacy fallback only while legacy-owned: takeover=${takenOver}, removedHead=${removedHead}`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "oura-lossy-replacement-"));
+      const db = initializeDatabase(join(dir, "index.db"));
+      const store = createSqliteRecordStore(db);
+      const authority = createLegacyScopeAuthority(db);
+      let snapshots = 0;
+      const view = createLegacyScopeView({
+        authority: {
+          ...authority,
+          readSnapshot(read) {
+            const value = authority.readSnapshot(read);
+            if (removedHead && ++snapshots === 1) {
+              db.prepare("DELETE FROM data_files WHERE scope=?").run(
+                "oura.activity",
+              );
+            }
+            return value;
+          },
+        },
+        records: store,
+        configuredMethods: () => ["oura-browser"],
+      });
+      const streams = ["sleep", "readiness", "activity"];
+      try {
+        connect(store, "lossy", "oura-browser");
+        db.prepare(
+          "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+        ).run(
+          "oura/activity/old.json",
+          "oura.activity",
+          "2026-01-01T00:00:00.000Z",
+          1,
+        );
+        for (const stream of streams)
+          replace(
+            store,
+            "lossy",
+            stream,
+            stream === "activity" ? ["old-a", "old-b"] : [],
+            {
+              method: "oura-browser",
+            },
+          );
+        if (takenOver) {
+          expect((await view.readLatest("oura.activity")).kind).toBe(
+            "canonical",
+          );
+        }
+        expect(authority.hasTakeover("oura.activity", "lossy", 1)).toBe(
+          takenOver,
+        );
+        const collectedAt = "2026-09-11T07:00:00.000Z";
+        for (const stream of streams) {
+          store.replaceStream({
+            instance: "lossy",
+            stream,
+            method: "oura-browser",
+            generation: 1,
+            primaryKey: ["id"],
+            emittedAt: collectedAt,
+            sourceCollectedAt: collectedAt,
+            envelopes:
+              stream === "activity"
+                ? [
+                    {
+                      instance: "lossy",
+                      stream,
+                      key: "new-good",
+                      data: { id: "new-good", day: "2026-09-01", score: 81 },
+                      emitted_at: collectedAt,
+                    },
+                    {
+                      instance: "lossy",
+                      stream,
+                      key: "new-bad",
+                      data: { id: "new-bad", score: 82 },
+                      emitted_at: collectedAt,
+                    },
+                  ]
+                : [],
+          });
+        }
+        expect(store.listStreamCompletions("lossy")).toHaveLength(3);
+        expect(
+          db
+            .prepare("SELECT COUNT(*) AS n FROM pdpp_records WHERE deleted=1")
+            .get(),
+        ).toEqual({ n: 2 });
+        const read = await view.readLatest("oura.activity");
+        if (takenOver || removedHead) {
+          expect(read).toMatchObject({
+            kind: "refused",
+            refusal: { reason: "canonical_view_incomplete" },
+          });
+        } else {
+          expect(read).toMatchObject({ kind: "file" });
+          expect(authority.hasTakeover("oura.activity", "lossy", 1)).toBe(
+            false,
+          );
+        }
+      } finally {
+        store.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
   for (const ids of [["old-a"], ["new-only"], []] as string[][]) {
     it(
       "serves exact current complete rows and listing after restart: " +
