@@ -24,6 +24,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { ownValue } from "./named.js";
 import { resolveCommitments, type ResolvedCommitments } from "./commitments.js";
 import {
   AI_TRAINING_PURPOSE,
@@ -384,9 +385,11 @@ export function buildConsentReview(
           name: s.name,
           // The deployment-supplied map still wins where a caller set it, so
           // this adds a source of copy without removing the existing one.
-          ...((input.streamDescriptions?.[s.name] ?? declared?.description) && {
+          ...((ownValue(input.streamDescriptions, s.name) ??
+            declared?.description) && {
             description:
-              input.streamDescriptions?.[s.name] ?? declared?.description,
+              ownValue(input.streamDescriptions, s.name) ??
+              declared?.description,
           }),
           ...(declared?.display?.label && {
             display_label: declared.display.label,

@@ -1,3 +1,4 @@
+import { ownValue } from "./named.js";
 import { expandedRequestFields, validateTimeRangeBounds } from "./selection.js";
 import {
   declaredTimeType,
@@ -406,7 +407,7 @@ function resolveOneStream(
   // v0.1 has no narrowing step, so its resolution is untouched by choices.
   const narrowedFields =
     revision !== "0.1"
-      ? narrowFields(ceiling.fields, choices?.fields?.[declared.name])
+      ? narrowFields(ceiling.fields, ownValue(choices?.fields, declared.name))
       : ceiling.fields;
   // Core candidate retains the schema-required floor at issuance, unlike
   // the independent private-v0.2 proposal. The RS only sees frozen authority.
@@ -429,15 +430,13 @@ function resolveOneStream(
     };
   }
 
-  if (
-    revision === "candidate" &&
-    choices?.time_ranges?.[declared.name] !== undefined
-  ) {
+  const chosenRange = ownValue(choices?.time_ranges, declared.name);
+  if (revision === "candidate" && chosenRange !== undefined) {
     const type = declaredTimeType(declared);
     const chosen =
       type &&
       validateTimeRangeBounds(
-        choices.time_ranges[declared.name],
+        chosenRange,
         `owner time range for '${declared.name}'`,
         type,
       );
@@ -457,7 +456,7 @@ function resolveOneStream(
     revision !== "0.1"
       ? narrowTimeRange(
           request.time_range,
-          choices?.time_ranges?.[declared.name],
+          chosenRange,
           revision === "candidate" ? declaredTimeType(declared) : undefined,
         )
       : request.time_range;

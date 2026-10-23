@@ -41,7 +41,10 @@
 
 import { Hono, type Context } from "hono";
 import type { Logger } from "pino";
-import { readNamedQueryValues } from "./pdpp-auth-query-keys.js";
+import {
+  hasMalformedNamedQuery,
+  readNamedQueryValues,
+} from "./pdpp-auth-query-keys.js";
 import type {
   ClientIdentityResult,
   ClientIdMetadataDocument,
@@ -794,6 +797,13 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       );
     }
 
+    if (hasMalformedNamedQuery(new URL(c.req.url).search))
+      return errorResponse(
+        c,
+        400,
+        "invalid_owner_choices",
+        "owner choice names and values must be well-formed Unicode",
+      );
     const candidate = session?.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE;
     const ownerChoices = parseOwnerChoices(c, candidate);
     if (ownerChoices === "invalid")

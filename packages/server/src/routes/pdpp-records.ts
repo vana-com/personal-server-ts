@@ -1878,9 +1878,19 @@ function projectFields(
   fields: string[] | undefined,
 ): Record<string, unknown> {
   if (!fields) return data;
+  // Field names are data. `in` and plain assignment treat `__proto__` and
+  // `constructor` as property machinery: the first finds inherited members, the
+  // second turns `__proto__` into a prototype change that drops the field.
   const projected: Record<string, unknown> = {};
   for (const field of fields) {
-    if (field in data) projected[field] = data[field];
+    if (Object.hasOwn(data, field)) {
+      Object.defineProperty(projected, field, {
+        value: data[field],
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
   }
   return projected;
 }
