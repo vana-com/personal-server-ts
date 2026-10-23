@@ -151,6 +151,7 @@ export async function startPersonalServer(
       health: body,
       localUrl: localOrigin,
       publicUrl: context.tunnelUrl ?? null,
+      loopbackUrl: context.getLocalApprovalOrigin() ?? null,
     });
     return lastInfo;
   }

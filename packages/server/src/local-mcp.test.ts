@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { createTestWallet } from "@opendatalabs/personal-server-ts-core/test-utils";
+import type { PersonalServerHandle } from "@opendatalabs/personal-server-ts-core/client";
 import { startPersonalServer } from "./client.js";
 
 // A local MCP client (Maple, Claude Code) reaches the server on the loopback
@@ -29,6 +30,7 @@ interface LocalServer {
   /** Loopback auth listener. */
   loopback: string;
   stop: () => Promise<void>;
+  info: PersonalServerHandle["info"];
 }
 
 let cleanupFns: Array<() => Promise<void>> = [];
@@ -118,6 +120,7 @@ async function startLocalServer(rootPath?: string): Promise<LocalServer> {
     main: `http://127.0.0.1:${port}`,
     loopback: `http://127.0.0.1:${loopbackPort}`,
     stop: () => ps.stop(),
+    info: () => ps.info(),
   };
 }
 
@@ -275,6 +278,13 @@ function expectedUrls(origin: string) {
 }
 
 describe("local MCP over the loopback listener", () => {
+  // Embedders (Desktop) print this so a local agent knows where to connect.
+  it("reports the bound loopback origin, honoring LOCAL_AUTH_PORT", async () => {
+    const server = await startLocalServer();
+
+    expect((await server.info()).urls.loopback).toBe(server.loopback);
+  });
+
   it("keeps telling main-listener (tunnel) clients the public origin", async () => {
     const server = await startLocalServer();
 
