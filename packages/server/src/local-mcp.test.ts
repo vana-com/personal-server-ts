@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
+import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { createServer as createNetServer, type Server } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -164,6 +165,24 @@ async function discoveredUrls(listener: string) {
   };
 }
 
+/** Raw HTTP so the test controls Host, Origin and fetch metadata exactly. */
+function rawRequest(
+  url: string,
+  headers: Record<string, string> = {},
+  method = "GET",
+): Promise<{ status: number; headers: IncomingHttpHeaders }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(url, { method, headers }, (res) => {
+      res.resume();
+      res.on("end", () =>
+        resolve({ status: res.statusCode ?? 0, headers: res.headers }),
+      );
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 function expectedUrls(origin: string) {
   return {
     challenge: `Bearer resource_metadata="${origin}${PROTECTED_RESOURCE_PATH}", scope="vana:read"`,
@@ -200,5 +219,68 @@ describe("local MCP over the loopback listener", () => {
     const localhost = server.loopback.replace("127.0.0.1", "localhost");
 
     expect(await discoveredUrls(localhost)).toEqual(expectedUrls(localhost));
+  });
+
+  it("refuses rebinding and cross-site requests on the loopback listener only", async () => {
+    const server = await startLocalServer();
+    const port = new URL(server.loopback).port;
+    const hostile = [
+      { host: `attacker.example:${port}` },
+      { origin: "https://attacker.example" },
+      { origin: `http://localhost:${port}` },
+      { "sec-fetch-site": "cross-site" },
+    ];
+    const routes = [
+      ["POST", "/mcp"],
+      ["POST", "/mcp/oauth/register"],
+      ["GET", PROTECTED_RESOURCE_PATH],
+      ["GET", "/.well-known/oauth-authorization-server"],
+    ];
+
+    for (const [method, path] of routes) {
+      for (const headers of hostile) {
+        const loopback = await rawRequest(
+          `${server.loopback}${path}`,
+          headers,
+          method,
+        );
+        expect(loopback.status, `${path} ${JSON.stringify(headers)}`).toBe(404);
+      }
+      const tunnel = await rawRequest(
+        `${server.main}${path}`,
+        { origin: "https://attacker.example" },
+        method,
+      );
+      expect(tunnel.status, path).not.toBe(404);
+    }
+
+    const sameOrigin = await rawRequest(
+      `${server.loopback}${PROTECTED_RESOURCE_PATH}`,
+      { origin: server.loopback, "sec-fetch-site": "same-origin" },
+    );
+    expect(sameOrigin.status).toBe(200);
+  });
+
+  // Native clients need no CORS and the gate refuses every foreign origin,
+  // so a wildcard grant would only widen what a browser page may read.
+  it("keeps loopback MCP out of the wildcard CORS, tunnel MCP in it", async () => {
+    const server = await startLocalServer();
+    const allowOrigin = "access-control-allow-origin";
+
+    const loopback = await rawRequest(
+      `${server.loopback}${PROTECTED_RESOURCE_PATH}`,
+      { origin: server.loopback },
+    );
+    expect(loopback.status).toBe(200);
+    expect(loopback.headers[allowOrigin]).toBeUndefined();
+
+    const tunnel = await rawRequest(
+      `${server.main}${PROTECTED_RESOURCE_PATH}`,
+      {
+        origin: "https://claude.ai",
+      },
+    );
+    expect(tunnel.status).toBe(200);
+    expect(tunnel.headers[allowOrigin]).toBe("*");
   });
 });
