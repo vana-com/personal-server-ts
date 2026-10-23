@@ -13,6 +13,8 @@ import type {
   McpConnectionStore,
   McpOAuthAuthorizationRecord,
   McpOAuthAuthorizationStore,
+  McpOAuthClientRecord,
+  McpOAuthClientStore,
 } from "./types.js";
 import { isMcpTokenExpired, matchesMcpRefreshHash } from "./token-expiry.js";
 
@@ -79,6 +81,21 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
       const updated = { ...record, ...patch };
       byId.set(id, updated);
       return { ...updated };
+    },
+  };
+}
+
+export function createInMemoryMcpOAuthClientStore(): McpOAuthClientStore {
+  const byId = new Map<string, McpOAuthClientRecord>();
+
+  return {
+    async create(record) {
+      byId.set(record.clientId, { ...record });
+    },
+
+    async getById(clientId) {
+      const record = byId.get(clientId);
+      return record ? { ...record } : null;
     },
   };
 }
