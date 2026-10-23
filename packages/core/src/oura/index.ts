@@ -64,7 +64,7 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Completed staged bodies are not proof of full historical coverage. Never delete old entities. */
+/** Eligible fresh complete imports replace current data while retaining historical files. */
 export async function importOuraBrowserRecords(
   storage: DataStoragePort,
   input: OuraBrowserImportInput,
@@ -187,20 +187,23 @@ async function importLocked(
       );
       if (!baseline.ok || (baseline.diagnostics?.length ?? 0) > 0)
         return { ok: false, reason: "prior_projection_unavailable", scope };
-      const verdict = compareLegacyCoverage(
-        baseline.payload,
-        projection.payload,
-        {
-          scope,
-          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
-          projectionOmissions: projection.projectionOmissions,
-          canonicalNewer:
-            Date.parse(input.collectedAt) > Date.parse(retained.collectedAt),
-          ...OURA_BROWSER_HISTORY_POLICY,
-        },
-      );
-      if (!verdict.covered)
-        return { ok: false, reason: verdict.reason!, scope };
+      // Fresh eligible completion replaces current data; only same-time retries need parity.
+      if (Date.parse(input.collectedAt) === Date.parse(retained.collectedAt)) {
+        const verdict = compareLegacyCoverage(
+          baseline.payload,
+          projection.payload,
+          {
+            scope,
+            entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+            projectionOmissions: projection.projectionOmissions,
+            canonicalNewer:
+              Date.parse(input.collectedAt) > Date.parse(retained.collectedAt),
+            ...OURA_BROWSER_HISTORY_POLICY,
+          },
+        );
+        if (!verdict.covered)
+          return { ok: false, reason: verdict.reason!, scope };
+      }
     }
     const served = await options.legacyScopeView?.readLatest(scope);
     if (
@@ -214,21 +217,27 @@ async function importLocked(
         Date.parse(input.collectedAt) < Date.parse(served.envelope.collectedAt)
       )
         return { ok: false, reason: "stale_collection", scope };
-      const verdict = compareLegacyCoverage(
-        served.envelope.data,
-        projection.payload,
-        {
-          scope,
-          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
-          projectionOmissions: projection.projectionOmissions,
-          canonicalNewer:
-            Date.parse(input.collectedAt) >
-            Date.parse(served.envelope.collectedAt),
-          ...OURA_BROWSER_HISTORY_POLICY,
-        },
-      );
-      if (!verdict.covered)
-        return { ok: false, reason: verdict.reason!, scope };
+      // Fresh eligible completion replaces current data; only same-time retries need parity.
+      if (
+        Date.parse(input.collectedAt) ===
+        Date.parse(served.envelope.collectedAt)
+      ) {
+        const verdict = compareLegacyCoverage(
+          served.envelope.data,
+          projection.payload,
+          {
+            scope,
+            entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+            projectionOmissions: projection.projectionOmissions,
+            canonicalNewer:
+              Date.parse(input.collectedAt) >
+              Date.parse(served.envelope.collectedAt),
+            ...OURA_BROWSER_HISTORY_POLICY,
+          },
+        );
+        if (!verdict.covered)
+          return { ok: false, reason: verdict.reason!, scope };
+      }
     }
     const head = storage.findEntry({ scope });
     let headTime = head?.collectedAt;
@@ -268,15 +277,18 @@ async function importLocked(
       } catch {
         return { ok: false, reason: "prior_projection_unavailable", scope };
       }
-      const verdict = compareLegacyCoverage(legacy.data, projection.payload, {
-        scope,
-        entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
-        projectionOmissions: projection.projectionOmissions,
-        canonicalNewer: Date.parse(input.collectedAt) > priorTime,
-        ...OURA_BROWSER_HISTORY_POLICY,
-      });
-      if (!verdict.covered)
-        return { ok: false, reason: verdict.reason!, scope };
+      // Fresh eligible completion replaces current data; only same-time retries need parity.
+      if (Date.parse(input.collectedAt) === priorTime) {
+        const verdict = compareLegacyCoverage(legacy.data, projection.payload, {
+          scope,
+          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          projectionOmissions: projection.projectionOmissions,
+          canonicalNewer: Date.parse(input.collectedAt) > priorTime,
+          ...OURA_BROWSER_HISTORY_POLICY,
+        });
+        if (!verdict.covered)
+          return { ok: false, reason: verdict.reason!, scope };
+      }
       if (
         head.producer === "pdpp-import-projection" &&
         headTime === input.collectedAt &&

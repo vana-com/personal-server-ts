@@ -163,18 +163,17 @@ describe("Lite Oura browser takeover", () => {
     expect((await post(input(), "unknown")).status).toBe(401);
     expect(storage.countVersions("oura.activity")).toBe(1);
   });
-  it("refuses a newer truncated checkpoint window before writing ANY scope", async () => {
+  it("accepts a fresh complete smaller dataset without deleting the historical file", async () => {
     const { storage, post } = await setup(true);
     const response = await post(input());
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({
-      ok: false,
-      reason: "missing_entity",
-      scope: "oura.activity",
-    });
-    expect(storage.countVersions("oura.activity")).toBe(1);
-    expect(storage.countVersions("oura.sleep")).toBe(0);
-    expect(storage.countVersions("oura.readiness")).toBe(0);
+    expect(response.status).toBe(200);
+    expect((await response.json()).receipts).toHaveLength(3);
+    expect(storage.countVersions("oura.activity")).toBe(2);
+    expect(storage.countVersions("oura.sleep")).toBe(1);
+    expect(storage.countVersions("oura.readiness")).toBe(1);
+    expect(
+      (await storage.readEnvelope("oura.activity", oldTime)).data,
+    ).toMatchObject({ days: [{ id: "activity-1" }, { id: "activity-older" }] });
   });
   it("admits legitimate refreshed values, retains legacy, and replays without another version", async () => {
     const { storage, post } = await setup();
@@ -275,7 +274,7 @@ describe("Lite Oura browser takeover", () => {
     expect(reloaded.countVersions("oura.activity")).toBe(2);
   });
 
-  it("never unions unbound disjoint batches across reloads and admits a later full covering batch", async () => {
+  it("replaces rather than unions complete disjoint batches across reloads", async () => {
     const persistence = createMemoryPsLitePersistence();
     const storage = await createPersistentPsLiteStorage(
       { kind: "indexeddb" },
@@ -283,12 +282,9 @@ describe("Lite Oura browser takeover", () => {
     );
     const { post } = await setup(true, storage);
     const first = await post(input());
-    expect(await first.json()).toMatchObject({
-      ok: false,
-      reason: "missing_entity",
-    });
-    expect(storage.countVersions("oura.activity")).toBe(1);
-    expect(storage.countVersions("oura.sleep")).toBe(0);
+    expect(await first.json()).toMatchObject({ ok: true });
+    expect(storage.countVersions("oura.activity")).toBe(2);
+    expect(storage.countVersions("oura.sleep")).toBe(1);
     const reloaded = await createPersistentPsLiteStorage(
       { kind: "indexeddb" },
       persistence,
@@ -321,12 +317,18 @@ describe("Lite Oura browser takeover", () => {
         body: JSON.stringify(olderWindow),
       }),
     );
-    expect(await response.json()).toMatchObject({
-      ok: false,
-      reason: "missing_entity",
-    });
-    expect(reloaded.countVersions("oura.activity")).toBe(1);
-    expect(reloaded.countVersions("oura.sleep")).toBe(0);
+    expect(await response.json()).toMatchObject({ ok: true });
+    expect(reloaded.countVersions("oura.activity")).toBe(3);
+    expect(reloaded.countVersions("oura.sleep")).toBe(2);
+    const disjointHead = reloaded.findEntry({ scope: "oura.activity" })!;
+    expect(
+      (await reloaded.readEnvelope("oura.activity", disjointHead.collectedAt))
+        .data,
+    ).toMatchObject({ days: [{ id: "activity-older" }] });
+    const disjointData = (
+      await reloaded.readEnvelope("oura.activity", disjointHead.collectedAt)
+    ).data as { days: unknown[] };
+    expect(disjointData.days).toHaveLength(1);
     const covering = input("2026-10-17T00:00:00.000Z");
     covering.records.push(...olderWindow.records);
     for (const proof of covering.completion.streams) proof.recordCount = 2;
@@ -486,7 +488,7 @@ describe("Lite Oura browser takeover", () => {
     });
   });
 
-  it("requires the oldest actual day before every run and preserves aged legacy history through covering imports", async () => {
+  it("reports the existing oldest day without requiring old identities in a fresh import", async () => {
     const { storage, runtime, post } = await setup(true);
     const requirements = () =>
       runtime.fetch(
@@ -502,8 +504,8 @@ describe("Lite Oura browser takeover", () => {
       takeoverSelection: "unrestricted-three-streams-v1",
       since: "2025-01-01",
     });
-    expect((await post(input())).status).toBe(409);
-    const covering = input();
+    expect((await post(input())).status).toBe(200);
+    const covering = input("2026-10-16T00:00:00.000Z");
     covering.records.push({
       stream: "activity",
       data: { id: "activity-older", day: "2025-01-01", score: 50 },
@@ -514,11 +516,88 @@ describe("Lite Oura browser takeover", () => {
       since: "2025-01-01",
     });
     const refresh = structuredClone(covering);
-    refresh.collectedAt = "2026-10-16T00:00:00.000Z";
+    refresh.collectedAt = "2026-10-17T00:00:00.000Z";
     refresh.records[2]!.data.score = 81;
     expect((await post(refresh)).status).toBe(200);
     expect(
       (await storage.readEnvelope("oura.activity", oldTime)).data,
     ).toMatchObject({ days: [{ score: 60 }, { score: 50 }] });
   });
+});
+
+describe("fresh complete Oura replacement", () => {
+  it.each(["fewer", "disjoint", "empty"] as const)(
+    "replaces current data with %s records and retains historical versions across restart",
+    async (variant) => {
+      const persistence = createMemoryPsLitePersistence();
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      const { post, runtime } = await setup(true, storage);
+      const body = input();
+      if (variant === "disjoint") {
+        for (const record of body.records)
+          record.data.id = record.stream + "-fresh";
+      }
+      if (variant === "empty") {
+        body.records = [];
+        for (const proof of body.completion.streams) proof.recordCount = 0;
+      }
+      const response = await post(body);
+      expect(response.status, await response.clone().text()).toBe(200);
+      const result = await response.json();
+      expect(
+        result.receipts
+          .map((receipt: { scope: string }) => receipt.scope)
+          .sort(),
+      ).toEqual(streams.map((stream) => "oura." + stream).sort());
+      for (const stream of streams) {
+        const read = await runtime.fetch(
+          new Request("https://ps.test/v1/data/oura." + stream, {
+            headers: { authorization: "Bearer owner" },
+          }),
+        );
+        expect(read.status).toBe(200);
+        const envelope = await read.json();
+        const rows =
+          stream === "sleep" ? envelope.data.dailyScores : envelope.data.days;
+        expect(rows.map((row: { id: string }) => row.id)).toEqual(
+          variant === "empty"
+            ? []
+            : [stream + (variant === "disjoint" ? "-fresh" : "-1")],
+        );
+      }
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      expect(
+        (await reloaded.readEnvelope("oura.activity", oldTime)).data,
+      ).toMatchObject({
+        days: [
+          { id: "activity-1", score: 60 },
+          { id: "activity-older", score: 50 },
+        ],
+      });
+      for (const stream of streams) {
+        const head = reloaded.findEntry({ scope: "oura." + stream });
+        expect(head).toBeDefined();
+        const envelope = await reloaded.readEnvelope(
+          "oura." + stream,
+          head!.collectedAt,
+        );
+        const data = envelope.data as {
+          dailyScores?: { id: string }[];
+          days?: { id: string }[];
+        };
+        const rows = stream === "sleep" ? data.dailyScores : data.days;
+        expect(rows?.map((row) => row.id)).toEqual(
+          variant === "empty"
+            ? []
+            : [stream + (variant === "disjoint" ? "-fresh" : "-1")],
+        );
+      }
+    },
+  );
 });

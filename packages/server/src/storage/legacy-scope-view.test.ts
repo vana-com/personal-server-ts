@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2929,4 +2929,168 @@ describe("one snapshot for the selection and the rows", () => {
       db.close();
     }
   });
+});
+
+describe("Oura completed wholesale snapshots with retained tombstones", () => {
+  for (const ids of [["old-a"], ["new-only"], []] as string[][]) {
+    it(
+      "serves exact current complete rows and listing after restart: " +
+        JSON.stringify(ids),
+      async () => {
+        const dir = mkdtempSync(join(tmpdir(), "oura-wholesale-"));
+        const databasePath = join(dir, "index.db");
+        const legacyPath = join(dir, "old.json");
+        const historical = '{"retained":"old file bytes"}\n';
+        writeFileSync(legacyPath, historical);
+        let db = initializeDatabase(databasePath);
+        let store = createSqliteRecordStore(db);
+        const streams = ["sleep", "readiness", "activity"];
+        const makeView = () =>
+          createLegacyScopeView({
+            authority: createLegacyScopeAuthority(db),
+            records: store,
+            configuredMethods: () => ["oura-browser"],
+            readLegacyHead: async () => {
+              throw new Error(
+                "Complete replacement must not require historical parity",
+              );
+            },
+          });
+        try {
+          connect(store, "wholesale", "oura-browser");
+          for (const stream of streams) {
+            writeFileSync(legacyPath + "." + stream, historical);
+            db.prepare(
+              "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+            ).run(
+              legacyPath + "." + stream,
+              "oura." + stream,
+              "2026-01-01T00:00:00.000Z",
+              historical.length,
+            );
+            replace(
+              store,
+              "wholesale",
+              stream,
+              stream === "activity" ? ["old-a", "old-b"] : [],
+              {
+                method: "oura-browser",
+                collectedAt: "2026-09-09T07:00:00.000Z",
+              },
+            );
+          }
+          const initial = makeView();
+          for (const stream of streams) {
+            const read = await initial.readLatest("oura." + stream);
+            expect(read.kind, JSON.stringify(read)).toBe("canonical");
+          }
+          const oldIndex = db
+            .prepare("SELECT * FROM data_files ORDER BY id")
+            .all();
+          for (const stream of streams)
+            replace(
+              store,
+              "wholesale",
+              stream,
+              stream === "activity" ? ids : [],
+              {
+                method: "oura-browser",
+                collectedAt: "2026-09-11T07:00:00.000Z",
+              },
+            );
+          expect(
+            db
+              .prepare("SELECT COUNT(*) AS n FROM pdpp_records WHERE deleted=1")
+              .get(),
+          ).toEqual({ n: ids.includes("old-a") ? 1 : 2 });
+          const receipts = store.listStreamCompletions("wholesale");
+          expect(receipts).toHaveLength(3);
+          for (const receipt of receipts)
+            expect(receipt).toMatchObject({
+              generation: 1,
+              method: "oura-browser",
+              liveCount: receipt.stream === "activity" ? ids.length : 0,
+              sourceCollectedAt: "2026-09-11T07:00:00.000Z",
+            });
+          const verify = async () => {
+            const current = makeView();
+            for (const stream of streams) {
+              const read = await current.readLatest("oura." + stream);
+              expect(read.kind).toBe("canonical");
+              if (read.kind !== "canonical")
+                throw new Error("Expected completed wholesale projection");
+              const rows =
+                stream === "sleep"
+                  ? read.envelope.data.dailyScores
+                  : read.envelope.data.days;
+              expect(rows).toEqual(
+                (stream === "activity" ? ids : []).map((id) => ({
+                  id,
+                  day: "2026-09-01",
+                  score: 80,
+                })),
+              );
+              expect(current.listingFor("oura." + stream)).toEqual({
+                kind: "canonical",
+                collectedAt: read.envelope.collectedAt,
+              });
+            }
+            expect(
+              db.prepare("SELECT * FROM data_files ORDER BY id").all(),
+            ).toEqual(oldIndex);
+            for (const stream of streams)
+              expect(readFileSync(legacyPath + "." + stream, "utf8")).toBe(
+                historical,
+              );
+            expect(
+              db
+                .prepare(
+                  "SELECT COUNT(*) AS n FROM legacy_scope_takeover_verdicts",
+                )
+                .get(),
+            ).toEqual({ n: 0 });
+          };
+          await verify();
+          store.close();
+          db = initializeDatabase(databasePath);
+          store = createSqliteRecordStore(db);
+          await verify();
+          // Neither current receipt damage nor a mixed collection horizon is
+          // repaired by the previously persisted replacement cursor.
+          for (const update of [
+            "generation=2",
+            "live_count=99",
+            "method='wrong'",
+            "source_collected_at='2026-09-12T07:00:00.000Z'",
+            "source_collected_at='2026-01-01T00:00:00.000Z'",
+          ]) {
+            db.prepare(
+              "UPDATE pdpp_stream_completion SET " +
+                update +
+                " WHERE instance=? AND stream='readiness'",
+            ).run("wholesale");
+            const incomplete = makeView();
+            expect((await incomplete.readLatest("oura.activity")).kind).toBe(
+              "refused",
+            );
+            expect(incomplete.listingFor("oura.activity").kind).toBe("refused");
+            db.prepare(
+              "UPDATE pdpp_stream_completion SET generation=1,live_count=0,method='oura-browser',source_collected_at='2026-09-11T07:00:00.000Z' WHERE instance=? AND stream='readiness'",
+            ).run("wholesale");
+          }
+          db.prepare(
+            "DELETE FROM pdpp_stream_completion WHERE instance=? AND stream='readiness'",
+          ).run("wholesale");
+          const incomplete = makeView();
+          expect((await incomplete.readLatest("oura.activity")).kind).toBe(
+            "refused",
+          );
+          expect(incomplete.listingFor("oura.activity").kind).toBe("refused");
+        } finally {
+          store.close();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      },
+    );
+  }
 });

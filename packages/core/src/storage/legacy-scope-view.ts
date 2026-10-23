@@ -619,7 +619,10 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return { kind: decision.kind };
-    if (ouraHasRetainedEntityLoss(decision))
+    if (
+      ouraHasRetainedEntityLoss(decision) &&
+      !ouraCompletedReplacement(decision)
+    )
       return { kind: hasTakeover || legacyHead === null ? "refused" : "file" };
     const hasLegacyHead = legacyHead !== null;
     if (hasLegacyHead && !hasTakeover && !initialOuraRunComplete(decision)) {
@@ -698,6 +701,29 @@ export function createLegacyScopeView(
     );
   }
 
+  // Omitted IDs are intentional only when every Oura stream has current,
+  // coherent completion evidence. A tombstone alone proves no replacement.
+  function ouraCompletedReplacement(
+    decision: Extract<Decision, { kind: "canonical" }>,
+  ): boolean {
+    if (!initialOuraRunComplete(decision)) return false;
+    const receipts = decision.records.listStreamCompletions(
+      decision.selection.instance,
+    );
+    return OURA_RUN_STREAMS.every((stream) => {
+      const head = authority.eligibleLegacyHead(`oura.${stream}`);
+      if (!head) return true;
+      const receipt = receipts.find((entry) => entry.stream === stream);
+      const collected = Date.parse(receipt?.sourceCollectedAt ?? "");
+      const previous = Date.parse(head.collectedAt);
+      return (
+        Number.isFinite(collected) &&
+        Number.isFinite(previous) &&
+        collected > previous
+      );
+    });
+  }
+
   function coverageCursor(
     scope: string,
     decision: Extract<Decision, { kind: "canonical" }>,
@@ -767,7 +793,7 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return decision;
-    if (initial.retainedEntityLoss) {
+    if (initial.retainedEntityLoss && !ouraCompletedReplacement(decision)) {
       return hasTakeover || legacyHead === null
         ? {
             kind: "refused",
@@ -1025,6 +1051,17 @@ export function createLegacyScopeView(
       }
       const { ok: _ok, ...refusal } = read;
       return { kind: "refused", refusal };
+    }
+    // Receipt presence cannot make a lossy/partial projection complete.
+    if (initial.retainedEntityLoss && !read.complete) {
+      return {
+        kind: "refused",
+        refusal: {
+          status: "incomplete",
+          reason: "canonical_view_incomplete",
+          diagnostics: incompleteness(read),
+        },
+      };
     }
     if (legacyHead !== null && replacementEligible && read.complete) {
       const confirmed = authority.confirmRead(
