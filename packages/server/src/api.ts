@@ -45,3 +45,4 @@ export {
 } from "./config/index.js";
 
 export { OURA_LEGACY_TAKEOVER_CONTRACT } from "@opendatalabs/personal-server-ts-core/api";
+export { STRAVA_BROWSER_TRANSITION_CONTRACT } from "./storage/strava-method-transition.js";
