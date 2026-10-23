@@ -623,6 +623,8 @@ export function createApp(deps: AppDeps): Hono {
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
     scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
     activityRecorder: mcpActivityRecorder,
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
   };
 
   app.route("/", mcpOAuthRoutes(mcpRouteDeps));
