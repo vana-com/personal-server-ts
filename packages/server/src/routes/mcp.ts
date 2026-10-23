@@ -54,6 +54,7 @@ import {
   MCP_CONNECTION_NOT_FOUND,
   McpConnectionNotFoundError,
   McpConnectionStateError,
+  McpIngress,
   McpOAuthAuthorizationError,
   isAllowedOAuthRedirectUri,
   McpScopeRequestError,
@@ -180,21 +181,30 @@ function resolveOrigin(origin: string | (() => string)): string {
   return typeof origin === "function" ? origin() : origin;
 }
 
+type ListenerDeps = Pick<
+  McpRouteDeps,
+  "serverOrigin" | "localApprovalPort" | "serverPort"
+>;
+
+/** Which listener accepted the request: the loopback one or the tunneled main one. */
+function requestIngress(c: Context, deps: ListenerDeps): McpIngress {
+  const listeners = {
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
+  };
+  return arrivedOnLoopbackListener(c, listeners)
+    ? McpIngress.Loopback
+    : McpIngress.Public;
+}
+
 /**
  * The origin every OAuth/discovery URL in this response must name. A local
  * client on the loopback listener gets the exact origin it called (RFC 9728:
  * the advertised resource must match the URL the client used, so `localhost`
  * and `127.0.0.1` differ); everyone else gets the public origin.
  */
-function requestOrigin(
-  c: Context,
-  deps: Pick<McpRouteDeps, "serverOrigin" | "localApprovalPort" | "serverPort">,
-): string {
-  const listeners = {
-    localApprovalPort: deps.localApprovalPort,
-    serverPort: deps.serverPort,
-  };
-  if (!arrivedOnLoopbackListener(c, listeners)) {
+function requestOrigin(c: Context, deps: ListenerDeps): string {
+  if (requestIngress(c, deps) === McpIngress.Public) {
     return resolveOrigin(deps.serverOrigin);
   }
   return new URL(c.req.url).origin;
@@ -795,6 +805,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
           codeChallengeMethod,
           scope,
           ...(state ? { state } : {}),
+          ingress: requestIngress(c, deps),
         },
         {
           connectionStore,
@@ -1173,7 +1184,11 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
     }
     const tokenHash = await hashConnectionToken(rawToken);
     const record = await store.getByTokenHash(tokenHash);
-    if (record) return handleConnectionRead(c, record);
+    // A token presented on the other listener reads as unknown.
+    const ingress = record?.ingress ?? McpIngress.Public;
+    if (record && ingress === requestIngress(c, deps)) {
+      return handleConnectionRead(c, record);
+    }
     const session = await sessionStore.getByTokenHash(tokenHash);
     if (session) return handleSessionRead(c, session);
     if (!options.oauthChallenge) {
