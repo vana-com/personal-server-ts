@@ -27,6 +27,7 @@ import {
   AuthorizationSessionStore,
   computeS256Challenge,
   openPdppAuthStore,
+  PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
   PdppTokenService,
   type DeclarationSnapshot,
@@ -132,7 +133,47 @@ function ownerToken(): string {
     .access_token;
 }
 
-function authorizeBody(name: string) {
+type Profile = "v0.1" | "v0.2" | "candidate";
+
+function details(name: string, profile: Profile) {
+  const common = {
+    source: { id: declared.source_id },
+    purpose_code: "https://apps.example.com/purposes/budget",
+    access_mode: "continuous",
+  };
+  if (profile === "v0.1") {
+    return {
+      type: PDPP_DATA_ACCESS_TYPE,
+      ...common,
+      streams: [{ name }, { name: "profile" }],
+    };
+  }
+  if (profile === "candidate") {
+    return {
+      type: "https://pdpp.dev/data-access/candidate-0.1.0",
+      ...common,
+      streams: [
+        { name: "profile", necessity: "required", fields: ["id"] },
+        { name, fields: ["date"] },
+      ],
+    };
+  }
+  return {
+    type: PDPP_DATA_ACCESS_TYPE_V02,
+    ...common,
+    streams: [
+      {
+        name,
+        necessity: "optional",
+        fields: ["date", "amount"],
+        time_range: YEAR,
+      },
+      { name: "profile", necessity: "optional", fields: ["id"] },
+    ],
+  };
+}
+
+function authorizeBody(name: string, profile: Profile = "v0.2") {
   return {
     client_id: "budget_example",
     redirect_uri: REDIRECT,
@@ -140,27 +181,11 @@ function authorizeBody(name: string) {
     code_challenge: CHALLENGE,
     code_challenge_method: "S256",
     client_display: { name: "Budget Example" },
-    authorization_details: [
-      {
-        type: PDPP_DATA_ACCESS_TYPE_V02,
-        source: { id: declared.source_id },
-        purpose_code: "https://apps.example.com/purposes/budget",
-        access_mode: "continuous",
-        streams: [
-          {
-            name,
-            necessity: "optional",
-            fields: ["date", "amount"],
-            time_range: YEAR,
-          },
-          { name: "profile", necessity: "optional", fields: ["id"] },
-        ],
-      },
-    ],
+    authorization_details: [details(name, profile)],
   };
 }
 
-async function open(name: string) {
+async function open(name: string, profile: Profile = "v0.2") {
   declared = snapshotDeclaring(name);
   const token = ownerToken();
   const created = await app.request("/pdpp/v1/authorize", {
@@ -169,7 +194,7 @@ async function open(name: string) {
       "content-type": "application/json",
       authorization: `Bearer ${token}`,
     },
-    body: JSON.stringify(authorizeBody(name)),
+    body: JSON.stringify(authorizeBody(name, profile)),
   });
   expect(created.status).toBe(201);
   const { session_id } = (await created.json()) as { session_id: string };
@@ -373,16 +398,56 @@ describe("a name that is not well-formed Unicode is refused", () => {
     expect(approved.status).toBe(200);
   });
 
-  it("when a request names a stream with one", async () => {
-    declared = snapshotDeclaring("transactions");
-    const response = await app.request("/pdpp/v1/authorize", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${ownerToken()}`,
-      },
-      body: JSON.stringify(authorizeBody("lone \ud800 surrogate")),
-    });
-    expect(response.status).toBe(400);
+  it("when a request names a declared stream with one", async () => {
+    // The declaration holds the same name, so the stream is known and only the
+    // Unicode check can refuse it. Refusing at authorize means no session
+    // exists to review, narrow or approve.
+    for (const profile of ["v0.1", "v0.2", "candidate"] as const) {
+      declared = snapshotDeclaring("lone \ud800 surrogate");
+      const response = await app.request("/pdpp/v1/authorize", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${ownerToken()}`,
+        },
+        body: JSON.stringify(authorizeBody("lone \ud800 surrogate", profile)),
+      });
+      expect(response.status, profile).toBe(400);
+      expect(((await response.json()) as { error: string }).error).toBe(
+        "invalid_request",
+      );
+    }
   });
+});
+
+describe("a null or mistyped choice map is a typed 400, never a 500", () => {
+  const bodies: Array<[string, Record<string, unknown>]> = [
+    ["instance_choices: null", { instance_choices: null }],
+    ["instance_choices: a list", { instance_choices: [] }],
+    ["instance_choices: a bare handle", { instance_choices: { profile: "x" } }],
+    ["owner_choices: null", { owner_choices: null }],
+    ["owner_choices.fields: null", { owner_choices: { fields: null } }],
+    [
+      "owner_choices.time_ranges: null",
+      { owner_choices: { time_ranges: null } },
+    ],
+    [
+      "owner_choices.fields: a bare field",
+      { owner_choices: { fields: { profile: "id" } } },
+    ],
+  ];
+
+  for (const profile of ["v0.1", "v0.2", "candidate"] as const) {
+    it.each(bodies)(`${profile} approval with %s`, async (_label, extra) => {
+      const { sessionId, token } = await open("constructor", profile);
+      const approved = await approveOf(sessionId, token, {
+        review_digest: "irrelevant",
+        ...extra,
+      });
+      expect(approved.status).toBe(400);
+      expect(((await approved.json()) as { error: string }).error).toBe(
+        "invalid_owner_choices",
+      );
+    });
+  }
 });

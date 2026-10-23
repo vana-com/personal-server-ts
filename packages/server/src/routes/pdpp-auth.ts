@@ -43,7 +43,6 @@ import { Hono, type Context } from "hono";
 import type { Logger } from "pino";
 import {
   hasMalformedNamedQuery,
-  isWellFormedJson,
   readNamedQueryValues,
 } from "./pdpp-auth-query-keys.js";
 import type {
@@ -906,17 +905,6 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     } catch {
       return errorResponse(c, 400, "invalid_request", "body must be JSON");
     }
-
-    if (
-      !isWellFormedJson(body?.owner_choices) ||
-      !isWellFormedJson(body?.instance_choices)
-    )
-      return errorResponse(
-        c,
-        400,
-        "invalid_owner_choices",
-        "owner choice names and values must be well-formed Unicode",
-      );
 
     if (session?.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE) {
       const invalid = validateCandidateOwnerChoices(

@@ -15,6 +15,7 @@
  * authority over this source" are different questions.
  */
 
+import { isWellFormedJson } from "./named.js";
 import { createHash } from "node:crypto";
 import { isIP } from "node:net";
 import type {
@@ -520,6 +521,16 @@ export function parseDeclaration(
   // exactly as retrieved, which is the property that proves a producer read
   // the same bytes the owner consented against.
   doc = normalizeNormativeDeclaration(doc);
+
+  if (!isWellFormedJson(doc)) {
+    return {
+      ok: false,
+      failure: {
+        code: "invalid_document",
+        message: "declaration must be well-formed Unicode",
+      },
+    };
+  }
 
   if (typeof doc.source_id !== "string" || doc.source_id.length === 0) {
     return {

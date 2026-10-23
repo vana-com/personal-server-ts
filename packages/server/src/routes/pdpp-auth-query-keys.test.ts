@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   hasMalformedNamedQuery,
-  isWellFormedJson,
   readNamedQueryValues,
 } from "./pdpp-auth-query-keys.js";
 
@@ -120,29 +119,19 @@ describe("hasMalformedNamedQuery", () => {
     expect(hasMalformedNamedQuery("")).toBe(false);
   });
 
+  it("does not mistake a key that starts with ? for a named axis", () => {
+    // The second pair's key is the text `?field[a]`, which is not `field[a]`.
+    expect(hasMalformedNamedQuery("?x=1&?field[a]=%ED%A0%80")).toBe(false);
+    // Encoded, the same bytes spell the key `?field[a]` as well; still not an axis.
+    expect(hasMalformedNamedQuery("?x=1&%3Ffield%5Ba%5D=%ED%A0%80")).toBe(
+      false,
+    );
+    // A real axis key is still examined, whatever precedes it.
+    expect(hasMalformedNamedQuery("?x=1&field[a]=%ED%A0%80")).toBe(true);
+    expect(hasMalformedNamedQuery("?field%5Ba%5D=%ED%A0%80")).toBe(true);
+  });
+
   it("ignores a malformed parameter that is not a named axis", () => {
     expect(hasMalformedNamedQuery("?other=%ED%A0%80&field[a]=x")).toBe(false);
-  });
-});
-
-describe("isWellFormedJson", () => {
-  it("accepts text, astral characters and paired surrogates anywhere", () => {
-    expect(
-      isWellFormedJson({
-        "key \u{1F600}": ["value", { nested: "😀" }],
-        n: 1,
-        b: null,
-      }),
-    ).toBe(true);
-  });
-
-  it.each([
-    ["a key", { "\ud800": 1 }],
-    ["a nested key", { a: { "x\udc00": 1 } }],
-    ["a string", "\ud83d"],
-    ["a string in an array", [["ok", "\udc00y"]]],
-    ["a reversed pair", "\ude00\ud83d"],
-  ])("rejects a lone surrogate in %s", (_label, value) => {
-    expect(isWellFormedJson(value)).toBe(false);
   });
 });

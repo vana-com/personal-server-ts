@@ -35,6 +35,7 @@ import {
 } from "./review.js";
 import { issueGrant, type ConsentEvidence } from "./issuance.js";
 import { ownValue } from "./named.js";
+import { normalizeOwnerChoiceInput } from "./owner-choice-input.js";
 import {
   expandSelections,
   streamIsOmitted,
@@ -106,6 +107,7 @@ export type ApprovalFailureCode =
    */
   | "recipient_terms_unsupported"
   | "unsupported_instance_fan_in"
+  | "invalid_owner_choices"
   | "invalid_request";
 
 export interface ApprovalFailure {
@@ -456,12 +458,21 @@ export function fetchReview(input: {
     };
   }
 
+  const given = normalizeOwnerChoiceInput(input);
+  if (!given.ok) {
+    return {
+      ok: false,
+      failure: { code: "invalid_owner_choices", message: given.message },
+    };
+  }
+  const { ownerChoices, instanceChoices } = given;
+
   if (
     requestsFanIn(
       session.request,
       session.snapshot,
-      input.instanceChoices,
-      input.ownerChoices,
+      instanceChoices,
+      ownerChoices,
     )
   ) {
     return {
@@ -473,15 +484,11 @@ export function fetchReview(input: {
     };
   }
 
-  const inventory = withInstanceChoices(input.inventory, input.instanceChoices);
+  const inventory = withInstanceChoices(input.inventory, instanceChoices);
 
   // Surface outstanding choices before attempting resolution: an unresolvable
   // instance is a consent step, not an error the owner can do nothing about.
-  const choices = pendingInstanceChoices(
-    session,
-    inventory,
-    input.ownerChoices,
-  );
+  const choices = pendingInstanceChoices(session, inventory, ownerChoices);
   if (choices.length > 0) {
     return {
       ok: true,
@@ -497,7 +504,7 @@ export function fetchReview(input: {
     session.request,
     session.snapshot,
     inventory,
-    input.ownerChoices,
+    ownerChoices,
   );
   // A candidate's optional streams start unselected. With none selected yet
   // the owner still needs the review to choose from; only issuance refuses
@@ -655,12 +662,21 @@ export function approveAuthorization(input: {
     };
   }
 
+  const given = normalizeOwnerChoiceInput(input);
+  if (!given.ok) {
+    return {
+      ok: false,
+      failure: { code: "invalid_owner_choices", message: given.message },
+    };
+  }
+  const { ownerChoices, instanceChoices } = given;
+
   if (
     requestsFanIn(
       session.request,
       session.snapshot,
-      input.instanceChoices,
-      input.ownerChoices,
+      instanceChoices,
+      ownerChoices,
     )
   ) {
     return {
@@ -686,8 +702,8 @@ export function approveAuthorization(input: {
     subjectId: session.subject_id,
     request: session.request,
     snapshot: session.snapshot,
-    inventory: withInstanceChoices(input.inventory, input.instanceChoices),
-    ownerChoices: input.ownerChoices,
+    inventory: withInstanceChoices(input.inventory, instanceChoices),
+    ownerChoices,
     ownerConditions: input.ownerConditions,
     standingTerms: input.standingTerms,
     requester: session.requester,

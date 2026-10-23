@@ -1,3 +1,4 @@
+import { isWellFormedJson } from "./named.js";
 import {
   compareTime,
   compareLegacyTimeBounds,
@@ -570,6 +571,16 @@ export function validateSelectionRequest(
   request: SelectionRequest,
   snapshot: DeclarationSnapshot,
 ): SelectionValidation {
+  // Names are data and the spec gives them no grammar, but a lone surrogate
+  // has no UTF-8 form: it would change in any URL, store or reader it passes
+  // through, so a request holding one is refused rather than repaired.
+  if (!isWellFormedJson(request)) {
+    return fail(
+      "invalid_request",
+      "the selection request must be well-formed Unicode",
+    );
+  }
+
   // Each recognized type is resolved under its own revision.
   // Anything else is rejected rather than processed as the nearest PDPP type:
   // a type URI the AS does not implement carries rules it does not apply.

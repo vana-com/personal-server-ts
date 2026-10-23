@@ -55,7 +55,10 @@ export function hasMalformedNamedQuery(search: string): boolean {
   if (query === "") return false;
   for (const pair of query.split("&")) {
     const [rawKey, ...rest] = pair.split("=");
-    const lenientKey = new URLSearchParams(pair).keys().next().value ?? "";
+    // The leading `&` stops URLSearchParams from stripping a `?` that is
+    // part of this pair's key; the empty first pair it adds is skipped.
+    const lenientKey =
+      new URLSearchParams(`&${pair}`).keys().next().value ?? "";
     if (!AXES.some((axis) => readNamedQueryKey(lenientKey, axis) !== null))
       continue;
     if (!decodesStrictly(rawKey) || !decodesStrictly(rest.join("="))) {
@@ -72,19 +75,4 @@ function decodesStrictly(raw: string): boolean {
   } catch {
     return false;
   }
-}
-
-const LONE_SURROGATE =
-  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
-
-/** Whether every key and string in a parsed JSON value is well-formed Unicode. */
-export function isWellFormedJson(value: unknown): boolean {
-  if (typeof value === "string") return !LONE_SURROGATE.test(value);
-  if (Array.isArray(value)) return value.every(isWellFormedJson);
-  if (typeof value === "object" && value !== null) {
-    return Object.entries(value).every(
-      ([key, entry]) => !LONE_SURROGATE.test(key) && isWellFormedJson(entry),
-    );
-  }
-  return true;
 }

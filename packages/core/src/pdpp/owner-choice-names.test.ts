@@ -137,3 +137,19 @@ it("leaves Object.prototype unchanged", () => {
   expect(Reflect.get({}, "since")).toBeUndefined();
   expect(Reflect.get({}, "date")).toBeUndefined();
 });
+
+it("reads no choice from a null or non-object map", () => {
+  for (const map of [null, "text", 7]) {
+    expect(
+      resolveSelection(
+        requesting("constructor"),
+        declaring("constructor"),
+        inventory,
+        {
+          fields: map as never,
+          time_ranges: map as never,
+        },
+      ).ok,
+    ).toBe(true);
+  }
+});
