@@ -59,7 +59,8 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 9;
+// Invalidate persisted witnesses created before completion-horizon fencing.
+const COVERAGE_RULE_VERSION = 11;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the
@@ -177,6 +178,15 @@ export interface LegacyScopeAuthority {
     head: LegacyScopeHead,
     instance?: string,
   ): boolean;
+  /** Exact current receipt-backed replacement, independent of historical parity. */
+  hasCompletedReplacement?(
+    scope: string,
+    head: LegacyScopeHead,
+    instance: string,
+    generation: number,
+    method: string,
+    canonicalCursor: string,
+  ): boolean;
   isReset(scope: string): boolean;
   cachedVerdict(
     scope: string,
@@ -207,9 +217,10 @@ export interface LegacyScopeAuthority {
       writeClock: number;
       arrivalRevision: number;
       canonicalCursor: string;
-      coverage: LegacyCoverageVerdict;
-      cached: boolean;
-    },
+    } & (
+      | { coverage: LegacyCoverageVerdict; cached: boolean; completion?: false }
+      | { completion: true; coverage?: never; cached?: false }
+    ),
   ): boolean;
 }
 
@@ -609,13 +620,32 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return { kind: decision.kind };
-    if (ouraHasRetainedEntityLoss(decision))
+    if (
+      ouraHasRetainedEntityLoss(decision) &&
+      !ouraCompletedReplacement(decision)
+    )
       return { kind: hasTakeover || legacyHead === null ? "refused" : "file" };
     const hasLegacyHead = legacyHead !== null;
     if (hasLegacyHead && !hasTakeover && !initialOuraRunComplete(decision)) {
       return { kind: "file" };
     }
-    if (hasLegacyHead && input.readLegacyHead) {
+    const completedReplacement =
+      legacyHead !== null &&
+      authority.hasCompletedReplacement?.(
+        scope,
+        legacyHead,
+        decision.selection.instance,
+        decision.generation,
+        decision.selection.method,
+        coverageCursor(
+          scope,
+          decision,
+          authority.writeClock(),
+          authority.arrivalRevision(),
+          receiptCursor(decision, input.declarations),
+        ),
+      ) === true;
+    if (hasLegacyHead && input.readLegacyHead && !completedReplacement) {
       const verdict = authority
         .verdictFor(scope)
         .find(
@@ -672,6 +702,29 @@ export function createLegacyScopeView(
     );
   }
 
+  // Omitted IDs are intentional only when every Oura stream has current,
+  // coherent completion evidence. A tombstone alone proves no replacement.
+  function ouraCompletedReplacement(
+    decision: Extract<Decision, { kind: "canonical" }>,
+  ): boolean {
+    if (!initialOuraRunComplete(decision)) return false;
+    const receipts = decision.records.listStreamCompletions(
+      decision.selection.instance,
+    );
+    return OURA_RUN_STREAMS.every((stream) => {
+      const head = authority.eligibleLegacyHead(`oura.${stream}`);
+      if (!head) return true;
+      const receipt = receipts.find((entry) => entry.stream === stream);
+      const collected = Date.parse(receipt?.sourceCollectedAt ?? "");
+      const previous = Date.parse(head.collectedAt);
+      return (
+        Number.isFinite(collected) &&
+        Number.isFinite(previous) &&
+        collected > previous
+      );
+    });
+  }
+
   function coverageCursor(
     scope: string,
     decision: Extract<Decision, { kind: "canonical" }>,
@@ -710,6 +763,9 @@ export function createLegacyScopeView(
           decision.kind === "canonical" ? decision.generation : undefined,
         ),
         canServeLegacy: canServeLegacyBeforeTakeover(scope),
+        hasCompletion:
+          decision.kind === "canonical" &&
+          missingCompletionReceipts(decision).length === 0,
         initialOuraRunComplete:
           decision.kind !== "canonical" || initialOuraRunComplete(decision),
         writeClock: authority.writeClock(),
@@ -738,7 +794,7 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return decision;
-    if (initial.retainedEntityLoss) {
+    if (initial.retainedEntityLoss && !ouraCompletedReplacement(decision)) {
       return hasTakeover || legacyHead === null
         ? {
             kind: "refused",
@@ -757,6 +813,9 @@ export function createLegacyScopeView(
     ) {
       return { kind: "file" };
     }
+    const replacementEligible =
+      initial.hasCompletion &&
+      typeof authority.hasCompletedReplacement === "function";
     const canonicalCursor = legacyHead
       ? coverageCursor(
           scope,
@@ -899,10 +958,11 @@ export function createLegacyScopeView(
       // partial refreshes still face coverage checks without requiring receipts.
       requireCompletionReceipts:
         legacyHead !== null &&
-        (!input.readLegacyHead ||
+        (replacementEligible ||
+          !input.readLegacyHead ||
           (decision.selection.method === "oura-browser" && !hasTakeover)),
       allowUnprovenEmptyStreams: legacyHead !== null && !!input.readLegacyHead,
-      includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
+      includeStreamTimes: legacyHead !== null,
       requireClaudeRawBlobs: legacyHead !== null && !!input.readLegacyHead,
       // The rows must come from a state in which this is still the one
       // connection: a second account appearing between the decision and
@@ -992,6 +1052,91 @@ export function createLegacyScopeView(
       }
       const { ok: _ok, ...refusal } = read;
       return { kind: "refused", refusal };
+    }
+    // Receipt presence cannot make a lossy/partial projection complete.
+    if (initial.retainedEntityLoss && !read.complete) {
+      if (legacyHead !== null && !hasTakeover) {
+        const stillLegacyOwned = authority.readSnapshot(() =>
+          canServeLegacyBeforeTakeover(scope),
+        );
+        if (stillLegacyOwned) return { kind: "file" };
+      }
+      return {
+        kind: "refused",
+        refusal: {
+          status: "incomplete",
+          reason: "canonical_view_incomplete",
+          diagnostics: incompleteness(read),
+        },
+      };
+    }
+    // Whole-dataset replacement needs a fresh completion for every input.
+    // Equal/older horizons retain the existing parity path, not deletion authority.
+    if (
+      legacyHead !== null &&
+      replacementEligible &&
+      read.complete &&
+      allStreamsProvenAfter(read, decision.streams, legacyHead.collectedAt)
+    ) {
+      const confirmed = authority.confirmRead(
+        scope,
+        legacyHead,
+        () =>
+          sameSelection(decide(scope), decision) &&
+          receiptCursor(decision, input.declarations) === initial.receiptCursor,
+        decision.selection.method,
+        {
+          instance: decision.selection.instance,
+          generation: decision.generation,
+          writeClock: initial.writeClock,
+          arrivalRevision: initial.arrivalRevision,
+          canonicalCursor,
+          completion: true,
+        },
+      );
+      if (!confirmed) {
+        if (authority.isReset(scope)) return { kind: "file" };
+        const canKeepFile = authority.readSnapshot(
+          () =>
+            canServeLegacyBeforeTakeover(scope) &&
+            !authority.hasTakeover(
+              scope,
+              decision.selection.instance,
+              decision.generation,
+            ),
+        );
+        if (canKeepFile) return { kind: "file" };
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail:
+              "legacy head or canonical snapshot changed during replacement",
+          },
+        };
+      }
+      return {
+        kind: "canonical",
+        envelope: read.envelope,
+        revision: read.revision,
+      };
+    }
+    // Without the old body, only a newer complete import can prove replacement.
+    // Do not fall through to confirmation that records an unscoped takeover.
+    if (legacyHead !== null && !input.readLegacyHead) {
+      const stillLegacyOwned = authority.readSnapshot(() =>
+        canServeLegacyBeforeTakeover(scope),
+      );
+      if (stillLegacyOwned) return { kind: "file" };
+      return {
+        kind: "refused",
+        refusal: {
+          status: "incomplete",
+          reason: "canonical_view_incomplete",
+          diagnostics: incompleteness(read),
+        },
+      };
     }
     if (legacyHead !== null && input.readLegacyHead) {
       // Coverage compares against the old file, so it cannot see rows the

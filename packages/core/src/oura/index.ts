@@ -13,14 +13,16 @@ import {
 } from "../legacy-projection/index.js";
 import { compareLegacyCoverage } from "../storage/legacy-scope-coverage.js";
 import { LEGACY_SCOPE_ENTITY_KEYS } from "../storage/legacy-scope-entity-keys.js";
+import { readOuraCollectionRequirements } from "../api/oura-collection-requirements.js";
 import {
   OURA_BROWSER_HISTORY_POLICY,
   isOuraTakeoverSelection,
+  ouraTakeoverSelectionSince,
 } from "./history-policy.js";
 
 const STREAMS = ["sleep", "readiness", "activity"] as const;
 export interface OuraBrowserImportInput {
-  /** Prepared run selection. Required unless Node supplies validated native proof. */
+  /** The START selection the batch was collected with. Required for every batch. */
   selection?: { streams: unknown[] };
   records: PdppRecord[];
   collectedAt: string;
@@ -32,6 +34,11 @@ export interface OuraBrowserImportInput {
     }[];
   };
 }
+/** Current-generation retained rows, including deleted IDs, as coverage constraints only. */
+export interface OuraRetainedHistory {
+  records: PdppRecord[];
+  collectedAt: string;
+}
 /** Ordinary owner-ingest effects supplied by the runtime after owner authentication. */
 export type OuraBrowserImportOptions = Pick<
   PersonalServerDataApiDeps,
@@ -41,10 +48,8 @@ export type OuraBrowserImportOptions = Pick<
   | "onDataWritten"
   | "legacyScopeView"
 > & {
-  /** Node's fixed artifact-bound producer already validates its current START selection. */
-  artifactBoundNativeCompletion?: boolean;
-  /** Current-generation retained rows, including deleted IDs, as coverage constraints only. */
-  retainedCanonicalHistory?: { records: PdppRecord[]; collectedAt: string };
+  /** Read once by the importer under its import lock, never before it. */
+  retainedCanonicalHistory?: () => OuraRetainedHistory | undefined;
   /** Node commits the validated current batch to its existing canonical store. */
   beforeCommit?: (
     input: OuraBrowserImportInput,
@@ -64,7 +69,7 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Completed staged bodies are not proof of full historical coverage. Never delete old entities. */
+/** Eligible fresh complete imports replace current data while retaining historical files. */
 export async function importOuraBrowserRecords(
   storage: DataStoragePort,
   input: OuraBrowserImportInput,
@@ -92,11 +97,8 @@ export async function importOuraBrowserRecords(
     return { ok: false, reason: "invalid_completion" };
   }
   const counts = new Map<string, number>(STREAMS.map((stream) => [stream, 0]));
-  if (
-    input.selection === undefined
-      ? options.artifactBoundNativeCompletion !== true
-      : !isOuraTakeoverSelection(input.selection)
-  ) {
+  // Native and browser batches alike must carry the START selection they ran with.
+  if (!isOuraTakeoverSelection(input.selection)) {
     return { ok: false, reason: "selection_not_eligible" };
   }
   const ids = new Set<string>();
@@ -156,11 +158,44 @@ export async function importOuraBrowserRecords(
   );
 }
 
+/**
+ * A window must reach back to the earliest day of the history it would replace.
+ * The caller reads the retained rows under the import lock, so a stale preparation
+ * cannot authorize truncation.
+ */
+async function narrowerThanHistory(
+  storage: DataStoragePort,
+  input: OuraBrowserImportInput,
+  options: OuraBrowserImportOptions,
+  retained: OuraRetainedHistory | undefined,
+): Promise<Extract<OuraBrowserImportResult, { ok: false }> | undefined> {
+  // The selection was validated before the lock.
+  const authorized = ouraTakeoverSelectionSince(input.selection)!.since;
+  // Full history cannot be narrower than what it replaces.
+  if (authorized === null) return;
+  const required = await readOuraCollectionRequirements(
+    storage,
+    options.legacyScopeView,
+    retained?.records,
+  ).catch(() => undefined);
+  if (!required) return { ok: false, reason: "prior_projection_unavailable" };
+  if (!required.ok)
+    return { ok: false, reason: required.reason, scope: required.scope };
+  // Absent or empty history has no day that a narrower window could drop.
+  if (required.since === null) return;
+  if (authorized > required.since)
+    return { ok: false, reason: "selection_narrower_than_history" };
+}
+
 async function importLocked(
   storage: DataStoragePort,
   input: OuraBrowserImportInput,
   options: OuraBrowserImportOptions,
 ): Promise<OuraBrowserImportResult> {
+  // One read under the lock: the boundary, stale and parity checks share this snapshot.
+  const retained = options.retainedCanonicalHistory?.();
+  const narrower = await narrowerThanHistory(storage, input, options, retained);
+  if (narrower) return narrower;
   // Current connector records have no trusted upstream account identity.
   // Compare this complete batch alone; never union raw windows across requests.
   const plans = [];
@@ -173,7 +208,6 @@ async function importLocked(
     if (!projection.ok || (projection.diagnostics?.length ?? 0) > 0) {
       return { ok: false, reason: "projection_incomplete", scope };
     }
-    const retained = options.retainedCanonicalHistory;
     if (retained) {
       if (Date.parse(input.collectedAt) < Date.parse(retained.collectedAt))
         return { ok: false, reason: "stale_collection", scope };
@@ -187,20 +221,23 @@ async function importLocked(
       );
       if (!baseline.ok || (baseline.diagnostics?.length ?? 0) > 0)
         return { ok: false, reason: "prior_projection_unavailable", scope };
-      const verdict = compareLegacyCoverage(
-        baseline.payload,
-        projection.payload,
-        {
-          scope,
-          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
-          projectionOmissions: projection.projectionOmissions,
-          canonicalNewer:
-            Date.parse(input.collectedAt) > Date.parse(retained.collectedAt),
-          ...OURA_BROWSER_HISTORY_POLICY,
-        },
-      );
-      if (!verdict.covered)
-        return { ok: false, reason: verdict.reason!, scope };
+      // Fresh eligible completion replaces current data; only same-time retries need parity.
+      if (Date.parse(input.collectedAt) === Date.parse(retained.collectedAt)) {
+        const verdict = compareLegacyCoverage(
+          baseline.payload,
+          projection.payload,
+          {
+            scope,
+            entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+            projectionOmissions: projection.projectionOmissions,
+            canonicalNewer:
+              Date.parse(input.collectedAt) > Date.parse(retained.collectedAt),
+            ...OURA_BROWSER_HISTORY_POLICY,
+          },
+        );
+        if (!verdict.covered)
+          return { ok: false, reason: verdict.reason!, scope };
+      }
     }
     const served = await options.legacyScopeView?.readLatest(scope);
     if (
@@ -214,21 +251,27 @@ async function importLocked(
         Date.parse(input.collectedAt) < Date.parse(served.envelope.collectedAt)
       )
         return { ok: false, reason: "stale_collection", scope };
-      const verdict = compareLegacyCoverage(
-        served.envelope.data,
-        projection.payload,
-        {
-          scope,
-          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
-          projectionOmissions: projection.projectionOmissions,
-          canonicalNewer:
-            Date.parse(input.collectedAt) >
-            Date.parse(served.envelope.collectedAt),
-          ...OURA_BROWSER_HISTORY_POLICY,
-        },
-      );
-      if (!verdict.covered)
-        return { ok: false, reason: verdict.reason!, scope };
+      // Fresh eligible completion replaces current data; only same-time retries need parity.
+      if (
+        Date.parse(input.collectedAt) ===
+        Date.parse(served.envelope.collectedAt)
+      ) {
+        const verdict = compareLegacyCoverage(
+          served.envelope.data,
+          projection.payload,
+          {
+            scope,
+            entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+            projectionOmissions: projection.projectionOmissions,
+            canonicalNewer:
+              Date.parse(input.collectedAt) >
+              Date.parse(served.envelope.collectedAt),
+            ...OURA_BROWSER_HISTORY_POLICY,
+          },
+        );
+        if (!verdict.covered)
+          return { ok: false, reason: verdict.reason!, scope };
+      }
     }
     const head = storage.findEntry({ scope });
     let headTime = head?.collectedAt;
@@ -268,15 +311,18 @@ async function importLocked(
       } catch {
         return { ok: false, reason: "prior_projection_unavailable", scope };
       }
-      const verdict = compareLegacyCoverage(legacy.data, projection.payload, {
-        scope,
-        entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
-        projectionOmissions: projection.projectionOmissions,
-        canonicalNewer: Date.parse(input.collectedAt) > priorTime,
-        ...OURA_BROWSER_HISTORY_POLICY,
-      });
-      if (!verdict.covered)
-        return { ok: false, reason: verdict.reason!, scope };
+      // Fresh eligible completion replaces current data; only same-time retries need parity.
+      if (Date.parse(input.collectedAt) === priorTime) {
+        const verdict = compareLegacyCoverage(legacy.data, projection.payload, {
+          scope,
+          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          projectionOmissions: projection.projectionOmissions,
+          canonicalNewer: Date.parse(input.collectedAt) > priorTime,
+          ...OURA_BROWSER_HISTORY_POLICY,
+        });
+        if (!verdict.covered)
+          return { ok: false, reason: verdict.reason!, scope };
+      }
       if (
         head.producer === "pdpp-import-projection" &&
         headTime === input.collectedAt &&

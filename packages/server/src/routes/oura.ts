@@ -125,16 +125,15 @@ export function ouraRoutes(deps: OuraRouteDeps): Hono {
       })
     )
       return c.json({ ok: false, reason: "method_opt_in" }, 409);
-    // One snapshot binds repair constraints and the epoch checked by the writer.
-    const preflight = deps.pdpp?.bindingStore.readSnapshot(() => ({
-      epoch: canonicalEpoch(deps),
-      history: retainedCanonicalHistory(deps),
-    }));
-    const expectedCanonicalEpoch = preflight?.epoch ?? "disabled";
+    // The writer fences on this epoch, captured before the lock. The retained
+    // history is read under the import lock, so the boundary check sees current rows.
+    const expectedCanonicalEpoch = canonicalEpoch(deps);
     const result = await importOuraBrowserRecords(storage, body, {
       legacyScopeView: deps.legacyScopeView,
-      retainedCanonicalHistory: preflight?.history,
-      artifactBoundNativeCompletion: body.native !== undefined,
+      retainedCanonicalHistory: () =>
+        deps.pdpp?.bindingStore.readSnapshot(() =>
+          retainedCanonicalHistory(deps),
+        ),
       scopeDeletions: deps.scopeDeletions,
       syncManager: deps.syncManager,
       additions: deps.additions,

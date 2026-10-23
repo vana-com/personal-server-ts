@@ -29,7 +29,7 @@ function fixture(scope: string): Fixture {
 
 const collectedAt = "2026-10-10T00:00:00.000Z";
 
-describe("source identities qualify legacy scope takeover", () => {
+describe("completed replacement and unreceipted historical comparison", () => {
   let db: InstanceType<typeof Database>;
   let store: ReturnType<typeof createSqliteRecordStore>;
   beforeEach(() => {
@@ -42,6 +42,7 @@ describe("source identities qualify legacy scope takeover", () => {
     input: Fixture,
     complete = true,
     legacyCollectedAt = collectedAt,
+    receipted = false,
   ) {
     const method = input.profileKey ?? input.scope.split(".")[0]!;
     const sourceId = `https://registry.pdpp.dev/sources/${method === "github-browser" ? "github" : method}`;
@@ -82,11 +83,17 @@ describe("source identities qualify legacy scope takeover", () => {
         envelopes: [],
       });
     }
+    if (!receipted) {
+      // The historical comparison cases exercise fallback without completion proof.
+      db.prepare("DELETE FROM pdpp_stream_completion WHERE instance = ?").run(
+        instance,
+      );
+    }
     db.prepare(
       "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
     ).run("source/old.json", input.scope, legacyCollectedAt, 1);
     const envelope = {
-      version: "1.0",
+      version: "1.0" as const,
       scope: input.scope,
       collectedAt: legacyCollectedAt,
       data: input.legacyBody,
@@ -182,6 +189,62 @@ describe("source identities qualify legacy scope takeover", () => {
     }
     return input;
   }
+
+  it.each([
+    "linkedin.connections",
+    "linkedin.experience",
+    "linkedin.education",
+    "linkedin.skills",
+    "linkedin.languages",
+    "github.profile",
+    "github.repositories",
+    "github.starred",
+    "spotify.savedTracks",
+    "spotify.playlists",
+    "instagram.ads",
+    "heb.profile",
+  ])(
+    "replaces keyless historical %s data after its fresh sync completes",
+    async (scope) => {
+      const input =
+        scope === "spotify.savedTracks" || scope === "spotify.playlists"
+          ? spotify(scope)
+          : scope === "github.profile"
+            ? githubProfile()
+            : fixture(scope);
+      input.legacyBody = { oldOnly: [{ arbitrary: "no historical key" }] };
+      const view = setup(input, true, "2026-10-09T00:00:00.000Z", true);
+      const indexed = db.prepare("SELECT * FROM data_files").all();
+      const read = await view.readLatest(scope);
+      expect(read.kind).toBe("canonical");
+      if (read.kind !== "canonical")
+        throw new Error("Fresh sync did not replace history");
+      expect(read.envelope.data).not.toHaveProperty("oldOnly");
+      expect(view.listingFor(scope).kind).toBe("canonical");
+      expect(view.verdictFor(scope)).toEqual([]);
+      expect(
+        db
+          .prepare("SELECT replacement_cursor FROM legacy_scope_takeovers")
+          .all(),
+      ).toEqual([{ replacement_cursor: expect.any(String) }]);
+      expect(db.prepare("SELECT * FROM data_files").all()).toEqual(indexed);
+    },
+  );
+
+  it.each([collectedAt, "2026-10-11T00:00:00.000Z"])(
+    "keeps keyless history when its head at %s is not older than the completed import",
+    async (legacyCollectedAt) => {
+      const input = fixture("linkedin.connections");
+      input.legacyBody = { oldOnly: [{ arbitrary: "no historical key" }] };
+      const view = setup(input, true, legacyCollectedAt, true);
+      const indexed = db.prepare("SELECT * FROM data_files").all();
+      expect((await view.readLatest(input.scope)).kind).toBe("file");
+      expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+        [],
+      );
+      expect(db.prepare("SELECT * FROM data_files").all()).toEqual(indexed);
+    },
+  );
 
   it("takes over playlist metadata when no old track entities need an identity", async () => {
     const input = playlistMetadata();

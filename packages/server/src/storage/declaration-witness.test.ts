@@ -189,6 +189,58 @@ describe("current declarations at the server legacy-read boundary", () => {
     expect(view.verdictFor(scope)[0]!.verdict).toBe("not_covered");
   });
 
+  it("invalidates a fresh whole-replacement cursor when declarations change", async () => {
+    current = registry(false);
+    const baseline = await makeView().readLatest(scope);
+    expect(baseline.kind).toBe("canonical");
+    if (baseline.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "chatgpt/conversations/older.json",
+      scope,
+      "2026-09-09T00:00:00.000Z",
+      12,
+    );
+    const readHead = vi.fn(async () => baseline.envelope);
+    const view = makeView(readHead);
+    const first = await view.readLatest(scope);
+    expect(first.kind).toBe("canonical");
+    const replacementCursor = () =>
+      (
+        db
+          .prepare(
+            "SELECT replacement_cursor FROM legacy_scope_takeovers WHERE scope = ?",
+          )
+          .get(scope) as { replacement_cursor: string }
+      ).replacement_cursor;
+    const before = replacementCursor();
+    expect(before).toEqual(expect.any(String));
+    expect(before.length).toBeGreaterThan(0);
+    expect(view.verdictFor(scope)).toEqual([]);
+    expect(readHead).not.toHaveBeenCalled();
+    const oldParts = before.split(":");
+    oldParts[oldParts.length - 3] = "10";
+    const oldRuleCursor = oldParts.join(":");
+    db.prepare(
+      "UPDATE legacy_scope_takeovers SET replacement_cursor = ? WHERE scope = ?",
+    ).run(oldRuleCursor, scope);
+    expect(view.listingFor(scope)).toEqual({ kind: "refused" });
+    expect((await view.readLatest(scope)).kind).toBe("canonical");
+    expect(replacementCursor()).not.toBe(oldRuleCursor);
+    current = registry(true);
+    expect(view.listingFor(scope)).toEqual({ kind: "refused" });
+    // The new declaration must be projected and confirmed anew, not served
+    // from the old replacement witness. Fresh completion still permits it.
+    const after = await view.readLatest(scope);
+    expect(after).toMatchObject({
+      kind: "canonical",
+      envelope: { data: { conversations: [{ id: "cv1", title: decoded }] } },
+    });
+    expect(replacementCursor()).not.toBe(before);
+    expect(readHead).not.toHaveBeenCalled();
+  });
+
   it("does not apply a declaration from another registered source", () => {
     current = registry(true);
     store.registerConnection({

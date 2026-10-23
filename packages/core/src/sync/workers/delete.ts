@@ -1,4 +1,6 @@
 import type { Logger } from "../../logger/index.js";
+import type { IndexEntry } from "../../storage/index/types.js";
+import { withScopeLock } from "../../additions/scope-lock.js";
 import type {
   DataPointFeedPort,
   DataPointFeedRecord,
@@ -150,6 +152,76 @@ export function planBlobDeletions(
   };
 }
 
+/**
+ * A local entry the tombstone covered, as it stood when the tombstone landed:
+ * its immutable row identity (`id`, `path`) and its collection stamp.
+ */
+type CoveredEntry = Pick<IndexEntry, "id" | "path" | "collectedAt">;
+
+/**
+ * The entries `tombstoneVersionValue` covers, read once when the tombstone
+ * lands and before any remote await. This fence is the only thing step 3 may
+ * erase: an entry that arrives later is outside it, whatever its marker.
+ */
+function captureCoveredEntries(
+  storage: Pick<DataStoragePort, "listVersions">,
+  scope: string,
+  tombstoneVersionValue: string | null,
+): CoveredEntry[] {
+  const tombstone = { version: tombstoneVersionValue };
+  const covered: CoveredEntry[] = [];
+  const PAGE_SIZE = 500;
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const entries = storage.listVersions(scope, { limit: PAGE_SIZE, offset });
+    for (const entry of entries) {
+      if (isEntryCoveredByTombstone(entry, tombstone)) {
+        covered.push({
+          id: entry.id,
+          path: entry.path,
+          collectedAt: entry.collectedAt,
+        });
+      }
+    }
+    if (entries.length < PAGE_SIZE) break;
+  }
+  return covered;
+}
+
+/**
+ * Erase exactly the fenced versions, one at a time, each through the storage's
+ * fenced erase. The storage checks the row's id and path at the erase itself,
+ * under its own lock or transaction, so a replacement that took a fenced stamp
+ * after capture is left alone and reported as not erased. No snapshot is taken
+ * here, because a snapshot is stale by the time the erase runs.
+ *
+ * The scope's first-seen sidecar was derived from the fenced rows, so it is
+ * dropped after the erases, under the scope lock: a rebuild that read the old
+ * rows cannot write it back once this returns. The next read rebuilds it from
+ * the rows that survive (a re-add starts afresh there).
+ */
+async function eraseCoveredEntries(
+  storage: Pick<DataStoragePort, "deleteVersion" | "deleteFirstSeenLedger">,
+  scope: string,
+  fence: CoveredEntry[],
+): Promise<number> {
+  if (fence.length === 0) return 0;
+  let erased = 0;
+  try {
+    for (const captured of fence) {
+      const removed = await storage.deleteVersion(scope, captured.collectedAt, {
+        id: captured.id,
+        path: captured.path,
+      });
+      if (removed) erased += 1;
+    }
+  } finally {
+    await withScopeLock(scope, async () => {
+      await storage.deleteFirstSeenLedger?.(scope);
+    });
+  }
+  return erased;
+}
+
 /** Take up to `count` versions from the head of a range; `rest` is what remains. */
 function takeFromRange(
   range: { from: string; to: string },
@@ -232,6 +304,8 @@ export async function deleteScope(
     },
     pendingBlobDeletion: false,
   };
+  // Set only once a gateway tombstone has landed (see step 2).
+  let covered: CoveredEntry[] | null = null;
 
   if (deleteData) {
     // 1. Gateway tombstone: the durable fact. Nothing else happens if it
@@ -309,6 +383,8 @@ export async function deleteScope(
     // queued. A tombstone whose version the gateway did not report cannot be
     // expanded into registry keys yet; a version-less marker asks the retry
     // to expand it once the registry answers.
+    // Fence first: the covered entries as they stand before the remote await.
+    covered = captureCoveredEntries(storage, scope, tombstoneVersionValue);
     const plan = planBlobDeletions(storage, scope, tombstoneVersionValue);
     const batch = plan.keys.slice(0, BLOB_DELETE_BATCH_SIZE);
     const leftovers: PendingBlobDeletion[] = plan.keys
@@ -337,9 +413,14 @@ export async function deleteScope(
   }
 
   // 3. Local copy. Safe now: the registry row is a tombstone (or the point
-  // was never registered / sync is off), so nothing can re-pull it.
+  // was never registered / sync is off), so nothing can re-pull it. Only the
+  // versions fenced in step 2 are erased: a row that arrived while the remote
+  // deletes were in flight is outside the fence and stays. With no gateway
+  // there is no fence and the whole local copy goes.
   try {
-    const deletedCount = await storage.deleteScope(scope);
+    const deletedCount = covered
+      ? await eraseCoveredEntries(storage, scope, covered)
+      : await storage.deleteScope(scope);
     result.steps.local = { status: "ok", deletedCount };
   } catch (err) {
     const message = errorMessage(err);
@@ -534,8 +615,11 @@ export async function retryPendingBlobDeletions(
     if (plan.range) {
       expanded.push({ scope: marker.scope, version: null, range: plan.range });
     }
-    await pendingBlobDeletions.remove([marker]);
+    // Persist the expansion before dropping the unexpanded marker: a failed or
+    // interrupted write leaves the marker to expand again (the same keys), and
+    // never drops keys that are still owed.
     await pendingBlobDeletions.add(expanded);
+    await pendingBlobDeletions.remove([marker]);
   }
   markers = await pendingBlobDeletions.list();
 
@@ -629,10 +713,12 @@ export async function retryPendingBlobDeletions(
     }
   }
   // Advance the ranges only now: a crash mid-pass re-sends already-deleted
-  // keys (404, harmless) rather than skipping keys that were never sent.
+  // keys (404, harmless) rather than skipping keys that were never sent. The
+  // successor is persisted before its predecessor is dropped, so a failed or
+  // interrupted write leaves the old range standing, never a gap.
   for (const { old, next } of advancedRanges) {
-    await pendingBlobDeletions.remove([old]);
     if (next) await pendingBlobDeletions.add([next]);
+    await pendingBlobDeletions.remove([old]);
   }
   result.remaining = (await pendingBlobDeletions.list()).length;
   return result;
