@@ -63,6 +63,8 @@ import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import type { PersonalServerDataApiDeps } from "@opendatalabs/personal-server-ts-core/api";
 
 const SERVER_ORIGIN = "http://localhost:8080";
+const MAIN_PORT = 8080;
+const LOOPBACK_PORT = 8081;
 const ownerWallet = createTestWallet(9);
 const CLAUDE_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
 const gatewayConfig = {
@@ -799,6 +801,8 @@ describe("MCP /mcp/:token route", () => {
         indexManager: createIndexManager(initializeDatabase(":memory:")),
         hierarchyOptions: { dataDir: "/tmp" },
         oauthApprovalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+        localApprovalPort: LOOPBACK_PORT,
+        serverPort: MAIN_PORT,
       }),
     );
     root.route(
@@ -1052,6 +1056,39 @@ describe("MCP /mcp/:token route", () => {
     const res = await call();
     expect(res.status).toBe(401);
     expect((await res.json()).error.errorCode).toBe("INVALID_TOKEN");
+  });
+
+  it("serves a record stored before listener binding on the main listener only", async () => {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-legacy", scopes: ["chatgpt.history"] }],
+      },
+      { store },
+    );
+    await store.mutate(created.connectionId, ({ ingress: _, ...legacy }) => ({
+      ...legacy,
+    }));
+    const call = (localPort: number) =>
+      app.request(
+        `/mcp/${encodeURIComponent(created.connectionToken)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+        },
+        { incoming: { socket: { localPort, localAddress: "127.0.0.1" } } },
+      );
+
+    expect((await call(MAIN_PORT)).status).toBe(200);
+    expect((await call(LOOPBACK_PORT)).status).toBe(401);
   });
 });
 
