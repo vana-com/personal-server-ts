@@ -17,6 +17,8 @@ const ownerWallet = createTestWallet(8);
 const APPROVAL_URL = "https://app.vana.org/mcp/approve";
 const PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource/mcp";
 const REDIRECT_URI = "http://127.0.0.1:33418/callback";
+const ACCESS_TOKEN = "local-mcp-owner-token";
+const VERIFIER = "local-mcp-pkce-verifier";
 
 interface LocalServer {
   /** `config.server.origin`: what tunnel clients are told today. */
@@ -83,6 +85,7 @@ async function startLocalServer(): Promise<LocalServer> {
   const rootPath = await mkdtemp(join(tmpdir(), "ps-local-mcp-"));
   const [port, loopbackPort] = await freePorts(2);
   vi.stubEnv("LOCAL_AUTH_PORT", String(loopbackPort));
+  vi.stubEnv("PS_ACCESS_TOKEN", ACCESS_TOKEN);
   const publicOrigin = `http://localhost:${port}`;
   const config = ServerConfigSchema.parse({
     server: { port, origin: publicOrigin },
@@ -119,7 +122,9 @@ async function pkceChallenge(verifier: string): Promise<string> {
 }
 
 /** DCR + authorize on one listener; returns the owner approval redirect. */
-async function authorize(listener: string, verifier: string): Promise<URL> {
+async function authorize(
+  listener: string,
+): Promise<{ clientId: string; approval: URL }> {
   const registered = await (
     await fetch(`${listener}/mcp/oauth/register`, {
       method: "POST",
@@ -134,13 +139,65 @@ async function authorize(listener: string, verifier: string): Promise<URL> {
     response_type: "code",
     client_id: registered.client_id,
     redirect_uri: REDIRECT_URI,
-    code_challenge: await pkceChallenge(verifier),
+    code_challenge: await pkceChallenge(VERIFIER),
     code_challenge_method: "S256",
   });
   const response = await fetch(`${listener}/mcp/oauth/authorize?${query}`, {
     redirect: "manual",
   });
-  return new URL(response.headers.get("location")!);
+  return {
+    clientId: registered.client_id,
+    approval: new URL(response.headers.get("location")!),
+  };
+}
+
+/** Full OAuth flow on one listener: the owner approves, the client redeems. */
+async function connect(listener: string): Promise<string> {
+  const { clientId, approval } = await authorize(listener);
+  const authorizationId = approval.searchParams.get("mcp_authorization");
+  const approved = await fetch(
+    `${approval.searchParams.get("ps_origin")}/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        grants: [{ grantId: "grant-local", scopes: ["chatgpt.history"] }],
+      }),
+    },
+  );
+  const code = new URL((await approved.json()).redirectTo).searchParams.get(
+    "code",
+  );
+  const token = await fetch(`${listener}/mcp/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code: code!,
+      code_verifier: VERIFIER,
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+    }),
+  });
+  return (await token.json()).access_token;
+}
+
+/** One MCP call with a bearer; the status says whether the token resolved. */
+async function listTools(url: string, accessToken: string): Promise<number> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+  });
+  await response.body?.cancel();
+  return response.status;
 }
 
 /** Every URL an MCP client learns from discovery, as one comparable shape. */
@@ -152,7 +209,7 @@ async function discoveredUrls(listener: string) {
   const authServer = await (
     await fetch(`${listener}/.well-known/oauth-authorization-server`)
   ).json();
-  const approval = await authorize(listener, "discovery-verifier");
+  const { approval } = await authorize(listener);
   return {
     challenge: challenge.headers.get("www-authenticate"),
     resource: resource.resource,
@@ -259,6 +316,23 @@ describe("local MCP over the loopback listener", () => {
       { origin: server.loopback, "sec-fetch-site": "same-origin" },
     );
     expect(sameOrigin.status).toBe(200);
+  });
+
+  it("binds a loopback-authorized token to the loopback listener", async () => {
+    const server = await startLocalServer();
+    const token = await connect(server.loopback);
+
+    expect(await listTools(`${server.loopback}/mcp`, token)).toBe(200);
+    expect(await listTools(`${server.main}/mcp`, token)).toBe(401);
+    expect(await listTools(`${server.main}/mcp/${token}`, token)).toBe(401);
+  });
+
+  it("binds a tunnel-authorized token to the main listener", async () => {
+    const server = await startLocalServer();
+    const token = await connect(server.main);
+
+    expect(await listTools(`${server.main}/mcp`, token)).toBe(200);
+    expect(await listTools(`${server.loopback}/mcp`, token)).toBe(401);
   });
 
   // Native clients need no CORS and the gate refuses every foreign origin,
