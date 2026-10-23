@@ -283,6 +283,19 @@ async function json(response: Response) {
   return (await response.json()) as Record<string, unknown>;
 }
 
+/** Read-only rows from the auth store, for checks on what was persisted. */
+function authRows(
+  sql: string,
+  params: unknown[] = [],
+): Record<string, unknown>[] {
+  const db = new Database(join(tempDir, "pdpp-auth.db"), { readonly: true });
+  try {
+    return db.prepare(sql).all(...params) as Record<string, unknown>[];
+  } finally {
+    db.close();
+  }
+}
+
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "pdpp-scoped-owner-as-"));
   vi.stubEnv("VANA_MASTER_KEY_SIGNATURE", KNOWN_SIG);
@@ -852,4 +865,147 @@ describe("scoped owner tokens in the AS consent path", () => {
     expect(changes.status).toBe(200);
     expect(await json(changes)).toMatchObject({ data: [] });
   });
+});
+
+it("an A-only owner token cannot consent to account B or redeem a token that reads B", async () => {
+  const sourceToken = await ownerToken(OURA);
+  const connectionB = "conn_11111111-1111-4111-8111-111111111111";
+  const registered = await ctx!.app.request(
+    `/pdpp/connections/${connectionB}`,
+    {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${sourceToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        source_id: OURA,
+        method_id: "oura",
+        label: "Second account",
+      }),
+    },
+  );
+  expect(registered.status).toBe(200);
+  await ingestOuraSleep(sourceToken, connectionB, 42);
+  const minted = await ctx!.app.request("/pdpp/v1/owner/token", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${ctx!.devToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ source_id: OURA, instance_id: instance(OURA) }),
+  });
+  expect(minted.status).toBe(200);
+  const scopedA = ((await minted.json()) as { access_token: string })
+    .access_token;
+  expect((await readSleep(scopedA)).status).toBe(404);
+
+  const approve = (
+    sessionId: string,
+    token: string,
+    body: Record<string, unknown>,
+  ) =>
+    ctx!.app.request(`/pdpp/v1/authorize/${sessionId}/approve`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+  // Attempt 1: the instance choice B on review. A refused review builds no
+  // digest, so there is nothing for B to approve.
+  const sessionId = await authorizeOura(scopedA);
+  const reviewedB = await ctx!.app.request(
+    `/pdpp/v1/authorize/${sessionId}/review?instance%5Bsleep%5D=${encodeURIComponent(connectionB)}`,
+    { headers: { authorization: `Bearer ${scopedA}` } },
+  );
+  expect(reviewedB.status).toBe(403);
+  expect(await reviewedB.text()).not.toContain(connectionB);
+
+  // Attempt 2: the digest the A-only token may review, approved with the
+  // instance choice B. The approval is refused before any grant is issued.
+  const reviewedA = await ctx!.app.request(
+    `/pdpp/v1/authorize/${sessionId}/review`,
+    { headers: { authorization: `Bearer ${scopedA}` } },
+  );
+  expect(reviewedA.status).toBe(200);
+  const { review } = (await reviewedA.json()) as {
+    review: { review_digest: string };
+  };
+  const approvedB = await approve(sessionId, scopedA, {
+    review_digest: review.review_digest,
+    instance_choices: { sleep: [connectionB] },
+  });
+  expect(approvedB.status).toBe(403);
+  expect(await approvedB.json()).not.toHaveProperty("redirect_uri");
+
+  // Attempt 3: a source-wide review that names B, approved by the A-only token,
+  // with the choice and without it. Neither may issue a grant over B.
+  const wideSession = await authorizeOura(sourceToken);
+  const wideReview = await ctx!.app.request(
+    `/pdpp/v1/authorize/${wideSession}/review?instance%5Bsleep%5D=${encodeURIComponent(connectionB)}`,
+    { headers: { authorization: `Bearer ${sourceToken}` } },
+  );
+  expect(wideReview.status).toBe(200);
+  const { review: wideReviewed } = (await wideReview.json()) as {
+    review: { review_digest: string };
+  };
+  const narrowedWithChoice = await approve(wideSession, scopedA, {
+    review_digest: wideReviewed.review_digest,
+    instance_choices: { sleep: [connectionB] },
+  });
+  expect(narrowedWithChoice.status).toBe(403);
+  const narrowedWithoutChoice = await approve(wideSession, scopedA, {
+    review_digest: wideReviewed.review_digest,
+  });
+  expect(narrowedWithoutChoice.status).toBe(409);
+
+  // Nothing was persisted for B, checked in the raw tables. A grant and its code
+  // are written together, and a client token exists only after a redeemed code,
+  // so zero grants and zero codes mean zero client tokens.
+  expect(authRows("SELECT COUNT(*) AS n FROM pdpp_grants")).toEqual([{ n: 0 }]);
+  expect(authRows("SELECT COUNT(*) AS n FROM pdpp_auth_codes")).toEqual([
+    { n: 0 },
+  ]);
+  expect(
+    authRows(
+      "SELECT COUNT(*) AS n FROM pdpp_access_tokens WHERE grant_id IS NOT NULL",
+    ),
+  ).toEqual([{ n: 0 }]);
+  // The A-only owner's direct read of B is still 404 after every attempt.
+  expect((await readSleep(scopedA)).status).toBe(404);
+
+  // The A-only owner can still consent to account A. That grant redeems to a
+  // client token that cannot read B's record.
+  const { accessToken, grantId } = await issueOuraGrant(scopedA);
+  expect((await readSleep(accessToken)).status).not.toBe(200);
+  expect(authRows("SELECT grant_id FROM pdpp_grants")).toEqual([
+    { grant_id: grantId },
+  ]);
+  expect(authRows("SELECT grant_id FROM pdpp_auth_codes")).toEqual([
+    { grant_id: grantId },
+  ]);
+  expect(
+    authRows(
+      "SELECT DISTINCT grant_id FROM pdpp_access_tokens WHERE grant_id IS NOT NULL",
+    ),
+  ).toEqual([{ grant_id: grantId }]);
+  expect(
+    authRows("SELECT COUNT(*) AS n FROM pdpp_grants WHERE grant_json LIKE ?", [
+      `%${connectionB}%`,
+    ]),
+  ).toEqual([{ n: 0 }]);
+  const granted = openPdppAuthStore(join(tempDir, "pdpp-auth.db"));
+  try {
+    const grants = granted.listGrantsForSubject(owner);
+    expect(
+      grants.flatMap((stored) =>
+        stored.grant.streams.flatMap((stream) => stream.instance_ids),
+      ),
+    ).toEqual([instance(OURA)]);
+  } finally {
+    granted.close();
+  }
 });
