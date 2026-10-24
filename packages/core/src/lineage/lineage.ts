@@ -46,6 +46,15 @@ export interface StoredLineage {
   sources: `0x${string}`[];
   /** ISO timestamp the Personal Server validated and stamped the lineage. */
   writtenAt: string;
+  /**
+   * Written by the server only, and only when every input was known to be
+   * legacy data. A derivative without it counts as PDPP-origin (see
+   * `hasPdppOrigin`), which is how derivatives written before this field
+   * existed fail closed.
+   */
+  origin?: "legacy";
+  /** Server-computed answer metadata, distinct from user-authored fields. */
+  kind?: "computed-question";
 }
 
 /** A source as the resolver saw it (local index or gateway). */
@@ -132,6 +141,10 @@ export function readStoredLineage(
   return {
     sources: sources.map((id) => id.toLowerCase() as `0x${string}`),
     writtenAt: value.writtenAt,
+    ...(value.origin === "legacy" ? { origin: "legacy" as const } : {}),
+    ...(value.kind === "computed-question"
+      ? { kind: "computed-question" as const }
+      : {}),
   };
 }
 
@@ -347,6 +360,12 @@ export interface PrepareLineageInput {
   now: () => Date;
 }
 
+export interface PreparedLineage {
+  lineage: StoredLineage;
+  /** The local scope of every cited source, for the origin decision. */
+  sourceScopes: string[];
+}
+
 /**
  * Validate a write's lineage end to end (shape, sources, naming rule) and
  * produce the `$lineage` record to stamp. An empty list is an EXPLICIT root
@@ -357,7 +376,7 @@ export interface PrepareLineageInput {
  */
 export async function prepareLineage(
   input: PrepareLineageInput,
-): Promise<StoredLineage> {
+): Promise<PreparedLineage> {
   const sources = parseLineageSources(input.field);
   if (!input.serverOwner) {
     throw new ServerNotConfiguredError({
@@ -375,5 +394,8 @@ export async function prepareLineage(
     input.scope,
     resolved.map((source) => source.scope),
   );
-  return { sources, writtenAt: input.now().toISOString() };
+  return {
+    lineage: { sources, writtenAt: input.now().toISOString() },
+    sourceScopes: resolved.map((source) => source.scope),
+  };
 }

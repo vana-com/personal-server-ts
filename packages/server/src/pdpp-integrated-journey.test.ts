@@ -194,7 +194,11 @@ const SNAPSHOT: DeclarationSnapshot = {
  */
 function bridgeAsToRs(tokens: PdppTokenService): PdppAuthorizationService {
   return {
-    async resolveToken(accessToken: string) {
+    locality: "local" as const,
+    async resolveToken(token: string) {
+      return this.resolveTokenNow(token);
+    },
+    resolveTokenNow(accessToken: string) {
       const context = tokens.resolveToken(accessToken);
       if (!context.active) {
         // The RS port requires tokenKind/subjectId even on the inactive

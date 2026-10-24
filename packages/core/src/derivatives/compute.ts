@@ -10,13 +10,21 @@ import {
   ProtocolError,
 } from "../errors/catalog.js";
 import { resolveReadDeletion } from "../api/index.js";
-import {
-  LOCAL_SCOPE_SCAN_PAGE,
-  readStoredLineage,
-} from "../lineage/lineage.js";
+import { LOCAL_SCOPE_SCAN_PAGE } from "../lineage/lineage.js";
 import { uncoveredSourceScopes } from "./registration.js";
+import {
+  dependencyDataPointIds,
+  readEvidence,
+  redactEnvelopeForGrantee,
+} from "../storage/read-evidence.js";
+import {
+  nonOwnerPublicationIsPdpp,
+  type PdppEnabled,
+} from "../policy/publication-origin.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
+import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
+import { storageForReader } from "../storage/disclosure-policy.js";
 import { assertDerivedScopeNaming } from "../lineage/lineage.js";
 import type { StoredLineage } from "../lineage/lineage.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
@@ -68,6 +76,13 @@ export interface QuestionComputeDeps {
   storage: DataStoragePort;
   store: QuestionStore;
   provider: InferenceProvider;
+  /**
+   * Whether the server has a PDPP surface. On a PDPP-enabled server (or when
+   * this is absent) a builder-registered question's output is PDPP-origin
+   * whatever its sources, because the question text is builder-supplied input
+   * copied into the output. See `nonOwnerPublicationIsPdpp`.
+   */
+  pdppEnabled?: PdppEnabled;
   /** Required: lineage ids are keccak256(owner, scope). */
   serverOwner: `0x${string}` | undefined;
   /** Newest-first items kept per source scope (default 50). */
@@ -352,22 +367,27 @@ function localScopesById(
 /**
  * Cycle guard on ACTUAL lineage, for cycles the per-store registration
  * check cannot see (two replicas each holding one half: B <- A here, A <- B
- * there, ping-ponging through sync). Walks `$lineage` from every source's
- * latest local version through the local index; reaching the derived data
- * point id means this question would consume its own output. Bounded by
- * the visited set.
+ * there, ping-ponging through sync). Walks inherited lineage and actual
+ * consumed input identities, including joins, through latest local versions.
+ * Reaching the derived data point id means this question would consume its
+ * own output. Bounded by the visited set.
  */
 async function assertNoLineageCycle(
   deps: QuestionComputeDeps,
   registration: QuestionRegistration,
   serverOwner: `0x${string}`,
-  sourceLineage: ReadonlyMap<string, readonly string[]>,
+  sourceDependencies: ReadonlyMap<string, readonly string[]>,
 ): Promise<void> {
   const derivedId = computeDataPointId(serverOwner, registration.derivedScope);
   let byId: Map<string, string> | null = null;
-  const visited = new Set<string>();
+  // Loaded roots already supplied their captured edges; do not reread them.
+  const visited = new Set<string>(
+    [...sourceDependencies.keys()].map((scope) =>
+      computeDataPointId(serverOwner, scope),
+    ),
+  );
   const stack: Array<{ id: string; path: string[] }> = [];
-  for (const [scope, sources] of sourceLineage) {
+  for (const [scope, sources] of sourceDependencies) {
     for (const id of sources) stack.push({ id, path: [scope] });
   }
   while (stack.length > 0) {
@@ -391,9 +411,12 @@ async function assertNoLineageCycle(
         scope,
         entry.collectedAt,
       );
-      sources = readStoredLineage(envelope.data)?.sources ?? [];
+      sources = dependencyDataPointIds(readEvidence(envelope), serverOwner);
     } catch {
-      // Unreadable or malformed lineage: nothing further to walk here.
+      throw new ComputeFailure(
+        "source dependencies could not be read",
+        "source_missing",
+      );
     }
     for (const next of sources)
       stack.push({ id: next, path: [...path, scope] });
@@ -403,7 +426,13 @@ async function assertNoLineageCycle(
 async function loadSource(
   deps: QuestionComputeDeps,
   scope: string,
-): Promise<{ source: PromptSource; lineageSources: string[] }> {
+  reader: LegacyReader,
+  serverOwner: string,
+): Promise<{
+  source: PromptSource;
+  dependencyIds: readonly string[];
+  pdppOrigin: boolean;
+}> {
   const entry = deps.storage.findEntry({ scope });
   // The same deletion gate a read applies: a tombstoned scope is refused
   // (410 on the read path) whether or not a stale local copy remains.
@@ -424,24 +453,29 @@ async function loadSource(
       "source_missing",
     );
   }
+  // The answer is disclosed to whoever registered the question, so each
+  // source passes the same disclosure policy as a read by that registrant:
+  // refused early on a row known to be PDPP, then decided on the bytes read.
+  authorizeLegacyRead(reader, { kind: "indexed-version", entry });
   let envelope;
   try {
-    envelope = await deps.storage.readEnvelope(scope, entry.collectedAt);
-  } catch {
+    envelope = await storageForReader(deps.storage, reader).readEnvelope(
+      scope,
+      entry.collectedAt,
+    );
+  } catch (err) {
+    if (err instanceof ProtocolError) throw err;
     throw new ComputeFailure(`source scope ${scope} could not be read`);
   }
-  let lineageSources: string[] = [];
-  try {
-    lineageSources = readStoredLineage(envelope.data)?.sources ?? [];
-  } catch {
-    // Malformed stored lineage: treated as a root for the cycle walk.
-  }
-  const raw = isBinaryEnvelope(envelope)
+  const evidence = readEvidence(envelope, entry);
+  const presentation =
+    reader === "owner" ? envelope : redactEnvelopeForGrantee(envelope);
+  const raw = isBinaryEnvelope(presentation)
     ? {
         binary: true,
         note: "binary record; its content is not included in the prompt",
       }
-    : envelope.data;
+    : presentation.data;
   const trimmed = trimSourceData(raw, {
     maxItems: deps.maxSourceItems,
     maxChars: deps.maxSourceChars,
@@ -456,7 +490,9 @@ async function loadSource(
       total: trimmed.total,
       truncated: trimmed.truncated,
     },
-    lineageSources,
+    dependencyIds: dependencyDataPointIds(evidence, serverOwner),
+    // The served envelope carries the provenance of every input it joined.
+    pdppOrigin: evidence.pdppOrigin,
   };
 }
 
@@ -534,13 +570,25 @@ export async function computeQuestion(
     );
 
     const sources: PromptSource[] = [];
-    const sourceLineage = new Map<string, readonly string[]>();
+    const sourceDependencies = new Map<string, readonly string[]>();
+    let sourcesHavePdppOrigin = false;
     for (const scope of registration.sourceScopes) {
-      const loaded = await loadSource(deps, scope);
+      const loaded = await loadSource(
+        deps,
+        scope,
+        registration.registeredBy.kind === "owner" ? "owner" : "grantee",
+        serverOwner,
+      );
       sources.push(loaded.source);
-      sourceLineage.set(scope, loaded.lineageSources);
+      sourceDependencies.set(scope, loaded.dependencyIds);
+      sourcesHavePdppOrigin ||= loaded.pdppOrigin;
     }
-    await assertNoLineageCycle(deps, registration, serverOwner, sourceLineage);
+    await assertNoLineageCycle(
+      deps,
+      registration,
+      serverOwner,
+      sourceDependencies,
+    );
     const messages = buildQuestionMessages({
       question: registration.question,
       sources,
@@ -578,6 +626,7 @@ export async function computeQuestion(
         : {}),
     };
     const lineage: StoredLineage = {
+      kind: "computed-question",
       sources: lineageIds,
       writtenAt: computedAt,
     };
@@ -597,6 +646,12 @@ export async function computeQuestion(
       collectedAt,
       status: deps.syncManager ? "syncing" : "stored",
       lineage,
+      // Handed to the publication point, which stamps the output: an answer
+      // computed from PDPP data must not be readable by a legacy chain grant.
+      inputsPdppOrigin:
+        sourcesHavePdppOrigin ||
+        (registration.registeredBy.kind === "builder" &&
+          nonOwnerPublicationIsPdpp(deps.pdppEnabled)),
       afterTombstoneVersion: await tombstoneMarker(
         deps.scopeDeletions,
         registration.derivedScope,

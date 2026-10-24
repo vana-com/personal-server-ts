@@ -1,4 +1,5 @@
 import type { Database } from "better-sqlite3";
+import { laterScopeDeletion } from "@opendatalabs/personal-server-ts-core/sync";
 import type {
   ScopeDeletionHistory,
   ScopeTombstone,
@@ -34,10 +35,11 @@ export function createScopeDeletionHistory(
     SELECT deleted_at, tombstone_version FROM vana_scope_deletion_history
     WHERE owner_address = ? AND scope = ?
   `);
-  return {
-    remember(scope, tombstone) {
-      remember.run(owner, scope, tombstone.deletedAt, tombstone.version);
-    },
+  const history: ScopeDeletionHistory = {
+    remember: db.transaction((scope: string, tombstone: ScopeTombstone) => {
+      const retained = laterScopeDeletion(history.get(scope), tombstone);
+      remember.run(owner, scope, retained.deletedAt, retained.version);
+    }),
     get(scope): ScopeTombstone | null {
       const row = get.get(owner, scope) as
         { deleted_at: string; tombstone_version: string | null } | undefined;
@@ -46,4 +48,5 @@ export function createScopeDeletionHistory(
         : null;
     },
   };
+  return history;
 }

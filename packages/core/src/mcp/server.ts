@@ -23,8 +23,15 @@ import {
   MCP_TOOLS,
   resolveGrantForScope,
   type McpToolContext,
+  type McpToolResult,
   type McpToolResultContent,
 } from "./tools.js";
+import { ProtocolError } from "../errors/catalog.js";
+import {
+  collectDeliveryLeases,
+  deliver,
+  type DeliveryLeaseCollector,
+} from "../policy/delivery-lease.js";
 import {
   READ_FULFILLMENT_NONE,
   reportPersonalServerReadDenial,
@@ -386,6 +393,34 @@ function markResponsePreparing(
   });
 }
 
+/**
+ * The tool-result boundary of the delivery lease (see
+ * `policy/delivery-lease.ts`). Whether a result carries data is decided by
+ * what produced it, not by `isError`: a result built after any read of this
+ * call (success or error, e.g. an error that reports a file's size) is
+ * released only when every one of those reads may still be delivered. A
+ * result no read contributed to is content-free. A refusal replaces the
+ * whole result with the read error a client would get from the read itself.
+ */
+async function releaseToolResult(
+  leases: DeliveryLeaseCollector,
+  result: McpToolResult,
+): Promise<McpToolResult> {
+  if (leases.size === 0) return result;
+  try {
+    return await deliver(leases, () => result);
+  } catch (err) {
+    if (err instanceof ProtocolError) {
+      return buildErrorResult({
+        error: "data_read_failed",
+        status: err.code,
+        body: err.toJSON(),
+      });
+    }
+    throw err;
+  }
+}
+
 /** What a client sees of a tool in `tools/list`: owner-independent metadata. */
 function toolConfig(tool: (typeof MCP_TOOLS)[number]) {
   return {
@@ -437,8 +472,25 @@ export function createMcpServerForConnection(
         const handlerStartedAt = performance.now();
         try {
           const timeoutMs = toolTimeoutMs(tool.name, args);
+          // Every read this call makes hands its delivery lease here; the
+          // result is released only through all of them, after the handler's
+          // last await (search aggregation, raw-body materialization).
+          const leases = collectDeliveryLeases();
+          const callCtx: McpToolContext = {
+            ...ctx,
+            readClient:
+              ctx.readClient.withDeliveryLeases?.((lease) =>
+                leases.add(lease),
+              ) ?? ctx.readClient,
+          };
+          // The timeout bounds the handler and the release together: a
+          // release that must re-verify a grant cannot outlive the call.
           const result = await withToolTimeout(
-            tool.handler(args as Record<string, unknown>, ctx),
+            (async () =>
+              releaseToolResult(
+                leases,
+                await tool.handler(args as Record<string, unknown>, callCtx),
+              ))(),
             tool.name,
             timeoutMs,
           );
@@ -508,7 +560,18 @@ export function createMcpServerForConnection(
       `raw-scope-file-${index}`,
       new ResourceTemplate(template, { list: undefined }),
       RAW_SCOPE_RESOURCE_CONFIG,
-      async (uri) => readRawScopeResource(uri, ctx),
+      async (uri) => {
+        // The resource body is released only through the read's lease, after
+        // the raw body was materialized into it.
+        const leases = collectDeliveryLeases();
+        const result = await readRawScopeResource(uri, {
+          ...ctx,
+          readClient:
+            ctx.readClient.withDeliveryLeases?.((lease) => leases.add(lease)) ??
+            ctx.readClient,
+        });
+        return deliver(leases, () => result);
+      },
     );
   });
 

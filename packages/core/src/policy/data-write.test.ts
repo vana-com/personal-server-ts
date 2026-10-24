@@ -258,6 +258,29 @@ describe("verifyDataWritePolicy", () => {
     ).rejects.toMatchObject({ errorCode: "GRANT_EXPIRED" });
   });
 
+  it("treats expiry as exclusive: a grant is expired from its expiry second on", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-10-24T12:00:00.500Z"));
+      const grant = makeGrant({
+        expiresAt: String(Math.floor(Date.now() / 1000)),
+      });
+      await expect(
+        verifyDataWritePolicy(
+          {
+            signer: BUILDER_ADDRESS,
+            grantId: grant.id,
+            requestedScope: "notes.entries",
+            serverOwner: SERVER_OWNER,
+          },
+          makePorts(grant),
+        ),
+      ).rejects.toMatchObject({ errorCode: "GRANT_EXPIRED" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("treats a null expiresAt as perpetual", async () => {
     const grant = makeGrant({ expiresAt: null });
     await expect(

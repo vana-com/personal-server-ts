@@ -1,3 +1,11 @@
+import {
+  admitPdppRead,
+  type PdppChainEnforcementPort,
+} from "../pdpp/read-admission.js";
+export type {
+  PdppChainEnforcementPort,
+  PdppChainDecision,
+} from "../pdpp/read-admission.js";
 import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { parseRecordQuery } from "./pdpp-record-query.js";
 import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
@@ -26,6 +34,8 @@ import {
   InvalidCursorSyntaxError,
   recordKeyWithinGrantResources,
   mapInactiveToError,
+  admitBearer,
+  connectionsLease,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
   summarizeIngest,
@@ -38,12 +48,22 @@ import {
   type StreamDeclaration,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import {
+  allDeliveryLeases,
+  deliver,
+  type DeliveryLease,
+} from "@opendatalabs/personal-server-ts-core/policy";
 import { createRecordDataValidator } from "../pdpp/record-schema.js";
 import {
   StreamCompletionError,
   type StreamCompletionFailure,
 } from "../storage/pdpp-stream-completion.js";
 
+import {
+  bearerErrorResponse,
+  type PdppProtocolProfile,
+} from "../pdpp/bearer-response.js";
+export { resourceMetadataUrlFor } from "../pdpp/bearer-response.js";
 export const MAX_BLOB_UPLOAD_BYTES = 512 * 1024 * 1024;
 
 /** 512 MiB — max body size for PDPP record ingest and replace routes. */
@@ -202,6 +222,7 @@ function parseIngestBody(bytes: Uint8Array): unknown {
 }
 
 export interface PdppRecordsRouteDeps {
+  protocolProfile?: PdppProtocolProfile;
   store: PdppRecordStore;
   /** Trusted reader classification; the receiver owns visibility and provisional markers. */
   replicaReads?: (reader: ReplicaReader) => PdppReplicaReadStore;
@@ -274,53 +295,6 @@ export interface PdppRecordsRouteDeps {
 export interface PdppRouteLogger {
   error(payload: Record<string, unknown>, message: string): void;
 }
-
-/**
- * The chain check a client read must pass, when a deployment enforces one.
- *
- * ## Why this is a port and not a direct chain call
- *
- * The route must not import a chain SDK: PDPP Core is chain-neutral, and a
- * deployment with no chain must still serve reads. Keeping the dependency as
- * an injected port is what lets standalone PDPP stay standalone while a Vana
- * deployment enforces the ledger, without two code paths through the route.
- *
- * ## Fail closed, and the three outcomes are NOT interchangeable
- *
- * `authorize` answers one of three things, and the distinction matters
- * because two of them deny while only one of those is worth retrying:
- *
- *   - `{ ok: true }` — a binding exists, the live chain grant is unrevoked,
- *     the owner matches, and the grantee is this client's app.
- *   - `{ ok: false, retryable: false }` — a definite denial. No binding, or
- *     a revoked/mismatched one. The answer will not change by asking again.
- *   - `{ ok: false, retryable: true }` — the chain or gateway could not be
- *     reached, so we do not KNOW the answer.
- *
- * The third case is the one that decides whether this design is honest. Not
- * knowing is not permission. Serving a read because the gateway was down
- * would make an outage into an authorization bypass, and it would do so
- * silently, which is worse than refusing. So an unknown answer denies, and
- * is reported as `503` with `Retry-After` rather than `403`, because the
- * client's grant may be perfectly valid and a permanent-looking refusal
- * would send them to re-consent for no reason.
- *
- * This also means a binding is never accepted as nullable: a deployment that
- * enforces the chain and cannot resolve a grant denies the read. There is no
- * "no binding yet, allow it" state, because that state is indistinguishable
- * from "never bound".
- */
-export interface PdppChainEnforcementPort {
-  authorize(input: {
-    /** The PDPP grant presented by the client token. */
-    pdppGrantId: string;
-    /** The OAuth client the token was issued to. */
-    clientId: string;
-  }): Promise<PdppChainDecision>;
-}
-
-export type PdppChainDecision =
-  { ok: true } | { ok: false; retryable: boolean; reason: string };
 
 /**
  * The slice of the owner access feed a PDPP read can populate.
@@ -461,56 +435,6 @@ function requireSubjectId(context: PdppTokenContext): string {
   return context.subjectId;
 }
 
-function sendError(c: Context, err: PdppError, reqId: string) {
-  // Every 401 carries the challenge, whichever branch produced it.
-  //
-  // Previously only the missing-token branch built one, so a client holding a
-  // STALE token -- the exact case §8's challenge exists to bootstrap -- got a
-  // bare 401 with no `WWW-Authenticate` and no pointer to the metadata it
-  // needed in order to re-authorize. Attaching it here rather than at each
-  // call site means a future 401 path cannot forget it.
-  const headers: Record<string, string> = {
-    "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
-  };
-  // The spec's retryable answer carries its delay.
-  if (err.status === 429) headers["Retry-After"] = "1";
-  if (err.status === 401) {
-    headers["WWW-Authenticate"] =
-      `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
-  }
-  return c.json(err.toJSON(reqId), err.status as never, headers);
-}
-
-/**
- * The RFC 9728 protected-resource metadata URL for THIS request's origin.
- *
- * RFC 9728 §5.1 requires `resource_metadata` to be a URI the client can
- * dereference. A relative path only resolves if the client already knows the
- * origin -- which an unauthenticated client bootstrapping discovery from a
- * failed read cannot be assumed to have. Deriving it from the request also
- * keeps it correct behind a tunnel or proxy, where a hardcoded origin would
- * point the client somewhere it cannot reach.
- */
-export function resourceMetadataUrlFor(c: Context): string {
-  return new URL(
-    "/.well-known/oauth-protected-resource",
-    new URL(c.req.url).origin,
-  ).toString();
-}
-
-function unauthorized(c: Context, reqId: string, resourceMetadataUrl: string) {
-  const err = new PdppError(
-    "authentication_error",
-    "Missing or invalid access token",
-  );
-  return c.json(err.toJSON(reqId), 401, {
-    "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
-    "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrl}"`,
-  });
-}
-
 /**
  * Project a declared JSON Schema down to exactly the granted fields.
  *
@@ -557,6 +481,14 @@ function projectSchemaToFields(
 }
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
+  function sendError(
+    c: Context,
+    err: PdppError,
+    reqId: string,
+    options?: Parameters<typeof bearerErrorResponse>[4],
+  ) {
+    return bearerErrorResponse(c, err, reqId, deps.protocolProfile, options);
+  }
   const app = new Hono();
   const validateData = createRecordDataValidator(deps.declarations);
   const reads = (context: PdppTokenContext) =>
@@ -611,84 +543,187 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       // Intentionally swallowed; see the doc comment.
     }
   }
+  /**
+   * The delivery gate for every PDPP read endpoint, registered first so it is
+   * the outermost step of this router. A handler builds its whole response
+   * (records, chain check); this step then releases it only through the
+   * read's delivery lease, set by `authenticate` (see `deliver`: remote
+   * checks first, then the local checks, then the release, with no await
+   * between). A grant revoked or expired, a token or refresh family revoked,
+   * or a required connection removed while the handler ran replaces the
+   * response with the profile-aware bearer error, so no record of it is
+   * released.
+   *
+   * The owner access feed records the outcome this gate decided: `completed`
+   * for a released read, `denied` for a refused one. The write starts in the
+   * same tick as the decision and is not awaited, so it cannot open a window
+   * before the release; `logClientRead` never throws.
+   *
+   * Writes are not gated: their effect is already committed, and their
+   * response carries no read data.
+   */
+  app.use("*", async (c, next) => {
+    await next();
+    const gate = c.get("delivery" as never) as DeliveryGate | undefined;
+    if (!gate) return;
+    if (c.req.method !== "GET" && c.req.method !== "HEAD") return;
+    if (!c.res.ok) return;
+    const read = gate.read;
+    try {
+      // A read result must name what it was selected from. One that does not
+      // (a handler that returned data without `released`) is not released.
+      if (!gate.selection) {
+        throw new PdppError(
+          "api_error",
+          "The read result carries no release dependencies",
+        );
+      }
+      await deliver(allDeliveryLeases(gate.lease, gate.selection), () => {
+        if (read) {
+          void logClientRead(
+            c,
+            read.context,
+            read.stream,
+            "completed",
+            read.reqId,
+          );
+        }
+      });
+    } catch (err) {
+      const reqId =
+        read?.reqId ??
+        (c.get("reqId" as never) as string | undefined) ??
+        requestId();
+      // Drop the built response whole, headers included, before the refusal
+      // replaces it.
+      c.res = undefined;
+      c.res = sendLeaseRefusal(c, err, reqId);
+      if (read) {
+        void logClientRead(c, read.context, read.stream, "denied", reqId);
+      }
+    }
+  });
+
   app.use("*", async (c, next) => {
     const reqId = requestId();
     c.set("reqId" as never, reqId as never);
     await next();
   });
 
+  interface DeliveryGate {
+    /** The bearer's release dependencies (`pdppBearerReadLease`). */
+    lease: DeliveryLease;
+    /** What the result was selected from; set only by `released`. */
+    selection?: DeliveryLease;
+    /** A served client read, logged with the outcome the gate decides. */
+    read?: { context: PdppTokenContext; stream: string; reqId: string };
+  }
+
+  /**
+   * Return a read result with the release dependencies its selection
+   * produced. The delivery gate releases it only through them (and the
+   * bearer's); a 2xx read result returned any other way is refused.
+   */
+  function released(
+    c: Context,
+    response: Response,
+    dependencies: DeliveryLease,
+  ): Response {
+    const gate = deliveryGate(c);
+    if (gate) {
+      gate.selection = gate.selection
+        ? allDeliveryLeases(gate.selection, dependencies)
+        : dependencies;
+    }
+    return response;
+  }
+
+  /**
+   * What a read of `stream` selects: its declaration, the read scope, the
+   * connections it reads, and the release dependencies that selection
+   * produces (exactly those connections).
+   */
+  function selectStreamRead(
+    context: PdppTokenContext,
+    stream: string,
+    fields?: string[],
+  ) {
+    const { declaration, ownerInstanceIds } = readDeclaration(context, stream);
+    const scope = resolveReadScope(context, stream, declaration, fields);
+    const instanceIds =
+      context.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
+    if (context.tokenKind === "client") {
+      requireRegisteredConnections(instanceIds);
+    }
+    return {
+      declaration,
+      scope,
+      instanceIds,
+      dependencies: connectionsLease(instanceIds, isConnectionAvailable),
+    };
+  }
+
+  function deliveryGate(c: Context): DeliveryGate | undefined {
+    return c.get("delivery" as never) as DeliveryGate | undefined;
+  }
+
+  /** Log this served read once the delivery gate has decided its outcome. */
+  function logReadAtDelivery(
+    c: Context,
+    context: PdppTokenContext | undefined,
+    stream: string,
+    reqId: string,
+  ): void {
+    const gate = deliveryGate(c);
+    if (gate && context) gate.read = { context, stream, reqId };
+  }
+
+  /** A failed delivery lease as the profile-aware bearer error. */
+  function sendLeaseRefusal(c: Context, err: unknown, reqId: string) {
+    const refusal = toPdppError(err);
+    return sendError(c, refusal, reqId, {
+      inactiveBearer: refusal.code === "authentication_error",
+      ...(refusal.code === "api_error" && {
+        headers: { "Retry-After": "5" },
+      }),
+    });
+  }
+
+  function isConnectionAvailable(instance: string): boolean {
+    if (!deps.bindingStore) return true;
+    const binding = deps.bindingStore.getInstanceBinding(instance);
+    return binding.sourceId !== null && binding.deletedAt === null;
+  }
+
   async function authenticate(c: Context, reqId: string) {
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
     if (!token) {
-      return { error: unauthorized(c, reqId, resourceMetadataUrlFor(c)) };
+      return {
+        error: sendError(
+          c,
+          new PdppError(
+            "authentication_error",
+            "Missing or invalid access token",
+          ),
+          reqId,
+        ),
+      };
     }
-    const context = await deps.auth.resolveToken(token);
-
-    // Chain enforcement, when the deployment configures it. Placed here so
-    // EVERY endpoint is covered by one gate: a check added per-route is a
-    // check that a later route forgets, and an unenforced read path is
-    // exactly the defect this closes.
-    //
-    // Only client tokens are gated. An owner token is the owner reading their
-    // own data, which no chain permission mediates -- requiring a grantee
-    // permission for it would lock owners out of their own server.
-    if (deps.chainEnforcement && context?.active) {
-      if (context.tokenKind === "client") {
-        const grantId = context.grant?.grant_id;
-        if (!grantId) {
-          // An active client token with no grant cannot be bound to anything,
-          // so there is nothing to verify and nothing to allow.
-          return {
-            error: sendError(
-              c,
-              new PdppError("grant_revoked", "No chain binding for this grant"),
-              reqId,
-            ),
-          };
-        }
-
-        const decision = await deps.chainEnforcement.authorize({
-          clientId: context.clientId ?? "",
-          pdppGrantId: grantId,
-        });
-
-        if (!decision.ok) {
-          await logClientRead(c, context, "unknown", "denied", reqId);
-
-          // A retryable failure is NOT reported as a denial. The grant may be
-          // perfectly valid and the chain merely unreachable, so answering
-          // `grant_revoked` would send a good client off to re-consent over an
-          // outage. §8 defines no 503 code and inventing one would be a spec
-          // extension, so this maps to `api_error` (500) -- which is honest:
-          // the failure is on our side, not in the client's request. The
-          // `Retry-After` hint costs nothing and tells a well-behaved client
-          // to come back rather than give up.
-          if (decision.retryable) {
-            c.header("Retry-After", "5");
-            return {
-              error: sendError(
-                c,
-                new PdppError(
-                  "api_error",
-                  "Chain authorization could not be verified",
-                ),
-                reqId,
-              ),
-            };
-          }
-          return {
-            error: sendError(
-              c,
-              new PdppError("grant_revoked", decision.reason),
-              reqId,
-            ),
-          };
-        }
+    const admission = await admitBearer(deps.auth, token);
+    try {
+      const read = await admitPdppRead(deps, admission);
+      c.set(
+        "delivery" as never,
+        { lease: read.lease } satisfies DeliveryGate as never,
+      );
+      return { context: read.context };
+    } catch (err) {
+      if (admission.context.active) {
+        await logClientRead(c, admission.context, "unknown", "denied", reqId);
       }
+      return { error: sendLeaseRefusal(c, err, reqId) };
     }
-
-    return { context };
   }
 
   // PDPP-Version negotiation: only PDPP_VERSION is supported in v0.1.
@@ -791,7 +826,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     // depending only on which endpoint it happened to call first. Found by
     // driving Context Gateway's real PdppContextClient against this server.
     if (!context?.active) {
-      return sendError(c, mapInactiveToError(context!), reqId);
+      return sendError(c, mapInactiveToError(context!), reqId, {
+        inactiveBearer: true,
+      });
     }
 
     const ownerInstanceIds =
@@ -823,6 +860,17 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     const reader = reads(context);
     const visibleGrantInstances =
       deps.replicaReads?.("grant").visibleInstanceIds;
+    const instanceIds =
+      context.tokenKind === "owner"
+        ? ownerInstanceIds
+        : [
+            ...new Set(
+              (context.grant?.streams ?? []).flatMap(
+                (grant) => grant.instance_ids,
+              ),
+            ),
+          ];
+    const dependencies = connectionsLease(instanceIds, isConnectionAvailable);
     const visibleStreams =
       context.tokenKind === "owner"
         ? reader.listStreams(ownerInstanceIds).map((s) => ({
@@ -861,33 +909,37 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       .filter((s) => s.budgetExhausted)
       .map((s) => s.name);
 
-    return c.json(
-      {
-        object: "list",
-        data: visibleStreams.map((s) => ({
-          object: "stream",
-          name: s.name,
-          record_count: s.recordCount,
-          last_updated: s.lastUpdated,
-          ...(s.confirmation && { confirmation: s.confirmation }),
-          ...(s.status && { visibility: s.visibility, status: s.status }),
-        })),
-        ...(cappedStreams.length > 0 && {
-          meta: {
-            warnings: [
-              {
-                code: "record_count_not_counted",
-                // Machine-readable: clients must not parse the prose to learn
-                // which streams were truncated.
-                streams: cappedStreams,
-                message: `record_count is null for ${cappedStreams.join(", ")}: more than ${STREAM_COUNT_CAP} grant-visible records, or the scan budget was reached`,
-              },
-            ],
-          },
-        }),
-      },
-      200,
-      { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+    return released(
+      c,
+      c.json(
+        {
+          object: "list",
+          data: visibleStreams.map((s) => ({
+            object: "stream",
+            name: s.name,
+            record_count: s.recordCount,
+            last_updated: s.lastUpdated,
+            ...(s.confirmation && { confirmation: s.confirmation }),
+            ...(s.status && { visibility: s.visibility, status: s.status }),
+          })),
+          ...(cappedStreams.length > 0 && {
+            meta: {
+              warnings: [
+                {
+                  code: "record_count_not_counted",
+                  // Machine-readable: clients must not parse the prose to learn
+                  // which streams were truncated.
+                  streams: cappedStreams,
+                  message: `record_count is null for ${cappedStreams.join(", ")}: more than ${STREAM_COUNT_CAP} grant-visible records, or the scan budget was reached`,
+                },
+              ],
+            },
+          }),
+        },
+        200,
+        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+      ),
+      dependencies,
     );
   });
 
@@ -899,11 +951,12 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     try {
       parseRecordQuery(c.req.url, "streamMetadata");
       const stream = c.req.param("stream");
-      const { declaration, ownerInstanceIds } = readDeclaration(
-        context!,
-        stream,
-      );
-      const scope = resolveReadScope(context!, stream, declaration);
+      const {
+        declaration,
+        scope,
+        instanceIds: ownerInstanceIds,
+        dependencies,
+      } = selectStreamRead(context!, stream);
 
       if (context!.tokenKind === "owner" && ownerInstanceIds.length === 0) {
         throw new PdppError(
@@ -913,7 +966,34 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       }
 
       if (context!.tokenKind === "owner") {
-        return c.json(
+        return released(
+          c,
+          c.json(
+            {
+              object: "stream_metadata",
+              name: declaration!.name,
+              primary_key: declaration!.primaryKey,
+              cursor_field: declaration!.cursorField,
+              consent_time_field: declaration!.consentTimeField ?? null,
+              query: {},
+              views: [],
+              relationships: [],
+              // §8 owner metadata carries the full declared schema and
+              // selection capability. Omitting them made this a public response
+              // contract mismatch that access-behavior fixtures could not see.
+              schema: declaration!.schema ?? null,
+              selection: declaration!.selection ?? null,
+            },
+            200,
+            { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+          ),
+          dependencies,
+        );
+      }
+
+      return released(
+        c,
+        c.json(
           {
             object: "stream_metadata",
             name: declaration!.name,
@@ -923,38 +1003,19 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             query: {},
             views: [],
             relationships: [],
-            // §8 owner metadata carries the full declared schema and
-            // selection capability. Omitting them made this a public response
-            // contract mismatch that access-behavior fixtures could not see.
-            schema: declaration!.schema ?? null,
+            // Grant-closed: the declared schema projected to exactly the
+            // granted fields, so a client token learns record shape without
+            // learning the existence of fields it was not granted. Falls back
+            // to bare field names when the retained declaration carries no
+            // schema, rather than fabricating one.
+            schema: projectSchemaToFields(declaration!.schema, scope.fields),
+            // The frozen selection capability the grant was resolved against.
             selection: declaration!.selection ?? null,
           },
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
-        );
-      }
-
-      return c.json(
-        {
-          object: "stream_metadata",
-          name: declaration!.name,
-          primary_key: declaration!.primaryKey,
-          cursor_field: declaration!.cursorField,
-          consent_time_field: declaration!.consentTimeField ?? null,
-          query: {},
-          views: [],
-          relationships: [],
-          // Grant-closed: the declared schema projected to exactly the
-          // granted fields, so a client token learns record shape without
-          // learning the existence of fields it was not granted. Falls back
-          // to bare field names when the retained declaration carries no
-          // schema, rather than fabricating one.
-          schema: projectSchemaToFields(declaration!.schema, scope.fields),
-          // The frozen selection capability the grant was resolved against.
-          selection: declaration!.selection ?? null,
-        },
-        200,
-        { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        ),
+        dependencies,
       );
     } catch (err) {
       return sendError(
@@ -978,21 +1039,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
       const stream = c.req.param("stream");
 
-      const { declaration, ownerInstanceIds } = readDeclaration(
-        context!,
-        stream,
-      );
-      const scope = resolveReadScope(
-        context!,
-        stream,
-        declaration,
-        query.fields,
-      );
-      const effectiveInstanceIds =
-        context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
-      if (context!.tokenKind === "client") {
-        requireRegisteredConnections(effectiveInstanceIds);
-      }
+      const {
+        scope,
+        instanceIds: effectiveInstanceIds,
+        dependencies,
+      } = selectStreamRead(context!, stream, query.fields);
       if (context!.tokenKind === "owner" && effectiveInstanceIds.length === 0) {
         throw new PdppError(
           "grant_stream_not_allowed",
@@ -1085,7 +1136,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
         );
-        await logClientRead(c, context, stream, "completed", reqId);
+        logReadAtDelivery(c, context, stream, reqId);
+        released(c, response, dependencies);
         return response;
       }
 
@@ -1122,8 +1174,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
-      await logClientRead(c, context, stream, "completed", reqId);
-      return response;
+      logReadAtDelivery(c, context, stream, reqId);
+      return released(c, response, dependencies);
     } catch (err) {
       const mapped = mapAndLog(
         deps,
@@ -1162,22 +1214,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       // narrower thing happened instead.
       const stream = c.req.param("stream");
       const recordKey = decodeURIComponent(c.req.param("id"));
-      const { declaration, ownerInstanceIds } = readDeclaration(
-        context!,
-        stream,
-      );
-      const scope = resolveReadScope(
-        context!,
-        stream,
-        declaration,
-        query.fields,
-      );
-
-      const effectiveInstanceIds =
-        context!.tokenKind === "owner" ? ownerInstanceIds : scope.instanceIds;
-      if (context!.tokenKind === "client") {
-        requireRegisteredConnections(effectiveInstanceIds);
-      }
+      const {
+        scope,
+        instanceIds: effectiveInstanceIds,
+        dependencies,
+      } = selectStreamRead(context!, stream, query.fields);
 
       if (!recordKeyWithinGrantResources(recordKey, scope.streamGrant)) {
         throw new PdppError("not_found", "Record not found");
@@ -1218,8 +1259,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         200,
         { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
       );
-      await logClientRead(c, context, stream, "completed", reqId);
-      return response;
+      logReadAtDelivery(c, context, stream, reqId);
+      return released(c, response, dependencies);
     } catch (err) {
       const mapped = mapAndLog(
         deps,

@@ -8,6 +8,7 @@
  * the methods it calls, which is not the property that matters.
  */
 
+import Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -491,4 +492,37 @@ describe("§10 — tokens are not stored in plaintext", () => {
     expect(record!.tokenHash).not.toBe(issued.issued.access_token);
     expect(record!.tokenHash).toMatch(/^[0-9a-f]{64}$/);
   });
+});
+
+describe("persisted client expiration", () => {
+  it.each([null, "not-a-date"])(
+    "fails closed for stored expiration %s",
+    (expiresAt) => {
+      const { code } = seedGrant("continuous");
+      const issued = redeem(code);
+      expect(issued.ok).toBe(true);
+      if (!issued.ok) return;
+      const db = new Database(join(dir, "auth.db"));
+      db.prepare("UPDATE pdpp_access_tokens SET expires_at = ?").run(expiresAt);
+      db.close();
+      expect(tokens.resolveToken(issued.issued.access_token)).toEqual({
+        active: false,
+        inactiveReason: "expired",
+      });
+      expect(tokens.introspect(issued.issued.access_token)).toEqual({
+        active: false,
+      });
+    },
+  );
+});
+
+describe("client access-token lifetime policy", () => {
+  it.each([NaN, Infinity, -Infinity, 0, -1, Number.MAX_VALUE])(
+    "rejects invalid TTL %s at construction",
+    (accessTokenTtlSeconds) => {
+      expect(
+        () => new PdppTokenService(store, { accessTokenTtlSeconds }),
+      ).toThrow(/positive finite/);
+    },
+  );
 });

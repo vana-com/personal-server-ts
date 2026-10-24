@@ -60,6 +60,7 @@ import type {
 } from "../storage/pdpp-records/index.js";
 import { computeRecordKeyFromData } from "../storage/pdpp-records/record-key.js";
 import type { Logger } from "../logger/index.js";
+import { LINEAGE_KEY, readStoredLineage } from "../lineage/lineage.js";
 
 /** The reserved key carrying PDPP import metadata inside `data`. */
 export const PDPP_METADATA_KEY = "$pdpp";
@@ -289,6 +290,136 @@ export function normalizeDigest(claimed: string): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Producer stamps that mark an envelope as PDPP-origin. The first two are
+ * asserted by the owner's PDPP pipelines over HTTP. `pdpp-derivative` is
+ * server-only: the derivative compute stamps it on an answer whose sources
+ * include PDPP-origin data, so the answer cannot leave through a legacy grant.
+ */
+export const PDPP_PRODUCERS = [
+  "pdpp-projector",
+  "pdpp-import-projection",
+  "pdpp-derivative",
+] as const;
+export type PdppProducer = (typeof PDPP_PRODUCERS)[number];
+
+export function isPdppProducer(value: unknown): value is PdppProducer {
+  return (PDPP_PRODUCERS as readonly unknown[]).includes(value);
+}
+
+/**
+ * The producer stamps of a legacy-format projection of PDPP data: the owner's
+ * pipelines assert them, and the legacy projection view stamps them on what it
+ * serves. Only the owner may assert one, so a non-owner write never has it.
+ */
+export const PDPP_PROJECTION_PRODUCERS = [
+  "pdpp-projector",
+  "pdpp-import-projection",
+] as const;
+
+export function isPdppProjectionProducer(value: unknown): boolean {
+  return (PDPP_PROJECTION_PRODUCERS as readonly unknown[]).includes(value);
+}
+
+/**
+ * Version of the provenance classifier (`hasPdppOrigin`). A block manifest
+ * records the version that classified it, and a non-owner trusts the recorded
+ * `pdppOrigin` only when that version is current. Bump it whenever the
+ * classification rules change: older sidecars are then re-classified on the
+ * bytes instead of trusted. 1 = before derivatives stated their origin.
+ */
+export const PDPP_CLASSIFIER_VERSION = 2;
+
+/**
+ * A derivative output (it carries `$lineage`) must state its origin. Only the
+ * server's write path stamps `origin: "legacy"`, and only when every input was
+ * known to be legacy. A derivative without that statement (written before the
+ * statement existed, or malformed) is PDPP-origin until it is recomputed.
+ */
+function derivativeLacksLegacyOrigin(data: unknown): boolean {
+  if (!isRecord(data) || !(LINEAGE_KEY in data)) return false;
+  try {
+    // A well-formed stamp only: a marker on a malformed `$lineage` fails closed.
+    return readStoredLineage(data)?.origin !== "legacy";
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Immutable PDPP provenance at storage publication. Native metadata (including
+ * malformed claims), owner-stamped PDPP producers and derivatives that do not
+ * state a legacy origin require grant-bound reads. Nested phone `{records}`
+ * metadata is ordinary legacy compatibility.
+ */
+export function hasPdppOrigin(
+  envelope:
+    | {
+        data: unknown;
+        producer?: unknown;
+      }
+    | undefined,
+): boolean {
+  return (
+    envelope !== undefined &&
+    (isPdppProducer(envelope.producer) ||
+      readMetadata(envelope.data) !== null ||
+      derivativeLacksLegacyOrigin(envelope.data))
+  );
+}
+
+/**
+ * True when an envelope is the legacy-format projection of PDPP data and
+ * nothing else: a projection producer stamp, no native `$pdpp` metadata (which
+ * is canonical data in its own format), and no derivative that lacks a legacy
+ * origin. A legacy chain grant that covers the scope may read it. This is the
+ * only PDPP-origin body a chain grant may receive.
+ */
+export function isLegacyProjectionBody(envelope: {
+  data: unknown;
+  producer?: unknown;
+}): boolean {
+  return (
+    isPdppProjectionProducer(envelope.producer) &&
+    readMetadata(envelope.data) === null &&
+    !derivativeLacksLegacyOrigin(envelope.data)
+  );
+}
+
+/**
+ * True when an envelope may feed the legacy projection of a scope a chain
+ * grant covers: not PDPP-origin at all, or PDPP data in its own form (valid
+ * native `$pdpp` metadata) or a projection body. A derivative, a body no
+ * pipeline owns (a non-owner publication) and malformed native metadata are
+ * not inputs: they would launder data into a view the grant covers.
+ */
+export function isProjectionInput(envelope: {
+  data: unknown;
+  producer?: unknown;
+}): boolean {
+  if (!hasPdppOrigin(envelope)) return true;
+  if (envelope.producer === "pdpp-derivative") return false;
+  if (derivativeLacksLegacyOrigin(envelope.data)) return false;
+  // Native metadata must be valid; a projection stamp does not excuse a
+  // malformed claim. A projection body carries no native metadata at all.
+  const metadata = readMetadata(envelope.data);
+  if (metadata !== null) return metadata.ok;
+  return isPdppProjectionProducer(envelope.producer);
+}
+
+/**
+ * Origin of one input an owner-authority transform reads: the index row or the
+ * bytes read, whichever says PDPP. Every such transform combines the origin of
+ * ALL its inputs with this one function and passes the result to the single
+ * publication point (`ingestDataContract`), which stamps the output.
+ */
+export function inputHasPdppOrigin(
+  entry: { pdppOrigin?: boolean } | undefined,
+  envelope: { data: unknown; producer?: unknown } | undefined,
+): boolean {
+  return entry?.pdppOrigin === true || hasPdppOrigin(envelope);
 }
 
 /**

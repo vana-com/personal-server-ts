@@ -34,7 +34,11 @@ import {
 } from "../issues.js";
 import { downloadRetryKey, type DownloadRetryMemory } from "../retry-memory.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
-import { isPermanentRejection, type PdppImporter } from "../pdpp-import.js";
+import {
+  isPdppProducer,
+  isPermanentRejection,
+  type PdppImporter,
+} from "../pdpp-import.js";
 import { recordStoredVersion } from "../../additions/ledger-store.js";
 
 /**
@@ -453,8 +457,7 @@ export async function downloadOne(
     schemaId: ctx.schemaId,
     dataPointId: record.id,
     version: expectedVersion,
-    ...(envelope.producer === "pdpp-projector" ||
-    envelope.producer === "pdpp-import-projection"
+    ...(isPdppProducer(envelope.producer)
       ? { producer: envelope.producer }
       : {}),
     ...(envelope.producer_provenance &&

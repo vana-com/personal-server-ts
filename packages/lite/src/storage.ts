@@ -1,3 +1,8 @@
+import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
+import {
+  canonicalJson,
+  envelopeGeneration,
+} from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   DataBlockManifest,
@@ -6,9 +11,7 @@ import type {
 import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import {
   DataBlockStorageError,
-  encodeDataBlockCursor,
-  selectScopeBlocksByIds,
-  validateDataBlockCursor,
+  readManifestScopeBlocks,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -97,9 +100,6 @@ export interface IndexedDbPsLitePersistenceOptions {
 const DEFAULT_INDEXED_DB_NAME = "personal-server-lite-storage";
 const DEFAULT_INDEXED_DB_STORE = "state";
 const DEFAULT_INDEXED_DB_KEY = "data-storage-v1";
-const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 function schemaIdFromEnvelope(envelope: DataFileEnvelope): string | undefined {
   const schemaId = (envelope as { schemaId?: unknown }).schemaId;
@@ -470,6 +470,39 @@ export function createIndexedDbPsLitePersistence(
   };
 }
 
+/** Publications in this realm when the Web Locks API is not available. */
+const realmPublications = new Map<string, Promise<unknown>>();
+
+/**
+ * Run a compare-and-publish of one version path exclusively, across every
+ * storage instance that shares the file store: other tabs and workers through
+ * the Web Locks API, other instances in this realm through a shared chain.
+ * The comparison inside reads the file store, never one instance's memory.
+ */
+function withPublicationLock<T>(
+  path: string,
+  publish: () => Promise<T>,
+): Promise<T> {
+  const locks = (
+    globalThis as {
+      navigator?: {
+        locks?: {
+          request<R>(name: string, callback: () => Promise<R>): Promise<R>;
+        };
+      };
+    }
+  ).navigator?.locks;
+  if (locks) return locks.request(`ps-lite:publish:${path}`, publish);
+  const previous = realmPublications.get(path) ?? Promise.resolve();
+  const next = previous.then(publish, publish);
+  const settled = next.catch(() => undefined);
+  realmPublications.set(path, settled);
+  void settled.then(() => {
+    if (realmPublications.get(path) === settled) realmPublications.delete(path);
+  });
+  return next;
+}
+
 export async function createPersistentPsLiteStorage(
   adapter: PsLiteStorageAdapter,
   persistence: PsLitePersistenceAdapter = createIndexedDbPsLitePersistence(),
@@ -542,6 +575,37 @@ export async function createPersistentPsLiteStorage(
     await write;
   }
 
+  async function readPublishedEnvelope(
+    path: string,
+  ): Promise<DataFileEnvelope | null> {
+    return (
+      (await fileStore.readEnvelope(path)) ??
+      (fileStore === fallbackStore
+        ? null
+        : await fallbackStore.readEnvelope(path))
+    );
+  }
+
+  /**
+   * PDPP provenance and generation of the bytes at a version path, both from
+   * one read; empty if unreadable.
+   */
+  async function identityOfPublishedBytes(
+    path: string,
+  ): Promise<{ pdppOrigin?: boolean; generation?: string }> {
+    try {
+      const envelope = await readPublishedEnvelope(path);
+      return envelope
+        ? {
+            pdppOrigin: hasPdppOrigin(envelope),
+            generation: envelopeGeneration(envelope),
+          }
+        : {};
+    } catch {
+      return {};
+    }
+  }
+
   function entriesForScope(scope: string): IndexEntry[] {
     return sortEntries(state.entries.filter((entry) => entry.scope === scope));
   }
@@ -584,18 +648,40 @@ export async function createPersistentPsLiteStorage(
       return envelope;
     },
 
+    /**
+     * Publish a version without replacing one. A version path names
+     * immutable bytes: readers authorize the version they selected, including
+     * its PDPP provenance, before reading the path. The same envelope, in any
+     * key order, republishes idempotently (this also moves an IndexedDB
+     * fallback copy into OPFS); a different envelope fails.
+     */
     async writeEnvelope(envelope): Promise<WriteResult> {
       const path = envelopePath(envelope.scope, envelope.collectedAt);
-      const sizeBytes = await fileStore.writeEnvelope(path, envelope);
-      if (fileStore.kind !== "indexeddb") {
-        await fallbackStore.deleteEnvelope(path);
-      }
-      await persist();
-      return {
-        path,
-        relativePath: path,
-        sizeBytes,
-      };
+      return withPublicationLock(path, async () => {
+        const published = await readPublishedEnvelope(path);
+        // An index row whose bytes were lost still names its version: new
+        // bytes may restore it only with the provenance the row records.
+        const indexed = state.entries.find((entry) => entry.path === path);
+        if (
+          (published && canonicalJson(published) !== canonicalJson(envelope)) ||
+          (indexed?.pdppOrigin !== undefined &&
+            indexed.pdppOrigin !== hasPdppOrigin(envelope))
+        ) {
+          throw new Error(
+            `Stored envelope conflicts with publication at ${path}`,
+          );
+        }
+        const sizeBytes = await fileStore.writeEnvelope(path, envelope);
+        if (fileStore.kind !== "indexeddb") {
+          await fallbackStore.deleteEnvelope(path);
+        }
+        await persist();
+        return {
+          path,
+          relativePath: path,
+          sizeBytes,
+        };
+      });
     },
 
     async readScopeBlocks(scope, collectedAt, options) {
@@ -636,120 +722,32 @@ export async function createPersistentPsLiteStorage(
         }
       }
 
-      if (options.blockIds?.length) {
-        const selection = await selectScopeBlocksByIds(
-          manifest,
-          options.blockIds,
-          { maxBytes: options.maxBytes },
-          async (blockId) =>
-            inMemoryBlocks?.find((candidate) => candidate.id === blockId) ??
-            (await readBlockPayloadFromStores(
-              fileStore,
-              fallbackStore,
-              blockPayloadPath(scope, collectedAt, blockId),
-            )),
-        );
-        return {
-          scope: manifest.scope,
-          collectedAt: manifest.collectedAt,
-          ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
-          contentKind: manifest.contentKind,
-          blocks: selection.blocks,
-          warnings: [...manifest.warnings, ...selection.warnings],
-        };
-      }
-
-      const cursorResult = options.cursor
-        ? validateDataBlockCursor(options.cursor, { scope, collectedAt })
-        : { ok: true as const, cursor: null };
-      if (!cursorResult.ok) {
-        throw new DataBlockStorageError(
-          "cursor_invalid",
-          cursorResult.error.message,
-        );
-      }
-
-      const maxBytes = Math.max(1, options.maxBytes);
-      const startIndex = cursorResult.cursor?.blockIndex ?? 0;
-      const startOffset = cursorResult.cursor?.intraBlockOffset ?? 0;
-      const blocks: DataScopeBlock[] = [];
-      let bytes = 0;
-      let nextIndex = startIndex;
-      let nextOffset: number | undefined;
-
-      while (nextIndex < manifest.blocks.length) {
-        const ref = manifest.blocks[nextIndex];
-        if (!ref) {
-          nextIndex += 1;
-          continue;
-        }
-        const offset = nextIndex === startIndex ? startOffset : 0;
-        if (offset >= ref.sizeBytes) {
-          nextIndex += 1;
-          continue;
-        }
+      const load = async (id: string) =>
+        inMemoryBlocks?.find((b) => b.id === id) ??
+        (await readBlockPayloadFromStores(
+          fileStore,
+          fallbackStore,
+          blockPayloadPath(scope, collectedAt, id),
+        ));
+      try {
+        return await readManifestScopeBlocks(manifest, load, options);
+      } catch (error) {
         if (
-          blocks.length > 0 &&
-          offset === 0 &&
-          bytes + ref.sizeBytes > maxBytes
-        ) {
-          break;
-        }
-        const block =
-          inMemoryBlocks?.find((candidate) => candidate.id === ref.id) ??
-          (await readBlockPayloadFromStores(
-            fileStore,
-            fallbackStore,
-            blockPayloadPath(scope, collectedAt, ref.id),
-          ));
-        if (!block) {
-          const envelope = await storagePort.readEnvelope(scope, collectedAt);
-          const rebuilt = await buildDataBlocksAsync({
-            scope,
-            collectedAt,
-            schemaId: schemaIdFromEnvelope(envelope),
-            content: envelope,
-          });
-          manifest = rebuilt.manifest;
-          inMemoryBlocks = rebuilt.blocks;
-          nextIndex = startIndex;
-          nextOffset = undefined;
-          bytes = 0;
-          blocks.length = 0;
-          continue;
-        }
-        const page = pageBlock(block, offset, maxBytes - bytes);
-        blocks.push(page.block);
-        bytes += page.block.sizeBytes;
-
-        if (page.nextOffset !== undefined) {
-          nextOffset = page.nextOffset;
-          break;
-        }
-
-        nextIndex += 1;
+          !(error instanceof DataBlockStorageError) ||
+          error.code !== "block_payload_not_found"
+        )
+          throw error;
+        const envelope = await storagePort.readEnvelope(scope, collectedAt);
+        const built = await buildDataBlocksAsync({
+          scope,
+          collectedAt,
+          schemaId: schemaIdFromEnvelope(envelope),
+          content: envelope,
+        });
+        inMemoryBlocks = built.blocks;
+        // Same cursor is validated against the rebuilt representation before any offsets are consumed.
+        return readManifestScopeBlocks(built.manifest, load, options);
       }
-
-      return {
-        scope: manifest.scope,
-        collectedAt: manifest.collectedAt,
-        ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
-        contentKind: manifest.contentKind,
-        blocks,
-        ...(nextOffset !== undefined || nextIndex < manifest.blocks.length
-          ? {
-              nextCursor: encodeDataBlockCursor({
-                scope,
-                collectedAt,
-                blockIndex: nextIndex,
-                ...(nextOffset === undefined
-                  ? {}
-                  : { intraBlockOffset: nextOffset }),
-              }),
-            }
-          : {}),
-        warnings: manifest.warnings,
-      };
     },
 
     async readBlockManifest(scope, collectedAt) {
@@ -838,6 +836,15 @@ export async function createPersistentPsLiteStorage(
     },
 
     async insertEntry(entry) {
+      // Storage derives provenance and generation from the bytes it
+      // published; a caller's values are never trusted. The row is indexed
+      // first, synchronously, so index writes keep their order; its identity
+      // follows from the read.
+      const {
+        pdppOrigin: _callerOrigin,
+        generation: _callerGeneration,
+        ...callerEntry
+      } = entry;
       const version =
         entry.version ??
         state.entries.reduce(
@@ -846,7 +853,7 @@ export async function createPersistentPsLiteStorage(
           0,
         ) + 1;
       const indexed: IndexEntry = {
-        ...entry,
+        ...callerEntry,
         schemaId: entry.schemaId ?? null,
         version,
         dataPointId: entry.dataPointId ?? null,
@@ -862,8 +869,59 @@ export async function createPersistentPsLiteStorage(
           indexed,
         ],
       };
+      const identity = await identityOfPublishedBytes(entry.path);
+      if (identity.pdppOrigin !== undefined) {
+        state = {
+          ...state,
+          entries: state.entries.map((item) =>
+            item.path === entry.path && item.id === indexed.id
+              ? { ...item, ...identity }
+              : item,
+          ),
+        };
+      }
       await persist();
-      return indexed;
+      return identity.pdppOrigin === undefined
+        ? indexed
+        : { ...indexed, ...identity };
+    },
+
+    async backfillGeneration(entry) {
+      if (entry.generation) return entry.generation;
+      const swap = (expected: string | null, next: string | null) => {
+        let swapped = false;
+        state = {
+          ...state,
+          entries: state.entries.map((item) => {
+            if (
+              item.id !== entry.id ||
+              (item.generation ?? null) !== expected
+            ) {
+              return item;
+            }
+            swapped = true;
+            const { generation: _previous, ...rest } = item;
+            return next === null ? rest : { ...rest, generation: next };
+          }),
+        };
+        return swapped;
+      };
+      const first = (await identityOfPublishedBytes(entry.path)).generation;
+      if (!first) return undefined;
+      if (!swap(null, first)) {
+        const current = state.entries.find((item) => item.id === entry.id);
+        return current?.generation;
+      }
+      // The bytes are read again: a version replaced between the two reads
+      // is not recorded.
+      const second = (await identityOfPublishedBytes(entry.path)).generation;
+      if (second !== first) {
+        swap(first, null);
+        await persist();
+        return undefined;
+      }
+      await persist();
+      return first;
     },
 
     async updateFileId(path, fileId) {
@@ -1116,37 +1174,6 @@ async function readPreviewFromFileStore(
   maxBytes: number,
 ): Promise<{ text: string; truncated: boolean } | null> {
   return (await store.readEnvelopePreview?.(path, { maxBytes })) ?? null;
-}
-
-function pageBlock(
-  block: DataScopeBlock,
-  offsetBytes: number,
-  maxBytes: number,
-): { block: DataScopeBlock; nextOffset?: number } {
-  const text =
-    typeof block.value === "string" ? block.value : JSON.stringify(block.value);
-  const bytes = textEncoder.encode(text);
-  if (offsetBytes <= 0 && bytes.length <= maxBytes) {
-    return { block };
-  }
-
-  const start = Math.min(Math.max(0, offsetBytes), bytes.length);
-  const end = Math.min(bytes.length, start + Math.max(1, maxBytes));
-  const value = textDecoder.decode(bytes.slice(start, end));
-
-  return {
-    block: {
-      ...block,
-      path: `${block.path}[bytes ${start}:${end}]`,
-      mediaType: block.mediaType.startsWith("text/")
-        ? block.mediaType
-        : TEXT_PAGE_MEDIA_TYPE,
-      value,
-      sizeBytes: end - start,
-      truncated: end < bytes.length,
-    },
-    ...(end < bytes.length ? { nextOffset: end } : {}),
-  };
 }
 
 async function readBlockPayloadFromStores(

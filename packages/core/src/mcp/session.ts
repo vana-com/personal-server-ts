@@ -17,10 +17,7 @@ import { generateMcpGrantee } from "./grantee.js";
 import { hashConnectionToken } from "./connection-api.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { ServerAccount } from "../keys/server-account.js";
-import {
-  resolveDataListGrantScopes,
-  verifyDataReadPolicy,
-} from "../policy/data-read.js";
+import { authorizeDataList, authorizeDataRead } from "../policy/data-read.js";
 import type {
   AuthSessionVerifierPort,
   GrantVerifierPort,
@@ -314,7 +311,7 @@ export function createMcpSessionAuthPort(params: {
     },
     async authorizeBuilderList() {
       // The session builder lists only what the session grant covers.
-      const grantedScopes = await resolveDataListGrantScopes(
+      const { grantedScopes, lease: listLease } = await authorizeDataList(
         {
           signer: params.builderAddress,
           grantId: params.grantId,
@@ -326,10 +323,10 @@ export function createMcpSessionAuthPort(params: {
           runtimeAvailability: params.runtimeAvailability,
         },
       );
-      return { grantedScopes };
+      return { grantedScopes, lease: listLease };
     },
     async authorizeBuilderRead(input: PersonalServerReadAuthInput) {
-      const grant = await verifyDataReadPolicy(
+      const { grant, lease } = await authorizeDataRead(
         {
           signer: params.builderAddress,
           grantId: params.grantId,
@@ -397,7 +394,7 @@ export function createMcpSessionAuthPort(params: {
         // cycle.kind === "ok" — payment settled; proceed to read.
       }
 
-      return { builder: params.builderAddress, grantId: grant.id };
+      return { builder: params.builderAddress, grantId: grant.id, lease };
     },
   };
 }

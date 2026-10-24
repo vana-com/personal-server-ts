@@ -2,6 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { createMemoryDataStorage } from "../test-utils/memory-storage.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
 import { readStoredLineage } from "../lineage/lineage.js";
+import { withLegacyProjection } from "../storage/legacy-projection.js";
+import { withDisclosurePolicy } from "../storage/disclosure-policy.js";
+import { readEvidence } from "../storage/read-evidence.js";
 import { ingestDataContract } from "../contracts/data.js";
 import { computeQuestion, type QuestionComputeDeps } from "./compute.js";
 import {
@@ -144,8 +147,10 @@ describe("computeQuestion", () => {
       computeDataPointId(OWNER, "chatgpt.conversations"),
     ];
     expect(readStoredLineage(envelope.data)).toEqual({
+      kind: "computed-question",
       sources: expectedIds,
       writtenAt: "2026-08-27T12:00:00.000Z",
+      origin: "legacy",
     });
     expect(envelope.data).toMatchObject({
       questionId: "q-1",
@@ -288,6 +293,100 @@ describe("computeQuestion", () => {
       status: "failed",
     });
     expect(fakeCalls(writeOnly)).toHaveLength(0);
+  });
+
+  it("blocks builder inference from a PDPP-projected source while owner compute can read it", async () => {
+    const builder = deps({
+      store: createInMemoryQuestionStore({ initial: [builderRegistration()] }),
+      writePolicyPorts: policyPorts([
+        "write:coach.weekly",
+        "oura.sleep",
+        "chatgpt.conversations",
+      ]),
+    });
+    await seed(builder.storage, "oura.sleep", { secret: "projected" });
+    await seed(builder.storage, "chatgpt.conversations", { items: [] });
+    const readBuilderSource = vi.spyOn(builder.storage, "readEnvelope");
+    builder.storage.findEntry({ scope: "oura.sleep" })!.pdppOrigin = true;
+
+    const builderOutcome = await computeQuestion("q-1", builder);
+
+    expect(builderOutcome.status).toBe("failed");
+    expect(fakeCalls(builder)).toHaveLength(0);
+    expect(readBuilderSource).not.toHaveBeenCalled();
+
+    const owner = deps();
+    await seed(owner.storage, "oura.sleep", { score: 80 });
+    await seed(owner.storage, "chatgpt.conversations", { items: [] });
+    const readOwnerSource = vi.spyOn(owner.storage, "readEnvelope");
+    owner.storage.findEntry({ scope: "oura.sleep" })!.pdppOrigin = true;
+
+    const ownerOutcome = await computeQuestion("q-1", owner);
+
+    expect(ownerOutcome.status).toBe("ready");
+    expect(fakeCalls(owner)).toHaveLength(1);
+    expect(readOwnerSource).toHaveBeenCalledWith(
+      "oura.sleep",
+      "2026-08-20T00:00:00Z",
+    );
+  });
+
+  it("stamps the derived record pdpp-derivative only when a source has PDPP origin", async () => {
+    const pdpp = deps();
+    await seed(pdpp.storage, "oura.sleep", { score: 80 });
+    await seed(pdpp.storage, "chatgpt.conversations", { items: [] });
+    pdpp.storage.findEntry({ scope: "oura.sleep" })!.pdppOrigin = true;
+    expect((await computeQuestion("q-1", pdpp)).status).toBe("ready");
+    expect(pdpp.storage.findEntry({ scope: "coach.weekly" })).toMatchObject({
+      producer: "pdpp-derivative",
+      pdppOrigin: true,
+    });
+
+    const legacy = deps();
+    await seed(legacy.storage, "oura.sleep", { score: 80 });
+    await seed(legacy.storage, "chatgpt.conversations", { items: [] });
+    expect((await computeQuestion("q-1", legacy)).status).toBe("ready");
+    const entry = legacy.storage.findEntry({ scope: "coach.weekly" });
+    expect(entry?.producer ?? null).toBeNull();
+    expect(entry?.pdppOrigin).toBeFalsy();
+  });
+
+  it("publishes a builder-registered question as PDPP-origin unless the server has no PDPP surface", async () => {
+    const ports = policyPorts([
+      "write:coach.weekly",
+      "oura.sleep",
+      "chatgpt.conversations",
+    ]);
+    const stampFor = async (pdppEnabled: boolean | undefined) => {
+      const d = deps({
+        store: createInMemoryQuestionStore({
+          initial: [builderRegistration()],
+        }),
+        writePolicyPorts: ports,
+        ...(pdppEnabled === undefined ? {} : { pdppEnabled }),
+      });
+      await seed(d.storage, "oura.sleep", { score: 80 });
+      await seed(d.storage, "chatgpt.conversations", { items: [] });
+      expect((await computeQuestion("q-1", d)).status).toBe("ready");
+      return d.storage.findEntry({ scope: "coach.weekly" });
+    };
+    // Legacy-only sources, builder question text: still PDPP when enabled or unknown.
+    expect(await stampFor(true)).toMatchObject({
+      producer: "pdpp-derivative",
+      pdppOrigin: true,
+    });
+    expect(await stampFor(undefined)).toMatchObject({ pdppOrigin: true });
+    expect((await stampFor(false))?.pdppOrigin).toBeFalsy();
+  });
+
+  it("keeps owner compute over legacy sources legacy even on a PDPP-enabled server", async () => {
+    const d = deps({ pdppEnabled: true });
+    await seed(d.storage, "oura.sleep", { score: 80 });
+    await seed(d.storage, "chatgpt.conversations", { items: [] });
+    expect((await computeQuestion("q-1", d)).status).toBe("ready");
+    expect(d.storage.findEntry({ scope: "coach.weekly" })?.pdppOrigin).toBe(
+      false,
+    );
   });
 
   it("fails closed for a builder question when no grant verifier is wired", async () => {
@@ -469,6 +568,231 @@ describe("computeQuestion", () => {
     const ok = deps({ store: selfSourcing() });
     await withLineage(ok.storage, "spine.summary", "oura.sleep");
     expect((await computeQuestion("q-1", ok)).status).toBe("ready");
+  });
+
+  it.each([
+    "requested",
+    "joined",
+    "intermediate",
+    "joined-intermediate",
+    "acyclic",
+    "unused-sibling",
+    "malformed",
+    "unreadable",
+  ])(
+    "cycle guard uses stored dependencies behind a projected %s source",
+    async (kind) => {
+      const raw = createMemoryDataStorage();
+      const at = "2026-08-21T00:00:00Z";
+      const put = async (
+        scope: string,
+        data: Record<string, unknown>,
+        from?: string,
+      ) => {
+        const envelope = {
+          version: "1.0",
+          scope,
+          collectedAt: at,
+          data: {
+            ...data,
+            ...(from
+              ? {
+                  $lineage: {
+                    sources: [computeDataPointId(OWNER, from)],
+                    writtenAt: at,
+                    origin: "legacy",
+                  },
+                }
+              : {}),
+          },
+        };
+        const written = await raw.writeEnvelope(envelope);
+        await raw.insertEntry({
+          fileId: null,
+          path: written.relativePath,
+          scope,
+          collectedAt: at,
+          sizeBytes: written.sizeBytes,
+        });
+      };
+      await put("coach.weekly", { answer: "previous-output" });
+      const joined = kind === "joined" || kind === "joined-intermediate";
+      const intermediate =
+        kind === "intermediate" ||
+        kind === "joined-intermediate" ||
+        kind === "unreadable";
+      const from =
+        kind === "acyclic" || kind === "unused-sibling"
+          ? "bank.transactions"
+          : "coach.weekly";
+      await put(
+        "chatgpt.conversations",
+        {
+          records: [
+            {
+              id: "conv-1",
+              title: "Trip",
+              create_time: at,
+              update_time: at,
+              current_node: "m1",
+              message_count_on_current_branch: 1,
+            },
+          ],
+        },
+        joined ? undefined : from,
+      );
+      await put(
+        "chatgpt.messages",
+        {
+          records: [
+            {
+              id: "m1",
+              conversation_id: "conv-1",
+              parent_id: null,
+              role: "user",
+              content: "joined-input",
+              content_type: "text",
+              model_slug: null,
+              create_time: at,
+              on_current_branch: true,
+            },
+          ],
+        },
+        joined ? from : undefined,
+      );
+      if (intermediate)
+        await put(
+          "spine.summary",
+          { answer: "intermediate" },
+          "chatgpt.conversations",
+        );
+      if (kind === "unused-sibling") {
+        const message = await raw.readEnvelope("chatgpt.messages", at);
+        message.data = {
+          notRecords: "unused legacy sibling",
+          $lineage: {
+            sources: [computeDataPointId(OWNER, "coach.weekly")],
+            writtenAt: at,
+            origin: "legacy",
+          },
+        };
+      }
+      if (kind === "malformed") {
+        (await raw.readEnvelope("chatgpt.conversations", at)).data.$lineage = {
+          sources: ["not-an-id"],
+          writtenAt: at,
+        };
+      }
+      if (kind === "unreadable") {
+        const read = raw.readEnvelope.bind(raw);
+        raw.readEnvelope = async (scope, collectedAt) => {
+          if (scope === "chatgpt.conversations")
+            throw new Error("unreadable internal dependency");
+          return read(scope, collectedAt);
+        };
+      }
+      const served = withLegacyProjection(raw);
+      if (kind === "acyclic" || kind === "unused-sibling") {
+        const approved = await withDisclosurePolicy(served).readEnvelope(
+          "chatgpt.conversations",
+          at,
+        );
+        const facts = readEvidence(approved);
+        expect(facts.lineageSources).toEqual([
+          computeDataPointId(OWNER, "bank.transactions"),
+        ]);
+        expect(
+          facts.inputVersions.map((version) => version.scope).sort(),
+        ).toEqual(
+          kind === "unused-sibling"
+            ? ["chatgpt.conversations"]
+            : ["chatgpt.conversations", "chatgpt.messages"],
+        );
+        expect(Object.isFrozen(facts)).toBe(true);
+        expect(Object.isFrozen(facts.lineageSources)).toBe(true);
+        expect(Object.isFrozen(facts.inputVersions)).toBe(true);
+        expect(JSON.stringify(approved)).not.toContain(
+          computeDataPointId(OWNER, "bank.transactions"),
+        );
+      }
+      const d = deps({
+        storage: served,
+        store: createInMemoryQuestionStore({
+          initial: [
+            registration({
+              sourceScopes: [
+                intermediate ? "spine.summary" : "chatgpt.conversations",
+              ],
+            }),
+          ],
+        }),
+      });
+      const outcome = await computeQuestion("q-1", d);
+      console.log(
+        JSON.stringify({
+          probe: "projected-cycle",
+          kind,
+          status: outcome.status,
+          error: (await d.store.get("q-1"))?.error,
+          inferenceCalls: fakeCalls(d).length,
+          versions: raw.countVersions("coach.weekly"),
+        }),
+      );
+      if (kind === "acyclic" || kind === "unused-sibling") {
+        expect(outcome.status).toBe("ready");
+        expect(fakeCalls(d)).toHaveLength(1);
+      } else {
+        expect(outcome.status).toBe("failed");
+        if (kind === "malformed" || kind === "unreadable")
+          expect((await d.store.get("q-1"))?.error).toBeTruthy();
+        else
+          expect((await d.store.get("q-1"))?.error).toMatch(
+            /^DERIVATIVE_CYCLE/,
+          );
+        expect(fakeCalls(d)).toHaveLength(0);
+        expect(raw.countVersions("coach.weekly")).toBe(1);
+      }
+    },
+  );
+
+  it("builder compute receives the grantee presentation of a generated source", async () => {
+    const raw = createMemoryDataStorage();
+    await seed(raw, "bank.transactions", { value: "authorized answer input" });
+    const ownerDeps = deps({
+      storage: raw,
+      store: createInMemoryQuestionStore({
+        initial: [registration({ sourceScopes: ["bank.transactions"] })],
+      }),
+    });
+    expect((await computeQuestion("q-1", ownerDeps)).status).toBe("ready");
+    const d = deps({
+      storage: raw,
+      pdppEnabled: false,
+      store: createInMemoryQuestionStore({
+        initial: [
+          registration({
+            derivedScope: "summary.daily",
+            sourceScopes: ["coach.weekly"],
+            registeredBy: { kind: "builder", builder: BUILDER, grantId: "g-1" },
+          }),
+        ],
+      }),
+      writePolicyPorts: policyPorts(["coach.*", "write:summary.daily"]),
+    });
+    const outcome = await computeQuestion("q-1", d);
+    const prompt = JSON.stringify(fakeCalls(d));
+    console.log(
+      JSON.stringify({
+        probe: "generated-compute-presentation",
+        status: outcome.status,
+        hiddenCoordinates: prompt.includes("bank.transactions"),
+      }),
+    );
+    expect(outcome.status).toBe("ready");
+    expect(prompt).not.toContain("bank.transactions");
+    expect(prompt).not.toContain(
+      computeDataPointId(OWNER, "bank.transactions"),
+    );
   });
 
   it("skips (status untouched) while the runtime is unavailable", async () => {

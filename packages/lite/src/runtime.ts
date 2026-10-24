@@ -44,8 +44,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/derivatives";
 import type { LineageGatewayPort } from "@opendatalabs/personal-server-ts-core/lineage";
 import {
-  resolveDataListGrantScopes,
-  verifyDataReadPolicy,
+  authorizeDataList,
+  authorizeDataRead,
   type DataListPolicyPorts,
   type DataWritePolicyPorts,
 } from "@opendatalabs/personal-server-ts-core/policy";
@@ -638,7 +638,7 @@ export function createWeb3SignedPsLiteAuth(
         throw dataReadPolicyPortsRequired();
       }
       // A builder lists only what its grants from this PS's owner cover.
-      const grantedScopes = await resolveDataListGrantScopes(
+      const { grantedScopes, lease: listLease } = await authorizeDataList(
         {
           signer: auth.auth.signer,
           grantId: auth.auth.payload.grantId ?? listOptions?.grantId,
@@ -646,7 +646,7 @@ export function createWeb3SignedPsLiteAuth(
         },
         options.dataReadPolicyPorts,
       );
-      return { grantedScopes };
+      return { grantedScopes, lease: listLease };
     },
     async authorizeBuilderRead(input) {
       const auth = await authenticatePsLiteRequest(input.request, options);
@@ -659,7 +659,7 @@ export function createWeb3SignedPsLiteAuth(
       if (!options.dataReadPolicyPorts) {
         throw dataReadPolicyPortsRequired();
       }
-      const grant = await verifyDataReadPolicy(
+      const { grant, lease } = await authorizeDataRead(
         {
           signer: auth.auth.signer,
           grantId: auth.auth.payload.grantId ?? input.grantId,
@@ -671,7 +671,7 @@ export function createWeb3SignedPsLiteAuth(
         },
         options.dataReadPolicyPorts,
       );
-      return { builder: auth.auth.signer, grantId: grant.id };
+      return { builder: auth.auth.signer, grantId: grant.id, lease };
     },
   };
 }
@@ -1148,6 +1148,8 @@ export function createPsLiteRuntime(
               serverOwner: options.serverOwner,
               serverSigner: x402ServerSigner,
               lineageGateway: options.lineageGateway,
+              // Lite has no PDPP surface, so no writer can hold PDPP data.
+              pdppEnabled: false,
               // A new local version marks every question that reads the
               // scope stale; the recompute waits for a reader.
               onDataWritten: options.derivatives
@@ -1330,6 +1332,7 @@ export function createPsLiteRuntime(
             dataStorage,
             accessLogWriter,
             readFulfillmentReporter: options.readFulfillmentReporter,
+            scopeDeletions: options.scopeDeletions,
             now,
             runtimeAvailability: { isAvailable: () => active },
             serverOrigin: url.origin,
@@ -1372,6 +1375,8 @@ async function handleMcpRoute(input: {
   dataStorage: DataStoragePort;
   accessLogWriter: AccessLogWriter;
   readFulfillmentReporter?: PersonalServerReadFulfillmentReporter;
+  /** The tracker `/v1/data` reads with; MCP reads refuse deleted scopes too. */
+  scopeDeletions?: ScopeDeletionTracker;
   now: () => Date;
   runtimeAvailability: RuntimeAvailabilityPort;
   serverOrigin: string;
@@ -1967,6 +1972,8 @@ async function handleMcpRoute(input: {
         accessLogWriter: input.accessLogWriter,
         readFulfillmentReporter: input.readFulfillmentReporter,
         runtimeAvailability: input.runtimeAvailability,
+        scopeDeletions: input.scopeDeletions,
+        serverOwner: input.serverOwner,
         now: input.now,
         createLogId,
       },

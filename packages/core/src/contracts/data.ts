@@ -1,4 +1,5 @@
 import { isReplicaScope } from "../replication/namespace.js";
+import type { PdppProducer } from "../sync/pdpp-import.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import {
@@ -56,7 +57,7 @@ export type DataContractErrorCode =
   | "DATA_FILE_MISSING"
   | "PRECONDITION_FAILED";
 
-export type LegacyProducer = "pdpp-projector" | "pdpp-import-projection";
+export type LegacyProducer = PdppProducer;
 export interface LegacyProducerProvenance {
   projector_version: string;
   declaration_digest: string;
@@ -129,6 +130,12 @@ export interface ListDataVersionsContractInput {
   limit?: number;
   offset?: number;
   isVisible?: DataVisibilityFilter;
+  /**
+   * The listing goes to a non-owner. PDPP producer provenance (payload
+   * digest, declaration digest, change tokens) describes PDPP data, so it is
+   * withheld; the producer name stays, since it is what marks the version.
+   */
+  forGrantee?: boolean;
 }
 
 export interface ListDataVersionsContractResult {
@@ -163,6 +170,8 @@ export interface ReadDataContractInput {
 }
 
 export interface ReadDataContractResult {
+  /** Snapshot of the entry used by this body read, for payment and logging. */
+  entry: Readonly<IndexEntry>;
   ok: true;
   scope: string;
   envelope: DataFileEnvelope;
@@ -253,6 +262,14 @@ export interface IngestDataContractInput {
    * unchanged.
    */
   lineage?: StoredLineage;
+  /**
+   * Whether any input of this write is PDPP-origin. The single place the
+   * output's origin is decided. `true`: the `pdpp-derivative` producer, with or
+   * without lineage. `false`: `$lineage.origin = "legacy"` when lineage is
+   * present, otherwise nothing. Absent: lineage present means `true`; no
+   * lineage means an ordinary root write, left unstamped.
+   */
+  inputsPdppOrigin?: boolean;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
   precondition?: LegacyPrecondition;
@@ -296,6 +313,14 @@ export interface IngestBinaryDataContractInput {
   attribution?: WriterAttribution;
   /** Validated lineage for a derivative write (see IngestDataContractInput). */
   lineage?: StoredLineage;
+  /**
+   * Whether any input of this write is PDPP-origin. The single place the
+   * output's origin is decided. `true`: the `pdpp-derivative` producer, with or
+   * without lineage. `false`: `$lineage.origin = "legacy"` when lineage is
+   * present, otherwise nothing. Absent: lineage present means `true`; no
+   * lineage means an ordinary root write, left unstamped.
+   */
+  inputsPdppOrigin?: boolean;
   /** See `IndexEntry.afterTombstoneVersion`. */
   afterTombstoneVersion?: number | null;
   precondition?: LegacyPrecondition;
@@ -507,9 +532,10 @@ export async function listDataVersionsContract(
         collectedAt: entry.collectedAt,
         version: entry.casRevision ?? entry.version,
         producer: entry.producer ?? null,
-        producer_provenance: entry.producerProvenance
-          ? (JSON.parse(entry.producerProvenance) as LegacyProducerProvenance)
-          : null,
+        producer_provenance:
+          entry.producerProvenance && !input.forGrantee
+            ? (JSON.parse(entry.producerProvenance) as LegacyProducerProvenance)
+            : null,
       })),
       total,
       limit,
@@ -521,7 +547,16 @@ export async function listDataVersionsContract(
 export interface SummarizeDataAdditionsContractInput {
   additions?: DurableAdditionsService;
   storage: DataStoragePort;
+  /** Deletion filter for scopes summarized from local storage. */
   isVisible?: DataVisibilityFilter;
+  /**
+   * Deletion filter for scopes summarized from the durable registry: the
+   * scope and the registry version its counts were folded through.
+   */
+  isRegistryVersionVisible?: (
+    scope: string,
+    registryVersion: string,
+  ) => Promise<boolean>;
   /** IANA timezone, e.g. "America/Toronto". */
   timezone: string;
   /** Number of local calendar days to report. Must be an integer 1..31. */
@@ -559,7 +594,16 @@ export async function summarizeDataAdditionsContract(
     throw err;
   }
 
-  if (input.additions) return input.additions.summarize(input);
+  if (input.additions) {
+    return input.additions.summarize({
+      timezone: input.timezone,
+      days: input.days,
+      now: input.now,
+      ...(input.isRegistryVersionVisible && {
+        isIncluded: input.isRegistryVersionVisible,
+      }),
+    });
+  }
   const scopes = (
     await collectScopes(input.storage, undefined, input.isVisible)
   ).filter((row) => !isSystemScope(row.scope));
@@ -594,7 +638,9 @@ export async function readDataContract(
     at: input.at,
   });
 
-  if (!entry) {
+  // A fileId names one version of one scope: a row of another scope is not
+  // this scope's data, whatever the storage lookup answered.
+  if (!entry || entry.scope !== scopeResult.scope) {
     return {
       ok: false,
       status: 404,
@@ -611,17 +657,18 @@ export async function readDataContract(
   // with a code distinct from `NOT_FOUND` (nothing indexed) so an operator
   // can tell a dangling row from an empty scope without reading a stack
   // trace. Before this it escaped as a bare INTERNAL_ERROR 500.
+  const selectedEntry = { ...entry };
   let envelope;
   try {
     envelope =
       input.view === "stored" && input.storage.readStoredEnvelope
         ? await input.storage.readStoredEnvelope(
             scopeResult.scope,
-            entry.collectedAt,
+            selectedEntry.collectedAt,
           )
         : await input.storage.readEnvelope(
             scopeResult.scope,
-            entry.collectedAt,
+            selectedEntry.collectedAt,
           );
   } catch (err) {
     if (!isMissingFileError(err)) throw err;
@@ -637,6 +684,7 @@ export async function readDataContract(
 
   return {
     ok: true,
+    entry: selectedEntry,
     scope: scopeResult.scope,
     envelope,
   };
@@ -701,13 +749,14 @@ export async function ingestDataContract(
     };
   }
 
+  const producer = outputProducer(input);
   let envelope: DataFileEnvelope = {
     ...createDataFileEnvelope(
       scopeResult.scope,
       input.collectedAt,
       stampServerKeys(input.body, input),
     ),
-    ...(input.producer ? { producer: input.producer } : {}),
+    ...(producer ? { producer } : {}),
     ...(input.producerProvenance
       ? { producer_provenance: input.producerProvenance }
       : {}),
@@ -759,7 +808,7 @@ export async function ingestDataContract(
         scope: scopeResult.scope,
         collectedAt: input.collectedAt,
         afterTombstoneVersion: input.afterTombstoneVersion ?? null,
-        producer: input.producer ?? null,
+        producer: producer ?? null,
         producerProvenance: input.producerProvenance
           ? JSON.stringify(input.producerProvenance)
           : null,
@@ -800,12 +849,39 @@ export async function ingestDataContract(
  * record about to be stored. Both are absent from owner root writes, so such
  * an envelope stays byte-identical to today's.
  */
+/** The producer stamp of an output: a caller's own, else `pdpp-derivative`. */
+function outputProducer(
+  input: Pick<
+    IngestDataContractInput,
+    "producer" | "lineage" | "inputsPdppOrigin"
+  >,
+): LegacyProducer | undefined {
+  if (input.producer) return input.producer;
+  const pdpp = input.inputsPdppOrigin ?? input.lineage !== undefined;
+  return pdpp ? "pdpp-derivative" : undefined;
+}
+
+/** The one place a derivative's origin is stamped (see inputsPdppOrigin). */
+function lineageWithOrigin(
+  input: Pick<IngestDataContractInput, "lineage" | "inputsPdppOrigin">,
+): StoredLineage | undefined {
+  if (!input.lineage) return undefined;
+  const { origin: _claimed, ...lineage } = input.lineage;
+  return input.inputsPdppOrigin === false
+    ? { ...lineage, origin: "legacy" }
+    : lineage;
+}
+
 function stampServerKeys(
   data: Record<string, unknown>,
-  input: Pick<IngestDataContractInput, "attribution" | "lineage">,
+  input: Pick<
+    IngestDataContractInput,
+    "attribution" | "lineage" | "inputsPdppOrigin"
+  >,
 ): Record<string, unknown> {
   let stamped = data;
-  if (input.lineage) stamped = stampLineage(stamped, input.lineage);
+  const lineage = lineageWithOrigin(input);
+  if (lineage) stamped = stampLineage(stamped, lineage);
   if (input.attribution) {
     stamped = stampWriterAttribution(stamped, input.attribution);
   }
@@ -877,11 +953,15 @@ export async function ingestBinaryDataContract(
     metadata: input.metadata,
   });
 
-  const envelope = createDataFileEnvelope(
-    scopeResult.scope,
-    input.collectedAt,
-    stampServerKeys(data, input),
-  );
+  const producer = outputProducer(input);
+  const envelope: DataFileEnvelope = {
+    ...createDataFileEnvelope(
+      scopeResult.scope,
+      input.collectedAt,
+      stampServerKeys(data, input),
+    ),
+    ...(producer ? { producer } : {}),
+  };
   const committed = await commitWrittenEnvelope(
     input.storage,
     envelope,
@@ -890,6 +970,7 @@ export async function ingestBinaryDataContract(
       schemaId: null,
       scope: scopeResult.scope,
       collectedAt: input.collectedAt,
+      producer: producer ?? null,
       sizeBytes: input.bytes.length,
       afterTombstoneVersion: input.afterTombstoneVersion ?? null,
     },

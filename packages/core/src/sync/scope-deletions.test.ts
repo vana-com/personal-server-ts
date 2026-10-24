@@ -499,3 +499,18 @@ describe("deletion helpers", () => {
     expect(deletionTimestamp(sdkRecord)).toBeNull();
   });
 });
+
+it("observed deletion history cannot regress when an older tombstone arrives after a live re-add", () => {
+  const tracker = createScopeDeletionTracker();
+  tracker.markDeleted(SCOPE, {
+    deletedAt: DELETED_AT,
+    version: "9007199254740995",
+  });
+  tracker.markLive(SCOPE);
+  tracker.markDeleted(SCOPE, {
+    deletedAt: DELETED_AT,
+    version: "9007199254740993",
+  });
+  tracker.markLive(SCOPE);
+  expect(tracker.deletionHistory?.get(SCOPE)?.version).toBe("9007199254740995");
+});
