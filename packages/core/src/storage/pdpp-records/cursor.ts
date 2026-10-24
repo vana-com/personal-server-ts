@@ -14,6 +14,8 @@ export interface ListCursorPayload {
   instance?: string;
   /** Stream this token was minted for. Absent only on legacy cursors. */
   stream?: string;
+  /** Opaque authorization and query fingerprint for PDPP list continuations. */
+  queryBinding?: string;
   /** Store reset epoch this token was minted in. Absent only on legacy cursors. */
   epoch?: string;
   order: "asc" | "desc";

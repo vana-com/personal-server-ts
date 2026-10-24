@@ -6,14 +6,11 @@ export type {
   PdppChainEnforcementPort,
   PdppChainDecision,
 } from "../pdpp/read-admission.js";
-import {
-  grantIsCandidate,
-  type DeclarationSnapshot,
-} from "@opendatalabs/personal-server-ts-core/pdpp";
+import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { parseRecordQuery } from "./pdpp-record-query.js";
 import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   isRfc3339DateTime,
   PdppBindingError,
@@ -21,6 +18,7 @@ import {
 } from "../storage/pdpp-records-sqlite-store.js";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
+import { streamDeclarationFromSnapshot } from "../pdpp/declaration-snapshot.js";
 import type {
   PdppAuthorizationService,
   PdppTokenContext,
@@ -779,25 +777,6 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     return { declaration, ownerInstanceIds };
   }
 
-  function streamDeclarationFromSnapshot(
-    snapshot: DeclarationSnapshot,
-    streamName: string,
-  ): StreamDeclaration | undefined {
-    const stream = snapshot.streams.find(({ name }) => name === streamName);
-    if (!stream) return undefined;
-    return {
-      name: stream.name,
-      semantics: stream.semantics ?? "mutable_state",
-      primaryKey: stream.primary_key,
-      cursorField: "emitted_at",
-      consentTimeField: stream.consent_time_field,
-      requiredFields: stream.required_fields,
-      declaredFields: stream.fields,
-      ...(stream.schema && { schema: stream.schema }),
-      ...(stream.selection && { selection: stream.selection }),
-    };
-  }
-
   function ownerInstances(context: PdppTokenContext): string[] {
     if (context.tokenKind !== "owner") return [];
     if (context.sourceId) {
@@ -1179,6 +1158,24 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         limit,
         order,
         cursor,
+        queryBinding: createHash("sha256")
+          .update(
+            JSON.stringify({
+              authorization: context!.grant
+                ? createHash("sha256")
+                    .update(JSON.stringify(context!.grant))
+                    .digest("hex")
+                : {
+                    tokenKind: context!.tokenKind,
+                    subject: context!.subjectId,
+                  },
+              stream,
+              instances: [...effectiveInstanceIds].sort(),
+              fields: fields ? [...new Set(fields)].sort() : null,
+              streamGrant: scope.streamGrant,
+            }),
+          )
+          .digest("hex"),
         oneRecordPerKey:
           context!.tokenKind === "client" && !grantIsCandidate(context!.grant),
         isVisible: (row) =>

@@ -779,9 +779,45 @@ describe("memory record store: changes_since", () => {
         cursor: first.nextCursor,
       }),
     ).toThrow(InvalidCursorError);
-    expect(() =>
-      sync.read({ ...query, limit: 2, cursor: first.nextCursor }),
-    ).toThrow(InvalidCursorError);
+    const resized = sync.read({
+      ...query,
+      limit: 2,
+      cursor: first.nextCursor,
+    });
+    expect(resized.data.map(({ recordKey }) => recordKey)).toEqual(["b"]);
+  });
+
+  it("allows a sync page size change while preserving grant, query, and order", () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      ["a", "b", "c"].map((key, index) => ({
+        instance: "inst_1",
+        stream: "playlists",
+        key,
+        data: { id: key, name: key },
+        emitted_at: `2026-04-0${index + 1}T00:00:00.000Z`,
+      })),
+      playlistsSemantics,
+      playlistsPk,
+    );
+    const sync = createPdppSyncSessionService(store);
+    const binding = { grant: "grant-a", query: { since: "2026-04-01" } };
+    const first = sync.read({
+      stream: "playlists",
+      instanceIds: ["inst_1"],
+      limit: 1,
+      order: "asc",
+      queryBinding: binding,
+    });
+    const next = sync.read({
+      stream: "playlists",
+      instanceIds: ["inst_1"],
+      limit: 5,
+      order: "asc",
+      queryBinding: binding,
+      cursor: first.nextCursor,
+    });
+    expect(next.data.map(({ recordKey }) => recordKey)).toEqual(["b", "c"]);
   });
 
   it("throws CursorExpiredError for a malformed changes_since token", () => {

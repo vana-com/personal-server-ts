@@ -6,6 +6,7 @@ import {
 } from "../pdpp/read-admission.js";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
+import { streamDeclarationFromSnapshot } from "../pdpp/declaration-snapshot.js";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
@@ -267,10 +268,12 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     // and blob_ref must be in the granted fields for that record's stream.
     let authorizedButUnavailable = false;
     for (const reference of references) {
-      const declaration = deps.declarations.forInstance(
-        reference.instance,
-        reference.stream,
-      );
+      const declaration = context.declarationSnapshot
+        ? streamDeclarationFromSnapshot(
+            context.declarationSnapshot,
+            reference.stream,
+          )
+        : deps.declarations.forInstance(reference.instance, reference.stream);
       let scope;
       try {
         scope = resolveReadScope(context, reference.stream, declaration);

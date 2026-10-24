@@ -5,6 +5,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   createMemorySyncStateStore,
+  assertListCursorBinding,
   decodeCursor,
   decodeListCursor,
   encodeCursor,
@@ -2432,6 +2433,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     let horizon: number;
     if (options.cursor) {
       const payload = decodeListCursor(options.cursor);
+      assertListCursorBinding(payload, options);
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
       horizon = parseHorizon(payload.horizon);
