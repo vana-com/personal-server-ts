@@ -3,31 +3,23 @@ import {
   timeSortKey,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
-  selectSyncChange,
+  createMemorySyncStateStore,
   decodeListCursor,
-  decodeSyncPageCursor,
   listSnapshotPage,
-  compareRecordIdentity,
   LIST_ORDER_COLUMNS,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { Database } from "better-sqlite3";
-import { createHash } from "node:crypto";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   encodeRecordKey,
   planIngest,
   RecordKeyError,
   summarizeIngest,
-  decodeCursor,
-  encodeCursor,
-  InvalidCursorSyntaxError,
   CursorExpiredError,
   InvalidCursorError,
   BlobConflictError,
   type PdppRecordStore,
-  type ChangesSinceOptions,
-  type ChangesSincePage,
   type IngestOutcome,
   type IngestResult,
   type ListRecordsOptions,
@@ -39,6 +31,15 @@ import {
   type RecordDataValidator,
   type StreamListing,
   type StreamSemantics,
+  type SyncBudget,
+  type SyncPreparationRequest,
+  type SyncPreparationResult,
+  type SyncStateStore,
+  type SyncTokenScope,
+  type SyncWindow,
+  type RecordIdentity,
+  type SyncWindowChange,
+  type SyncWindowRequest,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import {
   isCompletionTime,
@@ -317,6 +318,13 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
   // timestamp text, for list order, list seeks and the latest stream time.
   // `migrateToV13` applies it.
   "",
+  // v14: the secret that seals sync tokens, beside the epoch so a rebuilt
+  // records DB expires every token the old one issued, and the
+  // identity-ordered history index sync pages seek in. It also rebuilds the
+  // live summary index an earlier v13 left without `emitted_at`, and adds
+  // the table that holds sync session state behind opaque handles.
+  // `migrateToV14` applies it.
+  "",
   // v14: one recoverable export-to-live transition per Claude connection.
   `CREATE TABLE IF NOT EXISTS pdpp_claude_transition (
     instance TEXT PRIMARY KEY,
@@ -325,6 +333,49 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
     snapshots_json TEXT NOT NULL,
     conversations_covered INTEGER NOT NULL DEFAULT 0
   );`,
+  // v15: sync session state behind opaque handles (`sync-session.ts`).
+  `
+CREATE TABLE IF NOT EXISTS pdpp_sync_state (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  state TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_owner
+  ON pdpp_sync_state (owner);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_expires
+  ON pdpp_sync_state (expires_at);
+`,
+  // v16: bounded sync work. A session's prepared candidate set, walked by
+  // key, and an index of deletions alone for the deletion-after-horizon test.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_sync_preparation (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  high INTEGER NOT NULL,
+  rows INTEGER NOT NULL DEFAULT 0,
+  done INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_preparation_owner
+  ON pdpp_sync_preparation (owner, expires_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_preparation_expires
+  ON pdpp_sync_preparation (expires_at);
+CREATE TABLE IF NOT EXISTS pdpp_sync_candidate (
+  preparation TEXT NOT NULL,
+  record_key TEXT NOT NULL,
+  instance TEXT NOT NULL,
+  PRIMARY KEY (preparation, record_key, instance)
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_deleted
+  ON pdpp_record_changes (instance, stream, record_key, written_at)
+  WHERE deleted = 1;
+`,
+  // v17: a preparation keeps its own progress, written with its candidates.
+  // Every sync session walks its candidate set, so the v14 identity index
+  // has no reader left and is dropped.
+  // `migrateToV17` applies it.
+  "",
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -388,6 +439,99 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
 `);
 }
 
+/** Sync session state behind opaque handles (`sync-session.ts`). */
+function sqliteSyncStates(db: Database): SyncStateStore {
+  const put = db.prepare(`INSERT OR REPLACE INTO pdpp_sync_state
+    (id, owner, state, expires_at) VALUES (?, ?, ?, ?)`);
+  // Bounded per write: a backlog of expired states drains over later writes.
+  const dropExpired = db.prepare(`DELETE FROM pdpp_sync_state WHERE rowid IN (
+    SELECT rowid FROM pdpp_sync_state INDEXED BY idx_pdpp_sync_state_expires
+    WHERE expires_at <= ? LIMIT 100)`);
+  // rowid grows with each insert or replace, so it orders states by age.
+  const evict = db.prepare(`DELETE FROM pdpp_sync_state WHERE rowid IN (
+    SELECT rowid FROM pdpp_sync_state WHERE owner = ?
+    ORDER BY rowid DESC LIMIT -1 OFFSET ?)`);
+  const get = db.prepare(
+    "SELECT state FROM pdpp_sync_state WHERE id = ? AND expires_at > ?",
+  );
+  const del = db.prepare("DELETE FROM pdpp_sync_state WHERE id = ?");
+  const delIf = db.prepare(
+    "DELETE FROM pdpp_sync_state WHERE id = ? AND state = ?",
+  );
+  const putTx = db.transaction(
+    (entry: Parameters<SyncStateStore["put"]>[0]): boolean => {
+      if (entry.expect !== undefined) {
+        const current =
+          (get.get(entry.id, entry.now) as { state: string } | undefined)
+            ?.state ?? null;
+        if (current !== entry.expect) return false;
+      }
+      put.run(entry.id, entry.owner, entry.state, entry.expiresAt);
+      dropExpired.run(entry.now);
+      evict.run(entry.owner, entry.maxPerOwner);
+      return true;
+    },
+  );
+  return {
+    // IMMEDIATE takes the write lock before the compare, so another
+    // connection cannot change the state between the compare and the write.
+    put: (entry) => putTx.immediate(entry),
+    get: (id, now) =>
+      (get.get(id, now) as { state: string } | undefined)?.state,
+    delete: (id, expected) =>
+      void (expected === undefined ? del.run(id) : delIf.run(id, expected)),
+  };
+}
+
+function migrateToV14(db: Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(pdpp_store_metadata)")
+    .all() as { name: string }[];
+  if (!columns.some((c) => c.name === "sync_token_key")) {
+    db.exec("ALTER TABLE pdpp_store_metadata ADD COLUMN sync_token_key TEXT");
+  }
+  db.prepare(
+    "UPDATE pdpp_store_metadata SET sync_token_key = ? WHERE id = 1 AND sync_token_key IS NULL",
+  ).run(randomBytes(32).toString("base64"));
+  // An earlier v13 built the live summary index without `emitted_at`, so
+  // rebuild it as the covering index v13 now creates.
+  db.exec(`
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_sync_identity
+  ON pdpp_record_changes (stream, record_key, instance, written_at);
+DROP INDEX IF EXISTS idx_pdpp_records_live_instance_stream_emitted_key;
+CREATE INDEX idx_pdpp_records_live_instance_stream_emitted_key
+  ON pdpp_records (instance, stream, emitted_key, emitted_at)
+  WHERE deleted = 0;
+CREATE TABLE IF NOT EXISTS pdpp_sync_state (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  state TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_owner
+  ON pdpp_sync_state (owner);
+CREATE INDEX IF NOT EXISTS idx_pdpp_sync_state_expires
+  ON pdpp_sync_state (expires_at);
+`);
+}
+
+function migrateToV17(db: Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(pdpp_sync_preparation)")
+    .all() as { name: string }[];
+  if (!columns.some((c) => c.name === "cursor_instance")) {
+    db.exec(
+      "ALTER TABLE pdpp_sync_preparation ADD COLUMN cursor_instance INTEGER NOT NULL DEFAULT 0",
+    );
+  }
+  if (!columns.some((c) => c.name === "cursor_written")) {
+    db.exec(
+      "ALTER TABLE pdpp_sync_preparation ADD COLUMN cursor_written INTEGER",
+    );
+  }
+  db.exec("DROP INDEX IF EXISTS idx_pdpp_record_changes_sync_identity");
+}
+
 function migrate(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS pdpp_schema_version (
@@ -410,6 +554,8 @@ function migrate(db: Database): void {
         ).run(randomUUID());
       }
       if (v === 12) migrateToV13(db);
+      if (v === 13) migrateToV14(db);
+      if (v === 16) migrateToV17(db);
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -502,13 +648,6 @@ function parseHorizon(value: unknown): number {
     throw new InvalidCursorError();
   }
   return horizon;
-}
-
-function parseOffset(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new InvalidCursorError();
-  }
-  return value;
 }
 
 function instanceHasRecords(db: Database, instance: string): boolean {
@@ -1861,6 +2000,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         hasLaterWrites &&
         erasure.get(row.instance, row.stream, row.recordKey, horizon) !==
           undefined,
+      (instance, recordKey) => {
+        const row = versionAtStmt.get(instance, stream, recordKey, horizon) as
+          RecordRowDb | undefined;
+        return row ? toRow(row) : undefined;
+      },
     );
   }
 
@@ -1910,134 +2054,317 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     return result;
   }
 
-  function changesSince(
-    stream: string,
-    options: ChangesSinceOptions,
-  ): ChangesSincePage {
-    let horizon: number;
-    let sinceHorizon: number | null;
-    let offset = 0;
+  const versionAtStmt = db.prepare(
+    `SELECT * FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+     WHERE instance = ? AND stream = ? AND record_key = ? AND written_at <= ?
+     ORDER BY written_at DESC, version DESC LIMIT 1`,
+  );
+  const deletedAfterStmt =
+    lazy(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_deleted
+      WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
 
-    if (options.cursor) {
-      const payload = decodeSyncPageCursor(options.cursor);
-      assertCursorScope(payload, stream);
-      horizon = parseHorizon(payload.horizon);
-      sinceHorizon =
-        payload.sinceHorizon !== null
-          ? parseHorizon(payload.sinceHorizon)
-          : null;
-      offset = parseOffset(payload.offset);
-    } else if (options.changesSince) {
-      let payload;
-      try {
-        payload = decodeCursor(options.changesSince);
-      } catch (err) {
-        if (err instanceof InvalidCursorSyntaxError)
-          throw new CursorExpiredError();
-        throw err;
-      }
-      if (payload.kind !== "changes_since") throw new InvalidCursorError();
-      assertCursorScope(payload, stream);
-      sinceHorizon = parseHorizon(payload.horizon);
-      horizon = (nextWriteSeq.get() as { value: number }).value;
-    } else {
-      sinceHorizon = null;
-      horizon = (nextWriteSeq.get() as { value: number }).value;
-    }
-
-    assertNotResetSince(options.instanceIds, [
-      horizon,
-      sinceHorizon ?? horizon,
-    ]);
-
-    const latestRows = snapshotRows(stream, options.instanceIds, horizon);
-
-    const changed: PdppRecordRow[] = [];
-    for (const entry of latestRows) {
-      if (sinceHorizon !== null) {
-        const wroteSincePrior = db
-          .prepare(
-            `SELECT 1 FROM pdpp_record_changes
-             WHERE stream = ? AND instance = ? AND record_key = ?
-             AND written_at > ? AND written_at <= ? LIMIT 1`,
-          )
-          .get(
-            entry.stream,
-            entry.instance,
-            entry.record_key,
-            sinceHorizon,
-            horizon,
-          );
-        if (!wroteSincePrior) continue;
-      }
-
-      const previous =
-        sinceHorizon === null
-          ? undefined
-          : (db
-              .prepare(
-                `
-        SELECT * FROM pdpp_record_changes
-        WHERE stream = ? AND instance = ? AND record_key = ? AND written_at <= ?
-        ORDER BY version DESC LIMIT 1
-      `,
-              )
-              .get(
-                entry.stream,
-                entry.instance,
-                entry.record_key,
-                sinceHorizon,
-              ) as RecordRowDb | undefined);
-      const selected = selectSyncChange(
-        toRow(entry as RecordRowDb),
-        previous ? toRow(previous) : undefined,
-        options,
+  // The candidate set's primary key is unique, so each seek visits one
+  // index entry: no group, sort or skip over versions.
+  const seekStmts = new Map<string, { get(...params: unknown[]): unknown }>();
+  function seek(direction: "asc" | "desc", hasAfter: boolean) {
+    const key = `${direction}:${hasAfter}`;
+    let stmt = seekStmts.get(key);
+    if (!stmt) {
+      const dir = direction === "desc" ? "DESC" : "ASC";
+      const cmp = direction === "desc" ? "<" : ">";
+      stmt = db.prepare(
+        "SELECT record_key, instance FROM pdpp_sync_candidate WHERE preparation = ?" +
+          (hasAfter ? ` AND (record_key, instance) ${cmp} (?, ?)` : "") +
+          ` ORDER BY record_key ${dir}, instance ${dir} LIMIT 1`,
       );
-      if (selected) changed.push(selected);
+      seekStmts.set(key, stmt);
     }
+    return stmt;
+  }
 
-    changed.sort(compareRecordIdentity);
-    const page = changed.slice(offset, offset + options.limit);
-    const hasMore = offset + options.limit < changed.length;
-    if (options.expireOnErasure && horizon < readWriteClock()) {
-      const erasure =
-        db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
-        WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
-      if (
-        page.some(
-          (row) =>
-            !row.deleted &&
-            erasure.get(row.instance, stream, row.recordKey, horizon) !==
-              undefined,
-        )
-      )
+  function readSyncWindow<T>(
+    stream: string,
+    request: SyncWindowRequest,
+    read: (window: SyncWindow) => T,
+  ): T {
+    // One read transaction: the clock, the reset fence and every history
+    // lookup `read` makes belong to the same committed state.
+    return db.transaction(() => {
+      const clock = readWriteClock();
+      const high =
+        request.high === undefined ? clock : parseHorizon(request.high);
+      const low = request.low === null ? null : parseHorizon(request.low);
+      // A horizon past this store's clock was never issued by it.
+      if (high > clock || (low !== null && low > high)) {
         throw new CursorExpiredError();
-    }
+      }
+      assertNotResetSince(request.instanceIds, [high, low ?? high]);
+      const versionAt = (instance: string, recordKey: string, at: number) => {
+        const row = versionAtStmt.get(instance, stream, recordKey, at) as
+          RecordRowDb | undefined;
+        return row ? toRow(row) : undefined;
+      };
 
+      const preparation = preparationRow.get(request.preparation) as
+        { done: number; expires_at: number } | undefined;
+      // Unfinished, released, evicted or expired: not walkable.
+      if (!preparation?.done || preparation.expires_at <= request.now) {
+        throw new CursorExpiredError();
+      }
+
+      // One seek on the candidate set's primary key per call. SQLite's
+      // BINARY text order is `compareRecordIdentity`'s code-point order.
+      function next(
+        direction: "asc" | "desc",
+        after: RecordIdentity | undefined,
+        budget: SyncBudget,
+      ): RecordIdentity | undefined | null {
+        if (!budget.spend()) return null;
+        const row = (
+          after
+            ? seek(direction, true).get(
+                request.preparation,
+                after.recordKey,
+                after.instance,
+              )
+            : seek(direction, false).get(request.preparation)
+        ) as { record_key: string; instance: string } | undefined;
+        return row
+          ? { recordKey: row.record_key, instance: row.instance }
+          : undefined;
+      }
+
+      function change({
+        recordKey,
+        instance,
+      }: RecordIdentity): SyncWindowChange | undefined {
+        const after = versionAt(instance, recordKey, high);
+        if (!after) return undefined;
+        return {
+          after,
+          before: () =>
+            low === null ? undefined : versionAt(instance, recordKey, low),
+          deletedAfterHigh: () =>
+            high < clock &&
+            deletedAfterStmt.get(instance, stream, recordKey, high) !==
+              undefined,
+        };
+      }
+
+      return read({
+        high: String(high),
+        next,
+        change,
+        versionAtHigh: (instance, recordKey) =>
+          versionAt(instance, recordKey, high),
+      });
+    })();
+  }
+
+  // Prepared on first use: a database at an older schema version than these
+  // statements need still opens, migrates, and only then runs them.
+  function lazy(sql: string) {
+    let stmt: ReturnType<Database["prepare"]> | undefined;
+    const get = () => (stmt ??= db.prepare(sql));
     return {
-      data: page,
-      hasMore,
-      nextCursor: hasMore
-        ? encodeCursor({
-            kind: "changes_since",
-            stream,
-            epoch: cursorEpoch(),
-            horizon: String(horizon),
-            sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
-            offset: offset + options.limit,
-            orderKey: "code-point",
-          })
-        : undefined,
-      nextChangesSince: hasMore
-        ? undefined
-        : encodeCursor({
-            kind: "changes_since",
-            stream,
-            epoch: cursorEpoch(),
-            horizon: String(horizon),
-            sinceHorizon: null,
-            offset: 0,
-          }),
+      get: (...params: unknown[]) => get().get(...params),
+      all: (...params: unknown[]) => get().all(...params),
+      run: (...params: unknown[]) => get().run(...params),
+    };
+  }
+  const preparationRow = lazy(
+    "SELECT * FROM pdpp_sync_preparation WHERE id = ?",
+  );
+  const insertPreparation = lazy(`INSERT INTO pdpp_sync_preparation
+    (id, owner, high, rows, done, expires_at) VALUES (?, ?, ?, 0, 0, ?)`);
+  const updatePreparation = lazy(
+    "UPDATE pdpp_sync_preparation SET rows = ?, done = ?, expires_at = ?, cursor_instance = ?, cursor_written = ? WHERE id = ?",
+  );
+  const expirePreparation = lazy(
+    "UPDATE pdpp_sync_preparation SET expires_at = 0 WHERE id = ?",
+  );
+  const ownerPreparations = lazy(`SELECT COUNT(*) AS count,
+    COALESCE(SUM(rows), 0) AS rows FROM pdpp_sync_preparation
+    INDEXED BY idx_pdpp_sync_preparation_owner WHERE owner = ? AND expires_at > ?`);
+  // rowid orders preparations by age.
+  const evictPreparations =
+    db.prepare(`UPDATE pdpp_sync_preparation SET expires_at = 0
+    WHERE rowid IN (SELECT rowid FROM pdpp_sync_preparation
+      INDEXED BY idx_pdpp_sync_preparation_owner WHERE owner = ? AND expires_at > ?
+      ORDER BY rowid DESC LIMIT -1 OFFSET ?)`);
+  const preparationWrites = lazy(`SELECT id, record_key, written_at
+    FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_horizon
+    WHERE stream = ? AND instance = ? AND written_at > ? AND written_at <= ?
+    ORDER BY written_at LIMIT ?`);
+  const addCandidate = lazy(
+    "INSERT OR IGNORE INTO pdpp_sync_candidate (preparation, record_key, instance) VALUES (?, ?, ?)",
+  );
+  const expiredPreparations = lazy(`SELECT id FROM pdpp_sync_preparation
+    INDEXED BY idx_pdpp_sync_preparation_expires WHERE expires_at <= ? LIMIT 4`);
+  const dropCandidates =
+    db.prepare(`DELETE FROM pdpp_sync_candidate WHERE rowid IN (
+    SELECT rowid FROM pdpp_sync_candidate WHERE preparation = ? LIMIT ?)`);
+  const dropPreparation = lazy(
+    "DELETE FROM pdpp_sync_preparation WHERE id = ?",
+  );
+  /** Candidate rows one write may delete while sweeping expired preparations. */
+  const SWEEP_ROWS = 1000;
+
+  /** Frees expired preparations in bounded steps; the rest wait for later writes. */
+  function sweepPreparations(now: number): void {
+    let left = SWEEP_ROWS;
+    for (const { id } of expiredPreparations.all(now) as { id: string }[]) {
+      const dropped = dropCandidates.run(id, left).changes;
+      left -= dropped;
+      if (left <= 0) return;
+      dropPreparation.run(id);
+    }
+  }
+
+  const prepareTx = db.transaction(
+    (
+      stream: string,
+      request: SyncPreparationRequest,
+    ): SyncPreparationResult => {
+      sweepPreparations(request.now);
+      let row = preparationRow.get(request.id) as
+        | {
+            high: number;
+            rows: number;
+            done: number;
+            expires_at: number;
+            cursor_instance: number;
+            cursor_written: number | null;
+          }
+        | undefined;
+      if (row && row.expires_at <= request.now) {
+        expirePreparation.run(request.id);
+        throw new CursorExpiredError();
+      }
+      if (!row) {
+        // A session that already started has lost its preparation:
+        // expired, evicted or swept.
+        if (request.high !== undefined) throw new CursorExpiredError();
+        const high = readWriteClock();
+        insertPreparation.run(
+          request.id,
+          request.owner,
+          high,
+          request.expiresAt,
+        );
+        evictPreparations.run(request.owner, request.now, request.maxPerOwner);
+        row = {
+          high,
+          rows: 0,
+          done: 0,
+          expires_at: request.expiresAt,
+          cursor_instance: 0,
+          cursor_written: null,
+        };
+      }
+      const low = request.low === null ? null : parseHorizon(request.low);
+      const high = row.high;
+      assertNotResetSince(request.instanceIds, [high, low ?? high]);
+      const instanceIds = [...new Set(request.instanceIds)].sort();
+      let rows = row.rows;
+      let i = row.cursor_instance;
+      // write sequence numbers start at 1, so 0 reads a first sync from the start
+      let after = row.cursor_written ?? low ?? 0;
+      let done = row.done === 1;
+      const owner = ownerPreparations.get(request.owner, request.now) as {
+        rows: number;
+      };
+      let ownerRows = owner.rows;
+      while (!done) {
+        if (i >= instanceIds.length) {
+          done = true;
+          break;
+        }
+        // One row at a time from the horizon index (each written_at is
+        // unique), so a spent budget stops the scan at once.
+        if (!request.budget.spend()) break;
+        const write = preparationWrites.get(
+          stream,
+          instanceIds[i],
+          after,
+          high,
+          1,
+        ) as { id: number; record_key: string; written_at: number } | undefined;
+        if (!write) {
+          i += 1;
+          after = low ?? 0;
+          request.budget.progressed();
+          continue;
+        }
+        after = write.written_at;
+        if (
+          addCandidate.run(request.id, write.record_key, instanceIds[i])
+            .changes > 0
+        ) {
+          rows += 1;
+          ownerRows += 1;
+          if (ownerRows > request.maxRowsPerOwner) {
+            expirePreparation.run(request.id);
+            throw new CursorExpiredError();
+          }
+        }
+        request.budget.progressed();
+      }
+      // Progress and candidates commit together.
+      updatePreparation.run(
+        rows,
+        done ? 1 : 0,
+        request.expiresAt,
+        i,
+        after,
+        request.id,
+      );
+      return { high: String(high), done };
+    },
+  );
+
+  function prepareSyncWindow(
+    stream: string,
+    request: SyncPreparationRequest,
+  ): SyncPreparationResult {
+    if (db.readonly) {
+      throw new Error("a readonly store cannot prepare a sync window");
+    }
+    try {
+      return prepareTx.immediate(stream, request);
+    } catch (err) {
+      // An expiry decided inside the transaction must survive its rollback.
+      if (err instanceof CursorExpiredError) expirePreparation.run(request.id);
+      throw err;
+    }
+  }
+
+  const touchPreparation = lazy(
+    "UPDATE pdpp_sync_preparation SET expires_at = ? WHERE id = ? AND expires_at > ?",
+  );
+  const touchTx = db.transaction(
+    (id: string, expiresAt: number, now: number) => {
+      sweepPreparations(now);
+      touchPreparation.run(expiresAt <= now ? 0 : expiresAt, id, now);
+    },
+  );
+  const sweepTx = db.transaction((now: number) => sweepPreparations(now));
+
+  // A readonly handle cannot persist session state; it keeps it in process.
+  const syncStates: SyncStateStore = db.readonly
+    ? createMemorySyncStateStore()
+    : sqliteSyncStates(db);
+
+  function syncTokenScope(): SyncTokenScope {
+    const row = db
+      .prepare(
+        "SELECT epoch, sync_token_key FROM pdpp_store_metadata WHERE id = 1",
+      )
+      .get() as { epoch: string; sync_token_key: string | null } | undefined;
+    if (!row?.sync_token_key) throw new CursorExpiredError();
+    return {
+      epoch: row.epoch,
+      key: new Uint8Array(Buffer.from(row.sync_token_key, "base64")),
     };
   }
 
@@ -2220,7 +2547,29 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     getRecord,
     listRecords,
     deleteRecord,
-    changesSince,
+    readSyncWindow,
+    syncTokenScope,
+    syncStates: () => syncStates,
+    prepareSyncWindow,
+    touchSyncPreparation: (id, expiresAt, now) => {
+      if (!db.readonly) touchTx.immediate(id, expiresAt, now);
+    },
+    sweepSyncPreparations: (now) => {
+      if (!db.readonly) sweepTx.immediate(now);
+    },
+    inspectSyncState: () => {
+      const count = (table: string) =>
+        (
+          db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as {
+            n: number;
+          }
+        ).n;
+      return {
+        states: db.readonly ? 0 : count("pdpp_sync_state"),
+        preparations: count("pdpp_sync_preparation"),
+        candidates: count("pdpp_sync_candidate"),
+      };
+    },
     listStreams,
     putBlobMeta: (meta: PdppBlobMeta) =>
       putBlobStmt.run({

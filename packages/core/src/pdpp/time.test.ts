@@ -1,5 +1,5 @@
-import { expect, it } from "vitest";
-import { compareTime, parseTime } from "./time.js";
+import { describe, expect, it } from "vitest";
+import { compareTime, parseTime, timeSortKey } from "./time.js";
 import { withinTimeConstraint } from "../ports/pdpp-auth.js";
 it("compares offsets and arbitrary fractional precision exactly", () => {
   expect(
@@ -156,4 +156,37 @@ it("interprets legacy offset-less bounds identically on servers in every time zo
     if (previous === undefined) delete process.env.TZ;
     else process.env.TZ = previous;
   }
+});
+
+describe("timeSortKey", () => {
+  it("orders keys exactly as compareTime orders instants", () => {
+    const values = [
+      "2026-01-01T00:00:00Z",
+      "2026-01-01T00:00:00.1Z",
+      "2026-01-01T00:00:00.10Z",
+      "2026-01-01T00:00:00.05Z",
+      "2026-01-01T00:30:00+01:00",
+      "2025-12-31T23:45:00Z",
+      "2016-12-31T23:59:60Z",
+      "2017-01-01T00:00:00Z",
+      "1969-07-20T20:17:40Z",
+      "0001-01-01T00:00:00Z",
+      "9999-12-31T23:59:59.999999999Z",
+    ];
+    for (const a of values)
+      for (const b of values) {
+        const ka = timeSortKey(a);
+        const kb = timeSortKey(b);
+        expect(Math.sign(ka < kb ? -1 : ka > kb ? 1 : 0)).toBe(
+          compareTime(a, b, "date-time"),
+        );
+      }
+  });
+
+  it("sorts an invalid timestamp after every valid one, by its text", () => {
+    expect(timeSortKey("yesterday") > timeSortKey("9999-12-31T23:59:59Z")).toBe(
+      true,
+    );
+    expect(timeSortKey("a") < timeSortKey("b")).toBe(true);
+  });
 });

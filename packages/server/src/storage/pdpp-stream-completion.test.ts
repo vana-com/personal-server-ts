@@ -1085,7 +1085,7 @@ describe("stream completion over the real SQLite record store", () => {
         const upgraded = createSqliteRecordStore(upgradedDb);
         expect(
           upgradedDb.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 14 });
+        ).toEqual({ version: 17 });
         expect(
           upgradedDb.prepare("SELECT epoch FROM pdpp_store_metadata").get(),
         ).toEqual(epoch);
@@ -1390,7 +1390,7 @@ describe("stream completion over the real SQLite record store", () => {
         const upgraded = createSqliteRecordStore(genuine);
         expect(
           genuine.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 14 });
+        ).toEqual({ version: 17 });
         expect(
           genuine
             .prepare(

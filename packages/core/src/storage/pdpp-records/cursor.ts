@@ -39,15 +39,11 @@ export interface ChangesSinceCursorPayload {
   horizon: string;
   /** The previous session's horizon, or null for a first-ever sync. */
   sinceHorizon: string | null;
-  /** Pagination offset within the horizon-anchored result set. */
-  offset: number;
   /**
-   * Page cursors only: the identity order `offset` counts in. `code-point`
-   * is `compareRecordIdentity`; a page cursor without it counted a
-   * locale-dependent key order, so its offset names a different record.
-   * Checkpoints carry no position and need none.
+   * Always 0 on checkpoints. Readable page cursors are no longer issued: the
+   * session owner issues every page cursor as a handle (`sync-session.ts`).
    */
-  orderKey?: "code-point";
+  offset: number;
 }
 
 export type CursorPayload = ListCursorPayload | ChangesSinceCursorPayload;

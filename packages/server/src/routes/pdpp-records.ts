@@ -15,7 +15,12 @@ import type {
   StreamGrant,
 } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import {
+  createPdppSyncSessionService,
+  MAX_SYNC_INSTANCES,
+  SyncRetryLaterError,
+  type SyncSessionOptions,
   CursorExpiredError,
+  RecordIdentityConflictError,
   InvalidCursorError,
   InvalidCursorSyntaxError,
   recordKeyWithinGrantResources,
@@ -233,6 +238,10 @@ export interface PdppRecordsRouteDeps {
    * explicit rather than leaving to chance.
    */
   accessLog?: PdppAccessLogPort;
+  /** Changes one sync request may examine; defaults to the session service's. */
+  syncPageBudget?: number;
+  /** Sync session budgets, expiry and storage caps; defaults are the service's. */
+  syncSession?: SyncSessionOptions;
   /**
    * Vana chain enforcement for client reads. Absent by default, and absence
    * is the chain-NEUTRAL path: a standalone PDPP deployment has no chain, so
@@ -341,6 +350,22 @@ function toPdppError(err: unknown): PdppError {
   if (err instanceof CursorExpiredError) {
     return new PdppError("cursor_expired", "changes_since cursor has expired");
   }
+  if (err instanceof SyncRetryLaterError) {
+    // One answer whatever exhausted the budget: hidden changes or a slow
+    // store. The route adds Retry-After.
+    return new PdppError(
+      "rate_limit_exceeded",
+      "The sync request needs more time; retry it unchanged",
+    );
+  }
+  if (err instanceof RecordIdentityConflictError) {
+    // Records carry only their key on the wire, so two instances' records
+    // under one key would reach the client as one. Refuse instead.
+    return new PdppError(
+      "disclosure_unavailable",
+      "More than one connection this grant reads holds a record with this id; records from them cannot be told apart",
+    );
+  }
   // Two distinct classes reach here and both mean "this cursor is not usable":
   // the stores throw `InvalidCursorError` (decoded fine, but wrong order or
   // wrong kind), while `decodeCursor` throws `InvalidCursorSyntaxError` for a
@@ -443,6 +468,8 @@ function sendError(c: Context, err: PdppError, reqId: string) {
     "Request-Id": reqId,
     "PDPP-Version": PDPP_VERSION,
   };
+  // The spec's retryable answer carries its delay.
+  if (err.status === 429) headers["Retry-After"] = "1";
   if (err.status === 401) {
     headers["WWW-Authenticate"] =
       `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
@@ -498,23 +525,41 @@ function projectSchemaToFields(
     };
   }
 
+  // Built, never copied: any keyword outside a granted property (`allOf`,
+  // `$defs`, `dependentSchemas`, `if`, root `examples`, `title`, ...) can
+  // name or describe an ungranted field. A granted property whose schema
+  // refers elsewhere is reduced to `{}`, since following the reference would
+  // need the definitions it names.
   const properties = (schema.properties ?? {}) as Record<string, unknown>;
   const required = Array.isArray(schema.required)
     ? (schema.required as string[]).filter((f) => allowed.has(f))
     : [];
-
   return {
-    ...schema,
+    ...(typeof schema.$schema === "string" && { $schema: schema.$schema }),
+    type: "object",
     properties: Object.fromEntries(
-      Object.entries(properties).filter(([name]) => allowed.has(name)),
+      Object.entries(properties)
+        .filter(([name]) => allowed.has(name))
+        .map(([name, property]) => [
+          name,
+          /"\$(?:ref|dynamicRef|recursiveRef)"/.test(JSON.stringify(property))
+            ? {}
+            : property,
+        ]),
     ),
-    ...(required.length > 0 ? { required } : { required: [] }),
+    required,
   };
 }
 
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
   const validateData = createRecordDataValidator(deps.declarations);
+  const sync = createPdppSyncSessionService(deps.store, {
+    ...(deps.syncPageBudget !== undefined && {
+      maxExaminedPerRequest: deps.syncPageBudget,
+    }),
+    ...deps.syncSession,
+  });
 
   /**
    * Append one PDPP read to the owner access feed.
@@ -741,12 +786,10 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       return sendError(c, mapInactiveToError(context!), reqId);
     }
 
-    const instanceIds =
-      context.tokenKind === "owner"
-        ? ownerInstances(context)
-        : (context.grant?.streams.flatMap((s) => s.instance_ids) ?? []);
+    const ownerInstanceIds =
+      context.tokenKind === "owner" ? ownerInstances(context) : [];
 
-    if (context.tokenKind === "owner" && instanceIds.length === 0) {
+    if (context.tokenKind === "owner" && ownerInstanceIds.length === 0) {
       return sendError(
         c,
         mapAndLog(
@@ -762,39 +805,35 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       );
     }
 
-    const streams = deps.store.listStreams(instanceIds);
-
-    // A client token gets a closed projection: only the streams its grant
-    // names, and counts/recency computed over only the records the grant
-    // actually exposes. The store's raw listing counts every record in the
-    // instance, so returning it unchanged would leak the existence and
-    // recency of records outside the grant's time_constraint / resources.
+    // A client token lists exactly the streams its grant names, stored
+    // records or not: a stream that is empty, or whose last record was
+    // deleted, must stay discoverable so a client can start or finish its
+    // sync. Counts and recency cover only the records the grant exposes; the
+    // store's raw listing counts every record in the instance, so returning
+    // it would leak the existence and recency of records outside the grant's
+    // time_constraint / resources.
     const visibleStreams =
       context.tokenKind === "owner"
-        ? streams.map((s) => ({
+        ? deps.store.listStreams(ownerInstanceIds).map((s) => ({
             name: s.stream,
             recordCount: s.recordCount as number | null,
             lastUpdated: s.lastUpdated,
             budgetExhausted: false,
           }))
-        : streams
-            .filter((s) =>
-              context.grant?.streams.some((g) => g.name === s.stream),
+        : (context.grant?.streams ?? [])
+            .filter(
+              (streamGrant, index, all) =>
+                all.findIndex((g) => g.name === streamGrant.name) === index,
             )
-            .map((s) => {
-              const streamGrant = context.grant?.streams.find(
-                (g) => g.name === s.stream,
-              );
-              return {
-                name: s.stream,
-                ...summarizeGrantVisible(
-                  deps.store,
-                  s.stream,
-                  streamGrant?.instance_ids ?? [],
-                  streamGrant,
-                ),
-              };
-            });
+            .map((streamGrant) => ({
+              name: streamGrant.name,
+              ...summarizeGrantVisible(
+                deps.store,
+                streamGrant.name,
+                streamGrant.instance_ids,
+                streamGrant,
+              ),
+            }));
 
     // Report truncation explicitly rather than letting a capped count read as
     // exact. `meta.warnings` is the same shape the list endpoint uses for
@@ -944,52 +983,53 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const fields = scope.fields;
 
       if (query.changesSince !== undefined) {
-        // Eligibility compares the frozen candidate grant projection; sparse
-        // request fields shape only the response. Legacy profiles retain their
-        // existing request-field eligibility. The store returns raw rows.
-        // (spec §4:
-        // a record whose only change was to an unauthorized field must not
-        // appear as "changed" at all). The store returns each row's RAW,
-        // unprojected data regardless of `fields` — response-shaping
-        // projection happens only at toRecordJson below, after
-        // recordWithinGrantTimeConstraint has already run against the real
-        // field value. This split matters: if the store projected the
-        // returned data too, a grant whose fields exclude the
-        // time_constraint field would silently break that filter.
-        const page = deps.store.changesSince(stream, {
+        const candidate = grantIsCandidate(context!.grant);
+        const streamGrant = scope.streamGrant;
+        // The session owner decides disclosure, pagination and tokens; this
+        // route only states the grant and maps the page. Candidate
+        // eligibility compares the frozen grant projection; sparse request
+        // fields shape only the response.
+        // One sync request reads a bounded instance scope.
+        if (new Set(effectiveInstanceIds).size > MAX_SYNC_INSTANCES) {
+          throw new PdppError(
+            "disclosure_unavailable",
+            `This stream spans more than ${MAX_SYNC_INSTANCES} connections, more than one sync session reads`,
+          );
+        }
+        const page = sync.read({
+          stream,
+          owner: context!.grant?.subject.id ?? context!.subjectId,
           instanceIds: effectiveInstanceIds,
-          changesSince:
-            grantIsCandidate(context!.grant) &&
-            query.changesSince === "beginning"
-              ? undefined
-              : query.changesSince,
+          changesSince: query.changesSince,
           cursor,
           limit,
-          fields: grantIsCandidate(context!.grant)
-            ? scope.streamGrant!.fields
-            : fields,
-          ...(grantIsCandidate(context!.grant) && {
-            expireOnErasure: true,
-            isVisible: (row: {
-              recordKey: string;
-              data: Record<string, unknown>;
-            }) =>
-              recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-              recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
+          eligibilityFields: candidate ? streamGrant!.fields : fields,
+          // Candidate records carry instance_id, so one key held by two
+          // instances names two records; the current wire would merge them.
+          oneRecordPerKey: context!.tokenKind === "client" && !candidate,
+          ...(streamGrant && {
+            access: {
+              canSeeKey: (recordKey) =>
+                recordKeyWithinGrantResources(recordKey, streamGrant),
+              canSeeRecord: (row) =>
+                recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
+                recordWithinGrantTimeConstraint(row.data, streamGrant),
+            },
           }),
-        });
-        const visible = page.data.filter((row) => {
-          if (grantIsCandidate(context!.grant)) return true; // store compared both authorized historical states
-          if (row.deleted) {
-            return recordKeyWithinGrantResources(
-              row.recordKey,
-              scope.streamGrant,
-            );
-          }
-          return (
-            recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-            recordWithinGrantTimeConstraint(row.data, scope.streamGrant)
-          );
+          ...(candidate && {
+            candidate: {
+              order,
+              binding: {
+                protocol: context!.grant!.version,
+                grant: context!.grant!.grant_id,
+                subject: context!.grant!.subject.id,
+                client: context!.grant!.client.client_id,
+                source: context!.grant!.source.id,
+                streamGrant,
+                fields: fields ? [...new Set(fields)].sort() : null,
+              },
+            },
+          }),
         });
         const meta = clamped
           ? {
@@ -998,7 +1038,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
               ],
             }
           : {};
-        return c.json(
+        const response = c.json(
           {
             object: "list",
             has_more: page.hasMore,
@@ -1006,19 +1046,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             ...(page.nextChangesSince && {
               next_changes_since: page.nextChangesSince,
             }),
-            data: visible.map((row) =>
-              toRecordJson(
-                stream,
-                row,
-                fields,
-                grantIsCandidate(context!.grant),
-              ),
+            data: page.data.map((row) =>
+              toRecordJson(stream, row, fields, candidate),
             ),
             ...(clamped && { meta }),
           },
           200,
           { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
         );
+        await logClientRead(c, context, stream, "completed", reqId);
+        return response;
       }
 
       const page = deps.store.listRecords(stream, {
@@ -1026,6 +1063,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         limit,
         order,
         cursor,
+        oneRecordPerKey:
+          context!.tokenKind === "client" && !grantIsCandidate(context!.grant),
         isVisible: (row) =>
           recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
           recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
@@ -1111,20 +1150,23 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         throw new PdppError("not_found", "Record not found");
       }
 
-      let found;
-      for (const instance of effectiveInstanceIds) {
+      // Every read instance is consulted: the first holder of the key may be
+      // one the grant hides, and a second visible holder would make the id
+      // name two records.
+      const matches = effectiveInstanceIds.flatMap((instance) => {
         const record = deps.store.getRecord(instance, stream, recordKey);
-        if (record) {
-          found = record;
-          break;
-        }
-      }
-      if (
-        !found ||
-        !recordWithinGrantTimeConstraint(found.data, scope.streamGrant)
-      ) {
+        return record &&
+          recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
+          ? [record]
+          : [];
+      });
+      if (matches.length === 0) {
         throw new PdppError("not_found", "Record not found");
       }
+      if (matches.length > 1 && context!.tokenKind === "client") {
+        throw new RecordIdentityConflictError(recordKey);
+      }
+      const found = matches[0];
 
       const fields = scope.fields;
 
