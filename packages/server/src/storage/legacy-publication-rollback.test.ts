@@ -2,6 +2,7 @@ import { keccak256, stringToHex } from "viem";
 import {
   createLegacyDownloadHold,
   retainCanonicalInputs,
+  retainLegacyVersions,
 } from "./legacy-publication-fence.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { uploadAll, uploadOne } from "../../../core/src/sync/workers/upload.js";
@@ -140,9 +141,11 @@ describe("durable canonical rollback", () => {
       index.findLatestByScope("spotify.profile")!.path,
       "prior-remote",
     );
-    db.prepare(
-      "INSERT INTO legacy_publication_retained_versions SELECT id FROM data_files",
-    ).run();
+    retainLegacyVersions(
+      db,
+      { dataDir: join(root, "data") },
+      { scope: "spotify.profile" },
+    );
     const old = index.findLatestByScope("spotify.profile")!;
     const bytes = readFileSync(join(root, "data", old.path));
     db.prepare("UPDATE legacy_publication_policy SET state='stopped'").run();
@@ -1012,7 +1015,7 @@ it("repins a superseded restore's refused version on a host without a data-point
 });
 
 it("a superseded restore that can never publish does not block a later shutdown's drain check", async () => {
-  const { db, adapter, makePolicy, setRevision, index } = fixture();
+  const { db, adapter, makePolicy, setRevision, index, root } = fixture();
   const confirm = adapter.confirmRemote;
   adapter.confirmRemote = async () => {
     throw new Error("failed before upload");
@@ -1030,6 +1033,10 @@ it("a superseded restore that can never publish does not block a later shutdown'
     owner: "0xowner",
     serverGeneration: "generation-1",
     enabled: () => true,
+    storage: {
+      indexManager: index,
+      hierarchyOptions: { dataDir: join(root, "data") },
+    },
     canonical: canonicalStub(),
     qualification: {
       freezeAndQualify: async () => ({ incomplete: true }),

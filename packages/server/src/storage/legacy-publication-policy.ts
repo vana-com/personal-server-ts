@@ -13,6 +13,7 @@ import {
   armLegacyPublicationGate,
   initializeLegacyPublicationPolicy,
   retainCanonicalInputs,
+  retainLegacyVersions,
 } from "./legacy-publication-fence.js";
 import { LEGACY_GATE_INDEX_SCHEMA_VERSION } from "./schema-versions.js";
 import { legacyScopeMayReference } from "./legacy-publication-issuance.js";
@@ -246,6 +247,12 @@ export function createLegacyPublicationPolicy(
     serverGeneration: options.serverGeneration,
   };
   const immediate = <T>(run: () => T): T => db.transaction(run).immediate();
+  // Retention records version files in this root; only storage bound to this
+  // index database can name it.
+  const retainedFiles =
+    options.storage && indexDatabase(options.storage.indexManager) === db
+      ? options.storage.hierarchyOptions
+      : undefined;
   function rowFor(scope: string): PolicyRow | undefined {
     // A fence from *any* identity wins. Switching owner/generation never
     // creates an unfenced default and never transfers consent or evidence.
@@ -448,6 +455,16 @@ export function createLegacyPublicationPolicy(
               { missing: capabilities().missing },
             );
           if (
+            !retainedFiles &&
+            db.prepare("SELECT 1 FROM data_files WHERE scope = ?").get(scope)
+          )
+            throw new ProtocolError(
+              503,
+              "LEGACY_SHUTDOWN_UNAVAILABLE",
+              "Retaining indexed legacy versions needs this root's storage",
+              { missing: ["retained_version_files"] },
+            );
+          if (
             db
               .prepare(
                 "SELECT 1 FROM owner_import_operations WHERE scope = ? AND state = 'prepared' LIMIT 1",
@@ -603,9 +620,7 @@ export function createLegacyPublicationPolicy(
             "LEGACY_SHUTDOWN_BLOCKED",
             "Canonical coverage, retention or the global fence changed before commit",
           );
-        db.prepare(
-          "INSERT OR IGNORE INTO legacy_publication_retained_versions SELECT id FROM data_files WHERE scope = ?",
-        ).run(scope);
+        retainLegacyVersions(db, retainedFiles, { scope });
         retainCanonicalInputs(db, evidence.canonical.inputs);
         persist(scope, "stopped", current.epoch + 1, evidence);
         return read(scope);
@@ -810,9 +825,7 @@ export function createLegacyPublicationPolicy(
             "LEGACY_RESTORE_BLOCKED",
             "Global issuer reopening could not be recorded atomically",
           );
-        db.prepare(
-          "INSERT OR IGNORE INTO legacy_publication_retained_versions SELECT id FROM data_files WHERE scope = ?",
-        ).run(scope);
+        retainLegacyVersions(db, retainedFiles, { scope });
         // Preserve shutdown evidence and the qualified restoration receipt.
 
         db.prepare(

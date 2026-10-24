@@ -7,7 +7,12 @@ import { keccak256, stringToHex } from "viem";
 import {
   canonicalJson,
   envelopeGeneration,
+  type HierarchyManagerOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import {
+  hasRetainedVersionFiles,
+  recordRetainedVersionFiles,
+} from "./hierarchy.js";
 import {
   decryptWithPassword,
   deriveScopeKey,
@@ -191,6 +196,102 @@ export function exactVersionIdentity(
     (!replica ||
       (replica.version === entry.version &&
         replica.dataPointId === entry.dataPointId))
+  );
+}
+
+interface RetainableRow {
+  id: number;
+  path: string;
+  scope: string;
+  collected_at: string;
+  generation: string | null;
+  retained: number;
+}
+
+const toRetainedFiles = (row: RetainableRow) => ({
+  path: row.path,
+  scope: row.scope,
+  collectedAt: row.collected_at,
+  generation: row.generation,
+});
+
+/**
+ * Retain indexed versions: one exact version, or every version of a scope.
+ * Call it in the writer transaction that seals them. Their files' retention
+ * records are written first (`recordRetainedVersionFiles`), with the bytes
+ * present now, then their rows. A version retained earlier keeps the record
+ * it has, or gets an unknown-bytes record: its current bytes are never
+ * adopted as its identity. Indexed versions are never retained without this
+ * root's storage, because their files would stay mutable.
+ */
+export function retainLegacyVersions(
+  db: Database.Database,
+  storage: HierarchyManagerOptions | undefined,
+  versions: { scope: string } | { versionId: number },
+): void {
+  const rows = db
+    .prepare(
+      `SELECT f.id, f.path, f.scope, f.collected_at, f.generation,
+        EXISTS (SELECT 1 FROM legacy_publication_retained_versions r WHERE r.version_id = f.id) AS retained
+      FROM data_files f WHERE ${"scope" in versions ? "f.scope = ?" : "f.id = ?"}`,
+    )
+    .all(
+      "scope" in versions ? versions.scope : versions.versionId,
+    ) as RetainableRow[];
+  if (rows.length === 0) return;
+  if (!storage)
+    throw new ProtocolError(
+      503,
+      "LEGACY_SHUTDOWN_UNAVAILABLE",
+      "Retaining indexed legacy versions needs this root's storage",
+      { missing: ["retained_version_files"] },
+    );
+  recordRetainedVersionFiles(
+    storage,
+    rows.filter((row) => !row.retained).map(toRetainedFiles),
+    "observed",
+  );
+  recordRetainedVersionFiles(
+    storage,
+    rows.filter((row) => row.retained).map(toRetainedFiles),
+    "unknown",
+  );
+  const insert = db.prepare(
+    "INSERT OR IGNORE INTO legacy_publication_retained_versions(version_id) VALUES (?)",
+  );
+  for (const row of rows) insert.run(row.id);
+}
+
+/**
+ * Give every retained version without retention records an unknown-bytes
+ * record. Retention metadata older than these records named no bytes, so
+ * none are inferred now. Runs whenever storage or recovery opens a root.
+ */
+export function recordUnknownRetainedFiles(
+  db: Database.Database | undefined,
+  storage: HierarchyManagerOptions,
+): void {
+  if (
+    !db ||
+    !db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='legacy_publication_retained_versions'",
+      )
+      .get()
+  )
+    return;
+  const rows = (
+    db
+      .prepare(
+        `SELECT f.id, f.path, f.scope, f.collected_at, f.generation, 1 AS retained
+        FROM data_files f JOIN legacy_publication_retained_versions r ON r.version_id = f.id`,
+      )
+      .all() as RetainableRow[]
+  ).map(toRetainedFiles);
+  recordRetainedVersionFiles(
+    storage,
+    rows.filter((row) => !hasRetainedVersionFiles(storage, row)),
+    "unknown",
   );
 }
 

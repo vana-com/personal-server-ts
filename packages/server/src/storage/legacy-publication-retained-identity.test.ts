@@ -29,7 +29,10 @@ import {
   createLegacyPublicationPolicy,
   type LegacyRestorationAdapter,
 } from "./legacy-publication-policy.js";
-import { optInLegacyPublicationGate } from "./legacy-publication-fence.js";
+import {
+  optInLegacyPublicationGate,
+  retainLegacyVersions,
+} from "./legacy-publication-fence.js";
 
 const scope = "spotify.profile";
 const owner = "0xowner";
@@ -105,9 +108,7 @@ function fixture() {
     for (const entry of index.findByScope({ scope }))
       if (entry.dataPointId === null)
         index.updateDataPointId(entry.path, `remote-${entry.id}`);
-    db.prepare(
-      "INSERT OR IGNORE INTO legacy_publication_retained_versions SELECT id FROM data_files",
-    ).run();
+    retainLegacyVersions(db, hierarchyOptions, { scope });
     db.prepare("UPDATE legacy_publication_policy SET state='stopped'").run();
     if (state === "mirroring")
       expect(await policy.rollback(scope, { expectedEpoch: 2 })).toMatchObject({

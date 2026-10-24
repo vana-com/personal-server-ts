@@ -3,6 +3,7 @@ import {
   assertLegacyHistoryMutable,
   assertRetainedVersionRepair,
   holdLegacyPublication,
+  retainLegacyVersions,
 } from "./legacy-publication-fence.js";
 import {
   hasPdppOrigin,
@@ -233,9 +234,7 @@ export function createImportOperations(
       // Protect every restored version at acceptance, including a lost remote
       // acknowledgement or a later restoration of a newer canonical revision.
       if (restoreAuthorized.get(row)) {
-        db.prepare(
-          "INSERT OR IGNORE INTO legacy_publication_retained_versions(version_id) VALUES (?)",
-        ).run(entry.id);
+        retainLegacyVersions(db, options, { versionId: entry.id });
         db.prepare(
           `INSERT OR IGNORE INTO legacy_publication_restore_versions
           SELECT @version_id, a.owner, a.server_generation, a.epoch, a.operation, @data_hash, 'current'

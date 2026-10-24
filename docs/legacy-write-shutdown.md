@@ -248,14 +248,87 @@ any retained version.
 
 A retained NULL generation can be filled only by storage after verifying the
 published envelope twice inside the writer transaction. Direct generation edits
-and later changes remain forbidden. A retained version is immutable in every
-policy state, including mirroring after rollback and with the flag disabled.
-A lost legacy file can be repaired only at its existing retained path with the
-known full-envelope generation, scope and timestamp. Replica repair also needs
-the same registered version and data-point id. A NULL or mismatched identity
-is refused before any effect (`409 legacy_history_retained`, or
-`legacy_scope_retired` while the scope is fenced), and the index row is not
-changed. No new version is admitted by repair.
+and later changes remain forbidden. Storage callers also check identity before
+any effect (`409 legacy_history_retained`, or `legacy_scope_retired` while the
+scope is fenced): replica repair needs the same generation, registered version
+and data-point id, and the index row is not changed. These caller checks are
+defence in depth. The file owner below decides.
+
+## Retained version files
+
+`packages/server/src/storage/hierarchy.ts` owns every file effect under a data
+directory, and it enforces retained-version immutability itself. Every write,
+staged or synchronous publication, stage consumption, block sidecar write,
+first-seen ledger write, temp file, directory creation and deletion goes through
+its checked primitives, using the effect's actual absolute path. A caller with
+fresh options, a parent data directory, a symbolic-link alias or only paths
+reaches the same rule. The rule applies in every policy state, including
+mirroring after rollback and with the flag disabled, and on a restarted root.
+The table-driven test `retained-version-files.test.ts` lists every exported
+function of the owner and of node storage, and every storage-port method. A new
+export fails that test until it is classified, and every mutation has refusal
+and no-op cases.
+
+Sealing (`retainLegacyVersions` in
+`packages/server/src/storage/legacy-publication-fence.ts`, used by the stop
+barrier, by reopening and by restored-head acceptance) first writes byte records
+under `<dataDir>/.legacy-retained/`, then inserts the retained rows in the same
+SQLite transaction. Records are never replaced or removed. There is one record
+for the envelope at the row's indexed path, one for the canonical path its scope
+and time name if that path differs, and one for the block sidecar directory:
+the SHA-256 of each file, or `absent`. Stop seals only history that is really
+there. A missing indexed envelope, or bytes that are not the row's generation,
+make the seal fail, and the transaction does not commit. Indexed versions cannot
+be sealed without storage bound to the same index database
+(`503 LEGACY_SHUTDOWN_UNAVAILABLE`, `missing: ["retained_version_files"]`). The
+record root is admitted like any other effect: a data directory that is, or
+resolves through a link to, a path inside a retained set is refused.
+
+For a retained file set:
+
+- Removal, replacement, renaming, and consumption as a publication stage are
+  refused. This includes any directory that holds retained files or a data root.
+- Writing bytes identical to an existing retained file is a no-op.
+- A missing retained file is created only from bytes with its recorded SHA-256.
+  Equal content in other bytes (for example, another key order) is not the same
+  file. A sidecar recorded `absent` stays absent, so derived sidecars are never
+  added after sealing.
+- Nothing is created inside a retained set.
+
+Refusals are `409 legacy_history_retained`, raised before any lasting effect.
+The first-seen ledger is scope-level, not a version file. It is written and
+deleted freely at its own path, but if that path resolves inside a retained set
+it is refused like any other effect.
+
+Races: after writing its records, a seal reads the files again and fails if
+they changed. A removal first moves the path aside, then checks again. A
+creation checks again after it links. If a seal and a mutation overlap, in this
+process or another, either the seal fails or the mutation is undone and
+refused. Sealed bytes are never removed. A removal that moved a file aside
+before the seal read it wins, and the seal fails because the file is missing.
+Record existence counts as absent only on ENOENT or ENOTDIR. An unreadable
+record or record directory throws, so it is never treated as unretained.
+
+Migration and limits:
+
+- Roots retained by earlier gate builds have retained rows but no byte records.
+  Opening storage or boot recovery gives each such version an unknown-bytes
+  record and infers nothing from current bytes. Its files cannot be changed,
+  and the identical bytes stay a no-op. A lost file cannot be restored, even
+  from its old bytes, because they cannot be proven.
+- A raw SQL insert into `legacy_publication_retained_versions` is not a sealing
+  path. Until storage next opens the root, such a row has no file records, so
+  only the caller checks protect it. After storage opens, it fails closed as
+  above. All runtime sealing uses `retainLegacyVersions`.
+- A seal that fails after it wrote records leaves them in place. The files stay
+  protected even though no row was committed. This over-protection cannot be
+  undone through the runtime.
+- A crash inside a race window can leave a moved-aside `.retiring.*` file or an
+  extra link. It never deletes a retained byte.
+- Code that writes to the filesystem directly, outside this module, is not
+  fenced. Neither is another operating-system user.
+- Sealing reads and hashes every file of the scope synchronously inside the stop
+  transaction.
 
 A leftover `.pending` stage for an indexed version whose file is missing is
 published only through `publishIndexedStage` in
@@ -263,7 +336,8 @@ published only through `publishIndexedStage` in
 finalize replay. While the gate is active, it reads the stage bytes, checks
 them against the row's exact known identity and publishes those checked bytes
 in one `BEGIN IMMEDIATE` transaction. It publishes for a retained version in any
-state, or for an unretained version in an unfenced scope. Any other stage,
+state, or for an unretained version in an unfenced scope. The file owner still
+publishes a retained version only from its recorded bytes. Any other stage,
 including a NULL generation, is held as `recovery-stage` with its bytes and
 stays in place. Boot continues; a replay returns `409`. Chunked finalize does
 not index a generation, so a retained chunked version can be repaired from a

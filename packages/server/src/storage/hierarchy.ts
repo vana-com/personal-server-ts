@@ -1,14 +1,10 @@
 import {
   access,
-  link,
-  mkdir,
   open,
   readFile,
-  writeFile,
   readdir,
-  unlink,
-  rename,
   rm,
+  writeFile,
 } from "node:fs/promises";
 import {
   createReadStream,
@@ -21,15 +17,17 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
+  renameSync,
   rmSync,
   rmdirSync,
-  writeFileSync,
+  statSync,
   unlinkSync,
-  renameSync,
+  writeFileSync,
 } from "node:fs";
 import { Readable } from "node:stream";
-import { dirname, join, relative, resolve, sep } from "node:path";
-import { randomUUID } from "node:crypto";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import {
   DataFileEnvelopeSchema,
   scopeToPathSegments,
@@ -53,6 +51,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import { previewJsonEnvelopePrefix } from "@opendatalabs/personal-server-ts-core/storage/preview";
+import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 
 function syncDirectory(path: string): void {
   if (process.platform === "win32") return;
@@ -62,6 +61,594 @@ function syncDirectory(path: string): void {
   } finally {
     closeSync(fd);
   }
+}
+
+/*
+ * Retained version files.
+ *
+ * A retained legacy version (`legacy_publication_retained_versions`) is
+ * immutable in every policy state, including mirroring after rollback and
+ * with the gate flag off. This module owns every file effect under a data
+ * directory, so it enforces that rule itself for every caller, from the
+ * actual absolute path of each effect: any options object, any scope mapping
+ * and path-only calls reach the same rule. It needs no database handle:
+ * sealing writes a durable identity record per retained file set into the
+ * data root, and every effect reads those records synchronously, right
+ * before it happens and again right after it.
+ *
+ * Records live under `<dataDir>/.legacy-retained/` and are never replaced or
+ * removed:
+ * - `<envelope path>.retained`: `{ kind: "envelope", sha256 }`, for the
+ *   indexed path and for the path the version's scope and time name;
+ * - `blocks/<scope dirs>/<collectedAt>.retained`: `{ kind: "blocks", files }`,
+ *   where `files` maps each sidecar file name to its SHA-256, or is `"absent"`
+ *   (no sidecar existed when sealed) or `"unknown"`.
+ *
+ * Rules:
+ * - nothing removes, replaces or renames a retained file, a directory that
+ *   holds one or a data root; a publisher never consumes a retained file as
+ *   its stage; nothing creates a file or directory inside a retained set;
+ * - the same bytes over an existing retained file are a no-op;
+ * - a missing retained file is created only from bytes with its recorded
+ *   SHA-256. Without one (`sha256: null`, an absent or unknown sidecar) it
+ *   stays missing. Equal content in other bytes is not the same file.
+ * Refusals are `409 legacy_history_retained`, before any lasting effect.
+ *
+ * Races: sealing re-reads the files after writing their records and fails if
+ * they changed. A removal first moves the path aside and checks again; a
+ * creation checks again after it links. So a seal and a mutation that
+ * overlap, in this or another process, end with the seal failed or the
+ * mutation undone, never with sealed bytes removed or replaced. A crash inside
+ * that window can leave a moved-aside file (`.retiring.*`) or an extra link,
+ * never a deleted retained byte.
+ */
+const RETAINED_DIR = ".legacy-retained";
+const RETAINED_SUFFIX = ".retained";
+
+type RetainedIdentity =
+  | { kind: "envelope"; sha256: string | null }
+  | { kind: "blocks"; files: Record<string, string> | "absent" | "unknown" }
+  | { kind: "unknown" };
+
+function sha256Hex(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function retainedRefusal(): never {
+  throw new ProtocolError(
+    409,
+    "legacy_history_retained",
+    "A retained legacy version is immutable; only its recorded bytes can restore a missing file",
+  );
+}
+
+function missingPath(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** `path` with the symbolic links of its existing ancestors resolved. A link
+ * at `path` itself stays: it is what an effect at `path` changes. */
+function realTarget(path: string): string {
+  const absolute = resolve(path);
+  const rest = [basename(absolute)];
+  for (let current = dirname(absolute); ; current = dirname(current)) {
+    try {
+      return join(realpathSync(current), ...rest);
+    } catch (error) {
+      if (!missingPath(error)) throw error;
+      if (dirname(current) === current) return absolute;
+      rest.unshift(basename(current));
+    }
+  }
+}
+
+/** Whether a retention path exists. Only a proven absence (ENOENT, ENOTDIR)
+ * is false: an unreadable path throws, so it never reads as unretained. */
+function markerExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if (missingPath(error)) return false;
+    throw error;
+  }
+}
+
+function readRetainedIdentity(record: string): RetainedIdentity {
+  try {
+    const identity = JSON.parse(readFileSync(record, "utf8")) as {
+      kind?: unknown;
+    };
+    if (identity.kind === "envelope" || identity.kind === "blocks")
+      return identity as RetainedIdentity;
+  } catch {
+    // An unreadable record still marks its files retained, identity unknown.
+  }
+  return { kind: "unknown" };
+}
+
+/**
+ * The retained file set `path` belongs to, with the path's name inside it
+ * (`""` for the set itself), or whether `path` is a directory above retained
+ * files of a data root that encloses it. Every data root above `path` is
+ * consulted; a path inside the records themselves is refused.
+ */
+function retainedAt(path: string): {
+  version?: { identity: RetainedIdentity; inner: string };
+  holds: boolean;
+} {
+  const target = realTarget(path);
+  let holds = false;
+  for (let root = dirname(target); ; root = dirname(root)) {
+    if (markerExists(join(root, RETAINED_DIR))) {
+      const segments = relative(root, target).split(sep);
+      if (segments[0] === RETAINED_DIR) retainedRefusal();
+      for (let i = 1; i <= segments.length; i++) {
+        const record =
+          join(root, RETAINED_DIR, ...segments.slice(0, i)) + RETAINED_SUFFIX;
+        if (markerExists(record))
+          return {
+            version: {
+              identity: readRetainedIdentity(record),
+              inner: segments.slice(i).join(sep),
+            },
+            holds: false,
+          };
+      }
+      if (markerExists(join(root, RETAINED_DIR, ...segments))) holds = true;
+    }
+    if (dirname(root) === root) return { holds };
+  }
+}
+
+/** Whether the tree at `path` contains a data root's records. Links are not
+ * followed, as removal does not follow them. */
+function containsRetainedRoot(path: string): boolean {
+  let entries;
+  try {
+    entries = readdirSync(path, { withFileTypes: true });
+  } catch (error) {
+    if (missingPath(error)) return false;
+    throw error;
+  }
+  return entries.some(
+    (entry) =>
+      entry.name === RETAINED_DIR ||
+      (entry.isDirectory() && containsRetainedRoot(join(path, entry.name))),
+  );
+}
+
+/** Refuse creating a file or directory at `path` when it is, or is inside, a
+ * retained file set. Restoring a missing retained file uses `linkNewSync`. */
+function assertCreatable(path: string): void {
+  if (retainedAt(path).version) retainedRefusal();
+}
+
+/** Refuse removing, replacing or moving `path`, now at `physical`, when it is
+ * or holds retained files or a data root. */
+function assertRemovable(path: string, physical = path): void {
+  const at = retainedAt(path);
+  if (at.version || at.holds || containsRetainedRoot(physical))
+    retainedRefusal();
+}
+
+function recordedBytes(
+  { identity, inner }: { identity: RetainedIdentity; inner: string },
+  candidate: Buffer,
+): boolean {
+  if (identity.kind === "envelope")
+    return (
+      inner === "" &&
+      !!identity.sha256 &&
+      sha256Hex(candidate) === identity.sha256
+    );
+  return (
+    identity.kind === "blocks" &&
+    typeof identity.files === "object" &&
+    inner !== "" &&
+    !inner.includes(sep) &&
+    Object.hasOwn(identity.files, inner) &&
+    identity.files[inner] === sha256Hex(candidate)
+  );
+}
+
+/**
+ * Admit `bytes` as the file at `path`: `"free"` when no retained version owns
+ * the path, `"same"` when the retained file already holds exactly these bytes
+ * (a no-op), or `"restore"` when it is missing and these are its recorded
+ * bytes. Anything else is refused before any effect. `bytes` is read only for
+ * a retained path.
+ */
+function admitRetainedFile(
+  path: string,
+  bytes: () => Uint8Array,
+): "free" | "same" | "restore" {
+  const at = retainedAt(path);
+  if (at.holds) retainedRefusal();
+  if (!at.version) return "free";
+  const candidate = Buffer.from(bytes());
+  let existing: Buffer | undefined;
+  try {
+    existing = readFileSync(path);
+  } catch (error) {
+    if (!missingPath(error)) throw error;
+  }
+  if (existing) {
+    if (existing.equals(candidate)) return "same";
+    retainedRefusal();
+  }
+  if (recordedBytes(at.version, candidate)) return "restore";
+  retainedRefusal();
+}
+
+/** Create the directory `dir` and its missing parents, never inside a
+ * retained set. Returns the directories created, outermost first. */
+function ensureDirSync(dir: string): string[] {
+  const missing: string[] = [];
+  for (let parent = resolve(dir); !existsSync(parent);) {
+    missing.unshift(parent);
+    const next = dirname(parent);
+    if (next === parent) break;
+    parent = next;
+  }
+  if (missing.length === 0) return missing;
+  assertCreatable(dir);
+  mkdirSync(dir, { recursive: true });
+  if (retainedAt(dir).version) {
+    // A seal landed meanwhile: take back only what this call created.
+    for (const created of [...missing].reverse()) rmdirSync(created);
+    retainedRefusal();
+  }
+  return missing;
+}
+
+/** Undo a creation at `path` that a seal now covers, then refuse. Removes the
+ * file only if it is still the one this call created (`created`). */
+function refuseCreated(path: string, created: { dev: number; ino: number }) {
+  const now = lstatSync(path, { throwIfNoEntry: false });
+  if (now && now.dev === created.dev && now.ino === created.ino)
+    unlinkSync(path);
+  retainedRefusal();
+}
+
+/** Exclusively create `path` with `bytes`, fsynced. Never inside a retained
+ * set, including one sealed while it was written. */
+function createFileSync(path: string, bytes: Uint8Array): void {
+  assertCreatable(path);
+  const fd = openSync(path, "wx", 0o600);
+  try {
+    writeFileSync(fd, bytes);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  if (retainedAt(path).version) refuseCreated(path, statSync(path));
+}
+
+/**
+ * Link `source` at `path` without replacing a file; false when a file is
+ * already there. At a retained path only its recorded bytes may be linked.
+ * The path is checked again after the link: a seal that landed meanwhile
+ * either recorded these bytes or this link is removed and refused.
+ */
+function linkNewSync(source: string, path: string): boolean {
+  if (existsSync(path)) return false;
+  admitRetainedFile(path, () => readFileSync(source));
+  try {
+    linkSync(source, path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+  const at = retainedAt(path);
+  if (
+    at.holds ||
+    (at.version && !recordedBytes(at.version, readFileSync(path)))
+  )
+    refuseCreated(path, statSync(source));
+  return true;
+}
+
+/**
+ * A removal target: a whole tree, or a file removed with the semantics of
+ * `rmSync` or `unlinkSync` (a directory there fails as those calls fail).
+ */
+type Removal = string | { file: string; as: "rm" | "unlink" };
+
+const removalPath = (removal: Removal) =>
+  typeof removal === "string" ? removal : removal.file;
+
+/**
+ * Move existing targets aside so the caller can delete or replace them. Each
+ * is checked before any move and again after its own move: a seal that lands
+ * in between either finds the path gone and fails, or is found here and every
+ * moved path is put back. Returns the moved-aside paths; missing ones are
+ * skipped.
+ */
+function detachSync(removals: readonly Removal[]): string[] {
+  for (const removal of removals) {
+    assertRemovable(removalPath(removal));
+    if (
+      typeof removal !== "string" &&
+      lstatSync(removal.file, { throwIfNoEntry: false })?.isDirectory()
+    ) {
+      // Fail exactly as the plain file removal does; it removes nothing here.
+      if (removal.as === "rm") rmSync(removal.file, { force: true });
+      else unlinkSync(removal.file);
+    }
+  }
+  const moved: [string, string][] = [];
+  try {
+    for (const removal of removals) {
+      const path = removalPath(removal);
+      const aside = join(dirname(path), `.retiring.${randomUUID()}`);
+      try {
+        renameSync(path, aside);
+      } catch (error) {
+        if (missingPath(error)) continue;
+        throw error;
+      }
+      moved.push([path, aside]);
+      assertRemovable(path, aside);
+    }
+  } catch (error) {
+    for (const [path, aside] of moved.reverse())
+      restoreDetachedSync(aside, path);
+    throw error;
+  }
+  return moved.map(([, aside]) => aside);
+}
+
+/** Put a moved-aside path back without replacing anything there now. */
+function restoreDetachedSync(aside: string, path: string): void {
+  if (lstatSync(aside).isDirectory()) {
+    renameSync(aside, path);
+    return;
+  }
+  linkSync(aside, path);
+  unlinkSync(aside);
+}
+
+/** Remove targets; missing ones are a no-op. See `detachSync`. */
+function removeSync(removals: readonly Removal[]): void {
+  for (const aside of detachSync(removals))
+    rmSync(aside, { recursive: true, force: true });
+}
+
+/**
+ * Replace the file at `path` with `source` atomically for readers. A backup
+ * link keeps the old bytes until the new file is checked: if a seal landed
+ * meanwhile and did not record the new bytes, the old file is put back.
+ */
+function replaceFileSync(source: string, path: string): void {
+  assertRemovable(path);
+  assertCreatable(source);
+  const backup = join(dirname(path), `.retiring.${randomUUID()}`);
+  let backedUp = true;
+  try {
+    linkSync(path, backup);
+  } catch (error) {
+    if (!missingPath(error)) throw error;
+    backedUp = false;
+  }
+  renameSync(source, path);
+  const at = retainedAt(path);
+  if (
+    at.holds ||
+    (at.version && !recordedBytes(at.version, readFileSync(path)))
+  ) {
+    if (backedUp) renameSync(backup, path);
+    else unlinkSync(path);
+    retainedRefusal();
+  }
+  if (backedUp) unlinkSync(backup);
+}
+
+/** A version whose files become retained, as its index row names them. */
+export interface RetainedVersionFiles {
+  scope: string;
+  collectedAt: string;
+  /** The row's envelope path, relative to the data directory. */
+  path: string;
+  /** The generation the row records, if known. */
+  generation: string | null;
+}
+
+/**
+ * Seal versions' files: record them as retained. Call it in the writer
+ * transaction that inserts their retained rows, before that transaction
+ * commits. It changes no version file, and it never replaces a record: a
+ * version keeps its first one. Both the row's own envelope path and the path
+ * its scope and time name are sealed. A row path outside the data directory
+ * is refused.
+ *
+ * With `bytes: "observed"`, the record holds the SHA-256 of each file present
+ * now. A version is sealed only with its indexed envelope present and, when
+ * the row records a generation, holding that generation: missing or changed
+ * history is never certified, so this throws before writing any record. The
+ * files are read again after the records are written; if they no longer match
+ * (a mutation raced the seal), this throws. Either way the caller's
+ * transaction must not commit. A mutation that moved a file aside before this
+ * read therefore wins and the seal fails; one that starts later is refused
+ * (see `detachSync`, `linkNewSync`).
+ *
+ * With `bytes: "unknown"`, for versions retained before these records
+ * existed, no byte identity is recorded, so no lost file can be restored.
+ */
+export function recordRetainedVersionFiles(
+  options: HierarchyManagerOptions,
+  versions: readonly RetainedVersionFiles[],
+  bytes: "observed" | "unknown",
+): void {
+  if (versions.length === 0) return;
+  // The records' root is itself an effect: never inside a retained set,
+  // including through a link at the data directory itself.
+  ensureDirSync(options.dataDir);
+  const root = realpathSync(options.dataDir);
+  assertCreatable(root);
+  for (const version of versions) {
+    const blockDir = buildBlockDir(root, version.scope, version.collectedAt);
+    const sealed: {
+      path: string;
+      observe: () => RetainedIdentity;
+      unknown: RetainedIdentity;
+    }[] = [
+      ...retainedEnvelopePaths(root, version).map((path) => ({
+        path,
+        observe: () => observedEnvelopeIdentity(path, version.generation),
+        unknown: { kind: "envelope", sha256: null } as RetainedIdentity,
+      })),
+      {
+        path: blockDir,
+        observe: () => observedBlockIdentity(blockDir),
+        unknown: { kind: "blocks", files: "unknown" },
+      },
+    ];
+    const identities = sealed.map(({ observe, unknown }) =>
+      bytes === "observed" ? observe() : unknown,
+    );
+    const indexed = identities[0];
+    if (
+      bytes === "observed" &&
+      indexed.kind === "envelope" &&
+      indexed.sha256 === null
+    )
+      throw new Error(
+        `Cannot seal ${version.path}: its file is missing or is not its indexed generation`,
+      );
+    sealed.forEach(({ path }, i) =>
+      writeRetainedRecord(root, path, identities[i]),
+    );
+    if (bytes === "unknown") continue;
+    for (const { path, observe } of sealed)
+      if (
+        canonicalJson(readRetainedIdentity(retainedRecordPath(root, path))) !==
+        canonicalJson(observe())
+      )
+        throw new Error(
+          `Retained version files changed while sealing; retry: ${relative(root, path)}`,
+        );
+  }
+}
+
+/** Whether a version already has all its retention records. */
+export function hasRetainedVersionFiles(
+  options: HierarchyManagerOptions,
+  version: RetainedVersionFiles,
+): boolean {
+  let root: string;
+  try {
+    root = realpathSync(options.dataDir);
+  } catch (error) {
+    if (missingPath(error)) return false;
+    throw error;
+  }
+  return [
+    ...retainedEnvelopePaths(root, version),
+    buildBlockDir(root, version.scope, version.collectedAt),
+  ].every((target) => markerExists(retainedRecordPath(root, target)));
+}
+
+function retainedRecordPath(root: string, target: string): string {
+  return join(root, RETAINED_DIR, relative(root, target)) + RETAINED_SUFFIX;
+}
+
+/** The indexed path and the canonical path of a version's envelope. */
+function retainedEnvelopePaths(
+  root: string,
+  version: RetainedVersionFiles,
+): string[] {
+  const indexed = resolve(root, version.path);
+  const inside = relative(root, indexed);
+  if (
+    inside === "" ||
+    inside === ".." ||
+    inside.startsWith(`..${sep}`) ||
+    inside.split(sep)[0] === RETAINED_DIR ||
+    !inside.endsWith(".json")
+  )
+    throw new Error(
+      `Indexed version path is not a data file in its data directory: ${version.path}`,
+    );
+  const canonical = buildDataFilePath(root, version.scope, version.collectedAt);
+  return indexed === canonical ? [indexed] : [indexed, canonical];
+}
+
+function observedEnvelopeIdentity(
+  path: string,
+  generation: string | null,
+): RetainedIdentity {
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch (error) {
+    if (!missingPath(error)) throw error;
+    return { kind: "envelope", sha256: null };
+  }
+  if (generation !== null) {
+    let stored: string | undefined;
+    try {
+      stored = envelopeGeneration(JSON.parse(bytes.toString("utf8")));
+    } catch {
+      // Unparseable bytes have no generation.
+    }
+    // Bytes that are not the indexed version are not its identity.
+    if (stored !== generation) return { kind: "envelope", sha256: null };
+  }
+  return { kind: "envelope", sha256: sha256Hex(bytes) };
+}
+
+function observedBlockIdentity(dir: string): RetainedIdentity {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return { kind: "blocks", files: "absent" };
+    if (missingPath(error)) return { kind: "blocks", files: "unknown" };
+    throw error;
+  }
+  const files: Record<string, string> = {};
+  for (const entry of entries) {
+    if (!entry.isFile()) return { kind: "blocks", files: "unknown" };
+    files[entry.name] = sha256Hex(readFileSync(join(dir, entry.name)));
+  }
+  return { kind: "blocks", files };
+}
+
+function writeRetainedRecord(
+  root: string,
+  target: string,
+  identity: RetainedIdentity,
+): void {
+  const record = retainedRecordPath(root, target);
+  if (markerExists(record)) return;
+  const dir = dirname(record);
+  const missing: string[] = [];
+  for (let parent = dir; !existsSync(parent); parent = dirname(parent)) {
+    missing.push(parent);
+  }
+  mkdirSync(dir, { recursive: true });
+  for (const created of missing.reverse()) syncDirectory(dirname(created));
+  const temp = `${record}.tmp.${randomUUID()}`;
+  try {
+    const fd = openSync(temp, "wx", 0o600);
+    try {
+      writeFileSync(fd, JSON.stringify(identity));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      linkSync(temp, record);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  } finally {
+    rmSync(temp, { force: true });
+  }
+  syncDirectory(dir);
 }
 
 export class PublishedDataFileError extends Error {
@@ -86,38 +673,33 @@ export function publishDataFile(
     envelope.collectedAt,
   );
   const dir = dirname(path);
-  const missing: string[] = [];
-  for (let parent = dir; !existsSync(parent); parent = dirname(parent)) {
-    missing.push(parent);
-  }
-  mkdirSync(dir, { recursive: true });
-  for (const created of missing.reverse()) syncDirectory(dirname(created));
+  const result = {
+    path,
+    relativePath: relative(options.dataDir, path),
+    sizeBytes: bytes.byteLength,
+  };
   const temp = `${path}.tmp.${operation ?? randomUUID()}`;
-  rmSync(temp, { force: true });
+  if (admitRetainedFile(path, () => bytes) === "same") return result;
+  const missing = ensureDirSync(dir);
+  for (const created of missing) syncDirectory(dirname(created));
+  removeSync([{ file: temp, as: "rm" }]);
   let published = false;
   try {
     try {
-      const fd = openSync(temp, "wx", 0o600);
-      try {
-        writeFileSync(fd, bytes);
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      try {
-        linkSync(temp, path);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-        if (!readFileSync(path).equals(Buffer.from(bytes))) {
-          throw new Error(
-            `Stored envelope conflicts with publication at ${path}`,
-          );
-        }
+      createFileSync(temp, bytes);
+      if (
+        !linkNewSync(temp, path) &&
+        admitRetainedFile(path, () => bytes) === "free" &&
+        !readFileSync(path).equals(Buffer.from(bytes))
+      ) {
+        throw new Error(
+          `Stored envelope conflicts with publication at ${path}`,
+        );
       }
       published = true;
       syncDirectory(dir);
     } finally {
-      rmSync(temp, { force: true });
+      removeSync([{ file: temp, as: "rm" }]);
       syncDirectory(dir);
     }
   } catch (err) {
@@ -126,11 +708,7 @@ export function publishDataFile(
     }
     throw err;
   }
-  return {
-    path,
-    relativePath: relative(options.dataDir, path),
-    sizeBytes: bytes.byteLength,
-  };
+  return result;
 }
 
 export function deleteDataFileSync(
@@ -140,13 +718,15 @@ export function deleteDataFileSync(
   operation?: string,
 ): void {
   const path = buildDataFilePath(options.dataDir, scope, collectedAt);
-  rmSync(path, { force: true });
-  if (operation) rmSync(`${path}.tmp.${operation}`, { force: true });
+  const asides = detachSync([
+    { file: path, as: "rm" },
+    ...(operation
+      ? [{ file: `${path}.tmp.${operation}`, as: "rm" as const }]
+      : []),
+    buildBlockDir(options.dataDir, scope, collectedAt),
+  ]);
+  for (const aside of asides) rmSync(aside, { recursive: true, force: true });
   if (existsSync(dirname(path))) syncDirectory(dirname(path));
-  rmSync(buildBlockDir(options.dataDir, scope, collectedAt), {
-    recursive: true,
-    force: true,
-  });
 }
 
 export function deleteFirstSeenLedgerSync(
@@ -154,7 +734,9 @@ export function deleteFirstSeenLedgerSync(
   scope: string,
 ): void {
   try {
-    rmSync(buildFirstSeenLedgerPath(options.dataDir, scope), { force: true });
+    removeSync([
+      { file: buildFirstSeenLedgerPath(options.dataDir, scope), as: "rm" },
+    ]);
   } catch {
     /* Derived sidecar cleanup must not block data deletion. */
   }
@@ -208,14 +790,25 @@ export function snapshotScopeFiles(
   return { files, directories };
 }
 
+/**
+ * Delete a snapshot from `snapshotScopeFiles`. The snapshot may predate a
+ * seal, so every target is checked now, before any effect, and each removal
+ * is checked again after its move (see `detachSync`).
+ */
 export function deleteScopeFilesSync(
   snapshot: ReturnType<typeof snapshotScopeFiles>,
 ): void {
-  for (const path of snapshot.files) rmSync(path, { force: true });
+  for (const path of snapshot.directories) assertRemovable(path);
+  for (const aside of detachSync(
+    snapshot.files.map((file) => ({ file, as: "rm" as const })),
+  ))
+    rmSync(aside, { force: true });
   for (const dir of new Set(snapshot.files.map(dirname))) {
     if (existsSync(dir)) syncDirectory(dir);
   }
   for (const path of snapshot.directories) {
+    // Only an empty directory is removed: it holds no retained byte.
+    assertRemovable(path);
     try {
       rmdirSync(path);
     } catch (err) {
@@ -270,8 +863,9 @@ export async function stageDataFile(
   );
   const finalDir = dirname(finalPath);
   const directorySyncPaths = collectDirectorySyncPaths(finalDir);
-  await mkdir(finalDir, { recursive: true });
+  ensureDirSync(finalDir);
   const stagePath = `${finalPath}.pending.${randomUUID()}`;
+  assertCreatable(stagePath);
   const handle = await openFile(stagePath, "wx");
   try {
     await handle.writeFile(bytes);
@@ -279,6 +873,8 @@ export async function stageDataFile(
   } finally {
     await handle.close();
   }
+  if (retainedAt(stagePath).version)
+    refuseCreated(stagePath, statSync(stagePath));
   for (const directoryPath of directorySyncPaths) {
     const directory = await openFile(directoryPath, "r");
     try {
@@ -323,20 +919,27 @@ function sameEnvelope(a: Buffer, b: Buffer): boolean {
  * Fail when a file already published at `finalPath` holds a different
  * envelope than the staged one. Nothing is published or changed. Callers run
  * it before committing an index row, so a rejected publication leaves no row
- * describing bytes that are not there.
+ * describing bytes that are not there. A retained file accepts only its exact
+ * bytes.
  */
 export async function assertPublishable(
   stagePath: string,
   finalPath: string,
 ): Promise<void> {
+  assertPublishableSync(stagePath, finalPath);
+}
+
+function assertPublishableSync(stagePath: string, finalPath: string): void {
+  if (admitRetainedFile(finalPath, () => readFileSync(stagePath)) !== "free")
+    return;
   let published: Buffer;
   try {
-    published = await readFile(finalPath);
+    published = readFileSync(finalPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
     throw err;
   }
-  const staged = await readFile(stagePath);
+  const staged = readFileSync(stagePath);
   if (!published.equals(staged) && !sameEnvelope(published, staged)) {
     throw new Error(
       `Stored envelope conflicts with publication at ${finalPath}`,
@@ -351,25 +954,14 @@ export async function assertPublishable(
  * selected, including its PDPP provenance, and only then read the path, so
  * different bytes appearing there would bypass that decision. The same
  * envelope (in any key order) republishes idempotently and keeps the stored
- * bytes; a different envelope fails, as in `publishDataFile`.
+ * bytes; a different envelope fails, as in `publishDataFile`. The stage is
+ * consumed, so it must not be a retained file.
  */
 export async function publishStagedDataFile(
   stagePath: string,
   finalPath: string,
 ): Promise<void> {
-  try {
-    await link(stagePath, finalPath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    await assertPublishable(stagePath, finalPath);
-  }
-  await unlink(stagePath);
-  const directory = await open(dirname(finalPath), "r");
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
-  }
+  publishStagedDataFileSync(stagePath, finalPath);
 }
 
 /** No-replace stage publication for callers holding the SQLite writer gate.
@@ -378,19 +970,41 @@ export function publishStagedDataFileSync(
   stagePath: string,
   finalPath: string,
 ): void {
-  try {
-    linkSync(stagePath, finalPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const published = readFileSync(finalPath);
-    const staged = readFileSync(stagePath);
-    if (!published.equals(staged) && !sameEnvelope(published, staged))
-      throw new Error(
-        `Stored envelope conflicts with publication at ${finalPath}`,
-      );
-  }
+  assertRemovable(stagePath);
+  if (!linkNewSync(stagePath, finalPath))
+    assertPublishableSync(stagePath, finalPath);
   syncDirectory(dirname(finalPath));
-  unlinkSync(stagePath);
+  removeSync([{ file: stagePath, as: "unlink" }]);
+}
+
+/**
+ * Publish exactly `bytes`, read earlier from `stagePath`, at `finalPath`, then
+ * consume the stage. A stage changed after the read cannot reach the final
+ * path. Returns false, leaving the stage, when the final path refuses them.
+ */
+export function publishStageBytesSync(
+  stagePath: string,
+  bytes: Uint8Array,
+  finalPath: string,
+): boolean {
+  assertRemovable(stagePath);
+  const verified = `${stagePath}.${randomUUID()}`;
+  createFileSync(verified, bytes);
+  try {
+    publishStagedDataFileSync(verified, finalPath);
+  } catch {
+    // A file that appeared at the final path is not replaced.
+    removeSync([{ file: verified, as: "rm" }]);
+    return false;
+  }
+  removeSync([{ file: stagePath, as: "unlink" }]);
+  return true;
+}
+
+/** Remove a stage or an unindexed publication. A missing file is a no-op;
+ * a retained file is refused. */
+export async function discardDataFile(path: string): Promise<void> {
+  removeSync([{ file: path, as: "unlink" }]);
 }
 
 /** Read and parse a data file */
@@ -479,20 +1093,21 @@ export async function readFirstSeenLedger(
   }
 }
 
-/** Atomic write: mkdir -p, write temp file, rename. */
+/** Atomic write: mkdir -p, write temp file, rename. The ledger is
+ * scope-level, not a version file, but its actual path gets the same rules. */
 export async function writeFirstSeenLedger(
   options: HierarchyManagerOptions,
   scope: string,
   ledger: unknown,
 ): Promise<void> {
   const filePath = buildFirstSeenLedgerPath(options.dataDir, scope);
-  await mkdir(dirname(filePath), { recursive: true });
+  ensureDirSync(dirname(filePath));
   const tempPath = `${filePath}.tmp.${randomUUID()}`;
   try {
-    await writeFile(tempPath, JSON.stringify(ledger), "utf-8");
-    await rename(tempPath, filePath);
+    createFileSync(tempPath, Buffer.from(JSON.stringify(ledger), "utf-8"));
+    replaceFileSync(tempPath, filePath);
   } catch (err) {
-    await rm(tempPath, { force: true });
+    removeSync([{ file: tempPath, as: "rm" }]);
     throw err;
   }
 }
@@ -502,7 +1117,9 @@ export async function deleteFirstSeenLedger(
   options: HierarchyManagerOptions,
   scope: string,
 ): Promise<void> {
-  await rm(buildFirstSeenLedgerPath(options.dataDir, scope), { force: true });
+  removeSync([
+    { file: buildFirstSeenLedgerPath(options.dataDir, scope), as: "rm" },
+  ]);
 }
 
 export async function writeBlockManifest(
@@ -516,7 +1133,7 @@ export async function writeBlockManifest(
   const dir = buildBlockDir(options.dataDir, scope, collectedAt);
   const tempDir = `${dir}.tmp.${randomUUID()}`;
 
-  await mkdir(tempDir, { recursive: true });
+  ensureDirSync(tempDir);
   try {
     for (const block of blocks) {
       await writeFile(
@@ -525,46 +1142,68 @@ export async function writeBlockManifest(
         "utf-8",
       );
     }
-
-    const manifestPath = buildBlockManifestPath(
-      options.dataDir,
-      scope,
-      collectedAt,
-    );
-    if (commit) {
-      // The gate publishes blocks and manifest in one rename at its barrier.
-      const tempManifestPath = join(tempDir, "manifest.json");
-      await writeFile(
-        tempManifestPath,
-        JSON.stringify(manifest, null, 2),
-        "utf-8",
-      );
-      try {
-        commit(() => {
-          rmSync(dir, { recursive: true, force: true });
-          renameSync(tempDir, dir);
-          syncDirectory(dirname(manifestPath));
-        });
-      } finally {
-        await rm(tempManifestPath, { force: true });
-      }
-      return;
-    }
-
-    await rm(dir, { recursive: true, force: true });
-    await rename(tempDir, dir);
-
-    const tempManifestPath = `${manifestPath}.tmp.${randomUUID()}`;
     await writeFile(
-      tempManifestPath,
+      join(tempDir, "manifest.json"),
       JSON.stringify(manifest, null, 2),
       "utf-8",
     );
-    await rename(tempManifestPath, manifestPath);
-  } catch (err) {
-    await rm(tempDir, { recursive: true, force: true });
-    throw err;
+    // Blocks and manifest appear together. The gate publishes at its barrier.
+    const publish = () => publishBlockDirSync(tempDir, dir);
+    if (commit) commit(publish);
+    else publish();
+  } finally {
+    if (existsSync(tempDir)) removeSync([tempDir]);
   }
+}
+
+/**
+ * Replace the sidecar directory `dir` with `tempDir`. A retained sidecar is
+ * never replaced: files it already holds must be byte-identical, and a
+ * missing file is created only from its recorded bytes.
+ */
+function publishBlockDirSync(tempDir: string, dir: string): void {
+  const at = retainedAt(dir);
+  if (at.version) {
+    if (at.version.inner !== "") retainedRefusal();
+    const restore = readdirSync(tempDir).filter(
+      (name) =>
+        admitRetainedFile(join(dir, name), () =>
+          readFileSync(join(tempDir, name)),
+        ) === "restore",
+    );
+    if (restore.length === 0) return;
+    mkdirSync(dir, { recursive: true });
+    for (const name of restore)
+      if (!linkNewSync(join(tempDir, name), join(dir, name)))
+        admitRetainedFile(join(dir, name), () =>
+          readFileSync(join(tempDir, name)),
+        );
+    syncDirectory(dir);
+    syncDirectory(dirname(dir));
+    return;
+  }
+  const [aside] = detachSync([dir]);
+  try {
+    renameSync(tempDir, dir);
+  } catch (error) {
+    if (aside) restoreDetachedSync(aside, dir);
+    throw error;
+  }
+  const now = retainedAt(dir);
+  if (
+    now.holds ||
+    (now.version &&
+      (now.version.inner !== "" ||
+        canonicalJson(now.version.identity) !==
+          canonicalJson(observedBlockIdentity(dir))))
+  ) {
+    // A seal landed meanwhile and did not record this sidecar: undo.
+    renameSync(dir, tempDir);
+    if (aside) restoreDetachedSync(aside, dir);
+    retainedRefusal();
+  }
+  syncDirectory(dirname(dir));
+  if (aside) rmSync(aside, { recursive: true, force: true });
 }
 
 export async function readScopeBlocks(
@@ -650,20 +1289,22 @@ export async function listVersions(
   return jsonFiles.map((f) => filenameToTimestamp(f.replace(".json", "")));
 }
 
-/** Delete a single data file. Idempotent: a missing file is a no-op (matches deleteByFileId's
- * no-op contract and avoids stalling the sync cursor when the blob is already gone). */
+/** Delete a single data file and its sidecar. Idempotent: a missing file is a
+ * no-op (matches deleteByFileId's no-op contract and avoids stalling the sync
+ * cursor when the blob is already gone). */
 export async function deleteDataFile(
   options: HierarchyManagerOptions,
   scope: string,
   collectedAt: string,
 ): Promise<void> {
-  const filePath = buildDataFilePath(options.dataDir, scope, collectedAt);
-  try {
-    await unlink(filePath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-  }
-  await deleteBlockSidecars(options, scope, collectedAt);
+  for (const aside of detachSync([
+    {
+      file: buildDataFilePath(options.dataDir, scope, collectedAt),
+      as: "unlink",
+    },
+    buildBlockDir(options.dataDir, scope, collectedAt),
+  ]))
+    await rm(aside, { recursive: true, force: true });
 }
 
 /**
@@ -674,10 +1315,11 @@ export async function deleteAllForScope(
   options: HierarchyManagerOptions,
   scope: string,
 ): Promise<void> {
-  const scopeDir = buildScopeDir(options.dataDir, scope);
-  await rm(scopeDir, { recursive: true, force: true });
-  const blockScopeDir = buildScopeDir(join(options.dataDir, "blocks"), scope);
-  await rm(blockScopeDir, { recursive: true, force: true });
+  for (const aside of detachSync([
+    buildScopeDir(options.dataDir, scope),
+    buildScopeDir(join(options.dataDir, "blocks"), scope),
+  ]))
+    await rm(aside, { recursive: true, force: true });
 }
 
 async function readBlockManifest(
@@ -748,17 +1390,6 @@ async function readBlockPayloadIfPresent(
     }
     throw err;
   }
-}
-
-async function deleteBlockSidecars(
-  options: HierarchyManagerOptions,
-  scope: string,
-  collectedAt: string,
-): Promise<void> {
-  await rm(buildBlockDir(options.dataDir, scope, collectedAt), {
-    recursive: true,
-    force: true,
-  });
 }
 
 function buildBlockDir(

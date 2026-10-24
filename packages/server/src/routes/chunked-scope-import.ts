@@ -23,6 +23,7 @@ import {
 } from "../storage/legacy-publication-fence.js";
 import { publishIndexedStage } from "../storage/node-data-storage.js";
 import {
+  discardDataFile,
   publishStagedDataFileSync,
   publishStagedDataFile,
 } from "../storage/hierarchy.js";
@@ -441,10 +442,12 @@ async function removeImportArtifacts(
     metadata.scope,
     metadata.collectedAt,
   );
-  await unlink(`${finalPath}.pending.${metadata.id}`).catch(() => undefined);
+  await discardDataFile(`${finalPath}.pending.${metadata.id}`).catch(
+    () => undefined,
+  );
   const relativePath = relative(deps.hierarchyOptions.dataDir, finalPath);
   if (!deps.indexManager.findByPath(relativePath)) {
-    await unlink(finalPath).catch(() => undefined);
+    await discardDataFile(finalPath).catch(() => undefined);
   }
 }
 
@@ -1001,7 +1004,7 @@ async function finalizeScopeImportAuthorized(
   // index transaction. Remove that unindexed publication before retrying with
   // a fresh timestamp so repeated retries cannot leave visible orphan files.
   if (!committedEntry && (await pathExists(finalPath))) {
-    await unlink(finalPath);
+    await discardDataFile(finalPath);
   }
   const latestBeforeStage = deps.indexManager.findLatestByScope(scope);
   const latestTime = latestBeforeStage
@@ -1093,7 +1096,7 @@ async function finalizeScopeImportAuthorized(
     await write(Buffer.from("}"));
     await file.sync();
   } catch (error) {
-    await unlink(stagePath).catch(() => undefined);
+    await discardDataFile(stagePath).catch(() => undefined);
     if (error instanceof ScopeImportError) throw error;
     throw error;
   } finally {
@@ -1109,7 +1112,7 @@ async function finalizeScopeImportAuthorized(
       latestAtCommit &&
       Date.parse(latestAtCommit.collectedAt) >= Date.parse(metadata.collectedAt)
     ) {
-      await unlink(stagePath).catch(() => undefined);
+      await discardDataFile(stagePath).catch(() => undefined);
       metadata.collectedAt = new Date(
         Date.parse(latestAtCommit.collectedAt) + 1,
       ).toISOString();
@@ -1159,12 +1162,12 @@ async function finalizeScopeImportAuthorized(
       // The synchronous index API can throw. Keep the data file only if the
       // transaction committed before the error became observable.
       if (!deps.indexManager.findByPath(relativePath)) {
-        await unlink(finalPath).catch(() => undefined);
+        await discardDataFile(finalPath).catch(() => undefined);
       }
       throw error;
     }
     if (!indexed.ok) {
-      await unlink(finalPath).catch(() => undefined);
+      await discardDataFile(finalPath).catch(() => undefined);
       const latest = deps.indexManager.findLatestByScope(scope);
       if (latest) {
         metadata.collectedAt = new Date(

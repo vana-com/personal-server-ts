@@ -7,6 +7,7 @@ import {
   holdLegacyPublication,
   exactVersionIdentity,
   isRetainedVersion,
+  recordUnknownRetainedFiles,
 } from "./legacy-publication-fence.js";
 import {
   hasPdppOrigin,
@@ -31,18 +32,11 @@ import {
   assertPublishable,
   publishStagedDataFile,
   publishStagedDataFileSync,
+  publishStageBytesSync,
+  discardDataFile,
 } from "./hierarchy.js";
-import { randomUUID } from "node:crypto";
-import {
-  closeSync,
-  fsyncSync,
-  openSync,
-  readFileSync,
-  rmSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { readFile, readdir, stat, unlink } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
@@ -82,6 +76,7 @@ export async function publishIndexedStage(
   finalPath: string,
 ): Promise<boolean> {
   const db = indexDatabase(deps.indexManager);
+  recordUnknownRetainedFiles(db, deps.hierarchyOptions);
   if (!db || !legacyPublicationGateActive(db)) {
     await publishStagedDataFile(stagePath, finalPath);
     return true;
@@ -109,27 +104,9 @@ export async function publishIndexedStage(
         (isRetainedVersion(db, entry.id) ||
           !legacyPublicationFenced(db, entry.scope))
       ) {
-        // Publish exactly the checked bytes, never the stage path again.
-        const verified = `${stagePath}.${randomUUID()}`;
-        const fd = openSync(verified, "wx");
-        try {
-          writeFileSync(fd, bytes);
-          fsyncSync(fd);
-        } finally {
-          closeSync(fd);
-        }
-        let published = false;
-        try {
-          publishStagedDataFileSync(verified, finalPath);
-          published = true;
-        } catch {
-          // A file that appeared at the final path is not replaced; hold.
-          rmSync(verified, { force: true });
-        }
-        if (published) {
-          unlinkSync(stagePath);
-          return true;
-        }
+        // Publish exactly the checked bytes, never the stage path again. A
+        // file that appeared at the final path is not replaced; hold.
+        if (publishStageBytesSync(stagePath, bytes, finalPath)) return true;
       }
       holdLegacyPublication(
         db,
@@ -147,6 +124,10 @@ export async function publishIndexedStage(
 export async function recoverStagedDataFiles(
   deps: NodeDataStorageDeps,
 ): Promise<void> {
+  recordUnknownRetainedFiles(
+    indexDatabase(deps.indexManager),
+    deps.hierarchyOptions,
+  );
   const visit = async (dir: string): Promise<void> => {
     for (const item of await readdir(dir, { withFileTypes: true })) {
       const path = join(dir, item.name);
@@ -163,7 +144,7 @@ export async function recoverStagedDataFiles(
           relative(deps.hierarchyOptions.dataDir, finalPath),
         );
         if (!indexed) {
-          await unlink(path);
+          await discardDataFile(path);
           continue;
         }
         // A leftover stage can share the final path of a prior committed
@@ -171,7 +152,7 @@ export async function recoverStagedDataFiles(
         // cannot be identified as the one that created the older index row.
         try {
           await stat(finalPath);
-          await unlink(path);
+          await discardDataFile(path);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
           await publishIndexedStage(deps, path, finalPath);
@@ -191,6 +172,10 @@ export async function reindexLegacyDataFiles(
   },
 ): Promise<number> {
   const dataDir = deps.hierarchyOptions.dataDir;
+  recordUnknownRetainedFiles(
+    indexDatabase(deps.indexManager),
+    deps.hierarchyOptions,
+  );
   let recovered = 0;
   const recoveredScopes = new Set<string>();
   const visit = async (dir: string): Promise<void> => {
@@ -267,6 +252,7 @@ export function createNodeDataStorage(
   deps: NodeDataStorageDeps,
 ): DataStoragePort {
   const db = indexDatabase(deps.indexManager);
+  recordUnknownRetainedFiles(db, deps.hierarchyOptions);
   /**
    * PDPP provenance and generation of the bytes at a version path, both from
    * one read, or undefined when they cannot be read. Read at insert, never on
@@ -412,9 +398,7 @@ export function createNodeDataStorage(
             })
             .immediate();
         } finally {
-          await unlink(staged.stagePath).catch((error) => {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          });
+          await discardDataFile(staged.stagePath);
         }
       }
       return writeDataFile(deps.hierarchyOptions, envelope);
@@ -462,7 +446,7 @@ export function createNodeDataStorage(
         throw err;
       } finally {
         // An indexed stage must survive a failed rename for boot recovery.
-        if (!indexed) await unlink(staged.stagePath);
+        if (!indexed) await discardDataFile(staged.stagePath);
       }
     },
     writeBlockManifest(scope, collectedAt, manifest, blocks) {

@@ -1,5 +1,8 @@
 import { keccak256, stringToHex } from "viem";
-import { createLegacyDownloadHold } from "./legacy-publication-fence.js";
+import {
+  createLegacyDownloadHold,
+  retainLegacyVersions,
+} from "./legacy-publication-fence.js";
 import { downloadAll } from "../../../core/src/sync/workers/download.js";
 import {
   deriveScopeKey,
@@ -130,11 +133,7 @@ it("verifies lazy NULL generation fill while retaining immutable identity and pe
   f.db.prepare("UPDATE data_files SET generation=NULL").run();
   const entry = f.index.findLatestByScope(env.scope)!;
   f.index.updateDataPointId(entry.path, "retained-remote");
-  f.db
-    .prepare(
-      "INSERT INTO legacy_publication_retained_versions SELECT id FROM data_files",
-    )
-    .run();
+  retainLegacyVersions(f.db, f.hierarchyOptions, { scope: "spotify.profile" });
   f.stop();
   const versionPath = join(f.hierarchyOptions.dataDir, entry.path);
   const originalBytes = readFileSync(versionPath);
@@ -210,11 +209,7 @@ it("holds fenced live heads and tombstones durably without stalling unrelated do
     ),
     metadata: {},
   });
-  f.db
-    .prepare(
-      "INSERT INTO legacy_publication_retained_versions SELECT id FROM data_files",
-    )
-    .run();
+  retainLegacyVersions(f.db, f.hierarchyOptions, { scope: "spotify.profile" });
   f.stop();
   const original = f.index.findLatestByScope("spotify.profile")!;
   const bytes = readFileSync(join(f.hierarchyOptions.dataDir, original.path));

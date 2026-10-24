@@ -1,13 +1,30 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { initializeDatabase } from "./index-schema.js";
+import { createIndexManager } from "./index-manager.js";
 import { LEGACY_GATE_INDEX_SCHEMA_VERSION } from "./schema-versions.js";
 import { createLegacyPublicationPolicy } from "./legacy-publication-policy.js";
 import type { LegacyCanonicalCoveragePort } from "./legacy-publication-canonical.js";
 
 const databases: ReturnType<typeof initializeDatabase>[] = [];
+const dataDirs: string[] = [];
 afterEach(() => {
   for (const db of databases.splice(0)) db.close();
+  for (const dir of dataDirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
 });
+/** Storage bound to `db`, so stop can seal the files of indexed versions. */
+function storageFor(db: ReturnType<typeof initializeDatabase>) {
+  const dataDir = mkdtempSync(join(tmpdir(), "legacy-policy-storage-"));
+  dataDirs.push(dataDir);
+  return {
+    indexManager: createIndexManager(db),
+    hierarchyOptions: { dataDir },
+  };
+}
+
 function open(enabled = false) {
   const db = initializeDatabase(":memory:");
   databases.push(db);
@@ -35,7 +52,6 @@ describe("legacy publication shutdown", () => {
 
 it("persists an exact-scope fence and retains history across generation changes", async () => {
   const { db } = open(true);
-  const { createIndexManager } = await import("./index-manager.js");
   const index = createIndexManager(db);
   const entry = {
     scope: "spotify.profile",
@@ -46,10 +62,14 @@ it("persists an exact-scope fence and retains history across generation changes"
     dataPointId: "dp-history",
   };
   index.insert(entry);
+  // Stop seals only history whose indexed bytes are really there.
+  const storage = storageFor(db);
+  writeFileSync(join(storage.hierarchyOptions.dataDir, entry.path), "{}");
   const policy = createLegacyPublicationPolicy(db, {
     owner: "0xowner",
     serverGeneration: "generation-1",
     enabled: () => true,
+    storage,
     canonical: canonicalStub(),
     qualification: qualification(),
   });
@@ -275,6 +295,7 @@ it("refuses before quiescing while accepted imports or remote publications need 
     owner: "0xowner",
     serverGeneration: "generation-1",
     enabled: () => true,
+    storage: storageFor(db),
     canonical: canonicalStub(),
     qualification: qualification(),
   });
@@ -286,7 +307,6 @@ it("refuses before quiescing while accepted imports or remote publications need 
   ).rejects.toMatchObject({ errorCode: "LEGACY_SHUTDOWN_BLOCKED" });
   expect(policy.read("spotify.profile").state).toBe("mirroring");
   db.prepare("DELETE FROM owner_import_operations").run();
-  const { createIndexManager } = await import("./index-manager.js");
   createIndexManager(db).insert({
     fileId: null,
     scope: "spotify.profile",

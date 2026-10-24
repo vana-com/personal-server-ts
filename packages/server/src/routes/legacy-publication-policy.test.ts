@@ -8,6 +8,7 @@ import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
 import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import { createLegacyPublicationPolicy } from "../storage/legacy-publication-policy.js";
+import { retainLegacyVersions } from "../storage/legacy-publication-fence.js";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/node";
 import {
@@ -81,6 +82,7 @@ function fixture(enabled = false) {
     app,
     db,
     index,
+    hierarchyOptions,
     policy,
     storage,
     gateway,
@@ -211,7 +213,7 @@ it("default-off preserves fresh HTTP writes, import replay, signatures and regis
 });
 
 it("stopped gate refuses every legacy HTTP write and cleanup without deleting history", async () => {
-  const { app, db, storage, index } = fixture();
+  const { app, db, storage, index, hierarchyOptions } = fixture();
   const path = "/v1/data/spotify.profile";
   const headers = { ...auth, "Content-Type": "application/json" };
   expect(
@@ -223,9 +225,7 @@ it("stopped gate refuses every legacy HTTP write and cleanup without deleting hi
   db.prepare(
     "INSERT INTO legacy_publication_policy VALUES (?, 'server-1', 'spotify.profile', 'stopped', 2, 1, NULL)",
   ).run(owner.address.toLowerCase());
-  db.prepare(
-    "INSERT INTO legacy_publication_retained_versions SELECT id FROM data_files",
-  ).run();
+  retainLegacyVersions(db, hierarchyOptions, { scope: "spotify.profile" });
   for (const url of [
     path,
     `${path}?supersede=legacy`,
@@ -253,7 +253,7 @@ it("stopped gate refuses every legacy HTTP write and cleanup without deleting hi
 it.each(["stopped", "quiescing"])(
   "%s gate refuses an HTTP binary write before effects; a sibling binary write succeeds",
   async (state) => {
-    const { app, db, index, storage } = fixture();
+    const { app, db, index, storage, hierarchyOptions } = fixture();
     const binary = (scope: string, bytes: number[]) =>
       app.request(`/v1/data/${scope}`, {
         method: "POST",
@@ -271,9 +271,9 @@ it.each(["stopped", "quiescing"])(
       "INSERT INTO legacy_publication_policy VALUES (?, 'server-1', 'spotify.profile', ?, 2, 1, NULL)",
     ).run(owner.address.toLowerCase(), state);
     if (state === "stopped")
-      db.prepare(
-        "INSERT INTO legacy_publication_retained_versions SELECT id FROM data_files",
-      ).run();
+      retainLegacyVersions(db, hierarchyOptions, {
+        scope: "spotify.profile",
+      });
     const dir = join(db.name, "..", "data", "spotify", "profile");
     const files = readdirSync(dir).sort();
     const rows = () => ({

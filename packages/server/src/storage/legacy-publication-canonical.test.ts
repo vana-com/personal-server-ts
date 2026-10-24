@@ -1,4 +1,7 @@
 import { afterEach, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import { initializeDatabase } from "./index-schema.js";
@@ -55,9 +58,22 @@ const oura: DeclarationSnapshot = {
 };
 
 const databases: ReturnType<typeof initializeDatabase>[] = [];
+const dataDirs: string[] = [];
 afterEach(() => {
+  for (const dir of dataDirs.splice(0))
+    rmSync(dir, { recursive: true, force: true });
   for (const db of databases.splice(0)) db.close();
 });
+
+/** Storage bound to `db`, so stop can seal the files of indexed versions. */
+function storageFor(db: ReturnType<typeof initializeDatabase>) {
+  const dataDir = mkdtempSync(join(tmpdir(), "legacy-canonical-storage-"));
+  dataDirs.push(dataDir);
+  return {
+    indexManager: createIndexManager(db),
+    hierarchyOptions: { dataDir },
+  };
+}
 
 function fixture(
   options: {
@@ -529,10 +545,17 @@ it("qualifies a latest legacy head only with a current covered parity verdict, w
   let reevaluate = async () => {
     await f.view(async () => body, 1).readLatest(ACTIVITY);
   };
+  // Stop seals only history whose indexed bytes are really there.
+  const storage = storageFor(f.db);
+  writeFileSync(
+    join(storage.hierarchyOptions.dataDir, "legacy-head.json"),
+    "{}",
+  );
   const policy = createLegacyPublicationPolicy(f.db, {
     owner: "0xowner",
     serverGeneration: "gen",
     enabled: () => true,
+    storage,
     canonical: f.port(),
     qualification: echoingQualification(() => reevaluate()),
   });
