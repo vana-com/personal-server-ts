@@ -5,8 +5,9 @@
  * cursor is not usable":
  *
  *   - `InvalidCursorError` (`storage/pdpp-records/types.ts`) — the token
- *     decoded fine but was reused against a different `order`, or is the wrong
- *     cursor kind. This was already mapped to 400 `invalid_cursor`.
+ *     decoded fine but was reused against a different `order`, authorization
+ *     context, or query, or is the wrong cursor kind. This maps to 400
+ *     `invalid_cursor`.
  *   - `InvalidCursorSyntaxError` (`storage/pdpp-records/cursor.ts`) — the
  *     token is not base64url JSON at all. This was NOT mapped, so it escaped
  *     `toPdppError` as an unhandled throw: Hono returned a bare
@@ -108,15 +109,16 @@ function fixture() {
   return { app: a, store };
 }
 
-function mintedListCursor(order: "asc" | "desc") {
+async function mintedListCursor(order: "asc" | "desc") {
   const context = fixture();
-  const page = context.store.listRecords("s", {
-    instanceIds: [INSTANCE],
-    limit: 1,
-    order,
-  });
-  expect(page.nextCursor).toBeDefined();
-  return { ...context, cursor: page.nextCursor! };
+  const response = await context.app.request(
+    `/v1/streams/s/records?limit=1&order=${order}`,
+    { headers: AUTH },
+  );
+  expect(response.status).toBe(200);
+  const page = await response.json();
+  expect(page.next_cursor).toBeDefined();
+  return { ...context, cursor: page.next_cursor as string };
 }
 
 async function expectInvalidCursor(res: Response) {
@@ -173,9 +175,9 @@ describe("a malformed cursor is 400 invalid_cursor, never 500", () => {
 
   it("still rejects a valid cursor reused against a different order", async () => {
     // The already-mapped class, kept as a control so this fix cannot regress
-    // wrong-order handling. The cursor must be minted by the store so it has
-    // the current stream + epoch binding.
-    const { app, cursor } = mintedListCursor("asc");
+    // wrong-order handling. Mint it through HTTP so it carries the current
+    // grant/query fingerprint as well as the store's stream and epoch.
+    const { app, cursor } = await mintedListCursor("asc");
     const res = await app.request(
       `/v1/streams/s/records?order=desc&cursor=${encodeURIComponent(cursor)}`,
       { headers: AUTH },
@@ -184,9 +186,9 @@ describe("a malformed cursor is 400 invalid_cursor, never 500", () => {
   });
 
   it("still serves a valid cursor", async () => {
-    // Positive control: the narrowing above must not reject store-minted
-    // stream + epoch bound cursors.
-    const { app, cursor } = mintedListCursor("desc");
+    // Positive control: the cursor is minted with the same grant and query
+    // fingerprint the HTTP continuation validates.
+    const { app, cursor } = await mintedListCursor("desc");
     const res = await app.request(
       `/v1/streams/s/records?order=desc&cursor=${encodeURIComponent(cursor)}`,
       { headers: AUTH },
