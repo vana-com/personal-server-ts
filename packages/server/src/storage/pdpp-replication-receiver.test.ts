@@ -281,6 +281,62 @@ it("applies tombstones and later resurrection under reordered batches", () => {
   );
 });
 
+it("does not report a replica update to a legacy live identity as an addition", () => {
+  const d = device();
+  put(d, "legacy-before-tracking");
+  d.db
+    .prepare(
+      "DELETE FROM pdpp_record_first_added WHERE instance = ? AND stream = ? AND record_key = ?",
+    )
+    .run("conn_a", "messages", "a");
+  d.db
+    .prepare(
+      "UPDATE pdpp_additions_coverage SET tracked_since = ? WHERE instance = ?",
+    )
+    .run("2026-10-19T00:00:00.000Z", "conn_a");
+
+  send(d, [upsert(30)]);
+
+  expect(value(d)?.data.text).toBe("remote-30");
+  expect(
+    d.store.listFirstAdded(
+      ["conn_a"],
+      "2026-10-19T00:00:00.000Z",
+      "2100-01-01T00:00:00.000Z",
+    ),
+  ).toEqual([]);
+});
+
+it("does not treat a reappearing legacy identity as a new addition", () => {
+  const d = device();
+  put(d, "legacy-before-tracking");
+  d.db
+    .prepare(
+      "DELETE FROM pdpp_record_first_added WHERE instance = ? AND stream = ? AND record_key = ?",
+    )
+    .run("conn_a", "messages", "a");
+  const original = upsert(30);
+  const deletion: ReplicaOperation = {
+    ...original,
+    kind: "delete",
+    revision: { logical: 31, writerId: "remote", operationId: "delete-31" },
+    deletedAt: at,
+  };
+  delete (deletion as unknown as Record<string, unknown>).data;
+  delete (deletion as unknown as Record<string, unknown>).blobs;
+  send(d, [deletion]);
+  send(d, [upsert(32)]);
+
+  expect(value(d)?.data.text).toBe("remote-32");
+  expect(
+    d.db
+      .prepare(
+        "SELECT 1 FROM pdpp_record_first_added WHERE instance = ? AND stream = ? AND record_key = ?",
+      )
+      .get("conn_a", "messages", "a"),
+  ).toBeUndefined();
+});
+
 it("tracks first observation from replicas and restarts additions coverage on reset", () => {
   const d = device();
   send(d, [upsert()]);

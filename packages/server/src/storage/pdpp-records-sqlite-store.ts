@@ -465,7 +465,21 @@ INSERT OR IGNORE INTO pdpp_additions_coverage (instance, tracked_since)
   SELECT instance, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
   FROM pdpp_instance_binding;
 `,
+  // v25: distinguish a post-reset generation from migration-era rows, which
+  // must remain excluded from first-added metrics when a replica updates them.
+  `-- reset_generation is added idempotently by migrateAdditionsResetGeneration.`,
 ];
+
+function migrateAdditionsResetGeneration(db: Database): void {
+  const columns = db
+    .prepare("PRAGMA table_info(pdpp_additions_coverage)")
+    .all() as { name: string }[];
+  if (!columns.some((column) => column.name === "reset_generation")) {
+    db.exec(
+      "ALTER TABLE pdpp_additions_coverage ADD COLUMN reset_generation INTEGER",
+    );
+  }
+}
 
 function addCompletionProofColumns(db: Database): void {
   // `table_xinfo`, unlike `table_info`, also lists generated columns.
@@ -645,6 +659,7 @@ function migrate(db: Database): void {
       if (v === 12) migrateToV13(db);
       if (v === 13) migrateToV14(db);
       if (v === 17) migrateToV17(db);
+      if (v === 24) migrateAdditionsResetGeneration(db);
       if (v === 19) {
         db.prepare(
           "INSERT OR IGNORE INTO pdpp_installation_writer (id, writer_id) VALUES (1, ?)",
@@ -1752,10 +1767,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
 
       eraseInstanceData(input.instance);
       db.prepare(
-        `INSERT INTO pdpp_additions_coverage (instance, tracked_since)
-         VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-         ON CONFLICT(instance) DO UPDATE SET tracked_since = excluded.tracked_since`,
-      ).run(input.instance);
+        `INSERT INTO pdpp_additions_coverage
+           (instance, tracked_since, reset_generation)
+         VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)
+         ON CONFLICT(instance) DO UPDATE SET
+           tracked_since = excluded.tracked_since,
+           reset_generation = excluded.reset_generation`,
+      ).run(input.instance, input.expectedGeneration + 1);
       const resetClock = (nextWriteSeq.get() as { value: number }).value;
       db.prepare(
         "UPDATE pdpp_instance_binding SET method = ?, generation = ?, reset_clock = ? WHERE instance = ?",

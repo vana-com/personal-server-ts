@@ -1041,7 +1041,7 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 24 });
+        ).toEqual({ version: 25 });
         // v14 gives the upgraded store a 32-byte sync token key.
         expect(upgraded.syncTokenScope().key).toHaveLength(32);
         expect(
@@ -1580,7 +1580,7 @@ describe("v13 emitted-time order key", () => {
         const upgraded = createSqliteRecordStore(after);
         expect(
           after.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 24 });
+        ).toEqual({ version: 25 });
         expect(
           upgraded
             .listRecords("events", {
@@ -1671,7 +1671,7 @@ describe("v15 sync session state table", () => {
         const upgraded = createSqliteRecordStore(after);
         expect(
           after.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 24 });
+        ).toEqual({ version: 25 });
         upgraded.syncStates().put({
           id: "x",
           owner: "o",

@@ -239,7 +239,18 @@ export function createReplicaReceiver(deps: {
       operation?.kind === "upsert"
         ? (operation.blobs[0]?.blobId ?? null)
         : null;
-    if (data !== null && operation) {
+    const coverage = operation
+      ? (db
+          .prepare(
+            "SELECT reset_generation FROM pdpp_additions_coverage WHERE instance = ?",
+          )
+          .get(instance) as { reset_generation: number | null } | undefined)
+      : undefined;
+    if (
+      data !== null &&
+      operation &&
+      (!current || coverage?.reset_generation === operation.generation)
+    ) {
       db.prepare(
         `INSERT OR IGNORE INTO pdpp_record_first_added
            (instance, stream, record_key, first_added_at, generation)
@@ -403,10 +414,13 @@ export function createReplicaReceiver(deps: {
             "DELETE FROM pdpp_record_first_added WHERE instance = ?",
           ).run(id);
           db.prepare(
-            `INSERT INTO pdpp_additions_coverage (instance, tracked_since)
-             VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-             ON CONFLICT(instance) DO UPDATE SET tracked_since = excluded.tracked_since`,
-          ).run(id);
+            `INSERT INTO pdpp_additions_coverage
+               (instance, tracked_since, reset_generation)
+             VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)
+             ON CONFLICT(instance) DO UPDATE SET
+               tracked_since = excluded.tracked_since,
+               reset_generation = excluded.reset_generation`,
+          ).run(id, generation);
         }
       }
     }
