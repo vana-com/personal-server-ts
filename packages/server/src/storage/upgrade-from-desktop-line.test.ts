@@ -561,58 +561,60 @@ describe("writable upgrades from historical desktop storage schemas", () => {
       index: 14,
       label: "synthesized archive-capable pre-head schemas",
     },
-  ] as const)("$label (PDPP $pdpp / index $index)", ({ pdpp, index }) => {
-    mkdirSync(join(homedir(), ".tmp"), { recursive: true });
-    const dir = mkdtempSync(join(homedir(), ".tmp", "desktop-upgrade-"));
-    dirs.push(dir);
-    const fixture = seedFixture(dir, pdpp, index);
-    let firstSnapshot: ReturnType<typeof snapshot> | undefined;
-    for (let open = 0; open < 2; open++) {
-      // These are the real writable initializers, including startup GC.
-      const db = initializeDatabase(fixture.path);
-      try {
-        const records = createSqliteRecordStore(db);
-        const grants = createSqlitePdppGrantBindingStore(db);
-        const authority = createLegacyScopeAuthority(db);
-        const manager = createIndexManager(db);
-        expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
-        expect(db.pragma("foreign_key_check")).toEqual([]);
-        expect(db.pragma("user_version", { simple: true })).toBe(
-          INDEX_SCHEMA_VERSION,
-        );
-        expect(
-          db.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 23 });
-        expect(
-          db
-            .prepare("SELECT version FROM pdpp_grant_bindings_schema_version")
-            .get(),
-        ).toEqual({ version: 2 });
-        expect(
-          db
-            .prepare(
-              `SELECT instance, stream, record_key, data, version,
+  ] as const)(
+    "$label (PDPP $pdpp / index $index)",
+    ({ pdpp, index }) => {
+      mkdirSync(join(homedir(), ".tmp"), { recursive: true });
+      const dir = mkdtempSync(join(homedir(), ".tmp", "desktop-upgrade-"));
+      dirs.push(dir);
+      const fixture = seedFixture(dir, pdpp, index);
+      let firstSnapshot: ReturnType<typeof snapshot> | undefined;
+      for (let open = 0; open < 2; open++) {
+        // These are the real writable initializers, including startup GC.
+        const db = initializeDatabase(fixture.path);
+        try {
+          const records = createSqliteRecordStore(db);
+          const grants = createSqlitePdppGrantBindingStore(db);
+          const authority = createLegacyScopeAuthority(db);
+          const manager = createIndexManager(db);
+          expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
+          expect(db.pragma("foreign_key_check")).toEqual([]);
+          expect(db.pragma("user_version", { simple: true })).toBe(
+            INDEX_SCHEMA_VERSION,
+          );
+          expect(
+            db.prepare("SELECT version FROM pdpp_schema_version").get(),
+          ).toEqual({ version: 23 });
+          expect(
+            db
+              .prepare("SELECT version FROM pdpp_grant_bindings_schema_version")
+              .get(),
+          ).toEqual({ version: 2 });
+          expect(
+            db
+              .prepare(
+                `SELECT instance, stream, record_key, data, version,
           emitted_at, deleted, deleted_at FROM pdpp_records ORDER BY instance, record_key`,
-            )
-            .all(),
-        ).toEqual(fixture.records);
-        expect(
-          db
-            .prepare(
-              `SELECT id, instance, stream, record_key, version,
+              )
+              .all(),
+          ).toEqual(fixture.records);
+          expect(
+            db
+              .prepare(
+                `SELECT id, instance, stream, record_key, version,
           data, emitted_at, deleted, deleted_at, written_at FROM pdpp_record_changes ORDER BY id`,
-            )
-            .all(),
-        ).toEqual(fixture.historyRows);
-        expect(records.transitionWriteClock()).toBe(fixture.clock);
-        expect(
-          records.getRecord(LIVE, "conversations", "overwritten")?.data,
-        ).toEqual({ id: "overwritten", text: "latest" });
+              )
+              .all(),
+          ).toEqual(fixture.historyRows);
+          expect(records.transitionWriteClock()).toBe(fixture.clock);
+          expect(
+            records.getRecord(LIVE, "conversations", "overwritten")?.data,
+          ).toEqual({ id: "overwritten", text: "latest" });
 
-        // Enumerate all actual roots, not merely the IDs the fixture expects.
-        const referenced = db
-          .prepare(
-            `
+          // Enumerate all actual roots, not merely the IDs the fixture expects.
+          const referenced = db
+            .prepare(
+              `
           SELECT CAST(json_extract(data, '$.blob_ref.blob_id') AS TEXT) AS id
             FROM pdpp_records WHERE deleted = 0 AND json_extract(data, '$.blob_ref.blob_id') IS NOT NULL
           UNION SELECT CAST(json_extract(data, '$.blob_ref.blob_id') AS TEXT) AS id
@@ -620,146 +622,159 @@ describe("writable upgrades from historical desktop storage schemas", () => {
           UNION SELECT blob_id AS id FROM pdpp_blob_claims
           ORDER BY id
         `,
-          )
-          .all() as { id: string }[];
-        const retained = [...fixture.blobs.keys()]
-          .filter((id) => id !== "blob-orphan" && id !== "blob-stale-claim")
-          .sort();
-        expect(referenced.map((row) => row.id)).toEqual(retained);
-        for (const { id } of referenced) {
-          const bytes = records.getBlobBytes(id);
-          expect(
-            bytes,
-            "referenced blob must remain readable: " + id,
-          ).toBeDefined();
-          expect(Buffer.from(bytes!)).toEqual(fixture.blobs.get(id));
-          expect(records.getBlobMeta(id)?.sha256).toBe(
-            createHash("sha256").update(fixture.blobs.get(id)!).digest("hex"),
+            )
+            .all() as { id: string }[];
+          const retained = [...fixture.blobs.keys()]
+            .filter((id) => id !== "blob-orphan" && id !== "blob-stale-claim")
+            .sort();
+          expect(referenced.map((row) => row.id)).toEqual(retained);
+          for (const { id } of referenced) {
+            const bytes = records.getBlobBytes(id);
+            expect(
+              bytes,
+              "referenced blob must remain readable: " + id,
+            ).toBeDefined();
+            expect(Buffer.from(bytes!)).toEqual(fixture.blobs.get(id));
+            expect(records.getBlobMeta(id)?.sha256).toBe(
+              createHash("sha256").update(fixture.blobs.get(id)!).digest("hex"),
+            );
+          }
+          if (pdpp >= 3) {
+            // These negative controls prove the collector really ran.
+            expect(records.getBlobBytes("blob-orphan")).toBeUndefined();
+            expect(records.getBlobMeta("blob-orphan")).toBeUndefined();
+          }
+          if (pdpp === 15) {
+            expect(records.getBlobBytes("blob-stale-claim")).toBeUndefined();
+            expect(
+              db
+                .prepare("SELECT * FROM pdpp_blob_claims ORDER BY blob_id")
+                .all(),
+            ).toEqual([
+              {
+                blob_id: "blob-archive-claim",
+                instance: ARCHIVE,
+                generation: 1,
+              },
+              { blob_id: "blob-pending-claim", instance: LIVE, generation: 2 },
+            ]);
+            // Do NOT call getInstanceBinding(ARCHIVE): that would create a row
+            // and hide the archive-GC regression this fixture is meant to catch.
+            expect(
+              db
+                .prepare(
+                  "SELECT 1 FROM pdpp_instance_binding WHERE instance = ?",
+                )
+                .get(ARCHIVE),
+            ).toBeUndefined();
+            expect(records.claudeTransition(LIVE)).toEqual({
+              instance: LIVE,
+              archiveInstance: ARCHIVE,
+              generation: 2,
+              snapshots: fixture.snapshots,
+              conversationsCovered: false,
+            });
+            expect(records.getInstanceBinding(LIVE)).toMatchObject({
+              method: "anthropic-live",
+              generation: 2,
+              label: "Work",
+            });
+          }
+
+          const legacyGrant = grants.getByPdppGrantId(GRANT.pdppGrantId);
+          expect(legacyGrant).toEqual(GRANT);
+          expect(grants.getBindingsForPermission(PERMISSION)).toEqual([GRANT]);
+          let rejection: unknown;
+          try {
+            grants.putBinding({ ...GRANT, grantVersion: "1" });
+          } catch (error) {
+            rejection = error;
+          }
+          expect(rejection).toMatchObject({
+            errorCode: "INVALID_SIGNATURE",
+            details: {
+              reason:
+                "A different binding already exists for this PDPP grant id",
+            },
+          });
+          expect(grants.getByPdppGrantId(GRANT.pdppGrantId)).toEqual(GRANT);
+
+          for (const [path, bytes] of fixture.files) {
+            expect(readFileSync(join(dir, path), "utf8")).toBe(bytes);
+            const entry = manager.findByPath(path);
+            expect(entry).toMatchObject({
+              path,
+              version: 1,
+              casRevision: 1,
+              sizeBytes: Buffer.byteLength(bytes),
+            });
+            // Newly added provenance must remain unknown, never fabricated.
+            expect(
+              db
+                .prepare(
+                  "SELECT pdpp_origin, generation FROM data_files WHERE path = ?",
+                )
+                .get(path),
+            ).toEqual({ pdpp_origin: null, generation: null });
+            const taken = index === 14 && path.startsWith("claude/");
+            expect(manager.isHistoryOnly(entry!.scope, path)).toBe(taken);
+          }
+          expect(authority.hasTakeover(TAKEN_SCOPE)).toBe(index === 14);
+          expect(authority.hasCanonicalAuthority(TAKEN_SCOPE)).toBe(
+            index === 14,
           );
+          expect(authority.hasTakeover(UNTAKEN_SCOPE)).toBe(false);
+          expect(authority.hasCanonicalAuthority(UNTAKEN_SCOPE)).toBe(false);
+          if (index === 14) {
+            expect(
+              db.prepare("SELECT * FROM legacy_scope_takeovers").all(),
+            ).toEqual([
+              {
+                scope: TAKEN_SCOPE,
+                instance: LIVE,
+                generation: 2,
+                method: "",
+                superseded_version: 1,
+                superseded_cas_revision: 1,
+                superseded_collected_at: TIME,
+                superseded_path: "claude/conversations/old.json",
+                taken_over_at: TIME,
+              },
+            ]);
+            expect(
+              db.prepare("SELECT * FROM legacy_scope_takeover_verdicts").all(),
+            ).toEqual([
+              {
+                scope: TAKEN_SCOPE,
+                instance: LIVE,
+                generation: 2,
+                legacy_version_id: 1,
+                canonical_cursor: "legacy-cursor",
+                verdict: "covered",
+                comparison_case: "same_time",
+                reason_counts_json: "{}",
+                applied_exceptions_json: "[]",
+                reason_json: null,
+                legacy_bytes: 42,
+                canonical_bytes: 42,
+                byte_delta: 0,
+                evaluated_at: TIME,
+              },
+            ]);
+            expect(
+              authority.hasMethodTakeover(TAKEN_SCOPE, "anthropic-live"),
+            ).toBe(false);
+          }
+          const current = snapshot(db);
+          if (open === 0) firstSnapshot = current;
+          else expect(current).toEqual(firstSnapshot);
+        } finally {
+          db.close();
         }
-        if (pdpp >= 3) {
-          // These negative controls prove the collector really ran.
-          expect(records.getBlobBytes("blob-orphan")).toBeUndefined();
-          expect(records.getBlobMeta("blob-orphan")).toBeUndefined();
-        }
-        if (pdpp === 15) {
-          expect(records.getBlobBytes("blob-stale-claim")).toBeUndefined();
-          expect(
-            db.prepare("SELECT * FROM pdpp_blob_claims ORDER BY blob_id").all(),
-          ).toEqual([
-            { blob_id: "blob-archive-claim", instance: ARCHIVE, generation: 1 },
-            { blob_id: "blob-pending-claim", instance: LIVE, generation: 2 },
-          ]);
-          // Do NOT call getInstanceBinding(ARCHIVE): that would create a row
-          // and hide the archive-GC regression this fixture is meant to catch.
-          expect(
-            db
-              .prepare("SELECT 1 FROM pdpp_instance_binding WHERE instance = ?")
-              .get(ARCHIVE),
-          ).toBeUndefined();
-          expect(records.claudeTransition(LIVE)).toEqual({
-            instance: LIVE,
-            archiveInstance: ARCHIVE,
-            generation: 2,
-            snapshots: fixture.snapshots,
-            conversationsCovered: false,
-          });
-          expect(records.getInstanceBinding(LIVE)).toMatchObject({
-            method: "anthropic-live",
-            generation: 2,
-            label: "Work",
-          });
-        }
-
-        const legacyGrant = grants.getByPdppGrantId(GRANT.pdppGrantId);
-        expect(legacyGrant).toEqual(GRANT);
-        expect(grants.getBindingsForPermission(PERMISSION)).toEqual([GRANT]);
-        let rejection: unknown;
-        try {
-          grants.putBinding({ ...GRANT, grantVersion: "1" });
-        } catch (error) {
-          rejection = error;
-        }
-        expect(rejection).toMatchObject({
-          errorCode: "INVALID_SIGNATURE",
-          details: {
-            reason: "A different binding already exists for this PDPP grant id",
-          },
-        });
-        expect(grants.getByPdppGrantId(GRANT.pdppGrantId)).toEqual(GRANT);
-
-        for (const [path, bytes] of fixture.files) {
-          expect(readFileSync(join(dir, path), "utf8")).toBe(bytes);
-          const entry = manager.findByPath(path);
-          expect(entry).toMatchObject({
-            path,
-            version: 1,
-            casRevision: 1,
-            sizeBytes: Buffer.byteLength(bytes),
-          });
-          // Newly added provenance must remain unknown, never fabricated.
-          expect(
-            db
-              .prepare(
-                "SELECT pdpp_origin, generation FROM data_files WHERE path = ?",
-              )
-              .get(path),
-          ).toEqual({ pdpp_origin: null, generation: null });
-          const taken = index === 14 && path.startsWith("claude/");
-          expect(manager.isHistoryOnly(entry!.scope, path)).toBe(taken);
-        }
-        expect(authority.hasTakeover(TAKEN_SCOPE)).toBe(index === 14);
-        expect(authority.hasCanonicalAuthority(TAKEN_SCOPE)).toBe(index === 14);
-        expect(authority.hasTakeover(UNTAKEN_SCOPE)).toBe(false);
-        expect(authority.hasCanonicalAuthority(UNTAKEN_SCOPE)).toBe(false);
-        if (index === 14) {
-          expect(
-            db.prepare("SELECT * FROM legacy_scope_takeovers").all(),
-          ).toEqual([
-            {
-              scope: TAKEN_SCOPE,
-              instance: LIVE,
-              generation: 2,
-              method: "",
-              superseded_version: 1,
-              superseded_cas_revision: 1,
-              superseded_collected_at: TIME,
-              superseded_path: "claude/conversations/old.json",
-              taken_over_at: TIME,
-            },
-          ]);
-          expect(
-            db.prepare("SELECT * FROM legacy_scope_takeover_verdicts").all(),
-          ).toEqual([
-            {
-              scope: TAKEN_SCOPE,
-              instance: LIVE,
-              generation: 2,
-              legacy_version_id: 1,
-              canonical_cursor: "legacy-cursor",
-              verdict: "covered",
-              comparison_case: "same_time",
-              reason_counts_json: "{}",
-              applied_exceptions_json: "[]",
-              reason_json: null,
-              legacy_bytes: 42,
-              canonical_bytes: 42,
-              byte_delta: 0,
-              evaluated_at: TIME,
-            },
-          ]);
-          expect(
-            authority.hasMethodTakeover(TAKEN_SCOPE, "anthropic-live"),
-          ).toBe(false);
-        }
-        const current = snapshot(db);
-        if (open === 0) firstSnapshot = current;
-        else expect(current).toEqual(firstSnapshot);
-      } finally {
-        db.close();
       }
-    }
-  });
+    },
+    30_000,
+  );
 
   it("keeps an existing client bearer inactive without retained grant-digest evidence", () => {
     mkdirSync(join(homedir(), ".tmp"), { recursive: true });

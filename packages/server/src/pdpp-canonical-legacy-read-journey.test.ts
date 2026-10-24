@@ -39,9 +39,10 @@ import type {
 import type { StorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
+  PDPP_DATA_ACCESS_TYPE,
   openPdppAuthStore,
-  type Grant,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { issueAndStoreTestGrant as issueConsentGrant } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -516,30 +517,31 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     // Public store setup: the real RS resolves this token and frozen grant.
     const store = openPdppAuthStore(join(tempDir, "pdpp-auth.db"));
     try {
-      const narrowed: Grant = {
-        version: "0.1.0",
-        grant_id: "grt_narrowed",
-        subject: { id: owner },
-        client: { client_id: BUILDER_ID },
-        source: { kind: "connector", id: OURA },
-        source_declaration: { version: "1" },
-        purpose_code: "test",
-        access_mode: "continuous",
-        issued_at: new Date().toISOString(),
-        streams: [
-          {
-            name: "activity",
-            instance_ids: [accountOne],
-            fields: ["id", "day"],
-            resources: ["a1"],
-          },
-        ],
-      };
-      store.insertGrant({
-        grant: narrowed,
+      const narrowed = issueConsentGrant({
+        store,
         subjectId: owner,
-        reviewDigest: "test",
-      });
+        declarationDocument: OURA_DECLARATION,
+        request: {
+          type: PDPP_DATA_ACCESS_TYPE,
+          source: { id: OURA },
+          purpose_code: "test",
+          access_mode: "continuous",
+          streams: [
+            {
+              name: "activity",
+              instance_ids: [accountOne],
+              fields: ["id", "day"],
+              resources: ["a1"],
+            },
+          ],
+        },
+        requester: {
+          client_id: BUILDER_ID,
+          display_name: BUILDER_ID,
+          app_approved: false,
+        },
+        inventory: { eligibleFor: () => [accountOne] },
+      }).grant;
       expect(
         store.issueAccessToken({
           token: "narrowed-test-token",
