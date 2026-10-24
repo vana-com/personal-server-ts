@@ -1,6 +1,8 @@
 # PDPP publication and read evidence: review context
 
-This is evidence for scoped review of PR #455, not merge or release approval.
+This is evidence for the scoped review of the publication and read-back policy,
+which was stacked PR #455 and now sits in this branch. It is not merge or
+release approval.
 The historical F1 disclosure gate remains unresolved. New generated outputs and
 projected dependency cycles are a separate repair scope. No migration, quarantine,
 receipt scheme, automatic recompute, blanket denial, history deletion, grant change
