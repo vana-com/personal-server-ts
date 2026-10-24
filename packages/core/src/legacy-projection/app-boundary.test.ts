@@ -60,6 +60,38 @@ describe("Personal Server legacy projection boundary", () => {
     });
   });
 
+  it.each(bindingSources)(
+    "%s: rejects a missing conversation count even when messages are also dropped",
+    (_source, bindings) => {
+      const records: PdppRecord[] = [
+        {
+          stream: "conversations",
+          data: { id: "partial", current_node: null },
+        },
+        {
+          stream: "messages",
+          data: {
+            id: "orphan-message",
+            conversation_id: "absent",
+            on_current_branch: false,
+          },
+        },
+      ];
+      const options = { fetchedStreams: ["conversations", "messages"] };
+
+      expect(
+        bindings.get("chatgpt.conversations")?.project(records, options),
+      ).toMatchObject({
+        ok: false,
+        error: {
+          kind: "invalid_value",
+          scope: "chatgpt.conversations",
+          reason: "Conversation lacks required branch identity or count",
+        },
+      });
+    },
+  );
+
   it("rejects a hidden message without an id before replacing a conversation list", () => {
     expect(
       projectPdppRecordsToLegacyPayload(

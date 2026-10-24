@@ -3047,6 +3047,44 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       });
     });
 
+    it("fails closed when mixed diagnostics hide a fatal conversation drop behind a nonfatal reason", () => {
+      const result = projectPdppRecordsToLegacyPayload(
+        "chatgpt.conversations",
+        [
+          {
+            stream: "conversations",
+            data: {
+              id: "bad-timestamp",
+              create_time: 1,
+              current_node: null,
+            },
+          },
+          {
+            stream: "conversations",
+            data: { id: "partial", current_node: null },
+          },
+          {
+            stream: "messages",
+            data: {
+              id: "orphan-message",
+              conversation_id: "absent",
+              on_current_branch: false,
+            },
+          },
+        ],
+        { fetchedStreams: ["conversations", "messages"] },
+      );
+
+      expect(result).toEqual({
+        ok: false,
+        error: {
+          kind: "invalid_value",
+          scope: "chatgpt.conversations",
+          reason: "Conversation lacks required branch identity or count",
+        },
+      });
+    });
+
     it("drops and counts the conversation when the current-branch message set is incomplete", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
@@ -3224,8 +3262,9 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       expect(result).toMatchObject({
         ok: false,
         error: {
-          kind: "incomplete_scope",
+          kind: "invalid_value",
           scope: "chatgpt.conversations",
+          reason: "Conversation lacks required branch identity or count",
         },
       });
     });
