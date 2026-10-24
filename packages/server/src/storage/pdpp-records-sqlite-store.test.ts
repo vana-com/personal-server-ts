@@ -52,6 +52,64 @@ describe("sqlite record store", () => {
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
   });
 
+  it("keeps first-added time across updates, deletes and reappearance, then resets coverage on erase", () => {
+    const instance = "conn_123e4567-e89b-42d3-a456-426614174000";
+    const sourceId = "https://registry.pdpp.dev/connectors/spotify";
+    store.registerConnection({
+      instance,
+      sourceId,
+      method: "test_method",
+      label: "Test",
+    });
+    const since = new Date(Date.now() - 1000).toISOString();
+    const until = new Date(Date.now() + 60_000).toISOString();
+    const ingest = (data: { id: string; title: string }) =>
+      store.ingestBatch(
+        [
+          {
+            instance,
+            stream: "playlists",
+            key: data.id,
+            data,
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        playlistsSemantics,
+        playlistsPk,
+        { method: "test_method", generation: 1 },
+      );
+
+    expect(ingest({ id: "one", title: "first" }).accepted).toBe(1);
+    const first = store.listFirstAdded([instance], since, until);
+    expect(first).toEqual([{ instance, stream: "playlists", added: 1 }]);
+    expect(ingest({ id: "one", title: "updated" }).accepted).toBe(1);
+    expect(
+      store.deleteRecord(
+        instance,
+        "playlists",
+        "one",
+        "2026-04-02T00:00:00.000Z",
+        "mutable_state",
+      ),
+    ).toBe(true);
+    expect(ingest({ id: "one", title: "returned" }).accepted).toBe(1);
+    expect(store.listFirstAdded([instance], since, until)).toEqual(first);
+
+    const oldCoverage = store.firstAddedCoverage([instance])[0]?.trackedSince;
+    store.resetInstanceBinding({
+      instance,
+      expectedMethod: "test_method",
+      expectedGeneration: 1,
+      nextMethod: "test_method",
+    });
+    expect(store.listFirstAdded([instance], since, until)).toEqual([]);
+    const newCoverage = store.firstAddedCoverage([instance])[0]?.trackedSince;
+    expect(newCoverage).toBeDefined();
+    expect(Date.parse(newCoverage!)).toBeGreaterThanOrEqual(
+      Date.parse(oldCoverage!),
+    );
+  });
+
   it("serves the first historical list page without scanning each record's whole instance history", () => {
     for (let version = 1; version <= 2; version++) {
       const envelopes = Array.from({ length: 5000 }, (_, i) => ({
@@ -983,7 +1041,7 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 23 });
+        ).toEqual({ version: 24 });
         // v14 gives the upgraded store a 32-byte sync token key.
         expect(upgraded.syncTokenScope().key).toHaveLength(32);
         expect(
@@ -1522,7 +1580,7 @@ describe("v13 emitted-time order key", () => {
         const upgraded = createSqliteRecordStore(after);
         expect(
           after.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 23 });
+        ).toEqual({ version: 24 });
         expect(
           upgraded
             .listRecords("events", {
@@ -1613,7 +1671,7 @@ describe("v15 sync session state table", () => {
         const upgraded = createSqliteRecordStore(after);
         expect(
           after.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 23 });
+        ).toEqual({ version: 24 });
         upgraded.syncStates().put({
           id: "x",
           owner: "o",

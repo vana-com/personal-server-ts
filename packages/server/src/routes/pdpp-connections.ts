@@ -9,6 +9,11 @@ import {
   type PdppInstanceBinding,
 } from "../storage/pdpp-records-sqlite-store.js";
 import { resolveRetainedSourceId } from "../pdpp/source-id-compat.js";
+import type { DeclarationSnapshot } from "@opendatalabs/personal-server-ts-core/pdpp";
+import {
+  pdppOwnerNativeRoutes,
+  type PdppOwnerNativeStore,
+} from "./pdpp-owner-native.js";
 
 export interface PdppConnectionStore {
   listConnections(sourceId: string): PdppInstanceBinding[];
@@ -35,6 +40,8 @@ export interface PdppConnectionRouteDeps {
   canonicalSourceIds: Set<string>;
   /** Source ids in the connection registry. */
   sourceIds: Set<string>;
+  declarations?: DeclarationSnapshot[];
+  nativeStore?: PdppOwnerNativeStore;
 }
 
 function jsonError(code: string, message: string, status: number): Response {
@@ -83,6 +90,19 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
   const app = new Hono();
   app.use("*", bearerChallengeMiddleware(deps.protocolProfile));
 
+  if (deps.declarations && deps.nativeStore) {
+    app.route(
+      "/",
+      pdppOwnerNativeRoutes({
+        auth: deps.auth,
+        ownerSubjectId: deps.ownerSubjectId,
+        sourceIds: deps.sourceIds,
+        declarations: deps.declarations,
+        store: deps.nativeStore,
+      }),
+    );
+  }
+
   async function owner(
     request: Request,
   ): Promise<
@@ -130,6 +150,79 @@ export function pdppConnectionRoutes(deps: PdppConnectionRouteDeps): Hono {
         "Owner token has a different source scope",
         403,
       );
+    }
+    if (c.req.query("include") === "streams") {
+      const snapshot = deps.declarations?.find(
+        (declaration) => declaration.source_id === sourceId,
+      );
+      const nativeStore = deps.nativeStore;
+      if (!snapshot || !nativeStore) {
+        return jsonError("not_found", "Source declaration not found", 404);
+      }
+      const connections = deps.store
+        .listConnections(sourceId)
+        .filter((connection) => coversInstance(ownerScope, connection.instance))
+        .map((binding) => {
+          const listings = new Map(
+            nativeStore
+              .listStreams([binding.instance])
+              .map((listing) => [listing.stream, listing]),
+          );
+          return {
+            connection_id: binding.instance,
+            source_id: sourceId,
+            method_id: binding.method,
+            label: binding.label,
+            generation: binding.generation,
+            streams: snapshot.streams.map((declared) => {
+              const listing = listings.get(declared.name);
+              const completion = nativeStore.assessStreamCompletion({
+                instance: binding.instance,
+                stream: declared.name,
+                sourceId,
+                primaryKey: declared.primary_key,
+              });
+              return {
+                name: declared.name,
+                record_count:
+                  listing?.recordCount ??
+                  (completion.status === "current"
+                    ? (completion.receipt?.liveCount ?? null)
+                    : null),
+                last_updated: listing?.lastUpdated ?? null,
+                completion: {
+                  status: completion.status,
+                  receipt: completion.receipt
+                    ? {
+                        instance: completion.receipt.instance,
+                        stream: completion.receipt.stream,
+                        method: completion.receipt.method,
+                        generation: completion.receipt.generation,
+                        source_collected_at:
+                          completion.receipt.sourceCollectedAt,
+                        write_seq: completion.receipt.writeSeq,
+                        live_count: completion.receipt.liveCount,
+                        snapshot_sha256: completion.receipt.snapshotSha256,
+                        collection_time_basis:
+                          completion.receipt.collectionTimeBasis,
+                      }
+                    : null,
+                },
+              };
+            }),
+          };
+        });
+      return c.json({
+        source: {
+          id: sourceId,
+          kind: snapshot.source_kind,
+          source_declaration: {
+            version: snapshot.version,
+            digest: snapshot.digest,
+          },
+        },
+        connections,
+      });
     }
     return c.json({
       connections: deps.store

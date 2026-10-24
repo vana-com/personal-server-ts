@@ -124,6 +124,11 @@ export interface StreamCompletionReceipt {
   liveCount: number;
 }
 
+export type StreamCompletionAssessment = {
+  status: "current" | "missing" | "invalid" | "unknown";
+  receipt: NativeStreamCompletionReceipt | null;
+};
+
 /** Compatibility export; the portable temporal policy owns RFC3339 validity. */
 export function isRfc3339DateTime(value: unknown): value is string {
   return parseTime(value, "date-time") !== null;
@@ -433,6 +438,29 @@ DROP INDEX IF EXISTS idx_pdpp_records_live_instance_stream_emitted_key;
 CREATE INDEX idx_pdpp_records_live_instance_stream_emitted_key
   ON pdpp_records (instance, stream, emitted_key, emitted_at, record_key)
   WHERE deleted = 0;
+`,
+  // v23: record server-observed first additions. Existing identities are not
+  // backfilled: tracked_since marks the earliest point from which counts are
+  // complete for each instance. Reset and connection erasure start a new
+  // coverage window and remove the erased identities.
+  `
+CREATE TABLE IF NOT EXISTS pdpp_record_first_added (
+  instance TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  record_key TEXT NOT NULL,
+  first_added_at TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  PRIMARY KEY (instance, stream, record_key)
+);
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_first_added_window
+  ON pdpp_record_first_added (instance, stream, first_added_at);
+CREATE TABLE IF NOT EXISTS pdpp_additions_coverage (
+  instance TEXT PRIMARY KEY,
+  tracked_since TEXT NOT NULL
+);
+INSERT OR IGNORE INTO pdpp_additions_coverage (instance, tracked_since)
+  SELECT instance, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+  FROM pdpp_instance_binding;
 `,
 ];
 
@@ -901,6 +929,26 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     }): ReplaceStreamResult;
     /** Completion receipts of one instance, as stored. */
     listStreamCompletions(instance: string): StreamCompletionReceipt[];
+    listNativeStreamCompletions(
+      instance: string,
+    ): NativeStreamCompletionReceipt[];
+    assessStreamCompletion(input: {
+      instance: string;
+      stream: string;
+      sourceId: string;
+      primaryKey: string[];
+    }): StreamCompletionAssessment;
+    /** Earliest time native first-addition counts are complete for each instance. */
+    firstAddedCoverage(instanceIds: string[]): Array<{
+      instance: string;
+      trackedSince: string;
+    }>;
+    /** Server-observed first additions in the half-open interval [since, until). */
+    listFirstAdded(
+      instanceIds: string[],
+      since: string,
+      until: string,
+    ): Array<{ instance: string; stream: string; added: number }>;
     /**
      * Metadata-only completion: proves, for each requested stream, that the
      * live set SQLite holds is exactly the one the digest names, then stores
@@ -1294,6 +1342,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     const deleted = data === null;
     const version = latestVersion(instance, stream, recordKey) + 1;
     const writtenAt = nextWriteSeq.get() as { value: number };
+    if (!deleted && version === 1) {
+      db.prepare(
+        `INSERT OR IGNORE INTO pdpp_record_first_added
+           (instance, stream, record_key, first_added_at, generation)
+         SELECT ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), generation
+         FROM pdpp_instance_binding WHERE instance = ?`,
+      ).run(instance, stream, recordKey, instance);
+    }
     // The stream no longer holds what a replace delivered. `replaceStream`
     // writes its own receipt after its writes.
     dropCompletion(instance, stream);
@@ -1686,6 +1742,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
       }
 
       eraseInstanceData(input.instance);
+      db.prepare(
+        `INSERT INTO pdpp_additions_coverage (instance, tracked_since)
+         VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(instance) DO UPDATE SET tracked_since = excluded.tracked_since`,
+      ).run(input.instance);
       const resetClock = (nextWriteSeq.get() as { value: number }).value;
       db.prepare(
         "UPDATE pdpp_instance_binding SET method = ?, generation = ?, reset_clock = ? WHERE instance = ?",
@@ -1881,6 +1942,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
       db.prepare(
         "UPDATE pdpp_instance_binding SET source_id = ?, method = ?, label = ? WHERE instance = ?",
       ).run(input.sourceId, input.method, input.label, input.instance);
+      db.prepare(
+        `INSERT OR IGNORE INTO pdpp_additions_coverage (instance, tracked_since)
+         VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+      ).run(input.instance);
       if (current.source_id === null)
         replica.captureLifecycle(input.instance, "connection-register");
       replicaVisibilityObserver?.();
@@ -1893,6 +1958,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
       const current = ensureBinding(db, instance);
       if (current.deleted_at !== null) return toBinding(current);
       eraseInstanceData(instance);
+      db.prepare(
+        `INSERT INTO pdpp_additions_coverage (instance, tracked_since)
+         VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(instance) DO UPDATE SET tracked_since = excluded.tracked_since`,
+      ).run(instance);
       const resetClock = (nextWriteSeq.get() as { value: number }).value;
       const deletedAt = new Date().toISOString();
       db.prepare(
@@ -1923,6 +1993,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     db.prepare("DELETE FROM pdpp_record_arrival WHERE instance = ?").run(
       instance,
     );
+    db.prepare("DELETE FROM pdpp_record_first_added WHERE instance = ?").run(
+      instance,
+    );
     deleteUnclaimedBlobs(db);
   }
 
@@ -1949,6 +2022,36 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
       writeSeq: row.write_seq,
       liveCount: row.live_count,
     }));
+  }
+
+  function firstAddedCoverage(instanceIds: string[]) {
+    if (instanceIds.length === 0) return [];
+    const placeholders = instanceIds.map(() => "?").join(",");
+    return db
+      .prepare(
+        `SELECT instance, tracked_since FROM pdpp_additions_coverage
+         WHERE instance IN (${placeholders}) ORDER BY instance`,
+      )
+      .all(...instanceIds)
+      .map((row) => {
+        const value = row as { instance: string; tracked_since: string };
+        return { instance: value.instance, trackedSince: value.tracked_since };
+      });
+  }
+
+  function listFirstAdded(instanceIds: string[], since: string, until: string) {
+    if (instanceIds.length === 0) return [];
+    const placeholders = instanceIds.map(() => "?").join(",");
+    return db
+      .prepare(
+        `SELECT instance, stream, COUNT(*) AS added
+         FROM pdpp_record_first_added
+         WHERE instance IN (${placeholders})
+           AND first_added_at >= ? AND first_added_at < ?
+         GROUP BY instance, stream ORDER BY instance, stream`,
+      )
+      .all(...instanceIds, since, until)
+      .map((row) => row as { instance: string; stream: string; added: number });
   }
 
   type CompletionRowDb = {
@@ -2007,6 +2110,104 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
         (prior.snapshot_sha256 === expected.digest() &&
           prior.collection_time_basis === "host_run_finished"))
     );
+  }
+
+  function listNativeStreamCompletions(
+    instance: string,
+  ): NativeStreamCompletionReceipt[] {
+    const rows = db
+      .prepare(
+        "SELECT * FROM pdpp_stream_completion WHERE instance = ? ORDER BY stream",
+      )
+      .all(instance) as CompletionRowDb[];
+    return rows.flatMap((row) =>
+      row.snapshot_sha256 && row.collection_time_basis === "host_run_finished"
+        ? [
+            {
+              instance: row.instance,
+              stream: row.stream,
+              method: row.method,
+              generation: row.generation,
+              sourceCollectedAt: row.source_collected_at,
+              writeSeq: row.write_seq,
+              liveCount: row.live_count,
+              snapshotSha256: row.snapshot_sha256,
+              collectionTimeBasis: "host_run_finished" as const,
+            },
+          ]
+        : [],
+    );
+  }
+
+  function assessStreamCompletion(input: {
+    instance: string;
+    stream: string;
+    sourceId: string;
+    primaryKey: string[];
+  }): StreamCompletionAssessment {
+    const row = db
+      .prepare(
+        "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+      )
+      .get(input.instance, input.stream) as CompletionRowDb | undefined;
+    if (!row) return { status: "missing", receipt: null };
+    const receipt =
+      listNativeStreamCompletions(input.instance).find(
+        (candidate) => candidate.stream === input.stream,
+      ) ?? null;
+    if (!receipt) return { status: "invalid", receipt: null };
+    if (input.primaryKey.length === 0) {
+      return { status: "unknown", receipt };
+    }
+    try {
+      const binding = db
+        .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
+        .get(input.instance) as BindingRowDb | undefined;
+      if (!binding || binding.source_id !== input.sourceId) {
+        return { status: "invalid", receipt };
+      }
+      checkStreamQuarantine(input.instance, input.stream, binding.generation);
+      const rows = db
+        .prepare(
+          "SELECT record_key, data FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+        )
+        .all(input.instance, input.stream) as {
+        record_key: string;
+        data: string;
+      }[];
+      const held = db
+        .prepare(
+          `SELECT 1 FROM pdpp_replica_quarantined_keys
+           WHERE instance = ? AND stream = ? AND generation = ? LIMIT 1`,
+        )
+        .get(input.instance, input.stream, binding.generation);
+      if (held) return { status: "unknown", receipt };
+      const digest = liveSnapshotDigest(
+        {
+          sourceId: input.sourceId,
+          instance: input.instance,
+          method: binding.method ?? "",
+          generation: binding.generation,
+          stream: input.stream,
+        },
+        input.primaryKey,
+        rows.map((live) => ({
+          recordKey: live.record_key,
+          dataJson: live.data,
+        })),
+      );
+      const valid = receiptInvariantsHold(row, {
+        method: binding.method ?? "",
+        generation: binding.generation,
+        liveCount: rows.length,
+        clock: readWriteClock(),
+        lastChange: lastChangeSeq(input.instance, input.stream),
+        digest: () => digest,
+      });
+      return { status: valid ? "current" : "invalid", receipt };
+    } catch {
+      return { status: "unknown", receipt };
+    }
   }
 
   function completeStreams(
@@ -3026,6 +3227,10 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     storeBlobBytesForInstance,
     replaceStream,
     listStreamCompletions,
+    listNativeStreamCompletions,
+    assessStreamCompletion,
+    firstAddedCoverage,
+    listFirstAdded,
     completeStreams,
     listArrivalOrder,
     getRecord,

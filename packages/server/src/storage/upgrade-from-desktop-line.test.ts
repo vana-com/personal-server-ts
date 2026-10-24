@@ -584,7 +584,7 @@ describe("writable upgrades from historical desktop storage schemas", () => {
           );
           expect(
             db.prepare("SELECT version FROM pdpp_schema_version").get(),
-          ).toEqual({ version: 23 });
+          ).toEqual({ version: 24 });
           expect(
             db
               .prepare("SELECT version FROM pdpp_grant_bindings_schema_version")

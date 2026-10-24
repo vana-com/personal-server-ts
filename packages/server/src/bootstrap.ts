@@ -996,6 +996,8 @@ export async function createServer(
             (declaration) => declaration.source_id,
           ),
         ]),
+        declarations: pdppAuth.retainedDeclarations,
+        nativeStore: createSqliteRecordStore(db),
       }
     : undefined;
 
