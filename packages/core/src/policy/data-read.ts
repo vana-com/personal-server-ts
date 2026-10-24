@@ -295,7 +295,7 @@ function assertGrantAuthorizesBuilder(
     }
     if (expiresAtSec > 0) {
       const nowSec = Math.floor(Date.now() / 1000);
-      if (expiresAtSec < nowSec) {
+      if (expiresAtSec <= nowSec) {
         throw new GrantExpiredError({
           expiresAt: expiresAtSec,
         });
