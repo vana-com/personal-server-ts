@@ -22,9 +22,10 @@ const snapshot: DeclarationSnapshot = {
   streams: [
     {
       name: "playlists",
-      fields: ["id", "title"],
+      fields: ["id", "title", "created_at"],
       required_fields: ["id"],
       primary_key: ["id"],
+      consent_time_field: "created_at",
     },
     {
       name: "artists",
@@ -141,7 +142,7 @@ describe("PDPP owner-native projections", () => {
           instance,
           stream: "playlists",
           key,
-          data: { id: key, title },
+          data: { id: key, title, created_at: "2026-10-24T00:00:00.000Z" },
           emitted_at: "2026-10-24T00:00:00.000Z",
         },
       ],
@@ -177,7 +178,13 @@ describe("PDPP owner-native projections", () => {
               stream: "playlists",
             },
             ["id"],
-            [{ recordKey: "one", dataJson: '{"id":"one","title":"First"}' }],
+            [
+              {
+                recordKey: "one",
+                dataJson:
+                  '{"id":"one","title":"First","created_at":"2026-10-24T00:00:00.000Z"}',
+              },
+            ],
           ),
         },
       ],
@@ -241,6 +248,61 @@ describe("PDPP owner-native projections", () => {
     expect((await unknown.json()).status).toBe("unknown");
   });
 
+  it("counts only records inside resolved resources and time windows", async () => {
+    connect(A);
+    expect(ingest(A, "one", "First").accepted).toBe(1);
+    expect(ingest(A, "two", "Second").accepted).toBe(1);
+    const resourceSelection = requestSelection();
+    resourceSelection.streams[0]!.resources = ["missing"];
+    const resourceStatus = await status(resourceSelection, {
+      requirements: { playlists: { min_records: 1 } },
+    });
+    expect(await resourceStatus.json()).toMatchObject({
+      status: "not_ready",
+      streams: [{ record_count: 0, count_exact: true }],
+    });
+
+    const timeSelection = requestSelection();
+    timeSelection.streams[0]!.time_range = {
+      since: "2026-10-25T00:00:00.000Z",
+    };
+    const timeStatus = await status(timeSelection, {
+      requirements: { playlists: { min_records: 1 } },
+    });
+    expect(await timeStatus.json()).toMatchObject({
+      status: "not_ready",
+      streams: [{ record_count: 0, count_exact: true }],
+    });
+  });
+
+  it("reports unknown when a stream has quarantined rows and no receipt", async () => {
+    connect(A);
+    expect(ingest(A, "visible", "Visible").accepted).toBe(1);
+    expect(ingest(A, "held", "Quarantined").accepted).toBe(1);
+    db.prepare(
+      "INSERT INTO pdpp_replica_quarantined_keys VALUES (?, ?, ?, ?)",
+    ).run(A, 1, "playlists", "held");
+    const response = await status(requestSelection(), {
+      requirements: { playlists: { min_records: 1 } },
+    });
+    expect(await response.json()).toMatchObject({
+      status: "unknown",
+      streams: [{ record_count: null, count_exact: false }],
+    });
+  });
+
+  it("rejects non-string instance choices instead of widening the selection", async () => {
+    connect(A);
+    expect(ingest(A, "one", "First").accepted).toBe(1);
+    const response = await status(requestSelection(), {
+      instance_choices: { playlists: { playlists: 42 } },
+    });
+    expect(await response.json()).toMatchObject({
+      status: "unknown",
+      reasons: [{ code: "invalid_instance_choice" }],
+    });
+  });
+
   it("returns first-added metrics for the requested half-open interval", async () => {
     connect(A);
     const since = store.firstAddedCoverage([A])[0]?.trackedSince;
@@ -273,6 +335,26 @@ describe("PDPP owner-native projections", () => {
         { name: "artists", instance_id: A, added: 0 },
       ],
     });
+  });
+
+  it("records first-added within the write interval and preserves it on update", () => {
+    connect(A);
+    const before = Date.now();
+    expect(ingest(A, "one", "First").accepted).toBe(1);
+    const after = Date.now();
+    const firstAdded = () =>
+      (
+        db
+          .prepare(
+            "SELECT first_added_at FROM pdpp_record_first_added WHERE instance = ? AND stream = ? AND record_key = ?",
+          )
+          .get(A, "playlists", "one") as { first_added_at: string }
+      ).first_added_at;
+    const initial = firstAdded();
+    expect(Date.parse(initial)).toBeGreaterThanOrEqual(before - 1000);
+    expect(Date.parse(initial)).toBeLessThanOrEqual(after + 1000);
+    expect(ingest(A, "one", "Updated").accepted).toBe(1);
+    expect(firstAdded()).toBe(initial);
   });
 
   it("enforces owner identity and the token's instance ceiling on all new views", async () => {

@@ -3,6 +3,7 @@ import {
   parseTime,
   timeSortKey,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
+import type { StreamGrant } from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   createMemorySyncStateStore,
   assertListCursorBinding,
@@ -13,6 +14,8 @@ import {
   LIST_ORDER_COLUMNS,
   compareRecordIdentity,
   InvalidCursorSyntaxError,
+  recordKeyWithinGrantResources,
+  recordWithinGrantTimeConstraint,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { Database } from "better-sqlite3";
@@ -439,7 +442,7 @@ CREATE INDEX idx_pdpp_records_live_instance_stream_emitted_key
   ON pdpp_records (instance, stream, emitted_key, emitted_at, record_key)
   WHERE deleted = 0;
 `,
-  // v23: record server-observed first additions. Existing identities are not
+  // v24: record server-observed first additions. Existing identities are not
   // backfilled: tracked_since marks the earliest point from which counts are
   // complete for each instance. Reset and connection erasure start a new
   // coverage window and remove the erased identities.
@@ -949,6 +952,12 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
       since: string,
       until: string,
     ): Array<{ instance: string; stream: string; added: number }>;
+    countStreamSelection(input: {
+      instance: string;
+      stream: string;
+      resources?: string[];
+      timeConstraint?: StreamGrant["time_constraint"];
+    }): number | null;
     /**
      * Metadata-only completion: proves, for each requested stream, that the
      * live set SQLite holds is exactly the one the digest names, then stores
@@ -2145,6 +2154,18 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     sourceId: string;
     primaryKey: string[];
   }): StreamCompletionAssessment {
+    const binding = db
+      .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
+      .get(input.instance) as BindingRowDb | undefined;
+    if (!binding || binding.source_id !== input.sourceId) {
+      return { status: "invalid", receipt: null };
+    }
+    try {
+      checkConnectionQuarantine(input.instance);
+      checkStreamQuarantine(input.instance, input.stream, binding.generation);
+    } catch {
+      return { status: "unknown", receipt: null };
+    }
     const row = db
       .prepare(
         "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
@@ -2160,13 +2181,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
       return { status: "unknown", receipt };
     }
     try {
-      const binding = db
-        .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
-        .get(input.instance) as BindingRowDb | undefined;
-      if (!binding || binding.source_id !== input.sourceId) {
-        return { status: "invalid", receipt };
-      }
-      checkStreamQuarantine(input.instance, input.stream, binding.generation);
       const rows = db
         .prepare(
           "SELECT record_key, data FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
@@ -2175,13 +2189,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
         record_key: string;
         data: string;
       }[];
-      const held = db
-        .prepare(
-          `SELECT 1 FROM pdpp_replica_quarantined_keys
-           WHERE instance = ? AND stream = ? AND generation = ? LIMIT 1`,
-        )
-        .get(input.instance, input.stream, binding.generation);
-      if (held) return { status: "unknown", receipt };
       const digest = liveSnapshotDigest(
         {
           sourceId: input.sourceId,
@@ -3065,6 +3072,51 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     }));
   }
 
+  function countStreamSelection(input: {
+    instance: string;
+    stream: string;
+    resources?: string[];
+    timeConstraint?: StreamGrant["time_constraint"];
+  }): number | null {
+    const rows = db
+      .prepare(
+        `SELECT record_key, data FROM pdpp_records r
+         WHERE instance = ? AND stream = ? AND deleted = 0
+           AND ${unquarantinedRecordSql("r")}`,
+      )
+      .all(input.instance, input.stream) as {
+      record_key: string;
+      data: string;
+    }[];
+    const grant: StreamGrant = {
+      name: input.stream,
+      instance_ids: [input.instance],
+      fields: [],
+      ...(input.resources && { resources: input.resources }),
+      ...(input.timeConstraint && { time_constraint: input.timeConstraint }),
+    };
+    let count = 0;
+    try {
+      for (const row of rows) {
+        if (!recordKeyWithinGrantResources(row.record_key, grant)) continue;
+        const data: unknown = JSON.parse(row.data);
+        if (!data || typeof data !== "object" || Array.isArray(data))
+          return null;
+        if (
+          recordWithinGrantTimeConstraint(
+            data as Record<string, unknown>,
+            grant,
+          )
+        ) {
+          count += 1;
+        }
+      }
+    } catch {
+      return null;
+    }
+    return count;
+  }
+
   function getBlobMeta(blobId: string): PdppBlobMeta | undefined {
     const row = getBlobStmt.get(blobId) as
       | {
@@ -3267,6 +3319,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
       visibleInstanceIds: string[],
     ) => changesSince(stream, options, visibleInstanceIds),
     listStreams,
+    countStreamSelection,
     putBlobMeta: (meta: PdppBlobMeta) =>
       putBlobStmt.run({
         blob_id: meta.blobId,

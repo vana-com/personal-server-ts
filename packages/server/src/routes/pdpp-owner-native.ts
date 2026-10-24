@@ -6,6 +6,7 @@ import {
   type OwnerChoices,
   type SelectionRequest,
   type StreamGrant,
+  type TimeConstraint,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import type { PdppInstanceBinding } from "../storage/pdpp-records-sqlite-store.js";
@@ -19,6 +20,12 @@ export interface PdppOwnerNativeStore {
     recordCount: number;
     lastUpdated: string | null;
   }>;
+  countStreamSelection(input: {
+    instance: string;
+    stream: string;
+    resources?: string[];
+    timeConstraint?: TimeConstraint;
+  }): number | null;
   assessStreamCompletion(input: {
     instance: string;
     stream: string;
@@ -227,6 +234,13 @@ export function pdppOwnerNativeRoutes(deps: PdppOwnerNativeRouteDeps): Hono {
       : {};
     if (
       Object.values(instanceChoices).some(
+        (instance) => typeof instance !== "string",
+      )
+    ) {
+      return unresolved("unknown", "invalid_instance_choice");
+    }
+    if (
+      Object.values(instanceChoices).some(
         (instance) =>
           typeof instance === "string" &&
           !connections.some((binding) => binding.instance === instance),
@@ -286,9 +300,6 @@ export function pdppOwnerNativeRoutes(deps: PdppOwnerNativeRouteDeps): Hono {
     }
     const streams = resolution.streams.flatMap((grant) =>
       grant.instance_ids.map((instanceId) => {
-        const listing = deps.store
-          .listStreams([instanceId])
-          .find((item) => item.stream === grant.name);
         const declared = snapshot.streams.find(
           (item) => item.name === grant.name,
         );
@@ -301,10 +312,16 @@ export function pdppOwnerNativeRoutes(deps: PdppOwnerNativeRouteDeps): Hono {
             })
           : { status: "unknown" as const, receipt: null };
         const exactCount =
-          listing?.recordCount ??
-          (assessment.status === "current"
-            ? (assessment.receipt?.liveCount ?? null)
-            : null);
+          assessment.status === "unknown" || assessment.status === "invalid"
+            ? null
+            : declared
+              ? deps.store.countStreamSelection({
+                  instance: instanceId,
+                  stream: grant.name,
+                  resources: grant.resources,
+                  timeConstraint: grant.time_constraint,
+                })
+              : null;
         const rawRequirement = requirements[grant.name];
         const requirement = isObject(rawRequirement) ? rawRequirement : {};
         const minRecords = requirement.min_records;

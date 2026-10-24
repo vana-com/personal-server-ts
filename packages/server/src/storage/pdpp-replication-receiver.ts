@@ -239,6 +239,15 @@ export function createReplicaReceiver(deps: {
       operation?.kind === "upsert"
         ? (operation.blobs[0]?.blobId ?? null)
         : null;
+    if (data !== null && operation) {
+      db.prepare(
+        `INSERT OR IGNORE INTO pdpp_record_first_added
+           (instance, stream, record_key, first_added_at, generation)
+         SELECT ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), generation
+         FROM pdpp_instance_binding
+         WHERE instance = ? AND generation = ?`,
+      ).run(instance, stream, key, instance, operation.generation);
+    }
     db.prepare(
       `INSERT INTO pdpp_records
          (instance, stream, record_key, data, version, emitted_at, emitted_key, deleted, deleted_at, blob_id)
@@ -389,6 +398,16 @@ export function createReplicaReceiver(deps: {
           fence,
           id,
         );
+        if (reset) {
+          db.prepare(
+            "DELETE FROM pdpp_record_first_added WHERE instance = ?",
+          ).run(id);
+          db.prepare(
+            `INSERT INTO pdpp_additions_coverage (instance, tracked_since)
+             VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(instance) DO UPDATE SET tracked_since = excluded.tracked_since`,
+          ).run(id);
+        }
       }
     }
     for (const record of plan.records) {

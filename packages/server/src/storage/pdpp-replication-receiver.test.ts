@@ -281,6 +281,61 @@ it("applies tombstones and later resurrection under reordered batches", () => {
   );
 });
 
+it("tracks first observation from replicas and restarts additions coverage on reset", () => {
+  const d = device();
+  send(d, [upsert()]);
+  const first = d.db
+    .prepare(
+      "SELECT first_added_at FROM pdpp_record_first_added WHERE instance = ? AND stream = ? AND record_key = ?",
+    )
+    .get("conn_a", "messages", "a") as { first_added_at: string } | undefined;
+  const coverageBefore = d.store.firstAddedCoverage(["conn_a"])[0]!
+    .trackedSince;
+  expect(first?.first_added_at).toMatch(/^\d{4}-\d\d-\d\dT/);
+  expect(
+    d.store.listFirstAdded(
+      ["conn_a"],
+      "2000-01-01T00:00:00.000Z",
+      "2100-01-01T00:00:00.000Z",
+    ),
+  ).toEqual([{ instance: "conn_a", stream: "messages", added: 1 }]);
+
+  const reset: ReplicaOperation = {
+    kind: "connection-reset",
+    owner: "owner",
+    sourceId,
+    connectionId: "conn_a",
+    methodId: "collector",
+    generation: 2,
+    previousGeneration: 1,
+    revision: { logical: 30, writerId: "remote", operationId: "reset-2" },
+  };
+  d.db
+    .prepare(
+      "UPDATE pdpp_additions_coverage SET tracked_since = ? WHERE instance = ?",
+    )
+    .run("2000-01-01T00:00:00.000Z", "conn_a");
+  send(d, [reset]);
+  expect(
+    d.db
+      .prepare(
+        "SELECT 1 FROM pdpp_record_first_added WHERE instance = ? LIMIT 1",
+      )
+      .get("conn_a"),
+  ).toBeUndefined();
+  const coverageAfter = d.store.firstAddedCoverage(["conn_a"])[0]!.trackedSince;
+  expect(coverageAfter > coverageBefore).toBe(true);
+
+  send(d, [{ ...upsert(31), generation: 2 }]);
+  expect(
+    d.store.listFirstAdded(
+      ["conn_a"],
+      coverageAfter,
+      "2100-01-01T00:00:00.000Z",
+    ),
+  ).toEqual([{ instance: "conn_a", stream: "messages", added: 1 }]);
+});
+
 it("keeps future generations pending until reset evidence and suppresses old generations", () => {
   const d = device();
   const future = { ...upsert(20), generation: 3 };
