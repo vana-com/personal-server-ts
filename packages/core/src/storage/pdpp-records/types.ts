@@ -22,6 +22,10 @@ export interface PdppRecordEnvelopeInput {
 }
 
 export interface PdppStoredRecord {
+  /** Present only on an explicitly permitted provisional replica read. */
+  confirmation?: "not yet confirmed";
+  visibility?: "pending" | "conflicted";
+  status?: "account conflict";
   instance: string;
   stream: string;
   recordKey: string;
@@ -32,6 +36,9 @@ export interface PdppStoredRecord {
 }
 
 export interface PdppTombstoneRecord {
+  confirmation?: "not yet confirmed";
+  visibility?: "pending" | "conflicted";
+  status?: "account conflict";
   instance: string;
   stream: string;
   recordKey: string;
@@ -119,6 +126,9 @@ export interface ChangesSincePage {
 }
 
 export interface StreamListing {
+  confirmation?: "not yet confirmed";
+  visibility?: "pending" | "conflicted";
+  status?: "account conflict";
   stream: string;
   recordCount: number;
   lastUpdated: string | null;
@@ -163,3 +173,31 @@ export class CursorExpiredError extends Error {
 export class InvalidCursorError extends Error {}
 
 export class RecordIdentityMismatchError extends Error {}
+
+/** A read-time removal is explicit and contains no withdrawn record fields. */
+export interface PdppPendingRemoval extends Omit<PdppStoredRecord, "deleted"> {
+  deleted: true;
+  deletedAt: string;
+  confirmation: "not yet confirmed";
+  visibility: "pending";
+  /** Empty on removals; never expose the withdrawn value as current data. */
+  data: Record<string, never>;
+}
+export type PdppVisibleRecord = PdppStoredRecord | PdppPendingRemoval;
+export interface ListVisibleRecordsPage extends Omit<ListRecordsPage, "data"> {
+  data: PdppVisibleRecord[];
+}
+export interface PdppReplicaReadStore {
+  /** Confirmed history only; an identity conflict cannot establish row provenance. */
+  changesSince?(stream: string, options: ChangesSinceOptions): ChangesSincePage;
+  getRecord(
+    instance: string,
+    stream: string,
+    key: string,
+  ): PdppVisibleRecord | undefined;
+  listRecords(
+    stream: string,
+    options: ListRecordsOptions,
+  ): ListVisibleRecordsPage;
+  listStreams(instanceIds: string[]): StreamListing[];
+}

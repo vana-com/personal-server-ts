@@ -6,6 +6,12 @@
 
 export interface ListCursorPayload {
   kind: "list";
+  /** Current-view revision. A changed view expires rather than mixes pages. */
+  viewRevision?: string;
+  view?: "owner" | "grant";
+  instanceIds?: string[];
+  /** Final tuple component when records from several connections share time and key. */
+  instance?: string;
   /** Stream this token was minted for. Absent only on legacy cursors. */
   stream?: string;
   /** Store reset epoch this token was minted in. Absent only on legacy cursors. */
@@ -13,7 +19,6 @@ export interface ListCursorPayload {
   order: "asc" | "desc";
   sortValue: string | null; // cursor_field value of the last row on the page
   recordKey: string; // primary key tiebreaker
-  instance?: string; // final tiebreaker; absent only on legacy cursors
   /**
    * Write clock when page 1 was served. A reset of a read instance after
    * this point expires the cursor (410), so one paginated read never mixes
