@@ -4,7 +4,10 @@ import {
   type LegacyCoverageVerdict,
 } from "./legacy-scope-coverage.js";
 export type { LegacyCoverageVerdict } from "./legacy-scope-coverage.js";
-import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
+import {
+  LEGACY_SCOPE_ENTITY_KEYS,
+  LEGACY_SCOPE_SNAPSHOT_EQUIVALENCE,
+} from "./legacy-scope-entity-keys.js";
 import {
   ANTHROPIC_LIVE_BINDINGS,
   GITHUB_BROWSER_BINDINGS,
@@ -58,7 +61,7 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 7;
+const COVERAGE_RULE_VERSION = 8;
 
 /** Live Claude omits some account metadata. Preserve known fields from the
  * same organization's saved head; never borrow entities or another identity. */
@@ -969,6 +972,7 @@ export function createLegacyScopeView(
         coverage = compareLegacyCoverage(legacy.data, read.envelope.data, {
           scope,
           entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          exactSnapshot: LEGACY_SCOPE_SNAPSHOT_EQUIVALENCE[scope] === true,
           projectionOmissions: read.projectionOmissions,
           canonicalNewer: allStreamsNewerThan(
             read,

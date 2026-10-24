@@ -111,3 +111,19 @@ export const LEGACY_SCOPE_ENTITY_KEYS: Readonly<
     "$.watchLater": ["videoId"],
   },
 };
+
+/** ID-less legacy scopes that can only prove coverage by exact body snapshot. */
+export const LEGACY_SCOPE_SNAPSHOT_EQUIVALENCE: Readonly<Record<string, true>> =
+  {
+    "github.repositories": true,
+    // The old starred projection emits updatedAt:null. A non-null old value is
+    // deliberately not reproducible and therefore cannot pass exact equality.
+    "github.starred": true,
+    "instagram.ads": true,
+    "linkedin.connections": true,
+    "linkedin.education": true,
+    "linkedin.experience": true,
+    "linkedin.languages": true,
+    "linkedin.skills": true,
+    "spotify.savedTracks": true,
+  };
