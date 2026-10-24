@@ -10,6 +10,7 @@ import type {
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
   buildDataFilePath,
+  buildScopeDir,
   envelopeGeneration,
   type HierarchyManagerOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -24,7 +25,7 @@ import {
   PublishedDataFileError,
   snapshotScopeFiles,
 } from "./hierarchy.js";
-import { relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 interface OperationRow {
   authority: string;
@@ -111,8 +112,15 @@ export function createImportOperations(
       .all() as OperationRow[];
     for (const row of rows) {
       if (row.state !== "prepared") {
-        deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
-        index.deleteByPath(row.path);
+        if (!index.isHistoryOnly(row.scope, row.path)) {
+          deleteDataFileSync(
+            options,
+            row.scope,
+            row.collected_at,
+            row.operation,
+          );
+          index.deleteByPath(row.path);
+        }
         db.prepare(
           `UPDATE owner_import_operations SET envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
         ).run(row);
@@ -346,26 +354,36 @@ export function createImportOperations(
   return {
     commitVersion,
     deleteScope(scope: string): number {
-      const snapshot = immediate(() => {
-        deleteFirstSeenLedgerSync(options, scope);
-        const files = snapshotScopeFiles(options, scope);
+      return immediate(() => {
+        const history = index.findHistoryOnly(scope);
+        const dataRoot = resolve(options.dataDir);
+        const preservePaths = history.flatMap((entry) => [
+          resolve(dataRoot, entry.path),
+          join(
+            buildScopeDir(join(dataRoot, "blocks"), scope),
+            entry.collectedAt,
+          ),
+        ]);
+        const files = snapshotScopeFiles(options, scope, preservePaths);
         const entries = db
           .prepare("SELECT id, path FROM data_files WHERE scope = ?")
           .all(scope) as { id: number; path: string }[];
+        const retainedPaths = new Set(history.map((entry) => entry.path));
+        const removableEntries = entries.filter(
+          (entry) => !retainedPaths.has(entry.path),
+        );
+        if (history.length === 0) deleteFirstSeenLedgerSync(options, scope);
         retire("scope = @scope", { scope });
-        return { files, entries };
-      });
-      return immediate(() => {
         recover();
-        deleteScopeFilesSync(snapshot.files);
+        deleteScopeFilesSync(files);
         const remove = db.prepare(
           "DELETE FROM data_files WHERE id = @id AND path = @path",
         );
-        for (const entry of snapshot.entries) remove.run(entry);
+        for (const entry of removableEntries) remove.run(entry);
         if (index.countByScope(scope) === 0) {
           deleteFirstSeenLedgerSync(options, scope);
         }
-        return snapshot.entries.length;
+        return removableEntries.length;
       });
     },
     deleteVersion(
@@ -373,12 +391,6 @@ export function createImportOperations(
       collectedAt: string,
       indexedPath?: string,
     ): boolean {
-      immediate(() => {
-        retire("scope = @scope AND collected_at = @collectedAt", {
-          scope,
-          collectedAt,
-        });
-      });
       return immediate(() => {
         const path =
           indexedPath ??
@@ -386,6 +398,11 @@ export function createImportOperations(
             options.dataDir,
             buildDataFilePath(options.dataDir, scope, collectedAt),
           );
+        if (index.isHistoryOnly(scope, path)) return false;
+        retire("scope = @scope AND collected_at = @collectedAt", {
+          scope,
+          collectedAt,
+        });
         const existed = index.findByPath(path) !== undefined;
         recover();
         deleteDataFileSync(options, scope, collectedAt);
@@ -395,7 +412,9 @@ export function createImportOperations(
     },
     dropUnsyncedEntry(path: string): boolean {
       return immediate(() => {
-        if (index.findByPath(path)?.dataPointId !== null) return false;
+        const entry = index.findByPath(path);
+        if (!entry || entry.dataPointId !== null) return false;
+        if (index.isHistoryOnly(entry.scope, path)) return false;
         if (!index.deleteUnsyncedByPath(path)) return false;
         retire("path = @path", { path });
         return true;

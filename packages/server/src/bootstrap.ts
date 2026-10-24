@@ -389,6 +389,7 @@ export async function createServer(
     allowOpenMarkerMigration:
       hadIndex && !hadMetadataSentinel && !openMarkerProtocolInitialized,
   });
+  const legacyScopeAuthority = createLegacyScopeAuthority(db);
   db.exec(
     "CREATE TABLE IF NOT EXISTS cas_open_marker_protocol (id INTEGER PRIMARY KEY)",
   );
@@ -754,6 +755,7 @@ export async function createServer(
       masterKey: deriveMasterKey(masterKeySignature),
       signer: options?.additionsWriter?.signer ?? serverSigner,
       gateway: options?.additionsWriter?.gateway ?? gatewayClient,
+      registrationAuthority: legacyScopeAuthority,
     });
   }
 
@@ -779,6 +781,7 @@ export async function createServer(
 
     const uploadDeps = {
       additions,
+      registrationAuthority: legacyScopeAuthority,
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -1077,7 +1080,7 @@ export async function createServer(
     // file, on a boot that does not mount the RS.
     legacyScopeView: createLegacyScopeView({
       logger,
-      authority: createLegacyScopeAuthority(db),
+      authority: legacyScopeAuthority,
       records: pdppRecords?.bindingStore,
       // Reuse the source-scoped declarations selected by the record server.
       // Declaration schema identity participates in projection revisions and

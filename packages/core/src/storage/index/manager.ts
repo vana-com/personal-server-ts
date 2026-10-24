@@ -51,6 +51,10 @@ export interface IndexManager {
   findByFileId(fileId: string): IndexEntry | undefined;
   /** Find an index entry by its DPv2 data-point id (download dedup). */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
+  /** A legacy row is history after its scope gains canonical authority. */
+  isHistoryOnly(scope: string, path: string): boolean;
+  /** Retained legacy rows that cleanup must leave on disk and in the index. */
+  findHistoryOnly(scope: string): Pick<IndexEntry, "path" | "collectedAt">[];
   /**
    * Find unsynced entries eligible for remote publication, ordered oldest
    * first. Legacy history remains indexed but is excluded once its scope has

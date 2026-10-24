@@ -325,11 +325,11 @@ describe("legacy scope view over the real SQLite record store", () => {
       return { reader, authority, head, verdict, commitElsewhere, close };
     }
 
-    it("confirms a takeover that already names its method", () => {
+    it("confirms a takeover that already names its method", async () => {
       const t = twoConnections();
       try {
         expect(
-          t.authority.confirmRead(
+          await t.authority.confirmRead(
             "oura.sleep",
             t.head,
             () => true,
@@ -338,7 +338,7 @@ describe("legacy scope view over the real SQLite record store", () => {
           ),
         ).toBe(true);
         expect(
-          t.authority.confirmRead(
+          await t.authority.confirmRead(
             "oura.sleep",
             t.head,
             t.commitElsewhere,
@@ -351,7 +351,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       }
     });
 
-    it("names the method of an older unknown record without a snapshot conflict", () => {
+    it("names the method of an older unknown record without a snapshot conflict", async () => {
       const t = twoConnections();
       try {
         t.reader
@@ -362,7 +362,7 @@ describe("legacy scope view over the real SQLite record store", () => {
           )
           .run();
         expect(
-          t.authority.confirmRead(
+          await t.authority.confirmRead(
             "oura.sleep",
             t.head,
             () => true,
@@ -376,7 +376,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       }
     });
 
-    it("does not lock a scope from a cached not-covered verdict", () => {
+    it("does not lock a scope from a cached not-covered verdict", async () => {
       const t = twoConnections();
       const notCovered: LegacyCoverageVerdict = {
         ...covered,
@@ -387,7 +387,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       };
       try {
         expect(
-          t.authority.confirmRead(
+          await t.authority.confirmRead(
             "oura.sleep",
             t.head,
             () => true,
@@ -396,7 +396,7 @@ describe("legacy scope view over the real SQLite record store", () => {
           ),
         ).toBe(true);
         expect(
-          t.authority.confirmRead(
+          await t.authority.confirmRead(
             "oura.sleep",
             t.head,
             () => true,
@@ -411,7 +411,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     });
   });
 
-  it("persists provenance-backed omission evidence in the verdict ledger", () => {
+  it("persists provenance-backed omission evidence in the verdict ledger", async () => {
     db.prepare(
       "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
     ).run("oura/sleep/old.json", "oura.sleep", "2026-06-08T18:05:53.547Z", 1);
@@ -448,7 +448,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       byteDelta: 0,
     };
     expect(
-      authority.confirmRead("oura.sleep", head, () => true, "oura", {
+      await authority.confirmRead("oura.sleep", head, () => true, "oura", {
         instance: "conn_a",
         generation: 1,
         writeClock: authority.writeClock(),
@@ -1267,7 +1267,12 @@ describe("legacy scope view over the real SQLite record store", () => {
 
     const inFlight = parityView.readLatest("oura.activity");
     await readStarted;
-    parityView.resetTakeover("oura.activity");
+    await parityView.resetTakeover("oura.activity");
+    expect(
+      db
+        .prepare("SELECT * FROM legacy_scope_takeover_resets WHERE scope = ?")
+        .get("oura.activity"),
+    ).toBeDefined();
     resume();
 
     expect(await inFlight).toEqual({ kind: "file", deletion: "canonical" });

@@ -532,15 +532,32 @@ describe("IndexManager", () => {
       collectedAt: "2026-01-02T00:00:00Z",
       sizeBytes: 100,
     });
+    const noncanonicalPath = "oura/activity/late-import.json";
+    manager.insert({
+      fileId: null,
+      path: noncanonicalPath,
+      scope: "oura.activity",
+      collectedAt: "2026-01-03T00:00:00Z",
+      sizeBytes: 100,
+    });
+    db.prepare("UPDATE data_files SET producer = ? WHERE path = ?").run(
+      "old-client-import",
+      noncanonicalPath,
+    );
 
     expect(
       manager
         .findByScope({ scope: "oura.activity" })
         .map((entry) => entry.path),
-    ).toEqual([legacyPath, canonicalPath]);
+    ).toEqual([noncanonicalPath, legacyPath, canonicalPath]);
     expect(manager.findUnsynced().map((entry) => entry.path)).toEqual([
       canonicalPath,
     ]);
+    expect(
+      manager.findUnsynced({ limit: 50 }).map((entry) => entry.path),
+    ).toEqual([canonicalPath]);
+    expect(manager.isHistoryOnly("oura.activity", legacyPath)).toBe(true);
+    expect(manager.isHistoryOnly("oura.activity", noncanonicalPath)).toBe(true);
   });
 
   it("findUnsynced with limit returns at most N entries", () => {
