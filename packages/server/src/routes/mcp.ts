@@ -881,7 +881,8 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
       }
       const approve = new URL(approvalUrl);
       approve.searchParams.set("mcp_authorization", created.authorizationId);
-      approve.searchParams.set("ps_origin", origin);
+      // The approver signs for the registered public origin, never loopback.
+      approve.searchParams.set("ps_origin", resolveOrigin(deps.serverOrigin));
       return c.redirect(approve.toString(), 302);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
