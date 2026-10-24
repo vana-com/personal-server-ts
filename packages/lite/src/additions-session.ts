@@ -14,6 +14,7 @@ import type {
   HostMessage,
   WorkerMessage,
 } from "./additions-protocol.js";
+import type { DiagnosticsRecorder } from "./diagnostics.js";
 import type { PsLiteAdditionsTransport } from "./additions-transport.js";
 
 export interface AdditionsWorkerPort {
@@ -24,6 +25,7 @@ export interface AdditionsWorkerPort {
 }
 export interface PsLiteAdditionsSessionOptions {
   init: AdditionsWorkerInit;
+  diagnostics?: DiagnosticsRecorder;
   transport: PsLiteAdditionsTransport;
   deleteSystemScope(scope: string): Promise<void>;
   /** Bundlers may supply their own URL/factory; no synchronous fallback exists. */
@@ -35,11 +37,17 @@ export function createPsLiteAdditionsSession(
 ): DurableAdditionsService {
   async function run(operation: AdditionsOperation): Promise<unknown> {
     const started = performance.now();
+    // The longer window is for background summary reconstruction only.
+    // Optional upload hints must not delay a registered source for minutes.
+    const timeBudgetMs =
+      operation.method === "summarize"
+        ? options.init.timeBudgetMs
+        : Math.min(10_000, options.init.timeBudgetMs);
     if (typeof navigator === "undefined" || !navigator.locks)
       throw new Error(
         "Bounded additions requires browser locks for persisted publication",
       );
-    const signal = AbortSignal.timeout(options.init.timeBudgetMs);
+    const signal = AbortSignal.timeout(timeBudgetMs);
     // Web Locks span tabs and survive worker restarts without a stale lease.
     return navigator.locks.request(
       JSON.stringify([
@@ -52,7 +60,7 @@ export function createPsLiteAdditionsSession(
         signal.throwIfAborted();
         const remainingMs = Math.max(
           1,
-          Math.floor(options.init.timeBudgetMs - (performance.now() - started)),
+          Math.floor(timeBudgetMs - (performance.now() - started)),
         );
         return runLocked(operation, remainingMs);
       },
@@ -92,6 +100,16 @@ export function createPsLiteAdditionsSession(
         worker.onmessage = (event) => {
           if (finished) return;
           const message = event.data;
+          if (message.kind === "diagnostic") {
+            options.diagnostics?.observe({
+              phase: "unknown",
+              scope: message.event.scope,
+              fileId: message.event.version,
+              detail: `additions:${message.event.code}`,
+              error: true,
+            });
+            return;
+          }
           if (message.kind === "result") {
             finish(undefined, message.result);
             return;
@@ -197,7 +215,14 @@ export function createPsLiteAdditionsSession(
         };
         worker.postMessage({
           kind: "run",
-          init: { ...options.init, timeBudgetMs: remainingMs },
+          init: {
+            ...options.init,
+            timeBudgetMs: remainingMs,
+            byteBudget:
+              operation.method === "summarize"
+                ? options.init.byteBudget
+                : Math.min(8 * 1024 * 1024, options.init.byteBudget),
+          },
           operation,
         });
       });
@@ -240,7 +265,7 @@ export function createPsLiteAdditionsSession(
       // has no bounded-recovery deadline or noncancelable worker RPC.
       const budget = deletion?.durableOnly
         ? new AdditionsBudget(
-            options.init.byteBudget,
+            Math.min(8 * 1024 * 1024, options.init.byteBudget),
             options.init.timeBudgetMs,
             deletion.signal,
           )

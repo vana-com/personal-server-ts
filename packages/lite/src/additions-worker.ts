@@ -226,8 +226,17 @@ function createService(init: AdditionsWorkerInit) {
       return inventory.listScopes(options);
     },
   };
+  const reported = new Set<string>();
   return createDurableAdditions({
     ...init,
+    onRecoveryDiagnostic: init.diagnostics
+      ? (event) => {
+          const key = JSON.stringify(event);
+          if (reported.size >= 32 || reported.has(key)) return;
+          reported.add(key);
+          worker.postMessage({ kind: "diagnostic", event });
+        }
+      : undefined,
     inventory: boundedInventory,
     storageAdapter: {
       urlForKey: (key) => key,
