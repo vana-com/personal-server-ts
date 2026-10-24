@@ -126,6 +126,18 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       );
     },
 
+    hasRetainedTombstones(instance, streams) {
+      if (!streams.length || !hasTable("pdpp_records")) return false;
+      return (
+        db
+          .prepare(
+            `SELECT 1 FROM pdpp_records WHERE instance = ? AND deleted = 1
+        AND stream IN (${streams.map(() => "?").join(", ")}) LIMIT 1`,
+          )
+          .get(instance, ...streams) !== undefined
+      );
+    },
+
     readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
 
     writeClock() {

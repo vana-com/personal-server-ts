@@ -5,7 +5,10 @@
  * Diagnostics contain paths and counts, never entity keys or field values.
  */
 import type { ProjectionOmission } from "../legacy-projection/types.js";
-import { LEGACY_COVERAGE_EXCEPTIONS } from "./legacy-scope-coverage-exceptions.js";
+import {
+  LEGACY_COVERAGE_EXCEPTIONS,
+  LEGACY_INTEGER_ROUNDING_EXCEPTIONS,
+} from "./legacy-scope-coverage-exceptions.js";
 
 export interface LegacyCoverageSchema {
   type?: string | readonly string[];
@@ -497,6 +500,25 @@ export function compareLegacyCoverage(
       Object.is(legacy, canonical) ||
       (timestampField && sameIsoInstantAtMillisecond(legacy, canonical))
     ) {
+      return;
+    }
+    const normalizedPath = path.replace(/\[\d+\]/g, "[]");
+    if (
+      typeof legacy === "number" &&
+      Number.isFinite(legacy) &&
+      !Number.isInteger(legacy) &&
+      canonical === Math.round(legacy) &&
+      LEGACY_INTEGER_ROUNDING_EXCEPTIONS.some(
+        (entry) =>
+          entry.scope === options.scope && entry.path === normalizedPath,
+      )
+    ) {
+      appliedExceptions.set(normalizedPath, {
+        path: normalizedPath,
+        reason:
+          "legacy copied fractional average_hrv despite the frozen integer schema",
+        authority: "canonical",
+      });
       return;
     }
     if (field && (identityFields.includes(field) || isIdentityField(field))) {

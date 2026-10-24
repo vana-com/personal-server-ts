@@ -2470,13 +2470,16 @@ describe("legacy scope view over the real SQLite record store", () => {
   describe("every other binding keeps its automatic takeover of a legacy file", () => {
     it.each([
       {
-        name: "oura-browser where it is not opt-in (a dev build)",
+        name: "oura-browser with a completed three-stream run where it is not opt-in",
         scope: "oura.activity",
         seed: () => {
           connect(store, "conn_b", "oura-browser");
           replace(store, "conn_b", "activity", ["a1"], {
             method: "oura-browser",
           });
+          for (const stream of ["sleep", "readiness"]) {
+            replace(store, "conn_b", stream, [], { method: "oura-browser" });
+          }
         },
       },
       {
