@@ -391,4 +391,117 @@ describe("Strava export-to-browser transition", () => {
     });
     expect(await (await status()).json()).toEqual({ status: "pending" });
   });
+
+  /** The owner-authenticated binding routes over `transition`. */
+  function routes(transition: ReturnType<typeof create>) {
+    const app = pdppInstanceBindingRoutes({
+      store,
+      ownerSubjectId: "0xowner",
+      configuredMethods: new Map([[INSTANCE, ["strava"]]]),
+      instancesForSubject: () => [INSTANCE],
+      instancesForSource: () => [INSTANCE],
+      auth: {
+        resolveToken: async () => ({
+          active: true,
+          tokenKind: "owner",
+          subjectId: "0xowner",
+          sourceId: SOURCE,
+        }),
+      } as never,
+      transitionStrava: transition.transition,
+      stravaTransitionStatus: transition.status,
+    });
+    const send = (path: string, body: Record<string, unknown>) =>
+      app.request(`/pdpp/instances/${INSTANCE}/${path}`, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer owner",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+    return {
+      post: () => send("transition-strava-browser", { expected_generation: 1 }),
+      reset: () =>
+        send("reset", {
+          expected_method: "strava-browser",
+          expected_generation: 2,
+          next_method: "strava-browser",
+        }),
+    };
+  }
+
+  const errorCode = async (response: Response) =>
+    ((await response.json()) as { error: { code: string } }).error.code;
+
+  it("returns the same binding when the route replays a transition", async () => {
+    seedExport(store, ["a"]);
+    const { post } = routes(create());
+
+    const first = await post();
+    const archive = store.stravaTransition(INSTANCE)!.archiveInstance;
+    const replay = await post();
+
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual(await first.json());
+    expect(store.stravaTransition(INSTANCE)?.archiveInstance).toBe(archive);
+    expect(store.getRecord(archive, "activities", "a")?.data.id).toBe("a");
+  });
+
+  it("clears the transition archive on reset", async () => {
+    seedExport(store, ["a"]);
+    const { post, reset } = routes(create());
+    await post();
+    const archive = store.stravaTransition(INSTANCE)!.archiveInstance;
+
+    expect((await reset()).status).toBe(200);
+    expect(store.stravaTransition(INSTANCE)).toBeNull();
+    expect(store.getRecord(archive, "activities", "a")).toBeUndefined();
+  });
+
+  it("refuses over the route when saved activities are not readable", async () => {
+    seedExport(store, ["a"]);
+    // An unconfigured export method projects its rows to a refusal.
+    method = "unconfigured";
+
+    const response = await routes(create()).post();
+
+    expect(response.status).toBe(409);
+    expect(await errorCode(response)).toBe("strava_previous_data_not_readable");
+    expect(store.getInstanceBinding(INSTANCE)).toMatchObject({
+      method: "strava",
+      generation: 1,
+    });
+  });
+
+  it("refuses over the route when a write lands between snapshot and commit", async () => {
+    seedExport(store, ["a"]);
+    const view = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: () => [method],
+    });
+    // The export run writes while the snapshot is being read.
+    const racing = createStravaMethodTransition(
+      store,
+      {
+        ...view,
+        async readLatest(scope) {
+          const read = await view.readLatest(scope);
+          if (scope === ACTIVITIES) seedExport(store, ["a", "late"]);
+          return read;
+        },
+      },
+      files,
+    );
+
+    const response = await routes(racing).post();
+
+    expect(response.status).toBe(409);
+    expect(await errorCode(response)).toBe("binding_generation_mismatch");
+    expect(store.getInstanceBinding(INSTANCE).method).toBe("strava");
+    expect(store.getRecord(INSTANCE, "activities", "late")?.data.id).toBe(
+      "late",
+    );
+  });
 });
