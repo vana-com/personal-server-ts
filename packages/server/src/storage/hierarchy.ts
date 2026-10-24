@@ -309,6 +309,31 @@ function sameEnvelope(a: Buffer, b: Buffer): boolean {
 }
 
 /**
+ * Fail when a file already published at `finalPath` holds a different
+ * envelope than the staged one. Nothing is published or changed. Callers run
+ * it before committing an index row, so a rejected publication leaves no row
+ * describing bytes that are not there.
+ */
+export async function assertPublishable(
+  stagePath: string,
+  finalPath: string,
+): Promise<void> {
+  let published: Buffer;
+  try {
+    published = await readFile(finalPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+  const staged = await readFile(stagePath);
+  if (!published.equals(staged) && !sameEnvelope(published, staged)) {
+    throw new Error(
+      `Stored envelope conflicts with publication at ${finalPath}`,
+    );
+  }
+}
+
+/**
  * Publish a staged envelope at its version path without replacing one.
  *
  * A version path names immutable bytes. Readers authorize the version they
@@ -325,15 +350,7 @@ export async function publishStagedDataFile(
     await link(stagePath, finalPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-    const [published, staged] = await Promise.all([
-      readFile(finalPath),
-      readFile(stagePath),
-    ]);
-    if (!published.equals(staged) && !sameEnvelope(published, staged)) {
-      throw new Error(
-        `Stored envelope conflicts with publication at ${finalPath}`,
-      );
-    }
+    await assertPublishable(stagePath, finalPath);
   }
   await unlink(stagePath);
   const directory = await open(dirname(finalPath), "r");

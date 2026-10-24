@@ -1,13 +1,23 @@
 import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { tmpdir } from "node:os";
 import type Database from "better-sqlite3";
 import { initializeDatabase } from "./index-schema.js";
 import { createIndexManager } from "./index-manager.js";
-import { createNodeDataStorage } from "./node-data-storage.js";
+import {
+  createNodeDataStorage,
+  recoverStagedDataFiles,
+} from "./node-data-storage.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -526,7 +536,7 @@ describe("immutable PDPP version provenance", () => {
   };
 
   it("refuses to replace a published version with different bytes", async () => {
-    const { storage, dataDir, close } = await openStorage();
+    const { storage, dataDir, index, close } = await openStorage();
     try {
       const written = await storage.writeEnvelope(legacy);
       await storage.insertEntry({
@@ -565,6 +575,9 @@ describe("immutable PDPP version provenance", () => {
       // commitEnvelope over a published file that has no index row.
       const unindexed = { ...legacy, collectedAt: "2026-10-03T00:00:00Z" };
       await storage.writeEnvelope(unindexed);
+      const revisionBefore = index.findLatestByScope(
+        unindexed.scope,
+      )?.casRevision;
       await expect(
         storage.commitEnvelope!(
           { ...unindexed, data: nativeBytes.data },
@@ -575,6 +588,31 @@ describe("immutable PDPP version provenance", () => {
           },
         ),
       ).rejects.toThrow("conflicts with publication");
+      expect(
+        (await storage.readEnvelope(unindexed.scope, unindexed.collectedAt))
+          .data,
+      ).toEqual({ id: "legacy" });
+      // The rejection leaves the index unchanged: no row, no revision, and no
+      // stage for boot recovery to finish later.
+      const unindexedPath = relative(
+        dataDir,
+        buildDataFilePath(dataDir, unindexed.scope, unindexed.collectedAt),
+      );
+      expect(index.findByPath(unindexedPath)).toBeUndefined();
+      expect(index.countByScope(unindexed.scope)).toBe(1);
+      expect(index.findLatestByScope(unindexed.scope)?.casRevision).toBe(
+        revisionBefore,
+      );
+      const leftovers = async () =>
+        (await readdir(dirname(join(dataDir, unindexedPath)))).filter((name) =>
+          name.includes(".pending."),
+        );
+      expect(await leftovers()).toEqual([]);
+      await recoverStagedDataFiles({
+        indexManager: index,
+        hierarchyOptions: { dataDir },
+      });
+      expect(index.findByPath(unindexedPath)).toBeUndefined();
       expect(
         (await storage.readEnvelope(unindexed.scope, unindexed.collectedAt))
           .data,

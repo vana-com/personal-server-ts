@@ -18,6 +18,7 @@ import {
   writeBlockManifest,
   writeDataFile,
   stageDataFile,
+  assertPublishable,
   publishStagedDataFile,
 } from "./hierarchy.js";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
@@ -283,6 +284,9 @@ export function createNodeDataStorage(
       const staged = await stageDataFile(deps.hierarchyOptions, envelope);
       let indexed = false;
       try {
+        // Refuse a conflicting publication before the index commits: the row
+        // and its revision would otherwise describe bytes that are not there.
+        await assertPublishable(staged.stagePath, staged.finalPath);
         const result = deps.indexManager.insertIfCurrent(
           {
             ...entry,
