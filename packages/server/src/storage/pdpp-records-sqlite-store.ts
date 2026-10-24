@@ -325,6 +325,16 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
     snapshots_json TEXT NOT NULL,
     conversations_covered INTEGER NOT NULL DEFAULT 0
   );`,
+  // v15: expression index for the retained-history blob reference check in
+  // `deleteUnclaimedBlobs`. Without it each candidate blob scanned every
+  // history row at every writable open. The CAST gives the expression TEXT
+  // affinity, which the TEXT `blob_id` column comparison needs before the
+  // planner will search it. Additive only; the expression must stay identical
+  // to `noRetainedHistoryReferenceSql`.
+  `
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
+  ON pdpp_record_changes (CAST(json_extract(data, '$.blob_ref.blob_id') AS TEXT));
+`,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -449,6 +459,15 @@ function sweepStaleBlobClaims(db: Database): void {
   })();
 }
 
+/**
+ * `NOT EXISTS` predicate: no retained history row references `blobId`.
+ * The expression must match the v15 index `idx_pdpp_record_changes_blob_ref`
+ * exactly, so the planner searches by blob id rather than scanning history.
+ */
+export function noRetainedHistoryReferenceSql(blobId: string): string {
+  return `NOT EXISTS (SELECT 1 FROM pdpp_record_changes WHERE CAST(json_extract(data, '$.blob_ref.blob_id') AS TEXT) = ${blobId})`;
+}
+
 function deleteUnclaimedBlobs(db: Database): void {
   // Claims reconstructed by v4 only cover current records. Retained history
   // independently owns its bytes, even after overwrite or tombstone. Explicit
@@ -459,12 +478,12 @@ function deleteUnclaimedBlobs(db: Database): void {
       SELECT blob_id FROM pdpp_blobs b
       WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = b.blob_id)
         AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = b.blob_id AND r.deleted = 0)
-        AND NOT EXISTS (SELECT 1 FROM pdpp_record_changes h WHERE json_extract(h.data, '$.blob_ref.blob_id') = b.blob_id)
+        AND ${noRetainedHistoryReferenceSql("b.blob_id")}
     );
     DELETE FROM pdpp_blobs
     WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = pdpp_blobs.blob_id)
       AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = pdpp_blobs.blob_id AND r.deleted = 0)
-      AND NOT EXISTS (SELECT 1 FROM pdpp_record_changes h WHERE json_extract(h.data, '$.blob_ref.blob_id') = pdpp_blobs.blob_id);
+      AND ${noRetainedHistoryReferenceSql("pdpp_blobs.blob_id")};
   `);
 }
 
