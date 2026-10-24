@@ -1,5 +1,6 @@
 import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { parseRecordQuery } from "./pdpp-record-query.js";
+import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import {
@@ -31,6 +32,8 @@ import {
   type IngestOutcome,
   type PdppRecordEnvelopeInput,
   type PdppRecordRow,
+  type PdppReplicaReadStore,
+  type PdppVisibleRecord,
   type PdppRecordStore,
   type StreamDeclaration,
   type StreamDeclarationRegistry,
@@ -200,6 +203,8 @@ function parseIngestBody(bytes: Uint8Array): unknown {
 
 export interface PdppRecordsRouteDeps {
   store: PdppRecordStore;
+  /** Trusted reader classification; the receiver owns visibility and provisional markers. */
+  replicaReads?: (reader: ReplicaReader) => PdppReplicaReadStore;
   bindingStore?: {
     getInstanceBinding(instance: string): {
       sourceId: string | null;
@@ -554,6 +559,9 @@ function projectSchemaToFields(
 export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   const app = new Hono();
   const validateData = createRecordDataValidator(deps.declarations);
+  const reads = (context: PdppTokenContext) =>
+    deps.replicaReads?.(context.tokenKind === "owner" ? "owner" : "grant") ??
+    deps.store;
   const sync = createPdppSyncSessionService(deps.store, {
     ...(deps.syncPageBudget !== undefined && {
       maxExaminedPerRequest: deps.syncPageBudget,
@@ -812,10 +820,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     // store's raw listing counts every record in the instance, so returning
     // it would leak the existence and recency of records outside the grant's
     // time_constraint / resources.
+    const reader = reads(context);
+    const visibleGrantInstances =
+      deps.replicaReads?.("grant").visibleInstanceIds;
     const visibleStreams =
       context.tokenKind === "owner"
-        ? deps.store.listStreams(ownerInstanceIds).map((s) => ({
+        ? reader.listStreams(ownerInstanceIds).map((s) => ({
             name: s.stream,
+            confirmation: s.confirmation,
+            visibility: s.visibility,
+            status: s.status,
             recordCount: s.recordCount as number | null,
             lastUpdated: s.lastUpdated,
             budgetExhausted: false,
@@ -823,12 +837,17 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         : (context.grant?.streams ?? [])
             .filter(
               (streamGrant, index, all) =>
-                all.findIndex((g) => g.name === streamGrant.name) === index,
+                all.findIndex((g) => g.name === streamGrant.name) === index &&
+                (!visibleGrantInstances ||
+                  visibleGrantInstances(streamGrant.instance_ids).length > 0),
             )
             .map((streamGrant) => ({
               name: streamGrant.name,
+              confirmation: undefined,
+              visibility: undefined,
+              status: undefined,
               ...summarizeGrantVisible(
-                deps.store,
+                reader,
                 streamGrant.name,
                 streamGrant.instance_ids,
                 streamGrant,
@@ -850,6 +869,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           name: s.name,
           record_count: s.recordCount,
           last_updated: s.lastUpdated,
+          ...(s.confirmation && { confirmation: s.confirmation }),
+          ...(s.status && { visibility: s.visibility, status: s.status }),
         })),
         ...(cappedStreams.length > 0 && {
           meta: {
@@ -985,6 +1006,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       if (query.changesSince !== undefined) {
         const candidate = grantIsCandidate(context!.grant);
         const streamGrant = scope.streamGrant;
+        const replicaReader = deps.replicaReads?.(
+          context!.tokenKind === "owner" ? "owner" : "grant",
+        );
+        const visibleInstances = new Set(
+          replicaReader?.visibleInstanceIds?.(effectiveInstanceIds) ??
+            effectiveInstanceIds,
+        );
         // The session owner decides disclosure, pagination and tokens; this
         // route only states the grant and maps the page. Candidate
         // eligibility compares the frozen grant projection; sparse request
@@ -996,41 +1024,58 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             `This stream spans more than ${MAX_SYNC_INSTANCES} connections, more than one sync session reads`,
           );
         }
-        const page = sync.read({
-          stream,
-          owner: context!.grant?.subject.id ?? context!.subjectId,
-          instanceIds: effectiveInstanceIds,
-          changesSince: query.changesSince,
-          cursor,
-          limit,
-          eligibilityFields: candidate ? streamGrant!.fields : fields,
-          // Candidate records carry instance_id, so one key held by two
-          // instances names two records; the current wire would merge them.
-          oneRecordPerKey: context!.tokenKind === "client" && !candidate,
-          ...(streamGrant && {
-            access: {
-              canSeeKey: (recordKey) =>
-                recordKeyWithinGrantResources(recordKey, streamGrant),
-              canSeeRecord: (row) =>
-                recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
-                recordWithinGrantTimeConstraint(row.data, streamGrant),
-            },
-          }),
-          ...(candidate && {
-            candidate: {
-              order,
-              binding: {
-                protocol: context!.grant!.version,
-                grant: context!.grant!.grant_id,
-                subject: context!.grant!.subject.id,
-                client: context!.grant!.client.client_id,
-                source: context!.grant!.source.id,
-                streamGrant,
-                fields: fields ? [...new Set(fields)].sort() : null,
+        let page;
+        try {
+          page = sync.read({
+            stream,
+            owner: context!.grant?.subject.id ?? context!.subjectId,
+            instanceIds: effectiveInstanceIds,
+            changesSince: query.changesSince,
+            cursor,
+            limit,
+            eligibilityFields: candidate ? streamGrant!.fields : fields,
+            // Candidate records carry instance_id, so one key held by two
+            // instances names two records; the current wire would merge them.
+            oneRecordPerKey: context!.tokenKind === "client" && !candidate,
+            ...((streamGrant || replicaReader) && {
+              access: {
+                canSeeKey: (recordKey) =>
+                  !streamGrant ||
+                  recordKeyWithinGrantResources(recordKey, streamGrant),
+                canSeeRecord: (row) =>
+                  visibleInstances.has(row.instance) &&
+                  (!streamGrant ||
+                    (recordKeyWithinGrantResources(
+                      row.recordKey,
+                      streamGrant,
+                    ) &&
+                      recordWithinGrantTimeConstraint(row.data, streamGrant))),
               },
-            },
-          }),
-        });
+            }),
+            ...(candidate && {
+              candidate: {
+                order,
+                binding: {
+                  protocol: context!.grant!.version,
+                  grant: context!.grant!.grant_id,
+                  subject: context!.grant!.subject.id,
+                  client: context!.grant!.client.client_id,
+                  source: context!.grant!.source.id,
+                  streamGrant,
+                  fields: fields ? [...new Set(fields)].sort() : null,
+                },
+              },
+            }),
+          });
+        } catch (error) {
+          const continuation =
+            cursor !== undefined ||
+            (!!query.changesSince && query.changesSince !== "beginning");
+          if (continuation && error instanceof InvalidCursorError) {
+            throw new CursorExpiredError();
+          }
+          throw error;
+        }
         const meta = clamped
           ? {
               warnings: [
@@ -1058,7 +1103,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         return response;
       }
 
-      const page = deps.store.listRecords(stream, {
+      const page = reads(context!).listRecords(stream, {
         instanceIds: effectiveInstanceIds,
         limit,
         order,
@@ -1067,7 +1112,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           context!.tokenKind === "client" && !grantIsCandidate(context!.grant),
         isVisible: (row) =>
           recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-          recordWithinGrantTimeConstraint(row.data, scope.streamGrant),
+          (row.deleted
+            ? context!.tokenKind === "owner"
+            : recordWithinGrantTimeConstraint(row.data, scope.streamGrant)),
       });
       const meta = clamped
         ? {
@@ -1154,9 +1201,11 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       // one the grant hides, and a second visible holder would make the id
       // name two records.
       const matches = effectiveInstanceIds.flatMap((instance) => {
-        const record = deps.store.getRecord(instance, stream, recordKey);
+        const record = reads(context!).getRecord(instance, stream, recordKey);
         return record &&
-          recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
+          (record.deleted
+            ? context!.tokenKind === "owner"
+            : recordWithinGrantTimeConstraint(record.data, scope.streamGrant))
           ? [record]
           : [];
       });
@@ -1169,13 +1218,14 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       const found = matches[0];
 
       const fields = scope.fields;
-
-      const data = projectFields(found.data, fields);
+      const projected = found.deleted
+        ? found
+        : { ...found, data: projectFields(found.data, fields) };
 
       const response = c.json(
         toRecordJson(
           stream,
-          { ...found, data },
+          projected,
           undefined,
           grantIsCandidate(context?.grant),
         ),
@@ -1989,13 +2039,12 @@ interface GrantVisibleSummary {
  * against the record's real value, not a projected one.
  */
 function summarizeGrantVisible(
-  store: PdppRecordStore,
+  store: Pick<PdppReplicaReadStore, "listRecords">,
   stream: string,
   instanceIds: string[],
   streamGrant: StreamGrant | undefined,
 ): GrantVisibleSummary {
-  // `listRecords` already excludes tombstones, so a deleted row should not
-  // appear here; the guard keeps the narrowing honest rather than asserting.
+  // A pending removal has no current grant-visible value to summarize.
   const visible = (row: PdppRecordRow) =>
     !row.deleted &&
     recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
@@ -2077,7 +2126,7 @@ function summarizeGrantVisible(
  */
 function toRecordJson(
   stream: string,
-  row: PdppRecordRow,
+  row: PdppRecordRow | PdppVisibleRecord,
   fields: string[] | undefined,
   candidate = false,
 ) {
@@ -2094,11 +2143,15 @@ function toRecordJson(
       deleted: true,
       deleted_at: row.deletedAt,
       emitted_at: row.emittedAt,
+      ...(row.confirmation && { confirmation: row.confirmation }),
+      ...(row.status && { visibility: row.visibility, status: row.status }),
     };
   }
   return {
     ...identity,
     data: projectFields(row.data, fields),
     emitted_at: row.emittedAt,
+    ...(row.confirmation && { confirmation: row.confirmation }),
+    ...(row.status && { visibility: row.visibility, status: row.status }),
   };
 }
