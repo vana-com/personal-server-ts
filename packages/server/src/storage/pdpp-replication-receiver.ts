@@ -240,13 +240,20 @@ export function createReplicaReceiver(deps: {
         ? (operation.blobs[0]?.blobId ?? null)
         : null;
     db.prepare(
-      "INSERT INTO pdpp_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance,stream,record_key) DO UPDATE SET data=excluded.data, version=excluded.version, emitted_at=excluded.emitted_at, deleted=excluded.deleted, deleted_at=excluded.deleted_at, blob_id=excluded.blob_id",
+      `INSERT INTO pdpp_records
+         (instance, stream, record_key, data, version, emitted_at, emitted_key, deleted, deleted_at, blob_id)
+       VALUES (?, ?, ?, ?, ?, ?, pdpp_time_key(?), ?, ?, ?)
+       ON CONFLICT(instance,stream,record_key) DO UPDATE SET
+         data=excluded.data, version=excluded.version, emitted_at=excluded.emitted_at,
+         emitted_key=excluded.emitted_key, deleted=excluded.deleted,
+         deleted_at=excluded.deleted_at, blob_id=excluded.blob_id`,
     ).run(
       instance,
       stream,
       key,
       data,
       version,
+      emittedAt,
       emittedAt,
       data === null ? 1 : 0,
       deletedAt,
@@ -396,7 +403,7 @@ export function createReplicaReceiver(deps: {
         write(connectionId, stream, recordKey, null);
         continue;
       }
-      const winner = record.winner;
+      const winner = record.current;
       if (winner?.kind === "upsert" && !materializeBlob(winner, eligible)) {
         plan.pending.push({
           reason: "missing_or_invalid_blob",
@@ -904,7 +911,7 @@ export function createReplicaReceiver(deps: {
             ).run(canonicalJson(op), replicaOperationDigest(op));
             db.prepare(
               "UPDATE pdpp_replica_clock SET counter = MAX(counter, ?) WHERE id = 1",
-            ).run(op.revision.counter);
+            ).run(op.revision.logical);
           }
           const plan = reconcile();
           view.flush();

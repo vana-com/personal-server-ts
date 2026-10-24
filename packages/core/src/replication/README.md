@@ -9,7 +9,7 @@ transport encryption, byte transfer, or authorization-state replication.
 `REPLICA_POLICY` in `merge-plan.ts` is the decision index. The executable vectors
 pin these choices so a later policy revision must change its expected results.
 
-1. Mutable records use the greatest persisted `(counter, writerId, operationId)`.
+1. Mutable records use the greatest persisted `(logical, writerId, operationId)`.
    Strings compare by JavaScript UTF-16 code units, without locale collation.
    Retain every losing operation, including tombstones. A later upsert can
    resurrect a record. Convergence means equal retained evidence yields equal
@@ -42,14 +42,14 @@ binding. It does not fetch declarations or verify their digest itself.
 Connection registration starts generation 1. A reset advances exactly one
 generation and retains the method; incompatible methods or sources fail closed.
 Every intervening reset must be present before a newer generation becomes live.
-Old-generation records remain suppressed even if their counters are greater.
+Old-generation records remain suppressed even if their logical revisions are greater.
 Connection deletion dominates all writes and resets, including later revisions.
 Recreation requires a new logical connection ID. No missing batch implies delete.
 
 Operation identity is `(writerId, operationId)`. Identical replay has no extra
 multiplicity. Different bytes for that identity quarantine all affected
 connections. Clone/restore must rotate writer identity before making new writes.
-`nextLamportCounter` advances past every observed counter; the host must persist
+`nextLamportCounter` advances past every observed logical value; the host must persist
 it with its mutation. Slice 1 journal sequence and local record version are
 neither a Lamport counter nor evidence of cross-device ordering.
 
@@ -86,4 +86,4 @@ blob roundtrips, version rejection and each declaration-binding substitution.
 `merge-plan.test.ts` exhausts permutations with duplicate/reversed replay and
 checks concrete winners, retained losers, deletes and quarantine outcomes.
 `identity.test.ts` covers shared logical connections and refused account collapse.
-`revision.test.ts` covers total ordering, counter advance and exhaustion.
+`revision.test.ts` covers total ordering, logical-value advance and exhaustion.

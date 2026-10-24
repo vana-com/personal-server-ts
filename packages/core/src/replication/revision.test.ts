@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import { compareRevisions, nextLamportCounter } from "./revision.js";
 
 describe("persisted replica revisions", () => {
-  it("orders by counter, then code-unit writer and operation ids", () => {
-    const a = { counter: 4, writerId: "a", operationId: "z" };
-    expect(compareRevisions(a, { ...a, counter: 5 })).toBe(-1);
+  it("orders by logical revision, then writer and operation ids", () => {
+    const a = { logical: 4, writerId: "a", operationId: "z" };
+    expect(compareRevisions(a, { ...a, logical: 5 })).toBe(-1);
     expect(compareRevisions(a, { ...a, writerId: "b", operationId: "a" })).toBe(
       -1,
     );

@@ -16,7 +16,7 @@ const visible = (
   record
     ? {
         identity: record.identity,
-        winner: record.winner,
+        current: record.current,
         quarantined: record.quarantined,
       }
     : undefined;
@@ -58,7 +58,7 @@ for (const semantics of ["mutable_state", "append_only"] as const)
             kind: "connection-reset",
             generation: 2,
             previousGeneration: 1,
-            revision: { counter: 7, writerId: "writer", operationId: "reset2" },
+            revision: { logical: 7, writerId: "writer", operationId: "reset2" },
           },
         ],
         [
@@ -68,7 +68,7 @@ for (const semantics of ["mutable_state", "append_only"] as const)
             kind: "connection-reset",
             generation: 3,
             previousGeneration: 2,
-            revision: { counter: 7, writerId: "writer", operationId: "reset3" },
+            revision: { logical: 7, writerId: "writer", operationId: "reset3" },
           },
         ],
         [
@@ -76,7 +76,7 @@ for (const semantics of ["mutable_state", "append_only"] as const)
           {
             ...identity,
             kind: "connection-delete",
-            revision: { counter: 9, writerId: "writer", operationId: "delete" },
+            revision: { logical: 9, writerId: "writer", operationId: "delete" },
           },
         ],
       ];

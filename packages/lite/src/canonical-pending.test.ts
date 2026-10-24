@@ -166,7 +166,7 @@ it("keeps local Lamport allocation unchanged and merges concurrent local edits",
   const { revision: _, ...local } = upsert("local", 3);
   await store.commitLocal("local", [local]);
   expect(
-    (await store.readOutboxPage()).entries.at(-1)?.operation.revision.counter,
+    (await store.readOutboxPage()).entries.at(-1)?.operation.revision.logical,
   ).toBe(3);
   expect(await read(store)).toMatchObject({ data: { text: "local" } });
   expect(await read(store, "owner")).toMatchObject({
@@ -238,7 +238,7 @@ it("keeps pending blob bytes behind the same policy and hides quarantined bytes"
     {
       ...identity,
       kind: "blob-claim",
-      revision: { counter: 2, writerId: "device-a", operationId: "claim" },
+      revision: { logical: 2, writerId: "device-a", operationId: "claim" },
       blob,
     },
     record,
@@ -301,7 +301,7 @@ it("atomically exposes pending blob bytes to grants on promotion", async () => {
     {
       ...identity,
       kind: "blob-claim",
-      revision: { counter: 2, writerId: "device-a", operationId: "claim" },
+      revision: { logical: 2, writerId: "device-a", operationId: "claim" },
       blob,
     },
     record,
@@ -449,14 +449,14 @@ it.each(["delete", "connection-reset", "connection-delete"] as const)(
             recordKey: "same-key",
             emittedAt: "2026-10-20T01:00:00Z",
             deletedAt: "2026-10-20T01:00:00Z",
-            revision: { counter: 100, writerId: "device-b", operationId: kind },
+            revision: { logical: 100, writerId: "device-b", operationId: kind },
           }
         : {
             ...identity,
             kind,
             generation: kind === "connection-reset" ? 2 : 1,
             ...(kind === "connection-reset" ? { previousGeneration: 1 } : {}),
-            revision: { counter: 100, writerId: "device-b", operationId: kind },
+            revision: { logical: 100, writerId: "device-b", operationId: kind },
           };
     const request = {
       ...pending(),
@@ -782,7 +782,7 @@ it.each([
                     generation: 2,
                     previousGeneration: 1,
                     revision: {
-                      counter: 99,
+                      logical: 99,
                       writerId: "device-b",
                       operationId: "source-reset",
                     },
@@ -810,7 +810,7 @@ it.each([
                 ? { previousGeneration: sourceGeneration }
                 : {}),
               revision: {
-                counter: 200,
+                logical: 200,
                 writerId: "device-b",
                 operationId: kind,
               },
@@ -935,7 +935,7 @@ it.each(["connection-reset", "connection-delete"] as const)(
       generation: kind === "connection-reset" ? 2 : 1,
       ...(kind === "connection-reset" ? { previousGeneration: 1 } : {}),
       revision: {
-        counter: 10,
+        logical: 10,
         writerId: "device-b",
         operationId: "canonical-removal",
       },
@@ -966,7 +966,7 @@ it.each(["connection-reset", "connection-delete"] as const)(
             ...identity,
             kind: "connection-delete",
             revision: {
-              counter: 200,
+              logical: 200,
               writerId: "device-b",
               operationId: "pending-removal",
             },
@@ -1173,7 +1173,7 @@ it.each([20, 6000])(
             data: { ...op.data, text: "y".repeat(size) },
             revision: {
               ...op.revision,
-              counter: op.revision.counter + 200,
+              logical: op.revision.logical + 200,
               operationId: `preview-${op.recordKey}`,
             },
           })),

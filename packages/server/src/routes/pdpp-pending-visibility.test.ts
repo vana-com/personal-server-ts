@@ -141,7 +141,7 @@ it("serves owner pending markers while the same grant sees nothing until promoti
             kind: "blob-claim",
             blob,
             revision: {
-              counter: 4,
+              logical: 4,
               writerId: "device-a",
               operationId: "claim",
             },
@@ -265,7 +265,7 @@ it("serves owner pending markers while the same grant sees nothing until promoti
       ...identity,
       kind: "delete",
       revision: {
-        counter: 101,
+        logical: 101,
         writerId: "device-b",
         operationId: "final-delete",
       },

@@ -19,7 +19,6 @@ export interface ListCursorPayload {
   order: "asc" | "desc";
   sortValue: string | null; // cursor_field value of the last row on the page
   recordKey: string; // primary key tiebreaker
-  instance?: string; // final tiebreaker; absent only on legacy cursors
   /**
    * Write clock when page 1 was served. A reset of a read instance after
    * this point expires the cursor (410), so one paginated read never mixes

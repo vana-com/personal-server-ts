@@ -116,7 +116,7 @@ export function createReplicationJournal(db: Database, writerId: string) {
     const counter = prior.counter + 1;
     const operation = replicaOperationSchema.parse({
       ...value,
-      revision: { counter, writerId, operationId: randomUUID() },
+      revision: { logical: counter, writerId, operationId: randomUUID() },
     });
     db.prepare("UPDATE pdpp_replica_clock SET counter = ? WHERE id = 1").run(
       counter,

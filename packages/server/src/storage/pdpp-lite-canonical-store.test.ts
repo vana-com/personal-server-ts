@@ -422,7 +422,7 @@ for (const [name, factory] of Object.entries(factories))
           ...identity,
           kind: "blob-claim",
           blob: descriptor,
-          revision: { counter: 2, writerId: "device-a", operationId: "claim" },
+          revision: { logical: 2, writerId: "device-a", operationId: "claim" },
         },
         {
           ...upsert("blob", 3),
@@ -443,7 +443,7 @@ for (const [name, factory] of Object.entries(factories))
             kind: "blob-claim",
             blob: conflicting,
             revision: {
-              counter: 5,
+              logical: 5,
               writerId: "device-a",
               operationId: "mime-conflict",
             },
@@ -483,7 +483,7 @@ for (const [name, factory] of Object.entries(factories))
           kind: "connection-reset",
           previousGeneration: 1,
           generation: 2,
-          revision: { counter: 3, writerId: "device-a", operationId: "reset" },
+          revision: { logical: 3, writerId: "device-a", operationId: "reset" },
         },
       ]);
       device.reopen();
@@ -500,7 +500,7 @@ for (const [name, factory] of Object.entries(factories))
           generation: 2,
           kind: "connection-delete",
           revision: {
-            counter: 102,
+            logical: 102,
             writerId: "device-a",
             operationId: "remove",
           },
@@ -650,7 +650,7 @@ for (const [name, factory] of Object.entries({
             kind: "blob-claim",
             blob: descriptor,
             revision: {
-              counter: 2,
+              logical: 2,
               writerId: "device-a",
               operationId: "claim",
             },
@@ -776,7 +776,7 @@ for (const [name, factory] of Object.entries({
         {
           ...identity,
           kind: "connection-delete",
-          revision: { counter: 3, writerId: "device-a", operationId: "remove" },
+          revision: { logical: 3, writerId: "device-a", operationId: "remove" },
         },
       ]);
       await expect(
@@ -825,7 +825,7 @@ for (const [name, factory] of Object.entries({
           ...identity,
           kind: "blob-claim",
           blob: descriptor,
-          revision: { counter: 2, writerId: "device-a", operationId: "claim" },
+          revision: { logical: 2, writerId: "device-a", operationId: "claim" },
         },
         {
           ...upsert("blob", 3),
@@ -865,7 +865,7 @@ for (const [name, factory] of Object.entries(factories))
         kind: "connection-reset",
         generation: 3,
         previousGeneration: 2,
-        revision: { counter: 3, writerId: "device-a", operationId: "reset3" },
+        revision: { logical: 3, writerId: "device-a", operationId: "reset3" },
       },
     ]);
     device.reopen();
@@ -876,7 +876,7 @@ for (const [name, factory] of Object.entries(factories))
         kind: "connection-reset",
         generation: 2,
         previousGeneration: 1,
-        revision: { counter: 4, writerId: "device-a", operationId: "reset2" },
+        revision: { logical: 4, writerId: "device-a", operationId: "reset2" },
       },
     ]);
     expect(await device.read()).toMatchObject({ deleted: true });
@@ -943,8 +943,8 @@ for (const [name, factory] of Object.entries({
       (entry) => entry.operation,
     );
     expect(returning).toHaveLength(1);
-    expect(returning[0].revision.counter).toBeGreaterThan(
-      Math.max(...outbound.map((op) => op.revision.counter)),
+    expect(returning[0].revision.logical).toBeGreaterThan(
+      Math.max(...outbound.map((op) => op.revision.logical)),
     );
     await desktop.send(returning);
     desktop.reopen();
@@ -970,7 +970,7 @@ for (const [name, factory] of Object.entries(factories))
         kind: "connection-reset",
         generation: 2,
         previousGeneration: 1,
-        revision: { counter: 8, writerId: "device-a", operationId: "reset" },
+        revision: { logical: 8, writerId: "device-a", operationId: "reset" },
       },
     ]);
     device.reopen();
@@ -981,7 +981,7 @@ for (const [name, factory] of Object.entries(factories))
         generation: 2,
         kind: "connection-delete",
         revision: {
-          counter: 9,
+          logical: 9,
           writerId: "device-a",
           operationId: "delete-connection",
         },
@@ -1002,7 +1002,7 @@ for (const [name, factory] of Object.entries(factories))
           generation: 1,
           previousGeneration: 1,
           revision: {
-            counter: 4,
+            logical: 4,
             writerId: "device-a",
             operationId: "invalid",
           },
@@ -1020,7 +1020,7 @@ for (const [name, factory] of Object.entries(factories))
           kind: "connection-reset",
           generation: 2,
           previousGeneration: 1,
-          revision: { counter: 4, writerId: "device-a", operationId: "reset" },
+          revision: { logical: 4, writerId: "device-a", operationId: "reset" },
         };
         const record = { ...upsert("equal", 5, "one"), generation: 2 };
         if (together) await device.send([reset, record]);

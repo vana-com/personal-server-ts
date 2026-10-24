@@ -79,6 +79,8 @@ export function createReplicaVisibilityView(deps: {
       CREATE INDEX IF NOT EXISTS pdpp_replica_pending_blob ON pdpp_replica_pending_bytes(blob_id,batch_id);
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_streams (preview INTEGER NOT NULL, instance TEXT NOT NULL, stream TEXT NOT NULL, live_count INTEGER NOT NULL, row_count INTEGER NOT NULL, pending_count INTEGER NOT NULL, last_updated TEXT, PRIMARY KEY(preview,instance,stream));
       CREATE INDEX IF NOT EXISTS pdpp_replica_view_page ON pdpp_replica_view(instance,stream,emitted_at,record_key);
+      CREATE INDEX IF NOT EXISTS pdpp_replica_view_page_key ON pdpp_replica_view(instance,stream,pdpp_time_key(emitted_at),record_key);
+      CREATE INDEX IF NOT EXISTS pdpp_replica_canonical_page_key ON pdpp_records(instance,stream,pdpp_time_key(emitted_at),record_key) WHERE deleted=0;
       CREATE INDEX IF NOT EXISTS pdpp_replica_view_blob ON pdpp_replica_view(blob_id) WHERE blob_id IS NOT NULL;
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_evidence (
         operation_json TEXT PRIMARY KEY, confirmed INTEGER NOT NULL DEFAULT 0, pending INTEGER NOT NULL DEFAULT 0,
@@ -141,6 +143,7 @@ export function createReplicaVisibilityView(deps: {
       db.exec(`
       CREATE TABLE IF NOT EXISTS pdpp_replica_local_view (instance TEXT NOT NULL,stream TEXT NOT NULL,record_key TEXT NOT NULL,emitted_at TEXT NOT NULL,row_json TEXT NOT NULL,blob_id TEXT,pending INTEGER NOT NULL,deleted INTEGER NOT NULL,blob_json TEXT,sequence INTEGER NOT NULL,generation INTEGER NOT NULL,source_id TEXT NOT NULL,method TEXT NOT NULL,PRIMARY KEY(instance,stream,record_key));
       CREATE INDEX IF NOT EXISTS pdpp_replica_local_page ON pdpp_replica_local_view(instance,stream,emitted_at,record_key) WHERE deleted=0;
+      CREATE INDEX IF NOT EXISTS pdpp_replica_local_page_key ON pdpp_replica_local_view(instance,stream,pdpp_time_key(emitted_at),record_key) WHERE deleted=0;
       CREATE INDEX IF NOT EXISTS pdpp_replica_local_blob ON pdpp_replica_local_view(blob_id) WHERE deleted=0 AND blob_id IS NOT NULL;
       CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_journal AFTER INSERT ON pdpp_mutation_journal
       WHEN NEW.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=NEW.connection_id AND b.generation=NEW.generation AND b.source_id=NEW.source_id AND b.method=NEW.method AND b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL) BEGIN
@@ -522,7 +525,7 @@ export function createReplicaVisibilityView(deps: {
             record.identity.connectionId === instance &&
             record.identity.stream === stream &&
             record.identity.recordKey === key,
-        )?.winner;
+        )?.current;
         const withdrawn =
           prior?.kind === "upsert" && deps.blobsValid(prior, all)
             ? prior
@@ -545,7 +548,7 @@ export function createReplicaVisibilityView(deps: {
             r.identity.generation === generation,
         );
         if (record) {
-          const winner = record.winner;
+          const winner = record.current;
           const state =
             winner &&
             evidenceRows.find(
@@ -647,7 +650,7 @@ export function createReplicaVisibilityView(deps: {
       mode === "canonical"
         ? `json_object('instance',${alias}.instance,'stream',${alias}.stream,'recordKey',${alias}.record_key,'data',json(${alias}.data),'version',${alias}.version,'emittedAt',${alias}.emitted_at,'deleted',json('false'))`
         : `${alias}.row_json`;
-    return `${alias}.instance,${alias}.stream,${alias}.record_key,${alias}.emitted_at,${json} AS row_json,'${mode}' AS origin`;
+    return `${alias}.instance,${alias}.stream,${alias}.record_key,${alias}.emitted_at,pdpp_time_key(${alias}.emitted_at) AS emitted_key,${json} AS row_json,'${mode}' AS origin`;
   }
   function visibleRow(row: {
     row_json: string;
@@ -755,18 +758,18 @@ export function createReplicaVisibilityView(deps: {
             );
             const equal =
               options.order === "asc" ? instanceOrder > 0 : instanceOrder < 0;
-            boundary = ` AND (r.emitted_at,r.record_key) ${equal ? cmp + "=" : cmp} (?,?)`;
+            boundary = ` AND (pdpp_time_key(r.emitted_at),r.record_key) ${equal ? cmp + "=" : cmp} (pdpp_time_key(?),?)`;
             params.push(cursor.sortValue, cursor.recordKey);
           }
           params.push(options.limit + 1);
           return [
-            `SELECT * FROM (SELECT ${selectedColumns(mode)} FROM ${tableFor(mode)} r WHERE r.instance=? AND r.stream=? AND ${rowFilter(mode)}${boundary} ORDER BY r.emitted_at ${dir},r.record_key ${dir} LIMIT ?)`,
+            `SELECT * FROM (SELECT ${selectedColumns(mode)} FROM ${tableFor(mode)} r WHERE r.instance=? AND r.stream=? AND ${rowFilter(mode)}${boundary} ORDER BY pdpp_time_key(r.emitted_at) ${dir},r.record_key ${dir} LIMIT ?)`,
           ];
         });
         const rows = branches.length
           ? (db
               .prepare(
-                `SELECT * FROM (${branches.join(" UNION ALL ")}) ORDER BY emitted_at ${dir},record_key ${dir},instance ${dir} LIMIT ?`,
+                `SELECT * FROM (${branches.join(" UNION ALL ")}) ORDER BY emitted_key ${dir},record_key ${dir},instance ${dir} LIMIT ?`,
               )
               .all(...params, options.limit + 1) as {
               row_json: string;

@@ -1,6 +1,6 @@
 /** Persist with the mutation, never derive from a local query version or timestamp. */
 export interface ReplicaRevision {
-  counter: number;
+  logical: number;
   writerId: string;
   operationId: string;
 }
@@ -11,7 +11,7 @@ export function compareRevisions(
   b: ReplicaRevision,
 ): number {
   for (const [left, right] of [
-    [a.counter, b.counter],
+    [a.logical, b.logical],
     [a.writerId, b.writerId],
     [a.operationId, b.operationId],
   ] as const) {

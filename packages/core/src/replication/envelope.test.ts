@@ -84,12 +84,12 @@ describe("profile v1 golden wire vectors", () => {
       ),
     ).toThrow("binding");
   });
-  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
-    "rejects invalid persisted counter %s",
+  it.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects invalid persisted logical value %s",
     (counter) => {
       const operation = {
         ...upsert("a", 2),
-        revision: { counter, writerId: "a", operationId: "a" },
+        revision: { logical: counter, writerId: "a", operationId: "a" },
       };
       expect(() =>
         decodeReplicaEnvelope(
@@ -117,12 +117,12 @@ describe("profile v1 golden wire vectors", () => {
           kind: "connection-reset",
           generation: 2,
           previousGeneration: 1,
-          revision: { counter: 4, writerId: "a", operationId: "reset" },
+          revision: { logical: 4, writerId: "a", operationId: "reset" },
         },
         {
           ...identity,
           kind: "connection-delete",
-          revision: { counter: 5, writerId: "a", operationId: "delete" },
+          revision: { logical: 5, writerId: "a", operationId: "delete" },
         },
       ],
     });

@@ -40,10 +40,10 @@ export function createReplicaRecordReducer(
         operation,
       ]);
       record = plan.records[0];
-      if (record?.winner) evidence = [record.winner];
+      if (record?.current) evidence = [record.current];
       else if (record?.quarantined) {
-        const first = record.losers[0];
-        const witness = record.losers.find(
+        const first = record.candidates[0];
+        const witness = record.candidates.find(
           (candidate) =>
             planReplicaMerge(context, [...lifecycle, first, candidate])
               .records[0]?.quarantined,

@@ -23,11 +23,11 @@ export const identity = {
 export const registration: ReplicaOperation = {
   ...identity,
   kind: "connection-register",
-  revision: { counter: 1, writerId: "device-a", operationId: "register" },
+  revision: { logical: 1, writerId: "device-a", operationId: "register" },
 };
 export function upsert(
   operationId: string,
-  counter: number,
+  logical: number,
   text = operationId,
   writerId = "device-a",
 ): RecordOperation & { kind: "upsert" } {
@@ -39,7 +39,7 @@ export function upsert(
     emittedAt: "2026-10-20T00:00:00Z",
     data: { id: "same-key", text },
     blobs: [],
-    revision: { counter, writerId, operationId },
+    revision: { logical, writerId, operationId },
   };
 }
 export const mutableVectors: readonly RecordOperation[] = [
@@ -52,7 +52,7 @@ export const mutableVectors: readonly RecordOperation[] = [
     recordKey: "same-key",
     emittedAt: "2026-10-20T00:00:00Z",
     deletedAt: "2026-10-20T00:00:00Z",
-    revision: { counter: 3, writerId: "device-a", operationId: "delete" },
+    revision: { logical: 3, writerId: "device-a", operationId: "delete" },
   },
   upsert("resurrect", 4),
 ];

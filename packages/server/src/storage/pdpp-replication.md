@@ -33,7 +33,7 @@ A baseline cannot reconstruct rows or operation evidence erased before enablemen
 ## Capture and retention
 
 `pdpp_replica_operations` stores canonical profile operations with persisted
-`(counter, writerId, operationId)` revisions and SHA-256 digests. Its counter is
+`(logical, writerId, operationId)` revisions and SHA-256 digests. Its logical value is
 separate from local query clocks and the Slice 1 journal. Every tail revision is
 greater than the baseline watermark. The installation writer ID is reused. A
 future receiver must advance this clock past observed remote revisions, and

@@ -39,8 +39,8 @@ export interface MergedRecord {
     stream: string;
     recordKey: string;
   };
-  winner: RecordOperation | null;
-  losers: RecordOperation[];
+  current: RecordOperation | null;
+  candidates: RecordOperation[];
   quarantined: boolean;
 }
 export interface ReplicaMergePlan {
@@ -225,8 +225,8 @@ export function planReplicaMerge(
           stream: first.declaration.stream,
           recordKey: first.recordKey,
         },
-        winner: quarantined ? null : candidates[candidates.length - 1],
-        losers: quarantined ? candidates : candidates.slice(0, -1),
+        current: quarantined ? null : candidates[candidates.length - 1],
+        candidates: quarantined ? candidates : candidates.slice(0, -1),
         quarantined,
       });
     }

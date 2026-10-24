@@ -47,18 +47,18 @@ function assertPermutations(operations: ReplicaOperation[]) {
 describe("replica merge vectors", () => {
   it("retains losing mutable values and permits later resurrection in every order", () => {
     const result = assertPermutations([registration, ...mutableVectors]);
-    expect(result.records[0].winner?.revision.operationId).toBe("resurrect");
-    expect(result.records[0].losers).toEqual(mutableVectors.slice(0, 3));
+    expect(result.records[0].current?.revision.operationId).toBe("resurrect");
+    expect(result.records[0].candidates).toEqual(mutableVectors.slice(0, 3));
     const deleted = assertPermutations([
       registration,
       ...mutableVectors.slice(0, 3),
     ]);
-    expect(deleted.records[0].winner?.kind).toBe("delete");
+    expect(deleted.records[0].current?.kind).toBe("delete");
     const concurrent = assertPermutations([
       registration,
       ...mutableVectors.slice(0, 2),
     ]);
-    expect(concurrent.records[0].winner?.revision.operationId).toBe("b");
+    expect(concurrent.records[0].current?.revision.operationId).toBe("b");
   });
 });
 
@@ -86,11 +86,11 @@ it("quarantines append-only conflicts in all orders; ordinary later writes canno
     );
   }
   expect(expected.records[0]).toMatchObject({
-    winner: null,
+    current: null,
     quarantined: true,
   });
   expect(expected.conflicts[0].reason).toBe("append_only_content_conflict");
-  expect(expected.records[0].losers).toEqual([a, b, repairAttempt]);
+  expect(expected.records[0].candidates).toEqual([a, b, repairAttempt]);
   expect(expected.conflicts[0].operations).toHaveLength(3);
   expect(expected.conflicts[0].operations).toEqual(
     expect.arrayContaining([a, b, repairAttempt]),
@@ -98,7 +98,7 @@ it("quarantines append-only conflicts in all orders; ordinary later writes canno
   const same = {
     ...a,
     emittedAt: "later",
-    revision: { ...a.revision, counter: 5, operationId: "same" },
+    revision: { ...a.revision, logical: 5, operationId: "same" },
   };
   expect(
     planReplicaMerge(appendContext, [registration, a, same]).conflicts,
@@ -112,7 +112,7 @@ it("quarantines append-only conflicts in all orders; ordinary later writes canno
   expect(
     planReplicaMerge(appendContext, [registration, a, b, other]).records.find(
       (r) => r.identity.recordKey === "other",
-    )?.winner,
+    )?.current,
   ).toEqual(other);
   const deletion = { ...mutableVectors[2], declaration: appendBinding };
   expect(
@@ -140,16 +140,16 @@ it("requires registration and complete generation evidence; reset suppresses old
     kind: "connection-reset",
     generation: 2,
     previousGeneration: 1,
-    revision: { counter: 4, writerId: "device-a", operationId: "reset" },
+    revision: { logical: 4, writerId: "device-a", operationId: "reset" },
   };
   const fresh = { ...upsert("fresh", 5), generation: 2 };
   const result = assertPermutations([
     registration,
     reset,
-    upsert("old-but-higher-counter", 99),
+    upsert("old-but-higher-logical", 99),
     fresh,
   ]);
-  expect(result.records[0].winner).toEqual(fresh);
+  expect(result.records[0].current).toEqual(fresh);
   expect(result.suppressed[0].reason).toBe("old_generation");
   expect(planReplicaMerge(context, [fresh]).pending[0].reason).toBe(
     "missing_connection_registration",
@@ -167,12 +167,12 @@ it("requires registration and complete generation evidence; reset suppresses old
   ).toBe("invalid_generation_reset");
 });
 
-it("deleted connections dominate even later generations and high-counter writes", () => {
+it("deleted connections dominate even later generations and high-logical writes", () => {
   const deletion: ReplicaOperation = {
     ...identity,
     kind: "connection-delete",
     revision: {
-      counter: 2,
+      logical: 2,
       writerId: "device-b",
       operationId: "connection-delete",
     },
@@ -183,7 +183,7 @@ it("deleted connections dominate even later generations and high-counter writes"
     generation: 2,
     previousGeneration: 1,
     revision: {
-      counter: 3,
+      logical: 3,
       writerId: "device-a",
       operationId: "reset-after-delete",
     },
@@ -211,7 +211,7 @@ it("deleted connections dominate even later generations and high-counter writes"
       deletion,
       recreated,
       newRegistration,
-    ]).records[0].winner,
+    ]).records[0].current,
   ).toEqual(recreated);
 });
 
@@ -256,7 +256,7 @@ it("rejects wrong owner, invalid schema and primary key, and never orders by emi
     wrongOwner,
   ]);
   expect(result.rejected[0].reason).toBe("wrong_owner");
-  expect(result.records[0].winner?.revision.operationId).toBe("valid");
+  expect(result.records[0].current?.revision.operationId).toBe("valid");
   for (const data of [
     { id: "mismatch", text: "x" },
     { id: "same-key", text: 1 },
@@ -275,7 +275,7 @@ it("rejects wrong owner, invalid schema and primary key, and never orders by emi
   };
   expect(
     assertPermutations([registration, upsert("future-time", 2), earlier])
-      .records[0].winner,
+      .records[0].current,
   ).toEqual(earlier);
 });
 
@@ -294,9 +294,11 @@ it("quarantines operation id equivocation rather than choosing first arrival", (
 it("uses operation id as the last tie-break and ignores duplicate counts", () => {
   const a = upsert("a", 2);
   const z = upsert("z", 2);
-  expect(assertPermutations([registration, a, z]).records[0].winner).toEqual(z);
+  expect(assertPermutations([registration, a, z]).records[0].current).toEqual(
+    z,
+  );
   expect(
-    planReplicaMerge(context, [registration, a, a]).records[0].losers,
+    planReplicaMerge(context, [registration, a, a]).records[0].candidates,
   ).toEqual([]);
 });
 
@@ -307,6 +309,6 @@ it("preserves a valid empty canonical record key", () => {
     data: { id: "", text: "empty key" },
   };
   expect(
-    planReplicaMerge(context, [registration, empty]).records[0].winner,
+    planReplicaMerge(context, [registration, empty]).records[0].current,
   ).toEqual(empty);
 });

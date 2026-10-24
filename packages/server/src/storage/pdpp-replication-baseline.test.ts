@@ -145,7 +145,7 @@ it("pins existing rows before admitting newer tail revisions and resumes the sam
   expect(tail.find((op) => op.kind === "upsert")).toMatchObject({
     data: { text: "new" },
   });
-  expect(tail[0].revision.counter).toBeGreaterThan(fence.watermark);
+  expect(tail[0].revision.logical).toBeGreaterThan(fence.watermark);
   expect(() =>
     store.replication.beginBaseline({ ...config, owner: "other" }),
   ).toThrow("immutable");
@@ -228,7 +228,7 @@ it("pages a large frozen baseline while another DB handle updates, deletes, repl
   );
   const tail = drain(store.replication.readTailPage);
   expect(tail.filter((op) => op.kind === "delete")).toHaveLength(1204);
-  expect(tail.every((op) => op.revision.counter > fence.watermark)).toBe(true);
+  expect(tail.every((op) => op.revision.logical > fence.watermark)).toBe(true);
   const expected = planReplicaMerge(mergeContext, [...baseline, ...tail]);
   for (const arrival of [
     [...tail, ...baseline],
@@ -238,7 +238,7 @@ it("pages a large frozen baseline while another DB handle updates, deletes, repl
     expect(planReplicaMerge(mergeContext, arrival)).toEqual(expected);
   expect(
     expected.records
-      .filter((r) => r.winner?.kind === "upsert")
+      .filter((r) => r.current?.kind === "upsert")
       .map((r) => r.identity.recordKey)
       .sort(),
   ).toEqual(["0", "fresh"]);
@@ -283,7 +283,7 @@ it("makes a later upsert win in every permutation, including after an explicit r
   expect(operations).toHaveLength(4);
   for (const permutation of permutations(operations))
     expect(
-      planReplicaMerge(mergeContext, permutation).records[0].winner,
+      planReplicaMerge(mergeContext, permutation).records[0].current,
     ).toMatchObject({ kind: "upsert", data: { text: "new" } });
 });
 
@@ -696,7 +696,7 @@ it("exports existing tombstones, empty completions, resets and deleted connectio
   const plan = planReplicaMerge(mergeContext, operations.reverse());
   expect(
     plan.records.find((row) => row.identity.connectionId === "conn_reset")
-      ?.winner,
+      ?.current,
   ).toMatchObject({ generation: 2, kind: "upsert" });
   expect(
     plan.suppressed.some((issue) => issue.reason === "connection_deleted"),
@@ -982,7 +982,7 @@ it("preserves native versus producer-asserted completion proof provenance", () =
     ...drain(store.replication.readTailPage),
   ]);
   expect(merged.records).toHaveLength(1);
-  expect(merged.records[0].winner).toMatchObject({
+  expect(merged.records[0].current).toMatchObject({
     kind: "upsert",
     recordKey: "a",
     data: { id: "a", text: "old" },
@@ -1072,6 +1072,6 @@ it("does not revive a matching old completion after changed-then-reverted data",
   complete();
   const latest = selectStreamCompletion(events())!;
   expect(latest.snapshotSha256).toBe(original.snapshotSha256);
-  expect(latest.revision.counter).toBeGreaterThan(original.revision.counter);
+  expect(latest.revision.logical).toBeGreaterThan(original.revision.logical);
   expect(selectStreamCompletion(events().reverse())).toEqual(latest);
 });

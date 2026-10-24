@@ -138,7 +138,11 @@ const upsert = (counter = 20): ReplicaOperation => ({
   connectionId: "conn_a",
   methodId: "collector",
   generation: 1,
-  revision: { counter, writerId: "remote", operationId: `op-${counter}` },
+  revision: {
+    logical: counter,
+    writerId: "remote",
+    operationId: `op-${counter}`,
+  },
   declaration: binding,
   recordKey: "a",
   emittedAt: at,
@@ -152,7 +156,7 @@ const registration = (): ReplicaOperation => ({
   connectionId: "conn_a",
   methodId: "collector",
   generation: 1,
-  revision: { counter: 1, writerId: "remote", operationId: "register" },
+  revision: { logical: 1, writerId: "remote", operationId: "register" },
 });
 
 it("converges two fresh SQLite devices under reversed bidirectional delivery without echo", () => {
@@ -179,8 +183,8 @@ it("converges two fresh SQLite devices under reversed bidirectional delivery wit
   expect(
     retained
       .map((row) => JSON.parse(row.operation_json))
-      .sort((x, y) => x.revision.counter - y.revision.counter),
-  ).toEqual([...fromA].sort((x, y) => x.revision.counter - y.revision.counter));
+      .sort((x, y) => x.revision.logical - y.revision.logical),
+  ).toEqual([...fromA].sort((x, y) => x.revision.logical - y.revision.logical));
   expect(a.store.replication.readTailPage({ limit: 100 }).operations).toEqual(
     fromA.filter((op) => op.kind !== "connection-register"),
   );
@@ -261,7 +265,7 @@ it("applies tombstones and later resurrection under reordered batches", () => {
   const deletion: ReplicaOperation = {
     ...original,
     kind: "delete",
-    revision: { counter: 21, writerId: "remote", operationId: "delete" },
+    revision: { logical: 21, writerId: "remote", operationId: "delete" },
     deletedAt: at,
   };
   // The strict wire contract cannot carry upsert-only fields on a tombstone.
@@ -291,7 +295,7 @@ it("keeps future generations pending until reset evidence and suppresses old gen
     generation,
     previousGeneration: generation - 1,
     revision: {
-      counter: generation,
+      logical: generation,
       writerId: "remote",
       operationId: `reset-${generation}`,
     },
@@ -488,7 +492,7 @@ it("connection deletion dominates reordered record imports and survives restart"
     kind: "connection-delete",
     generation: 2,
     revision: {
-      counter: 30,
+      logical: 30,
       writerId: "remote",
       operationId: "connection-delete",
     },
@@ -531,7 +535,7 @@ it("advances the local Lamport clock beyond observed imported revisions", () => 
   put(d, "new-local");
   const tail = d.store.replication.readTailPage({ limit: 100 }).operations;
   const local = tail.find((op) => op.kind === "upsert");
-  expect(local?.revision.counter).toBeGreaterThan(1000);
+  expect(local?.revision.logical).toBeGreaterThan(1000);
   expect(local?.revision.writerId).not.toBe("remote");
   expect(value(d)?.data.text).toBe("new-local");
 });
@@ -880,7 +884,7 @@ it("keeps unknown-declaration invalidation pending without erasing a trusted com
   const invalidation: ReplicaOperation = {
     ...registration(),
     kind: "stream-invalidate",
-    revision: { counter: 100, writerId: "unknown", operationId: "invalidate" },
+    revision: { logical: 100, writerId: "unknown", operationId: "invalidate" },
     declaration: { ...binding, digest: `sha256:${"c".repeat(64)}` },
   };
   const plan = send(d, [invalidation]);
@@ -972,7 +976,7 @@ it.each(["empty", "tombstone-only"])(
       kind: "connection-reset",
       generation: 2,
       previousGeneration: 1,
-      revision: { counter: 100, writerId: "remote", operationId: "reset" },
+      revision: { logical: 100, writerId: "remote", operationId: "reset" },
     };
     send(d, [reset]);
     expect(d.store.getInstanceBinding("conn_a").resetClock).toBeGreaterThan(
@@ -993,7 +997,7 @@ it("keeps a committed connection deletion fence unchanged on duplicate replay af
   const deletion: ReplicaOperation = {
     ...registration(),
     kind: "connection-delete",
-    revision: { counter: 100, writerId: "remote", operationId: "delete" },
+    revision: { logical: 100, writerId: "remote", operationId: "delete" },
   };
   send(d, [deletion]);
   const before = d.store.getInstanceBinding("conn_a");
@@ -1326,7 +1330,7 @@ it("pending Lamport never advances local edits; preview agrees with eventual can
   const receiver = stagePending(d, [registration(), upsert(100)]);
   put(d, "local-after-preview");
   const local = all(d).find((op) => op.kind === "upsert");
-  expect(local?.revision.counter).toBeLessThan(100);
+  expect(local?.revision.logical).toBeLessThan(100);
   expect(preview(receiver)[0].data.text).toBe("remote-100");
   receiver.promote({ credential: "replica-secret", id: "pending" });
   expect(value(d)?.data).toEqual(preview(receiver)[0].data);
@@ -1396,7 +1400,7 @@ it("pending reset and deletion follow canonical lifecycle semantics without muta
     methodId: "collector",
     generation: 2,
     previousGeneration: 1,
-    revision: { counter: 30, writerId: "remote", operationId: "reset-pending" },
+    revision: { logical: 30, writerId: "remote", operationId: "reset-pending" },
   };
   const next = { ...upsert(31), generation: 2 } as ReplicaOperation;
   const receiver = stagePending(d, [registration(), reset, next]);
@@ -1411,7 +1415,7 @@ it("pending reset and deletion follow canonical lifecycle semantics without muta
     methodId: "collector",
     generation: 2,
     revision: {
-      counter: 32,
+      logical: 32,
       writerId: "remote",
       operationId: "delete-pending",
     },
@@ -1670,7 +1674,7 @@ for (const owner of ["confirmed-only", "include-pending"] as const)
       const regB = {
         ...registration(),
         connectionId: "conn_b",
-        revision: { counter: 1, writerId: "B", operationId: "register-b" },
+        revision: { logical: 1, writerId: "B", operationId: "register-b" },
       } as ReplicaOperation;
       const bRow = {
         ...upsert(100),
@@ -1886,12 +1890,12 @@ it("two devices resolve conflicting pending values by the existing tuple order a
     b = device();
   const left = {
     ...upsert(50),
-    revision: { counter: 50, writerId: "device-a", operationId: "edit" },
+    revision: { logical: 50, writerId: "device-a", operationId: "edit" },
     data: { id: "a", text: "left" },
   } as ReplicaOperation;
   const right = {
     ...upsert(50),
-    revision: { counter: 50, writerId: "device-b", operationId: "edit" },
+    revision: { logical: 50, writerId: "device-b", operationId: "edit" },
     data: { id: "a", text: "right" },
   } as ReplicaOperation;
   for (const [d, ops] of [
@@ -2045,7 +2049,7 @@ it.each(["connection-reset", "connection-delete"] as const)(
       kind,
       generation: 2,
       ...(kind === "connection-reset" ? { previousGeneration: 1 } : {}),
-      revision: { counter: 50, writerId: "remote", operationId: "lifecycle" },
+      revision: { logical: 50, writerId: "remote", operationId: "lifecycle" },
     } as ReplicaOperation;
     receiver.stage({
       credential: "replica-secret",
@@ -2184,11 +2188,9 @@ it("F3 page continuation seeks the full indexed tuple in canonical and preview t
   }
   expect(
     plans.filter((plan) =>
-      /SEARCH .*\(instance=\? AND stream=\? AND \(emitted_at,record_key\)>\(\?,\?\)\)/.test(
-        plan,
-      ),
+      /SEARCH .*pdpp_replica_(?:canonical|view)_page_key/.test(plan),
     ),
-  ).toHaveLength(2);
+  ).toHaveLength(4);
 });
 
 it("F1 pending-only stage and quarantine expire owner pages while confirmed app pages continue", () => {

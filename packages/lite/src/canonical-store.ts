@@ -349,7 +349,7 @@ export function createLiteCanonicalStore(deps: {
         }
       }
       const record = reducer.record;
-      const winner = mapped ? record?.winner : undefined;
+      const winner = mapped ? record?.current : undefined;
       const materialized =
         winner?.kind === "upsert" && (await blobReady(tx, winner))
           ? winner
@@ -359,7 +359,7 @@ export function createLiteCanonicalStore(deps: {
       const path = rowKey(id, stream, key);
       if (canonical) await tx.delete(path);
       let prior = await get<PdppRecordRow>(tx, path);
-      const source = mapped ? sourceReducer?.record?.winner : undefined;
+      const source = mapped ? sourceReducer?.record?.current : undefined;
       if (
         !prior &&
         !materialized &&
@@ -520,7 +520,7 @@ export function createLiteCanonicalStore(deps: {
           op = replicaOperationSchema.parse({
             ...raw,
             revision: {
-              counter: current.counter + 1,
+              logical: current.counter + 1,
               writerId: current.writerId,
               operationId: newId(),
             },
@@ -608,7 +608,7 @@ export function createLiteCanonicalStore(deps: {
         for (const blob of confirmedBlobs)
           if (await tx.blob(blob.blobId))
             await put(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`, true);
-        current.counter = Math.max(current.counter, op.revision.counter);
+        current.counter = Math.max(current.counter, op.revision.logical);
         const { collision, opKey } = await retain(tx, op, dirty);
         const address =
           op.kind === "upsert" || op.kind === "delete"

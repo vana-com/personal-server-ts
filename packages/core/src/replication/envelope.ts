@@ -3,6 +3,23 @@ import { z } from "zod";
 const token = z.string().min(1);
 const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+const logicalCounter = z.union([
+  integer,
+  z
+    .string()
+    .regex(/^(0|[1-9]\d*)$/)
+    .refine((value) => BigInt(value) <= (1n << 64n) - 1n),
+]);
+const upstreamAccount = z.strictObject({ issuer: token, subject: token });
+const frontier = z.record(
+  token,
+  z.strictObject({ wallMs: integer, logical: logicalCounter }),
+);
+const sourceVersion = z.strictObject({
+  domain: token,
+  incarnation: token,
+  value: token,
+});
 export const declarationBindingSchema = z.strictObject({
   digest,
   version: token,
@@ -17,9 +34,12 @@ const base = {
   sourceId: token,
   connectionId: token,
   methodId: token,
+  upstreamAccount: upstreamAccount.optional(),
+  batchId: token.optional(),
+  frontier: frontier.optional(),
   generation: integer.min(1),
   revision: z.strictObject({
-    counter: integer.min(1),
+    logical: integer,
     writerId: token,
     operationId: token,
   }),
@@ -29,6 +49,8 @@ const record = {
   declaration: declarationBindingSchema,
   recordKey: z.string(),
   emittedAt: token,
+  contentHash: digest.optional(),
+  sourceVersion: sourceVersion.optional(),
 };
 const blob = z.strictObject({
   blobId: token,

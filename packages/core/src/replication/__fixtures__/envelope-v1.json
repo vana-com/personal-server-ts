@@ -14,7 +14,7 @@
         "generation": 1,
         "kind": "connection-register",
         "revision": {
-          "counter": 1,
+          "logical": 1,
           "writerId": "device-a",
           "operationId": "register"
         }
@@ -27,7 +27,7 @@
         "generation": 1,
         "kind": "upsert",
         "revision": {
-          "counter": 2,
+          "logical": 2,
           "writerId": "device-a",
           "operationId": "a"
         },
@@ -49,5 +49,5 @@
       }
     ]
   },
-  "encoded": "{\"batchId\":\"batch-a\",\"format\":\"vana-pdpp-replica\",\"operations\":[{\"connectionId\":\"connection-a\",\"generation\":1,\"kind\":\"connection-register\",\"methodId\":\"export\",\"owner\":\"owner-a\",\"revision\":{\"counter\":1,\"operationId\":\"register\",\"writerId\":\"device-a\"},\"sourceId\":\"https://example.test/source\"},{\"blobs\":[],\"connectionId\":\"connection-a\",\"data\":{\"id\":\"same-key\",\"text\":\"hello\"},\"declaration\":{\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"primaryKey\":[\"id\"],\"schemaDigest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"semantics\":\"mutable_state\",\"stream\":\"messages\",\"version\":\"1.0.0\"},\"emittedAt\":\"2026-10-20T00:00:00Z\",\"generation\":1,\"kind\":\"upsert\",\"methodId\":\"export\",\"owner\":\"owner-a\",\"recordKey\":\"same-key\",\"revision\":{\"counter\":2,\"operationId\":\"a\",\"writerId\":\"device-a\"},\"sourceId\":\"https://example.test/source\"}],\"owner\":\"owner-a\",\"version\":1}"
+  "encoded": "{\"batchId\":\"batch-a\",\"format\":\"vana-pdpp-replica\",\"operations\":[{\"connectionId\":\"connection-a\",\"generation\":1,\"kind\":\"connection-register\",\"methodId\":\"export\",\"owner\":\"owner-a\",\"revision\":{\"logical\":1,\"operationId\":\"register\",\"writerId\":\"device-a\"},\"sourceId\":\"https://example.test/source\"},{\"blobs\":[],\"connectionId\":\"connection-a\",\"data\":{\"id\":\"same-key\",\"text\":\"hello\"},\"declaration\":{\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"primaryKey\":[\"id\"],\"schemaDigest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"semantics\":\"mutable_state\",\"stream\":\"messages\",\"version\":\"1.0.0\"},\"emittedAt\":\"2026-10-20T00:00:00Z\",\"generation\":1,\"kind\":\"upsert\",\"methodId\":\"export\",\"owner\":\"owner-a\",\"recordKey\":\"same-key\",\"revision\":{\"logical\":2,\"operationId\":\"a\",\"writerId\":\"device-a\"},\"sourceId\":\"https://example.test/source\"}],\"owner\":\"owner-a\",\"version\":1}"
 }

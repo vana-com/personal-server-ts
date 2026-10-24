@@ -1144,20 +1144,22 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
       }
       if (
         !found ||
-        (!(found.deleted && context!.tokenKind === "owner") &&
+        (found.deleted && context!.tokenKind !== "owner") ||
+        (!found.deleted &&
           !recordWithinGrantTimeConstraint(found.data, scope.streamGrant))
       ) {
         throw new PdppError("not_found", "Record not found");
       }
 
       const fields = scope.fields;
-
-      const data = projectFields(found.data, fields);
+      const projected = found.deleted
+        ? found
+        : { ...found, data: projectFields(found.data, fields) };
 
       const response = c.json(
         toRecordJson(
           stream,
-          { ...found, data },
+          projected,
           undefined,
           grantIsCandidate(context?.grant),
         ),
