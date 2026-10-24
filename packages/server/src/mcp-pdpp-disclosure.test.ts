@@ -31,7 +31,6 @@ import {
   buildWeb3SignedHeader,
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
-import { encodeDataBlockCursor } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { createScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
@@ -171,10 +170,11 @@ async function ownerRead(gateway: GatewayClient, scope: string) {
  * `instagram.profile`: a legacy file, then a PDPP-stamped version of the same
  * data. `instagram.posts`: a legacy file only.
  */
-async function seed(gateway: GatewayClient) {
-  const legacyAt = await ownerWrite(gateway, "instagram.profile", {
+async function seed(gateway: GatewayClient, afterLegacy?: () => Promise<void>) {
+  await ownerWrite(gateway, "instagram.profile", {
     rows: [{ id: LEGACY }],
   });
+  await afterLegacy?.();
   await ownerWrite(
     gateway,
     "instagram.profile",
@@ -182,7 +182,6 @@ async function seed(gateway: GatewayClient) {
     "pdpp-projector",
   );
   await ownerWrite(gateway, "instagram.posts", { rows: [{ id: LEGACY }] });
-  return { legacyAt };
 }
 
 function mcpApp(gateway: GatewayClient, extra: Record<string, unknown> = {}) {
@@ -235,6 +234,12 @@ async function toolCall(
   return response.text();
 }
 
+function nextCursorOf(rpcText: string): string {
+  const cursor = JSON.parse(rpcText).result.structuredContent.nextCursor;
+  expect(cursor).toBeTypeOf("string");
+  return cursor;
+}
+
 function matchesOf(rpcText: string): unknown[] {
   return JSON.parse(rpcText).result.structuredContent.matches;
 }
@@ -262,8 +267,18 @@ async function connection() {
 describe("owner's-Claude MCP connection with a live chain grant", () => {
   it("read_scope refuses the PDPP version and still reads the legacy file", async () => {
     const { gateway, path } = await connection();
-    const { legacyAt } = await seed(gateway);
     const app = mcpApp(gateway);
+    // A cursor into the legacy version, minted while it is the latest: it
+    // names the version and block representation the read started on.
+    let legacyCursor = "";
+    await seed(gateway, async () => {
+      legacyCursor = nextCursorOf(
+        await toolCall(app, path, {}, "read_scope", {
+          scope: "instagram.profile",
+          maxBytes: 1,
+        }),
+      );
+    });
 
     const latest = await toolCall(app, path, {}, "read_scope", {
       scope: "instagram.profile",
@@ -277,11 +292,7 @@ describe("owner's-Claude MCP connection with a live chain grant", () => {
     expect(await owned.text()).toContain(SECRET);
     const legacy = await toolCall(app, path, {}, "read_scope", {
       scope: "instagram.profile",
-      cursor: encodeDataBlockCursor({
-        scope: "instagram.profile",
-        collectedAt: legacyAt,
-        blockIndex: 0,
-      }),
+      cursor: legacyCursor,
     });
     expect(legacy).toContain(LEGACY);
     expect(legacy).not.toContain(SECRET);
@@ -372,9 +383,17 @@ describe("self-signing MCP session with a live chain grant", () => {
 
   it("read_scope refuses the PDPP version and still reads the legacy file", async () => {
     const gateway = gatewayFor(appWallet.address);
-    const { legacyAt } = await seed(gateway);
     const app = mcpApp(gateway);
     const headers = await session(gateway, app);
+    let legacyCursor = "";
+    await seed(gateway, async () => {
+      legacyCursor = nextCursorOf(
+        await toolCall(app, "/mcp", headers, "read_scope", {
+          scope: "instagram.profile",
+          maxBytes: 1,
+        }),
+      );
+    });
 
     const latest = await toolCall(app, "/mcp", headers, "read_scope", {
       scope: "instagram.profile",
@@ -387,11 +406,7 @@ describe("self-signing MCP session with a live chain grant", () => {
     expect(await owned.text()).toContain(SECRET);
     const legacy = await toolCall(app, "/mcp", headers, "read_scope", {
       scope: "instagram.profile",
-      cursor: encodeDataBlockCursor({
-        scope: "instagram.profile",
-        collectedAt: legacyAt,
-        blockIndex: 0,
-      }),
+      cursor: legacyCursor,
     });
     expect(legacy).toContain(LEGACY);
     expect(legacy).not.toContain(SECRET);

@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
-import { initializeDatabase } from "./index-schema.js";
+import { INDEX_SCHEMA_VERSION, initializeDatabase } from "./index-schema.js";
 
 function createHistoricalIndexBase(db: Database.Database, version: number) {
   db.exec(`
@@ -164,7 +164,7 @@ describe("initializeDatabase", () => {
     db.close();
   });
 
-  it("adds the takeover method to a v14 ledger without changing its version", async () => {
+  it("adds the takeover method to a v14 ledger", async () => {
     const dir = await mkdtemp(join(tmpdir(), "legacy-takeover-schema-"));
     try {
       const path = join(dir, "index.db");
@@ -192,8 +192,11 @@ describe("initializeDatabase", () => {
       old.close();
 
       const db = initializeDatabase(path);
-      // The version stays 14, so a runtime pinned before this can still open it.
-      expect(db.pragma("user_version", { simple: true })).toBe(14);
+      // The method column is added without its own version bump; the version
+      // is the runtime's, reached through every later migration.
+      expect(db.pragma("user_version", { simple: true })).toBe(
+        INDEX_SCHEMA_VERSION,
+      );
       expect(
         db.prepare("SELECT instance, method FROM legacy_scope_takeovers").all(),
       ).toEqual([{ instance: "oura:owner", method: "" }]);
