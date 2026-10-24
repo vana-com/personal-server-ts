@@ -296,8 +296,8 @@ export function createMemoryRecordStore(): PdppRecordStore {
     let horizon = new Date(writeClock).toISOString();
     if (options.cursor) {
       const payload = decodeListCursor(options.cursor);
-      assertListCursorBinding(payload, options);
       assertCursorScope(payload, stream);
+      assertListCursorBinding(payload, options);
       if (payload.order !== options.order) throw new InvalidCursorError();
       horizon = payload.horizon;
       after = {

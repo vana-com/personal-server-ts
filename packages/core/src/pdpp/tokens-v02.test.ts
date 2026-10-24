@@ -22,14 +22,17 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AUTHORIZATION_CODE_TTL_SECONDS, PdppTokenService } from "./tokens.js";
 import { openPdppAuthStore, type PdppAuthStore } from "./store.js";
+import { issueAndStoreTestGrant } from "../ports/pdpp-auth.test-utils.js";
 import {
   PDPP_DATA_ACCESS_TYPE,
   PDPP_DATA_ACCESS_TYPE_V02,
-  PDPP_GRANT_VERSION,
   PDPP_GRANT_VERSION_V02,
   type Grant,
   type PdppAuthorizationResultV02,
+  type SelectionRequest,
 } from "./types.js";
+import type { InstanceInventory } from "./resolve.js";
+import type { RequesterIdentity } from "./review.js";
 
 let dir: string;
 let store: PdppAuthStore;
@@ -42,84 +45,109 @@ const FUTURE_EXPIRY = new Date(
   Date.now() + 30 * 24 * 60 * 60 * 1000,
 ).toISOString();
 
-function v02Grant(overrides: Partial<Grant> = {}): Grant {
-  return {
-    version: PDPP_GRANT_VERSION_V02,
-    grant_id: `grt_${Math.random().toString(16).slice(2, 10)}`,
-    issued_at: "2026-09-14T20:00:00Z",
-    subject: { id: "subject_example" },
-    client: {
-      client_id: "budget_example",
-      client_display: { name: "Budget Example" },
+const declarationDocument = JSON.stringify({
+  source_id: "https://data.example.com/finance",
+  source_kind: "provider_native",
+  version: "2026-09-01",
+  streams: [
+    {
+      name: "transactions",
+      fields: ["date", "amount", "merchant", "private_note"],
+      required_fields: ["date"],
+      consent_time_field: "date",
+      primary_key: ["date"],
     },
-    source: { kind: "provider_native", id: "https://data.example.com/finance" },
-    source_declaration: { version: "2026-09-01" },
+    {
+      name: "profile",
+      fields: ["id", "display_name"],
+      required_fields: ["id"],
+      primary_key: ["id"],
+    },
+  ],
+});
+const inventory: InstanceInventory = {
+  eligibleFor: () => ["account_example"],
+};
+const requester: RequesterIdentity = {
+  client_id: "budget_example",
+  display_name: "Budget Example",
+  display: { name: "Budget Example" },
+  app_approved: false,
+};
+
+function v02Grant(overrides: Partial<Grant> = {}): Grant {
+  const request: SelectionRequest = {
+    type: PDPP_DATA_ACCESS_TYPE_V02,
+    source: { id: "https://data.example.com/finance" },
     purpose_code: "https://apps.example.com/purposes/budget",
-    access_mode: "single_use",
+    access_mode: overrides.access_mode ?? "single_use",
     retention: { max_duration: "P30D", on_expiry: "delete" },
-    // Must be in the future: an expired grant is not redeemable, and these
-    // tests are about the *shape* of a successful result.
-    expires_at: FUTURE_EXPIRY,
     streams: [
       {
         name: "transactions",
+        necessity: "required",
         instance_ids: ["account_example"],
-        fields: ["date", "amount"],
-        time_constraint: { field: "date", ...Q4 },
+        fields: ["date", "amount", "merchant"],
+        time_range: {
+          since: "2025-01-01T00:00:00Z",
+          until: "2026-01-01T00:00:00Z",
+        },
+        minimum: { fields: ["date", "amount"], time_range: Q4 },
+      },
+      {
+        name: "profile",
+        necessity: "optional",
+        instance_ids: ["account_example"],
+        fields: ["id", "display_name"],
       },
     ],
-    requested: {
-      streams: [
-        {
-          name: "transactions",
-          necessity: "required",
-          fields: ["date", "amount", "merchant"],
-          time_range: {
-            since: "2025-01-01T00:00:00Z",
-            until: "2026-01-01T00:00:00Z",
-          },
-          minimum: { fields: ["date", "amount"], time_range: Q4 },
-        },
-        {
-          name: "profile",
-          necessity: "optional",
-          fields: ["id", "display_name"],
-        },
-      ],
-      omitted_streams: ["profile"],
-    },
-    ...overrides,
   };
+  const result = issueAndStoreTestGrant({
+    store,
+    subjectId: "subject_example",
+    declarationDocument,
+    request,
+    requester,
+    inventory,
+    ownerChoices: {
+      fields: { transactions: ["date", "amount"] },
+      time_ranges: { transactions: Q4 },
+      declined_streams: ["profile"],
+    },
+    expiresAt: FUTURE_EXPIRY,
+  });
+  return result.grant;
 }
 
 function v01Grant(): Grant {
-  return {
-    version: PDPP_GRANT_VERSION,
-    grant_id: `grt_${Math.random().toString(16).slice(2, 10)}`,
-    issued_at: "2026-09-14T20:00:00Z",
-    subject: { id: "subject_example" },
-    client: { client_id: "budget_example" },
-    source: { kind: "provider_native", id: "https://data.example.com/finance" },
-    source_declaration: { version: "2026-09-01" },
-    purpose_code: "https://pdpp.dev/purpose/portability",
-    access_mode: "single_use",
-    retention: { max_duration: "P30D", on_expiry: "delete" },
-    streams: [
-      {
-        name: "transactions",
-        instance_ids: ["account_example"],
-        fields: ["date", "amount"],
-      },
-    ],
-  };
+  return issueAndStoreTestGrant({
+    store,
+    subjectId: "subject_example",
+    declarationDocument,
+    request: {
+      type: PDPP_DATA_ACCESS_TYPE,
+      source: { id: "https://data.example.com/finance" },
+      purpose_code: "https://pdpp.dev/purpose/portability",
+      access_mode: "single_use",
+      retention: { max_duration: "P30D", on_expiry: "delete" },
+      streams: [
+        {
+          name: "transactions",
+          instance_ids: ["account_example"],
+          fields: ["date", "amount"],
+        },
+      ],
+    },
+    requester: {
+      client_id: requester.client_id,
+      display_name: requester.display_name,
+      app_approved: requester.app_approved,
+    },
+    inventory,
+  }).grant;
 }
 
 function seed(grant: Grant): string {
-  store.insertGrant({
-    grant,
-    subjectId: grant.subject.id,
-    reviewDigest: "digest-placeholder",
-  });
   const code = `code_${Math.random().toString(16).slice(2)}`;
   store.insertAuthCode(code, {
     grantId: grant.grant_id,

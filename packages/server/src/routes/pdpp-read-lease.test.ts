@@ -11,11 +11,13 @@ import type { AddressInfo } from "node:net";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  PDPP_DATA_ACCESS_TYPE,
   openPdppAuthStore,
   PdppTokenService,
   type Grant,
   type PdppAuthStore,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
+import { issueAndStoreTestGrant } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import {
   createMemoryRecordStore,
   createStreamDeclarationRegistry,
@@ -57,19 +59,53 @@ let dir: string;
 let authStore: PdppAuthStore;
 let records: PdppRecordStore;
 let auth: ReturnType<typeof coLocatedAuthorizationService>;
+let approvedGrant: Grant;
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "pdpp-read-lease-"));
   authStore = openPdppAuthStore(join(dir, "auth.db"));
-  authStore.insertGrant({
-    grant: GRANT,
-    subjectId: "sub_1",
-    reviewDigest: "t",
+  const declarationDocument = JSON.stringify({
+    source_id: GRANT.source.id,
+    source_kind: GRANT.source.kind,
+    version: GRANT.source_declaration.version,
+    streams: [
+      {
+        name: "media",
+        semantics: "append_only",
+        fields: ["id", "blob_ref"],
+        required_fields: ["id"],
+        primary_key: ["id"],
+      },
+    ],
   });
+  approvedGrant = issueAndStoreTestGrant({
+    store: authStore,
+    subjectId: "sub_1",
+    declarationDocument,
+    request: {
+      type: PDPP_DATA_ACCESS_TYPE,
+      source: { id: GRANT.source.id },
+      purpose_code: GRANT.purpose_code,
+      access_mode: "continuous",
+      streams: [
+        {
+          name: "media",
+          instance_ids: ["inst_1"],
+          fields: ["id", "blob_ref"],
+        },
+      ],
+    },
+    requester: {
+      client_id: GRANT.client.client_id,
+      display_name: GRANT.client.client_id,
+      app_approved: false,
+    },
+    inventory: { eligibleFor: () => ["inst_1"] },
+  }).grant;
   expect(
     authStore.issueAccessToken({
       token: TOKEN,
-      grantId: GRANT.grant_id,
+      grantId: approvedGrant.grant_id,
       subjectId: "sub_1",
       clientId: "client_1",
       tokenKind: "client",
@@ -136,7 +172,7 @@ describe("a blob download whose grant is revoked mid-transfer", () => {
     expect(received).toBeLessThan(size);
 
     // The owner revokes the grant while the client is still downloading.
-    expect(authStore.revokeGrant(GRANT.grant_id)).toBe(true);
+    expect(authStore.revokeGrant(approvedGrant.grant_id)).toBe(true);
 
     let failure: unknown;
     try {
@@ -174,7 +210,7 @@ describe("a blob download whose grant is revoked mid-transfer", () => {
       expect(response.status).toBe(200);
       const reader = response.body!.getReader();
       let received = (await reader.read()).value?.byteLength ?? 0;
-      expect(authStore.revokeGrant(GRANT.grant_id)).toBe(true);
+      expect(authStore.revokeGrant(approvedGrant.grant_id)).toBe(true);
       let failed = false;
       try {
         for (;;) {
@@ -223,7 +259,7 @@ describe("a multi-page list whose grant is revoked between pages", () => {
     expect(body.data).toHaveLength(1);
     expect(body.next_cursor).toBeTruthy();
 
-    expect(authStore.revokeGrant(GRANT.grant_id)).toBe(true);
+    expect(authStore.revokeGrant(approvedGrant.grant_id)).toBe(true);
 
     const page2 = await app.request(
       `/streams/media/records?limit=1&order=asc&cursor=${encodeURIComponent(body.next_cursor)}`,
@@ -247,7 +283,7 @@ describe("a blob HEAD whose grant is revoked before the headers leave", () => {
         if (prop === "getBlobMeta") {
           return (...args: unknown[]) => {
             metaReads += 1;
-            if (metaReads === 2) authStore.revokeGrant(GRANT.grant_id);
+            if (metaReads === 2) authStore.revokeGrant(approvedGrant.grant_id);
             return (value as (...a: unknown[]) => unknown).apply(target, args);
           };
         }
