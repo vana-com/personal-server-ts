@@ -1,4 +1,10 @@
 import Database from "better-sqlite3";
+import {
+  INDEX_SCHEMA_VERSION,
+  assertSupportedSchemaVersions,
+} from "./schema-versions.js";
+
+export { INDEX_SCHEMA_VERSION } from "./schema-versions.js";
 import { PDPP_RECORD_SCHEMA_VERSION } from "./pdpp-records-sqlite-store.js";
 
 const CREATE_TABLE_SQL = `
@@ -34,14 +40,6 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_data_point_id ON data_files (data_point_id)",
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
-
-// v17 is a compatibility fence for the converged runtime. Slots 15 and 16
-// were also used by the conformance line for other additive columns.
-// Older Desktop builds must refuse this database even when PDPP is disabled:
-// they lack
-// retained-history blob protection and the current MCP ingress policy.
-// The table change remains v15's additive replacement_cursor migration.
-export const INDEX_SCHEMA_VERSION = 17;
 
 const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
@@ -254,28 +252,11 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
   }
 }
 
-function assertSupportedSchemaVersions(db: Database.Database): number {
-  const currentVersion = db.pragma("user_version", { simple: true }) as number;
-  if (currentVersion > INDEX_SCHEMA_VERSION) {
-    throw new Error(
-      `Unsupported index.db schema version ${currentVersion}; runtime supports ${INDEX_SCHEMA_VERSION}`,
-    );
-  }
-  if (hasTable(db, "pdpp_schema_version")) {
-    const records = db
-      .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
-      .get() as { version: number } | undefined;
-    if (records && records.version > PDPP_RECORD_SCHEMA_VERSION) {
-      throw new Error(
-        `Unsupported index.db PDPP schema version ${records.version}; runtime supports ${PDPP_RECORD_SCHEMA_VERSION}`,
-      );
-    }
-  }
-  return currentVersion;
-}
-
 function ensureSchemaVersion(db: Database.Database): void {
-  const currentVersion = assertSupportedSchemaVersions(db);
+  const currentVersion = assertSupportedSchemaVersions(
+    db,
+    PDPP_RECORD_SCHEMA_VERSION,
+  );
   migrateSchema(db, currentVersion);
   // The method that earned a takeover. Added without a version bump: a
   // runtime pinned before it opens the database unchanged and writes ''
@@ -297,7 +278,7 @@ export function initializeDatabase(dbPath: string): Database.Database {
     // their own `pdpp_schema_version`; neither counter may stand in for the
     // other. Check before changing journal mode or creating any schema so a
     // rollback runtime fails closed without touching a newer database.
-    assertSupportedSchemaVersions(db);
+    assertSupportedSchemaVersions(db, PDPP_RECORD_SCHEMA_VERSION);
     const deadline = performance.now() + 5000;
     const pause = new Int32Array(new SharedArrayBuffer(4));
     for (;;) {

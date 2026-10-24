@@ -1,3 +1,4 @@
+import { assertSupportedSchemaVersions } from "./schema-versions.js";
 import {
   parseTime,
   timeSortKey,
@@ -712,6 +713,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    */
   listArrivalOrder(instance: string, stream: string): string[];
 } {
+  assertSupportedSchemaVersions(db, PDPP_RECORD_SCHEMA_VERSION);
   // Insert statements call it, so even a readonly handle must register it
   // before they are prepared.
   registerTimeKey(db);

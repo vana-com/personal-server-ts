@@ -18,8 +18,9 @@ a compatibility fence without further table changes. Both Desktop v15 and
 main v14 indexes upgrade without dropping rows. The records counter advances
 from v14 to v15 only when needed. Each store rejects versions above its
 supported version.
-The shared database initializer preflights both counters before switching
-journal mode, creating tables, or letting bootstrap perform recovery work.
+The shared database initializer and direct records-store opener use the same
+two-counter preflight before switching journal mode or creating tables.
+The initializer also checks before bootstrap can perform recovery work.
 It checks the PDPP counter even when that store will not be mounted.
 
 The conformance branch also used legacy v15 and v16 for other additive columns
