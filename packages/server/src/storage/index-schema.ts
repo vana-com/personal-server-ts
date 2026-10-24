@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { PDPP_RECORD_SCHEMA_VERSION } from "./pdpp-records-sqlite-store.js";
 
 const CREATE_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS data_files (
@@ -34,7 +35,13 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 14;
+// v17 is a compatibility fence for the converged runtime. Slots 15 and 16
+// were also used by the conformance line for other additive columns.
+// Older Desktop builds must refuse this database even when PDPP is disabled:
+// they lack
+// retained-history blob protection and the current MCP ingress policy.
+// The table change remains v15's additive replacement_cursor migration.
+export const INDEX_SCHEMA_VERSION = 17;
 
 const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
@@ -46,6 +53,7 @@ CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
   superseded_cas_revision INTEGER NOT NULL,
   superseded_collected_at TEXT NOT NULL,
   superseded_path TEXT NOT NULL,
+  replacement_cursor TEXT,
   taken_over_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   PRIMARY KEY (scope, instance, generation, superseded_path)
 )`;
@@ -237,15 +245,37 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
       db.exec("DROP TABLE legacy_scope_takeover_verdicts_old");
     })();
   }
+  // Parallel lines used v15/v16 without this column. Never infer its
+  // presence from their version stamp or invent a completed replacement.
+  if (!hasColumn(db, "legacy_scope_takeovers", "replacement_cursor")) {
+    db.exec(
+      "ALTER TABLE legacy_scope_takeovers ADD COLUMN replacement_cursor TEXT",
+    );
+  }
 }
 
-function ensureSchemaVersion(db: Database.Database): void {
+function assertSupportedSchemaVersions(db: Database.Database): number {
   const currentVersion = db.pragma("user_version", { simple: true }) as number;
   if (currentVersion > INDEX_SCHEMA_VERSION) {
     throw new Error(
       `Unsupported index.db schema version ${currentVersion}; runtime supports ${INDEX_SCHEMA_VERSION}`,
     );
   }
+  if (hasTable(db, "pdpp_schema_version")) {
+    const records = db
+      .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
+      .get() as { version: number } | undefined;
+    if (records && records.version > PDPP_RECORD_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported index.db PDPP schema version ${records.version}; runtime supports ${PDPP_RECORD_SCHEMA_VERSION}`,
+      );
+    }
+  }
+  return currentVersion;
+}
+
+function ensureSchemaVersion(db: Database.Database): void {
+  const currentVersion = assertSupportedSchemaVersions(db);
   migrateSchema(db, currentVersion);
   // The method that earned a takeover. Added without a version bump: a
   // runtime pinned before it opens the database unchanged and writes ''
@@ -263,6 +293,11 @@ export function initializeDatabase(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   try {
     db.pragma("busy_timeout = 5000");
+    // `user_version` belongs to the legacy index schema. PDPP records use
+    // their own `pdpp_schema_version`; neither counter may stand in for the
+    // other. Check before changing journal mode or creating any schema so a
+    // rollback runtime fails closed without touching a newer database.
+    assertSupportedSchemaVersions(db);
     const deadline = performance.now() + 5000;
     const pause = new Int32Array(new SharedArrayBuffer(4));
     for (;;) {

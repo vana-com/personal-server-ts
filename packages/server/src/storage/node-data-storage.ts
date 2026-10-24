@@ -16,6 +16,7 @@ import {
   stageDataFile,
   publishStagedDataFile,
 } from "./hierarchy.js";
+import type { VersionFence } from "@opendatalabs/personal-server-ts-core/ports";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
@@ -348,21 +349,33 @@ export function createNodeDataStorage(
         return true;
       });
     },
-    async deleteVersion(scope: string, collectedAt: string) {
+    async deleteVersion(
+      scope: string,
+      collectedAt: string,
+      fence?: VersionFence,
+    ) {
       const entry = deps.indexManager.findClosestByScope(scope, collectedAt);
       if (operations) {
         return withScopeLock(scope, async () => {
-          const removed = operations.deleteVersion(
-            scope,
-            collectedAt,
-            entry?.collectedAt === collectedAt ? entry.path : undefined,
-          );
+          const removed = fence
+            ? operations.deleteFencedVersion(scope, collectedAt, fence)
+            : operations.deleteVersion(
+                scope,
+                collectedAt,
+                entry?.collectedAt === collectedAt ? entry.path : undefined,
+              );
           await dropLedgerIfEmpty(scope);
           return removed;
         });
       }
       if (!entry || entry.collectedAt !== collectedAt) return false;
       return withScopeLock(scope, async () => {
+        if (fence) {
+          const current = deps.indexManager.findByPath(entry.path);
+          if (entry.path !== fence.path || current?.id !== fence.id) {
+            return false;
+          }
+        }
         // Same ordering as deleteByFileId: blob first (ENOENT-tolerant), then
         // the index row, so a real blob failure keeps the row for a retry.
         await deleteDataFile(deps.hierarchyOptions, scope, collectedAt);

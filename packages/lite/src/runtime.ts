@@ -1,3 +1,4 @@
+import { importOuraBrowserRecords } from "./oura-import.js";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   withLegacyProjection,
@@ -29,6 +30,7 @@ import {
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
+  handleOuraCollectionRequirementsRequest,
   handlePersonalServerGrantsRequest,
   handlePersonalServerOauthTokenRequest,
   handlePersonalServerSyncRequest,
@@ -1109,6 +1111,46 @@ export function createPsLiteRuntime(
 
         if (!active) {
           return unavailableResponse();
+        }
+
+        if (url.pathname === "/v1/import/oura-browser/requirements") {
+          return handleOuraCollectionRequirementsRequest(request, {
+            auth,
+            storage: toDataStoragePort(options.storage),
+          });
+        }
+
+        if (url.pathname === "/v1/import/oura-browser") {
+          await auth.authorizeOwner(request);
+          if (request.method !== "POST")
+            return errorResponse(
+              405,
+              "METHOD_NOT_ALLOWED",
+              "Method not allowed",
+            );
+          let body;
+          try {
+            body = await request.json();
+          } catch {
+            return errorResponse(400, "INVALID_BODY", "Body must be JSON");
+          }
+          const result = await importOuraBrowserRecords(
+            toDataStoragePort(options.storage),
+            body,
+            {
+              additions: options.additions,
+              scopeDeletions: options.scopeDeletions,
+              syncManager: options.syncManager ?? null,
+              onDataWritten: options.derivatives
+                ? (event) =>
+                    options.derivatives?.scheduler.markSourceChanged(
+                      event.scope,
+                      { lineageSources: event.lineageSources },
+                    )
+                : undefined,
+            },
+          );
+          return jsonResponse(result, { status: result.ok ? 200 : 409 });
         }
 
         const dataPrefix = "/v1/data";

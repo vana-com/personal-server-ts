@@ -25,7 +25,10 @@ export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 export { META_040_BINDINGS } from "./meta-040-bindings.js";
-export { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
+export {
+  OURA_BROWSER_BINDINGS,
+  OURA_BROWSER_DECLARATION_DIGEST,
+} from "./oura-browser-bindings.js";
 export type { LegacyScopeBindingProvenance } from "./provenance.js";
 export { classifyAsTestDebris } from "./test-debris.js";
 export type {

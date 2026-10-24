@@ -95,3 +95,26 @@ describe("Oura browser source bindings", () => {
     });
   });
 });
+
+describe("Oura timestamp parity", () => {
+  it.each(["activity", "readiness"])(
+    "preserves %s timestamps from current connector records",
+    (stream) => {
+      const timestamp = "2026-10-01T00:00:00+00:00";
+      const result = projectPdppRecordsToLegacyPayload(
+        `oura.${stream}`,
+        [
+          {
+            stream,
+            data: { id: "day", day: "2026-10-01", score: 80, timestamp },
+          },
+        ],
+        { fetchedStreams: [stream], profileKey: "oura-browser" },
+      );
+      expect(result).toMatchObject({
+        ok: true,
+        payload: { days: [{ timestamp }] },
+      });
+    },
+  );
+});

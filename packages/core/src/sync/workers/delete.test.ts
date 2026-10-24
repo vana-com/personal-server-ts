@@ -8,14 +8,19 @@ import {
   retryPendingBlobDeletions,
 } from "./delete.js";
 import { computeDataPointId } from "../data-point-id.js";
-import { createMemoryPendingBlobDeletionStore } from "../pending-blob-deletions.js";
+import {
+  createMemoryPendingBlobDeletionStore,
+  createPendingBlobDeletionStore,
+} from "../pending-blob-deletions.js";
 import type { Logger } from "../../logger/index.js";
 import type { IndexEntry } from "../../storage/index/types.js";
+import { createMemoryDataStorage } from "../../test-utils/memory-storage.js";
 import type {
   DataPointFeedPort,
   DataStoragePort,
   DeleteBlobVersionsOutcome,
   DeleteDataPort,
+  PendingBlobDeletion,
   PendingBlobDeletionStore,
 } from "../../ports/index.js";
 
@@ -127,8 +132,19 @@ function makeDeps(
     return allDeleted(scope, versions);
   });
   const { localVersions = [], ...depOverrides } = overrides ?? {};
+  // Per-version local copy, as the real port behaves: listing reads the live
+  // rows and each erase removes exactly the row it names.
   const storage: Partial<DataStoragePort> = {
     listVersions: vi.fn(() => localVersions),
+    deleteVersion: vi.fn(async (_scope: string, collectedAt: string) => {
+      calls.push("local");
+      const at = localVersions.findIndex(
+        (row) => row.collectedAt === collectedAt,
+      );
+      if (at < 0) return false;
+      localVersions.splice(at, 1);
+      return true;
+    }),
     deleteScope: vi.fn(async () => {
       calls.push("local");
       return 2;
@@ -217,11 +233,24 @@ describe("planBlobDeletions", () => {
 
 describe("deleteScope orchestration", () => {
   it("runs gateway tombstone, then exact blob deletes, then local delete", async () => {
-    const deps = makeDeps({ localVersions: [entry({ version: 2 })] });
+    const deps = makeDeps({
+      localVersions: [
+        entry({
+          version: 2,
+          path: `${SCOPE}/v2.json`,
+          collectedAt: "2026-08-02T00:00:00.000Z",
+        }),
+        entry({
+          version: 3,
+          path: `${SCOPE}/v3.json`,
+          collectedAt: "2026-08-03T00:00:00.000Z",
+        }),
+      ],
+    });
 
     const result = await deleteScope(deps, SCOPE);
 
-    expect(deps.calls).toEqual(["gateway", "storage", "local"]);
+    expect(deps.calls).toEqual(["gateway", "storage", "local", "local"]);
     expect(versionsSent(deps.deleteData!)).toEqual([["1", "2", "3", "4"]]);
     expect(result).toEqual({
       scope: SCOPE,
@@ -294,7 +323,20 @@ describe("deleteScope orchestration", () => {
   });
 
   it("records exact retry markers for the keys that failed, still deletes locally", async () => {
-    const deps = makeDeps();
+    const deps = makeDeps({
+      localVersions: [
+        entry({
+          version: 2,
+          path: `${SCOPE}/v2.json`,
+          collectedAt: "2026-08-02T00:00:00.000Z",
+        }),
+        entry({
+          version: 3,
+          path: `${SCOPE}/v3.json`,
+          collectedAt: "2026-08-03T00:00:00.000Z",
+        }),
+      ],
+    });
     (
       deps.deleteData!.deleteBlobVersions as ReturnType<typeof vi.fn>
     ).mockImplementation(async (_scope: string, versions: string[]) => ({
@@ -500,8 +542,10 @@ describe("deleteScope orchestration", () => {
   });
 
   it("reports a local delete failure without hiding the remote outcome", async () => {
-    const deps = makeDeps();
-    (deps.storage.deleteScope as ReturnType<typeof vi.fn>).mockRejectedValue(
+    const deps = makeDeps({
+      localVersions: [entry({ version: 1, dataPointId: "0xdp" })],
+    });
+    (deps.storage.deleteVersion as ReturnType<typeof vi.fn>).mockRejectedValue(
       new Error("index locked"),
     );
 
@@ -524,7 +568,21 @@ describe("deleteScope vs a registration racing a not-registered answer", () => {
         ? { deletedAt: null, expectedVersion: "1" }
         : { deletedAt: DELETED_AT, expectedVersion: "2" },
     );
-    const deps = makeDeps({ dataPointFeed });
+    const deps = makeDeps({
+      dataPointFeed,
+      localVersions: [
+        entry({
+          version: 1,
+          path: `${SCOPE}/v1.json`,
+          collectedAt: "2026-08-01T00:00:00.000Z",
+        }),
+        entry({
+          version: 2,
+          path: `${SCOPE}/v2.json`,
+          collectedAt: "2026-08-02T00:00:00.000Z",
+        }),
+      ],
+    });
     (deps.deleteData!.tombstone as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({
         status: "not-registered",
@@ -808,6 +866,156 @@ describe("retryPendingBlobDeletions", () => {
       failed: [],
       remaining: 0,
     });
+  });
+});
+
+describe("deleteScope erases only the fence captured before the remote await", () => {
+  const indexed = (
+    storage: ReturnType<typeof createMemoryDataStorage>,
+    path: string,
+    collectedAt: string,
+    afterTombstoneVersion: number | null,
+  ) =>
+    storage.insertEntry({
+      fileId: null,
+      schemaId: null,
+      path,
+      scope: SCOPE,
+      collectedAt,
+      sizeBytes: 10,
+      afterTombstoneVersion,
+    });
+
+  it("keeps every entry that arrives during the remote delete and erases only the captured covered versions", async () => {
+    const storage = createMemoryDataStorage();
+    indexed(storage, "p/a.json", "2026-08-01T00:00:00.000Z", null);
+    indexed(storage, "p/f.json", "2026-08-02T00:00:00.000Z", 3);
+    // A first-seen sidecar derived from the rows about to be erased.
+    await storage.writeFirstSeenLedger!(SCOPE, { stale: true });
+    const deleteData = makeDeleteData({
+      deleteBlobVersions: vi.fn(async (_scope, versions) => {
+        indexed(storage, "p/b.json", "2026-08-03T00:00:00.000Z", 4);
+        indexed(storage, "p/c.json", "2026-08-04T00:00:00.000Z", null);
+        indexed(storage, "p/d.json", "2026-08-05T00:00:00.000Z", 5);
+        return { deleted: versions, missing: [], failed: [] };
+      }),
+    });
+
+    const result = await deleteScope(
+      {
+        storage,
+        serverOwner: OWNER,
+        deleteData,
+        logger: makeLogger(),
+      },
+      SCOPE,
+    );
+
+    expect(await storage.readFirstSeenLedger!(SCOPE)).toBeNull();
+    expect(result.steps.local).toMatchObject({ status: "ok", deletedCount: 2 });
+    expect(
+      storage
+        .listVersions(SCOPE, { limit: 50 })
+        .map((entry) => entry.path)
+        .sort(),
+    ).toEqual(["p/b.json", "p/c.json", "p/d.json"]);
+  });
+});
+
+describe("retry marker writes never drop an owed key", () => {
+  const range = (from: string, to: string): PendingBlobDeletion => ({
+    scope: SCOPE,
+    version: null,
+    range: { from, to },
+  });
+  /**
+   * A marker KV whose first write matching `failOn` throws, as ENOSPC would.
+   * Matching is by content, so the test does not depend on write order.
+   */
+  function kvFailingOnce(
+    initial: PendingBlobDeletion[],
+    failOn: (next: PendingBlobDeletion[]) => boolean,
+  ) {
+    let saved = structuredClone(initial);
+    let failed = false;
+    return {
+      kv: {
+        read: async () => structuredClone(saved),
+        write: async (next: PendingBlobDeletion[]) => {
+          if (!failed && failOn(next)) {
+            failed = true;
+            throw new Error("ENOSPC");
+          }
+          saved = structuredClone(next);
+        },
+      },
+      snapshot: () => structuredClone(saved),
+    };
+  }
+  const allVersions = (sent: string[]) => new Set(sent);
+
+  it("keeps the old range standing when its successor cannot be persisted, then drains the unread tail", async () => {
+    const { kv, snapshot } = kvFailingOnce([range("16", "100")], (next) =>
+      next.some((key) => key.range?.from === "31"),
+    );
+    const pending = createPendingBlobDeletionStore(kv);
+    const sent: string[] = [];
+    const deps = {
+      deleteData: makeDeleteData({
+        deleteBlobVersions: vi.fn(async (_scope, versions) => {
+          sent.push(...versions);
+          return { deleted: versions, missing: [], failed: [] };
+        }),
+      }),
+      pendingBlobDeletions: pending,
+      logger: makeLogger(),
+    };
+
+    await expect(retryPendingBlobDeletions(deps)).rejects.toThrow("ENOSPC");
+    expect(snapshot()).toEqual([range("16", "100")]);
+
+    for (let pass = 0; pass < 10; pass++) {
+      if ((await pending.list()).length === 0) break;
+      await retryPendingBlobDeletions(deps);
+    }
+    expect(await pending.list()).toEqual([]);
+    expect(allVersions(sent)).toEqual(
+      new Set(Array.from({ length: 85 }, (_, i) => String(16 + i))),
+    );
+  });
+
+  it("keeps an unexpanded marker until its expansion is persisted, then expands it on a later pass", async () => {
+    const { kv, snapshot } = kvFailingOnce(
+      [{ scope: SCOPE, version: null }],
+      (next) => next.some((key) => key.range !== undefined),
+    );
+    const pending = createPendingBlobDeletionStore(kv);
+    const sent: string[] = [];
+    const deps = {
+      deleteData: makeDeleteData({
+        deleteBlobVersions: vi.fn(async (_scope, versions) => {
+          sent.push(...versions);
+          return { deleted: versions, missing: [], failed: [] };
+        }),
+      }),
+      pendingBlobDeletions: pending,
+      dataPointFeed: feedAnswering(async () => ({
+        deletedAt: DELETED_AT,
+        expectedVersion: "4",
+      })),
+      serverOwner: OWNER,
+      logger: makeLogger(),
+    };
+
+    await expect(retryPendingBlobDeletions(deps)).rejects.toThrow("ENOSPC");
+    expect(snapshot()).toEqual([{ scope: SCOPE, version: null }]);
+
+    for (let pass = 0; pass < 5; pass++) {
+      if ((await pending.list()).length === 0) break;
+      await retryPendingBlobDeletions(deps);
+    }
+    expect(await pending.list()).toEqual([]);
+    expect(allVersions(sent)).toEqual(new Set(["1", "2", "3", "4"]));
   });
 });
 

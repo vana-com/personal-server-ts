@@ -65,6 +65,77 @@ function createV14TakeoverTables(db: Database.Database) {
 }
 
 describe("initializeDatabase", () => {
+  it("refuses a newer PDPP counter before legacy initialization can change the shared database", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ps-index-newer-pdpp-"));
+    try {
+      const path = join(dir, "index.db");
+      const future = new Database(path);
+      future.exec(
+        "CREATE TABLE pdpp_schema_version (id INTEGER PRIMARY KEY, version INTEGER NOT NULL); INSERT INTO pdpp_schema_version VALUES (1, 16)",
+      );
+      future.pragma("user_version = 15");
+      future.pragma("journal_mode = DELETE");
+      future.close();
+      expect(() => {
+        const opened = initializeDatabase(path);
+        opened.close();
+      }).toThrow(
+        "Unsupported index.db PDPP schema version 16; runtime supports 15",
+      );
+      const unchanged = new Database(path, { readonly: true });
+      try {
+        expect(unchanged.pragma("user_version", { simple: true })).toBe(15);
+        expect(unchanged.pragma("journal_mode", { simple: true })).toBe(
+          "delete",
+        );
+        expect(
+          unchanged.prepare("SELECT version FROM pdpp_schema_version").get(),
+        ).toEqual({ version: 16 });
+        expect(
+          unchanged
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .all(),
+        ).toEqual([{ name: "pdpp_schema_version" }]);
+      } finally {
+        unchanged.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a newer index schema before creating or changing database objects", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ps-index-newer-version-"));
+    try {
+      const path = join(dir, "index.db");
+      const newer = new Database(path);
+      newer.exec("CREATE TABLE rollback_guard (value TEXT NOT NULL)");
+      newer.prepare("INSERT INTO rollback_guard VALUES (?)").run("preserve");
+      newer.pragma("user_version = 18");
+      newer.pragma("journal_mode = DELETE");
+      newer.close();
+
+      expect(() => initializeDatabase(path)).toThrow(
+        "Unsupported index.db schema version 18; runtime supports 17",
+      );
+
+      const unchanged = new Database(path, { readonly: true });
+      expect(unchanged.pragma("user_version", { simple: true })).toBe(18);
+      expect(unchanged.pragma("journal_mode", { simple: true })).toBe("delete");
+      expect(
+        unchanged.prepare("SELECT value FROM rollback_guard").all(),
+      ).toEqual([{ value: "preserve" }]);
+      expect(
+        unchanged
+          .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+          .all(),
+      ).toEqual([{ name: "rollback_guard" }]);
+      unchanged.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("upgrades an owner-import canary index stamped version 5 without producer columns", async () => {
     const dir = await mkdtemp(join(tmpdir(), "ps-index-owner-import-v5-"));
     try {
@@ -96,7 +167,7 @@ describe("initializeDatabase", () => {
       canary.close();
 
       const db = initializeDatabase(path);
-      expect(db.pragma("user_version", { simple: true })).toBe(14);
+      expect(db.pragma("user_version", { simple: true })).toBe(17);
       expect(
         db
           .prepare(
@@ -159,18 +230,22 @@ describe("initializeDatabase", () => {
       "superseded_cas_revision",
       "superseded_collected_at",
       "superseded_path",
+      "replacement_cursor",
       "taken_over_at",
     ]);
     db.close();
   });
 
-  it("adds the takeover method to a v14 ledger without changing its version", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "legacy-takeover-schema-"));
-    try {
-      const path = join(dir, "index.db");
-      // A v14 ledger as a runtime pinned before the method column wrote it.
-      const old = new Database(path);
-      old.exec(`CREATE TABLE legacy_scope_takeovers (
+  it.each([14, 15, 16])(
+    "upgrades a method-less v%i ledger without inventing replacement proof",
+    async (version) => {
+      const dir = await mkdtemp(join(tmpdir(), "legacy-takeover-schema-"));
+      try {
+        const path = join(dir, "index.db");
+        // Parallel branch lines reused version slots before replacement_cursor.
+        // Column presence must decide this additive migration.
+        const old = new Database(path);
+        old.exec(`CREATE TABLE legacy_scope_takeovers (
         scope TEXT NOT NULL,
         instance TEXT NOT NULL DEFAULT '',
         generation INTEGER NOT NULL DEFAULT 1,
@@ -181,27 +256,34 @@ describe("initializeDatabase", () => {
         taken_over_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         PRIMARY KEY (scope, instance, generation, superseded_path)
       )`);
-      old
-        .prepare(
-          `INSERT INTO legacy_scope_takeovers
+        old
+          .prepare(
+            `INSERT INTO legacy_scope_takeovers
             (scope, instance, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
             VALUES ('oura.sleep', 'oura:owner', 1, 1, '2026-01-01T00:00:00Z', 'oura/sleep/old.json')`,
-        )
-        .run();
-      old.pragma("user_version = 14");
-      old.close();
+          )
+          .run();
+        old.pragma(`user_version = ${version}`);
+        old.close();
 
-      const db = initializeDatabase(path);
-      // The version stays 14, so a runtime pinned before this can still open it.
-      expect(db.pragma("user_version", { simple: true })).toBe(14);
-      expect(
-        db.prepare("SELECT instance, method FROM legacy_scope_takeovers").all(),
-      ).toEqual([{ instance: "oura:owner", method: "" }]);
-      db.close();
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
+        const db = initializeDatabase(path);
+        // Migrated history gains no authority to represent a completed replacement.
+        expect(db.pragma("user_version", { simple: true })).toBe(17);
+        expect(
+          db
+            .prepare(
+              "SELECT instance, method, replacement_cursor FROM legacy_scope_takeovers",
+            )
+            .all(),
+        ).toEqual([
+          { instance: "oura:owner", method: "", replacement_cursor: null },
+        ]);
+        db.close();
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("migrates a v8 takeover ledger without losing its recorded file", async () => {
     const dir = await mkdtemp(join(tmpdir(), "legacy-takeover-schema-"));
@@ -288,7 +370,7 @@ describe("initializeDatabase", () => {
         reason_counts_json: "{}",
         applied_exceptions_json: "[]",
       });
-      expect(migrated.pragma("user_version", { simple: true })).toBe(14);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(17);
       migrated.close();
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -334,6 +416,7 @@ describe("initializeDatabase", () => {
           superseded_cas_revision: 31,
           superseded_collected_at: "2026-01-01T00:00:00Z",
           superseded_path: "oura/activity/old.json",
+          replacement_cursor: null,
           taken_over_at: "2026-02-01T00:00:00Z",
         },
         {
@@ -345,6 +428,7 @@ describe("initializeDatabase", () => {
           superseded_cas_revision: 9,
           superseded_collected_at: "2026-03-01T00:00:00Z",
           superseded_path: "strava/activities/old.json",
+          replacement_cursor: null,
           taken_over_at: "2026-04-01T00:00:00Z",
         },
       ];
@@ -384,7 +468,7 @@ describe("initializeDatabase", () => {
       ];
 
       const upgraded = initializeDatabase(path);
-      expect(upgraded.pragma("user_version", { simple: true })).toBe(14);
+      expect(upgraded.pragma("user_version", { simple: true })).toBe(17);
       expect(
         upgraded
           .prepare("SELECT * FROM legacy_scope_takeovers ORDER BY scope")
@@ -400,7 +484,7 @@ describe("initializeDatabase", () => {
       upgraded.close();
 
       const reopened = initializeDatabase(path);
-      expect(reopened.pragma("user_version", { simple: true })).toBe(14);
+      expect(reopened.pragma("user_version", { simple: true })).toBe(17);
       expect(
         reopened
           .prepare("SELECT * FROM legacy_scope_takeovers ORDER BY scope")
@@ -419,7 +503,7 @@ describe("initializeDatabase", () => {
     }
   });
 
-  it("preserves multiple generation rows in an existing v14 index", async () => {
+  it("adds no replacement proof while preserving and reopening a populated method-bearing v14 index", async () => {
     const dir = await mkdtemp(join(tmpdir(), "legacy-v14-index-"));
     const path = join(dir, "index.db");
     try {
@@ -427,6 +511,9 @@ describe("initializeDatabase", () => {
       createHistoricalIndexBase(historical, 14);
       createV14TakeoverTables(historical);
       historical.exec(`
+        ALTER TABLE legacy_scope_takeovers ADD COLUMN method TEXT NOT NULL DEFAULT '';
+        INSERT INTO data_files (path, scope, collected_at, size_bytes, version, cas_revision)
+        VALUES ('old-1.json', 'oura.activity', '2026-01-01T00:00:00Z', 42, 2, 3);
         INSERT INTO legacy_scope_takeovers
           (scope, instance, generation, superseded_version, superseded_cas_revision,
            superseded_collected_at, superseded_path, taken_over_at)
@@ -441,43 +528,74 @@ describe("initializeDatabase", () => {
           ('oura.activity', 'owner', 1, 2, 'cursor-1', 'covered', 'same_time', '{}', '[]', NULL, 10, 10, 0, '2026-02-01T00:00:00Z'),
           ('oura.activity', 'owner', 2, 4, 'cursor-2', 'not_covered', 'same_time', '{"field_mismatch":1}', '["exception"]', '{"reason":"field_mismatch"}', 10, 11, 1, '2026-04-01T00:00:00Z');
       `);
+      historical.exec("UPDATE legacy_scope_takeovers SET method = 'oura'");
+      const expected = {
+        takeovers: historical
+          .prepare("SELECT * FROM legacy_scope_takeovers ORDER BY generation")
+          .all(),
+        verdicts: historical
+          .prepare(
+            "SELECT * FROM legacy_scope_takeover_verdicts ORDER BY generation",
+          )
+          .all(),
+        files: historical.prepare("SELECT * FROM data_files ORDER BY id").all(),
+      };
       historical.close();
 
-      const expected = {
-        takeovers: [
-          { generation: 1, superseded_path: "old-1.json" },
-          { generation: 2, superseded_path: "old-2.json" },
-        ],
-        verdicts: [
-          {
-            generation: 1,
-            reason_counts_json: "{}",
-            applied_exceptions_json: "[]",
-          },
-          {
-            generation: 2,
-            reason_counts_json: '{"field_mismatch":1}',
-            applied_exceptions_json: '["exception"]',
-          },
-        ],
-      };
-      const upgraded = initializeDatabase(path);
-      expect(upgraded.pragma("user_version", { simple: true })).toBe(14);
-      expect(
-        upgraded
-          .prepare(
-            "SELECT generation, superseded_path FROM legacy_scope_takeovers ORDER BY generation",
-          )
-          .all(),
-      ).toEqual(expected.takeovers);
-      expect(
-        upgraded
-          .prepare(
-            "SELECT generation, reason_counts_json, applied_exceptions_json FROM legacy_scope_takeover_verdicts ORDER BY generation",
-          )
-          .all(),
-      ).toEqual(expected.verdicts);
-      upgraded.close();
+      for (let reopening = 0; reopening < 3; reopening++) {
+        const upgraded = initializeDatabase(path);
+        try {
+          expect(upgraded.pragma("user_version", { simple: true })).toBe(17);
+          const columns = upgraded
+            .prepare("PRAGMA table_info(legacy_scope_takeovers)")
+            .all() as {
+            name: string;
+            type: string;
+            notnull: number;
+            dflt_value: unknown;
+          }[];
+          expect(
+            columns.filter((column) => column.name === "replacement_cursor"),
+          ).toEqual([
+            expect.objectContaining({
+              type: "TEXT",
+              notnull: 0,
+              dflt_value: null,
+            }),
+          ]);
+          const takeovers = upgraded
+            .prepare("SELECT * FROM legacy_scope_takeovers ORDER BY generation")
+            .all() as (Record<string, unknown> & {
+            replacement_cursor: string | null;
+          })[];
+          expect(
+            takeovers.map(({ replacement_cursor: _cursor, ...old }) => old),
+          ).toEqual(expected.takeovers);
+          expect(takeovers.map((row) => row.replacement_cursor)).toEqual(
+            reopening === 0 ? [null, null] : ["retained-cursor-bytes", null],
+          );
+          expect(
+            upgraded
+              .prepare(
+                "SELECT * FROM legacy_scope_takeover_verdicts ORDER BY generation",
+              )
+              .all(),
+          ).toEqual(expected.verdicts);
+          expect(
+            upgraded.prepare("SELECT * FROM data_files ORDER BY id").all(),
+          ).toEqual(expected.files);
+          if (reopening === 0) {
+            // Storage round trip only: this string is not an authorization proof.
+            upgraded
+              .prepare(
+                "UPDATE legacy_scope_takeovers SET replacement_cursor = ? WHERE generation = 1",
+              )
+              .run("retained-cursor-bytes");
+          }
+        } finally {
+          upgraded.close();
+        }
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -513,7 +631,7 @@ describe("initializeDatabase", () => {
       crashPoint.close();
 
       const recovered = initializeDatabase(path);
-      expect(recovered.pragma("user_version", { simple: true })).toBe(14);
+      expect(recovered.pragma("user_version", { simple: true })).toBe(17);
       expect(
         recovered
           .prepare(
@@ -611,7 +729,7 @@ describe("initializeDatabase", () => {
       .get("instagram/profile.json") as
       { path: string; scope: string; size_bytes: number } | undefined;
 
-    expect(version).toBe(14);
+    expect(version).toBe(17);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -667,7 +785,7 @@ describe("initializeDatabase", () => {
         }
       | undefined;
 
-    expect(version).toBe(14);
+    expect(version).toBe(17);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
@@ -716,7 +834,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(14);
+    expect(db.pragma("user_version", { simple: true })).toBe(17);
     const row = db
       .prepare(
         "SELECT path, schema_id, version, cas_revision, data_point_id FROM data_files WHERE path = ?",
@@ -776,7 +894,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(14);
+    expect(db.pragma("user_version", { simple: true })).toBe(17);
     const row = db
       .prepare(
         "SELECT path, version, cas_revision, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",
@@ -819,7 +937,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(14);
+    expect(db.pragma("user_version", { simple: true })).toBe(17);
     expect(
       db
         .prepare(

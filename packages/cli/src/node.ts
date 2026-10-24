@@ -1,3 +1,4 @@
+export { OURA_LEGACY_TAKEOVER_CONTRACT } from "@opendatalabs/personal-server-ts-server";
 export {
   DEFAULT_ROOT_PATH,
   DEFAULT_CONFIG_PATH,

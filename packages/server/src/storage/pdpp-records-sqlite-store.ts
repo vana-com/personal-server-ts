@@ -339,6 +339,9 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
 `,
 ];
 
+/** The records namespace in the shared index.db; preflight before bootstrap effects. */
+export const PDPP_RECORD_SCHEMA_VERSION = MIGRATIONS.length;
+
 function addCompletionProofColumns(db: Database): void {
   // `table_xinfo`, unlike `table_info`, also lists generated columns.
   const existing = new Map(
@@ -620,6 +623,19 @@ function toRow(db: RecordRowDb): PdppRecordRow {
   };
 }
 
+export interface SqliteReplaceStreamInput {
+  instance: string;
+  stream: string;
+  method: string;
+  generation: number;
+  emittedAt: string;
+  envelopes: PdppRecordEnvelopeInput[];
+  primaryKey: string[];
+  validateData?: RecordDataValidator;
+  sourceCollectedAt?: string;
+  completionPolicy?: "preserve_if_unchanged";
+}
+
 /**
  * SQLite-backed PdppRecordStore for desktop persistence. Requires
  * `better-sqlite3` (already a `packages/server` dependency in this repo).
@@ -648,6 +664,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    * bindings, listings and pages it sees belong to one point in time.
    */
   readSnapshot<T>(read: () => T): T;
+  /** Validate history and commit under one SQLite write reservation. */
+  writeTransaction<T>(write: () => T): T;
+  /** Last nondeleted data for every retained key; constraints for guarded repair, never disclosure. */
+  listRetainedRecordData(
+    instance: string,
+    stream: string,
+  ): { data: Record<string, unknown>; emittedAt: string }[];
   resetInstanceBinding(input: {
     instance: string;
     expectedMethod: string | null;
@@ -661,18 +684,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     bytes: Uint8Array;
     mimeType: string;
   }): PdppBlobMeta;
-  replaceStream(input: {
-    instance: string;
-    stream: string;
-    method: string;
-    generation: number;
-    emittedAt: string;
-    envelopes: PdppRecordEnvelopeInput[];
-    primaryKey: string[];
-    validateData?: RecordDataValidator;
-    sourceCollectedAt?: string;
-    completionPolicy?: "preserve_if_unchanged";
-  }): ReplaceStreamResult;
+  replaceStream(input: SqliteReplaceStreamInput): ReplaceStreamResult;
+  /** P7 replacements and their completion receipts commit together or all roll back. */
+  replaceStreams(inputs: readonly SqliteReplaceStreamInput[]): void;
   /** Completion receipts of one instance, as stored. */
   listStreamCompletions(instance: string): StreamCompletionReceipt[];
   /**
@@ -979,18 +993,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   // receipt in the same transaction. Without it there is no receipt, and an
   // older one is deleted: it would describe a collection that is no longer
   // the latest.
-  function replaceStream(input: {
-    instance: string;
-    stream: string;
-    method: string;
-    generation: number;
-    emittedAt: string;
-    envelopes: PdppRecordEnvelopeInput[];
-    primaryKey: string[];
-    validateData?: RecordDataValidator;
-    sourceCollectedAt?: string;
-    completionPolicy?: "preserve_if_unchanged";
-  }): ReplaceStreamResult {
+  function replaceStream(input: SqliteReplaceStreamInput): ReplaceStreamResult {
     if (
       input.sourceCollectedAt !== undefined &&
       !isRfc3339DateTime(input.sourceCollectedAt)
@@ -2262,10 +2265,47 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     deleteConnection,
     ingestBatch,
     getInstanceBinding,
+    listRetainedRecordData: (instance: string, stream: string) => {
+      const prior = db.prepare(`SELECT data FROM pdpp_record_changes
+        WHERE instance = ? AND stream = ? AND record_key = ? AND deleted = 0
+        ORDER BY version DESC LIMIT 1`);
+      const rows = db
+        .prepare(
+          `SELECT record_key, data, emitted_at FROM pdpp_records
+        WHERE instance = ? AND stream = ? ORDER BY record_key`,
+        )
+        .all(instance, stream) as {
+        record_key: string;
+        data: string | null;
+        emitted_at: string;
+      }[];
+      return rows.map((row) => {
+        const data =
+          row.data ??
+          (
+            prior.get(instance, stream, row.record_key) as
+              { data: string } | undefined
+          )?.data;
+        if (!data) throw new Error("Retained record history unavailable");
+        return {
+          data: JSON.parse(data) as Record<string, unknown>,
+          emittedAt: row.emitted_at,
+        };
+      });
+    },
     readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
+    writeTransaction: <T>(write: () => T): T =>
+      db.transaction(write).immediate(),
     resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,
+    replaceStreams: (inputs) =>
+      db.transaction(() => {
+        for (const input of inputs) {
+          if (!replaceStream(input).applied)
+            throw new Error("canonical_batch_rejected");
+        }
+      })(),
     listStreamCompletions,
     completeStreams,
     listArrivalOrder,
