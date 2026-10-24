@@ -392,6 +392,47 @@ it("tracks first observation from replicas and restarts additions coverage on re
   ).toEqual([{ instance: "conn_a", stream: "messages", added: 1 }]);
 });
 
+it("tracks a local resurrection after a replica reset", () => {
+  const d = device();
+  send(d, [upsert(20)]);
+  const reset: ReplicaOperation = {
+    kind: "connection-reset",
+    owner: "owner",
+    sourceId,
+    connectionId: "conn_a",
+    methodId: "collector",
+    generation: 2,
+    previousGeneration: 1,
+    revision: { logical: 30, writerId: "remote", operationId: "reset-2" },
+  };
+  send(d, [reset]);
+  const coverageAfter = d.store.firstAddedCoverage(["conn_a"])[0]!.trackedSince;
+
+  d.store.ingestBatch(
+    [
+      {
+        instance: "conn_a",
+        stream: "messages",
+        key: "a",
+        data: { id: "a", text: "local-after-reset" },
+        emitted_at: at,
+      },
+    ],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "collector", generation: 2 },
+  );
+
+  expect(value(d)?.data.text).toBe("local-after-reset");
+  expect(
+    d.store.listFirstAdded(
+      ["conn_a"],
+      coverageAfter,
+      "2100-01-01T00:00:00.000Z",
+    ),
+  ).toEqual([{ instance: "conn_a", stream: "messages", added: 1 }]);
+});
+
 it("keeps future generations pending until reset evidence and suppresses old generations", () => {
   const d = device();
   const future = { ...upsert(20), generation: 3 };

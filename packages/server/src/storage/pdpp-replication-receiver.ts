@@ -246,10 +246,22 @@ export function createReplicaReceiver(deps: {
           )
           .get(instance) as { reset_generation: number | null } | undefined)
       : undefined;
+    const alreadyTracked =
+      db
+        .prepare(
+          `SELECT 1 FROM pdpp_record_first_added
+           WHERE instance = ? AND stream = ? AND record_key = ?`,
+        )
+        .get(instance, stream, key) !== undefined;
     if (
       data !== null &&
       operation &&
-      (!current || coverage?.reset_generation === operation.generation)
+      store.shouldCountFirstAddition({
+        priorExists: current !== undefined,
+        preTracking: current !== undefined && !alreadyTracked,
+        resetGeneration: coverage?.reset_generation ?? null,
+        writeGeneration: operation.generation,
+      })
     ) {
       db.prepare(
         `INSERT OR IGNORE INTO pdpp_record_first_added

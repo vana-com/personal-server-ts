@@ -52,6 +52,59 @@ describe("sqlite record store", () => {
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
   });
 
+  it.each([
+    {
+      name: "legacy update",
+      priorExists: true,
+      preTracking: true,
+      resetGeneration: null,
+      writeGeneration: 1,
+      expected: false,
+    },
+    {
+      name: "legacy delete then reappear",
+      priorExists: true,
+      preTracking: true,
+      resetGeneration: null,
+      writeGeneration: 1,
+      expected: false,
+    },
+    {
+      name: "genuinely new identity",
+      priorExists: false,
+      preTracking: false,
+      resetGeneration: null,
+      writeGeneration: 1,
+      expected: true,
+    },
+    {
+      name: "tracked delete then reappear",
+      priorExists: true,
+      preTracking: false,
+      resetGeneration: null,
+      writeGeneration: 1,
+      expected: false,
+    },
+    {
+      name: "replica reset then replica upsert",
+      priorExists: true,
+      preTracking: true,
+      resetGeneration: 2,
+      writeGeneration: 2,
+      expected: true,
+    },
+    {
+      name: "replica reset then local upsert",
+      priorExists: true,
+      preTracking: true,
+      resetGeneration: 2,
+      writeGeneration: 2,
+      expected: true,
+    },
+  ])("decides first addition admission for $name", ({ expected, ...input }) => {
+    expect(store.shouldCountFirstAddition(input)).toBe(expected);
+  });
+
   it("keeps first-added time across updates, deletes and reappearance, then resets coverage on erase", () => {
     const instance = "conn_123e4567-e89b-42d3-a456-426614174000";
     const sourceId = "https://registry.pdpp.dev/connectors/spotify";

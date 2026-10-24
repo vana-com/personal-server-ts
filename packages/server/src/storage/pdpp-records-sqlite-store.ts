@@ -91,6 +91,20 @@ export interface PdppInstanceBinding {
   empty?: boolean;
 }
 
+export interface FirstAdditionAdmissionInput {
+  priorExists: boolean;
+  preTracking: boolean;
+  resetGeneration: number | null;
+  writeGeneration: number;
+}
+
+function shouldCountFirstAddition(input: FirstAdditionAdmissionInput): boolean {
+  return (
+    !input.priorExists ||
+    (input.preTracking && input.resetGeneration === input.writeGeneration)
+  );
+}
+
 export interface ClaudeTransition {
   instance: string;
   archiveInstance: string;
@@ -967,6 +981,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
       since: string,
       until: string,
     ): Array<{ instance: string; stream: string; added: number }>;
+    shouldCountFirstAddition(input: FirstAdditionAdmissionInput): boolean;
     countStreamSelection(input: {
       instance: string;
       stream: string;
@@ -1366,7 +1381,29 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     const deleted = data === null;
     const version = latestVersion(instance, stream, recordKey) + 1;
     const writtenAt = nextWriteSeq.get() as { value: number };
-    if (!deleted && version === 1) {
+    const priorExists = version > 1;
+    const alreadyTracked =
+      db
+        .prepare(
+          `SELECT 1 FROM pdpp_record_first_added
+           WHERE instance = ? AND stream = ? AND record_key = ?`,
+        )
+        .get(instance, stream, recordKey) !== undefined;
+    const reset = db
+      .prepare(
+        "SELECT b.generation, c.reset_generation FROM pdpp_instance_binding b LEFT JOIN pdpp_additions_coverage c ON c.instance = b.instance WHERE b.instance = ?",
+      )
+      .get(instance) as
+      { generation: number; reset_generation: number | null } | undefined;
+    if (
+      !deleted &&
+      shouldCountFirstAddition({
+        priorExists,
+        preTracking: priorExists && !alreadyTracked,
+        resetGeneration: reset?.reset_generation ?? null,
+        writeGeneration: reset?.generation ?? 0,
+      })
+    ) {
       db.prepare(
         `INSERT OR IGNORE INTO pdpp_record_first_added
            (instance, stream, record_key, first_added_at, generation)
@@ -3301,6 +3338,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     assessStreamCompletion,
     firstAddedCoverage,
     listFirstAdded,
+    shouldCountFirstAddition,
     completeStreams,
     listArrivalOrder,
     getRecord,
