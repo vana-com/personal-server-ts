@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const snapshot: DeclarationSnapshot = {
-  source_id: "https://registry.pdpp.dev/connectors/spotify",
+  source_id: "https://registry.pdpp.dev/sources/spotify",
   source_kind: "connector",
   version: "2026-08-11",
   digest: "d".repeat(64),

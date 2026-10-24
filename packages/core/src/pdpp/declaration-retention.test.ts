@@ -28,7 +28,7 @@ import {
   type PdppAuthStore,
 } from "./index.js";
 
-const SOURCE_ID = "https://registry.pdpp.dev/connectors/spotify";
+const SOURCE_ID = "https://registry.pdpp.dev/sources/spotify";
 
 function declarationDocument(
   streams: Record<string, unknown>[] = [

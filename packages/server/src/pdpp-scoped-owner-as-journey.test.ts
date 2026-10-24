@@ -25,8 +25,8 @@ import { registerTestConnection } from "./pdpp/test-connections.js";
 const KNOWN_SIG =
   "0xedbb7743cce459345238442dcfb291f234a321d253485eaa58251aa0f28ea8f1410ab988bae2657b689cd24417b41e315efc22ba333024f4a6269c424ded8d361b";
 
-const CLAUDE = "https://registry.pdpp.dev/connectors/claude";
-const OURA = "https://registry.pdpp.dev/connectors/oura";
+const CLAUDE = "https://registry.pdpp.dev/sources/claude";
+const OURA = "https://registry.pdpp.dev/sources/oura";
 const REDIRECT = "https://app.example.com/callback";
 const CLIENT_ID = "sleep_recommendations";
 const VERIFIER = "scoped-owner-verifier-0123456789abcdefghijklmnopqrstuvwxyz";

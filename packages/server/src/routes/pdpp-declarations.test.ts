@@ -25,7 +25,7 @@ import {
 import { pdppDeclarationRoutes } from "./pdpp-declarations.js";
 
 const logger = pino({ level: "silent" });
-const SOURCE_ID = "https://registry.pdpp.dev/connectors/spotify";
+const SOURCE_ID = "https://registry.pdpp.dev/sources/spotify";
 const OPERATOR_TOKEN = "operator-secret";
 
 /** A minimal normative SourceDeclaration this deployment would accept. */
@@ -205,7 +205,7 @@ describe("POST /pdpp/declarations — refusal carries the spec error shape", () 
       declarationDocument({
         source: {
           kind: "connector",
-          id: "https://registry.pdpp.dev/connectors/netflix",
+          id: "https://registry.pdpp.dev/sources/netflix",
         },
       }),
     );

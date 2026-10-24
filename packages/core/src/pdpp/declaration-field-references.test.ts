@@ -22,7 +22,7 @@
 import { describe, expect, it } from "vitest";
 import { parseDeclaration } from "./declaration.js";
 
-const SOURCE_ID = "https://registry.pdpp.dev/connectors/conformance";
+const SOURCE_ID = "https://registry.pdpp.dev/sources/conformance";
 
 /** A normative §5 document over `properties`, with the references overridable. */
 function normativeDocument(overrides: {

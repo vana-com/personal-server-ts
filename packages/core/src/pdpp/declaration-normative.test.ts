@@ -151,7 +151,7 @@ describe("the private shape still parses", () => {
     // fixtures — including every declaration in the current conformance run —
     // must keep working.
     const privateShape = JSON.stringify({
-      source_id: "https://registry.pdpp.dev/connectors/spotify",
+      source_id: "https://registry.pdpp.dev/sources/spotify",
       source_kind: "connector",
       version: "2026-08-11",
       streams: [
@@ -166,7 +166,7 @@ describe("the private shape still parses", () => {
 
     const parsed = parseDeclaration(
       privateShape,
-      "https://registry.pdpp.dev/connectors/spotify",
+      "https://registry.pdpp.dev/sources/spotify",
     );
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;

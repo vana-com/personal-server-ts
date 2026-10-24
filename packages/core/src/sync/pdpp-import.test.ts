@@ -29,7 +29,7 @@ import type { Logger } from "../logger/index.js";
 
 const SCOPE = "instagram.profile";
 const COLLECTED_AT = "2026-09-17T10:00:00.000Z";
-const SOURCE_ID = "https://registry.pdpp.dev/connectors/instagram";
+const SOURCE_ID = "https://registry.pdpp.dev/sources/instagram";
 
 /** A real declaration document, as a deployment would retain it on disk. */
 const DECLARATION_DOCUMENT = JSON.stringify(
@@ -508,7 +508,7 @@ describe("createPdppImporter", () => {
     it("rejects a source with no retained declaration", () => {
       const { importer } = setup();
       const outcome = importer.importEnvelope(
-        envelope({ sourceId: "https://registry.pdpp.dev/connectors/spotify" }),
+        envelope({ sourceId: "https://registry.pdpp.dev/sources/spotify" }),
       );
       expect(outcome).toMatchObject({
         status: "rejected",

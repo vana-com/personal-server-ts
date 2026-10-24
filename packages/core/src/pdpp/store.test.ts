@@ -34,7 +34,7 @@ function grantFixture(overrides: Partial<Grant> = {}): Grant {
     client: { client_id: "client_1" },
     source: {
       kind: "connector",
-      id: "https://registry.pdpp.dev/connectors/spotify",
+      id: "https://registry.pdpp.dev/sources/spotify",
     },
     source_declaration: { version: "2026-08-11" },
     purpose_code: "test",
