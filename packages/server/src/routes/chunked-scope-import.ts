@@ -16,7 +16,12 @@ import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-c
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { cacheRequestBodyBytes } from "@opendatalabs/personal-server-ts-core/auth";
 import { indexDatabase } from "../storage/index-manager.js";
-import { assertLegacyPublicationAllowed } from "../storage/legacy-publication-fence.js";
+import {
+  assertLegacyPublicationAllowed,
+  legacyPublicationGateActive,
+  throwRetainedMismatch,
+} from "../storage/legacy-publication-fence.js";
+import { publishIndexedStage } from "../storage/node-data-storage.js";
 import {
   publishStagedDataFileSync,
   publishStagedDataFile,
@@ -963,8 +968,13 @@ async function finalizeScopeImportAuthorized(
     committedEntry?.scope === scope &&
     committedEntry.collectedAt === metadata.collectedAt
   ) {
-    if (!(await pathExists(finalPath)) && (await pathExists(stagePath))) {
-      await publishStagedDataFile(stagePath, finalPath);
+    if (
+      !(await pathExists(finalPath)) &&
+      (await pathExists(stagePath)) &&
+      !(await publishIndexedStage(deps, stagePath, finalPath))
+    ) {
+      // The held stage is not this version's known identity.
+      throwRetainedMismatch(indexDatabase(deps.indexManager)!, scope);
     }
     if (await pathExists(finalPath)) {
       const receipt = {
@@ -1112,7 +1122,9 @@ async function finalizeScopeImportAuthorized(
     }
     // Publish the complete, fsynced envelope before swapping the SQLite index.
     // Readers continue to resolve the old entry until the new file is ready.
-    const db = indexDatabase(deps.indexManager);
+    const indexDb = indexDatabase(deps.indexManager);
+    const db =
+      indexDb && legacyPublicationGateActive(indexDb) ? indexDb : undefined;
     if (!db) await publishStagedDataFile(stagePath, finalPath);
     let indexed: ReturnType<typeof deps.indexManager.insertIfCurrent>;
     try {

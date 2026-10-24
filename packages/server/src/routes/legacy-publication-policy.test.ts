@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pino from "pino";
@@ -249,6 +249,58 @@ it("stopped gate refuses every legacy HTTP write and cleanup without deleting hi
     bytes,
   );
 });
+
+it.each(["stopped", "quiescing"])(
+  "%s gate refuses an HTTP binary write before effects; a sibling binary write succeeds",
+  async (state) => {
+    const { app, db, index, storage } = fixture();
+    const binary = (scope: string, bytes: number[]) =>
+      app.request(`/v1/data/${scope}`, {
+        method: "POST",
+        headers: {
+          ...auth,
+          "Content-Type": "application/octet-stream",
+          "X-Filename": "photo.bin",
+        },
+        body: new Uint8Array(bytes),
+      });
+    expect((await binary("spotify.profile", [1, 2, 3])).status).toBe(201);
+    const old = index.findLatestByScope("spotify.profile")!;
+    const bytes = await storage.readEnvelopeBytes!(old.scope, old.collectedAt);
+    db.prepare(
+      "INSERT INTO legacy_publication_policy VALUES (?, 'server-1', 'spotify.profile', ?, 2, 1, NULL)",
+    ).run(owner.address.toLowerCase(), state);
+    if (state === "stopped")
+      db.prepare(
+        "INSERT INTO legacy_publication_retained_versions SELECT id FROM data_files",
+      ).run();
+    const dir = join(db.name, "..", "data", "spotify", "profile");
+    const files = readdirSync(dir).sort();
+    const rows = () => ({
+      versions: db.prepare("SELECT * FROM data_files ORDER BY id").all(),
+      retained: db
+        .prepare("SELECT * FROM legacy_publication_retained_versions")
+        .all(),
+      revisions: db.prepare("SELECT * FROM scope_revisions").all(),
+    });
+    const before = rows();
+
+    const refused = await binary("spotify.profile", [9, 9, 9]);
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({
+      error: { errorCode: "legacy_scope_retired" },
+    });
+    expect(readdirSync(dir).sort()).toEqual(files);
+    expect(rows()).toEqual(before);
+    expect(
+      await storage.readEnvelopeBytes!(old.scope, old.collectedAt),
+    ).toEqual(bytes);
+
+    expect((await binary("spotify.playlists", [4, 5])).status).toBe(201);
+    expect(index.countByScope("spotify.playlists")).toBe(1);
+    expect(index.countByScope("spotify.profile")).toBe(1);
+  },
+);
 
 it("fences alternate storage and remote upload/cleanup paths before effects", async () => {
   const { db, storage, index } = fixture();

@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { initializeDatabase } from "./index-schema.js";
+import { CONVERGED_INDEX_SCHEMA_VERSION } from "./schema-versions.js";
 import { createIndexManager } from "./index-manager.js";
 import {
   createNodeDataStorage,
@@ -184,14 +185,18 @@ it("verifies lazy NULL generation fill while retaining immutable identity and pe
   expect(f.index.countByScope(entry.scope)).toBe(1);
 });
 
-it("keeps never-enrolled schema compatible and detached stop fails with unavailable", async () => {
+it("keeps the converged stamp for a never-enrolled root and detached stop fails with unavailable", async () => {
   const f = fixture();
-  expect(f.db.pragma("user_version", { simple: true })).toBe(16);
+  expect(f.db.pragma("user_version", { simple: true })).toBe(
+    CONVERGED_INDEX_SCHEMA_VERSION,
+  );
   const { stop } = f.policy;
   await expect(
     stop("spotify.profile", { ownerOptIn: true, expectedEpoch: 0 }),
   ).rejects.toMatchObject({ errorCode: "LEGACY_SHUTDOWN_UNAVAILABLE" });
-  expect(f.db.pragma("user_version", { simple: true })).toBe(16);
+  expect(f.db.pragma("user_version", { simple: true })).toBe(
+    CONVERGED_INDEX_SCHEMA_VERSION,
+  );
 });
 
 it("holds fenced live heads and tombstones durably without stalling unrelated download pages", async () => {

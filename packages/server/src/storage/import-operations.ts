@@ -1,6 +1,7 @@
 import {
   assertLegacyPublicationAllowed,
   assertLegacyHistoryMutable,
+  assertRetainedVersionRepair,
   holdLegacyPublication,
 } from "./legacy-publication-fence.js";
 import {
@@ -82,6 +83,14 @@ export function createImportOperations(
   options: HierarchyManagerOptions,
 ) {
   const immediate = <T>(run: () => T): T => db.transaction(run).immediate();
+  // A restoration authorized for this exact operation, under a restoring policy.
+  const restoreAuthorized = db.prepare(`
+    SELECT 1 FROM legacy_publication_restore_authorization a
+    JOIN legacy_publication_policy p ON p.scope=a.scope AND p.owner=a.owner
+      AND p.server_generation=a.server_generation AND p.epoch=a.epoch
+      AND p.state='restoring'
+    WHERE a.scope=@scope AND a.owner=@owner AND a.operation=@operation
+      AND a.authority=@authority AND a.body_sha256=@body_sha256`);
   const lookup = db.prepare(
     `SELECT * FROM owner_import_operations WHERE ${keyWhere}`,
   );
@@ -183,7 +192,12 @@ export function createImportOperations(
           path: row.path,
           pdppOrigin: hasPdppOrigin(envelope),
           generation: envelopeGeneration(envelope),
-          producer: producerOf(envelope),
+          // Only a restored canonical head records its projector producer, so
+          // it stays publishable under canonical authority. Other imports keep
+          // the producer-less rows they always had.
+          ...(restoreAuthorized.get(row)
+            ? { producer: producerOf(envelope) }
+            : {}),
           scope: row.scope,
           collectedAt: row.collected_at,
           sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
@@ -218,32 +232,22 @@ export function createImportOperations(
       ).run({ ...row, receipt: JSON.stringify(receipt) });
       // Protect every restored version at acceptance, including a lost remote
       // acknowledgement or a later restoration of a newer canonical revision.
-      db.prepare(
-        `
-        INSERT OR IGNORE INTO legacy_publication_retained_versions(version_id)
-        SELECT @version_id WHERE EXISTS (
-          SELECT 1 FROM legacy_publication_restore_authorization a
-          JOIN legacy_publication_policy p ON p.scope=a.scope AND p.owner=a.owner
-            AND p.server_generation=a.server_generation AND p.epoch=a.epoch
-            AND p.state='restoring'
+      if (restoreAuthorized.get(row)) {
+        db.prepare(
+          "INSERT OR IGNORE INTO legacy_publication_retained_versions(version_id) VALUES (?)",
+        ).run(entry.id);
+        db.prepare(
+          `INSERT OR IGNORE INTO legacy_publication_restore_versions
+          SELECT @version_id, a.owner, a.server_generation, a.epoch, a.operation, @data_hash, 'current'
+          FROM legacy_publication_restore_authorization a
           WHERE a.scope=@scope AND a.owner=@owner AND a.operation=@operation
-            AND a.authority=@authority AND a.body_sha256=@body_sha256
-        )
-      `,
-      ).run({ ...row, version_id: entry.id });
-      db.prepare(
-        `INSERT OR IGNORE INTO legacy_publication_restore_versions
-        SELECT @version_id, a.owner, a.server_generation, a.epoch, a.operation, @data_hash, 'current'
-        FROM legacy_publication_restore_authorization a
-        JOIN legacy_publication_policy p ON p.scope=a.scope AND p.owner=a.owner
-          AND p.server_generation=a.server_generation AND p.epoch=a.epoch AND p.state='restoring'
-        WHERE a.scope=@scope AND a.owner=@owner AND a.operation=@operation
-          AND a.authority=@authority AND a.body_sha256=@body_sha256`,
-      ).run({
-        ...row,
-        version_id: entry.id,
-        data_hash: keccak256(stringToHex(JSON.stringify(envelope))),
-      });
+            AND a.authority=@authority AND a.body_sha256=@body_sha256`,
+        ).run({
+          ...row,
+          version_id: entry.id,
+          data_hash: keccak256(stringToHex(JSON.stringify(envelope))),
+        });
+      }
     }
   }
 
@@ -375,27 +379,23 @@ export function createImportOperations(
             envelope.collectedAt,
           ),
         );
-        const known =
-          command.kind === "replica" ? index.findByPath(path) : undefined;
+        // A retained version keeps its bytes and replica identity in every
+        // policy state; a mismatch is refused before any effect.
         const repairingRetained =
-          known?.generation === envelopeGeneration(envelope) &&
           command.kind === "replica" &&
-          known.version === command.metadata.version &&
-          known.dataPointId === command.metadata.dataPointId &&
-          !!db
-            .prepare(
-              "SELECT 1 FROM legacy_publication_retained_versions WHERE version_id=?",
-            )
-            .get(known.id);
+          assertRetainedVersionRepair(
+            db,
+            index.findByPath(path),
+            envelope,
+            command.metadata,
+          );
         if (!repairingRetained)
           assertLegacyPublicationAllowed(db, envelope.scope);
         const bytes = Buffer.from(JSON.stringify(envelope, null, 2));
         // Synchronous with the serialization above: these describe the bytes.
-        const producer = producerOf(envelope);
         const identity = {
           pdppOrigin: hasPdppOrigin(envelope),
           generation: envelopeGeneration(envelope),
-          ...(producer ? { producer } : {}),
         };
         let writeResult;
         try {

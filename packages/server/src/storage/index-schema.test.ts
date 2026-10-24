@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
 import { initializeDatabase } from "./index-schema.js";
+import { CONVERGED_INDEX_SCHEMA_VERSION } from "./schema-versions.js";
 
 function createHistoricalIndexBase(db: Database.Database, version: number) {
   db.exec(`
@@ -96,7 +97,9 @@ describe("initializeDatabase", () => {
       canary.close();
 
       const db = initializeDatabase(path);
-      expect(db.pragma("user_version", { simple: true })).toBe(16);
+      expect(db.pragma("user_version", { simple: true })).toBe(
+        CONVERGED_INDEX_SCHEMA_VERSION,
+      );
       expect(
         db
           .prepare(
@@ -193,7 +196,9 @@ describe("initializeDatabase", () => {
 
       const db = initializeDatabase(path);
       // The v14 ledger migrates through the linear index schema sequence.
-      expect(db.pragma("user_version", { simple: true })).toBe(16);
+      expect(db.pragma("user_version", { simple: true })).toBe(
+        CONVERGED_INDEX_SCHEMA_VERSION,
+      );
       expect(
         db.prepare("SELECT instance, method FROM legacy_scope_takeovers").all(),
       ).toEqual([{ instance: "oura:owner", method: "" }]);
@@ -291,7 +296,9 @@ describe("initializeDatabase", () => {
         reason_counts_json: "{}",
         applied_exceptions_json: "[]",
       });
-      expect(migrated.pragma("user_version", { simple: true })).toBe(16);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(
+        CONVERGED_INDEX_SCHEMA_VERSION,
+      );
       migrated.close();
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -387,7 +394,9 @@ describe("initializeDatabase", () => {
       ];
 
       const upgraded = initializeDatabase(path);
-      expect(upgraded.pragma("user_version", { simple: true })).toBe(16);
+      expect(upgraded.pragma("user_version", { simple: true })).toBe(
+        CONVERGED_INDEX_SCHEMA_VERSION,
+      );
       expect(
         upgraded
           .prepare("SELECT * FROM legacy_scope_takeovers ORDER BY scope")
@@ -403,7 +412,9 @@ describe("initializeDatabase", () => {
       upgraded.close();
 
       const reopened = initializeDatabase(path);
-      expect(reopened.pragma("user_version", { simple: true })).toBe(16);
+      expect(reopened.pragma("user_version", { simple: true })).toBe(
+        CONVERGED_INDEX_SCHEMA_VERSION,
+      );
       expect(
         reopened
           .prepare("SELECT * FROM legacy_scope_takeovers ORDER BY scope")
@@ -465,7 +476,9 @@ describe("initializeDatabase", () => {
         ],
       };
       const upgraded = initializeDatabase(path);
-      expect(upgraded.pragma("user_version", { simple: true })).toBe(16);
+      expect(upgraded.pragma("user_version", { simple: true })).toBe(
+        CONVERGED_INDEX_SCHEMA_VERSION,
+      );
       expect(
         upgraded
           .prepare(
@@ -516,7 +529,9 @@ describe("initializeDatabase", () => {
       crashPoint.close();
 
       const recovered = initializeDatabase(path);
-      expect(recovered.pragma("user_version", { simple: true })).toBe(16);
+      expect(recovered.pragma("user_version", { simple: true })).toBe(
+        CONVERGED_INDEX_SCHEMA_VERSION,
+      );
       expect(
         recovered
           .prepare(
@@ -614,7 +629,7 @@ describe("initializeDatabase", () => {
       .get("instagram/profile.json") as
       { path: string; scope: string; size_bytes: number } | undefined;
 
-    expect(version).toBe(16);
+    expect(version).toBe(CONVERGED_INDEX_SCHEMA_VERSION);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -659,7 +674,9 @@ describe("initializeDatabase", () => {
       v15.close();
 
       const db = initializeDatabase(dbPath);
-      expect(db.pragma("user_version", { simple: true })).toBe(16);
+      expect(db.pragma("user_version", { simple: true })).toBe(
+        CONVERGED_INDEX_SCHEMA_VERSION,
+      );
       expect(columns(db)).toContain("generation");
       expect(
         db
@@ -721,7 +738,7 @@ describe("initializeDatabase", () => {
         }
       | undefined;
 
-    expect(version).toBe(16);
+    expect(version).toBe(CONVERGED_INDEX_SCHEMA_VERSION);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
@@ -770,7 +787,9 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(16);
+    expect(db.pragma("user_version", { simple: true })).toBe(
+      CONVERGED_INDEX_SCHEMA_VERSION,
+    );
     const row = db
       .prepare(
         "SELECT path, schema_id, version, cas_revision, data_point_id FROM data_files WHERE path = ?",
@@ -830,7 +849,9 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(16);
+    expect(db.pragma("user_version", { simple: true })).toBe(
+      CONVERGED_INDEX_SCHEMA_VERSION,
+    );
     const row = db
       .prepare(
         "SELECT path, version, cas_revision, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",
@@ -873,7 +894,9 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(16);
+    expect(db.pragma("user_version", { simple: true })).toBe(
+      CONVERGED_INDEX_SCHEMA_VERSION,
+    );
     expect(
       db
         .prepare(

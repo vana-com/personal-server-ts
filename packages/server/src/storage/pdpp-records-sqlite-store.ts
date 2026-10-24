@@ -1,4 +1,5 @@
 import { canonicalRetentionConflict } from "./legacy-publication-fence.js";
+import { assertSupportedSchemaVersions } from "./schema-versions.js";
 import { RECEIVER_MIGRATION } from "./pdpp-replication-receiver.js";
 import {
   parseTime,
@@ -539,6 +540,7 @@ INSERT OR IGNORE INTO pdpp_additions_coverage (instance, tracked_since)
   // must remain excluded from first-added metrics when a replica updates them.
   `-- reset_generation is added idempotently by migrateAdditionsResetGeneration.`,
 ];
+export const PDPP_RECORD_SCHEMA_VERSION = MIGRATIONS.length;
 
 function migrateAdditionsResetGeneration(db: Database): void {
   const columns = db
@@ -1068,6 +1070,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
      */
     listArrivalOrder(instance: string, stream: string): string[];
   } {
+  // Both counters before any change, including the WAL switch below.
+  assertSupportedSchemaVersions(db, PDPP_RECORD_SCHEMA_VERSION);
   // Insert statements call it, so even a readonly handle must register it
   // before they are prepared.
   registerTimeKey(db);

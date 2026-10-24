@@ -1,13 +1,58 @@
 # Legacy write shutdown contract
 
-`legacyWriteShutdownEnabled` defaults to `false`. The Node runtime exposes the
-owner policy API but supplies **no shutdown or restore qualification adapters**.
-Enabling the flag does not make a scope eligible. Missing dependencies return
+`legacyWriteShutdownEnabled` defaults to `false`. The Node runtime supplies
+**no shutdown or restore qualification adapters**. Enabling the flag does not
+make a scope eligible. Missing dependencies return
 `503 LEGACY_SHUTDOWN_UNAVAILABLE`; they never become an empty grant proof.
+
+## When the gate is active
+
+The gate is active for an index handle when the host opts in
+(`optInLegacyPublicationGate`, which the Node bootstrap calls when the flag is
+true) or when the root has durable enrollment history: any row in
+`legacy_publication_policy` or `legacy_publication_transitions`, in any state,
+including `mirroring` after rollback. The additive gate tables alone are not
+enrollment. `legacyPublicationGateActive` in
+`packages/server/src/storage/legacy-publication-fence.ts` owns this rule.
+
+On a never-enrolled root with the flag off, behavior equals the pre-gate
+runtime (ddd2b8d1). Bootstrap installs the raw gateway, signer, remote storage
+and deletion ports, no download hold and no owner policy API. Storage keeps its
+earlier write, commit, block-sidecar, chunk-finalize and stage-recovery paths
+and lock modes. No issuance journal row is written. A direct or recovered
+import records no producer unless it is an authorized restoration, so
+history-only and upload-queue predicates select the same rows. SQLite
+`recursive_triggers` stays off. Direct storage (`createNodeDataStorage`
+without the host opt-in) is off in the same way.
+
+Enrollment needs the flag, so a never-enrolled process with the flag off cannot
+become enrolled while it runs. An enrolled root stays gated with the flag off:
+its fences, retention, holds and rollback route remain. Disabling the flag
+stops only new enrollment.
+
+`scripts/legacy-gate-differential/compare.mjs` proves the off equality by
+running the same operations against a pre-gate tree and a candidate tree. These
+operations are HTTP JSON, binary and chunked writes, a durable owner import,
+grant signing and registration, encrypted upload and registration, direct
+appends under canonical authority, boot recovery of a prepared import and of a
+leftover stage, and a final sync. A candidate run with a failing gate journal is
+compared too. Each run must pass positive checks (successful statuses, signed
+grant and data-point registrations, encrypted uploads, recovery), so two equal
+failures prove nothing. Only the authorized differences are removed: the
+converged stamp (16 to 17), empty gate tables and the default-off config key.
+Gate rows, producers, queues, uploads, signatures and registrations are
+compared. `--expect-different` runs a negative control; the first gate build
+(fca7e255) fails the comparison. Build both trees first:
+
+```sh
+node scripts/legacy-gate-differential/compare.mjs \
+  --baseline <pre-gate tree> --candidate <tree> --work <scratch dir>
+```
 
 ## Owner API
 
-These routes use the existing owner authentication, CORS and JSON error handler:
+These routes are mounted only while the gate is active. They use the existing
+owner authentication, CORS and JSON error handler:
 
 - `GET /v1/legacy-publication-policy/:scope` returns `policy`, `capabilities`
   and `canonical`, the current native canonical assessment (see below), or
@@ -203,10 +248,26 @@ any retained version.
 
 A retained NULL generation can be filled only by storage after verifying the
 published envelope twice inside the writer transaction. Direct generation edits
-and later changes remain forbidden. A lost legacy file can be repaired only at
-its existing retained path with the known full-envelope generation; NULL or
-mismatched identity still blocks repair. Replica repair also requires the same
-registered version and data-point identity. No new version is admitted by repair.
+and later changes remain forbidden. A retained version is immutable in every
+policy state, including mirroring after rollback and with the flag disabled.
+A lost legacy file can be repaired only at its existing retained path with the
+known full-envelope generation, scope and timestamp. Replica repair also needs
+the same registered version and data-point id. A NULL or mismatched identity
+is refused before any effect (`409 legacy_history_retained`, or
+`legacy_scope_retired` while the scope is fenced), and the index row is not
+changed. No new version is admitted by repair.
+
+A leftover `.pending` stage for an indexed version whose file is missing is
+published only through `publishIndexedStage` in
+`packages/server/src/storage/node-data-storage.ts`, at boot and on chunked
+finalize replay. While the gate is active, it reads the stage bytes, checks
+them against the row's exact known identity and publishes those checked bytes
+in one `BEGIN IMMEDIATE` transaction. It publishes for a retained version in any
+state, or for an unretained version in an unfenced scope. Any other stage,
+including a NULL generation, is held as `recovery-stage` with its bytes and
+stays in place. Boot continues; a replay returns `409`. Chunked finalize does
+not index a generation, so a retained chunked version can be repaired from a
+stage only after a read has filled its generation.
 
 Boot recovery holds fenced finalized orphans and prepared imports without
 publishing or discarding their bytes. Sync holds fenced remote heads (ciphertext
@@ -328,12 +389,29 @@ coordination, external issuers, external canonical readers and app-owner accepta
 remain unqualified. The nine catalog scope sets in tests come from the supplied
 design snapshot; those tests make no external UI or canonical authorization claim.
 
-Never-enrolled roots keep schema version 16 and the existing downgrade behavior;
-additive gate tables alone do not raise the compatibility stamp. The first durable
-gate enrollment raises it to 17 in the same transaction as quiescing, including
-when later qualification fails. It stays 17 after rollback. Version 17 prevents
-starting an older supported runtime against an enrolled root. Stop old processes
-before enrollment; a schema stamp cannot evict an already
+`packages/server/src/storage/schema-versions.ts` owns the shared, monotonic
+`user_version` stamps. Version 17 is the converged runtime (#475), and version
+18 is a root with durable gate enrollment history. Both openers
+(`initializeDatabase` and `createSqliteRecordStore`) read both counters before
+any change, including the WAL switch. A newer index or PDPP stamp is refused
+and the database and sidecars stay unchanged. Every never-enrolled root,
+including a #475 root, gets the converged stamp 17 whether or not gate tables
+exist. The first durable enrollment raises the stamp to 18 in the same
+transaction as quiescing, including when later qualification fails. It stays
+18 after rollback. The first gate build (fca7e255) stamped enrolled roots 17.
+On open, any policy or transition row moves such a root to 18 in one
+transaction, and no history row changes.
+
+`scripts/legacy-gate-differential/schema-crossline.mjs` checks these rules with
+real builds of each line. Each root holds a seeded legacy version, and an
+enrolled root also holds its retained identity. Every successful open must keep
+both unchanged. Older runtimes refuse these roots.
+The conformance line (ddd2b8d1) shares PDPP 25, so its legacy counter is its
+only guard. It refuses 17 and 18, but only after its own WAL switch, because it
+predates the preflight. The convergence line (#475) refuses through its
+preflight with no change: PDPP 25 is above its 16, and 18 is above its 17. So
+the gate stamp is not #475's only guard. Stop old processes before enrollment;
+a schema stamp cannot evict an already
 running binary or fence code writing directly to the filesystem. Back up the
 whole root, database/WAL, policy/receipt tables and retained data together. Never
 discard policy tables to rebuild the index or downgrade. Cross-server policy

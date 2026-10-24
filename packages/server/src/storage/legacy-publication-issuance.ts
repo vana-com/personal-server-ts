@@ -12,6 +12,7 @@ import {
   assertLegacyPublicationAllowed,
   assertLegacyHistoryMutable,
   legacyPublicationFenced,
+  legacyPublicationGateActive,
 } from "./legacy-publication-fence.js";
 import { keccak256, stringToHex } from "viem";
 import { envelopeGeneration } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -182,6 +183,8 @@ export function withLegacySignerFence(
         return async (
           message: Parameters<ServerSigner["signGrantRegistration"]>[0],
         ) => {
+          if (!legacyPublicationGateActive(db))
+            return target.signGrantRegistration(message);
           recordLegacyIssuanceIntent(
             db,
             message.grantorAddress,
@@ -193,6 +196,8 @@ export function withLegacySignerFence(
         };
       if (property === "signAddData")
         return async (message: Parameters<ServerSigner["signAddData"]>[0]) => {
+          if (!legacyPublicationGateActive(db))
+            return target.signAddData(message);
           if (isTombstoneHashes(message.dataHash, message.metadataHash))
             assertLegacyHistoryMutable(db, message.scope);
           recordLegacyIssuanceIntent(
@@ -249,6 +254,8 @@ export function withLegacyGatewayFence(
     get(target, property) {
       if (property === "createGrant")
         return async (message: Parameters<GatewayClient["createGrant"]>[0]) => {
+          if (!legacyPublicationGateActive(db))
+            return target.createGrant(message);
           recordLegacyIssuanceIntent(
             db,
             message.grantorAddress,
@@ -262,6 +269,8 @@ export function withLegacyGatewayFence(
         return async (
           message: Parameters<GatewayClient["registerDataPoint"]>[0],
         ) => {
+          if (!legacyPublicationGateActive(db))
+            return target.registerDataPoint(message);
           if (isTombstoneHashes(message.dataHash, message.metadataHash))
             assertLegacyHistoryMutable(db, message.scope);
           recordLegacyIssuanceIntent(
@@ -295,6 +304,8 @@ export function withLegacyStorageFence(
     get(target, property) {
       if (property === "upload")
         return async (key: string, bytes: Uint8Array) => {
+          if (!legacyPublicationGateActive(db))
+            return target.upload(key, bytes);
           const scope = key.split("/", 1)[0];
           const ciphertextSha256 = createHash("sha256")
             .update(bytes)
@@ -317,6 +328,7 @@ export function withLegacyStorageFence(
       if (property === "download")
         return async (url: string) => {
           const bytes = await target.download(url);
+          if (!legacyPublicationGateActive(db)) return bytes;
           // A retry may encounter ciphertext reserved before an uncertain remote
           // registration. Re-verify that occupant through the same exact permit.
           const active = db
@@ -351,6 +363,7 @@ export function withLegacyDeletionFence(
   port: DeleteDataPort,
 ): DeleteDataPort {
   const check = (scope: string) => {
+    if (!legacyPublicationGateActive(db)) return;
     assertLegacyPublicationAllowed(db, scope);
     assertLegacyHistoryMutable(db, scope);
   };

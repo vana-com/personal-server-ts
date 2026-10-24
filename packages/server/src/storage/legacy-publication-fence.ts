@@ -16,7 +16,45 @@ import {
 import { classifySyncFailure } from "@opendatalabs/personal-server-ts-core/sync";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
+import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
+
+const optedIn = new WeakSet<Database.Database>();
+
+/** Retention triggers need SQLite REPLACE deletes to fire them. A never-enrolled
+ * root keeps the connection default, so its existing triggers behave as before.
+ */
+export function armLegacyPublicationGate(db: Database.Database): void {
+  db.pragma("recursive_triggers = ON");
+}
+
+/** The host's explicit `legacyWriteShutdownEnabled` opt-in for this handle.
+ * Direct storage stays off unless the host opts in or the root is enrolled.
+ */
+export function optInLegacyPublicationGate(db: Database.Database): void {
+  optedIn.add(db);
+  armLegacyPublicationGate(db);
+}
+
+/** Durable enrollment history: a policy or transition row in any state,
+ * including mirroring after rollback. Gate tables alone are not enrollment.
+ */
+export function legacyPublicationEnrolled(db: Database.Database): boolean {
+  return ["legacy_publication_policy", "legacy_publication_transitions"].some(
+    (table) =>
+      !!db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+        .get(table) && !!db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get(),
+  );
+}
+
+/** Whether gate effects apply. Off, storage and issuance behave as before the
+ * gate: no journal writes, producer changes or barrier transactions. Enrolled
+ * roots keep their fences and retention even after the flag is disabled.
+ */
+export function legacyPublicationGateActive(db: Database.Database): boolean {
+  return optedIn.has(db) || legacyPublicationEnrolled(db);
+}
 
 export function initializeLegacyPublicationPolicy(db: Database.Database): void {
   db.transaction(() => {
@@ -135,6 +173,81 @@ export function assertLegacyPublicationAllowed(
     );
 }
 
+/** Whether bytes carry an indexed version's exact known identity: its
+ * generation, scope and timestamp, and for a replica its registered version
+ * and data point. A NULL generation is unknown and never matches.
+ */
+export function exactVersionIdentity(
+  entry: IndexEntry,
+  envelope: { scope: string; collectedAt: string } | undefined,
+  replica?: { version: number; dataPointId: string | null },
+): boolean {
+  return (
+    !!envelope &&
+    !!entry.generation &&
+    entry.scope === envelope.scope &&
+    entry.collectedAt === envelope.collectedAt &&
+    entry.generation === envelopeGeneration(envelope) &&
+    (!replica ||
+      (replica.version === entry.version &&
+        replica.dataPointId === entry.dataPointId))
+  );
+}
+
+export function isRetainedVersion(
+  db: Database.Database,
+  versionId: number,
+): boolean {
+  return !!db
+    .prepare(
+      "SELECT 1 FROM legacy_publication_retained_versions WHERE version_id=?",
+    )
+    .get(versionId);
+}
+
+/** Identity of a write at an indexed path. A retained version is immutable in
+ * every policy state, including mirroring after rollback: only its exact known
+ * identity may repair a lost file.
+ */
+export function retainedVersionIdentity(
+  db: Database.Database,
+  entry: IndexEntry | undefined,
+  envelope: { scope: string; collectedAt: string } | undefined,
+  replica?: { version: number; dataPointId: string | null },
+): "unretained" | "exact" | "mismatch" {
+  if (!entry || !isRetainedVersion(db, entry.id)) return "unretained";
+  return exactVersionIdentity(entry, envelope, replica) ? "exact" : "mismatch";
+}
+
+/** Refuse a write that does not match a retained version, before any effect.
+ * Returns true for an exact repair, which bypasses the publication fence.
+ */
+export function assertRetainedVersionRepair(
+  db: Database.Database,
+  entry: IndexEntry | undefined,
+  envelope: { scope: string; collectedAt: string },
+  replica?: { version: number; dataPointId: string | null },
+): boolean {
+  const identity = retainedVersionIdentity(db, entry, envelope, replica);
+  if (identity === "exact") return true;
+  if (identity === "mismatch") throwRetainedMismatch(db, entry!.scope);
+  return false;
+}
+
+export function throwRetainedMismatch(
+  db: Database.Database,
+  scope: string,
+): never {
+  // A fenced scope keeps its retired refusal; otherwise history wins.
+  assertLegacyPublicationAllowed(db, scope);
+  throw new ProtocolError(
+    409,
+    "legacy_history_retained",
+    "A retained legacy version can be repaired only with its exact known identity",
+    { scope },
+  );
+}
+
 /** Local deletion/drop guard. A fenced scope refuses every deletion, retained
  * or not. Otherwise only retained versions are protected: scope-wide for a
  * scope deletion, or the one targeted version for individual cleanup.
@@ -175,6 +288,7 @@ export function retainCanonicalInputs(
   db: Database.Database,
   inputs: { instance: string; stream: string; generation: number }[],
 ): void {
+  armLegacyPublicationGate(db);
   db.exec(`CREATE TABLE IF NOT EXISTS legacy_publication_canonical_retention (
     instance TEXT NOT NULL, stream TEXT NOT NULL, generation INTEGER NOT NULL,
     PRIMARY KEY(instance, stream, generation))`);

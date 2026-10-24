@@ -1,8 +1,12 @@
 import {
   assertLegacyPublicationAllowed,
   assertLegacyHistoryMutable,
+  assertRetainedVersionRepair,
   legacyPublicationFenced,
+  legacyPublicationGateActive,
   holdLegacyPublication,
+  exactVersionIdentity,
+  isRetainedVersion,
 } from "./legacy-publication-fence.js";
 import {
   hasPdppOrigin,
@@ -28,9 +32,18 @@ import {
   publishStagedDataFile,
   publishStagedDataFileSync,
 } from "./hierarchy.js";
-import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { basename, join, relative } from "node:path";
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
 import {
@@ -53,6 +66,81 @@ import { createImportOperations } from "./import-operations.js";
 export interface NodeDataStorageDeps {
   indexManager: IndexManager;
   hierarchyOptions: HierarchyManagerOptions;
+}
+
+/**
+ * Publish a leftover stage for an indexed version whose final file is missing.
+ * Off the gate this is the ordinary publication. Under the gate the stage
+ * bytes are read, checked and linked in one writer transaction: only the
+ * row's exact known identity publishes, for a retained version in any state
+ * or an unretained one in an unfenced scope. Any other stage is held with its
+ * bytes, left in place and not published. Returns false when not published.
+ */
+export async function publishIndexedStage(
+  deps: NodeDataStorageDeps,
+  stagePath: string,
+  finalPath: string,
+): Promise<boolean> {
+  const db = indexDatabase(deps.indexManager);
+  if (!db || !legacyPublicationGateActive(db)) {
+    await publishStagedDataFile(stagePath, finalPath);
+    return true;
+  }
+  const dataDir = deps.hierarchyOptions.dataDir;
+  const relativePath = relative(dataDir, finalPath);
+  return db
+    .transaction((): boolean => {
+      const entry = deps.indexManager.findByPath(relativePath);
+      if (!entry) return false;
+      const bytes = readFileSync(stagePath);
+      let envelope: DataFileEnvelope | undefined;
+      try {
+        const parsed = JSON.parse(bytes.toString("utf8")) as DataFileEnvelope;
+        if (
+          buildDataFilePath(dataDir, parsed.scope, parsed.collectedAt) ===
+          finalPath
+        )
+          envelope = parsed;
+      } catch {
+        // Unreadable bytes have unknown identity.
+      }
+      if (
+        exactVersionIdentity(entry, envelope) &&
+        (isRetainedVersion(db, entry.id) ||
+          !legacyPublicationFenced(db, entry.scope))
+      ) {
+        // Publish exactly the checked bytes, never the stage path again.
+        const verified = `${stagePath}.${randomUUID()}`;
+        const fd = openSync(verified, "wx");
+        try {
+          writeFileSync(fd, bytes);
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        let published = false;
+        try {
+          publishStagedDataFileSync(verified, finalPath);
+          published = true;
+        } catch {
+          // A file that appeared at the final path is not replaced; hold.
+          rmSync(verified, { force: true });
+        }
+        if (published) {
+          unlinkSync(stagePath);
+          return true;
+        }
+      }
+      holdLegacyPublication(
+        db,
+        entry.scope,
+        "recovery-stage",
+        { path: relativePath, stage: basename(stagePath) },
+        bytes,
+      );
+      return false;
+    })
+    .immediate();
 }
 
 /** Finish committed stages and discard stages that lost their index race. */
@@ -86,7 +174,7 @@ export async function recoverStagedDataFiles(
           await unlink(path);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          await publishStagedDataFile(path, finalPath);
+          await publishIndexedStage(deps, path, finalPath);
         }
       }
     }
@@ -277,16 +365,15 @@ export function createNodeDataStorage(
       // Publication refuses different bytes at an existing file. An index row
       // whose file was lost still names its version: new bytes may restore
       // it only with the same provenance the row already records.
-      const indexed = deps.indexManager.findByPath(
-        relative(
+      const relativePath = relative(
+        deps.hierarchyOptions.dataDir,
+        buildDataFilePath(
           deps.hierarchyOptions.dataDir,
-          buildDataFilePath(
-            deps.hierarchyOptions.dataDir,
-            envelope.scope,
-            envelope.collectedAt,
-          ),
+          envelope.scope,
+          envelope.collectedAt,
         ),
       );
+      const indexed = deps.indexManager.findByPath(relativePath);
       if (
         indexed?.pdppOrigin !== undefined &&
         indexed.pdppOrigin !== hasPdppOrigin(envelope)
@@ -297,26 +384,25 @@ export function createNodeDataStorage(
           ),
         );
       }
-      if (db) {
+      if (db && legacyPublicationGateActive(db)) {
+        // A retained version is immutable in every state; refuse before
+        // staging and again at the writer barrier.
+        const admit = () => {
+          if (
+            !assertRetainedVersionRepair(
+              db,
+              deps.indexManager.findByPath(relativePath),
+              envelope,
+            )
+          )
+            assertLegacyPublicationAllowed(db, envelope.scope);
+        };
+        admit();
         const staged = await stageDataFile(deps.hierarchyOptions, envelope);
         try {
           return db
             .transaction(() => {
-              const current = deps.indexManager.findByPath(staged.relativePath);
-              const retained =
-                current?.generation &&
-                db
-                  .prepare(
-                    "SELECT 1 FROM legacy_publication_retained_versions WHERE version_id=?",
-                  )
-                  .get(current.id);
-              if (!(
-                retained &&
-                current.scope === envelope.scope &&
-                current.collectedAt === envelope.collectedAt &&
-                current.generation === envelopeGeneration(envelope)
-              ))
-                assertLegacyPublicationAllowed(db, envelope.scope);
+              admit();
               publishStagedDataFileSync(staged.stagePath, staged.finalPath);
               return {
                 path: staged.finalPath,
@@ -334,6 +420,7 @@ export function createNodeDataStorage(
       return writeDataFile(deps.hierarchyOptions, envelope);
     },
     async commitEnvelope(envelope, entry, precondition) {
+      const gated = !!db && legacyPublicationGateActive(db);
       const staged = await stageDataFile(deps.hierarchyOptions, envelope);
       let indexed = false;
       try {
@@ -341,7 +428,7 @@ export function createNodeDataStorage(
         // and its revision would otherwise describe bytes that are not there.
         await assertPublishable(staged.stagePath, staged.finalPath);
         const commit = () => {
-          if (db) assertLegacyPublicationAllowed(db, envelope.scope);
+          if (gated) assertLegacyPublicationAllowed(db!, envelope.scope);
           const result = deps.indexManager.insertIfCurrent(
             {
               ...entry,
@@ -351,16 +438,16 @@ export function createNodeDataStorage(
             },
             precondition,
           );
-          if (result.ok && db)
+          if (result.ok && gated)
             publishStagedDataFileSync(staged.stagePath, staged.finalPath);
           return result;
         };
-        const result = db ? db.transaction(commit).immediate() : commit();
+        const result = gated ? db!.transaction(commit).immediate() : commit();
         if (!result.ok) {
           return result;
         }
         indexed = true;
-        if (!db)
+        if (!gated)
           await publishStagedDataFile(staged.stagePath, staged.finalPath);
         return {
           ok: true as const,
@@ -385,7 +472,7 @@ export function createNodeDataStorage(
         collectedAt,
         manifest,
         blocks,
-        db
+        db && legacyPublicationGateActive(db)
           ? (publish) =>
               db
                 .transaction(() => {

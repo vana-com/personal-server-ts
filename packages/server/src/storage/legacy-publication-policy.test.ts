@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { initializeDatabase } from "./index-schema.js";
+import { LEGACY_GATE_INDEX_SCHEMA_VERSION } from "./schema-versions.js";
 import { createLegacyPublicationPolicy } from "./legacy-publication-policy.js";
 import type { LegacyCanonicalCoveragePort } from "./legacy-publication-canonical.js";
 
@@ -57,7 +58,9 @@ it("persists an exact-scope fence and retains history across generation changes"
     expectedEpoch: 0,
   });
   expect(stopped).toMatchObject({ state: "stopped", epoch: 2 });
-  expect(db.pragma("user_version", { simple: true })).toBe(17);
+  expect(db.pragma("user_version", { simple: true })).toBe(
+    LEGACY_GATE_INDEX_SCHEMA_VERSION,
+  );
   expect(() => index.insert({ ...entry, path: "new.json" })).toThrow(
     expect.objectContaining({ errorCode: "legacy_scope_retired" }),
   );

@@ -1237,7 +1237,7 @@ describe("sqlite record store", () => {
         "UPDATE pdpp_schema_version SET version = 9999 WHERE id = 1",
       ).run();
       expect(() => createSqliteRecordStore(db)).toThrow(
-        /newer than this build supports/,
+        /Unsupported index\.db PDPP schema version 9999/,
       );
     });
   });

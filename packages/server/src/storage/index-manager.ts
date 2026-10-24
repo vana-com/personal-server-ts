@@ -1,4 +1,7 @@
-import { assertLegacyPublicationAllowed } from "./legacy-publication-fence.js";
+import {
+  assertLegacyPublicationAllowed,
+  legacyPublicationGateActive,
+} from "./legacy-publication-fence.js";
 import type { PdppProducer } from "@opendatalabs/personal-server-ts-core/sync";
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
@@ -533,12 +536,19 @@ export function createIndexManager(
 
   const manager: IndexManager = {
     insert(entry) {
-      const result = insertIfCurrent.immediate(entry);
+      const result = (
+        legacyPublicationGateActive(db)
+          ? insertIfCurrent.immediate
+          : insertIfCurrent
+      )(entry);
       if (!result.ok) throw new Error("Unconditional insert was rejected");
       return result.entry;
     },
+    // The gate takes the writer lock before its fence check; off, as before.
     insertIfCurrent: (entry, precondition) =>
-      insertIfCurrent.immediate(entry, precondition),
+      (legacyPublicationGateActive(db)
+        ? insertIfCurrent.immediate
+        : insertIfCurrent)(entry, precondition),
     closeScopeForWrites(scope) {
       ensureScopeRevisionStmt.run({ scope });
       // Durable fail-closed marker. There is no HTTP reset path; clearing this

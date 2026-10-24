@@ -10,9 +10,11 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
+  armLegacyPublicationGate,
   initializeLegacyPublicationPolicy,
   retainCanonicalInputs,
 } from "./legacy-publication-fence.js";
+import { LEGACY_GATE_INDEX_SCHEMA_VERSION } from "./schema-versions.js";
 import { legacyScopeMayReference } from "./legacy-publication-issuance.js";
 import { historyOnlyPredicate, indexDatabase } from "./index-manager.js";
 import { createImportOperations } from "./import-operations.js";
@@ -343,7 +345,10 @@ export function createLegacyPublicationPolicy(
     epoch: number,
     evidence: LegacyShutdownEvidence | null,
   ): void {
-    db.pragma("user_version = 17");
+    // The first durable enrollment raises the compatibility stamp in the same
+    // transaction; it never returns to the never-enrolled stamp.
+    db.pragma(`user_version = ${LEGACY_GATE_INDEX_SCHEMA_VERSION}`);
+    armLegacyPublicationGate(db);
     db.prepare(
       `INSERT INTO legacy_publication_policy(owner, server_generation, scope, state, epoch, owner_opt_in, evidence_json)
       VALUES (?, ?, ?, ?, ?, 1, ?)

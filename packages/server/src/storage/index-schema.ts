@@ -1,5 +1,17 @@
 import Database from "better-sqlite3";
-import { initializeLegacyPublicationPolicy } from "./legacy-publication-fence.js";
+import {
+  armLegacyPublicationGate,
+  initializeLegacyPublicationPolicy,
+  legacyPublicationEnrolled,
+} from "./legacy-publication-fence.js";
+import { PDPP_RECORD_SCHEMA_VERSION } from "./pdpp-records-sqlite-store.js";
+import {
+  CONVERGED_INDEX_SCHEMA_VERSION,
+  LEGACY_GATE_INDEX_SCHEMA_VERSION,
+  assertSupportedSchemaVersions,
+} from "./schema-versions.js";
+
+export { INDEX_SCHEMA_VERSION } from "./schema-versions.js";
 
 const CREATE_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS data_files (
@@ -36,8 +48,6 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_data_point_id ON data_files (data_point_id)",
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
-
-export const INDEX_SCHEMA_VERSION = 17;
 
 const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
@@ -265,13 +275,11 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
   `);
 }
 
-function ensureSchemaVersion(db: Database.Database): void {
-  const currentVersion = db.pragma("user_version", { simple: true }) as number;
-  if (currentVersion > INDEX_SCHEMA_VERSION) {
-    throw new Error(
-      `Unsupported index.db schema version ${currentVersion}; runtime supports ${INDEX_SCHEMA_VERSION}`,
-    );
-  }
+function ensureSchemaVersion(db: Database.Database): number {
+  const currentVersion = assertSupportedSchemaVersions(
+    db,
+    PDPP_RECORD_SCHEMA_VERSION,
+  );
   migrateSchema(db, currentVersion);
   // The method that earned a takeover. Added without a version bump: a
   // runtime pinned before it opens the database unchanged and writes ''
@@ -281,9 +289,28 @@ function ensureSchemaVersion(db: Database.Database): void {
       "ALTER TABLE legacy_scope_takeovers ADD COLUMN method TEXT NOT NULL DEFAULT ''",
     );
   }
-  // Additive gate tables do not strand a never-enrolled root on upgrade.
-  // Enrollment raises the minimum runtime version in its durable transaction.
-  db.pragma(`user_version = ${Math.max(currentVersion, 16)}`);
+  return currentVersion;
+}
+
+/**
+ * Stamp the converged runtime (v17), or v18 for a root with durable gate
+ * enrollment history. An experimental gate build stamped enrolled roots 17;
+ * its policy or transition rows, in any state including mirroring after
+ * rollback, move them to 18 here. Gate tables alone are not enrollment.
+ * Stamps never decrease and no history row changes.
+ */
+function stampSchemaVersion(db: Database.Database, currentVersion: number) {
+  const enrolled = db
+    .transaction(() => {
+      const enrolled = legacyPublicationEnrolled(db);
+      const target = enrolled
+        ? LEGACY_GATE_INDEX_SCHEMA_VERSION
+        : CONVERGED_INDEX_SCHEMA_VERSION;
+      db.pragma(`user_version = ${Math.max(currentVersion, target)}`);
+      return enrolled;
+    })
+    .immediate();
+  if (enrolled) armLegacyPublicationGate(db);
 }
 
 /** Open/create SQLite database, run CREATE TABLE IF NOT EXISTS, set WAL mode */
@@ -291,6 +318,10 @@ export function initializeDatabase(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   try {
     db.pragma("busy_timeout = 5000");
+    // `user_version` belongs to the legacy index schema; PDPP records use
+    // `pdpp_schema_version`. Check both before the journal mode or any schema
+    // changes, so an unsupported database is refused untouched.
+    assertSupportedSchemaVersions(db, PDPP_RECORD_SCHEMA_VERSION);
     const deadline = performance.now() + 5000;
     const pause = new Int32Array(new SharedArrayBuffer(4));
     for (;;) {
@@ -309,9 +340,6 @@ export function initializeDatabase(dbPath: string): Database.Database {
       }
     }
     db.pragma("synchronous = FULL");
-    // Required for SQLite REPLACE: its implicit deletes must run retention
-    // triggers on data_files and canonical history, including through PDPP.
-    db.pragma("recursive_triggers = ON");
 
     db.exec(CREATE_TABLE_SQL);
     db.exec(CREATE_SCOPE_REVISIONS_SQL);
@@ -319,7 +347,7 @@ export function initializeDatabase(dbPath: string): Database.Database {
     db.exec(CREATE_LEGACY_SCOPE_VERDICTS_SQL);
     db.exec(CREATE_LEGACY_SCOPE_RESETS_SQL);
     db.exec(CREATE_LEGACY_SCOPE_CANONICAL_AUTHORITY_SQL);
-    ensureSchemaVersion(db);
+    const currentVersion = ensureSchemaVersion(db);
     db.exec(`CREATE TABLE IF NOT EXISTS owner_import_operations (
     authority TEXT NOT NULL,
     owner TEXT NOT NULL,
@@ -344,6 +372,7 @@ export function initializeDatabase(dbPath: string): Database.Database {
     for (const sql of CREATE_INDEXES_SQL) {
       db.exec(sql);
     }
+    stampSchemaVersion(db, currentVersion);
 
     return db;
   } catch (err) {

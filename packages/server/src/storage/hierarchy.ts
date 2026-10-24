@@ -531,13 +531,14 @@ export async function writeBlockManifest(
       scope,
       collectedAt,
     );
-    const tempManifestPath = join(tempDir, "manifest.json");
-    await writeFile(
-      tempManifestPath,
-      JSON.stringify(manifest, null, 2),
-      "utf-8",
-    );
     if (commit) {
+      // The gate publishes blocks and manifest in one rename at its barrier.
+      const tempManifestPath = join(tempDir, "manifest.json");
+      await writeFile(
+        tempManifestPath,
+        JSON.stringify(manifest, null, 2),
+        "utf-8",
+      );
       try {
         commit(() => {
           rmSync(dir, { recursive: true, force: true });
@@ -547,10 +548,19 @@ export async function writeBlockManifest(
       } finally {
         await rm(tempManifestPath, { force: true });
       }
-    } else {
-      await rm(dir, { recursive: true, force: true });
-      await rename(tempDir, dir);
+      return;
     }
+
+    await rm(dir, { recursive: true, force: true });
+    await rename(tempDir, dir);
+
+    const tempManifestPath = `${manifestPath}.tmp.${randomUUID()}`;
+    await writeFile(
+      tempManifestPath,
+      JSON.stringify(manifest, null, 2),
+      "utf-8",
+    );
+    await rename(tempManifestPath, manifestPath);
   } catch (err) {
     await rm(tempDir, { recursive: true, force: true });
     throw err;

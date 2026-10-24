@@ -1,4 +1,8 @@
-import { createLegacyDownloadHold } from "./storage/legacy-publication-fence.js";
+import {
+  createLegacyDownloadHold,
+  legacyPublicationGateActive,
+  optInLegacyPublicationGate,
+} from "./storage/legacy-publication-fence.js";
 import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   createDurableAdditions,
@@ -373,6 +377,11 @@ export async function createServer(
   };
 
   const db = initializeDatabase(indexPath);
+  // Explicit runtime opt-in. Without it, a never-enrolled root behaves as it
+  // did before the gate; enrollment needs the flag, so that cannot change
+  // while this process runs. An enrolled root stays gated with the flag off.
+  if (config.legacyWriteShutdownEnabled) optInLegacyPublicationGate(db);
+  const legacyGateActive = legacyPublicationGateActive(db);
   await migrateLocalState({
     storageRoot,
     dataDir,
@@ -450,10 +459,12 @@ export async function createServer(
         : logger.info(issue, "Legacy scope projection left rows out"),
   });
 
-  const gatewayClient = withLegacyGatewayFence(
-    db,
-    options?.gatewayClient ?? createGatewayClient(config.gateway.url),
-  );
+  // Gate ports only for an opted-in or enrolled root; off, the raw ports.
+  const rawGatewayClient =
+    options?.gatewayClient ?? createGatewayClient(config.gateway.url);
+  const gatewayClient = legacyGateActive
+    ? withLegacyGatewayFence(db, rawGatewayClient)
+    : rawGatewayClient;
 
   // X402 payment enforcement on data reads. When config.payment.enabled is
   // true, GET /v1/data/:scope requires builders to supply a signed X-PAYMENT
@@ -507,13 +518,13 @@ export async function createServer(
       "Server account loaded",
     );
 
-    serverSigner = withLegacySignerFence(
-      db,
-      createServerSigner(serverAccount, {
-        chainId: config.gateway.chainId,
-        contracts: config.gateway.contracts,
-      }),
-    );
+    const rawSigner = createServerSigner(serverAccount, {
+      chainId: config.gateway.chainId,
+      contracts: config.gateway.contracts,
+    });
+    serverSigner = legacyGateActive
+      ? withLegacySignerFence(db, rawSigner)
+      : rawSigner;
 
     // Identity starts with serverId=null; background services will populate it
     identity = {
@@ -788,13 +799,15 @@ export async function createServer(
       serverAccount,
       reads: isEnclave ? "public" : "signed",
     });
-    const storageAdapter = withLegacyStorageFence(
-      db,
-      serverOwner,
-      remoteStorage,
-      masterKey,
-      rawDataStorage,
-    );
+    const storageAdapter = legacyGateActive
+      ? withLegacyStorageFence(
+          db,
+          serverOwner,
+          remoteStorage,
+          masterKey,
+          rawDataStorage,
+        )
+      : remoteStorage;
 
     const cursor = createSyncCursor(syncCursorPath, {
       legacyConfigPath: configPath,
@@ -818,12 +831,9 @@ export async function createServer(
     const downloadDeps = {
       // The hold captures foreign bytes as they are; it must not use the
       // publisher's fenced reader, which refuses non-restore occupants.
-      holdRemoteChange: createLegacyDownloadHold(
-        db,
-        remoteStorage,
-        rawDataStorage,
-        masterKey,
-      ),
+      holdRemoteChange: legacyGateActive
+        ? createLegacyDownloadHold(db, remoteStorage, rawDataStorage, masterKey)
+        : undefined,
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -846,22 +856,23 @@ export async function createServer(
     // Durable deletion: gateway tombstone signed with the same server
     // account + AddData signer uploads use, storage DELETE authorised with
     // the same Web3Signed signer the storage provider uploads with.
-    const deleteData = isEnclave
+    const gatewayDeleteData = isEnclave
       ? null
-      : withLegacyDeletionFence(
-          db,
-          createGatewayDeleteDataPort({
-            gatewayUrl: config.gateway.url,
-            dataPointFeed,
-            serverOwner,
-            signer: serverSigner,
-            storage: {
-              endpoint: resolveVanaStorageEndpoint(config),
-              chainId: config.gateway.chainId,
-              signMessage: (message) => serverAccount.signMessage(message),
-            },
-          }),
-        );
+      : createGatewayDeleteDataPort({
+          gatewayUrl: config.gateway.url,
+          dataPointFeed,
+          serverOwner,
+          signer: serverSigner,
+          storage: {
+            endpoint: resolveVanaStorageEndpoint(config),
+            chainId: config.gateway.chainId,
+            signMessage: (message) => serverAccount.signMessage(message),
+          },
+        });
+    const deleteData =
+      gatewayDeleteData && legacyGateActive
+        ? withLegacyDeletionFence(db, gatewayDeleteData)
+        : gatewayDeleteData;
     const pendingBlobDeletions = createFilePendingBlobDeletionStore(
       pendingBlobDeletionsPath,
     );
@@ -1057,8 +1068,9 @@ export async function createServer(
         })
       : undefined;
 
+  // Off a never-enrolled root, the owner policy API is not mounted.
   const legacyPublicationPolicy =
-    serverOwner && serverAccount
+    legacyGateActive && serverOwner && serverAccount
       ? createLegacyPublicationPolicy(db, {
           owner: serverOwner,
           serverGeneration: `server-key:${serverAccount.address.toLowerCase()}:legacy-publication-v1`,
