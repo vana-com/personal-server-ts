@@ -246,14 +246,21 @@ describe("source identities qualify legacy scope takeover", () => {
   );
 
   it.each(["spotify.savedTracks", "spotify.playlists"] as const)(
-    "keeps artist-free %s track lists unkeyed because URIs can encode local metadata",
+    "uses exact snapshot equivalence for artist-free %s tracks only when the bodies match",
     async (scope) => {
       const input = spotify(scope);
       const view = setup(input);
-      expect(await view.readLatest(scope)).toMatchObject({ kind: "file" });
-      expect(view.verdictFor(scope)[0]).toMatchObject({
-        reason: { reason: "no_stable_key" },
-      });
+      const read = await view.readLatest(scope);
+      if (scope === "spotify.savedTracks") {
+        expect(read.kind).toBe("canonical");
+        if (read.kind === "canonical")
+          expect(read.envelope.data).toEqual(input.legacyBody);
+      } else {
+        expect(read).toMatchObject({ kind: "file" });
+        expect(view.verdictFor(scope)[0]).toMatchObject({
+          reason: { reason: "no_stable_key" },
+        });
+      }
     },
   );
 
@@ -299,25 +306,32 @@ describe("source identities qualify legacy scope takeover", () => {
   );
 
   it.each([
-    "linkedin.connections",
-    "github.repositories",
-    "github.starred",
-    "linkedin.experience",
-    "linkedin.education",
-    "linkedin.skills",
-    "linkedin.languages",
-    "instagram.ads",
-    "heb.profile",
-    "spotify.playlists",
-  ])(
-    "keeps %s unkeyed where the legacy object lists retain no upstream identifier",
-    async (scope) => {
+    ["linkedin.connections", "canonical"],
+    ["github.repositories", "canonical"],
+    ["github.starred", "canonical"],
+    ["linkedin.experience", "canonical"],
+    ["linkedin.education", "canonical"],
+    ["linkedin.skills", "canonical"],
+    ["linkedin.languages", "canonical"],
+    ["instagram.ads", "canonical"],
+    ["heb.profile", "file"],
+    ["spotify.playlists", "file"],
+  ] as const)(
+    "uses the reviewed same-snapshot rule for %s",
+    async (scope, expectedKind) => {
       const view = setup(fixture(scope));
-      expect(await view.readLatest(scope)).toMatchObject({ kind: "file" });
-      expect(view.verdictFor(scope)[0]).toMatchObject({
-        verdict: "not_covered",
-        reason: { reason: "no_stable_key" },
-      });
+      const read = await view.readLatest(scope);
+      if (expectedKind === "canonical") {
+        expect(read.kind).toBe("canonical");
+        if (read.kind === "canonical")
+          expect(read.envelope.data).toEqual(fixture(scope).legacyBody);
+      } else {
+        expect(read).toMatchObject({ kind: "file" });
+        expect(view.verdictFor(scope)[0]).toMatchObject({
+          verdict: "not_covered",
+          reason: { reason: "no_stable_key" },
+        });
+      }
     },
   );
 
@@ -333,7 +347,7 @@ describe("source identities qualify legacy scope takeover", () => {
   );
 
   it.each(["spotify.savedTracks", "spotify.playlists"] as const)(
-    "keeps %s artist names unkeyed even when track URIs match",
+    "uses exact snapshot equivalence for %s artist names only when the full body matches",
     async (scope) => {
       const input = spotify(scope);
       const stream =
@@ -347,10 +361,17 @@ describe("source identities qualify legacy scope takeover", () => {
       const track = body.savedTracks?.[0] ?? body.playlists![0]!.tracks[1]!;
       track.artists = [{ name: "Same display name" }];
       const view = setup(input);
-      expect(await view.readLatest(scope)).toMatchObject({ kind: "file" });
-      expect(view.verdictFor(scope)[0]).toMatchObject({
-        reason: { reason: "no_stable_key" },
-      });
+      const read = await view.readLatest(scope);
+      if (scope === "spotify.savedTracks") {
+        expect(read.kind).toBe("canonical");
+        if (read.kind === "canonical")
+          expect(read.envelope.data).toEqual(input.legacyBody);
+      } else {
+        expect(read).toMatchObject({ kind: "file" });
+        expect(view.verdictFor(scope)[0]).toMatchObject({
+          reason: { reason: "no_stable_key" },
+        });
+      }
     },
   );
 
@@ -370,7 +391,7 @@ describe("source identities qualify legacy scope takeover", () => {
   });
 
   it.each(["missing", "duplicate"])(
-    "refuses %s LinkedIn source URLs",
+    "accepts %s LinkedIn source URLs only when the full snapshot matches",
     async (kind) => {
       const input = fixture("linkedin.connections");
       const row = input.streams.connections![0]!;
@@ -389,12 +410,10 @@ describe("source identities qualify legacy scope takeover", () => {
         connections.push({ ...connections[0]! });
       }
       const view = setup(input);
-      expect(await view.readLatest(input.scope)).toMatchObject({
-        kind: "file",
-      });
-      expect(view.verdictFor(input.scope)[0]).toMatchObject({
-        reason: { reason: "no_stable_key" },
-      });
+      const read = await view.readLatest(input.scope);
+      expect(read.kind).toBe("canonical");
+      if (read.kind === "canonical")
+        expect(read.envelope.data).toEqual(input.legacyBody);
     },
   );
 
