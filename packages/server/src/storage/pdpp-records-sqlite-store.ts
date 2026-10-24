@@ -457,8 +457,34 @@ function sweepStaleBlobClaims(db: Database): void {
         WHERE t.archive_instance = pdpp_blob_claims.instance
       );
     `);
-    deleteUnclaimedBlobs(db);
+    collectStartupUnclaimedBlobs(db);
   })();
+}
+
+/**
+ * Automatic (startup) blob collection. A history row whose JSON cannot be
+ * parsed may reference any blob, so collection is skipped while one exists.
+ * Explicit owner erasure calls `deleteUnclaimedBlobs` directly and is not
+ * gated here.
+ */
+function collectStartupUnclaimedBlobs(db: Database): void {
+  const { found } = db
+    .prepare(
+      "SELECT EXISTS (SELECT 1 FROM pdpp_record_changes WHERE NOT json_valid(data)) AS found",
+    )
+    .get() as { found: number };
+  if (found === 1) {
+    const { count } = db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM pdpp_record_changes WHERE NOT json_valid(data)",
+      )
+      .get() as { count: number };
+    console.warn(
+      `[pdpp-records] skipped startup blob collection: ${count} history row(s) hold invalid JSON, so their blob references cannot be read`,
+    );
+    return;
+  }
+  deleteUnclaimedBlobs(db);
 }
 
 /**
