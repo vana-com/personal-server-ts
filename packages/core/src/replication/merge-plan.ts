@@ -712,22 +712,30 @@ function mergeRecord(
         : "visible";
   const finalizedAt = (op: RecordOperation) =>
     op.batchId ? context.finalizedAt?.(op.batchId) : undefined;
-  const purgedDeletes = ownerOps.filter(
-    (op) =>
-      op.kind === "owner-delete" &&
-      context.now !== undefined &&
-      finalizedAt(op) !== undefined &&
-      context.now >= finalizedAt(op)! + OWNER_DELETE_GRACE_PERIOD_MS &&
-      !ownerOps.some(
-        (restore) =>
-          restore.kind === "owner-restore" &&
-          restore.parents.some(
-            (parent) => referenceKey(parent) === operationKey(op),
-          ) &&
-          restore.revision.wallMs <
-            finalizedAt(op)! + OWNER_DELETE_GRACE_PERIOD_MS,
-      ),
-  );
+  const purgedDeletes = ownerOps.filter((deletion) => {
+    const deletionFinalizedAt = finalizedAt(deletion);
+    if (
+      deletion.kind !== "owner-delete" ||
+      context.now === undefined ||
+      deletionFinalizedAt === undefined ||
+      context.now < deletionFinalizedAt + OWNER_DELETE_GRACE_PERIOD_MS
+    )
+      return false;
+    return !ownerOps.some((restore) => {
+      if (
+        restore.kind !== "owner-restore" ||
+        !restore.parents.some(
+          (parent) => referenceKey(parent) === operationKey(deletion),
+        )
+      )
+        return false;
+      const restoreFinalizedAt = finalizedAt(restore);
+      return (
+        restoreFinalizedAt !== undefined &&
+        restoreFinalizedAt < deletionFinalizedAt + OWNER_DELETE_GRACE_PERIOD_MS
+      );
+    });
+  });
   const erased = purgedDeletes.length > 0 || retainedMarker !== undefined;
   const purgedRemovalIds = new Set([
     ...purgedDeletes.map(operationKey),

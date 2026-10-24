@@ -279,6 +279,7 @@ describe("replica policy v3 vectors", () => {
     const postPurgeRestore = {
       ...hide,
       kind: "owner-restore" as const,
+      batchId: "restore-after-purge-batch",
       parents: [ref("owner-delete", "A")],
       revision: {
         ...hide.revision,
@@ -292,7 +293,11 @@ describe("replica policy v3 vectors", () => {
     };
     const afterPurge = plan(
       [item, deleteOp, postPurgeRestore, afterPurgeObservation],
-      { now: T0 + 31 * day, finalizedAt: () => T0 },
+      {
+        now: T0 + 31 * day,
+        finalizedAt: (batchId) =>
+          batchId === "delete-batch" ? T0 : T0 + 31 * day,
+      },
     );
     expect(afterPurge.records[0].current?.revision.operationId).toBe(
       "after-purge",
@@ -306,7 +311,7 @@ describe("replica policy v3 vectors", () => {
       plan([item, hide, restore, laterRemoval]).records[0].ownerControl,
     ).toBe("hidden");
   });
-  it("keeps a pre-expiry restore and erasure irreversible after the deadline", () => {
+  it("uses restore finality rather than HLC time for delete expiry", () => {
     const item = observed("expiry-item", "A", "payload");
     const {
       emittedAt: _emittedAt,
@@ -325,16 +330,27 @@ describe("replica policy v3 vectors", () => {
     const restoredBeforeExpiry = {
       ...ownerBase,
       kind: "owner-restore" as const,
+      batchId: "restore-before-expiry-batch",
       parents: [ref("expiry-delete", "A")],
       revision: {
         ...item.revision,
         operationId: "restore-before-expiry",
-        wallMs: T0 + day,
+        wallMs: T0 + OWNER_DELETE_GRACE_PERIOD_MS + 60_000,
       },
     };
-    const afterDeadline = T0 + 31 * day;
+    const deadline = T0 + OWNER_DELETE_GRACE_PERIOD_MS;
+    const afterDeadline = deadline + 1;
+    const finalizedAt = (batchId: string) =>
+      batchId === "expiry-delete-batch" ? T0 : deadline - 60_000;
+    const beforeDeadline = planReplicaMerge(
+      { ...context, now: deadline - 1, finalizedAt },
+      [registration, item, deletion, restoredBeforeExpiry],
+    );
+    expect(beforeDeadline.records[0].ownerControl).toBe("visible");
+    expect(beforeDeadline.records[0].payloadRetained).toBe(true);
+    expect(beforeDeadline.payloadErasures).toEqual([]);
     const retainedRestore = planReplicaMerge(
-      { ...context, now: afterDeadline, finalizedAt: () => T0 },
+      { ...context, now: afterDeadline, finalizedAt },
       [registration, item, deletion, restoredBeforeExpiry],
     );
     expect(retainedRestore.records[0].ownerControl).toBe("visible");
@@ -343,6 +359,39 @@ describe("replica policy v3 vectors", () => {
     );
     expect(retainedRestore.records[0].payloadRetained).toBe(true);
     expect(retainedRestore.payloadErasures).toEqual([]);
+
+    const restoredAfterExpiryWithBackwardClock = planReplicaMerge(
+      {
+        ...context,
+        now: afterDeadline + 60_001,
+        finalizedAt: (batchId) =>
+          batchId === "expiry-delete-batch" ? T0 : deadline + 60_000,
+      },
+      [
+        registration,
+        item,
+        deletion,
+        {
+          ...restoredBeforeExpiry,
+          batchId: "restore-after-expiry-batch",
+          revision: {
+            ...restoredBeforeExpiry.revision,
+            operationId: "restore-after-expiry-with-backward-clock",
+            wallMs: T0 + day,
+          },
+        },
+      ],
+    );
+    expect(restoredAfterExpiryWithBackwardClock.records[0].ownerControl).toBe(
+      "visible",
+    );
+    expect(
+      restoredAfterExpiryWithBackwardClock.records[0].payloadRetained,
+    ).toBe(false);
+    expect(
+      restoredAfterExpiryWithBackwardClock.payloadErasures[0]
+        .operationReferences,
+    ).toContainEqual(ref("expiry-item", "A"));
 
     const erased = planReplicaMerge(
       { ...context, now: afterDeadline, finalizedAt: () => T0 },
@@ -356,7 +405,8 @@ describe("replica policy v3 vectors", () => {
       {
         ...context,
         now: afterDeadline + day,
-        finalizedAt: () => T0,
+        finalizedAt: (batchId) =>
+          batchId === "expiry-delete-batch" ? T0 : afterDeadline + day,
         suppressionMarkers: erased.records[0].suppressionMarker
           ? [erased.records[0].suppressionMarker]
           : [],
@@ -366,6 +416,7 @@ describe("replica policy v3 vectors", () => {
         deletion,
         {
           ...restoredBeforeExpiry,
+          batchId: "restore-after-erasure-batch",
           revision: {
             ...restoredBeforeExpiry.revision,
             operationId: "restore-after-erasure",
@@ -884,6 +935,7 @@ describe("replica policy v3 vectors", () => {
     const restore = {
       ...del,
       kind: "owner-restore" as const,
+      batchId: "restore-after-expiry-batch",
       revision: {
         ...del.revision,
         operationId: "restore",
@@ -896,7 +948,8 @@ describe("replica policy v3 vectors", () => {
         ...context,
         declarations: [declaration],
         now: T0 + 31 * day,
-        finalizedAt: () => T0,
+        finalizedAt: (batchId) =>
+          batchId === del.batchId ? T0 : T0 + 31 * day,
       },
       [registration, skewedOld, del, restore],
     );
@@ -925,7 +978,8 @@ describe("replica policy v3 vectors", () => {
         ...context,
         declarations: [declaration],
         now: T0 + 31 * day,
-        finalizedAt: () => T0,
+        finalizedAt: (batchId) =>
+          batchId === del.batchId ? T0 : T0 + 31 * day,
         suppressionMarkers: [marker],
       },
       [registration, old, del, restore, observedAfterRestore],
@@ -952,7 +1006,8 @@ describe("replica policy v3 vectors", () => {
         ...context,
         declarations: [declaration],
         now: T0 + 31 * day,
-        finalizedAt: () => T0,
+        finalizedAt: (batchId) =>
+          batchId === del.batchId ? T0 : T0 + 31 * day,
         suppressionMarkers: [markerAfterRestore],
       },
       [registration, del, restore, observedAfterRestore],
@@ -1026,6 +1081,7 @@ describe("replica policy v3 vectors", () => {
     };
     const secondRestore = {
       ...restore,
+      batchId: "restore-second-epoch-batch",
       revision: {
         ...restore.revision,
         operationId: "restore-second-epoch",
@@ -1063,7 +1119,10 @@ describe("replica policy v3 vectors", () => {
         ...context,
         declarations: [declaration],
         now: T0 + 33 * day,
-        finalizedAt: () => T0,
+        finalizedAt: (batchId) =>
+          batchId === secondRestore.batchId || batchId === restore.batchId
+            ? T0 + 31 * day
+            : T0,
         suppressionMarkers: [marker],
       },
       [

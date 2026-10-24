@@ -40,16 +40,19 @@ frontier shows it received the resolution.
 
 `OWNER_DELETE_GRACE_PERIOD_MS` is the single delete-retention contract constant
 (30 days by default). The period starts at the delete batch's finality time. Once
-it expires, the derived record retains only a suppression marker with its key,
-writer-qualified operation ids, content hashes, observation times, and finality
-times. The marker lists only payload-bearing operations already erased, with
-hashes and times kept separately from observations received later. The planner
-omits expired payload from candidates and diagnostic operation lists and returns
+it expires without a pre-deadline restore, the derived record retains only a
+suppression marker with its key, writer-qualified operation ids, content hashes,
+observation times, and finality times. The marker lists only payload-bearing
+operations already erased, with hashes and times kept separately from
+observations received later. The planner omits expired payload from candidates
+and diagnostic operation lists and returns
 `payloadErasures` with writer-qualified references for upserts and resolved
-upsert values. Storage must apply each erasure and persist its marker atomically.
-A later observation cannot restore erased payload. A restore after erasure waits
-for a new source observation that causally follows the restore; remote
-wall-clock values do not establish this.
+upsert values. A restore finalized before the delete deadline prevents erasure,
+even when its HLC wall clock is skewed past the deadline. A restore finalized at
+or after the deadline does not reverse an erasure. Storage must apply each
+erasure and persist its marker atomically. A later observation cannot restore
+erased payload. A restore after erasure waits for a new source observation that
+causally follows the restore; remote wall-clock values do not establish this.
 
 ## Account identity
 
