@@ -2,8 +2,9 @@ import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import {
   createMemoryRecordStore,
+  createPdppSyncSessionService,
   type PdppRecordStore,
-  type ChangesSinceOptions,
+  type SyncRequest,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 
@@ -76,7 +77,9 @@ for (const backend of ["memory", "sqlite"])
             .data.map((r) => r.recordKey),
         ).toEqual(expected);
         expect(
-          store.changesSince("events", options).data.map((r) => r.recordKey),
+          createPdppSyncSessionService(store)
+            .read({ stream: "events", ...options })
+            .data.map((r) => r.recordKey),
         ).toEqual(expected);
       } finally {
         store.close();
@@ -110,14 +113,21 @@ for (const backend of ["memory", "sqlite"])
       try {
         write(store, "visible", 1);
         write(store, "hidden", 1, "2025-01-01");
-        const options = {
+        const options: SyncRequest = {
+          stream: "events",
           instanceIds: ["inst_1"],
           limit: 100,
-          fields: ["id"],
-          isVisible: (row: { data: Record<string, unknown> }) =>
-            row.data.at === "2026-01-02",
-        } as ChangesSinceOptions;
-        const baseline = store.changesSince("events", options);
+          eligibilityFields: ["id"],
+          access: {
+            canSeeKey: () => true,
+            canSeeRecord: (row) => row.data.at === "2026-01-02",
+          },
+          candidate: { binding: "test", order: "asc" },
+        };
+        const baseline = createPdppSyncSessionService(store).read({
+          stream: "events",
+          ...options,
+        });
         expect(baseline.data.map((r) => r.recordKey)).toEqual(["visible"]);
         for (const key of ["visible", "hidden"])
           store.deleteRecord(
@@ -127,14 +137,20 @@ for (const backend of ["memory", "sqlite"])
             "2026-04-02T00:00:00Z",
             "mutable_state",
           );
-        const changes = store.changesSince("events", {
+        const changes = createPdppSyncSessionService(store).read({
+          stream: "events",
           ...options,
           changesSince: baseline.nextChangesSince,
         });
         expect(
           changes.data.map((r) => ({ key: r.recordKey, deleted: r.deleted })),
         ).toEqual([{ key: "visible", deleted: true }]);
-        expect(store.changesSince("events", options).data).toEqual([]);
+        expect(
+          createPdppSyncSessionService(store).read({
+            stream: "events",
+            ...options,
+          }).data,
+        ).toEqual([]);
       } finally {
         store.close();
       }
@@ -144,17 +160,25 @@ for (const backend of ["memory", "sqlite"])
       try {
         write(store, "enter", 1, "2025-01-01");
         write(store, "leave", 1);
-        const options = {
+        const options: SyncRequest = {
+          stream: "events",
           instanceIds: ["inst_1"],
           limit: 100,
-          fields: ["id"],
-          isVisible: (row: { data: Record<string, unknown> }) =>
-            row.data.at === "2026-01-02",
-        } as ChangesSinceOptions;
-        const baseline = store.changesSince("events", options);
+          eligibilityFields: ["id"],
+          access: {
+            canSeeKey: () => true,
+            canSeeRecord: (row) => row.data.at === "2026-01-02",
+          },
+          candidate: { binding: "test", order: "asc" },
+        };
+        const baseline = createPdppSyncSessionService(store).read({
+          stream: "events",
+          ...options,
+        });
         write(store, "enter", 2);
         write(store, "leave", 2, "invalid");
-        const changes = store.changesSince("events", {
+        const changes = createPdppSyncSessionService(store).read({
+          stream: "events",
           ...options,
           changesSince: baseline.nextChangesSince,
         });
@@ -357,49 +381,6 @@ it.each(["asc", "desc"] as const)(
   },
 );
 
-it.each([false, true])(
-  "a candidate sync expires rather than serve a record erased after its first page; the current contract keeps the horizon (reinserted: %s)",
-  async (reinsert) => {
-    const { CursorExpiredError } =
-      await import("@opendatalabs/personal-server-ts-core/storage/pdpp-records");
-    for (const candidate of [false, true])
-      for (const store of stores()) {
-        try {
-          for (const key of ["a", "b"])
-            put(store, key, "2026-04-01T00:00:00Z", { id: key, v: "old" });
-          const options = {
-            instanceIds: ["inst_1"],
-            limit: 1,
-            ...(candidate && { expireOnErasure: true }),
-          };
-          const first = store.changesSince("events", options);
-          expect(first.data.map((r) => r.recordKey)).toEqual(["a"]);
-          store.deleteRecord(
-            "inst_1",
-            "events",
-            "b",
-            "2026-04-02T00:00:00Z",
-            "mutable_state",
-          );
-          if (reinsert)
-            put(store, "b", "2026-04-01T00:00:00Z", { id: "b", v: "new" });
-          const later = () =>
-            store.changesSince("events", {
-              ...options,
-              cursor: first.nextCursor,
-            });
-          if (candidate) expect(later).toThrow(CursorExpiredError);
-          else
-            expect(later().data.map((r) => [r.recordKey, r.data.v])).toEqual([
-              ["b", "old"],
-            ]);
-        } finally {
-          store.close();
-        }
-      }
-  },
-);
-
 it("expires a list cursor minted under timestamp-text order instead of resuming it by instant", async () => {
   const { encodeCursor, CursorExpiredError } =
     await import("@opendatalabs/personal-server-ts-core/storage/pdpp-records");
@@ -448,58 +429,57 @@ it("expires a list cursor minted under timestamp-text order instead of resuming 
   }
 });
 
-it("expires a sync page cursor minted under the earlier identity order", async () => {
-  const { decodeCursor, encodeCursor, CursorExpiredError } =
-    await import("@opendatalabs/personal-server-ts-core/storage/pdpp-records");
-  for (const store of stores()) {
-    try {
-      // localeCompare put "a" before "A" and "é" before "f"; code-point
-      // order puts "A" first and "é" last.
-      for (const key of ["a", "A"]) put(store, key, "2026-04-01T00:00:00Z");
-      const options = { instanceIds: ["inst_1"], limit: 1 };
-      const fresh = store.changesSince("events", options);
-      const minted = decodeCursor(fresh.nextCursor!);
-      if (minted.kind !== "changes_since") throw Error("expected sync cursor");
-      // The same page position as an older build minted it.
-      const legacy = {
-        kind: "changes_since" as const,
-        stream: minted.stream,
-        epoch: minted.epoch,
-        horizon: minted.horizon,
-        sinceHorizon: minted.sinceHorizon,
-        offset: 1,
-      };
-      expect(() =>
-        store.changesSince("events", {
+it.each(["asc", "desc"] as const)(
+  "does not count a same-key record erased after the horizon as a conflict (%s)",
+  (order) => {
+    for (const store of stores()) {
+      try {
+        for (const [instance, key] of [
+          ["inst_1", order === "asc" ? "a" : "z"],
+          ["inst_1", "k"],
+          ["inst_2", "k"],
+        ] as const)
+          store.ingestBatch(
+            [
+              {
+                instance,
+                stream: "events",
+                key,
+                data: { id: key, from: instance },
+                emitted_at: "2026-04-01T00:00:00Z",
+              },
+            ],
+            () => "mutable_state",
+            () => ["id"],
+          );
+        const options = {
+          instanceIds: ["inst_1", "inst_2"],
+          limit: 1,
+          order,
+          oneRecordPerKey: true,
+        };
+        const first = store.listRecords("events", options);
+        expect(first.data.map((r) => r.recordKey)).toEqual([
+          order === "asc" ? "a" : "z",
+        ]);
+        store.deleteRecord(
+          "inst_1",
+          "events",
+          "k",
+          "2026-04-02T00:00:00Z",
+          "mutable_state",
+        );
+        // inst_1's k is withheld as erased, so inst_2's k names one record.
+        const second = store.listRecords("events", {
           ...options,
-          cursor: encodeCursor(legacy),
-        }),
-      ).toThrow(CursorExpiredError);
-      // A page cursor this build mints still resumes, and the session's
-      // checkpoint is unaffected.
-      const next = store.changesSince("events", {
-        ...options,
-        cursor: fresh.nextCursor,
-      });
-      expect([...fresh.data, ...next.data].map((r) => r.recordKey)).toEqual([
-        "A",
-        "a",
-      ]);
-      // A completed checkpoint carries no position: one minted without the
-      // order revision still returns exactly the later changes.
-      const checkpoint = decodeCursor(next.nextChangesSince!);
-      if (checkpoint.kind !== "changes_since")
-        throw Error("expected checkpoint");
-      delete checkpoint.orderKey;
-      for (const key of ["é", "f"]) put(store, key, "2026-04-02T00:00:00Z");
-      const later = store.changesSince("events", {
-        ...options,
-        limit: 10,
-        changesSince: encodeCursor(checkpoint),
-      });
-      expect(later.data.map((r) => r.recordKey)).toEqual(["f", "é"]);
-    } finally {
-      store.close();
+          cursor: first.nextCursor,
+        });
+        expect(second.data.map((r) => [r.instance, r.recordKey])).toEqual([
+          ["inst_2", "k"],
+        ]);
+      } finally {
+        store.close();
+      }
     }
-  }
-});
+  },
+);

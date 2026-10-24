@@ -1,14 +1,18 @@
 import {
   decodeCursor,
   encodeCursor,
-  type ChangesSinceCursorPayload,
   type ListCursorPayload,
 } from "./cursor.js";
-import { InvalidCursorError, CursorExpiredError } from "./types.js";
+import {
+  InvalidCursorError,
+  CursorExpiredError,
+  RecordIdentityConflictError,
+} from "./types.js";
 import { timeSortKey } from "../../pdpp/time.js";
 import type {
   ListRecordsOptions,
   ListRecordsPage,
+  PdppRecordRow,
   PdppStoredRecord,
 } from "./types.js";
 
@@ -28,20 +32,6 @@ export function decodeListCursor(
   )
     throw new CursorExpiredError();
   return { ...payload, instance: payload.instance, horizon: payload.horizon };
-}
-
-/**
- * A sync page cursor's offset counts records in `compareRecordIdentity`
- * order. One minted under the earlier locale-dependent order names a
- * different record, so it restarts explicitly; checkpoints are unaffected.
- */
-export function decodeSyncPageCursor(
-  cursor: string,
-): ChangesSinceCursorPayload {
-  const payload = decodeCursor(cursor);
-  if (payload.kind !== "changes_since") throw new InvalidCursorError();
-  if (payload.orderKey !== "code-point") throw new CursorExpiredError();
-  return payload;
 }
 
 /** Complete identity, in the existing public sort order with instance last. */
@@ -93,18 +83,38 @@ export function listSnapshotPage(
   options: ListRecordsOptions,
   snapshot: { stream: string; epoch: string; horizon: string },
   wasErased?: (row: PdppStoredRecord) => boolean,
+  versionAt?: (
+    instance: string,
+    recordKey: string,
+  ) => PdppRecordRow | undefined,
 ): ListRecordsPage {
   const data: PdppStoredRecord[] = [];
   let hasMore = false;
+  // The one visibility rule for enumeration and the identity check alike.
+  // Erasure overrides historical membership for that record only: a list is
+  // not a sync session, so withholding it loses nothing a later read could
+  // have relied on, and the rest of the snapshot stays readable.
+  const served = (row: PdppRecordRow | undefined): row is PdppStoredRecord =>
+    row !== undefined &&
+    !row.deleted &&
+    (!options.isVisible || options.isVisible(row as PdppStoredRecord)) &&
+    !wasErased?.(row as PdppStoredRecord);
   for (const row of rows) {
-    if (options.isVisible && !options.isVisible(row)) continue;
-    // Erasure overrides historical membership for that record only: a list
-    // is not a sync session, so withholding it loses nothing a later read
-    // could have relied on, and the rest of the snapshot stays readable.
-    if (wasErased?.(row)) continue;
+    if (!served(row)) continue;
     if (data.length === options.limit) {
       hasMore = true;
       break;
+    }
+    // The wire names a record by key alone: never send two records as one.
+    if (options.oneRecordPerKey && versionAt) {
+      for (const instance of options.instanceIds) {
+        if (
+          instance !== row.instance &&
+          served(versionAt(instance, row.recordKey))
+        ) {
+          throw new RecordIdentityConflictError(row.recordKey);
+        }
+      }
     }
     data.push(row);
   }

@@ -44,6 +44,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
+import { createPdppSyncSessionService } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { pino } from "pino";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -645,7 +646,8 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
         await encryptEnvelope(envelope, masterKey),
       );
 
-      const anchor = store.changesSince("profile", {
+      const anchor = createPdppSyncSessionService(store).read({
+        stream: "profile",
         instanceIds: [INSTANCE],
         limit: 50,
       }).nextChangesSince;
@@ -659,7 +661,8 @@ describe("DataPipe encrypted sync -> PDPP import -> scoped read", () => {
       expect(store.getRecord(INSTANCE, "profile", "235680975")?.version).toBe(
         1,
       );
-      const changes = store.changesSince("profile", {
+      const changes = createPdppSyncSessionService(store).read({
+        stream: "profile",
         instanceIds: [INSTANCE],
         changesSince: anchor,
         limit: 50,
