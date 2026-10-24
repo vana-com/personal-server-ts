@@ -1778,8 +1778,7 @@ const chatgptMemories: LegacyScopeBinding = {
   },
 };
 
-// Signed ChatGPT 0.1.1 is the source; Desktop ingest remains disabled until
-// catalog admission and static_secret host setup land separately.
+// Reads ChatGPT 0.2.0 rows and PageShim 0.3.1 rows (see provenance).
 const chatgptConversations: LegacyScopeBinding = {
   scope: "chatgpt.conversations",
   pdppSource: "https://registry.pdpp.dev/connectors/chatgpt",
@@ -1796,6 +1795,7 @@ const chatgptConversations: LegacyScopeBinding = {
     ],
     messages: [
       "id",
+      "node_id",
       "conversation_id",
       "parent_id",
       "role",
@@ -1804,6 +1804,7 @@ const chatgptConversations: LegacyScopeBinding = {
       "model_slug",
       "create_time",
       "on_current_branch",
+      "blob_ref",
     ],
   },
   primaryKey: { conversations: ["id"], messages: ["id"] },
@@ -1811,11 +1812,19 @@ const chatgptConversations: LegacyScopeBinding = {
     "Conversation create/update times pass through as null when the source lacks them, matching legacy's listed?.create_time ?? fetched.create_time ?? null fallback.",
     "fetched_at is the projection time (options.now, else the wall clock), matching legacy's per-run toConversationRecord timestamp.",
     "A conversation without complete current-branch message evidence, a valid id, or valid timestamps is dropped and counted in a records_dropped diagnostic; nested full threads are not invented. Messages whose conversation is absent are dropped and counted the same way.",
+    "A user or assistant text message whose text the source did not deliver (no content and no blob_ref, or a blob_ref this read did not resolve) is left out of its thread and counted in a messages records_dropped diagnostic; the legacy message requires content and closes its object, so it cannot carry an omission flag, and no placeholder text is written.",
     "Only user/assistant text or multimodal_text messages with nonempty string content are retained, matching the legacy connector's walkMessages filter; message_count is the retained count.",
     "A missing title becomes 'Untitled', matching the legacy connector's toConversationRecord fallback; model_slug is renamed to model.",
-    "Legacy message ids are source node ids. ChatGPT 0.3.0 stores a message under '<conversation_id>:<node_id>' (and links parent_id the same way); the projection strips that prefix, reads a bare pre-0.3.0 id as it is, and counts a node stored under both forms once, preferring the 0.3.0 row.",
+    "Legacy message ids are source node ids. ChatGPT 0.3.0 and later store a message under '<conversation_id>:<node_id>', carry the node in node_id, and link parent_id to the parent's record id; the projection threads by node_id when present, else strips that prefix, reads a bare pre-0.3.0 id as it is, and counts a node stored under both forms once, preferring the 0.3.0 row.",
   ],
   provenance: [
+    {
+      kind: "source-manifest",
+      ref: "https://github.com/PDP-Connect/data-connectors/blob/073f916b602fe0663a50c36a425d41787334fbf0/connectors/chatgpt/manifest.json",
+      digest:
+        "sha256:fc0677f904bc44726a7ef5a02d63a7b94e61092605e6606f71721f74c994118f",
+      path: "declarations/chatgpt-0.3.1.collection-profile.json#streams[name=conversations,messages]",
+    },
     {
       kind: "oci",
       ref: "ghcr.io/pdp-connect/connector/chatgpt:0.2.0",
@@ -1842,6 +1851,8 @@ const chatgptConversations: LegacyScopeBinding = {
       dropped.set(reason, (dropped.get(reason) ?? 0) + 1);
     let malformedMessages = 0;
     let unlinkedMessages = 0;
+    // Messages of a projected thread whose text never reached this read.
+    const textUndelivered = new Map<string, number>();
 
     const messagesByConversation = new Map<string, Record<string, unknown>[]>();
     for (const message of byStream(records, "messages")) {
@@ -1915,7 +1926,7 @@ const chatgptConversations: LegacyScopeBinding = {
       // under their record id: the bare node id before ChatGPT 0.3.0,
       // `<conversation_id>:<node_id>` since. An instance that holds both
       // forms of one node uses the current one.
-      const { byNode, unkeyed } = chatgptMessagesByNode(
+      const { byNode, unkeyed, parentNode } = chatgptMessagesByNode(
         id,
         messagesByConversation.get(id),
       );
@@ -1934,27 +1945,27 @@ const chatgptConversations: LegacyScopeBinding = {
         if (!message || message.on_current_branch !== true) break;
         seen.add(node);
         ordered.push(message);
-        node =
-          typeof message.parent_id === "string"
-            ? chatgptNodeId(id, message.parent_id)
-            : null;
+        node = parentNode(message);
       }
       if (ordered.length !== branch.length) {
         drop("Current branch message chain is incomplete");
         continue;
       }
       ordered.reverse();
-      const messages = ordered
-        .filter(
-          (m) =>
-            (m.role === "user" || m.role === "assistant") &&
-            (m.content_type === "text" ||
-              m.content_type === "multimodal_text") &&
-            typeof m.content === "string" &&
-            m.content.length > 0,
-        )
+      const legacyKind = ordered.filter(
+        (m) =>
+          (m.role === "user" || m.role === "assistant") &&
+          (m.content_type === "text" || m.content_type === "multimodal_text"),
+      );
+      for (const m of legacyKind) {
+        const reason = chatgptTextUndelivered(m);
+        if (reason)
+          textUndelivered.set(reason, (textUndelivered.get(reason) ?? 0) + 1);
+      }
+      const messages = legacyKind
+        .filter((m) => typeof m.content === "string" && m.content.length > 0)
         .map((m) => ({
-          id: chatgptNodeId(id, m.id as string),
+          id: chatgptMessageNode(id, m)!,
           role: m.role,
           content: m.content,
           content_type: m.content_type,
@@ -1997,6 +2008,17 @@ const chatgptConversations: LegacyScopeBinding = {
         ],
       });
     }
+    // Only messages of conversations that were projected are counted here;
+    // a dropped conversation is already counted once, above.
+    for (const [reason, count] of textUndelivered) {
+      diagnostics.push({
+        kind: "records_dropped",
+        scope,
+        stream: "messages",
+        count,
+        reasons: [reason],
+      });
+    }
     if (messagesMissing) {
       diagnostics.push({ kind: "stream_missing", scope, stream: "messages" });
     }
@@ -2024,9 +2046,56 @@ function chatgptNodeId(conversationId: string, recordId: string): string {
 }
 
 /**
+ * A message's source node: its declared `node_id` (ChatGPT 0.3.0 and later),
+ * else the node its record id names. Null when it has neither.
+ */
+function chatgptMessageNode(
+  conversationId: string,
+  message: Record<string, unknown>,
+): string | null {
+  if (isNonEmptyString(message.node_id)) return message.node_id;
+  return typeof message.id === "string"
+    ? chatgptNodeId(conversationId, message.id)
+    : null;
+}
+
+/** Whether a row is in the 0.3.0 form: it declares its node, or scopes its id. */
+function isScopedChatgptMessage(
+  conversationId: string,
+  message: Record<string, unknown>,
+): boolean {
+  return (
+    isNonEmptyString(message.node_id) ||
+    (typeof message.id === "string" &&
+      chatgptNodeId(conversationId, message.id) !== message.id)
+  );
+}
+
+/**
+ * Why a message's text is not in its row, or null when it is (or the row
+ * never had any). PageShim leaves out both `content` and `blob_ref` when it
+ * could not store the text at all, and sets `content` to null beside a
+ * `blob_ref` when the text is in a blob; a read that has not resolved that
+ * blob has no text to give.
+ */
+function chatgptTextUndelivered(
+  message: Record<string, unknown>,
+): string | null {
+  const hasBlob = Object.hasOwn(message, "blob_ref");
+  if (!Object.hasOwn(message, "content") && !hasBlob) {
+    return "Message text was omitted by the source";
+  }
+  if (hasBlob && typeof message.content !== "string") {
+    return "Message text is in a blob that was not resolved";
+  }
+  return null;
+}
+
+/**
  * One conversation's stored messages by source node id. When an instance holds
  * a node under both the pre-0.3.0 key and the 0.3.0 key, the 0.3.0 row wins:
- * it was written later, from the full source body.
+ * it was written later, from the full source body. `parentNode` resolves a
+ * row's `parent_id`, which names a record, to that record's node.
  */
 function chatgptMessagesByNode(
   conversationId: string,
@@ -2034,22 +2103,30 @@ function chatgptMessagesByNode(
 ): {
   byNode: Map<string, Record<string, unknown>>;
   unkeyed: Record<string, unknown>[];
+  parentNode: (message: Record<string, unknown>) => string | null;
 } {
   const byNode = new Map<string, Record<string, unknown>>();
   const unkeyed: Record<string, unknown>[] = [];
   const current = new Set<string>();
+  const nodeOfRecord = new Map<string, string>();
   for (const message of messages ?? []) {
-    if (typeof message.id !== "string") {
+    const node = chatgptMessageNode(conversationId, message);
+    if (node === null) {
       unkeyed.push(message);
       continue;
     }
-    const node = chatgptNodeId(conversationId, message.id);
-    const isCurrent = node !== message.id;
+    if (typeof message.id === "string") nodeOfRecord.set(message.id, node);
+    const isCurrent = isScopedChatgptMessage(conversationId, message);
     if (byNode.has(node) && (current.has(node) || !isCurrent)) continue;
     byNode.set(node, message);
     if (isCurrent) current.add(node);
   }
-  return { byNode, unkeyed };
+  const parentNode = (message: Record<string, unknown>) =>
+    typeof message.parent_id === "string"
+      ? (nodeOfRecord.get(message.parent_id) ??
+        chatgptNodeId(conversationId, message.parent_id))
+      : null;
+  return { byNode, unkeyed, parentNode };
 }
 
 /**

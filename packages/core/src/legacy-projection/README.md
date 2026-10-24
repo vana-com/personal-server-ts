@@ -8,6 +8,31 @@ that existing apps read (for example `chatgpt.conversations` →
   legacy scope from `{stream, data}` records of one PDPP source.
 - `legacyScopeToPdppSelection(scope)` — the PDPP source and streams a legacy
   scope is built from.
+- `legacyScopesProjectedOnRead()` and `legacyProjectionFor(scope, { profileKey })`
+  — which scopes the Personal Server projects on read, and for one scope its
+  PDPP source and streams, the vault scopes those streams are stored under
+  (`storedScopes`, e.g. `chatgpt.conversations` and `chatgpt.messages`) and
+  the legacy body version served (`legacySchemaVersion`). Null for a scope it
+  does not project. A client that writes raw `{records}` stream bodies under
+  `storedScopes` reads the legacy body back from the Personal Server.
+- `everyItemRowDropped(stream, sourceRows, diagnostics)` — whether a
+  projection dropped every source row of its item stream. Both read paths
+  (`withLegacyProjection` and `readCanonicalLegacyScope`) then fail the scope
+  rather than serve an empty list.
+
+## ChatGPT conversations
+
+`chatgpt.conversations` reads ChatGPT 0.2.0 and PageShim 0.3.1 rows (the
+binding's provenance pins both declarations). A message's node is its
+`node_id` when present, else its record id without the `<conversation_id>:`
+prefix; `parent_id` names a record and is resolved to that record's node.
+A conversation whose current branch is incomplete is dropped and counted
+(`records_dropped` on `conversations`); the others are served. A user or
+assistant text message whose text the source did not deliver (no `content`
+and no `blob_ref`, or an unresolved `blob_ref`) is left out of its thread and
+counted (`records_dropped` on `messages`). The legacy message requires
+`content` and allows no other fields, so no omission flag or placeholder
+text is written.
 
 This module has no dependencies and no Node built-ins, so it runs in browsers
 and WebViews (eslint rejects `node:` imports here). It is not a published
