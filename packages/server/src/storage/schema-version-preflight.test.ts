@@ -89,6 +89,7 @@ describe("schema version preflight", () => {
         const dbPath = await seedDatabase(root, legacy, pdpp);
         const before = await snapshot(root, dbPath);
         db = new Database(dbPath);
+        // copy-assertion-ok: refusal must identify unsupported and supported versions.
         expect(() => createSqliteRecordStore(db!)).toThrow(error);
         db.close();
         db = undefined;
@@ -108,6 +109,7 @@ describe("schema version preflight", () => {
       try {
         const dbPath = await seedDatabase(root, legacy, pdpp);
         const before = await snapshot(root, dbPath);
+        // copy-assertion-ok: startup must expose the same actionable schema refusal.
         await expect(async () => {
           context = await createServer(startupConfig, { rootPath: root });
           await context.cleanup();

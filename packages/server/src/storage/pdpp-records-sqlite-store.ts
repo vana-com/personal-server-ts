@@ -478,7 +478,7 @@ function migrate(db: Database): void {
 
 function sweepStaleBlobClaims(db: Database): void {
   db.transaction(() => {
-    // A Claude transition archive is retained history, not a registered
+    // A method-transition archive is retained history, not a registered
     // instance: it has no binding row, so only the transition ledger vouches
     // for its claims. Erasing the connection drops the ledger row and claims.
     db.exec(`
@@ -490,6 +490,10 @@ function sweepStaleBlobClaims(db: Database): void {
       )
       AND NOT EXISTS (
         SELECT 1 FROM pdpp_claude_transition t
+        WHERE t.archive_instance = pdpp_blob_claims.instance
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM pdpp_strava_transition t
         WHERE t.archive_instance = pdpp_blob_claims.instance
       );
     `);
@@ -1500,7 +1504,21 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
           ).run(transition.archiveInstance, stream);
         }
+        // Unreadable retained history may still reference any archived blob.
+        db.prepare(
+          `DELETE FROM pdpp_blob_claims WHERE instance = ?
+          AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
+          AND NOT EXISTS (
+            SELECT 1 FROM pdpp_record_changes c
+            WHERE c.instance = pdpp_blob_claims.instance
+              AND CASE WHEN json_valid(c.data)
+                THEN json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id
+                ELSE c.data IS NOT NULL END
+          )`,
+        ).run(transition.archiveInstance);
       }
+      // A scope reset must retain blobs that unreadable history may reference.
+      collectStartupUnclaimedBlobs(db);
     })();
   }
 
