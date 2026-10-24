@@ -31,6 +31,12 @@ import {
   encodePaymentHeader,
   nextPaymentNonce,
 } from "@opendatalabs/personal-server-ts-core/payment";
+import { createSyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type {
+  DataPointFeedRecord,
+  DataStoragePort,
+} from "@opendatalabs/personal-server-ts-core/ports";
+import type { StorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import {
   openPdppAuthStore,
@@ -761,6 +767,125 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
         "canonical",
       );
       expect(ctx!.indexManager.countByScope("oura.activity")).toBe(6);
+
+      let registryHead: DataPointFeedRecord = {
+        id: "canonical-registry-head",
+        ownerAddress: owner,
+        scope: "oura.activity",
+        dataHash: `0x${"11".repeat(32)}`,
+        metadataHash: `0x${"22".repeat(32)}`,
+        expectedVersion: "8",
+        addedAt: "2026-09-11T06:00:00Z",
+        deletedAt: null,
+      };
+      const registerDataPoint = vi.fn(
+        async (request: {
+          ownerAddress: string;
+          scope: string;
+          dataHash: `0x${string}`;
+          metadataHash: `0x${string}`;
+          expectedVersion: string;
+        }) => {
+          const id = "legacy-history-registry-head";
+          registryHead = {
+            ...registryHead,
+            id,
+            scope: request.scope,
+            dataHash: request.dataHash,
+            metadataHash: request.metadataHash,
+            expectedVersion: request.expectedVersion,
+          };
+          return { dataPointId: id, expectedVersion: request.expectedVersion };
+        },
+      );
+      const feed = {
+        getDataPoint: async () => registryHead,
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      };
+      const indexedStorage = {
+        kind: "node-fs-sqlite" as const,
+        listScopes: (options: { limit?: number; offset?: number }) =>
+          ctx!.indexManager.listDistinctScopes(options),
+        findEntry: (lookup: { scope: string; fileId?: string; at?: string }) =>
+          lookup.fileId
+            ? ctx!.indexManager.findByFileId(lookup.fileId)
+            : lookup.at
+              ? ctx!.indexManager.findClosestByScope(lookup.scope, lookup.at)
+              : ctx!.indexManager.findLatestByScope(lookup.scope),
+        findByFileId: (fileId: string) =>
+          ctx!.indexManager.findByFileId(fileId),
+        findByDataPointId: (dataPointId: string) =>
+          ctx!.indexManager.findByDataPointId(dataPointId),
+        findUnsynced: (options?: { limit?: number }) =>
+          ctx!.indexManager.findUnsynced(options),
+        readEnvelope: async (scope: string, collectedAt: string) => {
+          const entry = ctx!.indexManager.findClosestByScope(
+            scope,
+            collectedAt,
+          )!;
+          return JSON.parse(
+            await readFile(join(tempDir, "data", entry.path), "utf8"),
+          );
+        },
+        updateDataPointId: (path: string, dataPointId: string | null) =>
+          ctx!.indexManager.updateDataPointId(path, dataPointId),
+        updateEntryVersion: (path: string, version: number) =>
+          ctx!.indexManager.updateVersion(path, version),
+      } as unknown as DataStoragePort;
+      const blobs = new Map<string, Uint8Array>();
+      const storageAdapter = {
+        urlForKey: (key: string) => `https://storage.test/${key}`,
+        upload: async (key: string, bytes: Uint8Array) => {
+          blobs.set(key, bytes);
+          return `https://storage.test/${key}`;
+        },
+        download: async (url: string) =>
+          blobs.get(url.replace("https://storage.test/", ""))!,
+        delete: async (url: string) =>
+          blobs.delete(url.replace("https://storage.test/", "")),
+        exists: async (url: string) =>
+          blobs.has(url.replace("https://storage.test/", "")),
+      } as StorageAdapter;
+      const gateway = {
+        getDataPoint: async () => registryHead,
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+        registerDataPoint,
+      } as unknown as GatewayClient;
+      const cursor = { read: async () => null, write: async () => undefined };
+      const sync = createSyncManager(
+        {
+          storage: indexedStorage,
+          storageAdapter,
+          gateway,
+          dataPointFeed: feed,
+          signer: { signAddData: async () => "0x01" },
+          masterKey: new Uint8Array(65).fill(0xaa),
+          serverOwner: owner,
+          logger: ctx!.logger,
+        } as never,
+        {
+          storage: indexedStorage,
+          storageAdapter,
+          gateway,
+          dataPointFeed: feed,
+          cursor,
+          masterKey: new Uint8Array(65).fill(0xaa),
+          serverOwner: owner,
+          logger: ctx!.logger,
+        } as never,
+      );
+      try {
+        await sync.trigger();
+        expect(sync.getStatus().errors).toEqual([]);
+        expect(registerDataPoint).not.toHaveBeenCalled();
+        expect(registryHead).toMatchObject({
+          id: "canonical-registry-head",
+          expectedVersion: "8",
+        });
+        expect(ctx!.indexManager.findUnsynced()).toEqual([]);
+      } finally {
+        await sync.stop();
+      }
     } finally {
       vi.useRealTimers();
     }
@@ -2193,7 +2318,8 @@ describe("configured methods that share one public source", () => {
 });
 
 // These are fixture regression checks, not new captures from the named apps.
-// The route must keep the same body when ownership moves off the legacy file.
+// A newer complete source snapshot proves coverage even when the legacy
+// collection has no stable entity keys; an incomplete snapshot keeps the file.
 describe.each([
   "linkedin.connections",
   "linkedin.education",
@@ -2346,18 +2472,7 @@ describe.each([
       }
       const read = await ownerGet(`/v1/data/${scope}`);
       expect(read.status).toBe(200);
-      const hasUnkeyedEntities = [
-        "linkedin.connections",
-        "linkedin.education",
-        "linkedin.experience",
-        "linkedin.languages",
-        "linkedin.skills",
-        "github.repositories",
-        "github.starred",
-        "spotify.savedTracks",
-        "instagram.ads",
-      ].includes(scope);
-      const canonical = complete && !hasUnkeyedEntities;
+      const canonical = complete;
       expect(read.dataSource).toBe(canonical ? "canonical" : "legacy");
       expect(JSON.parse(read.text).data).toEqual(
         canonical ? canonicalBody : fixture.legacyBody,

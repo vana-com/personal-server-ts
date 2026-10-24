@@ -57,9 +57,9 @@ export interface IndexManager {
   /** Find an index entry by its DPv2 data-point id (download dedup). */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
   /**
-   * Find all index entries where dataPointId is null (not yet synced /
-   * registered on-chain). Returns entries ordered by created_at ASC (oldest
-   * first).
+   * Find unsynced entries eligible for remote publication, ordered oldest
+   * first. Legacy history remains indexed but is excluded once its scope has
+   * canonical authority.
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   /**
@@ -361,11 +361,30 @@ export function createIndexManager(
   );
 
   const findUnsyncedStmt = db.prepare(
-    "SELECT * FROM data_files WHERE data_point_id IS NULL ORDER BY created_at ASC",
+    `SELECT entry.* FROM data_files AS entry
+      WHERE entry.data_point_id IS NULL
+        AND (
+          entry.producer IN ('pdpp-projector', 'pdpp-import-projection')
+          OR NOT EXISTS (
+            SELECT 1 FROM legacy_scope_canonical_authority AS authority
+             WHERE authority.scope = entry.scope
+          )
+        )
+      ORDER BY entry.created_at ASC`,
   );
 
   const findUnsyncedLimitStmt = db.prepare<{ limit: number }>(
-    "SELECT * FROM data_files WHERE data_point_id IS NULL ORDER BY created_at ASC LIMIT @limit",
+    `SELECT entry.* FROM data_files AS entry
+      WHERE entry.data_point_id IS NULL
+        AND (
+          entry.producer IS NOT NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM legacy_scope_canonical_authority AS authority
+             WHERE authority.scope = entry.scope
+          )
+        )
+      ORDER BY entry.created_at ASC
+      LIMIT @limit`,
   );
 
   const updateFileIdStmt = db.prepare<{ file_id: string; path: string }>(
