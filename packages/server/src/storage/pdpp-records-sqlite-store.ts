@@ -450,16 +450,21 @@ function sweepStaleBlobClaims(db: Database): void {
 }
 
 function deleteUnclaimedBlobs(db: Database): void {
+  // Claims reconstructed by v4 only cover current records. Retained history
+  // independently owns its bytes, even after overwrite or tombstone. Explicit
+  // owner erasure removes that history before calling this collector.
   db.exec(`
     DELETE FROM pdpp_blob_bytes
     WHERE blob_id IN (
       SELECT blob_id FROM pdpp_blobs b
       WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = b.blob_id)
         AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = b.blob_id AND r.deleted = 0)
+        AND NOT EXISTS (SELECT 1 FROM pdpp_record_changes h WHERE json_extract(h.data, '$.blob_ref.blob_id') = b.blob_id)
     );
     DELETE FROM pdpp_blobs
     WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = pdpp_blobs.blob_id)
-      AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = pdpp_blobs.blob_id AND r.deleted = 0);
+      AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = pdpp_blobs.blob_id AND r.deleted = 0)
+      AND NOT EXISTS (SELECT 1 FROM pdpp_record_changes h WHERE json_extract(h.data, '$.blob_ref.blob_id') = pdpp_blobs.blob_id);
   `);
 }
 
