@@ -212,6 +212,30 @@ describe("source identities qualify legacy scope takeover", () => {
       );
   });
 
+  it.each([
+    "github.events",
+    "github.history",
+    "heb.orders",
+    "heb.nutrition",
+    "wholefoods.orders",
+    "wholefoods.nutrition",
+  ])(
+    "takes over %s when its legacy projection retains source identity",
+    async (scope) => {
+      const input = fixture(scope);
+      const expected = structuredClone(input.legacyBody);
+      if (scope === "github.history") expected.fetchedAt = collectedAt;
+      const read = await setup(
+        input,
+        true,
+        "2026-10-09T00:00:00.000Z",
+      ).readLatest(scope);
+      expect(read.kind).toBe("canonical");
+      if (read.kind === "canonical")
+        expect(read.envelope.data).toEqual(expected);
+    },
+  );
+
   it.each(["spotify.savedTracks", "spotify.playlists"] as const)(
     "keeps artist-free %s track lists unkeyed because URIs can encode local metadata",
     async (scope) => {

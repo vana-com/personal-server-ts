@@ -114,6 +114,59 @@ describe("CHARACTERIZATION: legacy identity is not supplied by mutable content",
     expectUnkeyed(verdict, "$.connections");
   });
 
+  it.each([
+    {
+      scope: "linkedin.education",
+      path: "$.education",
+      list: "education",
+      legacy: { schoolName: "Old school", degree: "BA" },
+      canonical: { schoolName: "Replacement school", degree: "BA" },
+    },
+    {
+      scope: "linkedin.experience",
+      path: "$.experiences",
+      list: "experiences",
+      legacy: { companyName: "Old company", jobTitle: "Engineer" },
+      canonical: { companyName: "Replacement company", jobTitle: "Engineer" },
+    },
+    {
+      scope: "linkedin.languages",
+      path: "$.languages",
+      list: "languages",
+      legacy: { name: "English", proficiency: "fluent" },
+      canonical: { name: "English", proficiency: "native" },
+    },
+    {
+      scope: "linkedin.skills",
+      path: "$.skills",
+      list: "skills",
+      legacy: { name: "TypeScript", endorsements: 4 },
+      canonical: { name: "TypeScript", endorsements: 8 },
+    },
+    {
+      scope: "instagram.ads",
+      path: "$.advertisers",
+      list: "advertisers",
+      legacy: { name: "Example Brand" },
+      canonical: { name: "Example Brand" },
+    },
+  ])(
+    "leaves $scope unkeyed when its legacy entities have no stable source ID",
+    ({ scope, path, list, legacy, canonical }) => {
+      const verdict = compareLegacyCoverage(
+        { [list]: [legacy] },
+        { [list]: [canonical] },
+        {
+          scope,
+          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          canonicalNewer: true,
+          allowProvenDeletion: true,
+        },
+      );
+      expectUnkeyed(verdict, path);
+    },
+  );
+
   it("refuses nonempty name-only artist subtrees independently of track refusal", () => {
     // Compare the subtree directly so an unkeyed enclosing track cannot mask it.
     const artists = [{ name: "private-artist" }];
@@ -143,6 +196,81 @@ describe("CHARACTERIZATION: legacy identity is not supplied by mutable content",
     expect(verdict.mismatchedFieldPaths).toEqual([]);
     expect(JSON.stringify(verdict)).not.toContain("private-");
   });
+
+  it.each([
+    {
+      scope: "github.events",
+      keys: LEGACY_SCOPE_ENTITY_KEYS["github.events"],
+      legacy: { events: [{ id: "event-1", title: "Old title" }] },
+      canonical: { events: [{ id: "event-1", title: "Updated title" }] },
+    },
+    {
+      scope: "github.history",
+      keys: LEGACY_SCOPE_ENTITY_KEYS["github.history"],
+      legacy: {
+        pullRequests: [{ id: "pr-1", title: "Old title" }],
+        issues: [{ id: "issue-1", title: "Old issue" }],
+      },
+      canonical: {
+        pullRequests: [{ id: "pr-1", title: "Updated title" }],
+        issues: [{ id: "issue-1", title: "Updated issue" }],
+      },
+    },
+    {
+      scope: "github.contributions",
+      keys: LEGACY_SCOPE_ENTITY_KEYS["github.contributions"],
+      legacy: {
+        yearTotals: [{ year: 2026, total: 365 }],
+        days: [{ date: "2026-01-01", count: 1 }],
+        monthlyTotals: [{ month: "2026-01", count: 30 }],
+      },
+      canonical: {
+        yearTotals: [{ year: 2026, total: 366 }],
+        days: [{ date: "2026-01-01", count: 2 }],
+        monthlyTotals: [{ month: "2026-01", count: 31 }],
+      },
+    },
+    {
+      scope: "heb.orders",
+      keys: LEGACY_SCOPE_ENTITY_KEYS["heb.orders"],
+      legacy: {
+        orders: [
+          { orderId: "order-1", items: [{ productId: "p-1", name: "Old" }] },
+        ],
+      },
+      canonical: {
+        orders: [
+          { orderId: "order-1", items: [{ productId: "p-1", name: "New" }] },
+        ],
+      },
+    },
+    {
+      scope: "wholefoods.orders",
+      keys: LEGACY_SCOPE_ENTITY_KEYS["wholefoods.orders"],
+      legacy: {
+        orders: [
+          { orderId: "order-1", items: [{ productId: "p-1", name: "Old" }] },
+        ],
+      },
+      canonical: {
+        orders: [
+          { orderId: "order-1", items: [{ productId: "p-1", name: "New" }] },
+        ],
+      },
+    },
+  ])(
+    "covers $scope rows by stable upstream IDs when mutable fields change",
+    ({ scope, keys: entityKeys, legacy, canonical }) => {
+      const verdict = compareLegacyCoverage(legacy, canonical, {
+        scope,
+        entityKeys,
+        canonicalNewer: true,
+      });
+      expect(verdict.covered).toBe(true);
+      expect(verdict.reason).toBeNull();
+      expect(verdict.missingEntityCount).toBe(0);
+    },
+  );
 });
 
 describe("legacy scope coverage", () => {

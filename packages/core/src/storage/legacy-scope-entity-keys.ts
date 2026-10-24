@@ -3,9 +3,12 @@
  * Singleton profiles belong to the selected connection; they need no array key.
  * Grocery nutrition already uses source product IDs as object-map keys.
  *
- * LinkedIn experience/education/skills/languages, Instagram ads, H-E-B delivery
- * addresses, GitHub achievements and Spotify artists retain no upstream ID in
- * the legacy body. Keep those lists unkeyed: names/content are not identities.
+ * LinkedIn connections/experience/education/skills/languages, Instagram ads,
+ * H-E-B delivery addresses, GitHub achievements and Spotify artists retain no
+ * upstream ID in the legacy body. Keep those lists unkeyed: names/content are
+ * not identities. Instagram ads drops source IDs while projecting. LinkedIn
+ * profile, Spotify profile, Instagram profile and YouTube profile are single
+ * records scoped to their selected connection, so they need no array key.
  * GitHub repository URLs/qualified names, organization logins and LinkedIn
  * profile URLs are reusable aliases, not stable IDs. Their source IDs are
  * omitted from the legacy body, so those lists must also stay unkeyed.

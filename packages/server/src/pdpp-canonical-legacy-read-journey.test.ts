@@ -1882,14 +1882,25 @@ describe("configured methods that share one public source", () => {
 // The route must keep the same body when ownership moves off the legacy file.
 describe.each([
   "linkedin.connections",
+  "linkedin.education",
+  "linkedin.experience",
+  "linkedin.languages",
+  "linkedin.skills",
   "github.repositories",
   "github.starred",
+  "github.events",
+  "github.history",
   "github.profile",
   "spotify.playlists",
   "spotify.savedTracks",
   "linkedin.profile",
   "spotify.profile",
   "instagram.profile",
+  "instagram.ads",
+  "youtube.profile",
+  "heb.orders",
+  "wholefoods.orders",
+  "wholefoods.profile",
 ])("owner coverage decision for %s", (scope) => {
   it.each([false, true])(
     "serves canonical only when its PDPP read covers the old file (complete=%s)",
@@ -1938,6 +1949,8 @@ describe.each([
               ),
             );
       const canonicalBody = structuredClone(fixture.legacyBody);
+      if (scope === "github.history")
+        canonicalBody.fetchedAt = "2026-10-21T00:00:00.000Z";
       if (scope === "spotify.playlists") {
         // No old track entities need an identity. The newer complete read can
         // add real tracks, including local tracks and nonempty artist lists.
@@ -2013,9 +2026,14 @@ describe.each([
       expect(read.status).toBe(200);
       const hasUnkeyedEntities = [
         "linkedin.connections",
+        "linkedin.education",
+        "linkedin.experience",
+        "linkedin.languages",
+        "linkedin.skills",
         "github.repositories",
         "github.starred",
         "spotify.savedTracks",
+        "instagram.ads",
       ].includes(scope);
       const canonical = complete && !hasUnkeyedEntities;
       expect(read.dataSource).toBe(canonical ? "canonical" : "legacy");
