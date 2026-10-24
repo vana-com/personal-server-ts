@@ -105,6 +105,61 @@ function shouldCountFirstAddition(input: FirstAdditionAdmissionInput): boolean {
   );
 }
 
+interface FirstAdditionWrite {
+  instance: string;
+  stream: string;
+  recordKey: string;
+  priorExists: boolean;
+  writeGeneration?: number;
+}
+
+function recordFirstAddition(db: Database, input: FirstAdditionWrite): boolean {
+  const state = db
+    .prepare(
+      `SELECT b.generation, c.reset_generation
+       FROM pdpp_instance_binding b
+       LEFT JOIN pdpp_additions_coverage c ON c.instance = b.instance
+       WHERE b.instance = ?`,
+    )
+    .get(input.instance) as
+    { generation: number; reset_generation: number | null } | undefined;
+  const alreadyTracked =
+    db
+      .prepare(
+        `SELECT 1 FROM pdpp_record_first_added
+         WHERE instance = ? AND stream = ? AND record_key = ?`,
+      )
+      .get(input.instance, input.stream, input.recordKey) !== undefined;
+  const writeGeneration = input.writeGeneration ?? state?.generation ?? 0;
+  if (
+    !shouldCountFirstAddition({
+      priorExists: input.priorExists,
+      preTracking: input.priorExists && !alreadyTracked,
+      resetGeneration: state?.reset_generation ?? null,
+      writeGeneration,
+    })
+  ) {
+    return false;
+  }
+  return (
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO pdpp_record_first_added
+           (instance, stream, record_key, first_added_at, generation)
+         SELECT ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), generation
+         FROM pdpp_instance_binding
+         WHERE instance = ? AND generation = ?`,
+      )
+      .run(
+        input.instance,
+        input.stream,
+        input.recordKey,
+        input.instance,
+        writeGeneration,
+      ).changes > 0
+  );
+}
+
 export interface ClaudeTransition {
   instance: string;
   archiveInstance: string;
@@ -982,6 +1037,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
       until: string,
     ): Array<{ instance: string; stream: string; added: number }>;
     shouldCountFirstAddition(input: FirstAdditionAdmissionInput): boolean;
+    recordFirstAddition(input: FirstAdditionWrite): boolean;
     countStreamSelection(input: {
       instance: string;
       stream: string;
@@ -1382,34 +1438,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     const version = latestVersion(instance, stream, recordKey) + 1;
     const writtenAt = nextWriteSeq.get() as { value: number };
     const priorExists = version > 1;
-    const alreadyTracked =
-      db
-        .prepare(
-          `SELECT 1 FROM pdpp_record_first_added
-           WHERE instance = ? AND stream = ? AND record_key = ?`,
-        )
-        .get(instance, stream, recordKey) !== undefined;
-    const reset = db
-      .prepare(
-        "SELECT b.generation, c.reset_generation FROM pdpp_instance_binding b LEFT JOIN pdpp_additions_coverage c ON c.instance = b.instance WHERE b.instance = ?",
-      )
-      .get(instance) as
-      { generation: number; reset_generation: number | null } | undefined;
-    if (
-      !deleted &&
-      shouldCountFirstAddition({
-        priorExists,
-        preTracking: priorExists && !alreadyTracked,
-        resetGeneration: reset?.reset_generation ?? null,
-        writeGeneration: reset?.generation ?? 0,
-      })
-    ) {
-      db.prepare(
-        `INSERT OR IGNORE INTO pdpp_record_first_added
-           (instance, stream, record_key, first_added_at, generation)
-         SELECT ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), generation
-         FROM pdpp_instance_binding WHERE instance = ?`,
-      ).run(instance, stream, recordKey, instance);
+    if (!deleted) {
+      recordFirstAddition(db, { instance, stream, recordKey, priorExists });
     }
     // The stream no longer holds what a replace delivered. `replaceStream`
     // writes its own receipt after its writes.
@@ -1951,6 +1981,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
         generation,
         JSON.stringify(input.snapshots),
       );
+      // This changes transport only: first-added time and coverage span the connection lifetime.
       // An archive is deliberately not a registered connection and cannot mint
       // owner tokens or accept writes. Blob claims keep the old bytes alive.
       for (const table of [
@@ -3339,6 +3370,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     firstAddedCoverage,
     listFirstAdded,
     shouldCountFirstAddition,
+    recordFirstAddition: (input) => recordFirstAddition(db, input),
     completeStreams,
     listArrivalOrder,
     getRecord,

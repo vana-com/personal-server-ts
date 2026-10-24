@@ -239,37 +239,14 @@ export function createReplicaReceiver(deps: {
       operation?.kind === "upsert"
         ? (operation.blobs[0]?.blobId ?? null)
         : null;
-    const coverage = operation
-      ? (db
-          .prepare(
-            "SELECT reset_generation FROM pdpp_additions_coverage WHERE instance = ?",
-          )
-          .get(instance) as { reset_generation: number | null } | undefined)
-      : undefined;
-    const alreadyTracked =
-      db
-        .prepare(
-          `SELECT 1 FROM pdpp_record_first_added
-           WHERE instance = ? AND stream = ? AND record_key = ?`,
-        )
-        .get(instance, stream, key) !== undefined;
-    if (
-      data !== null &&
-      operation &&
-      store.shouldCountFirstAddition({
+    if (data !== null && operation) {
+      store.recordFirstAddition({
+        instance,
+        stream,
+        recordKey: key,
         priorExists: current !== undefined,
-        preTracking: current !== undefined && !alreadyTracked,
-        resetGeneration: coverage?.reset_generation ?? null,
         writeGeneration: operation.generation,
-      })
-    ) {
-      db.prepare(
-        `INSERT OR IGNORE INTO pdpp_record_first_added
-           (instance, stream, record_key, first_added_at, generation)
-         SELECT ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), generation
-         FROM pdpp_instance_binding
-         WHERE instance = ? AND generation = ?`,
-      ).run(instance, stream, key, instance, operation.generation);
+      });
     }
     db.prepare(
       `INSERT INTO pdpp_records
