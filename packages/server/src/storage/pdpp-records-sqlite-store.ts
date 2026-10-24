@@ -325,6 +325,18 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
     snapshots_json TEXT NOT NULL,
     conversations_covered INTEGER NOT NULL DEFAULT 0
   );`,
+  // v15: expression index for the retained-history blob reference check in
+  // `deleteUnclaimedBlobs`. Without it each candidate blob scanned every
+  // history row at every writable open. `json_valid` guards the extraction:
+  // `json_extract` raises on malformed JSON, which would make this index
+  // (and every later insert of such a row) fail. The outer CAST gives the
+  // expression TEXT affinity, which the TEXT `blob_id` comparison needs before
+  // the planner will search it; a CASE alone does not provide that. Additive
+  // only; the expression must stay identical to `noRetainedHistoryReferenceSql`.
+  `
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
+  ON pdpp_record_changes (CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT));
+`,
 ];
 
 function addCompletionProofColumns(db: Database): void {
@@ -445,21 +457,61 @@ function sweepStaleBlobClaims(db: Database): void {
         WHERE t.archive_instance = pdpp_blob_claims.instance
       );
     `);
-    deleteUnclaimedBlobs(db);
+    collectStartupUnclaimedBlobs(db);
   })();
 }
 
+/**
+ * Automatic (startup) blob collection. A history row whose JSON cannot be
+ * parsed may reference any blob, so collection is skipped while one exists.
+ * Explicit owner erasure calls `deleteUnclaimedBlobs` directly and is not
+ * gated here.
+ */
+function collectStartupUnclaimedBlobs(db: Database): void {
+  const { found } = db
+    .prepare(
+      "SELECT EXISTS (SELECT 1 FROM pdpp_record_changes WHERE NOT json_valid(data)) AS found",
+    )
+    .get() as { found: number };
+  if (found === 1) {
+    const { count } = db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM pdpp_record_changes WHERE NOT json_valid(data)",
+      )
+      .get() as { count: number };
+    console.warn(
+      `[pdpp-records] skipped startup blob collection: ${count} history row(s) hold invalid JSON, so their blob references cannot be read`,
+    );
+    return;
+  }
+  deleteUnclaimedBlobs(db);
+}
+
+/**
+ * `NOT EXISTS` predicate: no retained history row references `blobId`.
+ * The expression must match the v15 index `idx_pdpp_record_changes_blob_ref`
+ * exactly, so the planner searches by blob id rather than scanning history.
+ */
+export function noRetainedHistoryReferenceSql(blobId: string): string {
+  return `NOT EXISTS (SELECT 1 FROM pdpp_record_changes WHERE CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT) = ${blobId})`;
+}
+
 function deleteUnclaimedBlobs(db: Database): void {
+  // Claims reconstructed by v4 only cover current records. Retained history
+  // independently owns its bytes, even after overwrite or tombstone. Explicit
+  // owner erasure removes that history before calling this collector.
   db.exec(`
     DELETE FROM pdpp_blob_bytes
     WHERE blob_id IN (
       SELECT blob_id FROM pdpp_blobs b
       WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = b.blob_id)
         AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = b.blob_id AND r.deleted = 0)
+        AND ${noRetainedHistoryReferenceSql("b.blob_id")}
     );
     DELETE FROM pdpp_blobs
     WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = pdpp_blobs.blob_id)
-      AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = pdpp_blobs.blob_id AND r.deleted = 0);
+      AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = pdpp_blobs.blob_id AND r.deleted = 0)
+      AND ${noRetainedHistoryReferenceSql("pdpp_blobs.blob_id")};
   `);
 }
 
