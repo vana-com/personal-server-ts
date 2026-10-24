@@ -12,6 +12,7 @@ import {
 import {
   approveMcpConnection,
   approveMcpOAuthAuthorization,
+  approveMcpOAuthAuthorizationWithScopes,
   approveMcpScopeAccessRequest,
   buildStableMcpUrl,
   buildMcpUrl,
@@ -1202,5 +1203,85 @@ describe("mcpGrantDefaultExpiry", () => {
   it("rejects a negative or non-finite TTL", () => {
     expect(() => mcpGrantDefaultExpiry(-1, now)).toThrow(RangeError);
     expect(() => mcpGrantDefaultExpiry(Number.NaN, now)).toThrow(RangeError);
+  });
+});
+
+describe("mcp/connection-api superseded OAuth authorizations", () => {
+  const START = new Date("2026-10-24T10:00:00.000Z");
+  const PAST_TTL = new Date("2026-10-24T10:11:00.000Z");
+
+  async function authorize(
+    stores: {
+      connectionStore: ReturnType<typeof createInMemoryMcpConnectionStore>;
+      authorizationStore: ReturnType<
+        typeof createInMemoryMcpOAuthAuthorizationStore
+      >;
+    },
+    clientId: string,
+    now = START,
+  ) {
+    return createMcpOAuthAuthorization(
+      {
+        clientId,
+        redirectUri: REDIRECT_URI,
+        codeChallenge: await pkceChallenge("verifier"),
+        codeChallengeMethod: "S256",
+      },
+      { ...stores, publicOrigin: PUBLIC_ORIGIN, now: () => now },
+    );
+  }
+
+  function newStores() {
+    return {
+      connectionStore: createInMemoryMcpConnectionStore(),
+      authorizationStore: createInMemoryMcpOAuthAuthorizationStore(),
+    };
+  }
+
+  it("drops another client's pending connection once its authorization expired", async () => {
+    const stores = newStores();
+    const stale = await authorize(stores, "client-a");
+    await authorize(stores, "client-b", PAST_TTL);
+
+    expect(
+      (await stores.connectionStore.getById(stale.connectionId))?.status,
+    ).toBe("revoked");
+  });
+
+  it("keeps an unexpired pending connection of another client", async () => {
+    const stores = newStores();
+    const other = await authorize(stores, "client-a");
+    await authorize(stores, "client-b");
+
+    expect(
+      (await stores.connectionStore.getById(other.connectionId))?.status,
+    ).toBe("pending");
+  });
+
+  it("signs no grant for a superseded authorization", async () => {
+    const stores = newStores();
+    const first = await authorize(stores, "client-a");
+    await authorize(stores, "client-a");
+    const gateway = {
+      getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+      createGrant: vi.fn(async () => ({ grantId: "0xgrant" })),
+    };
+
+    await expect(
+      approveMcpOAuthAuthorizationWithScopes(
+        { authorizationId: first.authorizationId, scopes: ["chatgpt.history"] },
+        {
+          ...stores,
+          gateway: gateway as never,
+          gatewayConfig: GATEWAY_CONFIG as never,
+          gatewayUrl: "https://gateway.test",
+          serverOwner: "0x00000000000000000000000000000000000000aa",
+          serverSigner: {
+            signGrantRegistration: vi.fn(async () => "0xsig" as `0x${string}`),
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_state" });
+    expect(gateway.createGrant).not.toHaveBeenCalled();
   });
 });
