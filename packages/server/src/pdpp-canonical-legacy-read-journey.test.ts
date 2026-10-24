@@ -11,6 +11,7 @@
  * checked again and may explicitly return to the file.
  */
 
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -416,7 +417,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(ids(read.text)).toEqual(["a1"]);
   });
 
-  it("rechecks a newer legacy version and records either continued coverage or file fallback", async () => {
+  it("keeps newer legacy route writes as history after canonical takeover", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       vi.setSystemTime(new Date("2026-10-14T22:00:00Z"));
@@ -442,17 +443,92 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       await legacyWrite("oura.activity", {
         days: [day("a1", "2026-09-01"), day("missing", "2026-09-03")],
       });
-      const fallback = await ownerGet("/v1/data/oura.activity");
-      expect(fallback.dataSource).toBe("legacy");
-      expect(ids(fallback.text)).toEqual(["a1", "missing"]);
-      const verdict = await ownerGet("/v1/data/oura.activity/takeover");
-      expect(verdict.status).toBe(200);
-      expect(JSON.parse(verdict.text).verdicts).toMatchObject([
-        {
-          verdict: "not_covered",
-          reason: { reason: "missing_entity", missingEntityCount: 1 },
-        },
+      const latest = await ownerGet("/v1/data/oura.activity");
+      expect(latest.dataSource).toBe("canonical");
+      expect(ids(latest.text)).toEqual(["a1", "a2"]);
+      expect(ctx!.indexManager.countByScope("oura.activity")).toBe(3);
+      const storedLegacy =
+        ctx!.indexManager.findLatestByScope("oura.activity")!;
+      const bytes = await readFile(join(tempDir, "data", storedLegacy.path));
+      expect(JSON.parse(bytes.toString("utf8")).data.days).toEqual([
+        day("a1", "2026-09-01"),
+        day("missing", "2026-09-03"),
       ]);
+
+      vi.setSystemTime(new Date("2026-10-14T22:00:02Z"));
+      const binaryWrite = await ctx!.app.request("/v1/data/oura.activity", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${ctx!.devToken}`,
+          "content-type": "application/octet-stream",
+        },
+        body: new Uint8Array([0x6f, 0x6c, 0x64]),
+      });
+      expect(binaryWrite.status).toBe(201);
+      expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+        "canonical",
+      );
+
+      vi.setSystemTime(new Date("2026-10-14T22:00:03Z"));
+      const chunkedEnvelope = new TextEncoder().encode(
+        JSON.stringify({ days: [day("chunked-only", "2026-09-05")] }),
+      );
+      const chunkedHash = createHash("sha256")
+        .update(chunkedEnvelope)
+        .digest("hex");
+      const importPath = "/v1/data/oura.activity/imports";
+      const auth = { authorization: `Bearer ${ctx!.devToken}` };
+      const begun = await ctx!.app.request(importPath, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({
+          totalBytes: chunkedEnvelope.byteLength,
+          totalChunks: 1,
+          sha256: chunkedHash,
+        }),
+      });
+      expect(begun.status).toBe(201);
+      const { importId } = (await begun.json()) as { importId: string };
+      const chunked = await ctx!.app.request(
+        `${importPath}/${importId}/chunks/0`,
+        {
+          method: "PUT",
+          headers: {
+            ...auth,
+            "content-type": "application/octet-stream",
+            "x-chunk-sha256": chunkedHash,
+          },
+          body: chunkedEnvelope,
+        },
+      );
+      expect(chunked.status, await chunked.text()).toBe(200);
+      const finalized = await ctx!.app.request(
+        `${importPath}/${importId}/finalize`,
+        { method: "POST", headers: auth },
+      );
+      expect(finalized.status, await finalized.text()).toBe(201);
+      expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+        "canonical",
+      );
+
+      const imported = await ctx!.app.request(
+        `/v1/data/oura.activity/imports/${"f".repeat(64)}`,
+        {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${ctx!.devToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            days: [day("imported-only", "2026-09-04")],
+          }),
+        },
+      );
+      expect(imported.status).toBe(201);
+      expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+        "canonical",
+      );
+      expect(ctx!.indexManager.countByScope("oura.activity")).toBe(6);
     } finally {
       vi.useRealTimers();
     }

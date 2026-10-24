@@ -1,8 +1,10 @@
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import {
   createLegacyScopeView,
   type LegacyScopeAuthority,
@@ -11,6 +13,8 @@ import {
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { initializeDatabase } from "./index-schema.js";
+import { createIndexManager } from "./index-manager.js";
+import { createNodeDataStorage } from "./node-data-storage.js";
 
 const OURA = "https://registry.pdpp.dev/sources/oura";
 const GITHUB = "https://registry.pdpp.dev/sources/github";
@@ -203,6 +207,7 @@ describe("legacy scope view over the real SQLite record store", () => {
   let db: InstanceType<typeof Database>;
   let store: Store;
   let view: ReturnType<typeof createLegacyScopeView>;
+  let persistentDir: string | undefined;
 
   beforeEach(() => {
     db = initializeDatabase(":memory:");
@@ -213,7 +218,13 @@ describe("legacy scope view over the real SQLite record store", () => {
       configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
     });
   });
-  afterEach(() => store.close());
+  afterEach(() => {
+    store.close();
+    if (persistentDir) {
+      rmSync(persistentDir, { recursive: true, force: true });
+      persistentDir = undefined;
+    }
+  });
 
   it("refuses a scope when two accounts of its methods hold data", async () => {
     connect(store, "conn_a", "oura");
@@ -279,13 +290,16 @@ describe("legacy scope view over the real SQLite record store", () => {
         );
       const authority = createLegacyScopeAuthority(reader);
       const head = authority.eligibleLegacyHead("oura.sleep")!;
-      const verdict = (cached: boolean) => ({
+      const verdict = (
+        cached: boolean,
+        coverage: LegacyCoverageVerdict = covered,
+      ) => ({
         instance: "conn_a",
         generation: 1,
         writeClock: authority.writeClock(),
         arrivalRevision: authority.arrivalRevision(),
         canonicalCursor: "0:0:receipt:revision:1",
-        coverage: covered,
+        coverage,
         cached,
       });
       // Commits an unrelated scope from the other connection, after the
@@ -357,6 +371,40 @@ describe("legacy scope view over the real SQLite record store", () => {
           ),
         ).toBe(true);
         expect(t.authority.hasMethodTakeover("oura.sleep", "oura")).toBe(true);
+      } finally {
+        t.close();
+      }
+    });
+
+    it("does not lock a scope from a cached not-covered verdict", () => {
+      const t = twoConnections();
+      const notCovered: LegacyCoverageVerdict = {
+        ...covered,
+        covered: false,
+        reason: "missing_entity",
+        reasonCounts: { ...covered.reasonCounts, missing_entity: 1 },
+        missingEntityCount: 1,
+      };
+      try {
+        expect(
+          t.authority.confirmRead(
+            "oura.sleep",
+            t.head,
+            () => true,
+            "oura",
+            t.verdict(false, notCovered),
+          ),
+        ).toBe(true);
+        expect(
+          t.authority.confirmRead(
+            "oura.sleep",
+            t.head,
+            () => true,
+            "oura",
+            t.verdict(true, notCovered),
+          ),
+        ).toBe(true);
+        expect(t.authority.hasCanonicalAuthority("oura.sleep")).toBe(false);
       } finally {
         t.close();
       }
@@ -495,19 +543,18 @@ describe("legacy scope view over the real SQLite record store", () => {
       "2026-09-01T00:00:00.000Z",
       1,
     );
-    let organizationId = "org";
     const makeView = () =>
       createLegacyScopeView({
         authority: createLegacyScopeAuthority(db),
         records: store,
         configuredMethods: (sourceId) =>
           sourceId === CLAUDE ? ["anthropic-live"] : [],
-        readLegacyHead: async () => ({
+        readLegacyHead: async (head) => ({
           version: "1.0",
           scope: "claude.conversations",
           collectedAt: "2026-09-01T00:00:00.000Z",
           data: {
-            organizationId,
+            organizationId: head.path.includes("other") ? "other-org" : "org",
             profile: { name: "Known reader", plan: "Known team" },
             source: "official-export",
             total: 0,
@@ -533,8 +580,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         },
       });
     }
-    // A new file from another organization cannot lend its metadata or take over.
-    organizationId = "other-org";
+    // A new file from another organization is history; it cannot lend metadata.
     db.prepare(
       "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
     ).run(
@@ -543,9 +589,14 @@ describe("legacy scope view over the real SQLite record store", () => {
       "2026-09-02T00:00:00.000Z",
       1,
     );
-    expect(await makeView().readLatest("claude.conversations")).toEqual({
-      kind: "file",
-      deletion: "canonical",
+    expect(await makeView().readLatest("claude.conversations")).toMatchObject({
+      kind: "canonical",
+      envelope: {
+        data: {
+          organizationId: "org",
+          profile: { name: "Known reader", plan: "Known team" },
+        },
+      },
     });
   });
 
@@ -1035,11 +1086,7 @@ describe("legacy scope view over the real SQLite record store", () => {
       }),
     });
     await mismatchView.readLatest("strava.activities");
-    expect(mismatchView.verdictFor("strava.activities")[0]).toMatchObject({
-      verdict: "not_covered",
-      reason: { reason: "field_mismatch" },
-      reasonCounts: { missing_raw_blob: 0, field_mismatch: 1 },
-    });
+    expect(mismatchView.verdictFor("strava.activities")).toEqual([]);
   });
 
   it("keeps covering Claude project rows with their raw blob references", async () => {
@@ -1059,13 +1106,10 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(await parityView.readLatest("claude.projects")).toMatchObject({
       kind: "canonical",
     });
-    expect(
-      parityView.verdictFor("claude.projects")[0]?.reasonCounts
-        .missing_raw_blob,
-    ).toBe(0);
+    expect(parityView.verdictFor("claude.projects")).toEqual([]);
   });
 
-  it("keeps parity verdicts isolated by connection instance", async () => {
+  it("keeps scope authority across a connection replacement", async () => {
     connect(store, "conn_a", "oura");
     replace(store, "conn_a", "activity", ["a1"]);
     const projected = await view.readLatest("oura.activity");
@@ -1091,7 +1135,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     db.prepare(
       "UPDATE pdpp_stream_completion SET source_collected_at = ? WHERE instance = ? AND stream = ?",
     ).run("2026-09-12T00:00:00.000Z", "conn_a", "activity");
-    expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
       "canonical",
     );
@@ -1101,28 +1145,19 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
       "canonical",
     );
-    expect(
-      db
-        .prepare(
-          "SELECT instance FROM legacy_scope_takeovers ORDER BY instance",
-        )
-        .all(),
-    ).toEqual([{ instance: "conn_a" }, { instance: "conn_b" }]);
+    expect(db.prepare("SELECT * FROM legacy_scope_takeovers").all()).toEqual(
+      [],
+    );
     ingest(store, "conn_b", "a1", "2026-09-10T08:00:00.000Z", 91);
-    expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
-    expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
-    expect(parityView.listingFor("oura.activity")).toEqual({ kind: "refused" });
-    expect(parityView.verdictFor("oura.activity")).toMatchObject([
-      { instance: "conn_a", verdict: "covered" },
-      {
-        instance: "conn_b",
-        verdict: "not_covered",
-        reason: { reason: "field_mismatch" },
-      },
-    ]);
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
+    expect(parityView.verdictFor("oura.activity")).toEqual([]);
   });
 
-  it("does not fall back to an unchanged head after connection generation replacement", async () => {
+  it("keeps scope authority through a covering connection generation replacement", async () => {
     connect(store, "conn_a", "oura");
     replace(store, "conn_a", "activity", ["a1"]);
     const projected = await view.readLatest("oura.activity");
@@ -1152,23 +1187,19 @@ describe("legacy scope view over the real SQLite record store", () => {
       expectedGeneration: 1,
       nextMethod: "oura",
     });
-    replace(store, "conn_a", "activity", ["a1"], {
-      score: 91,
-      generation: 2,
-    });
+    replace(store, "conn_a", "activity", ["a1"], { generation: 2 });
 
-    expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
-    expect(parityView.verdictFor("oura.activity")).toMatchObject([
-      { generation: 1, verdict: "covered" },
-      { generation: 2, verdict: "not_covered" },
-    ]);
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
     expect(
       db
         .prepare(
           "SELECT generation FROM legacy_scope_takeovers WHERE scope = ? AND instance = ?",
         )
         .all("oura.activity", "conn_a"),
-    ).toEqual([{ generation: 1 }]);
+    ).toEqual([]);
   });
 
   it("keeps an unchanged superseded head from falling back for a replacement account", async () => {
@@ -1199,19 +1230,13 @@ describe("legacy scope view over the real SQLite record store", () => {
     connect(store, "conn_b", "oura");
     replace(store, "conn_b", "activity", ["a1"], { score: 91 });
 
-    expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
-    expect(parityView.verdictFor("oura.activity")).toMatchObject([
-      { instance: "conn_a", generation: 1, verdict: "covered" },
-      { instance: "conn_b", generation: 1, verdict: "not_covered" },
-    ]);
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
   });
 
   it("honors a reset that commits while a cache-miss evaluation is in flight", async () => {
-    connect(store, "conn_a", "oura");
-    replace(store, "conn_a", "activity", ["a1"]);
-    const projected = await view.readLatest("oura.activity");
-    expect(projected.kind).toBe("canonical");
-    if (projected.kind !== "canonical") return;
     db.prepare(
       "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
     ).run(
@@ -1220,6 +1245,11 @@ describe("legacy scope view over the real SQLite record store", () => {
       "2026-10-01T00:00:00.000Z",
       1,
     );
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    const projected = await view.readLatest("oura.activity");
+    expect(projected.kind).toBe("canonical");
+    if (projected.kind !== "canonical") return;
     let resume!: () => void;
     let started!: () => void;
     const readStarted = new Promise<void>((resolve) => (started = resolve));
@@ -1247,7 +1277,40 @@ describe("legacy scope view over the real SQLite record store", () => {
     );
   });
 
-  it("reuses the covered projection without reading source rows again", async () => {
+  it("keeps canonical authority after a later legacy file appears", async () => {
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    const projected = await view.readLatest("oura.activity");
+    expect(projected.kind).toBe("canonical");
+    if (projected.kind !== "canonical") return;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-10-01T00:00:00.000Z",
+      1,
+    );
+    const readLegacyHead = vi.fn(async () => projected.envelope);
+    const parityView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead,
+    });
+    const listRecords = vi.spyOn(store, "listRecords");
+
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    expect(readLegacyHead).not.toHaveBeenCalled();
+    expect(listRecords).toHaveBeenCalled();
+  });
+
+  it("keeps listing after canonical data changes under locked authority", async () => {
     connect(store, "conn_a", "oura");
     replace(store, "conn_a", "activity", ["a1"]);
     const projected = await view.readLatest("oura.activity");
@@ -1267,24 +1330,80 @@ describe("legacy scope view over the real SQLite record store", () => {
       configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
       readLegacyHead: async () => projected.envelope,
     });
-    const listRecords = vi.spyOn(store, "listRecords");
-
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
       "canonical",
     );
-    const storedCursor = db
-      .prepare(
-        "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
-      )
-      .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/9");
-    const callsAfterFirstRead = listRecords.mock.calls.length;
-    expect(callsAfterFirstRead).toBeGreaterThan(0);
+    replace(store, "conn_a", "activity", ["a1"], {
+      score: 90,
+      collectedAt: "2026-09-12T07:00:00.000Z",
+    });
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
       "canonical",
     );
+    expect(parityView.listingFor("oura.activity").kind).toBe("canonical");
+  });
 
-    expect(listRecords).toHaveBeenCalledTimes(callsAfterFirstRead);
+  it("ignores a legacy write that arrives during a read after takeover", async () => {
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    const projected = await view.readLatest("oura.activity");
+    expect(projected.kind).toBe("canonical");
+    if (projected.kind !== "canonical") return;
+    db.prepare(
+      "DELETE FROM legacy_scope_canonical_authority WHERE scope = ?",
+    ).run("oura.activity");
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/old.json",
+      "oura.activity",
+      "2026-09-01T00:00:00.000Z",
+      1,
+    );
+    const initialView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async () => projected.envelope,
+    });
+    expect((await initialView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    replace(store, "conn_a", "activity", ["a1"], {
+      score: 90,
+      collectedAt: "2026-09-12T07:00:00.000Z",
+    });
+
+    let markStarted!: () => void;
+    let releaseRead!: () => void;
+    const started = new Promise<void>((resolve) => (markStarted = resolve));
+    const gate = new Promise<void>((resolve) => (releaseRead = resolve));
+    const racingView = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+      readLegacyHead: async (head) => {
+        expect(head.path).toBe("oura/activity/old.json");
+        markStarted();
+        await gate;
+        return projected.envelope;
+      },
+    });
+    const inFlight = racingView.readLatest("oura.activity");
+    await started;
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run(
+      "oura/activity/new.json",
+      "oura.activity",
+      "2026-10-02T00:00:00.000Z",
+      1,
+    );
+    releaseRead();
+
+    expect((await inFlight).kind).toBe("canonical");
+    expect(racingView.listingFor("oura.activity").kind).toBe("canonical");
   });
 
   it("refreshes a covered projection after an unchanged re-delivery changes arrival order", async () => {
@@ -1315,7 +1434,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     const callsAfterWarm = listRecords.mock.calls.length;
     const repeated = await parityView.readLatest("strava.activities");
     expect(repeated.kind).toBe("canonical");
-    expect(listRecords).toHaveBeenCalledTimes(callsAfterWarm);
+    expect(listRecords.mock.calls.length).toBeGreaterThan(callsAfterWarm);
 
     ingest(store, "conn_a", "a", "2026-09-10T07:00:00.000Z", 80, {
       stream: "activities",
@@ -1337,7 +1456,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect((await parityView.readLatest("strava.activities")).kind).toBe(
       "canonical",
     );
-    expect(listRecords).toHaveBeenCalledTimes(callsAfterRefresh);
+    expect(listRecords.mock.calls.length).toBeGreaterThan(callsAfterRefresh);
   });
 
   it("refreshes a covered projection after an unchanged replacement reorders records", async () => {
@@ -1376,7 +1495,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(refreshed.revision).not.toBe(warm.revision);
   });
 
-  it("re-evaluates a same-time parity verdict after only arrival order changes", async () => {
+  it("keeps late legacy data out of a scope with canonical authority", async () => {
     connect(store, "conn_a", "strava", STRAVA);
     replace(store, "conn_a", "activities", ["a", "b"], { method: "strava" });
     const initialProjection = await view.readLatest("strava.activities");
@@ -1390,20 +1509,19 @@ describe("legacy scope view over the real SQLite record store", () => {
       "2026-09-09T07:00:00.000Z",
       1,
     );
+    const readLegacyHead = vi.fn(async () => initialProjection.envelope);
     const parityView = createLegacyScopeView({
       authority: createLegacyScopeAuthority(db),
       records: store,
       configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
-      readLegacyHead: async () => initialProjection.envelope,
+      readLegacyHead,
     });
 
     expect((await parityView.readLatest("strava.activities")).kind).toBe(
       "canonical",
     );
-    expect(parityView.verdictFor("strava.activities")[0]).toMatchObject({
-      verdict: "covered",
-      comparisonCase: "same_time",
-    });
+    expect(parityView.verdictFor("strava.activities")).toEqual([]);
+    expect(readLegacyHead).not.toHaveBeenCalled();
 
     ingest(store, "conn_a", "a", "2026-09-10T07:00:00.000Z", 80, {
       stream: "activities",
@@ -1412,14 +1530,13 @@ describe("legacy scope view over the real SQLite record store", () => {
     expect(store.listArrivalOrder("conn_a", "activities")).toEqual(["b", "a"]);
     await parityView.readLatest("strava.activities");
 
-    expect(parityView.verdictFor("strava.activities")[0]).toMatchObject({
-      verdict: "not_covered",
-      comparisonCase: "same_time",
-      reason: { reason: "array_order" },
-    });
+    expect((await parityView.readLatest("strava.activities")).kind).toBe(
+      "canonical",
+    );
+    expect(parityView.verdictFor("strava.activities")).toEqual([]);
   });
 
-  it("reuses a not-covered verdict without rebuilding the projection", async () => {
+  it("ignores a legacy write after canonical authority", async () => {
     connect(store, "conn_a", "oura");
     replace(store, "conn_a", "activity", ["a1"]);
     const projected = await view.readLatest("oura.activity");
@@ -1433,23 +1550,23 @@ describe("legacy scope view over the real SQLite record store", () => {
       "2026-10-01T00:00:00.000Z",
       1,
     );
-    const legacy = {
+    const readLegacyHead = vi.fn(async () => ({
       ...projected.envelope,
       data: { values: ["legacy-only"] } as typeof projected.envelope.data,
-    };
+    }));
     const parityView = createLegacyScopeView({
       authority: createLegacyScopeAuthority(db),
       records: store,
       configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
-      readLegacyHead: async () => legacy,
+      readLegacyHead,
     });
     const listRecords = vi.spyOn(store, "listRecords");
 
-    expect((await parityView.readLatest("oura.activity")).kind).toBe("file");
-    const callsAfterEvaluation = listRecords.mock.calls.length;
-    expect(callsAfterEvaluation).toBeGreaterThan(0);
-    expect((await parityView.readLatest("oura.activity")).kind).toBe("file");
-    expect(listRecords).toHaveBeenCalledTimes(callsAfterEvaluation);
+    expect((await parityView.readLatest("oura.activity")).kind).toBe(
+      "canonical",
+    );
+    expect(readLegacyHead).not.toHaveBeenCalled();
+    expect(listRecords).toHaveBeenCalled();
   });
 
   it("does not treat one newer unproven upsert as a newer full stream", async () => {
@@ -1540,11 +1657,8 @@ describe("legacy scope view over the real SQLite record store", () => {
       "2026-10-02T00:00:00.000Z",
       1,
     );
-    expect((await parityView.readLatest("oura.activity")).kind).toBe("file");
-    expect(parityView.verdictFor("oura.activity")[0]).toMatchObject({
-      verdict: "not_covered",
-      reason: { reason: "projection_unavailable" },
-    });
+    expect((await parityView.readLatest("oura.activity")).kind).toBe("refused");
+    expect(parityView.verdictFor("oura.activity")).toEqual([]);
   });
 
   it("leaves a scope to its file until a connection of its methods holds its streams", async () => {
@@ -1767,6 +1881,78 @@ describe("legacy scope view over the real SQLite record store", () => {
         taken_over_at: expect.any(String),
       }),
     ]);
+    expect(
+      db.prepare("SELECT scope FROM legacy_scope_canonical_authority").all(),
+    ).toEqual([{ scope: "oura.activity" }]);
+  });
+
+  it("keeps later legacy writes as history after takeover, including after restart", async () => {
+    const tempRoot = join(homedir(), ".tmp");
+    mkdirSync(tempRoot, { recursive: true });
+    persistentDir = mkdtempSync(join(tempRoot, "ps-legacy-authority-"));
+    const path = join(persistentDir, "index.db");
+    store.close();
+    db = initializeDatabase(path);
+    store = createSqliteRecordStore(db);
+    view = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+    });
+    db.prepare(
+      `INSERT INTO data_files (scope, version, cas_revision, collected_at, path)
+         VALUES (?, ?, ?, ?, ?)`,
+    ).run(
+      "oura.activity",
+      1,
+      1,
+      "2026-01-01T00:00:00.000Z",
+      "oura/activity/old.json",
+    );
+    connect(store, "conn_a", "oura");
+    replace(store, "conn_a", "activity", ["a1"]);
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+
+    const storage = createNodeDataStorage({
+      indexManager: createIndexManager(db),
+      hierarchyOptions: { dataDir: join(persistentDir, "data") },
+    });
+    const remoteLegacy = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00.000Z",
+      { days: [{ id: "remote-only" }] },
+    );
+    const replica = await storage.commitVersion!({
+      kind: "replica",
+      envelope: remoteLegacy,
+      metadata: {
+        schemaId: null,
+        dataPointId: `0x${"11".repeat(32)}`,
+        version: 2,
+      },
+    });
+    expect(replica.kind).toBe("stored");
+    expect(
+      db
+        .prepare("SELECT path FROM data_files WHERE scope = ? ORDER BY id")
+        .all("oura.activity"),
+    ).toEqual([
+      { path: "oura/activity/old.json" },
+      { path: replica.kind === "stored" ? replica.entry.path : "" },
+    ]);
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+    expect(view.listingFor("oura.activity").kind).toBe("canonical");
+
+    store.close();
+    db = initializeDatabase(path);
+    store = createSqliteRecordStore(db);
+    view = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => CONFIGURED[sourceId] ?? [],
+    });
+    expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+    expect(view.listingFor("oura.activity").kind).toBe("canonical");
   });
 
   it("records every eligible version once, including a later legacy head", async () => {
@@ -1828,11 +2014,6 @@ describe("legacy scope view over the real SQLite record store", () => {
         superseded_version: 7,
         superseded_cas_revision: 9,
         superseded_path: "oura/activity/old.json",
-      },
-      {
-        superseded_version: 8,
-        superseded_cas_revision: 10,
-        superseded_path: "oura/activity/new.json",
       },
     ]);
   });
@@ -2321,15 +2502,16 @@ describe("legacy scope view over the real SQLite record store", () => {
       });
     });
 
-    it("yields to a legacy head that appears after the projection", async () => {
+    it("keeps an opted-in projection canonical after a legacy head appears", async () => {
       connect(store, "conn_b", "oura-browser");
       replace(store, "conn_b", "activity", ["a1"], { method: "oura-browser" });
       expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+      expect(
+        db.prepare("SELECT scope FROM legacy_scope_canonical_authority").all(),
+      ).toEqual([{ scope: "oura.activity" }]);
       legacyHead("oura.activity", "oura/activity/later.json");
-      expect(await view.readLatest("oura.activity")).toEqual({
-        kind: "file",
-        deletion: "file",
-      });
+      expect((await view.readLatest("oura.activity")).kind).toBe("canonical");
+      expect(view.listingFor("oura.activity").kind).toBe("canonical");
     });
 
     it("says so once when it keeps the file over a connection that holds synced rows", async () => {
@@ -2529,7 +2711,7 @@ describe("legacy scope view over the real SQLite record store", () => {
     );
   });
 
-  it("writes nothing while deciding, reading or listing", async () => {
+  it("records canonical authority once while deciding, reading and listing", async () => {
     connect(store, "conn_a", "oura");
     replace(store, "conn_a", "activity", ["a1"]);
     const before = db.prepare("SELECT total_changes() AS n").get();
@@ -2537,7 +2719,9 @@ describe("legacy scope view over the real SQLite record store", () => {
     view.listingFor("oura.activity");
     view.listCanonicalScopes(undefined);
     view.ownsScope("oura.readiness");
-    expect(db.prepare("SELECT total_changes() AS n").get()).toEqual(before);
+    expect(db.prepare("SELECT total_changes() AS n").get()).toEqual({
+      n: before.n + 1,
+    });
   });
 });
 

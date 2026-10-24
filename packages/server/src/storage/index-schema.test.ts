@@ -164,7 +164,7 @@ describe("initializeDatabase", () => {
     db.close();
   });
 
-  it("adds the takeover method to a v14 ledger without changing its version", async () => {
+  it("migrates a v14 takeover ledger into durable scope authority", async () => {
     const dir = await mkdtemp(join(tmpdir(), "legacy-takeover-schema-"));
     try {
       const path = join(dir, "index.db");
@@ -192,11 +192,13 @@ describe("initializeDatabase", () => {
       old.close();
 
       const db = initializeDatabase(path);
-      // The version stays 14, so a runtime pinned before this can still open it.
       expect(db.pragma("user_version", { simple: true })).toBe(14);
       expect(
         db.prepare("SELECT instance, method FROM legacy_scope_takeovers").all(),
       ).toEqual([{ instance: "oura:owner", method: "" }]);
+      expect(
+        db.prepare("SELECT scope FROM legacy_scope_canonical_authority").all(),
+      ).toEqual([{ scope: "oura.sleep" }]);
       db.close();
     } finally {
       await rm(dir, { recursive: true, force: true });
