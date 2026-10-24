@@ -40,6 +40,7 @@ import type {
   McpConnectionRecord,
   McpConnectionStore,
   McpConnectionGrant,
+  McpIngress,
   McpScopeAccessDecision,
   McpScopeAccessRequest,
   McpScopeAccessRequestView,
@@ -157,6 +158,7 @@ function randomToken(): string {
 
 export interface CreateMcpConnectionInput {
   displayName?: string;
+  ingress?: McpIngress;
 }
 
 export interface CreateMcpConnectionOutput {
@@ -201,6 +203,7 @@ export async function createMcpConnection(
     status: "pending",
     grants: [],
     createdAt,
+    ...(input.ingress ? { ingress: input.ingress } : {}),
   };
 
   await options.store.create(record);
@@ -873,7 +876,15 @@ export interface CreateMcpOAuthAuthorizationInput {
   codeChallengeMethod: string;
   scope?: string;
   state?: string;
+  /** Listener the authorize request arrived on; binds the connection to it. */
+  ingress?: McpIngress;
+  /** From the client's registration; names the connection. */
+  clientName?: string;
+  clientUri?: string;
 }
+
+/** Connection label when the client never told this server its name. */
+const DEFAULT_MCP_CLIENT_NAME = "MCP client";
 
 export interface CreateMcpOAuthAuthorizationOptions {
   connectionStore: McpConnectionStore;
@@ -941,7 +952,10 @@ export async function createMcpOAuthAuthorization(
     now.getTime() + OAUTH_AUTHORIZATION_TTL_MS,
   ).toISOString();
   const created = await createMcpConnection(
-    { displayName: "Claude" },
+    {
+      displayName: input.clientName ?? DEFAULT_MCP_CLIENT_NAME,
+      ingress: input.ingress,
+    },
     {
       store: options.connectionStore,
       publicOrigin: options.publicOrigin,
@@ -952,6 +966,8 @@ export async function createMcpOAuthAuthorization(
   const record: McpOAuthAuthorizationRecord = {
     id: authorizationId,
     clientId: input.clientId,
+    ...(input.clientName ? { clientName: input.clientName } : {}),
+    ...(input.clientUri ? { clientUri: input.clientUri } : {}),
     redirectUri: input.redirectUri,
     codeChallenge: input.codeChallenge,
     codeChallengeMethod: "S256",
@@ -976,6 +992,8 @@ export async function createMcpOAuthAuthorization(
 export interface McpOAuthAuthorizationView {
   id: string;
   clientId: string;
+  clientName?: string;
+  clientUri?: string;
   redirectUri: string;
   scope?: string;
   state?: string;
@@ -992,6 +1010,8 @@ export function toMcpOAuthAuthorizationView(
   return {
     id: record.id,
     clientId: record.clientId,
+    ...(record.clientName ? { clientName: record.clientName } : {}),
+    ...(record.clientUri ? { clientUri: record.clientUri } : {}),
     redirectUri: record.redirectUri,
     ...(record.scope ? { scope: record.scope } : {}),
     ...(record.state ? { state: record.state } : {}),

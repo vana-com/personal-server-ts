@@ -13,6 +13,8 @@ import type {
   McpConnectionStore,
   McpOAuthAuthorizationRecord,
   McpOAuthAuthorizationStore,
+  McpOAuthClientRecord,
+  McpOAuthClientStore,
 } from "./types.js";
 import { isMcpTokenExpired, matchesMcpRefreshHash } from "./token-expiry.js";
 
@@ -79,6 +81,40 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
       const updated = { ...record, ...patch };
       byId.set(id, updated);
       return { ...updated };
+    },
+  };
+}
+
+/** Registration is unauthenticated; past this, the oldest client is evicted. */
+export const MAX_MCP_OAUTH_CLIENTS = 500;
+
+/**
+ * Client to evict before adding one, or undefined while under the cap.
+ * Authorizations copy the client's name, so eviction only forgets
+ * registrations never authorized. Ties keep insertion order.
+ */
+export function evictableMcpClient(
+  clients: McpOAuthClientRecord[],
+): string | undefined {
+  if (clients.length < MAX_MCP_OAUTH_CLIENTS) return undefined;
+  return clients.reduce((oldest, client) =>
+    client.createdAt < oldest.createdAt ? client : oldest,
+  ).clientId;
+}
+
+export function createInMemoryMcpOAuthClientStore(): McpOAuthClientStore {
+  const byId = new Map<string, McpOAuthClientRecord>();
+
+  return {
+    async create(record) {
+      const evicted = evictableMcpClient(Array.from(byId.values()));
+      if (evicted) byId.delete(evicted);
+      byId.set(record.clientId, { ...record });
+    },
+
+    async getById(clientId) {
+      const record = byId.get(clientId);
+      return record ? { ...record } : null;
     },
   };
 }

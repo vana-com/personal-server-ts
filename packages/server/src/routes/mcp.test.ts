@@ -25,11 +25,13 @@ import { Hono } from "hono";
 import {
   approveMcpConnection,
   MCP_TOKEN_TTL_MS,
+  MAX_MCP_OAUTH_CLIENTS,
   createInMemoryMcpConnectionStore,
   createInMemoryMcpOAuthAuthorizationStore,
   createMcpConnection,
   createMcpDataReadClient,
   hashConnectionToken,
+  listMcpConnectionViews,
   loadMcpGranteeAccount,
   McpActivityRecorder,
   MCP_TOOLS,
@@ -63,6 +65,10 @@ import { createNodeDataStorage } from "../storage/node-data-storage.js";
 import type { PersonalServerDataApiDeps } from "@opendatalabs/personal-server-ts-core/api";
 
 const SERVER_ORIGIN = "http://localhost:8080";
+const MAIN_PORT = 8080;
+const LOOPBACK_PORT = 8081;
+/** Longest DCR client_name kept as a connection label. */
+const MAX_CLIENT_NAME_CHARS = 64;
 const ownerWallet = createTestWallet(9);
 const CLAUDE_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
 const gatewayConfig = {
@@ -799,6 +805,8 @@ describe("MCP /mcp/:token route", () => {
         indexManager: createIndexManager(initializeDatabase(":memory:")),
         hierarchyOptions: { dataDir: "/tmp" },
         oauthApprovalUrl: "https://app-dev.vana.org/mcp/connect/claude",
+        localApprovalPort: LOOPBACK_PORT,
+        serverPort: MAIN_PORT,
       }),
     );
     root.route(
@@ -1052,6 +1060,39 @@ describe("MCP /mcp/:token route", () => {
     const res = await call();
     expect(res.status).toBe(401);
     expect((await res.json()).error.errorCode).toBe("INVALID_TOKEN");
+  });
+
+  it("serves a record stored before listener binding on the main listener only", async () => {
+    const created = await createMcpConnection(
+      { displayName: "Claude" },
+      { store, publicOrigin: SERVER_ORIGIN },
+    );
+    await approveMcpConnection(
+      {
+        connectionId: created.connectionId,
+        grants: [{ grantId: "grant-legacy", scopes: ["chatgpt.history"] }],
+      },
+      { store },
+    );
+    await store.mutate(created.connectionId, ({ ingress: _, ...legacy }) => ({
+      ...legacy,
+    }));
+    const call = (localPort: number) =>
+      app.request(
+        `/mcp/${encodeURIComponent(created.connectionToken)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+        },
+        { incoming: { socket: { localPort, localAddress: "127.0.0.1" } } },
+      );
+
+    expect((await call(MAIN_PORT)).status).toBe(200);
+    expect((await call(LOOPBACK_PORT)).status).toBe(401);
   });
 });
 
@@ -1327,6 +1368,101 @@ describe("MCP OAuth routes", () => {
     expect(rejected.status).toBe(400);
     expect(await rejected.json()).toMatchObject({
       error: "invalid_redirect_uri",
+    });
+  });
+
+  describe("client identity", () => {
+    /** Authorizes `clientId`; returns what the owner's approval page reads. */
+    async function authorizationFor(clientId: string) {
+      const authorize = await app.request(
+        `/mcp/oauth/authorize?${new URLSearchParams({
+          response_type: "code",
+          client_id: clientId,
+          redirect_uri: CLAUDE_REDIRECT_URI,
+          code_challenge: await pkceChallenge("client-identity-verifier"),
+          code_challenge_method: "S256",
+        })}`,
+      );
+      const id = new URL(authorize.headers.get("location")!).searchParams.get(
+        "mcp_authorization",
+      );
+      const view = await (
+        await ownerRequest("GET", `/v1/mcp/oauth/authorizations/${id}`)
+      ).json();
+      const connection = (await listMcpConnectionViews(store)).find(
+        (candidate) => candidate.id === view.connectionId,
+      );
+      return { view, displayName: connection?.displayName };
+    }
+
+    async function registerClient(metadata: Record<string, unknown>) {
+      const register = await app.request("/mcp/oauth/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...metadata,
+          redirect_uris: [CLAUDE_REDIRECT_URI],
+        }),
+      });
+      return register.json();
+    }
+
+    it("shows the registered client name and uri to the owner and on the connection", async () => {
+      const registered = await registerClient({
+        client_name: "  Maple\u0000 AI\u202e ",
+        client_uri: "https://trymaple.ai",
+      });
+      expect(registered.client_name).toBe("Maple AI");
+
+      const { view, displayName } = await authorizationFor(
+        registered.client_id,
+      );
+
+      expect(view.clientName).toBe("Maple AI");
+      expect(view.clientUri).toBe("https://trymaple.ai/");
+      expect(displayName).toBe("Maple AI");
+    });
+
+    it("caps the client name and drops a client_uri that is not http(s)", async () => {
+      const registered = await registerClient({
+        client_name: "x".repeat(500),
+        client_uri: "javascript:alert(1)",
+      });
+
+      const { view } = await authorizationFor(registered.client_id);
+
+      expect(view.clientName).toBe("x".repeat(MAX_CLIENT_NAME_CHARS));
+      expect(view).not.toHaveProperty("clientUri");
+    });
+
+    // Registration is unauthenticated, so the store evicts the oldest client.
+    it("keeps only the newest registered clients; authorized ones keep their name", async () => {
+      const first = await registerClient({ client_name: "Maple AI" });
+      const { view: pending } = await authorizationFor(first.client_id);
+
+      let newest = first;
+      for (let i = 0; i < MAX_MCP_OAUTH_CLIENTS; i++) {
+        newest = await registerClient({ client_name: `Client ${i}` });
+      }
+
+      expect((await authorizationFor(first.client_id)).displayName).toBe(
+        "MCP client",
+      );
+      expect((await authorizationFor(newest.client_id)).displayName).toBe(
+        `Client ${MAX_MCP_OAUTH_CLIENTS - 1}`,
+      );
+      const stillPending = await (
+        await ownerRequest("GET", `/v1/mcp/oauth/authorizations/${pending.id}`)
+      ).json();
+      expect(stillPending.clientName).toBe("Maple AI");
+    });
+
+    // Claude.ai may reuse a client_id this server never registered.
+    it("labels an unregistered client_id with a neutral name", async () => {
+      const { view, displayName } = await authorizationFor("never-registered");
+
+      expect(view).not.toHaveProperty("clientName");
+      expect(displayName).toBe("MCP client");
     });
   });
 
