@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { compareLegacyCoverage } from "./legacy-scope-coverage.js";
-import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
+import {
+  LEGACY_SCOPE_ENTITY_KEYS,
+  LEGACY_SCOPE_SNAPSHOT_EQUIVALENCE,
+} from "./legacy-scope-entity-keys.js";
 
 const keys = { "$.items": ["id"], "$.items[].children": ["id"] };
 
@@ -274,6 +277,335 @@ describe("CHARACTERIZATION: legacy identity is not supplied by mutable content",
 });
 
 describe("legacy scope coverage", () => {
+  const unkeyedSnapshotScopes = [
+    {
+      scope: "linkedin.connections",
+      paths: ["$.connections"],
+      body: () => ({
+        connections: [
+          {
+            fullName: "Grace Hopper",
+            headline: "Computer scientist",
+            profileUrl: "https://example.test/grace",
+            dateConnected: "2024-01-02",
+          },
+          {
+            fullName: "Ada Lovelace",
+            headline: "Mathematician",
+            profileUrl: "https://example.test/ada",
+            dateConnected: "2024-01-01",
+          },
+        ],
+      }),
+      mutate: (body: { connections: { fullName: string }[] }) => {
+        body.connections[0]!.fullName = "Ada Byron";
+      },
+    },
+    {
+      scope: "linkedin.education",
+      paths: ["$.education"],
+      body: () => ({
+        education: [
+          {
+            schoolName: "University",
+            degree: "Math",
+            years: "09/2020 - 06/2024",
+            grade: "A",
+            logoUrl: "https://example.test/university.png",
+          },
+          {
+            schoolName: "College",
+            degree: "Science",
+            years: "09/2018 - 06/2020",
+            grade: "B",
+            logoUrl: "https://example.test/college.png",
+          },
+        ],
+      }),
+      mutate: (body: {
+        education: { schoolName: string; degree: string }[];
+      }) => {
+        body.education[0]!.degree = "Other";
+      },
+    },
+    {
+      scope: "linkedin.experience",
+      paths: ["$.experiences"],
+      body: () => ({
+        experiences: [
+          {
+            jobTitle: "Engineer",
+            companyName: "First",
+            dates: "1/2020 - 2/2021",
+            location: "London",
+            description: "Built systems",
+          },
+          {
+            jobTitle: "Lead",
+            companyName: "Second",
+            dates: "3/2021 - Present",
+            location: "Remote",
+            description: "Led team",
+          },
+        ],
+      }),
+      mutate: (body: {
+        experiences: { companyName: string; jobTitle: string }[];
+      }) => {
+        body.experiences[0]!.jobTitle = "Director";
+      },
+    },
+    {
+      scope: "linkedin.languages",
+      paths: ["$.languages"],
+      body: () => ({
+        languages: [
+          { name: "English", proficiency: "fluent" },
+          { name: "French", proficiency: "basic" },
+        ],
+      }),
+      mutate: (body: {
+        languages: { name: string; proficiency: string }[];
+      }) => {
+        body.languages[0]!.proficiency = "native";
+      },
+    },
+    {
+      scope: "linkedin.skills",
+      paths: ["$.skills"],
+      body: () => ({
+        skills: [
+          { name: "TypeScript", endorsements: "4" },
+          { name: "Rust", endorsements: "2" },
+        ],
+      }),
+      mutate: (body: { skills: { name: string; endorsements: string }[] }) => {
+        body.skills[0]!.endorsements = "5";
+      },
+    },
+    {
+      scope: "instagram.ads",
+      paths: ["$.advertisers", "$.ad_topics", "$.categories"],
+      body: () => ({
+        advertisers: [{ name: "Brand" }, { name: "Other Brand" }],
+        ad_topics: [{ name: "Travel" }, { name: "Food" }],
+        categories: [
+          { name: "Retail", description: "Category" },
+          { name: "Finance", description: "Second category" },
+        ],
+      }),
+      mutate: (body: {
+        categories: { name: string; description: string }[];
+      }) => {
+        body.categories[0]!.description = "Changed";
+      },
+    },
+    {
+      scope: "spotify.savedTracks",
+      paths: ["$.savedTracks"],
+      body: () => ({
+        savedTracks: [
+          {
+            added_at: "2024-01-01",
+            name: "Song",
+            artists: [{ name: "Artist" }],
+            album: { name: "Album", artists: [{ name: "Album artist" }] },
+            duration_ms: 180000,
+            uri: "spotify:track:song",
+            explicit: false,
+          },
+          {
+            added_at: "2024-01-02",
+            name: "Other",
+            artists: [],
+            album: { name: "Other album", artists: [] },
+            duration_ms: 190000,
+            uri: "spotify:track:other",
+            explicit: true,
+          },
+        ],
+        total: 2,
+      }),
+      mutate: (body: {
+        savedTracks: {
+          name: string;
+          added_at: string;
+          artists: { name: string }[];
+          album: { name: string; artists: { name: string }[] };
+          duration_ms: number;
+          uri: string;
+          explicit: boolean;
+        }[];
+        total: number;
+      }) => {
+        body.savedTracks[0]!.added_at = "2024-01-03";
+      },
+    },
+    {
+      scope: "github.repositories",
+      paths: ["$.repositories"],
+      body: () => ({
+        repositories: [
+          {
+            name: "one",
+            url: "https://github.com/a/one",
+            description: "First",
+            language: "TypeScript",
+            stars: 1,
+            forks: 1,
+            visibility: "Public",
+            topics: ["one"],
+            updatedAt: "2024-01-01",
+          },
+          {
+            name: "two",
+            url: "https://github.com/a/two",
+            description: "Second",
+            language: "Rust",
+            stars: 2,
+            forks: 2,
+            visibility: "Private",
+            topics: ["two"],
+            updatedAt: "2024-01-02",
+          },
+        ],
+      }),
+      mutate: (body: { repositories: { stars: number }[] }) => {
+        body.repositories[0]!.stars = 9;
+      },
+    },
+    {
+      scope: "github.starred",
+      paths: ["$.starred"],
+      body: () => ({
+        starred: [
+          {
+            fullName: "a/one",
+            url: "https://github.com/a/one",
+            description: "First",
+            language: "TypeScript",
+            stars: 1,
+            updatedAt: null,
+          },
+          {
+            fullName: "a/two",
+            url: "https://github.com/a/two",
+            description: "Second",
+            language: "Rust",
+            stars: 2,
+            updatedAt: null,
+          },
+        ],
+      }),
+      mutate: (body: {
+        starred: { fullName: string; updatedAt: string | null }[];
+      }) => {
+        body.starred[0]!.updatedAt = "2024-01-03";
+      },
+    },
+  ];
+
+  it.each(unkeyedSnapshotScopes)(
+    "$scope requires an exact ordered legacy snapshot",
+    ({ scope, paths, body, mutate }) => {
+      const options = {
+        scope,
+        entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+        exactSnapshot: LEGACY_SCOPE_SNAPSHOT_EQUIVALENCE[scope] === true,
+        canonicalNewer: true,
+        allowProvenDeletion: true,
+      };
+      const legacy = body();
+      const identical = body();
+      const covered = compareLegacyCoverage(legacy, identical, options);
+      expect(covered.covered).toBe(true);
+
+      const repeated = body() as Record<string, { [key: string]: unknown }[]>;
+      const repeatedList = paths[0]!.slice(2).split(".").at(-1)!;
+      repeated[repeatedList]!.push(
+        structuredClone(repeated[repeatedList]![0]!),
+      );
+      expect(
+        compareLegacyCoverage(repeated, structuredClone(repeated), options)
+          .covered,
+      ).toBe(true);
+
+      for (const listPath of paths) {
+        const reordered = body() as Record<
+          string,
+          { [key: string]: unknown }[]
+        >;
+        const list = listPath.slice(2).split(".").at(-1)!;
+        reordered[list]!.reverse();
+        expect(compareLegacyCoverage(legacy, reordered, options).covered).toBe(
+          false,
+        );
+      }
+
+      const changed = body() as Record<string, unknown>;
+      mutate(changed as never);
+      expect(compareLegacyCoverage(legacy, changed, options).covered).toBe(
+        false,
+      );
+
+      const duplicate = body() as Record<string, { [key: string]: unknown }[]>;
+      const list = paths[0]!.slice(2).split(".").at(-1)!;
+      const duplicateList = duplicate[list]!;
+      duplicateList.push(structuredClone(duplicateList[0]!));
+      expect(compareLegacyCoverage(legacy, duplicate, options).covered).toBe(
+        false,
+      );
+    },
+  );
+
+  it("keeps GitHub starred on legacy when old updatedAt cannot be reproduced", () => {
+    const legacy = {
+      starred: [
+        {
+          fullName: "a/repo",
+          url: "https://github.com/a/repo",
+          description: "Repository",
+          language: "TypeScript",
+          stars: 4,
+          updatedAt: "2024-02-01",
+        },
+      ],
+    };
+    const canonical = {
+      starred: [
+        {
+          fullName: "a/repo",
+          url: "https://github.com/a/repo",
+          description: "Repository",
+          language: "TypeScript",
+          stars: 4,
+          updatedAt: null,
+        },
+      ],
+    };
+    const verdict = compareLegacyCoverage(legacy, canonical, {
+      scope: "github.starred",
+      exactSnapshot: LEGACY_SCOPE_SNAPSHOT_EQUIVALENCE["github.starred"],
+      canonicalNewer: true,
+    });
+    expect(verdict.covered).toBe(false);
+  });
+
+  it("requires Spotify saved-track total to match the exact body snapshot", () => {
+    const legacy = unkeyedSnapshotScopes
+      .find(({ scope }) => scope === "spotify.savedTracks")!
+      .body();
+    const canonical = structuredClone(legacy);
+    (canonical as { total: number }).total += 1;
+    expect(
+      compareLegacyCoverage(legacy, canonical, {
+        scope: "spotify.savedTracks",
+        exactSnapshot: true,
+        canonicalNewer: true,
+      }).covered,
+    ).toBe(false);
+  });
+
   it.each(["spotify.playlists", "spotify.savedTracks"])(
     "keeps metadata-derived local-file track URIs unkeyed in %s",
     (scope) => {

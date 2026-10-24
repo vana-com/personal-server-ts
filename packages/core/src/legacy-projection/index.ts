@@ -282,33 +282,23 @@ function appBinding(binding: LegacyScopeBinding): LegacyScopeBinding {
       const result = binding.project(records, options);
       if (!result.ok) return result;
       if (binding.scope === "chatgpt.conversations") {
-        const dropped = result.diagnostics?.filter(
+        const hasFatalConversationDrop = result.diagnostics?.some(
           (diagnostic) =>
-            diagnostic.kind === "records_dropped" && diagnostic.count > 0,
+            diagnostic.kind === "records_dropped" &&
+            diagnostic.count > 0 &&
+            diagnostic.reasons.some(
+              (reason) =>
+                reason === "Conversation lacks an id" ||
+                reason === "Conversation lacks a current-branch message count",
+            ),
         );
-        const diagnostic =
-          dropped?.find(
-            (entry) =>
-              entry.kind === "records_dropped" && entry.stream === "messages",
-          ) ?? dropped?.[0];
-        if (
-          diagnostic?.kind === "records_dropped" &&
-          (diagnostic.reasons.includes("Conversation lacks an id") ||
-            diagnostic.reasons.includes(
-              "Conversation lacks a current-branch message count",
-            ))
-        ) {
-          const reason = diagnostic.reasons[0];
+        if (hasFatalConversationDrop) {
           return {
             ok: false,
             error: {
               kind: "invalid_value",
               scope: binding.scope,
-              reason:
-                reason === "Conversation lacks an id" ||
-                reason === "Conversation lacks a current-branch message count"
-                  ? "Conversation lacks required branch identity or count"
-                  : reason,
+              reason: "Conversation lacks required branch identity or count",
             },
           };
         }
