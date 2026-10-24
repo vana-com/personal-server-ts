@@ -12,6 +12,7 @@ import {
   replicaConflictMetadata,
   replicaConnectionVisibility,
   replicaStateVisible,
+  type ReplicaVisibilityPolicy,
   type ReplicaReader,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import {
@@ -43,6 +44,7 @@ type CanonicalRow = {
 export function createReplicaVisibilityView(deps: {
   db: Database;
   owner: string;
+  visibilityPolicy?: ReplicaVisibilityPolicy;
   declarations: () => MergeContext["declarations"];
   unquarantinedRecordSql: (alias: string) => string;
   blobsValid: (
@@ -634,7 +636,10 @@ export function createReplicaVisibilityView(deps: {
       return replicaStateVisible(conflict.state, reader, undefined, "local")
         ? "local"
         : "hidden";
-    return preview ? "preview" : "canonical";
+    return preview &&
+      replicaStateVisible("pending", reader, deps.visibilityPolicy)
+      ? "preview"
+      : "canonical";
   }
   const tableFor = (mode: Mode) =>
     mode === "local"
@@ -761,22 +766,28 @@ export function createReplicaVisibilityView(deps: {
             boundary = ` AND (pdpp_time_key(r.emitted_at),r.record_key) ${equal ? cmp + "=" : cmp} (pdpp_time_key(?),?)`;
             params.push(cursor.sortValue, cursor.recordKey);
           }
-          params.push(options.limit + 1);
+          if (!options.isVisible) params.push(options.limit + 1);
           return [
-            `SELECT * FROM (SELECT ${selectedColumns(mode)} FROM ${tableFor(mode)} r WHERE r.instance=? AND r.stream=? AND ${rowFilter(mode)}${boundary} ORDER BY pdpp_time_key(r.emitted_at) ${dir},r.record_key ${dir} LIMIT ?)`,
+            `SELECT * FROM (SELECT ${selectedColumns(mode)} FROM ${tableFor(mode)} r WHERE r.instance=? AND r.stream=? AND ${rowFilter(mode)}${boundary} ORDER BY pdpp_time_key(r.emitted_at) ${dir},r.record_key ${dir}${options.isVisible ? "" : " LIMIT ?"})`,
           ];
         });
         const rows = branches.length
           ? (db
               .prepare(
-                `SELECT * FROM (${branches.join(" UNION ALL ")}) ORDER BY emitted_key ${dir},record_key ${dir},instance ${dir} LIMIT ?`,
+                `SELECT * FROM (${branches.join(" UNION ALL ")}) ORDER BY emitted_key ${dir},record_key ${dir},instance ${dir}${options.isVisible ? "" : " LIMIT ?"}`,
               )
-              .all(...params, options.limit + 1) as {
+              .all(
+                ...params,
+                ...(options.isVisible ? [] : [options.limit + 1]),
+              ) as {
               row_json: string;
               origin: Mode;
             }[])
           : [];
-        const data = rows.slice(0, options.limit).map((raw) => {
+        const eligibleRows = options.isVisible
+          ? rows.filter((raw) => options.isVisible!(visibleRow(raw)))
+          : rows;
+        const data = eligibleRows.slice(0, options.limit).map((raw) => {
           const row = visibleRow(raw);
           return options.fields && !row.deleted
             ? {
@@ -790,7 +801,7 @@ export function createReplicaVisibilityView(deps: {
             : row;
         });
         const last = data[data.length - 1],
-          hasMore = rows.length > options.limit;
+          hasMore = eligibleRows.length > options.limit;
         return {
           data,
           hasMore,

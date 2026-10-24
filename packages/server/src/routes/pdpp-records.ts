@@ -1050,8 +1050,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         cursor,
         isVisible: (row) =>
           recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-          ((row.deleted && context!.tokenKind === "owner") ||
-            recordWithinGrantTimeConstraint(row.data, scope.streamGrant)),
+          (row.deleted
+            ? context!.tokenKind === "owner"
+            : recordWithinGrantTimeConstraint(row.data, scope.streamGrant)),
       });
       const meta = clamped
         ? {

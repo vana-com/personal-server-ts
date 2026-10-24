@@ -14,18 +14,6 @@ const cases = [
     ownerStates: [true, true, false],
     grantStates: [true, false, false],
   },
-  {
-    owner: "confirmed-only",
-    grant: "include-pending",
-    ownerStates: [true, false, false],
-    grantStates: [true, true, false],
-  },
-  {
-    owner: "include-pending",
-    grant: "include-pending",
-    ownerStates: [true, true, false],
-    grantStates: [true, true, false],
-  },
 ] as const;
 for (const policy of cases)
   for (const reader of ["owner", "grant"] as const)

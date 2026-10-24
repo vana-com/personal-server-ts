@@ -598,6 +598,7 @@ export function createReplicaReceiver(deps: {
   const view = createReplicaVisibilityView({
     db,
     owner,
+    visibilityPolicy: deps.visibilityPolicy,
     declarations: deps.declarations,
     blobsValid: previewBlobsValid,
     unquarantinedRecordSql: store.unquarantinedRecordSql,
@@ -695,7 +696,7 @@ export function createReplicaReceiver(deps: {
   }
   const api = {
     setPendingEnabled(enabled: boolean) {
-      pendingEnabled = enabled;
+      pendingEnabled = enabled === true;
     },
     stage(input: {
       credential: unknown;

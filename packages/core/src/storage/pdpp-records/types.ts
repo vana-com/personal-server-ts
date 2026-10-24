@@ -80,7 +80,7 @@ export interface IngestResult {
 
 export interface ListRecordsOptions {
   /** Grant eligibility, evaluated on raw snapshot rows before pagination/projection. */
-  isVisible?: (row: PdppStoredRecord) => boolean;
+  isVisible?: (row: PdppRecordRow) => boolean;
   instanceIds: string[];
   limit: number;
   cursor?: string;

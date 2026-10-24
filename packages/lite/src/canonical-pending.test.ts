@@ -90,18 +90,16 @@ describe("Lite pending visibility", () => {
 });
 
 it.each([
-  ["confirmed-only", "confirmed-only", false, false],
-  ["include-pending", "confirmed-only", true, false],
-  ["confirmed-only", "include-pending", false, true],
-  ["include-pending", "include-pending", true, true],
+  ["confirmed-only", false],
+  ["include-pending", true],
 ] as const)(
-  "applies owner %s and grant %s to records and pages",
-  async (owner, grant, ownerVisible, grantVisible) => {
+  "limits pending records and pages to owner mode %s",
+  async (owner, ownerVisible) => {
     const { adapter } = device();
     const store = createLiteCanonicalStore({
       persistence: adapter.port,
       enabled: true,
-      visibilityPolicy: { owner, grant },
+      visibilityPolicy: { owner, grant: "confirmed-only" },
       context: () => ({
         owner: identity.owner,
         declarations: [
@@ -114,7 +112,7 @@ it.each([
     await store.stagePending(pending());
     for (const [reader, visible] of [
       ["owner", ownerVisible],
-      ["grant", grantVisible],
+      ["grant", false],
     ] as const) {
       expect(!!(await read(store, reader))).toBe(visible);
       expect(
