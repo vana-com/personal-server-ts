@@ -52,9 +52,9 @@ export interface IndexManager {
   /** Find an index entry by its DPv2 data-point id (download dedup). */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
   /**
-   * Find all index entries where dataPointId is null (not yet synced /
-   * registered on-chain). Returns entries ordered by created_at ASC (oldest
-   * first).
+   * Find unsynced entries eligible for remote publication, ordered oldest
+   * first. Legacy history remains indexed but is excluded once its scope has
+   * canonical authority.
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   /**

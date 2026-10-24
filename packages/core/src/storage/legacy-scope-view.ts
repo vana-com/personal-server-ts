@@ -399,7 +399,16 @@ export function createLegacyScopeView(
     scope: string,
   ): Map<string, readonly string[]> {
     const methods = scopeMethods(scope);
-    if (authority.hasCanonicalAuthority?.(scope)) return methods;
+    // Canonical authority can be established before a scope has any legacy
+    // head. In that case no method-specific takeover was earned, so keep the
+    // currently configured method eligible when a later legacy write arrives.
+    // When a takeover exists, retain its method gate across later connections.
+    if (
+      authority.hasCanonicalAuthority?.(scope) &&
+      !authority.hasTakeover(scope)
+    ) {
+      return methods;
+    }
     const head = authority.eligibleLegacyHead(scope);
     if (head === null) return methods;
     const gated = new Set(

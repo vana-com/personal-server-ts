@@ -833,11 +833,11 @@ describe("an owner with a legacy Oura file and an oura-browser connection", () =
       expect(await readAll()).toEqual(ALL(CANON));
     });
 
-    it("and then yields to a legacy file written afterwards", async () => {
+    it("keeps serving canonical data after a legacy file is written afterwards", async () => {
       await writePdpp(DAYS, T_PDPP);
       expect(await readAll()).toEqual(ALL(CANON));
       await writeLegacy(DAYS, T_LEGACY_NEWER);
-      expect(await readAll()).toEqual(ALL(FILE));
+      expect(await readAll()).toEqual(ALL(CANON));
     });
 
     it("with two accounts and no legacy file, still refuses as ambiguous (409)", async () => {
@@ -1055,10 +1055,10 @@ describe("a read whose legacy file is re-added while the canonical body is chose
     const raced = await ownerRead("oura.activity");
     expect(barrier.afterReadLatest).toBeNull();
     expect(raced.status).toBe(410);
-    expect(raced.source).not.toBe("canonical");
 
-    // Settled, the re-added file is what every reader is served.
-    expect(await readAll()).toEqual(ALL(FILE));
+    // The late file remains history. Canonical deletion history still makes
+    // the scope return 410 instead of serving that old-format body.
+    expect((await observe("oura.activity")).owner.status).toBe(410);
   });
 });
 

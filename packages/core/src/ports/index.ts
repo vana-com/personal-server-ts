@@ -143,6 +143,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * so every version of a scope shares one id.
    */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
+  /** Entries eligible for sync publication; retained canonical-authority history is omitted. */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   /**

@@ -578,9 +578,10 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
     const latest = db
       .prepare(
         `
-        SELECT id, path, version, cas_revision, collected_at, producer
+        SELECT id, path, version, cas_revision, collected_at
           FROM data_files
          WHERE scope = ?
+           AND (producer IS NULL OR producer NOT IN ('pdpp-projector', 'pdpp-import-projection'))
          ORDER BY julianday(collected_at) DESC, id DESC
          LIMIT 1
       `,
@@ -592,16 +593,9 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           version: number;
           cas_revision: number;
           collected_at: string;
-          producer: string | null;
         }
       | undefined;
-    if (
-      !latest ||
-      latest.producer === "pdpp-projector" ||
-      latest.producer === "pdpp-import-projection"
-    ) {
-      return null;
-    }
+    if (!latest) return null;
     return {
       id: latest.id,
       path: latest.path,
