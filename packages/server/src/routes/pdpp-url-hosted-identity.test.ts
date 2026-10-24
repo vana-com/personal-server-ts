@@ -32,6 +32,7 @@ import {
   AuthorizationSessionStore,
   computeS256Challenge,
   openPdppAuthStore,
+  parseDeclaration,
   PDPP_DATA_ACCESS_TYPE,
   PdppTokenService,
   resolveUrlHostedClientIdentity,
@@ -54,21 +55,26 @@ const OWNER_INSTANCE = "spotify-account-a";
 const DOCUMENT_NAME = "Document Name";
 const INLINE_NAME = "Inline Name";
 
-const snapshot: DeclarationSnapshot = {
+const declarationDocument = JSON.stringify({
   source_id: "https://registry.pdpp.dev/connectors/spotify",
   source_kind: "connector",
   version: "2026-08-11",
-  digest: "d".repeat(64),
   streams: [
     {
       name: "top_artists",
-      fields: ["id", "name"],
+      fields: ["id", "name", "source_updated_at"],
       required_fields: ["id"],
       consent_time_field: "source_updated_at",
       primary_key: ["id"],
     },
   ],
-};
+});
+const parsedDeclaration = parseDeclaration(
+  declarationDocument,
+  "https://registry.pdpp.dev/connectors/spotify",
+);
+if (!parsedDeclaration.ok) throw new Error("invalid test declaration");
+const snapshot: DeclarationSnapshot = parsedDeclaration.snapshot;
 
 let dir: string;
 let store: PdppAuthStore;
@@ -125,6 +131,10 @@ beforeEach(() => {
       sessions: new AuthorizationSessionStore(),
       resolveDeclaration: (sourceId) =>
         sourceId === snapshot.source_id ? snapshot : null,
+      documentForDeclaration: (sourceId, version) =>
+        sourceId === snapshot.source_id && version === snapshot.version
+          ? declarationDocument
+          : null,
       inventoryFor: () => inventory,
       currentSubjectId: (_c: Context) => OWNER,
       // No registration at all: this client is known only by its document.

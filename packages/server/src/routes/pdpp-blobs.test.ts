@@ -143,6 +143,60 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     expect(body.error.code).toBe("blob_not_found");
   });
 
+  it.each([
+    ["grant_revoked", "grant_revoked"],
+    ["grant_expired", "grant_expired"],
+  ] as const)(
+    "keeps known candidate-profile %s at 403 without reading bytes",
+    async (reason, code) => {
+      const store = newStore();
+      let readBytes = false;
+      const app = pdppBlobsRoutes({
+        store,
+        declarations,
+        auth: createFixtureAuthorizationService({
+          stale: {
+            active: false,
+            tokenKind: "client",
+            subjectId: "sub_1",
+            inactiveReason: reason,
+          },
+        }),
+        protocolProfile: "candidate-0.1.0",
+        readBlobBytes: async () => {
+          readBytes = true;
+          return new Uint8Array([1]);
+        },
+      });
+
+      const response = await app.request("/blob_1", {
+        headers: { Authorization: "Bearer stale" },
+      });
+      expect(response.status).toBe(403);
+      expect((await response.json()).error.code).toBe(code);
+      expect(response.headers.get("WWW-Authenticate")).toBeNull();
+      expect(readBytes).toBe(false);
+    },
+  );
+
+  it("maps an unknown candidate-profile blob bearer to 401 invalid_token", async () => {
+    const store = newStore();
+    const app = pdppBlobsRoutes({
+      store,
+      declarations,
+      auth: createFixtureAuthorizationService({}),
+      protocolProfile: "candidate-0.1.0",
+    });
+    const response = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer missing" },
+    });
+    expect(response.status).toBe(401);
+    expect((await response.json()).error.code).toBe("invalid_token");
+    expect(response.headers.get("WWW-Authenticate")).toContain(
+      'error="invalid_token"',
+    );
+  });
+
   it("serves Content-Type/Content-Length/Cache-Control for an owner-authorized blob", async () => {
     const store = newStore();
     store.putBlobMeta({

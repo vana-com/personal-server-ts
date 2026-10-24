@@ -51,6 +51,10 @@ export interface SyncRequest {
    */
   eligibilityFields?: string[];
   access?: SyncAccess;
+  /** Query direction applies to every profile's session pages. */
+  order?: "asc" | "desc";
+  /** Caller-owned authorization/query facts bound into every cursor. */
+  queryBinding?: unknown;
   /**
    * The wire names a record by key alone. When set, a session that would
    * disclose a key another read instance holds visibly at the horizon throws
@@ -307,8 +311,7 @@ export function createPdppSyncSessionService(
           now: policy.now(),
         },
         (window): ChangesSincePage | { paused: PausedScan } => {
-          const direction =
-            request.candidate?.order === "desc" ? "desc" : "asc";
+          const direction = request.order ?? request.candidate?.order ?? "asc";
           const withheld = [...withheld0];
           const rows: PdppRecordRow[] = [];
           // Accepts one disclosed change, or withholds it; false if neither.
@@ -500,7 +503,9 @@ function disclose(
     return after;
   }
   if (after.deleted) {
-    return !access || access.canSeeKey(after.recordKey) ? after : undefined;
+    // A key-only tombstone is still identity/activity metadata. The prior
+    // version must have been visible under the same grant before its deletion.
+    return visible(change.before(), access) ? after : undefined;
   }
   if (access && !access.canSeeRecord(after)) return undefined;
   const before = low === null ? undefined : change.before();
@@ -693,19 +698,18 @@ function sessionTokens(
 ): SessionTokens {
   const instances = [...new Set(request.instanceIds)].sort();
   const context = digest(
-    canonicalJson(
-      request.candidate
-        ? {
-            binding: request.candidate.binding,
-            stream: request.stream,
-            instances,
-            fields: request.eligibilityFields
-              ? [...new Set(request.eligibilityFields)].sort()
-              : null,
-            order: request.candidate.order,
-          }
-        : { profile: "current", stream: request.stream, instances },
-    ),
+    canonicalJson({
+      profile: request.candidate ? "candidate" : "current",
+      binding: request.queryBinding ?? request.candidate?.binding ?? null,
+      stream: request.stream,
+      instances,
+      fields: request.eligibilityFields
+        ? [...new Set(request.eligibilityFields)].sort()
+        : null,
+      limit: request.limit,
+      order: request.order ?? request.candidate?.order ?? "asc",
+      oneRecordPerKey: request.oneRecordPerKey ?? false,
+    }),
   );
   const baseline = digest(request.changesSince ?? "beginning");
   const owner = request.owner ?? "";

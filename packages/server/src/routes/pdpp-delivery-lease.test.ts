@@ -14,7 +14,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  computeGrantArtifactDigest,
+  computeReviewDigest,
   openPdppAuthStore,
+  parseDeclaration,
   PdppTokenService,
   type Grant,
   type PdppAuthStore,
@@ -68,10 +71,48 @@ let records: PdppRecordStore;
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "pdpp-delivery-lease-"));
   authStore = openPdppAuthStore(join(dir, "auth.db"));
+  const declarationDocument = JSON.stringify({
+    source_id: GRANT.source.id,
+    source_kind: GRANT.source.kind,
+    version: GRANT.source_declaration.version,
+    streams: [
+      {
+        name: "media",
+        fields: ["id"],
+        required_fields: ["id"],
+        primary_key: ["id"],
+        semantics: "append_only",
+      },
+    ],
+  });
+  const declaration = parseDeclaration(declarationDocument, GRANT.source.id);
+  if (!declaration.ok) throw new Error("invalid test declaration");
+  authStore.retainDeclaration(declaration.snapshot, declarationDocument);
+  const reviewDigest = computeReviewDigest({
+    subject_id: GRANT.subject.id,
+    client_id: GRANT.client.client_id,
+    source_id: GRANT.source.id,
+    source_kind: GRANT.source.kind,
+    source_declaration_version: GRANT.source_declaration.version,
+    declaration_digest: declaration.snapshot.digest,
+    purpose_code: GRANT.purpose_code,
+    access_mode: GRANT.access_mode,
+    streams: GRANT.streams,
+  });
   authStore.insertGrant({
     grant: GRANT,
     subjectId: "sub_1",
-    reviewDigest: "t",
+    reviewDigest,
+    consentEvidence: {
+      review_digest: reviewDigest,
+      grant_digest: computeGrantArtifactDigest(GRANT),
+      approved_at: new Date().toISOString(),
+      declaration: {
+        source_id: GRANT.source.id,
+        version: GRANT.source_declaration.version,
+        digest: declaration.snapshot.digest,
+      },
+    },
   });
   const familyId = authStore.createRefreshFamily(GRANT.grant_id);
   expect(
@@ -349,15 +390,13 @@ describe("release-gate refusals follow the protocol profile", () => {
     expect(response.headers.get("WWW-Authenticate")).toBeNull();
   });
 
-  it("is 401 invalid_token with the challenge under candidate-0.1.0", async () => {
+  it("keeps a known grant revocation as 403 under candidate-0.1.0", async () => {
     const response = await revokedWhileReading("candidate-0.1.0");
-    expect(response.status).toBe(401);
+    expect(response.status).toBe(403);
     const body = await response.json();
-    expect(body.error.code).toBe("invalid_token");
+    expect(body.error.code).toBe("grant_revoked");
     expect(JSON.stringify(body)).not.toContain(SECRET);
-    expect(response.headers.get("WWW-Authenticate")).toBe(
-      'Bearer error="invalid_token", resource_metadata="http://rs.test/.well-known/oauth-protected-resource"',
-    );
+    expect(response.headers.get("WWW-Authenticate")).toBeNull();
   });
 });
 

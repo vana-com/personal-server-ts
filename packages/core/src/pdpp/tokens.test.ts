@@ -25,6 +25,8 @@ import {
   type AccessMode,
   type Grant,
 } from "./types.js";
+import { parseDeclaration } from "./declaration.js";
+import { computeGrantArtifactDigest, computeReviewDigest } from "./review.js";
 
 let dir: string;
 let store: PdppAuthStore;
@@ -61,10 +63,49 @@ function seedGrant(
   overrides: Partial<Grant> = {},
 ): { grant: Grant; code: string } {
   const grant = makeGrant({ access_mode: accessMode, ...overrides });
+  const declarationDocument = JSON.stringify({
+    source_id: grant.source.id,
+    source_kind: grant.source.kind,
+    version: grant.source_declaration.version,
+    streams: grant.streams.map((stream) => ({
+      name: stream.name,
+      fields: stream.fields,
+      required_fields: ["id"],
+      primary_key: ["id"],
+    })),
+  });
+  const declaration = parseDeclaration(declarationDocument, grant.source.id);
+  if (!declaration.ok) throw new Error("invalid test declaration");
+  store.retainDeclaration(declaration.snapshot, declarationDocument);
+  const reviewDigest = computeReviewDigest({
+    subject_id: grant.subject.id,
+    client_id: grant.client.client_id,
+    source_id: grant.source.id,
+    source_kind: grant.source.kind,
+    source_declaration_version: grant.source_declaration.version,
+    declaration_digest: declaration.snapshot.digest,
+    purpose_code: grant.purpose_code,
+    purpose_description: grant.purpose_description,
+    access_mode: grant.access_mode,
+    streams: grant.streams,
+    retention: grant.retention,
+    expires_at: grant.expires_at,
+  });
+  const consentEvidence = {
+    review_digest: reviewDigest,
+    grant_digest: computeGrantArtifactDigest(grant),
+    approved_at: new Date().toISOString(),
+    declaration: {
+      source_id: grant.source.id,
+      version: grant.source_declaration.version,
+      digest: declaration.snapshot.digest,
+    },
+  };
   store.insertGrant({
     grant,
     subjectId: grant.subject.id,
-    reviewDigest: "digest-placeholder",
+    reviewDigest,
+    consentEvidence,
   });
   const code = `code_${Math.random().toString(16).slice(2)}`;
   store.insertAuthCode(code, {
@@ -379,6 +420,37 @@ describe("§8 — introspection carries the full enforcement context", () => {
 
     const context = tokens.resolveToken(owner.access_token);
     expect(context.instanceIds).toEqual(["spotify-account-a"]);
+  });
+});
+
+describe("persisted grant integrity", () => {
+  it("makes a token inactive when approved rights change in persisted JSON", () => {
+    const { code, grant } = seedGrant("continuous");
+    const result = redeem(code);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const db = new Database(join(dir, "auth.db"));
+    const raw = JSON.parse(
+      db
+        .prepare("SELECT grant_json FROM pdpp_grants WHERE grant_id = ?")
+        .get(grant.grant_id)?.grant_json as string,
+    ) as Record<string, unknown>;
+    const streams = raw.streams as Record<string, unknown>[];
+    streams[0]!.fields = ["id", "name", "private_note"];
+    db.prepare("UPDATE pdpp_grants SET grant_json = ? WHERE grant_id = ?").run(
+      JSON.stringify(raw),
+      grant.grant_id,
+    );
+    db.close();
+
+    expect(tokens.resolveToken(result.issued.access_token)).toMatchObject({
+      active: false,
+      inactiveReason: "unknown",
+    });
+    expect(tokens.introspect(result.issued.access_token)).toEqual({
+      active: false,
+    });
   });
 });
 

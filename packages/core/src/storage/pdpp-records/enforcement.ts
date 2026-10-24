@@ -173,7 +173,7 @@ function resolveReadFields(
   for (const field of requested) {
     if (!allowed.includes(field)) {
       throw new PdppError(
-        "invalid_request",
+        "field_not_granted",
         `Field '${field}' is not in this grant's authorized fields for the stream`,
         { param: "fields" },
       );

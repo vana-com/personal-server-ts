@@ -23,6 +23,7 @@ import {
   AuthorizationSessionStore,
   computeS256Challenge,
   openPdppAuthStore,
+  parseDeclaration,
   PDPP_DATA_ACCESS_TYPE_V02,
   PDPP_GRANT_VERSION_V02,
   PdppTokenService,
@@ -44,17 +45,14 @@ const INSTANCE = "account_example";
 const YEAR = { since: "2025-01-01T00:00:00Z", until: "2026-01-01T00:00:00Z" };
 const Q4 = { since: "2025-10-01T00:00:00Z", until: "2026-01-01T00:00:00Z" };
 
-const snapshot: DeclarationSnapshot = {
+const declarationDocument = JSON.stringify({
   source_id: "https://data.example.com/finance",
   source_kind: "provider_native",
   version: "2026-09-01",
-  digest: "d".repeat(64),
   streams: [
     {
       name: "transactions",
       fields: ["date", "amount", "merchant", "private_note"],
-      // A v0.1 consent floor. v0.2 revokes its consent effect; the projection
-      // test below is the wire-level proof.
       required_fields: ["date", "private_note"],
       consent_time_field: "date",
       schema: {
@@ -70,7 +68,13 @@ const snapshot: DeclarationSnapshot = {
       primary_key: ["id"],
     },
   ],
-};
+});
+const parsedDeclaration = parseDeclaration(
+  declarationDocument,
+  "https://data.example.com/finance",
+);
+if (!parsedDeclaration.ok) throw new Error("invalid test declaration");
+const snapshot: DeclarationSnapshot = parsedDeclaration.snapshot;
 
 let dir: string;
 let store: PdppAuthStore;
@@ -189,6 +193,10 @@ beforeEach(() => {
       sessions,
       resolveDeclaration: (sourceId) =>
         sourceId === snapshot.source_id ? snapshot : null,
+      documentForDeclaration: (sourceId, version) =>
+        sourceId === snapshot.source_id && version === snapshot.version
+          ? declarationDocument
+          : null,
       inventoryFor: () => inventory,
       currentSubjectId: (_c: Context) => OWNER,
       registeredClient: (clientId) =>
@@ -628,6 +636,10 @@ it("refuses a candidate request in the default current deployment profile", asyn
     tokens,
     sessions,
     resolveDeclaration: () => snapshot,
+    documentForDeclaration: (sourceId, version) =>
+      sourceId === snapshot.source_id && version === snapshot.version
+        ? declarationDocument
+        : null,
     inventoryFor: () => inventory,
     currentSubjectId: () => OWNER,
     registeredClient: (clientId) => ({

@@ -76,6 +76,7 @@ export type {
 
 export {
   buildConsentReview,
+  computeGrantArtifactDigest,
   computeReviewDigest,
   isRegisteredPurposeCode,
   normalizeClientClaims,

@@ -480,7 +480,7 @@ describe("memory record store: changes_since", () => {
     const page2 = createPdppSyncSessionService(store).read({
       stream: "playlists",
       instanceIds: ["inst_1"],
-      limit: 10,
+      limit: 1,
       cursor: page1.nextCursor,
     });
     const keys = page2.data.map((r) => r.recordKey);
@@ -668,6 +668,120 @@ describe("memory record store: changes_since", () => {
     });
     expect(session2.data).toHaveLength(1);
     expect(session2.data[0].deleted).toBe(true);
+  });
+
+  it("does not reveal a tombstone when the prior record was outside the grant window", () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "hidden_1",
+          data: { id: "hidden_1", created_at: "2025-12-31T23:59:59Z" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      playlistsSemantics,
+      playlistsPk,
+    );
+    const access = {
+      canSeeKey: () => true,
+      canSeeRecord: (row: { data: Record<string, unknown> }) =>
+        row.data.created_at === "2026-01-01T00:00:00Z",
+    };
+    const first = createPdppSyncSessionService(store).read({
+      stream: "playlists",
+      instanceIds: ["inst_1"],
+      limit: 10,
+      access,
+    });
+
+    store.deleteRecord(
+      "inst_1",
+      "playlists",
+      "hidden_1",
+      "2026-04-02T00:00:00.000Z",
+      "mutable_state",
+    );
+
+    const next = createPdppSyncSessionService(store).read({
+      stream: "playlists",
+      instanceIds: ["inst_1"],
+      limit: 10,
+      access,
+      changesSince: first.nextChangesSince,
+    });
+    expect(next.data).toEqual([]);
+  });
+
+  it("rejects a page cursor reused with a different order", () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      ["a", "b"].map((key, index) => ({
+        instance: "inst_1",
+        stream: "playlists",
+        key,
+        data: { id: key },
+        emitted_at: `2026-04-0${index + 1}T00:00:00.000Z`,
+      })),
+      playlistsSemantics,
+      playlistsPk,
+    );
+    const sync = createPdppSyncSessionService(store);
+    const first = sync.read({
+      stream: "playlists",
+      instanceIds: ["inst_1"],
+      limit: 1,
+      order: "asc",
+    });
+    expect(first.nextCursor).toBeDefined();
+    expect(() =>
+      sync.read({
+        stream: "playlists",
+        instanceIds: ["inst_1"],
+        limit: 1,
+        order: "desc",
+        cursor: first.nextCursor,
+      }),
+    ).toThrow(InvalidCursorError);
+  });
+
+  it("rejects a page cursor reused with a different field query or grant", () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      ["a", "b"].map((key, index) => ({
+        instance: "inst_1",
+        stream: "playlists",
+        key,
+        data: { id: key, name: key },
+        emitted_at: `2026-04-0${index + 1}T00:00:00.000Z`,
+      })),
+      playlistsSemantics,
+      playlistsPk,
+    );
+    const sync = createPdppSyncSessionService(store);
+    const query = {
+      stream: "playlists",
+      instanceIds: ["inst_1"],
+      limit: 1,
+      order: "asc" as const,
+      eligibilityFields: ["id"],
+      queryBinding: { grant: "grant-a" },
+    };
+    const first = sync.read(query);
+    expect(first.nextCursor).toBeDefined();
+    expect(() =>
+      sync.read({
+        ...query,
+        eligibilityFields: ["id", "name"],
+        queryBinding: { grant: "grant-b" },
+        cursor: first.nextCursor,
+      }),
+    ).toThrow(InvalidCursorError);
+    expect(() =>
+      sync.read({ ...query, limit: 2, cursor: first.nextCursor }),
+    ).toThrow(InvalidCursorError);
   });
 
   it("throws CursorExpiredError for a malformed changes_since token", () => {

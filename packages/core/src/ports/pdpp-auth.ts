@@ -5,6 +5,7 @@ export type SourceKind = "connector" | "provider_native";
 
 export type { TimeConstraint } from "../pdpp/types.js";
 import type { TimeConstraint } from "../pdpp/types.js";
+import type { DeclarationSnapshot } from "../pdpp/types.js";
 import { withinTimeRange } from "../pdpp/time.js";
 
 export interface StreamGrant {
@@ -89,6 +90,8 @@ export interface PdppTokenContext {
   sourceId?: string;
   /** Client tokens only. */
   grant?: Grant;
+  /** Exact declaration revision approved for this grant, never a current substitute. */
+  declarationSnapshot?: DeclarationSnapshot;
   clientId?: string;
   expiresAt?: string;
   inactiveReason?: PdppInactiveReason;

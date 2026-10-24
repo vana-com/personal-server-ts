@@ -138,9 +138,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       return await deliver(lease, build);
     } catch (err) {
       const refusal = toLeaseRefusal(err);
-      return jsonError(c, refusal, reqId, {
-        inactiveBearer: refusal.code === "authentication_error",
-      });
+      return jsonError(c, refusal, reqId, {});
     }
   }
 
@@ -180,7 +178,6 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       const refusal = toLeaseRefusal(err);
       return {
         error: jsonError(c, refusal, reqId, {
-          inactiveBearer: refusal.code === "authentication_error",
           ...(refusal.code === "api_error" && {
             headers: { "Retry-After": "5" },
           }),

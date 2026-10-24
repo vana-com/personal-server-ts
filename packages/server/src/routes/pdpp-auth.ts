@@ -106,6 +106,8 @@ export interface PdppAuthRouteDeps {
    * only against this snapshot — never a live re-fetch at approval time.
    */
   resolveDeclaration(sourceId: string): DeclarationSnapshot | null;
+  /** Resolve exact retained source bytes by the session's pinned version. */
+  documentForDeclaration?(sourceId: string, version: string): string | null;
   /** Resolve an owner-token source from the independent connection registry. */
   resolveConnectionSourceId?(sourceId: string): string | undefined;
   /** The owner's connected instances, read fresh at review and approval. */
@@ -1089,11 +1091,25 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     // be retried rather than being stranded as already-decided with nothing
     // durable behind it.
     const code = `pdpp_code_${crypto.randomUUID().replace(/-/g, "")}`;
+    const declarationDocument = deps.documentForDeclaration?.(
+      session!.snapshot.source_id,
+      session!.snapshot.version,
+    );
+    if (declarationDocument === null || declarationDocument === undefined) {
+      return errorResponse(
+        c,
+        500,
+        "server_error",
+        "the approved declaration bytes are not retained; the grant was not stored",
+      );
+    }
     deps.store.insertGrantWithAuthCode({
       grant: result.grant,
       subjectId: result.grant.subject.id,
       reviewDigest: result.consentEvidence.review_digest,
       consentEvidence: result.consentEvidence,
+      declarationSnapshot: session!.snapshot,
+      declarationDocument,
       code,
       authCode: {
         grantId: result.grant.grant_id,

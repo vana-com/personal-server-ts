@@ -14,7 +14,7 @@ const auth = createFixtureAuthorizationService({
 
 describe("bearer conformance profile", () => {
   it.each(["records", "blobs"])(
-    "candidate %s returns the uniform inactive-bearer response",
+    "candidate %s preserves a known grant revocation",
     async (surface) => {
       const deps = {
         auth,
@@ -28,16 +28,30 @@ describe("bearer conformance profile", () => {
         surface === "records" ? "/streams" : "/blob_1",
         { headers: { Authorization: "Bearer stale" } },
       );
-      expect(response.status).toBe(401);
-      expect(response.headers.get("WWW-Authenticate")).toContain(
-        'error="invalid_token"',
-      );
-      expect((await response.json()).error).toMatchObject({
-        type: "authentication_error",
-        code: "invalid_token",
-      });
+      expect(response.status).toBe(403);
+      expect(response.headers.get("WWW-Authenticate")).toBeNull();
+      expect((await response.json()).error.code).toBe("grant_revoked");
     },
   );
+
+  it("candidate maps an inactive remote answer without a reason to invalid_token", async () => {
+    const unknown = createFixtureAuthorizationService({
+      stale: { active: false },
+    });
+    const response = await pdppRecordsRoutes({
+      auth: unknown,
+      store: createMemoryRecordStore(),
+      declarations: createStreamDeclarationRegistry([]),
+      protocolProfile: "candidate-0.1.0",
+    }).request("/streams", {
+      headers: { Authorization: "Bearer stale" },
+    });
+    expect(response.status).toBe(401);
+    expect(response.headers.get("WWW-Authenticate")).toContain(
+      'error="invalid_token"',
+    );
+    expect((await response.json()).error.code).toBe("invalid_token");
+  });
 
   it.each([undefined, "current"] as const)(
     "preserves current records behavior for profile %s",

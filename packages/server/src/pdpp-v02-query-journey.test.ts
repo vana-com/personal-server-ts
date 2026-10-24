@@ -39,6 +39,7 @@ import {
   AuthorizationSessionStore,
   computeS256Challenge,
   openPdppAuthStore,
+  parseDeclaration,
   PDPP_DATA_ACCESS_TYPE_V02,
   PdppTokenService,
   type DeclarationSnapshot,
@@ -67,17 +68,14 @@ const YEAR = { since: "2025-01-01T00:00:00Z", until: "2026-01-01T00:00:00Z" };
 const Q4 = { since: "2025-10-01T00:00:00Z", until: "2026-01-01T00:00:00Z" };
 
 /** ONE declaration, shared by the AS and the RS. See the header comment. */
-const snapshot: DeclarationSnapshot = {
+const declarationDocument = JSON.stringify({
   source_id: "https://data.example.com/finance",
   source_kind: "provider_native",
   version: "2026-09-01",
-  digest: "d".repeat(64),
   streams: [
     {
       name: "transactions",
       fields: ["date", "amount", "merchant", "private_note"],
-      // `private_note` is schema-required and never requested. Under v0.1 it
-      // rode along on every read; under v0.2 it must not.
       required_fields: ["date", "private_note"],
       consent_time_field: "date",
       primary_key: ["date"],
@@ -89,7 +87,13 @@ const snapshot: DeclarationSnapshot = {
       primary_key: ["id"],
     },
   ],
-};
+});
+const parsedDeclaration = parseDeclaration(
+  declarationDocument,
+  "https://data.example.com/finance",
+);
+if (!parsedDeclaration.ok) throw new Error("invalid test declaration");
+const snapshot: DeclarationSnapshot = parsedDeclaration.snapshot;
 
 /** The same snapshot, projected onto what the RS enforces. */
 const declarations = createStreamDeclarationRegistry(
@@ -125,6 +129,10 @@ beforeEach(() => {
       sessions: new AuthorizationSessionStore(),
       resolveDeclaration: (sourceId) =>
         sourceId === snapshot.source_id ? snapshot : null,
+      documentForDeclaration: (sourceId, version) =>
+        sourceId === snapshot.source_id && version === snapshot.version
+          ? declarationDocument
+          : null,
       inventoryFor: () => ({ eligibleFor: () => [INSTANCE] }),
       currentSubjectId: (_c: Context) => OWNER,
       registeredClient: (clientId) =>

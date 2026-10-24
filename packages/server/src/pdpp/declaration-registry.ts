@@ -67,6 +67,8 @@ export interface MutableDeclarationRegistry {
   resolve(sourceId: string): DeclarationSnapshot | null;
   /** The exact retained bytes for a source, for digest verification. */
   documentFor(sourceId: string): string | null;
+  /** Exact bytes for a grant's retained source declaration revision. */
+  documentForVersion(sourceId: string, version: string): string | null;
   /** Every currently-authoritative declaration. */
   list(): DeclarationSnapshot[];
   /**
@@ -252,6 +254,15 @@ export function openDeclarationRegistry(
            WHERE source_id = ? AND is_current = 1`,
         )
         .get(sourceId) as { document: string } | undefined;
+      return row?.document ?? null;
+    },
+    documentForVersion(sourceId, version) {
+      const row = db
+        .prepare(
+          `SELECT document FROM pdpp_current_declarations
+           WHERE source_id = ? AND version = ?`,
+        )
+        .get(sourceId, version) as { document: string } | undefined;
       return row?.document ?? null;
     },
     list() {
