@@ -228,6 +228,56 @@ export function createIndexedDbMcpConnectionStore(
       );
     },
 
+    replacePendingOAuthConnections(clientId, expiredBefore, replacement) {
+      if (
+        replacement.status !== "pending" ||
+        replacement.clientId !== clientId
+      ) {
+        return Promise.reject(
+          new Error("OAuth replacement must be pending for its client"),
+        );
+      }
+      return openDb(resolved, CONNECTION_INDEXES).then(
+        (db) =>
+          new Promise<void>((resolve, reject) => {
+            const transaction = db.transaction(resolved.storeName, "readwrite");
+            const store = transaction.objectStore(resolved.storeName);
+            const request = store.getAll() as IDBRequest<McpConnectionRecord[]>;
+            request.onsuccess = () => {
+              for (const record of request.result) {
+                const expired = Date.parse(record.createdAt) <= expiredBefore;
+                if (
+                  record.status !== "pending" ||
+                  !record.clientId ||
+                  (record.clientId !== clientId && !expired)
+                ) {
+                  continue;
+                }
+                store.put({
+                  ...record,
+                  status: "revoked",
+                  revokedAt: replacement.createdAt,
+                });
+              }
+              store.add({ ...replacement });
+            };
+            request.onerror = () => reject(request.error);
+            transaction.oncomplete = () => {
+              db.close();
+              resolve();
+            };
+            transaction.onerror = () => {
+              db.close();
+              reject(transaction.error);
+            };
+            transaction.onabort = () => {
+              db.close();
+              reject(transaction.error);
+            };
+          }),
+      );
+    },
+
     async list() {
       const all = await runTx<McpConnectionRecord[]>(
         resolved,

@@ -447,6 +447,33 @@ export async function openMcpDurableState(options: {
             throw new Error("MCP connection already exists");
           draft.connections[record.id] = structuredClone(record);
         }),
+      replacePendingOAuthConnections: (clientId, expiredBefore, replacement) =>
+        mutate((draft) => {
+          if (
+            replacement.status !== "pending" ||
+            replacement.clientId !== clientId
+          ) {
+            throw new Error("OAuth replacement must be pending for its client");
+          }
+          if (draft.connections[replacement.id])
+            throw new Error("MCP connection already exists");
+          for (const record of Object.values(draft.connections)) {
+            const expired = Date.parse(record.createdAt) <= expiredBefore;
+            if (
+              record.status !== "pending" ||
+              !record.clientId ||
+              (record.clientId !== clientId && !expired)
+            ) {
+              continue;
+            }
+            draft.connections[record.id] = {
+              ...record,
+              status: "revoked",
+              revokedAt: replacement.createdAt,
+            };
+          }
+          draft.connections[replacement.id] = structuredClone(replacement);
+        }),
       list: () => read((current) => Object.values(current.connections)),
       getById: (id) => read((current) => current.connections[id] ?? null),
       getByTokenHash: (hash) =>

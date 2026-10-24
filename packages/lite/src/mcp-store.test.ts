@@ -3,12 +3,48 @@ import { IDBFactory } from "fake-indexeddb";
 import {
   approveMcpConnection,
   createMcpConnection,
+  createMcpOAuthAuthorization,
+  createInMemoryMcpOAuthAuthorizationStore,
   requestMcpScopeAccess,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { createIndexedDbMcpConnectionStore } from "./mcp-store.js";
 
 describe("IndexedDB MCP connection mutations", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("keeps one pending OAuth connection after concurrent registrations", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const connectionStore = createIndexedDbMcpConnectionStore({
+      dbName: "mcp-oauth-replacement-concurrency",
+    });
+    const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
+
+    await Promise.all(
+      Array.from({ length: 100 }, () =>
+        createMcpOAuthAuthorization(
+          {
+            clientId: "same-client",
+            redirectUri: "https://claude.ai/api/mcp/auth_callback",
+            codeChallenge: "challenge",
+            codeChallengeMethod: "S256",
+          },
+          {
+            connectionStore,
+            authorizationStore,
+            publicOrigin: "https://ps.local",
+          },
+        ),
+      ),
+    );
+
+    expect(
+      (await connectionStore.list()).filter(
+        (connection) =>
+          connection.clientId === "same-client" &&
+          connection.status === "pending",
+      ),
+    ).toHaveLength(1);
+  });
 
   it("atomically preserves concurrent requests on a legacy record", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
