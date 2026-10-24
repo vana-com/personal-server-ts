@@ -2,7 +2,7 @@
 import {
   ANTHROPIC_LIVE_BINDINGS,
   GROCERY_INVALID_ORDER,
-  LEGACY_SCOPE_BINDINGS,
+  LEGACY_SCOPE_BINDINGS as BASE_LEGACY_SCOPE_BINDINGS,
 } from "./bindings.js";
 import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
@@ -22,8 +22,19 @@ import type {
 } from "./types.js";
 
 export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
-export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
+export const LEGACY_SCOPE_BINDINGS = new Map(
+  [...BASE_LEGACY_SCOPE_BINDINGS].map(([scope, binding]) => [
+    scope,
+    appBinding(binding),
+  ]),
+);
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
+export {
+  isStoredPdppScopeFile,
+  projectStoredScopeToLegacyPayload,
+  storedScopeJoinScopes,
+} from "./stored-scope.js";
+export { isGithubBrowserSnapshotFile } from "./github-browser-snapshot.js";
 export { META_040_BINDINGS } from "./meta-040-bindings.js";
 export { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
 export type { LegacyScopeBindingProvenance } from "./provenance.js";
@@ -71,11 +82,14 @@ export function legacyBindingsForProfile(
   profileKey: string,
 ): ReadonlyMap<string, LegacyScopeBinding> {
   const alternate = ALTERNATE_PROFILE_BINDINGS.get(profileKey);
-  if (alternate) return alternate;
+  if (alternate)
+    return new Map(
+      [...alternate].map(([scope, binding]) => [scope, appBinding(binding)]),
+    );
   return new Map(
-    [...LEGACY_SCOPE_BINDINGS].filter(([, binding]) =>
-      binding.pdppSource.endsWith(`/${profileKey}`),
-    ),
+    [...BASE_LEGACY_SCOPE_BINDINGS]
+      .filter(([, binding]) => binding.pdppSource.endsWith(`/${profileKey}`))
+      .map(([scope, binding]) => [scope, appBinding(binding)]),
   );
 }
 
@@ -174,6 +188,11 @@ export function projectPdppRecordsToLegacyPayload(
     assertOuraLegacyScoresAreIntegers(scope, result.payload);
   }
 
+  if (scope === "chatgpt.conversations") {
+    const primaryKeyFailure = chatgptPrimaryKeyFailure(records, binding);
+    if (primaryKeyFailure) return primaryKeyFailure;
+  }
+
   // These bindings drop and count malformed rows themselves (see their
   // records_dropped diagnostics) instead of failing the whole scope.
   if (DROP_AND_COUNT_SCOPES.has(scope)) return result;
@@ -250,6 +269,80 @@ export function projectPdppRecordsToLegacyPayload(
     };
   }
   return result;
+}
+
+/** Keep the legacy app's ingest contract at the Personal Server boundary. */
+function appBinding(binding: LegacyScopeBinding): LegacyScopeBinding {
+  if (binding.scope !== "chatgpt.conversations") {
+    return binding;
+  }
+  return {
+    ...binding,
+    project(records, options) {
+      const result = binding.project(records, options);
+      if (!result.ok) return result;
+      if (binding.scope === "chatgpt.conversations") {
+        const hasFatalConversationDrop = result.diagnostics?.some(
+          (diagnostic) =>
+            diagnostic.kind === "records_dropped" &&
+            diagnostic.count > 0 &&
+            diagnostic.reasons.some(
+              (reason) =>
+                reason === "Conversation lacks an id" ||
+                reason === "Conversation lacks a current-branch message count",
+            ),
+        );
+        if (hasFatalConversationDrop) {
+          return {
+            ok: false,
+            error: {
+              kind: "invalid_value",
+              scope: binding.scope,
+              reason: "Conversation lacks required branch identity or count",
+            },
+          };
+        }
+      }
+      return result;
+    },
+  };
+}
+
+function chatgptPrimaryKeyFailure(
+  records: PdppRecord[],
+  binding: LegacyScopeBinding,
+): ProjectionResult | undefined {
+  const scope = "chatgpt.conversations";
+  for (const record of records) {
+    if (!binding.pdppStreams.includes(record.stream)) continue;
+    if (
+      record.data === null ||
+      typeof record.data !== "object" ||
+      Array.isArray(record.data)
+    ) {
+      return {
+        ok: false,
+        error: {
+          kind: "incomplete_scope",
+          scope,
+          reason: `${record.stream} record is unavailable`,
+        },
+      };
+    }
+    for (const key of binding.primaryKey[record.stream] ?? []) {
+      const value = record.data[key];
+      if (value == null || (typeof value === "string" && !value.trim())) {
+        return {
+          ok: false,
+          error: {
+            kind: "incomplete_scope",
+            scope,
+            reason: `${record.stream}.${key} is unavailable`,
+          },
+        };
+      }
+    }
+  }
 }
 
 const DROP_AND_COUNT_SCOPES: ReadonlySet<string> = new Set([

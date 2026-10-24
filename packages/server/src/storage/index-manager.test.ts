@@ -511,6 +511,55 @@ describe("IndexManager", () => {
     expect(unsynced[0]!.path).toBe("ig/profile/2026-01-01T00-00-00Z.json");
   });
 
+  it("retains but does not queue legacy history after canonical authority", () => {
+    const canonicalPath = "oura/activity/canonical.json";
+    const legacyPath = "oura/activity/late-legacy.json";
+    manager.insert({
+      fileId: null,
+      path: canonicalPath,
+      scope: "oura.activity",
+      collectedAt: "2026-01-01T00:00:00Z",
+      sizeBytes: 100,
+      producer: "pdpp-projector",
+    });
+    db.prepare(
+      "INSERT INTO legacy_scope_canonical_authority (scope) VALUES (?)",
+    ).run("oura.activity");
+    manager.insert({
+      fileId: null,
+      path: legacyPath,
+      scope: "oura.activity",
+      collectedAt: "2026-01-02T00:00:00Z",
+      sizeBytes: 100,
+    });
+    const noncanonicalPath = "oura/activity/late-import.json";
+    manager.insert({
+      fileId: null,
+      path: noncanonicalPath,
+      scope: "oura.activity",
+      collectedAt: "2026-01-03T00:00:00Z",
+      sizeBytes: 100,
+    });
+    db.prepare("UPDATE data_files SET producer = ? WHERE path = ?").run(
+      "old-client-import",
+      noncanonicalPath,
+    );
+
+    expect(
+      manager
+        .findByScope({ scope: "oura.activity" })
+        .map((entry) => entry.path),
+    ).toEqual([noncanonicalPath, legacyPath, canonicalPath]);
+    expect(manager.findUnsynced().map((entry) => entry.path)).toEqual([
+      canonicalPath,
+    ]);
+    expect(
+      manager.findUnsynced({ limit: 50 }).map((entry) => entry.path),
+    ).toEqual([canonicalPath]);
+    expect(manager.isHistoryOnly("oura.activity", legacyPath)).toBe(true);
+    expect(manager.isHistoryOnly("oura.activity", noncanonicalPath)).toBe(true);
+  });
+
   it("findUnsynced with limit returns at most N entries", () => {
     for (let i = 1; i <= 5; i++) {
       manager.insert({

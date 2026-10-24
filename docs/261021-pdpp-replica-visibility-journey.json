@@ -1,0 +1,1190 @@
+{
+  "sourceHead": "602e0b8de8603e6db62c7880be348fd314b167ff",
+  "baseHead": "da9ec8b2821ef8f1d61a94595fd9953f1f348b58",
+  "pullRequest": 438,
+  "scope": "Two canonical Node worker hosts with one random ephemeral owner; receiver reader APIs, not AS-issued live app tokens.",
+  "tests": {
+    "focusedFiles": 8,
+    "passed": 292,
+    "policyMatrixCombinations": 24,
+    "twoConnectionReaderModes": 4
+  },
+  "review": {
+    "model": "Claude Opus 5.5",
+    "effort": "high",
+    "rounds": 2,
+    "verdict": "MERGE-WITH-NITS for internal draft only; no runtime enablement",
+    "reportSha256": "be8dc9bd9354e9b31548b6354b2d8c062114a81dae6ff97c4fe6a7494c62bdc7"
+  },
+  "runtimeEnablementBlockers": [
+    "Unify Node preview with canonical materialization and avoid recomputing complete logs per read; bound Lite preview and prune confirmed pending batches.",
+    "Recover a finalized replacement after a conflicting optimistic copy without burning the writer batch identity.",
+    "Expose pending Node removals with an explicit data-model marker.",
+    "Bound retained confirmation/import loops and separate ordinary waiting from errors.",
+    "Give the pending-enabled switch one owner and measure realistic/native mobile backlogs."
+  ],
+  "integrationContract": [
+    "ReplicaVisibilityPolicy",
+    "readStore({reader})",
+    "replicaReads on Node record and blob routes",
+    "confirmation: not yet confirmed"
+  ],
+  "provisionalInternalHooks": [
+    "stage",
+    "promote",
+    "quarantine by pending batch id",
+    "readVisibleRecords"
+  ],
+  "latencies": [
+    {
+      "direction": "A to B",
+      "ownerVisibleMs": 16159,
+      "appVisibleMs": 234093,
+      "restartedPending": true
+    },
+    {
+      "direction": "B to A",
+      "ownerVisibleMs": 7375,
+      "appVisibleMs": 144890,
+      "restartedPending": true
+    }
+  ],
+  "rawReceiptSha256": "d09807cb74d36a5675e20872091ac2cd37f0e40c877cf9b873d224ed02bd8e3f",
+  "receipt": {
+    "run": "991018ba-dc7e-487d-aec9-9c7596e6516d",
+    "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+    "gatewayUrl": "https://dp-rpc-dev.vana.org",
+    "storageUrl": "https://storage-dev.vana.org",
+    "rpcUrl": "https://rpc.moksha.vana.org",
+    "chainId": 14800,
+    "base": "723c4854ee5ee83d8e83baa20cc2b0d30b99fea3",
+    "head": "602e0b8de8603e6db62c7880be348fd314b167ff",
+    "sourceSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "harnessSha256": "c1181437c5f38d4b174f3859036e66899f1481c068f67d2b9ce548bdaa8d13bb",
+    "node": "v22.23.1",
+    "dirtyTree": "",
+    "retryableCycleErrors": {},
+    "hostHeapMiB": 2048,
+    "hostRssBudgetKiB": 3145728,
+    "chunkBytes": 4194304,
+    "cases": [
+      {
+        "case": "reader-visibility",
+        "direction": "A to B",
+        "ownerVisibleMs": 16159,
+        "appVisibleMs": 234093,
+        "restartedPending": true,
+        "pendingReceipt": {
+          "ownerRows": [
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-0",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "deleted": false,
+              "version": 0,
+              "confirmation": "not yet confirmed",
+              "visibility": "pending"
+            }
+          ],
+          "appRows": [],
+          "pid": 3765830,
+          "importedScopes": [],
+          "receivedOperations": [],
+          "staged": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+              "writer": "3c2a2988dc864665b798bbb5cc9feaa3",
+              "batch": "ea42bdda42724a4694ac4414b2df61bd"
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+              "writer": "e536ef0b0c114177a34297f9f4476db2",
+              "batch": "b260c18353794492908d9cfca1c81194"
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+              "writer": "e536ef0b0c114177a34297f9f4476db2",
+              "batch": "acd2127035d849218bbb63d0811d4e5c"
+            }
+          ],
+          "gets": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+              "attempts": 1
+            }
+          ],
+          "puts": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+              "sha256": "78fe9fe1ed06b57733ebdfd3b5de65dfcbaa7059bcb5ccff80ecde2e94d74494",
+              "attempts": 1
+            }
+          ],
+          "inboxErrors": [],
+          "quarantines": 0,
+          "evidence": [
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+                "version": "1",
+                "dataHash": "0xd915330a6fff7ac27ad3846f8c0e1c7ee276ce1341919ad9c060c17c119d7ef0",
+                "metadataHash": "0x64aa27ec3376861a62c3c354c6294af77a4d5d20845d4103a503641e16f87a72",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+                "version": "1",
+                "currentVersion": "0",
+                "status": "None",
+                "commitment": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566299",
+                "blockHash": "0x1686304b545bd49742072a2c2ba894e9bb18c0c8fae64b095aeaa7846522d90f",
+                "blockTimestamp": "1792556448"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+                "version": "1",
+                "dataHash": "0x2d080c05561b1fe0f5cf2c20e99ca908862d9e30cd46c6e89839f1e695929baf",
+                "metadataHash": "0xb00d6fd5f0abc87fa8e1e582252ecca71b44e06e107760061d41907a832bff86",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+                "version": "1",
+                "currentVersion": "0",
+                "status": "None",
+                "commitment": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566299",
+                "blockHash": "0x1686304b545bd49742072a2c2ba894e9bb18c0c8fae64b095aeaa7846522d90f",
+                "blockTimestamp": "1792556448"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+                "version": "1",
+                "dataHash": "0x1ab02fdc190b6b91a51c97348ca2f1a975e79c0d80925a175ea70d25f5194144",
+                "metadataHash": "0x260cfa10dce5864819ccd08ab6b93a46b09affecf42c2b0d4d030257309e6ae0",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+                "version": "1",
+                "currentVersion": "0",
+                "status": "None",
+                "commitment": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566299",
+                "blockHash": "0x1686304b545bd49742072a2c2ba894e9bb18c0c8fae64b095aeaa7846522d90f",
+                "blockTimestamp": "1792556448"
+              },
+              "pending": false
+            }
+          ],
+          "records": {},
+          "blobs": {},
+          "published": 0,
+          "importedFragments": 0,
+          "stagedFragments": 3,
+          "importedBatches": 0,
+          "received": 0,
+          "journal": 1,
+          "history": 0,
+          "pending": 1,
+          "errors": [
+            {
+              "error": "registration not confirmed",
+              "n": 1
+            }
+          ],
+          "peakRssKiB": 333032,
+          "generation": 1,
+          "writer": "3c2a2988dc864665b798bbb5cc9feaa3",
+          "operations": [
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "1efd0245-bc1f-490c-be29-82603e2e5679",
+                "writerId": "40741984-112d-4344-9ab0-93cb25665656"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            }
+          ],
+          "wire": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+              "batch": "ea42bdda42724a4694ac4414b2df61bd",
+              "state": "ready",
+              "bytes": 1443
+            }
+          ]
+        },
+        "confirmedReceipt": {
+          "ownerRows": [
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-0",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "version": 1,
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "deleted": false
+            }
+          ],
+          "appRows": [
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-0",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "version": 1,
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "deleted": false
+            }
+          ],
+          "pid": 3775303,
+          "importedScopes": [
+            "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+            "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+            "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0"
+          ],
+          "receivedOperations": [
+            {
+              "blobs": [],
+              "connectionId": "conn",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "declaration": {
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "primaryKey": ["id"],
+                "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "semantics": "mutable_state",
+                "stream": "messages",
+                "version": "1"
+              },
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "generation": 1,
+              "kind": "upsert",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "recordKey": "visibility-0",
+              "revision": {
+                "counter": 2,
+                "operationId": "7c166b9a-d799-42f2-99b4-5e83716337e4",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            },
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "1efd0245-bc1f-490c-be29-82603e2e5679",
+                "writerId": "40741984-112d-4344-9ab0-93cb25665656"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            },
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "b539a028-f6cc-470d-9892-74ba38f1b1bc",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            }
+          ],
+          "staged": [],
+          "gets": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+              "attempts": 1
+            }
+          ],
+          "puts": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+              "sha256": "78fe9fe1ed06b57733ebdfd3b5de65dfcbaa7059bcb5ccff80ecde2e94d74494",
+              "attempts": 1
+            }
+          ],
+          "inboxErrors": [],
+          "quarantines": 0,
+          "evidence": [
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+                "version": "1",
+                "dataHash": "0xd915330a6fff7ac27ad3846f8c0e1c7ee276ce1341919ad9c060c17c119d7ef0",
+                "metadataHash": "0x64aa27ec3376861a62c3c354c6294af77a4d5d20845d4103a503641e16f87a72",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0xb0e6da72b92fb2930fae117c93bf10d0bc2f5f28693d8caaed377ab3547887f9",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566331",
+                "blockHash": "0x3f08e9fa94bf78c490355bd8f28a82557b9a62b2db00953c63f46d0ec1870a95",
+                "blockTimestamp": "1792556640"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+                "version": "1",
+                "dataHash": "0x2d080c05561b1fe0f5cf2c20e99ca908862d9e30cd46c6e89839f1e695929baf",
+                "metadataHash": "0xb00d6fd5f0abc87fa8e1e582252ecca71b44e06e107760061d41907a832bff86",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0x3973bc5cf7a4bc043935dee87701eab06e53a1430b1cc9fb376610af8355c126",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566339",
+                "blockHash": "0x3566d62f30e2272e3cfc4a91123ce21db9abc4074a01500400270d63cc2bbfbc",
+                "blockTimestamp": "1792556688"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+                "version": "1",
+                "dataHash": "0x1ab02fdc190b6b91a51c97348ca2f1a975e79c0d80925a175ea70d25f5194144",
+                "metadataHash": "0x260cfa10dce5864819ccd08ab6b93a46b09affecf42c2b0d4d030257309e6ae0",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0x3227988c683568dd1ebad75331de3236e7357e83ad40ecde9eaa85d9a8c6f754",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566339",
+                "blockHash": "0x3566d62f30e2272e3cfc4a91123ce21db9abc4074a01500400270d63cc2bbfbc",
+                "blockTimestamp": "1792556688"
+              },
+              "pending": false
+            }
+          ],
+          "records": {
+            "visibility-0": {
+              "id": "visibility-0",
+              "text": "A to B"
+            }
+          },
+          "blobs": {},
+          "published": 0,
+          "importedFragments": 3,
+          "stagedFragments": 0,
+          "importedBatches": 3,
+          "received": 3,
+          "journal": 1,
+          "history": 1,
+          "pending": 1,
+          "errors": [
+            {
+              "error": "registration not confirmed",
+              "n": 1
+            }
+          ],
+          "peakRssKiB": 302236,
+          "generation": 1,
+          "writer": "3c2a2988dc864665b798bbb5cc9feaa3",
+          "operations": [
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "1efd0245-bc1f-490c-be29-82603e2e5679",
+                "writerId": "40741984-112d-4344-9ab0-93cb25665656"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            }
+          ],
+          "wire": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+              "batch": "ea42bdda42724a4694ac4414b2df61bd",
+              "state": "ready",
+              "bytes": 1443
+            }
+          ]
+        }
+      },
+      {
+        "case": "reader-visibility",
+        "direction": "B to A",
+        "ownerVisibleMs": 7375,
+        "appVisibleMs": 144890,
+        "restartedPending": true,
+        "pendingReceipt": {
+          "ownerRows": [
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-0",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "deleted": false,
+              "version": 1
+            },
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-1",
+              "data": {
+                "id": "visibility-1",
+                "text": "B to A"
+              },
+              "emittedAt": "2026-10-21T04:26:25.540Z",
+              "deleted": false,
+              "version": 0,
+              "confirmation": "not yet confirmed",
+              "visibility": "pending"
+            }
+          ],
+          "appRows": [
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-0",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "version": 1,
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "deleted": false
+            }
+          ],
+          "pid": 3765197,
+          "importedScopes": [
+            "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+            "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+            "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0"
+          ],
+          "receivedOperations": [
+            {
+              "blobs": [],
+              "connectionId": "conn",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "declaration": {
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "primaryKey": ["id"],
+                "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "semantics": "mutable_state",
+                "stream": "messages",
+                "version": "1"
+              },
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "generation": 1,
+              "kind": "upsert",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "recordKey": "visibility-0",
+              "revision": {
+                "counter": 2,
+                "operationId": "7c166b9a-d799-42f2-99b4-5e83716337e4",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            },
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "1efd0245-bc1f-490c-be29-82603e2e5679",
+                "writerId": "40741984-112d-4344-9ab0-93cb25665656"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            },
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "b539a028-f6cc-470d-9892-74ba38f1b1bc",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            }
+          ],
+          "staged": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_28b0ab8eb7a24e4e9d7ba2b1ba2597c9.0",
+              "writer": "3c2a2988dc864665b798bbb5cc9feaa3",
+              "batch": "28b0ab8eb7a24e4e9d7ba2b1ba2597c9"
+            }
+          ],
+          "gets": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_28b0ab8eb7a24e4e9d7ba2b1ba2597c9.0",
+              "attempts": 1
+            }
+          ],
+          "puts": [
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+              "sha256": "bc409257654e7582c20b12569eb8eb1fd9f3ba47cfa7cbdd1bca098fceafc6db",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+              "sha256": "a6faf5b68a3cbbbc5c0b12a9d5d66782b645e91c3d3f9d12f415915db56e1b90",
+              "attempts": 1
+            }
+          ],
+          "inboxErrors": [],
+          "quarantines": 0,
+          "evidence": [
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_28b0ab8eb7a24e4e9d7ba2b1ba2597c9.0",
+                "version": "1",
+                "dataHash": "0xcca4b135b4c5f52dec7e27b02ded41518f508d5ff456c53c3c9057d2d239f10c",
+                "metadataHash": "0x74a934ce1b0dae413bde1e0db12ca75dabf50286120370e781c317407dd27ed4",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_28b0ab8eb7a24e4e9d7ba2b1ba2597c9.0",
+                "version": "1",
+                "currentVersion": "0",
+                "status": "None",
+                "commitment": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566339",
+                "blockHash": "0x3566d62f30e2272e3cfc4a91123ce21db9abc4074a01500400270d63cc2bbfbc",
+                "blockTimestamp": "1792556688"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+                "version": "1",
+                "dataHash": "0xd915330a6fff7ac27ad3846f8c0e1c7ee276ce1341919ad9c060c17c119d7ef0",
+                "metadataHash": "0x64aa27ec3376861a62c3c354c6294af77a4d5d20845d4103a503641e16f87a72",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0xb0e6da72b92fb2930fae117c93bf10d0bc2f5f28693d8caaed377ab3547887f9",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566331",
+                "blockHash": "0x3f08e9fa94bf78c490355bd8f28a82557b9a62b2db00953c63f46d0ec1870a95",
+                "blockTimestamp": "1792556640"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+                "version": "1",
+                "dataHash": "0x2d080c05561b1fe0f5cf2c20e99ca908862d9e30cd46c6e89839f1e695929baf",
+                "metadataHash": "0xb00d6fd5f0abc87fa8e1e582252ecca71b44e06e107760061d41907a832bff86",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0x3973bc5cf7a4bc043935dee87701eab06e53a1430b1cc9fb376610af8355c126",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566339",
+                "blockHash": "0x3566d62f30e2272e3cfc4a91123ce21db9abc4074a01500400270d63cc2bbfbc",
+                "blockTimestamp": "1792556688"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+                "version": "1",
+                "dataHash": "0x1ab02fdc190b6b91a51c97348ca2f1a975e79c0d80925a175ea70d25f5194144",
+                "metadataHash": "0x260cfa10dce5864819ccd08ab6b93a46b09affecf42c2b0d4d030257309e6ae0",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0x3227988c683568dd1ebad75331de3236e7357e83ad40ecde9eaa85d9a8c6f754",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566339",
+                "blockHash": "0x3566d62f30e2272e3cfc4a91123ce21db9abc4074a01500400270d63cc2bbfbc",
+                "blockTimestamp": "1792556688"
+              },
+              "pending": false
+            }
+          ],
+          "records": {
+            "visibility-0": {
+              "id": "visibility-0",
+              "text": "A to B"
+            }
+          },
+          "blobs": {},
+          "published": 0,
+          "importedFragments": 3,
+          "stagedFragments": 1,
+          "importedBatches": 3,
+          "received": 3,
+          "journal": 2,
+          "history": 1,
+          "pending": 2,
+          "errors": [
+            {
+              "error": "registration not confirmed",
+              "n": 2
+            }
+          ],
+          "peakRssKiB": 332056,
+          "generation": 1,
+          "writer": "e536ef0b0c114177a34297f9f4476db2",
+          "operations": [
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "b539a028-f6cc-470d-9892-74ba38f1b1bc",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            },
+            {
+              "blobs": [],
+              "connectionId": "conn",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "declaration": {
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "primaryKey": ["id"],
+                "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "semantics": "mutable_state",
+                "stream": "messages",
+                "version": "1"
+              },
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "generation": 1,
+              "kind": "upsert",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "recordKey": "visibility-0",
+              "revision": {
+                "counter": 2,
+                "operationId": "7c166b9a-d799-42f2-99b4-5e83716337e4",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            }
+          ],
+          "wire": [
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+              "batch": "b260c18353794492908d9cfca1c81194",
+              "state": "ready",
+              "bytes": 1443
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+              "batch": "acd2127035d849218bbb63d0811d4e5c",
+              "state": "ready",
+              "bytes": 2070
+            }
+          ]
+        },
+        "confirmedReceipt": {
+          "ownerRows": [
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-0",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "version": 1,
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "deleted": false
+            },
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-1",
+              "data": {
+                "id": "visibility-1",
+                "text": "B to A"
+              },
+              "version": 1,
+              "emittedAt": "2026-10-21T04:26:25.540Z",
+              "deleted": false
+            }
+          ],
+          "appRows": [
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-0",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "version": 1,
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "deleted": false
+            },
+            {
+              "instance": "conn",
+              "stream": "messages",
+              "recordKey": "visibility-1",
+              "data": {
+                "id": "visibility-1",
+                "text": "B to A"
+              },
+              "version": 1,
+              "emittedAt": "2026-10-21T04:26:25.540Z",
+              "deleted": false
+            }
+          ],
+          "pid": 3864653,
+          "importedScopes": [
+            "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+            "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+            "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+            "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_28b0ab8eb7a24e4e9d7ba2b1ba2597c9.0"
+          ],
+          "receivedOperations": [
+            {
+              "blobs": [],
+              "connectionId": "conn",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "declaration": {
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "primaryKey": ["id"],
+                "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "semantics": "mutable_state",
+                "stream": "messages",
+                "version": "1"
+              },
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "generation": 1,
+              "kind": "upsert",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "recordKey": "visibility-0",
+              "revision": {
+                "counter": 2,
+                "operationId": "7c166b9a-d799-42f2-99b4-5e83716337e4",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            },
+            {
+              "blobs": [],
+              "connectionId": "conn",
+              "data": {
+                "id": "visibility-1",
+                "text": "B to A"
+              },
+              "declaration": {
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "primaryKey": ["id"],
+                "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "semantics": "mutable_state",
+                "stream": "messages",
+                "version": "1"
+              },
+              "emittedAt": "2026-10-21T04:26:25.540Z",
+              "generation": 1,
+              "kind": "upsert",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "recordKey": "visibility-1",
+              "revision": {
+                "counter": 3,
+                "operationId": "43ea8e00-cab3-456d-935c-3f985a5bc882",
+                "writerId": "40741984-112d-4344-9ab0-93cb25665656"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            },
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "1efd0245-bc1f-490c-be29-82603e2e5679",
+                "writerId": "40741984-112d-4344-9ab0-93cb25665656"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            },
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "b539a028-f6cc-470d-9892-74ba38f1b1bc",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            }
+          ],
+          "staged": [],
+          "gets": [
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_28b0ab8eb7a24e4e9d7ba2b1ba2597c9.0",
+              "attempts": 1
+            }
+          ],
+          "puts": [
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+              "sha256": "bc409257654e7582c20b12569eb8eb1fd9f3ba47cfa7cbdd1bca098fceafc6db",
+              "attempts": 1
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+              "sha256": "a6faf5b68a3cbbbc5c0b12a9d5d66782b645e91c3d3f9d12f415915db56e1b90",
+              "attempts": 1
+            }
+          ],
+          "inboxErrors": [],
+          "quarantines": 0,
+          "evidence": [
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_28b0ab8eb7a24e4e9d7ba2b1ba2597c9.0",
+                "version": "1",
+                "dataHash": "0xcca4b135b4c5f52dec7e27b02ded41518f508d5ff456c53c3c9057d2d239f10c",
+                "metadataHash": "0x74a934ce1b0dae413bde1e0db12ca75dabf50286120370e781c317407dd27ed4",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_28b0ab8eb7a24e4e9d7ba2b1ba2597c9.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0x06e53a92a67a81c128662844600159adfebd244da42927b37fc7a4a6987f32b3",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566363",
+                "blockHash": "0xf36b5ad92b9686361d170eab75363be6436195d47b31cfb57055251e549e9bd2",
+                "blockTimestamp": "1792556832"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+                "version": "1",
+                "dataHash": "0xd915330a6fff7ac27ad3846f8c0e1c7ee276ce1341919ad9c060c17c119d7ef0",
+                "metadataHash": "0x64aa27ec3376861a62c3c354c6294af77a4d5d20845d4103a503641e16f87a72",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.3c2a2988dc864665b798bbb5cc9feaa3_ea42bdda42724a4694ac4414b2df61bd.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0xb0e6da72b92fb2930fae117c93bf10d0bc2f5f28693d8caaed377ab3547887f9",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566331",
+                "blockHash": "0x3f08e9fa94bf78c490355bd8f28a82557b9a62b2db00953c63f46d0ec1870a95",
+                "blockTimestamp": "1792556640"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+                "version": "1",
+                "dataHash": "0x2d080c05561b1fe0f5cf2c20e99ca908862d9e30cd46c6e89839f1e695929baf",
+                "metadataHash": "0xb00d6fd5f0abc87fa8e1e582252ecca71b44e06e107760061d41907a832bff86",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0x3973bc5cf7a4bc043935dee87701eab06e53a1430b1cc9fb376610af8355c126",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566347",
+                "blockHash": "0xcaf5e56aea21f4af3ebd0ff3fc20b3f62419b073049c74aba9ac8c1f60a23a3b",
+                "blockTimestamp": "1792556736"
+              },
+              "pending": false
+            },
+            {
+              "head": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+                "version": "1",
+                "dataHash": "0x1ab02fdc190b6b91a51c97348ca2f1a975e79c0d80925a175ea70d25f5194144",
+                "metadataHash": "0x260cfa10dce5864819ccd08ab6b93a46b09affecf42c2b0d4d030257309e6ae0",
+                "deleted": false
+              },
+              "chain": {
+                "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+                "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+                "version": "1",
+                "currentVersion": "1",
+                "status": "Active",
+                "commitment": "0x3227988c683568dd1ebad75331de3236e7357e83ad40ecde9eaa85d9a8c6f754",
+                "chainId": 14800,
+                "registry": "0x8f1eFCdff3d0d5BB535e32620721c7EBed151867",
+                "blockNumber": "9566339",
+                "blockHash": "0x3566d62f30e2272e3cfc4a91123ce21db9abc4074a01500400270d63cc2bbfbc",
+                "blockTimestamp": "1792556688"
+              },
+              "pending": false
+            }
+          ],
+          "records": {
+            "visibility-0": {
+              "id": "visibility-0",
+              "text": "A to B"
+            },
+            "visibility-1": {
+              "id": "visibility-1",
+              "text": "B to A"
+            }
+          },
+          "blobs": {},
+          "published": 2,
+          "importedFragments": 4,
+          "stagedFragments": 0,
+          "importedBatches": 4,
+          "received": 4,
+          "journal": 2,
+          "history": 2,
+          "pending": 0,
+          "errors": [],
+          "peakRssKiB": 306084,
+          "generation": 1,
+          "writer": "e536ef0b0c114177a34297f9f4476db2",
+          "operations": [
+            {
+              "connectionId": "conn",
+              "generation": 1,
+              "kind": "connection-register",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "revision": {
+                "counter": 1,
+                "operationId": "b539a028-f6cc-470d-9892-74ba38f1b1bc",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            },
+            {
+              "blobs": [],
+              "connectionId": "conn",
+              "data": {
+                "id": "visibility-0",
+                "text": "A to B"
+              },
+              "declaration": {
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "primaryKey": ["id"],
+                "schemaDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "semantics": "mutable_state",
+                "stream": "messages",
+                "version": "1"
+              },
+              "emittedAt": "2026-10-21T04:22:31.445Z",
+              "generation": 1,
+              "kind": "upsert",
+              "methodId": "export",
+              "owner": "0xd861a58b1AA665eDd4701B658D69289d394211F3",
+              "recordKey": "visibility-0",
+              "revision": {
+                "counter": 2,
+                "operationId": "7c166b9a-d799-42f2-99b4-5e83716337e4",
+                "writerId": "fc4d2f75-e2e9-4757-8f98-b100845208f5"
+              },
+              "sourceId": "https://replica-journey.invalid/declaration"
+            }
+          ],
+          "wire": [
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_b260c18353794492908d9cfca1c81194.0",
+              "batch": "b260c18353794492908d9cfca1c81194",
+              "state": "published",
+              "bytes": 1443
+            },
+            {
+              "scope": "pdpp_replica_v1.e536ef0b0c114177a34297f9f4476db2_acd2127035d849218bbb63d0811d4e5c.0",
+              "batch": "acd2127035d849218bbb63d0811d4e5c",
+              "state": "published",
+              "bytes": 2070
+            }
+          ]
+        }
+      }
+    ],
+    "startedAt": "2026-10-21T04:22:27.155Z",
+    "status": "passed",
+    "finishedAt": "2026-10-21T04:28:50.429Z",
+    "peakRssKiB": {
+      "parent": 293652,
+      "A": 335212,
+      "B": 336656
+    }
+  }
+}

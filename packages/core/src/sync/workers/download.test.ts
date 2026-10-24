@@ -316,6 +316,47 @@ describe("download worker", () => {
       });
     });
 
+    it("commits a downloaded legacy envelope through the replica path", async () => {
+      const deps = makeMockDeps();
+      const envelope = makeEnvelope();
+      const commitVersion = vi.fn().mockResolvedValue({
+        kind: "stored",
+        envelope,
+        entry: {
+          id: 1,
+          fileId: null,
+          schemaId: null,
+          path: RELATIVE_PATH,
+          scope: SCOPE,
+          collectedAt: COLLECTED_AT,
+          createdAt: COLLECTED_AT,
+          sizeBytes: 128,
+          version: 1,
+          dataPointId: DATA_POINT_ID,
+        },
+        writeResult: {
+          path: `/home/owner/data/${RELATIVE_PATH}`,
+          relativePath: RELATIVE_PATH,
+          sizeBytes: 128,
+        },
+      });
+      deps.storage.commitVersion = commitVersion;
+
+      await downloadOne(deps, makeDataPointRecord());
+
+      expect(commitVersion).toHaveBeenCalledWith({
+        kind: "replica",
+        envelope,
+        metadata: {
+          schemaId: null,
+          dataPointId: DATA_POINT_ID,
+          version: 1,
+        },
+      });
+      expect(deps.storage.writeEnvelope).not.toHaveBeenCalled();
+      expect(deps.storage.insertEntry).not.toHaveBeenCalled();
+    });
+
     it("preserves envelope producer attribution and indexes it after a sync download", async () => {
       const deps = makeMockDeps();
       const source = {

@@ -28,8 +28,9 @@ const UNKNOWN_ID = `0x${"9".repeat(64)}` as const;
 
 function storageWithScopes(
   ...scopes: string[]
-): Pick<DataStoragePort, "listScopes"> {
+): Pick<DataStoragePort, "listScopes" | "findEntry"> {
   return {
+    findEntry: vi.fn().mockReturnValue({ pdppOrigin: false }),
     listScopes: vi.fn().mockReturnValue({
       scopes: scopes.map((scope) => ({
         scope,
@@ -296,7 +297,7 @@ describe("prepareLineage", () => {
   const now = () => new Date("2026-08-31T09:12:44.000Z");
 
   it("produces the $lineage record for valid sources", async () => {
-    const lineage = await prepareLineage({
+    const { lineage, sourceScopes } = await prepareLineage({
       scope: DERIVED_SCOPE,
       field: [SOURCE_ID.toUpperCase().replace("0X", "0x"), OTHER_SOURCE_ID],
       serverOwner: OWNER,
@@ -307,6 +308,7 @@ describe("prepareLineage", () => {
       sources: [SOURCE_ID, OTHER_SOURCE_ID],
       writtenAt: "2026-08-31T09:12:44.000Z",
     });
+    expect(sourceScopes).toEqual([SOURCE_SCOPE, OTHER_SOURCE_SCOPE]);
   });
 
   it("keeps an explicit empty list as a root statement (stamped, distinct from absent)", async () => {
@@ -318,7 +320,10 @@ describe("prepareLineage", () => {
         storage: storageWithScopes(),
         now,
       }),
-    ).resolves.toEqual({ sources: [], writtenAt: "2026-08-31T09:12:44.000Z" });
+    ).resolves.toEqual({
+      lineage: { sources: [], writtenAt: "2026-08-31T09:12:44.000Z" },
+      sourceScopes: [],
+    });
   });
 
   it("applies the naming rule against the resolved source scopes", async () => {

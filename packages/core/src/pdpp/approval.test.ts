@@ -24,6 +24,7 @@ import {
 } from "./approval.js";
 import { openPdppAuthStore, type PdppAuthStore } from "./store.js";
 import { PdppTokenService } from "./tokens.js";
+import { parseDeclaration } from "./declaration.js";
 import type { InstanceInventory } from "./resolve.js";
 import type { RequesterIdentity } from "./review.js";
 import {
@@ -36,21 +37,26 @@ import {
 const OWNER = "user_abc123";
 const OTHER_OWNER = "user_someone_else";
 
-const snapshot: DeclarationSnapshot = {
+const declarationDocument = JSON.stringify({
   source_id: "https://registry.pdpp.dev/connectors/spotify",
   source_kind: "connector",
   version: "2026-08-11",
-  digest: "d".repeat(64),
   streams: [
     {
       name: "top_artists",
-      fields: ["id", "name", "genres"],
+      fields: ["id", "name", "genres", "source_updated_at"],
       required_fields: ["id"],
       consent_time_field: "source_updated_at",
       primary_key: ["id"],
     },
   ],
-};
+});
+const parsedSnapshot = parseDeclaration(
+  declarationDocument,
+  "https://registry.pdpp.dev/connectors/spotify",
+);
+if (!parsedSnapshot.ok) throw new Error("invalid approval test declaration");
+const snapshot: DeclarationSnapshot = parsedSnapshot.snapshot;
 
 const requester: RequesterIdentity = {
   client_id: "music_recommendations",
@@ -191,10 +197,12 @@ describe("owner approval requires authentication, not affiliation", () => {
     });
     expect(issued.ok).toBe(true);
     if (!issued.ok) return;
+    store.retainDeclaration(snapshot, declarationDocument);
     store.insertGrant({
       grant: issued.grant,
       subjectId: OWNER,
       reviewDigest: seeded.digest,
+      consentEvidence: issued.consentEvidence,
     });
     store.insertAuthCode("code_x", {
       grantId: issued.grant.grant_id,

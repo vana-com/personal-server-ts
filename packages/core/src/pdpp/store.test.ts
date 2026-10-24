@@ -7,11 +7,14 @@
  */
 
 import { mkdtempSync, rmSync } from "node:fs";
+import Database from "better-sqlite3";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openPdppAuthStore, type PdppAuthStore } from "./store.js";
 import type { Grant } from "./types.js";
+import { parseDeclaration } from "./declaration.js";
+import { computeGrantArtifactDigest, computeReviewDigest } from "./review.js";
 
 let dir: string;
 let store: PdppAuthStore;
@@ -43,6 +46,61 @@ function grantFixture(overrides: Partial<Grant> = {}): Grant {
     issued_at: new Date().toISOString(),
     ...overrides,
   };
+}
+
+function insertApprovedGrant(): Grant {
+  const grant = grantFixture({
+    streams: [
+      {
+        name: "top_artists",
+        instance_ids: ["instance_1"],
+        fields: ["id", "name"],
+      },
+    ],
+  });
+  const document = JSON.stringify({
+    source_id: grant.source.id,
+    source_kind: grant.source.kind,
+    version: grant.source_declaration.version,
+    streams: [
+      {
+        name: "top_artists",
+        fields: ["id", "name"],
+        required_fields: ["id"],
+        primary_key: ["id"],
+      },
+    ],
+  });
+  const parsed = parseDeclaration(document, grant.source.id);
+  if (!parsed.ok) throw new Error("invalid test declaration");
+  store.retainDeclaration(parsed.snapshot, document);
+  const reviewDigest = computeReviewDigest({
+    subject_id: grant.subject.id,
+    client_id: grant.client.client_id,
+    source_id: grant.source.id,
+    source_kind: grant.source.kind,
+    source_declaration_version: grant.source_declaration.version,
+    declaration_digest: parsed.snapshot.digest,
+    purpose_code: grant.purpose_code,
+    access_mode: grant.access_mode,
+    streams: grant.streams,
+  });
+  store.insertGrant({
+    grant,
+    subjectId: grant.subject.id,
+    reviewDigest,
+    consentEvidence: {
+      review_digest: reviewDigest,
+      grant_digest: computeGrantArtifactDigest(grant),
+      approved_at: new Date().toISOString(),
+      declaration: {
+        source_id: grant.source.id,
+        version: grant.source_declaration.version,
+        digest: parsed.snapshot.digest,
+      },
+    },
+  });
+  return grant;
 }
 
 describe("insertGrantWithAuthCode", () => {
@@ -111,4 +169,156 @@ describe("insertGrantWithAuthCode", () => {
       priorGrant.grant_id,
     );
   });
+});
+
+describe("validated persisted grants", () => {
+  it("loads a valid v0.1.0 grant bound to its declaration and approved artifact", () => {
+    const grant = insertApprovedGrant();
+    const validated = store.getValidatedGrant(grant.grant_id);
+    expect(validated?.grant).toEqual(grant);
+    expect(validated?.declarationSnapshot.version).toBe(
+      grant.source_declaration.version,
+    );
+  });
+
+  it("refuses a grant when consent evidence is absent", () => {
+    const grant = insertApprovedGrant();
+    const db = new Database(join(dir, "auth.db"));
+    db.prepare(
+      "UPDATE pdpp_grants SET consent_evidence_json = NULL WHERE grant_id = ?",
+    ).run(grant.grant_id);
+    db.close();
+
+    expect(store.getValidatedGrant(grant.grant_id)).toBeNull();
+  });
+
+  it("retains vA facts when a later declaration vB is present", () => {
+    const grant = insertApprovedGrant();
+    const document = JSON.stringify({
+      source_id: grant.source.id,
+      source_kind: grant.source.kind,
+      version: "2026-09-01",
+      streams: [
+        {
+          name: "top_artists",
+          fields: ["id", "name", "genre"],
+          required_fields: ["id", "genre"],
+          primary_key: ["id", "name"],
+        },
+      ],
+    });
+    const parsed = parseDeclaration(document, grant.source.id);
+    if (!parsed.ok) throw new Error("invalid vB test declaration");
+    store.retainDeclaration(parsed.snapshot, document);
+
+    const validated = store.getValidatedGrant(grant.grant_id);
+    expect(validated?.declarationSnapshot.version).toBe("2026-08-11");
+    expect(validated?.declarationSnapshot.streams[0]?.primary_key).toEqual([
+      "id",
+    ]);
+  });
+
+  it.each([
+    [
+      "unsupported major version",
+      (grant: Record<string, unknown>) => {
+        grant.version = "9.0.0";
+      },
+    ],
+    [
+      "changed approved fields",
+      (grant: Record<string, unknown>) => {
+        const streams = grant.streams as Record<string, unknown>[];
+        streams[0]!.fields = ["id", "name", "secret"];
+      },
+    ],
+    [
+      "changed client identity",
+      (grant: Record<string, unknown>) => {
+        (grant.client as Record<string, unknown>).client_id = "other_client";
+      },
+    ],
+    [
+      "changed source identity",
+      (grant: Record<string, unknown>) => {
+        (grant.source as Record<string, unknown>).id = "other_source";
+      },
+    ],
+    [
+      "changed indexed expiry",
+      (grant: Record<string, unknown>) => {
+        grant.expires_at = "2027-01-01T00:00:00Z";
+      },
+    ],
+    [
+      "missing required members",
+      (grant: Record<string, unknown>) => {
+        delete grant.source_declaration;
+      },
+    ],
+    [
+      "duplicate fields",
+      (grant: Record<string, unknown>) => {
+        const streams = grant.streams as Record<string, unknown>[];
+        streams[0]!.fields = ["id", "id"];
+      },
+    ],
+    [
+      "invalid temporal shape",
+      (grant: Record<string, unknown>) => {
+        const streams = grant.streams as Record<string, unknown>[];
+        streams[0]!.time_constraint = {
+          field: "created_at",
+          since: "2027-01-01T00:00:00Z",
+          until: "2026-01-01T00:00:00Z",
+        };
+      },
+    ],
+  ])("refuses %s as a token grant", (_name, mutate) => {
+    const grant = insertApprovedGrant();
+    const db = new Database(join(dir, "auth.db"));
+    const raw = JSON.parse(
+      db
+        .prepare("SELECT grant_json FROM pdpp_grants WHERE grant_id = ?")
+        .get(grant.grant_id)?.grant_json as string,
+    ) as Record<string, unknown>;
+    mutate(raw);
+    db.prepare("UPDATE pdpp_grants SET grant_json = ? WHERE grant_id = ?").run(
+      JSON.stringify(raw),
+      grant.grant_id,
+    );
+    db.close();
+
+    expect(store.getValidatedGrant(grant.grant_id)).toBeNull();
+  });
+
+  it("refuses a grant when its retained declaration artifact is missing", () => {
+    const grant = insertApprovedGrant();
+    const db = new Database(join(dir, "auth.db"));
+    db.prepare(
+      "DELETE FROM pdpp_declarations WHERE source_id = ? AND version = ?",
+    ).run(grant.source.id, grant.source_declaration.version);
+    db.close();
+    expect(store.getValidatedGrant(grant.grant_id)).toBeNull();
+  });
+});
+
+describe("client access-token expiration", () => {
+  it.each([null, "not-a-date", "Infinity"])(
+    "rejects nonfinite expiration %s before persistence",
+    (expiresAt) => {
+      expect(() =>
+        store.issueAccessToken({
+          token: "invalid-expiry",
+          grantId: null,
+          subjectId: "user_1",
+          clientId: "client_1",
+          tokenKind: "client",
+          expiresAt,
+          consumeSingleUse: false,
+        }),
+      ).toThrow(/finite expiration/);
+      expect(store.getAccessToken("invalid-expiry")).toBeNull();
+    },
+  );
 });

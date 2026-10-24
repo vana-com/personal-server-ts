@@ -8,6 +8,7 @@
  * the methods it calls, which is not the property that matters.
  */
 
+import Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,8 @@ import {
   type AccessMode,
   type Grant,
 } from "./types.js";
+import { parseDeclaration } from "./declaration.js";
+import { computeGrantArtifactDigest, computeReviewDigest } from "./review.js";
 
 let dir: string;
 let store: PdppAuthStore;
@@ -60,10 +63,49 @@ function seedGrant(
   overrides: Partial<Grant> = {},
 ): { grant: Grant; code: string } {
   const grant = makeGrant({ access_mode: accessMode, ...overrides });
+  const declarationDocument = JSON.stringify({
+    source_id: grant.source.id,
+    source_kind: grant.source.kind,
+    version: grant.source_declaration.version,
+    streams: grant.streams.map((stream) => ({
+      name: stream.name,
+      fields: stream.fields,
+      required_fields: ["id"],
+      primary_key: ["id"],
+    })),
+  });
+  const declaration = parseDeclaration(declarationDocument, grant.source.id);
+  if (!declaration.ok) throw new Error("invalid test declaration");
+  store.retainDeclaration(declaration.snapshot, declarationDocument);
+  const reviewDigest = computeReviewDigest({
+    subject_id: grant.subject.id,
+    client_id: grant.client.client_id,
+    source_id: grant.source.id,
+    source_kind: grant.source.kind,
+    source_declaration_version: grant.source_declaration.version,
+    declaration_digest: declaration.snapshot.digest,
+    purpose_code: grant.purpose_code,
+    purpose_description: grant.purpose_description,
+    access_mode: grant.access_mode,
+    streams: grant.streams,
+    retention: grant.retention,
+    expires_at: grant.expires_at,
+  });
+  const consentEvidence = {
+    review_digest: reviewDigest,
+    grant_digest: computeGrantArtifactDigest(grant),
+    approved_at: new Date().toISOString(),
+    declaration: {
+      source_id: grant.source.id,
+      version: grant.source_declaration.version,
+      digest: declaration.snapshot.digest,
+    },
+  };
   store.insertGrant({
     grant,
     subjectId: grant.subject.id,
-    reviewDigest: "digest-placeholder",
+    reviewDigest,
+    consentEvidence,
   });
   const code = `code_${Math.random().toString(16).slice(2)}`;
   store.insertAuthCode(code, {
@@ -381,6 +423,37 @@ describe("§8 — introspection carries the full enforcement context", () => {
   });
 });
 
+describe("persisted grant integrity", () => {
+  it("makes a token inactive when approved rights change in persisted JSON", () => {
+    const { code, grant } = seedGrant("continuous");
+    const result = redeem(code);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const db = new Database(join(dir, "auth.db"));
+    const raw = JSON.parse(
+      db
+        .prepare("SELECT grant_json FROM pdpp_grants WHERE grant_id = ?")
+        .get(grant.grant_id)?.grant_json as string,
+    ) as Record<string, unknown>;
+    const streams = raw.streams as Record<string, unknown>[];
+    streams[0]!.fields = ["id", "name", "private_note"];
+    db.prepare("UPDATE pdpp_grants SET grant_json = ? WHERE grant_id = ?").run(
+      JSON.stringify(raw),
+      grant.grant_id,
+    );
+    db.close();
+
+    expect(tokens.resolveToken(result.issued.access_token)).toMatchObject({
+      active: false,
+      inactiveReason: "unknown",
+    });
+    expect(tokens.introspect(result.issued.access_token)).toEqual({
+      active: false,
+    });
+  });
+});
+
 describe("delivery §2 / §9 AS item 8 — revocation and lifecycle", () => {
   it("reports active: false immediately after revocation", () => {
     const { grant, code } = seedGrant("continuous");
@@ -491,4 +564,37 @@ describe("§10 — tokens are not stored in plaintext", () => {
     expect(record!.tokenHash).not.toBe(issued.issued.access_token);
     expect(record!.tokenHash).toMatch(/^[0-9a-f]{64}$/);
   });
+});
+
+describe("persisted client expiration", () => {
+  it.each([null, "not-a-date"])(
+    "fails closed for stored expiration %s",
+    (expiresAt) => {
+      const { code } = seedGrant("continuous");
+      const issued = redeem(code);
+      expect(issued.ok).toBe(true);
+      if (!issued.ok) return;
+      const db = new Database(join(dir, "auth.db"));
+      db.prepare("UPDATE pdpp_access_tokens SET expires_at = ?").run(expiresAt);
+      db.close();
+      expect(tokens.resolveToken(issued.issued.access_token)).toEqual({
+        active: false,
+        inactiveReason: "expired",
+      });
+      expect(tokens.introspect(issued.issued.access_token)).toEqual({
+        active: false,
+      });
+    },
+  );
+});
+
+describe("client access-token lifetime policy", () => {
+  it.each([NaN, Infinity, -Infinity, 0, -1, Number.MAX_VALUE])(
+    "rejects invalid TTL %s at construction",
+    (accessTokenTtlSeconds) => {
+      expect(
+        () => new PdppTokenService(store, { accessTokenTtlSeconds }),
+      ).toThrow(/positive finite/);
+    },
+  );
 });

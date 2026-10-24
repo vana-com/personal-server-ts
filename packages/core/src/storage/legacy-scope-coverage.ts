@@ -1,7 +1,9 @@
 /**
  * A pure coverage check for a latest legacy body and its canonical projection.
- * Entity arrays use stable keys. Same-time comparisons retain relative order;
- * newer canonical state may reorder or, with proof, delete entities.
+ * Keyed entity arrays use stable IDs. ID-less legacy scopes can opt into exact
+ * body snapshots, which preserve array order, duplicates and every field.
+ * Same-time keyed comparisons retain relative order; newer canonical state may
+ * reorder or, with proof, delete keyed entities.
  * Diagnostics contain paths and counts, never entity keys or field values.
  */
 import type { ProjectionOmission } from "../legacy-projection/types.js";
@@ -21,6 +23,8 @@ export interface LegacyCoverageOptions {
   projectionOmissions?: readonly ProjectionOmission[];
   /** JSON paths to entity arrays; [] marks each array element, e.g. $.posts[].comments. */
   entityKeys?: Readonly<Record<string, readonly string[]>>;
+  /** Require exact JSON snapshot equality for this ID-less legacy scope body. */
+  exactSnapshot?: boolean;
   /** Legacy payload schema. An `id` or `uuid` item field supplies a key. */
   schema?: LegacyCoverageSchema;
   /** Maximum canonical/legacy byte ratio before payload growth can refuse takeover. Default 1.5. */
@@ -143,6 +147,31 @@ function isIdentityField(field: string): boolean {
 
 function object(value: unknown): value is JsonObject {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function sameJsonSnapshot(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => sameJsonSnapshot(value, right[index]))
+    );
+  }
+  if (object(left) || object(right)) {
+    if (!object(left) || !object(right)) return false;
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    return (
+      leftKeys.length === rightKeys.length &&
+      leftKeys.every(
+        (key) =>
+          Object.hasOwn(right, key) && sameJsonSnapshot(left[key], right[key]),
+      )
+    );
+  }
+  return false;
 }
 
 function stableKey(value: unknown, fields: readonly string[]): string | null {
@@ -527,7 +556,12 @@ export function compareLegacyCoverage(
   }
 
   const schema = options.schema?.schema ?? options.schema;
-  compare(legacyPayload, canonicalPayload, "$", "$", schema);
+  if (options.exactSnapshot) {
+    if (!sameJsonSnapshot(legacyPayload, canonicalPayload))
+      mark("field_mismatch", "$");
+  } else {
+    compare(legacyPayload, canonicalPayload, "$", "$", schema);
+  }
   if (
     canonicalBytes > legacyBytes * (options.maxPayloadRatio ?? 1.5) &&
     byteDelta > (options.maxExtraBytes ?? 256 * 1024)

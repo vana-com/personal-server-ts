@@ -17,6 +17,7 @@ import {
   buildScopeDir,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { GatewayClient, Builder } from "@opendatalabs/vana-sdk/node";
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { GatewayGrantResponse } from "@opendatalabs/vana-sdk/node";
 import type { AccessLogWriter } from "@opendatalabs/personal-server-ts-core/logging/access-log";
 import {
@@ -3026,6 +3027,265 @@ describe("X402 payment on GET /v1/data/:scope", () => {
     await rm(dataDir, { recursive: true, force: true });
     vi.unstubAllGlobals();
   });
+
+  it.each([
+    ["payment-refresh", "control"],
+    ["payment-refresh", "legacy-mutation"],
+    ["payment-refresh", "pdpp-mutation"],
+    ["read-return", "control"],
+    ["read-return", "legacy-mutation"],
+    ["read-return", "pdpp-mutation"],
+  ])(
+    "payment serves the approved owned Lite envelope: %s/%s",
+    async (window, mode) => {
+      const {
+        createPersistentPsLiteStorage,
+        createIndexedDbFallbackDataFileStore,
+      } = await import("../../../lite/src/storage.js");
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        { read: async () => null, write: async () => {} },
+        createIndexedDbFallbackDataFileStore(
+          new Map<string, DataFileEnvelope>(),
+        ),
+      );
+      const data: {
+        nested: { marker: string };
+        $pdpp?: { version: 1; sourceId: string };
+      } = { nested: { marker: "authorized-original" } };
+      const source = {
+        version: "1.0",
+        scope: "instagram.profile",
+        collectedAt: "2026-10-01T00:00:00.000Z",
+        data,
+      };
+      const published = await storage.writeEnvelope(source);
+      await storage.insertEntry({
+        fileId: null,
+        path: published.relativePath,
+        scope: source.scope,
+        collectedAt: source.collectedAt,
+        sizeBytes: published.sizeBytes,
+      });
+      // Exercise the actual borrowed-object adapter, not a fake storage port.
+      expect(await storage.readEnvelope(source.scope, source.collectedAt)).toBe(
+        source,
+      );
+      const mutate = () => {
+        if (mode === "control") return;
+        data.nested.marker = `${mode}-after-policy`;
+        if (mode === "pdpp-mutation") {
+          data.$pdpp = {
+            version: 1,
+            sourceId: "https://registry.pdpp.dev/oura",
+          };
+        }
+      };
+      if (window === "read-return") {
+        const read = storage.readEnvelope.bind(storage);
+        storage.readEnvelope = async (scope, collectedAt) => {
+          const borrowed = await read(scope, collectedAt);
+          // First let the guard's await continue, then mutate before its
+          // caller continues. A snapshot in HTTP after await is too late.
+          queueMicrotask(() => queueMicrotask(mutate));
+          return borrowed;
+        };
+      }
+      let calls = 0;
+      const gateway = createMockGateway({
+        getGrant: vi.fn(async () => {
+          calls++;
+          if (calls === 2 && window === "payment-refresh") mutate();
+          return paidGrant();
+        }),
+      });
+      const forwarded = vi.fn(async () => new Response("{}", { status: 200 }));
+      vi.stubGlobal("fetch", forwarded);
+      const app = createX402App({ dataStorage: storage, gateway });
+      const response = await getWithPayment(
+        app,
+        source.scope,
+        await signedXPayment(),
+      );
+      const body = await response.json();
+      console.log(
+        JSON.stringify({
+          probe: "http-approved-body-ownership",
+          window,
+          mode,
+          status: response.status,
+          grantCalls: calls,
+          settled: forwarded.mock.calls.length,
+          body,
+        }),
+      );
+      expect(calls).toBe(2);
+      expect(response.status).toBe(200);
+      expect(body).toEqual({
+        version: source.version,
+        scope: source.scope,
+        collectedAt: source.collectedAt,
+        data: { nested: { marker: "authorized-original" } },
+      });
+      expect(forwarded).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["challenge", "settlement"])(
+    "payment keeps the retained version during grant refresh: %s",
+    async (mode) => {
+      const { createNodeDataStorage } =
+        await import("../storage/node-data-storage.js");
+      const storage = createNodeDataStorage({ indexManager, hierarchyOptions });
+      const scope = "instagram.profile";
+      const dataPointId = ("0x" + "11".repeat(32)) as `0x${string}`;
+      let calls = 0;
+      let publishDuringRefresh = mode === "challenge";
+      let firstAt = "";
+      const gateway = createMockGateway({
+        getGrant: vi.fn(async () => {
+          calls++;
+          if (publishDuringRefresh && calls === 2) {
+            const replacement = {
+              version: "1.0",
+              scope,
+              collectedAt: new Date(Date.parse(firstAt) + 1000).toISOString(),
+              data: { marker: "replacement-B" },
+            };
+            const written = await storage.writeEnvelope(replacement);
+            indexManager.insert({
+              fileId: null,
+              path: written.relativePath,
+              scope,
+              collectedAt: replacement.collectedAt,
+              sizeBytes: written.sizeBytes,
+              dataPointId,
+              version: 2,
+              pdppOrigin: false,
+            });
+          }
+          return paidGrant();
+        }),
+      });
+      const app = createX402App({ gateway });
+      expect((await ingest(app, scope, { marker: "response-A" })).status).toBe(
+        201,
+      );
+      const first = indexManager.findLatestByScope(scope)!;
+      firstAt = first.collectedAt;
+      indexManager.updateDataPointId(first.path, dataPointId);
+      indexManager.updateVersion(first.path, 1);
+      const challenge = await getNoPayment(app, scope);
+      expect(challenge.status).toBe(402);
+      const offered = await challenge.json();
+      if (mode === "challenge") {
+        console.log(
+          JSON.stringify({
+            probe: "payment-retained-challenge",
+            offeredVersion: offered.accepts[0].accessRecord.version,
+            latestVersion: indexManager.findLatestByScope(scope)?.version,
+          }),
+        );
+        expect(indexManager.findLatestByScope(scope)?.version).toBe(2);
+        expect(offered.accepts[0].accessRecord.version).toBe("1");
+        return;
+      }
+      expect(offered.accepts[0].accessRecord.version).toBe("1");
+      const payment = JSON.parse(
+        Buffer.from(await signedXPayment(), "base64").toString(),
+      );
+      payment.payload.accessRecord = offered.accepts[0].accessRecord;
+      const forwarded = vi.fn(async () => new Response("{}", { status: 200 }));
+      vi.stubGlobal("fetch", forwarded);
+      calls = 0;
+      publishDuringRefresh = true;
+      const paid = await getWithPayment(
+        app,
+        scope,
+        encodePaymentHeader(payment),
+      );
+      const body = await paid.json();
+      console.log(
+        JSON.stringify({
+          probe: "payment-retained-settlement",
+          status: paid.status,
+          settled: forwarded.mock.calls.length,
+          returnedMarker: body.data?.marker,
+          latestVersion: indexManager.findLatestByScope(scope)?.version,
+        }),
+      );
+      expect(indexManager.findLatestByScope(scope)?.version).toBe(2);
+      expect(paid.status).toBe(200);
+      expect(body.data.marker).toBe("response-A");
+      expect(forwarded).toHaveBeenCalledTimes(1);
+      const posted = JSON.parse(
+        (forwarded.mock.calls[0] as unknown as [string, RequestInit])[1]
+          .body as string,
+      );
+      expect(posted.accessRecord.version).toBe("1");
+    },
+  );
+
+  it.each([false, true])(
+    "refuses an unrelated reader before payment with indexed PDPP origin %s",
+    async (indexedOrigin) => {
+      const { createNodeDataStorage } =
+        await import("../storage/node-data-storage.js");
+      const storage = createNodeDataStorage({ indexManager, hierarchyOptions });
+      const envelope = {
+        version: "1.0",
+        scope: "instagram.profile",
+        collectedAt: "2026-09-01T00:00:00Z",
+        producer: "pdpp-derivative",
+        data: {
+          value: "private-to-other-writer",
+          $writtenBy: {
+            builder: createTestWallet(2).address,
+            grantId: "other-grant",
+            signature: "server-stamped-proof",
+            bodyHash: "sha256:proof",
+            writtenAt: "2026-09-01T00:00:00Z",
+          },
+        },
+      };
+      const written = await storage.writeEnvelope(envelope as never);
+      await storage.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: written.sizeBytes,
+        pdppOrigin: indexedOrigin,
+        producer: "pdpp-derivative",
+      });
+      const app = createX402App();
+      const gatewayFetch = vi.fn().mockResolvedValue(
+        new Response("{}", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      vi.stubGlobal("fetch", gatewayFetch);
+      const challenge = await getNoPayment(app, "instagram.profile");
+      const paid = await getWithPayment(
+        app,
+        "instagram.profile",
+        await signedXPayment(),
+      );
+      console.log(
+        JSON.stringify({
+          probe: "charge-before-refusal",
+          challenge: challenge.status,
+          paidResponse: paid.status,
+          settled: gatewayFetch.mock.calls.length,
+          body: await paid.clone().text(),
+        }),
+      );
+      expect(challenge.status).toBe(403);
+      expect(paid.status).toBe(403);
+      expect(gatewayFetch).not.toHaveBeenCalled();
+    },
+  );
 
   it("answers 410 for a deleted scope before issuing any payment challenge", async () => {
     // Deletion is checked ahead of the x402 cycle so a builder is never

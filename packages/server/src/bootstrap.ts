@@ -87,7 +87,7 @@ import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js"
 import type { Hono } from "hono";
 import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
-import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
+import { createPdppAuthDeps, pdppIsConfigured } from "./pdpp/bootstrap.js";
 import {
   createPdppRecordsDeps,
   coLocatedAuthorizationService,
@@ -389,6 +389,7 @@ export async function createServer(
     allowOpenMarkerMigration:
       hadIndex && !hadMetadataSentinel && !openMarkerProtocolInitialized,
   });
+  const legacyScopeAuthority = createLegacyScopeAuthority(db);
   db.exec(
     "CREATE TABLE IF NOT EXISTS cas_open_marker_protocol (id INTEGER PRIMARY KEY)",
   );
@@ -670,6 +671,12 @@ export async function createServer(
       "Inference E2EE is disabled: prompts and answers travel as plaintext over TLS",
     );
   }
+  // One signal for "PDPP is configured here", shared by the data routes and
+  // the derivative compute. It follows configuration, not whether the PDPP
+  // routes mounted: a configured service that failed to mount (no retained
+  // declarations, say) still counts, because PDPP data may still exist.
+  // Read lazily; `pdppAuth` is resolved further down.
+  const pdppConfigured = () => pdppIsConfigured(config, pdppAuth) ?? true;
   const derivativeScheduler: RecomputeScheduler = createRecomputeScheduler({
     store: questionStore,
     debounceMs: config.inference.recomputeDebounceMs,
@@ -682,6 +689,8 @@ export async function createServer(
           derivativeScheduler.markSourceChanged(event.scope, {
             lineageSources: event.lineageSources,
           }),
+        // Read when a question computes, after the PDPP surface is resolved.
+        pdppEnabled: pdppConfigured,
         storage: dataStorage,
         store: questionStore,
         provider: inferenceProvider,
@@ -746,6 +755,7 @@ export async function createServer(
       masterKey: deriveMasterKey(masterKeySignature),
       signer: options?.additionsWriter?.signer ?? serverSigner,
       gateway: options?.additionsWriter?.gateway ?? gatewayClient,
+      registrationAuthority: legacyScopeAuthority,
     });
   }
 
@@ -771,6 +781,7 @@ export async function createServer(
 
     const uploadDeps = {
       additions,
+      registrationAuthority: legacyScopeAuthority,
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -1013,6 +1024,7 @@ export async function createServer(
       : undefined;
 
   const app = createApp({
+    pdppEnabled: pdppConfigured,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
     // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).
@@ -1068,7 +1080,7 @@ export async function createServer(
     // file, on a boot that does not mount the RS.
     legacyScopeView: createLegacyScopeView({
       logger,
-      authority: createLegacyScopeAuthority(db),
+      authority: legacyScopeAuthority,
       records: pdppRecords?.bindingStore,
       // Reuse the source-scoped declarations selected by the record server.
       // Declaration schema identity participates in projection revisions and

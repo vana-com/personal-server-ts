@@ -16,6 +16,7 @@
  * §8 is the RS's positive-result cache, not slack in the AS.
  */
 
+import { hasFiniteExpiration } from "./token-expiry.js";
 import { verifyCodeVerifier } from "./pkce.js";
 import {
   newOpaqueToken,
@@ -112,6 +113,15 @@ export class PdppTokenService {
   ) {
     this.accessTtl =
       options.accessTokenTtlSeconds ?? DEFAULT_ACCESS_TOKEN_TTL_SECONDS;
+    if (
+      !Number.isFinite(this.accessTtl) ||
+      this.accessTtl <= 0 ||
+      !Number.isFinite(new Date(Date.now() + this.accessTtl * 1000).getTime())
+    ) {
+      throw new Error(
+        "Client access-token TTL must be positive finite seconds within the supported date range",
+      );
+    }
   }
 
   /**
@@ -184,7 +194,7 @@ export class PdppTokenService {
       };
     }
 
-    const stored = this.store.getGrant(record.grantId);
+    const stored = this.store.getValidatedGrant(record.grantId);
     if (!stored) {
       return {
         ok: false,
@@ -231,7 +241,7 @@ export class PdppTokenService {
       };
     }
 
-    const stored = this.store.getGrant(rotation.grantId);
+    const stored = this.store.getValidatedGrant(rotation.grantId);
     if (!stored) {
       return {
         ok: false,
@@ -351,7 +361,7 @@ export class PdppTokenService {
     // revocation, and the RS keys 403 `grant_revoked` off this exact reason
     // (§2 revocation propagation) — it would return the wrong error.
     if (record.tokenKind === "client" && record.grantId) {
-      const stored = this.store.getGrant(record.grantId);
+      const stored = this.store.getValidatedGrant(record.grantId);
       if (!stored) {
         return { active: false, inactiveReason: "unknown" };
       }
@@ -365,7 +375,11 @@ export class PdppTokenService {
       return { active: false, inactiveReason: "revoked" };
     }
 
-    if (record.expiresAt && Date.parse(record.expiresAt) <= now.getTime()) {
+    if (
+      (record.tokenKind === "client" &&
+        !hasFiniteExpiration(record.expiresAt)) ||
+      (record.expiresAt && Date.parse(record.expiresAt) <= now.getTime())
+    ) {
       return { active: false, inactiveReason: "expired" };
     }
 
@@ -396,7 +410,7 @@ export class PdppTokenService {
       return { active: false, inactiveReason: "unknown" };
     }
 
-    const stored = this.store.getGrant(record.grantId);
+    const stored = this.store.getValidatedGrant(record.grantId);
     if (!stored) {
       return { active: false, inactiveReason: "unknown" };
     }
@@ -412,6 +426,7 @@ export class PdppTokenService {
       tokenKind: "client",
       subjectId: stored.subjectId,
       grant: stored.grant,
+      declarationSnapshot: stored.declarationSnapshot,
       clientId: stored.grant.client.client_id,
       ...(record.expiresAt && { expiresAt: record.expiresAt }),
     };

@@ -18,6 +18,7 @@ import {
   AuthorizationSessionStore,
   computeS256Challenge,
   openPdppAuthStore,
+  parseDeclaration,
   PDPP_API_VERSION,
   PDPP_DATA_ACCESS_TYPE,
   PdppTokenService,
@@ -37,11 +38,10 @@ const OWNER_INSTANCE = "spotify-account-a";
 const VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const CHALLENGE = computeS256Challenge(VERIFIER);
 
-const snapshot: DeclarationSnapshot = {
+const declarationDocument = JSON.stringify({
   source_id: SOURCE_ID,
   source_kind: "connector",
   version: "2026-08-11",
-  digest: "d".repeat(64),
   streams: [
     {
       name: "top_artists",
@@ -51,7 +51,10 @@ const snapshot: DeclarationSnapshot = {
       primary_key: ["id"],
     },
   ],
-};
+});
+const parsedDeclaration = parseDeclaration(declarationDocument, SOURCE_ID);
+if (!parsedDeclaration.ok) throw new Error("invalid test declaration");
+const snapshot: DeclarationSnapshot = parsedDeclaration.snapshot;
 
 let dir: string;
 let store: PdppAuthStore;
@@ -161,6 +164,10 @@ beforeEach(() => {
       sessions,
       resolveDeclaration: (sourceId) =>
         sourceId === snapshot.source_id ? snapshot : null,
+      documentForDeclaration: (sourceId, version) =>
+        sourceId === snapshot.source_id && version === snapshot.version
+          ? declarationDocument
+          : null,
       inventoryFor: () => inventory,
       currentSubjectId: (_c: Context) => authenticatedSubject,
       // Registered client metadata: redirect_uri is validated by exact match,

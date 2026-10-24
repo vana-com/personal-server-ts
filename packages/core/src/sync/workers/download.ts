@@ -1,3 +1,4 @@
+import { isReplicaScope } from "../../replication/namespace.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   DataFileEnvelopeSchema,
@@ -33,7 +34,11 @@ import {
 } from "../issues.js";
 import { downloadRetryKey, type DownloadRetryMemory } from "../retry-memory.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
-import { isPermanentRejection, type PdppImporter } from "../pdpp-import.js";
+import {
+  isPdppProducer,
+  isPermanentRejection,
+  type PdppImporter,
+} from "../pdpp-import.js";
 import { recordStoredVersion } from "../../additions/ledger-store.js";
 
 /**
@@ -274,6 +279,7 @@ export async function downloadOne(
   deps: DownloadWorkerDeps,
   record: DataPointRecord,
 ): Promise<DownloadResult | null> {
+  if (isReplicaScope(record.scope)) return null;
   const { storage, storageAdapter, masterKey, logger, diagnostics } = deps;
   const ctx: RecordContext = { dataPointId: record.id, schemaId: null };
 
@@ -451,8 +457,7 @@ export async function downloadOne(
     schemaId: ctx.schemaId,
     dataPointId: record.id,
     version: expectedVersion,
-    ...(envelope.producer === "pdpp-projector" ||
-    envelope.producer === "pdpp-import-projection"
+    ...(isPdppProducer(envelope.producer)
       ? { producer: envelope.producer }
       : {}),
     ...(envelope.producer_provenance &&
@@ -648,6 +653,7 @@ export async function downloadAll(
 
   // 3. Process each data point record
   for (const dataPoint of dataPoints) {
+    if (isReplicaScope(dataPoint.scope)) continue;
     const deletedAt = deletionTimestamp(dataPoint);
     if (deletedAt !== null) {
       // Tombstone: never download; drop what the deletion covers locally.

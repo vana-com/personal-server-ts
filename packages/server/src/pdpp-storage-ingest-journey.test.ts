@@ -982,7 +982,8 @@ describe("P8: active method, owner reset, and generation-fenced blobs", () => {
       method: "oura",
       generation: 2,
     });
-    expect(storeCounters()).toEqual({ clock: 4, changes: 0 });
+    // Two writes and the reset; a sync read does not advance the clock.
+    expect(storeCounters()).toEqual({ clock: 3, changes: 0 });
 
     const staleAAfterReset = await ingest(
       ctx,
@@ -1368,7 +1369,7 @@ describe("P10c and method authority over HTTP", () => {
     const changesPage = await read(
       ctx!,
       token,
-      "/v1/streams/events/records?changes_since=&limit=1",
+      "/v1/streams/events/records?changes_since=&limit=1&order=asc",
     );
     const changesCursor = changesPage.body.next_cursor as string;
     expect(changesCursor).toBeTruthy();
@@ -1410,7 +1411,7 @@ describe("P10c and method authority over HTTP", () => {
     const staleChanges = await read(
       ctx,
       newToken,
-      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(changesCursor)}`,
+      `/v1/streams/events/records?changes_since=&limit=1&order=asc&cursor=${encodeURIComponent(changesCursor)}`,
     );
     expect(staleChanges.status).toBe(410);
 
@@ -1439,7 +1440,7 @@ describe("P10c and method authority over HTTP", () => {
     const page = await read(
       ctx!,
       token,
-      "/v1/streams/events/records?changes_since=&limit=1",
+      "/v1/streams/events/records?changes_since=&limit=1&order=asc",
     );
     const cursor = page.body.next_cursor as string;
     const listPage = await read(
@@ -1481,21 +1482,20 @@ describe("P10c and method authority over HTTP", () => {
       expect(forged.status).toBe(400);
       expect(forged.body.error.code).toBe("invalid_cursor");
     }
+    // A changes_since page cursor is sealed, so its horizons cannot be
+    // forged. A readable one is refused before any horizon it carries is used.
+    expect(() =>
+      JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")),
+    ).toThrow();
     for (const horizon of badHorizons) {
       const forged = await read(
         ctx!,
         token,
-        `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forge(cursor, { horizon }))}`,
+        `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forge(token1, { horizon, offset: 1 }))}`,
       );
-      expect(forged.status).toBe(400);
-      expect(forged.body.error.code).toBe("invalid_cursor");
+      expect(forged.status).toBe(410);
+      expect(forged.body.error.code).toBe("cursor_expired");
     }
-    const since = await read(
-      ctx!,
-      token,
-      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forge(cursor, { sinceHorizon: "abc" }))}`,
-    );
-    expect(since.status).toBe(400);
     const forgedSince = await read(
       ctx!,
       token,
@@ -1597,7 +1597,7 @@ describe("P10c and method authority over HTTP", () => {
     const staleChanges = await read(
       ctx,
       tokenB,
-      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(changesCursor)}`,
+      `/v1/streams/events/records?changes_since=&limit=1&order=asc&cursor=${encodeURIComponent(changesCursor)}`,
     );
     expect(staleChanges.status).toBe(410);
     expect(staleChanges.body.error.code).toBe("cursor_expired");
@@ -1611,7 +1611,7 @@ describe("P10c and method authority over HTTP", () => {
     const page1 = await read(
       ctx!,
       token,
-      "/v1/streams/events/records?changes_since=&limit=1",
+      "/v1/streams/events/records?changes_since=&limit=1&order=asc",
     );
     expect(page1.status).toBe(200);
     expect(page1.body.data.map((r: any) => r.id)).toEqual(["a1"]);
@@ -1622,7 +1622,7 @@ describe("P10c and method authority over HTTP", () => {
     const page2 = await read(
       ctx!,
       token,
-      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(page1.body.next_cursor)}`,
+      `/v1/streams/events/records?changes_since=&limit=1&order=asc&cursor=${encodeURIComponent(page1.body.next_cursor)}`,
     );
     expect(page2.status).toBe(200);
     expect(page2.body.data.map((r: any) => r.id)).toEqual(["a2"]);
@@ -2937,7 +2937,7 @@ describe("P5: record data is validated against the declared stream schema", () =
     expect(JSON.stringify(result.body)).not.toMatch(/alice|bob|5551234/);
   });
 
-  it("rejects invalid changes_since cursor offsets before pagination", async () => {
+  it("rejects altered changes_since page cursors before pagination", async () => {
     ctx = await bootBoth();
     const token = await ownerToken(ctx);
     const instance = `oura:${owner}`;
@@ -2959,35 +2959,29 @@ describe("P5: record data is validated against the declared stream schema", () =
       "/v1/streams/events/records?changes_since=&limit=1",
     );
     const cursor = first.body.next_cursor as string;
-    const forgeOffset = (offset: unknown) =>
-      Buffer.from(
-        JSON.stringify({
-          ...JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")),
-          offset,
-        }),
-      ).toString("base64url");
-
-    for (const offset of [
-      "1",
-      "abc",
-      -1,
-      1.5,
-      null,
-      "9007199254740993",
-      9007199254740992,
+    // Sealed: no offset or position to edit. Every altered byte is refused.
+    for (const at of [
+      0,
+      10,
+      Math.floor(cursor.length / 2),
+      cursor.length - 2,
     ]) {
+      const altered =
+        cursor.slice(0, at) +
+        (cursor[at] === "A" ? "B" : "A") +
+        cursor.slice(at + 1);
       const result = await read(
         ctx,
         token,
-        `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forgeOffset(offset))}`,
+        `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(altered)}`,
       );
-      expect(result.status).toBe(400);
-      expect(result.body.error.code).toBe("invalid_cursor");
+      expect(result.status).toBeGreaterThanOrEqual(400);
+      expect(result.body.data).toBeUndefined();
     }
     const valid = await read(
       ctx,
       token,
-      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(forgeOffset(1))}`,
+      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(cursor)}`,
     );
     expect(valid.status).toBe(200);
     expect(valid.body.data).toHaveLength(1);

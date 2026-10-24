@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
-import { initializeDatabase } from "./index-schema.js";
+import { INDEX_SCHEMA_VERSION, initializeDatabase } from "./index-schema.js";
 
 function createHistoricalIndexBase(db: Database.Database, version: number) {
   db.exec(`
@@ -96,7 +96,7 @@ describe("initializeDatabase", () => {
       canary.close();
 
       const db = initializeDatabase(path);
-      expect(db.pragma("user_version", { simple: true })).toBe(14);
+      expect(db.pragma("user_version", { simple: true })).toBe(16);
       expect(
         db
           .prepare(
@@ -164,7 +164,7 @@ describe("initializeDatabase", () => {
     db.close();
   });
 
-  it("adds the takeover method to a v14 ledger without changing its version", async () => {
+  it("migrates a v14 takeover ledger into durable scope authority", async () => {
     const dir = await mkdtemp(join(tmpdir(), "legacy-takeover-schema-"));
     try {
       const path = join(dir, "index.db");
@@ -192,11 +192,16 @@ describe("initializeDatabase", () => {
       old.close();
 
       const db = initializeDatabase(path);
-      // The version stays 14, so a runtime pinned before this can still open it.
-      expect(db.pragma("user_version", { simple: true })).toBe(14);
+      // The v14 ledger migrates through the linear index schema sequence.
+      expect(db.pragma("user_version", { simple: true })).toBe(
+        INDEX_SCHEMA_VERSION,
+      );
       expect(
         db.prepare("SELECT instance, method FROM legacy_scope_takeovers").all(),
       ).toEqual([{ instance: "oura:owner", method: "" }]);
+      expect(
+        db.prepare("SELECT scope FROM legacy_scope_canonical_authority").all(),
+      ).toEqual([{ scope: "oura.sleep" }]);
       db.close();
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -288,7 +293,7 @@ describe("initializeDatabase", () => {
         reason_counts_json: "{}",
         applied_exceptions_json: "[]",
       });
-      expect(migrated.pragma("user_version", { simple: true })).toBe(14);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(16);
       migrated.close();
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -384,7 +389,7 @@ describe("initializeDatabase", () => {
       ];
 
       const upgraded = initializeDatabase(path);
-      expect(upgraded.pragma("user_version", { simple: true })).toBe(14);
+      expect(upgraded.pragma("user_version", { simple: true })).toBe(16);
       expect(
         upgraded
           .prepare("SELECT * FROM legacy_scope_takeovers ORDER BY scope")
@@ -400,7 +405,7 @@ describe("initializeDatabase", () => {
       upgraded.close();
 
       const reopened = initializeDatabase(path);
-      expect(reopened.pragma("user_version", { simple: true })).toBe(14);
+      expect(reopened.pragma("user_version", { simple: true })).toBe(16);
       expect(
         reopened
           .prepare("SELECT * FROM legacy_scope_takeovers ORDER BY scope")
@@ -462,7 +467,7 @@ describe("initializeDatabase", () => {
         ],
       };
       const upgraded = initializeDatabase(path);
-      expect(upgraded.pragma("user_version", { simple: true })).toBe(14);
+      expect(upgraded.pragma("user_version", { simple: true })).toBe(16);
       expect(
         upgraded
           .prepare(
@@ -513,7 +518,7 @@ describe("initializeDatabase", () => {
       crashPoint.close();
 
       const recovered = initializeDatabase(path);
-      expect(recovered.pragma("user_version", { simple: true })).toBe(14);
+      expect(recovered.pragma("user_version", { simple: true })).toBe(16);
       expect(
         recovered
           .prepare(
@@ -611,7 +616,7 @@ describe("initializeDatabase", () => {
       .get("instagram/profile.json") as
       { path: string; scope: string; size_bytes: number } | undefined;
 
-    expect(version).toBe(14);
+    expect(version).toBe(16);
     expect(row).toEqual({
       path: "instagram/profile.json",
       scope: "instagram.profile",
@@ -620,6 +625,53 @@ describe("initializeDatabase", () => {
     db2.close();
 
     await rm(tempDir, { recursive: true });
+  });
+
+  it("migrates a v15 index by adding a null generation to every row", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "schema-v15-"));
+    const dbPath = join(tempDir, "v15.db");
+    try {
+      const v15 = initializeDatabase(dbPath);
+      const columns = (db: Database.Database) =>
+        (
+          db.prepare("PRAGMA table_info(data_files)").all() as Array<{
+            name: string;
+          }>
+        ).map((column) => column.name);
+      // A v15 data_files table has no generation column.
+      if (columns(v15).includes("generation")) {
+        v15.exec("ALTER TABLE data_files DROP COLUMN generation");
+      }
+      v15
+        .prepare(
+          "INSERT INTO data_files (path, scope, collected_at, size_bytes, pdpp_origin) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(
+          "oura/activity/a.json",
+          "oura.activity",
+          "2026-01-01T00:00:00Z",
+          7,
+          0,
+        );
+      v15.pragma("user_version = 15");
+      v15.close();
+
+      const db = initializeDatabase(dbPath);
+      expect(db.pragma("user_version", { simple: true })).toBe(16);
+      expect(columns(db)).toContain("generation");
+      expect(
+        db
+          .prepare("SELECT path, pdpp_origin, generation FROM data_files")
+          .get(),
+      ).toEqual({
+        path: "oura/activity/a.json",
+        pdpp_origin: 0,
+        generation: null,
+      });
+      db.close();
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it("migrates an existing v1 index by adding schema_id", async () => {
@@ -667,7 +719,7 @@ describe("initializeDatabase", () => {
         }
       | undefined;
 
-    expect(version).toBe(14);
+    expect(version).toBe(16);
     expect(row).toEqual({
       path: "instagram/profile.json",
       schema_id: null,
@@ -716,7 +768,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(14);
+    expect(db.pragma("user_version", { simple: true })).toBe(16);
     const row = db
       .prepare(
         "SELECT path, schema_id, version, cas_revision, data_point_id FROM data_files WHERE path = ?",
@@ -776,7 +828,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(14);
+    expect(db.pragma("user_version", { simple: true })).toBe(16);
     const row = db
       .prepare(
         "SELECT path, version, cas_revision, data_point_id, after_tombstone_version FROM data_files WHERE path = ?",
@@ -819,7 +871,7 @@ describe("initializeDatabase", () => {
     legacy.close();
 
     const db = initializeDatabase(dbPath);
-    expect(db.pragma("user_version", { simple: true })).toBe(14);
+    expect(db.pragma("user_version", { simple: true })).toBe(16);
     expect(
       db
         .prepare(

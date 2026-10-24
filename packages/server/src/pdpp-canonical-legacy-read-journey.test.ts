@@ -11,6 +11,7 @@
  * checked again and may explicitly return to the file.
  */
 
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -30,7 +31,18 @@ import {
   encodePaymentHeader,
   nextPaymentNonce,
 } from "@opendatalabs/personal-server-ts-core/payment";
+import { createSyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type {
+  DataPointFeedRecord,
+  DataStoragePort,
+} from "@opendatalabs/personal-server-ts-core/ports";
+import type { StorageAdapter } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  PDPP_DATA_ACCESS_TYPE,
+  openPdppAuthStore,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
+import { issueAndStoreTestGrant as issueConsentGrant } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -268,16 +280,21 @@ async function upsert(token: string, data: Record<string, unknown>) {
 }
 
 /** A legacy file written the way older collectors write one. */
-async function legacyWrite(scope: string, data: Record<string, unknown>) {
+async function legacyWrite(
+  scope: string,
+  data: Record<string, unknown>,
+  producer?: string,
+) {
   const response = await ctx!.app.request(`/v1/data/${scope}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${ctx!.devToken}`,
       "content-type": "application/json",
+      ...(producer ? { "Vana-Producer": producer } : {}),
     },
     body: JSON.stringify(data),
   });
-  expect(response.status).toBe(201);
+  expect(response.status, await response.text()).toBe(201);
 }
 
 async function ownerGet(path: string) {
@@ -299,7 +316,7 @@ async function builderGet(scope: string) {
         wallet: builder,
         aud: ctx!.config.server.origin,
         method: "GET",
-        uri: `/v1/data/${scope}`,
+        uri: `/v1/data/${scope.split("?")[0]}`,
         grantId: GRANT_ID,
       }),
     },
@@ -317,6 +334,10 @@ const day = (id: string, date: string, score = 80) => ({
 
 const STALE = { days: [{ id: "stale-legacy", day: "2026-01-01", score: 1 }] };
 const COVERED_A1 = { days: [day("a1", "2026-09-01")] };
+
+function latestAt(scope: string): string {
+  return ctx!.indexManager.findLatestByScope(scope)!.collectedAt;
+}
 
 function ids(text: string): string[] {
   const body = JSON.parse(text) as { data: { days: { id: string }[] } };
@@ -340,6 +361,226 @@ afterEach(async () => {
 });
 
 describe("GET /v1/data/:scope for a bound connector scope", () => {
+  it("preserves chain-authorized projection of legacy phone records envelopes", async () => {
+    await legacyWrite("oura.activity", {
+      records: [
+        { ...day("stored-pdpp", "2026-09-01", 99), $pdpp: { sourceId: OURA } },
+      ],
+    });
+    const owned = await ownerGet("/v1/data/oura.activity");
+    expect(owned.status).toBe(200);
+    expect(ids(owned.text)).toEqual(["stored-pdpp"]);
+    const read = await builderGet("oura.activity");
+    expect(read.status).toBe(200);
+    expect(ids(read.text)).toEqual(["stored-pdpp"]);
+  });
+  it.each(["pdpp-projector", "pdpp-import-projection"])(
+    "serves a chain grant a historical legacy-format cache version stamped %s",
+    async (producer) => {
+      // An actual legacy file first: the positive control on the same scope.
+      await legacyWrite("oura.activity", STALE);
+      const legacyAt = latestAt("oura.activity");
+      const token = await ownerPdppToken();
+      await replace(
+        token,
+        "activity",
+        [day("cached-pdpp", "2026-09-01", 99)],
+        "2026-09-01T00:00:00Z",
+      );
+      await legacyWrite(
+        "oura.activity",
+        { days: [day("cached-pdpp", "2026-09-01", 99)] },
+        producer,
+      );
+      const path = `oura.activity?at=${encodeURIComponent(latestAt("oura.activity"))}`;
+      const owned = await ownerGet(`/v1/data/${path}`);
+      expect(owned.status).toBe(200);
+      expect(owned.text).toContain("cached-pdpp");
+      // A projection stamp marks the legacy-format projection of the scope
+      // the grant covers, which the grant may read.
+      const read = await builderGet(path);
+      expect(read.status, read.text).toBe(200);
+      expect(ids(read.text)).toEqual(["cached-pdpp"]);
+      const legacy = await builderGet(
+        `oura.activity?at=${encodeURIComponent(legacyAt)}`,
+      );
+      expect(legacy.status, legacy.text).toBe(200);
+      expect(ids(legacy.text)).toEqual(["stale-legacy"]);
+    },
+  );
+  it("denies a chain-only historical native PDPP copy of canonical rows", async () => {
+    await legacyWrite("oura.activity", STALE);
+    const legacyAt = latestAt("oura.activity");
+    const token = await ownerPdppToken();
+    // A canonical row and its retained native-format transport copy. The
+    // current P8 importer refuses method-less imports, so populate the real
+    // canonical store through its authenticated acquisition boundary.
+    await replace(
+      token,
+      "activity",
+      [day("native-pdpp", "2026-09-01", 99)],
+      "2026-09-01T00:00:00Z",
+    );
+    await legacyWrite("oura.activity", {
+      ...day("native-pdpp", "2026-09-01", 99),
+      $pdpp: {
+        version: 1,
+        sourceId: OURA,
+        declaration: {
+          source: "oura",
+          version: "1",
+          digest: `sha256:${createHash("sha256").update(OURA_DECLARATION).digest("hex")}`,
+        },
+        stream: {
+          name: "activity",
+          scope: "oura.activity",
+          primaryKey: ["id"],
+          semantics: "mutable_state",
+        },
+        record: { key: { id: "native-pdpp" }, op: "upsert" },
+      },
+    });
+    const nativeRead = await ctx!.app.request("/v1/streams/activity/records", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(nativeRead.status).toBe(200);
+    const nativeBody = await nativeRead.text();
+    expect(nativeBody).toContain('"id":"native-pdpp"');
+    expect(nativeBody).toContain('"score":99');
+    const path = `oura.activity?at=${encodeURIComponent(latestAt("oura.activity"))}`;
+    const ownerRead = await ownerGet(`/v1/data/${path}`);
+    expect(ownerRead.status).toBe(200);
+    expect(ownerRead.text).toContain("native-pdpp");
+    const builderRead = await builderGet(path);
+    expect(builderRead.status, builderRead.text).toBe(403);
+    expect(builderRead.text).not.toContain('"score"');
+    expect(builderRead.text).not.toContain("native-pdpp");
+    const legacy = await builderGet(
+      `oura.activity?at=${encodeURIComponent(legacyAt)}`,
+    );
+    expect(legacy.status, legacy.text).toBe(200);
+    expect(ids(legacy.text)).toEqual(["stale-legacy"]);
+  });
+  it("serves a live legacy chain grant the legacy projection of a covered scope, and refuses it the canonical PDPP stream", async () => {
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01"), day("a2", "2026-09-02", 99)],
+      "2026-09-10T06:00:00Z",
+    );
+    // Same data and live server: a deny-all implementation cannot pass.
+    const ownerRead = await ownerGet("/v1/data/oura.activity");
+    expect(ownerRead.status).toBe(200);
+    expect(ownerRead.dataSource).toBe("canonical");
+    expect(ids(ownerRead.text)).toEqual(["a1", "a2"]);
+
+    // (a) The grant covers oura.*: it reads the legacy-format projection.
+    const read = await builderGet("oura.activity");
+    expect(read.status).toBe(200);
+    expect(ids(read.text)).toEqual(["a1", "a2"]);
+
+    // (b) The same grant cannot read the canonical PDPP stream: the PDPP
+    // resource server takes a PDPP access token, not a chain-grant signature
+    // (401). A native-form PDPP copy served on the legacy route is refused
+    // 403 (the native PDPP copy test above).
+    for (const path of [
+      "/v1/streams/activity/records",
+      "/v1/streams/activity/records/a2",
+    ]) {
+      const canonical = await ctx!.app.request(path, {
+        headers: {
+          authorization: await buildWeb3SignedHeader({
+            wallet: builder,
+            aud: ctx!.config.server.origin,
+            method: "GET",
+            uri: path,
+            grantId: GRANT_ID,
+          }),
+        },
+      });
+      const text = await canonical.text();
+      expect(canonical.status, text).toBe(401);
+      expect(text).not.toContain('a2"');
+      expect(text).not.toContain('"score"');
+    }
+  });
+
+  it("keeps a narrowed PDPP grant narrow while a legacy grant reads the legacy projection it covers", async () => {
+    const ownerToken = await ownerPdppToken();
+    await replace(
+      ownerToken,
+      "activity",
+      [day("a1", "2026-09-01"), day("a2", "2026-09-02", 99)],
+      "2026-09-10T06:00:00Z",
+    );
+    // Public store setup: the real RS resolves this token and frozen grant.
+    const store = openPdppAuthStore(join(tempDir, "pdpp-auth.db"));
+    try {
+      const narrowed = issueConsentGrant({
+        store,
+        subjectId: owner,
+        declarationDocument: OURA_DECLARATION,
+        request: {
+          type: PDPP_DATA_ACCESS_TYPE,
+          source: { id: OURA },
+          purpose_code: "test",
+          access_mode: "continuous",
+          streams: [
+            {
+              name: "activity",
+              instance_ids: [accountOne],
+              fields: ["id", "day"],
+              resources: ["a1"],
+            },
+          ],
+        },
+        requester: {
+          client_id: BUILDER_ID,
+          display_name: BUILDER_ID,
+          app_approved: false,
+        },
+        inventory: { eligibleFor: () => [accountOne] },
+      }).grant;
+      expect(
+        store.issueAccessToken({
+          token: "narrowed-test-token",
+          grantId: narrowed.grant_id,
+          subjectId: owner,
+          clientId: BUILDER_ID,
+          tokenKind: "client",
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          consumeSingleUse: false,
+        }),
+      ).toBe(true);
+      const native = await ctx!.app.request("/v1/streams/activity/records", {
+        headers: { authorization: "Bearer narrowed-test-token" },
+      });
+      expect(native.status).toBe(200);
+      const nativeBody = await native.text();
+      expect(
+        JSON.parse(nativeBody).data.map(
+          (row: { data: { id: string } }) => row.data.id,
+        ),
+      ).toEqual(["a1"]);
+      expect(nativeBody).not.toContain('"score"');
+      // The legacy grant is its own consent for the legacy form of oura.*;
+      // it neither widens nor is narrowed by the PDPP grant.
+      const legacy = await builderGet("oura.activity");
+      expect(legacy.status).toBe(200);
+      expect(ids(legacy.text)).toEqual(["a1", "a2"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps live legacy grants working for data that has never entered the canonical store", async () => {
+    await legacyWrite("oura.activity", STALE);
+    const read = await builderGet("oura.activity");
+    expect(read.status).toBe(200);
+    expect(ids(read.text)).toEqual(["stale-legacy"]);
+  });
+
   it("accepts mutable value drift from a newer canonical collection", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
@@ -416,7 +657,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(ids(read.text)).toEqual(["a1"]);
   });
 
-  it("rechecks a newer legacy version and records either continued coverage or file fallback", async () => {
+  it("keeps newer legacy route writes as history after canonical takeover", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       vi.setSystemTime(new Date("2026-10-14T22:00:00Z"));
@@ -442,17 +683,211 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       await legacyWrite("oura.activity", {
         days: [day("a1", "2026-09-01"), day("missing", "2026-09-03")],
       });
-      const fallback = await ownerGet("/v1/data/oura.activity");
-      expect(fallback.dataSource).toBe("legacy");
-      expect(ids(fallback.text)).toEqual(["a1", "missing"]);
-      const verdict = await ownerGet("/v1/data/oura.activity/takeover");
-      expect(verdict.status).toBe(200);
-      expect(JSON.parse(verdict.text).verdicts).toMatchObject([
-        {
-          verdict: "not_covered",
-          reason: { reason: "missing_entity", missingEntityCount: 1 },
-        },
+      const latest = await ownerGet("/v1/data/oura.activity");
+      expect(latest.dataSource).toBe("canonical");
+      expect(ids(latest.text)).toEqual(["a1", "a2"]);
+      expect(ctx!.indexManager.countByScope("oura.activity")).toBe(3);
+      const storedLegacy =
+        ctx!.indexManager.findLatestByScope("oura.activity")!;
+      const bytes = await readFile(join(tempDir, "data", storedLegacy.path));
+      expect(JSON.parse(bytes.toString("utf8")).data.days).toEqual([
+        day("a1", "2026-09-01"),
+        day("missing", "2026-09-03"),
       ]);
+
+      vi.setSystemTime(new Date("2026-10-14T22:00:02Z"));
+      const binaryWrite = await ctx!.app.request("/v1/data/oura.activity", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${ctx!.devToken}`,
+          "content-type": "application/octet-stream",
+        },
+        body: new Uint8Array([0x6f, 0x6c, 0x64]),
+      });
+      expect(binaryWrite.status).toBe(201);
+      expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+        "canonical",
+      );
+
+      vi.setSystemTime(new Date("2026-10-14T22:00:03Z"));
+      const chunkedEnvelope = new TextEncoder().encode(
+        JSON.stringify({ days: [day("chunked-only", "2026-09-05")] }),
+      );
+      const chunkedHash = createHash("sha256")
+        .update(chunkedEnvelope)
+        .digest("hex");
+      const importPath = "/v1/data/oura.activity/imports";
+      const auth = { authorization: `Bearer ${ctx!.devToken}` };
+      const begun = await ctx!.app.request(importPath, {
+        method: "POST",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({
+          totalBytes: chunkedEnvelope.byteLength,
+          totalChunks: 1,
+          sha256: chunkedHash,
+        }),
+      });
+      expect(begun.status).toBe(201);
+      const { importId } = (await begun.json()) as { importId: string };
+      const chunked = await ctx!.app.request(
+        `${importPath}/${importId}/chunks/0`,
+        {
+          method: "PUT",
+          headers: {
+            ...auth,
+            "content-type": "application/octet-stream",
+            "x-chunk-sha256": chunkedHash,
+          },
+          body: chunkedEnvelope,
+        },
+      );
+      expect(chunked.status, await chunked.text()).toBe(200);
+      const finalized = await ctx!.app.request(
+        `${importPath}/${importId}/finalize`,
+        { method: "POST", headers: auth },
+      );
+      expect(finalized.status, await finalized.text()).toBe(201);
+      expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+        "canonical",
+      );
+
+      const imported = await ctx!.app.request(
+        `/v1/data/oura.activity/imports/${"f".repeat(64)}`,
+        {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${ctx!.devToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            days: [day("imported-only", "2026-09-04")],
+          }),
+        },
+      );
+      expect(imported.status).toBe(201);
+      expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
+        "canonical",
+      );
+      expect(ctx!.indexManager.countByScope("oura.activity")).toBe(6);
+
+      let registryHead: DataPointFeedRecord = {
+        id: "canonical-registry-head",
+        ownerAddress: owner,
+        scope: "oura.activity",
+        dataHash: `0x${"11".repeat(32)}`,
+        metadataHash: `0x${"22".repeat(32)}`,
+        expectedVersion: "8",
+        addedAt: "2026-09-11T06:00:00Z",
+        deletedAt: null,
+      };
+      const registerDataPoint = vi.fn(
+        async (request: {
+          ownerAddress: string;
+          scope: string;
+          dataHash: `0x${string}`;
+          metadataHash: `0x${string}`;
+          expectedVersion: string;
+        }) => {
+          const id = "legacy-history-registry-head";
+          registryHead = {
+            ...registryHead,
+            id,
+            scope: request.scope,
+            dataHash: request.dataHash,
+            metadataHash: request.metadataHash,
+            expectedVersion: request.expectedVersion,
+          };
+          return { dataPointId: id, expectedVersion: request.expectedVersion };
+        },
+      );
+      const feed = {
+        getDataPoint: async () => registryHead,
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      };
+      const indexedStorage = {
+        kind: "node-fs-sqlite" as const,
+        listScopes: (options: { limit?: number; offset?: number }) =>
+          ctx!.indexManager.listDistinctScopes(options),
+        findEntry: (lookup: { scope: string; fileId?: string; at?: string }) =>
+          lookup.fileId
+            ? ctx!.indexManager.findByFileId(lookup.fileId)
+            : lookup.at
+              ? ctx!.indexManager.findClosestByScope(lookup.scope, lookup.at)
+              : ctx!.indexManager.findLatestByScope(lookup.scope),
+        findByFileId: (fileId: string) =>
+          ctx!.indexManager.findByFileId(fileId),
+        findByDataPointId: (dataPointId: string) =>
+          ctx!.indexManager.findByDataPointId(dataPointId),
+        findUnsynced: (options?: { limit?: number }) =>
+          ctx!.indexManager.findUnsynced(options),
+        readEnvelope: async (scope: string, collectedAt: string) => {
+          const entry = ctx!.indexManager.findClosestByScope(
+            scope,
+            collectedAt,
+          )!;
+          return JSON.parse(
+            await readFile(join(tempDir, "data", entry.path), "utf8"),
+          );
+        },
+        updateDataPointId: (path: string, dataPointId: string | null) =>
+          ctx!.indexManager.updateDataPointId(path, dataPointId),
+        updateEntryVersion: (path: string, version: number) =>
+          ctx!.indexManager.updateVersion(path, version),
+      } as unknown as DataStoragePort;
+      const blobs = new Map<string, Uint8Array>();
+      const storageAdapter = {
+        urlForKey: (key: string) => `https://storage.test/${key}`,
+        upload: async (key: string, bytes: Uint8Array) => {
+          blobs.set(key, bytes);
+          return `https://storage.test/${key}`;
+        },
+        download: async (url: string) =>
+          blobs.get(url.replace("https://storage.test/", ""))!,
+        delete: async (url: string) =>
+          blobs.delete(url.replace("https://storage.test/", "")),
+        exists: async (url: string) =>
+          blobs.has(url.replace("https://storage.test/", "")),
+      } as StorageAdapter;
+      const gateway = {
+        getDataPoint: async () => registryHead,
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+        registerDataPoint,
+      } as unknown as GatewayClient;
+      const cursor = { read: async () => null, write: async () => undefined };
+      const sync = createSyncManager(
+        {
+          storage: indexedStorage,
+          storageAdapter,
+          gateway,
+          dataPointFeed: feed,
+          signer: { signAddData: async () => "0x01" },
+          masterKey: new Uint8Array(65).fill(0xaa),
+          serverOwner: owner,
+          logger: ctx!.logger,
+        } as never,
+        {
+          storage: indexedStorage,
+          storageAdapter,
+          gateway,
+          dataPointFeed: feed,
+          cursor,
+          masterKey: new Uint8Array(65).fill(0xaa),
+          serverOwner: owner,
+          logger: ctx!.logger,
+        } as never,
+      );
+      try {
+        await sync.trigger();
+        expect(sync.getStatus().errors).toEqual([]);
+        expect(registerDataPoint).not.toHaveBeenCalled();
+        expect(registryHead).toMatchObject({
+          id: "canonical-registry-head",
+          expectedVersion: "8",
+        });
+        expect(ctx!.indexManager.findUnsynced()).toEqual([]);
+      } finally {
+        await sync.stop();
+      }
     } finally {
       vi.useRealTimers();
     }
@@ -839,6 +1274,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
 
   it("serves canonical rows to a legacy grant and the owner after coverage", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
+    const legacyAt = latestAt("oura.activity");
     const token = await ownerPdppToken();
     await replace(
       token,
@@ -850,6 +1286,12 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     const asBuilder = await builderGet("oura.activity");
     expect(asBuilder.status).toBe(200);
     expect(ids(asBuilder.text)).toEqual(["a1", "a2"]);
+    // The same grant still reads the actual legacy file by its version.
+    const legacy = await builderGet(
+      `oura.activity?at=${encodeURIComponent(legacyAt)}`,
+    );
+    expect(legacy.status, legacy.text).toBe(200);
+    expect(ids(legacy.text)).toEqual(["a1"]);
 
     const asOwner = await ownerGet("/v1/data/oura.activity");
     expect(asOwner.status).toBe(200);
@@ -1020,10 +1462,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       SECOND_ACCOUNT,
     );
 
-    for (const read of [
-      await ownerGet("/v1/data/oura.activity"),
-      await builderGet("oura.activity"),
-    ]) {
+    const ownerRead = await ownerGet("/v1/data/oura.activity");
+    const builderRead = await builderGet("oura.activity");
+    for (const read of [ownerRead, builderRead]) {
       expect(read.status).toBe(409);
       expect(JSON.parse(read.text)).toMatchObject({
         error: "CANONICAL_VIEW_UNAVAILABLE",
@@ -1879,17 +2320,30 @@ describe("configured methods that share one public source", () => {
 });
 
 // These are fixture regression checks, not new captures from the named apps.
-// The route must keep the same body when ownership moves off the legacy file.
+// A newer complete source snapshot proves coverage even when the legacy
+// collection has no stable entity keys; an incomplete snapshot keeps the file.
 describe.each([
   "linkedin.connections",
+  "linkedin.education",
+  "linkedin.experience",
+  "linkedin.languages",
+  "linkedin.skills",
+  "github.contributions",
   "github.repositories",
   "github.starred",
+  "github.events",
+  "github.history",
   "github.profile",
   "spotify.playlists",
   "spotify.savedTracks",
   "linkedin.profile",
   "spotify.profile",
   "instagram.profile",
+  "instagram.ads",
+  "youtube.profile",
+  "heb.orders",
+  "wholefoods.orders",
+  "wholefoods.profile",
 ])("owner coverage decision for %s", (scope) => {
   it.each([false, true])(
     "serves canonical only when its PDPP read covers the old file (complete=%s)",
@@ -1937,7 +2391,16 @@ describe.each([
                 "utf8",
               ),
             );
+      if (scope === "github.contributions" && !fixture.legacyBody) {
+        const snapshot = fixture.streams.contributions?.[0];
+        if (snapshot) {
+          const { id: _id, ...legacyBody } = snapshot;
+          fixture.legacyBody = legacyBody;
+        }
+      }
       const canonicalBody = structuredClone(fixture.legacyBody);
+      if (scope === "github.history")
+        canonicalBody.fetchedAt = "2026-10-21T00:00:00.000Z";
       if (scope === "spotify.playlists") {
         // No old track entities need an identity. The newer complete read can
         // add real tracks, including local tracks and nonempty artist lists.
@@ -2011,13 +2474,7 @@ describe.each([
       }
       const read = await ownerGet(`/v1/data/${scope}`);
       expect(read.status).toBe(200);
-      const hasUnkeyedEntities = [
-        "linkedin.connections",
-        "github.repositories",
-        "github.starred",
-        "spotify.savedTracks",
-      ].includes(scope);
-      const canonical = complete && !hasUnkeyedEntities;
+      const canonical = complete;
       expect(read.dataSource).toBe(canonical ? "canonical" : "legacy");
       expect(JSON.parse(read.text).data).toEqual(
         canonical ? canonicalBody : fixture.legacyBody,

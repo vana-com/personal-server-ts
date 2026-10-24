@@ -698,10 +698,11 @@ const listGrantedScopes: McpToolDefinition = {
     const scopeEntries = await Promise.all(
       grantedScopes.map(async (scope) => {
         let meta = null;
-        if (typeof readClient.getScopeMetadata === "function") {
+        const metaGrant = resolveGrantForScope(connection, scope);
+        if (typeof readClient.getScopeMetadata === "function" && metaGrant) {
           try {
             meta = await withTimeout(
-              readClient.getScopeMetadata(scope),
+              readClient.getScopeMetadata(scope, metaGrant.grantId),
               DEFAULT_SCOPE_METADATA_TIMEOUT_MS,
               `scope metadata for ${scope}`,
             );
@@ -897,7 +898,7 @@ const readScope: McpToolDefinition = {
       .max(MAX_SELECTED_BLOCK_IDS)
       .optional()
       .describe(
-        "Block ids from a search hit's blockRef or list_scope_blocks. Ignores cursor; maxBytes still applies.",
+        "Block ids from a search hit's blockRef or list_scope_blocks. Pass list_scope_blocks' versionCursor as cursor to read that exact version; maxBytes still applies.",
       ),
     maxBytes: z.number().int().min(1).max(MAX_READ_SCOPE_MAX_BYTES).optional(),
     timeoutMs: z
@@ -952,10 +953,8 @@ const readScope: McpToolDefinition = {
     );
 
     // In-band steer: the model may call read_scope on a large scope without
-    // first consulting list_granted_scopes. Fetch lightweight planning metadata
-    // (storage-index only, no network/auth) opportunistically so we can attach a
-    // `guidance` hint when it is already available. This is advisory only: it
-    // must never delay the read or consume the read timeout budget.
+    // first consulting list_granted_scopes. The read reports the size of the
+    // version it selected, and a large one gets a `guidance` hint below.
     let guidance:
       | {
           sizeClass: SizeClass;
@@ -964,34 +963,6 @@ const readScope: McpToolDefinition = {
           reason: string;
         }
       | undefined;
-    if (typeof readClient.getScopeMetadata === "function") {
-      void withTimeout(
-        readClient.getScopeMetadata(scope),
-        DEFAULT_SCOPE_METADATA_TIMEOUT_MS,
-        `scope metadata for ${scope}`,
-      )
-        .then((meta) => {
-          if (!meta) return;
-          const sizeClass = classifySizeBytes(meta.sizeBytes);
-          const recommendation = recommendAccessForScope(
-            sizeClass,
-            meta.hasBlocks,
-          );
-          // Only steer when search is the better tool; a normal small read gets
-          // no extra noise.
-          if (recommendation.recommendedAccess === "search") {
-            guidance = {
-              sizeClass,
-              sizeBytes: meta.sizeBytes,
-              recommendedAccess: recommendation.recommendedAccess,
-              reason: recommendation.reason,
-            };
-          }
-        })
-        .catch(() => {
-          // Advisory only — serve the read without guidance.
-        });
-    }
 
     const payment = typeof args.payment === "string" ? args.payment : undefined;
 
@@ -1010,6 +981,22 @@ const readScope: McpToolDefinition = {
         `read blocks for ${scope}`,
       );
       const nextCursor = result.nextCursor ?? null;
+      // Planning guidance from the version this read selected: its size is
+      // part of the authorized read, so no second authorization is needed.
+      if (result.scopeSizeBytes !== undefined) {
+        const sizeClass = classifySizeBytes(result.scopeSizeBytes);
+        const recommendation = recommendAccessForScope(sizeClass, true);
+        // Only steer when search is the better tool; a normal small read gets
+        // no extra noise.
+        if (recommendation.recommendedAccess === "search") {
+          guidance = {
+            sizeClass,
+            sizeBytes: result.scopeSizeBytes,
+            recommendedAccess: recommendation.recommendedAccess,
+            reason: recommendation.reason,
+          };
+        }
+      }
       return textResult({
         scope,
         grantId: grant.grantId,
@@ -1109,7 +1096,7 @@ const listScopeBlocks: McpToolDefinition = {
   name: "list_scope_blocks",
   title: "List scope blocks",
   description:
-    "Scope table of contents: block ids, paths, sizes. Feed ids to read_scope blockIds.",
+    "Scope table of contents: block ids, paths, sizes. Feed ids to read_scope blockIds, with versionCursor as cursor.",
   inputSchema: {
     scope: z.string().min(1).describe("Exact scope id."),
     offset: z.number().int().min(0).optional(),
@@ -1181,6 +1168,9 @@ const listScopeBlocks: McpToolDefinition = {
         collectedAt: manifest.collectedAt,
         contentKind: manifest.contentKind,
         manifestAvailable: true,
+        ...(manifest.versionCursor
+          ? { versionCursor: manifest.versionCursor }
+          : {}),
         totalBlocks: manifest.blocks.length,
         blocks: page.map((block) => ({
           id: block.id,
@@ -1854,7 +1844,7 @@ const getScopeFile: McpToolDefinition = {
             // single-use payment can't fund a second resources/read).
             let meta: { sizeBytes?: number } | null = null;
             try {
-              meta = await readClient.getScopeMetadata(scope);
+              meta = await readClient.getScopeMetadata(scope, grant.grantId);
             } catch {
               meta = null;
             }

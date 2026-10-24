@@ -3018,7 +3018,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       });
     });
 
-    it("drops and counts the conversation when a conversation is missing required branch count", () => {
+    it("rejects the conversation when a conversation is missing required branch count", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -3037,17 +3037,51 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         { fetchedStreams: ["conversations", "messages"] },
       );
 
-      expect(result).toMatchObject({
-        ok: true,
-        payload: { conversations: [], total: 0 },
-        diagnostics: [
+      expect(result).toEqual({
+        ok: false,
+        error: {
+          kind: "invalid_value",
+          scope: "chatgpt.conversations",
+          reason: "Conversation lacks required branch identity or count",
+        },
+      });
+    });
+
+    it("fails closed when mixed diagnostics hide a fatal conversation drop behind a nonfatal reason", () => {
+      const result = projectPdppRecordsToLegacyPayload(
+        "chatgpt.conversations",
+        [
           {
-            kind: "records_dropped",
             stream: "conversations",
-            count: 1,
-            reasons: ["Conversation lacks a current-branch message count"],
+            data: {
+              id: "bad-timestamp",
+              create_time: 1,
+              current_node: null,
+            },
+          },
+          {
+            stream: "conversations",
+            data: { id: "partial", current_node: null },
+          },
+          {
+            stream: "messages",
+            data: {
+              id: "orphan-message",
+              conversation_id: "absent",
+              on_current_branch: false,
+            },
           },
         ],
+        { fetchedStreams: ["conversations", "messages"] },
+      );
+
+      expect(result).toEqual({
+        ok: false,
+        error: {
+          kind: "invalid_value",
+          scope: "chatgpt.conversations",
+          reason: "Conversation lacks required branch identity or count",
+        },
       });
     });
 
@@ -3204,7 +3238,7 @@ describe("projectPdppRecordsToLegacyPayload", () => {
       );
     });
 
-    it("drops a conversation without an id and non-object rows instead of failing the scope", () => {
+    it("fails the scope when a conversation or message record is unavailable", () => {
       const result = projectPdppRecordsToLegacyPayload(
         "chatgpt.conversations",
         [
@@ -3225,30 +3259,14 @@ describe("projectPdppRecordsToLegacyPayload", () => {
         { fetchedStreams: ["conversations", "messages"] },
       );
 
-      expect(result.ok).toBe(true);
-      if (!result.ok) return;
-      expect(
-        (result.payload.conversations as { id: string }[]).map((c) => c.id),
-      ).toEqual(["conv_1"]);
-      expect(result.diagnostics).toEqual([
-        {
-          kind: "records_dropped",
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          kind: "invalid_value",
           scope: "chatgpt.conversations",
-          stream: "conversations",
-          count: 2,
-          reasons: [
-            "Conversation record is not an object",
-            "Conversation lacks an id",
-          ],
+          reason: "Conversation lacks required branch identity or count",
         },
-        {
-          kind: "records_dropped",
-          scope: "chatgpt.conversations",
-          stream: "messages",
-          count: 1,
-          reasons: ["Message record is not an object"],
-        },
-      ]);
+      });
     });
 
     it("projects empty threads and reports stream_missing when allowed to run without messages", () => {

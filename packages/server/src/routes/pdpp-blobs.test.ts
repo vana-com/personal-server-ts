@@ -66,6 +66,123 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     stores = [];
   });
 
+  it("uses the grant's retained declaration when the current version removes the stream", async () => {
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "application/octet-stream",
+      sizeBytes: 2,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const declarationSnapshot = {
+      source_id: "src_1",
+      source_kind: "connector" as const,
+      version: "vA",
+      digest: "a".repeat(64),
+      streams: [
+        {
+          name: "media",
+          fields: ["id", "blob_ref"],
+          required_fields: ["id"],
+          primary_key: ["id"],
+        },
+      ],
+    };
+    const app = pdppBlobsRoutes({
+      store,
+      declarations: createStreamDeclarationRegistry([]),
+      auth: createFixtureAuthorizationService({
+        client: {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          clientId: "client_1",
+          grant: {
+            ...clientGrant(),
+            source_declaration: { version: "vA" },
+          },
+          declarationSnapshot,
+        },
+      }),
+      readBlobBytes: async () => new Uint8Array([4, 5]),
+    });
+    const response = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer client" },
+    });
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(
+      new Uint8Array([4, 5]),
+    );
+  });
+
+  it.each(["owner", "client"] as const)(
+    "%s blob holds one authorizing connection when another is deleted during loading",
+    async (kind) => {
+      const store = newStore();
+      const bytes = new Uint8Array([7]);
+      const meta = store.storeBlobBytes(bytes, "application/octet-stream");
+      store.ingestBatch(
+        ["inst_1", "inst_2"].map((instance) => ({
+          instance,
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: meta.blobId } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        })),
+        () => "append_only",
+        () => ["id"],
+      );
+      let secondDeleted = false;
+      const app = pdppBlobsRoutes({
+        store,
+        declarations,
+        auth: createFixtureAuthorizationService({
+          tok:
+            kind === "owner"
+              ? {
+                  active: true,
+                  tokenKind: "owner",
+                  subjectId: "sub_1",
+                  instanceIds: ["inst_1", "inst_2"],
+                }
+              : {
+                  active: true,
+                  tokenKind: "client",
+                  subjectId: "sub_1",
+                  clientId: "client_1",
+                  grant: clientGrant({ instance_ids: ["inst_1", "inst_2"] }),
+                },
+        }),
+        instancesForSubject: () => ["inst_1", "inst_2"],
+        isConnectionAvailable: (instance) =>
+          instance !== "inst_2" || !secondDeleted,
+        readBlobBytes: async () => {
+          secondDeleted = true;
+          return bytes;
+        },
+      });
+      const res = await app.request(`/${meta.blobId}`, {
+        headers: { Authorization: "Bearer tok" },
+      });
+      expect(secondDeleted).toBe(true);
+      expect(res.status, res.status === 200 ? "" : await res.text()).toBe(200);
+      expect(new Uint8Array(await res.arrayBuffer())).toEqual(bytes);
+    },
+  );
+
   it("returns 404 blob_not_found for an unknown blob_id", async () => {
     const store = newStore();
     const app = pdppBlobsRoutes({
@@ -86,6 +203,60 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error.code).toBe("blob_not_found");
+  });
+
+  it.each([
+    ["grant_revoked", "grant_revoked"],
+    ["grant_expired", "grant_expired"],
+  ] as const)(
+    "keeps known candidate-profile %s at 403 without reading bytes",
+    async (reason, code) => {
+      const store = newStore();
+      let readBytes = false;
+      const app = pdppBlobsRoutes({
+        store,
+        declarations,
+        auth: createFixtureAuthorizationService({
+          stale: {
+            active: false,
+            tokenKind: "client",
+            subjectId: "sub_1",
+            inactiveReason: reason,
+          },
+        }),
+        protocolProfile: "candidate-0.1.0",
+        readBlobBytes: async () => {
+          readBytes = true;
+          return new Uint8Array([1]);
+        },
+      });
+
+      const response = await app.request("/blob_1", {
+        headers: { Authorization: "Bearer stale" },
+      });
+      expect(response.status).toBe(403);
+      expect((await response.json()).error.code).toBe(code);
+      expect(response.headers.get("WWW-Authenticate")).toBeNull();
+      expect(readBytes).toBe(false);
+    },
+  );
+
+  it("maps an unknown candidate-profile blob bearer to 401 invalid_token", async () => {
+    const store = newStore();
+    const app = pdppBlobsRoutes({
+      store,
+      declarations,
+      auth: createFixtureAuthorizationService({}),
+      protocolProfile: "candidate-0.1.0",
+    });
+    const response = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer missing" },
+    });
+    expect(response.status).toBe(401);
+    expect((await response.json()).error.code).toBe("invalid_token");
+    expect(response.headers.get("WWW-Authenticate")).toContain(
+      'error="invalid_token"',
+    );
   });
 
   it("serves Content-Type/Content-Length/Cache-Control for an owner-authorized blob", async () => {

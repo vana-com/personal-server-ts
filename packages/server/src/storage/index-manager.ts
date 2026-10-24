@@ -1,3 +1,4 @@
+import type { PdppProducer } from "@opendatalabs/personal-server-ts-core/sync";
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import {
@@ -55,10 +56,12 @@ export interface IndexManager {
   findByFileId(fileId: string): IndexEntry | undefined;
   /** Find an index entry by its DPv2 data-point id (download dedup). */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
+  isHistoryOnly(scope: string, path: string): boolean;
+  findHistoryOnly(scope: string): Pick<IndexEntry, "path" | "collectedAt">[];
   /**
-   * Find all index entries where dataPointId is null (not yet synced /
-   * registered on-chain). Returns entries ordered by created_at ASC (oldest
-   * first).
+   * Find unsynced entries eligible for remote publication, ordered oldest
+   * first. Legacy history remains indexed but is excluded once its scope has
+   * canonical authority.
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   /**
@@ -79,6 +82,15 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateVersion(path: string, version: number): boolean;
+  /**
+   * Compare-and-set a row's generation (see the core `IndexManager`). Only
+   * storage calls it, with a value it computed from the published bytes.
+   */
+  swapGeneration(
+    id: number,
+    expected: string | null,
+    next: string | null,
+  ): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;
@@ -97,8 +109,10 @@ interface RawRow {
   cas_revision: number;
   data_point_id: string | null;
   after_tombstone_version: number | null;
-  producer: "pdpp-projector" | "pdpp-import-projection" | null;
+  producer: PdppProducer | null;
   producer_provenance: string | null;
+  pdpp_origin: number | null;
+  generation: string | null;
 }
 
 const databases = new WeakMap<IndexManager, Database.Database>();
@@ -125,6 +139,8 @@ function rowToEntry(row: RawRow): IndexEntry {
     afterTombstoneVersion: row.after_tombstone_version ?? null,
     producer: row.producer,
     producerProvenance: row.producer_provenance,
+    pdppOrigin: row.pdpp_origin === null ? undefined : row.pdpp_origin !== 0,
+    ...(row.generation === null ? {} : { generation: row.generation }),
   };
 }
 
@@ -286,9 +302,11 @@ export function createIndexManager(
     after_tombstone_version: number | null;
     producer: string | null;
     producer_provenance: string | null;
+    pdpp_origin: number | null;
+    generation: string | null;
   }>(
-    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes, version, cas_revision, data_point_id, after_tombstone_version, producer, producer_provenance)
-     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes, @version, @cas_revision, @data_point_id, @after_tombstone_version, @producer, @producer_provenance)`,
+    `INSERT INTO data_files (file_id, schema_id, path, scope, collected_at, size_bytes, version, cas_revision, data_point_id, after_tombstone_version, producer, producer_provenance, pdpp_origin, generation)
+     VALUES (@file_id, @schema_id, @path, @scope, @collected_at, @size_bytes, @version, @cas_revision, @data_point_id, @after_tombstone_version, @producer, @producer_provenance, @pdpp_origin, @generation)`,
   );
 
   const maxVersionByScopeStmt = db.prepare<{ scope: string }>(
@@ -344,12 +362,34 @@ export function createIndexManager(
     "SELECT * FROM data_files WHERE data_point_id = @data_point_id ORDER BY version DESC, id DESC LIMIT 1",
   );
 
-  const findUnsyncedStmt = db.prepare(
-    "SELECT * FROM data_files WHERE data_point_id IS NULL ORDER BY created_at ASC",
-  );
+  const historyOnlyPredicate = `
+    EXISTS (
+      SELECT 1 FROM legacy_scope_canonical_authority AS authority
+       WHERE authority.scope = entry.scope
+    )
+    AND (
+      entry.producer IS NULL
+      OR entry.producer NOT IN ('pdpp-projector', 'pdpp-import-projection')
+    )`;
+  const findUnsyncedSql = `SELECT entry.* FROM data_files AS entry
+    WHERE entry.data_point_id IS NULL
+      AND NOT (${historyOnlyPredicate})
+    ORDER BY entry.created_at ASC`;
+  const findUnsyncedStmt = db.prepare(findUnsyncedSql);
 
   const findUnsyncedLimitStmt = db.prepare<{ limit: number }>(
-    "SELECT * FROM data_files WHERE data_point_id IS NULL ORDER BY created_at ASC LIMIT @limit",
+    `${findUnsyncedSql.replace("ORDER BY entry.created_at ASC", "")}\n    LIMIT @limit`,
+  );
+  const isHistoryOnlyStmt = db.prepare<{ scope: string; path: string }>(
+    `SELECT 1 FROM data_files AS entry
+      WHERE entry.scope = @scope AND entry.path = @path
+        AND (${historyOnlyPredicate})
+      LIMIT 1`,
+  );
+  const findHistoryOnlyStmt = db.prepare<{ scope: string }>(
+    `SELECT entry.path, entry.collected_at FROM data_files AS entry
+      WHERE entry.scope = @scope AND (${historyOnlyPredicate})
+      ORDER BY julianday(entry.collected_at) ASC, entry.id ASC`,
   );
 
   const updateFileIdStmt = db.prepare<{ file_id: string; path: string }>(
@@ -426,6 +466,9 @@ export function createIndexManager(
       after_tombstone_version: entry.afterTombstoneVersion ?? null,
       producer: entry.producer ?? null,
       producer_provenance: entry.producerProvenance ?? null,
+      pdpp_origin:
+        entry.pdppOrigin === undefined ? null : Number(entry.pdppOrigin),
+      generation: entry.generation ?? null,
     });
     const row = db
       .prepare("SELECT * FROM data_files WHERE id = ?")
@@ -545,6 +588,15 @@ export function createIndexManager(
       return row.cnt;
     },
 
+    swapGeneration(id, expected, next) {
+      const result = db
+        .prepare(
+          "UPDATE data_files SET generation = @next WHERE id = @id AND generation IS @expected",
+        )
+        .run({ id, expected, next });
+      return result.changes > 0;
+    },
+
     deleteByPath(path) {
       const result = deleteByPathStmt.run({ path });
       return result.changes > 0;
@@ -626,6 +678,21 @@ export function createIndexManager(
       const row = findByDataPointIdStmt.get({ data_point_id: dataPointId }) as
         RawRow | undefined;
       return row ? rowToEntry(row) : undefined;
+    },
+
+    isHistoryOnly(scope, path) {
+      return isHistoryOnlyStmt.get({ scope, path }) !== undefined;
+    },
+
+    findHistoryOnly(scope) {
+      const rows = findHistoryOnlyStmt.all({ scope }) as {
+        path: string;
+        collected_at: string;
+      }[];
+      return rows.map((row) => ({
+        path: row.path,
+        collectedAt: row.collected_at,
+      }));
     },
 
     findUnsynced(options) {

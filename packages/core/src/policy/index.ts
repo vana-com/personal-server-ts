@@ -1,11 +1,32 @@
 export {
+  DELIVERY_FRESHNESS_ATTEMPTS,
+  DeliveryNotFreshError,
+  REMOTE_GRANT_REVERIFY_AFTER_MS,
+  allDeliveryLeases,
+  localLease,
+  collectDeliveryLeases,
+  deliver,
+  evidenceTime,
+  leasedStream,
+  remoteEvidence,
+  type DeliveryLease,
+  type DeliveryLeaseCollector,
+  type EvidenceTime,
+  type RemoteEvidence,
+} from "./delivery-lease.js";
+export {
+  authorizeDataList,
+  authorizeDataRead,
   verifyDataReadPolicy,
+  authorizeLegacyRead,
   resolveDataListGrantScopes,
   parseGrantExpiresAtSeconds,
   type DataListPolicyInput,
   type DataListPolicyPorts,
   type DataReadPolicyInput,
   type DataReadPolicyPorts,
+  type LegacyReadBody,
+  type LegacyReader,
 } from "./data-read.js";
 export {
   deriveBuilderId,
@@ -25,4 +46,8 @@ export {
   type WriteFeeVerifierPort,
 } from "./data-write.js";
 
+export {
+  nonOwnerPublicationIsPdpp,
+  type PdppEnabled,
+} from "./publication-origin.js";
 export { isSystemScope } from "./reserved-scopes.js";

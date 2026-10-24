@@ -1,3 +1,4 @@
+import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import { existsSync } from "node:fs";
 import type Database from "better-sqlite3";
 import type {
@@ -9,6 +10,8 @@ import type {
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
   buildDataFilePath,
+  buildScopeDir,
+  envelopeGeneration,
   type HierarchyManagerOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
@@ -22,7 +25,7 @@ import {
   PublishedDataFileError,
   snapshotScopeFiles,
 } from "./hierarchy.js";
-import { relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 interface OperationRow {
   authority: string;
@@ -40,6 +43,24 @@ interface OperationRow {
 
 const keyWhere =
   "authority = @authority AND owner = @owner AND scope = @scope AND operation = @operation";
+
+/**
+ * The replica fields a caller may set on an index row. Anything else in the
+ * metadata, such as provenance or a generation, is never copied.
+ */
+function replicaMetadata(
+  metadata: Extract<VersionCommit, { kind: "replica" }>["metadata"],
+) {
+  return {
+    schemaId: metadata.schemaId,
+    dataPointId: metadata.dataPointId,
+    version: metadata.version,
+    ...(metadata.producer === undefined ? {} : { producer: metadata.producer }),
+    ...(metadata.producerProvenance === undefined
+      ? {}
+      : { producerProvenance: metadata.producerProvenance }),
+  };
+}
 
 export function createImportOperations(
   db: Database.Database,
@@ -91,8 +112,15 @@ export function createImportOperations(
       .all() as OperationRow[];
     for (const row of rows) {
       if (row.state !== "prepared") {
-        deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
-        index.deleteByPath(row.path);
+        if (!index.isHistoryOnly(row.scope, row.path)) {
+          deleteDataFileSync(
+            options,
+            row.scope,
+            row.collected_at,
+            row.operation,
+          );
+          index.deleteByPath(row.path);
+        }
         db.prepare(
           `UPDATE owner_import_operations SET envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
         ).run(row);
@@ -113,6 +141,8 @@ export function createImportOperations(
           fileId: null,
           schemaId: null,
           path: row.path,
+          pdppOrigin: hasPdppOrigin(envelope),
+          generation: envelopeGeneration(envelope),
           scope: row.scope,
           collectedAt: row.collected_at,
           sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
@@ -264,6 +294,11 @@ export function createImportOperations(
             ? reserve(command.envelope)
             : command.envelope;
         const bytes = Buffer.from(JSON.stringify(envelope, null, 2));
+        // Synchronous with the serialization above: these describe the bytes.
+        const identity = {
+          pdppOrigin: hasPdppOrigin(envelope),
+          generation: envelopeGeneration(envelope),
+        };
         let writeResult;
         try {
           writeResult = publishDataFile(options, envelope, bytes);
@@ -289,11 +324,14 @@ export function createImportOperations(
                 ? (command.metadata.sizeBytes ?? writeResult.sizeBytes)
                 : writeResult.sizeBytes,
             ...(command.kind === "replica"
-              ? command.metadata
+              ? replicaMetadata(command.metadata)
               : {
                   afterTombstoneVersion:
                     command.metadata.afterTombstoneVersion ?? null,
                 }),
+            // Storage's own values, from the bytes it serialized; last, so
+            // nothing a caller passes can replace them.
+            ...identity,
           });
         }
         return { kind: "stored", envelope, entry, writeResult };
@@ -316,26 +354,36 @@ export function createImportOperations(
   return {
     commitVersion,
     deleteScope(scope: string): number {
-      const snapshot = immediate(() => {
-        deleteFirstSeenLedgerSync(options, scope);
-        const files = snapshotScopeFiles(options, scope);
+      return immediate(() => {
+        const history = index.findHistoryOnly(scope);
+        const dataRoot = resolve(options.dataDir);
+        const preservePaths = history.flatMap((entry) => [
+          resolve(dataRoot, entry.path),
+          join(
+            buildScopeDir(join(dataRoot, "blocks"), scope),
+            entry.collectedAt,
+          ),
+        ]);
+        const files = snapshotScopeFiles(options, scope, preservePaths);
         const entries = db
           .prepare("SELECT id, path FROM data_files WHERE scope = ?")
           .all(scope) as { id: number; path: string }[];
+        const retainedPaths = new Set(history.map((entry) => entry.path));
+        const removableEntries = entries.filter(
+          (entry) => !retainedPaths.has(entry.path),
+        );
+        if (history.length === 0) deleteFirstSeenLedgerSync(options, scope);
         retire("scope = @scope", { scope });
-        return { files, entries };
-      });
-      return immediate(() => {
         recover();
-        deleteScopeFilesSync(snapshot.files);
+        deleteScopeFilesSync(files);
         const remove = db.prepare(
           "DELETE FROM data_files WHERE id = @id AND path = @path",
         );
-        for (const entry of snapshot.entries) remove.run(entry);
+        for (const entry of removableEntries) remove.run(entry);
         if (index.countByScope(scope) === 0) {
           deleteFirstSeenLedgerSync(options, scope);
         }
-        return snapshot.entries.length;
+        return removableEntries.length;
       });
     },
     deleteVersion(
@@ -343,12 +391,6 @@ export function createImportOperations(
       collectedAt: string,
       indexedPath?: string,
     ): boolean {
-      immediate(() => {
-        retire("scope = @scope AND collected_at = @collectedAt", {
-          scope,
-          collectedAt,
-        });
-      });
       return immediate(() => {
         const path =
           indexedPath ??
@@ -356,6 +398,11 @@ export function createImportOperations(
             options.dataDir,
             buildDataFilePath(options.dataDir, scope, collectedAt),
           );
+        if (index.isHistoryOnly(scope, path)) return false;
+        retire("scope = @scope AND collected_at = @collectedAt", {
+          scope,
+          collectedAt,
+        });
         const existed = index.findByPath(path) !== undefined;
         recover();
         deleteDataFileSync(options, scope, collectedAt);
@@ -365,7 +412,9 @@ export function createImportOperations(
     },
     dropUnsyncedEntry(path: string): boolean {
       return immediate(() => {
-        if (index.findByPath(path)?.dataPointId !== null) return false;
+        const entry = index.findByPath(path);
+        if (!entry || entry.dataPointId !== null) return false;
+        if (index.isHistoryOnly(entry.scope, path)) return false;
         if (!index.deleteUnsyncedByPath(path)) return false;
         retire("path = @path", { path });
         return true;
