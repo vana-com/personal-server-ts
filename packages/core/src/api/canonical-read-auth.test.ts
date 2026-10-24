@@ -67,18 +67,21 @@ async function fixture() {
   };
 }
 
-describe("canonical data reads require owner authorization", () => {
-  it("refuses a builder after selecting the live canonical source", async () => {
+describe("canonical data reads under a chain grant", () => {
+  it("serves a builder the legacy-format canonical view of a scope its grant covers", async () => {
     const { deps, get, readLatest } = await fixture();
     const response = await get();
 
-    expect(response.status).toBe(403);
-    expect((await response.json()).error.errorCode).toBe("GRANT_REQUIRED");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Vana-Data-Source")).toBe("canonical");
+    expect(await response.json()).toMatchObject({
+      data: { restingHeartRate: 49 },
+    });
     expect(readLatest).toHaveBeenCalledWith(SCOPE);
-    expect(deps.accessLogWriter.write).not.toHaveBeenCalled();
+    expect(deps.accessLogWriter.write).toHaveBeenCalledOnce();
   });
 
-  it("denies canonical data that becomes selectable while authorization is awaiting settlement", async () => {
+  it("serves the canonical view that becomes selectable while authorization is awaiting settlement, as a canonical read", async () => {
     const { deps, get, readLatest } = await fixture();
     let settle!: () => void;
     let started!: () => void;
@@ -108,8 +111,9 @@ describe("canonical data reads require owner authorization", () => {
     } as never);
     settle();
     const response = await pending;
-    expect(response.status).toBe(403);
-    expect(await response.text()).not.toContain("late-canonical");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-Vana-Data-Source")).toBe("canonical");
+    expect(await response.text()).toContain("late-canonical");
   });
 
   it("serves the selected canonical body to the owner", async () => {

@@ -826,7 +826,7 @@ describe("PS-Lite legacy projection", () => {
     });
   });
 
-  it("P2-b: refuses a grantee a projection that joins a PDPP-stamped sibling", async () => {
+  it("P2-b: serves a grantee the projection of a covered scope that joins a projector-stamped sibling", async () => {
     const { runtime } = createRuntime();
     const stamped = await runtime.fetch(
       new Request("https://ps.local/v1/data/chatgpt.messages", {
@@ -848,8 +848,14 @@ describe("PS-Lite legacy projection", () => {
       "builder-token",
     );
     const text = await res.text();
-    expect(res.status, text).toBe(403);
-    expect(text).not.toContain("message_count");
+    // The sibling is an input to the legacy projection of the covered scope,
+    // not a disclosure of its own: the grantee reads the projection. Inputs
+    // that are derivatives or non-owner publications are refused instead
+    // (data-lineage.test.ts).
+    expect(res.status, text).toBe(200);
+    expect(JSON.parse(text).data).toMatchObject({
+      conversations: [{ id: "conv-1", message_count: 1 }],
+    });
     // Control: the owner reads the same projection.
     const owner = await get(runtime, "/v1/data/chatgpt.conversations");
     expect(owner.status).toBe(200);

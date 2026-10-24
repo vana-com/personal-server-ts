@@ -167,19 +167,32 @@ async function ownerRead(gateway: GatewayClient, scope: string) {
 }
 
 /**
- * `instagram.profile`: a legacy file, then a PDPP-stamped version of the same
- * data. `instagram.posts`: a legacy file only.
+ * `instagram.profile`: a legacy file, then a later version of the same data
+ * that is either canonical PDPP data in its own form (`native`: `$pdpp`
+ * metadata, which only the PDPP resource server may serve) or the legacy-format
+ * projection of PDPP data (`projection`: a projector stamp, which a chain grant
+ * covering the scope may read). `instagram.posts`: a legacy file only.
  */
-async function seed(gateway: GatewayClient, afterLegacy?: () => Promise<void>) {
+async function seed(
+  gateway: GatewayClient,
+  afterLegacy?: () => Promise<void>,
+  origin: "native" | "projection" = "native",
+) {
   await ownerWrite(gateway, "instagram.profile", {
     rows: [{ id: LEGACY }],
   });
   await afterLegacy?.();
+  const rows = { rows: [{ id: LEGACY, score: SECRET, note: "zebracorn" }] };
   await ownerWrite(
     gateway,
     "instagram.profile",
-    { rows: [{ id: LEGACY, score: SECRET, note: "zebracorn" }] },
-    "pdpp-projector",
+    origin === "native"
+      ? {
+          ...rows,
+          $pdpp: { version: 1, sourceId: "https://registry.pdpp.dev/ig" },
+        }
+      : rows,
+    origin === "projection" ? "pdpp-projector" : undefined,
   );
   await ownerWrite(gateway, "instagram.posts", { rows: [{ id: LEGACY }] });
 }
@@ -265,7 +278,7 @@ async function connection() {
 }
 
 describe("owner's-Claude MCP connection with a live chain grant", () => {
-  it("read_scope refuses the PDPP version and still reads the legacy file", async () => {
+  it("read_scope refuses the canonical PDPP version and still reads the legacy file", async () => {
     const { gateway, path } = await connection();
     const app = mcpApp(gateway);
     // A cursor into the legacy version, minted while it is the latest: it
@@ -298,12 +311,12 @@ describe("owner's-Claude MCP connection with a live chain grant", () => {
     expect(legacy).not.toContain(SECRET);
   });
 
-  it("search previews never quote the PDPP version", async () => {
+  it("search previews never quote the canonical PDPP version", async () => {
     const { gateway, path } = await connection();
     await seed(gateway);
     const app = mcpApp(gateway);
 
-    // "zebracorn" occurs only in the PDPP version.
+    // "zebracorn" occurs only in the canonical PDPP version.
     const pdpp = await toolCall(app, path, {}, "search_personal_context", {
       query: "zebracorn",
       scopes: ["instagram.profile"],
@@ -320,7 +333,7 @@ describe("owner's-Claude MCP connection with a live chain grant", () => {
     expect(JSON.stringify(matchesOf(legacy))).toContain(LEGACY);
   });
 
-  it("list_scope_blocks refuses the PDPP version's block table", async () => {
+  it("list_scope_blocks refuses the canonical PDPP version's block table", async () => {
     const { gateway, path } = await connection();
     await seed(gateway);
     const app = mcpApp(gateway);
@@ -336,6 +349,30 @@ describe("owner's-Claude MCP connection with a live chain grant", () => {
     });
     expect(legacy).toContain('"blocks"');
     expect(legacy).not.toContain("GRANT_REQUIRED");
+  });
+
+  it("serves the legacy-format projection of a covered scope: read_scope, search and block table", async () => {
+    const { gateway, path } = await connection();
+    await seed(gateway, undefined, "projection");
+    const app = mcpApp(gateway);
+
+    const read = await toolCall(app, path, {}, "read_scope", {
+      scope: "instagram.profile",
+    });
+    expect(read).not.toContain("GRANT_REQUIRED");
+    expect(read).toContain(SECRET);
+
+    const found = await toolCall(app, path, {}, "search_personal_context", {
+      query: "zebracorn",
+      scopes: ["instagram.profile"],
+    });
+    expect(matchesOf(found).length).toBeGreaterThan(0);
+
+    const blocks = await toolCall(app, path, {}, "list_scope_blocks", {
+      scope: "instagram.profile",
+    });
+    expect(blocks).toContain('"blocks"');
+    expect(blocks).not.toContain("GRANT_REQUIRED");
   });
 
   it("refuses a read of a scope the owner deleted, like /v1/data", async () => {
@@ -381,7 +418,7 @@ describe("self-signing MCP session with a live chain grant", () => {
     return { Authorization: `Bearer ${access_token}` };
   }
 
-  it("read_scope refuses the PDPP version and still reads the legacy file", async () => {
+  it("read_scope refuses the canonical PDPP version and still reads the legacy file", async () => {
     const gateway = gatewayFor(appWallet.address);
     const app = mcpApp(gateway);
     const headers = await session(gateway, app);

@@ -204,8 +204,33 @@ async function signedGet(
   );
 }
 
-/** A legacy file, then a PDPP-stamped version of the same data. */
-async function seed(runtime: Runtime, storage: DataStoragePort) {
+/**
+ * A body whose origin is PDPP: canonical data in its own form (`native`:
+ * `$pdpp` metadata, readable only through the PDPP resource server) or the
+ * legacy-format projection of PDPP data (`projection`: a projector stamp, which
+ * a chain grant covering the scope may read).
+ */
+function pdppVersion(
+  rows: Record<string, unknown>,
+  origin: "native" | "projection",
+): [Record<string, unknown>, "pdpp-projector" | undefined] {
+  return origin === "native"
+    ? [
+        {
+          ...rows,
+          $pdpp: { version: 1, sourceId: "https://registry.pdpp.dev/ig" },
+        },
+        undefined,
+      ]
+    : [rows, "pdpp-projector"];
+}
+
+/** A legacy file, then a PDPP-origin version of the same data. */
+async function seed(
+  runtime: Runtime,
+  storage: DataStoragePort,
+  origin: "native" | "projection" = "native",
+) {
   await ownerWrite(runtime, "instagram.profile", { rows: [{ id: LEGACY }] });
   const legacyAt = storage.findEntry({
     scope: "instagram.profile",
@@ -213,14 +238,13 @@ async function seed(runtime: Runtime, storage: DataStoragePort) {
   await ownerWrite(
     runtime,
     "instagram.profile",
-    { rows: [{ id: LEGACY, score: SECRET }] },
-    "pdpp-projector",
+    ...pdppVersion({ rows: [{ id: LEGACY, score: SECRET }] }, origin),
   );
   return { legacyAt };
 }
 
 describe("PS Lite GET /v1/data/:scope with a live chain grant", () => {
-  it("refuses the PDPP version, latest and by ?at=, and still serves the legacy file", async () => {
+  it("refuses the canonical PDPP version, latest and by ?at=, and still serves the legacy file", async () => {
     const { runtime, storage } = await boot(builder.address);
     const { legacyAt } = await seed(runtime, storage);
     const pdppAt = storage.findEntry({
@@ -256,6 +280,28 @@ describe("PS Lite GET /v1/data/:scope with a live chain grant", () => {
     expect(legacy.status, legacyText).toBe(200);
     expect(legacyText).toContain(LEGACY);
     expect(legacyText).not.toContain(SECRET);
+  });
+});
+
+describe("PS Lite GET /v1/data/:scope, legacy-format projection of PDPP data", () => {
+  it("serves a chain grant the projection of a scope it covers, latest and by ?at=", async () => {
+    const { runtime, storage } = await boot(builder.address);
+    await seed(runtime, storage, "projection");
+    const projectedAt = storage.findEntry({
+      scope: "instagram.profile",
+    })!.collectedAt;
+
+    for (const query of ["", `?at=${encodeURIComponent(projectedAt)}`]) {
+      const read = await signedGet(
+        runtime,
+        builder,
+        "instagram.profile",
+        query,
+      );
+      const text = await read.text();
+      expect(read.status, text).toBe(200);
+      expect(text).toContain(SECRET);
+    }
   });
 });
 
@@ -305,7 +351,7 @@ describe("PS Lite MCP connection with a live chain grant", () => {
     return { ...booted, call };
   }
 
-  it("read_scope refuses the PDPP version and still reads the legacy file", async () => {
+  it("read_scope refuses the canonical PDPP version and still reads the legacy file", async () => {
     const { runtime, call } = await connection();
     await ownerWrite(runtime, "instagram.profile", { rows: [{ id: LEGACY }] });
     const first = JSON.parse(
@@ -316,8 +362,7 @@ describe("PS Lite MCP connection with a live chain grant", () => {
     await ownerWrite(
       runtime,
       "instagram.profile",
-      { rows: [{ id: LEGACY, score: SECRET }] },
-      "pdpp-projector",
+      ...pdppVersion({ rows: [{ id: LEGACY, score: SECRET }] }, "native"),
     );
 
     const latest = await call("read_scope", { scope: "instagram.profile" });
@@ -330,6 +375,20 @@ describe("PS Lite MCP connection with a live chain grant", () => {
     });
     expect(legacy).toContain(LEGACY);
     expect(legacy).not.toContain(SECRET);
+  });
+
+  it("read_scope serves the legacy-format projection of a covered scope", async () => {
+    const { runtime, call } = await connection();
+    await ownerWrite(runtime, "instagram.profile", { rows: [{ id: LEGACY }] });
+    await ownerWrite(
+      runtime,
+      "instagram.profile",
+      ...pdppVersion({ rows: [{ id: LEGACY, score: SECRET }] }, "projection"),
+    );
+
+    const latest = await call("read_scope", { scope: "instagram.profile" });
+    expect(latest).not.toContain("GRANT_REQUIRED");
+    expect(latest).toContain(SECRET);
   });
 
   it("refuses a read of a scope the owner deleted, like /v1/data", async () => {

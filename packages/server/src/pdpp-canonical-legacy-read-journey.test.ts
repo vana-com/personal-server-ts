@@ -368,7 +368,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(ids(read.text)).toEqual(["stored-pdpp"]);
   });
   it.each(["pdpp-projector", "pdpp-import-projection"])(
-    "denies a historical canonical cache version stamped %s",
+    "serves a chain grant a historical legacy-format cache version stamped %s",
     async (producer) => {
       // An actual legacy file first: the positive control on the same scope.
       await legacyWrite("oura.activity", STALE);
@@ -389,10 +389,11 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       const owned = await ownerGet(`/v1/data/${path}`);
       expect(owned.status).toBe(200);
       expect(owned.text).toContain("cached-pdpp");
+      // A projection stamp marks the legacy-format projection of the scope
+      // the grant covers, which the grant may read.
       const read = await builderGet(path);
-      expect(read.status, read.text).toBe(403);
-      expect(read.text).not.toContain('"score"');
-      expect(read.text).not.toContain("cached-pdpp");
+      expect(read.status, read.text).toBe(200);
+      expect(ids(read.text)).toEqual(["cached-pdpp"]);
       const legacy = await builderGet(
         `oura.activity?at=${encodeURIComponent(legacyAt)}`,
       );
@@ -453,7 +454,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(legacy.status, legacy.text).toBe(200);
     expect(ids(legacy.text)).toEqual(["stale-legacy"]);
   });
-  it("denies a live legacy chain grant access to canonical PDPP rows without PDPP authorization", async () => {
+  it("serves a live legacy chain grant the legacy projection of a covered scope, and refuses it the canonical PDPP stream", async () => {
     const token = await ownerPdppToken();
     await replace(
       token,
@@ -467,16 +468,38 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     expect(ownerRead.dataSource).toBe("canonical");
     expect(ids(ownerRead.text)).toEqual(["a1", "a2"]);
 
+    // (a) The grant covers oura.*: it reads the legacy-format projection.
     const read = await builderGet("oura.activity");
-    expect(read.status).toBe(403);
-    expect(JSON.parse(read.text)).toMatchObject({
-      error: { errorCode: "GRANT_REQUIRED" },
-    });
-    expect(read.text).not.toContain("a2");
-    expect(read.text).not.toContain('"score"');
+    expect(read.status).toBe(200);
+    expect(ids(read.text)).toEqual(["a1", "a2"]);
+
+    // (b) The same grant cannot read the canonical PDPP stream: the PDPP
+    // resource server takes a PDPP access token, not a chain-grant signature
+    // (401). A native-form PDPP copy served on the legacy route is refused
+    // 403 (the native PDPP copy test above).
+    for (const path of [
+      "/v1/streams/activity/records",
+      "/v1/streams/activity/records/a2",
+    ]) {
+      const canonical = await ctx!.app.request(path, {
+        headers: {
+          authorization: await buildWeb3SignedHeader({
+            wallet: builder,
+            aud: ctx!.config.server.origin,
+            method: "GET",
+            uri: path,
+            grantId: GRANT_ID,
+          }),
+        },
+      });
+      const text = await canonical.text();
+      expect(canonical.status, text).toBe(401);
+      expect(text).not.toContain('a2"');
+      expect(text).not.toContain('"score"');
+    }
   });
 
-  it("does not let a legacy grant widen a narrowed PDPP grant", async () => {
+  it("keeps a narrowed PDPP grant narrow while a legacy grant reads the legacy projection it covers", async () => {
     const ownerToken = await ownerPdppToken();
     await replace(
       ownerToken,
@@ -533,10 +556,11 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
         ),
       ).toEqual(["a1"]);
       expect(nativeBody).not.toContain('"score"');
+      // The legacy grant is its own consent for the legacy form of oura.*;
+      // it neither widens nor is narrowed by the PDPP grant.
       const legacy = await builderGet("oura.activity");
-      expect(legacy.status).toBe(403);
-      expect(legacy.text).not.toContain('"score"');
-      expect(legacy.text).not.toContain("a2");
+      expect(legacy.status).toBe(200);
+      expect(ids(legacy.text)).toEqual(["a1", "a2"]);
     } finally {
       store.close();
     }
@@ -1046,7 +1070,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     ).toEqual(["notes.manual", "oura.readiness"]);
   });
 
-  it("serves canonical rows only to the owner after coverage", async () => {
+  it("serves canonical rows to a legacy grant and the owner after coverage", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
     const legacyAt = latestAt("oura.activity");
     const token = await ownerPdppToken();
@@ -1058,9 +1082,8 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     );
 
     const asBuilder = await builderGet("oura.activity");
-    expect(asBuilder.status).toBe(403);
-    expect(asBuilder.text).not.toContain('"score"');
-    expect(asBuilder.text).not.toContain('"a2"');
+    expect(asBuilder.status).toBe(200);
+    expect(ids(asBuilder.text)).toEqual(["a1", "a2"]);
     // The same grant still reads the actual legacy file by its version.
     const legacy = await builderGet(
       `oura.activity?at=${encodeURIComponent(legacyAt)}`,
@@ -1238,18 +1261,13 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     );
 
     const ownerRead = await ownerGet("/v1/data/oura.activity");
-    expect(ownerRead.status).toBe(409);
-    expect(JSON.parse(ownerRead.text)).toMatchObject({
-      error: "CANONICAL_VIEW_UNAVAILABLE",
-      reason: "ambiguous_connection",
-    });
-    // A chain grant never reaches the canonical view, not even its refusal.
     const builderRead = await builderGet("oura.activity");
-    expect(builderRead.status).toBe(403);
-    expect(JSON.parse(builderRead.text)).toMatchObject({
-      error: { errorCode: "GRANT_REQUIRED" },
-    });
     for (const read of [ownerRead, builderRead]) {
+      expect(read.status).toBe(409);
+      expect(JSON.parse(read.text)).toMatchObject({
+        error: "CANONICAL_VIEW_UNAVAILABLE",
+        reason: "ambiguous_connection",
+      });
       for (const leaked of ["stale-legacy", '"one"', '"two"', SECOND_ACCOUNT]) {
         expect(read.text).not.toContain(leaked);
       }
@@ -1831,12 +1849,11 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
         await signedRead("oura.activity"),
         await signedRead("oura.activity", await paymentHeader()),
       ]) {
-        // Refused as a canonical-view read by a chain grant, still before
-        // any challenge or payment.
-        expect(response.status).toBe(403);
+        expect(response.status).toBe(409);
         expect(response.headers.get("x-payment-response")).toBeNull();
         expect(await response.json()).toMatchObject({
-          error: { errorCode: "GRANT_REQUIRED" },
+          error: "CANONICAL_VIEW_UNAVAILABLE",
+          reason: "ambiguous_connection",
         });
       }
       expect(pay).not.toHaveBeenCalled();
@@ -1861,10 +1878,11 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
         await signedRead("oura.activity"),
         await signedRead("oura.activity", await paymentHeader()),
       ]) {
-        expect(response.status).toBe(403);
+        expect(response.status).toBe(503);
         const text = await response.text();
         expect(JSON.parse(text)).toMatchObject({
-          error: { errorCode: "GRANT_REQUIRED" },
+          error: "CANONICAL_VIEW_UNAVAILABLE",
+          reason: "paid_read_unsupported",
         });
         expect(text).not.toContain("accessRecord");
         expect(text).not.toContain('"a1"');
