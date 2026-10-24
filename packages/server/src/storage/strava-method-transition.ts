@@ -95,6 +95,10 @@ export function createStravaMethodTransition(
       if (scope === ACTIVITIES && !store.getInstanceBinding(instance).empty)
         throw new PdppBindingError("strava_previous_data_not_readable");
     }
+    // Coverage needs every saved id; without them no run could hand over.
+    const activities = saved[ACTIVITIES];
+    if (activities && activityIds(activities.data) === null)
+      throw new PdppBindingError("strava_previous_data_not_readable");
     return saved;
   }
 
@@ -177,10 +181,13 @@ export function createStravaMethodTransition(
       return { status: "covered", current };
     if (!completedBrowserRun(before.transition) || current.kind !== "canonical")
       return { status: "pending", current };
-    const savedIds = activityIds(before.envelope.data) ?? new Set<string>();
+    // Unreadable saved ids fail closed: nothing proves the same account.
+    const savedIds = activityIds(before.envelope.data);
     const browserIds = activityIds(current.envelope.data);
     const covers =
-      browserIds !== null && [...savedIds].every((id) => browserIds.has(id));
+      savedIds !== null &&
+      browserIds !== null &&
+      [...savedIds].every((id) => browserIds.has(id));
     if (!covers) return { status: "account_mismatch", current };
     store.confirmStravaTransition(
       before.transition.instance,

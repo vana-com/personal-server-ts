@@ -261,6 +261,50 @@ describe("Strava export-to-browser transition", () => {
     expect(await status(INSTANCE)).toBe("covered");
   });
 
+  it("refuses a saved export body whose activity ids cannot be read", async () => {
+    seedExport(store, ["a"]);
+    const unreadable = savedEnvelope(ACTIVITIES, { activities: [{ id: 1 }] });
+    const withFile = createStravaMethodTransition(
+      store,
+      createLegacyScopeView({
+        authority: createLegacyScopeAuthority(db),
+        records: store,
+        configuredMethods: () => [method],
+        readLegacyHead: async () => unreadable,
+      }),
+      {
+        findEntry: ({ scope }: { scope: string }) =>
+          scope === ACTIVITIES ? { collectedAt: SAVED_AT } : undefined,
+        readEnvelope: async () => unreadable,
+      } as unknown as DataStoragePort,
+    );
+    db.prepare(
+      "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
+    ).run("strava/activities/export.json", ACTIVITIES, SAVED_AT, 1);
+
+    await expect(withFile.transition(INSTANCE, 1)).rejects.toThrow(
+      "strava_previous_data_not_readable",
+    );
+    expect(store.getInstanceBinding(INSTANCE).method).toBe("strava");
+  });
+
+  it("never counts unreadable saved ids as covered", async () => {
+    seedExport(store, ["a"]);
+    store.transitionStravaToBrowser({
+      instance: INSTANCE,
+      expectedGeneration: 1,
+      expectedWriteClock: store.transitionWriteClock(),
+      snapshots: { [ACTIVITIES]: savedEnvelope(ACTIVITIES, {}) },
+    });
+    method = "strava-browser";
+    const { status } = create();
+
+    browserRun(store, ["a"], true);
+
+    expect(await status(INSTANCE)).toBe("account_mismatch");
+    expect(store.stravaTransition(INSTANCE)?.activitiesCovered).toBe(false);
+  });
+
   it("keeps saved coverage diagnostics readable as a frozen snapshot", async () => {
     seedExport(store, ["a"]);
     store.replaceStream({
