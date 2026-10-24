@@ -1,5 +1,6 @@
 import { ouraRoutes } from "./routes/oura.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
+import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono } from "hono";
@@ -350,7 +351,16 @@ export function createApp(deps: AppDeps): Hono {
           deps.dataStorage,
         )
       : undefined;
-  const legacyScopeView = claudeTransition?.view ?? deps.legacyScopeView;
+  const claudeView = claudeTransition?.view ?? deps.legacyScopeView;
+  const stravaTransition =
+    deps.pdpp && claudeView && deps.dataStorage
+      ? createStravaMethodTransition(
+          deps.pdpp.bindingStore,
+          claudeView,
+          deps.dataStorage,
+        )
+      : undefined;
+  const legacyScopeView = stravaTransition?.view ?? claudeView;
 
   // Mount health route
   app.route(
@@ -387,6 +397,8 @@ export function createApp(deps: AppDeps): Hono {
         instancesForSource: deps.pdpp.instancesForSource,
         configuredMethods: deps.pdpp.configuredMethods,
         transitionClaude: claudeTransition?.transition,
+        transitionStrava: stravaTransition?.transition,
+        stravaTransitionStatus: stravaTransition?.status,
       }),
     );
     app.route(

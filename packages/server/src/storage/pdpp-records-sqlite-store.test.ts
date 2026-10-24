@@ -1013,7 +1013,7 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 15 });
+        ).toEqual({ version: 16 });
         expect(
           dbAfterUpgrade
             .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
@@ -1154,7 +1154,7 @@ describe("sqlite record store", () => {
         "UPDATE pdpp_schema_version SET version = 9999 WHERE id = 1",
       ).run();
       expect(() => createSqliteRecordStore(db)).toThrow(
-        "Unsupported index.db PDPP schema version 9999; runtime supports 15",
+        "Unsupported index.db PDPP schema version 9999; runtime supports 16",
       );
     });
   });
@@ -1541,7 +1541,7 @@ describe("v13 emitted-time order key", () => {
         const upgraded = createSqliteRecordStore(after);
         expect(
           after.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 15 });
+        ).toEqual({ version: 16 });
         expect(
           upgraded
             .listRecords("events", {

@@ -27,7 +27,14 @@ export interface PdppInstanceBindingRouteDeps {
     instance: string,
     generation: number,
   ): Promise<PdppInstanceBinding>;
+  transitionStrava?(
+    instance: string,
+    generation: number,
+  ): Promise<PdppInstanceBinding>;
+  stravaTransitionStatus?(instance: string): Promise<string>;
 }
+
+const STRAVA_METHODS = ["strava", "strava-browser"];
 
 function errorResponse(
   code: string,
@@ -174,6 +181,73 @@ export function pdppInstanceBindingRoutes(
         );
       throw error;
     }
+  });
+
+  // Strava export → browser: same owner contract as the Claude transition.
+  app.post("/pdpp/instances/:instance/transition-strava-browser", async (c) => {
+    const owner = await ownerContext(c.req.raw);
+    if ("error" in owner) return owner.error;
+    const instance = c.req.param("instance");
+    if (!canAccessInstance(instance, owner))
+      return errorResponse(
+        "authentication_error",
+        "Instance is not owned",
+        401,
+      );
+    if (
+      !deps.transitionStrava ||
+      !STRAVA_METHODS.includes(configuredActiveMethod(instance) ?? "")
+    )
+      return errorResponse(
+        "transition_unavailable",
+        "Strava transition is not configured",
+        409,
+      );
+    const body = await c.req.json().catch(() => null);
+    if (
+      !body ||
+      !Number.isSafeInteger(body.expected_generation) ||
+      body.expected_generation < 1
+    )
+      return errorResponse(
+        "invalid_request",
+        "expected_generation is required",
+        400,
+      );
+    try {
+      const binding = await deps.transitionStrava(
+        instance,
+        body.expected_generation,
+      );
+      return c.json({ method: binding.method, generation: binding.generation });
+    } catch (error) {
+      if (error instanceof PdppBindingError)
+        return errorResponse(
+          error.reason,
+          "Strava transition could not preserve the current connection",
+          409,
+        );
+      throw error;
+    }
+  });
+
+  app.get("/pdpp/instances/:instance/strava-browser-transition", async (c) => {
+    const owner = await ownerContext(c.req.raw);
+    if ("error" in owner) return owner.error;
+    const instance = c.req.param("instance");
+    if (!canAccessInstance(instance, owner))
+      return errorResponse(
+        "authentication_error",
+        "Instance is not owned",
+        401,
+      );
+    if (!deps.stravaTransitionStatus)
+      return errorResponse(
+        "transition_unavailable",
+        "Strava transition is not configured",
+        409,
+      );
+    return c.json({ status: await deps.stravaTransitionStatus(instance) });
   });
 
   app.post("/pdpp/instances/:instance/reset", async (c) => {

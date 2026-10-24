@@ -81,6 +81,26 @@ export interface ClaudeTransition {
   >;
 }
 
+export type StravaTransitionScope =
+  "strava.activities" | "strava.coverage_diagnostics";
+
+/** One export-to-browser transition of a Strava connection, converged at v16. */
+export interface StravaTransition {
+  instance: string;
+  archiveInstance: string;
+  /** A completed browser run covered every saved activity id. */
+  activitiesCovered: boolean;
+  generation: number;
+  snapshots: Partial<Record<StravaTransitionScope, DataFileEnvelope>>;
+}
+
+export interface StravaTransitionInput {
+  instance: string;
+  expectedGeneration: number;
+  expectedWriteClock: number;
+  snapshots: StravaTransition["snapshots"];
+}
+
 export interface ClaudeTransitionInput {
   instance: string;
   expectedGeneration: number;
@@ -335,6 +355,18 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
   // the planner will search it; a CASE alone does not provide that. Additive
   // only; the expression must stay identical to `noRetainedHistoryReferenceSql`.
   `
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
+  ON pdpp_record_changes (CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT));
+`,
+  // v16: converge main v15 (history index) with Desktop v15 (Strava).
+  // Either v15 database may lack the other addition; preserve both by presence.
+  `CREATE TABLE IF NOT EXISTS pdpp_strava_transition (
+    instance TEXT PRIMARY KEY,
+    archive_instance TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL,
+    snapshots_json TEXT NOT NULL,
+    activities_covered INTEGER NOT NULL DEFAULT 0
+  );
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
   ON pdpp_record_changes (CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT));
 `,
@@ -649,6 +681,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   listClaudeTransitions(): ClaudeTransition[];
   clearClaudeTransitionScope(scope: string): void;
   confirmClaudeTransition(instance: string, generation: number): void;
+  transitionStravaToBrowser(input: StravaTransitionInput): PdppInstanceBinding;
+  stravaTransition(instance: string): StravaTransition | null;
+  listStravaTransitions(): StravaTransition[];
+  clearStravaTransitionScope(scope: string): void;
+  confirmStravaTransition(instance: string, generation: number): void;
   transitionWriteClock(): number;
   listConnections(sourceId: string): PdppInstanceBinding[];
   registerConnection(input: {
@@ -1391,6 +1428,139 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     })();
   }
 
+  const STRAVA_SOURCE = "https://registry.pdpp.dev/sources/strava";
+  const STRAVA_EXPORT_METHOD = "strava";
+  const STRAVA_BROWSER_METHOD = "strava-browser";
+  const STRAVA_SCOPE_STREAMS: Record<StravaTransitionScope, string> = {
+    "strava.activities": "activities",
+    "strava.coverage_diagnostics": "coverage_diagnostics",
+  };
+  /** Tables whose rows move to the archive instance on a method transition. */
+  const ARCHIVED_TABLES = [
+    "pdpp_records",
+    "pdpp_record_changes",
+    "pdpp_blob_claims",
+    "pdpp_stream_completion",
+    "pdpp_record_arrival",
+  ];
+
+  function stravaTransition(instance: string): StravaTransition | null {
+    const row = db
+      .prepare("SELECT * FROM pdpp_strava_transition WHERE instance = ?")
+      .get(instance) as
+      | {
+          instance: string;
+          archive_instance: string;
+          generation: number;
+          snapshots_json: string;
+          activities_covered: number;
+        }
+      | undefined;
+    if (!row) return null;
+    return {
+      instance: row.instance,
+      archiveInstance: row.archive_instance,
+      activitiesCovered: row.activities_covered === 1,
+      generation: row.generation,
+      snapshots: JSON.parse(
+        row.snapshots_json,
+      ) as StravaTransition["snapshots"],
+    };
+  }
+
+  function listStravaTransitions(): StravaTransition[] {
+    return (
+      db
+        .prepare(
+          "SELECT instance FROM pdpp_strava_transition ORDER BY instance",
+        )
+        .all() as { instance: string }[]
+    ).map((row) => stravaTransition(row.instance)!);
+  }
+
+  function confirmStravaTransition(instance: string, generation: number): void {
+    db.prepare(
+      "UPDATE pdpp_strava_transition SET activities_covered = 1 WHERE instance = ? AND generation = ?",
+    ).run(instance, generation);
+  }
+
+  /** A takeover reset drops the saved body and its archived rows. */
+  function clearStravaTransitionScope(scope: string): void {
+    if (!(scope in STRAVA_SCOPE_STREAMS)) return;
+    const stream = STRAVA_SCOPE_STREAMS[scope as StravaTransitionScope];
+    db.transaction(() => {
+      for (const transition of listStravaTransitions()) {
+        delete transition.snapshots[scope as StravaTransitionScope];
+        db.prepare(
+          "UPDATE pdpp_strava_transition SET snapshots_json = ? WHERE instance = ?",
+        ).run(JSON.stringify(transition.snapshots), transition.instance);
+        for (const table of ARCHIVED_TABLES) {
+          if (table === "pdpp_blob_claims") continue;
+          db.prepare(
+            `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
+          ).run(transition.archiveInstance, stream);
+        }
+      }
+    })();
+  }
+
+  /**
+   * Owner-authorized, one-way: archive the export rows and bind the browser
+   * method at the next generation in one transaction. Replaying the same
+   * intent after success returns the current binding and erases nothing.
+   */
+  function transitionStravaToBrowser(
+    input: StravaTransitionInput,
+  ): PdppInstanceBinding {
+    return db.transaction(() => {
+      const current = getInstanceBinding(input.instance);
+      if (current.deletedAt !== null)
+        throw new PdppBindingError("connection_deleted");
+      const previous = stravaTransition(input.instance);
+      if (
+        previous &&
+        previous.generation === input.expectedGeneration + 1 &&
+        current.method === STRAVA_BROWSER_METHOD &&
+        current.generation === previous.generation
+      )
+        return current;
+      if (
+        current.method !== STRAVA_EXPORT_METHOD ||
+        current.sourceId !== STRAVA_SOURCE
+      )
+        throw new PdppBindingError("connection_conflict");
+      if (
+        current.generation !== input.expectedGeneration ||
+        transitionWriteClock() !== input.expectedWriteClock
+      )
+        throw new PdppBindingError("binding_generation_mismatch");
+      if (previous || listConnections(current.sourceId).length !== 1)
+        throw new PdppBindingError("connection_conflict");
+      const archive = `retired-strava:${randomUUID()}`;
+      const generation = current.generation + 1;
+      db.prepare(
+        "INSERT INTO pdpp_strava_transition (instance, archive_instance, generation, snapshots_json) VALUES (?, ?, ?, ?)",
+      ).run(
+        input.instance,
+        archive,
+        generation,
+        JSON.stringify(input.snapshots),
+      );
+      // The archive is not a registered connection: it cannot accept writes.
+      for (const table of ARCHIVED_TABLES) {
+        db.prepare(`UPDATE ${table} SET instance = ? WHERE instance = ?`).run(
+          archive,
+          input.instance,
+        );
+      }
+      const clock = (nextWriteSeq.get() as { value: number }).value;
+      db.prepare(
+        "UPDATE pdpp_instance_binding SET method = ?, generation = ?, reset_clock = ? WHERE instance = ?",
+      ).run(STRAVA_BROWSER_METHOD, generation, clock, input.instance);
+      return getInstanceBinding(input.instance);
+    })();
+  }
+
   function transitionClaudeToLive(
     input: ClaudeTransitionInput,
   ): PdppInstanceBinding {
@@ -1509,6 +1679,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         instance,
       );
       eraseInstanceData(transition.archiveInstance);
+    }
+    const strava = stravaTransition(instance);
+    if (strava) {
+      db.prepare("DELETE FROM pdpp_strava_transition WHERE instance = ?").run(
+        instance,
+      );
+      eraseInstanceData(strava.archiveInstance);
     }
     db.prepare("DELETE FROM pdpp_records WHERE instance = ?").run(instance);
     db.prepare("DELETE FROM pdpp_record_changes WHERE instance = ?").run(
@@ -2261,6 +2438,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     listClaudeTransitions,
     clearClaudeTransitionScope,
     confirmClaudeTransition,
+    transitionStravaToBrowser,
+    stravaTransition,
+    listStravaTransitions,
+    clearStravaTransitionScope,
+    confirmStravaTransition,
     transitionWriteClock,
     listConnections,
     registerConnection,

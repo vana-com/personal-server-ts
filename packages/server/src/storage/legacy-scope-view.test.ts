@@ -22,7 +22,7 @@ const CONFIGURED: Record<string, string[]> = {
   [OURA]: ["oura", "oura-browser"],
   [GITHUB]: ["github-browser"],
   [CLAUDE]: ["anthropic"],
-  [STRAVA]: ["strava"],
+  [STRAVA]: ["strava", "strava-browser"],
 };
 
 const CLAUDE_PROFILE = {
@@ -2919,6 +2919,60 @@ describe("legacy scope view over the real SQLite record store", () => {
         ).toEqual([{ scope }]);
       },
     );
+  });
+
+  describe("strava-browser beside the Strava export method", () => {
+    it("serves strava.activities from a strava-browser connection", async () => {
+      connect(store, "conn_live", "strava-browser", STRAVA);
+      replace(store, "conn_live", "activities", ["a1"], {
+        method: "strava-browser",
+      });
+
+      const read = await view.readLatest("strava.activities");
+
+      expect(read.kind).toBe("canonical");
+      expect(read.kind === "canonical" && read.envelope.data).toEqual({
+        activities: [{ id: "a1", day: "2026-09-01", score: 80 }],
+      });
+    });
+
+    // The browser method declares no diagnostics stream.
+    it("leaves strava.coverage_diagnostics to the export method", async () => {
+      connect(store, "conn_live", "strava-browser", STRAVA);
+      replace(store, "conn_live", "activities", ["a1"], {
+        method: "strava-browser",
+      });
+
+      expect(await view.readLatest("strava.coverage_diagnostics")).toEqual({
+        kind: "file",
+        deletion: "file",
+      });
+    });
+
+    // Never a mix of two producers: the owner must hold one Strava method.
+    it("refuses activities, not diagnostics, while both methods hold data", async () => {
+      connect(store, "conn_export", "strava", STRAVA);
+      connect(store, "conn_live", "strava-browser", STRAVA);
+      replace(store, "conn_export", "activities", ["a1"], { method: "strava" });
+      replace(store, "conn_export", "coverage_diagnostics", ["d1"], {
+        method: "strava",
+      });
+      replace(store, "conn_live", "activities", ["a2"], {
+        method: "strava-browser",
+      });
+
+      expect(await view.readLatest("strava.activities")).toEqual({
+        kind: "refused",
+        refusal: {
+          status: "unavailable",
+          reason: "ambiguous_connection",
+          candidates: 2,
+        },
+      });
+      expect((await view.readLatest("strava.coverage_diagnostics")).kind).toBe(
+        "canonical",
+      );
+    });
   });
 
   it("writes nothing while deciding, reading or listing", async () => {

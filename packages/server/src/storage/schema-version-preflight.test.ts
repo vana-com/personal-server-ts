@@ -16,10 +16,10 @@ const counters = [
     error: "Unsupported index.db schema version 18; runtime supports 17",
   },
   {
-    label: "PDPP 16",
+    label: "PDPP 17",
     legacy: 17,
-    pdpp: 16,
-    error: "Unsupported index.db PDPP schema version 16; runtime supports 15",
+    pdpp: 17,
+    error: "Unsupported index.db PDPP schema version 17; runtime supports 16",
   },
 ];
 

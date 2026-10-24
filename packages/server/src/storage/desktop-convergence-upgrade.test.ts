@@ -242,7 +242,11 @@ describe("B-written Desktop profile convergence", () => {
       for (let restart = 0; restart < 2; restart++) {
         openDb = initializeDatabase(path);
         const store = createSqliteRecordStore(openDb);
-        if (restart === 0) expect(rows(openDb)).toEqual(original);
+        if (restart === 0)
+          expect(rows(openDb)).toEqual({
+            ...original,
+            pdpp_strava_transition: [],
+          });
         if (restart === 0 && scenario.name === "stale-nonhead") {
           openDb.exec("SAVEPOINT sequence_probe");
           try {
@@ -256,12 +260,15 @@ describe("B-written Desktop profile convergence", () => {
           } finally {
             openDb.exec("ROLLBACK TO sequence_probe; RELEASE sequence_probe");
           }
-          expect(rows(openDb)).toEqual(original);
+          expect(rows(openDb)).toEqual({
+            ...original,
+            pdpp_strava_transition: [],
+          });
         }
         expect(openDb.pragma("user_version", { simple: true })).toBe(17);
         expect(
           openDb.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 15 });
+        ).toEqual({ version: 16 });
         const index = openDb
           .prepare(
             "SELECT sql FROM sqlite_master WHERE name='idx_pdpp_record_changes_blob_ref'",
@@ -437,7 +444,7 @@ describe("B-written Desktop profile convergence", () => {
     60000,
   );
 
-  it("rolls back a failed PDPP v15 migration without losing history, then retries exactly once", async () => {
+  it("rolls back a failed PDPP v15/v16 migration without losing history, then retries exactly once", async () => {
     dir = await mkdtemp(join(tmpdir(), "desktop-b-migration-fault-"));
     const path = join(dir, "index.db");
     openDb = new Database(path);
@@ -467,10 +474,10 @@ describe("B-written Desktop profile convergence", () => {
     expect(rows(openDb)).toEqual(original);
     openDb.exec("DROP TRIGGER fail_pdpp_upgrade");
     const store = createSqliteRecordStore(openDb);
-    expect(rows(openDb)).toEqual(original);
+    expect(rows(openDb)).toEqual({ ...original, pdpp_strava_transition: [] });
     expect(
       openDb.prepare("SELECT version FROM pdpp_schema_version").get(),
-    ).toEqual({ version: 15 });
+    ).toEqual({ version: 16 });
     store.close();
   });
 });
