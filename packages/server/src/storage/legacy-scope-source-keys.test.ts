@@ -16,7 +16,7 @@ interface Fixture {
 }
 
 function fixture(scope: string): Fixture {
-  return JSON.parse(
+  const input = JSON.parse(
     readFileSync(
       new URL(
         `../../../core/src/legacy-projection/__fixtures__/parity/${scope}.json`,
@@ -25,6 +25,14 @@ function fixture(scope: string): Fixture {
       "utf8",
     ),
   ) as Fixture;
+  if (scope === "github.contributions" && !input.legacyBody) {
+    const snapshot = input.streams.contributions?.[0];
+    if (snapshot) {
+      const { id: _id, ...legacyBody } = snapshot;
+      input.legacyBody = legacyBody;
+    }
+  }
+  return input;
 }
 
 const collectedAt = "2026-10-10T00:00:00.000Z";
@@ -213,6 +221,7 @@ describe("source identities qualify legacy scope takeover", () => {
   });
 
   it.each([
+    "github.contributions",
     "github.events",
     "github.history",
     "heb.orders",

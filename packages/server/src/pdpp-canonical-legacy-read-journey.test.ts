@@ -277,7 +277,7 @@ async function legacyWrite(scope: string, data: Record<string, unknown>) {
     },
     body: JSON.stringify(data),
   });
-  expect(response.status).toBe(201);
+  expect(response.status, await response.text()).toBe(201);
 }
 
 async function ownerGet(path: string) {
@@ -1886,6 +1886,7 @@ describe.each([
   "linkedin.experience",
   "linkedin.languages",
   "linkedin.skills",
+  "github.contributions",
   "github.repositories",
   "github.starred",
   "github.events",
@@ -1948,6 +1949,13 @@ describe.each([
                 "utf8",
               ),
             );
+      if (scope === "github.contributions" && !fixture.legacyBody) {
+        const snapshot = fixture.streams.contributions?.[0];
+        if (snapshot) {
+          const { id: _id, ...legacyBody } = snapshot;
+          fixture.legacyBody = legacyBody;
+        }
+      }
       const canonicalBody = structuredClone(fixture.legacyBody);
       if (scope === "github.history")
         canonicalBody.fetchedAt = "2026-10-21T00:00:00.000Z";
