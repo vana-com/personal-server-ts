@@ -327,13 +327,15 @@ CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
   );`,
   // v15: expression index for the retained-history blob reference check in
   // `deleteUnclaimedBlobs`. Without it each candidate blob scanned every
-  // history row at every writable open. The CAST gives the expression TEXT
-  // affinity, which the TEXT `blob_id` column comparison needs before the
-  // planner will search it. Additive only; the expression must stay identical
-  // to `noRetainedHistoryReferenceSql`.
+  // history row at every writable open. `json_valid` guards the extraction:
+  // `json_extract` raises on malformed JSON, which would make this index
+  // (and every later insert of such a row) fail. The outer CAST gives the
+  // expression TEXT affinity, which the TEXT `blob_id` comparison needs before
+  // the planner will search it; a CASE alone does not provide that. Additive
+  // only; the expression must stay identical to `noRetainedHistoryReferenceSql`.
   `
 CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
-  ON pdpp_record_changes (CAST(json_extract(data, '$.blob_ref.blob_id') AS TEXT));
+  ON pdpp_record_changes (CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT));
 `,
 ];
 
@@ -465,7 +467,7 @@ function sweepStaleBlobClaims(db: Database): void {
  * exactly, so the planner searches by blob id rather than scanning history.
  */
 export function noRetainedHistoryReferenceSql(blobId: string): string {
-  return `NOT EXISTS (SELECT 1 FROM pdpp_record_changes WHERE CAST(json_extract(data, '$.blob_ref.blob_id') AS TEXT) = ${blobId})`;
+  return `NOT EXISTS (SELECT 1 FROM pdpp_record_changes WHERE CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT) = ${blobId})`;
 }
 
 function deleteUnclaimedBlobs(db: Database): void {
