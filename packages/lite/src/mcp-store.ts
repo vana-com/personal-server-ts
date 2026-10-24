@@ -132,16 +132,48 @@ function runTx<T>(
   return openDb(opts, indexes).then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const transaction = db.transaction(opts.storeName, mode);
-        const store = transaction.objectStore(opts.storeName);
-        const request = fn(store);
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-        transaction.oncomplete = () => db.close();
-        transaction.onerror = () => {
-          db.close();
-          reject(transaction.error);
+        let settled = false;
+        let result!: T;
+        const closeDb = () => {
+          try {
+            db.close();
+          } catch {
+            // The transaction result or error remains the useful outcome.
+          }
         };
+        const resolveOnce = (value: T) => {
+          if (settled) return;
+          settled = true;
+          closeDb();
+          resolve(value);
+        };
+        const rejectOnce = (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          closeDb();
+          reject(error);
+        };
+        try {
+          const transaction = db.transaction(opts.storeName, mode);
+          const store = transaction.objectStore(opts.storeName);
+          const request = fn(store);
+          request.onsuccess = () => {
+            result = request.result;
+          };
+          request.onerror = () =>
+            rejectOnce(request.error ?? new Error("IndexedDB request failed"));
+          transaction.oncomplete = () => resolveOnce(result);
+          transaction.onerror = () =>
+            rejectOnce(
+              transaction.error ?? new Error("IndexedDB transaction failed"),
+            );
+          transaction.onabort = () =>
+            rejectOnce(
+              transaction.error ?? new Error("IndexedDB transaction aborted"),
+            );
+        } catch (error) {
+          rejectOnce(error);
+        }
       }),
   );
 }

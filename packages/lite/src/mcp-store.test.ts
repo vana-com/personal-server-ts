@@ -96,6 +96,58 @@ describe("IndexedDB MCP connection mutations", () => {
     }
   });
 
+  it("rejects a write when its request succeeds but the transaction aborts", async () => {
+    const factory = new IDBFactory();
+    const abortingIndexedDB = {
+      open(name: string, version?: number) {
+        const request =
+          version === undefined
+            ? factory.open(name)
+            : factory.open(name, version);
+        request.addEventListener("success", () => {
+          const db = request.result;
+          const originalTransaction = db.transaction.bind(db);
+          db.transaction = ((
+            ...args: Parameters<IDBDatabase["transaction"]>
+          ) => {
+            const transaction = originalTransaction(...args);
+            if (transaction.mode === "readwrite") {
+              const originalObjectStore =
+                transaction.objectStore.bind(transaction);
+              transaction.objectStore = (storeName: string) => {
+                const store = originalObjectStore(storeName);
+                const originalPut = store.put.bind(store);
+                store.put = ((
+                  ...putArgs: Parameters<IDBObjectStore["put"]>
+                ) => {
+                  const write = originalPut(...putArgs);
+                  write.addEventListener("success", () =>
+                    queueMicrotask(() => transaction.abort()),
+                  );
+                  return write;
+                }) as IDBObjectStore["put"];
+                return store;
+              };
+            }
+            return transaction;
+          }) as IDBDatabase["transaction"];
+        });
+        return request;
+      },
+    } as unknown as IDBFactory;
+    vi.stubGlobal("indexedDB", abortingIndexedDB);
+    const store = createIndexedDbMcpConnectionStore({
+      dbName: "mcp-write-aborted-after-request-success",
+    });
+
+    await expect(
+      createMcpConnection(
+        { displayName: "Claude" },
+        { store, publicOrigin: "https://ps.local" },
+      ),
+    ).rejects.toThrow("IndexedDB transaction aborted");
+  });
+
   it("atomically preserves concurrent requests on a legacy record", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
     const store = createIndexedDbMcpConnectionStore({
