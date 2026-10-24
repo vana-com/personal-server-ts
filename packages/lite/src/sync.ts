@@ -105,6 +105,10 @@ export interface PsLiteSyncOptions {
   logger?: Logger;
   /** Build the sync capability without starting its background loop. Defaults to true. */
   autoStartSync?: boolean;
+  /** Time budget for one owner additions session. Defaults to 10 seconds. */
+  additionsTimeBudgetMs?: number;
+  /** Byte budget for one owner additions session. Defaults to 8 MiB. */
+  additionsByteBudget?: number;
   /** Registers derivatives (envelopes carrying `$lineage`) with their lineage. */
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   /** Post-index download hook (marks derivative questions stale). */
@@ -297,8 +301,8 @@ export async function createPsLiteSyncManager(
             gatewayUrl: options.config.gateway.url,
             storageEndpoint: resolveVanaStorageEndpoint(options.config),
             masterKey,
-            byteBudget: 8 * 1024 * 1024,
-            timeBudgetMs: 10_000,
+            byteBudget: options.additionsByteBudget ?? 8 * 1024 * 1024,
+            timeBudgetMs: options.additionsTimeBudgetMs ?? 10_000,
           },
           transport: createPsLiteAdditionsTransport({
             config: options.config,
