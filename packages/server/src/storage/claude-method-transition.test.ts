@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import Database from "better-sqlite3";
 import { expect, it } from "vitest";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
@@ -246,4 +249,90 @@ it("preserves the readable baseline through an authenticated transition, incompl
   expect((await request("owner")).status).toBe(409);
   store.close();
   db.close();
+});
+
+it("keeps every blob of the archived Claude history readable across a writable restart", () => {
+  const dir = mkdtempSync(join(tmpdir(), "claude-archive-gc-"));
+  const file = join(dir, "pdpp.db");
+  try {
+    const instance = "claude:0xowner";
+    const sourceId = "https://registry.pdpp.dev/sources/claude";
+    const A = { method: "anthropic", generation: 1 };
+    const bytes = (text: string) => new TextEncoder().encode(text);
+    let db = new Database(file);
+    let store = createSqliteRecordStore(db);
+    store.registerConnection({
+      instance,
+      sourceId,
+      method: "anthropic",
+      label: "Work",
+    });
+    const blob = (text: string) =>
+      store.storeBlobBytesForInstance({
+        instance,
+        ...A,
+        bytes: bytes(text),
+        mimeType: "text/plain",
+      }).blobId;
+    const put = (key: string, blobId: string, emittedAt: string) =>
+      store.ingestBatch(
+        [
+          {
+            instance,
+            stream: "messages",
+            key,
+            data: { id: key, blob_ref: { blob_id: blobId } },
+            emitted_at: emittedAt,
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+        A,
+      );
+    // `old` was re-pointed at a new blob, so the first blob is referenced by
+    // history only; `kept` is still referenced by its live record.
+    const historyOnly = blob("history only");
+    put("old", historyOnly, "2026-10-01T00:00:00Z");
+    const replacement = blob("replacement");
+    put("old", replacement, "2026-10-02T00:00:00Z");
+    const kept = blob("kept");
+    put("kept", kept, "2026-10-03T00:00:00Z");
+
+    expect(
+      store.transitionClaudeToLive({
+        instance,
+        expectedGeneration: 1,
+        expectedWriteClock: store.transitionWriteClock(),
+        snapshots: {},
+      }).method,
+    ).toBe("anthropic-live");
+    const archive = store.claudeTransition(instance)!.archiveInstance;
+    const archived = (
+      db
+        .prepare(
+          "SELECT json_extract(data, '$.blob_ref.blob_id') AS id FROM pdpp_record_changes WHERE instance = ?",
+        )
+        .all(archive) as { id: string }[]
+    ).map((row) => row.id);
+    expect(new Set(archived)).toEqual(
+      new Set([historyOnly, replacement, kept]),
+    );
+    store.close();
+    db.close();
+
+    // Next writable startup runs the stale-claim sweep and blob GC.
+    db = new Database(file);
+    store = createSqliteRecordStore(db);
+    for (const blobId of archived) {
+      expect(store.getBlobBytes(blobId), blobId).toBeDefined();
+    }
+    // Erasing the connection is the one explicit way the archive goes away.
+    store.deleteConnection(instance);
+    for (const blobId of archived)
+      expect(store.getBlobBytes(blobId), blobId).toBeUndefined();
+    store.close();
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

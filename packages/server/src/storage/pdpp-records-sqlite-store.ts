@@ -430,12 +430,19 @@ function migrate(db: Database): void {
 
 function sweepStaleBlobClaims(db: Database): void {
   db.transaction(() => {
+    // A Claude transition archive is retained history, not a registered
+    // instance: it has no binding row, so only the transition ledger vouches
+    // for its claims. Erasing the connection drops the ledger row and claims.
     db.exec(`
       DELETE FROM pdpp_blob_claims
       WHERE NOT EXISTS (
         SELECT 1 FROM pdpp_instance_binding b
         WHERE b.instance = pdpp_blob_claims.instance
           AND b.generation = pdpp_blob_claims.generation
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM pdpp_claude_transition t
+        WHERE t.archive_instance = pdpp_blob_claims.instance
       );
     `);
     deleteUnclaimedBlobs(db);
