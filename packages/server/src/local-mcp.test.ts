@@ -483,6 +483,40 @@ describe("repeated MCP OAuth authorize", () => {
     expect((await approve(first)).status).toBe(400);
   });
 
+  it.each([
+    ["main", "loopback"],
+    ["loopback", "main"],
+  ] as const)(
+    "binds a retry from %s to %s only to the new listener",
+    async (firstListener, latestListener) => {
+      const server = await startLocalServer();
+      const { clientId, approval: first } = await authorize(
+        server[firstListener],
+      );
+      const { approval: latest } = await authorize(
+        server[latestListener],
+        clientId,
+        RETRY_VERIFIER,
+      );
+
+      expect(pending(await connections(server))).toHaveLength(1);
+      const refused = await approve(first);
+      expect(refused.status).toBe(400);
+      expect(await refused.json()).toMatchObject({
+        error: { errorCode: "invalid_state" },
+      });
+      const token = await approveAndRedeem(
+        server[latestListener],
+        clientId,
+        latest,
+        RETRY_VERIFIER,
+      );
+      expect(typeof token).toBe("string");
+      expect(await listTools(`${server[latestListener]}/mcp`, token)).toBe(200);
+      expect(await listTools(`${server[firstListener]}/mcp`, token)).toBe(401);
+    },
+  );
+
   it("leaves another client's pending connection alone", async () => {
     const server = await startLocalServer();
     await authorize(server.loopback);
