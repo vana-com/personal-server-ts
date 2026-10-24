@@ -157,13 +157,14 @@ async function register(listener: string): Promise<string> {
 async function authorize(
   listener: string,
   registeredClientId?: string,
+  verifier = VERIFIER,
 ): Promise<{ clientId: string; approval: URL }> {
   const clientId = registeredClientId ?? (await register(listener));
   const query = new URLSearchParams({
     response_type: "code",
     client_id: clientId,
     redirect_uri: REDIRECT_URI,
-    code_challenge: await pkceChallenge(VERIFIER),
+    code_challenge: await pkceChallenge(verifier),
     code_challenge_method: "S256",
   });
   const response = await fetch(`${listener}/mcp/oauth/authorize?${query}`, {
@@ -178,8 +179,13 @@ async function authorize(
 /** Full OAuth flow on one listener: the owner approves, the client redeems. */
 async function connect(listener: string): Promise<string> {
   const { clientId, approval } = await authorize(listener);
+  return approveAndRedeem(listener, clientId, approval);
+}
+
+/** Owner approves the authorization behind `approval` with one grant. */
+async function approve(approval: URL): Promise<Response> {
   const authorizationId = approval.searchParams.get("mcp_authorization");
-  const approved = await fetch(
+  return fetch(
     `${approval.searchParams.get("ps_origin")}/v1/mcp/oauth/authorizations/${authorizationId}/approve`,
     {
       method: "POST",
@@ -192,6 +198,16 @@ async function connect(listener: string): Promise<string> {
       }),
     },
   );
+}
+
+/** Owner approves the authorization behind `approval`; the client redeems. */
+async function approveAndRedeem(
+  listener: string,
+  clientId: string,
+  approval: URL,
+  verifier = VERIFIER,
+): Promise<string> {
+  const approved = await approve(approval);
   const code = new URL((await approved.json()).redirectTo).searchParams.get(
     "code",
   );
@@ -201,7 +217,7 @@ async function connect(listener: string): Promise<string> {
     body: new URLSearchParams({
       grant_type: "authorization_code",
       code: code!,
-      code_verifier: VERIFIER,
+      code_verifier: verifier,
       client_id: clientId,
       redirect_uri: REDIRECT_URI,
     }),
@@ -420,5 +436,70 @@ describe("local MCP over the loopback listener", () => {
     );
     expect(tunnel.status).toBe(200);
     expect(tunnel.headers[allowOrigin]).toBe("*");
+  });
+});
+
+// A client that retries authorize (owner disconnected it, or it restarted
+// before approval) must leave the owner one row to answer, not one per try.
+describe("repeated MCP OAuth authorize", () => {
+  const RETRY_VERIFIER = "local-mcp-retry-verifier";
+
+  async function connections(server: LocalServer) {
+    const { connections } = await ownerGet(
+      server.loopback,
+      "/v1/mcp/connections",
+    );
+    return connections as Array<{ id: string; status: string }>;
+  }
+
+  function pending(list: Array<{ status: string }>) {
+    return list.filter((connection) => connection.status === "pending");
+  }
+
+  it("keeps one pending connection per client", async () => {
+    const server = await startLocalServer();
+    const { clientId } = await authorize(server.loopback);
+    await authorize(server.loopback, clientId);
+
+    expect(pending(await connections(server))).toHaveLength(1);
+  });
+
+  it("approves the latest flow", async () => {
+    const server = await startLocalServer();
+    const { clientId, approval: first } = await authorize(server.loopback);
+    const { approval: latest } = await authorize(
+      server.loopback,
+      clientId,
+      RETRY_VERIFIER,
+    );
+    const token = await approveAndRedeem(
+      server.loopback,
+      clientId,
+      latest,
+      RETRY_VERIFIER,
+    );
+
+    expect(await listTools(`${server.loopback}/mcp`, token)).toBe(200);
+    expect((await approve(first)).status).toBe(400);
+  });
+
+  it("leaves another client's pending connection alone", async () => {
+    const server = await startLocalServer();
+    await authorize(server.loopback);
+    await authorize(server.loopback);
+
+    expect(pending(await connections(server))).toHaveLength(2);
+  });
+
+  it("keeps the client's approved connection", async () => {
+    const server = await startLocalServer();
+    const { clientId, approval } = await authorize(server.loopback);
+    const token = await approveAndRedeem(server.loopback, clientId, approval);
+    await authorize(server.loopback, clientId, RETRY_VERIFIER);
+
+    const list = await connections(server);
+    expect(list.filter((c) => c.status === "approved")).toHaveLength(1);
+    expect(pending(list)).toHaveLength(1);
+    expect(await listTools(`${server.loopback}/mcp`, token)).toBe(200);
   });
 });
