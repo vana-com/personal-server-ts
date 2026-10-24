@@ -336,7 +336,7 @@ describe("createMcpSessionAuthPort", () => {
     });
     await expect(
       port.authorizeBuilderList(new Request("http://ps.local/")),
-    ).resolves.toEqual({ grantedScopes: ["instagram.profile"] });
+    ).resolves.toMatchObject({ grantedScopes: ["instagram.profile"] });
 
     const foreign = fakeGateway(grant({ grantorAddress: OTHER }));
     await expect(

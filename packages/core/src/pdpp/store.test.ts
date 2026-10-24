@@ -112,3 +112,23 @@ describe("insertGrantWithAuthCode", () => {
     );
   });
 });
+
+describe("client access-token expiration", () => {
+  it.each([null, "not-a-date", "Infinity"])(
+    "rejects nonfinite expiration %s before persistence",
+    (expiresAt) => {
+      expect(() =>
+        store.issueAccessToken({
+          token: "invalid-expiry",
+          grantId: null,
+          subjectId: "user_1",
+          clientId: "client_1",
+          tokenKind: "client",
+          expiresAt,
+          consumeSingleUse: false,
+        }),
+      ).toThrow(/finite expiration/);
+      expect(store.getAccessToken("invalid-expiry")).toBeNull();
+    },
+  );
+});

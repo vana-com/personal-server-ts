@@ -8,6 +8,13 @@ export interface DataBlockCursor {
   intraBlockOffset?: number;
   /** Identifies a read-time view of the version (see readBuiltScopeBlocks). */
   view?: string;
+  /**
+   * The generation of the version the paged read started on. A read that
+   * resumes the cursor on another version at the same collectedAt is
+   * refused instead of serving that version's bytes.
+   */
+  generation?: string;
+  representationId?: string;
 }
 
 export interface EncodeDataBlockCursorInput {
@@ -16,6 +23,8 @@ export interface EncodeDataBlockCursorInput {
   blockIndex: number;
   intraBlockOffset?: number;
   view?: string;
+  generation?: string;
+  representationId?: string;
 }
 
 export type DataBlockCursorErrorCode =
@@ -57,7 +66,13 @@ export function encodeDataBlockCursor(
       ...(input.intraBlockOffset === undefined
         ? {}
         : { intraBlockOffset: input.intraBlockOffset }),
+      ...(input.representationId === undefined
+        ? {}
+        : { representationId: input.representationId }),
       ...(input.view === undefined ? {} : { view: input.view }),
+      ...(input.generation === undefined
+        ? {}
+        : { generation: input.generation }),
     }),
   );
 }
@@ -107,7 +122,11 @@ export function decodeDataBlockCursor(
     !isNonNegativeInteger(candidate.blockIndex) ||
     (candidate.intraBlockOffset !== undefined &&
       !isNonNegativeInteger(candidate.intraBlockOffset)) ||
-    (candidate.view !== undefined && typeof candidate.view !== "string")
+    (candidate.view !== undefined && typeof candidate.view !== "string") ||
+    (candidate.representationId !== undefined &&
+      typeof candidate.representationId !== "string") ||
+    (candidate.generation !== undefined &&
+      typeof candidate.generation !== "string")
   ) {
     return malformedCursor("Cursor payload has invalid fields");
   }
@@ -122,14 +141,25 @@ export function decodeDataBlockCursor(
       ...(candidate.intraBlockOffset === undefined
         ? {}
         : { intraBlockOffset: candidate.intraBlockOffset }),
+      ...(typeof candidate.representationId === "string"
+        ? { representationId: candidate.representationId }
+        : {}),
       ...(typeof candidate.view === "string" ? { view: candidate.view } : {}),
+      ...(typeof candidate.generation === "string"
+        ? { generation: candidate.generation }
+        : {}),
     },
   };
 }
 
 export function validateDataBlockCursor(
   cursor: string,
-  expected: { scope: string; collectedAt: string; view?: string },
+  expected: {
+    scope: string;
+    collectedAt: string;
+    view?: string;
+    representationId?: string;
+  },
 ): ValidateDataBlockCursorResult {
   const decoded = decodeDataBlockCursor(cursor);
   if (!decoded.ok) return decoded;
@@ -150,6 +180,20 @@ export function validateDataBlockCursor(
       error: {
         code: "cursor_collected_at_mismatch",
         message: "Cursor collectedAt does not match requested collectedAt",
+      },
+    };
+  }
+
+  if (
+    decoded.cursor.representationId !== undefined &&
+    decoded.cursor.representationId !== expected.representationId
+  ) {
+    return {
+      ok: false,
+      error: {
+        code: "cursor_view_mismatch",
+        message:
+          "representation_mismatch: the block layout or serialization changed; restart without a cursor",
       },
     };
   }

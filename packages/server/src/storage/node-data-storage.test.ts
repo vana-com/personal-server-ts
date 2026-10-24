@@ -1,16 +1,44 @@
+import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { tmpdir } from "node:os";
 import type Database from "better-sqlite3";
 import { initializeDatabase } from "./index-schema.js";
 import { createIndexManager } from "./index-manager.js";
-import { createNodeDataStorage } from "./node-data-storage.js";
+import {
+  createNodeDataStorage,
+  recoverStagedDataFiles,
+} from "./node-data-storage.js";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataBlocks } from "@opendatalabs/personal-server-ts-core/storage/blocks/build";
+
+/**
+ * An oracle for a generation that does not use the code under test:
+ * SHA-256 (node:crypto) of the JSON value with object keys sorted.
+ */
+function oracleGeneration(value: unknown): string {
+  const sorted = JSON.stringify(value, (_key, item: unknown) =>
+    item !== null && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.entries(item as Record<string, unknown>).sort(([a], [b]) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          ),
+        )
+      : item,
+  );
+  return createHash("sha256").update(sorted).digest("hex");
+}
 
 describe("owner import deletion ordering", () => {
   it("preserves a new import accepted after scope retirement committed", async () => {
@@ -473,5 +501,192 @@ describe("createNodeDataStorage block sidecars", () => {
       page.blocks.reduce((sum, block) => sum + block.sizeBytes, 0),
     ).toBeLessThan(1200);
     expect(page.nextCursor).toBeDefined();
+  });
+});
+
+describe("immutable PDPP version provenance", () => {
+  async function openStorage() {
+    const root = await mkdtemp(join(tmpdir(), "pdpp-origin-"));
+    const dataDir = join(root, "data");
+    const db = initializeDatabase(join(root, "index.db"));
+    const index = createIndexManager(db);
+    const storage = createNodeDataStorage({
+      indexManager: index,
+      hierarchyOptions: { dataDir },
+    });
+    return {
+      db,
+      dataDir,
+      index,
+      storage,
+      async close() {
+        index.close();
+        await rm(root, { recursive: true, force: true });
+      },
+    };
+  }
+  const legacy = createDataFileEnvelope(
+    "oura.activity",
+    "2026-10-01T00:00:00Z",
+    { id: "legacy" },
+  );
+  const nativeBytes = {
+    ...legacy,
+    data: { id: "native", $pdpp: { version: 1 } },
+  };
+
+  it("refuses to replace a published version with different bytes", async () => {
+    const { storage, dataDir, index, close } = await openStorage();
+    try {
+      const written = await storage.writeEnvelope(legacy);
+      await storage.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        sizeBytes: written.sizeBytes,
+        pdppOrigin: false,
+      });
+      const selected = storage.findEntry({ scope: legacy.scope })!;
+
+      // Native PDPP bytes at the same scope and collectedAt, by every
+      // publication path of the port.
+      await expect(storage.writeEnvelope(nativeBytes)).rejects.toThrow(
+        "Stored envelope conflicts with publication",
+      );
+      await expect(
+        storage.commitVersion!({
+          kind: "replica",
+          envelope: nativeBytes,
+          metadata: { schemaId: null, dataPointId: "native", version: 1 },
+        }),
+      ).rejects.toThrow("conflicts with publication");
+      expect(
+        (await storage.readEnvelope(selected.scope, selected.collectedAt)).data,
+      ).toEqual({ id: "legacy" });
+      expect(storage.findEntry({ scope: legacy.scope })?.pdppOrigin).toBe(
+        false,
+      );
+      // The same bytes again are an idempotent republish.
+      await expect(storage.writeEnvelope(legacy)).resolves.toMatchObject({
+        relativePath: written.relativePath,
+      });
+
+      // commitEnvelope over a published file that has no index row.
+      const unindexed = { ...legacy, collectedAt: "2026-10-03T00:00:00Z" };
+      await storage.writeEnvelope(unindexed);
+      const revisionBefore = index.findLatestByScope(
+        unindexed.scope,
+      )?.casRevision;
+      await expect(
+        storage.commitEnvelope!(
+          { ...unindexed, data: nativeBytes.data },
+          {
+            fileId: null,
+            scope: unindexed.scope,
+            collectedAt: unindexed.collectedAt,
+          },
+        ),
+      ).rejects.toThrow("conflicts with publication");
+      expect(
+        (await storage.readEnvelope(unindexed.scope, unindexed.collectedAt))
+          .data,
+      ).toEqual({ id: "legacy" });
+      // The rejection leaves the index unchanged: no row, no revision, and no
+      // stage for boot recovery to finish later.
+      const unindexedPath = relative(
+        dataDir,
+        buildDataFilePath(dataDir, unindexed.scope, unindexed.collectedAt),
+      );
+      expect(index.findByPath(unindexedPath)).toBeUndefined();
+      expect(index.countByScope(unindexed.scope)).toBe(1);
+      expect(index.findLatestByScope(unindexed.scope)?.casRevision).toBe(
+        revisionBefore,
+      );
+      const leftovers = async () =>
+        (await readdir(dirname(join(dataDir, unindexedPath)))).filter((name) =>
+          name.includes(".pending."),
+        );
+      expect(await leftovers()).toEqual([]);
+      await recoverStagedDataFiles({
+        indexManager: index,
+        hierarchyOptions: { dataDir },
+      });
+      expect(index.findByPath(unindexedPath)).toBeUndefined();
+      expect(
+        (await storage.readEnvelope(unindexed.scope, unindexed.collectedAt))
+          .data,
+      ).toEqual({ id: "legacy" });
+
+      // An index row whose file was lost keeps its provenance.
+      await rm(join(dataDir, written.relativePath));
+      await expect(storage.writeEnvelope(nativeBytes)).rejects.toThrow(
+        "conflicts with publication",
+      );
+
+      // Two concurrent first publications of one path: exactly one wins.
+      const fresh = { ...legacy, collectedAt: "2026-10-02T00:00:00Z" };
+      const results = await Promise.allSettled([
+        storage.writeEnvelope({ ...fresh, data: { id: "first" } }),
+        storage.writeEnvelope({ ...fresh, data: nativeBytes.data }),
+      ]);
+      expect(
+        results.filter((result) => result.status === "fulfilled"),
+      ).toHaveLength(1);
+      const winner =
+        results[0].status === "fulfilled" ? { id: "first" } : nativeBytes.data;
+      expect(
+        (await storage.readEnvelope(fresh.scope, fresh.collectedAt)).data,
+      ).toEqual(winner);
+    } finally {
+      await close();
+    }
+  });
+
+  it("derives the version generation from the published bytes, not the caller", async () => {
+    const { storage, index, close } = await openStorage();
+    try {
+      const written = await storage.writeEnvelope(legacy);
+      const inserted = await storage.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        sizeBytes: written.sizeBytes,
+        generation: "caller-value",
+      });
+      // Key order does not change a generation; the stored bytes decide it.
+      const reordered = {
+        data: { id: "legacy" },
+        collectedAt: legacy.collectedAt,
+        scope: legacy.scope,
+        version: legacy.version,
+      };
+      expect(inserted.generation).toBe(oracleGeneration(reordered));
+      expect(index.findByPath(written.relativePath)?.generation).toBe(
+        inserted.generation,
+      );
+      // The sidecar built from the same envelope is bound to that generation.
+      const built = buildDataBlocks({
+        scope: legacy.scope,
+        collectedAt: legacy.collectedAt,
+        content: legacy,
+      });
+      expect(built.manifest.envelopeDigest).toBe(inserted.generation);
+
+      // commitEnvelope derives it from the envelope it publishes.
+      const committed = { ...legacy, collectedAt: "2026-10-04T00:00:00Z" };
+      await storage.commitEnvelope!(committed, {
+        fileId: null,
+        scope: committed.scope,
+        collectedAt: committed.collectedAt,
+        generation: "caller-value",
+      });
+      expect(storage.findEntry({ scope: committed.scope })?.generation).toBe(
+        oracleGeneration(committed),
+      );
+    } finally {
+      await close();
+    }
   });
 });

@@ -1,3 +1,4 @@
+import { createNodeDataStorage as reviewNodeStorage } from "../storage/node-data-storage.js";
 /**
  * Derivative data through the data routes: lineage on write (session and
  * owner, JSON and binary), the proxied lineage read, and cascade delete.
@@ -39,6 +40,8 @@ import { dataRoutes, type DataRouteDeps } from "./data.js";
 
 const SERVER_ORIGIN = "http://localhost:8080";
 const builderWallet = createTestWallet(0);
+// A second app: holds its own legacy read grant, never wrote the data.
+const otherWallet = createTestWallet(2);
 const ownerWallet = createTestWallet(9);
 
 const BUILDER_ID = "0xbuilder1";
@@ -107,6 +110,7 @@ function makeGrant(
 }
 
 const READ_REPORT_GRANT_ID = "grant-r-2";
+const CHAT_READ_GRANT_ID = "grant-r-chat";
 const REPORT_SCOPE = "spine.health.report";
 
 const grants: Record<string, GatewayGrantResponse> = {
@@ -207,6 +211,8 @@ describe("derivative data routes", () => {
       accessLogWriter,
       writeSessionStore,
       lineageGateway,
+      // Most tests are about lineage, not exposure: no PDPP surface here.
+      pdppEnabled: false,
     };
     app = dataRoutes(deps);
     cleanup = () => indexManager.close();
@@ -216,6 +222,27 @@ describe("derivative data routes", () => {
     cleanup();
     await rm(dataDir, { recursive: true, force: true });
   });
+
+  function appFor(wallet: ReturnType<typeof createTestWallet>) {
+    grants[CHAT_READ_GRANT_ID] = makeGrant({
+      id: CHAT_READ_GRANT_ID,
+      scopes: ["chatgpt.conversations"],
+    });
+    return dataRoutes({
+      ...deps,
+      gateway: createMockGateway({
+        getBuilder: vi.fn().mockResolvedValue({
+          id: BUILDER_ID,
+          ownerAddress: ownerWallet.address,
+          granteeAddress: wallet.address,
+          publicKey: "0x04key",
+          appUrl: "https://app.example.com",
+          addedAt: "2026-01-21T10:00:00.000Z",
+        } satisfies Builder),
+        getGrant: vi.fn(async (id: string) => grants[id] ?? null),
+      }),
+    });
+  }
 
   async function ownerHeader(method: string, uri: string, body?: string) {
     return buildWeb3SignedHeader({
@@ -981,6 +1008,713 @@ describe("derivative data routes", () => {
       expect(res.status).toBe(403);
       expect(accessLogWriter.write).not.toHaveBeenCalledWith(
         expect.objectContaining({ action: "lineage" }),
+      );
+    });
+  });
+
+  describe("HTTP lineage stamps the origin of the exact input consumed", () => {
+    it("positive control: a builder derivative citing a legacy-only, non-joined source stays readable", async () => {
+      await seedSource();
+      const write = await sessionWrite(DERIVED_SCOPE, {
+        summary: "legacy-only-summary",
+        lineage: [SOURCE_ID],
+      });
+      expect(write.status).toBe(201);
+      const stored = await (await ownerRead(DERIVED_SCOPE)).json();
+      expect(stored.data.$lineage.origin).toBe("legacy");
+      const read = await app.request(`/${DERIVED_SCOPE}`, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: `/${DERIVED_SCOPE}`,
+            grantId: READ_GRANT_ID,
+          }),
+        },
+      });
+      const text = await read.text();
+      expect(read.status, text).toBe(200);
+      expect(text).toContain("legacy-only-summary");
+    });
+
+    it("stamps an attested root (empty sources) legacy", async () => {
+      const res = await ownerWrite("notes.entries", {
+        note: "root",
+        lineage: [],
+      });
+      expect(res.status).toBe(201);
+      const envelope = await (await ownerRead("notes.entries")).json();
+      expect(envelope.data.$lineage.origin).toBe("legacy");
+    });
+  });
+  describe("round2 independent HTTP origin probes", () => {
+    async function seedJoinedPdpp() {
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      for (const envelope of [
+        {
+          version: "1.0",
+          scope: SOURCE_SCOPE,
+          collectedAt: "2026-09-01T00:00:00Z",
+          data: {
+            records: [
+              {
+                id: "conv-1",
+                title: "Trip",
+                create_time: "2026-09-01T00:00:00Z",
+                update_time: "2026-09-01T00:00:00Z",
+                current_node: "m1",
+                message_count_on_current_branch: 1,
+              },
+            ],
+          },
+        },
+        {
+          version: "1.0",
+          scope: "chatgpt.messages",
+          collectedAt: "2026-09-01T00:00:00Z",
+          producer: "pdpp-projector",
+          data: {
+            records: [
+              {
+                id: "m1",
+                conversation_id: "conv-1",
+                parent_id: null,
+                role: "user",
+                content: "review-synthetic-marker",
+                content_type: "text",
+                model_slug: null,
+                create_time: "2026-09-01T00:00:00Z",
+                on_current_branch: true,
+              },
+            ],
+          },
+        },
+      ]) {
+        const written = await raw.writeEnvelope(envelope as never);
+        await raw.insertEntry({
+          fileId: null,
+          path: written.relativePath,
+          scope: envelope.scope,
+          collectedAt: envelope.collectedAt,
+          sizeBytes: written.sizeBytes,
+        });
+      }
+      const served = await (await ownerRead(SOURCE_SCOPE)).json();
+      expect(served.producer).toBe("pdpp-projector");
+      expect(JSON.stringify(served)).toContain("review-synthetic-marker");
+      expect(raw.findEntry({ scope: SOURCE_SCOPE })?.pdppOrigin).toBe(false);
+      const stored = await raw.readEnvelope(
+        SOURCE_SCOPE,
+        "2026-09-01T00:00:00Z",
+      );
+      expect(
+        (stored as unknown as { producer?: string }).producer,
+      ).toBeUndefined();
+    }
+    async function builderRead(scope: string, grantId: string) {
+      return appFor(otherWallet).request(`/${scope}`, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: otherWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: `/${scope}`,
+            grantId,
+          }),
+        },
+      });
+    }
+    it("does not launder a joined projection through a builder JSON lineage write", async () => {
+      await seedJoinedPdpp();
+      const write = await sessionWrite(DERIVED_SCOPE, {
+        summary: "review-synthetic-marker",
+        lineage: [SOURCE_ID],
+      });
+      expect(write.status).toBe(201);
+      const output = await (await ownerRead(DERIVED_SCOPE)).json();
+      const read = await builderRead(DERIVED_SCOPE, READ_GRANT_ID);
+      const text = await read.text();
+      const leaked =
+        text.includes("review-synthetic-marker") ||
+        text.includes(
+          Buffer.from("review-synthetic-marker").toString("base64"),
+        );
+      console.log(
+        JSON.stringify({
+          probe: "http-json-joined",
+          origin: output.data.$lineage.origin,
+          status: read.status,
+          leakedSyntheticMarker: leaked,
+        }),
+      );
+      expect(read.status).toBe(403);
+    });
+    it("does not launder a joined projection through a builder binary lineage write", async () => {
+      await seedJoinedPdpp();
+      const bytes = new TextEncoder().encode("review-synthetic-marker");
+      const representation = {
+        contentType: "application/pdf",
+        filename: "report.pdf",
+        metadataHeader: JSON.stringify({ lineage: [SOURCE_ID] }),
+      };
+      const write = await app.request(`/${REPORT_SCOPE}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": representation.contentType,
+          "X-Filename": representation.filename,
+          "X-Vana-Metadata": representation.metadataHeader,
+          Authorization: `Bearer ${SESSION_TOKEN}`,
+          [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: `/${REPORT_SCOPE}`,
+            body: await binaryWriteSignedBytes({ bytes, ...representation }),
+            grantId: WRITE_GRANT_ID,
+          }),
+        },
+        body: bytes,
+      });
+      expect(write.status).toBe(201);
+      const output = await (await ownerRead(REPORT_SCOPE)).json();
+      const read = await builderRead(REPORT_SCOPE, READ_REPORT_GRANT_ID);
+      const text = await read.text();
+      const leaked =
+        text.includes("review-synthetic-marker") ||
+        text.includes(
+          Buffer.from("review-synthetic-marker").toString("base64"),
+        );
+      console.log(
+        JSON.stringify({
+          probe: "http-binary-joined",
+          origin: output.data.$lineage.origin,
+          status: read.status,
+          leakedSyntheticMarker: leaked,
+        }),
+      );
+      expect(read.status).toBe(403);
+    });
+    it("does not trust a pre-upgrade false provenance row on a builder lineage write", async () => {
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      const scope = "archive.answer";
+      const envelope = {
+        version: "1.0",
+        scope,
+        collectedAt: "2026-09-01T00:00:00Z",
+        data: {
+          answer: "review-synthetic-marker",
+          $lineage: { sources: [], writtenAt: "2026-09-01T00:00:00Z" },
+        },
+      };
+      const written = await raw.writeEnvelope(envelope);
+      deps.indexManager.insert({
+        fileId: null,
+        path: written.relativePath,
+        scope,
+        collectedAt: envelope.collectedAt,
+        sizeBytes: written.sizeBytes,
+        pdppOrigin: false,
+      });
+      const write = await sessionWrite(DERIVED_SCOPE, {
+        summary: "review-synthetic-marker",
+        lineage: [computeDataPointId(ownerWallet.address, scope)],
+      });
+      expect(write.status).toBe(201);
+      const output = await (await ownerRead(DERIVED_SCOPE)).json();
+      const read = await builderRead(DERIVED_SCOPE, READ_GRANT_ID);
+      console.log(
+        JSON.stringify({
+          probe: "http-preupgrade-row",
+          origin: output.data.$lineage.origin,
+          status: read.status,
+        }),
+      );
+      expect(read.status).toBe(403);
+    });
+  });
+
+  describe("a non-owner publication on a PDPP-enabled server is PDPP-origin", () => {
+    const MARKER = "exposure-synthetic-marker";
+
+    function usePdppEnabled(value: DataRouteDeps["pdppEnabled"]) {
+      deps.pdppEnabled = value;
+      app = dataRoutes(deps);
+    }
+    async function builderRead(scope: string, grantId: string) {
+      return appFor(otherWallet).request(`/${scope}`, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: otherWallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: `/${scope}`,
+            grantId,
+          }),
+        },
+      });
+    }
+    async function binaryWrite(metadata: unknown) {
+      const bytes = new TextEncoder().encode(MARKER);
+      const representation = {
+        contentType: "application/pdf",
+        filename: "report.pdf",
+        metadataHeader:
+          metadata === undefined ? undefined : JSON.stringify(metadata),
+      };
+      return app.request(`/${REPORT_SCOPE}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": representation.contentType,
+          "X-Filename": representation.filename,
+          ...(representation.metadataHeader
+            ? { "X-Vana-Metadata": representation.metadataHeader }
+            : {}),
+          Authorization: `Bearer ${SESSION_TOKEN}`,
+          [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+            wallet: builderWallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: `/${REPORT_SCOPE}`,
+            body: await binaryWriteSignedBytes({ bytes, ...representation }),
+            grantId: WRITE_GRANT_ID,
+          }),
+        },
+        body: bytes,
+      });
+    }
+
+    const jsonVariants: [string, () => Record<string, unknown>][] = [
+      [
+        "cites only a legacy scope",
+        () => ({ summary: MARKER, lineage: [OTHER_SOURCE_ID] }),
+      ],
+      ["cites an empty list", () => ({ summary: MARKER, lineage: [] })],
+      ["omits lineage", () => ({ summary: MARKER })],
+    ];
+
+    it.each(jsonVariants)(
+      "a builder's JSON write that %s is PDPP-origin and refused to a legacy grant",
+      async (_name, body) => {
+        await seedSource(OTHER_SOURCE_SCOPE);
+        usePdppEnabled(true);
+        expect((await sessionWrite(DERIVED_SCOPE, body())).status).toBe(201);
+        const read = await builderRead(DERIVED_SCOPE, READ_GRANT_ID);
+        const text = await read.text();
+        expect(read.status, text).toBe(403);
+        expect(text).not.toContain(MARKER);
+        expect((await (await ownerRead(DERIVED_SCOPE)).json()).producer).toBe(
+          "pdpp-derivative",
+        );
+      },
+    );
+
+    it.each([
+      ["cites only a legacy scope", () => ({ lineage: [OTHER_SOURCE_ID] })],
+      ["cites an empty list", () => ({ lineage: [] })],
+      ["omits lineage", () => undefined],
+    ])(
+      "a builder's binary write that %s is PDPP-origin and refused",
+      async (_name, metadata) => {
+        await seedSource(OTHER_SOURCE_SCOPE);
+        usePdppEnabled(true);
+        expect((await binaryWrite(metadata())).status).toBe(201);
+        const read = await builderRead(REPORT_SCOPE, READ_REPORT_GRANT_ID);
+        const text = await read.text();
+        expect(read.status, text).toBe(403);
+        expect(text).not.toContain(Buffer.from(MARKER).toString("base64"));
+      },
+    );
+
+    it("positive control: on a PDPP-disabled server a builder citing legacy-only sources stays readable (JSON and binary)", async () => {
+      await seedSource(OTHER_SOURCE_SCOPE);
+      usePdppEnabled(false);
+      expect(
+        (
+          await sessionWrite(DERIVED_SCOPE, {
+            summary: MARKER,
+            lineage: [OTHER_SOURCE_ID],
+          })
+        ).status,
+      ).toBe(201);
+      const json = await builderRead(DERIVED_SCOPE, READ_GRANT_ID);
+      expect(json.status, await json.text()).toBe(200);
+      expect((await binaryWrite({ lineage: [OTHER_SOURCE_ID] })).status).toBe(
+        201,
+      );
+      const binary = await builderRead(REPORT_SCOPE, READ_REPORT_GRANT_ID);
+      expect(binary.status, await binary.text()).toBe(200);
+    });
+
+    it("a builder with no PDPP binding of any kind is not exempt (no lookup exists to exempt it)", async () => {
+      await seedSource(OTHER_SOURCE_SCOPE);
+      usePdppEnabled(true);
+      expect(
+        (
+          await sessionWrite(DERIVED_SCOPE, {
+            summary: MARKER,
+            lineage: [OTHER_SOURCE_ID],
+          })
+        ).status,
+      ).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        403,
+      );
+    });
+
+    it("fails closed to PDPP when the PDPP-enabled state is unknown", async () => {
+      await seedSource(OTHER_SOURCE_SCOPE);
+      const write = () =>
+        sessionWrite(DERIVED_SCOPE, {
+          summary: MARKER,
+          lineage: [OTHER_SOURCE_ID],
+        });
+      // A failing lookup.
+      usePdppEnabled(() => {
+        throw new Error("config unavailable");
+      });
+      expect((await write()).status).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        403,
+      );
+      // Not supplied at all.
+      usePdppEnabled(undefined);
+      expect((await write()).status).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        403,
+      );
+    });
+
+    it("a server with PDPP disabled stays legacy", async () => {
+      await seedSource(OTHER_SOURCE_SCOPE);
+      usePdppEnabled(false);
+      expect(
+        (await sessionWrite(DERIVED_SCOPE, { summary: MARKER, lineage: [] }))
+          .status,
+      ).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        200,
+      );
+    });
+
+    it("a builder is refused even when the cited scope's PDPP version is no longer the latest", async () => {
+      // V1 PDPP, V2 legacy: citation checking would certify V2; the publication policy does not look.
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      for (const envelope of [
+        {
+          version: "1.0",
+          scope: OTHER_SOURCE_SCOPE,
+          collectedAt: "2026-09-01T00:00:00Z",
+          data: {
+            v: "one",
+            $pdpp: { version: 1, sourceId: "https://registry.pdpp.dev/oura" },
+          },
+        },
+        {
+          version: "1.0",
+          scope: OTHER_SOURCE_SCOPE,
+          collectedAt: "2026-09-02T00:00:00Z",
+          data: { v: "two" },
+        },
+      ]) {
+        const written = await raw.writeEnvelope(envelope as never);
+        await raw.insertEntry({
+          fileId: null,
+          path: written.relativePath,
+          scope: envelope.scope,
+          collectedAt: envelope.collectedAt,
+          sizeBytes: written.sizeBytes,
+        });
+      }
+      usePdppEnabled(true);
+      expect(
+        (
+          await sessionWrite(DERIVED_SCOPE, {
+            summary: MARKER,
+            lineage: [OTHER_SOURCE_ID],
+          })
+        ).status,
+      ).toBe(201);
+      expect((await builderRead(DERIVED_SCOPE, READ_GRANT_ID)).status).toBe(
+        403,
+      );
+    });
+  });
+
+  describe("the writing app can read its own write back; no other legacy grant can", () => {
+    const MARKER = "own-write-synthetic-marker";
+    const OTHER_TOKEN = "vana_write_other_token";
+
+    async function readAs(
+      wallet: ReturnType<typeof createTestWallet>,
+      path: string,
+      grantId = READ_GRANT_ID,
+    ) {
+      const [pathname] = path.split("?");
+      return appFor(wallet).request(path, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet,
+            aud: SERVER_ORIGIN,
+            method: "GET",
+            uri: pathname!,
+            grantId,
+          }),
+        },
+      });
+    }
+    async function writeAs(
+      wallet: ReturnType<typeof createTestWallet>,
+      token: string,
+      scope: string,
+      body: unknown,
+    ) {
+      const raw = JSON.stringify(body);
+      return appFor(wallet).request(`/${scope}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+            wallet,
+            aud: SERVER_ORIGIN,
+            method: "POST",
+            uri: `/${scope}`,
+            body: new TextEncoder().encode(raw),
+            grantId: WRITE_GRANT_ID,
+          }),
+        },
+        body: raw,
+      });
+    }
+    beforeEach(async () => {
+      deps.pdppEnabled = true;
+      await writeSessionStore.create({
+        tokenHash: await hashWriteSessionToken(OTHER_TOKEN),
+        builderAddress: otherWallet.address,
+        grantId: WRITE_GRANT_ID,
+        writeScopes: ["spine.*", "chatgpt.*"],
+        createdAt: new Date().toISOString(),
+        expiresAtMs: Date.now() + 60_000,
+      });
+    });
+
+    it("app A reads its own write back through its own legacy grant; app B cannot", async () => {
+      expect(
+        (
+          await writeAs(builderWallet, SESSION_TOKEN, DERIVED_SCOPE, {
+            v: MARKER,
+          })
+        ).status,
+      ).toBe(201);
+      const own = await readAs(builderWallet, `/${DERIVED_SCOPE}`);
+      const ownText = await own.text();
+      expect(own.status, ownText).toBe(200);
+      expect(ownText).toContain(MARKER);
+      // The server-stamped writer field still never reaches a grantee.
+      expect(ownText).not.toContain("$writtenBy");
+
+      const other = await readAs(otherWallet, `/${DERIVED_SCOPE}`);
+      const otherText = await other.text();
+      expect(other.status, otherText).toBe(403);
+      expect(otherText).not.toContain(MARKER);
+    });
+
+    it("a newer version by another writer is judged on its own bytes", async () => {
+      expect(
+        (
+          await writeAs(builderWallet, SESSION_TOKEN, DERIVED_SCOPE, {
+            v: MARKER,
+          })
+        ).status,
+      ).toBe(201);
+      const first = (await (await ownerRead(DERIVED_SCOPE)).json())
+        .collectedAt as string;
+      await new Promise((r) => setTimeout(r, 1100));
+      expect(
+        (await writeAs(otherWallet, OTHER_TOKEN, DERIVED_SCOPE, { v: "later" }))
+          .status,
+      ).toBe(201);
+      const latest = await readAs(builderWallet, `/${DERIVED_SCOPE}`);
+      expect(latest.status, await latest.text()).toBe(403);
+      const mine = await readAs(
+        builderWallet,
+        `/${DERIVED_SCOPE}?at=${encodeURIComponent(first)}`,
+      );
+      const mineText = await mine.text();
+      expect(mine.status, mineText).toBe(200);
+      expect(mineText).toContain(MARKER);
+    });
+
+    it("a projection that joins the app's write with another scope is refused", async () => {
+      const conv = {
+        records: [
+          {
+            id: "conv-1",
+            title: "Trip",
+            create_time: "2026-09-01T00:00:00Z",
+            update_time: "2026-09-01T00:00:00Z",
+            current_node: "m1",
+            message_count_on_current_branch: 1,
+          },
+        ],
+      };
+      expect(
+        (await writeAs(builderWallet, SESSION_TOKEN, SOURCE_SCOPE, conv))
+          .status,
+      ).toBe(201);
+      // A PDPP-stamped sibling the app did not write.
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      const messages = {
+        version: "1.0",
+        scope: "chatgpt.messages",
+        collectedAt: "2026-09-01T00:00:00Z",
+        producer: "pdpp-projector",
+        data: {
+          records: [
+            {
+              id: "m1",
+              conversation_id: "conv-1",
+              parent_id: null,
+              role: "user",
+              content: MARKER,
+              content_type: "text",
+              model_slug: null,
+              create_time: "2026-09-01T00:00:00Z",
+              on_current_branch: true,
+            },
+          ],
+        },
+      };
+      const written = await raw.writeEnvelope(messages as never);
+      await raw.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: messages.scope,
+        collectedAt: messages.collectedAt,
+        sizeBytes: written.sizeBytes,
+      });
+      const read = await readAs(
+        builderWallet,
+        `/${SOURCE_SCOPE}`,
+        CHAT_READ_GRANT_ID,
+      );
+      const text = await read.text();
+      expect(read.status, text).toBe(403);
+      expect(text).not.toContain(MARKER);
+    });
+    it("refuses an own conversation projection that would join another writer legacy messages", async () => {
+      const raw = reviewNodeStorage({
+        indexManager: deps.indexManager,
+        hierarchyOptions,
+      });
+      const sibling = {
+        version: "1.0",
+        scope: "chatgpt.messages",
+        collectedAt: "2026-09-01T00:00:00Z",
+        data: {
+          records: [
+            {
+              id: "m1",
+              conversation_id: "conv-1",
+              parent_id: null,
+              role: "user",
+              content: "other-writer-message-marker",
+              content_type: "text",
+              model_slug: null,
+              create_time: "2026-09-01T00:00:00Z",
+              on_current_branch: true,
+            },
+          ],
+        },
+      };
+      const written = await raw.writeEnvelope(sibling as never);
+      await raw.insertEntry({
+        fileId: null,
+        path: written.relativePath,
+        scope: sibling.scope,
+        collectedAt: sibling.collectedAt,
+        sizeBytes: written.sizeBytes,
+      });
+      expect(
+        (
+          await writeAs(builderWallet, SESSION_TOKEN, SOURCE_SCOPE, {
+            records: [
+              {
+                id: "conv-1",
+                title: "Trip",
+                create_time: "2026-09-01T00:00:00Z",
+                update_time: "2026-09-01T00:00:00Z",
+                current_node: "m1",
+                message_count_on_current_branch: 1,
+              },
+            ],
+          })
+        ).status,
+      ).toBe(201);
+      const read = await readAs(
+        builderWallet,
+        `/${SOURCE_SCOPE}`,
+        CHAT_READ_GRANT_ID,
+      );
+      const text = await read.text();
+      console.log(
+        JSON.stringify({
+          probe: "own-write-legacy-join",
+          status: read.status,
+          otherWriterBytes: text.includes("other-writer-message-marker"),
+          body: text,
+        }),
+      );
+      expect(read.status).toBe(403);
+    });
+    it("reader cache eviction never shares an authorized writer view", async () => {
+      const { withLegacyProjection } =
+        await import("@opendatalabs/personal-server-ts-core/storage/legacy-projection");
+      deps.dataStorage = withLegacyProjection(
+        reviewNodeStorage({
+          indexManager: deps.indexManager,
+          hierarchyOptions,
+        }),
+      );
+      expect(
+        (
+          await writeAs(builderWallet, SESSION_TOKEN, DERIVED_SCOPE, {
+            value: MARKER,
+          })
+        ).status,
+      ).toBe(201);
+      expect((await readAs(builderWallet, `/${DERIVED_SCOPE}`)).status).toBe(
+        200,
+      );
+      for (let i = 3; i < 23; i++) {
+        if (i === 9) continue;
+        const other = createTestWallet(i);
+        const res = await readAs(other, `/${DERIVED_SCOPE}`);
+        expect(res.status, await res.clone().text()).toBe(403);
+      }
+      expect((await readAs(builderWallet, `/${DERIVED_SCOPE}`)).status).toBe(
+        200,
+      );
+      console.log(
+        JSON.stringify({
+          probe: "cache-eviction",
+          writerBefore: 200,
+          otherReadersDenied: 19,
+          writerAfter: 200,
+        }),
       );
     });
   });

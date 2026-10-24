@@ -866,14 +866,9 @@ describe("mcp/tools", () => {
       value: { id: 1 },
       sizeBytes: 20,
     };
+    // The read reports the size of the version it selected.
     const makeClient = (sizeBytes: number) =>
       createMinimalReadClient({
-        getScopeMetadata: vi.fn(async (scope: string) => ({
-          scope,
-          collectedAt: "2026-06-05T00:00:00Z",
-          sizeBytes,
-          hasBlocks: true,
-        })),
         readScopeBlocks: vi.fn().mockResolvedValue({
           scope: "instagram.profile",
           collectedAt: "2026-06-05T00:00:00Z",
@@ -881,6 +876,7 @@ describe("mcp/tools", () => {
           blocks: [block],
           nextCursor: "cursor-2",
           warnings: [],
+          scopeSizeBytes: sizeBytes,
         }),
       });
 

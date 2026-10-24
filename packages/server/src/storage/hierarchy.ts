@@ -1,5 +1,6 @@
 import {
   access,
+  link,
   mkdir,
   open,
   readFile,
@@ -35,24 +36,21 @@ import {
 import {
   buildDataFilePath,
   buildScopeDir,
+  canonicalJson,
+  envelopeGeneration,
   filenameToTimestamp,
   type HierarchyManagerOptions,
   type WriteResult,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import {
   DataBlockStorageError,
-  encodeDataBlockCursor,
-  selectScopeBlocksByIds,
-  validateDataBlockCursor,
+  readManifestScopeBlocks,
   type DataBlockManifest,
   type DataScopeBlock,
   type ReadScopeBlocksResponse,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import { previewJsonEnvelopePrefix } from "@opendatalabs/personal-server-ts-core/storage/preview";
-
-const TEXT_PAGE_MEDIA_TYPE = "text/plain; charset=utf-8";
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 function syncDirectory(path: string): void {
   if (process.platform === "win32") return;
@@ -241,8 +239,19 @@ export async function stageDataFile(
   stagePath: string;
   relativePath: string;
   sizeBytes: number;
+  /**
+   * Provenance and generation of the bytes staged, taken with the same
+   * snapshot of `envelope` as the bytes, before any await: a caller that
+   * changes its object later cannot change what is recorded.
+   */
+  identity: { pdppOrigin: boolean; generation: string };
 }> {
   const openFile = deps.openFile ?? open;
+  const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
+  const identity = {
+    pdppOrigin: hasPdppOrigin(envelope),
+    generation: envelopeGeneration(envelope),
+  };
   const finalPath = buildDataFilePath(
     options.dataDir,
     envelope.scope,
@@ -252,7 +261,6 @@ export async function stageDataFile(
   const directorySyncPaths = collectDirectorySyncPaths(finalDir);
   await mkdir(finalDir, { recursive: true });
   const stagePath = `${finalPath}.pending.${randomUUID()}`;
-  const bytes = Buffer.from(JSON.stringify(envelope, null, 2), "utf-8");
   const handle = await openFile(stagePath, "wx");
   try {
     await handle.writeFile(bytes);
@@ -273,6 +281,7 @@ export async function stageDataFile(
     stagePath,
     relativePath: relative(options.dataDir, finalPath),
     sizeBytes: bytes.length,
+    identity,
   };
 }
 
@@ -287,11 +296,63 @@ function collectDirectorySyncPaths(finalDir: string): string[] {
   }
 }
 
+/** Two serialized envelopes with the same content, in any key order. */
+function sameEnvelope(a: Buffer, b: Buffer): boolean {
+  try {
+    return (
+      canonicalJson(JSON.parse(a.toString("utf8"))) ===
+      canonicalJson(JSON.parse(b.toString("utf8")))
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fail when a file already published at `finalPath` holds a different
+ * envelope than the staged one. Nothing is published or changed. Callers run
+ * it before committing an index row, so a rejected publication leaves no row
+ * describing bytes that are not there.
+ */
+export async function assertPublishable(
+  stagePath: string,
+  finalPath: string,
+): Promise<void> {
+  let published: Buffer;
+  try {
+    published = await readFile(finalPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+  const staged = await readFile(stagePath);
+  if (!published.equals(staged) && !sameEnvelope(published, staged)) {
+    throw new Error(
+      `Stored envelope conflicts with publication at ${finalPath}`,
+    );
+  }
+}
+
+/**
+ * Publish a staged envelope at its version path without replacing one.
+ *
+ * A version path names immutable bytes. Readers authorize the version they
+ * selected, including its PDPP provenance, and only then read the path, so
+ * different bytes appearing there would bypass that decision. The same
+ * envelope (in any key order) republishes idempotently and keeps the stored
+ * bytes; a different envelope fails, as in `publishDataFile`.
+ */
 export async function publishStagedDataFile(
   stagePath: string,
   finalPath: string,
 ): Promise<void> {
-  await rename(stagePath, finalPath);
+  try {
+    await link(stagePath, finalPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    await assertPublishable(stagePath, finalPath);
+  }
+  await unlink(stagePath);
   const directory = await open(dirname(finalPath), "r");
   try {
     await directory.sync();
@@ -461,93 +522,15 @@ export async function readScopeBlocks(
     cursor?: string;
     maxBytes: number;
     blockIds?: readonly string[];
+    representation?: "stored" | "grantee";
   },
 ): Promise<ReadScopeBlocksResponse> {
   const manifest = await readBlockManifest(options, scope, collectedAt);
-
-  if (readOptions.blockIds?.length) {
-    const selection = await selectScopeBlocksByIds(
-      manifest,
-      readOptions.blockIds,
-      { maxBytes: readOptions.maxBytes },
-      (blockId) =>
-        readBlockPayloadIfPresent(options, scope, collectedAt, blockId),
-    );
-    return {
-      scope: manifest.scope,
-      collectedAt: manifest.collectedAt,
-      ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
-      contentKind: manifest.contentKind,
-      blocks: selection.blocks,
-      warnings: [...manifest.warnings, ...selection.warnings],
-    };
-  }
-
-  const cursor = readOptions.cursor
-    ? validateDataBlockCursor(readOptions.cursor, { scope, collectedAt })
-    : undefined;
-
-  if (cursor && !cursor.ok) {
-    throw new DataBlockStorageError("cursor_invalid", cursor.error.message);
-  }
-
-  const maxBytes = Math.max(1, readOptions.maxBytes);
-  const startIndex = cursor?.ok ? cursor.cursor.blockIndex : 0;
-  const startOffset = cursor?.ok ? (cursor.cursor.intraBlockOffset ?? 0) : 0;
-  const blocks: DataScopeBlock[] = [];
-  let totalBytes = 0;
-  let nextIndex = startIndex;
-  let nextOffset: number | undefined;
-
-  while (nextIndex < manifest.blocks.length) {
-    const ref = manifest.blocks[nextIndex]!;
-    const offset = nextIndex === startIndex ? startOffset : 0;
-    if (offset >= ref.sizeBytes) {
-      nextIndex++;
-      continue;
-    }
-    if (
-      blocks.length > 0 &&
-      offset === 0 &&
-      totalBytes + ref.sizeBytes > maxBytes
-    )
-      break;
-
-    const block = await readBlockPayload(options, scope, collectedAt, ref.id);
-    const page = pageBlock(block, offset, maxBytes - totalBytes);
-    blocks.push(page.block);
-    totalBytes += page.block.sizeBytes;
-
-    if (page.nextOffset !== undefined) {
-      nextOffset = page.nextOffset;
-      break;
-    }
-
-    nextIndex++;
-
-    if (totalBytes >= maxBytes) break;
-  }
-
-  return {
-    scope: manifest.scope,
-    collectedAt: manifest.collectedAt,
-    ...(manifest.schemaId ? { schemaId: manifest.schemaId } : {}),
-    contentKind: manifest.contentKind,
-    blocks,
-    ...(nextOffset !== undefined || nextIndex < manifest.blocks.length
-      ? {
-          nextCursor: encodeDataBlockCursor({
-            scope,
-            collectedAt,
-            blockIndex: nextIndex,
-            ...(nextOffset === undefined
-              ? {}
-              : { intraBlockOffset: nextOffset }),
-          }),
-        }
-      : {}),
-    warnings: manifest.warnings,
-  };
+  return readManifestScopeBlocks(
+    manifest,
+    (id) => readBlockPayloadIfPresent(options, scope, collectedAt, id),
+    readOptions,
+  );
 }
 
 /**
@@ -712,37 +695,6 @@ async function readBlockPayloadIfPresent(
     }
     throw err;
   }
-}
-
-function pageBlock(
-  block: DataScopeBlock,
-  offsetBytes: number,
-  maxBytes: number,
-): { block: DataScopeBlock; nextOffset?: number } {
-  const text =
-    typeof block.value === "string" ? block.value : JSON.stringify(block.value);
-  const bytes = textEncoder.encode(text);
-  if (offsetBytes <= 0 && bytes.length <= maxBytes) {
-    return { block };
-  }
-
-  const start = Math.min(Math.max(0, offsetBytes), bytes.length);
-  const end = Math.min(bytes.length, start + Math.max(1, maxBytes));
-  const value = textDecoder.decode(bytes.slice(start, end));
-
-  return {
-    block: {
-      ...block,
-      path: `${block.path}[bytes ${start}:${end}]`,
-      mediaType: block.mediaType.startsWith("text/")
-        ? block.mediaType
-        : TEXT_PAGE_MEDIA_TYPE,
-      value,
-      sizeBytes: end - start,
-      truncated: end < bytes.length,
-    },
-    ...(end < bytes.length ? { nextOffset: end } : {}),
-  };
 }
 
 async function deleteBlockSidecars(

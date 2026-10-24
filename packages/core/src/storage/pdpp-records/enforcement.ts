@@ -1,6 +1,7 @@
 import { grantIsCandidate } from "../../pdpp/types.js";
 import { PdppError } from "../../errors/pdpp-catalog.js";
 import {
+  type PdppAuthorizationService,
   findStreamGrant,
   grantIsV02,
   withinTimeConstraint,
@@ -8,6 +9,12 @@ import {
   type StreamGrant,
 } from "../../ports/pdpp-auth.js";
 import type { StreamDeclaration } from "./stream-declaration.js";
+import {
+  evidenceTime,
+  remoteEvidence,
+  type DeliveryLease,
+  type EvidenceTime,
+} from "../../policy/delivery-lease.js";
 
 /**
  * Resolves a request-time authorization context to the effective read
@@ -225,4 +232,155 @@ export function mapInactiveToError(context: PdppTokenContext): PdppError {
         "Missing or invalid access token",
       );
   }
+}
+
+/** What the chain said about a PDPP grant's permission, carried by the lease. */
+export interface PdppChainEvidence {
+  /** The permission's expiry (ISO 8601); absent or null when it has none. */
+  expiresAt?: string | null;
+}
+
+/**
+ * A bearer as admitted: the token, what it resolved to, and when the
+ * resolution started. The time is part of the admission because a remote
+ * AS's answer is as old as the moment its introspection started; a lease
+ * built from an admission cannot date it later.
+ */
+export interface BearerAdmission {
+  readonly token: string;
+  readonly context: PdppTokenContext;
+  readonly resolvedAt: EvidenceTime;
+}
+
+/** Resolve a bearer, dated before the resolution is awaited. */
+export async function admitBearer(
+  auth: Pick<PdppAuthorizationService, "resolveToken">,
+  token: string,
+): Promise<BearerAdmission> {
+  const resolvedAt = evidenceTime();
+  const context = await auth.resolveToken(token);
+  return { token, context, resolvedAt };
+}
+
+/**
+ * The connections a read result was selected from, as a release dependency:
+ * once any of them is unavailable (deleted or unbound), the release refuses
+ * with `instance_unavailable`. A selection holds exactly the connections it
+ * used; an aggregate (stream discovery) holds all of its own.
+ */
+export function connectionsLease(
+  instanceIds: readonly string[],
+  isConnectionAvailable: ((instance: string) => boolean) | undefined,
+): DeliveryLease {
+  const held = [...new Set(instanceIds)];
+  return {
+    evidence: () => [],
+    assertLocal() {
+      for (const instance of held) {
+        if (isConnectionAvailable?.(instance) === false) {
+          throw new PdppError(
+            "instance_unavailable",
+            "The connection for this grant is unavailable",
+          );
+        }
+      }
+    },
+  };
+}
+
+/**
+ * The bearer half of a PDPP read's release dependencies (records, metadata,
+ * discovery and blobs). See `policy/delivery-lease.ts` for the release rule.
+ * What the read selected (its connections) is a separate dependency, produced
+ * by the selection (`connectionsLease`).
+ *
+ * Remote evidence: the chain permission, when the deployment enforces one
+ * (its answer carries the permission's expiry); and, for a remote AS, its
+ * introspection answer. Each is dated from when its check started
+ * (`verifiedAt`), and `deliver` asks it again once it is older than
+ * `REMOTE_GRANT_REVERIFY_AFTER_MS` (30 s).
+ *
+ * Local checks, synchronous, at release: the bearer resolved again (a local
+ * AS through `resolveTokenNow`, which reports a revoked or expired grant, a
+ * revoked or expired token, and a revoked refresh family; a remote AS's last
+ * answer); the same grant the read was admitted under; and every carried
+ * token, PDPP grant and chain deadline. Malformed deadlines fail closed.
+ */
+export function pdppBearerReadLease(
+  auth: PdppAuthorizationService,
+  admission: BearerAdmission,
+  options: {
+    chain?: {
+      admitted: PdppChainEvidence;
+      reverify: () => Promise<PdppChainEvidence>;
+      verifiedAt?: EvidenceTime;
+    };
+  } = {},
+): DeliveryLease {
+  if (auth.locality !== "local" && auth.locality !== "remote") {
+    // Fail closed: the lease cannot know how to re-check this bearer.
+    throw new PdppError(
+      "api_error",
+      "The PDPP authorization server's locality is not declared",
+    );
+  }
+  const { token, context: admitted, resolvedAt } = admission;
+  const grantId = admitted.grant?.grant_id;
+  const chain = options.chain
+    ? remoteEvidence(options.chain.admitted, options.chain.reverify, {
+        ...(options.chain.verifiedAt && {
+          verifiedAt: options.chain.verifiedAt,
+        }),
+      })
+    : undefined;
+  const remoteAs =
+    auth.locality === "remote"
+      ? remoteEvidence(admitted, () => auth.resolveToken(token), {
+          verifiedAt: resolvedAt,
+        })
+      : undefined;
+  const evidence = [chain, remoteAs].filter(
+    (piece): piece is NonNullable<typeof piece> => piece !== undefined,
+  );
+  return {
+    evidence: () => evidence,
+    assertLocal() {
+      const current =
+        auth.locality === "local"
+          ? auth.resolveTokenNow(token)
+          : remoteAs!.current;
+      if (!current.active) throw mapInactiveToError(current);
+      if (current.grant?.grant_id !== grantId) {
+        throw mapInactiveToError({ active: false, inactiveReason: "unknown" });
+      }
+      const now = Date.now();
+      if (
+        current.expiresAt !== undefined &&
+        !liveDeadline(current.expiresAt, now)
+      ) {
+        throw mapInactiveToError({ active: false, inactiveReason: "expired" });
+      }
+      const grantExpiry = current.grant?.expires_at;
+      if (grantExpiry !== undefined && !liveDeadline(grantExpiry, now)) {
+        throw mapInactiveToError({
+          active: false,
+          inactiveReason: "grant_expired",
+        });
+      }
+      const chainExpiry = chain?.current.expiresAt;
+      if (
+        chainExpiry !== undefined &&
+        chainExpiry !== null &&
+        !liveDeadline(chainExpiry, now)
+      ) {
+        throw new PdppError("grant_expired", "Chain permission has expired");
+      }
+    },
+  };
+}
+
+/** A carried deadline is authority, even before remote evidence ages out. */
+function liveDeadline(deadline: string, now: number): boolean {
+  const at = Date.parse(deadline);
+  return Number.isFinite(at) && at > now;
 }

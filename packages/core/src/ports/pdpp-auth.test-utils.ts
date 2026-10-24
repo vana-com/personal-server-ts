@@ -1,5 +1,5 @@
 import type {
-  PdppAuthorizationService,
+  LocalPdppAuthorizationService,
   PdppTokenContext,
 } from "./pdpp-auth.js";
 
@@ -11,16 +11,18 @@ import type {
  */
 export function createFixtureAuthorizationService(
   tokens: Record<string, PdppTokenContext>,
-): PdppAuthorizationService {
+): LocalPdppAuthorizationService {
+  const resolveTokenNow = (accessToken: string): PdppTokenContext =>
+    tokens[accessToken] ?? {
+      active: false,
+      tokenKind: "client",
+      subjectId: "",
+    };
   return {
+    locality: "local",
+    resolveTokenNow,
     async resolveToken(accessToken: string): Promise<PdppTokenContext> {
-      return (
-        tokens[accessToken] ?? {
-          active: false,
-          tokenKind: "client",
-          subjectId: "",
-        }
-      );
+      return resolveTokenNow(accessToken);
     },
   };
 }

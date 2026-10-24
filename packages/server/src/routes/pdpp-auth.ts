@@ -39,6 +39,10 @@
  *     an instance to pick.
  */
 
+import {
+  oauthBearerErrorResponse,
+  type PdppProtocolProfile,
+} from "../pdpp/bearer-response.js";
 import { Hono, type Context } from "hono";
 import type { Logger } from "pino";
 import { readNamedQueryValues } from "./pdpp-auth-query-keys.js";
@@ -92,7 +96,7 @@ export const OWNER_TOKEN_TTL_SECONDS = 15 * 60;
 
 export interface PdppAuthRouteDeps {
   /** Candidate protocol behavior is opt-in per deployment. */
-  protocolProfile?: "current" | "candidate-0.1.0";
+  protocolProfile?: PdppProtocolProfile;
   logger: Logger;
   store: PdppAuthStore;
   tokens: PdppTokenService;
@@ -189,7 +193,7 @@ export interface PdppAuthRouteDeps {
   issuer?: string | (() => string);
 }
 
-function errorResponse(
+function oauthErrorResponse(
   c: Context,
   status: 400 | 401 | 403 | 404 | 409 | 500,
   error: string,
@@ -350,15 +354,6 @@ function grantContainedByOwnerScope(
   );
 }
 
-function scopedOwnerFailureResponse(c: Context, failure: ApprovalFailure) {
-  return errorResponse(
-    c,
-    failure.code === "access_denied" ? 403 : approvalStatus(failure.code),
-    approvalOAuthError(failure.code),
-    failure.message,
-  );
-}
-
 /**
  * Negotiate `PDPP-Version` (§7 version layering, §9 AS item 17).
  *
@@ -396,7 +391,7 @@ export function pdppAsMetadataHandler(
     const issuer =
       typeof issuerSource === "function" ? issuerSource() : issuerSource;
     if (!issuer) {
-      return errorResponse(
+      return oauthErrorResponse(
         c,
         404,
         "not_found",
@@ -434,6 +429,40 @@ export function pdppAsMetadataHandler(
 
 export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
   const app = new Hono();
+
+  /**
+   * The route's OAuth error, except that a 401 caused by a missing or
+   * inactive bearer goes through the shared bearer adapter, which owns the
+   * profile-dependent wire form.
+   */
+  function errorResponse(
+    c: Context,
+    status: 400 | 401 | 403 | 404 | 409 | 500,
+    error: string,
+    description: string,
+    credential?: "bearer",
+  ) {
+    if (status === 401 && credential === "bearer") {
+      return oauthBearerErrorResponse(
+        c,
+        error,
+        description,
+        deps.protocolProfile,
+        NO_STORE,
+      );
+    }
+    return oauthErrorResponse(c, status, error, description);
+  }
+
+  function scopedOwnerFailureResponse(c: Context, failure: ApprovalFailure) {
+    return errorResponse(
+      c,
+      failure.code === "access_denied" ? 403 : approvalStatus(failure.code),
+      approvalOAuthError(failure.code),
+      failure.message,
+      "bearer",
+    );
+  }
 
   // The selected version echoes back on every response (§9 AS item 17).
   app.use("*", async (c, next) => {
@@ -1271,6 +1300,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         401,
         "invalid_client",
         "the resource server must authenticate to introspect",
+        "bearer",
       );
     }
     const caller = deps.tokens.resolveToken(callerToken);
@@ -1280,6 +1310,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         401,
         "invalid_client",
         "introspection requires an authenticated resource server",
+        "bearer",
       );
     }
     if (!caller.subjectId) {
@@ -1437,7 +1468,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         sourceId?: string;
         instanceIds?: string[];
       }
-    | { ok: false; response: ReturnType<typeof errorResponse> } {
+    | { ok: false; response: Response } {
     const ownerToken = bearer(c);
     if (!ownerToken) {
       return {
@@ -1447,6 +1478,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
           401,
           "unauthorized",
           "an owner token is required",
+          "bearer",
         ),
       };
     }
@@ -1459,6 +1491,7 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
           401,
           "unauthorized",
           "an active owner token is required",
+          "bearer",
         ),
       };
     }

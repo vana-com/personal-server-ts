@@ -1,5 +1,16 @@
 import type { DurableAdditionsService } from "../additions/durable.js";
+import type { IndexEntry } from "../storage/index/types.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
+import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
+import {
+  allDeliveryLeases,
+  collectDeliveryLeases,
+  deliver,
+  localLease,
+  type DeliveryLease,
+} from "../policy/delivery-lease.js";
+import { storageForReader } from "../storage/disclosure-policy.js";
+import { redactEnvelopeForGrantee } from "../storage/read-evidence.js";
 import {
   DataDeletedError,
   DeleteTombstoneFailedError,
@@ -24,7 +35,8 @@ import {
   isEntryCoveredByTombstone,
   type ScopeDeletionTracker,
 } from "../sync/scope-deletions.js";
-import type { IndexEntry, ScopeSummary } from "../storage/index/types.js";
+import type { ScopeSummary } from "../storage/index/types.js";
+import { PdppError } from "../errors/pdpp-catalog.js";
 import {
   isPermanentRejection,
   type PdppImporter,
@@ -82,16 +94,17 @@ import type {
 } from "@opendatalabs/vana-sdk/browser";
 import { scopeCoveredByGrant } from "@opendatalabs/vana-sdk/browser";
 import type { ServerSigner } from "../signing/index.js";
-import {
-  WRITER_ATTRIBUTION_KEY,
-  type WriterAttribution,
-} from "../write/attribution.js";
+import type { WriterAttribution } from "../write/attribution.js";
 import {
   extractLineageField,
-  LINEAGE_KEY,
   prepareLineage,
   type StoredLineage,
 } from "../lineage/lineage.js";
+import {
+  nonOwnerPublicationIsPdpp,
+  type PdppEnabled,
+} from "../policy/publication-origin.js";
+import { citedSourcesHavePdppOrigin } from "../lineage/cited-origin.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import {
   deletionHistoryOf,
@@ -132,6 +145,12 @@ export interface PersonalServerReadAuthInput {
 export interface PersonalServerReadAuthResult {
   builder?: `0x${string}` | string;
   grantId?: string;
+  /**
+   * The grant-liveness half of the read's delivery lease (see
+   * `policy/delivery-lease.ts`). Absent for reads no grant mediates (owner,
+   * policy bypass, a static bearer): those have nothing to revoke.
+   */
+  lease?: DeliveryLease;
 }
 
 export interface PersonalServerWriteAuthInput {
@@ -232,13 +251,19 @@ export interface PersonalServerReadFulfillmentReporter {
 }
 
 /**
- * What a non-owner caller may see in a data listing: the scope patterns of
- * the grants it holds from this server's owner. Only scopes they cover are
- * listed, and versions of any other scope are refused.
+ * Permitted scopes, presentation and delivery authority for a data listing.
+ * A grantee sees its grants' scopes; a scoped owner bridge retains owner
+ * presentation without dropping the bearer lease.
  */
-export interface PersonalServerListAuthResult {
+export type PersonalServerListAuthResult = {
   grantedScopes: readonly string[];
-}
+} &
+  // Scoped bearer owners carry a lease without losing owner presentation.
+  (
+    | { view: "owner"; lease: DeliveryLease }
+    // Omitted view retains compatibility with existing grantee auth ports.
+    | { view?: "grantee"; lease?: DeliveryLease }
+  );
 
 export interface PersonalServerApiAuthPort {
   authorizeOwner(request: Request): Promise<void>;
@@ -261,8 +286,9 @@ export interface PersonalServerApiAuthPort {
   /**
    * Authorize listing versions for one legacy scope. Optional so auth ports
    * without scoped owner-token support keep the `authorizeBuilderList` gate.
-   * Returns what `authorizeBuilderList` does: void is a full listing, a
-   * result names the scopes a non-owner may see.
+   * A result retains permitted scopes, presentation and release authority.
+   * A scoped bearer owner returns an explicit owner view with its lease;
+   * void remains the existing full-listing owner contract.
    */
   authorizeScopeVersions?(
     input: PersonalServerScopeAuthInput,
@@ -407,6 +433,12 @@ export interface PersonalServerDataApiDeps {
    */
   lineageGateway?: LineageGatewayPort;
   /**
+   * Whether this server has a PDPP surface. Every non-owner publication is
+   * PDPP-origin unless this is explicitly `false` (see
+   * `nonOwnerPublicationIsPdpp`); absent fails closed.
+   */
+  pdppEnabled?: PdppEnabled;
+  /**
    * Called after a write is committed (owner or builder, JSON or binary).
    * The derivative compute layer uses it to mark questions that read the
    * scope stale; the recompute itself waits for a reader (see onDataRead).
@@ -498,6 +530,13 @@ export interface PersonalServerOauthTokenApiDeps {
 
 export interface PersonalServerApiDispatchOptions {
   basePath?: string;
+  /**
+   * Receives the delivery lease of a body this request releases. An in-process
+   * caller that keeps working on the body (the MCP read client materializing
+   * a raw file into a tool result) holds the read to it until its own final
+   * release.
+   */
+  onDeliveryLease?: (lease: DeliveryLease) => void;
 }
 
 type JsonStatus =
@@ -646,6 +685,11 @@ async function withApiErrors(
     if (err instanceof ProtocolError) {
       return protocolErrorResponse(err);
     }
+    if (err instanceof PdppError) {
+      return protocolErrorResponse(
+        new ProtocolError(err.status, err.code.toUpperCase(), err.message),
+      );
+    }
     if (context) {
       context.logger?.error?.(
         {
@@ -771,6 +815,8 @@ function listAuthCovers(
 }
 
 export interface X402CycleInput {
+  /** Entry snapshot returned with an already-read response; never reselect it. */
+  selectedEntry?: Pick<IndexEntry, "dataPointId" | "scope" | "version">;
   deps: PersonalServerDataApiDeps;
   request: Request;
   scope: string;
@@ -812,6 +858,23 @@ export async function handleX402Cycle(
   // same in the challenge so the builder signs over the canonical form.
   const opIdLower = input.grantId.toLowerCase() as `0x${string}`;
 
+  // Bind the accessRecord to the entry being served, if it exists and has
+  // been registered with DPv2 yet.
+  const entryRow =
+    input.selectedEntry ??
+    deps.storage.findEntry({
+      scope,
+      fileId: input.fileIdParam,
+      at: input.atParam,
+    });
+  const entryForChallenge = entryRow
+    ? {
+        dataPointId: entryRow.dataPointId as `0x${string}` | null,
+        scope: entryRow.scope,
+        version: entryRow.version,
+      }
+    : undefined;
+
   // Live grant — re-fetched every cycle. The fee.totalDue is a snapshot
   // (SDK comment: "clients shouldn't cache"); paymentStatus may have just
   // flipped if a concurrent payer paid the registration fee.
@@ -826,21 +889,6 @@ export async function handleX402Cycle(
       } as unknown as X402Challenge,
     };
   }
-
-  // Bind the accessRecord to the entry being served, if it exists and has
-  // been registered with DPv2 yet.
-  const entryRow = deps.storage.findEntry({
-    scope,
-    fileId: input.fileIdParam,
-    at: input.atParam,
-  });
-  const entryForChallenge = entryRow
-    ? {
-        dataPointId: entryRow.dataPointId as `0x${string}` | null,
-        scope,
-        version: entryRow.version,
-      }
-    : undefined;
 
   // `grant` is narrowed to non-null above, but that narrowing is not carried
   // into this closure (vana-sdk 3.14.0 made getGrant return `... | null`), so
@@ -1052,6 +1100,8 @@ function parseProducerHeader(
   const encodedProvenance =
     request.headers.get("vana-producer-provenance") ?? undefined;
   if (producer === null && !encodedProvenance) return {};
+  // `pdpp-derivative` is deliberately absent: only the server's derivative
+  // compute may stamp it, never a request.
   if (producer !== "pdpp-projector" && producer !== "pdpp-import-projection") {
     return errorResponse(
       400,
@@ -1150,6 +1200,49 @@ export async function resolveReadDeletion(
   entry: ReadDeletionEntry | null | undefined,
   body: "file" | "canonical" = "file",
   gatewayTimeoutMs?: number,
+): Promise<ReadDeletion | null> {
+  return (await selectReadable(deps, scope, entry, body, gatewayTimeoutMs))
+    .deletion;
+}
+
+/** The deletion a read must refuse with (see `resolveReadDeletion`). */
+export type ReadDeletion = {
+  scope: string;
+  dataPointId: string | null;
+  deletedAt: string;
+};
+
+/**
+ * Select `scope` (at `entry`) for a result: its deletion state now, and the
+ * release dependency that selecting it produces. A result that includes a
+ * selected scope or version must hold `dependency`, so a deletion that lands
+ * before the release refuses it.
+ */
+export async function selectReadable(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  scope: string,
+  entry: ReadDeletionEntry | null | undefined,
+  body: "file" | "canonical" = "file",
+  gatewayTimeoutMs?: number,
+): Promise<{ deletion: ReadDeletion | null; dependency: DeliveryLease }> {
+  return {
+    deletion: await resolveTrackerDeletion(
+      deps,
+      scope,
+      entry,
+      body,
+      gatewayTimeoutMs,
+    ),
+    dependency: scopeDeletionLease(deps, { scope, entry, body }),
+  };
+}
+
+async function resolveTrackerDeletion(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  scope: string,
+  entry: ReadDeletionEntry | null | undefined,
+  body: "file" | "canonical",
+  gatewayTimeoutMs: number | undefined,
 ): Promise<{
   scope: string;
   dataPointId: string | null;
@@ -1196,22 +1289,144 @@ export async function assertScopeNotDeleted(
   scope: string,
   entry: ReadDeletionEntry | null | undefined,
   body: "file" | "canonical" = "file",
-): Promise<void> {
-  const deletion = await resolveReadDeletion(deps, scope, entry, body);
+): Promise<DeliveryLease> {
+  const { deletion, dependency } = await selectReadable(
+    deps,
+    scope,
+    entry,
+    body,
+  );
   if (deletion) throw new DataDeletedError(deletion);
+  return dependency;
+}
+
+/**
+ * The deletion half of a read's delivery lease: the scope's deletion state in
+ * the tracker `/v1/data` uses, as local evidence. It reads what this process
+ * knows (`knownDeletion`, the deletion history), synchronously, with no
+ * gateway call: the early gate already consulted the gateway, and the release
+ * catches what this process learned since (a sync tombstone, a local
+ * delete). It refuses with `DataDeletedError`.
+ */
+export function scopeDeletionLease(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  read: {
+    scope: string;
+    entry: ReadDeletionEntry | null | undefined;
+    body?: "file" | "canonical";
+  },
+): DeliveryLease {
+  return localLease(() => {
+    const tracker = deps.scopeDeletions;
+    if (!tracker) return;
+    const known = tracker.knownDeletion(read.scope);
+    // The canonical body is held to the deletion history. A file is judged on
+    // what the tracker knows now, which a registered re-add clears, except a
+    // synced version: its registry version is compared with the remembered
+    // tombstone, so a re-add cannot revive a version the tombstone superseded.
+    const entryByRegistry =
+      read.body !== "canonical" &&
+      read.entry?.dataPointId !== null &&
+      read.entry?.dataPointId !== undefined;
+    const tombstone =
+      read.body === "canonical" || entryByRegistry
+        ? (tracker.deletionHistory?.get(read.scope) ?? known)
+        : known;
+    if (!tombstone) return;
+    if (
+      read.body !== "canonical" &&
+      read.entry &&
+      !isEntryCoveredByTombstone(read.entry, tombstone)
+    ) {
+      return;
+    }
+    throw new DataDeletedError({
+      scope: read.scope,
+      dataPointId: deps.serverOwner
+        ? computeDataPointId(deps.serverOwner, read.scope)
+        : null,
+      deletedAt: tombstone.deletedAt,
+    });
+  });
+}
+
+/**
+ * The delivery lease for a read made outside the data API dispatcher (a TEE
+ * job): its grant lease and the deletion state of the version it reads.
+ */
+export function readDeliveryLease(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  read: {
+    grant?: DeliveryLease;
+    scope: string;
+    entry: ReadDeletionEntry | null | undefined;
+    body?: "file" | "canonical";
+  },
+): DeliveryLease {
+  return allDeliveryLeases(read.grant, scopeDeletionLease(deps, read));
 }
 
 /**
  * Discovery filter for the scope and version listings: an entry a read would
- * refuse with 410 is not listed either. Undefined (no filtering) when no
- * deletion tracker is wired.
+ * refuse with 410 is not listed either. Each entry it lets through is a
+ * selection, and its release dependency goes to `hold`. Undefined (no
+ * filtering) when no deletion tracker is wired.
  */
 function discoveryVisibility(
   deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  hold: (dependency: DeliveryLease) => void,
 ): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
   if (!deps.scopeDeletions) return undefined;
-  return async (scope, entry) =>
-    (await resolveReadDeletion(deps, scope, entry)) === null;
+  return (scope, entry) => selectVisible(deps, hold, scope, entry, "file");
+}
+
+/**
+ * Discovery filter for a summary built from the durable registry: a scope
+ * whose counts were folded through registry version `registryVersion`. That
+ * version is what a gateway tombstone is compared with, so it stands in for
+ * the local entry. Each scope it lets through is a selection, and its
+ * release dependency goes to `hold`.
+ */
+function registryVersionVisibility(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  hold: (dependency: DeliveryLease) => void,
+): ((scope: string, registryVersion: string) => Promise<boolean>) | undefined {
+  if (!deps.scopeDeletions) return undefined;
+  return (scope, registryVersion) =>
+    selectVisible(
+      deps,
+      hold,
+      scope,
+      {
+        version: registryVersion,
+        // Registered at the gateway (any non-null id): the version is then
+        // compared as a registry version.
+        dataPointId: "registry",
+        afterTombstoneVersion: null,
+      },
+      "file",
+    );
+}
+
+/** Select one listed item; hold its dependency when it is visible. */
+async function selectVisible(
+  deps: Pick<PersonalServerDataApiDeps, "scopeDeletions" | "serverOwner">,
+  hold: (dependency: DeliveryLease) => void,
+  scope: string,
+  entry: ReadDeletionEntry | undefined,
+  body: "file" | "canonical",
+  gatewayTimeoutMs?: number,
+): Promise<boolean> {
+  const { deletion, dependency } = await selectReadable(
+    deps,
+    scope,
+    entry,
+    body,
+    gatewayTimeoutMs,
+  );
+  if (deletion) return false;
+  hold(dependency);
+  return true;
 }
 
 /**
@@ -1224,16 +1439,18 @@ function listingVisibility(
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
   deadlineAtMs: number,
+  hold: (dependency: DeliveryLease) => void,
 ): ((scope: string, entry: ReadDeletionEntry) => Promise<boolean>) | undefined {
   const deletion = deps.scopeDeletions
-    ? async (scope: string, entry: ReadDeletionEntry) =>
-        (await resolveReadDeletion(
+    ? (scope: string, entry: ReadDeletionEntry) =>
+        selectVisible(
           deps,
+          hold,
           scope,
           entry,
           "file",
           Math.max(0, deadlineAtMs - Date.now()),
-        )) === null
+        )
     : undefined;
   const view = deps.legacyScopeView;
   if (!view) return deletion;
@@ -1243,14 +1460,13 @@ function listingVisibility(
     const canonicalOwned = deletionHistoryOf(listing) === "canonical";
     // A file's re-add marker cannot revive the canonical body this row
     // describes. Canonical re-adds have no registered version yet.
-    return (
-      (await resolveReadDeletion(
-        deps,
-        scope,
-        canonicalOwned ? undefined : entry,
-        canonicalOwned ? "canonical" : "file",
-        Math.max(0, deadlineAtMs - Date.now()),
-      )) === null
+    return selectVisible(
+      deps,
+      hold,
+      scope,
+      canonicalOwned ? undefined : entry,
+      canonicalOwned ? "canonical" : "file",
+      Math.max(0, deadlineAtMs - Date.now()),
     );
   };
 }
@@ -1266,6 +1482,7 @@ function canonicalOnlyScopes(
     "scopeDeletions" | "serverOwner" | "legacyScopeView"
   >,
   deadlineAtMs: number,
+  hold: (dependency: DeliveryLease) => void,
 ):
   | ((
       scopePrefix: string | undefined,
@@ -1281,13 +1498,14 @@ function canonicalOnlyScopes(
     )) {
       if (stored.has(scope)) continue;
       if (
-        (await resolveReadDeletion(
+        !(await selectVisible(
           deps,
+          hold,
           scope,
           undefined,
           "canonical",
           Math.max(0, deadlineAtMs - Date.now()),
-        )) !== null
+        ))
       ) {
         continue;
       }
@@ -1352,11 +1570,8 @@ function legacyViewRefusalResponse(
   );
 }
 
-/** The index fields the deletion gate needs from the entry a read would serve. */
-export type ReadDeletionEntry = Pick<
-  IndexEntry,
-  "version" | "dataPointId" | "afterTombstoneVersion"
->;
+/** The deletion gate's entry contract, including exact registry versions. */
+export type ReadDeletionEntry = Parameters<typeof isEntryCoveredByTombstone>[0];
 
 /**
  * The causal marker a fresh ingest carries: the tombstone version this
@@ -1568,7 +1783,7 @@ async function prepareWriteLineage(
   deps: PersonalServerDataApiDeps,
   scope: string,
   field: unknown,
-): Promise<StoredLineage | undefined> {
+): Promise<{ lineage: StoredLineage; sourceScopes: string[] } | undefined> {
   if (field === undefined || field === null) return undefined;
   return prepareLineage({
     scope,
@@ -1578,6 +1793,26 @@ async function prepareWriteLineage(
     gateway: deps.lineageGateway,
     now: deps.now ?? (() => new Date()),
   });
+}
+
+/**
+ * Origin of a write's inputs, decided once per write (see `inputsPdppOrigin`
+ * on the ingest contract). A non-owner's output is classified by the server's
+ * publication policy, not by what it cites (see `nonOwnerPublicationIsPdpp`).
+ * The owner's own derivatives are classified by their cited sources;
+ * `undefined` is an ordinary owner root write.
+ */
+async function writeInputsPdppOrigin(
+  deps: PersonalServerDataApiDeps,
+  writeAuth: PersonalServerWriteAuthResult | undefined,
+  prepared: { sourceScopes: string[] } | undefined,
+): Promise<boolean | undefined> {
+  if (writeAuth) {
+    if (nonOwnerPublicationIsPdpp(deps.pdppEnabled)) return true;
+  } else if (!prepared) {
+    return undefined;
+  }
+  return citedSourcesHavePdppOrigin(deps.storage, prepared?.sourceScopes ?? []);
 }
 
 /**
@@ -1623,66 +1858,108 @@ export function isOwnerView(
   );
 }
 
-/**
- * The envelope view a grantee read is entitled to. The server-stamped
- * `$writtenBy` (writing builder's address, grantId, signature) and
- * `$lineage` (the owner's source data-point ids, dictionary-attackable back
- * to scopes since dataPointId = keccak(owner, scope)) never leave the server
- * on a grantee read: the owner reads them from storage, and grantees get the
- * graph only through the grant-redacted lineage endpoint. When `$lineage` is
- * present, the caller-supplied lineage field it mirrors (top-level `lineage`
- * on a JSON record, `metadata.lineage` on a binary one) carries the same ids
- * and is dropped with it; without the stamp such a field is ordinary user
- * data and stays. Redaction is at serve time only — the stored envelope, its
- * dataHash commitment, and the owner's view are unchanged.
- */
-export function redactEnvelopeForGrantee(
-  envelope: DataFileEnvelope,
-): DataFileEnvelope {
-  const {
-    [WRITER_ATTRIBUTION_KEY]: attribution,
-    [LINEAGE_KEY]: storedLineage,
-    ...rest
-  } = envelope.data;
-  if (attribution === undefined && storedLineage === undefined) {
-    return envelope;
-  }
-  let data: Record<string, unknown> = rest;
-  if (storedLineage !== undefined) {
-    if (isBinaryEnvelope(envelope)) {
-      const metadata = data["metadata"];
-      if (
-        metadata !== null &&
-        typeof metadata === "object" &&
-        !Array.isArray(metadata)
-      ) {
-        const { lineage: _consumed, ...metadataRest } = metadata as Record<
-          string,
-          unknown
-        >;
-        if (Object.keys(metadataRest).length === 0) {
-          // The lineage was the whole metadata object; leaving `{}` behind
-          // would still disclose that a metadata object existed.
-          const { metadata: _emptied, ...dataRest } = data;
-          data = dataRest;
-        } else {
-          data = { ...data, metadata: metadataRest };
-        }
-      }
-    } else {
-      const { lineage: _consumed, ...dataRest } = data;
-      data = dataRest;
-    }
-  }
-  return { ...envelope, data };
-}
+export { redactEnvelopeForGrantee };
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
 
+const RELEASE = Symbol("release dependencies");
+
+interface ReleaseInfo {
+  dependencies: DeliveryLease;
+  afterRelease: Array<() => void>;
+}
+
+/**
+ * A read result together with the release dependencies its selection
+ * produced (grant leases, scope and version deletion state). The data API
+ * releases a successful read result only in this form; see
+ * `releaseDataResult`.
+ */
+export type SelectedResponse = Response & {
+  readonly [RELEASE]: ReleaseInfo;
+};
+
+/**
+ * Attach a read result's release dependencies. `afterRelease` runs only once
+ * the result is released (a fulfillment report). Use it for every response
+ * that carries data-derived content, error responses included (a payment
+ * challenge, a refusal that reveals the stored shape).
+ */
+export function selected(
+  response: Response,
+  dependencies: DeliveryLease,
+  options: { afterRelease?: () => void } = {},
+): SelectedResponse {
+  const info: ReleaseInfo = {
+    dependencies,
+    afterRelease: options.afterRelease ? [options.afterRelease] : [],
+  };
+  return Object.assign(response, { [RELEASE]: info }) as SelectedResponse;
+}
+
+function releaseOf(response: Response): ReleaseInfo | undefined {
+  return (response as Partial<SelectedResponse>)[RELEASE];
+}
+
+/**
+ * The data API (`/v1/data`), shared by Node, Lite and the MCP read client.
+ *
+ * Every read result, whatever the route (a body, raw content, lineage, a
+ * scope or version listing), is released at one point (`releaseDataResult`),
+ * through the dependencies its selection produced: the grant lease the
+ * authorization returned and the deletion state of every scope and version
+ * the result was selected from (`selectReadable`). A successful read result
+ * without them is refused. See `policy/delivery-lease.ts`.
+ */
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
   options: PersonalServerApiDispatchOptions = {},
+): Promise<Response> {
+  return releaseDataResult(request, options, () =>
+    dispatchDataRequest(request, deps, options),
+  );
+}
+
+/**
+ * The data API's one release point. A read (GET or HEAD) result that carries
+ * data is released only through the dependencies its selection attached
+ * (`selected`); a successful read result without them is refused, because
+ * nothing says what it may be released on. An unselected error response is
+ * content-free and returned as is. A write result is returned as is: its
+ * effect is already committed.
+ */
+export async function releaseDataResult(
+  request: Request,
+  options: Pick<PersonalServerApiDispatchOptions, "onDeliveryLease">,
+  handle: () => Promise<Response>,
+): Promise<Response> {
+  const response = await handle();
+  if (request.method !== "GET" && request.method !== "HEAD") return response;
+  const release = releaseOf(response);
+  if (!release) {
+    if (!response.ok) return response;
+    return withApiErrors(() => {
+      throw new ProtocolError(
+        500,
+        "RELEASE_DEPENDENCIES_MISSING",
+        "The read result carries no release dependencies",
+      );
+    });
+  }
+  options.onDeliveryLease?.(release.dependencies);
+  return withApiErrors(() =>
+    deliver(release.dependencies, () => {
+      for (const effect of release.afterRelease) effect();
+      return response;
+    }),
+  );
+}
+
+async function dispatchDataRequest(
+  request: Request,
+  deps: PersonalServerDataApiDeps,
+  options: PersonalServerApiDispatchOptions,
 ): Promise<Response> {
   // Filled in as the dispatch narrows, so a 500 thrown deep in a read is
   // logged against the route that served it rather than a generic label. It
@@ -1704,23 +1981,29 @@ export async function handlePersonalServerDataRequest(
       });
       // One budget for every stored and canonical-only scope, not per row.
       const deletionDeadlineAtMs = Date.now() + 250;
+      // Every scope the listing selects holds its deletion state.
+      const selection = collectDeliveryLeases();
+      const hold = (dependency: DeliveryLease) => selection.add(dependency);
       const result = await listDataScopesContract({
         storage: deps.storage,
         scopePrefix: url.searchParams.get("scopePrefix") ?? undefined,
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
-        isVisible: listingVisibility(deps, deletionDeadlineAtMs),
+        isVisible: listingVisibility(deps, deletionDeadlineAtMs, hold),
         isListable: (scope) =>
           !isSystemScope(scope) &&
           (!listAuth || listAuthCovers(listAuth, scope)),
-        extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs),
+        extraScopes: canonicalOnlyScopes(deps, deletionDeadlineAtMs, hold),
       });
-      return jsonResponse({
-        ...result.response,
-        scopes: result.response.scopes.map((summary) =>
-          withCanonicalListing(deps, summary),
-        ),
-      });
+      return selected(
+        jsonResponse({
+          ...result.response,
+          scopes: result.response.scopes.map((summary) =>
+            withCanonicalListing(deps, summary),
+          ),
+        }),
+        allDeliveryLeases(listAuth?.lease, selection),
+      );
     }
 
     // "additions" has no dot, so it can never be a real scope name (scopes are
@@ -1730,10 +2013,17 @@ export async function handlePersonalServerDataRequest(
       // The counts span every scope, so only the owner may read them.
       await deps.auth.authorizeOwner(request);
       const daysRaw = url.searchParams.get("days");
+      const selection = collectDeliveryLeases();
       const result = await summarizeDataAdditionsContract({
         additions: deps.additions,
         storage: deps.storage,
-        isVisible: discoveryVisibility(deps),
+        isVisible: discoveryVisibility(deps, (dependency) =>
+          selection.add(dependency),
+        ),
+        isRegistryVersionVisible: registryVersionVisibility(
+          deps,
+          (dependency) => selection.add(dependency),
+        ),
         timezone: url.searchParams.get("tz") ?? "UTC",
         // Digits only: Number() would also accept "", "1e1", "0x7" and " 7".
         days:
@@ -1745,7 +2035,7 @@ export async function handlePersonalServerDataRequest(
         now: (deps.now ?? (() => new Date()))(),
       });
       if ("ok" in result) return contractErrorResponse(result);
-      return jsonResponse(result);
+      return selected(jsonResponse(result), selection);
     }
 
     const parts = pathname.split("/").filter(Boolean);
@@ -1850,20 +2140,30 @@ export async function handlePersonalServerDataRequest(
           requestedScope: scopeResult.scope,
         });
       }
+      // Every version the listing selects holds its deletion state.
+      const selection = collectDeliveryLeases();
       const result = await listDataVersionsContract({
         storage: deps.storage,
         scopeParam: decodePathPart(parts[0]),
         limit: normalizeLimit(url.searchParams.get("limit"), 20),
         offset: normalizeLimit(url.searchParams.get("offset"), 0),
-        isVisible: discoveryVisibility(deps),
+        isVisible: discoveryVisibility(deps, (dependency) =>
+          selection.add(dependency),
+        ),
+        forGrantee: listAuth ? listAuth.view !== "owner" : false,
       });
       if (!result.ok) return contractErrorResponse(result);
       if (result.response.total === 0) {
         // Nothing visible: answer 410 rather than an empty list when that is
         // because the scope is tombstoned, exactly as a read would.
-        await assertScopeNotDeleted(deps, result.scope, undefined);
+        selection.add(
+          await assertScopeNotDeleted(deps, result.scope, undefined),
+        );
       }
-      return jsonResponse(result.response);
+      return selected(
+        jsonResponse(result.response),
+        allDeliveryLeases(listAuth?.lease, selection),
+      );
     }
 
     if ((parts.length === 2 || parts.length === 3) && parts[1] === "lineage") {
@@ -1912,6 +2212,19 @@ export async function handlePersonalServerDataRequest(
       }
       if (!deps.lineageGateway) throw new LineageUnavailableError();
       const { grantId } = resolveLineageGrantView(authResult);
+      // A grantee's view is selected from the scope's lineage: like a read,
+      // it is refused for a deleted scope, and its release holds the
+      // scope's deletion state. The owner keeps lineage of a deleted scope.
+      const scopeDependency = isOwnerView(authResult)
+        ? undefined
+        : await assertScopeNotDeleted(
+            deps,
+            scopeResult.scope,
+            // The local entry only decides whether a tombstone covers it.
+            deps.scopeDeletions
+              ? deps.storage?.findEntry?.({ scope: scopeResult.scope })
+              : undefined,
+          );
       let result: Awaited<ReturnType<LineageGatewayPort["getLineage"]>>;
       try {
         result = await deps.lineageGateway.getLineage({
@@ -1966,7 +2279,10 @@ export async function handlePersonalServerDataRequest(
           "unknown",
         userAgent: request.headers.get("user-agent") ?? "unknown",
       });
-      return jsonResponse({ data: result.data, proof: result.proof });
+      return selected(
+        jsonResponse({ data: result.data, proof: result.proof }),
+        allDeliveryLeases(authResult?.lease, scopeDependency),
+      );
     }
 
     if (parts.length !== 1) return notFound();
@@ -2005,7 +2321,7 @@ export async function handlePersonalServerDataRequest(
         scope: scopeResult.scope,
         grantId,
         fileId: fileIdParam ?? selectedEntry?.fileId ?? undefined,
-        at: atParam,
+        at: atParam ?? selectedEntry?.collectedAt,
       });
 
       // Select the body after auth and before deletion or payment. A file's
@@ -2024,12 +2340,35 @@ export async function handlePersonalServerDataRequest(
       // Deletion gate, after auth (so unauthenticated callers learn nothing)
       // and before payment (so nobody is charged for deleted data). Covers
       // both a stale local copy of a tombstoned scope and a local miss.
-      await assertScopeNotDeleted(
-        deps,
-        scopeResult.scope,
-        canonicalOwned ? undefined : selectedEntry,
-        canonicalOwned ? "canonical" : "file",
+      // The selected scope's deletion state and the grant lease are what the
+      // result is released on.
+      const dependencies = allDeliveryLeases(
+        authResult?.lease,
+        await assertScopeNotDeleted(
+          deps,
+          scopeResult.scope,
+          canonicalOwned ? undefined : selectedEntry,
+          canonicalOwned ? "canonical" : "file",
+        ),
       );
+
+      // Disclosure gate, before demand or payment. The canonical view is the
+      // legacy-format projection of a scope the grant covers, so it is served
+      // to a chain grant, held to the same redaction as any grantee body. A
+      // stored version known to be canonical or derived PDPP data is refused
+      // here, before payment. The body is decided again on its bytes when it
+      // is read, through the reader's storage below.
+      const reader: LegacyReader = isOwnerView(authResult)
+        ? "owner"
+        : typeof authResult?.builder === "string"
+          ? { builder: authResult.builder }
+          : "grantee";
+      if (selectedEntry && (latest === undefined || latest.kind === "file")) {
+        authorizeLegacyRead(reader, {
+          kind: "indexed-version",
+          entry: selectedEntry,
+        });
+      }
 
       if (view === "stored" && !isOwnerView(authResult)) {
         return errorResponse(
@@ -2037,6 +2376,52 @@ export async function handlePersonalServerDataRequest(
           "FORBIDDEN",
           "Only the owner can read the stored view",
         );
+      }
+
+      // A canonical scope's latest body is the canonical view, and only it:
+      // a refusal is answered, never replaced by the legacy file. Explicit
+      // versions stay legacy history. Read before payment, so a builder is
+      // never challenged or charged for a read that is then refused.
+      if (latest?.kind === "refused") {
+        return selected(
+          legacyViewRefusalResponse(scopeResult.scope, latest.refusal),
+          dependencies,
+        );
+      }
+
+      // Decide on and retain the exact response before settlement. Index
+      // provenance can be stale, and a projection can add other inputs.
+      const headers: Record<string, string> = {};
+      headers["X-Vana-Data-Source"] =
+        latest?.kind === "canonical" ? "canonical" : "legacy";
+      let envelope: DataFileEnvelope;
+      let servedFileId: string | undefined;
+      let servedEntry: Readonly<IndexEntry> | undefined;
+      if (latest?.kind === "canonical") {
+        envelope = latest.envelope;
+        headers.ETag = `"${latest.revision}"`;
+      } else {
+        const result = await readDataContract({
+          storage: storageForReader(deps.storage, reader),
+          scopeParam: scopeResult.scope,
+          fileId: fileIdParam,
+          at: atParam ?? selectedEntry?.collectedAt,
+          ...(view === "stored" ? { view } : {}),
+        });
+        if (!result.ok) {
+          if (result.status === 404) {
+            // The entry selected above can vanish before the read (a sync
+            // reconcile applying a tombstone concurrently); answer 410, not
+            // 404, when that is why.
+            await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
+            // An authorized miss still demands the first derivative version.
+            notifyDataRead(deps, { scope: scopeResult.scope });
+          }
+          return selected(contractErrorResponse(result), dependencies);
+        }
+        envelope = result.envelope;
+        servedEntry = result.entry;
+        servedFileId = fileIdParam ?? servedEntry.fileId ?? undefined;
       }
 
       // Demand: this authorized read is what pays for a recompute of a
@@ -2048,14 +2433,6 @@ export async function handlePersonalServerDataRequest(
       // answer unreachable through this route. Nothing here blocks: a
       // previous version is served now, the fresh one lands in a later read.
       notifyDataRead(deps, { scope: scopeResult.scope });
-
-      // A canonical scope's latest body is the canonical view, and only it:
-      // a refusal is answered, never replaced by the legacy file. Explicit
-      // versions stay legacy history. Read before payment, so a builder is
-      // never challenged or charged for a read that is then refused.
-      if (latest?.kind === "refused") {
-        return legacyViewRefusalResponse(scopeResult.scope, latest.refusal);
-      }
 
       // X402 payment dance for builder reads. Owner-exempt reads (the
       // grantId sentinels "owner" / "policy-bypass") skip payment entirely
@@ -2117,10 +2494,13 @@ export async function handlePersonalServerDataRequest(
         });
       }
       if (willCharge && latest?.kind === "canonical") {
-        return legacyViewRefusalResponse(scopeResult.scope, {
-          status: "unavailable",
-          reason: "paid_read_unsupported",
-        });
+        return selected(
+          legacyViewRefusalResponse(scopeResult.scope, {
+            status: "unavailable",
+            reason: "paid_read_unsupported",
+          }),
+          dependencies,
+        );
       }
       // Keep the full condition inline (not `if (willCharge)`) so TS narrows
       // deps.gateway/gatewayConfig/gatewayUrl to non-undefined in the block.
@@ -2135,6 +2515,7 @@ export async function handlePersonalServerDataRequest(
         deps.gatewayUrl
       ) {
         const x402Result = await handleX402Cycle({
+          selectedEntry: servedEntry,
           deps,
           request,
           scope: scopeResult.scope,
@@ -2147,49 +2528,26 @@ export async function handlePersonalServerDataRequest(
           gatewayUrl: deps.gatewayUrl,
         });
         if (x402Result.kind === "challenge") {
-          return jsonResponse(x402Result.body, { status: 402 });
+          return selected(
+            jsonResponse(x402Result.body, { status: 402 }),
+            dependencies,
+          );
         }
         if (x402Result.kind === "gateway-error") {
           // Relay the gateway's structured body verbatim so the builder can
           // dispatch on it (insufficient balance vs. replay vs. race etc.).
-          return jsonResponse(x402Result.body, { status: x402Result.status });
+          return selected(
+            jsonResponse(x402Result.body, { status: x402Result.status }),
+            dependencies,
+          );
         }
-        // x402Result.kind === "ok" — payment accepted, proceed to read.
+        // x402Result.kind === "ok" — payment accepted, serve the retained read.
         // The gateway's success body is forwarded back to the builder via
         // X-PAYMENT-RESPONSE (canonical X402 convention) so callers can see
         // breakdown / paidAt / paymentNonce without a second gateway round-trip.
         paymentResponseHeader = encodePaymentResponseHeader(
           x402Result.payResponse,
         );
-      }
-
-      const headers: Record<string, string> = {};
-      headers["X-Vana-Data-Source"] =
-        latest?.kind === "canonical" ? "canonical" : "legacy";
-      let envelope: DataFileEnvelope;
-      let servedFileId: string | undefined;
-      if (latest?.kind === "canonical") {
-        envelope = latest.envelope;
-        headers.ETag = `"${latest.revision}"`;
-      } else {
-        const result = await readDataContract({
-          storage: deps.storage,
-          scopeParam: scopeResult.scope,
-          fileId: fileIdParam,
-          at: atParam,
-          ...(view === "stored" ? { view } : {}),
-        });
-        if (!result.ok) {
-          if (result.status === 404) {
-            // The entry selected above can vanish before the read (a sync
-            // reconcile applying a tombstone concurrently); answer 410, not
-            // 404, when that is why.
-            await assertScopeNotDeleted(deps, scopeResult.scope, undefined);
-          }
-          return contractErrorResponse(result);
-        }
-        envelope = result.envelope;
-        servedFileId = fileIdParam ?? selectedEntry?.fileId ?? undefined;
       }
 
       const servedEnvelope = isOwnerView(authResult)
@@ -2242,12 +2600,15 @@ export async function handlePersonalServerDataRequest(
       // X-PAYMENT-RESPONSE header (if any) rides along on the raw response too.
       if (wantsRawContent) {
         if (!isBinaryEnvelope(servedEnvelope)) {
-          return jsonResponse(
-            {
-              error: "NOT_BINARY_SCOPE",
-              message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
-            },
-            { status: 400, headers },
+          return selected(
+            jsonResponse(
+              {
+                error: "NOT_BINARY_SCOPE",
+                message: `Scope "${scopeResult.scope}" does not expose raw binary content.`,
+              },
+              { status: 400, headers },
+            ),
+            dependencies,
           );
         }
         const decoded = decodeBinaryEnvelope(servedEnvelope);
@@ -2262,15 +2623,18 @@ export async function handlePersonalServerDataRequest(
             decoded.metadata,
           );
         }
-        const response = new Response(decoded.bytes as unknown as BodyInit, {
-          status: 200,
-          headers,
-        });
-        return response;
+        return selected(
+          new Response(decoded.bytes as unknown as BodyInit, {
+            status: 200,
+            headers,
+          }),
+          dependencies,
+        );
       }
-      const response = jsonResponse(servedEnvelope, { headers });
-      reportReadFulfillment();
-      return response;
+      // Reported as served only once the result is released.
+      return selected(jsonResponse(servedEnvelope, { headers }), dependencies, {
+        afterRelease: reportReadFulfillment,
+      });
     }
 
     if (request.method === "POST") {
@@ -2419,11 +2783,12 @@ export async function handlePersonalServerDataRequest(
           );
           // A binary derivative names its sources inside the metadata
           // object; the validated mirror lands at the top of the record.
-          const lineage = await prepareWriteLineage(
+          const prepared = await prepareWriteLineage(
             deps,
             scopeResult.scope,
             extractLineageField(metadata),
           );
+          const lineage = prepared?.lineage;
           const result = await ingestBinaryDataContract({
             storage: deps.storage,
             scopeParam: scopeResult.scope,
@@ -2435,6 +2800,11 @@ export async function handlePersonalServerDataRequest(
             status,
             attribution: writeAuth?.attribution,
             lineage,
+            inputsPdppOrigin: await writeInputsPdppOrigin(
+              deps,
+              writeAuth,
+              prepared,
+            ),
             afterTombstoneVersion,
             precondition: parsedPrecondition,
           });
@@ -2473,11 +2843,12 @@ export async function handlePersonalServerDataRequest(
         if (provenance instanceof Response) return failWrite(provenance);
         // Derivative writes: validate the caller's `lineage` before anything
         // is stored (a failure here throws, releasing the builder's proof).
-        const lineage = await prepareWriteLineage(
+        const prepared = await prepareWriteLineage(
           deps,
           scopeResult.scope,
           extractLineageField(parsed.body),
         );
+        const lineage = prepared?.lineage;
         // DPv2 is scope-addressed and the gateway records no schemas, so JSON
         // ingest is schemaless too — no lookup, no schemaId/$schema stamped.
         const result = await ingestDataContract({
@@ -2488,6 +2859,11 @@ export async function handlePersonalServerDataRequest(
           status,
           attribution: writeAuth?.attribution,
           lineage,
+          inputsPdppOrigin: await writeInputsPdppOrigin(
+            deps,
+            writeAuth,
+            prepared,
+          ),
           afterTombstoneVersion,
           precondition: parsedPrecondition,
           producer: producerHeader.producer,

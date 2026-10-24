@@ -1,3 +1,4 @@
+import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
 import { existsSync } from "node:fs";
 import type Database from "better-sqlite3";
 import type {
@@ -9,6 +10,7 @@ import type {
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
   buildDataFilePath,
+  envelopeGeneration,
   type HierarchyManagerOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
@@ -40,6 +42,24 @@ interface OperationRow {
 
 const keyWhere =
   "authority = @authority AND owner = @owner AND scope = @scope AND operation = @operation";
+
+/**
+ * The replica fields a caller may set on an index row. Anything else in the
+ * metadata, such as provenance or a generation, is never copied.
+ */
+function replicaMetadata(
+  metadata: Extract<VersionCommit, { kind: "replica" }>["metadata"],
+) {
+  return {
+    schemaId: metadata.schemaId,
+    dataPointId: metadata.dataPointId,
+    version: metadata.version,
+    ...(metadata.producer === undefined ? {} : { producer: metadata.producer }),
+    ...(metadata.producerProvenance === undefined
+      ? {}
+      : { producerProvenance: metadata.producerProvenance }),
+  };
+}
 
 export function createImportOperations(
   db: Database.Database,
@@ -113,6 +133,8 @@ export function createImportOperations(
           fileId: null,
           schemaId: null,
           path: row.path,
+          pdppOrigin: hasPdppOrigin(envelope),
+          generation: envelopeGeneration(envelope),
           scope: row.scope,
           collectedAt: row.collected_at,
           sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
@@ -264,6 +286,11 @@ export function createImportOperations(
             ? reserve(command.envelope)
             : command.envelope;
         const bytes = Buffer.from(JSON.stringify(envelope, null, 2));
+        // Synchronous with the serialization above: these describe the bytes.
+        const identity = {
+          pdppOrigin: hasPdppOrigin(envelope),
+          generation: envelopeGeneration(envelope),
+        };
         let writeResult;
         try {
           writeResult = publishDataFile(options, envelope, bytes);
@@ -289,11 +316,14 @@ export function createImportOperations(
                 ? (command.metadata.sizeBytes ?? writeResult.sizeBytes)
                 : writeResult.sizeBytes,
             ...(command.kind === "replica"
-              ? command.metadata
+              ? replicaMetadata(command.metadata)
               : {
                   afterTombstoneVersion:
                     command.metadata.afterTombstoneVersion ?? null,
                 }),
+            // Storage's own values, from the bytes it serialized; last, so
+            // nothing a caller passes can replace them.
+            ...identity,
           });
         }
         return { kind: "stored", envelope, entry, writeResult };

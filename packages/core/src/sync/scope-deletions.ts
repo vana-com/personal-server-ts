@@ -208,31 +208,39 @@ export function createScopeDeletionTracker(
   let lastGatewayFailureMs: number | null = null;
   // Coalesce concurrent lookups of the same scope into one request.
   const inflight = new Map<string, Promise<ScopeDeletionVerdict | null>>();
-  // A live file may clear `deleted`, but cannot clear an observed canonical
-  // refusal whose history write failed. Remove it only after persistence.
+  // A live file may clear `deleted`, but cannot clear an observed deletion.
+  // Failed durable observations remain pending until persistence succeeds.
   const pendingHistory = new Map<string, ScopeTombstone>();
+  const observedDeletions = new Map<string, ScopeTombstone>();
   const history = options.deletionHistory;
 
   function persistPendingHistory(scope: string): void {
     const tombstone = pendingHistory.get(scope);
     if (!history || !tombstone) return;
-    history.remember(scope, tombstone);
+    history.remember(scope, laterScopeDeletion(history.get(scope), tombstone));
     pendingHistory.delete(scope);
   }
 
-  const deletionHistory: ScopeDeletionHistory | undefined = history
-    ? {
-        remember(scope, tombstone) {
-          pendingHistory.set(scope, tombstone);
-          persistPendingHistory(scope);
-        },
-        get(scope) {
-          // Preserve durable-read errors and the existing durable fact when
-          // an update failed. Either fact is sufficient to refuse canonical.
-          return history.get(scope) ?? pendingHistory.get(scope) ?? null;
-        },
+  const deletionHistory: ScopeDeletionHistory = {
+    remember(scope, tombstone) {
+      const observed = laterScopeDeletion(
+        observedDeletions.get(scope) ?? null,
+        tombstone,
+      );
+      observedDeletions.set(scope, observed);
+      if (history) {
+        pendingHistory.set(scope, observed);
+        persistPendingHistory(scope);
       }
-    : undefined;
+    },
+    get(scope) {
+      // Current liveness cannot erase an observed deletion of an older
+      // selected version. Durable-read failures still propagate.
+      const observed = observedDeletions.get(scope) ?? null;
+      const durable = history?.get(scope);
+      return durable ? laterScopeDeletion(observed, durable) : observed;
+    },
+  };
 
   function rememberLive(scope: string, at: number): void {
     deleted.delete(scope);
@@ -261,7 +269,7 @@ export function createScopeDeletionTracker(
       verifiedAtMs: nowMs(),
     });
     live.delete(scope);
-    deletionHistory?.remember(scope, normalized);
+    deletionHistory.remember(scope, normalized);
   }
 
   function isFresh(at: number | null): boolean {
@@ -477,6 +485,21 @@ function normalizeVersion(value: string | null | undefined): string | null {
   return BigInt(value) > 0n ? BigInt(value).toString() : null;
 }
 
+/** Monotonic deletion boundary; an unknown version conservatively covers all. */
+export function laterScopeDeletion(
+  previous: ScopeTombstone | null,
+  next: ScopeTombstone,
+): ScopeTombstone {
+  const incoming = { ...next, version: normalizeVersion(next.version) };
+  if (!previous) return incoming;
+  const retained = { ...previous, version: normalizeVersion(previous.version) };
+  if (retained.version === null) return retained;
+  if (incoming.version === null) return incoming;
+  return BigInt(incoming.version) >= BigInt(retained.version)
+    ? incoming
+    : retained;
+}
+
 /**
  * True when a local index entry is part of what a gateway tombstone deleted,
  * decided causally rather than by comparing clocks across machines:
@@ -491,7 +514,10 @@ function normalizeVersion(value: string | null | undefined): string | null {
  * failure this guards against, and the window is one sync poll interval.
  */
 export function isEntryCoveredByTombstone(
-  entry: Pick<IndexEntry, "version" | "dataPointId" | "afterTombstoneVersion">,
+  entry: Pick<IndexEntry, "dataPointId" | "afterTombstoneVersion"> & {
+    /** Local index number or exact uint256 registry version. */
+    version: number | string;
+  },
   tombstone: Pick<ScopeTombstone, "version">,
 ): boolean {
   const version = normalizeVersion(tombstone.version);

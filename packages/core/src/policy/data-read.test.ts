@@ -211,6 +211,44 @@ describe("verifyDataReadPolicy", () => {
     ).rejects.toMatchObject({ errorCode: "GRANT_EXPIRED" });
   });
 
+  it("treats expiry as exclusive: a grant is expired from its expiry second on", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-10-24T12:00:00.500Z"));
+      const nowSec = Math.floor(Date.now() / 1000);
+      const read = (expiresAt: number) =>
+        verifyDataReadPolicy(
+          {
+            signer: BUILDER_ADDRESS,
+            grantId: "grant-123",
+            requestedScope: "instagram.profile",
+            serverOwner: "0xOwner",
+          },
+          {
+            authSessionVerifier: {
+              getBuilder: vi.fn().mockResolvedValue(builder),
+            },
+            grantVerifier: {
+              getGrant: vi
+                .fn()
+                .mockResolvedValue(makeGrant({ expiresAt: String(expiresAt) })),
+            },
+          },
+        );
+      await expect(read(nowSec)).rejects.toMatchObject({
+        errorCode: "GRANT_EXPIRED",
+      });
+      await expect(read(nowSec - 1)).rejects.toMatchObject({
+        errorCode: "GRANT_EXPIRED",
+      });
+      await expect(read(nowSec + 1)).resolves.toMatchObject({
+        id: "grant-123",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("accepts ISO expiresAt timestamps from the current DPv2 gateway", async () => {
     const grant = makeGrant({
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
