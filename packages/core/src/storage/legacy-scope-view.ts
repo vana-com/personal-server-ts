@@ -13,6 +13,7 @@ import {
   legacyBindingsForProfile,
   META_040_BINDINGS,
   OURA_BROWSER_BINDINGS,
+  STRAVA_BROWSER_BINDINGS,
 } from "../legacy-projection/index.js";
 import {
   legacyConnectorKey,
@@ -57,6 +58,7 @@ const BINDING_PROFILES = [
   GITHUB_BROWSER_BINDINGS,
   META_040_BINDINGS,
   OURA_BROWSER_BINDINGS,
+  STRAVA_BROWSER_BINDINGS,
 ];
 
 // Invalidate persisted witnesses created before completion-horizon fencing.
