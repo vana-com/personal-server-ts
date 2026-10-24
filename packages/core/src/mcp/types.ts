@@ -111,8 +111,9 @@ export interface McpConnectionRecord {
    */
   tokenExpiresAt?: string;
   /**
-   * OAuth `client_id` the current token pair was issued to. The refresh grant
-   * refuses a token presented by any other client.
+   * OAuth `client_id` the current token pair was issued to, or, while
+   * pending, the client asking. The refresh grant refuses a token presented
+   * by any other client.
    */
   clientId?: string;
   /** SHA-256 hex of the current refresh token. Absent means no refresh grant. */

@@ -159,6 +159,8 @@ function randomToken(): string {
 export interface CreateMcpConnectionInput {
   displayName?: string;
   ingress?: McpIngress;
+  /** OAuth client asking for this connection, if any. */
+  clientId?: string;
 }
 
 export interface CreateMcpConnectionOutput {
@@ -204,6 +206,7 @@ export async function createMcpConnection(
     grants: [],
     createdAt,
     ...(input.ingress ? { ingress: input.ingress } : {}),
+    ...(input.clientId ? { clientId: input.clientId } : {}),
   };
 
   await options.store.create(record);
@@ -951,10 +954,12 @@ export async function createMcpOAuthAuthorization(
   const expiresAt = new Date(
     now.getTime() + OAUTH_AUTHORIZATION_TTL_MS,
   ).toISOString();
+  await revokeStalePending(input.clientId, now, options.connectionStore);
   const created = await createMcpConnection(
     {
       displayName: input.clientName ?? DEFAULT_MCP_CLIENT_NAME,
       ingress: input.ingress,
+      clientId: input.clientId,
     },
     {
       store: options.connectionStore,
@@ -987,6 +992,38 @@ export async function createMcpOAuthAuthorization(
     granteeAddress: created.granteeAddress,
     expiresAt,
   };
+}
+
+/**
+ * Revoke never-approved OAuth connections a new authorize makes moot: the
+ * same client's earlier tries (a retry or restart replaces them) and any
+ * whose authorization expired. Owner-made connections carry no clientId and
+ * are kept. Runs before the new connection exists, so two racing tries leave
+ * an extra row at worst, never none.
+ */
+async function revokeStalePending(
+  clientId: string,
+  now: Date,
+  store: McpConnectionStore,
+): Promise<void> {
+  const cutoff = now.getTime() - OAUTH_AUTHORIZATION_TTL_MS;
+  for (const connection of await store.list()) {
+    if (connection.status !== "pending" || !connection.clientId) continue;
+
+    const expired = Date.parse(connection.createdAt) <= cutoff;
+    if (connection.clientId !== clientId && !expired) continue;
+
+    await revokeMcpConnection(connection.id, { store, now: () => now });
+  }
+}
+
+/** A superseded or removed authorization has a revoked connection; refuse it. */
+function requireLive(connection: McpConnectionRecord | null): void {
+  if (connection?.status !== "revoked") return;
+  throw new McpOAuthAuthorizationError(
+    "invalid_state",
+    "MCP OAuth authorization was superseded or removed; connect again",
+  );
 }
 
 export interface McpOAuthAuthorizationView {
@@ -1080,6 +1117,7 @@ export async function approveMcpOAuthAuthorization(
       "Approve requires at least one grant",
     );
   }
+  requireLive(await options.connectionStore.getById(record.connectionId));
 
   await approveMcpConnection(
     { connectionId: record.connectionId, grants: input.grants },
@@ -1149,6 +1187,7 @@ export async function approveMcpOAuthAuthorizationWithScopes(
       404,
     );
   }
+  requireLive(connection);
 
   try {
     await ensureMcpGranteeRegistered({
