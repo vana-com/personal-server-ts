@@ -541,11 +541,19 @@ describe("canonical mutation journal", () => {
       historical.close();
       historical = new Database(path);
       upgraded = createSqliteRecordStore(historical);
+      const after = retained.map((table) =>
+        historical.prepare(`SELECT * FROM ${table}`).all(),
+      );
       expect(
-        retained.map((table) =>
-          historical.prepare(`SELECT * FROM ${table}`).all(),
+        after.map((rows) =>
+          rows.map(({ emitted_key: _emittedKey, ...row }) => row),
         ),
       ).toEqual(before);
+      expect(
+        historical
+          .prepare("SELECT emitted_key FROM pdpp_records WHERE record_key = ?")
+          .get("same-key"),
+      ).toEqual({ emitted_key: "101792490427" });
       expect(
         upgraded.getRecord("account-a", "messages", "same-key"),
       ).toMatchObject({ version: 1, data: { id: "same-key", content: "old" } });

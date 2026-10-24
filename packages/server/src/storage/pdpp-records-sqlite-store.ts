@@ -215,7 +215,7 @@ CREATE TABLE IF NOT EXISTS pdpp_blob_bytes (
 CREATE TABLE IF NOT EXISTS pdpp_instance_binding (
   instance TEXT PRIMARY KEY,
   method TEXT,
-  generation INTEGER CHECK (generation > 0),
+  generation INTEGER NOT NULL CHECK (generation > 0),
   reset_clock INTEGER NOT NULL DEFAULT 0
 );
 
@@ -342,7 +342,7 @@ CREATE TABLE IF NOT EXISTS pdpp_mutation_journal (
   source_id TEXT,
   connection_id TEXT NOT NULL,
   method TEXT,
-  generation INTEGER NOT NULL CHECK (generation > 0),
+  generation INTEGER CHECK (generation > 0),
   stream TEXT NOT NULL,
   record_key TEXT NOT NULL,
   operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
@@ -445,7 +445,7 @@ function migrate(db: Database): void {
         ).run(randomUUID());
       }
       if (v === 12) migrateToV13(db);
-      if (v === 15) {
+      if (v === 14) {
         db.prepare(
           "INSERT OR IGNORE INTO pdpp_installation_writer (id, writer_id) VALUES (1, ?)",
         ).run(randomUUID());
@@ -614,78 +614,79 @@ function toRow(db: RecordRowDb): PdppRecordRow {
  * A readonly database must already have the current schema; no migration,
  * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
-export function createSqliteRecordStore(db: Database): PdppRecordStore & MutationJournalReader & {
-  transitionClaudeToLive(input: ClaudeTransitionInput): PdppInstanceBinding;
-  claudeTransition(instance: string): ClaudeTransition | null;
-  listClaudeTransitions(): ClaudeTransition[];
-  clearClaudeTransitionScope(scope: string): void;
-  confirmClaudeTransition(instance: string, generation: number): void;
-  transitionWriteClock(): number;
-  listConnections(sourceId: string): PdppInstanceBinding[];
-  registerConnection(input: {
-    instance: string;
-    sourceId: string;
-    method: string;
-    label: string;
-  }): PdppInstanceBinding;
-  deleteConnection(instance: string): PdppInstanceBinding;
-  getInstanceBinding(instance: string): PdppInstanceBinding;
-  /**
-   * Run synchronous reads against one SQLite read snapshot. A write from any
-   * connection that commits while `read` runs stays invisible to it, so the
-   * bindings, listings and pages it sees belong to one point in time.
-   */
-  readSnapshot<T>(read: () => T): T;
-  resetInstanceBinding(input: {
-    instance: string;
-    expectedMethod: string | null;
-    expectedGeneration: number;
-    nextMethod: string | null;
-  }): { binding: PdppInstanceBinding; alreadyReset: boolean };
-  storeBlobBytesForInstance(input: {
-    instance: string;
-    method: string;
-    generation: number;
-    bytes: Uint8Array;
-    mimeType: string;
-  }): PdppBlobMeta;
-  replaceStream(input: {
-    instance: string;
-    stream: string;
-    method: string;
-    generation: number;
-    emittedAt: string;
-    envelopes: PdppRecordEnvelopeInput[];
-    primaryKey: string[];
-    validateData?: RecordDataValidator;
-    sourceCollectedAt?: string;
-    completionPolicy?: "preserve_if_unchanged";
-  }): ReplaceStreamResult;
-  /** Completion receipts of one instance, as stored. */
-  listStreamCompletions(instance: string): StreamCompletionReceipt[];
-  /**
-   * Metadata-only completion: proves, for each requested stream, that the
-   * live set SQLite holds is exactly the one the digest names, then stores
-   * every receipt in one immediate transaction. It writes no rows, history,
-   * arrival or clock. The binding must already be registered, undeleted and
-   * equal to the request's source, method and generation; nothing is
-   * registered here. The caller is not authenticated at this seam.
-   * Throws `PdppBindingError` for the binding and `StreamCompletionError`
-   * for a malformed request, declaration, stored data or receipt, or a
-   * conflicting proof. SQLite failures (busy, trigger aborts) propagate
-   * unchanged. Any throw rolls the transaction back.
-   */
-  completeStreams(
-    request: StreamCompletionRequest,
-    declarations: StreamDeclarationResolver,
-  ): { receipts: NativeStreamCompletionReceipt[] };
-  /**
-   * Live record keys of one stream in the order each last arrived in the
-   * current generation, for the legacy view only. A key with no arrival
-   * since v8 is absent.
-   */
-  listArrivalOrder(instance: string, stream: string): string[];
-} {
+export function createSqliteRecordStore(db: Database): PdppRecordStore &
+  MutationJournalReader & {
+    transitionClaudeToLive(input: ClaudeTransitionInput): PdppInstanceBinding;
+    claudeTransition(instance: string): ClaudeTransition | null;
+    listClaudeTransitions(): ClaudeTransition[];
+    clearClaudeTransitionScope(scope: string): void;
+    confirmClaudeTransition(instance: string, generation: number): void;
+    transitionWriteClock(): number;
+    listConnections(sourceId: string): PdppInstanceBinding[];
+    registerConnection(input: {
+      instance: string;
+      sourceId: string;
+      method: string;
+      label: string;
+    }): PdppInstanceBinding;
+    deleteConnection(instance: string): PdppInstanceBinding;
+    getInstanceBinding(instance: string): PdppInstanceBinding;
+    /**
+     * Run synchronous reads against one SQLite read snapshot. A write from any
+     * connection that commits while `read` runs stays invisible to it, so the
+     * bindings, listings and pages it sees belong to one point in time.
+     */
+    readSnapshot<T>(read: () => T): T;
+    resetInstanceBinding(input: {
+      instance: string;
+      expectedMethod: string | null;
+      expectedGeneration: number;
+      nextMethod: string | null;
+    }): { binding: PdppInstanceBinding; alreadyReset: boolean };
+    storeBlobBytesForInstance(input: {
+      instance: string;
+      method: string;
+      generation: number;
+      bytes: Uint8Array;
+      mimeType: string;
+    }): PdppBlobMeta;
+    replaceStream(input: {
+      instance: string;
+      stream: string;
+      method: string;
+      generation: number;
+      emittedAt: string;
+      envelopes: PdppRecordEnvelopeInput[];
+      primaryKey: string[];
+      validateData?: RecordDataValidator;
+      sourceCollectedAt?: string;
+      completionPolicy?: "preserve_if_unchanged";
+    }): ReplaceStreamResult;
+    /** Completion receipts of one instance, as stored. */
+    listStreamCompletions(instance: string): StreamCompletionReceipt[];
+    /**
+     * Metadata-only completion: proves, for each requested stream, that the
+     * live set SQLite holds is exactly the one the digest names, then stores
+     * every receipt in one immediate transaction. It writes no rows, history,
+     * arrival or clock. The binding must already be registered, undeleted and
+     * equal to the request's source, method and generation; nothing is
+     * registered here. The caller is not authenticated at this seam.
+     * Throws `PdppBindingError` for the binding and `StreamCompletionError`
+     * for a malformed request, declaration, stored data or receipt, or a
+     * conflicting proof. SQLite failures (busy, trigger aborts) propagate
+     * unchanged. Any throw rolls the transaction back.
+     */
+    completeStreams(
+      request: StreamCompletionRequest,
+      declarations: StreamDeclarationResolver,
+    ): { receipts: NativeStreamCompletionReceipt[] };
+    /**
+     * Live record keys of one stream in the order each last arrived in the
+     * current generation, for the legacy view only. A key with no arrival
+     * since v8 is absent.
+     */
+    listArrivalOrder(instance: string, stream: string): string[];
+  } {
   // Insert statements call it, so even a readonly handle must register it
   // before they are prepared.
   registerTimeKey(db);
@@ -705,7 +706,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
   }
 
   const writerId = (
-    db.prepare("SELECT writer_id FROM pdpp_installation_writer WHERE id = 1").get() as {
+    db
+      .prepare("SELECT writer_id FROM pdpp_installation_writer WHERE id = 1")
+      .get() as {
       writer_id: string;
     }
   ).writer_id;
@@ -717,15 +720,20 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
             @stream, @record_key, @operation, @value_json, @blob_ids_json)
   `);
 
-  function journalMutation(instance: string, stream: string, recordKey: string): void {
+  function journalMutation(
+    instance: string,
+    stream: string,
+    recordKey: string,
+  ): void {
     const binding = db
       .prepare(
         "SELECT source_id, method, generation FROM pdpp_instance_binding WHERE instance = ?",
       )
       .get(instance) as
-      | Pick<BindingRowDb, "source_id" | "method" | "generation">
-      | undefined;
-    const record = toRow(getCurrentStmt.get(instance, stream, recordKey) as RecordRowDb);
+      Pick<BindingRowDb, "source_id" | "method" | "generation"> | undefined;
+    const record = toRow(
+      getCurrentStmt.get(instance, stream, recordKey) as RecordRowDb,
+    );
     const blobId = record.deleted ? null : extractBlobId(record.data);
     insertMutationStmt.run({
       operation_id: randomUUID(),
@@ -742,24 +750,58 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & Mutatio
     });
   }
 
-  function readMutationJournalPage(options: MutationJournalPageOptions): MutationJournalPage {
+  function readMutationJournalPage(
+    options: MutationJournalPageOptions,
+  ): MutationJournalPage {
     const afterSequence = options.afterSequence ?? 0;
-    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0 || !Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 1000) {
+    if (
+      !Number.isSafeInteger(afterSequence) ||
+      afterSequence < 0 ||
+      !Number.isSafeInteger(options.limit) ||
+      options.limit < 1 ||
+      options.limit > 1000
+    ) {
       throw new RangeError("Invalid mutation journal offset or limit");
     }
-    const rows = db.prepare("SELECT * FROM pdpp_mutation_journal WHERE sequence > ? ORDER BY sequence LIMIT ?")
+    const rows = db
+      .prepare(
+        "SELECT * FROM pdpp_mutation_journal WHERE sequence > ? ORDER BY sequence LIMIT ?",
+      )
       .all(afterSequence, options.limit + 1) as Array<{
-        sequence: number; operation_id: string; writer_id: string; source_id: string | null;
-        connection_id: string; method: string | null; generation: number | null; stream: string;
-        record_key: string; operation: CanonicalMutation["operation"]; value_json: string; blob_ids_json: string;
-      }>;
-    const mutations = rows.slice(0, options.limit).map((row): CanonicalMutation => ({
-      sequence: row.sequence, operationId: row.operation_id, writerId: row.writer_id,
-      sourceId: row.source_id, connectionId: row.connection_id, method: row.method,
-      generation: row.generation, stream: row.stream, recordKey: row.record_key,
-      operation: row.operation, value: JSON.parse(row.value_json), blobIds: JSON.parse(row.blob_ids_json),
-    }));
-    return { mutations, hasMore: rows.length > options.limit, nextAfterSequence: mutations.at(-1)?.sequence ?? afterSequence };
+      sequence: number;
+      operation_id: string;
+      writer_id: string;
+      source_id: string | null;
+      connection_id: string;
+      method: string | null;
+      generation: number | null;
+      stream: string;
+      record_key: string;
+      operation: CanonicalMutation["operation"];
+      value_json: string;
+      blob_ids_json: string;
+    }>;
+    const mutations = rows
+      .slice(0, options.limit)
+      .map((row): CanonicalMutation => ({
+        sequence: row.sequence,
+        operationId: row.operation_id,
+        writerId: row.writer_id,
+        sourceId: row.source_id,
+        connectionId: row.connection_id,
+        method: row.method,
+        generation: row.generation,
+        stream: row.stream,
+        recordKey: row.record_key,
+        operation: row.operation,
+        value: JSON.parse(row.value_json),
+        blobIds: JSON.parse(row.blob_ids_json),
+      }));
+    return {
+      mutations,
+      hasMore: rows.length > options.limit,
+      nextAfterSequence: mutations.at(-1)?.sequence ?? afterSequence,
+    };
   }
 
   const nextWriteSeq = db.prepare(
