@@ -233,7 +233,6 @@ async function discoveredUrls(listener: string) {
   const authServer = await (
     await fetch(`${listener}/.well-known/oauth-authorization-server`)
   ).json();
-  const { approval } = await authorize(listener);
   return {
     challenge: challenge.headers.get("www-authenticate"),
     resource: resource.resource,
@@ -242,7 +241,6 @@ async function discoveredUrls(listener: string) {
     authorizationEndpoint: authServer.authorization_endpoint,
     tokenEndpoint: authServer.token_endpoint,
     registrationEndpoint: authServer.registration_endpoint,
-    approvalPsOrigin: approval.searchParams.get("ps_origin"),
   };
 }
 
@@ -273,7 +271,6 @@ function expectedUrls(origin: string) {
     authorizationEndpoint: `${origin}/mcp/oauth/authorize`,
     tokenEndpoint: `${origin}/mcp/oauth/token`,
     registrationEndpoint: `${origin}/mcp/oauth/register`,
-    approvalPsOrigin: origin,
   };
 }
 
@@ -299,6 +296,17 @@ describe("local MCP over the loopback listener", () => {
     expect(await discoveredUrls(server.loopback)).toEqual(
       expectedUrls(server.loopback),
     );
+  });
+
+  // Vana Web signs approvals for the registered public origin; a loopback
+  // origin is never registered, so the page would refuse it.
+  it("names the public origin to the approval page from either listener", async () => {
+    const server = await startLocalServer();
+
+    for (const listener of [server.main, server.loopback]) {
+      const { approval } = await authorize(listener);
+      expect(approval.searchParams.get("ps_origin")).toBe(server.publicOrigin);
+    }
   });
 
   // RFC 9728: the advertised resource must equal the URL the client used.
