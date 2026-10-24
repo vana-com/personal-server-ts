@@ -3,6 +3,7 @@ import {
   listSnapshotPage,
   compareRecordIdentity,
   decodeListCursor,
+  assertListCursorBinding,
 } from "./list-page.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { timeSortKey } from "../../pdpp/time.js";
@@ -295,6 +296,7 @@ export function createMemoryRecordStore(): PdppRecordStore {
     let horizon = new Date(writeClock).toISOString();
     if (options.cursor) {
       const payload = decodeListCursor(options.cursor);
+      assertListCursorBinding(payload, options);
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
       horizon = payload.horizon;

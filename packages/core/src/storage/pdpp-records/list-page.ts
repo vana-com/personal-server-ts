@@ -34,6 +34,16 @@ export function decodeListCursor(
   return { ...payload, instance: payload.instance, horizon: payload.horizon };
 }
 
+/** Reject a continuation if the authorization or requested projection changed. */
+export function assertListCursorBinding(
+  payload: ListCursorPayload,
+  options: ListRecordsOptions,
+): void {
+  if (payload.queryBinding !== options.queryBinding) {
+    throw new InvalidCursorError();
+  }
+}
+
 /** Complete identity, in the existing public sort order with instance last. */
 export const LIST_ORDER_COLUMNS = [
   "emitted_key",
@@ -129,6 +139,7 @@ export function listSnapshotPage(
           recordKey: last.recordKey,
           instance: last.instance,
           orderKey: "instant",
+          ...(options.queryBinding && { queryBinding: options.queryBinding }),
         }
       : undefined;
   return {

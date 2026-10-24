@@ -178,9 +178,9 @@ describe("§8 client `fields` narrows within the grant", () => {
       "/v1/streams/s/records?fields=secret",
       { headers: AUTH },
     );
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
     const body = await res.json();
-    expect(body.error.code).toBe("invalid_request");
+    expect(body.error.code).toBe("field_not_granted");
     expect(body.error.param).toBe("fields");
   });
 
@@ -189,7 +189,7 @@ describe("§8 client `fields` narrows within the grant", () => {
       "/v1/streams/s/records?fields=id,name,secret",
       { headers: AUTH },
     );
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
   });
 
   it("still returns the full granted set when no fields are requested", async () => {

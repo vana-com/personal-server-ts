@@ -66,6 +66,68 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     stores = [];
   });
 
+  it("uses the grant's retained declaration when the current version removes the stream", async () => {
+    const store = newStore();
+    store.putBlobMeta({
+      blobId: "blob_1",
+      mimeType: "application/octet-stream",
+      sizeBytes: 2,
+      sha256: "abc",
+    });
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: "blob_1" } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "append_only",
+      () => ["id"],
+    );
+    const declarationSnapshot = {
+      source_id: "src_1",
+      source_kind: "connector" as const,
+      version: "vA",
+      digest: "a".repeat(64),
+      streams: [
+        {
+          name: "media",
+          fields: ["id", "blob_ref"],
+          required_fields: ["id"],
+          primary_key: ["id"],
+        },
+      ],
+    };
+    const app = pdppBlobsRoutes({
+      store,
+      declarations: createStreamDeclarationRegistry([]),
+      auth: createFixtureAuthorizationService({
+        client: {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          clientId: "client_1",
+          grant: {
+            ...clientGrant(),
+            source_declaration: { version: "vA" },
+          },
+          declarationSnapshot,
+        },
+      }),
+      readBlobBytes: async () => new Uint8Array([4, 5]),
+    });
+    const response = await app.request("/blob_1", {
+      headers: { Authorization: "Bearer client" },
+    });
+    expect(response.status).toBe(200);
+    expect(new Uint8Array(await response.arrayBuffer())).toEqual(
+      new Uint8Array([4, 5]),
+    );
+  });
+
   it.each(["owner", "client"] as const)(
     "%s blob holds one authorizing connection when another is deleted during loading",
     async (kind) => {

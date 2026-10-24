@@ -81,6 +81,13 @@ inactive when presented. Unknown profile values fail configuration loading.
 
 ### PDPP data and legacy grants
 
+Authorization grants issued before the retained consent-evidence checks may
+not contain enough approved facts to validate safely. On upgrade, those grants
+remain stored but are treated as inactive: existing client tokens return
+`401 invalid_token`, and introspection reports them inactive. The owner must
+complete consent again to issue a new grant. The server does not infer approval
+or backfill evidence from current configuration or declarations.
+
 A legacy chain grant reads actual legacy files only, with or without a PDPP
 grant binding. The canonical view of a scope, and every stored version with
 PDPP origin (native `$pdpp` import metadata, or a `pdpp-projector` /

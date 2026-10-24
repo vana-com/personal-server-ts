@@ -706,7 +706,6 @@ function sessionTokens(
       fields: request.eligibilityFields
         ? [...new Set(request.eligibilityFields)].sort()
         : null,
-      limit: request.limit,
       order: request.order ?? request.candidate?.order ?? "asc",
       oneRecordPerKey: request.oneRecordPerKey ?? false,
     }),
@@ -723,7 +722,8 @@ function sessionTokens(
       .digest()
       .subarray(0, MAC_BYTES);
   // A paused scan is found again by the request that paused it: the same
-  // context, input tokens and limit.
+  // persistent context, input tokens and page size. Page size stays out of
+  // persistent cursor identity so callers may resize between pages.
   const scanId = `scan:${digest(
     canonicalJson([context, request.cursor ?? null, baseline, request.limit]),
   )}`;

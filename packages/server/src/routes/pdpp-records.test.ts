@@ -863,6 +863,59 @@ describe("pdpp records routes: cursor/order mismatch", () => {
     expect(body.error.code).toBe("invalid_cursor");
   });
 
+  it("rejects a list cursor when the same grant's temporal window broadens", async () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      ["2026-04-01", "2026-04-02", "2026-04-03"].map((day) => ({
+        instance: "inst_1",
+        stream: "playlists",
+        key: day,
+        data: { id: day, name: day, captured_at: `${day}T00:00:00Z` },
+        emitted_at: `${day}T00:00:00.000Z`,
+      })),
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const narrowGrant = clientGrant({
+      time_constraint: { field: "captured_at", since: "2026-04-02T00:00:00Z" },
+    });
+    const broadGrant = clientGrant();
+    const { app } = buildApp(
+      {
+        narrow: {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: narrowGrant,
+        },
+        broad: {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: broadGrant,
+        },
+      },
+      { store },
+    );
+    const first = await app.request(
+      "/streams/playlists/records?limit=1&order=asc",
+      {
+        headers: { Authorization: "Bearer narrow" },
+      },
+    );
+    const firstBody = await first.json();
+    expect(first.status).toBe(200);
+    expect(firstBody.data.map((row: { id: string }) => row.id)).toEqual([
+      "2026-04-02",
+    ]);
+    const replay = await app.request(
+      `/streams/playlists/records?limit=1&order=asc&cursor=${encodeURIComponent(firstBody.next_cursor)}`,
+      { headers: { Authorization: "Bearer broad" } },
+    );
+    expect(replay.status).toBe(400);
+    expect((await replay.json()).error.code).toBe("invalid_cursor");
+  });
+
   it("paginates correctly across pages for a client token whose fields exclude the time_constraint field", async () => {
     // Regression, cursor half: the sort/cursor key is envelope-level
     // (emitted_at, record_key), never a projected data field, so a grant

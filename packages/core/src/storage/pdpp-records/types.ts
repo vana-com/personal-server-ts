@@ -91,6 +91,8 @@ export interface ListRecordsOptions {
   limit: number;
   cursor?: string;
   order: "asc" | "desc";
+  /** Opaque authorization and query fingerprint bound to paginated cursors. */
+  queryBinding?: string;
   /** undefined = no projection restriction (owner reads / unrestricted). */
   fields?: string[];
 }
