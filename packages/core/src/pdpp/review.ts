@@ -30,6 +30,7 @@ import {
   type ClientClaims,
   type ClientDisplay,
   type DeclarationSnapshot,
+  type Grant,
   type OwnerConditions,
   type RecipientTerms,
   type RequestedStream,
@@ -276,6 +277,11 @@ export function computeReviewDigest(fields: ReviewDecisionFields): string {
   return createHash("sha256")
     .update(canonicalize(fields), "utf8")
     .digest("hex");
+}
+
+/** Integrity digest of the complete immutable grant artifact issued on approval. */
+export function computeGrantArtifactDigest(grant: Grant): string {
+  return createHash("sha256").update(canonicalize(grant), "utf8").digest("hex");
 }
 
 export interface BuildReviewInput {

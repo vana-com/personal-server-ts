@@ -6,7 +6,10 @@ export type {
   PdppChainEnforcementPort,
   PdppChainDecision,
 } from "../pdpp/read-admission.js";
-import { grantIsCandidate } from "@opendatalabs/personal-server-ts-core/pdpp";
+import {
+  grantIsCandidate,
+  type DeclarationSnapshot,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
 import { parseRecordQuery } from "./pdpp-record-query.js";
 import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
@@ -682,7 +685,6 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   function sendLeaseRefusal(c: Context, err: unknown, reqId: string) {
     const refusal = toPdppError(err);
     return sendError(c, refusal, reqId, {
-      inactiveBearer: refusal.code === "authentication_error",
       ...(refusal.code === "api_error" && {
         headers: { "Retry-After": "5" },
       }),
@@ -756,8 +758,13 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     ownerInstanceIds: string[];
   } {
     if (context.tokenKind !== "owner") {
+      const retained = context.declarationSnapshot
+        ? streamDeclarationFromSnapshot(context.declarationSnapshot, stream)
+        : undefined;
       return {
-        declaration: deps.declarations.get(stream, context.grant?.source.id),
+        declaration: context.declarationSnapshot
+          ? retained
+          : deps.declarations.get(stream, context.grant?.source.id),
         ownerInstanceIds: [],
       };
     }
@@ -770,6 +777,25 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         ? deps.declarations.forInstance(ownerInstanceIds[0], stream)
         : deps.declarations.get(stream);
     return { declaration, ownerInstanceIds };
+  }
+
+  function streamDeclarationFromSnapshot(
+    snapshot: DeclarationSnapshot,
+    streamName: string,
+  ): StreamDeclaration | undefined {
+    const stream = snapshot.streams.find(({ name }) => name === streamName);
+    if (!stream) return undefined;
+    return {
+      name: stream.name,
+      semantics: stream.semantics ?? "mutable_state",
+      primaryKey: stream.primary_key,
+      cursorField: "emitted_at",
+      consentTimeField: stream.consent_time_field,
+      requiredFields: stream.required_fields,
+      declaredFields: stream.fields,
+      ...(stream.schema && { schema: stream.schema }),
+      ...(stream.selection && { selection: stream.selection }),
+    };
   }
 
   function ownerInstances(context: PdppTokenContext): string[] {
@@ -826,9 +852,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
     // depending only on which endpoint it happened to call first. Found by
     // driving Context Gateway's real PdppContextClient against this server.
     if (!context?.active) {
-      return sendError(c, mapInactiveToError(context!), reqId, {
-        inactiveBearer: true,
-      });
+      return sendError(c, mapInactiveToError(context!), reqId);
     }
 
     const ownerInstanceIds =
@@ -1082,7 +1106,24 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           changesSince: query.changesSince,
           cursor,
           limit,
+          order,
           eligibilityFields: candidate ? streamGrant!.fields : fields,
+          queryBinding: context!.grant
+            ? {
+                protocol: context!.grant.version,
+                grant: context!.grant.grant_id,
+                subject: context!.grant.subject.id,
+                client: context!.grant.client.client_id,
+                source: context!.grant.source.id,
+                streamGrant,
+                fields: fields ? [...new Set(fields)].sort() : null,
+              }
+            : {
+                tokenKind: context!.tokenKind,
+                subject: context!.subjectId,
+                instances: effectiveInstanceIds,
+                fields: fields ? [...new Set(fields)].sort() : null,
+              },
           // Candidate records carry instance_id, so one key held by two
           // instances names two records; the current wire would merge them.
           oneRecordPerKey: context!.tokenKind === "client" && !candidate,
@@ -1101,15 +1142,7 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
           ...(candidate && {
             candidate: {
               order,
-              binding: {
-                protocol: context!.grant!.version,
-                grant: context!.grant!.grant_id,
-                subject: context!.grant!.subject.id,
-                client: context!.grant!.client.client_id,
-                source: context!.grant!.source.id,
-                streamGrant,
-                fields: fields ? [...new Set(fields)].sort() : null,
-              },
+              binding: context!.grant!.grant_id,
             },
           }),
         });

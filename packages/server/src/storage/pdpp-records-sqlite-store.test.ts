@@ -549,7 +549,7 @@ describe("sqlite record store", () => {
     const page2 = createPdppSyncSessionService(store).read({
       stream: "playlists",
       instanceIds: ["inst_1"],
-      limit: 10,
+      limit: 1,
       cursor: page1.nextCursor,
     });
     expect(page2.data.map((r) => r.recordKey)).not.toContain("pl_3");

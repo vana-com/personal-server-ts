@@ -126,6 +126,53 @@ describe("pdpp records routes: authentication", () => {
     const body = await res.json();
     expect(body.error.code).toBe("grant_revoked");
   });
+
+  it.each([
+    ["grant_revoked", "grant_revoked"],
+    ["grant_expired", "grant_expired"],
+  ] as const)(
+    "keeps known %s at 403 in the candidate profile",
+    async (reason, code) => {
+      const { app } = buildApp(
+        {
+          "stale-tok": {
+            active: false,
+            tokenKind: "client",
+            subjectId: "sub_1",
+            inactiveReason: reason,
+          },
+        },
+        { protocolProfile: "candidate-0.1.0" },
+      );
+      for (const path of [
+        "/streams",
+        "/streams/playlists",
+        "/streams/playlists/records",
+        "/streams/playlists/records/pl_1",
+      ]) {
+        const res = await app.request(path, {
+          headers: { Authorization: "Bearer stale-tok" },
+        });
+        expect(res.status).toBe(403);
+        const body = await res.json();
+        expect(body.error.code).toBe(code);
+        expect(body).not.toHaveProperty("data");
+        expect(res.headers.get("WWW-Authenticate")).toBeNull();
+      }
+    },
+  );
+
+  it("maps an unknown candidate-profile bearer to 401 invalid_token", async () => {
+    const { app } = buildApp({}, { protocolProfile: "candidate-0.1.0" });
+    const res = await app.request("/streams/playlists/records", {
+      headers: { Authorization: "Bearer unknown-tok" },
+    });
+    expect(res.status).toBe(401);
+    expect((await res.json()).error.code).toBe("invalid_token");
+    expect(res.headers.get("WWW-Authenticate")).toContain(
+      'error="invalid_token"',
+    );
+  });
 });
 
 describe("pdpp records routes: 500 observability", () => {
@@ -195,6 +242,113 @@ describe("pdpp records routes: 500 observability", () => {
 });
 
 describe("pdpp records routes: field projection", () => {
+  it("uses the declaration snapshot bound to the client grant version", async () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_1",
+          data: { id: "pl_1", name: "visible" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const snapshotV1 = {
+      source_id: clientGrant().source.id,
+      source_kind: "connector" as const,
+      version: "vA",
+      digest: "a".repeat(64),
+      streams: [
+        {
+          name: "playlists",
+          fields: ["id", "name"],
+          required_fields: ["id"],
+          primary_key: ["id"],
+        },
+      ],
+    };
+    const currentV2 = createStreamDeclarationRegistry([
+      {
+        name: "playlists",
+        semantics: "mutable_state",
+        primaryKey: ["id"],
+        cursorField: "emitted_at",
+        requiredFields: ["name"],
+      },
+    ]);
+    const { app } = buildApp(
+      {
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: {
+            ...clientGrant(),
+            source_declaration: { version: "vA" },
+          },
+          declarationSnapshot: snapshotV1,
+        },
+      },
+      { store, declarations: currentV2 },
+    );
+
+    const response = await app.request(
+      "/streams/playlists/records?fields=name",
+      { headers: { Authorization: "Bearer client-tok" } },
+    );
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.data[0].data).toEqual({ name: "visible", id: "pl_1" });
+  });
+
+  it.each([
+    "/streams/playlists/records?fields=id,secret",
+    "/streams/playlists/records/pl_1?fields=id,secret",
+  ])(
+    "rejects mixed granted and ungranted fields without returning records: %s",
+    async (path) => {
+      const store = createMemoryRecordStore();
+      store.ingestBatch(
+        [
+          {
+            instance: "inst_1",
+            stream: "playlists",
+            key: "pl_1",
+            data: { id: "pl_1", name: "visible", secret: "hidden" },
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        () => "mutable_state",
+        () => ["id"],
+      );
+      const { app } = buildApp(
+        {
+          "client-tok": {
+            active: true,
+            tokenKind: "client",
+            subjectId: "sub_1",
+            grant: clientGrant({ fields: ["id", "name"] }),
+          },
+        },
+        { store },
+      );
+
+      const res = await app.request(path, {
+        headers: { Authorization: "Bearer client-tok" },
+      });
+
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body.error.code).toBe("field_not_granted");
+      expect(body.error.param).toBe("fields");
+      expect(body).not.toHaveProperty("data");
+    },
+  );
+
   it("never exposes an unprojected field to a client token via list/get", async () => {
     const store = createMemoryRecordStore();
     store.ingestBatch(

@@ -454,13 +454,13 @@ describe("chain-denial classification", () => {
       label: "revoked",
       chain: { revokedAt: "2026-01-01T00:00:00.000Z" },
       current: { status: 403, code: "grant_revoked" },
-      candidate: { status: 401, code: "invalid_token" },
+      candidate: { status: 403, code: "grant_revoked" },
     },
     {
       label: "expired",
       chain: { expiresAt: "2026-01-01T00:00:00.000Z" },
       current: { status: 403, code: "grant_expired" },
-      candidate: { status: 401, code: "invalid_token" },
+      candidate: { status: 403, code: "grant_expired" },
     },
     {
       label: "invalid expiry",

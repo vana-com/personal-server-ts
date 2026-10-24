@@ -13,9 +13,8 @@ import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas
  *
  *   - `current`: unchanged. An inactive grant is 403 `grant_revoked` or
  *     `grant_expired`; every 401 carries the RFC 6750 challenge.
- *   - `candidate-0.1.0`: an inactive bearer (grant revoked or expired, by the
- *     AS or on chain) is 401 `invalid_token` with the challenge, the same as
- *     any other unusable token. The cause stays in the message.
+ *   - `candidate-0.1.0`: a missing or unusable bearer is 401 `invalid_token`
+ *     with the challenge. Known grant revocation and expiry remain typed 403s.
  */
 export type PdppProtocolProfile = ServerConfig["pdpp"]["protocolProfile"];
 
@@ -37,25 +36,12 @@ export function bearerChallenge(c: Context): string {
   return `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`;
 }
 
-const INACTIVE_GRANT_CODES: ReadonlySet<string> = new Set([
-  "grant_expired",
-  "grant_revoked",
-]);
-
 /**
- * The error a PDPP bearer failure is rendered as under `profile`. A failure
- * is an inactive bearer when the route says so (it resolved the token and it
- * was not active) or when its code names an inactive grant.
+ * Render missing, unknown, or invalid bearers as OAuth invalid_token in the
+ * candidate profile. Typed grant lifecycle errors retain their 403 code.
  */
-function wireError(
-  err: PdppError,
-  profile: PdppProtocolProfile,
-  inactiveBearer: boolean,
-): PdppError {
-  if (
-    profile === "candidate-0.1.0" &&
-    (inactiveBearer || INACTIVE_GRANT_CODES.has(err.code))
-  ) {
+function wireError(err: PdppError, profile: PdppProtocolProfile): PdppError {
+  if (profile === "candidate-0.1.0" && err.code === "authentication_error") {
     return new PdppError("invalid_token", err.message);
   }
   return err;
@@ -89,12 +75,10 @@ export function bearerErrorResponse(
   reqId: string,
   profile: PdppProtocolProfile = "current",
   options: {
-    /** The presented token resolved, and it was not active. */
-    inactiveBearer?: boolean;
     headers?: Record<string, string>;
   } = {},
 ) {
-  const wire = wireError(err, profile, options.inactiveBearer ?? false);
+  const wire = wireError(err, profile);
   return c.json(wire.toJSON(reqId), wire.status as never, {
     "Request-Id": reqId,
     "PDPP-Version": PDPP_VERSION,

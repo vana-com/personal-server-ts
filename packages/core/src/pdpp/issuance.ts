@@ -17,6 +17,7 @@
 import { randomBytes } from "node:crypto";
 import {
   buildConsentReview,
+  computeGrantArtifactDigest,
   computeReviewDigest,
   normalizeClientClaims,
   type RequesterIdentity,
@@ -74,6 +75,8 @@ export type IssuanceResult =
  */
 export interface ConsentEvidence {
   review_digest: string;
+  /** Integrity binding for the exact immutable grant artifact issued. */
+  grant_digest: string;
   approved_at: string;
   /** The exact snapshot identity consent was given against. */
   declaration: { source_id: string; version: string; digest: string };
@@ -290,6 +293,7 @@ export function issueGrant(input: IssueGrantInput): IssuanceResult {
   const normalizedClaims = normalizeClientClaims(input.request.client_claims);
   const consentEvidence: ConsentEvidence = {
     review_digest: review.review_digest,
+    grant_digest: computeGrantArtifactDigest(grant),
     approved_at: now.toISOString(),
     declaration: {
       source_id: input.snapshot.source_id,

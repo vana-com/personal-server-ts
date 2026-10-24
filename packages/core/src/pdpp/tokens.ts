@@ -194,7 +194,7 @@ export class PdppTokenService {
       };
     }
 
-    const stored = this.store.getGrant(record.grantId);
+    const stored = this.store.getValidatedGrant(record.grantId);
     if (!stored) {
       return {
         ok: false,
@@ -241,7 +241,7 @@ export class PdppTokenService {
       };
     }
 
-    const stored = this.store.getGrant(rotation.grantId);
+    const stored = this.store.getValidatedGrant(rotation.grantId);
     if (!stored) {
       return {
         ok: false,
@@ -361,7 +361,7 @@ export class PdppTokenService {
     // revocation, and the RS keys 403 `grant_revoked` off this exact reason
     // (§2 revocation propagation) — it would return the wrong error.
     if (record.tokenKind === "client" && record.grantId) {
-      const stored = this.store.getGrant(record.grantId);
+      const stored = this.store.getValidatedGrant(record.grantId);
       if (!stored) {
         return { active: false, inactiveReason: "unknown" };
       }
@@ -410,7 +410,7 @@ export class PdppTokenService {
       return { active: false, inactiveReason: "unknown" };
     }
 
-    const stored = this.store.getGrant(record.grantId);
+    const stored = this.store.getValidatedGrant(record.grantId);
     if (!stored) {
       return { active: false, inactiveReason: "unknown" };
     }
@@ -426,6 +426,7 @@ export class PdppTokenService {
       tokenKind: "client",
       subjectId: stored.subjectId,
       grant: stored.grant,
+      declarationSnapshot: stored.declarationSnapshot,
       clientId: stored.grant.client.client_id,
       ...(record.expiresAt && { expiresAt: record.expiresAt }),
     };

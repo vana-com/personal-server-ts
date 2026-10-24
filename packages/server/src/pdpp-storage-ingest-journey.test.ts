@@ -1369,7 +1369,7 @@ describe("P10c and method authority over HTTP", () => {
     const changesPage = await read(
       ctx!,
       token,
-      "/v1/streams/events/records?changes_since=&limit=1",
+      "/v1/streams/events/records?changes_since=&limit=1&order=asc",
     );
     const changesCursor = changesPage.body.next_cursor as string;
     expect(changesCursor).toBeTruthy();
@@ -1411,7 +1411,7 @@ describe("P10c and method authority over HTTP", () => {
     const staleChanges = await read(
       ctx,
       newToken,
-      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(changesCursor)}`,
+      `/v1/streams/events/records?changes_since=&limit=1&order=asc&cursor=${encodeURIComponent(changesCursor)}`,
     );
     expect(staleChanges.status).toBe(410);
 
@@ -1440,7 +1440,7 @@ describe("P10c and method authority over HTTP", () => {
     const page = await read(
       ctx!,
       token,
-      "/v1/streams/events/records?changes_since=&limit=1",
+      "/v1/streams/events/records?changes_since=&limit=1&order=asc",
     );
     const cursor = page.body.next_cursor as string;
     const listPage = await read(
@@ -1597,7 +1597,7 @@ describe("P10c and method authority over HTTP", () => {
     const staleChanges = await read(
       ctx,
       tokenB,
-      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(changesCursor)}`,
+      `/v1/streams/events/records?changes_since=&limit=1&order=asc&cursor=${encodeURIComponent(changesCursor)}`,
     );
     expect(staleChanges.status).toBe(410);
     expect(staleChanges.body.error.code).toBe("cursor_expired");
@@ -1611,7 +1611,7 @@ describe("P10c and method authority over HTTP", () => {
     const page1 = await read(
       ctx!,
       token,
-      "/v1/streams/events/records?changes_since=&limit=1",
+      "/v1/streams/events/records?changes_since=&limit=1&order=asc",
     );
     expect(page1.status).toBe(200);
     expect(page1.body.data.map((r: any) => r.id)).toEqual(["a1"]);
@@ -1622,7 +1622,7 @@ describe("P10c and method authority over HTTP", () => {
     const page2 = await read(
       ctx!,
       token,
-      `/v1/streams/events/records?changes_since=&limit=1&cursor=${encodeURIComponent(page1.body.next_cursor)}`,
+      `/v1/streams/events/records?changes_since=&limit=1&order=asc&cursor=${encodeURIComponent(page1.body.next_cursor)}`,
     );
     expect(page2.status).toBe(200);
     expect(page2.body.data.map((r: any) => r.id)).toEqual(["a2"]);

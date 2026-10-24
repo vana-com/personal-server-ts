@@ -245,6 +245,8 @@ export async function createPdppAuthDeps(
     resolveConnectionSourceId: (requested) =>
       resolveRetainedSourceId(requested, connectionSourceIds),
     resolveDeclaration: config.pdpp.enabled ? registry.resolve : () => null,
+    documentForDeclaration: (sourceId, version) =>
+      declarationRegistry.documentForVersion(sourceId, version),
     declarationRegistry,
     supportedConnectors,
     // The AS's own issuer identity, for its metadata document. Carried as the

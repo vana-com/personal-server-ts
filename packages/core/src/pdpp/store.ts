@@ -23,7 +23,10 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
+import { parseDeclaration } from "./declaration.js";
+import { computeGrantArtifactDigest, computeReviewDigest } from "./review.js";
 import { hasFiniteExpiration } from "./token-expiry.js";
 import type {
   DeclarationSnapshot,
@@ -191,12 +194,298 @@ interface GrantRow {
   grant_id: string;
   subject_id: string;
   client_id: string;
+  source_id: string;
+  declaration_version: string;
+  access_mode: string;
   grant_json: string;
   issued_at: string;
   expires_at: string | null;
   revoked_at: string | null;
   consumed_at: string | null;
   review_digest: string;
+  consent_evidence_json: string | null;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: string[],
+): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function validDate(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.test(
+      value,
+    ) &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+function validTimeBound(value: unknown, type: unknown): value is string {
+  if (type === "date") {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return false;
+    }
+    return Number.isFinite(Date.parse(`${value}T00:00:00Z`));
+  }
+  return validDate(value);
+}
+
+function uniqueStrings(value: unknown, allowEmpty = false): value is string[] {
+  return (
+    Array.isArray(value) &&
+    (allowEmpty || value.length > 0) &&
+    value.every(nonEmptyString) &&
+    new Set(value).size === value.length
+  );
+}
+
+/** Runtime counterpart to the normative grant shape; persisted JSON is untrusted. */
+function isSupportedGrant(value: unknown): value is Grant {
+  if (!isObject(value)) return false;
+  const v02 = value.version === "0.2.0";
+  const candidate = value.version === "0.1.0-candidate";
+  if (!(value.version === "0.1.0" || v02 || candidate)) return false;
+  const keys = [
+    "version",
+    "grant_id",
+    "issued_at",
+    "subject",
+    "client",
+    "source",
+    "source_declaration",
+    "purpose_code",
+    "purpose_description",
+    "access_mode",
+    "streams",
+    "selection_preset",
+    "retention",
+    "expires_at",
+    ...(v02 ? ["requested"] : []),
+  ];
+  if (!hasOnlyKeys(value, keys)) return false;
+  if (
+    !nonEmptyString(value.grant_id) ||
+    !validDate(value.issued_at) ||
+    !isObject(value.subject) ||
+    !hasOnlyKeys(value.subject, ["id"]) ||
+    !nonEmptyString(value.subject.id) ||
+    !isObject(value.client) ||
+    !hasOnlyKeys(value.client, ["client_id", "client_display"]) ||
+    !nonEmptyString(value.client.client_id) ||
+    !isObject(value.source) ||
+    !hasOnlyKeys(value.source, ["kind", "id"]) ||
+    !(
+      value.source.kind === "connector" ||
+      value.source.kind === "provider_native"
+    ) ||
+    !nonEmptyString(value.source.id) ||
+    !isObject(value.source_declaration) ||
+    !hasOnlyKeys(value.source_declaration, ["version"]) ||
+    !nonEmptyString(value.source_declaration.version) ||
+    !nonEmptyString(value.purpose_code) ||
+    (value.purpose_description !== undefined &&
+      typeof value.purpose_description !== "string") ||
+    !(
+      value.access_mode === "single_use" || value.access_mode === "continuous"
+    ) ||
+    !Array.isArray(value.streams) ||
+    value.streams.length === 0 ||
+    (value.selection_preset !== undefined &&
+      !nonEmptyString(value.selection_preset)) ||
+    (value.expires_at !== undefined && !validDate(value.expires_at))
+  )
+    return false;
+  if (value.client.client_display !== undefined) {
+    const display = value.client.client_display;
+    if (
+      !isObject(display) ||
+      !hasOnlyKeys(display, [
+        "name",
+        "uri",
+        "logo_uri",
+        "policy_uri",
+        "tos_uri",
+      ]) ||
+      !nonEmptyString(display.name) ||
+      Object.values(display).some((member) => typeof member !== "string")
+    )
+      return false;
+  }
+  if (value.retention !== undefined) {
+    if (
+      !isObject(value.retention) ||
+      !hasOnlyKeys(value.retention, ["max_duration", "on_expiry"]) ||
+      !nonEmptyString(value.retention.max_duration) ||
+      !(
+        value.retention.on_expiry === "delete" ||
+        value.retention.on_expiry === "anonymize"
+      )
+    )
+      return false;
+  }
+  const names = new Set<string>();
+  for (const stream of value.streams) {
+    if (
+      !isObject(stream) ||
+      !hasOnlyKeys(stream, [
+        "name",
+        "instance_ids",
+        "fields",
+        "time_constraint",
+        "resources",
+        ...(candidate ? ["required_fields"] : []),
+      ]) ||
+      !nonEmptyString(stream.name) ||
+      names.has(stream.name) ||
+      !uniqueStrings(stream.instance_ids) ||
+      !uniqueStrings(stream.fields) ||
+      (stream.resources !== undefined && !uniqueStrings(stream.resources))
+    )
+      return false;
+    names.add(stream.name);
+    if (candidate && !uniqueStrings(stream.required_fields, true)) return false;
+    if (
+      candidate &&
+      (stream.required_fields as string[]).some(
+        (field) => !(stream.fields as string[]).includes(field),
+      )
+    )
+      return false;
+    if (stream.time_constraint !== undefined) {
+      const time = stream.time_constraint;
+      if (
+        !isObject(time) ||
+        !hasOnlyKeys(time, ["type", "field", "since", "until"]) ||
+        !nonEmptyString(time.field) ||
+        (time.type !== undefined &&
+          !(time.type === "date" || time.type === "date-time")) ||
+        (time.since !== undefined && !validTimeBound(time.since, time.type)) ||
+        (time.until !== undefined && !validTimeBound(time.until, time.type)) ||
+        (time.since !== undefined &&
+          time.until !== undefined &&
+          Date.parse(time.since) >= Date.parse(time.until))
+      )
+        return false;
+    }
+  }
+  if (v02) {
+    const requested = value.requested;
+    if (
+      !isObject(requested) ||
+      !hasOnlyKeys(requested, ["streams", "omitted_streams"]) ||
+      !Array.isArray(requested.streams) ||
+      requested.streams.length === 0 ||
+      (requested.omitted_streams !== undefined &&
+        !uniqueStrings(requested.omitted_streams, true))
+    )
+      return false;
+    const requestedNames = new Set<string>();
+    const optionalNames = new Set<string>();
+    for (const requestedStream of requested.streams) {
+      if (
+        !isObject(requestedStream) ||
+        !hasOnlyKeys(requestedStream, [
+          "name",
+          "necessity",
+          "fields",
+          "time_range",
+          "minimum",
+        ]) ||
+        !nonEmptyString(requestedStream.name) ||
+        requestedNames.has(requestedStream.name) ||
+        !(
+          requestedStream.necessity === "required" ||
+          requestedStream.necessity === "optional"
+        ) ||
+        !uniqueStrings(requestedStream.fields)
+      )
+        return false;
+      requestedNames.add(requestedStream.name);
+      if (requestedStream.necessity === "optional")
+        optionalNames.add(requestedStream.name);
+      if (requestedStream.time_range !== undefined) {
+        const range = requestedStream.time_range;
+        if (
+          !isObject(range) ||
+          !hasOnlyKeys(range, ["since", "until"]) ||
+          (range.since !== undefined && !validDate(range.since)) ||
+          (range.until !== undefined && !validDate(range.until)) ||
+          (range.since !== undefined &&
+            range.until !== undefined &&
+            Date.parse(range.since) >= Date.parse(range.until))
+        )
+          return false;
+      }
+      if (requestedStream.minimum !== undefined) {
+        const minimum = requestedStream.minimum;
+        if (
+          !isObject(minimum) ||
+          !hasOnlyKeys(minimum, ["fields", "time_range"]) ||
+          (minimum.fields !== undefined && !uniqueStrings(minimum.fields))
+        )
+          return false;
+        if (minimum.time_range !== undefined) {
+          const range = minimum.time_range;
+          if (
+            !isObject(range) ||
+            !hasOnlyKeys(range, ["since", "until"]) ||
+            !validDate(range.since) ||
+            !validDate(range.until) ||
+            Date.parse(range.since) >= Date.parse(range.until)
+          )
+            return false;
+        }
+      }
+    }
+    if (
+      Array.isArray(requested.omitted_streams) &&
+      requested.omitted_streams.some((name) => !optionalNames.has(name))
+    )
+      return false;
+  }
+  return true;
+}
+
+function isConsentEvidence(value: unknown): value is {
+  review_digest: string;
+  grant_digest: string;
+  approved_at: string;
+  declaration: { source_id: string; version: string; digest: string };
+  client_claims?: { attributed_to: string; commitments: string[] };
+} {
+  if (
+    !isObject(value) ||
+    !nonEmptyString(value.review_digest) ||
+    !/^[a-f0-9]{64}$/.test(String(value.grant_digest ?? "")) ||
+    !validDate(value.approved_at) ||
+    !isObject(value.declaration) ||
+    !hasOnlyKeys(value.declaration, ["source_id", "version", "digest"]) ||
+    !nonEmptyString(value.declaration.source_id) ||
+    !nonEmptyString(value.declaration.version) ||
+    !nonEmptyString(value.declaration.digest)
+  )
+    return false;
+  if (value.client_claims !== undefined) {
+    return (
+      isObject(value.client_claims) &&
+      hasOnlyKeys(value.client_claims, ["attributed_to", "commitments"]) &&
+      nonEmptyString(value.client_claims.attributed_to) &&
+      Array.isArray(value.client_claims.commitments) &&
+      value.client_claims.commitments.every((item) => typeof item === "string")
+    );
+  }
+  return true;
 }
 
 /**
@@ -384,10 +673,21 @@ export class PdppAuthStore {
     subjectId: string;
     reviewDigest: string;
     consentEvidence?: unknown;
+    declarationSnapshot?: DeclarationSnapshot;
+    declarationDocument?: string;
     code: string;
     authCode: AuthCodeRecord;
   }): void {
     const tx = this.db.transaction(() => {
+      if (
+        input.declarationSnapshot &&
+        input.declarationDocument !== undefined
+      ) {
+        this.retainDeclaration(
+          input.declarationSnapshot,
+          input.declarationDocument,
+        );
+      }
       this.insertGrant({
         grant: input.grant,
         subjectId: input.subjectId,
@@ -414,6 +714,105 @@ export class PdppAuthStore {
       revokedAt: row.revoked_at,
       consumedAt: row.consumed_at,
     };
+  }
+
+  /**
+   * Load a grant only when its persisted representation still matches the
+   * approved consent artifact and exact retained declaration. Token
+   * validation uses this single boundary before returning any rights.
+   */
+  getValidatedGrant(
+    grantId: string,
+  ): (StoredGrant & { declarationSnapshot: DeclarationSnapshot }) | null {
+    const row = this.db
+      .prepare("SELECT * FROM pdpp_grants WHERE grant_id = ?")
+      .get(grantId) as GrantRow | undefined;
+    if (!row) return null;
+    try {
+      const value: unknown = JSON.parse(row.grant_json);
+      if (!isSupportedGrant(value)) return null;
+      const grant = value;
+      if (
+        grant.grant_id !== row.grant_id ||
+        grant.subject.id !== row.subject_id ||
+        grant.client.client_id !== row.client_id ||
+        grant.source.id !== row.source_id ||
+        grant.source_declaration.version !== row.declaration_version ||
+        grant.access_mode !== row.access_mode ||
+        grant.issued_at !== row.issued_at ||
+        (grant.expires_at ?? null) !== row.expires_at
+      ) {
+        return null;
+      }
+      if (!row.consent_evidence_json) return null;
+      const evidence: unknown = JSON.parse(row.consent_evidence_json);
+      if (
+        !isConsentEvidence(evidence) ||
+        evidence.review_digest !== row.review_digest ||
+        evidence.grant_digest !== computeGrantArtifactDigest(grant) ||
+        evidence.declaration.source_id !== grant.source.id ||
+        evidence.declaration.version !== grant.source_declaration.version
+      ) {
+        return null;
+      }
+
+      const declarationSnapshot = this.getDeclaration(
+        evidence.declaration.source_id,
+        evidence.declaration.version,
+      );
+      const document = this.getDeclarationDocument(
+        evidence.declaration.source_id,
+        evidence.declaration.version,
+      );
+      if (!declarationSnapshot || document === null) return null;
+      const parsedDeclaration = parseDeclaration(
+        document,
+        evidence.declaration.source_id,
+        evidence.declaration.digest,
+      );
+      if (
+        !parsedDeclaration.ok ||
+        !isDeepStrictEqual(parsedDeclaration.snapshot, declarationSnapshot) ||
+        declarationSnapshot.version !== grant.source_declaration.version
+      ) {
+        return null;
+      }
+
+      const approvedDigest = computeReviewDigest({
+        subject_id: grant.subject.id,
+        client_id: grant.client.client_id,
+        source_id: grant.source.id,
+        source_kind: grant.source.kind,
+        source_declaration_version: grant.source_declaration.version,
+        declaration_digest: evidence.declaration.digest,
+        purpose_code: grant.purpose_code,
+        purpose_description: grant.purpose_description,
+        access_mode: grant.access_mode,
+        streams: grant.streams,
+        ...(grant.requested?.omitted_streams && {
+          omitted_streams: grant.requested.omitted_streams,
+        }),
+        retention: grant.retention,
+        expires_at: grant.expires_at,
+        client_claims: evidence.client_claims,
+      });
+      if (approvedDigest !== row.review_digest) return null;
+
+      return {
+        grant,
+        declarationSnapshot,
+        subjectId: row.subject_id,
+        clientId: row.client_id,
+        reviewDigest: row.review_digest,
+        issuedAt: row.issued_at,
+        expiresAt: row.expires_at,
+        revokedAt: row.revoked_at,
+        consumedAt: row.consumed_at,
+      };
+    } catch {
+      // Corrupt persisted facts are unusable. Never rebuild them from config.
+      return null;
+    }
   }
 
   listGrantsForSubject(subjectId: string): StoredGrant[] {
