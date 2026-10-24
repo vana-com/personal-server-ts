@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS legacy_scope_takeover_resets (
   reset_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 )`;
 
+const CREATE_LEGACY_SCOPE_CANONICAL_AUTHORITY_SQL = `
+CREATE TABLE IF NOT EXISTS legacy_scope_canonical_authority (
+  scope TEXT NOT NULL PRIMARY KEY,
+  established_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)`;
+
 function hasColumn(
   db: Database.Database,
   table: string,
@@ -237,6 +243,12 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
       db.exec("DROP TABLE legacy_scope_takeover_verdicts_old");
     })();
   }
+  db.exec(`
+    -- Additive authority metadata stays at v14 so a prior runtime can still
+    -- open the index; that runtime ignores this table and does not drop it.
+    INSERT OR IGNORE INTO legacy_scope_canonical_authority (scope)
+    SELECT DISTINCT scope FROM legacy_scope_takeovers
+  `);
 }
 
 function ensureSchemaVersion(db: Database.Database): void {
@@ -287,6 +299,7 @@ export function initializeDatabase(dbPath: string): Database.Database {
     db.exec(CREATE_LEGACY_SCOPE_TAKEOVERS_SQL);
     db.exec(CREATE_LEGACY_SCOPE_VERDICTS_SQL);
     db.exec(CREATE_LEGACY_SCOPE_RESETS_SQL);
+    db.exec(CREATE_LEGACY_SCOPE_CANONICAL_AUTHORITY_SQL);
     ensureSchemaVersion(db);
     db.exec(`CREATE TABLE IF NOT EXISTS owner_import_operations (
     authority TEXT NOT NULL,
