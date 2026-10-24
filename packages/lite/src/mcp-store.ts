@@ -183,20 +183,45 @@ function mutateConnectionRecord(
           McpConnectionRecord | undefined
         >;
         let result: McpConnectionRecord | null = null;
+        let settled = false;
+        const resolveOnce = (value: McpConnectionRecord | null) => {
+          if (settled) return;
+          settled = true;
+          db.close();
+          resolve(value);
+        };
+        const rejectOnce = (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          db.close();
+          reject(error);
+        };
         request.onsuccess = () => {
           if (!request.result) return;
-          result = update(structuredClone(request.result));
-          store.put(result);
+          try {
+            result = update(structuredClone(request.result));
+            store.put(result);
+          } catch (error) {
+            try {
+              transaction.abort();
+            } catch {
+              // The transaction may already be inactive; settle with the update error.
+            }
+            rejectOnce(error);
+          }
         };
-        request.onerror = () => reject(request.error);
-        transaction.oncomplete = () => {
-          db.close();
-          resolve(result ? structuredClone(result) : null);
-        };
-        transaction.onerror = () => {
-          db.close();
-          reject(transaction.error);
-        };
+        request.onerror = () =>
+          rejectOnce(request.error ?? new Error("IndexedDB request failed"));
+        transaction.oncomplete = () =>
+          resolveOnce(result ? structuredClone(result) : null);
+        transaction.onerror = () =>
+          rejectOnce(
+            transaction.error ?? new Error("IndexedDB transaction failed"),
+          );
+        transaction.onabort = () =>
+          rejectOnce(
+            transaction.error ?? new Error("IndexedDB transaction aborted"),
+          );
       }),
   );
 }

@@ -5,6 +5,7 @@ import {
   createMcpConnection,
   createMcpOAuthAuthorization,
   createInMemoryMcpOAuthAuthorizationStore,
+  McpConnectionStateError,
   requestMcpScopeAccess,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { createIndexedDbMcpConnectionStore } from "./mcp-store.js";
@@ -44,6 +45,55 @@ describe("IndexedDB MCP connection mutations", () => {
           connection.status === "pending",
       ),
     ).toHaveLength(1);
+  });
+
+  it("settles approval with a state error when cleanup already revoked the row", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const connectionStore = createIndexedDbMcpConnectionStore({
+      dbName: "mcp-oauth-approve-after-cleanup",
+    });
+    const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
+    const stale = await createMcpConnection(
+      { displayName: "Claude", clientId: "same-client" },
+      { store: connectionStore, publicOrigin: "https://ps.local" },
+    );
+    await createMcpOAuthAuthorization(
+      {
+        clientId: "same-client",
+        redirectUri: "https://claude.ai/api/mcp/auth_callback",
+        codeChallenge: "challenge",
+        codeChallengeMethod: "S256",
+      },
+      {
+        connectionStore,
+        authorizationStore,
+        publicOrigin: "https://ps.local",
+      },
+    );
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutGuard = new Promise<never>((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("approval timed out")),
+        1_000,
+      );
+    });
+    try {
+      await expect(
+        Promise.race([
+          approveMcpConnection(
+            {
+              connectionId: stale.connectionId,
+              grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+            },
+            { store: connectionStore },
+          ),
+          timeoutGuard,
+        ]),
+      ).rejects.toBeInstanceOf(McpConnectionStateError);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
   });
 
   it("atomically preserves concurrent requests on a legacy record", async () => {
