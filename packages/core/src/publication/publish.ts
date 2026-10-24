@@ -28,6 +28,22 @@ export interface PublicationFence {
   generation: string;
   head: PublicationRecord | null;
 }
+export type PublicationContentClass = "canonical" | "legacy";
+export interface PublicationRegistrationAuthority {
+  /** Serialize the remote head change with local canonical takeover. */
+  withRegistration<T>(
+    scope: string,
+    contentClass: PublicationContentClass,
+    register: () => Promise<T>,
+  ): Promise<T>;
+}
+export class HistoryOnlyVersionError extends Error {
+  readonly code = "HISTORY_ONLY_VERSION";
+  constructor(readonly scope: string) {
+    super(`Legacy version for ${scope} is retained as history`);
+    this.name = "HistoryOnlyVersionError";
+  }
+}
 type Registration = Parameters<GatewayClient["registerDataPoint"]>[0] & {
   lineage?: readonly string[];
   lineageSignature?: string;
@@ -77,6 +93,8 @@ export interface PublishOptions {
   gateway: Pick<GatewayClient, "registerDataPoint">;
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   fencedPublication?: FencedPublicationPort;
+  registrationAuthority?: PublicationRegistrationAuthority;
+  publicationClass?: PublicationContentClass;
   /** Undefined means the caller has no initial registry observation. */
   head?: PublicationRecord | null;
   readHead(): Promise<PublicationRecord | null>;
@@ -246,41 +264,51 @@ export async function publishPreparedVersion(
         }),
       };
     }
-    let id: string | undefined;
-    if (fencedPublication) {
-      const previous = requireFence("registration/adoption");
-      const result = await fencedPublication.commit({
-        ...request,
-        ...lineageFields,
-        mode,
-        fence: previous,
-      });
-      const registered = result.fence.head;
-      if (
-        result.fence.generation !== previous.generation ||
-        !registered ||
-        isDeleted(registered) ||
-        registered.expectedVersion !== String(version) ||
-        !sameHash(registered.dataHash, value.dataHash) ||
-        !sameHash(registered.metadataHash, value.metadataHash) ||
-        registered.id !== result.dataPointId
-      )
-        throw new Error("Gateway returned inconsistent publication evidence");
-      fence = result.fence;
-      head = registered;
-      id = result.dataPointId;
-    } else if (mode === "adopt") {
-      // No remote effect: the caller verified the live row's stored bytes.
-      id = head?.id;
-    } else {
+    const register = async (): Promise<string | undefined> => {
+      if (fencedPublication) {
+        const previous = requireFence("registration/adoption");
+        const result = await fencedPublication.commit({
+          ...request,
+          ...lineageFields,
+          mode,
+          fence: previous,
+        });
+        const registered = result.fence.head;
+        if (
+          result.fence.generation !== previous.generation ||
+          !registered ||
+          isDeleted(registered) ||
+          registered.expectedVersion !== String(version) ||
+          !sameHash(registered.dataHash, value.dataHash) ||
+          !sameHash(registered.metadataHash, value.metadataHash) ||
+          registered.id !== result.dataPointId
+        )
+          throw new Error("Gateway returned inconsistent publication evidence");
+        fence = result.fence;
+        head = registered;
+        return result.dataPointId;
+      }
+      if (mode === "adopt") {
+        // No remote effect: the caller verified the live row's stored bytes.
+        return head?.id;
+      }
       const result = lineageFields
         ? await options.lineageGateway!.registerDataPoint({
             ...request,
             ...lineageFields,
           })
         : await options.gateway.registerDataPoint(request);
-      id = result.dataPointId;
-    }
+      return result.dataPointId;
+    };
+    const id: string | undefined =
+      (mode === "register" || Boolean(fencedPublication)) &&
+      options.registrationAuthority
+        ? await options.registrationAuthority.withRegistration(
+            scope,
+            options.publicationClass ?? "canonical",
+            register,
+          )
+        : await register();
     if (!id)
       throw new Error(
         `Gateway registerDataPoint did not return a dataPointId for ${scope} version ${version}`,

@@ -4,6 +4,8 @@ import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import {
   publishVersion,
+  HistoryOnlyVersionError,
+  type PublicationRegistrationAuthority,
   type FencedPublicationPort,
   type PublicationRecord,
 } from "../../publication/publish.js";
@@ -32,6 +34,7 @@ export { isEntryCoveredByTombstone } from "../scope-deletions.js";
 export interface UploadWorkerDeps {
   additions?: DurableAdditionsService;
   fencedPublication?: FencedPublicationPort;
+  registrationAuthority?: PublicationRegistrationAuthority;
   storage: DataStoragePort;
   storageAdapter: StorageAdapter;
   gateway: GatewayClient;
@@ -126,7 +129,11 @@ async function dropIfCoveredByDeletion(
 ): Promise<void> {
   const version = tombstoneVersion(tombstone);
   if (!isEntryCoveredByTombstone(entry, { version })) return;
-  await deps.storage.deleteVersion(entry.scope, entry.collectedAt);
+  const deleted = await deps.storage.deleteVersion(
+    entry.scope,
+    entry.collectedAt,
+  );
+  if (!deleted) throw new HistoryOnlyVersionError(entry.scope);
   deps.logger.warn(
     {
       path: entry.path,
@@ -239,6 +246,12 @@ export async function uploadOne(
         signer,
         lineageGateway: deps.lineageGateway,
         fencedPublication: deps.fencedPublication,
+        registrationAuthority: deps.registrationAuthority,
+        publicationClass:
+          entry.producer === "pdpp-projector" ||
+          entry.producer === "pdpp-import-projection"
+            ? "canonical"
+            : "legacy",
         head: initialHead,
         readHead,
         checkHead,
@@ -304,7 +317,8 @@ export async function uploadAll(
       // user deleted on purpose. Already logged in uploadOne; swallow here.
       if (
         err instanceof OrphanedEntryError ||
-        err instanceof DeletedScopeEntryError
+        err instanceof DeletedScopeEntryError ||
+        err instanceof HistoryOnlyVersionError
       ) {
         continue;
       }

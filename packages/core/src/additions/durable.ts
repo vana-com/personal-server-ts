@@ -16,6 +16,7 @@ import type { StorageAdapter } from "../storage/adapters/interface.js";
 import {
   publishVersion,
   type FencedPublicationPort,
+  type PublicationRegistrationAuthority,
   NeedsFencedPublicationError,
 } from "../publication/publish.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
@@ -84,6 +85,7 @@ export interface DurableAdditionsOptions {
   signer: Pick<ServerSigner, "signAddData">;
   gateway: Pick<GatewayClient, "registerDataPoint">;
   fencedPublication?: FencedPublicationPort;
+  registrationAuthority?: PublicationRegistrationAuthority;
   /** Summaries remain behind; hosts can expose the retryable recovery reason. */
   onPublicationBlocked?: (error: NeedsFencedPublicationError) => void;
   /** Full PS defaults remain unlimited. Bounded hosts must also supply boundedWork. */
@@ -389,6 +391,8 @@ export function createDurableAdditions(
       signer: options.signer,
       gateway: options.gateway,
       fencedPublication: options.fencedPublication,
+      registrationAuthority: options.registrationAuthority,
+      publicationClass: "canonical",
       head: toHead(snapshot),
       readHead: async () =>
         toHead(await inventory.list(scope, budget.readOptions)),

@@ -56,6 +56,8 @@ export interface IndexManager {
   findByFileId(fileId: string): IndexEntry | undefined;
   /** Find an index entry by its DPv2 data-point id (download dedup). */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
+  isHistoryOnly(scope: string, path: string): boolean;
+  findHistoryOnly(scope: string): Pick<IndexEntry, "path" | "collectedAt">[];
   /**
    * Find unsynced entries eligible for remote publication, ordered oldest
    * first. Legacy history remains indexed but is excluded once its scope has
@@ -360,31 +362,34 @@ export function createIndexManager(
     "SELECT * FROM data_files WHERE data_point_id = @data_point_id ORDER BY version DESC, id DESC LIMIT 1",
   );
 
-  const findUnsyncedStmt = db.prepare(
-    `SELECT entry.* FROM data_files AS entry
-      WHERE entry.data_point_id IS NULL
-        AND (
-          entry.producer IN ('pdpp-projector', 'pdpp-import-projection')
-          OR NOT EXISTS (
-            SELECT 1 FROM legacy_scope_canonical_authority AS authority
-             WHERE authority.scope = entry.scope
-          )
-        )
-      ORDER BY entry.created_at ASC`,
-  );
+  const historyOnlyPredicate = `
+    EXISTS (
+      SELECT 1 FROM legacy_scope_canonical_authority AS authority
+       WHERE authority.scope = entry.scope
+    )
+    AND (
+      entry.producer IS NULL
+      OR entry.producer NOT IN ('pdpp-projector', 'pdpp-import-projection')
+    )`;
+  const findUnsyncedSql = `SELECT entry.* FROM data_files AS entry
+    WHERE entry.data_point_id IS NULL
+      AND NOT (${historyOnlyPredicate})
+    ORDER BY entry.created_at ASC`;
+  const findUnsyncedStmt = db.prepare(findUnsyncedSql);
 
   const findUnsyncedLimitStmt = db.prepare<{ limit: number }>(
-    `SELECT entry.* FROM data_files AS entry
-      WHERE entry.data_point_id IS NULL
-        AND (
-          entry.producer IS NOT NULL
-          OR NOT EXISTS (
-            SELECT 1 FROM legacy_scope_canonical_authority AS authority
-             WHERE authority.scope = entry.scope
-          )
-        )
-      ORDER BY entry.created_at ASC
-      LIMIT @limit`,
+    `${findUnsyncedSql.replace("ORDER BY entry.created_at ASC", "")}\n    LIMIT @limit`,
+  );
+  const isHistoryOnlyStmt = db.prepare<{ scope: string; path: string }>(
+    `SELECT 1 FROM data_files AS entry
+      WHERE entry.scope = @scope AND entry.path = @path
+        AND (${historyOnlyPredicate})
+      LIMIT 1`,
+  );
+  const findHistoryOnlyStmt = db.prepare<{ scope: string }>(
+    `SELECT entry.path, entry.collected_at FROM data_files AS entry
+      WHERE entry.scope = @scope AND (${historyOnlyPredicate})
+      ORDER BY julianday(entry.collected_at) ASC, entry.id ASC`,
   );
 
   const updateFileIdStmt = db.prepare<{ file_id: string; path: string }>(
@@ -673,6 +678,21 @@ export function createIndexManager(
       const row = findByDataPointIdStmt.get({ data_point_id: dataPointId }) as
         RawRow | undefined;
       return row ? rowToEntry(row) : undefined;
+    },
+
+    isHistoryOnly(scope, path) {
+      return isHistoryOnlyStmt.get({ scope, path }) !== undefined;
+    },
+
+    findHistoryOnly(scope) {
+      const rows = findHistoryOnlyStmt.all({ scope }) as {
+        path: string;
+        collected_at: string;
+      }[];
+      return rows.map((row) => ({
+        path: row.path,
+        collectedAt: row.collected_at,
+      }));
     },
 
     findUnsynced(options) {

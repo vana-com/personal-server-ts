@@ -137,6 +137,84 @@ describe("owner import deletion ordering", () => {
   });
 });
 
+describe("canonical-authority legacy retention", () => {
+  it("keeps history-only files through tombstone deletion and import recovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "history-only-retention-"));
+    const dataDir = join(root, "data");
+    const databasePath = join(root, "index.db");
+    const scope = "github.events";
+    const collectedAt = "2026-10-11T00:00:00Z";
+    let db = initializeDatabase(databasePath);
+    let index = createIndexManager(db);
+    let storage = createNodeDataStorage({
+      indexManager: index,
+      hierarchyOptions: { dataDir },
+    });
+    try {
+      const envelope = createDataFileEnvelope(scope, collectedAt, {
+        value: "retained",
+      });
+      const written = await storage.writeEnvelope(envelope);
+      index.insert({
+        fileId: null,
+        path: written.relativePath,
+        scope,
+        collectedAt,
+        sizeBytes: written.sizeBytes,
+      });
+      db.prepare(
+        "INSERT INTO legacy_scope_canonical_authority (scope) VALUES (?)",
+      ).run(scope);
+      db.prepare(
+        `INSERT INTO owner_import_operations
+          (authority, owner, scope, operation, body_sha256, state, collected_at, path, envelope_bytes, metadata_json)
+         VALUES ('local', 'owner', ?, ?, ?, 'deleted', ?, ?, X'7B7D', '{}')`,
+      ).run(
+        scope,
+        "a".repeat(64),
+        "b".repeat(64),
+        collectedAt,
+        written.relativePath,
+      );
+
+      expect(await storage.deleteVersion(scope, collectedAt)).toBe(false);
+      expect(await storage.dropUnsyncedEntry!(written.relativePath)).toBe(
+        false,
+      );
+      expect(await storage.deleteScope(scope)).toBe(0);
+      expect(index.countByScope(scope)).toBe(1);
+      await expect(readFile(written.path, "utf8")).resolves.toContain(
+        "retained",
+      );
+
+      index.close();
+      db = initializeDatabase(databasePath);
+      index = createIndexManager(db);
+      storage = createNodeDataStorage({
+        indexManager: index,
+        hierarchyOptions: { dataDir },
+      });
+
+      expect(index.countByScope(scope)).toBe(1);
+      await expect(
+        storage.readEnvelope(scope, collectedAt),
+      ).resolves.toMatchObject({
+        data: { value: "retained" },
+      });
+      expect(
+        db
+          .prepare(
+            "SELECT metadata_json FROM owner_import_operations WHERE scope = ?",
+          )
+          .get(scope),
+      ).toEqual({ metadata_json: null });
+    } finally {
+      index.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("owner imports beside the revision-guarded index", () => {
   const scope = "github.events";
   const command = (collectedAt: string) => ({

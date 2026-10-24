@@ -26,7 +26,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { Readable } from "node:stream";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   DataFileEnvelopeSchema,
@@ -161,6 +161,7 @@ export function deleteFirstSeenLedgerSync(
 export function snapshotScopeFiles(
   options: HierarchyManagerOptions,
   scope: string,
+  preservePaths: readonly string[] = [],
 ): { files: string[]; directories: string[] } {
   const files: string[] = [];
   const directories: string[] = [];
@@ -173,6 +174,14 @@ export function snapshotScopeFiles(
       throw err;
     }
     if (!info.isDirectory()) {
+      if (
+        preservePaths.some(
+          (preserved) =>
+            path === preserved || path.startsWith(`${preserved}${sep}`),
+        )
+      ) {
+        return;
+      }
       files.push(path);
       return;
     }

@@ -157,8 +157,8 @@ export function createClaudeMethodTransition(
       }
       return [...listed.values()];
     },
-    resetTakeover(scope) {
-      base.resetTakeover(scope);
+    async resetTakeover(scope) {
+      await base.resetTakeover(scope);
       store.clearClaudeTransitionScope(scope);
     },
     ownsScope: (scope) => snapshot(scope) !== null || base.ownsScope(scope),

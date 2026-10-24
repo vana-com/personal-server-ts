@@ -1,4 +1,5 @@
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import type { PublicationRegistrationAuthority } from "../publication/publish.js";
 import {
   compareLegacyCoverage,
   type LegacyCoverageVerdict,
@@ -149,7 +150,7 @@ function scopeDeclarationCursor(scope: string): string {
  * the rows. Facts must work when the record server is not mounted (its tables
  * may then be absent: no connection, no evidence).
  */
-export interface LegacyScopeAuthority {
+export interface LegacyScopeAuthority extends PublicationRegistrationAuthority {
   /** Connections registered with one of `methods`, deleted ones included. */
   listMethodConnections(
     methods: readonly string[],
@@ -189,7 +190,7 @@ export interface LegacyScopeAuthority {
     canonicalCursor: string,
   ): LegacyCoverageVerdict | null;
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
-  resetTakeover(scope: string): void;
+  resetTakeover(scope: string): Promise<void>;
   /** Identity of the latest index entry not owned by a known projector. */
   eligibleLegacyHead(scope: string): LegacyScopeHead | null;
   /**
@@ -218,7 +219,7 @@ export interface LegacyScopeAuthority {
       canonicalAuthority?: boolean;
       baselineHead?: LegacyScopeHead | null;
     },
-  ): boolean;
+  ): Promise<boolean>;
 }
 
 export interface LegacyScopeVerdictRecord {
@@ -332,7 +333,7 @@ export interface LegacyScopeViewPort {
    */
   ownsScope(scope: string): boolean;
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
-  resetTakeover(scope: string): void;
+  resetTakeover(scope: string): Promise<void>;
   isReset(scope: string): boolean;
 }
 
@@ -797,7 +798,7 @@ export function createLegacyScopeView(
         : null;
     const cachedProjection = coveredProjection.get(projectionOwner);
     if (cachedCoverage?.covered && cachedProjection?.key === projectionKey) {
-      const confirmed = authority.confirmRead(
+      const confirmed = await authority.confirmRead(
         scope,
         expectedHead,
         () =>
@@ -863,7 +864,7 @@ export function createLegacyScopeView(
         };
       }
       const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
-      const confirmed = authority.confirmRead(
+      const confirmed = await authority.confirmRead(
         scope,
         expectedHead,
         () =>
@@ -958,7 +959,7 @@ export function createLegacyScopeView(
           legacy.data,
           read.reason === "missing_raw_blob" ? read.recordCount : 0,
         );
-        const confirmed = authority.confirmRead(
+        const confirmed = await authority.confirmRead(
           scope,
           expectedHead,
           () =>
@@ -1102,7 +1103,7 @@ export function createLegacyScopeView(
         });
       }
       const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
-      const confirmed = authority.confirmRead(
+      const confirmed = await authority.confirmRead(
         scope,
         expectedHead,
         () =>
@@ -1176,7 +1177,7 @@ export function createLegacyScopeView(
         },
       };
     }
-    const confirmed = authority.confirmRead(
+    const confirmed = await authority.confirmRead(
       scope,
       expectedHead,
       () => sameSelection(decide(scope), decision),

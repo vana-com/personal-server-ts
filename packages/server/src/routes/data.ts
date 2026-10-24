@@ -344,7 +344,7 @@ export function dataRoutes(deps: DataRouteDeps): Hono {
         request: c.req.raw,
         scope: parsed.scope,
       });
-      deps.legacyScopeView?.resetTakeover(parsed.scope);
+      await deps.legacyScopeView?.resetTakeover(parsed.scope);
       return { scope: parsed.scope, reset: true };
     }),
   );
