@@ -1320,8 +1320,16 @@ export function scopeDeletionLease(
     const tracker = deps.scopeDeletions;
     if (!tracker) return;
     const known = tracker.knownDeletion(read.scope);
+    // The canonical body is held to the deletion history. A file is judged on
+    // what the tracker knows now, which a registered re-add clears, except a
+    // synced version: its registry version is compared with the remembered
+    // tombstone, so a re-add cannot revive a version the tombstone superseded.
+    const entryByRegistry =
+      read.body !== "canonical" &&
+      read.entry?.dataPointId !== null &&
+      read.entry?.dataPointId !== undefined;
     const tombstone =
-      read.body === "canonical" || read.entry
+      read.body === "canonical" || entryByRegistry
         ? (tracker.deletionHistory?.get(read.scope) ?? known)
         : known;
     if (!tombstone) return;
