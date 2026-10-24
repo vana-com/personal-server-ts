@@ -306,6 +306,79 @@ describe("replica policy v3 vectors", () => {
       plan([item, hide, restore, laterRemoval]).records[0].ownerControl,
     ).toBe("hidden");
   });
+  it("keeps a pre-expiry restore and erasure irreversible after the deadline", () => {
+    const item = observed("expiry-item", "A", "payload");
+    const {
+      emittedAt: _emittedAt,
+      contentHash: _contentHash,
+      data: _data,
+      blobs: _blobs,
+      ...ownerBase
+    } = item;
+    const deletion = {
+      ...ownerBase,
+      kind: "owner-delete" as const,
+      parents: [],
+      batchId: "expiry-delete-batch",
+      revision: { ...item.revision, operationId: "expiry-delete" },
+    };
+    const restoredBeforeExpiry = {
+      ...ownerBase,
+      kind: "owner-restore" as const,
+      parents: [ref("expiry-delete", "A")],
+      revision: {
+        ...item.revision,
+        operationId: "restore-before-expiry",
+        wallMs: T0 + day,
+      },
+    };
+    const afterDeadline = T0 + 31 * day;
+    const retainedRestore = planReplicaMerge(
+      { ...context, now: afterDeadline, finalizedAt: () => T0 },
+      [registration, item, deletion, restoredBeforeExpiry],
+    );
+    expect(retainedRestore.records[0].ownerControl).toBe("visible");
+    expect(retainedRestore.records[0].current?.revision.operationId).toBe(
+      "expiry-item",
+    );
+    expect(retainedRestore.records[0].payloadRetained).toBe(true);
+    expect(retainedRestore.payloadErasures).toEqual([]);
+
+    const erased = planReplicaMerge(
+      { ...context, now: afterDeadline, finalizedAt: () => T0 },
+      [registration, item, deletion],
+    );
+    expect(erased.records[0].payloadRetained).toBe(false);
+    expect(erased.payloadErasures[0].operationReferences).toContainEqual(
+      ref("expiry-item", "A"),
+    );
+    const restoredAfterErasure = planReplicaMerge(
+      {
+        ...context,
+        now: afterDeadline + day,
+        finalizedAt: () => T0,
+        suppressionMarkers: erased.records[0].suppressionMarker
+          ? [erased.records[0].suppressionMarker]
+          : [],
+      },
+      [
+        registration,
+        deletion,
+        {
+          ...restoredBeforeExpiry,
+          revision: {
+            ...restoredBeforeExpiry.revision,
+            operationId: "restore-after-erasure",
+            wallMs: afterDeadline + day,
+          },
+        },
+      ],
+    );
+    expect(restoredAfterErasure.records[0].ownerControl).toBe("visible");
+    expect(restoredAfterErasure.records[0].payloadRetained).toBe(false);
+    expect(restoredAfterErasure.records[0].current).toBeNull();
+    expect(restoredAfterErasure.payloadErasures).toEqual([]);
+  });
   it("keeps owner resolutions explicit, waits for their dependencies, and exposes competing choices", () => {
     const a = observed("a", "A", "X");
     const b = observed("b", "B", "Y", 1);

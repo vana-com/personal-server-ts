@@ -717,7 +717,16 @@ function mergeRecord(
       op.kind === "owner-delete" &&
       context.now !== undefined &&
       finalizedAt(op) !== undefined &&
-      context.now >= finalizedAt(op)! + OWNER_DELETE_GRACE_PERIOD_MS,
+      context.now >= finalizedAt(op)! + OWNER_DELETE_GRACE_PERIOD_MS &&
+      !ownerOps.some(
+        (restore) =>
+          restore.kind === "owner-restore" &&
+          restore.parents.some(
+            (parent) => referenceKey(parent) === operationKey(op),
+          ) &&
+          restore.revision.wallMs <
+            finalizedAt(op)! + OWNER_DELETE_GRACE_PERIOD_MS,
+      ),
   );
   const erased = purgedDeletes.length > 0 || retainedMarker !== undefined;
   const purgedRemovalIds = new Set([
