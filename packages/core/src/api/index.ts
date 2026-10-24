@@ -1,4 +1,5 @@
 import type { DurableAdditionsService } from "../additions/durable.js";
+import type { IndexEntry } from "../storage/index/types.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import { authorizeLegacyRead, type LegacyReader } from "../policy/data-read.js";
 import {
