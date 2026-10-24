@@ -181,6 +181,17 @@ describe("validated persisted grants", () => {
     );
   });
 
+  it("refuses a grant when consent evidence is absent", () => {
+    const grant = insertApprovedGrant();
+    const db = new Database(join(dir, "auth.db"));
+    db.prepare(
+      "UPDATE pdpp_grants SET consent_evidence_json = NULL WHERE grant_id = ?",
+    ).run(grant.grant_id);
+    db.close();
+
+    expect(store.getValidatedGrant(grant.grant_id)).toBeNull();
+  });
+
   it("retains vA facts when a later declaration vB is present", () => {
     const grant = insertApprovedGrant();
     const document = JSON.stringify({

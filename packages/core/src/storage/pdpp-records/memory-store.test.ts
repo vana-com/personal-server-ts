@@ -308,6 +308,7 @@ describe("memory record store: list records", () => {
       instanceIds: ["inst_1"],
       limit: 1,
       order: "asc",
+      queryBinding: "grant-a",
     });
     expect(page1.nextCursor).toBeDefined();
 
@@ -317,6 +318,7 @@ describe("memory record store: list records", () => {
         limit: 1,
         order: "asc",
         cursor: page1.nextCursor,
+        queryBinding: "grant-b",
       }),
     ).toThrow(CursorExpiredError);
   });

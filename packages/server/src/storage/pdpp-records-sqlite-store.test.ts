@@ -1329,6 +1329,7 @@ describe("sqlite record store", () => {
         instanceIds: ["inst_a"],
         limit: 1,
         order: "asc",
+        queryBinding: "grant-a",
       });
       expect(page1.nextCursor).toBeDefined();
 
@@ -1338,6 +1339,7 @@ describe("sqlite record store", () => {
           limit: 1,
           order: "asc",
           cursor: page1.nextCursor,
+          queryBinding: "grant-b",
         }),
       ).toThrow(CursorExpiredError);
     });
