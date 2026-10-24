@@ -246,7 +246,7 @@ describe("withLegacyProjection", () => {
     ).toEqual(await raw.readEnvelope(scope, "2026-10-01T00:00:01.000Z"));
   });
 
-  it("serves the other conversations when one stored conversation is malformed", async () => {
+  it("refuses the whole scope when one stored conversation is malformed", async () => {
     const raw = createMemoryDataStorage();
     const issues: LegacyProjectionIssue[] = [];
     await store(raw, "chatgpt.messages", "2026-10-01T00:00:01.000Z", {
@@ -262,29 +262,25 @@ describe("withLegacyProjection", () => {
       onIssue: (issue) => issues.push(issue),
     });
 
-    const { data } = await served.readEnvelope(
-      "chatgpt.conversations",
-      "2026-10-01T00:00:01.000Z",
-    );
-
-    expect(data).toMatchObject({
-      conversations: [{ id: "conv-1", message_count: 2 }],
-      total: 1,
+    await expect(
+      served.readEnvelope("chatgpt.conversations", "2026-10-01T00:00:01.000Z"),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+      details: {
+        reason: "Conversation lacks required branch identity or count",
+      },
     });
     expect(issues).toEqual([
       {
-        kind: "projection_diagnostics",
+        kind: "projection_failed",
         scope: "chatgpt.conversations",
         collectedAt: "2026-10-01T00:00:01.000Z",
-        diagnostics: [
-          {
-            kind: "records_dropped",
-            scope: "chatgpt.conversations",
-            stream: "conversations",
-            count: 1,
-            reasons: ["Conversation lacks a current-branch message count"],
-          },
-        ],
+        error: {
+          kind: "invalid_value",
+          scope: "chatgpt.conversations",
+          reason: "Conversation lacks required branch identity or count",
+        },
       },
     ]);
   });
@@ -1037,7 +1033,7 @@ describe("supersedeLegacyVersions", () => {
       ),
     ).toEqual({
       superseded: [],
-      refused: "the projection is partial (records_dropped)",
+      refused: "the new version cannot be projected",
     });
     expect(raw.entries).toHaveLength(3);
   });
