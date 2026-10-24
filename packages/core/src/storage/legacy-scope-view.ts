@@ -174,10 +174,15 @@ export interface LegacyScopeAuthority extends PublicationRegistrationAuthority {
    * that do not name their method (written before takeovers did) never match.
    */
   hasMethodTakeover(scope: string, method: string): boolean;
+  /**
+   * Whether a takeover superseded `head`. With `selection`, only one recorded
+   * for exactly that connection and generation counts; a takeover recorded
+   * without an instance never does.
+   */
   hasCoveredHead(
     scope: string,
     head: LegacyScopeHead,
-    instance?: string,
+    selection?: { instance: string; generation: number },
   ): boolean;
   /** Legacy file whose coverage established canonical authority for this selection. */
   canonicalBaselineHead?(scope: string): LegacyScopeHead | null;
@@ -645,7 +650,7 @@ export function createLegacyScopeView(
         if (
           baselineVerdict &&
           baselineVerdict.canonicalCursor.startsWith(
-            `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(decision, input.declarations)}:`,
+            currentVerdictCursorPrefix(authority, decision, input.declarations),
           ) &&
           baselineVerdict.verdict !== "covered"
         ) {
@@ -677,7 +682,7 @@ export function createLegacyScopeView(
       }
       if (
         !verdict.canonicalCursor.startsWith(
-          `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(decision, input.declarations)}:`,
+          currentVerdictCursorPrefix(authority, decision, input.declarations),
         )
       ) {
         return { kind: "refused" };
@@ -1290,8 +1295,28 @@ function isProjectionDataFailure(reason: string): boolean {
   ].includes(reason);
 }
 
+/** The rows and receipts a verdict about one connection is judged against. */
+export interface VerdictSelection {
+  records: Pick<CanonicalLegacyReadStore, "listStreamCompletions">;
+  selection: { instance: string };
+  streams: readonly string[];
+}
+
+/**
+ * The prefix a recorded verdict's `canonicalCursor` keeps while it still
+ * describes the selection's current rows, receipts and declarations. A
+ * verdict without it is stale: it neither covers nor refuses a head.
+ */
+export function currentVerdictCursorPrefix(
+  authority: Pick<LegacyScopeAuthority, "writeClock" | "arrivalRevision">,
+  selection: VerdictSelection,
+  declarations?: ReadCanonicalLegacyScopeInput["declarations"],
+): string {
+  return `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(selection, declarations)}:`;
+}
+
 function receiptCursor(
-  decision: Extract<Decision, { kind: "canonical" }>,
+  decision: VerdictSelection,
   declarations?: ReadCanonicalLegacyScopeInput["declarations"],
 ): string {
   const receipts = decision.records
@@ -1404,7 +1429,7 @@ function sameSelection(
  * reads. A method id is a binding's connector key; its binding is the one
  * the reader will use for that method.
  */
-function scopeMethods(scope: string): Map<string, readonly string[]> {
+export function scopeMethods(scope: string): Map<string, readonly string[]> {
   const methods = new Map<string, readonly string[]>();
   for (const profile of BINDING_PROFILES) {
     const bound = profile.get(scope);

@@ -1,3 +1,4 @@
+import { assertLegacyPublicationAllowed } from "./legacy-publication-fence.js";
 import type { PdppProducer } from "@opendatalabs/personal-server-ts-core/sync";
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
@@ -143,6 +144,20 @@ function rowToEntry(row: RawRow): IndexEntry {
     ...(row.generation === null ? {} : { generation: row.generation }),
   };
 }
+
+/** SQL over `data_files AS entry`: a row kept only as history, never published.
+ * A superseded rollback restore, or a legacy-form row under canonical authority.
+ */
+export const historyOnlyPredicate = `
+    EXISTS (SELECT 1 FROM legacy_publication_restore_versions r WHERE r.version_id=entry.id AND r.state='superseded')
+    OR (EXISTS (
+      SELECT 1 FROM legacy_scope_canonical_authority AS authority
+       WHERE authority.scope = entry.scope
+    )
+    AND (
+      entry.producer IS NULL
+      OR entry.producer NOT IN ('pdpp-projector', 'pdpp-import-projection')
+    ))`;
 
 export function createIndexManager(
   db: Database.Database,
@@ -362,15 +377,6 @@ export function createIndexManager(
     "SELECT * FROM data_files WHERE data_point_id = @data_point_id ORDER BY version DESC, id DESC LIMIT 1",
   );
 
-  const historyOnlyPredicate = `
-    EXISTS (
-      SELECT 1 FROM legacy_scope_canonical_authority AS authority
-       WHERE authority.scope = entry.scope
-    )
-    AND (
-      entry.producer IS NULL
-      OR entry.producer NOT IN ('pdpp-projector', 'pdpp-import-projection')
-    )`;
   const findUnsyncedSql = `SELECT entry.* FROM data_files AS entry
     WHERE entry.data_point_id IS NULL
       AND NOT (${historyOnlyPredicate})
@@ -428,6 +434,7 @@ export function createIndexManager(
   );
 
   const insertRow = (entry: NewIndexEntry): IndexEntry => {
+    assertLegacyPublicationAllowed(db, entry.scope, { path: entry.path });
     ensureScopeRevisionStmt.run({ scope: entry.scope });
     const current = readScopeRevisionStmt.get({ scope: entry.scope }) as {
       cas_revision: number;
@@ -480,6 +487,7 @@ export function createIndexManager(
       entry: NewIndexEntry,
       precondition?: { kind: "none" } | { kind: "match"; version: number },
     ) => {
+      assertLegacyPublicationAllowed(db, entry.scope, { path: entry.path });
       const current = currentForWriteStmt.get({ scope: entry.scope }) as
         | {
             cas_revision: number | null;
@@ -525,11 +533,12 @@ export function createIndexManager(
 
   const manager: IndexManager = {
     insert(entry) {
-      const result = insertIfCurrent(entry);
+      const result = insertIfCurrent.immediate(entry);
       if (!result.ok) throw new Error("Unconditional insert was rejected");
       return result.entry;
     },
-    insertIfCurrent,
+    insertIfCurrent: (entry, precondition) =>
+      insertIfCurrent.immediate(entry, precondition),
     closeScopeForWrites(scope) {
       ensureScopeRevisionStmt.run({ scope });
       // Durable fail-closed marker. There is no HTTP reset path; clearing this

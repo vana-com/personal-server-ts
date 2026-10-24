@@ -199,13 +199,14 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       return canonicalAuthorityExists(scope);
     },
 
-    hasCoveredHead(scope, head, instance) {
+    hasCoveredHead(scope, head, selection) {
+      if (selection?.instance === "") return false;
       const instanceFilter =
-        instance === undefined ? "" : " AND (instance = ? OR instance = '')";
+        selection === undefined ? "" : " AND instance = ? AND generation = ?";
       const params =
-        instance === undefined
+        selection === undefined
           ? [scope, head.path]
-          : [scope, head.path, instance];
+          : [scope, head.path, selection.instance, selection.generation];
       return (
         hasTable("legacy_scope_takeovers") &&
         db

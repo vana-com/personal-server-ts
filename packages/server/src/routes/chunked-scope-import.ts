@@ -15,7 +15,12 @@ import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { cacheRequestBodyBytes } from "@opendatalabs/personal-server-ts-core/auth";
-import { publishStagedDataFile } from "../storage/hierarchy.js";
+import { indexDatabase } from "../storage/index-manager.js";
+import { assertLegacyPublicationAllowed } from "../storage/legacy-publication-fence.js";
+import {
+  publishStagedDataFileSync,
+  publishStagedDataFile,
+} from "../storage/hierarchy.js";
 
 export const SCOPE_IMPORT_CHUNK_BYTES = 8 * 1024 * 1024;
 export const SCOPE_IMPORT_MAX_BYTES = 256 * 1024 * 1024;
@@ -1107,29 +1112,37 @@ async function finalizeScopeImportAuthorized(
     }
     // Publish the complete, fsynced envelope before swapping the SQLite index.
     // Readers continue to resolve the old entry until the new file is ready.
-    await publishStagedDataFile(stagePath, finalPath);
+    const db = indexDatabase(deps.indexManager);
+    if (!db) await publishStagedDataFile(stagePath, finalPath);
     let indexed: ReturnType<typeof deps.indexManager.insertIfCurrent>;
     try {
-      indexed = deps.indexManager.insertIfCurrent(
-        {
-          fileId: null,
-          schemaId: null,
-          path: relativePath,
-          scope,
-          collectedAt: metadata.collectedAt,
-          sizeBytes,
-          dataPointId: null,
-          afterTombstoneVersion,
-          producer: null,
-          producerProvenance: null,
-        },
-        latestAtCommit
-          ? {
-              kind: "match",
-              version: latestAtCommit.casRevision ?? latestAtCommit.version,
-            }
-          : { kind: "none" },
-      );
+      const commit = () => {
+        if (db) {
+          assertLegacyPublicationAllowed(db, scope);
+          publishStagedDataFileSync(stagePath, finalPath);
+        }
+        return deps.indexManager.insertIfCurrent(
+          {
+            fileId: null,
+            schemaId: null,
+            path: relativePath,
+            scope,
+            collectedAt: metadata.collectedAt,
+            sizeBytes,
+            dataPointId: null,
+            afterTombstoneVersion,
+            producer: null,
+            producerProvenance: null,
+          },
+          latestAtCommit
+            ? {
+                kind: "match",
+                version: latestAtCommit.casRevision ?? latestAtCommit.version,
+              }
+            : { kind: "none" },
+        );
+      };
+      indexed = db ? db.transaction(commit).immediate() : commit();
     } catch (error) {
       // The synchronous index API can throw. Keep the data file only if the
       // transaction committed before the error became observable.

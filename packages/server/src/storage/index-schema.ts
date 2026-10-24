@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { initializeLegacyPublicationPolicy } from "./legacy-publication-fence.js";
 
 const CREATE_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS data_files (
@@ -36,7 +37,7 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
 
-export const INDEX_SCHEMA_VERSION = 16;
+export const INDEX_SCHEMA_VERSION = 17;
 
 const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
@@ -280,7 +281,9 @@ function ensureSchemaVersion(db: Database.Database): void {
       "ALTER TABLE legacy_scope_takeovers ADD COLUMN method TEXT NOT NULL DEFAULT ''",
     );
   }
-  db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
+  // Additive gate tables do not strand a never-enrolled root on upgrade.
+  // Enrollment raises the minimum runtime version in its durable transaction.
+  db.pragma(`user_version = ${Math.max(currentVersion, 16)}`);
 }
 
 /** Open/create SQLite database, run CREATE TABLE IF NOT EXISTS, set WAL mode */
@@ -306,6 +309,9 @@ export function initializeDatabase(dbPath: string): Database.Database {
       }
     }
     db.pragma("synchronous = FULL");
+    // Required for SQLite REPLACE: its implicit deletes must run retention
+    // triggers on data_files and canonical history, including through PDPP.
+    db.pragma("recursive_triggers = ON");
 
     db.exec(CREATE_TABLE_SQL);
     db.exec(CREATE_SCOPE_REVISIONS_SQL);
@@ -334,6 +340,7 @@ export function initializeDatabase(dbPath: string): Database.Database {
     db.exec(
       "CREATE INDEX IF NOT EXISTS idx_owner_import_operations_recovery ON owner_import_operations(operation) WHERE state = 'prepared' OR (state IN ('deleted', 'cancelled') AND metadata_json IS NOT NULL)",
     );
+    initializeLegacyPublicationPolicy(db);
     for (const sql of CREATE_INDEXES_SQL) {
       db.exec(sql);
     }

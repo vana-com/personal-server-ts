@@ -1,3 +1,5 @@
+import { canonicalRetentionConflict } from "./storage/legacy-publication-fence.js";
+import { createServerApiAuth } from "./api-auth.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
@@ -110,7 +112,11 @@ export interface IdentityInfo {
   serverId: string | null;
 }
 
+import { legacyPublicationPolicyRoutes } from "./routes/legacy-publication-policy.js";
+import type { createLegacyPublicationPolicy } from "./storage/legacy-publication-policy.js";
+
 export interface AppDeps {
+  legacyPublicationPolicy?: ReturnType<typeof createLegacyPublicationPolicy>;
   additions?: DurableAdditionsService;
   logger: Logger;
   version: string;
@@ -588,6 +594,22 @@ export function createApp(deps: AppDeps): Hono {
     }),
   );
 
+  if (deps.legacyPublicationPolicy)
+    app.route(
+      "/v1/legacy-publication-policy",
+      legacyPublicationPolicyRoutes({
+        policy: deps.legacyPublicationPolicy,
+        auth: createServerApiAuth({
+          serverOrigin: deps.serverOrigin,
+          serverOwner: deps.serverOwner,
+          gateway: deps.gateway,
+          devToken: deps.devToken,
+          accessToken: deps.accessToken,
+          tokenStore: deps.tokenStore,
+        }),
+      }),
+    );
+
   // Mount grants routes (POST /verify is public, GET / and POST / need owner auth)
   app.route(
     "/v1/grants",
@@ -827,7 +849,8 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   // Global error handler
-  app.onError((err, c) => {
+  app.onError((error, c) => {
+    const err = canonicalRetentionConflict(error) ?? error;
     if (err instanceof ProtocolError) {
       deps.logger.warn({ err }, err.message);
       return c.json(err.toJSON(), err.code as 401 | 403 | 413 | 503);

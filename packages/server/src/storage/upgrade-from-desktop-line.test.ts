@@ -20,7 +20,7 @@ import {
   type Grant as CoreGrant,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { openPdppAuthStore } from "@opendatalabs/personal-server-ts-core/pdpp";
-import { initializeDatabase, INDEX_SCHEMA_VERSION } from "./index-schema.js";
+import { initializeDatabase } from "./index-schema.js";
 import { createIndexManager } from "./index-manager.js";
 import { createLegacyScopeAuthority } from "./legacy-scope-authority.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
@@ -579,9 +579,8 @@ describe("writable upgrades from historical desktop storage schemas", () => {
           const manager = createIndexManager(db);
           expect(db.pragma("integrity_check", { simple: true })).toBe("ok");
           expect(db.pragma("foreign_key_check")).toEqual([]);
-          expect(db.pragma("user_version", { simple: true })).toBe(
-            INDEX_SCHEMA_VERSION,
-          );
+          // Never-enrolled roots preserve compatibility with the Desktop line.
+          expect(db.pragma("user_version", { simple: true })).toBe(16);
           expect(
             db.prepare("SELECT version FROM pdpp_schema_version").get(),
           ).toEqual({ version: 25 });

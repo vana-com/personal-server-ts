@@ -1,3 +1,4 @@
+import { canonicalRetentionConflict } from "./legacy-publication-fence.js";
 import { RECEIVER_MIGRATION } from "./pdpp-replication-receiver.js";
 import {
   parseTime,
@@ -3341,6 +3342,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     return bytes as Uint8Array<ArrayBuffer>;
   }
 
+  function retentionGuard<T>(mutate: () => T): T {
+    try {
+      return mutate();
+    } catch (error) {
+      throw canonicalRetentionConflict(error) ?? error;
+    }
+  }
   return {
     unquarantinedRecordSql,
     setReplicaVisibilityObserver: (observer: () => void) => {
@@ -3349,19 +3357,23 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore &
     replication: replica.exporter,
     getInstallationWriterId: () => writerId,
     readMutationJournalPage,
-    transitionClaudeToLive,
+    transitionClaudeToLive: (input) =>
+      retentionGuard(() => transitionClaudeToLive(input)),
     claudeTransition,
     listClaudeTransitions,
-    clearClaudeTransitionScope,
+    clearClaudeTransitionScope: (scope) =>
+      retentionGuard(() => clearClaudeTransitionScope(scope)),
     confirmClaudeTransition,
     transitionWriteClock,
     listConnections,
     registerConnection,
-    deleteConnection,
+    deleteConnection: (instance) =>
+      retentionGuard(() => deleteConnection(instance)),
     ingestBatch,
     getInstanceBinding,
     readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
-    resetInstanceBinding,
+    resetInstanceBinding: (input) =>
+      retentionGuard(() => resetInstanceBinding(input)),
     storeBlobBytesForInstance,
     replaceStream,
     listStreamCompletions,

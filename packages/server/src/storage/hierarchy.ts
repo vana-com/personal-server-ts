@@ -24,6 +24,8 @@ import {
   rmSync,
   rmdirSync,
   writeFileSync,
+  unlinkSync,
+  renameSync,
 } from "node:fs";
 import { Readable } from "node:stream";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -370,6 +372,27 @@ export async function publishStagedDataFile(
   }
 }
 
+/** No-replace stage publication for callers holding the SQLite writer gate.
+ * A collision is refused; this path never replaces a retained version. */
+export function publishStagedDataFileSync(
+  stagePath: string,
+  finalPath: string,
+): void {
+  try {
+    linkSync(stagePath, finalPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const published = readFileSync(finalPath);
+    const staged = readFileSync(stagePath);
+    if (!published.equals(staged) && !sameEnvelope(published, staged))
+      throw new Error(
+        `Stored envelope conflicts with publication at ${finalPath}`,
+      );
+  }
+  syncDirectory(dirname(finalPath));
+  unlinkSync(stagePath);
+}
+
 /** Read and parse a data file */
 export async function readDataFile(
   options: HierarchyManagerOptions,
@@ -488,6 +511,7 @@ export async function writeBlockManifest(
   collectedAt: string,
   manifest: DataBlockManifest,
   blocks: DataScopeBlock[],
+  commit?: (publish: () => void) => void,
 ): Promise<void> {
   const dir = buildBlockDir(options.dataDir, scope, collectedAt);
   const tempDir = `${dir}.tmp.${randomUUID()}`;
@@ -502,21 +526,31 @@ export async function writeBlockManifest(
       );
     }
 
-    await rm(dir, { recursive: true, force: true });
-    await rename(tempDir, dir);
-
     const manifestPath = buildBlockManifestPath(
       options.dataDir,
       scope,
       collectedAt,
     );
-    const tempManifestPath = `${manifestPath}.tmp.${randomUUID()}`;
+    const tempManifestPath = join(tempDir, "manifest.json");
     await writeFile(
       tempManifestPath,
       JSON.stringify(manifest, null, 2),
       "utf-8",
     );
-    await rename(tempManifestPath, manifestPath);
+    if (commit) {
+      try {
+        commit(() => {
+          rmSync(dir, { recursive: true, force: true });
+          renameSync(tempDir, dir);
+          syncDirectory(dirname(manifestPath));
+        });
+      } finally {
+        await rm(tempManifestPath, { force: true });
+      }
+    } else {
+      await rm(dir, { recursive: true, force: true });
+      await rename(tempDir, dir);
+    }
   } catch (err) {
     await rm(tempDir, { recursive: true, force: true });
     throw err;

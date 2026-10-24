@@ -1,4 +1,10 @@
 import {
+  assertLegacyPublicationAllowed,
+  assertLegacyHistoryMutable,
+  legacyPublicationFenced,
+  holdLegacyPublication,
+} from "./legacy-publication-fence.js";
+import {
   hasPdppOrigin,
   isPdppProducer,
 } from "@opendatalabs/personal-server-ts-core/sync";
@@ -20,7 +26,9 @@ import {
   stageDataFile,
   assertPublishable,
   publishStagedDataFile,
+  publishStagedDataFileSync,
 } from "./hierarchy.js";
+import { readFileSync } from "node:fs";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
@@ -123,6 +131,17 @@ export async function reindexLegacyDataFiles(
         buildDataFilePath(dataDir, envelope.scope, envelope.collectedAt) !==
         path
       ) {
+        continue;
+      }
+      const recoveryDb = indexDatabase(deps.indexManager);
+      if (recoveryDb && legacyPublicationFenced(recoveryDb, envelope.scope)) {
+        holdLegacyPublication(
+          recoveryDb,
+          envelope.scope,
+          "recovery-orphan",
+          { path: relativePath },
+          await readFile(path),
+        );
         continue;
       }
       const bytes = (await stat(path)).size;
@@ -254,7 +273,7 @@ export function createNodeDataStorage(
     readBlockManifest(scope: string, collectedAt: string) {
       return readScopeBlockManifest(deps.hierarchyOptions, scope, collectedAt);
     },
-    writeEnvelope(envelope: DataFileEnvelope) {
+    async writeEnvelope(envelope: DataFileEnvelope) {
       // Publication refuses different bytes at an existing file. An index row
       // whose file was lost still names its version: new bytes may restore
       // it only with the same provenance the row already records.
@@ -278,6 +297,40 @@ export function createNodeDataStorage(
           ),
         );
       }
+      if (db) {
+        const staged = await stageDataFile(deps.hierarchyOptions, envelope);
+        try {
+          return db
+            .transaction(() => {
+              const current = deps.indexManager.findByPath(staged.relativePath);
+              const retained =
+                current?.generation &&
+                db
+                  .prepare(
+                    "SELECT 1 FROM legacy_publication_retained_versions WHERE version_id=?",
+                  )
+                  .get(current.id);
+              if (!(
+                retained &&
+                current.scope === envelope.scope &&
+                current.collectedAt === envelope.collectedAt &&
+                current.generation === envelopeGeneration(envelope)
+              ))
+                assertLegacyPublicationAllowed(db, envelope.scope);
+              publishStagedDataFileSync(staged.stagePath, staged.finalPath);
+              return {
+                path: staged.finalPath,
+                relativePath: staged.relativePath,
+                sizeBytes: staged.sizeBytes,
+              };
+            })
+            .immediate();
+        } finally {
+          await unlink(staged.stagePath).catch((error) => {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          });
+        }
+      }
       return writeDataFile(deps.hierarchyOptions, envelope);
     },
     async commitEnvelope(envelope, entry, precondition) {
@@ -287,20 +340,28 @@ export function createNodeDataStorage(
         // Refuse a conflicting publication before the index commits: the row
         // and its revision would otherwise describe bytes that are not there.
         await assertPublishable(staged.stagePath, staged.finalPath);
-        const result = deps.indexManager.insertIfCurrent(
-          {
-            ...entry,
-            ...staged.identity,
-            path: staged.relativePath,
-            sizeBytes: entry.sizeBytes ?? staged.sizeBytes,
-          },
-          precondition,
-        );
+        const commit = () => {
+          if (db) assertLegacyPublicationAllowed(db, envelope.scope);
+          const result = deps.indexManager.insertIfCurrent(
+            {
+              ...entry,
+              ...staged.identity,
+              path: staged.relativePath,
+              sizeBytes: entry.sizeBytes ?? staged.sizeBytes,
+            },
+            precondition,
+          );
+          if (result.ok && db)
+            publishStagedDataFileSync(staged.stagePath, staged.finalPath);
+          return result;
+        };
+        const result = db ? db.transaction(commit).immediate() : commit();
         if (!result.ok) {
           return result;
         }
         indexed = true;
-        await publishStagedDataFile(staged.stagePath, staged.finalPath);
+        if (!db)
+          await publishStagedDataFile(staged.stagePath, staged.finalPath);
         return {
           ok: true as const,
           writeResult: {
@@ -324,6 +385,15 @@ export function createNodeDataStorage(
         collectedAt,
         manifest,
         blocks,
+        db
+          ? (publish) =>
+              db
+                .transaction(() => {
+                  assertLegacyPublicationAllowed(db, scope);
+                  publish();
+                })
+                .immediate()
+          : undefined,
       );
     },
     async insertEntry(entry) {
@@ -341,6 +411,59 @@ export function createNodeDataStorage(
     },
     async backfillGeneration(entry) {
       if (entry.generation) return entry.generation;
+      if (
+        db &&
+        db
+          .prepare(
+            "SELECT 1 FROM legacy_publication_retained_versions WHERE version_id=?",
+          )
+          .get(entry.id)
+      ) {
+        // Retained identities cannot be changed or rolled back. Verify both reads
+        // before the one-time fill, inside the writer transaction, with no await.
+        return db
+          .transaction(() => {
+            const current = deps.indexManager.findByPath(entry.path);
+            if (!current || current.id !== entry.id) return undefined;
+            if (current.generation) return current.generation;
+            const path = join(deps.hierarchyOptions.dataDir, entry.path);
+            let generation: string;
+            try {
+              const first = readFileSync(path);
+              const envelope = JSON.parse(
+                first.toString("utf8"),
+              ) as DataFileEnvelope;
+              if (
+                envelope.scope !== current.scope ||
+                envelope.collectedAt !== current.collectedAt ||
+                !first.equals(readFileSync(path))
+              )
+                return undefined;
+              generation = envelopeGeneration(envelope);
+            } catch {
+              // Preserve the ordinary lazy-read refusal when bytes are missing
+              // or invalid; never assign a retained identity from uncertainty.
+              return undefined;
+            }
+            db.prepare(
+              "INSERT INTO legacy_publication_generation_backfill VALUES (?, ?)",
+            ).run(entry.id, generation);
+            try {
+              return deps.indexManager.swapGeneration(
+                entry.id,
+                null,
+                generation,
+              )
+                ? generation
+                : undefined;
+            } finally {
+              db.prepare(
+                "DELETE FROM legacy_publication_generation_backfill WHERE version_id=?",
+              ).run(entry.id);
+            }
+          })
+          .immediate();
+      }
       const first = (await identityOfPublishedBytes(entry.path)).generation;
       if (!first) return undefined;
       if (!deps.indexManager.swapGeneration(entry.id, null, first)) {
@@ -382,6 +505,7 @@ export function createNodeDataStorage(
     // version, so no delete path can leave a stale ledger behind.
     deleteScope(scope: string) {
       return withScopeLock(scope, async () => {
+        if (db) assertLegacyHistoryMutable(db, scope);
         if (operations) return operations.deleteScope(scope);
         // The sidecar first: it holds record ids, so it must not survive a
         // data delete that fails half way. A sidecar that cannot be removed

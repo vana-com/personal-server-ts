@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
-import { INDEX_SCHEMA_VERSION, initializeDatabase } from "./index-schema.js";
+import { initializeDatabase } from "./index-schema.js";
 
 function createHistoricalIndexBase(db: Database.Database, version: number) {
   db.exec(`
@@ -193,9 +193,7 @@ describe("initializeDatabase", () => {
 
       const db = initializeDatabase(path);
       // The v14 ledger migrates through the linear index schema sequence.
-      expect(db.pragma("user_version", { simple: true })).toBe(
-        INDEX_SCHEMA_VERSION,
-      );
+      expect(db.pragma("user_version", { simple: true })).toBe(16);
       expect(
         db.prepare("SELECT instance, method FROM legacy_scope_takeovers").all(),
       ).toEqual([{ instance: "oura:owner", method: "" }]);
@@ -640,6 +638,10 @@ describe("initializeDatabase", () => {
         ).map((column) => column.name);
       // A v15 data_files table has no generation column.
       if (columns(v15).includes("generation")) {
+        // The v17 retention trigger did not exist on a v15 installation.
+        v15.exec(
+          "DROP TRIGGER IF EXISTS legacy_publication_history_identity_fence",
+        );
         v15.exec("ALTER TABLE data_files DROP COLUMN generation");
       }
       v15

@@ -1,3 +1,4 @@
+import { createLegacyDownloadHold } from "./storage/legacy-publication-fence.js";
 import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   createDurableAdditions,
@@ -85,6 +86,14 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
 import type { Hono } from "hono";
+import { createLegacyPublicationPolicy } from "./storage/legacy-publication-policy.js";
+import { createLegacyCanonicalCoverage } from "./storage/legacy-publication-canonical.js";
+import {
+  withLegacyGatewayFence,
+  withLegacySignerFence,
+  withLegacyStorageFence,
+  withLegacyDeletionFence,
+} from "./storage/legacy-publication-issuance.js";
 import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
 import { createPdppAuthDeps, pdppIsConfigured } from "./pdpp/bootstrap.js";
@@ -441,8 +450,10 @@ export async function createServer(
         : logger.info(issue, "Legacy scope projection left rows out"),
   });
 
-  const gatewayClient =
-    options?.gatewayClient ?? createGatewayClient(config.gateway.url);
+  const gatewayClient = withLegacyGatewayFence(
+    db,
+    options?.gatewayClient ?? createGatewayClient(config.gateway.url),
+  );
 
   // X402 payment enforcement on data reads. When config.payment.enabled is
   // true, GET /v1/data/:scope requires builders to supply a signed X-PAYMENT
@@ -496,10 +507,13 @@ export async function createServer(
       "Server account loaded",
     );
 
-    serverSigner = createServerSigner(serverAccount, {
-      chainId: config.gateway.chainId,
-      contracts: config.gateway.contracts,
-    });
+    serverSigner = withLegacySignerFence(
+      db,
+      createServerSigner(serverAccount, {
+        chainId: config.gateway.chainId,
+        contracts: config.gateway.contracts,
+      }),
+    );
 
     // Identity starts with serverId=null; background services will populate it
     identity = {
@@ -768,12 +782,19 @@ export async function createServer(
   ) {
     const masterKey = deriveMasterKey(masterKeySignature);
 
-    const storageAdapter = createVanaSyncStorageAdapter({
+    const remoteStorage = createVanaSyncStorageAdapter({
       config,
       serverOwner,
       serverAccount,
       reads: isEnclave ? "public" : "signed",
     });
+    const storageAdapter = withLegacyStorageFence(
+      db,
+      serverOwner,
+      remoteStorage,
+      masterKey,
+      rawDataStorage,
+    );
 
     const cursor = createSyncCursor(syncCursorPath, {
       legacyConfigPath: configPath,
@@ -795,6 +816,14 @@ export async function createServer(
     };
 
     const downloadDeps = {
+      // The hold captures foreign bytes as they are; it must not use the
+      // publisher's fenced reader, which refuses non-restore occupants.
+      holdRemoteChange: createLegacyDownloadHold(
+        db,
+        remoteStorage,
+        rawDataStorage,
+        masterKey,
+      ),
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -819,17 +848,20 @@ export async function createServer(
     // the same Web3Signed signer the storage provider uploads with.
     const deleteData = isEnclave
       ? null
-      : createGatewayDeleteDataPort({
-          gatewayUrl: config.gateway.url,
-          dataPointFeed,
-          serverOwner,
-          signer: serverSigner,
-          storage: {
-            endpoint: resolveVanaStorageEndpoint(config),
-            chainId: config.gateway.chainId,
-            signMessage: (message) => serverAccount.signMessage(message),
-          },
-        });
+      : withLegacyDeletionFence(
+          db,
+          createGatewayDeleteDataPort({
+            gatewayUrl: config.gateway.url,
+            dataPointFeed,
+            serverOwner,
+            signer: serverSigner,
+            storage: {
+              endpoint: resolveVanaStorageEndpoint(config),
+              chainId: config.gateway.chainId,
+              signMessage: (message) => serverAccount.signMessage(message),
+            },
+          }),
+        );
     const pendingBlobDeletions = createFilePendingBlobDeletionStore(
       pendingBlobDeletionsPath,
     );
@@ -1025,7 +1057,30 @@ export async function createServer(
         })
       : undefined;
 
+  const legacyPublicationPolicy =
+    serverOwner && serverAccount
+      ? createLegacyPublicationPolicy(db, {
+          owner: serverOwner,
+          serverGeneration: `server-key:${serverAccount.address.toLowerCase()}:legacy-publication-v1`,
+          enabled: () => config.legacyWriteShutdownEnabled,
+          storage: { indexManager, hierarchyOptions },
+          // Native canonical coverage over this server's own record store.
+          canonical:
+            pdppRecords && pdppAuth
+              ? createLegacyCanonicalCoverage({
+                  store: pdppRecords.bindingStore,
+                  declarations: pdppAuth.retainedDeclarations,
+                  streamDeclarations: pdppRecords.declarations,
+                  configuredMethods: pdppRecords.configuredMethods,
+                  authority: legacyScopeAuthority,
+                })
+              : undefined,
+          // No complete inventory/global fence, qualified canonical retention
+          // or coordinated rollback capability is available in this runtime.
+        })
+      : undefined;
   const app = createApp({
+    legacyPublicationPolicy,
     pdppEnabled: pdppConfigured,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
