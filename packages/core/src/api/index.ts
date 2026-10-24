@@ -2352,19 +2352,18 @@ async function dispatchDataRequest(
         ),
       );
 
-      // Disclosure gate, before demand or payment: a chain grant reads actual
-      // legacy files only, so a grantee never receives the canonical view (or
-      // its refusal) or a version with PDPP origin.
-      // The body is decided again on its bytes when it is read, through the
-      // reader's storage below; this only refuses early, before payment.
+      // Disclosure gate, before demand or payment. The canonical view is the
+      // legacy-format projection of a scope the grant covers, so it is served
+      // to a chain grant, held to the same redaction as any grantee body. A
+      // stored version known to be canonical or derived PDPP data is refused
+      // here, before payment. The body is decided again on its bytes when it
+      // is read, through the reader's storage below.
       const reader: LegacyReader = isOwnerView(authResult)
         ? "owner"
         : typeof authResult?.builder === "string"
           ? { builder: authResult.builder }
           : "grantee";
-      if (latest !== undefined && latest.kind !== "file") {
-        authorizeLegacyRead(reader, { kind: "canonical-view" });
-      } else if (selectedEntry) {
+      if (selectedEntry && (latest === undefined || latest.kind === "file")) {
         authorizeLegacyRead(reader, {
           kind: "indexed-version",
           entry: selectedEntry,

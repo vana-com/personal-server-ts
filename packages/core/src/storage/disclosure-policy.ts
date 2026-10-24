@@ -229,19 +229,17 @@ export function withDisclosurePolicy(
       // Storage checks each block against the manifest read in the same
       // call, and reports the manifest's binding only when every served
       // block matched. The pinned generation, not the provenance bit, is the
-      // authority that these are the authorized version's bytes. A missing
+      // authority that these are the authorized version's bytes. A sidecar of
+      // a PDPP-origin version is never trusted: the bytes are read and checked,
+      // because only a legacy projection of PDPP data may be served. A missing
       // sidecar fails here as it does for the owner.
       const result = await rawBlocks(scope, collectedAt, readOptions);
       if (
         generation !== undefined &&
         result.envelopeDigest === generation &&
-        result.pdppOrigin !== undefined &&
+        result.pdppOrigin === false &&
         isCurrentBlockRedactionContext(result.redaction)
       ) {
-        authorizeLegacyRead("grantee", {
-          kind: "stored-blocks",
-          pdppOrigin: result.pdppOrigin,
-        });
         return servedBlocks(result);
       }
       return servedBlocks(
@@ -263,13 +261,9 @@ export function withDisclosurePolicy(
       if (
         generation !== undefined &&
         boundEnvelopeDigest(manifest) === generation &&
-        pdppOrigin !== undefined &&
+        pdppOrigin === false &&
         isCurrentBlockRedactionContext(manifest.redaction)
       ) {
-        authorizeLegacyRead("grantee", {
-          kind: "stored-blocks",
-          pdppOrigin,
-        });
         return servedManifest(manifest);
       }
       return servedManifest(
@@ -291,6 +285,34 @@ export function withDisclosurePolicy(
         Object.prototype.hasOwnProperty.call(overrides, property) ||
         Reflect.has(target, property)
       );
+    },
+  });
+}
+
+/**
+ * The port a legacy projection reads its inputs through for a non-owner. The
+ * inputs are not disclosed; only the composed projection reaches the reader.
+ * An input that is not legacy data, PDPP data in its own form or a projection
+ * body (a derivative, a non-owner publication) is refused, so it cannot be
+ * joined into a view the grant covers.
+ */
+export function forProjectionInputs(raw: DataStoragePort): DataStoragePort {
+  return new Proxy(raw, {
+    get(target, property) {
+      if (property === "readEnvelope") {
+        return async (scope: string, collectedAt: string) => {
+          const envelope = ownReadEnvelope(
+            await target.readEnvelope(scope, collectedAt),
+          );
+          authorizeLegacyRead("grantee", {
+            kind: "projection-input",
+            envelope,
+          });
+          return envelope;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
     },
   });
 }

@@ -419,16 +419,8 @@ async function observe(
 ): Promise<{ owner: Outcome; builder: Outcome }> {
   const ownerOutcome = await ownerRead(scope);
   const builderOutcome = await builderRead(scope);
-  // A builder's chain grant reads actual legacy files only. Where the owner is
-  // served a legacy file the builder is served the same file, and a deletion
-  // answers both alike; where the owner is served the canonical view or a
-  // refusal of it, the builder is refused.
-  const ownerLabel = label(ownerOutcome);
-  expect(label(builderOutcome)).toBe(
-    ownerLabel === "FILE (legacy body L)" || ownerOutcome.status === 410
-      ? ownerLabel
-      : "403 null",
-  );
+  // OpenPet's builder read and the owner read must agree on what is served.
+  expect(label(builderOutcome)).toBe(label(ownerOutcome));
   return { owner: ownerOutcome, builder: builderOutcome };
 }
 
@@ -1113,7 +1105,7 @@ describe("an owner with the PAT `oura` and the `oura-browser` method both config
       const activity = await observe("oura.activity");
       expect(label(activity.owner), `read ${read}`).toBe(CANON);
       expect(scores(activity.owner)).toEqual(DAYS.map((day) => day.score));
-      expect(label(activity.builder), `read ${read}`).toBe("403 null");
+      expect(scores(activity.builder)).toEqual(DAYS.map((day) => day.score));
       // No PAT rows, no takeover: the browser method stays gated.
       expect(label((await observe("oura.sleep")).owner)).toBe(FILE);
       expect(label((await observe("oura.readiness")).owner)).toBe(FILE);

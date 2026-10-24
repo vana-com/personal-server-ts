@@ -26,7 +26,7 @@ import {
   type ProjectionError,
 } from "../legacy-projection/index.js";
 import type { DataStoragePort } from "../ports/index.js";
-import { ProtocolError } from "../errors/catalog.js";
+import { GrantRequiredError, ProtocolError } from "../errors/catalog.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
 import type { LegacyReader } from "../policy/legacy-disclosure.js";
 import { inputHasPdppOrigin, isPdppProducer } from "../sync/pdpp-import.js";
@@ -40,6 +40,7 @@ import { previewEnvelopeValue } from "./preview.js";
 import {
   GRANTEE_VIEW,
   isGuarded,
+  forProjectionInputs,
   withDisclosurePolicy,
 } from "./disclosure-policy.js";
 
@@ -184,7 +185,19 @@ export function withLegacyProjection(
     let cached = forms.get(formKey);
     let own: DataFileEnvelope | undefined;
     if (!cached) {
-      own = await raw.readEnvelope(scope, collectedAt);
+      try {
+        own = await raw.readEnvelope(scope, collectedAt);
+      } catch (error) {
+        // A guarded port refuses canonical PDPP data in its own form. A body
+        // that projects to the legacy form is not refused: it is an input.
+        if (projectionRaw === raw || !(error instanceof GrantRequiredError)) {
+          throw error;
+        }
+        own = await projectionRaw.readEnvelope(scope, collectedAt);
+        if (classifyStoredBody(scope, own.data) !== "pdpp-projected") {
+          throw error;
+        }
+      }
       const form = classifyStoredBody(scope, own.data);
       cached = {
         form,
@@ -545,13 +558,14 @@ export function withLegacyProjection(
           if (granteeViews.size >= 16) {
             granteeViews.delete(granteeViews.keys().next().value!);
           }
-          // Classification reads go through the reader-aware guard (an own
-          // write served unprojected); anything a projection reads goes
-          // through the plain guard.
+          // A body served unprojected is decided on its bytes by the
+          // reader-aware guard (an own write may be read back). What a
+          // projection reads are its inputs, not a disclosure: only the
+          // composed legacy projection reaches the reader, stamped as one.
           view = withLegacyProjection(
             withDisclosurePolicy(raw, reader),
             options,
-            withDisclosurePolicy(raw, "grantee"),
+            forProjectionInputs(raw),
           );
           granteeViews.set(key, view);
         }

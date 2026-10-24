@@ -96,7 +96,10 @@ export {
   hasPdppOrigin,
   PDPP_CLASSIFIER_VERSION,
   inputHasPdppOrigin,
+  isLegacyProjectionBody,
+  isProjectionInput,
   isPdppProducer,
+  isPdppProjectionProducer,
   PDPP_PRODUCERS,
   type PdppProducer,
 } from "./pdpp-import.js";

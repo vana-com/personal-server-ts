@@ -310,6 +310,20 @@ export function isPdppProducer(value: unknown): value is PdppProducer {
 }
 
 /**
+ * The producer stamps of a legacy-format projection of PDPP data: the owner's
+ * pipelines assert them, and the legacy projection view stamps them on what it
+ * serves. Only the owner may assert one, so a non-owner write never has it.
+ */
+export const PDPP_PROJECTION_PRODUCERS = [
+  "pdpp-projector",
+  "pdpp-import-projection",
+] as const;
+
+export function isPdppProjectionProducer(value: unknown): boolean {
+  return (PDPP_PROJECTION_PRODUCERS as readonly unknown[]).includes(value);
+}
+
+/**
  * Version of the provenance classifier (`hasPdppOrigin`). A block manifest
  * records the version that classified it, and a non-owner trusts the recorded
  * `pdppOrigin` only when that version is current. Bump it whenever the
@@ -353,6 +367,44 @@ export function hasPdppOrigin(
     (isPdppProducer(envelope.producer) ||
       readMetadata(envelope.data) !== null ||
       derivativeLacksLegacyOrigin(envelope.data))
+  );
+}
+
+/**
+ * True when an envelope is the legacy-format projection of PDPP data and
+ * nothing else: a projection producer stamp, no native `$pdpp` metadata (which
+ * is canonical data in its own format), and no derivative that lacks a legacy
+ * origin. A legacy chain grant that covers the scope may read it. This is the
+ * only PDPP-origin body a chain grant may receive.
+ */
+export function isLegacyProjectionBody(envelope: {
+  data: unknown;
+  producer?: unknown;
+}): boolean {
+  return (
+    isPdppProjectionProducer(envelope.producer) &&
+    readMetadata(envelope.data) === null &&
+    !derivativeLacksLegacyOrigin(envelope.data)
+  );
+}
+
+/**
+ * True when an envelope may feed the legacy projection of a scope a chain
+ * grant covers: not PDPP-origin at all, or PDPP data in its own form (valid
+ * native `$pdpp` metadata) or a projection body. A derivative, a body no
+ * pipeline owns (a non-owner publication) and malformed native metadata are
+ * not inputs: they would launder data into a view the grant covers.
+ */
+export function isProjectionInput(envelope: {
+  data: unknown;
+  producer?: unknown;
+}): boolean {
+  if (!hasPdppOrigin(envelope)) return true;
+  if (envelope.producer === "pdpp-derivative") return false;
+  if (derivativeLacksLegacyOrigin(envelope.data)) return false;
+  return (
+    isPdppProjectionProducer(envelope.producer) ||
+    readMetadata(envelope.data)?.ok === true
   );
 }
 

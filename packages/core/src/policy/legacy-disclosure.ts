@@ -5,7 +5,12 @@
  */
 import { GrantRequiredError } from "../errors/catalog.js";
 import type { IndexEntry } from "../storage/index/types.js";
-import { hasPdppOrigin } from "../sync/pdpp-import.js";
+import {
+  hasPdppOrigin,
+  isLegacyProjectionBody,
+  isPdppProjectionProducer,
+  isProjectionInput,
+} from "../sync/pdpp-import.js";
 import { WRITER_ATTRIBUTION_KEY } from "../write/attribution-key.js";
 
 /**
@@ -26,8 +31,6 @@ export type LegacyReader =
 
 /** What a legacy-surface read is about to disclose, or has selected. */
 export type LegacyReadBody =
-  /** The canonical view, or its refusal, of a scope the PDPP store owns. */
-  | { kind: "canonical-view" }
   /**
    * The stored envelope actually read, the bytes about to be served. This is
    * the authority: `withDisclosurePolicy` decides on it for every body a
@@ -35,14 +38,19 @@ export type LegacyReadBody =
    */
   | { kind: "stored-envelope"; envelope: { data: unknown; producer?: unknown } }
   /**
-   * Blocks read from a sidecar whose manifest records the provenance of the
-   * envelope it was built from, read in the same call as the blocks.
+   * A stored envelope the legacy projection reads as an input to the
+   * projection of a covered scope. It is not disclosed itself; only the
+   * composed projection reaches the reader.
    */
-  | { kind: "stored-blocks"; pdppOrigin: boolean }
+  | {
+      kind: "projection-input";
+      envelope: { data: unknown; producer?: unknown };
+    }
   /**
    * The index row selected before any body is read. Only an early refusal,
-   * so a read that will be refused is not charged: a row known to be PDPP is
-   * refused here; any other row is decided later on its bytes.
+   * so a read that will be refused is not charged: a row known to be PDPP and
+   * not a projection is refused here; any other row is decided later on its
+   * bytes.
    */
   | {
       kind: "indexed-version";
@@ -81,9 +89,11 @@ function readerWroteVersion(reader: LegacyReader, data: unknown): boolean {
 /**
  * The one decision for disclosing PDPP data through the legacy surfaces.
  *
- * A legacy chain grant authorizes actual legacy files only, with or without a
- * PDPP grant binding. The canonical view and every stored envelope with PDPP
- * origin (native `$pdpp` metadata, or a PDPP producer stamp) reach a
+ * A legacy chain grant authorizes the legacy form of the scopes it covers:
+ * real legacy files, and the legacy-format projection of PDPP data for a
+ * covered scope (the canonical view, and bodies a projection producer stamped).
+ * Canonical data in its own form (native `$pdpp` envelopes), derivatives of
+ * PDPP data and non-owner publications on a PDPP-enabled server reach a
  * non-owner only through the PDPP resource server, which applies the PDPP
  * grant's selection, projection and time constraints. There is deliberately
  * no chain-to-PDPP bridge here. The owner keeps full authority over their own
@@ -91,24 +101,28 @@ function readerWroteVersion(reader: LegacyReader, data: unknown): boolean {
  *
  * One exception, decided on the bytes served: a reader whose identity is known
  * may read back a version it wrote itself (`$writtenBy.builder`). It applies
- * to envelope reads only. A block manifest does not carry `$writtenBy`, so
- * block reads and the canonical view stay refused, and a version's index row
- * is deferred to its bytes only for a pdpp-derivative row, the stamp a direct
- * non-owner write gets.
+ * to envelope reads only: block reads are checked as a plain grantee.
  */
 export function authorizeLegacyRead(
   reader: LegacyReader,
   body: LegacyReadBody,
 ): void {
   if (reader === "owner") return;
+  if (body.kind === "projection-input") {
+    if (isProjectionInput(body.envelope)) return;
+    throw new GrantRequiredError({
+      reason:
+        "PDPP data is readable only with a PDPP access token at the PDPP resource server",
+    });
+  }
   const pdpp =
-    body.kind === "canonical-view" ||
     (body.kind === "stored-envelope" &&
       hasPdppOrigin(body.envelope) &&
+      !isLegacyProjectionBody(body.envelope) &&
       !readerWroteVersion(reader, body.envelope.data)) ||
-    (body.kind === "stored-blocks" && body.pdppOrigin) ||
     (body.kind === "indexed-version" &&
       body.entry.pdppOrigin === true &&
+      !isPdppProjectionProducer(body.entry.producer) &&
       !(
         typeof reader === "object" && body.entry.producer === "pdpp-derivative"
       ));
