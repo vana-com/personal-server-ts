@@ -38,6 +38,31 @@ describe("PS Lite sync", () => {
     vi.unstubAllEnvs();
   });
 
+  it("can create the sync capability without starting its background loop", async () => {
+    const stateStore = createMemoryPsLiteStateStore();
+    const identity = await loadOrCreatePsLiteServerIdentity({
+      store: stateStore,
+      ownerSignature: OWNER_SIGNATURE,
+    });
+    const { syncManager } = await createPsLiteSyncManager({
+      config: ServerConfigSchema.parse({ sync: { enabled: true } }),
+      stateStore,
+      storage: createMemoryPsLiteStorage(),
+      ownerSignature: OWNER_SIGNATURE,
+      serverAccount: identity.account,
+      autoStartSync: false,
+      gateway: {
+        getServer: vi.fn().mockResolvedValue(null),
+      } as never,
+      dataPointFeed: {
+        getDataPoint: async () => null,
+        listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+      },
+    });
+
+    expect(syncManager.running).toBe(false);
+  });
+
   it("uploads with owner authority without a registered server", async () => {
     const owner = privateKeyToAccount(`0x${"12".repeat(32)}`);
     const ownerSignature = await owner.signMessage({

@@ -1024,58 +1024,44 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
             `This stream spans more than ${MAX_SYNC_INSTANCES} connections, more than one sync session reads`,
           );
         }
-        let page;
-        try {
-          page = sync.read({
-            stream,
-            owner: context!.grant?.subject.id ?? context!.subjectId,
-            instanceIds: effectiveInstanceIds,
-            changesSince: query.changesSince,
-            cursor,
-            limit,
-            eligibilityFields: candidate ? streamGrant!.fields : fields,
-            // Candidate records carry instance_id, so one key held by two
-            // instances names two records; the current wire would merge them.
-            oneRecordPerKey: context!.tokenKind === "client" && !candidate,
-            ...((streamGrant || replicaReader) && {
-              access: {
-                canSeeKey: (recordKey) =>
-                  !streamGrant ||
-                  recordKeyWithinGrantResources(recordKey, streamGrant),
-                canSeeRecord: (row) =>
-                  visibleInstances.has(row.instance) &&
-                  (!streamGrant ||
-                    (recordKeyWithinGrantResources(
-                      row.recordKey,
-                      streamGrant,
-                    ) &&
-                      recordWithinGrantTimeConstraint(row.data, streamGrant))),
+        const page = sync.read({
+          stream,
+          owner: context!.grant?.subject.id ?? context!.subjectId,
+          instanceIds: effectiveInstanceIds,
+          changesSince: query.changesSince,
+          cursor,
+          limit,
+          eligibilityFields: candidate ? streamGrant!.fields : fields,
+          // Candidate records carry instance_id, so one key held by two
+          // instances names two records; the current wire would merge them.
+          oneRecordPerKey: context!.tokenKind === "client" && !candidate,
+          ...((streamGrant || replicaReader) && {
+            access: {
+              canSeeKey: (recordKey) =>
+                !streamGrant ||
+                recordKeyWithinGrantResources(recordKey, streamGrant),
+              canSeeRecord: (row) =>
+                visibleInstances.has(row.instance) &&
+                (!streamGrant ||
+                  (recordKeyWithinGrantResources(row.recordKey, streamGrant) &&
+                    recordWithinGrantTimeConstraint(row.data, streamGrant))),
+            },
+          }),
+          ...(candidate && {
+            candidate: {
+              order,
+              binding: {
+                protocol: context!.grant!.version,
+                grant: context!.grant!.grant_id,
+                subject: context!.grant!.subject.id,
+                client: context!.grant!.client.client_id,
+                source: context!.grant!.source.id,
+                streamGrant,
+                fields: fields ? [...new Set(fields)].sort() : null,
               },
-            }),
-            ...(candidate && {
-              candidate: {
-                order,
-                binding: {
-                  protocol: context!.grant!.version,
-                  grant: context!.grant!.grant_id,
-                  subject: context!.grant!.subject.id,
-                  client: context!.grant!.client.client_id,
-                  source: context!.grant!.source.id,
-                  streamGrant,
-                  fields: fields ? [...new Set(fields)].sort() : null,
-                },
-              },
-            }),
-          });
-        } catch (error) {
-          const continuation =
-            cursor !== undefined ||
-            (!!query.changesSince && query.changesSince !== "beginning");
-          if (continuation && error instanceof InvalidCursorError) {
-            throw new CursorExpiredError();
-          }
-          throw error;
-        }
+            },
+          }),
+        });
         const meta = clamped
           ? {
               warnings: [

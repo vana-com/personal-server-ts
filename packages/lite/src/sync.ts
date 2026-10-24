@@ -103,6 +103,8 @@ export interface PsLiteSyncOptions {
   scopeDeletions?: ScopeDeletionTracker;
   diagnostics?: DiagnosticsRecorder;
   logger?: Logger;
+  /** Build the sync capability without starting its background loop. Defaults to true. */
+  autoStartSync?: boolean;
   /** Registers derivatives (envelopes carrying `$lineage`) with their lineage. */
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   /** Post-index download hook (marks derivative questions stale). */
@@ -401,6 +403,8 @@ export async function createPsLiteSyncManager(
       },
     },
   );
-  syncManager.start();
+  if (options.autoStartSync !== false) {
+    syncManager.start();
+  }
   return { syncManager, additions, serverOwner, dataPointFeed, scopeDeletions };
 }
