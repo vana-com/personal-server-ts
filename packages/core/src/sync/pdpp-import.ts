@@ -402,10 +402,11 @@ export function isProjectionInput(envelope: {
   if (!hasPdppOrigin(envelope)) return true;
   if (envelope.producer === "pdpp-derivative") return false;
   if (derivativeLacksLegacyOrigin(envelope.data)) return false;
-  return (
-    isPdppProjectionProducer(envelope.producer) ||
-    readMetadata(envelope.data)?.ok === true
-  );
+  // Native metadata must be valid; a projection stamp does not excuse a
+  // malformed claim. A projection body carries no native metadata at all.
+  const metadata = readMetadata(envelope.data);
+  if (metadata !== null) return metadata.ok;
+  return isPdppProjectionProducer(envelope.producer);
 }
 
 /**

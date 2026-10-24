@@ -105,5 +105,18 @@ describe("authorizeLegacyRead: a chain grant reads the legacy form of a covered 
       ).toThrow(GrantRequiredError);
       expect(input({ data: { $pdpp: "claimed" } })).toThrow(GrantRequiredError);
     });
+
+    it.each(["pdpp-projector", "pdpp-import-projection"])(
+      "refuses malformed native metadata under a %s stamp, and accepts valid metadata under it",
+      (producer) => {
+        expect(input({ data: { $pdpp: "claimed" }, producer })).toThrow(
+          GrantRequiredError,
+        );
+        expect(input({ data: { $pdpp: { version: "1" } }, producer })).toThrow(
+          GrantRequiredError,
+        );
+        expect(input({ data: { id: "a", ...NATIVE }, producer })).not.toThrow();
+      },
+    );
   });
 });
