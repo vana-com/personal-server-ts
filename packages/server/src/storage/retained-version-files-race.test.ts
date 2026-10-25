@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+} from "node:fs";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,8 +23,9 @@ import * as hierarchy from "./hierarchy.js";
  * the owner. Each hook fires once.
  */
 type Hook = {
-  call: "renameSync" | "linkSync";
+  call: "renameSync" | "linkSync" | "fsyncSync" | "openSync";
   when: "before" | "after";
+  /** `from` is the first argument as text: a path, or a file descriptor. */
   match: (from: string, to: string) => boolean;
   run: () => void;
 };
@@ -28,7 +36,8 @@ vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof fs>();
   const wrap =
     (call: Hook["call"]) =>
-    (from: string, to: string): void => {
+    (...args: unknown[]) => {
+      const [from, to] = args;
       const fire = (when: Hook["when"]) => {
         const i = hooks.findIndex(
           (hook) =>
@@ -39,13 +48,16 @@ vi.mock("node:fs", async (importOriginal) => {
         if (i >= 0) hooks.splice(i, 1)[0].run();
       };
       fire("before");
-      actual[call](from, to);
+      const result = (actual[call] as (...args: unknown[]) => unknown)(...args);
       fire("after");
+      return result;
     };
   const mocked = {
     ...actual,
     renameSync: wrap("renameSync"),
     linkSync: wrap("linkSync"),
+    fsyncSync: wrap("fsyncSync"),
+    openSync: wrap("openSync"),
     lstatSync: ((path: string, options?: never) => {
       if (unreadable.has(String(path)))
         throw Object.assign(new Error(`EACCES: ${path}`), { code: "EACCES" });
@@ -259,4 +271,161 @@ it("an unreadable retention record never reads as unretained", async () => {
     unreadable.clear();
     expect(readFileSync(f.file)).toEqual(f.bytes);
   }
+});
+
+/** The file a descriptor names, as text; empty if it names nothing. */
+function descriptorPath(fd: string): string {
+  try {
+    return fs.readlinkSync(`/proc/self/fd/${fd}`);
+  } catch {
+    return "";
+  }
+}
+
+it("a temp file a seal recorded survives the refusal of its creation, unchanged", async () => {
+  const f = await fixture(true);
+  // A data directory whose first-seen dir is the sealed sidecar itself.
+  const alias = join(f.outside, "alias");
+  mkdirSync(alias);
+  fs.symlinkSync(f.blockDir, join(alias, "first-seen"));
+  const realBlockDir = fs.realpathSync(f.blockDir);
+  let staged = "";
+  let sealError: unknown = "not run";
+  hooks.push({
+    call: "fsyncSync",
+    when: "after",
+    match: (fd) => {
+      const path = descriptorPath(fd);
+      if (!path.startsWith(`${realBlockDir}/`) || !path.includes(".tmp."))
+        return false;
+      staged = path;
+      return true;
+    },
+    // Another process seals after the whole temp file is written.
+    run: () => (sealError = f.seal()),
+  });
+  await expect(
+    hierarchy.writeFirstSeenLedger({ dataDir: alias }, scope, { seen: 42 }),
+  ).rejects.toMatchObject({ errorCode: "legacy_history_retained" });
+  expect(sealError).toBeUndefined();
+  expect(f.retained()).toHaveLength(1);
+  // The seal recorded the temp file by name and bytes; it is still that file.
+  const record = JSON.parse(
+    readFileSync(
+      join(
+        fs.realpathSync(f.dataDir),
+        ".legacy-retained",
+        "blocks",
+        "spotify",
+        "profile",
+        `${f.entry.collectedAt}.retained`,
+      ),
+      "utf8",
+    ),
+  ) as { files: Record<string, string> };
+  const name = staged.split("/").pop()!;
+  expect(record.files[name]).toBeDefined();
+  expect(existsSync(staged)).toBe(true);
+  expect(createHash("sha256").update(readFileSync(staged)).digest("hex")).toBe(
+    record.files[name],
+  );
+  // The ledger itself was never published, and the version file is unchanged.
+  expect(existsSync(join(f.blockDir, `${scope}.json`))).toBe(false);
+  expect(readFileSync(f.file)).toEqual(f.bytes);
+});
+
+it("a temp file the seal did not record is still removed when its creation is refused", async () => {
+  const f = await fixture(true);
+  const alias = join(f.outside, "alias");
+  mkdirSync(alias);
+  fs.symlinkSync(f.blockDir, join(alias, "first-seen"));
+  let sealError: unknown = "not run";
+  hooks.push({
+    call: "openSync",
+    when: "before",
+    match: (path) =>
+      path.startsWith(`${join(alias, "first-seen")}/`) &&
+      path.includes(".tmp."),
+    // The seal lists the sidecar before the temp file exists.
+    run: () => (sealError = f.seal()),
+  });
+  await expect(
+    hierarchy.writeFirstSeenLedger({ dataDir: alias }, scope, { seen: 42 }),
+  ).rejects.toMatchObject({ errorCode: "legacy_history_retained" });
+  expect(sealError).toBeUndefined();
+  expect(readdirSync(f.blockDir).filter((n) => n.includes(".tmp."))).toEqual(
+    [],
+  );
+  expect(readFileSync(f.file)).toEqual(f.bytes);
+});
+
+/** A data directory that is a link to the retained sidecar itself. */
+function rootAlias(f: Awaited<ReturnType<typeof fixture>>): string {
+  const alias = join(f.outside, "root-alias");
+  fs.symlinkSync(f.blockDir, alias);
+  return alias;
+}
+
+it("a streamed stage whose data directory is a sidecar keeps that sidecar unsealed while it is written", async () => {
+  const f = await fixture(true);
+  const alias = rootAlias(f);
+  const stagePath = join(alias, ".scope-imports", "import", "envelope.stage");
+  const stage = await hierarchy.createStreamedStage(
+    { dataDir: alias },
+    stagePath,
+  );
+  await stage.write(Buffer.from("first"));
+  // The sidecar now holds the import directory: it is not flat files.
+  expect(String(f.seal())).toContain("more than flat files");
+  expect(f.retained()).toEqual([]);
+  expect(existsSync(join(fs.realpathSync(f.dataDir), ".legacy-retained"))).toBe(
+    false,
+  );
+  await stage.write(Buffer.from(" second"));
+  await stage.sync();
+  await stage.close();
+  expect(readFileSync(stagePath, "utf8")).toBe("first second");
+  expect(readFileSync(f.file)).toEqual(f.bytes);
+});
+
+it("a streamed stage is refused inside a sidecar sealed before its directory existed", async () => {
+  const f = await fixture(true);
+  expect(f.seal()).toBeUndefined();
+  const before = readdirSync(f.blockDir).sort();
+  const alias = rootAlias(f);
+  await expect(
+    hierarchy.createStreamedStage(
+      { dataDir: alias },
+      join(alias, ".scope-imports", "import", "envelope.stage"),
+    ),
+  ).rejects.toMatchObject({ errorCode: "legacy_history_retained" });
+  expect(readdirSync(f.blockDir).sort()).toEqual(before);
+});
+
+it("a streamed stage is refused outside a dot directory or behind a link below the data directory", async () => {
+  const f = await fixture(true);
+  // A scope directory that is a link into the sidecar is not a private place.
+  const scopeAlias = join(f.outside, "scope-alias");
+  mkdirSync(scopeAlias);
+  fs.symlinkSync(f.blockDir, join(scopeAlias, "spotify"));
+  await expect(
+    hierarchy.createStreamedStage(
+      { dataDir: scopeAlias },
+      join(scopeAlias, "spotify", "envelope.stage"),
+    ),
+  ).rejects.toThrow("private file in a dot directory");
+  // A dot directory that is itself a link is refused before anything is made.
+  const elsewhere = join(f.outside, "elsewhere");
+  mkdirSync(elsewhere);
+  fs.symlinkSync(elsewhere, join(f.dataDir, ".scope-imports"));
+  await expect(
+    hierarchy.createStreamedStage(
+      { dataDir: f.dataDir },
+      join(f.dataDir, ".scope-imports", "import", "envelope.stage"),
+    ),
+  ).rejects.toThrow("through a link or file");
+  expect(readdirSync(elsewhere)).toEqual([]);
+  expect(readdirSync(f.blockDir).filter((n) => n.endsWith(".stage"))).toEqual(
+    [],
+  );
 });

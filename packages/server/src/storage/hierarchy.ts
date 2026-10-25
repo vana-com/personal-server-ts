@@ -11,6 +11,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -303,13 +304,40 @@ function ensureDirSync(dir: string): string[] {
   return missing;
 }
 
-/** Undo a creation at `path` that a seal now covers, then refuse. Removes the
- * file only if it is still the one this call created (`created`). */
+/**
+ * Undo a creation at `path` that a seal now covers, then refuse. `created` is
+ * the file or link this call made; it is removed only when it is still that
+ * file and no record can name it: the seal listed the sidecar without it, or
+ * found none. A file a record names, a record that could not list its sidecar,
+ * an unreadable record and any envelope record leave it: that is sealed or
+ * unknown history, a hash that differs from the file proves nothing, and
+ * keeping an ambiguous file is safer than deleting history.
+ */
 function refuseCreated(path: string, created: { dev: number; ino: number }) {
   const now = lstatSync(path, { throwIfNoEntry: false });
-  if (now && now.dev === created.dev && now.ino === created.ino)
+  if (
+    now &&
+    now.dev === created.dev &&
+    now.ino === created.ino &&
+    unnamedBySeal(path)
+  )
     unlinkSync(path);
   retainedRefusal();
+}
+
+function unnamedBySeal(path: string): boolean {
+  try {
+    const { version } = retainedAt(path);
+    if (!version) return true;
+    const { identity, inner } = version;
+    if (identity.kind !== "blocks") return false;
+    return (
+      identity.files === "absent" ||
+      (identity.files !== "unknown" && !Object.hasOwn(identity.files, inner))
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Exclusively create `path` with `bytes`, fsynced. Never inside a retained
@@ -317,13 +345,14 @@ function refuseCreated(path: string, created: { dev: number; ino: number }) {
 function createFileSync(path: string, bytes: Uint8Array): void {
   assertCreatable(path);
   const fd = openSync(path, "wx", 0o600);
+  const created = fstatSync(fd);
   try {
     writeFileSync(fd, bytes);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
-  if (retainedAt(path).version) refuseCreated(path, statSync(path));
+  if (retainedAt(path).version) refuseCreated(path, created);
 }
 
 /**
@@ -508,6 +537,18 @@ export function recordRetainedVersionFiles(
     const identities = sealed.map(({ observe, unknown }) =>
       bytes === "observed" ? observe() : unknown,
     );
+    // A sidecar is flat files. One that holds anything else (a directory, a
+    // link) cannot be sealed by bytes, and a directory there could be a
+    // private stage still being written: it stays unsealed.
+    const sidecar = identities[identities.length - 1];
+    if (
+      bytes === "observed" &&
+      sidecar.kind === "blocks" &&
+      sidecar.files === "unknown"
+    )
+      throw new Error(
+        `Cannot seal ${relative(root, blockDir)}: its sidecar holds more than flat files`,
+      );
     const indexed = identities[0];
     if (
       bytes === "observed" &&
@@ -833,6 +874,73 @@ export async function writeDataFile(
   };
 }
 
+/** A file written in pieces whose bytes arrive over time. */
+export interface StreamedStage {
+  write(bytes: Uint8Array): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+}
+
+/**
+ * Exclusively create `stagePath` for bytes that arrive over time, such as an
+ * uploaded scope read in chunks. A seal that lands while it is written can
+ * neither record nor freeze it, and it enters a version path only whole,
+ * through `publishStagedDataFile`, which links without replacing and checks
+ * the retention records after the link (`linkNewSync`).
+ *
+ * Why no seal can cover a stage:
+ * - Retention records name only envelope paths (`<scope dirs>/<time>.json`)
+ *   and sidecar directories (`blocks/<scope dirs>/<time>`). A scope directory
+ *   starts with a letter or digit, so a stage is accepted only in a dot
+ *   directory of the data directory (`.scope-imports`), reached through no
+ *   link below the data directory, and never named `.json`. It is therefore
+ *   not an envelope and not a sidecar file of this root.
+ * - The data directory may itself be, or lie inside, a sidecar of another
+ *   root (a link to it). Such a sidecar then holds this dot directory, which
+ *   is not a file, and `recordRetainedVersionFiles` refuses to seal a sidecar
+ *   that holds anything but files. A sidecar sealed before this directory
+ *   existed is found by `assertCreatable` here, which refuses the stage.
+ * Anything else is refused before any effect: a plain error for a stage that
+ * is not private (a caller defect), `legacy_history_retained` for one inside
+ * a sealed set.
+ */
+export async function createStreamedStage(
+  options: HierarchyManagerOptions,
+  stagePath: string,
+): Promise<StreamedStage> {
+  const root = realpathSync(options.dataDir);
+  const dir = resolve(dirname(stagePath));
+  const lexical = relative(resolve(options.dataDir), dir);
+  const [top] = lexical.split(sep);
+  if (
+    lexical.startsWith("..") ||
+    !top.startsWith(".") ||
+    top === RETAINED_DIR ||
+    stagePath.endsWith(".json")
+  )
+    throw new Error(
+      `A streamed stage must be a private file in a dot directory of the data directory: ${stagePath}`,
+    );
+  let current = root;
+  for (const segment of lexical.split(sep)) {
+    current = join(current, segment);
+    const info = lstatSync(current, { throwIfNoEntry: false });
+    if (!info) break;
+    if (!info.isDirectory())
+      throw new Error(
+        `A streamed stage cannot be reached through a link or file: ${current}`,
+      );
+  }
+  ensureDirSync(dir);
+  assertCreatable(stagePath);
+  const handle = await open(stagePath, "wx");
+  return {
+    write: (bytes) => handle.writeFile(bytes),
+    sync: () => handle.sync(),
+    close: () => handle.close(),
+  };
+}
+
 /** Stage and fsync an envelope before an index transaction makes it visible. */
 export async function stageDataFile(
   options: HierarchyManagerOptions,
@@ -867,14 +975,14 @@ export async function stageDataFile(
   const stagePath = `${finalPath}.pending.${randomUUID()}`;
   assertCreatable(stagePath);
   const handle = await openFile(stagePath, "wx");
+  const created = await handle.stat();
   try {
     await handle.writeFile(bytes);
     await handle.sync();
   } finally {
     await handle.close();
   }
-  if (retainedAt(stagePath).version)
-    refuseCreated(stagePath, statSync(stagePath));
+  if (retainedAt(stagePath).version) refuseCreated(stagePath, created);
   for (const directoryPath of directorySyncPaths) {
     const directory = await openFile(directoryPath, "r");
     try {
@@ -971,6 +1079,9 @@ export function publishStagedDataFileSync(
   finalPath: string,
 ): void {
   assertRemovable(stagePath);
+  // A stage kept apart from the version path leaves its directory to us.
+  for (const created of ensureDirSync(dirname(finalPath)))
+    syncDirectory(dirname(created));
   if (!linkNewSync(stagePath, finalPath))
     assertPublishableSync(stagePath, finalPath);
   syncDirectory(dirname(finalPath));

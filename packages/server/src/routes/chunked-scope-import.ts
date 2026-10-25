@@ -23,6 +23,7 @@ import {
 } from "../storage/legacy-publication-fence.js";
 import { publishIndexedStage } from "../storage/node-data-storage.js";
 import {
+  createStreamedStage,
   discardDataFile,
   publishStagedDataFileSync,
   publishStagedDataFile,
@@ -1027,18 +1028,17 @@ async function finalizeScopeImportAuthorized(
     scope,
     metadata.collectedAt,
   );
-  stagePath = `${finalPath}.pending.${id}`;
+  // The stream is staged privately in the import directory, never in a version
+  // path, so a retention seal cannot record or freeze it while it is read. It
+  // enters the version path whole, by the no-replace publication below.
+  stagePath = join(importPath(deps, id), `envelope.${randomUUID()}.stage`);
   relativePath = relative(deps.hierarchyOptions.dataDir, finalPath);
-  await mkdir(dirname(finalPath), { recursive: true });
-  const file = await open(stagePath, "wx");
+  const stage = await createStreamedStage(deps.hierarchyOptions, stagePath);
   const hash = createHash("sha256");
   const validator = new JsonObjectStreamValidator();
   let total = 0;
-  const write = async (bytes: Uint8Array) => {
-    await file.writeFile(bytes);
-  };
   try {
-    await write(
+    await stage.write(
       Buffer.from(
         `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(metadata.collectedAt)},"data":`,
       ),
@@ -1062,7 +1062,7 @@ async function finalizeScopeImportAuthorized(
             "Scope data is not valid JSON",
           );
         }
-        await write(bytes);
+        await stage.write(bytes);
       }
       const declared = metadata.chunks[String(index)];
       if (
@@ -1093,14 +1093,14 @@ async function finalizeScopeImportAuthorized(
         "Imported scope size or SHA-256 does not match",
       );
     }
-    await write(Buffer.from("}"));
-    await file.sync();
+    await stage.write(Buffer.from("}"));
+    await stage.sync();
   } catch (error) {
     await discardDataFile(stagePath).catch(() => undefined);
     if (error instanceof ScopeImportError) throw error;
     throw error;
   } finally {
-    await file.close();
+    await stage.close();
   }
 
   try {
@@ -1201,6 +1201,7 @@ async function finalizeScopeImportAuthorized(
     notifyCommittedScope(deps, scope, metadata.collectedAt);
     return receipt;
   } catch (error) {
+    await discardDataFile(stagePath).catch(() => undefined);
     await removeImportArtifacts(deps, metadata);
     throw error;
   }

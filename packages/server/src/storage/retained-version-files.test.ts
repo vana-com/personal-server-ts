@@ -463,6 +463,7 @@ const hierarchyExports: Record<string, "read" | "error-type" | "mutation"> = {
   deleteScopeFilesSync: "mutation",
   writeDataFile: "mutation",
   stageDataFile: "mutation",
+  createStreamedStage: "mutation",
   assertPublishable: "read",
   publishStagedDataFile: "mutation",
   publishStagedDataFileSync: "mutation",
@@ -668,6 +669,46 @@ const cases: Record<string, Case[]> = {
       run: async (c) => {
         await expect(
           hierarchy.stageDataFile({ dataDir: c.stageAliasDataDir }, c.changed),
+        ).rejects.toMatchObject(RETAINED);
+      },
+    },
+  ],
+  createStreamedStage: [
+    {
+      name: "creates only a private stage in a dot directory of the data directory",
+      ignore: /(^|\/)\.scope-imports\//,
+      run: async (c) => {
+        const stage = await hierarchy.createStreamedStage(
+          c.opts(),
+          join(c.opts().dataDir, ".scope-imports", "import", "envelope.stage"),
+        );
+        await stage.write(Buffer.from("first"));
+        await stage.write(Buffer.from(" second"));
+        await stage.sync();
+        await stage.close();
+      },
+    },
+    {
+      name: "creates nothing inside a retained set a scope directory link resolves to",
+      run: async (c) => {
+        await expect(
+          hierarchy.createStreamedStage(
+            { dataDir: c.stageAliasDataDir },
+            join(c.stageAliasDataDir, "spotify", "envelope.stage"),
+          ),
+        ).rejects.toThrow("private file in a dot directory");
+      },
+    },
+    {
+      name: "creates nothing when the data directory is a link to a retained set",
+      run: async (c) => {
+        const alias = join(c.f.root, "root-alias");
+        symlinkSync(c.blockDir, alias);
+        await expect(
+          hierarchy.createStreamedStage(
+            { dataDir: alias },
+            join(alias, ".scope-imports", "import", "envelope.stage"),
+          ),
         ).rejects.toMatchObject(RETAINED);
       },
     },
