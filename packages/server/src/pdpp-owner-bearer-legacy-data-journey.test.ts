@@ -350,3 +350,26 @@ describe("PDPP owner bearer bridge for POST /v1/data/:scope", () => {
     expect(await responseCode(response)).toBe("INVALID_SIGNATURE");
   });
 });
+
+describe("Oura requirements scoped owner bridge", () => {
+  it("refuses a minted owner token for the wrong source", async () => {
+    const token = await ownerToken(CLAUDE);
+    const response = await ctx!.app.request(
+      "/v1/import/oura-browser/requirements",
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(response.status).toBe(403);
+    expect(await responseCode(response)).toBe(
+      "PDPP_OWNER_BEARER_SCOPE_MISMATCH",
+    );
+  });
+  it("refuses a real PDPP client bearer", async () => {
+    const token = await issueClientToken();
+    const response = await ctx!.app.request(
+      "/v1/import/oura-browser/requirements",
+      { headers: { authorization: `Bearer ${token}` } },
+    );
+    expect(response.status).toBe(403);
+    expect(await responseCode(response)).toBe("PDPP_CLIENT_BEARER_NOT_OWNER");
+  });
+});

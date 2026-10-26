@@ -22,6 +22,18 @@
  */
 
 export type McpConnectionStatus = "pending" | "approved" | "revoked";
+
+/**
+ * Listener an OAuth connection was authorized through. Its bearer resolves
+ * only on that listener, so a token minted for a local client is useless
+ * through the tunnel and the reverse.
+ */
+export enum McpIngress {
+  /** The server's loopback auth listener: a client on this machine. */
+  Loopback = "loopback",
+  /** The main listener the tunnel forwards to. */
+  Public = "public",
+}
 export const MCP_SCOPE_ACCESS_REQUEST_LIMIT = 20;
 
 export interface McpConnectionGrant {
@@ -99,8 +111,9 @@ export interface McpConnectionRecord {
    */
   tokenExpiresAt?: string;
   /**
-   * OAuth `client_id` the current token pair was issued to. The refresh grant
-   * refuses a token presented by any other client.
+   * OAuth `client_id` the current token pair was issued to, or, while
+   * pending, the client asking. The refresh grant refuses a token presented
+   * by any other client.
    */
   clientId?: string;
   /** SHA-256 hex of the current refresh token. Absent means no refresh grant. */
@@ -123,10 +136,18 @@ export interface McpConnectionRecord {
   approvedAt?: string;
   revokedAt?: string;
   lastUsedAt?: string;
+  /** Absent on records written before listeners were told apart: Public. */
+  ingress?: McpIngress;
 }
 
 export interface McpConnectionStore {
   create(record: McpConnectionRecord): Promise<void>;
+  /** Atomically replace pending OAuth connections when the store can transact. */
+  replacePendingOAuthConnections?(
+    clientId: string,
+    expiredBefore: number,
+    replacement: McpConnectionRecord,
+  ): Promise<void>;
   list(): Promise<McpConnectionRecord[]>;
   getById(id: string): Promise<McpConnectionRecord | null>;
   /**
@@ -177,9 +198,29 @@ export interface McpConnectionStore {
 export type McpOAuthAuthorizationStatus =
   "pending" | "approved" | "redeemed" | "denied" | "expired";
 
+/**
+ * What an MCP client said about itself at dynamic client registration
+ * (RFC 7591). Self-asserted and unauthenticated: a label for the owner, never
+ * a proof of identity.
+ */
+export interface McpOAuthClientRecord {
+  clientId: string;
+  clientName?: string;
+  clientUri?: string;
+  createdAt: string;
+}
+
+export interface McpOAuthClientStore {
+  create(record: McpOAuthClientRecord): Promise<void>;
+  getById(clientId: string): Promise<McpOAuthClientRecord | null>;
+}
+
 export interface McpOAuthAuthorizationRecord {
   id: string;
   clientId: string;
+  /** Registered name of `clientId`, if this server registered it. */
+  clientName?: string;
+  clientUri?: string;
   redirectUri: string;
   codeChallenge: string;
   codeChallengeMethod: "S256";

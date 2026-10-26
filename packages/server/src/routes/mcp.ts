@@ -34,6 +34,7 @@ import {
   buildMcpUrl,
   buildStableMcpUrl,
   createInMemoryMcpOAuthAuthorizationStore,
+  createInMemoryMcpOAuthClientStore,
   createMcpConnection,
   createMcpOAuthAuthorization,
   createInMemoryMcpConnectionStore,
@@ -54,6 +55,7 @@ import {
   MCP_CONNECTION_NOT_FOUND,
   McpConnectionNotFoundError,
   McpConnectionStateError,
+  McpIngress,
   McpOAuthAuthorizationError,
   isAllowedOAuthRedirectUri,
   McpScopeRequestError,
@@ -71,6 +73,8 @@ import {
   type McpConnectionStore,
   type McpSessionStore,
   type McpOAuthAuthorizationStore,
+  type McpOAuthClientRecord,
+  type McpOAuthClientStore,
   type McpActivityRecorder,
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
@@ -82,6 +86,7 @@ import type {
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import { createServerApiAuth } from "../api-auth.js";
 import { createBodyLimit, DEFAULT_MAX_SIZE } from "../middleware/body-limit.js";
+import { arrivedOnLoopbackListener } from "../middleware/local-listener.js";
 import {
   authenticateRequest,
   isWeb3SignedLifetimeError,
@@ -156,6 +161,8 @@ export interface McpRouteDeps {
    * `/mcp/oauth/token`, and the owner approval endpoint.
    */
   oauthAuthorizationStore?: McpOAuthAuthorizationStore;
+  /** DCR client metadata, read back at authorize to name the connection. */
+  oauthClientStore?: McpOAuthClientStore;
   /** Activity recorder for live MCP call visibility. */
   activityRecorder?: McpActivityRecorder;
   /**
@@ -169,10 +176,43 @@ export interface McpRouteDeps {
    * user. Absent: the agent is told to wait for approval in Vana.
    */
   scopeRequestApprovalUrl?: McpScopeRequestApprovalUrlHook;
+  /** Loopback auth listener port; requests on it are local MCP clients. */
+  localApprovalPort?: number;
+  /** Main (tunneled) port; a collision with `localApprovalPort` disables local MCP. */
+  serverPort?: number;
 }
 
 function resolveOrigin(origin: string | (() => string)): string {
   return typeof origin === "function" ? origin() : origin;
+}
+
+type ListenerDeps = Pick<
+  McpRouteDeps,
+  "serverOrigin" | "localApprovalPort" | "serverPort"
+>;
+
+/** Which listener accepted the request: the loopback one or the tunneled main one. */
+function requestIngress(c: Context, deps: ListenerDeps): McpIngress {
+  const listeners = {
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
+  };
+  return arrivedOnLoopbackListener(c, listeners)
+    ? McpIngress.Loopback
+    : McpIngress.Public;
+}
+
+/**
+ * The origin every OAuth/discovery URL in this response must name. A local
+ * client on the loopback listener gets the exact origin it called (RFC 9728:
+ * the advertised resource must match the URL the client used, so `localhost`
+ * and `127.0.0.1` differ); everyone else gets the public origin.
+ */
+function requestOrigin(c: Context, deps: ListenerDeps): string {
+  if (requestIngress(c, deps) === McpIngress.Public) {
+    return resolveOrigin(deps.serverOrigin);
+  }
+  return new URL(c.req.url).origin;
 }
 
 function jsonError(status: number, errorCode: string, message: string) {
@@ -216,6 +256,34 @@ function isSupportedGrantType(
   value: string,
 ): value is (typeof SUPPORTED_GRANT_TYPES)[number] {
   return (SUPPORTED_GRANT_TYPES as readonly string[]).includes(value);
+}
+
+/** Longest DCR client_name kept, in code points; it labels the connection. */
+const MAX_CLIENT_NAME_CHARS = 64;
+const MAX_CLIENT_URI_CHARS = 2048;
+/** Control and format chars: NUL, newlines, bidi overrides, zero-width. */
+const INVISIBLE_CHARS = /[\p{Cc}\p{Cf}]/gu;
+const WEB_PROTOCOLS = new Set(["https:", "http:"]);
+
+/** A printable label from an untrusted string, e.g. " Maple\u202e " → "Maple". */
+function cleanClientName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const visible = value.replace(INVISIBLE_CHARS, "").trim();
+  const capped = Array.from(visible).slice(0, MAX_CLIENT_NAME_CHARS).join("");
+  return capped.trim() || undefined;
+}
+
+/** An http(s) URL or nothing: the owner may be shown it as a link. */
+function cleanClientUri(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > MAX_CLIENT_URI_CHARS) {
+    return undefined;
+  }
+  try {
+    const url = new URL(value.trim());
+    return WEB_PROTOCOLS.has(url.protocol) ? url.href : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function authorizationServerMetadata(origin: string) {
@@ -617,6 +685,7 @@ export type McpOAuthRouteDeps = Pick<
   McpRouteDeps,
   | "connectionStore"
   | "oauthAuthorizationStore"
+  | "oauthClientStore"
   | "oauthApprovalUrl"
   | "serverOrigin"
   | "serverOwner"
@@ -627,6 +696,8 @@ export type McpOAuthRouteDeps = Pick<
   | "gatewayConfig"
   | "serverSigner"
   | "mcpGrantTtlSeconds"
+  | "localApprovalPort"
+  | "serverPort"
 >;
 
 export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
@@ -636,6 +707,8 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
     deps.connectionStore ?? createInMemoryMcpConnectionStore();
   const authorizationStore =
     deps.oauthAuthorizationStore ?? createInMemoryMcpOAuthAuthorizationStore();
+  const clientStore =
+    deps.oauthClientStore ?? createInMemoryMcpOAuthClientStore();
 
   const ownerAuth: PersonalServerApiAuthPort = createServerApiAuth({
     serverOrigin: deps.serverOrigin,
@@ -660,7 +733,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
 
   app.get("/.well-known/oauth-protected-resource/mcp", (c) =>
     resolveApprovalUrl(deps)
-      ? c.json(protectedResourceMetadata(resolveOrigin(deps.serverOrigin)))
+      ? c.json(protectedResourceMetadata(requestOrigin(c, deps)))
       : c.json(
           jsonError(
             404,
@@ -673,7 +746,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
 
   app.get("/.well-known/oauth-authorization-server", (c) =>
     resolveApprovalUrl(deps)
-      ? c.json(authorizationServerMetadata(resolveOrigin(deps.serverOrigin)))
+      ? c.json(authorizationServerMetadata(requestOrigin(c, deps)))
       : c.json(
           jsonError(
             404,
@@ -695,7 +768,11 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
         404,
       );
     }
-    let body: { client_name?: string; redirect_uris?: string[] } = {};
+    let body: {
+      client_name?: unknown;
+      client_uri?: unknown;
+      redirect_uris?: string[];
+    } = {};
     try {
       body = (await c.req.json()) as typeof body;
     } catch {
@@ -713,10 +790,21 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
         400,
       );
     }
+    // Kept so /authorize can name the connection after the client.
+    const clientName = cleanClientName(body.client_name);
+    const clientUri = cleanClientUri(body.client_uri);
+    const client: McpOAuthClientRecord = {
+      clientId: `mcp-client-${crypto.randomUUID()}`,
+      ...(clientName ? { clientName } : {}),
+      ...(clientUri ? { clientUri } : {}),
+      createdAt: new Date().toISOString(),
+    };
+    await clientStore.create(client);
     return c.json(
       {
-        client_id: `mcp-client-${crypto.randomUUID()}`,
-        client_name: body.client_name ?? "Claude",
+        client_id: client.clientId,
+        ...(clientName ? { client_name: clientName } : {}),
+        ...(clientUri ? { client_uri: clientUri } : {}),
         redirect_uris: Array.isArray(body.redirect_uris)
           ? body.redirect_uris
           : [],
@@ -739,7 +827,7 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
         404,
       );
     }
-    const origin = resolveOrigin(deps.serverOrigin);
+    const origin = requestOrigin(c, deps);
     const url = new URL(c.req.url);
     const responseType = url.searchParams.get("response_type");
     const clientId = url.searchParams.get("client_id") ?? "";
@@ -760,14 +848,19 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
     }
 
     try {
+      // Unknown ids (registered elsewhere or before) get the default name.
+      const client = clientId ? await clientStore.getById(clientId) : null;
       const created = await createMcpOAuthAuthorization(
         {
           clientId,
+          clientName: client?.clientName,
+          clientUri: client?.clientUri,
           redirectUri,
           codeChallenge,
           codeChallengeMethod,
           scope,
           ...(state ? { state } : {}),
+          ingress: requestIngress(c, deps),
         },
         {
           connectionStore,
@@ -788,7 +881,8 @@ export function mcpOAuthRoutes(deps: McpOAuthRouteDeps): Hono {
       }
       const approve = new URL(approvalUrl);
       approve.searchParams.set("mcp_authorization", created.authorizationId);
-      approve.searchParams.set("ps_origin", origin);
+      // The approver signs for the registered public origin, never loopback.
+      approve.searchParams.set("ps_origin", resolveOrigin(deps.serverOrigin));
       return c.redirect(approve.toString(), 302);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1142,11 +1236,15 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
           401,
         );
       }
-      return mcpUnauthorized(resolveOrigin(deps.serverOrigin));
+      return mcpUnauthorized(requestOrigin(c, deps));
     }
     const tokenHash = await hashConnectionToken(rawToken);
     const record = await store.getByTokenHash(tokenHash);
-    if (record) return handleConnectionRead(c, record);
+    // A token presented on the other listener reads as unknown.
+    const ingress = record?.ingress ?? McpIngress.Public;
+    if (record && ingress === requestIngress(c, deps)) {
+      return handleConnectionRead(c, record);
+    }
     const session = await sessionStore.getByTokenHash(tokenHash);
     if (session) return handleSessionRead(c, session);
     if (!options.oauthChallenge) {
@@ -1156,7 +1254,7 @@ export function mcpStreamableHttpRoutes(deps: McpRouteDeps): Hono {
       );
     }
     return mcpUnauthorized(
-      resolveOrigin(deps.serverOrigin),
+      requestOrigin(c, deps),
       "Unknown or revoked MCP connection",
     );
   }

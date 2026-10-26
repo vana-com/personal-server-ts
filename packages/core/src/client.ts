@@ -33,6 +33,12 @@ export interface PersonalServerUrls {
   public: string | null;
   apiOrigin: string | null;
   registration: string | null;
+  /**
+   * Loopback auth listener origin, e.g. `http://127.0.0.1:34127`: local MCP
+   * clients connect to `${loopback}/mcp`. Null when no loopback listener is
+   * bound (Lite, cloud mode, `localApproval: false`, or the bind failed).
+   */
+  loopback: string | null;
 }
 
 export type PersonalServerRegistrationCandidate = Omit<
@@ -322,6 +328,7 @@ export function createPersonalServerInfoFromHealth(params: {
   health: unknown;
   localUrl?: string | null;
   publicUrl?: string | null;
+  loopbackUrl?: string | null;
 }): PersonalServerInfo {
   const health = toHealthBody(params.health);
   const publicUrl =
@@ -358,6 +365,7 @@ export function createPersonalServerInfoFromHealth(params: {
       public: publicUrl,
       apiOrigin,
       registration: publicUrl ?? health.registration?.serverUrl ?? null,
+      loopback: params.loopbackUrl ?? null,
     },
     registration: {
       registered: Boolean(health.registration?.registered),

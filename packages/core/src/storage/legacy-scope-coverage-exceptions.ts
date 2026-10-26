@@ -8,3 +8,8 @@ export const LEGACY_COVERAGE_EXCEPTIONS = [
     authority: "canonical",
   },
 ] as const;
+
+/** Legacy oura-playwright copied average_hrv despite its frozen integer schema. */
+export const LEGACY_INTEGER_ROUNDING_EXCEPTIONS = [
+  { scope: "oura.sleep", path: "$.sleepPeriods[].averageHrv" },
+] as const;

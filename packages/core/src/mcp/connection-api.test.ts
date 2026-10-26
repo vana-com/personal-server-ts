@@ -12,6 +12,7 @@ import {
 import {
   approveMcpConnection,
   approveMcpOAuthAuthorization,
+  approveMcpOAuthAuthorizationWithScopes,
   approveMcpScopeAccessRequest,
   buildStableMcpUrl,
   buildMcpUrl,
@@ -35,6 +36,10 @@ import {
 } from "./connection-api.js";
 import { MCP_REFRESH_TTL_MS, MCP_TOKEN_TTL_MS } from "./token-expiry.js";
 import { ensureMcpGranteeRegistered } from "./builder-registration.js";
+import type {
+  McpConnectionStore,
+  McpOAuthAuthorizationStore,
+} from "./types.js";
 
 const PUBLIC_ORIGIN = "https://example-session.relay.test";
 const REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
@@ -1202,5 +1207,164 @@ describe("mcpGrantDefaultExpiry", () => {
   it("rejects a negative or non-finite TTL", () => {
     expect(() => mcpGrantDefaultExpiry(-1, now)).toThrow(RangeError);
     expect(() => mcpGrantDefaultExpiry(Number.NaN, now)).toThrow(RangeError);
+  });
+});
+
+describe("mcp/connection-api superseded OAuth authorizations", () => {
+  const START = new Date("2026-10-24T10:00:00.000Z");
+  const PAST_TTL = new Date("2026-10-24T10:11:00.000Z");
+
+  async function authorize(
+    stores: {
+      connectionStore: McpConnectionStore;
+      authorizationStore: McpOAuthAuthorizationStore;
+    },
+    clientId: string,
+    now = START,
+  ) {
+    return createMcpOAuthAuthorization(
+      {
+        clientId,
+        redirectUri: REDIRECT_URI,
+        codeChallenge: await pkceChallenge("verifier"),
+        codeChallengeMethod: "S256",
+      },
+      { ...stores, publicOrigin: PUBLIC_ORIGIN, now: () => now },
+    );
+  }
+
+  function newStores() {
+    return {
+      connectionStore: createInMemoryMcpConnectionStore(),
+      authorizationStore: createInMemoryMcpOAuthAuthorizationStore(),
+    };
+  }
+
+  it("drops another client's pending connection once its authorization expired", async () => {
+    const stores = newStores();
+    const stale = await authorize(stores, "client-a");
+    await authorize(stores, "client-b", PAST_TTL);
+
+    expect(
+      (await stores.connectionStore.getById(stale.connectionId))?.status,
+    ).toBe("revoked");
+  });
+
+  it("keeps an unexpired pending connection of another client", async () => {
+    const stores = newStores();
+    const other = await authorize(stores, "client-a");
+    await authorize(stores, "client-b");
+
+    expect(
+      (await stores.connectionStore.getById(other.connectionId))?.status,
+    ).toBe("pending");
+  });
+
+  it("keeps exactly one pending connection after concurrent registrations", async () => {
+    const stores = newStores();
+    const registrations = await Promise.all(
+      Array.from({ length: 100 }, () => authorize(stores, "same-client")),
+    );
+
+    const connections = await stores.connectionStore.list();
+    expect(
+      connections.filter(
+        (connection) =>
+          connection.clientId === "same-client" &&
+          connection.status === "pending",
+      ),
+    ).toHaveLength(1);
+    expect(connections).toHaveLength(100);
+    expect(registrations).toHaveLength(100);
+  });
+
+  it("preserves an approval that races with a replacement", async () => {
+    const stores = newStores();
+    const first = await authorize(stores, "client-a");
+    const originalList = stores.connectionStore.list.bind(
+      stores.connectionStore,
+    );
+    let replacementStarted!: () => void;
+    let continueReplacement!: () => void;
+    const started = new Promise<void>((resolve) => {
+      replacementStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      continueReplacement = resolve;
+    });
+    const fallbackStore: McpConnectionStore = {
+      ...stores.connectionStore,
+      replacePendingOAuthConnections: undefined,
+      list: async () => {
+        const snapshot = await originalList();
+        replacementStarted();
+        await gate;
+        return snapshot;
+      },
+    };
+    const raceStores = { ...stores, connectionStore: fallbackStore };
+
+    const replacing = authorize(raceStores, "client-a");
+    await started;
+    await approveMcpOAuthAuthorization(
+      {
+        authorizationId: first.authorizationId,
+        grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+      },
+      { ...raceStores, now: () => START },
+    );
+    continueReplacement();
+    await replacing;
+
+    expect(
+      await stores.connectionStore.getById(first.connectionId),
+    ).toMatchObject({
+      status: "approved",
+      grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+    });
+  });
+
+  it("creates one pending connection and authorization for a single registration", async () => {
+    const stores = newStores();
+    const created = await authorize(stores, "client-a");
+
+    expect(await stores.connectionStore.list()).toMatchObject([
+      { id: created.connectionId, clientId: "client-a", status: "pending" },
+    ]);
+    expect(
+      await stores.authorizationStore.getById(created.authorizationId),
+    ).toMatchObject({
+      id: created.authorizationId,
+      connectionId: created.connectionId,
+      clientId: "client-a",
+      status: "pending",
+    });
+  });
+
+  it("signs no grant for a superseded authorization", async () => {
+    const stores = newStores();
+    const first = await authorize(stores, "client-a");
+    await authorize(stores, "client-a");
+    const gateway = {
+      getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+      createGrant: vi.fn(async () => ({ grantId: "0xgrant" })),
+    };
+
+    await expect(
+      approveMcpOAuthAuthorizationWithScopes(
+        { authorizationId: first.authorizationId, scopes: ["chatgpt.history"] },
+        {
+          ...stores,
+          gateway: gateway as never,
+          gatewayConfig: GATEWAY_CONFIG as never,
+          gatewayUrl: "https://gateway.test",
+          serverOwner: "0x00000000000000000000000000000000000000aa",
+          serverSigner: {
+            signGrantRegistration: vi.fn(async () => "0xsig" as `0x${string}`),
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "invalid_state" });
+    expect(gateway.createGrant).not.toHaveBeenCalled();
   });
 });
