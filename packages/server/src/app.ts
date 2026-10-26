@@ -1,3 +1,4 @@
+import { ouraRoutes } from "./routes/oura.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
@@ -465,6 +466,8 @@ export function createApp(deps: AppDeps): Hono {
       }),
     );
   }
+
+  app.route("/v1/import/oura-browser", ouraRoutes(deps));
 
   // Mount data routes (ingest + read + delete)
   app.route(
