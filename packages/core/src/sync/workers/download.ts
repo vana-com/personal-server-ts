@@ -1094,11 +1094,9 @@ async function repairMissingBlockSidecars(
   logger: Logger,
   ctx: RecordContext,
   entry: {
-    id: number;
     scope: string;
     collectedAt: string;
     fileId: string | null;
-    dataPointId: string | null;
     schemaId: string | null;
     path: string;
   },
@@ -1143,32 +1141,27 @@ async function repairMissingBlockSidecars(
       },
       "Bounded block sidecar repair skipped because local envelope is unavailable",
     );
-    // Remove the stale index entry whose payload is gone, so the caller
-    // re-downloads it. A row from a gateway file is removed by its fileId; a
-    // DataPoint-only row (fileId === null) by (scope, collectedAt), fenced to
-    // this exact row so a newer row at the same stamp is left alone. A row
-    // with neither id was never synced, so nothing could restore it: keep it.
-    if (!entry.fileId && !entry.dataPointId) return "not-repaired";
-    diagnostics?.onRepair(
-      entry.scope,
-      "index exists without local payload; removing stale local index entry",
-    );
-    const removed = entry.fileId
-      ? await storage.deleteByFileId(entry.fileId)
-      : await storage.deleteVersion(entry.scope, entry.collectedAt, {
-          id: entry.id,
-          path: entry.path,
-        });
-    logger.warn(
-      {
-        dataPointId: ctx.dataPointId,
-        scope: entry.scope,
-        collectedAt: entry.collectedAt,
-        removed,
-      },
-      "Removed stale local index entry missing local envelope",
-    );
-    return removed ? "missing-envelope" : "not-repaired";
+    // Remove the stale index entry whose payload is gone. We can only target
+    // it by gateway fileId; DataPoint-only entries (fileId === null) are left
+    // in place (no path-keyed delete on the port) and self-heal on re-download.
+    if (entry.fileId) {
+      diagnostics?.onRepair(
+        entry.scope,
+        "index exists without local payload; removing stale local index entry",
+      );
+      const removed = await storage.deleteByFileId(entry.fileId);
+      logger.warn(
+        {
+          dataPointId: ctx.dataPointId,
+          scope: entry.scope,
+          collectedAt: entry.collectedAt,
+          removed,
+        },
+        "Removed stale local index entry missing local envelope",
+      );
+      return removed ? "missing-envelope" : "not-repaired";
+    }
+    return "not-repaired";
   }
 
   await writeBlockSidecars(

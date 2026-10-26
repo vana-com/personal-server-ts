@@ -177,43 +177,6 @@ describe("download worker", () => {
       expect(deps.storageAdapter.download).not.toHaveBeenCalled();
     });
 
-    it("re-downloads a data point whose row has no envelope and no fileId", async () => {
-      const deps = makeMockDeps();
-      const existingEntry: IndexEntry = {
-        id: 7,
-        fileId: null,
-        schemaId: null,
-        path: RELATIVE_PATH,
-        scope: SCOPE,
-        collectedAt: COLLECTED_AT,
-        createdAt: "2026-01-21T10:00:00Z",
-        sizeBytes: 128,
-        version: 1,
-        dataPointId: DATA_POINT_ID,
-      };
-      (
-        deps.storage.findByDataPointId as ReturnType<typeof vi.fn>
-      ).mockReturnValue(existingEntry);
-      deps.storage.writeBlockManifest = vi.fn();
-      deps.storage.hasScopeBlocks = vi.fn().mockResolvedValue(false);
-      deps.storage.readEnvelope = vi
-        .fn()
-        .mockRejectedValue(new Error("Envelope not found"));
-      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
-
-      const result = await downloadOne(deps, makeDataPointRecord());
-
-      // The stale row is removed, fenced to that exact row, and the data
-      // point is fetched again instead of being skipped as already indexed.
-      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
-        SCOPE,
-        COLLECTED_AT,
-        { id: 7, path: RELATIVE_PATH },
-      );
-      expect(deps.storageAdapter.download).toHaveBeenCalledTimes(1);
-      expect(result).not.toBeNull();
-    });
-
     it("downloads a newer version of a data point indexed at an older one", async () => {
       // DPv2 ids are per (owner, scope): every version of a scope shares
       // one id, so the id alone must not dedup a new version away.
