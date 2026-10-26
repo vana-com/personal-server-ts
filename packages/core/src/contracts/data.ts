@@ -224,6 +224,17 @@ async function commitWrittenEnvelope(
   if (precondition) {
     throw new Error("Conditional legacy writes require atomic storage support");
   }
+  if (storage.writeEnvelopeAndIndex) {
+    const indexed = await storage.writeEnvelopeAndIndex(envelope, entry);
+    return {
+      ok: true,
+      writeResult: {
+        path: indexed.path,
+        relativePath: indexed.path,
+        sizeBytes: indexed.sizeBytes,
+      },
+    };
+  }
   const writeResult = await storage.writeEnvelope(envelope);
   await indexWrittenEnvelope(storage, {
     ...entry,

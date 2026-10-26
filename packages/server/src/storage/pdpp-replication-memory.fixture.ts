@@ -14,6 +14,8 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 
 const [mode, directory, sizeArg] = process.argv.slice(2);
+// Peak RSS only rises, so each marker bounds everything that ran before it.
+const maxRssKiB = () => process.resourceUsage().maxRSS;
 if (!directory) throw new Error("probe directory required");
 const size = Number(sizeArg);
 const owner = "0x0000000000000000000000000000000000000001";
@@ -40,8 +42,8 @@ const open = (role: string) => {
   store.replication.beginBaseline(expected);
   return { db, store };
 };
-if (mode === "seed" || mode === "seed-legacy") {
-  const { db, store } = open("source");
+if (mode === "seed") {
+  const { store } = open("source");
   const blob = store.storeBlobBytesForInstance({
     instance: "conn",
     method: "export",
@@ -70,26 +72,25 @@ if (mode === "seed" || mode === "seed-legacy") {
     () => ["id"],
     { method: "export", generation: 1 },
   );
-  if (mode === "seed-legacy") {
-    // Keep only main's legacy whole-value row to exercise its fallback reader.
-    db.prepare(
-      "DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=?",
-    ).run(blob.blobId);
-    db.prepare(
-      "DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=?",
-    ).run(blob.blobId);
-  }
   writeFileSync(join(directory, "blob-id"), blob.blobId);
   store.close();
-} else if (mode === "legacy-read") {
-  const { store } = open("source");
-  const bytes = store.getBlobBytes(
-    readFileSync(join(directory, "blob-id"), "utf8"),
-  );
-  if (bytes?.length !== size) throw new Error("legacy read failed");
-  console.log(JSON.stringify({ size: bytes.length }));
-  store.close();
 } else if (mode === "measure" || mode === "probe") {
+  const startKiB = maxRssKiB();
+  // Backfill guard: opening the source runs the canonical port's chunk-only
+  // backfill when a manifest has no whole row. The seed writes main's whole
+  // row, so check that read-only before any writable open can touch it.
+  const preflight = new Database(join(directory, "source.sqlite"), {
+    readonly: true,
+    fileMustExist: true,
+  });
+  const seeded = readFileSync(join(directory, "blob-id"), "utf8");
+  if (
+    !preflight
+      .prepare("SELECT 1 FROM pdpp_blob_bytes WHERE blob_id=?")
+      .get(seeded)
+  )
+    throw new Error("seed lacks main's whole row; open would backfill");
+  preflight.close();
   const source = open("source"),
     destination = open("destination");
   const heads = new Map<string, ReplicaCommitment>();
@@ -192,6 +193,19 @@ if (mode === "seed" || mode === "seed-legacy") {
   }
   const a = worker(source),
     b = worker(destination);
+  // Phase markers live in the fixture, not the worker. Materialization runs
+  // INSERT OR IGNORE INTO pdpp_blobs before the canonical promotion and
+  // INSERT INTO pdpp_blob_claims after it, so the two prepares bracket it.
+  let beforePromotionKiB: number | undefined;
+  let afterPromotionKiB: number | undefined;
+  const prepareStatement = destination.db.prepare.bind(destination.db);
+  destination.db.prepare = ((sql: string) => {
+    if (sql.startsWith("INSERT OR IGNORE INTO pdpp_blobs"))
+      beforePromotionKiB ??= maxRssKiB();
+    if (sql.startsWith("INSERT INTO pdpp_blob_claims"))
+      afterPromotionKiB ??= maxRssKiB();
+    return prepareStatement(sql);
+  }) as typeof destination.db.prepare;
   if (mode === "probe") {
     try {
       await a.cycle();
@@ -231,7 +245,10 @@ if (mode === "seed" || mode === "seed-legacy") {
     JSON.stringify({
       size,
       published,
-      peakRssKiB: process.resourceUsage().maxRSS,
+      startKiB,
+      workerPeakKiB: beforePromotionKiB,
+      afterPromotionKiB,
+      peakRssKiB: maxRssKiB(),
     }),
   );
   source.store.close();

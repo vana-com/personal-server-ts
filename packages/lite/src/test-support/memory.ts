@@ -516,6 +516,51 @@ export function createMemoryPsLiteDataFileStore(
   };
 }
 
+/**
+ * Committed files are text in `files`; a file being written lives only in
+ * the writer, so dropping the writer (a crash) leaves nothing at the path.
+ */
+export function createMemoryPsLiteStagedFileStore(
+  files = new Map<string, string>(),
+) {
+  const store: PsLiteDataFileStore & { files: Map<string, string> } = {
+    kind: "custom",
+    files,
+    async readEnvelope(path) {
+      const text = files.get(path);
+      return text === undefined ? null : JSON.parse(text);
+    },
+    async writeEnvelope(path, envelope) {
+      const text = JSON.stringify(envelope);
+      files.set(path, text);
+      return new TextEncoder().encode(text).byteLength;
+    },
+    async openEnvelopeWriter(path) {
+      let pieces: string[] | null = [];
+      return {
+        async write(text) {
+          if (!pieces) throw new Error("writer is closed");
+          pieces.push(text);
+        },
+        async commit() {
+          if (!pieces) throw new Error("writer is closed");
+          const text = pieces.join("");
+          pieces = null;
+          files.set(path, text);
+          return new TextEncoder().encode(text).byteLength;
+        },
+        async abort() {
+          pieces = null;
+        },
+      };
+    },
+    async deleteEnvelope(path) {
+      files.delete(path);
+    },
+  };
+  return store;
+}
+
 function deleteMapPrefix<T>(map: Map<string, T>, pathPrefix: string): void {
   const prefix = pathPrefix.endsWith("/") ? pathPrefix : `${pathPrefix}/`;
   for (const path of map.keys()) {

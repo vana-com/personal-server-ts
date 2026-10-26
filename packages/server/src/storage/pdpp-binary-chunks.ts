@@ -2,6 +2,9 @@ import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 
 export const BINARY_CHUNK_BYTES = 64 * 1024;
+/** Legacy whole-row reads: windows are at least this big and at most this many. */
+export const LEGACY_MIN_WINDOW_BYTES = 8 * 1024 * 1024;
+export const LEGACY_WINDOWS = 16;
 export const CANONICAL_INLINE_BYTES = 1024 * 1024;
 export const BINARY_CHUNKS_MIGRATION = `
 CREATE TABLE IF NOT EXISTS pdpp_binary_manifests (
@@ -80,14 +83,28 @@ export function* readBinaryChunks(
       .prepare(`SELECT length(bytes) AS size FROM ${table} WHERE blob_id=?`)
       .get(id) as { size: number } | undefined;
     if (row) {
-      const readPart = db.prepare(
+      // SQLite reaches a BLOB offset by walking its overflow pages, so a read
+      // at offset N costs O(N). One read per 64 KiB chunk is quadratic (a
+      // 64 MiB row took 37 s). Reading windows of size/WINDOWS_PER_BLOB bounds
+      // the walk to a constant multiple of the blob and memory to a fraction.
+      const readWindow = db.prepare(
         `SELECT substr(bytes, ?, ?) AS bytes FROM ${table} WHERE blob_id=?`,
       );
-      for (let offset = 0; offset < row.size; offset += BINARY_CHUNK_BYTES) {
-        const part = readPart.get(offset + 1, BINARY_CHUNK_BYTES, id) as
+      const window =
+        Math.ceil(
+          Math.max(LEGACY_MIN_WINDOW_BYTES, row.size / LEGACY_WINDOWS) /
+            BINARY_CHUNK_BYTES,
+        ) * BINARY_CHUNK_BYTES;
+      for (let start = 0; start < row.size; start += window) {
+        const part = readWindow.get(start + 1, window, id) as
           { bytes: Buffer } | undefined;
         if (!part?.bytes.length) throw new Error("corrupt binary chunks");
-        yield part.bytes;
+        for (
+          let offset = 0;
+          offset < part.bytes.length;
+          offset += BINARY_CHUNK_BYTES
+        )
+          yield part.bytes.subarray(offset, offset + BINARY_CHUNK_BYTES);
       }
       return;
     }
