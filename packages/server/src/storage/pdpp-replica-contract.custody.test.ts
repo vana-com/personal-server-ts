@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import {
@@ -359,7 +359,7 @@ async function sourceScenario(options: SourceOptions) {
   const sourceValue = a.get();
   const journalBefore = count(
     b.db,
-    "SELECT count(*) AS n FROM pdpp_mutation_journal",
+    "SELECT count(*) AS n FROM pdpp_replica_own_writes",
   );
   net.faults.list = () => new Error("feed down");
   net.faults.evidence = () => new Error("rpc down");
@@ -412,7 +412,7 @@ async function sourceScenario(options: SourceOptions) {
       ).map((r) => r.n),
       destJournal: count(
         b.db,
-        "SELECT count(*) AS n FROM pdpp_mutation_journal",
+        "SELECT count(*) AS n FROM pdpp_replica_own_writes",
       ),
     }),
     checkCrashed({ label }) {
@@ -524,7 +524,7 @@ async function sourceScenario(options: SourceOptions) {
           );
       }
       if (
-        count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal") !==
+        count(b.db, "SELECT count(*) AS n FROM pdpp_replica_own_writes") !==
         journalBefore
       )
         out.push("[echo] receiver journal grew after replay");
@@ -640,7 +640,7 @@ async function destinationScenario(options: DestinationOptions) {
   const b = transportDevice(net, { chunk, cap: 64 * 1024, crash });
   const journalBefore = count(
     b.db,
-    "SELECT count(*) AS n FROM pdpp_mutation_journal",
+    "SELECT count(*) AS n FROM pdpp_replica_own_writes",
   );
   let fetchedAtCrash = new Set<string>();
   let getsAtCrash = 0;
@@ -676,7 +676,7 @@ async function destinationScenario(options: DestinationOptions) {
           .all() as { state: string }[]
       ).map((r) => r.state),
       changes: count(b.db, "SELECT count(*) AS n FROM pdpp_record_changes"),
-      journal: count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal"),
+      journal: count(b.db, "SELECT count(*) AS n FROM pdpp_replica_own_writes"),
       staging: count(
         b.db,
         "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace='staging'",
@@ -760,7 +760,7 @@ async function destinationScenario(options: DestinationOptions) {
         if (fetchedAtCrash.has(scope))
           out.push(`[download] re-fetched retained fragment ${scope}`);
       if (
-        count(b.db, "SELECT count(*) AS n FROM pdpp_mutation_journal") !==
+        count(b.db, "SELECT count(*) AS n FROM pdpp_replica_own_writes") !==
         journalBefore
       )
         out.push("[echo] receiver journal grew after replay");
@@ -988,7 +988,7 @@ describe("section C: fences, outcomes and claims", () => {
     });
     // Second handle on the same file, same process.
     const second = new Database(a.path);
-    const secondStore = createSqliteRecordStore(second);
+    const secondStore = createReplicaRecordStore(second);
     const alias = createReplicaTransportWorker({
       db: second,
       enabled: true,

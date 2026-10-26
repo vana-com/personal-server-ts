@@ -54,7 +54,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/7";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/9";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -375,6 +375,7 @@ export async function readCanonicalLegacyScope(
             : MAX_BLOB_READ_BYTES,
           input.requireCompletionReceipts === true,
           input.allowUnprovenEmptyStreams === true,
+          new Set(binding.ancillaryBlobStreams),
           input.declarations,
         ),
   );
@@ -419,6 +420,7 @@ function collectSnapshot(
   blobByteBudget: number,
   requireCompletionReceipts: boolean,
   allowUnprovenEmptyStreams: boolean,
+  ancillaryBlobStreams: ReadonlySet<string>,
   declarations?: Pick<StreamDeclarationRegistry, "forInstance">,
 ): Snapshot | { ok: false; result: CanonicalLegacyReadResult } {
   const { instance } = selection;
@@ -505,6 +507,8 @@ function collectSnapshot(
   let requiredBytes = 0;
   const declaredBlobIds = new Set<string>();
   for (const stream of streams) {
+    // The binding projects these rows from their typed fields alone.
+    if (ancillaryBlobStreams.has(stream)) continue;
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (blobBacked.length === 0) continue;
     const projectedField = declaredBlobField(streamSchemas[stream]);
@@ -703,6 +707,7 @@ async function projectSnapshot(
   const expanded = [];
   const canExpandClaude =
     selection.sourceId === CLAUDE_SOURCE_ID &&
+    selection.method === "anthropic" &&
     (scope === "claude.conversations" || scope === "claude.projects");
   if (canExpandClaude && input.requireClaudeRawBlobs) {
     const parentStream =
@@ -718,6 +723,7 @@ async function projectSnapshot(
     }
   }
   for (const stream of streams) {
+    if (binding.ancillaryBlobStreams?.includes(stream)) continue;
     const blobBacked = (rowsByStream.get(stream) ?? []).filter(hasBlobRef);
     if (
       canExpandClaude &&
@@ -1024,22 +1030,10 @@ function rejection(
   error: ProjectionError,
   sourceRowCounts: Record<string, number>,
 ): CanonicalLegacyReadResult {
-  if (
-    error.kind === "unknown_scope" ||
-    error.kind === "unsupported_profile" ||
-    error.kind === "gap"
-  ) {
+  if (error.kind === "unknown_scope" || error.kind === "unsupported_profile") {
     return unavailable({
       reason: "unbound_scope",
-      lookup:
-        error.kind === "gap"
-          ? {
-              kind: "gap",
-              scope: error.scope,
-              reason: error.reason,
-              provenanceChecked: [],
-            }
-          : error,
+      lookup: error,
     });
   }
   return {
@@ -1222,7 +1216,11 @@ export function legacyConnectorKey(pdppSource: string): string {
 
 /** Most connector keys match their public source; Anthropic collects Claude. */
 function canonicalSourceId(pdppSource: string): string {
-  if (pdppSource === ANTHROPIC_CONNECTOR_ID) return CLAUDE_SOURCE_ID;
+  if (
+    pdppSource === ANTHROPIC_CONNECTOR_ID ||
+    pdppSource === "https://registry.pdpp.dev/connectors/anthropic-live"
+  )
+    return CLAUDE_SOURCE_ID;
   return pdppSource.startsWith(CONNECTOR_ID_PREFIX)
     ? SOURCE_ID_PREFIX + pdppSource.slice(CONNECTOR_ID_PREFIX.length)
     : pdppSource;

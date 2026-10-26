@@ -9,7 +9,7 @@ import {
   registration,
   upsert,
 } from "@opendatalabs/personal-server-ts-core/replication/fixtures";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "../storage/pdpp-replication-receiver.js";
 import {
   pdppRecordsRoutes,
@@ -21,7 +21,7 @@ import { pdppBlobsRoutes, type PdppBlobsRouteDeps } from "./pdpp-blobs.js";
 it("serves owner pending markers while the same grant sees nothing until promotion", async () => {
   const db = new Database(":memory:");
   try {
-    const store = createSqliteRecordStore(db);
+    const store = createReplicaRecordStore(db);
     store.registerConnection({
       instance: identity.connectionId,
       sourceId: identity.sourceId,
@@ -297,7 +297,7 @@ it("serves owner pending markers while the same grant sees nothing until promoti
 it("keeps the visible row's instance when rebinding a multi-connection page cursor", async () => {
   const db = new Database(":memory:");
   try {
-    const store = createSqliteRecordStore(db);
+    const store = createReplicaRecordStore(db);
     const ids = ["conn_a", "conn_b", "conn_c"];
     for (const instance of ids)
       store.registerConnection({
@@ -385,10 +385,10 @@ it("keeps the visible row's instance when rebinding a multi-connection page curs
 it("uses local journal values for conflicted owners and hides the whole connection from apps", async () => {
   const db = new Database(":memory:");
   try {
-    const store = createSqliteRecordStore(db);
+    const store = createReplicaRecordStore(db);
     // The hardening lane owns migration 18 and its monotone fact writer.
     db.exec(
-      "CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts(instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS local_journal_lookup ON pdpp_mutation_journal(connection_id,generation,stream,record_key,sequence DESC)",
+      "CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts(instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL); CREATE INDEX IF NOT EXISTS local_journal_lookup ON pdpp_replica_own_writes(connection_id,generation,stream,record_key,sequence DESC)",
     );
     store.registerConnection({
       instance: identity.connectionId,

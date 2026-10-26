@@ -11,10 +11,10 @@ import {
   decodeCursor,
   encodeCursor,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
-const stores: ReturnType<typeof createSqliteRecordStore>[] = [];
+const stores: ReturnType<typeof createReplicaRecordStore>[] = [];
 afterEach(() => {
   vi.restoreAllMocks();
   for (const store of stores.splice(0)) store.close();
@@ -33,7 +33,7 @@ function fixture(
   { local = false, epoch }: { local?: boolean; epoch?: () => number } = {},
 ) {
   const db = new Database(":memory:");
-  const store = createSqliteRecordStore(db);
+  const store = createReplicaRecordStore(db);
   stores.push(store);
   store.registerConnection({
     instance: identity.connectionId,

@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import {
@@ -226,7 +226,7 @@ function device(
   directories.push(dir);
   const path = join(dir, "records.sqlite");
   let db = new Database(path);
-  let store = createSqliteRecordStore(db);
+  let store = createReplicaRecordStore(db);
   store.registerConnection({
     instance: "conn",
     sourceId,
@@ -297,7 +297,7 @@ function device(
     reopen() {
       store.close();
       db = new Database(path);
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
       engine = worker();
     },
     close() {
@@ -1488,7 +1488,7 @@ it("protects a live same-process writer opened through a different directory ali
   directories.push(aliasRoot);
   symlinkSync(dirname(a.db.name), join(aliasRoot, "alias"), "dir");
   const aliasDb = new Database(join(aliasRoot, "alias", "records.sqlite"));
-  const aliasStore = createSqliteRecordStore(aliasDb);
+  const aliasStore = createReplicaRecordStore(aliasDb);
   const aliasWorker = createReplicaTransportWorker({
     db: aliasDb,
     enabled: true,

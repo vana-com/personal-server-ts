@@ -14,7 +14,7 @@ import {
   hasCompletionDependencies,
   selectStreamCompletion,
 } from "@opendatalabs/personal-server-ts-core/replication/completion";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import {
   replicaOperationDigest,
   type ReplicaPageOptions,
@@ -50,7 +50,7 @@ const mergeContext = {
 let directory: string;
 let path: string;
 let db: Database.Database;
-let store: ReturnType<typeof createSqliteRecordStore>;
+let store: ReturnType<typeof createReplicaRecordStore>;
 const register = (instance = "conn_a") =>
   store.registerConnection({
     instance,
@@ -122,7 +122,7 @@ beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), "pdpp-baseline-"));
   path = join(directory, "db.sqlite");
   db = new Database(path);
-  store = createSqliteRecordStore(db);
+  store = createReplicaRecordStore(db);
   register();
 });
 afterEach(() => {
@@ -178,7 +178,7 @@ it("pages a large frozen baseline while another DB handle updates, deletes, repl
   ingest("a", "old", "conn_delete");
   const fence = store.replication.beginBaseline(config);
   const first = store.replication.readBaselinePage({ limit: 37 });
-  const second = createSqliteRecordStore(new Database(path));
+  const second = createReplicaRecordStore(new Database(path));
   try {
     second.ingestBatch(
       [envelope("0", "new")],
@@ -445,7 +445,7 @@ it("persists checkpoint progress only on explicit acknowledgment and survives re
   const next = store.replication.readBaselinePage({ limit: 1 });
   store.close();
   db = new Database(path);
-  store = createSqliteRecordStore(db);
+  store = createReplicaRecordStore(db);
   expect(store.replication.beginBaseline(config)).toEqual(fence);
   expect(store.replication.readBaselinePage({ limit: 1 })).toEqual(next);
   store.replication.acknowledgeBaselinePage(
@@ -482,7 +482,7 @@ it.each([
       "pdpp_record_arrival",
       "pdpp_record_arrival_clock",
       "pdpp_write_clock",
-      "pdpp_mutation_journal",
+      "pdpp_replica_own_writes",
       "pdpp_replica_operations",
       "pdpp_replica_clock",
       "pdpp_replica_blob_bytes",
@@ -555,8 +555,10 @@ it.each(
       action === "baseline" ? [] : drain(store.replication.readBaselinePage);
     const recordBefore = store.getRecord("conn_a", "messages", "a");
     store.close();
-    const storeUrl = new URL("./pdpp-records-sqlite-store.ts", import.meta.url)
-      .href;
+    const storeUrl = new URL(
+      "./pdpp-replica-canonical-port.ts",
+      import.meta.url,
+    ).href;
     const completionUrl = new URL(
       "./pdpp-stream-completion.ts",
       import.meta.url,
@@ -578,7 +580,7 @@ it.each(
       complete: `store.completeStreams({instance:'conn_a',sourceId:'${sourceId}',method:'collector',generation:1,sourceCollectedAt:'${at}',collectionTimeBasis:'host_run_finished',streams:[{stream:'messages',coverage:'full_stream',liveCount:1,snapshotSha256:liveSnapshotDigest({sourceId:'${sourceId}',instance:'conn_a',method:'collector',generation:1,stream:'messages'},['id'],[{recordKey:'a',dataJson:'{"id":"a","text":"old"}'}])}]},()=>['id'])`,
       checkpoint: `store.replication.acknowledgeBaselinePage(0,1)`,
     };
-    const code = `import Database from 'better-sqlite3'; import {createSqliteRecordStore} from '${storeUrl}'; import {liveSnapshotDigest} from '${completionUrl}'; const db = new Database(${JSON.stringify(path)}); const store = createSqliteRecordStore(db); db.function('crash',()=>process.kill(process.pid,'SIGKILL')); ${afterCommit ? "" : `db.exec("CREATE TEMP TRIGGER crash BEFORE ${event} ON ${triggerTable} BEGIN SELECT crash(); END;");`} ${operations[action as keyof typeof operations]}; process.kill(process.pid,'SIGKILL');`;
+    const code = `import Database from 'better-sqlite3'; import {createReplicaRecordStore} from '${storeUrl}'; import {liveSnapshotDigest} from '${completionUrl}'; const db = new Database(${JSON.stringify(path)}); const store = createReplicaRecordStore(db); db.function('crash',()=>process.kill(process.pid,'SIGKILL')); ${afterCommit ? "" : `db.exec("CREATE TEMP TRIGGER crash BEFORE ${event} ON ${triggerTable} BEGIN SELECT crash(); END;");`} ${operations[action as keyof typeof operations]}; process.kill(process.pid,'SIGKILL');`;
     const child = spawnSync(
       process.execPath,
       ["--import", "tsx", "--input-type=module", "-e", code],
@@ -587,7 +589,7 @@ it.each(
     expect(child.stderr).toBe("");
     expect(child.signal).toBe("SIGKILL");
     db = new Database(path);
-    store = createSqliteRecordStore(db);
+    store = createReplicaRecordStore(db);
     if (action === "baseline") {
       expect(
         db.prepare("SELECT COUNT(*) AS n FROM pdpp_replica_operations").get(),
@@ -730,13 +732,13 @@ it("uses strict bounds and durable immutable operations on readonly reopen", () 
   const before = drain(store.replication.readBaselinePage);
   store.close();
   db = new Database(path, { readonly: true });
-  store = createSqliteRecordStore(db);
+  store = createReplicaRecordStore(db);
   expect(drain(store.replication.readBaselinePage)).toEqual(before);
 });
 
 it("serializes baseline creation against another handle's attempted write at the fence", () => {
   ingest("a");
-  const second = createSqliteRecordStore(new Database(path, { timeout: 1 }));
+  const second = createReplicaRecordStore(new Database(path, { timeout: 1 }));
   let attempts = 0;
   try {
     db.function("attempt_tail", () => {
@@ -939,7 +941,7 @@ it("exports a durable completion invalidation when unchanged replace drops the l
   expect(selectStreamCompletion([...events, ...events].reverse())).toBeNull();
   store.close();
   db = new Database(path);
-  store = createSqliteRecordStore(db);
+  store = createReplicaRecordStore(db);
   expect(drain(store.replication.readTailPage)).toEqual(invalidation);
 });
 

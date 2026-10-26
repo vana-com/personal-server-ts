@@ -83,6 +83,8 @@ export interface IngestResult {
 }
 
 export interface ListRecordsOptions {
+  /** Grant eligibility, evaluated on raw snapshot rows before pagination/projection. */
+  isVisible?: (row: PdppVisibleRecord) => boolean;
   instanceIds: string[];
   limit: number;
   cursor?: string;
@@ -100,6 +102,16 @@ export interface ListRecordsPage {
 }
 
 export interface ChangesSinceOptions {
+  /** Candidate visibility policy, evaluated at BOTH historical horizons. */
+  isVisible?: (row: PdppStoredRecord) => boolean;
+  /**
+   * Candidate: a page that reaches a record deleted after the session horizon
+   * fails with `CursorExpiredError` instead of serving that record. Withholding
+   * it could lose it: the next session compares against this horizon, so a
+   * record deleted and recreated unchanged would never reach the client.
+   * The current contract serves every page at the session horizon.
+   */
+  expireOnErasure?: boolean;
   instanceIds: string[];
   /** Absent = start a new session anchored at "now". */
   changesSince?: string;

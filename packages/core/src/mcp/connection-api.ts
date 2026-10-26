@@ -40,6 +40,7 @@ import type {
   McpConnectionRecord,
   McpConnectionStore,
   McpConnectionGrant,
+  McpIngress,
   McpScopeAccessDecision,
   McpScopeAccessRequest,
   McpScopeAccessRequestView,
@@ -57,6 +58,10 @@ import {
 
 const TOKEN_BYTES = 32;
 const OAUTH_AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
+const pendingOAuthReplacements = new WeakMap<
+  McpConnectionStore,
+  Promise<void>
+>();
 
 /**
  * Default lifetime of a grant the server signs itself for an MCP connection
@@ -157,6 +162,9 @@ function randomToken(): string {
 
 export interface CreateMcpConnectionInput {
   displayName?: string;
+  ingress?: McpIngress;
+  /** OAuth client asking for this connection, if any. */
+  clientId?: string;
 }
 
 export interface CreateMcpConnectionOutput {
@@ -184,6 +192,15 @@ export async function createMcpConnection(
   input: CreateMcpConnectionInput,
   options: CreateMcpConnectionOptions,
 ): Promise<CreateMcpConnectionOutput> {
+  const { record, output } = await buildMcpConnection(input, options);
+  await options.store.create(record);
+  return output;
+}
+
+async function buildMcpConnection(
+  input: CreateMcpConnectionInput,
+  options: Pick<CreateMcpConnectionOptions, "publicOrigin" | "now">,
+): Promise<{ record: McpConnectionRecord; output: CreateMcpConnectionOutput }> {
   const grantee = generateMcpGrantee();
   const token = randomToken();
   const tokenHash = await hashConnectionToken(token);
@@ -201,16 +218,19 @@ export async function createMcpConnection(
     status: "pending",
     grants: [],
     createdAt,
+    ...(input.ingress ? { ingress: input.ingress } : {}),
+    ...(input.clientId ? { clientId: input.clientId } : {}),
   };
 
-  await options.store.create(record);
-
   return {
-    connectionId: id,
-    granteeAddress: grantee.key.address,
-    connectionToken: token,
-    mcpUrl: buildMcpUrl(options.publicOrigin, token),
-    createdAt,
+    record,
+    output: {
+      connectionId: id,
+      granteeAddress: grantee.key.address,
+      connectionToken: token,
+      mcpUrl: buildMcpUrl(options.publicOrigin, token),
+      createdAt,
+    },
   };
 }
 
@@ -873,7 +893,15 @@ export interface CreateMcpOAuthAuthorizationInput {
   codeChallengeMethod: string;
   scope?: string;
   state?: string;
+  /** Listener the authorize request arrived on; binds the connection to it. */
+  ingress?: McpIngress;
+  /** From the client's registration; names the connection. */
+  clientName?: string;
+  clientUri?: string;
 }
+
+/** Connection label when the client never told this server its name. */
+const DEFAULT_MCP_CLIENT_NAME = "MCP client";
 
 export interface CreateMcpOAuthAuthorizationOptions {
   connectionStore: McpConnectionStore;
@@ -940,18 +968,29 @@ export async function createMcpOAuthAuthorization(
   const expiresAt = new Date(
     now.getTime() + OAUTH_AUTHORIZATION_TTL_MS,
   ).toISOString();
-  const created = await createMcpConnection(
-    { displayName: "Claude" },
+  const { record: connection, output: created } = await buildMcpConnection(
     {
-      store: options.connectionStore,
+      displayName: input.clientName ?? DEFAULT_MCP_CLIENT_NAME,
+      ingress: input.ingress,
+      clientId: input.clientId,
+    },
+    {
       publicOrigin: options.publicOrigin,
       now: () => now,
     },
+  );
+  await replacePendingOAuthConnections(
+    options.connectionStore,
+    input.clientId,
+    now.getTime() - OAUTH_AUTHORIZATION_TTL_MS,
+    connection,
   );
   const authorizationId = randomId();
   const record: McpOAuthAuthorizationRecord = {
     id: authorizationId,
     clientId: input.clientId,
+    ...(input.clientName ? { clientName: input.clientName } : {}),
+    ...(input.clientUri ? { clientUri: input.clientUri } : {}),
     redirectUri: input.redirectUri,
     codeChallenge: input.codeChallenge,
     codeChallengeMethod: "S256",
@@ -973,9 +1012,68 @@ export async function createMcpOAuthAuthorization(
   };
 }
 
+async function replacePendingOAuthConnections(
+  store: McpConnectionStore,
+  clientId: string,
+  expiredBefore: number,
+  replacement: McpConnectionRecord,
+): Promise<void> {
+  if (store.replacePendingOAuthConnections) {
+    await store.replacePendingOAuthConnections(
+      clientId,
+      expiredBefore,
+      replacement,
+    );
+    return;
+  }
+
+  const previous = pendingOAuthReplacements.get(store) ?? Promise.resolve();
+  const operation = previous.then(async () => {
+    for (const connection of await store.list()) {
+      const expired = Date.parse(connection.createdAt) <= expiredBefore;
+      if (
+        connection.status !== "pending" ||
+        !connection.clientId ||
+        (connection.clientId !== clientId && !expired)
+      ) {
+        continue;
+      }
+      await store.mutate(connection.id, (latest) =>
+        latest.status === "pending"
+          ? {
+              ...latest,
+              status: "revoked",
+              revokedAt: replacement.createdAt,
+            }
+          : latest,
+      );
+    }
+    await store.create(replacement);
+  });
+  pendingOAuthReplacements.set(
+    store,
+    operation.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  await operation;
+}
+
+/** A superseded or removed authorization has a revoked connection; refuse it. */
+function requireLive(connection: McpConnectionRecord | null): void {
+  if (connection?.status !== "revoked") return;
+  throw new McpOAuthAuthorizationError(
+    "invalid_state",
+    "MCP OAuth authorization was superseded or removed; connect again",
+  );
+}
+
 export interface McpOAuthAuthorizationView {
   id: string;
   clientId: string;
+  clientName?: string;
+  clientUri?: string;
   redirectUri: string;
   scope?: string;
   state?: string;
@@ -992,6 +1090,8 @@ export function toMcpOAuthAuthorizationView(
   return {
     id: record.id,
     clientId: record.clientId,
+    ...(record.clientName ? { clientName: record.clientName } : {}),
+    ...(record.clientUri ? { clientUri: record.clientUri } : {}),
     redirectUri: record.redirectUri,
     ...(record.scope ? { scope: record.scope } : {}),
     ...(record.state ? { state: record.state } : {}),
@@ -1060,6 +1160,7 @@ export async function approveMcpOAuthAuthorization(
       "Approve requires at least one grant",
     );
   }
+  requireLive(await options.connectionStore.getById(record.connectionId));
 
   await approveMcpConnection(
     { connectionId: record.connectionId, grants: input.grants },
@@ -1129,6 +1230,7 @@ export async function approveMcpOAuthAuthorizationWithScopes(
       404,
     );
   }
+  requireLive(connection);
 
   try {
     await ensureMcpGranteeRegistered({

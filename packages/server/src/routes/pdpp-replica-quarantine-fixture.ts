@@ -24,7 +24,7 @@ import {
   type PdppRecordsRouteDeps,
 } from "./pdpp-records.js";
 import { pdppBlobsRoutes, type PdppBlobsRouteDeps } from "./pdpp-blobs.js";
-import type { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import type { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
 
 const sourceId = "https://replica-journey.invalid/declaration";
 const logger = pino({ level: "silent" });
@@ -122,7 +122,7 @@ export async function openConsentIssuer(
 export type ConsentIssuer = Awaited<ReturnType<typeof openConsentIssuer>>;
 
 export async function openReplicaResourceServer(
-  store: ReturnType<typeof createSqliteRecordStore>,
+  store: ReturnType<typeof createReplicaRecordStore>,
   options: {
     owner: string;
     tokens: PdppTokenService;

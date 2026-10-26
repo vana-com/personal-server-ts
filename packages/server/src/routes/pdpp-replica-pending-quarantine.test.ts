@@ -20,7 +20,7 @@ import {
   replicaDigest,
   toBase64,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "../storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../storage/pdpp-replication-transport.js";
 import {
@@ -34,7 +34,7 @@ it.each(["key", "connection"] as const)(
   async (scope) => {
     const root = mkdtempSync(join(homedir(), ".tmp/8b-pending-quarantine-"));
     const db = new Database(join(root, "replica.sqlite"));
-    const store = createSqliteRecordStore(db);
+    const store = createReplicaRecordStore(db);
     const owner = "owner-pending-quarantine";
     const sourceId = "https://replica-journey.invalid/declaration";
     const credential = "local-receiver";

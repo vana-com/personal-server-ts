@@ -6,8 +6,8 @@
  * legacy files written through POST /v1/data, and the legacy read auth
  * (owner control-plane token, and a builder's Web3Signed legacy grant).
  *
- * A stored legacy head remains latest until its canonical projection covers
- * it. A regression against a covered head refuses; a newer legacy head is
+ * A stored legacy head remains latest until a fresh complete import replaces
+ * it wholesale or its canonical projection covers it. A regression against a covered head refuses; a newer legacy head is
  * checked again and may explicitly return to the file.
  */
 
@@ -120,6 +120,7 @@ function grant(): GatewayGrantResponse {
     settleTxHash: null,
     settleSubmittedAt: null,
     revocationTxHash: null,
+    revocationSubmittedAt: null,
     fee: {
       asset: "0x0000000000000000000000000000000000000000",
       registrationFee: "0",
@@ -339,6 +340,25 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
+function expectCompletedReplacement(scope: string): void {
+  const db = new Database(join(tempDir, "index.db"), {
+    readonly: true,
+    fileMustExist: true,
+  });
+  try {
+    const head = ctx!.indexManager.findLatestByScope(scope)!;
+    const row = db
+      .prepare(
+        "SELECT replacement_cursor FROM legacy_scope_takeovers WHERE scope = ? AND superseded_path = ?",
+      )
+      .get(scope, head.path) as { replacement_cursor: string } | undefined;
+    expect(row?.replacement_cursor).toEqual(expect.any(String));
+    expect(row!.replacement_cursor.length).toBeGreaterThan(0);
+  } finally {
+    db.close();
+  }
+}
+
 describe("GET /v1/data/:scope for a bound connector scope", () => {
   it("accepts mutable value drift from a newer canonical collection", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -361,9 +381,8 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       expect(
         JSON.parse((await ownerGet("/v1/data/oura.activity/takeover")).text)
           .verdicts,
-      ).toMatchObject([
-        { comparisonCase: "canonical_newer", verdict: "covered" },
-      ]);
+      ).toEqual([]);
+      expectCompletedReplacement("oura.activity");
     } finally {
       vi.useRealTimers();
     }
@@ -382,6 +401,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
         "legacy",
       );
+      const historicalVerdicts = JSON.parse(
+        (await ownerGet("/v1/data/oura.activity/takeover")).text,
+      ).verdicts;
       await replace(
         token,
         "activity",
@@ -394,13 +416,8 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       expect(
         JSON.parse((await ownerGet("/v1/data/oura.activity/takeover")).text)
           .verdicts,
-      ).toMatchObject([
-        {
-          comparisonCase: "canonical_newer",
-          verdict: "covered",
-          reasonCounts: { missing_entity: 1 },
-        },
-      ]);
+      ).toEqual(historicalVerdicts);
+      expectCompletedReplacement("oura.activity");
     } finally {
       vi.useRealTimers();
     }
@@ -1560,7 +1577,7 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     };
     const signature = await builder.signTypedData({
       domain: escrowPaymentDomain(ctx!.config.gateway),
-      types: GENERIC_PAYMENT_TYPES,
+      types: { GenericPayment: [...GENERIC_PAYMENT_TYPES.GenericPayment] },
       primaryType: "GenericPayment",
       message,
     });
@@ -1876,4 +1893,149 @@ describe("configured methods that share one public source", () => {
     expect(read.status).toBe(200);
     expect(ids(read.text)).toEqual(["b1"]);
   });
+});
+
+// These are fixture regression checks, not new captures from the named apps.
+// The route must keep the same body when ownership moves off the legacy file.
+describe.each([
+  "linkedin.connections",
+  "github.repositories",
+  "github.starred",
+  "github.profile",
+  "spotify.playlists",
+  "spotify.savedTracks",
+  "linkedin.profile",
+  "spotify.profile",
+  "instagram.profile",
+])("owner coverage decision for %s", (scope) => {
+  it.each([false, true])(
+    "serves canonical only when its PDPP read covers the old file (complete=%s)",
+    async (complete) => {
+      const fixture: {
+        profileKey?: string;
+        streams: Record<string, Record<string, unknown>[]>;
+        legacyBody: Record<string, unknown>;
+      } =
+        scope === "spotify.savedTracks"
+          ? {
+              streams: {
+                saved_tracks: [
+                  {
+                    id: "track-a",
+                    name: "Song",
+                    artist_names: [],
+                    album_name: "Album",
+                    album_artist_names: [],
+                    uri: "spotify:track:track-a",
+                  },
+                ],
+              },
+              legacyBody: {
+                savedTracks: [
+                  {
+                    name: "Song",
+                    artists: [],
+                    album: { name: "Album", artists: [] },
+                    uri: "spotify:track:track-a",
+                    added_at: "",
+                    duration_ms: 0,
+                    explicit: false,
+                  },
+                ],
+                total: 1,
+              },
+            }
+          : JSON.parse(
+              await readFile(
+                new URL(
+                  `../../core/src/legacy-projection/__fixtures__/parity/${scope}.json`,
+                  import.meta.url,
+                ),
+                "utf8",
+              ),
+            );
+      const canonicalBody = structuredClone(fixture.legacyBody);
+      if (scope === "spotify.playlists") {
+        // No old track entities need an identity. The newer complete read can
+        // add real tracks, including local tracks and nonempty artist lists.
+        for (const playlist of fixture.legacyBody.playlists as {
+          tracks: unknown[];
+          tracks_total: number;
+        }[]) {
+          playlist.tracks = [];
+          playlist.tracks_total = 0;
+        }
+      }
+      const method = fixture.profileKey ?? scope.split(".")[0]!;
+      const source = `https://registry.pdpp.dev/sources/${method}`;
+      // A profile fixture may include other scopes' input streams.
+      const streams = scope.endsWith("profile")
+        ? { profile: fixture.streams.profile! }
+        : fixture.streams;
+      const declaration = JSON.stringify({
+        source_id: source,
+        source_kind: "connector",
+        version: "1",
+        streams: Object.entries(streams).map(([name, rows]) => ({
+          name,
+          fields: [...new Set(rows.flatMap((row) => Object.keys(row)))],
+          required_fields: ["id"],
+          primary_key: ["id"],
+        })),
+      });
+      await ctx!.cleanup();
+      ctx = await boot(method, { declaration });
+      // Store the old file before registering the canonical owner.
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        vi.setSystemTime(new Date("2026-10-09T00:00:00.000Z"));
+        await legacyWrite(scope, fixture.legacyBody);
+      } finally {
+        vi.useRealTimers();
+      }
+      const token = await registerTestConnection(
+        ctx.app,
+        ctx.devToken!,
+        owner,
+        source,
+        method,
+      );
+      const instance = `${method}:${owner}`;
+      for (const [stream, rows] of Object.entries(streams)) {
+        const response = await ctx.app.request(
+          `/v1/streams/${stream}/records/replace?method=${method}&binding_generation=1`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              instance,
+              emitted_at: "2026-10-21T00:00:00.000Z",
+              ...(complete
+                ? { source_collected_at: "2026-10-21T00:00:00.000Z" }
+                : {}),
+              records: (complete ? rows : []).map((data) => ({
+                key: String(data.id),
+                data,
+                emitted_at: "2026-10-21T00:00:00.000Z",
+              })),
+            }),
+          },
+        );
+        expect(response.status, await response.text()).toBe(200);
+      }
+      const read = await ownerGet(`/v1/data/${scope}`);
+      expect(read.status).toBe(200);
+      // Fresh complete imports replace the whole dataset, including bodies
+      // whose old entities have no comparable key. Incomplete imports do not.
+      const canonical = complete;
+      expect(read.dataSource).toBe(canonical ? "canonical" : "legacy");
+      expect(JSON.parse(read.text).data).toEqual(
+        canonical ? canonicalBody : fixture.legacyBody,
+      );
+      if (canonical) expectCompletedReplacement(scope);
+    },
+  );
 });

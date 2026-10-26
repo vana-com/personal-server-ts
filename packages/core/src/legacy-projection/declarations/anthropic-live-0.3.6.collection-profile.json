@@ -1,0 +1,415 @@
+{
+	"protocol_version": "0.1.0",
+	"connector_id": "https://registry.pdpp.dev/connectors/anthropic-live",
+	"source": {
+		"id": "https://registry.pdpp.dev/sources/claude",
+		"display": {
+			"name": "Claude"
+		}
+	},
+	"connector_key": "anthropic-live",
+	"manifest_uri": "https://registry.pdpp.dev/connectors/anthropic-live",
+	"version": "0.3.6",
+	"display_name": "Claude (Live Session)",
+	"brand": {
+		"icon": "icon.svg",
+		"background_color": "#D97757"
+	},
+	"runtime_requirements": {
+		"bindings": {
+			"network": {
+				"required": true,
+				"features": ["same_origin_page_fetch"]
+			},
+			"browser": {
+				"required": true,
+				"features": ["page_navigation", "page_script_evaluation"]
+			}
+		}
+	},
+	"capabilities": {
+		"human_interaction": ["manual_action"],
+		"refresh_policy": {
+			"recommended_mode": "automatic",
+			"recommended_interval_seconds": 3600,
+			"minimum_interval_seconds": 3600,
+			"maximum_staleness_seconds": 86400,
+			"interaction_posture": "manual_action_likely",
+			"rate_limit_sensitivity": "medium",
+			"bot_detection_sensitivity": "high",
+			"background_safe": true,
+			"assisted_after_owner_auth": true,
+			"rationale": "Collection reuses the owner's signed-in claude.ai browser session and reads the web app's own JSON endpoints; it requests no data export and sends no email. Automatic refresh is session-reuse-only: first collection and expired sessions need the owner to sign in through the browser handoff. Each run reads at most 200 changed conversations."
+		},
+		"public_listing": {
+			"tier": "preview"
+		}
+	},
+	"reason_display_messages": {
+		"anthropic_live_backlog_deferred": "This run read as many changed Claude conversations as one run allows. The rest are read on later runs from the saved checkpoint.",
+		"no_chat_organization": "No Claude organization with chat access could be found for this account.",
+		"http_error": "We hit a network problem talking to Claude",
+		"parse_error": "Claude sent back a response we couldn't read",
+		"not_available": "This data isn't available for this Claude account"
+	},
+	"mobile": {
+		"pageshim": {
+			"scope_prefix": "claude_live",
+			"login_url": "https://claude.ai/login",
+			"login_message": "Sign in to Claude, then return here.",
+			"collect_export": "collectAnthropicLive",
+			"probe_export": "probeAnthropicLiveSessionOnPage",
+			"summary": {
+				"stream": "conversations",
+				"singular": "conversation",
+				"plural": "conversations",
+				"details": ["conversations", "messages"]
+			}
+		}
+	},
+	"streams": [
+		{
+			"name": "conversations",
+			"description": "Claude.ai conversations, read live from the signed-in session.",
+			"required": false,
+			"display": {
+				"label": "Your Claude conversations",
+				"detail": "Conversation titles, create/update times, project membership, starred flag and the conversation's current model. The message count is filled in only when messages are collected in the same run. One organization per account; temporary chats and conversations deleted on claude.ai are not included or retracted."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"title": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "primary-title",
+						"x_pdpp_text_encoding": "pdpp-safe-escape-v1",
+						"description": "Encoded as pdpp-safe-escape-v1: each code unit in U+0000-0008, U+000B, U+000C, U+000E-001F, U+007F-009F or a lone surrogate (U+D800-DFFF not part of a valid pair) is written as a six-character \\uXXXX escape with uppercase hex. A source backslash that starts a \\uXXXX whose code unit is in that set or is U+005C is written \\u005C. All other text, including noncharacters and valid surrogate pairs, is unchanged. To decode, replace each \\uXXXX whose code unit is U+005C or in the escaped set with that code unit. Conversation title. Never truncated: when the escaped text is over 10000000 characters the field is absent from the record and the run reports an exceeds_inline_cap count."
+					},
+					"create_time": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"update_time": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"project_id": {
+						"type": ["string", "null"]
+					},
+					"model": {
+						"type": ["string", "null"]
+					},
+					"message_count": {
+						"type": ["integer", "null"]
+					},
+					"is_starred": {
+						"type": ["boolean", "null"]
+					},
+					"blob_ref": {
+						"type": "object",
+						"description": "The raw source envelope as a Core blob. Absent when the envelope is over the host blob cap (33554432 bytes); the typed record and its children are still complete.",
+						"properties": {
+							"blob_id": { "type": "string" },
+							"mime_type": { "type": "string" },
+							"size_bytes": { "type": "integer" },
+							"sha256": { "type": "string" }
+						},
+						"required": ["blob_id", "mime_type", "size_bytes", "sha256"]
+					}
+				},
+				"required": ["id"]
+			},
+			"primary_key": ["id"],
+			"consent_time_field": "create_time",
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": true,
+			"query": {
+				"search": {
+					"lexical_fields": ["title"],
+					"semantic_fields": ["title"]
+				},
+				"range_filters": {
+					"create_time": ["gte", "gt", "lte", "lt"],
+					"update_time": ["gte", "gt", "lte", "lt"]
+				},
+				"aggregations": {
+					"count": true,
+					"group_by_time": ["create_time"]
+				}
+			},
+			"coverage_strategy": "checkpoint_window",
+			"freshness_strategy": "scheduled_window"
+		},
+		{
+			"name": "messages",
+			"description": "Messages within Claude conversations, all branches. Claude records the model on the conversation, not on a message: model is the conversation's model when the message was collected, on assistant messages only.",
+			"required": false,
+			"display": {
+				"label": "Your Claude messages",
+				"detail": "Role, text content, parent message, create/update times and attachments for every message, including edited branches. Thinking and tool-call blocks are not included in the text. The model is the conversation's model at collection time (model_source says so), so it can be wrong for messages written before the model was switched."
+			},
+			"semantics": "append_only",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"conversation_id": { "type": "string" },
+					"role": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "actor"
+					},
+					"parent_id": {
+						"type": ["string", "null"]
+					},
+					"content": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "primary-title",
+						"description": "Encoded as pdpp-safe-escape-v1: each code unit in U+0000-0008, U+000B, U+000C, U+000E-001F, U+007F-009F or a lone surrogate (U+D800-DFFF not part of a valid pair) is written as a six-character \\uXXXX escape with uppercase hex. A source backslash that starts a \\uXXXX whose code unit is in that set or is U+005C is written \\u005C. All other text, including noncharacters and valid surrogate pairs, is unchanged. To decode, replace each \\uXXXX whose code unit is U+005C or in the escaped set with that code unit. Full message text. When the escaped text is over 10000000 characters it is not truncated: content is null and blob_ref holds the full text. When the text cannot be stored (the host has no blob store, or its JSON encoding exceeds 33554432 bytes) content and blob_ref are both absent from the record; the run reports an aggregate count.",
+						"x_pdpp_text_encoding": "pdpp-safe-escape-v1"
+					},
+					"blob_ref": {
+						"type": "object",
+						"description": "Present only when content is null because the message text is over the inline cap. The blob (application/json) is the JSON string of the exact source text, with no pdpp-safe-escape-v1 escaping: JSON.parse(bytes) returns the source text for the content field.",
+						"properties": {
+							"blob_id": { "type": "string" },
+							"mime_type": { "type": "string" },
+							"size_bytes": { "type": "integer" },
+							"sha256": { "type": "string" }
+						},
+						"required": ["blob_id", "mime_type", "size_bytes", "sha256"],
+						"x_pdpp_blob_projects_field": "content",
+						"x_pdpp_blob_codec": "json-string-v1"
+					},
+					"model": {
+						"type": ["string", "null"]
+					},
+					"model_source": {
+						"type": ["string", "null"]
+					},
+					"create_time": {
+						"type": ["string", "null"],
+						"format": "date-time",
+						"x_pdpp_role": "event-time"
+					},
+					"update_time": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"attachments": {
+						"type": ["array", "null"],
+						"items": {
+							"type": "object"
+						},
+						"x_pdpp_text_encoding": "pdpp-safe-escape-v1",
+						"description": "Attachment objects as exported. Every string key and string value inside is encoded as pdpp-safe-escape-v1 (see messages.content for the encoding)."
+					}
+				},
+				"required": ["id", "conversation_id"]
+			},
+			"primary_key": ["id"],
+			"consent_time_field": "create_time",
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": true,
+			"relationships": [
+				{
+					"name": "conversation",
+					"stream": "conversations",
+					"foreign_key": "conversation_id",
+					"cardinality": "has_one"
+				}
+			],
+			"query": {
+				"search": {
+					"lexical_fields": ["content"],
+					"semantic_fields": ["content"]
+				},
+				"range_filters": {
+					"create_time": ["gte", "gt", "lte", "lt"],
+					"update_time": ["gte", "gt", "lte", "lt"]
+				},
+				"aggregations": {
+					"count": true,
+					"group_by_time": ["create_time"]
+				}
+			},
+			"coverage_strategy": "checkpoint_window",
+			"freshness_strategy": "scheduled_window"
+		},
+		{
+			"name": "account_plan",
+			"required": false,
+			"description": "The subscription plan of the signed-in Claude account's chat organization, with its renewal and end dates. Same fields as the ChatGPT account_plan stream.",
+			"compaction_fingerprint": {
+				"exclude_keys": []
+			},
+			"display": {
+				"label": "Your Claude plan",
+				"detail": "Which plan the organization is on (free, Pro, Max, Team…), its rate-limit tier, whether the subscription is active, its billing period and renewal date, and when the organization was created. will_renew is inferred for an active subscription only (a next charge and no end date) and is empty otherwise. cancels_at and scheduled_plan_change are always empty: Claude exposes no source for them. Usage limits are in usage_limits. Payment details and billing identifiers are not collected. Singleton — one record for the organization the session reads."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"account_id": {
+						"type": ["string", "null"]
+					},
+					"account_structure": {
+						"type": ["string", "null"]
+					},
+					"account_created_at": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"plan_type": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "primary-title"
+					},
+					"plan_display_name": {
+						"type": ["string", "null"]
+					},
+					"subscription_plan": {
+						"type": ["string", "null"]
+					},
+					"has_active_subscription": {
+						"type": ["boolean", "null"]
+					},
+					"billing_period": {
+						"type": ["string", "null"]
+					},
+					"will_renew": {
+						"type": ["boolean", "null"]
+					},
+					"renews_at": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"expires_at": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"cancels_at": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					},
+					"scheduled_plan_change": {
+						"type": ["object", "null"],
+						"properties": {
+							"plan_type": {
+								"type": ["string", "null"],
+								"pattern": "^[a-z][a-z_-]{0,39}$"
+							},
+							"changes_at": {
+								"type": ["string", "null"],
+								"format": "date-time"
+							}
+						},
+						"required": ["plan_type", "changes_at"],
+						"additionalProperties": false
+					}
+				},
+				"required": ["id"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": true,
+			"query": {
+				"search": {
+					"lexical_fields": [
+						"plan_type",
+						"plan_display_name",
+						"subscription_plan"
+					]
+				},
+				"range_filters": {
+					"account_created_at": ["gte", "gt", "lte", "lt"],
+					"renews_at": ["gte", "gt", "lte", "lt"],
+					"expires_at": ["gte", "gt", "lte", "lt"],
+					"cancels_at": ["gte", "gt", "lte", "lt"]
+				},
+				"aggregations": {
+					"count": true
+				}
+			},
+			"coverage_strategy": "singleton_presence",
+			"freshness_strategy": "scheduled_window"
+		},
+		{
+			"name": "usage_limits",
+			"required": false,
+			"description": "Claude usage limits for the signed-in account's chat organization: the share of each limit used and when it resets.",
+			"compaction_fingerprint": {
+				"exclude_keys": []
+			},
+			"display": {
+				"label": "Your Claude usage limits",
+				"detail": "One record per limit Claude reports (the current session, the week, and any per-model weekly limit): percent used, reset time, severity and whether it is currently the binding limit. Claude reports percentages, not absolute caps. Extra-usage spend and credit balances are not collected."
+			},
+			"semantics": "mutable_state",
+			"schema": {
+				"type": "object",
+				"properties": {
+					"id": { "type": "string" },
+					"kind": {
+						"type": ["string", "null"],
+						"x_pdpp_role": "primary-title"
+					},
+					"group": {
+						"type": ["string", "null"]
+					},
+					"scope_model": {
+						"type": ["string", "null"]
+					},
+					"scope_surface": {
+						"type": ["string", "null"]
+					},
+					"percent_used": {
+						"type": ["number", "null"]
+					},
+					"severity": {
+						"type": ["string", "null"]
+					},
+					"is_active": {
+						"type": ["boolean", "null"]
+					},
+					"resets_at": {
+						"type": ["string", "null"],
+						"format": "date-time"
+					}
+				},
+				"required": ["id"]
+			},
+			"primary_key": ["id"],
+			"selection": {
+				"fields": true,
+				"resources": true
+			},
+			"incremental": true,
+			"query": {
+				"search": {
+					"lexical_fields": ["kind", "group", "scope_model"]
+				},
+				"range_filters": {
+					"resets_at": ["gte", "gt", "lte", "lt"],
+					"percent_used": ["gte", "gt", "lte", "lt"]
+				},
+				"aggregations": {
+					"count": true
+				}
+			},
+			"coverage_strategy": "full_inventory",
+			"freshness_strategy": "scheduled_window"
+		}
+	]
+}

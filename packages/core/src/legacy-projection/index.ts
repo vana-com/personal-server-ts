@@ -1,12 +1,13 @@
 // biome-ignore lint/performance/noBarrelFile: re-exported through @vana-unity/app-runtime/sources
 import {
+  ANTHROPIC_LIVE_BINDINGS,
   GROCERY_INVALID_ORDER,
   LEGACY_SCOPE_BINDINGS,
-  LEGACY_SCOPE_GAPS,
 } from "./bindings.js";
 import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
 import { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
+import { STRAVA_BROWSER_BINDINGS } from "./strava-browser-bindings.js";
 import { classifyAsTestDebris } from "./test-debris.js";
 import {
   decodeDeclaredRecordsForProjection,
@@ -21,11 +22,15 @@ import type {
   ProjectionResult,
 } from "./types.js";
 
+export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
-export { LEGACY_SCOPE_GAPS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 export { META_040_BINDINGS } from "./meta-040-bindings.js";
-export { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
+export {
+  OURA_BROWSER_BINDINGS,
+  OURA_BROWSER_DECLARATION_DIGEST,
+} from "./oura-browser-bindings.js";
+export { STRAVA_BROWSER_BINDINGS } from "./strava-browser-bindings.js";
 export type { LegacyScopeBindingProvenance } from "./provenance.js";
 export { classifyAsTestDebris } from "./test-debris.js";
 export type {
@@ -45,9 +50,11 @@ const ALTERNATE_PROFILE_BINDINGS: ReadonlyMap<
   string,
   ReadonlyMap<string, LegacyScopeBinding>
 > = new Map([
+  ["anthropic-live", ANTHROPIC_LIVE_BINDINGS],
   ["github-browser", GITHUB_BROWSER_BINDINGS],
   ["meta", META_040_BINDINGS],
   ["oura-browser", OURA_BROWSER_BINDINGS],
+  ["strava-browser", STRAVA_BROWSER_BINDINGS],
 ]);
 
 export function hasAlternateLegacyProfile(profileKey: string): boolean {
@@ -80,8 +87,8 @@ export function legacyBindingsForProfile(
 
 /**
  * Translate an exact legacy scope string to the PDPP selection an already
- * deployed app should now be served from. Exact string match only — a known
- * gap is distinct from an unknown scope, and neither is guessed.
+ * deployed app should now be served from. Exact string match only; unbound
+ * scopes are not guessed.
  */
 export function legacyScopeToPdppSelection(
   scope: string,
@@ -104,18 +111,6 @@ export function legacyScopeToPdppSelection(
           kind: "unsupported_profile",
           scope,
           profileKey: options.profileKey,
-        },
-      };
-    }
-    const gap = LEGACY_SCOPE_GAPS.get(scope);
-    if (gap) {
-      return {
-        ok: false,
-        error: {
-          kind: "gap",
-          scope,
-          reason: gap.reason,
-          provenanceChecked: gap.provenanceChecked,
         },
       };
     }
@@ -155,10 +150,6 @@ export function projectPdppRecordsToLegacyPayload(
           profileKey: options.profileKey,
         },
       };
-    }
-    const gap = LEGACY_SCOPE_GAPS.get(scope);
-    if (gap) {
-      return { ok: false, error: { kind: "gap", scope, reason: gap.reason } };
     }
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }

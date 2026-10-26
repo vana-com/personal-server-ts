@@ -126,6 +126,18 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       );
     },
 
+    hasRetainedTombstones(instance, streams) {
+      if (!streams.length || !hasTable("pdpp_records")) return false;
+      return (
+        db
+          .prepare(
+            `SELECT 1 FROM pdpp_records WHERE instance = ? AND deleted = 1
+        AND stream IN (${streams.map(() => "?").join(", ")}) LIMIT 1`,
+          )
+          .get(instance, ...streams) !== undefined
+      );
+    },
+
     readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
 
     writeClock() {
@@ -170,6 +182,18 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
             `SELECT 1 FROM legacy_scope_takeovers WHERE scope = ?${instanceFilter}`,
           )
           .get(...params) !== undefined
+      );
+    },
+
+    hasMethodTakeover(scope, method) {
+      return (
+        method !== "" &&
+        hasTable("legacy_scope_takeovers") &&
+        db
+          .prepare(
+            "SELECT 1 FROM legacy_scope_takeovers WHERE scope = ? AND method = ?",
+          )
+          .get(scope, method) !== undefined
       );
     },
 
@@ -259,12 +283,68 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
       }).immediate();
     },
 
+    hasCompletedReplacement(
+      scope,
+      head,
+      instance,
+      generation,
+      method,
+      canonicalCursor,
+    ) {
+      if (
+        !hasTable("legacy_scope_takeovers") ||
+        !(
+          db.pragma("table_info(legacy_scope_takeovers)") as { name: string }[]
+        ).some((column) => column.name === "replacement_cursor")
+      )
+        return false;
+      return (
+        db
+          .prepare(
+            `SELECT 1 FROM legacy_scope_takeovers
+        WHERE scope = ? AND instance = ? AND generation = ? AND method = ?
+          AND superseded_path = ? AND superseded_version = ? AND superseded_cas_revision = ?
+          AND superseded_collected_at = ? AND replacement_cursor = ?`,
+          )
+          .get(
+            scope,
+            instance,
+            generation,
+            method,
+            head.path,
+            head.version,
+            head.casRevision,
+            head.collectedAt,
+            `${head.id}:${canonicalCursor}`,
+          ) !== undefined
+      );
+    },
+
     eligibleLegacyHead(scope) {
       return readEligibleLegacyHead(scope);
     },
 
-    confirmRead(scope, expectedHead, selectionIsCurrent, verdict) {
+    confirmRead(scope, expectedHead, selectionIsCurrent, method, verdict) {
       if (!hasTable("data_files")) return expectedHead === null;
+      // A cached proof for a takeover recorded without its method names it.
+      // Checked before the transaction so the read-only case never writes.
+      const upgradesUnknownMethod =
+        verdict?.cached === true &&
+        verdict.coverage.covered &&
+        expectedHead !== null &&
+        hasTable("legacy_scope_takeovers") &&
+        db
+          .prepare(
+            `SELECT 1 FROM legacy_scope_takeovers
+             WHERE scope = ? AND instance = ? AND generation = ?
+               AND superseded_path = ? AND method = ''`,
+          )
+          .get(
+            scope,
+            verdict.instance,
+            verdict.generation,
+            expectedHead.path,
+          ) !== undefined;
       const validate = () => {
         if (isReset(scope)) return false;
         const currentHead = readEligibleLegacyHead(scope);
@@ -294,8 +374,59 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
         )
           return false;
         if (expectedHead === null) return true;
-        if (verdict?.cached) return true;
+        if (verdict?.cached) {
+          // The same proof as when the takeover was recorded: it also names
+          // the method of a record written before takeovers did. Only then
+          // does a cached confirmation write, under the writer lock taken
+          // below; otherwise it stays a read.
+          if (upgradesUnknownMethod)
+            db.prepare(
+              `UPDATE legacy_scope_takeovers SET method = ?
+               WHERE scope = ? AND instance = ? AND generation = ?
+                 AND superseded_path = ? AND method = ''`,
+            ).run(
+              method,
+              scope,
+              verdict.instance,
+              verdict.generation,
+              expectedHead.path,
+            );
+          return true;
+        }
         if (!hasTable("legacy_scope_takeovers")) return false;
+
+        if (verdict?.completion) {
+          if (
+            !(
+              db.pragma("table_info(legacy_scope_takeovers)") as {
+                name: string;
+              }[]
+            ).some((column) => column.name === "replacement_cursor")
+          )
+            return false;
+          db.prepare(
+            `INSERT INTO legacy_scope_takeovers
+            (scope, instance, generation, method, superseded_version, superseded_cas_revision,
+             superseded_collected_at, superseded_path, replacement_cursor)
+            SELECT scope, ?, ?, ?, version, cas_revision, collected_at, path,
+              CASE WHEN id = ? THEN ? ELSE NULL END
+            FROM data_files WHERE scope = ?
+              AND (producer IS NULL OR producer NOT IN ('pdpp-projector', 'pdpp-import-projection'))
+            ON CONFLICT(scope, instance, generation, superseded_path) DO UPDATE SET
+              method = excluded.method, superseded_version = excluded.superseded_version,
+              superseded_cas_revision = excluded.superseded_cas_revision,
+              superseded_collected_at = excluded.superseded_collected_at,
+              replacement_cursor = excluded.replacement_cursor`,
+          ).run(
+            verdict.instance,
+            verdict.generation,
+            method,
+            expectedHead.id,
+            `${expectedHead.id}:${verdict.canonicalCursor}`,
+            scope,
+          );
+          return true;
+        }
 
         if (verdict) {
           if (!hasTable("legacy_scope_takeover_verdicts")) return false;
@@ -343,13 +474,17 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           );
           if (!coverage.covered) return true;
           db.prepare(
-            `INSERT OR IGNORE INTO legacy_scope_takeovers
-            (scope, instance, generation, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO legacy_scope_takeovers
+            (scope, instance, generation, method, superseded_version, superseded_cas_revision, superseded_collected_at, superseded_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope, instance, generation, superseded_path) DO UPDATE
+              SET method = excluded.method
+              WHERE legacy_scope_takeovers.method = ''`,
           ).run(
             scope,
             verdict.instance,
             verdict.generation,
+            method,
             expectedHead.version,
             expectedHead.casRevision,
             expectedHead.collectedAt,
@@ -362,21 +497,25 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
         // legacy pipeline. Null covers manual and old connector files.
         db.prepare(
           `
-          INSERT OR IGNORE INTO legacy_scope_takeovers (
-            scope, superseded_version, superseded_cas_revision,
+          INSERT INTO legacy_scope_takeovers (
+            scope, method, superseded_version, superseded_cas_revision,
             superseded_collected_at, superseded_path
           )
-          SELECT scope, version, cas_revision, collected_at, path
+          SELECT scope, ?, version, cas_revision, collected_at, path
             FROM data_files
            WHERE scope = ?
              AND (producer IS NULL OR producer NOT IN ('pdpp-projector', 'pdpp-import-projection'))
            ORDER BY julianday(collected_at) DESC, id DESC
+          ON CONFLICT(scope, instance, generation, superseded_path) DO UPDATE
+            SET method = excluded.method
+            WHERE legacy_scope_takeovers.method = ''
         `,
-        ).run(scope);
+        ).run(method, scope);
         return true;
       };
       try {
-        return expectedHead === null || verdict?.cached
+        return expectedHead === null ||
+          (verdict?.cached && !upgradesUnknownMethod)
           ? db.transaction(validate).deferred()
           : db.transaction(validate).immediate();
       } catch (error) {
@@ -385,7 +524,9 @@ export function createLegacyScopeAuthority(db: Database): LegacyScopeAuthority {
           typeof error === "object" &&
           error !== null &&
           "code" in error &&
-          (error.code === "SQLITE_BUSY" || error.code === "SQLITE_LOCKED")
+          (error.code === "SQLITE_BUSY" ||
+            error.code === "SQLITE_BUSY_SNAPSHOT" ||
+            error.code === "SQLITE_LOCKED")
         ) {
           return false;
         }

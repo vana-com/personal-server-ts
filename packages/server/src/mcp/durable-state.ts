@@ -7,12 +7,15 @@ import {
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
+  evictableMcpClient,
   isMcpTokenExpired,
   matchesMcpRefreshHash,
   type McpConnectionRecord,
   type McpConnectionStore,
   type McpOAuthAuthorizationRecord,
   type McpOAuthAuthorizationStore,
+  type McpOAuthClientRecord,
+  type McpOAuthClientStore,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import type { Address } from "viem";
 import type { ClaimResponse } from "@opendatalabs/vana-sdk/protocol/jobs";
@@ -83,6 +86,8 @@ interface State {
   };
   connections: Record<string, McpConnectionRecord>;
   authorizations: Record<string, McpOAuthAuthorizationRecord>;
+  /** Absent in files and snapshots written before clients were kept. */
+  clients: Record<string, McpOAuthClientRecord>;
   owners: Record<string, McpOwnerBinding>;
   identities: Record<string, McpWakeupIdentity>;
 }
@@ -122,6 +127,7 @@ export interface McpDurableState {
    */
   ownerConnections(owner: Address): Promise<McpConnectionRecord[]>;
   authorizations: McpOAuthAuthorizationStore;
+  clients: McpOAuthClientStore;
   bindOwner(connectionId: string, binding: McpOwnerBinding): Promise<void>;
   getOwner(connectionId: string): Promise<McpOwnerBinding | null>;
   rememberIdentity(identity: McpWakeupIdentity): Promise<void>;
@@ -147,6 +153,7 @@ export async function openMcpDurableState(options: {
   let state: State = {
     connections: {},
     authorizations: {},
+    clients: {},
     owners: {},
     identities: {},
   };
@@ -172,6 +179,7 @@ export async function openMcpDurableState(options: {
     try {
       state = JSON.parse(plaintext.toString("utf8")) as State;
       state.identities ??= {};
+      state.clients ??= {};
       if (!state.connections || !state.authorizations || !state.owners) {
         throw new Error("Invalid MCP state");
       }
@@ -416,6 +424,7 @@ export async function openMcpDurableState(options: {
           )
             throw new Error("Invalid fenced MCP snapshot");
           const draft = incoming.state;
+          draft.clients ??= {};
           draft.writer = {
             fenced: false,
             importedId: migrationId,
@@ -437,6 +446,33 @@ export async function openMcpDurableState(options: {
           if (draft.connections[record.id])
             throw new Error("MCP connection already exists");
           draft.connections[record.id] = structuredClone(record);
+        }),
+      replacePendingOAuthConnections: (clientId, expiredBefore, replacement) =>
+        mutate((draft) => {
+          if (
+            replacement.status !== "pending" ||
+            replacement.clientId !== clientId
+          ) {
+            throw new Error("OAuth replacement must be pending for its client");
+          }
+          if (draft.connections[replacement.id])
+            throw new Error("MCP connection already exists");
+          for (const record of Object.values(draft.connections)) {
+            const expired = Date.parse(record.createdAt) <= expiredBefore;
+            if (
+              record.status !== "pending" ||
+              !record.clientId ||
+              (record.clientId !== clientId && !expired)
+            ) {
+              continue;
+            }
+            draft.connections[record.id] = {
+              ...record,
+              status: "revoked",
+              revokedAt: replacement.createdAt,
+            };
+          }
+          draft.connections[replacement.id] = structuredClone(replacement);
         }),
       list: () => read((current) => Object.values(current.connections)),
       getById: (id) => read((current) => current.connections[id] ?? null),
@@ -495,6 +531,15 @@ export async function openMcpDurableState(options: {
         mutate((draft) => {
           delete draft.authorizations[id];
         }),
+    },
+    clients: {
+      create: (record) =>
+        mutate((draft) => {
+          const evicted = evictableMcpClient(Object.values(draft.clients));
+          if (evicted) delete draft.clients[evicted];
+          draft.clients[record.clientId] = structuredClone(record);
+        }),
+      getById: (id) => read((current) => current.clients[id] ?? null),
     },
     bindOwner: (connectionId, binding) =>
       mutate((draft) => {

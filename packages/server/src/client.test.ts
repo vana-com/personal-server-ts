@@ -138,6 +138,7 @@ describe("startPersonalServer node handle", () => {
         local: `http://127.0.0.1:${port}`,
         apiOrigin: `http://localhost:${port}`,
         registration: `http://localhost:${port}`,
+        loopback: null,
       },
     });
     expect(info.server?.address).toMatch(/^0x[0-9a-fA-F]{40}$/);

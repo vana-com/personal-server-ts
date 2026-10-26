@@ -112,6 +112,51 @@ All authenticated endpoints use `Authorization: Web3Signed <base64url(json)>.<si
 | `/v1/sync/status`                      | GET    | Owner           | Sync status                    |
 | `/v1/sync/file/{fileId}`               | POST   | Owner           | Sync specific file             |
 
+### Claude export-to-live transition
+
+The owner-only `POST /pdpp/instances/:instance/transition-claude-live` accepts
+`{ "expected_generation": N }` for the single registered Claude connection,
+configured as `anthropic` or `anthropic-live`. It is deliberately separate from
+reset: reset still cannot change a registered connection's method.
+
+The transition captures currently readable conversations and projects, archives
+the old canonical rows/history/blob claims, and binds `anthropic-live` at N+1 in
+one SQLite transaction. Snapshot preparation checks the write clock. Stale export
+runs cannot write afterward; replaying N never clears live data. Unreadable,
+nonempty prior data refuses transition. Desktop must verify the signed successor
+before requesting this operation, then activate its declaration at an idle
+restart boundary. A lost response is reconciled by reading the binding.
+
+The previous public bodies remain readable while live collection is incomplete.
+Conversations take over only after covering the saved messages in the same
+organization; a later regression refuses instead of resurrecting the old export.
+Saved projects remain available, but the live connector does not refresh them.
+Deletion/reset removes the corresponding saved baseline and archived data. This
+is a one-way method transition, not an arbitrary method-switching API. Saved
+provider sessions stay at their existing host-owned credential boundary.
+
+### Strava export-to-browser transition
+
+The owner-only `POST /pdpp/instances/:instance/transition-strava-browser`
+accepts `{ "expected_generation": N }` for the single registered Strava
+connection, configured as `strava` or `strava-browser`. It follows the Claude
+transition: it captures the readable `strava.activities` and
+`strava.coverage_diagnostics` bodies, archives the export rows and binds
+`strava-browser` at N+1 in one SQLite transaction. Replays never clear browser
+data. Unreadable, nonempty activities refuse the transition.
+
+Strava browser records carry no athlete id. The saved activities stay
+authoritative until a browser run with a completion receipt holds every saved
+activity id; nothing is deleted before then. A completed run that misses saved
+ids keeps the export. `GET /pdpp/instances/:instance/strava-browser-transition`
+reports `none`, `pending`, `account_mismatch` or `covered`, so a host can tell
+the owner the signed-in account does not match the saved data. After the
+handover, `strava.activities` follows the normal legacy view. The saved
+`strava.coverage_diagnostics` body stays readable and frozen; the browser
+method does not collect diagnostics. Reset or deletion removes the saved bodies
+and archive. The server exports `STRAVA_BROWSER_TRANSITION_CONTRACT`
+(`strava-browser-transition-v1`) for hosts to check before use.
+
 ### Owner import acceptance
 
 `PUT /v1/data/{scope}/imports/{operation}` accepts an owner root JSON object up to the data-ingest limit (512 MiB). `operation` is a stable 64-character lowercase hexadecimal identifier for one intended import; derive it from the owner, saved run identity and scope, excluding the body digest and server port. Ordinary `POST` continues to create a distinct write on each request. Binary, lineage and query parameters (including `supersede`) are refused on import PUT.

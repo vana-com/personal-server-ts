@@ -1,9 +1,225 @@
 import { describe, expect, it } from "vitest";
 import { compareLegacyCoverage } from "./legacy-scope-coverage.js";
+import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
 
 const keys = { "$.items": ["id"], "$.items[].children": ["id"] };
 
+describe("CHARACTERIZATION: legacy identity is not supplied by mutable content", () => {
+  const catalog = {
+    uri: "spotify:track:private-catalog",
+    name: "private-catalog-name",
+    artists: [],
+  };
+  const local = {
+    uri: "spotify:local:private-artist:private-album:private-title:180",
+    name: "private-local-name",
+    artists: [],
+  };
+  const unknown = { name: "private-missing-uri", artists: [] };
+
+  function expectUnkeyed(
+    verdict: ReturnType<typeof compareLegacyCoverage>,
+    path: string,
+  ) {
+    expect(verdict.covered).toBe(false);
+    expect(verdict.reason).toBe("no_stable_key");
+    expect(verdict.comparisonCase).toBe("canonical_newer");
+    expect(verdict.reasonCounts.no_stable_key).toBe(1);
+    expect(Object.values(verdict.reasonCounts).reduce((a, b) => a + b, 0)).toBe(
+      1,
+    );
+    // Unknown identity is not evidence that a particular entity was deleted.
+    expect(verdict.missingEntityCount).toBe(0);
+    expect(verdict.mismatchedFieldPaths).toEqual([path]);
+    expect(verdict.appliedExceptions).toEqual([]);
+    expect(JSON.stringify(verdict)).not.toContain("private-");
+  }
+
+  describe.each(["spotify.playlists", "spotify.savedTracks"])("%s", (scope) => {
+    const body = (tracks: object[]) =>
+      scope === "spotify.playlists"
+        ? {
+            playlists: [{ uri: "spotify:playlist:private-parent", tracks }],
+          }
+        : { savedTracks: tracks };
+    const path =
+      scope === "spotify.playlists" ? "$.playlists[0].tracks" : "$.savedTracks";
+
+    it.each([
+      {
+        label: "duplicate URI loses an occurrence",
+        legacy: [catalog, local, catalog],
+        canonical: [catalog, local],
+      },
+      {
+        label: "duplicate URI occurrences reorder",
+        legacy: [catalog, local, catalog],
+        canonical: [catalog, catalog, local],
+      },
+      {
+        label: "mixed catalog and local rows retain an unknown canonical extra",
+        legacy: [catalog, local],
+        canonical: [catalog, unknown, local],
+      },
+      {
+        label: "legacy row has no URI",
+        legacy: [catalog, unknown],
+        canonical: [catalog, local],
+      },
+      {
+        label: "canonical row has no URI",
+        legacy: [catalog, local],
+        canonical: [catalog, unknown],
+      },
+    ])(
+      "$label cannot establish identity even with completion proof",
+      ({ legacy, canonical }) => {
+        const verdict = compareLegacyCoverage(body(legacy), body(canonical), {
+          scope,
+          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          canonicalNewer: true,
+          allowProvenDeletion: true,
+        });
+        expectUnkeyed(verdict, path);
+      },
+    );
+  });
+
+  it("does not turn a changed LinkedIn URL into a proven deletion", () => {
+    const scope = "linkedin.connections";
+    const verdict = compareLegacyCoverage(
+      {
+        connections: [
+          {
+            profileUrl: "https://www.linkedin.com/in/private-old",
+            fullName: "private-person",
+          },
+        ],
+      },
+      {
+        connections: [
+          {
+            profileUrl: "https://www.linkedin.com/in/private-new",
+            fullName: "private-person",
+          },
+        ],
+      },
+      {
+        scope,
+        entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+        canonicalNewer: true,
+        allowProvenDeletion: true,
+      },
+    );
+    expectUnkeyed(verdict, "$.connections");
+  });
+
+  it("refuses nonempty name-only artist subtrees independently of track refusal", () => {
+    // Compare the subtree directly so an unkeyed enclosing track cannot mask it.
+    const artists = [{ name: "private-artist" }];
+    const verdict = compareLegacyCoverage(
+      { artists },
+      { artists: [{ name: "private-replacement" }] },
+      { canonicalNewer: true, allowProvenDeletion: true },
+    );
+    expectUnkeyed(verdict, "$.artists");
+  });
+
+  it("still covers keyed playlist parents with empty tracks", () => {
+    const body = {
+      playlists: [{ uri: "spotify:playlist:private-parent", tracks: [] }],
+    };
+    const verdict = compareLegacyCoverage(body, body, {
+      scope: "spotify.playlists",
+      entityKeys: LEGACY_SCOPE_ENTITY_KEYS["spotify.playlists"],
+      canonicalNewer: true,
+    });
+    expect(verdict.covered).toBe(true);
+    expect(verdict.reason).toBeNull();
+    expect(
+      Object.values(verdict.reasonCounts).every((count) => count === 0),
+    ).toBe(true);
+    expect(verdict.missingEntityCount).toBe(0);
+    expect(verdict.mismatchedFieldPaths).toEqual([]);
+    expect(JSON.stringify(verdict)).not.toContain("private-");
+  });
+});
+
 describe("legacy scope coverage", () => {
+  it.each(["spotify.playlists", "spotify.savedTracks"])(
+    "keeps metadata-derived local-file track URIs unkeyed in %s",
+    (scope) => {
+      const track = {
+        uri: "spotify:local:Artist:Album:Title:180",
+        name: "Title",
+        artists: [],
+      };
+      const body =
+        scope === "spotify.playlists"
+          ? {
+              playlists: [
+                { uri: "spotify:playlist:playlist-a", tracks: [track] },
+              ],
+            }
+          : { savedTracks: [track] };
+      const verdict = compareLegacyCoverage(body, body, {
+        scope,
+        entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+        canonicalNewer: true,
+      });
+      expect(verdict.covered).toBe(false);
+      expect(verdict.reason).toBe("no_stable_key");
+    },
+  );
+  it.each([
+    {
+      scope: "github.repositories",
+      list: "repositories",
+      key: "url",
+      value: "https://github.com/a/foo",
+    },
+    {
+      scope: "github.starred",
+      list: "starred",
+      key: "url",
+      value: "https://github.com/a/foo",
+    },
+    {
+      scope: "github.profile",
+      list: "pinnedRepositories",
+      key: "fullName",
+      value: "a/foo",
+    },
+    {
+      scope: "github.profile",
+      list: "organizations",
+      key: "login",
+      value: "example",
+    },
+    {
+      scope: "linkedin.connections",
+      list: "connections",
+      key: "profileUrl",
+      value: "https://www.linkedin.com/in/alex",
+    },
+  ])(
+    "does not treat a reused source alias as the same $scope entity",
+    ({ scope, list, key, value }) => {
+      const verdict = compareLegacyCoverage(
+        { [list]: [{ [key]: value, label: "original entity", stars: 99 }] },
+        {
+          [list]: [{ [key]: value, label: "unrelated replacement", stars: 0 }],
+        },
+        {
+          scope,
+          entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          canonicalNewer: true,
+          allowProvenDeletion: false,
+        },
+      );
+      expect(verdict.covered).toBe(false);
+    },
+  );
   describe.each([false, true])(
     "memory creation coverage (newer=%s)",
     (canonicalNewer) => {
@@ -746,5 +962,38 @@ describe("legacy scope coverage", () => {
     );
     expect(verdict.reason).toBe("timestamp_format");
     expect(verdict.appliedExceptions).toEqual([]);
+  });
+});
+
+describe("Oura frozen integer schema defect", () => {
+  const payload = (averageHrv: unknown) => ({
+    sleepPeriods: [{ id: "session", averageHrv }],
+  });
+  const options = {
+    scope: "oura.sleep",
+    entityKeys: { "$.sleepPeriods": ["id"] },
+  };
+  it("accepts only the exact schema rounding of a fractional legacy averageHrv", () => {
+    const verdict = compareLegacyCoverage(payload(48.6), payload(49), options);
+    expect(verdict.covered).toBe(true);
+    expect(verdict.appliedExceptions).toHaveLength(1);
+    expect(
+      compareLegacyCoverage(payload(48.6), payload(48), options).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(payload(48), payload(49), options).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(payload(48.6), payload("49"), options).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(payload(48.6), payload(null), options).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(payload(48.6), payload(49), {
+        ...options,
+        scope: "other.sleep",
+      }).covered,
+    ).toBe(false);
   });
 });

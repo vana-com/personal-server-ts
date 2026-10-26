@@ -42,7 +42,7 @@ import { pdppRecordsRoutes } from "../packages/server/src/routes/pdpp-records.js
 import { pdppWellKnownRoutes } from "../packages/server/src/routes/pdpp-well-known.js";
 import { pdppBlobsRoutes } from "../packages/server/src/routes/pdpp-blobs.js";
 import { createReplicaAuthorizationService } from "../packages/server/src/pdpp/replica-authorization.js";
-import type { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-records-sqlite-store.js";
+import type { createReplicaRecordStore } from "../packages/server/src/storage/pdpp-replica-canonical-port.js";
 import {
   buildReplicaRuntimeSource,
   type ReplicaRuntimeSource,
@@ -170,7 +170,7 @@ export type ConsentIssuer = Awaited<ReturnType<typeof openConsentIssuer>>;
 
 /** Real RS routes over B's canonical SQLite store; no local grant/token database. */
 export async function openReplicaResourceServer(
-  store: ReturnType<typeof createSqliteRecordStore>,
+  store: ReturnType<typeof createReplicaRecordStore>,
   options: {
     owner: string;
     issuerOrigin: string;
@@ -660,6 +660,7 @@ async function main() {
     "packages/server/src/routes/pdpp-records.ts",
     "packages/server/src/routes/pdpp-blobs.ts",
     "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+    "packages/server/src/storage/pdpp-replica-canonical-port.ts",
     "packages/server/src/storage/pdpp-replication-receiver.ts",
     "packages/server/src/storage/pdpp-replication-transport.ts",
   ];

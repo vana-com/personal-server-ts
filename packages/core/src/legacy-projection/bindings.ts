@@ -2142,22 +2142,66 @@ function claudeMetadata(
   };
 }
 
-function claudeConversationsBinding(): LegacyScopeBinding {
+function claudeLiveMetadata(
+  scope: string,
+  records: PdppRecord[],
+): ReturnType<typeof claudeMetadata> {
+  const plans = byStream(records, "account_plan");
+  const plan = plans[0];
+  if (
+    plans.length !== 1 ||
+    !plan ||
+    typeof plan.id !== "string" ||
+    !plan.id.trim() ||
+    typeof plan.account_id !== "string" ||
+    !plan.account_id.trim() ||
+    !(
+      typeof plan.plan_display_name === "string" ||
+      plan.plan_display_name === null
+    )
+  ) {
+    return {
+      ok: false,
+      error: {
+        kind: "incomplete_scope",
+        scope,
+        reason: "A single verified organization account_plan is required",
+      },
+    };
+  }
+  return {
+    ok: true,
+    organizationId: plan.account_id,
+    profile: { name: null, plan: plan.plan_display_name },
+  };
+}
+
+function claudeConversationsBinding(live = false): LegacyScopeBinding {
   const scope = "claude.conversations";
   return {
     scope,
-    pdppSource: ANTHROPIC_CONNECTOR_ID,
-    pdppStreams: ["account_profile", "conversations", "messages"],
+    pdppSource: live
+      ? "https://registry.pdpp.dev/connectors/anthropic-live"
+      : ANTHROPIC_CONNECTOR_ID,
+    pdppStreams: [
+      live ? "account_plan" : "account_profile",
+      "conversations",
+      "messages",
+    ],
     legacySchemaPath: "claude.conversations.json",
     fieldsRead: {
-      account_profile: [
-        "id",
-        "organization_id",
-        "full_name",
-        "plan",
-        "name_source",
-        "metadata_status",
-      ],
+      ...(live
+        ? { account_plan: ["id", "account_id", "plan_display_name"] }
+        : {
+            account_profile: [
+              "id",
+              "organization_id",
+              "full_name",
+              "plan",
+              "name_source",
+              "metadata_status",
+            ],
+          }),
       conversations: [
         "id",
         "title",
@@ -2179,22 +2223,37 @@ function claudeConversationsBinding(): LegacyScopeBinding {
       ],
     },
     primaryKey: {
-      account_profile: ["id"],
+      [live ? "account_plan" : "account_profile"]: ["id"],
       conversations: ["id"],
       messages: ["id"],
     },
     lossy: [
       "href is reconstructed from the retained Claude route convention; rawContent and unavailable fetchError are omitted.",
     ],
-    provenance: anthropicProjectionProvenance,
+    // The live declaration's conversation blob_ref is the raw envelope; its
+    // typed record and messages are complete without it.
+    ...(live ? { ancillaryBlobStreams: ["conversations"] } : {}),
+    provenance: live
+      ? [
+          {
+            kind: "oci",
+            ref: "ghcr.io/pdp-connect/connector/anthropic-live:0.3.6",
+            digest:
+              "sha256:817716e8c732c9c991be507049147a0cc887b154363428bc4509cc91ed5d17a6",
+            path: "declarations/anthropic-live-0.3.6.collection-profile.json",
+          },
+        ]
+      : anthropicProjectionProvenance,
     project(records, options): ProjectionResult {
       const guard = requireStreams(scope, options, [
-        "account_profile",
+        live ? "account_plan" : "account_profile",
         "conversations",
         "messages",
       ]);
       if (guard) return guard;
-      const metadata = claudeMetadata(scope, records);
+      const metadata = live
+        ? claudeLiveMetadata(scope, records)
+        : claudeMetadata(scope, records);
       if (!metadata.ok) return metadata;
       const conversations = byStream(records, "conversations");
       const messagesByConversation = new Map<
@@ -2226,6 +2285,7 @@ function claudeConversationsBinding(): LegacyScopeBinding {
           },
         };
       const projected = [];
+      let unknownMessageCounts = 0;
       for (const conversation of conversations) {
         if (
           typeof conversation.id !== "string" ||
@@ -2283,11 +2343,15 @@ function claudeConversationsBinding(): LegacyScopeBinding {
               attachments: message.attachments ?? [],
             };
           });
-        const messageCount =
-          typeof conversation.message_count === "number"
-            ? conversation.message_count
-            : messages.length;
-        if (messageCount !== messages.length)
+        // Only the source's own count proves the fetched messages are the
+        // whole conversation. Without one (anthropic-live writes null when
+        // the run did not read the detail) the conversation is reported
+        // partial, never certified complete. messageCount stays the number
+        // of messages collected, as the legacy schema defines it.
+        const sourceCount = conversation.message_count ?? null;
+        const messageCount = messages.length;
+        if (sourceCount === null) unknownMessageCounts += 1;
+        else if (sourceCount !== messageCount)
           return {
             ok: false,
             error: {
@@ -2309,24 +2373,33 @@ function claudeConversationsBinding(): LegacyScopeBinding {
           messages,
         });
       }
+      const diagnostics = partialRows(
+        scope,
+        "conversations",
+        "message_count_unknown",
+        unknownMessageCounts,
+      );
       return {
         ok: true,
+        ...(diagnostics.length > 0 ? { diagnostics } : {}),
         payload: {
           profile: metadata.profile,
           organizationId: metadata.organizationId,
           conversations: projected,
           total: projected.length,
           messageTotal: projected.reduce(
-            (total, conversation) =>
-              total + (conversation.messageCount as number),
+            (total, conversation) => total + conversation.messageCount,
             0,
           ),
-          source: "official-export",
+          source: live ? "live-session" : "official-export",
         },
       };
     },
   };
 }
+
+export const ANTHROPIC_LIVE_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
+  new Map([["claude.conversations", claudeConversationsBinding(true)]]);
 
 const claudeConversations = claudeConversationsBinding();
 
@@ -3296,9 +3369,10 @@ const ouraActivity: LegacyScopeBinding = {
       "contributors",
     ],
   },
+  optionalFieldsRead: { activity: ["timestamp"] },
   primaryKey: { activity: ["id"] },
   lossy: [
-    "timestamp: no source field; omitted (legacy schema makes it optional)",
+    "timestamp: preserved when supplied; absent or null source timestamps are omitted",
     "target_calories: has no legacy field and is not projected",
     "Legacy integer fields: fractional source numbers are rounded with Math.round at projection time",
   ],
@@ -3327,6 +3401,9 @@ const ouraActivity: LegacyScopeBinding = {
         days: rows.map((r) => ({
           id: r.id,
           day: r.day,
+          ...(typeof r.timestamp === "string"
+            ? { timestamp: r.timestamp }
+            : {}),
           score: ouraInteger(r.score),
           ...ifDefinedOuraInteger(r, "active_calories", "activeCalories"),
           ...ifDefinedOuraInteger(r, "total_calories", "totalCalories"),
@@ -3371,9 +3448,10 @@ const ouraReadiness: LegacyScopeBinding = {
       "contributors",
     ],
   },
+  optionalFieldsRead: { readiness: ["timestamp"] },
   primaryKey: { readiness: ["id"] },
   lossy: [
-    "timestamp: no source field; omitted (legacy schema makes it optional)",
+    "timestamp: preserved when supplied; absent or null source timestamps are omitted",
     "Legacy integer fields: fractional source numbers are rounded with Math.round at projection time",
   ],
   provenance: [
@@ -3401,6 +3479,9 @@ const ouraReadiness: LegacyScopeBinding = {
         days: rows.map((r) => ({
           id: r.id,
           day: r.day,
+          ...(typeof r.timestamp === "string"
+            ? { timestamp: r.timestamp }
+            : {}),
           score: ouraInteger(r.score),
           ...ifDefined(r, "temperature_deviation", "temperatureDeviation"),
           ...ifDefined(
@@ -4545,10 +4626,6 @@ const wholefoodsNutrition: LegacyScopeBinding = {
   },
 };
 
-// amazon.profile is a documented GAP: no `profile` stream exists on the
-// amazon collection-profile.json at all (verified: exactly 2 streams,
-// orders and order_items) — legacy's `name`/`isPrime` have no PDPP source.
-
 // iCloud Notes is bound to the signed 0.1.0 collection profile. Desktop
 // admission and ingest projection are separate gates.
 const icloudNoteFolders: LegacyScopeBinding = {
@@ -4851,10 +4928,3 @@ export const LEGACY_SCOPE_BINDINGS: ReadonlyMap<string, LegacyScopeBinding> =
       "strava.coverage_diagnostics": stravaCoverageDiagnostics,
     }),
   );
-
-/** Known legacy contracts checked against signed declarations but not
- * projectable without fabricating fields or changing the retained contract. */
-export const LEGACY_SCOPE_GAPS: ReadonlyMap<
-  string,
-  { reason: string; provenanceChecked: LegacyScopeBindingProvenance[] }
-> = new Map([]);

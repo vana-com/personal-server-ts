@@ -160,6 +160,10 @@
       "types": "./dist/signing/index.d.ts",
       "import": "./dist/signing/index.js"
     },
+    "./publication": {
+      "types": "./dist/publication/publish.d.ts",
+      "import": "./dist/publication/publish.js"
+    },
     "./sync": {
       "types": "./dist/sync/index.d.ts",
       "import": "./dist/sync/index.js"
@@ -203,6 +207,18 @@
     "./replication/*": {
       "types": "./dist/replication/*.d.ts",
       "import": "./dist/replication/*.js"
+    },
+    "./storage/legacy-scope-coverage": {
+      "types": "./dist/storage/legacy-scope-coverage.d.ts",
+      "import": "./dist/storage/legacy-scope-coverage.js"
+    },
+    "./storage/legacy-scope-entity-keys": {
+      "types": "./dist/storage/legacy-scope-entity-keys.d.ts",
+      "import": "./dist/storage/legacy-scope-entity-keys.js"
+    },
+    "./oura": {
+      "types": "./dist/oura/index.d.ts",
+      "import": "./dist/oura/index.js"
     }
   },
   "scripts": {

@@ -9,6 +9,7 @@ import {
 import { ServerConfigSchema } from "../../schemas/server-config.js";
 import { AdditionsBudget } from "../../additions/budget.js";
 import { createVanaSyncStorageAdapter } from "./vana.js";
+import { StoredBlobConflictError } from "./interface.js";
 
 const stops: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -139,4 +140,66 @@ it("authenticates preview upload/read/delete against an independent Storage audi
   await expect(adapter.delete("https://other.invalid/blob")).rejects.toThrow(
     /namespace/,
   );
+});
+
+it("reports a write-once storage refusal as StoredBlobConflictError on both upload paths", async () => {
+  const owner = privateKeyToAccount(`0x${"46".repeat(32)}`);
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request);
+    const conflict = request.url!.endsWith("/taken");
+    response.statusCode = conflict ? 409 : 500;
+    response.setHeader("content-type", "application/json");
+    response.end(
+      JSON.stringify({
+        error: conflict ? "BLOB_EXISTS" : "INTERNAL_ERROR",
+        message: conflict
+          ? "Blob already exists with different content"
+          : "boom",
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  stops.push(
+    () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  );
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Missing port");
+  const endpoint = `http://127.0.0.1:${address.port}`;
+  const config = ServerConfigSchema.parse({
+    gateway: { chainId: 14800 },
+    storage: { config: { vana: { apiUrl: endpoint } } },
+  });
+  const serverAccount = {
+    address: owner.address,
+    signMessage: (message: string) => owner.signMessage({ message }),
+  };
+  const adapters = [
+    createVanaSyncStorageAdapter({
+      config,
+      serverOwner: owner.address,
+      serverAccount,
+    }),
+    createVanaSyncStorageAdapter({
+      config,
+      serverOwner: owner.address,
+      serverAccount,
+      audience: "https://storage.vana.org",
+    }),
+  ];
+
+  for (const adapter of adapters) {
+    await expect(
+      adapter.upload("linkedin.profile/taken", new Uint8Array([1])),
+    ).rejects.toBeInstanceOf(StoredBlobConflictError);
+    const failure = adapter.upload(
+      "linkedin.profile/broken",
+      new Uint8Array([1]),
+    );
+    await expect(failure).rejects.toThrow(/500/);
+    await expect(failure).rejects.not.toBeInstanceOf(StoredBlobConflictError);
+  }
 });

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
 /**
@@ -84,7 +84,7 @@ function device() {
   const directory = mkdtempSync(join(tmpdir(), "pdpp-repair-"));
   directories.push(directory);
   const db = new Database(join(directory, "db.sqlite"));
-  const store = createSqliteRecordStore(db);
+  const store = createReplicaRecordStore(db);
   store.registerConnection({
     instance: "conn_a",
     sourceId,

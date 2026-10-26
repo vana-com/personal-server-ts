@@ -222,6 +222,51 @@ export function copyBinary(
   writer.finish();
 }
 
+/**
+ * Canonical values up to this size stay one `pdpp_blob_bytes` row, which a
+ * build without replication (or without chunk tables) can still read.
+ */
+export const CANONICAL_INLINE_BYTES = 1024 * 1024;
+
+/** Store canonical bytes: inline up to CANONICAL_INLINE_BYTES, chunked above. */
+export function writeCanonicalBinary(
+  db: Database,
+  id: string,
+  bytes: Uint8Array,
+): void {
+  if (bytes.length <= CANONICAL_INLINE_BYTES) {
+    db.prepare(
+      `INSERT INTO ${legacy.canonical} (blob_id, bytes) VALUES (?, ?)`,
+    ).run(id, Buffer.from(bytes));
+    return;
+  }
+  const writer = binaryWriter(db, "canonical", id);
+  writer.write(bytes);
+  writer.finish();
+}
+
+/** Promote verified bytes into canonical storage with the same size rule. */
+export function copyBinaryToCanonical(
+  db: Database,
+  from: BinaryNamespace,
+  sourceId: string,
+  targetId = sourceId,
+): void {
+  const size = binaryLength(db, from, sourceId);
+  if (size === undefined) throw new Error("missing binary bytes");
+  if (size > CANONICAL_INLINE_BYTES) {
+    copyBinary(db, from, sourceId, "canonical", targetId);
+    return;
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of readBinaryChunks(db, from, sourceId)) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  writeCanonicalBinary(db, targetId, bytes);
+}
+
 /** Explicit whole-value API for existing HTTP consumers, never used by replication. */
 export function readBinary(
   db: Database,

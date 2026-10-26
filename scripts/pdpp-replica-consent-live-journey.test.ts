@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { describe, expect, it } from "vitest";
-import { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "../packages/server/src/storage/pdpp-replica-canonical-port.js";
 import {
   approveNarrowConsent,
   assertAppRead,
@@ -31,7 +31,7 @@ function temporaryRoot() {
 }
 function fixture(path: string) {
   const db = new Database(path);
-  const store = createSqliteRecordStore(db);
+  const store = createReplicaRecordStore(db);
   for (const instance of ["conn", "conn-other"])
     store.registerConnection({
       instance,
@@ -416,7 +416,7 @@ async function scenario(
   }
 }
 function seed(
-  store: ReturnType<typeof createSqliteRecordStore>,
+  store: ReturnType<typeof createReplicaRecordStore>,
   instance: string,
   key: string,
   data: Record<string, unknown>,

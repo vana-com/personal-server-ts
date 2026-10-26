@@ -11,7 +11,7 @@ import type * as MergePlan from "@opendatalabs/personal-server-ts-core/replicati
 import { createFixtureAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth.test-utils";
 import { createStreamDeclarationRegistry } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { pdppRecordsRoutes } from "../routes/pdpp-records.js";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
 // Count reducer runs: the receiver's canonical reconcile plus any view materialization.
@@ -24,7 +24,7 @@ vi.mock(
 );
 const merges = vi.mocked(planReplicaMerge);
 
-const stores: ReturnType<typeof createSqliteRecordStore>[] = [];
+const stores: ReturnType<typeof createReplicaRecordStore>[] = [];
 afterEach(() => {
   merges.mockClear();
   for (const store of stores.splice(0)) store.close();
@@ -54,7 +54,7 @@ const rows = (prefix: string, n: number, instance = identity.connectionId) =>
 
 function device(size: number) {
   const db = new Database(":memory:");
-  const store = createSqliteRecordStore(db);
+  const store = createReplicaRecordStore(db);
   stores.push(store);
   store.registerConnection({
     instance: identity.connectionId,

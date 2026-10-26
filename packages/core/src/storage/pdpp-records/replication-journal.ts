@@ -18,31 +18,3 @@ export interface CanonicalMutation {
   readonly value: PdppRecordRow;
   readonly blobIds: readonly string[];
 }
-
-export interface MutationJournalPageOptions {
-  /** Exclusive local offset. Omit to start at the beginning. */
-  afterSequence?: number;
-  /** Integer in [1, 1000]. Bounds row count, not serialized byte size. */
-  limit: number;
-}
-
-export interface MutationJournalPage {
-  mutations: CanonicalMutation[];
-  hasMore: boolean;
-  /** Last returned offset, or the input offset on an empty page. Retain even at the tail. */
-  nextAfterSequence: number;
-}
-
-/**
- * Internal journal reads, separate from grant-relative PDPP cursors. No publisher.
- * Capture currently covers incremental ingest and owner record deletion only;
- * lifecycle capture and a fenced baseline are required before publication.
- * Writer identity belongs to this database installation; cloning/restoring the
- * database copies it. Rotation after restore is required before replication.
- */
-export interface MutationJournalReader {
-  getInstallationWriterId(): string;
-  readMutationJournalPage(
-    options: MutationJournalPageOptions,
-  ): MutationJournalPage;
-}

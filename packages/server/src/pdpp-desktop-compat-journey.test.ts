@@ -89,7 +89,7 @@ function seedRegisteredConnection() {
 
 async function mintOwnerToken(
   sourceId: string,
-  instanceId: string | undefined = legacyId,
+  instanceId?: string,
 ): Promise<Response> {
   return ctx!.app.request("/pdpp/v1/owner/token", {
     method: "POST",
@@ -97,7 +97,11 @@ async function mintOwnerToken(
       authorization: `Bearer ${ctx!.devToken}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({ source_id: sourceId, instance_id: instanceId }),
+    // Desktop requests source-wide management authority; collection callers can select one account.
+    body: JSON.stringify({
+      source_id: sourceId,
+      ...(instanceId === undefined ? {} : { instance_id: instanceId }),
+    }),
   });
 }
 
@@ -187,6 +191,48 @@ describe("Desktop multi-account compatibility on a real Personal Server", () => 
       method_id: "claude",
       label: "Claude account",
     });
+  });
+
+  it("keeps explicitly account-limited tokens out of another account's registration", async () => {
+    ctx = await boot();
+    const limitedResponse = await mintOwnerToken(SOURCE_ID, legacyId);
+    expect(limitedResponse.status).toBe(200);
+    const { access_token: limited } = (await limitedResponse.json()) as {
+      access_token: string;
+    };
+    const connectionId = "conn_123e4567-e89b-42d3-a456-426614174000";
+    const register = (token: string) =>
+      ctx!.app.request(`/pdpp/connections/${connectionId}`, {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          source_id: SOURCE_ID,
+          method_id: "claude",
+          label: "Second account",
+        }),
+      });
+    expect((await register(limited)).status).toBe(403);
+
+    const sourceResponse = await mintOwnerToken(SOURCE_ID);
+    expect(sourceResponse.status).toBe(200);
+    const { access_token: sourceToken } = (await sourceResponse.json()) as {
+      access_token: string;
+    };
+    expect((await register(sourceToken)).status).toBe(200);
+    const listed = await ctx!.app.request(
+      `/pdpp/connections?source_id=${PUBLIC_SOURCE_ID}`,
+      { headers: { authorization: `Bearer ${limited}` } },
+    );
+    expect(listed.status).toBe(200);
+    const body = (await listed.json()) as {
+      connections: Array<{ connection_id: string }>;
+    };
+    expect(
+      body.connections.map((connection) => connection.connection_id),
+    ).toEqual([legacyId]);
   });
 
   it("does not mint source authority for aliases without a retained declaration", async () => {

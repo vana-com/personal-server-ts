@@ -31,7 +31,7 @@ import {
   writeCrashPoint,
   type CanonicalCrashPoint,
 } from "../../../lite/src/test-support/canonical-persistence.js";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { sha256 } from "viem";
 
@@ -295,7 +295,7 @@ function nodeDevice(entries = context) {
   const directory = mkdtempSync(join(tmpdir(), "node-canonical-"));
   const path = join(directory, "records.sqlite");
   let db = new Database(path);
-  let store = createSqliteRecordStore(db);
+  let store = createReplicaRecordStore(db);
   store.registerConnection({
     instance: identity.connectionId,
     sourceId: identity.sourceId,
@@ -377,7 +377,7 @@ function nodeDevice(entries = context) {
     reopen() {
       store.close();
       db = new Database(path);
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
     },
   };
 }

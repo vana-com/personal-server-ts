@@ -230,12 +230,12 @@ describe("01 Progress with retained custody, not premature availability", () => 
       method: "export",
       label: "C",
     });
-    const journal = tableRows(b.db, "pdpp_mutation_journal");
+    const journal = tableRows(b.db, "pdpp_replica_own_writes");
     wake(b, "mapping:conn");
     const woken = await step(b);
     expect(b.get()).toEqual(a.get());
     expect(woken?.waits ?? []).toEqual([]);
-    expect(tableRows(b.db, "pdpp_mutation_journal")).toEqual(journal); // no local echo
+    expect(tableRows(b.db, "pdpp_replica_own_writes")).toEqual(journal); // no local echo
     expect(workOfA()).toEqual(work); // visibility did not rewrite the import receipt
   });
 

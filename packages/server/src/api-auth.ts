@@ -126,6 +126,7 @@ export function createServerApiAuth(
   deps: ServerApiAuthDeps,
 ): PersonalServerApiAuthPort & {
   authorizeOwnerScope(input: PersonalServerScopeAuthInput): Promise<void>;
+  authorizeWrite: NonNullable<PersonalServerApiAuthPort["authorizeWrite"]>;
 } {
   const writeProofReplayStore =
     deps.writeProofReplayStore ?? createInMemoryWriteProofReplayStore();

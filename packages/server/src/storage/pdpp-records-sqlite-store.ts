@@ -1,23 +1,19 @@
-import {
-  BINARY_CHUNKS_MIGRATION,
-  binaryLength,
-  clearMalformedManifest,
-  binaryWriter,
-  readBinary,
-  verifyBinary,
-} from "./pdpp-binary-chunks.js";
+import { assertSupportedSchemaVersions } from "./schema-versions.js";
+import type { ReplicaCanonicalPort } from "./pdpp-replica-canonical-port.js";
 import type { DeclarationBinding } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
-  RECEIVER_MIGRATION,
-  REPLICA_INTEGRITY_MIGRATION,
-  REPLICA_FACT_REMOVAL_MIGRATION,
-} from "./pdpp-replication-receiver.js";
-import { REPLICA_COPY_MIGRATION } from "./pdpp-replica-copies.js";
+  parseTime,
+  timeSortKey,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
-  createReplicationJournal,
-  REPLICATION_MIGRATION,
-  type ReplicationExport,
-} from "./pdpp-replication-sqlite.js";
+  selectSyncChange,
+  decodeListCursor,
+  decodeSyncPageCursor,
+  listSnapshotPage,
+  compareRecordIdentity,
+  LIST_ORDER_COLUMNS,
+} from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
@@ -33,10 +29,6 @@ import {
   InvalidCursorError,
   BlobConflictError,
   type PdppRecordStore,
-  type CanonicalMutation,
-  type MutationJournalReader,
-  type MutationJournalPageOptions,
-  type MutationJournalPage,
   type ChangesSinceOptions,
   type ChangesSincePage,
   type IngestOutcome,
@@ -81,6 +73,43 @@ export interface PdppInstanceBinding {
   empty?: boolean;
 }
 
+export interface ClaudeTransition {
+  instance: string;
+  archiveInstance: string;
+  conversationsCovered: boolean;
+  generation: number;
+  snapshots: Partial<
+    Record<"claude.conversations" | "claude.projects", DataFileEnvelope>
+  >;
+}
+
+export type StravaTransitionScope =
+  "strava.activities" | "strava.coverage_diagnostics";
+
+/** One export-to-browser transition of a Strava connection, converged at v16. */
+export interface StravaTransition {
+  instance: string;
+  archiveInstance: string;
+  /** A completed browser run covered every saved activity id. */
+  activitiesCovered: boolean;
+  generation: number;
+  snapshots: Partial<Record<StravaTransitionScope, DataFileEnvelope>>;
+}
+
+export interface StravaTransitionInput {
+  instance: string;
+  expectedGeneration: number;
+  expectedWriteClock: number;
+  snapshots: StravaTransition["snapshots"];
+}
+
+export interface ClaudeTransitionInput {
+  instance: string;
+  expectedGeneration: number;
+  expectedWriteClock: number;
+  snapshots: ClaudeTransition["snapshots"];
+}
+
 /** Outcome of a P7 stream replace. `applied: false` means nothing was written. */
 export interface ReplaceStreamResult extends IngestResult {
   applied: boolean;
@@ -100,32 +129,9 @@ export interface StreamCompletionReceipt {
   liveCount: number;
 }
 
-const RFC3339_DATE_TIME =
-  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?(?:[Zz]|[+-](\d{2}):(\d{2}))$/;
-
-/** RFC 3339 `date-time`, with calendar-valid fields. No clock check. */
+/** Compatibility export; the portable temporal policy owns RFC3339 validity. */
 export function isRfc3339DateTime(value: unknown): value is string {
-  if (typeof value !== "string") return false;
-  const match = RFC3339_DATE_TIME.exec(value);
-  if (!match) return false;
-  const [year, month, day, hour, minute, second] = match
-    .slice(1, 7)
-    .map(Number);
-  const offsetHour = Number(match[8] ?? 0);
-  const offsetMinute = Number(match[9] ?? 0);
-  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return (
-    month >= 1 &&
-    month <= 12 &&
-    day >= 1 &&
-    day <= daysInMonth &&
-    hour <= 23 &&
-    minute <= 59 &&
-    second <= 59 &&
-    offsetHour <= 23 &&
-    offsetMinute <= 59 &&
-    !Number.isNaN(Date.parse(value))
-  );
+  return parseTime(value, "date-time") !== null;
 }
 
 export class PdppBindingError extends Error {
@@ -322,48 +328,54 @@ CREATE TABLE IF NOT EXISTS pdpp_record_arrival_clock (
 );
 INSERT OR IGNORE INTO pdpp_record_arrival_clock (id, value) VALUES (1, 0);
 `,
-  // v12: inert canonical mutation evidence, independent of query history.
+  // v12: ordered history traversal and one-key as-of lookup. The horizon
+  // index alone scans an instance's full history for every outer row.
   `
-CREATE TABLE IF NOT EXISTS pdpp_installation_writer (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  writer_id TEXT NOT NULL UNIQUE
-);
-CREATE TABLE IF NOT EXISTS pdpp_mutation_journal (
-  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-  operation_id TEXT NOT NULL UNIQUE,
-  writer_id TEXT NOT NULL,
-  source_id TEXT,
-  connection_id TEXT NOT NULL,
-  method TEXT,
-  generation INTEGER CHECK (generation > 0),
-  stream TEXT NOT NULL,
-  record_key TEXT NOT NULL,
-  operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
-  value_json TEXT NOT NULL,
-  blob_ids_json TEXT NOT NULL
-);
--- REPLACE's implicit delete need not fire DELETE triggers. Guard both identities
--- before insertion as well, independent of recursive_triggers configuration.
-CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_replace BEFORE INSERT ON pdpp_mutation_journal
-WHEN EXISTS (SELECT 1 FROM pdpp_mutation_journal
-             WHERE sequence = NEW.sequence OR operation_id = NEW.operation_id)
-BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
-CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_update BEFORE UPDATE ON pdpp_mutation_journal
-BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
-CREATE TRIGGER IF NOT EXISTS pdpp_mutation_journal_no_delete BEFORE DELETE ON pdpp_mutation_journal
-BEGIN SELECT RAISE(ABORT, 'mutation journal is append-only'); END;
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_order
+  ON pdpp_record_changes (stream, emitted_at, record_key, instance, written_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_latest
+  ON pdpp_record_changes (instance, stream, record_key, written_at DESC, version DESC);
 `,
-  REPLICATION_MIGRATION,
-  RECEIVER_MIGRATION,
-  BINARY_CHUNKS_MIGRATION +
-    `CREATE TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END;`,
-  // Replica family: integrity fences and binding-conflict facts (replica tables only).
-  REPLICA_INTEGRITY_MIGRATION,
-  // Replica family: batch copies, finalized facts, dispositions, receipts.
-  REPLICA_COPY_MIGRATION,
-  // Replica family: removing a quarantine fact raises the integrity epoch.
-  REPLICA_FACT_REMOVAL_MIGRATION,
+  // v13: an `emitted_key` that orders emitted time by instant rather than by
+  // timestamp text, for list order, list seeks and the latest stream time.
+  // `migrateToV13` applies it.
+  "",
+  // v14: one recoverable export-to-live transition per Claude connection.
+  `CREATE TABLE IF NOT EXISTS pdpp_claude_transition (
+    instance TEXT PRIMARY KEY,
+    archive_instance TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL,
+    snapshots_json TEXT NOT NULL,
+    conversations_covered INTEGER NOT NULL DEFAULT 0
+  );`,
+  // v15: expression index for the retained-history blob reference check in
+  // `deleteUnclaimedBlobs`. Without it each candidate blob scanned every
+  // history row at every writable open. `json_valid` guards the extraction:
+  // `json_extract` raises on malformed JSON, which would make this index
+  // (and every later insert of such a row) fail. The outer CAST gives the
+  // expression TEXT affinity, which the TEXT `blob_id` comparison needs before
+  // the planner will search it; a CASE alone does not provide that. Additive
+  // only; the expression must stay identical to `noRetainedHistoryReferenceSql`.
+  `
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
+  ON pdpp_record_changes (CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT));
+`,
+  // v16: converge main v15 (history index) with Desktop v15 (Strava).
+  // Either v15 database may lack the other addition; preserve both by presence.
+  `CREATE TABLE IF NOT EXISTS pdpp_strava_transition (
+    instance TEXT PRIMARY KEY,
+    archive_instance TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL,
+    snapshots_json TEXT NOT NULL,
+    activities_covered INTEGER NOT NULL DEFAULT 0
+  );
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_blob_ref
+  ON pdpp_record_changes (CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT));
+`,
 ];
+
+/** The records namespace in the shared index.db; preflight before bootstrap effects. */
+export const PDPP_RECORD_SCHEMA_VERSION = MIGRATIONS.length;
 
 function addCompletionProofColumns(db: Database): void {
   // `table_xinfo`, unlike `table_info`, also lists generated columns.
@@ -397,6 +409,35 @@ function addCompletionProofColumns(db: Database): void {
   }
 }
 
+/** `emitted_key` is `timeSortKey(emitted_at)`, written by SQL on every insert. */
+function registerTimeKey(db: Database): void {
+  db.function("pdpp_time_key", { deterministic: true }, (value: unknown) =>
+    timeSortKey(String(value)),
+  );
+}
+
+function migrateToV13(db: Database): void {
+  for (const table of ["pdpp_records", "pdpp_record_changes"]) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+    }[];
+    if (!columns.some((c) => c.name === "emitted_key")) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN emitted_key TEXT`);
+    }
+    db.exec(
+      `UPDATE ${table} SET emitted_key = pdpp_time_key(emitted_at) WHERE emitted_key IS NULL`,
+    );
+  }
+  db.exec(`
+DROP INDEX IF EXISTS idx_pdpp_record_changes_snapshot_order;
+CREATE INDEX IF NOT EXISTS idx_pdpp_record_changes_snapshot_key_order
+  ON pdpp_record_changes (stream, emitted_key, record_key, instance, written_at);
+CREATE INDEX IF NOT EXISTS idx_pdpp_records_live_instance_stream_emitted_key
+  ON pdpp_records (instance, stream, emitted_key, emitted_at)
+  WHERE deleted = 0;
+`);
+}
+
 function migrate(db: Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS pdpp_schema_version (
@@ -413,16 +454,12 @@ function migrate(db: Database): void {
     for (let v = fromVersion; v < MIGRATIONS.length; v++) {
       db.exec(MIGRATIONS[v]);
       if (v === 8) addCompletionProofColumns(db);
-      if (v === 11) {
-        db.prepare(
-          "INSERT OR IGNORE INTO pdpp_installation_writer (id, writer_id) VALUES (1, ?)",
-        ).run(randomUUID());
-      }
       if (v === 4) {
         db.prepare(
           "INSERT OR IGNORE INTO pdpp_store_metadata (id, epoch) VALUES (1, ?)",
         ).run(randomUUID());
       }
+      if (v === 12) migrateToV13(db);
     }
     db.prepare("UPDATE pdpp_schema_version SET version = ? WHERE id = 1").run(
       MIGRATIONS.length,
@@ -443,29 +480,80 @@ function migrate(db: Database): void {
 
 function sweepStaleBlobClaims(db: Database): void {
   db.transaction(() => {
+    // A method-transition archive is retained history, not a registered
+    // instance: it has no binding row, so only the transition ledger vouches
+    // for its claims. Erasing the connection drops the ledger row and claims.
     db.exec(`
       DELETE FROM pdpp_blob_claims
       WHERE NOT EXISTS (
         SELECT 1 FROM pdpp_instance_binding b
         WHERE b.instance = pdpp_blob_claims.instance
           AND b.generation = pdpp_blob_claims.generation
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM pdpp_claude_transition t
+        WHERE t.archive_instance = pdpp_blob_claims.instance
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM pdpp_strava_transition t
+        WHERE t.archive_instance = pdpp_blob_claims.instance
       );
     `);
-    deleteUnclaimedBlobs(db);
+    collectStartupUnclaimedBlobs(db);
   })();
 }
 
+/**
+ * Automatic (startup) blob collection. A history row whose JSON cannot be
+ * parsed may reference any blob, so collection is skipped while one exists.
+ * Explicit owner erasure calls `deleteUnclaimedBlobs` directly and is not
+ * gated here.
+ */
+function collectStartupUnclaimedBlobs(db: Database): void {
+  const { found } = db
+    .prepare(
+      "SELECT EXISTS (SELECT 1 FROM pdpp_record_changes WHERE NOT json_valid(data)) AS found",
+    )
+    .get() as { found: number };
+  if (found === 1) {
+    const { count } = db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM pdpp_record_changes WHERE NOT json_valid(data)",
+      )
+      .get() as { count: number };
+    console.warn(
+      `[pdpp-records] skipped startup blob collection: ${count} history row(s) hold invalid JSON, so their blob references cannot be read`,
+    );
+    return;
+  }
+  deleteUnclaimedBlobs(db);
+}
+
+/**
+ * `NOT EXISTS` predicate: no retained history row references `blobId`.
+ * The expression must match the v15 index `idx_pdpp_record_changes_blob_ref`
+ * exactly, so the planner searches by blob id rather than scanning history.
+ */
+export function noRetainedHistoryReferenceSql(blobId: string): string {
+  return `NOT EXISTS (SELECT 1 FROM pdpp_record_changes WHERE CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT) = ${blobId})`;
+}
+
 function deleteUnclaimedBlobs(db: Database): void {
+  // Claims reconstructed by v4 only cover current records. Retained history
+  // independently owns its bytes, even after overwrite or tombstone. Explicit
+  // owner erasure removes that history before calling this collector.
   db.exec(`
     DELETE FROM pdpp_blob_bytes
     WHERE blob_id IN (
       SELECT blob_id FROM pdpp_blobs b
       WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = b.blob_id)
         AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = b.blob_id AND r.deleted = 0)
+        AND ${noRetainedHistoryReferenceSql("b.blob_id")}
     );
     DELETE FROM pdpp_blobs
     WHERE NOT EXISTS (SELECT 1 FROM pdpp_blob_claims c WHERE c.blob_id = pdpp_blobs.blob_id)
-      AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = pdpp_blobs.blob_id AND r.deleted = 0);
+      AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.blob_id = pdpp_blobs.blob_id AND r.deleted = 0)
+      AND ${noRetainedHistoryReferenceSql("pdpp_blobs.blob_id")};
   `);
 }
 
@@ -574,16 +662,19 @@ function toRow(db: RecordRowDb): PdppRecordRow {
   };
 }
 
-function projectFields(
-  data: Record<string, unknown>,
-  fields: string[] | undefined,
-): Record<string, unknown> {
-  if (!fields) return data;
-  const projected: Record<string, unknown> = {};
-  for (const field of fields) {
-    if (field in data) projected[field] = data[field];
-  }
-  return projected;
+export interface SqliteReplaceStreamInput {
+  instance: string;
+  stream: string;
+  method: string;
+  generation: number;
+  emittedAt: string;
+  envelopes: PdppRecordEnvelopeInput[];
+  primaryKey: string[];
+  validateData?: RecordDataValidator;
+  /** The declaration `validateData` validates against (see ingestBatch). */
+  declaration?: DeclarationBinding;
+  sourceCollectedAt?: string;
+  completionPolicy?: "preserve_if_unchanged";
 }
 
 /**
@@ -592,31 +683,39 @@ function projectFields(
  * A readonly database must already have the current schema; no migration,
  * journal-mode change or stale-blob sweep runs. SQLite rejects write methods.
  */
-// Shared read predicate for canonical, replica-preview, and known-local projections.
-// A key fact hides rows of exactly its generation. Without `generationSql`
-// that is the binding's current generation (canonical rows). With it, it is
-// the row's own generation, for overlay and local rows that can belong to a
-// generation a pending reset introduces. Both halves use equality, so an
-// overlay row and the canonical row of one generation always agree.
-function unquarantinedRecordSql(alias: string, generationSql?: string): string {
-  const connection = `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_connections q WHERE q.instance = ${alias}.instance)`;
-  const key = (scope: string) =>
-    `NOT EXISTS (SELECT 1 FROM pdpp_replica_quarantined_keys q ${scope} q.instance=${alias}.instance AND q.stream=${alias}.stream AND q.record_key=${alias}.record_key`;
-  return generationSql === undefined
-    ? `${connection} AND ${key("JOIN pdpp_instance_binding b ON b.instance=q.instance AND b.generation=q.generation WHERE")})`
-    : `${connection} AND ${key("WHERE")} AND q.generation = (${generationSql}))`;
+/** Where the store keeps canonical blob bytes. */
+export interface CanonicalBlobBytes {
+  has(blobId: string): boolean;
+  /** The stored bytes, only when they match `meta`'s size and hash. */
+  readVerified(meta: PdppBlobMeta): Uint8Array<ArrayBuffer> | undefined;
+  /** Run first in a blob write transaction. */
+  clearMalformed(blobId: string): void;
+  write(blobId: string, bytes: Uint8Array): void;
 }
 
-export function createSqliteRecordStore(db: Database): PdppRecordStore & {
-  /** Internal synchronous observer, called after journal capture in the write transaction. */
-  setReplicaVisibilityObserver(observer: () => void): void;
-  unquarantinedRecordSql(alias: string, generationSql?: string): string;
-  changesSinceForInstances(
-    stream: string,
-    options: ChangesSinceOptions,
-    visibleInstanceIds: string[],
-  ): ChangesSincePage;
-  replication: ReplicationExport;
+export interface SqliteRecordStoreOptions {
+  /**
+   * Replication, built after the canonical schema migrated. Absent, the store
+   * reads and writes only canonical tables. See pdpp-replica-canonical-port.ts.
+   */
+  replica?: (db: Database) => ReplicaCanonicalPort;
+}
+
+export function createSqliteRecordStore(
+  db: Database,
+  options: SqliteRecordStoreOptions = {},
+): PdppRecordStore & {
+  transitionClaudeToLive(input: ClaudeTransitionInput): PdppInstanceBinding;
+  claudeTransition(instance: string): ClaudeTransition | null;
+  listClaudeTransitions(): ClaudeTransition[];
+  clearClaudeTransitionScope(scope: string): void;
+  confirmClaudeTransition(instance: string, generation: number): void;
+  transitionStravaToBrowser(input: StravaTransitionInput): PdppInstanceBinding;
+  stravaTransition(instance: string): StravaTransition | null;
+  listStravaTransitions(): StravaTransition[];
+  clearStravaTransitionScope(scope: string): void;
+  confirmStravaTransition(instance: string, generation: number): void;
+  transitionWriteClock(): number;
   listConnections(sourceId: string): PdppInstanceBinding[];
   registerConnection(input: {
     instance: string;
@@ -632,22 +731,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    * bindings, listings and pages it sees belong to one point in time.
    */
   readSnapshot<T>(read: () => T): T;
-  /** Replica integrity epoch of a connection (0 when never fenced). */
-  replicaIntegrityEpoch(connectionKey: string): number;
-  /** Raise a connection's integrity epoch inside the hiding transaction. */
-  fenceReplicaConnection(connectionKey: string): void;
-  /** True once replica evidence disagreed with the connection's binding. */
-  replicaBindingConflict(connectionId: string): boolean;
-  markReplicaBindingConflict(input: {
-    connectionId: string;
-    reason: "source_binding_conflict" | "local_mapping_conflict";
-    evidence: unknown;
-  }): boolean;
-  /** Query and integrity binding a list cursor of these connections must carry. */
-  cursorBinding(
-    instanceIds: string[],
-    fields: string[] | undefined,
-  ): { query: string; integrity: Record<string, number> };
+  /** Validate history and commit under one SQLite write reservation. */
+  writeTransaction<T>(write: () => T): T;
+  /** Last nondeleted data for every retained key; constraints for guarded repair, never disclosure. */
+  listRetainedRecordData(
+    instance: string,
+    stream: string,
+  ): { data: Record<string, unknown>; emittedAt: string }[];
   resetInstanceBinding(input: {
     instance: string;
     expectedMethod: string | null;
@@ -661,20 +751,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     bytes: Uint8Array;
     mimeType: string;
   }): PdppBlobMeta;
-  replaceStream(input: {
-    instance: string;
-    stream: string;
-    method: string;
-    generation: number;
-    emittedAt: string;
-    envelopes: PdppRecordEnvelopeInput[];
-    primaryKey: string[];
-    validateData?: RecordDataValidator;
-    /** The declaration `validateData` validates against (see ingestBatch). */
-    declaration?: DeclarationBinding;
-    sourceCollectedAt?: string;
-    completionPolicy?: "preserve_if_unchanged";
-  }): ReplaceStreamResult;
+  replaceStream(input: SqliteReplaceStreamInput): ReplaceStreamResult;
+  /** P7 replacements and their completion receipts commit together or all roll back. */
+  replaceStreams(inputs: readonly SqliteReplaceStreamInput[]): void;
   /** Completion receipts of one instance, as stored. */
   listStreamCompletions(instance: string): StreamCompletionReceipt[];
   /**
@@ -699,7 +778,17 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
    * since v8 is absent.
    */
   listArrivalOrder(instance: string, stream: string): string[];
-} & MutationJournalReader {
+  /** `changesSince` over the subset of `options.instanceIds` a reader may see. */
+  changesSinceForInstances(
+    stream: string,
+    options: ChangesSinceOptions,
+    visibleInstanceIds: string[],
+  ): ChangesSincePage;
+} {
+  assertSupportedSchemaVersions(db, PDPP_RECORD_SCHEMA_VERSION);
+  // Insert statements call it, so even a readonly handle must register it
+  // before they are prepared.
+  registerTimeKey(db);
   if (db.readonly) {
     const current = db
       .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
@@ -714,121 +803,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     migrate(db);
     sweepStaleBlobClaims(db);
   }
-
-  const writerId = (
-    db
-      .prepare("SELECT writer_id FROM pdpp_installation_writer WHERE id = 1")
-      .get() as { writer_id: string }
-  ).writer_id;
-  const replica = createReplicationJournal(db, writerId);
-  const insertMutationStmt = db.prepare(`
-    INSERT INTO pdpp_mutation_journal
-      (operation_id, writer_id, source_id, connection_id, method, generation,
-       stream, record_key, operation, value_json, blob_ids_json)
-    VALUES (@operation_id, @writer_id, @source_id, @connection_id, @method, @generation,
-            @stream, @record_key, @operation, @value_json, @blob_ids_json)
-  `);
-
-  let replicaVisibilityObserver: (() => void) | undefined;
-  // Called only inside the canonical write transaction, after current/history writes.
-  function journalMutation(
-    instance: string,
-    stream: string,
-    recordKey: string,
-    semantics?: StreamSemantics,
-    primaryKey?: string[],
-    declaration?: DeclarationBinding,
-  ): void {
-    // Do not use getInstanceBinding's synthetic defaults for a missing legacy row.
-    const binding = db
-      .prepare(
-        "SELECT source_id, method, generation FROM pdpp_instance_binding WHERE instance = ?",
-      )
-      .get(instance) as
-      Pick<BindingRowDb, "source_id" | "method" | "generation"> | undefined;
-    const record = toRow(
-      getCurrentStmt.get(instance, stream, recordKey) as RecordRowDb,
-    );
-    const blobId = record.deleted ? null : extractBlobId(record.data);
-    insertMutationStmt.run({
-      operation_id: randomUUID(),
-      writer_id: writerId,
-      source_id: binding?.source_id ?? null,
-      connection_id: instance,
-      method: binding?.method ?? null,
-      generation: binding?.generation ?? null,
-      stream,
-      record_key: recordKey,
-      operation: record.deleted ? "delete" : "upsert",
-      value_json: JSON.stringify(record),
-      blob_ids_json: JSON.stringify(blobId ? [blobId] : []),
-    });
-    replica.captureRecord(
-      instance,
-      stream,
-      recordKey,
-      semantics,
-      primaryKey,
-      declaration,
-    );
-    replicaVisibilityObserver?.();
-  }
-
-  function readMutationJournalPage(
-    options: MutationJournalPageOptions,
-  ): MutationJournalPage {
-    const afterSequence = options.afterSequence ?? 0;
-    if (
-      !Number.isSafeInteger(afterSequence) ||
-      afterSequence < 0 ||
-      !Number.isSafeInteger(options.limit) ||
-      options.limit < 1 ||
-      options.limit > 1000
-    ) {
-      throw new RangeError("Invalid mutation journal offset or limit");
-    }
-    const rows = db
-      .prepare(
-        `
-      SELECT * FROM pdpp_mutation_journal WHERE sequence > ? ORDER BY sequence LIMIT ?
-    `,
-      )
-      .all(afterSequence, options.limit + 1) as Array<{
-      sequence: number;
-      operation_id: string;
-      writer_id: string;
-      source_id: string | null;
-      connection_id: string;
-      method: string | null;
-      generation: number | null;
-      stream: string;
-      record_key: string;
-      operation: CanonicalMutation["operation"];
-      value_json: string;
-      blob_ids_json: string;
-    }>;
-    const mutations = rows
-      .slice(0, options.limit)
-      .map((row): CanonicalMutation => ({
-        sequence: row.sequence,
-        operationId: row.operation_id,
-        writerId: row.writer_id,
-        sourceId: row.source_id,
-        connectionId: row.connection_id,
-        method: row.method,
-        generation: row.generation,
-        stream: row.stream,
-        recordKey: row.record_key,
-        operation: row.operation,
-        value: JSON.parse(row.value_json),
-        blobIds: JSON.parse(row.blob_ids_json),
-      }));
-    return {
-      mutations,
-      hasMore: rows.length > options.limit,
-      nextAfterSequence: mutations.at(-1)?.sequence ?? afterSequence,
-    };
-  }
+  const replica = options.replica?.(db);
+  /** Replica quarantine filter for read SQL; empty without replication. */
+  const unquarantined = (alias: string) =>
+    replica ? ` AND ${replica.unquarantinedRecordSql(alias)}` : "";
+  /** Without replication a read needs no snapshot beyond its write horizon. */
+  const inReadSnapshot = <T>(read: () => T): T =>
+    replica ? db.transaction(read).deferred() : read();
 
   const nextWriteSeq = db.prepare(
     "UPDATE pdpp_write_clock SET value = value + 1 WHERE id = 1 RETURNING value",
@@ -843,20 +824,21 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     "SELECT * FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
   );
   const upsertCurrentStmt = db.prepare(`
-    INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, deleted, deleted_at, blob_id)
-    VALUES (@instance, @stream, @record_key, @data, @version, @emitted_at, @deleted, @deleted_at, @blob_id)
+    INSERT INTO pdpp_records (instance, stream, record_key, data, version, emitted_at, emitted_key, deleted, deleted_at, blob_id)
+    VALUES (@instance, @stream, @record_key, @data, @version, @emitted_at, pdpp_time_key(@emitted_at), @deleted, @deleted_at, @blob_id)
     ON CONFLICT (instance, stream, record_key) DO UPDATE SET
       data = excluded.data,
       version = excluded.version,
       emitted_at = excluded.emitted_at,
+      emitted_key = excluded.emitted_key,
       deleted = excluded.deleted,
       deleted_at = excluded.deleted_at,
       blob_id = excluded.blob_id
   `);
   const insertHistoryStmt = db.prepare(`
     INSERT INTO pdpp_record_changes
-      (instance, stream, record_key, version, data, emitted_at, deleted, deleted_at, written_at)
-    VALUES (@instance, @stream, @record_key, @version, @data, @emitted_at, @deleted, @deleted_at, @written_at)
+      (instance, stream, record_key, version, data, emitted_at, emitted_key, deleted, deleted_at, written_at)
+    VALUES (@instance, @stream, @record_key, @version, @data, @emitted_at, pdpp_time_key(@emitted_at), @deleted, @deleted_at, @written_at)
   `);
   const putBlobStmt = db.prepare(`
     INSERT INTO pdpp_blobs (blob_id, mime_type, size_bytes, sha256)
@@ -866,17 +848,20 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   `);
   const getBlobStmt = db.prepare("SELECT * FROM pdpp_blobs WHERE blob_id = ?");
   const findBlobRefsStmt = db.prepare(
-    `SELECT r.instance, r.stream, r.record_key FROM pdpp_records r WHERE r.blob_id = ? AND r.deleted = 0 AND ${unquarantinedRecordSql("r")}`,
+    `SELECT r.instance, r.stream, r.record_key FROM pdpp_records r WHERE r.blob_id = ? AND r.deleted = 0${unquarantined("r")}`,
   );
   const insertBlobBytesStmt = db.prepare(
     "INSERT INTO pdpp_blob_bytes (blob_id, bytes) VALUES (@blob_id, @bytes)",
+  );
+  const getBlobBytesStmt = db.prepare(
+    "SELECT bytes FROM pdpp_blob_bytes WHERE blob_id = ?",
   );
   const dropCompletionStmt = db.prepare(
     "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
   );
   function dropCompletion(instance: string, stream: string): void {
     if (dropCompletionStmt.run(instance, stream).changes > 0)
-      replica.captureInvalidation(instance, stream);
+      replica?.captureInvalidation(instance, stream);
   }
 
   const noteArrivalStmt = db.prepare(`
@@ -1022,7 +1007,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           data,
           envelope.emitted_at,
         );
-        journalMutation(
+        replica?.recordWritten(
           envelope.instance,
           envelope.stream,
           recordKey,
@@ -1066,15 +1051,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     data: Record<string, unknown> | null,
     emittedAt: string,
   ): void {
-    if (
-      db
-        .prepare(
-          "SELECT 1 FROM pdpp_replica_quarantined_keys q JOIN pdpp_instance_binding b ON q.instance = b.instance AND q.generation = b.generation WHERE q.instance = ? AND q.stream = ? AND q.record_key = ?",
-        )
-        .get(instance, stream, recordKey)
-    ) {
-      throw new PdppBindingError("replica_integrity_quarantine");
-    }
+    replica?.assertKeyWritable(instance, stream, recordKey);
     const deleted = data === null;
     const version = latestVersion(instance, stream, recordKey) + 1;
     const writtenAt = nextWriteSeq.get() as { value: number };
@@ -1117,19 +1094,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
   // receipt in the same transaction. Without it there is no receipt, and an
   // older one is deleted: it would describe a collection that is no longer
   // the latest.
-  function replaceStream(input: {
-    instance: string;
-    stream: string;
-    method: string;
-    generation: number;
-    emittedAt: string;
-    envelopes: PdppRecordEnvelopeInput[];
-    primaryKey: string[];
-    validateData?: RecordDataValidator;
-    declaration?: DeclarationBinding;
-    sourceCollectedAt?: string;
-    completionPolicy?: "preserve_if_unchanged";
-  }): ReplaceStreamResult {
+  function replaceStream(input: SqliteReplaceStreamInput): ReplaceStreamResult {
     if (
       input.sourceCollectedAt !== undefined &&
       !isRfc3339DateTime(input.sourceCollectedAt)
@@ -1145,7 +1110,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     }
     return db.transaction((): ReplaceStreamResult => {
       checkInstanceBinding(input.instance, input.method, input.generation);
-      checkStreamQuarantine(input.instance, input.stream, input.generation);
+      replica?.assertStreamWritable(
+        input.instance,
+        input.stream,
+        input.generation,
+      );
 
       const seen = new Set<string>();
       /** Live keys of the snapshot, in the order it delivered them. */
@@ -1223,7 +1192,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           write.data,
           write.emittedAt,
         );
-        journalMutation(
+        replica?.recordWritten(
           input.instance,
           input.stream,
           write.recordKey,
@@ -1247,7 +1216,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           null,
           input.emittedAt,
         );
-        journalMutation(
+        replica?.recordWritten(
           input.instance,
           input.stream,
           record_key,
@@ -1287,7 +1256,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         );
       }
       if (input.sourceCollectedAt !== undefined)
-        replica.captureCompletion(input.instance, input.stream);
+        replica?.captureCompletion(input.instance, input.stream);
       return { ...summary, applied: true, deleted: missing.length };
     })();
   }
@@ -1374,7 +1343,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     if (typeof method !== "string" || method.length === 0) {
       throw new PdppBindingError("method_required");
     }
-    checkConnectionQuarantine(instance);
+    replica?.assertConnectionWritable(instance);
     const current = ensureBinding(db, instance);
     if (current.deleted_at !== null) {
       throw new PdppBindingError("connection_deleted");
@@ -1387,34 +1356,6 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     }
     if (current.method !== method) {
       throw new PdppBindingError("instance_bound_to_other_method");
-    }
-  }
-
-  function checkConnectionQuarantine(instance: string): void {
-    if (
-      db
-        .prepare(
-          "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ?",
-        )
-        .get(instance)
-    ) {
-      throw new PdppBindingError("replica_integrity_quarantine");
-    }
-  }
-
-  function checkStreamQuarantine(
-    instance: string,
-    stream: string,
-    generation: number,
-  ): void {
-    if (
-      db
-        .prepare(
-          "SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND stream = ? AND generation = ? LIMIT 1",
-        )
-        .get(instance, stream, generation)
-    ) {
-      throw new PdppBindingError("replica_integrity_quarantine");
     }
   }
 
@@ -1482,12 +1423,303 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         resetClock,
         input.instance,
       );
-      replica.captureLifecycle(input.instance, "connection-reset");
-      replicaVisibilityObserver?.();
+      replica?.captureLifecycle(input.instance, "connection-reset");
+      replica?.notifyVisibility();
       return {
         binding: toBinding(ensureBinding(db, input.instance)),
         alreadyReset: false,
       };
+    })();
+  }
+
+  function transitionWriteClock(): number {
+    return (
+      db.prepare("SELECT value FROM pdpp_write_clock WHERE id = 1").get() as {
+        value: number;
+      }
+    ).value;
+  }
+
+  function claudeTransition(instance: string): ClaudeTransition | null {
+    const row = db
+      .prepare("SELECT * FROM pdpp_claude_transition WHERE instance = ?")
+      .get(instance) as
+      | {
+          instance: string;
+          archive_instance: string;
+          generation: number;
+          snapshots_json: string;
+          conversations_covered: number;
+        }
+      | undefined;
+    return row
+      ? {
+          instance: row.instance,
+          archiveInstance: row.archive_instance,
+          conversationsCovered: row.conversations_covered === 1,
+          generation: row.generation,
+          snapshots: JSON.parse(
+            row.snapshots_json,
+          ) as ClaudeTransition["snapshots"],
+        }
+      : null;
+  }
+
+  function listClaudeTransitions(): ClaudeTransition[] {
+    return (
+      db
+        .prepare(
+          "SELECT instance FROM pdpp_claude_transition ORDER BY instance",
+        )
+        .all() as { instance: string }[]
+    ).map((row) => claudeTransition(row.instance)!);
+  }
+
+  function confirmClaudeTransition(instance: string, generation: number): void {
+    db.prepare(
+      "UPDATE pdpp_claude_transition SET conversations_covered = 1 WHERE instance = ? AND generation = ?",
+    ).run(instance, generation);
+  }
+
+  function clearClaudeTransitionScope(scope: string): void {
+    if (scope !== "claude.conversations" && scope !== "claude.projects") return;
+    db.transaction(() => {
+      for (const transition of listClaudeTransitions()) {
+        delete transition.snapshots[scope];
+        db.prepare(
+          "UPDATE pdpp_claude_transition SET snapshots_json = ? WHERE instance = ?",
+        ).run(JSON.stringify(transition.snapshots), transition.instance);
+        const streams =
+          scope === "claude.conversations"
+            ? ["conversations", "messages"]
+            : ["projects", "project_documents"];
+        if (Object.keys(transition.snapshots).length === 0)
+          streams.push("account_profile");
+        for (const table of [
+          "pdpp_records",
+          "pdpp_record_changes",
+          "pdpp_stream_completion",
+          "pdpp_record_arrival",
+        ]) {
+          for (const stream of streams)
+            db.prepare(
+              `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
+            ).run(transition.archiveInstance, stream);
+        }
+        db.prepare(
+          `DELETE FROM pdpp_blob_claims WHERE instance = ?
+          AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
+          AND NOT EXISTS (SELECT 1 FROM pdpp_record_changes c WHERE c.instance = pdpp_blob_claims.instance AND json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id)`,
+        ).run(transition.archiveInstance);
+      }
+      deleteUnclaimedBlobs(db);
+    })();
+  }
+
+  const STRAVA_SOURCE = "https://registry.pdpp.dev/sources/strava";
+  const STRAVA_EXPORT_METHOD = "strava";
+  const STRAVA_BROWSER_METHOD = "strava-browser";
+  const STRAVA_SCOPE_STREAMS: Record<StravaTransitionScope, string> = {
+    "strava.activities": "activities",
+    "strava.coverage_diagnostics": "coverage_diagnostics",
+  };
+  /** Tables whose rows move to the archive instance on a method transition. */
+  const ARCHIVED_TABLES = [
+    "pdpp_records",
+    "pdpp_record_changes",
+    "pdpp_blob_claims",
+    "pdpp_stream_completion",
+    "pdpp_record_arrival",
+  ];
+
+  function stravaTransition(instance: string): StravaTransition | null {
+    const row = db
+      .prepare("SELECT * FROM pdpp_strava_transition WHERE instance = ?")
+      .get(instance) as
+      | {
+          instance: string;
+          archive_instance: string;
+          generation: number;
+          snapshots_json: string;
+          activities_covered: number;
+        }
+      | undefined;
+    if (!row) return null;
+    return {
+      instance: row.instance,
+      archiveInstance: row.archive_instance,
+      activitiesCovered: row.activities_covered === 1,
+      generation: row.generation,
+      snapshots: JSON.parse(
+        row.snapshots_json,
+      ) as StravaTransition["snapshots"],
+    };
+  }
+
+  function listStravaTransitions(): StravaTransition[] {
+    return (
+      db
+        .prepare(
+          "SELECT instance FROM pdpp_strava_transition ORDER BY instance",
+        )
+        .all() as { instance: string }[]
+    ).map((row) => stravaTransition(row.instance)!);
+  }
+
+  function confirmStravaTransition(instance: string, generation: number): void {
+    db.prepare(
+      "UPDATE pdpp_strava_transition SET activities_covered = 1 WHERE instance = ? AND generation = ?",
+    ).run(instance, generation);
+  }
+
+  /** A takeover reset drops the saved body and its archived rows. */
+  function clearStravaTransitionScope(scope: string): void {
+    if (!(scope in STRAVA_SCOPE_STREAMS)) return;
+    const stream = STRAVA_SCOPE_STREAMS[scope as StravaTransitionScope];
+    db.transaction(() => {
+      for (const transition of listStravaTransitions()) {
+        delete transition.snapshots[scope as StravaTransitionScope];
+        db.prepare(
+          "UPDATE pdpp_strava_transition SET snapshots_json = ? WHERE instance = ?",
+        ).run(JSON.stringify(transition.snapshots), transition.instance);
+        for (const table of ARCHIVED_TABLES) {
+          if (table === "pdpp_blob_claims") continue;
+          db.prepare(
+            `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
+          ).run(transition.archiveInstance, stream);
+        }
+        // Unreadable retained history may still reference any archived blob.
+        db.prepare(
+          `DELETE FROM pdpp_blob_claims WHERE instance = ?
+          AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
+          AND NOT EXISTS (
+            SELECT 1 FROM pdpp_record_changes c
+            WHERE c.instance = pdpp_blob_claims.instance
+              AND CASE WHEN json_valid(c.data)
+                THEN json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id
+                ELSE c.data IS NOT NULL END
+          )`,
+        ).run(transition.archiveInstance);
+      }
+      // A scope reset must retain blobs that unreadable history may reference.
+      collectStartupUnclaimedBlobs(db);
+    })();
+  }
+
+  /**
+   * Owner-authorized, one-way: archive the export rows and bind the browser
+   * method at the next generation in one transaction. Replaying the same
+   * intent after success returns the current binding and erases nothing.
+   */
+  function transitionStravaToBrowser(
+    input: StravaTransitionInput,
+  ): PdppInstanceBinding {
+    return db.transaction(() => {
+      const current = getInstanceBinding(input.instance);
+      if (current.deletedAt !== null)
+        throw new PdppBindingError("connection_deleted");
+      const previous = stravaTransition(input.instance);
+      if (
+        previous &&
+        previous.generation === input.expectedGeneration + 1 &&
+        current.method === STRAVA_BROWSER_METHOD &&
+        current.generation === previous.generation
+      )
+        return current;
+      if (
+        current.method !== STRAVA_EXPORT_METHOD ||
+        current.sourceId !== STRAVA_SOURCE
+      )
+        throw new PdppBindingError("connection_conflict");
+      if (
+        current.generation !== input.expectedGeneration ||
+        transitionWriteClock() !== input.expectedWriteClock
+      )
+        throw new PdppBindingError("binding_generation_mismatch");
+      if (previous || listConnections(current.sourceId).length !== 1)
+        throw new PdppBindingError("connection_conflict");
+      const archive = `retired-strava:${randomUUID()}`;
+      const generation = current.generation + 1;
+      db.prepare(
+        "INSERT INTO pdpp_strava_transition (instance, archive_instance, generation, snapshots_json) VALUES (?, ?, ?, ?)",
+      ).run(
+        input.instance,
+        archive,
+        generation,
+        JSON.stringify(input.snapshots),
+      );
+      // The archive is not a registered connection: it cannot accept writes.
+      for (const table of ARCHIVED_TABLES) {
+        db.prepare(`UPDATE ${table} SET instance = ? WHERE instance = ?`).run(
+          archive,
+          input.instance,
+        );
+      }
+      const clock = (nextWriteSeq.get() as { value: number }).value;
+      db.prepare(
+        "UPDATE pdpp_instance_binding SET method = ?, generation = ?, reset_clock = ? WHERE instance = ?",
+      ).run(STRAVA_BROWSER_METHOD, generation, clock, input.instance);
+      return getInstanceBinding(input.instance);
+    })();
+  }
+
+  function transitionClaudeToLive(
+    input: ClaudeTransitionInput,
+  ): PdppInstanceBinding {
+    return db.transaction(() => {
+      const current = getInstanceBinding(input.instance);
+      if (current.deletedAt !== null)
+        throw new PdppBindingError("connection_deleted");
+      const previous = claudeTransition(input.instance);
+      // Replaying the same intent must not erase a successful live import.
+      if (
+        previous &&
+        previous.generation === input.expectedGeneration + 1 &&
+        current.method === "anthropic-live" &&
+        current.generation === previous.generation
+      )
+        return current;
+      if (
+        current.method !== "anthropic" ||
+        current.sourceId !== "https://registry.pdpp.dev/sources/claude"
+      )
+        throw new PdppBindingError("connection_conflict");
+      if (
+        current.generation !== input.expectedGeneration ||
+        transitionWriteClock() !== input.expectedWriteClock
+      )
+        throw new PdppBindingError("binding_generation_mismatch");
+      if (previous || listConnections(current.sourceId).length !== 1)
+        throw new PdppBindingError("connection_conflict");
+      const archive = `retired-claude:${randomUUID()}`;
+      const generation = current.generation + 1;
+      db.prepare(
+        "INSERT INTO pdpp_claude_transition (instance, archive_instance, generation, snapshots_json) VALUES (?, ?, ?, ?)",
+      ).run(
+        input.instance,
+        archive,
+        generation,
+        JSON.stringify(input.snapshots),
+      );
+      // An archive is deliberately not a registered connection and cannot mint
+      // owner tokens or accept writes. Blob claims keep the old bytes alive.
+      for (const table of [
+        "pdpp_records",
+        "pdpp_record_changes",
+        "pdpp_blob_claims",
+        "pdpp_stream_completion",
+        "pdpp_record_arrival",
+      ]) {
+        db.prepare(`UPDATE ${table} SET instance = ? WHERE instance = ?`).run(
+          archive,
+          input.instance,
+        );
+      }
+      const clock = (nextWriteSeq.get() as { value: number }).value;
+      db.prepare(
+        "UPDATE pdpp_instance_binding SET method = 'anthropic-live', generation = ?, reset_clock = ? WHERE instance = ?",
+      ).run(generation, clock, input.instance);
+      return getInstanceBinding(input.instance);
     })();
   }
 
@@ -1525,8 +1757,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         "UPDATE pdpp_instance_binding SET source_id = ?, method = ?, label = ? WHERE instance = ?",
       ).run(input.sourceId, input.method, input.label, input.instance);
       if (current.source_id === null)
-        replica.captureLifecycle(input.instance, "connection-register");
-      replicaVisibilityObserver?.();
+        replica?.captureLifecycle(input.instance, "connection-register");
+      replica?.notifyVisibility();
       return getInstanceBinding(input.instance);
     })();
   }
@@ -1541,13 +1773,27 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       db.prepare(
         "UPDATE pdpp_instance_binding SET deleted_at = ?, generation = generation + 1, reset_clock = ? WHERE instance = ?",
       ).run(deletedAt, resetClock, instance);
-      replica.captureLifecycle(instance, "connection-delete");
-      replicaVisibilityObserver?.();
+      replica?.captureLifecycle(instance, "connection-delete");
+      replica?.notifyVisibility();
       return getInstanceBinding(instance);
     })();
   }
 
   function eraseInstanceData(instance: string): void {
+    const transition = claudeTransition(instance);
+    if (transition) {
+      db.prepare("DELETE FROM pdpp_claude_transition WHERE instance = ?").run(
+        instance,
+      );
+      eraseInstanceData(transition.archiveInstance);
+    }
+    const strava = stravaTransition(instance);
+    if (strava) {
+      db.prepare("DELETE FROM pdpp_strava_transition WHERE instance = ?").run(
+        instance,
+      );
+      eraseInstanceData(strava.archiveInstance);
+    }
     db.prepare("DELETE FROM pdpp_records WHERE instance = ?").run(instance);
     db.prepare("DELETE FROM pdpp_record_changes WHERE instance = ?").run(
       instance,
@@ -1671,14 +1917,14 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           throw new PdppBindingError("instance_bound_to_other_method");
         }
 
-        checkConnectionQuarantine(request.instance);
+        replica?.assertConnectionWritable(request.instance);
         const clock = readWriteClock();
         const requestedAt = Date.parse(request.sourceCollectedAt);
         // Validate every stream before the first receipt is written.
         const writes: { stream: string; kind: "insert" | "update" | "keep" }[] =
           [];
         for (const proof of request.streams) {
-          checkStreamQuarantine(
+          replica?.assertStreamWritable(
             request.instance,
             proof.stream,
             request.generation,
@@ -1790,7 +2036,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
 
         for (const write of writes) {
           if (write.kind !== "keep")
-            replica.captureCompletion(request.instance, write.stream);
+            replica?.captureCompletion(request.instance, write.stream);
         }
         return {
           receipts: request.streams.map((proof) => {
@@ -1829,108 +2075,20 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     return rows.map((row) => row.record_key);
   }
 
-  /**
-   * Integrity epoch of one connection: its replica fences plus its reset
-   * fence. Both only grow, so every write that can hide the connection's data
-   * (key or connection quarantine, binding conflict, reset, delete) moves it.
-   * Readers compare it inside their read snapshot.
-   */
-  function replicaIntegrityEpoch(connectionKey: string): number {
-    return (
-      db
-        .prepare(
-          `SELECT coalesce((SELECT fences FROM pdpp_replica_integrity_fences WHERE instance = ?), 0)
-           + coalesce((SELECT reset_clock FROM pdpp_instance_binding WHERE instance = ?), 0) AS epoch`,
-        )
-        .get(connectionKey, connectionKey) as { epoch: number }
-    ).epoch;
-  }
-  /** Raise the epoch. Call inside the transaction that hides the connection's data. */
-  function fenceReplicaConnection(connectionKey: string): void {
-    if (!db.inTransaction)
-      throw new Error("an integrity fence requires the hiding transaction");
-    db.prepare(
-      "INSERT INTO pdpp_replica_integrity_fences VALUES (?, 1) ON CONFLICT(instance) DO UPDATE SET fences = fences + 1",
-    ).run(connectionKey);
-  }
-  function replicaBindingConflict(connectionId: string): boolean {
-    return !!db
-      .prepare(
-        "SELECT 1 FROM pdpp_replica_binding_conflicts WHERE instance = ?",
-      )
-      .get(connectionId);
-  }
-  /**
-   * Record that a connection's evidence disagrees with its binding. The fact
-   * is append-only and puts the connection in the conflicted state (the
-   * visibility view hides it from apps; the owner sees local rows), and it
-   * raises the integrity epoch in the same transaction. Idempotent: returns
-   * true only when this call recorded it.
-   */
-  function markReplicaBindingConflict(input: {
-    connectionId: string;
-    reason: "source_binding_conflict" | "local_mapping_conflict";
-    evidence: unknown;
-  }): boolean {
-    return db.transaction(() => {
-      const recorded =
-        db
-          .prepare(
-            "INSERT OR IGNORE INTO pdpp_replica_binding_conflicts VALUES (?, ?, ?)",
-          )
-          .run(input.connectionId, input.reason, JSON.stringify(input.evidence))
-          .changes > 0;
-      if (!recorded) return false;
-      fenceReplicaConnection(input.connectionId);
-      return true;
-    })();
-  }
-  /**
-   * What a list or changes token is bound to besides its stream and store.
-   * Page cursors bind the field projection too; a terminal changes token
-   * (`fields` undefined here) may start the next session under another one.
-   */
-  function cursorBinding(instanceIds: string[], fields: string[] | undefined) {
-    const ids = [...new Set(instanceIds)].sort();
-    return {
-      query: createHash("sha256")
-        .update(JSON.stringify([ids, fields ? [...fields].sort() : null]))
-        .digest("hex"),
-      integrity: Object.fromEntries(
-        ids.map((id) => [id, replicaIntegrityEpoch(id)]),
-      ),
-    };
-  }
-  /**
-   * A token is refused for another connection set or projection, and expires
-   * when any read connection's integrity epoch moved since page 1. A token
-   * minted before integrity binding expires: it may span a quarantine.
-   */
-  function assertCursorIntegrity(
-    payload: { query?: string; integrity?: Record<string, number> },
-    instanceIds: string[],
-    fields: string[] | undefined,
-  ): void {
-    const current = cursorBinding(instanceIds, fields);
-    if (payload.query !== undefined && payload.query !== current.query)
-      throw new InvalidCursorError();
-    if (
-      payload.query === undefined ||
-      JSON.stringify(payload.integrity) !== JSON.stringify(current.integrity)
-    )
-      throw new CursorExpiredError();
-  }
-
   function getRecord(
     instance: string,
     stream: string,
     recordKey: string,
   ): PdppStoredRecord | undefined {
-    const row = db
-      .prepare(
-        `SELECT r.* FROM pdpp_records r WHERE r.instance=? AND r.stream=? AND r.record_key=? AND ${unquarantinedRecordSql("r")}`,
-      )
-      .get(instance, stream, recordKey) as RecordRowDb | undefined;
+    const row = (
+      replica
+        ? db
+            .prepare(
+              `SELECT r.* FROM pdpp_records r WHERE r.instance=? AND r.stream=? AND r.record_key=?${unquarantined("r")}`,
+            )
+            .get(instance, stream, recordKey)
+        : getCurrentStmt.get(instance, stream, recordKey)
+    ) as RecordRowDb | undefined;
     if (!row || row.deleted) return undefined;
     return toRow(row) as PdppStoredRecord;
   }
@@ -1978,82 +2136,105 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     }
   }
 
+  /** Latest version of each complete identity at one fixed write horizon. */
+  function* snapshotRows(
+    stream: string,
+    instanceIds: string[],
+    horizon: number,
+    options: {
+      order?: "asc" | "desc";
+      after?: { val: string; key: string; instance: string } | null;
+      liveOnly?: boolean;
+    } = {},
+  ): Generator<RecordRowDb & { written_at: number }> {
+    const dir = options.order === "desc" ? "DESC" : "ASC";
+    const comparison = options.order === "desc" ? "<" : ">";
+    let sql = `SELECT c.* FROM pdpp_record_changes c INDEXED BY idx_pdpp_record_changes_snapshot_key_order
+      WHERE c.stream = ? AND c.instance IN (${instanceIds.map(() => "?").join(",")}) AND c.written_at <= ?
+      AND c.version = (
+        SELECT c2.version FROM pdpp_record_changes c2 INDEXED BY idx_pdpp_record_changes_snapshot_latest
+        WHERE c2.instance = c.instance AND c2.stream = c.stream AND c2.record_key = c.record_key AND c2.written_at <= ?
+        ORDER BY c2.written_at DESC, c2.version DESC LIMIT 1
+      )`;
+    const params: unknown[] = [stream, ...instanceIds, horizon, horizon];
+    if (options.liveOnly) sql += " AND c.deleted = 0";
+    sql += unquarantined("c");
+    if (options.after) {
+      sql += ` AND (c.emitted_key, c.record_key, c.instance) ${comparison} (?, ?, ?)`;
+      params.push(
+        timeSortKey(options.after.val),
+        options.after.key,
+        options.after.instance,
+      );
+    }
+    sql += ` ORDER BY ${LIST_ORDER_COLUMNS.map((column) => `c.${column} ${dir}`).join(", ")}`;
+    for (const row of db.prepare(sql).iterate(...params))
+      yield row as RecordRowDb & { written_at: number };
+  }
+
   function listRecords(
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
-    // One read snapshot: a fence that commits meanwhile cannot mix into the
-    // page or label its cursor with the post-fence epoch.
-    return db
-      .transaction(() => listRecordsInSnapshot(stream, options))
-      .deferred();
+    // With replication, one read snapshot: a fence that commits meanwhile
+    // cannot mix into the page or label its cursor with the post-fence epoch.
+    return inReadSnapshot(() => listRecordsAtHorizon(stream, options));
   }
-  function listRecordsInSnapshot(
+  function listRecordsAtHorizon(
     stream: string,
     options: ListRecordsOptions,
   ): ListRecordsPage {
-    let startAfter: { val: string; key: string } | null = null;
+    let startAfter: { val: string; key: string; instance: string } | null =
+      null;
     let horizon: number;
     if (options.cursor) {
-      const payload = decodeCursor(options.cursor);
-      if (payload.kind !== "list") throw new InvalidCursorError();
+      const payload = decodeListCursor(options.cursor);
       assertCursorScope(payload, stream);
       if (payload.order !== options.order) throw new InvalidCursorError();
-      // Syntax first (400), then binding and integrity (410).
-      const cursorHorizon =
-        payload.horizon === undefined ? null : parseHorizon(payload.horizon);
-      assertCursorIntegrity(payload, options.instanceIds, options.fields);
-      assertNotResetSince(options.instanceIds, [cursorHorizon]);
-      // A legacy cursor that survives the fence read no reset instance; it
-      // is anchored at the current clock from here on.
-      horizon = cursorHorizon ?? readWriteClock();
-      startAfter = { val: payload.sortValue ?? "", key: payload.recordKey };
+      horizon = parseHorizon(payload.horizon);
+      replica?.assertCursorIntegrity(
+        payload,
+        options.instanceIds,
+        options.fields,
+      );
+      assertNotResetSince(options.instanceIds, [horizon]);
+      startAfter = {
+        val: payload.sortValue ?? "",
+        key: payload.recordKey,
+        instance: payload.instance,
+      };
     } else {
       horizon = readWriteClock();
     }
 
-    const placeholders = options.instanceIds.map(() => "?").join(",");
-    const dir = options.order === "asc" ? "ASC" : "DESC";
-    const cmp = options.order === "asc" ? ">" : "<";
-
-    let sql = `
-      SELECT r.* FROM pdpp_records r
-      WHERE stream = ? AND deleted = 0 AND instance IN (${placeholders}) AND ${unquarantinedRecordSql("r")}
-    `;
-    const params: unknown[] = [stream, ...options.instanceIds];
-    if (startAfter) {
-      sql += ` AND (emitted_at ${cmp} ? OR (emitted_at = ? AND record_key ${cmp} ?))`;
-      params.push(startAfter.val, startAfter.val, startAfter.key);
+    // The generator holds at most one raw row beyond the visible client page.
+    function* rows(): Generator<PdppStoredRecord> {
+      for (const row of snapshotRows(stream, options.instanceIds, horizon, {
+        order: options.order,
+        after: startAfter,
+        liveOnly: true,
+      })) {
+        yield toRow(row) as PdppStoredRecord;
+      }
     }
-    sql += ` ORDER BY emitted_at ${dir}, record_key ${dir} LIMIT ?`;
-    params.push(options.limit + 1);
-
-    const rows = db.prepare(sql).all(...params) as RecordRowDb[];
-    const hasMore = rows.length > options.limit;
-    const page = rows.slice(0, options.limit);
-    const last = page[page.length - 1];
-
-    return {
-      data: page.map((row) => {
-        const stored = toRow(row) as PdppStoredRecord;
-        return { ...stored, data: projectFields(stored.data, options.fields) };
-      }),
-      hasMore,
-      nextCursor:
-        hasMore && last
-          ? encodeCursor({
-              kind: "list",
-              stream,
-              epoch: cursorEpoch(),
-              ...cursorBinding(options.instanceIds, options.fields),
-              order: options.order,
-              sortValue: last.emitted_at,
-              recordKey: last.record_key,
-              horizon: String(horizon),
-            })
-          : undefined,
-      horizon: String(horizon),
-    };
+    const hasLaterWrites = horizon < readWriteClock();
+    const erasure =
+      db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+      WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
+    return listSnapshotPage(
+      rows(),
+      options,
+      {
+        stream,
+        epoch: cursorEpoch(),
+        ...replica?.cursorBinding(options.instanceIds, options.fields),
+        horizon: String(horizon),
+      },
+      (row) =>
+        hasLaterWrites &&
+        erasure.get(row.instance, row.stream, row.recordKey, horizon) !==
+          undefined,
+    );
   }
 
   function deleteRecord(
@@ -2095,7 +2276,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         deleted_at: deletedAt,
         written_at: writtenAt.value,
       });
-      journalMutation(instance, stream, recordKey, streamSemantics);
+      replica?.recordWritten(instance, stream, recordKey, streamSemantics);
       forgetArrivalStmt.run(instance, stream, recordKey);
       result = true;
     });
@@ -2108,16 +2289,22 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     options: ChangesSinceOptions,
     visibleInstanceIds: string[] = options.instanceIds,
   ): ChangesSincePage {
+    if (!replica)
+      return changesSinceInSnapshot(
+        stream,
+        options,
+        visibleInstanceIds,
+        undefined,
+      );
     // A new session allocates its horizon first, in its own write. The rest
     // reads one snapshot, so a concurrent fence is wholly before or after it.
-    const fresh = options.cursor
-      ? undefined
-      : (nextWriteSeq.get() as { value: number }).value;
-    return db
-      .transaction(() =>
-        changesSinceInSnapshot(stream, options, visibleInstanceIds, fresh),
-      )
-      .deferred();
+    const fresh = options.cursor ? undefined : allocateHorizon();
+    return inReadSnapshot(() =>
+      changesSinceInSnapshot(stream, options, visibleInstanceIds, fresh),
+    );
+  }
+  function allocateHorizon(): number {
+    return (nextWriteSeq.get() as { value: number }).value;
   }
   function changesSinceInSnapshot(
     stream: string,
@@ -2130,8 +2317,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     let offset = 0;
 
     if (options.cursor) {
-      const payload = decodeCursor(options.cursor);
-      if (payload.kind !== "changes_since") throw new InvalidCursorError();
+      const payload = decodeSyncPageCursor(options.cursor);
       assertCursorScope(payload, stream);
       horizon = parseHorizon(payload.horizon);
       sinceHorizon =
@@ -2139,7 +2325,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
           ? parseHorizon(payload.sinceHorizon)
           : null;
       offset = parseOffset(payload.offset);
-      assertCursorIntegrity(payload, options.instanceIds, options.fields);
+      replica?.assertCursorIntegrity(
+        payload,
+        options.instanceIds,
+        options.fields,
+      );
     } else if (options.changesSince) {
       let payload;
       try {
@@ -2152,11 +2342,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       if (payload.kind !== "changes_since") throw new InvalidCursorError();
       assertCursorScope(payload, stream);
       sinceHorizon = parseHorizon(payload.horizon);
-      assertCursorIntegrity(payload, options.instanceIds, undefined);
-      horizon = freshHorizon!;
+      replica?.assertCursorIntegrity(payload, options.instanceIds, undefined);
+      horizon = freshHorizon ?? allocateHorizon();
     } else {
       sinceHorizon = null;
-      horizon = freshHorizon!;
+      horizon = freshHorizon ?? allocateHorizon();
     }
 
     assertNotResetSince(options.instanceIds, [
@@ -2167,33 +2357,8 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     const visibleIds = [...new Set(visibleInstanceIds)].filter((id) =>
       options.instanceIds.includes(id),
     );
-    const placeholders = visibleIds.map(() => "?").join(",");
-
-    // Latest history row per key, as of the horizon.
     const latestRows = visibleIds.length
-      ? (db
-          .prepare(
-            `
-        SELECT c.* FROM pdpp_record_changes c
-        WHERE c.stream = ? AND c.instance IN (${placeholders}) AND c.written_at <= ? AND ${unquarantinedRecordSql("c")}
-        AND c.version = (
-          SELECT MAX(c2.version) FROM pdpp_record_changes c2
-          WHERE c2.stream = c.stream AND c2.instance = c.instance
-            AND c2.record_key = c.record_key AND c2.written_at <= ?
-        )
-      `,
-          )
-          .all(stream, ...visibleIds, horizon, horizon) as Array<{
-          instance: string;
-          stream: string;
-          record_key: string;
-          version: number;
-          data: string | null;
-          emitted_at: string;
-          deleted: number;
-          deleted_at: string | null;
-          written_at: number;
-        }>)
+      ? snapshotRows(stream, visibleIds, horizon)
       : [];
 
     const changed: PdppRecordRow[] = [];
@@ -2215,62 +2380,48 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         if (!wroteSincePrior) continue;
       }
 
-      if (entry.deleted) {
-        changed.push({
-          instance: entry.instance,
-          stream: entry.stream,
-          recordKey: entry.record_key,
-          version: entry.version,
-          deletedAt: entry.deleted_at ?? entry.emitted_at,
-          emittedAt: entry.emitted_at,
-          deleted: true,
-        });
-        continue;
-      }
-
-      const currentData = entry.data ? JSON.parse(entry.data) : {};
-      const projectedNow = projectFields(currentData, options.fields);
-
-      if (sinceHorizon !== null && options.fields) {
-        const priorRow = db
-          .prepare(
-            `SELECT * FROM pdpp_record_changes
-             WHERE stream = ? AND instance = ? AND record_key = ? AND written_at <= ?
-             ORDER BY version DESC LIMIT 1`,
-          )
-          .get(entry.stream, entry.instance, entry.record_key, sinceHorizon) as
-          { data: string | null; deleted: number } | undefined;
-        if (priorRow && !priorRow.deleted) {
-          const priorData = priorRow.data ? JSON.parse(priorRow.data) : {};
-          const priorProjected = projectFields(priorData, options.fields);
-          if (JSON.stringify(priorProjected) === JSON.stringify(projectedNow)) {
-            continue;
-          }
-        }
-      }
-
-      // Return the RAW (unprojected) data here, not `projectedNow`.
-      // `projectedNow`/`priorProjected` above exist only to decide
-      // eligibility (did the grant-authorized projection change) without
-      // leaking a hidden-field change. A caller enforcing time_constraint
-      // against `data` needs the real field value; projecting here would
-      // silently break that filter for any grant whose fields don't happen
-      // to include the time_constraint field. Response field projection is
-      // the caller's job, applied after any filtering on real values.
-      changed.push({
-        instance: entry.instance,
-        stream: entry.stream,
-        recordKey: entry.record_key,
-        data: currentData,
-        version: entry.version,
-        emittedAt: entry.emitted_at,
-        deleted: false,
-      });
+      const previous =
+        sinceHorizon === null
+          ? undefined
+          : (db
+              .prepare(
+                `
+        SELECT * FROM pdpp_record_changes
+        WHERE stream = ? AND instance = ? AND record_key = ? AND written_at <= ?
+        ORDER BY version DESC LIMIT 1
+      `,
+              )
+              .get(
+                entry.stream,
+                entry.instance,
+                entry.record_key,
+                sinceHorizon,
+              ) as RecordRowDb | undefined);
+      const selected = selectSyncChange(
+        toRow(entry as RecordRowDb),
+        previous ? toRow(previous) : undefined,
+        options,
+      );
+      if (selected) changed.push(selected);
     }
 
-    changed.sort((a, b) => a.recordKey.localeCompare(b.recordKey));
+    changed.sort(compareRecordIdentity);
     const page = changed.slice(offset, offset + options.limit);
     const hasMore = offset + options.limit < changed.length;
+    if (options.expireOnErasure && horizon < readWriteClock()) {
+      const erasure =
+        db.prepare(`SELECT 1 FROM pdpp_record_changes INDEXED BY idx_pdpp_record_changes_snapshot_latest
+        WHERE instance = ? AND stream = ? AND record_key = ? AND written_at > ? AND deleted = 1 LIMIT 1`);
+      if (
+        page.some(
+          (row) =>
+            !row.deleted &&
+            erasure.get(row.instance, stream, row.recordKey, horizon) !==
+              undefined,
+        )
+      )
+        throw new CursorExpiredError();
+    }
 
     return {
       data: page,
@@ -2280,10 +2431,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             kind: "changes_since",
             stream,
             epoch: cursorEpoch(),
-            ...cursorBinding(options.instanceIds, options.fields),
+            ...replica?.cursorBinding(options.instanceIds, options.fields),
             horizon: String(horizon),
             sinceHorizon: sinceHorizon !== null ? String(sinceHorizon) : null,
             offset: offset + options.limit,
+            orderKey: "code-point",
           })
         : undefined,
       nextChangesSince: hasMore
@@ -2292,7 +2444,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
             kind: "changes_since",
             stream,
             epoch: cursorEpoch(),
-            ...cursorBinding(options.instanceIds, undefined),
+            ...replica?.cursorBinding(options.instanceIds, undefined),
             horizon: String(horizon),
             sinceHorizon: null,
             offset: 0,
@@ -2304,8 +2456,9 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     const placeholders = instanceIds.map(() => "?").join(",");
     const rows = db
       .prepare(
-        `SELECT stream, COUNT(*) as count, MAX(emitted_at) as last_updated
-         FROM pdpp_records r WHERE deleted = 0 AND instance IN (${placeholders}) AND ${unquarantinedRecordSql("r")}
+        // SQLite takes a bare column from the row that holds the single MAX.
+        `SELECT stream, COUNT(*) as count, emitted_at as last_updated, MAX(emitted_key)
+         FROM pdpp_records r WHERE deleted = 0 AND instance IN (${placeholders})${unquarantined("r")}
          GROUP BY stream`,
       )
       .all(...instanceIds) as Array<{
@@ -2338,15 +2491,27 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
     };
   }
 
+  /** Canonical blob bytes: one `pdpp_blob_bytes` row, unless replication stores them. */
+  const blobBytes: CanonicalBlobBytes = replica?.blobBytes ?? {
+    has: (blobId) => getBlobBytesStmt.get(blobId) !== undefined,
+    readVerified(meta) {
+      const row = getBlobBytesStmt.get(meta.blobId) as
+        { bytes: Buffer } | undefined;
+      if (!row) return undefined;
+      const stored = new Uint8Array(row.bytes);
+      if (stored.byteLength !== meta.sizeBytes) return undefined;
+      return createHash("sha256").update(stored).digest("hex") === meta.sha256
+        ? (stored as Uint8Array<ArrayBuffer>)
+        : undefined;
+    },
+    clearMalformed: () => {},
+    write: (blobId, bytes) =>
+      insertBlobBytesStmt.run({ blob_id: blobId, bytes: Buffer.from(bytes) }),
+  };
+
   /** True only when a stored bytes row actually hash/size-matches `meta`. */
   function storedBytesVerify(meta: PdppBlobMeta): boolean {
-    return verifyBinary(
-      db,
-      "canonical",
-      meta.blobId,
-      `sha256:${meta.sha256}`,
-      meta.sizeBytes,
-    );
+    return blobBytes.readVerified(meta) !== undefined;
   }
 
   function storeBlobBytes(bytes: Uint8Array, mimeType: string): PdppBlobMeta {
@@ -2359,24 +2524,13 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
       sha256,
     };
 
-    const retainBytes = () => {
-      if (bytes.length <= 1024 * 1024)
-        insertBlobBytesStmt.run({ blob_id: blobId, bytes: Buffer.from(bytes) });
-      else {
-        const writer = binaryWriter(db, "canonical", blobId);
-        writer.write(bytes);
-        writer.finish();
-      }
-    };
-
     // The existing-row read and the write both happen inside one
     // transaction, not a check-then-upsert outside it -- otherwise two
     // concurrent writers for the same content could both see "no existing
     // row" and race to insert, or one could complete a metadata-only row
     // while another concurrently overwrites it.
     const run = db.transaction((): PdppBlobMeta => {
-      // A malformed manifest vetoes every reader; this write repairs it.
-      clearMalformedManifest(db, "canonical", blobId);
+      blobBytes.clearMalformed(blobId);
       const existing = getBlobMeta(blobId);
 
       if (existing) {
@@ -2387,11 +2541,11 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         ) {
           throw new BlobConflictError(blobId, existing);
         }
-        if (binaryLength(db, "canonical", blobId) === undefined) {
+        if (!blobBytes.has(blobId)) {
           // Metadata-only row (legacy/test fixture via putBlobMeta, or a
           // prior write that never got this far): complete it with real
           // bytes now instead of reporting a false "already stored" no-op.
-          retainBytes();
+          blobBytes.write(blobId, bytes);
           return existing;
         }
         if (!storedBytesVerify(existing)) {
@@ -2411,7 +2565,7 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
         size_bytes: candidate.sizeBytes,
         sha256: candidate.sha256,
       });
-      retainBytes();
+      blobBytes.write(blobId, bytes);
       return candidate;
     });
 
@@ -2445,46 +2599,78 @@ export function createSqliteRecordStore(db: Database): PdppRecordStore & {
          VALUES (?, ?, ?)
          ON CONFLICT (blob_id, instance) DO UPDATE SET generation = excluded.generation`,
       ).run(meta.blobId, input.instance, input.generation);
-      replica.captureBlob(input.instance, meta.blobId);
-      replicaVisibilityObserver?.();
+      replica?.captureBlob(input.instance, meta.blobId);
+      replica?.notifyVisibility();
       return meta;
     })();
   }
 
   function getBlobBytes(blobId: string): Uint8Array<ArrayBuffer> | undefined {
-    return db
-      .transaction(() => {
-        const meta = getBlobMeta(blobId);
-        if (!meta || !storedBytesVerify(meta)) return undefined;
-        // Verification and assembly share a snapshot. A forged/incomplete manifest
-        // cannot force a whole-value allocation, and concurrent writes cannot swap it.
-        return readBinary(db, "canonical", blobId);
-      })
-      .deferred();
+    // Verification and assembly share a snapshot.
+    return inReadSnapshot(() => {
+      const meta = getBlobMeta(blobId);
+      return meta ? blobBytes.readVerified(meta) : undefined;
+    });
   }
 
   return {
-    unquarantinedRecordSql,
-    setReplicaVisibilityObserver: (observer: () => void) => {
-      replicaVisibilityObserver = observer;
-    },
-    replication: replica.exporter,
-    getInstallationWriterId: () => writerId,
-    readMutationJournalPage,
+    transitionClaudeToLive,
+    claudeTransition,
+    listClaudeTransitions,
+    clearClaudeTransitionScope,
+    confirmClaudeTransition,
+    transitionStravaToBrowser,
+    stravaTransition,
+    listStravaTransitions,
+    clearStravaTransitionScope,
+    confirmStravaTransition,
+    transitionWriteClock,
     listConnections,
     registerConnection,
     deleteConnection,
     ingestBatch,
     getInstanceBinding,
+    listRetainedRecordData: (instance: string, stream: string) => {
+      const prior = db.prepare(`SELECT data FROM pdpp_record_changes
+        WHERE instance = ? AND stream = ? AND record_key = ? AND deleted = 0
+        ORDER BY version DESC LIMIT 1`);
+      const rows = db
+        .prepare(
+          `SELECT record_key, data, emitted_at FROM pdpp_records
+        WHERE instance = ? AND stream = ? ORDER BY record_key`,
+        )
+        .all(instance, stream) as {
+        record_key: string;
+        data: string | null;
+        emitted_at: string;
+      }[];
+      return rows.map((row) => {
+        const data =
+          row.data ??
+          (
+            prior.get(instance, stream, row.record_key) as
+              { data: string } | undefined
+          )?.data;
+        if (!data) throw new Error("Retained record history unavailable");
+        return {
+          data: JSON.parse(data) as Record<string, unknown>,
+          emittedAt: row.emitted_at,
+        };
+      });
+    },
     readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
-    replicaIntegrityEpoch,
-    fenceReplicaConnection,
-    replicaBindingConflict,
-    markReplicaBindingConflict,
-    cursorBinding,
+    writeTransaction: <T>(write: () => T): T =>
+      db.transaction(write).immediate(),
     resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,
+    replaceStreams: (inputs) =>
+      db.transaction(() => {
+        for (const input of inputs) {
+          if (!replaceStream(input).applied)
+            throw new Error("canonical_batch_rejected");
+        }
+      })(),
     listStreamCompletions,
     completeStreams,
     listArrivalOrder,

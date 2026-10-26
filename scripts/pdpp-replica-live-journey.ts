@@ -37,7 +37,7 @@ import type { SignTypedDataParams } from "../packages/core/src/keys/server-accou
 import { createServerSigner } from "../packages/core/src/signing/signer.js";
 import { createVanaSyncStorageAdapter } from "../packages/core/src/storage/adapters/vana.js";
 import { createGatewayDataPointFeed } from "../packages/core/src/sync/data-point-feed.js";
-import { createSqliteRecordStore } from "../packages/server/src/storage/pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "../packages/server/src/storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../packages/server/src/storage/pdpp-replication-transport.js";
 import {
@@ -205,7 +205,7 @@ export async function openReplicaRuntime(init: Init) {
   mkdirSync(init.root, { recursive: true, mode: 0o700 });
   const db = new Database(join(init.root, "records.sqlite"));
   db.pragma("journal_mode = WAL");
-  const store = createSqliteRecordStore(db);
+  const store = createReplicaRecordStore(db);
   // Trusted host provisioning is explicit and local; replicated metadata never provisions authority.
   if (
     !db

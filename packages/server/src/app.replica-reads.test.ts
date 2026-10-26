@@ -14,7 +14,7 @@ import { legacyScopeRecords } from "./pdpp/records-bootstrap.js";
 import { createIndexManager } from "./storage/index-manager.js";
 import { initializeDatabase } from "./storage/index-schema.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
-import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./storage/pdpp-replication-receiver.js";
 
 // The host composes an enabled receiver with the real app. Every
@@ -43,7 +43,7 @@ function host({
   conflictFacts = true,
 }: { epoch?: () => number; conflictFacts?: boolean } = {}) {
   const db = initializeDatabase(":memory:");
-  const store = createSqliteRecordStore(db);
+  const store = createReplicaRecordStore(db);
   store.registerConnection({ instance, sourceId, method, label: "A" });
   const declarations = [
     { sourceId, binding: declaration, validateData: () => true },

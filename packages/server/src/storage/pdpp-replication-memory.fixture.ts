@@ -4,7 +4,7 @@ import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import {
@@ -30,7 +30,7 @@ const expected = { owner, declarations: [{ sourceId, binding }] };
 const open = (role: string) => {
   const db = new Database(join(directory, `${role}.sqlite`));
   db.pragma("cache_size=-2048");
-  const store = createSqliteRecordStore(db);
+  const store = createReplicaRecordStore(db);
   store.registerConnection({
     instance: "conn",
     sourceId,

@@ -57,6 +57,10 @@ const snapshot: DeclarationSnapshot = {
       // test below is the wire-level proof.
       required_fields: ["date", "private_note"],
       consent_time_field: "date",
+      schema: {
+        type: "object",
+        properties: { date: { type: "string", format: "date-time" } },
+      },
       primary_key: ["date"],
     },
     {
@@ -114,6 +118,24 @@ function v02Body(streamOverrides: Record<string, unknown> = {}) {
   };
 }
 
+function candidateBody() {
+  return {
+    ...v02Body(),
+    authorization_details: [
+      {
+        type: "https://pdpp.dev/data-access/candidate-0.1.0",
+        source: { id: snapshot.source_id },
+        purpose_code: "https://apps.example.com/purposes/budget",
+        access_mode: "continuous",
+        streams: [
+          { name: "profile", necessity: "required", fields: ["id"] },
+          { name: "transactions", fields: ["date"] },
+        ],
+      },
+    ],
+  };
+}
+
 function post(
   path: string,
   body: unknown,
@@ -160,6 +182,7 @@ beforeEach(() => {
   app.route(
     "/pdpp/v1",
     pdppAuthRoutes({
+      protocolProfile: "candidate-0.1.0",
       logger,
       store,
       tokens,
@@ -478,4 +501,160 @@ describe("recipient commitments over the wire", () => {
     // The owner sees their own covered condition, not the client's ask.
     expect(body.review.policy.retention?.max_duration).toBe("P7D");
   });
+});
+
+describe("candidate opt-in survives HTTP review and approval", () => {
+  it.each(["approve", "decline", "field", "since", "until"])(
+    "rejects line breaks in %s names only after parsing them",
+    async (axis) => {
+      const params = new URLSearchParams();
+      params.append(
+        `${axis}[unknown\nstream]`,
+        axis === "approve" ? "true" : "date",
+      );
+      const { response } = await review(
+        `?${params.toString()}`,
+        candidateBody(),
+      );
+
+      expect(response.status).toBe(400);
+      expect((await response.json()).error).toBe("invalid_owner_choices");
+    },
+  );
+
+  it.each(["__proto__", "constructor", "toString"])(
+    "rejects %s field names as candidate owner choices",
+    async (name) => {
+      const params = new URLSearchParams();
+      params.append(`field[${name}]`, "date");
+      const { response } = await review(
+        `?${params.toString()}`,
+        candidateBody(),
+      );
+
+      expect(response.status).toBe(400);
+      expect((await response.json()).error).toBe("invalid_owner_choices");
+    },
+  );
+
+  it.each(
+    ["since", "until"].flatMap((axis) =>
+      ["__proto__", "constructor", "toString"].map((name) => [axis, name]),
+    ),
+  )("recognizes %s[%s] as an own time-range choice", async (axis, name) => {
+    const params = new URLSearchParams();
+    params.append(`${axis}[${name}]`, "2025-01-01T00:00:00Z");
+    const { response } = await review(`?${params.toString()}`, candidateBody());
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe("invalid_owner_choices");
+    if (name === "__proto__") expect(Reflect.get({}, axis)).toBeUndefined();
+  });
+
+  it.each(["__proto__", "constructor", "toString"])(
+    "accepts %s as an instance choice name without throwing",
+    async (name) => {
+      const params = new URLSearchParams();
+      params.append(`instance[${name}]`, INSTANCE);
+      const { response } = await review(
+        `?${params.toString()}`,
+        candidateBody(),
+      );
+
+      expect(response.status).toBe(200);
+    },
+  );
+
+  it("retains an optional stream only with affirmative review and approval choices", async () => {
+    const body = candidateBody();
+    const ownerToken = scopedOwnerToken();
+    const created = await post("/pdpp/v1/authorize", body);
+    expect(created.status).toBe(201);
+    const { session_id } = await created.json();
+    for (const query of [
+      "approve[transactions]=false",
+      "approve[unknown]=true",
+      "approve[transactions]=true&decline[transactions]=true",
+    ]) {
+      const invalid = await app.request(
+        `/pdpp/v1/authorize/${session_id}/review?${query}`,
+        { headers: ownerAuth(ownerToken) },
+      );
+      expect(invalid.status).toBe(400);
+      expect((await invalid.json()).error).toBe("invalid_owner_choices");
+    }
+    const defaultReview = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(defaultReview.status).toBe(200);
+    expect(
+      (await defaultReview.json()).review.data.streams.map(
+        (s: { name: string }) => s.name,
+      ),
+    ).toEqual(["profile"]);
+    const selected = await app.request(
+      `/pdpp/v1/authorize/${session_id}/review?approve[transactions]=true`,
+      { headers: ownerAuth(ownerToken) },
+    );
+    expect(selected.status).toBe(200);
+    const reviewed = await selected.json();
+    expect(
+      reviewed.review.data.streams.map((s: { name: string }) => s.name),
+    ).toEqual(["profile", "transactions"]);
+    const approved = await post(
+      `/pdpp/v1/authorize/${session_id}/approve`,
+      {
+        review_digest: reviewed.review.review_digest,
+        owner_choices: { approved_streams: ["transactions"] },
+      },
+      ownerAuth(ownerToken),
+    );
+    expect(approved.status).toBe(200);
+    const result = await approved.json();
+    const grant = store.getGrant(result.grant_id)?.grant;
+    expect(grant?.version).toBe("0.1.0-candidate");
+    expect(grant?.streams.map((s) => s.name)).toEqual([
+      "profile",
+      "transactions",
+    ]);
+  });
+});
+
+it("refuses a candidate request in the default current deployment profile", async () => {
+  const current = pdppAuthRoutes({
+    logger,
+    store,
+    tokens,
+    sessions,
+    resolveDeclaration: () => snapshot,
+    inventoryFor: () => inventory,
+    currentSubjectId: () => OWNER,
+    registeredClient: (clientId) => ({
+      client_id: clientId,
+      redirect_uris: [REDIRECT],
+    }),
+  });
+  const request = {
+    ...v02Body(),
+    authorization_details: [
+      {
+        type: "https://pdpp.dev/data-access/candidate-0.1.0",
+        source: { id: snapshot.source_id },
+        purpose_code: "https://apps.example.com/purposes/budget",
+        access_mode: "continuous",
+        streams: [{ name: "profile", necessity: "required", fields: ["id"] }],
+      },
+    ],
+  };
+  const response = await current.request("/authorize", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...ownerAuth(scopedOwnerToken()),
+    },
+    body: JSON.stringify(request),
+  });
+  expect(response.status).toBe(400);
+  expect((await response.json()).error).toBe("invalid_authorization_details");
 });

@@ -17,7 +17,7 @@ import {
   type Hex,
 } from "@opendatalabs/personal-server-ts-core/replication/copy-promotion";
 import { CursorExpiredError } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { ReplicaCopyRefused } from "./pdpp-replica-copies.js";
 
@@ -53,7 +53,7 @@ function device() {
   directories.push(directory);
   const path = join(directory, "db.sqlite");
   let db = new Database(path);
-  let store = createSqliteRecordStore(db);
+  let store = createReplicaRecordStore(db);
   for (const instance of ["conn_x", "conn_y", "conn_z", "conn_u", "conn_o"])
     store.registerConnection({
       instance,
@@ -88,7 +88,7 @@ function device() {
     reopen() {
       store.close();
       db = new Database(path);
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
       current = receiver();
     },
     close() {

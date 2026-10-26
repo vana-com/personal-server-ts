@@ -26,6 +26,7 @@ import {
   type PdppBlobMeta,
   type StreamListing,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
+import { timeSortKey } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { replicaOperationDigest } from "./pdpp-replication-sqlite.js";
 
 type Evidence = { op: ReplicaOperation; confirmed: boolean; pending: number };
@@ -53,7 +54,7 @@ type OverlayRow = {
 };
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
-const VIEW_SCHEMA = 9;
+const VIEW_SCHEMA = 10;
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -128,7 +129,7 @@ export function createReplicaVisibilityView(deps: {
     .get();
   const localIdentitySql = (alias: string) =>
     `EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=${alias}.instance AND b.deleted_at IS NULL AND b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.source_id=${alias}.source_id AND b.method=${alias}.method AND b.generation=${alias}.generation)`;
-  const localProjection = `SELECT j.connection_id,j.stream,j.record_key,json_extract(j.value_json,'$.emittedAt'),j.value_json,json_extract(j.value_json,'$.data.blob_ref.blob_id'),0,json_extract(j.value_json,'$.deleted'),NULL,j.sequence,j.generation,j.source_id,j.method FROM pdpp_mutation_journal j JOIN pdpp_instance_binding b ON b.instance=j.connection_id AND b.generation=j.generation AND b.source_id=j.source_id AND b.method=j.method WHERE b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL AND j.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND NOT EXISTS (SELECT 1 FROM pdpp_mutation_journal newer WHERE newer.connection_id=j.connection_id AND newer.generation=j.generation AND newer.stream=j.stream AND newer.record_key=j.record_key AND newer.source_id=j.source_id AND newer.method=j.method AND newer.writer_id=j.writer_id AND newer.sequence>j.sequence)`;
+  const localProjection = `SELECT j.connection_id,j.stream,j.record_key,json_extract(j.value_json,'$.emittedAt'),j.value_json,json_extract(j.value_json,'$.data.blob_ref.blob_id'),0,json_extract(j.value_json,'$.deleted'),NULL,j.sequence,j.generation,j.source_id,j.method FROM pdpp_replica_own_writes j JOIN pdpp_instance_binding b ON b.instance=j.connection_id AND b.generation=j.generation AND b.source_id=j.source_id AND b.method=j.method WHERE b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL AND j.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND NOT EXISTS (SELECT 1 FROM pdpp_replica_own_writes newer WHERE newer.connection_id=j.connection_id AND newer.generation=j.generation AND newer.stream=j.stream AND newer.record_key=j.record_key AND newer.source_id=j.source_id AND newer.method=j.method AND newer.writer_id=j.writer_id AND newer.sequence>j.sequence)`;
   // Whether a key can have an overlay row at all. Canonical writes and retained
   // record operations outside this predicate cannot change the owner preview.
   const touches = (instance: string, stream: string, key: string) =>
@@ -178,11 +179,14 @@ export function createReplicaVisibilityView(deps: {
         -- Generation of the value this row shows: a pending reset's winner can
         -- be newer than the binding. Quarantine is applied by it.
         generation INTEGER NOT NULL,
+        -- List order is the emitted instant, as on the canonical store.
+        emitted_key TEXT GENERATED ALWAYS AS (pdpp_time_key(emitted_at)) VIRTUAL,
         PRIMARY KEY(instance,stream,record_key)
       );
-      CREATE INDEX IF NOT EXISTS pdpp_replica_view_page ON pdpp_replica_view(instance,stream,emitted_at,record_key) WHERE present=1;
+      CREATE INDEX IF NOT EXISTS pdpp_replica_view_page ON pdpp_replica_view(instance,stream,emitted_key,record_key) WHERE present=1;
       CREATE INDEX IF NOT EXISTS pdpp_replica_view_blob ON pdpp_replica_view(blob_id) WHERE blob_id IS NOT NULL;
-      CREATE INDEX IF NOT EXISTS pdpp_replica_canonical_page ON pdpp_records(instance,stream,emitted_at,record_key) WHERE deleted=0;
+      DROP INDEX IF EXISTS pdpp_replica_canonical_page;
+      CREATE INDEX IF NOT EXISTS pdpp_replica_view_canonical_page ON pdpp_records(instance,stream,emitted_key,record_key) WHERE deleted=0;
       CREATE INDEX IF NOT EXISTS pdpp_replica_pending_blob ON pdpp_replica_pending_bytes(blob_id,batch_id);
       -- One summary and one monotone cursor revision per (mode table, connection, stream).
       -- Mode 1 holds the overlay's deltas against mode 0, not a second count.
@@ -293,10 +297,10 @@ export function createReplicaVisibilityView(deps: {
       const conflicted = (instance: string) =>
         `EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=${instance})`;
       db.exec(`
-      CREATE TABLE IF NOT EXISTS pdpp_replica_local_view (instance TEXT NOT NULL,stream TEXT NOT NULL,record_key TEXT NOT NULL,emitted_at TEXT NOT NULL,row_json TEXT NOT NULL,blob_id TEXT,pending INTEGER NOT NULL,deleted INTEGER NOT NULL,blob_json TEXT,sequence INTEGER NOT NULL,generation INTEGER NOT NULL,source_id TEXT NOT NULL,method TEXT NOT NULL,PRIMARY KEY(instance,stream,record_key));
-      CREATE INDEX IF NOT EXISTS pdpp_replica_local_page ON pdpp_replica_local_view(instance,stream,emitted_at,record_key) WHERE deleted=0;
+      CREATE TABLE IF NOT EXISTS pdpp_replica_local_view (instance TEXT NOT NULL,stream TEXT NOT NULL,record_key TEXT NOT NULL,emitted_at TEXT NOT NULL,row_json TEXT NOT NULL,blob_id TEXT,pending INTEGER NOT NULL,deleted INTEGER NOT NULL,blob_json TEXT,sequence INTEGER NOT NULL,generation INTEGER NOT NULL,source_id TEXT NOT NULL,method TEXT NOT NULL,emitted_key TEXT GENERATED ALWAYS AS (pdpp_time_key(emitted_at)) VIRTUAL,PRIMARY KEY(instance,stream,record_key));
+      CREATE INDEX IF NOT EXISTS pdpp_replica_local_page ON pdpp_replica_local_view(instance,stream,emitted_key,record_key) WHERE deleted=0;
       CREATE INDEX IF NOT EXISTS pdpp_replica_local_blob ON pdpp_replica_local_view(blob_id) WHERE deleted=0 AND blob_id IS NOT NULL;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_journal AFTER INSERT ON pdpp_mutation_journal
+      CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_journal AFTER INSERT ON pdpp_replica_own_writes
       WHEN ${conflicted("NEW.connection_id")} AND NEW.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=NEW.connection_id AND b.generation=NEW.generation AND b.source_id=NEW.source_id AND b.method=NEW.method AND b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL) BEGIN
         INSERT INTO pdpp_replica_local_view VALUES (NEW.connection_id,NEW.stream,NEW.record_key,json_extract(NEW.value_json,'$.emittedAt'),NEW.value_json,json_extract(NEW.value_json,'$.data.blob_ref.blob_id'),0,json_extract(NEW.value_json,'$.deleted'),NULL,NEW.sequence,NEW.generation,NEW.source_id,NEW.method)
         ON CONFLICT(instance,stream,record_key) DO UPDATE SET emitted_at=excluded.emitted_at,row_json=excluded.row_json,blob_id=excluded.blob_id,deleted=excluded.deleted,sequence=excluded.sequence,generation=excluded.generation,source_id=excluded.source_id,method=excluded.method WHERE excluded.sequence>pdpp_replica_local_view.sequence;
@@ -995,7 +999,7 @@ export function createReplicaVisibilityView(deps: {
       masked = "0",
     ) => ({
       table,
-      columns: `${alias}.instance,${alias}.stream,${alias}.record_key,${alias}.emitted_at,${json} AS row_json,'${origin}' AS origin,(${masked}) AS masked`,
+      columns: `${alias}.instance,${alias}.stream,${alias}.record_key,${alias}.emitted_at,${alias}.emitted_key,${json} AS row_json,'${origin}' AS origin,(${masked}) AS masked`,
       filter,
       masked,
     });
@@ -1157,66 +1161,101 @@ export function createReplicaVisibilityView(deps: {
           throw new InvalidCursorError();
         const dir = options.order === "asc" ? "ASC" : "DESC",
           cmp = options.order === "asc" ? ">" : "<";
-        const params: unknown[] = [];
-        const branches = ids.flatMap((instance) => {
-          const mode = modes.get(instance)!;
-          if (mode === "hidden") return [];
-          let boundary = "";
-          const bounds: unknown[] = [];
-          if (cursor) {
-            const instanceOrder = Buffer.compare(
-              Buffer.from(instance),
-              Buffer.from(cursor.instance!),
-            );
-            const equal =
-              options.order === "asc" ? instanceOrder > 0 : instanceOrder < 0;
-            boundary = ` AND (r.emitted_at,r.record_key) ${equal ? cmp + "=" : cmp} (?,?)`;
-            bounds.push(cursor.sortValue, cursor.recordKey);
+        type Position = {
+          instance: string;
+          sortValue: string | null;
+          recordKey: string;
+        };
+        type Raw = {
+          instance: string;
+          record_key: string;
+          emitted_at: string;
+          row_json: string;
+          origin: Mode;
+          masked: number;
+        };
+        // One keyset window of at most limit+1 rows after `after`, masked rows
+        // included, so each window's work is bounded by the page size, not by
+        // how many canonical rows an overlay masks. A masked row and its
+        // overlay can share a position; the overlay sorts first, so a window
+        // boundary between them loses nothing.
+        const windowAfter = (after: Position | undefined): Raw[] => {
+          const params: unknown[] = [];
+          const branches = ids.flatMap((instance) => {
+            const mode = modes.get(instance)!;
+            if (mode === "hidden") return [];
+            let boundary = "";
+            const bounds: unknown[] = [];
+            if (after) {
+              const instanceOrder = Buffer.compare(
+                Buffer.from(instance),
+                Buffer.from(after.instance),
+              );
+              const equal =
+                options.order === "asc" ? instanceOrder > 0 : instanceOrder < 0;
+              boundary = ` AND (r.emitted_key,r.record_key) ${equal ? cmp + "=" : cmp} (?,?)`;
+              bounds.push(timeSortKey(after.sortValue ?? ""), after.recordKey);
+            }
+            return sources(mode).map((source) => {
+              params.push(instance, stream, ...bounds, options.limit + 1);
+              return `SELECT * FROM (SELECT ${source.columns} FROM ${source.table} r WHERE r.instance=? AND r.stream=? AND ${source.filter}${boundary} ORDER BY r.emitted_key ${dir},r.record_key ${dir} LIMIT ?)`;
+            });
+          });
+          return branches.length
+            ? (db
+                .prepare(
+                  `SELECT * FROM (${branches.join(" UNION ALL ")}) ORDER BY emitted_key ${dir},record_key ${dir},instance ${dir},masked ASC LIMIT ?`,
+                )
+                .all(...params, options.limit + 1) as Raw[])
+            : [];
+        };
+        // Grant eligibility applies before pagination, as on the canonical
+        // store. A masked row still takes a page slot, so page work stays
+        // bounded by the page size; the page may then hold fewer than `limit`
+        // rows and the cursor continues after the last consumed position.
+        // Scan windows until one slot beyond the page proves continuation.
+        const taken: { raw: Raw; row?: ReturnType<typeof visibleRow> }[] = [];
+        let after: Position | undefined = cursor && {
+          instance: cursor.instance!,
+          sortValue: cursor.sortValue,
+          recordKey: cursor.recordKey,
+        };
+        for (;;) {
+          const rows = windowAfter(after);
+          for (const raw of rows) {
+            if (raw.masked) taken.push({ raw });
+            else {
+              const row = visibleRow(raw);
+              if (options.isVisible && !options.isVisible(row)) continue;
+              taken.push({ raw, row });
+            }
+            if (taken.length > options.limit) break;
           }
-          return sources(mode).map((source) => {
-            params.push(instance, stream, ...bounds, options.limit + 1);
-            return `SELECT * FROM (SELECT ${source.columns} FROM ${source.table} r WHERE r.instance=? AND r.stream=? AND ${source.filter}${boundary} ORDER BY r.emitted_at ${dir},r.record_key ${dir} LIMIT ?)`;
-          });
-        });
-        // Each source contributes at most limit+1 keyset rows, masked ones
-        // included, so the merged window is exact and the work is bounded by
-        // the page size, not by how many canonical rows an overlay masks. A
-        // masked row and its overlay can share a position; the overlay sorts
-        // first, so a window boundary between them loses nothing.
-        const rows = branches.length
-          ? (db
-              .prepare(
-                `SELECT * FROM (${branches.join(" UNION ALL ")}) ORDER BY emitted_at ${dir},record_key ${dir},instance ${dir},masked ASC LIMIT ?`,
-              )
-              .all(...params, options.limit + 1) as {
-              instance: string;
-              record_key: string;
-              emitted_at: string;
-              row_json: string;
-              origin: Mode;
-              masked: number;
-            }[])
-          : [];
-        // The page may hold fewer than `limit` rows; the cursor then continues
-        // after the last consumed position, visible or masked.
-        const consumed = rows.slice(0, options.limit);
-        const data = consumed
-          .filter((raw) => !raw.masked)
-          .map((raw) => {
-            const row = visibleRow(raw);
-            return options.fields && !row.deleted
-              ? {
-                  ...row,
-                  data: Object.fromEntries(
-                    options.fields
-                      .filter((field) => field in row.data)
-                      .map((field) => [field, row.data[field]]),
-                  ),
-                }
-              : row;
-          });
-        const last = consumed[consumed.length - 1],
-          hasMore = rows.length > options.limit;
+          if (taken.length > options.limit || rows.length <= options.limit)
+            break;
+          const tail = rows[rows.length - 1];
+          after = {
+            instance: tail.instance,
+            sortValue: tail.emitted_at,
+            recordKey: tail.record_key,
+          };
+        }
+        const hasMore = taken.length > options.limit;
+        const consumed = taken.slice(0, options.limit);
+        const last = consumed.at(-1)?.raw;
+        const page = consumed.flatMap(({ row }) => (row ? [{ row }] : []));
+        const data = page.map(({ row }) =>
+          options.fields && !row.deleted
+            ? {
+                ...row,
+                data: Object.fromEntries(
+                  options.fields
+                    .filter((field) => field in row.data)
+                    .map((field) => [field, row.data[field]]),
+                ),
+              }
+            : row,
+        );
         return {
           data,
           hasMore,

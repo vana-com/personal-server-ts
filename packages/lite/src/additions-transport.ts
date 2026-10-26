@@ -12,7 +12,15 @@ import {
   type ByteBudget,
 } from "@opendatalabs/personal-server-ts-core/additions";
 import { createGatewayDeleteDataPort } from "@opendatalabs/personal-server-ts-core/sync";
-import { resolveVanaStorageEndpoint } from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import {
+  resolveVanaStorageEndpoint,
+  StoredBlobConflictError,
+} from "@opendatalabs/personal-server-ts-core/storage/adapters";
+import {
+  publishPreparedVersion,
+  NeedsFencedPublicationError,
+  type PublicationRecord,
+} from "@opendatalabs/personal-server-ts-core/publication";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { RequestSigner } from "@opendatalabs/personal-server-ts-core/signing";
 import type { ServerSigner } from "@opendatalabs/personal-server-ts-core/signing";
@@ -278,72 +286,189 @@ export function createPsLiteAdditionsTransport(options: {
         throw new Error(
           "Interrupted checkpoint must be reconciled before replacement",
         );
-      if (!pending) {
-        await persistPending(prepared, budget);
-        fingerprints.set(prepared.scope, candidate);
+      const inventory = createVersionInventoryClient({
+        gatewayUrl: gateway,
+        ownerAddress: owner,
+        ownerSigner: { signRequest },
+        boundedOwnerSigner: signRequest,
+        fetch: fetcher,
+      });
+      async function readHead(): Promise<PublicationRecord | null> {
+        const page = await inventory.page(prepared.scope, { limit: 1, budget });
+        return page.data.head
+          ? { ...page.data.head, id: page.data.dataPointId }
+          : null;
       }
-      const url = blobUrl(prepared.scope, prepared.expectedVersion);
-      const authorization = await signRequest(
-        {
-          aud: options.storageAudience ?? storage,
-          method: "PUT",
-          uri: new URL(url).pathname,
-          body: prepared.encrypted,
-        },
-        budget.signal,
-      );
-      const uploaded = await fetchBounded(
-        {
-          url,
-          method: "PUT",
-          headers: [
-            ["authorization", authorization],
-            ["content-type", "application/octet-stream"],
-          ],
-          body: prepared.encrypted,
-        },
-        budget,
-      );
-      if (uploaded.status < 200 || uploaded.status >= 300)
-        throw new Error(`Checkpoint upload failed (${uploaded.status})`);
-      budget.charge();
-      const signature = await options.ownerSigner.signAddDataBounded(
-        {
-          ownerAddress: getAddress(owner),
-          scope: prepared.scope,
-          dataHash: prepared.dataHash,
-          metadataHash: prepared.metadataHash,
-          expectedVersion: BigInt(prepared.expectedVersion),
-        },
-        budget.signal,
-      );
-      budget.charge();
-      const body = new TextEncoder().encode(
-        JSON.stringify({
+      const wanted = {
+        dataHash: prepared.dataHash,
+        metadataHash: prepared.metadataHash,
+        sizeBytes: prepared.encrypted.byteLength,
+        lineage: null,
+      };
+      try {
+        const result = await publishPreparedVersion({
           ownerAddress: owner,
           scope: prepared.scope,
-          dataHash: prepared.dataHash,
-          metadataHash: prepared.metadataHash,
-          expectedVersion: prepared.expectedVersion,
-        }),
-      );
-      const registered = await fetchBounded(
-        {
-          url: `${gateway}/v1/data`,
-          method: "POST",
-          headers: [
-            ["Content-Type", "application/json"],
-            ["Authorization", `Web3Signed ${signature}`],
-          ],
-          body,
-        },
-        budget,
-      );
-      if (registered.status < 200 || registered.status >= 300)
-        throw new Error(
-          `Checkpoint registration failed (${registered.status})`,
-        );
-      // Keep the journal until the worker verifies inventory AND decrypted blob commitments.
+          preferredVersion: BigInt(prepared.expectedVersion),
+          head: await readHead(),
+          readHead,
+          async prepare() {
+            return {
+              encrypted: prepared.encrypted,
+              wanted,
+              async verifyStored(bytes) {
+                budget.charge(bytes.byteLength);
+                if (
+                  bytes.byteLength !== prepared.encrypted.byteLength ||
+                  !bytes.every(
+                    (byte, index) => byte === prepared.encrypted[index],
+                  )
+                )
+                  throw new NeedsFencedPublicationError(
+                    prepared.scope,
+                    "stored bytes differ from the authenticated checkpoint journal",
+                    false,
+                  );
+                return wanted;
+              },
+            };
+          },
+          storageAdapter: {
+            urlForKey: (key) => {
+              const slash = key.lastIndexOf("/");
+              return blobUrl(key.slice(0, slash), key.slice(slash + 1));
+            },
+            async upload(key, bytes) {
+              const version = key.slice(key.lastIndexOf("/") + 1);
+              if (
+                !fingerprints.get(prepared.scope) ||
+                version !== prepared.expectedVersion
+              ) {
+                // Rebase the durable intent before leaving bytes at the new key.
+                prepared = { ...prepared, expectedVersion: version };
+                await persistPending(prepared, budget);
+                fingerprints.set(prepared.scope, fingerprint(prepared));
+              }
+              const url = blobUrl(prepared.scope, version);
+              const authorization = await signRequest(
+                {
+                  aud: options.storageAudience ?? storage,
+                  method: "PUT",
+                  uri: new URL(url).pathname,
+                  body: bytes,
+                },
+                budget.signal,
+              );
+              const response = await fetchBounded(
+                {
+                  url,
+                  method: "PUT",
+                  headers: [
+                    ["authorization", authorization],
+                    ["content-type", "application/octet-stream"],
+                  ],
+                  body: bytes,
+                },
+                budget,
+              );
+              if (response.status === 409)
+                throw new StoredBlobConflictError(key);
+              if (response.status < 200 || response.status >= 300)
+                throw new Error(
+                  `Checkpoint upload failed (${response.status})`,
+                );
+              return url;
+            },
+            async download(url) {
+              const response = await fetchBounded({ url }, budget);
+              if (response.status < 200 || response.status >= 300)
+                throw new Error(
+                  `Checkpoint download failed (${response.status})`,
+                );
+              return response.body;
+            },
+            async exists(url) {
+              const response = await fetchBounded(
+                { url, method: "HEAD" },
+                budget,
+              );
+              if (response.status === 404) return false;
+              if (response.status < 200 || response.status >= 300)
+                throw new Error(
+                  `Checkpoint availability check failed (${response.status})`,
+                );
+              return true;
+            },
+            delete: async () => {
+              throw new Error("Publication cannot delete ciphertext");
+            },
+          },
+          signer: {
+            async signAddData(message) {
+              budget.charge();
+              const signature = await options.ownerSigner.signAddDataBounded(
+                message,
+                budget.signal,
+              );
+              budget.charge();
+              return signature;
+            },
+          },
+          gateway: {
+            async registerDataPoint({ signature, ...registration }) {
+              const body = new TextEncoder().encode(
+                JSON.stringify(registration),
+              );
+              const response = await fetchBounded(
+                {
+                  url: `${gateway}/v1/data`,
+                  method: "POST",
+                  headers: [
+                    ["Content-Type", "application/json"],
+                    ["Authorization", `Web3Signed ${signature}`],
+                  ],
+                  body,
+                },
+                budget,
+              );
+              if (response.status < 200 || response.status >= 300) {
+                const message = new TextDecoder().decode(response.body);
+                throw new Error(
+                  `Gateway error: ${response.status} Checkpoint registration failed: ${message}`,
+                );
+              }
+              const receipt = z
+                .object({ dataPointId: hash.optional(), id: hash.optional() })
+                .parse(JSON.parse(new TextDecoder().decode(response.body)));
+              return {
+                dataPointId: hash.parse(receipt.dataPointId ?? receipt.id),
+              };
+            },
+          },
+        });
+        if (
+          !fingerprints.get(prepared.scope) ||
+          String(result.version) !== prepared.expectedVersion
+        ) {
+          prepared = { ...prepared, expectedVersion: String(result.version) };
+          await persistPending(prepared, budget);
+          fingerprints.set(prepared.scope, fingerprint(prepared));
+        }
+        // Keep the journal until the worker verifies inventory AND blob commitments.
+        return {
+          expectedVersion: String(result.version),
+          dataHash: result.dataHash,
+          metadataHash: result.metadataHash,
+        };
+      } catch (error) {
+        if (error instanceof NeedsFencedPublicationError)
+          throw new NeedsFencedPublicationError(
+            error.scope,
+            error.reason,
+            false,
+          );
+        throw error;
+      }
     }
     return {
       fetch: fetchBounded,

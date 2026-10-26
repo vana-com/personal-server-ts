@@ -323,7 +323,8 @@ export function withLegacyProjection(
       !recordsMatchBindingSource(
         records,
         binding,
-        alternateLegacyBindingsForScope(scope).size > 0,
+        alternateLegacyBindingsForScope(scope).size > 0 &&
+          !(UNTAGGED_ORIGINAL_SCOPES.has(scope) && profileKey === undefined),
       )
     ) {
       failProjection(scope, collectedAt, {
@@ -499,6 +500,12 @@ function isProjectedScope(scope: string): boolean {
   return LEGACY_SCOPE_BINDINGS.has(scope);
 }
 
+/** Scopes whose untagged stored rows keep the original binding. */
+const UNTAGGED_ORIGINAL_SCOPES: ReadonlySet<string> = new Set([
+  "claude.conversations",
+  "strava.activities",
+]);
+
 function selectProjectionBinding(
   scope: string,
   rows: Record<string, unknown>[],
@@ -507,6 +514,17 @@ function selectProjectionBinding(
   const alternates = alternateLegacyBindingsForScope(scope);
   const identities = rows.map(recordSourceId);
   if (identities.includes(null)) return null;
+  // Before live-session admission, stored Claude export rows did not require
+  // identity tags. Keep that persisted contract tied to the original binding,
+  // whose account_profile join is still required. Never infer a live profile.
+  // Strava rows predate strava-browser too; both of its profiles are the
+  // same identity projection, so the original binding serves them unchanged.
+  if (
+    UNTAGGED_ORIGINAL_SCOPES.has(scope) &&
+    identities.every((identity) => identity === undefined)
+  ) {
+    return { binding: original };
+  }
   if (alternates.size > 0 && identities.includes(undefined)) return null;
   const sources = new Set(identities.filter((id): id is string => !!id));
   if (sources.size > 1) return null;

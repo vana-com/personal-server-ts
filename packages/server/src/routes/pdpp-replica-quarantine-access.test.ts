@@ -24,7 +24,7 @@ import {
   openConsentIssuer,
   openReplicaResourceServer,
 } from "./pdpp-replica-quarantine-fixture.js";
-import { createSqliteRecordStore } from "../storage/pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "../storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../storage/pdpp-replication-transport.js";
 
@@ -157,7 +157,7 @@ function record(
 async function fixture() {
   const root = mkdtempSync(join(homedir(), ".tmp/8b-quarantine-"));
   let db = new Database(join(root, "replica.sqlite"));
-  let store = createSqliteRecordStore(db);
+  let store = createReplicaRecordStore(db);
   const issuer = await openConsentIssuer(root, owner, 3600);
   let resource:
     Awaited<ReturnType<typeof openReplicaResourceServer>> | undefined;
@@ -453,7 +453,7 @@ async function fixture() {
       resource = undefined;
       store.close();
       db = new Database(join(root, "replica.sqlite"));
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
       transport = worker();
       await start();
     },

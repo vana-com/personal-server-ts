@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import {
   CursorExpiredError,
   createStreamDeclarationRegistry,
@@ -41,7 +41,7 @@ function device(registered = true, entries = declarations) {
   directories.push(directory);
   const path = join(directory, "db.sqlite");
   let db = new Database(path);
-  let store = createSqliteRecordStore(db);
+  let store = createReplicaRecordStore(db);
   if (registered)
     store.registerConnection({
       instance: "conn_a",
@@ -83,7 +83,7 @@ function device(registered = true, entries = declarations) {
     reopen() {
       if (db.open) store.close();
       db = new Database(path);
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
     },
     close() {
       if (db.open) store.close();
@@ -167,15 +167,15 @@ it("converges two fresh SQLite devices under reversed bidirectional delivery wit
   put(b, "from-b");
   const fromA = all(a),
     fromB = all(b);
-  const journalA = a.db.prepare("SELECT * FROM pdpp_mutation_journal").all();
-  const journalB = b.db.prepare("SELECT * FROM pdpp_mutation_journal").all();
+  const journalA = a.db.prepare("SELECT * FROM pdpp_replica_own_writes").all();
+  const journalB = b.db.prepare("SELECT * FROM pdpp_replica_own_writes").all();
   send(a, [...fromB].reverse());
   send(b, [...fromA].reverse());
   expect(value(a)?.data).toEqual(value(b)?.data);
-  expect(a.db.prepare("SELECT * FROM pdpp_mutation_journal").all()).toEqual(
+  expect(a.db.prepare("SELECT * FROM pdpp_replica_own_writes").all()).toEqual(
     journalA,
   );
-  expect(b.db.prepare("SELECT * FROM pdpp_mutation_journal").all()).toEqual(
+  expect(b.db.prepare("SELECT * FROM pdpp_replica_own_writes").all()).toEqual(
     journalB,
   );
   const retained = b.db
@@ -617,13 +617,15 @@ it.each([false, true])(
     // Initialize receiver schema before opening the independent process.
     d.receiver.retry({ credential: "replica-secret" });
     d.close();
-    const storeUrl = new URL("./pdpp-records-sqlite-store.ts", import.meta.url)
-      .href;
+    const storeUrl = new URL(
+      "./pdpp-replica-canonical-port.ts",
+      import.meta.url,
+    ).href;
     const receiverUrl = new URL(
       "./pdpp-replication-receiver.ts",
       import.meta.url,
     ).href;
-    const code = `import Database from 'better-sqlite3'; import {createSqliteRecordStore} from '${storeUrl}'; import {createReplicaReceiver} from '${receiverUrl}'; const db=new Database(${JSON.stringify(d.path)}); const store=createSqliteRecordStore(db); const receiver=createReplicaReceiver({db,store,owner:'owner',authenticate:()=> 'owner',declarations:()=>[{sourceId:${JSON.stringify(sourceId)},binding:${JSON.stringify(binding)},validateData:()=>true}]}); db.function('crash',()=>process.kill(process.pid,'SIGKILL')); ${afterCommit ? "" : 'db.exec("CREATE TEMP TRIGGER crash BEFORE INSERT ON pdpp_records BEGIN SELECT crash(); END");'} receiver.import({credential:'replica-secret',envelope:${JSON.stringify(batch([upsert()]))}}); process.kill(process.pid,'SIGKILL');`;
+    const code = `import Database from 'better-sqlite3'; import {createReplicaRecordStore} from '${storeUrl}'; import {createReplicaReceiver} from '${receiverUrl}'; const db=new Database(${JSON.stringify(d.path)}); const store=createReplicaRecordStore(db); const receiver=createReplicaReceiver({db,store,owner:'owner',authenticate:()=> 'owner',declarations:()=>[{sourceId:${JSON.stringify(sourceId)},binding:${JSON.stringify(binding)},validateData:()=>true}]}); db.function('crash',()=>process.kill(process.pid,'SIGKILL')); ${afterCommit ? "" : 'db.exec("CREATE TEMP TRIGGER crash BEFORE INSERT ON pdpp_records BEGIN SELECT crash(); END");'} receiver.import({credential:'replica-secret',envelope:${JSON.stringify(batch([upsert()]))}}); process.kill(process.pid,'SIGKILL');`;
     const child = spawnSync(
       process.execPath,
       ["--import", "tsx", "--input-type=module", "-e", code],
@@ -722,7 +724,7 @@ it("does not let a local collector restore an append-only quarantined record, in
     { ...upsert(21), declaration: appendBinding },
   ]);
   expect(value(d)).toBeUndefined();
-  const before = d.db.prepare("SELECT * FROM pdpp_mutation_journal").all();
+  const before = d.db.prepare("SELECT * FROM pdpp_replica_own_writes").all();
   const outbound = d.store.replication.readTailPage({ limit: 100 }).operations;
   for (const restart of [false, true]) {
     if (restart) d.reopen();
@@ -745,7 +747,7 @@ it("does not let a local collector restore an append-only quarantined record, in
       // Refusing a local write is an acceptable enforcement of quarantine.
     }
     expect(value(d)).toBeUndefined();
-    expect(d.db.prepare("SELECT * FROM pdpp_mutation_journal").all()).toEqual(
+    expect(d.db.prepare("SELECT * FROM pdpp_replica_own_writes").all()).toEqual(
       before,
     );
     expect(d.store.replication.readTailPage({ limit: 100 }).operations).toEqual(
@@ -942,14 +944,14 @@ it.each([false, true])(
     ).toBe(true);
     expect(value(d)).toBeUndefined();
     expect(d.store.getInstanceBinding("conn_a").deletedAt).toBeNull();
-    const before = d.db.prepare("SELECT * FROM pdpp_mutation_journal").all();
+    const before = d.db.prepare("SELECT * FROM pdpp_replica_own_writes").all();
     try {
       put(d, "local");
     } catch {
       /* Quarantine may explicitly refuse the write. */
     }
     expect(value(d)).toBeUndefined();
-    expect(d.db.prepare("SELECT * FROM pdpp_mutation_journal").all()).toEqual(
+    expect(d.db.prepare("SELECT * FROM pdpp_replica_own_writes").all()).toEqual(
       before,
     );
     d.reopen();
@@ -2642,7 +2644,7 @@ it("F3 page continuation seeks the full indexed tuple in canonical and preview t
   // confirmed-only grant continuation seeks the canonical keyset.
   expect(
     plans.filter((plan) =>
-      /SEARCH .*\(instance=\? AND stream=\? AND \(emitted_at,record_key\)>\(\?,\?\)\)/.test(
+      /SEARCH .*\(instance=\? AND stream=\? AND \(emitted_key,record_key\)>\(\?,\?\)\)/.test(
         plan,
       ),
     ),
@@ -2852,7 +2854,7 @@ it.each(["pending", "confirmed"] as const)(
 function installBindingConflictFixture(d: ReturnType<typeof device>) {
   d.db
     .exec(`CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS idx_pdpp_mutation_journal_local_key ON pdpp_mutation_journal(connection_id,generation,stream,record_key,sequence DESC);`);
+    CREATE INDEX IF NOT EXISTS idx_pdpp_replica_own_writes_local_key ON pdpp_replica_own_writes(connection_id,generation,stream,record_key,sequence DESC);`);
   return (instance = "conn_a") => {
     d.db
       .prepare(
@@ -2979,8 +2981,8 @@ it("account conflict keeps local tombstones, current-generation identity, and in
   const local = d.store.getRecord("conn_a", "messages", "b")!;
   d.db
     .prepare(
-      `INSERT INTO pdpp_mutation_journal(operation_id,writer_id,source_id,connection_id,method,generation,stream,record_key,operation,value_json,blob_ids_json)
-    SELECT 'foreign-journal-writer','foreign',source_id,connection_id,method,generation,stream,record_key,operation,json_set(value_json,'$.data.text','foreign'),blob_ids_json FROM pdpp_mutation_journal WHERE record_key='b' ORDER BY sequence DESC LIMIT 1`,
+      `INSERT INTO pdpp_replica_own_writes(operation_id,writer_id,source_id,connection_id,method,generation,stream,record_key,operation,value_json,blob_ids_json)
+    SELECT 'foreign-journal-writer','foreign',source_id,connection_id,method,generation,stream,record_key,operation,json_set(value_json,'$.data.text','foreign'),blob_ids_json FROM pdpp_replica_own_writes WHERE record_key='b' ORDER BY sequence DESC LIMIT 1`,
     )
     .run();
   receiver.retry({ credential: "replica-secret" });
@@ -3271,8 +3273,8 @@ it.each(["owner", "grant"] as const)(
     // invisible to the app. The fixture appends through the installation writer.
     d.db
       .prepare(
-        `INSERT INTO pdpp_mutation_journal(operation_id,writer_id,source_id,connection_id,method,generation,stream,record_key,operation,value_json,blob_ids_json)
-    SELECT 'next-local-value',writer_id,source_id,connection_id,method,generation,stream,record_key,operation,json_set(value_json,'$.data.text','new-local','$.version',2),blob_ids_json FROM pdpp_mutation_journal WHERE connection_id='conn_a' ORDER BY sequence DESC LIMIT 1`,
+        `INSERT INTO pdpp_replica_own_writes(operation_id,writer_id,source_id,connection_id,method,generation,stream,record_key,operation,value_json,blob_ids_json)
+    SELECT 'next-local-value',writer_id,source_id,connection_id,method,generation,stream,record_key,operation,json_set(value_json,'$.data.text','new-local','$.version',2),blob_ids_json FROM pdpp_replica_own_writes WHERE connection_id='conn_a' ORDER BY sequence DESC LIMIT 1`,
       )
       .run();
     expect(() =>
@@ -3836,6 +3838,17 @@ it.each([
           receiver.readStore({ reader }).getBlobBytes(blob.blobId)?.length,
       );
     expect(served()).toEqual([3, 3]);
+    if (namespace === "canonical") {
+      // Promotion stores a blob this small inline; store it chunked, as
+      // canonical storage holds a blob over 1 MiB.
+      target.db
+        .prepare("DELETE FROM pdpp_blob_bytes WHERE blob_id=?")
+        .run(blob.blobId);
+      const chunked = binaryWriter(target.db, "canonical", blob.blobId);
+      chunked.write(bytes);
+      chunked.finish();
+      expect(served()).toEqual([3, 3]);
+    }
     const size = (value: number) =>
       target.db
         .prepare(
@@ -3975,7 +3988,7 @@ it.each(["point", "page", "streams", "changes"] as const)(
     const receiver = pendingReceiver(d, false);
     const other = new Database(d.path);
     other.pragma("busy_timeout=0");
-    const otherStore = createSqliteRecordStore(other);
+    const otherStore = createReplicaRecordStore(other);
     const prepare = d.db.prepare.bind(d.db);
     let interleaved = false;
     d.db.prepare = ((sql: string) => {

@@ -3,7 +3,7 @@ import Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 
 const emittedAt = "2026-10-20T10:00:00.000Z";
 const binding = { method: "collector", generation: 1 };
@@ -17,12 +17,47 @@ const envelope = (instance = "account-a", content = "hello") => ({
 const semantics = () => "mutable_state" as const;
 const primaryKey = () => ["id"];
 
-describe("canonical mutation journal", () => {
+/** The own-write log of a replication-enabled store, oldest first. */
+function ownWrites(db: Database.Database) {
+  return (
+    db
+      .prepare("SELECT * FROM pdpp_replica_own_writes ORDER BY sequence")
+      .all() as {
+      sequence: number;
+      operation_id: string;
+      writer_id: string;
+      source_id: string | null;
+      connection_id: string;
+      method: string | null;
+      generation: number | null;
+      stream: string;
+      record_key: string;
+      operation: "upsert" | "delete";
+      value_json: string;
+      blob_ids_json: string;
+    }[]
+  ).map((row) => ({
+    sequence: row.sequence,
+    operationId: row.operation_id,
+    writerId: row.writer_id,
+    sourceId: row.source_id,
+    connectionId: row.connection_id,
+    method: row.method,
+    generation: row.generation,
+    stream: row.stream,
+    recordKey: row.record_key,
+    operation: row.operation,
+    value: JSON.parse(row.value_json),
+    blobIds: JSON.parse(row.blob_ids_json) as string[],
+  }));
+}
+
+describe("own-write log (replication enabled)", () => {
   let db: Database.Database;
-  let store: ReturnType<typeof createSqliteRecordStore>;
+  let store: ReturnType<typeof createReplicaRecordStore>;
   beforeEach(() => {
     db = new Database(":memory:");
-    store = createSqliteRecordStore(db);
+    store = createReplicaRecordStore(db);
     store.registerConnection({
       instance: "account-a",
       sourceId: "https://source.invalid/declaration",
@@ -38,10 +73,7 @@ describe("canonical mutation journal", () => {
     expect(
       store.ingestBatch([envelope()], semantics, primaryKey, binding).accepted,
     ).toBe(1);
-    const page = store.readMutationJournalPage({ limit: 10 });
-    expect(page.hasMore).toBe(false);
-    expect(page.nextAfterSequence).toBe(1);
-    expect(page.mutations).toEqual([
+    expect(ownWrites(db)).toEqual([
       {
         sequence: 1,
         operationId: expect.any(String),
@@ -70,7 +102,7 @@ describe("canonical mutation journal", () => {
   it("suppresses duplicates, append-only conflicts, schema rejects, and unclaimed blobs", () => {
     const first = envelope();
     store.ingestBatch([first], () => "append_only", primaryKey, binding);
-    const before = store.readMutationJournalPage({ limit: 10 });
+    const before = ownWrites(db);
     expect(
       store.ingestBatch([first], () => "append_only", primaryKey, binding)
         .unchanged,
@@ -109,7 +141,7 @@ describe("canonical mutation journal", () => {
     expect(
       store.ingestBatch([first], semantics, primaryKey).rejected[0].reason,
     ).toBe("method_required");
-    expect(store.readMutationJournalPage({ limit: 10 })).toEqual(before);
+    expect(ownWrites(db)).toEqual(before);
   });
 
   it("keeps identical canonical keys distinct across connections and retains old full values", () => {
@@ -127,7 +159,7 @@ describe("canonical mutation journal", () => {
       primaryKey,
       binding,
     );
-    const { mutations } = store.readMutationJournalPage({ limit: 10 });
+    const mutations = ownWrites(db);
     expect(new Set(mutations.map((m) => m.operationId)).size).toBe(3);
     expect(
       mutations.map((m) => [
@@ -146,7 +178,7 @@ describe("canonical mutation journal", () => {
     ).toEqual(["hello", "hello", "new value"]);
   });
 
-  it.each(["pdpp_mutation_journal", "pdpp_record_changes"])(
+  it.each(["pdpp_replica_own_writes", "pdpp_record_changes"])(
     "rolls back an entire ingest batch when %s insertion aborts",
     (table) => {
       db.exec(`CREATE TRIGGER fail_insert BEFORE INSERT ON ${table}
@@ -169,9 +201,7 @@ describe("canonical mutation journal", () => {
       expect(
         store.getRecord("account-a", "messages", "second"),
       ).toBeUndefined();
-      expect(store.readMutationJournalPage({ limit: 10 }).mutations).toEqual(
-        [],
-      );
+      expect(ownWrites(db)).toEqual([]);
       expect(
         db.prepare("SELECT COUNT(*) AS n FROM pdpp_record_changes").get(),
       ).toEqual({ n: 0 });
@@ -184,9 +214,7 @@ describe("canonical mutation journal", () => {
         store.ingestBatch([envelope()], semantics, primaryKey, binding)
           .accepted,
       ).toBe(1);
-      expect(
-        store.readMutationJournalPage({ limit: 10 }).mutations,
-      ).toHaveLength(1);
+      expect(ownWrites(db)).toHaveLength(1);
     },
   );
 
@@ -229,9 +257,9 @@ describe("canonical mutation journal", () => {
         "mutable_state",
       ),
     ).toBe(false);
-    const page = store.readMutationJournalPage({ limit: 10 });
-    expect(page.mutations).toHaveLength(2);
-    expect(page.mutations[1]).toMatchObject({
+    const page = ownWrites(db);
+    expect(page).toHaveLength(2);
+    expect(page[1]).toMatchObject({
       operation: "delete",
       sourceId: "https://source.invalid/declaration",
       method: "collector",
@@ -247,14 +275,14 @@ describe("canonical mutation journal", () => {
         deleted: true,
       },
     });
-    expect(page.mutations[1].value).not.toHaveProperty("data");
+    expect(page[1].value).not.toHaveProperty("data");
   });
 
-  it.each(["pdpp_mutation_journal", "pdpp_record_changes"])(
+  it.each(["pdpp_replica_own_writes", "pdpp_record_changes"])(
     "rolls back an owner delete when %s insertion aborts",
     (table) => {
       store.ingestBatch([envelope()], semantics, primaryKey, binding);
-      const before = store.readMutationJournalPage({ limit: 10 });
+      const before = ownWrites(db);
       const record = store.getRecord("account-a", "messages", "same-key");
       db.exec(`CREATE TRIGGER fail_delete BEFORE INSERT ON ${table}
       BEGIN SELECT RAISE(ABORT, 'delete failed'); END;`);
@@ -270,7 +298,7 @@ describe("canonical mutation journal", () => {
       expect(store.getRecord("account-a", "messages", "same-key")).toEqual(
         record,
       );
-      expect(store.readMutationJournalPage({ limit: 10 })).toEqual(before);
+      expect(ownWrites(db)).toEqual(before);
       expect(
         db.prepare("SELECT COUNT(*) AS n FROM pdpp_record_changes").get(),
       ).toEqual({ n: 1 });
@@ -315,7 +343,7 @@ describe("canonical mutation journal", () => {
       primaryKey,
       current,
     );
-    const { mutations } = store.readMutationJournalPage({ limit: 10 });
+    const mutations = ownWrites(db);
     expect(
       mutations.map((m) => [m.generation, m.operation, m.blobIds]),
     ).toEqual([
@@ -329,79 +357,13 @@ describe("canonical mutation journal", () => {
     });
   });
 
-  it("pages by exclusive offset and supports resuming from an empty tail", () => {
-    expect(store.readMutationJournalPage({ limit: 1 })).toEqual({
-      mutations: [],
-      hasMore: false,
-      nextAfterSequence: 0,
-    });
-    store.ingestBatch([envelope()], semantics, primaryKey, binding);
-    store.ingestBatch(
-      [envelope("account-a", "v2")],
-      semantics,
-      primaryKey,
-      binding,
-    );
-    const first = store.readMutationJournalPage({ limit: 1 });
-    expect(first.mutations.map((m) => m.sequence)).toEqual([1]);
-    expect(first.hasMore).toBe(true);
-    const second = store.readMutationJournalPage({
-      limit: 1,
-      afterSequence: first.nextAfterSequence,
-    });
-    expect(second.mutations.map((m) => m.sequence)).toEqual([2]);
-    expect(second.hasMore).toBe(false);
-    expect(
-      store.readMutationJournalPage({
-        limit: 1,
-        afterSequence: second.nextAfterSequence,
-      }),
-    ).toEqual({ mutations: [], hasMore: false, nextAfterSequence: 2 });
-    store.ingestBatch(
-      [envelope("account-a", "v3")],
-      semantics,
-      primaryKey,
-      binding,
-    );
-    expect(
-      store
-        .readMutationJournalPage({
-          limit: 1,
-          afterSequence: second.nextAfterSequence,
-        })
-        .mutations.map((m) => m.sequence),
-    ).toEqual([3]);
-    expect(
-      store.readMutationJournalPage({ limit: 1000 }).mutations,
-    ).toHaveLength(3);
-  });
-
-  it("rejects invalid page bounds instead of issuing an unbounded read", () => {
-    for (const limit of [0, -1, 1001, 1.5, NaN, Infinity]) {
-      expect(() => store.readMutationJournalPage({ limit })).toThrow(
-        RangeError,
-      );
-    }
-    for (const afterSequence of [
-      -1,
-      0.5,
-      NaN,
-      Infinity,
-      Number.MAX_SAFE_INTEGER + 1,
-    ]) {
-      expect(() =>
-        store.readMutationJournalPage({ limit: 1, afterSequence }),
-      ).toThrow(RangeError);
-    }
-  });
-
   it("is append-only and survives history erasure without changing earlier evidence", () => {
     store.ingestBatch([envelope()], semantics, primaryKey, binding);
-    const before = store.readMutationJournalPage({ limit: 10 });
+    const before = ownWrites(db);
     expect(() =>
-      db.exec("UPDATE pdpp_mutation_journal SET operation_id = 'changed'"),
+      db.exec("UPDATE pdpp_replica_own_writes SET operation_id = 'changed'"),
     ).toThrow("append-only");
-    expect(() => db.exec("DELETE FROM pdpp_mutation_journal")).toThrow(
+    expect(() => db.exec("DELETE FROM pdpp_replica_own_writes")).toThrow(
       "append-only",
     );
     store.resetInstanceBinding({
@@ -414,14 +376,14 @@ describe("canonical mutation journal", () => {
       db.prepare("SELECT COUNT(*) AS n FROM pdpp_record_changes").get(),
     ).toEqual({ n: 0 });
     store.deleteConnection("account-a");
-    expect(store.readMutationJournalPage({ limit: 10 })).toEqual(before);
+    expect(ownWrites(db)).toEqual(before);
   });
 
   it.each(["sequence", "operation_id"])(
     "rejects REPLACE by %s even with recursive triggers disabled",
     (conflict) => {
       store.ingestBatch([envelope()], semantics, primaryKey, binding);
-      const before = store.readMutationJournalPage({ limit: 10 });
+      const before = ownWrites(db);
       db.pragma("recursive_triggers = OFF");
       const columns =
         conflict === "sequence"
@@ -436,10 +398,10 @@ describe("canonical mutation journal", () => {
           : columns;
       expect(() =>
         db.exec(
-          `INSERT OR REPLACE INTO pdpp_mutation_journal (${columns}) SELECT ${values} FROM pdpp_mutation_journal`,
+          `INSERT OR REPLACE INTO pdpp_replica_own_writes (${columns}) SELECT ${values} FROM pdpp_replica_own_writes`,
         ),
       ).toThrow("append-only");
-      expect(store.readMutationJournalPage({ limit: 10 })).toEqual(before);
+      expect(ownWrites(db)).toEqual(before);
     },
   );
 
@@ -456,9 +418,7 @@ describe("canonical mutation journal", () => {
         "mutable_state",
       ),
     ).toBe(true);
-    expect(
-      store.readMutationJournalPage({ limit: 10 }).mutations[0],
-    ).toMatchObject({
+    expect(ownWrites(db)[0]).toMatchObject({
       sourceId: null,
       method: null,
       generation: null,
@@ -470,7 +430,7 @@ describe("canonical mutation journal", () => {
     const directory = mkdtempSync(join(tmpdir(), "pdpp-journal-v11-"));
     const path = join(directory, "records.sqlite");
     let historical = new Database(path);
-    let upgraded: ReturnType<typeof createSqliteRecordStore> | undefined;
+    let upgraded: ReturnType<typeof createReplicaRecordStore> | undefined;
     try {
       // Literal pre-journal v11 schema: no use of the current migration output.
       historical.exec(`
@@ -540,31 +500,33 @@ describe("canonical mutation journal", () => {
       );
       historical.close();
       historical = new Database(path);
-      upgraded = createSqliteRecordStore(historical);
+      upgraded = createReplicaRecordStore(historical);
+      // The canonical v13 migration adds the derived `emitted_key` column.
       expect(
         retained.map((table) =>
-          historical.prepare(`SELECT * FROM ${table}`).all(),
+          (
+            historical.prepare(`SELECT * FROM ${table}`).all() as Record<
+              string,
+              unknown
+            >[]
+          ).map(({ emitted_key: _derived, ...row }) => row),
         ),
       ).toEqual(before);
       expect(
         upgraded.getRecord("account-a", "messages", "same-key"),
       ).toMatchObject({ version: 1, data: { id: "same-key", content: "old" } });
-      expect(upgraded.readMutationJournalPage({ limit: 10 }).mutations).toEqual(
-        [],
-      );
+      expect(ownWrites(historical)).toEqual([]);
       const writer = upgraded.getInstallationWriterId();
       expect(writer.length).toBeGreaterThan(0);
       upgraded.close();
       historical = new Database(path);
-      upgraded = createSqliteRecordStore(historical);
+      upgraded = createReplicaRecordStore(historical);
       expect(upgraded.getInstallationWriterId()).toBe(writer);
       expect(
         upgraded.ingestBatch([envelope()], semantics, primaryKey, binding)
           .accepted,
       ).toBe(1);
-      expect(
-        upgraded.readMutationJournalPage({ limit: 10 }).mutations,
-      ).toMatchObject([
+      expect(ownWrites(historical)).toMatchObject([
         {
           sequence: 1,
           writerId: writer,
@@ -581,8 +543,16 @@ describe("canonical mutation journal", () => {
     const directory = mkdtempSync(join(tmpdir(), "pdpp-journal-"));
     const path = join(directory, "records.sqlite");
     const firstDb = new Database(path);
-    const first = createSqliteRecordStore(firstDb);
-    let second: ReturnType<typeof createSqliteRecordStore> | undefined;
+    const first = createReplicaRecordStore(firstDb);
+    let second: ReturnType<typeof createReplicaRecordStore> | undefined;
+    const readOwnWrites = () => {
+      const reader = new Database(path, { readonly: true });
+      try {
+        return ownWrites(reader);
+      } finally {
+        reader.close();
+      }
+    };
     try {
       first.registerConnection({
         instance: "account-a",
@@ -591,29 +561,29 @@ describe("canonical mutation journal", () => {
         label: "A",
       });
       first.ingestBatch([envelope()], semantics, primaryKey, binding);
-      const before = first.readMutationJournalPage({ limit: 10 });
+      const before = ownWrites(firstDb);
       const writer = first.getInstallationWriterId();
-      second = createSqliteRecordStore(new Database(path));
+      second = createReplicaRecordStore(new Database(path));
       expect(second.getInstallationWriterId()).toBe(writer);
       expect(
         second.ingestBatch([envelope()], semantics, primaryKey, binding)
           .unchanged,
       ).toBe(1);
-      expect(second.readMutationJournalPage({ limit: 10 })).toEqual(before);
+      expect(readOwnWrites()).toEqual(before);
       first.close();
       second.close();
-      second = createSqliteRecordStore(new Database(path));
+      second = createReplicaRecordStore(new Database(path));
       expect(second.getInstallationWriterId()).toBe(writer);
-      expect(second.readMutationJournalPage({ limit: 10 })).toEqual(before);
+      expect(readOwnWrites()).toEqual(before);
       expect(
         second.ingestBatch([envelope()], semantics, primaryKey, binding)
           .unchanged,
       ).toBe(1);
-      expect(second.readMutationJournalPage({ limit: 10 })).toEqual(before);
+      expect(readOwnWrites()).toEqual(before);
       expect(store.getInstallationWriterId()).not.toBe(writer);
       second.close();
-      second = createSqliteRecordStore(new Database(path, { readonly: true }));
-      expect(second.readMutationJournalPage({ limit: 10 })).toEqual(before);
+      second = createReplicaRecordStore(new Database(path, { readonly: true }));
+      expect(readOwnWrites()).toEqual(before);
     } finally {
       if (firstDb.open) first.close();
       second?.close();

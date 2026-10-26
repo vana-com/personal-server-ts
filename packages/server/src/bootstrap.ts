@@ -716,6 +716,11 @@ export async function createServer(
     serverSigner
   ) {
     additions = createDurableAdditions({
+      onPublicationBlocked: (error) =>
+        logger.warn(
+          { code: error.code, retryable: error.retryable },
+          error.message,
+        ),
       deleteSystemScope: async (scope) => {
         if (!syncManager)
           throw new Error("Durable system deletion capability unavailable");
@@ -1063,6 +1068,7 @@ export async function createServer(
     // so a scope whose data moved there is refused, not read from its stale
     // file, on a boot that does not mount the RS.
     legacyScopeView: createLegacyScopeView({
+      logger,
       authority: createLegacyScopeAuthority(db),
       records: pdppRecords && legacyScopeRecords(pdppRecords),
       // Reuse the source-scoped declarations selected by the record server.
@@ -1071,6 +1077,7 @@ export async function createServer(
       declarations: pdppRecords?.declarations,
       configuredMethods: (sourceId) =>
         pdppRecords?.configuredMethods.get(sourceId) ?? [],
+      optInMethods: new Set(config.pdpp.optInMethods),
       readLegacyHead: async (head) => {
         if (
           head.path.startsWith("/") ||
@@ -1106,6 +1113,7 @@ export async function createServer(
     mcpGrantTtlSeconds: options?.mcpGrantTtlSeconds,
     mcpConnectionStore: mcpState?.connections,
     mcpOAuthAuthorizationStore: mcpState?.authorizations,
+    mcpOAuthClientStore: mcpState?.clients,
     onServerRegistered: (serverId) => notifyServerRegistered(serverId),
     profile: options?.profile,
     jobWorker,

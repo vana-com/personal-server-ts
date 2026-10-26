@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { BlobConflictError } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 function sha256Hex(bytes: Uint8Array): string {
@@ -312,7 +313,7 @@ describe("sqlite record store: blob bytes (real on-disk database)", () => {
     const version = db
       .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
       .get() as { version: number };
-    expect(version.version).toBe(18);
+    expect(version.version).toBe(16);
 
     store.close();
   });
@@ -353,7 +354,8 @@ describe("metadata-only completion integrity", () => {
 
 it("reads legacy and chunked blobs together, detects replacement, and removes chunks on connection deletion", () => {
   const db = new Database(":memory:");
-  const store = createTestBoundRecordStore(db);
+  // Chunked canonical storage exists only with replication enabled.
+  const store = createReplicaRecordStore(db);
   try {
     store.registerConnection({
       instance: "chunks",
@@ -419,7 +421,8 @@ it("reads legacy and chunked blobs together, detects replacement, and removes ch
 
 it("rejects an incomplete matching chunk manifest before allocating its declared whole size", () => {
   const db = new Database(":memory:");
-  const store = createTestBoundRecordStore(db);
+  // Chunked canonical storage exists only with replication enabled.
+  const store = createReplicaRecordStore(db);
   try {
     const blobId = `sha256:${"a".repeat(64)}`;
     const sizeBytes = 2 ** 40;

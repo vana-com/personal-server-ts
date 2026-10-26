@@ -41,7 +41,7 @@ import {
   createFakeCanonicalPersistence,
   fakeCanonicalDisk,
 } from "../../../lite/src/test-support/canonical-persistence.js";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import {
   CrashController,
@@ -303,6 +303,21 @@ function afterSelectDatabase(
                   onSelect(sql);
                   return rows;
                 };
+              // A streamed read fires once its first row is selected.
+              if (name === "iterate")
+                return function* (...args: unknown[]) {
+                  let fired = false;
+                  for (const row of (
+                    value as (...a: unknown[]) => Iterable<unknown>
+                  ).apply(statement, args)) {
+                    if (!fired) {
+                      fired = true;
+                      onSelect(sql);
+                    }
+                    yield row;
+                  }
+                  if (!fired) onSelect(sql);
+                };
               return value.bind(statement);
             },
           });
@@ -318,7 +333,7 @@ interface LocalOptions {
   crash?: CrashController;
   hook?: (sql: string) => void;
 }
-type LocalStore = ReturnType<typeof createSqliteRecordStore>;
+type LocalStore = ReturnType<typeof createReplicaRecordStore>;
 type Semantics = "append_only" | "mutable_state";
 const at = "2026-10-20T00:00:00.000Z";
 
@@ -334,7 +349,7 @@ function nodeLocal(options: LocalOptions = {}) {
         : handle;
   let real = new Database(path);
   let db = wrap(real);
-  let store: LocalStore = createSqliteRecordStore(db);
+  let store: LocalStore = createReplicaRecordStore(db);
   for (const connection of options.connections ?? [C])
     store.registerConnection({
       instance: connection,
@@ -490,7 +505,7 @@ function nodeLocal(options: LocalOptions = {}) {
       if (real.open) real.close();
       real = new Database(path);
       db = wrap(real);
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
     },
     /** Process loss: drop every component, reopen without injection. */
     crashReopen() {
@@ -498,12 +513,12 @@ function nodeLocal(options: LocalOptions = {}) {
       options.crash?.disarm();
       real = new Database(path);
       db = real;
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
     },
     /** A second connection to the same file (a concurrent writer). */
     second() {
       const handle = new Database(path);
-      const other = createSqliteRecordStore(handle);
+      const other = createReplicaRecordStore(handle);
       closers.push(() => {
         if (handle.open) handle.close();
       });
@@ -1381,7 +1396,7 @@ describe("60 [Node SQLite] a fence that commits between row selection and the re
   }
   it("60a list: the page is wholly pre-fence or expired, and its cursor is never labelled with the post-fence epoch", () => {
     const { d, arm } = raced(
-      /FROM pdpp_records(?: r)?\s+WHERE stream = \? AND deleted = 0/,
+      /FROM pdpp_record_changes c INDEXED BY idx_pdpp_record_changes_snapshot_key_order\s+WHERE c\.stream = \?/,
     );
     arm();
     let page: ReturnType<Local["list"]> | undefined;
@@ -1410,7 +1425,7 @@ describe("60 [Node SQLite] a fence that commits between row selection and the re
   });
   it("60b changes: the page is wholly pre-fence or expired, and its terminal token expires", () => {
     const { d, arm } = raced(
-      /FROM pdpp_record_changes c\s+WHERE c\.stream = \?/,
+      /FROM pdpp_record_changes c INDEXED BY idx_pdpp_record_changes_snapshot_key_order\s+WHERE c\.stream = \?/,
     );
     arm();
     let page: ReturnType<Local["changes"]> | undefined;

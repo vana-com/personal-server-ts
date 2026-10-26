@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import {
@@ -451,7 +451,7 @@ export function transportDevice(
   const instance = opts.instance ?? "conn";
   let real = new Database(path);
   let db = opts.crash ? crashableDatabase(real, opts.crash) : real;
-  let store = createSqliteRecordStore(db);
+  let store = createReplicaRecordStore(db);
   store.registerConnection({
     instance,
     sourceId,
@@ -543,7 +543,7 @@ export function transportDevice(
       if (real.open) real.close();
       real = new Database(path);
       db = opts.crash ? crashableDatabase(real, opts.crash) : real;
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
       worker = make();
     },
     /** Process loss: drop every component without cleanup, reopen without injection. */
@@ -552,7 +552,7 @@ export function transportDevice(
       opts.crash?.disarm();
       real = new Database(path);
       db = real;
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
       worker = make();
     },
     close() {
@@ -1040,7 +1040,7 @@ export function nodeAdapter(
   const path = join(directory, "records.sqlite");
   let known = context;
   let db = new Database(path);
-  let store = createSqliteRecordStore(db);
+  let store = createReplicaRecordStore(db);
   if (provisioned)
     store.registerConnection({
       instance: provisioned.connectionId,
@@ -1096,7 +1096,7 @@ export function nodeAdapter(
     reopen() {
       store.close();
       db = new Database(path);
-      store = createSqliteRecordStore(db);
+      store = createReplicaRecordStore(db);
     },
     async point(connectionId, stream, key) {
       const row = store.getRecord(connectionId, stream, key);

@@ -5,6 +5,7 @@ import {
   binaryWriter,
   verifyBinary,
   copyBinary,
+  copyBinaryToCanonical,
   deleteBinary,
   readBinaryChunks,
   type BinaryNamespace,
@@ -36,7 +37,7 @@ import {
 import { selectStreamCompletion } from "@opendatalabs/personal-server-ts-core/replication/completion";
 import { replicaOperationDigest } from "./pdpp-replication-sqlite.js";
 import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
-import type { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import type { ReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 
 import {
   replicaStateVisible,
@@ -93,10 +94,7 @@ CREATE TRIGGER IF NOT EXISTS pdpp_quarantined_keys_removal_fence AFTER DELETE ON
 CREATE TRIGGER IF NOT EXISTS pdpp_quarantined_connections_removal_fence AFTER DELETE ON pdpp_replica_quarantined_connections BEGIN INSERT INTO pdpp_replica_integrity_fences VALUES (OLD.instance, 1) ON CONFLICT(instance) DO UPDATE SET fences = fences + 1; END;
 `;
 
-type Store = Omit<
-  ReturnType<typeof createSqliteRecordStore>,
-  "unquarantinedRecordSql"
-> & {
+type Store = Omit<ReplicaRecordStore, "unquarantinedRecordSql"> & {
   /**
    * The shared quarantine predicate. `generationSql` is the generation of the
    * aliased row's value; without it the binding's current generation applies.
@@ -327,7 +325,7 @@ export function createReplicaReceiver(deps: {
           )
         )
           throw new Error("corrupt canonical blob bytes");
-      } else copyBinary(db, bytes, blob.blobId, "canonical");
+      } else copyBinaryToCanonical(db, bytes, blob.blobId);
       db.prepare(
         "INSERT INTO pdpp_blob_claims VALUES (?, ?, ?) ON CONFLICT(blob_id, instance) DO UPDATE SET generation = excluded.generation",
       ).run(blob.blobId, operation.connectionId, operation.generation);
@@ -375,7 +373,7 @@ export function createReplicaReceiver(deps: {
         ? (operation.blobs[0]?.blobId ?? null)
         : null;
     db.prepare(
-      "INSERT INTO pdpp_records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance,stream,record_key) DO UPDATE SET data=excluded.data, version=excluded.version, emitted_at=excluded.emitted_at, deleted=excluded.deleted, deleted_at=excluded.deleted_at, blob_id=excluded.blob_id",
+      "INSERT INTO pdpp_records (instance,stream,record_key,data,version,emitted_at,emitted_key,deleted,deleted_at,blob_id) VALUES (?, ?, ?, ?, ?, ?, pdpp_time_key(?), ?, ?, ?) ON CONFLICT(instance,stream,record_key) DO UPDATE SET data=excluded.data, version=excluded.version, emitted_at=excluded.emitted_at, emitted_key=excluded.emitted_key, deleted=excluded.deleted, deleted_at=excluded.deleted_at, blob_id=excluded.blob_id",
     ).run(
       instance,
       stream,
@@ -383,18 +381,20 @@ export function createReplicaReceiver(deps: {
       data,
       version,
       emittedAt,
+      emittedAt,
       data === null ? 1 : 0,
       deletedAt,
       blobId,
     );
     db.prepare(
-      "INSERT INTO pdpp_record_changes (instance,stream,record_key,version,data,emitted_at,deleted,deleted_at,written_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO pdpp_record_changes (instance,stream,record_key,version,data,emitted_at,emitted_key,deleted,deleted_at,written_at) VALUES (?, ?, ?, ?, ?, ?, pdpp_time_key(?), ?, ?, ?)",
     ).run(
       instance,
       stream,
       key,
       version,
       data,
+      emittedAt,
       emittedAt,
       data === null ? 1 : 0,
       deletedAt,

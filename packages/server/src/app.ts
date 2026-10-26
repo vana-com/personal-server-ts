@@ -1,6 +1,10 @@
+import { ouraRoutes } from "./routes/oura.js";
+import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
+import { createStravaMethodTransition } from "./storage/strava-method-transition.js";
 import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
@@ -14,7 +18,11 @@ import type { AccessLogReader } from "@opendatalabs/personal-server-ts-core/logg
 import type { PersonalServerReadFulfillmentReporter } from "@opendatalabs/personal-server-ts-core/api";
 import { healthRoute, type HealthDeps } from "./routes/health.js";
 import { corsMiddleware } from "./middleware/cors.js";
-import { requireLoopbackListener } from "./middleware/local-listener.js";
+import {
+  arrivedOnLoopbackListener,
+  isSameOriginLoopbackRequest,
+  requireLoopbackListener,
+} from "./middleware/local-listener.js";
 import { dataRoutes } from "./routes/data.js";
 import { writeSessionRoutes } from "./routes/write-session.js";
 import {
@@ -42,6 +50,7 @@ import {
   createInMemoryMcpOAuthAuthorizationStore,
   type McpConnectionStore,
   type McpOAuthAuthorizationStore,
+  type McpOAuthClientStore,
   type McpScopeRequestApprovalUrlHook,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { uiConfigRoutes } from "./routes/ui-config.js";
@@ -195,6 +204,8 @@ export interface AppDeps {
    */
   mcpConnectionStore?: McpConnectionStore;
   mcpOAuthAuthorizationStore?: McpOAuthAuthorizationStore;
+  /** DCR client names; defaults to in-memory (lost on restart). */
+  mcpOAuthClientStore?: McpOAuthClientStore;
   mcpOAuthApprovalUrl?: string | (() => string);
   /**
    * PDPP Core v0.1 Authorization Server. Absent = the `/pdpp/v1` surface is
@@ -267,6 +278,21 @@ export interface AppDeps {
   };
 }
 
+/** MCP endpoint and its OAuth discovery documents, served on both listeners. */
+const MCP_PATH = "/mcp";
+const MCP_WELL_KNOWN_PATHS = new Set([
+  "/.well-known/oauth-protected-resource/mcp",
+  "/.well-known/oauth-authorization-server",
+]);
+
+function isMcpPath(path: string): boolean {
+  return (
+    path === MCP_PATH ||
+    path.startsWith(`${MCP_PATH}/`) ||
+    MCP_WELL_KNOWN_PATHS.has(path)
+  );
+}
+
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
 
@@ -295,6 +321,23 @@ export function createApp(deps: AppDeps): Hono {
   app.use("/ui", uiLoopbackOnly);
   app.use("/ui/*", uiLoopbackOnly);
 
+  // Local MCP gate. On the loopback listener, MCP answers only a loopback
+  // Host with no foreign browser origin (DNS rebinding, another page probing
+  // the port), and skips the wildcard CORS below: native clients need none.
+  // Tunnel requests on the main listener pass untouched.
+  const listeners = {
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
+  };
+  const isLoopbackMcp = (c: Context) =>
+    isMcpPath(c.req.path) && arrivedOnLoopbackListener(c, listeners);
+  app.use("*", async (c, next) => {
+    if (isLoopbackMcp(c) && !isSameOriginLoopbackRequest(c)) {
+      return c.notFound();
+    }
+    await next();
+  });
+
   // The whole /auth/device subtree stays out of the wildcard CORS: no other
   // origin may read the approval page or the approve/initiate responses
   // (which carry session ids). That includes /auth/device/token (the
@@ -304,10 +347,31 @@ export function createApp(deps: AppDeps): Hono {
   // so a cross-origin preflight for them must fail.
   const cors = corsMiddleware();
   app.use("*", (c, next) =>
-    c.req.path === "/auth/device" || c.req.path.startsWith("/auth/device/")
+    c.req.path === "/auth/device" ||
+    c.req.path.startsWith("/auth/device/") ||
+    isLoopbackMcp(c)
       ? next()
       : cors(c, next),
   );
+
+  const claudeTransition =
+    deps.pdpp && deps.legacyScopeView && deps.dataStorage
+      ? createClaudeMethodTransition(
+          deps.pdpp.bindingStore,
+          deps.legacyScopeView,
+          deps.dataStorage,
+        )
+      : undefined;
+  const claudeView = claudeTransition?.view ?? deps.legacyScopeView;
+  const stravaTransition =
+    deps.pdpp && claudeView && deps.dataStorage
+      ? createStravaMethodTransition(
+          deps.pdpp.bindingStore,
+          claudeView,
+          deps.dataStorage,
+        )
+      : undefined;
+  const legacyScopeView = stravaTransition?.view ?? claudeView;
 
   // Mount health route
   app.route(
@@ -346,6 +410,9 @@ export function createApp(deps: AppDeps): Hono {
         instancesForSubject: deps.pdpp.instancesForSubject!,
         instancesForSource: deps.pdpp.instancesForSource,
         configuredMethods: deps.pdpp.configuredMethods,
+        transitionClaude: claudeTransition?.transition,
+        transitionStrava: stravaTransition?.transition,
+        stravaTransitionStatus: stravaTransition?.status,
       }),
     );
     app.route(
@@ -428,6 +495,8 @@ export function createApp(deps: AppDeps): Hono {
     );
   }
 
+  app.route("/v1/import/oura-browser", ouraRoutes(deps));
+
   // Mount data routes (ingest + read + delete)
   app.route(
     "/v1/data",
@@ -448,7 +517,7 @@ export function createApp(deps: AppDeps): Hono {
       scopeDeletions: deps.scopeDeletions,
       runtimeAvailability: deps.runtimeAvailability,
       dataStorage: deps.dataStorage,
-      legacyScopeView: deps.legacyScopeView,
+      legacyScopeView,
       // Powers the RECORD_DATA_ACCESS attestation embedded in X402 challenges.
       serverSigner: deps.serverSigner,
       serverAddress: deps.identity?.address,
@@ -609,9 +678,12 @@ export function createApp(deps: AppDeps): Hono {
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,
+    oauthClientStore: deps.mcpOAuthClientStore,
     oauthApprovalUrl: deps.mcpOAuthApprovalUrl,
     scopeRequestApprovalUrl: deps.mcpScopeRequestApprovalUrl,
     activityRecorder: mcpActivityRecorder,
+    localApprovalPort: deps.localApprovalPort,
+    serverPort: deps.serverPort,
   };
 
   app.route("/", mcpOAuthRoutes(mcpRouteDeps));
@@ -702,7 +774,10 @@ export function createApp(deps: AppDeps): Hono {
     // keeps it distinct from the bare well-known the MCP AS owns.
     app.get(
       "/.well-known/oauth-authorization-server/pdpp/v1",
-      pdppAsMetadataHandler(deps.pdppAuth.issuer),
+      pdppAsMetadataHandler(
+        deps.pdppAuth.issuer,
+        deps.pdppAuth.protocolProfile,
+      ),
     );
 
     // Declaration submission (§5 acceptance). Mounted at `/pdpp`, NOT under

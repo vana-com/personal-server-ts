@@ -1,12 +1,13 @@
 import { isReplicaScope } from "../../replication/namespace.js";
 import type { DurableAdditionsService } from "../../additions/durable.js";
-import { keccak256, stringToHex } from "viem";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
+import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
 import {
-  deriveScopeKey,
-  encryptWithPassword,
-  type GatewayClient,
-} from "@opendatalabs/vana-sdk/browser";
+  publishVersion,
+  type FencedPublicationPort,
+  type PublicationRecord,
+} from "../../publication/publish.js";
+export { parseGatewayNextVersion } from "../../publication/publish.js";
 import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "../../logger/index.js";
 import type { IndexEntry } from "../../storage/index/types.js";
@@ -23,7 +24,6 @@ import {
   tombstoneVersion,
   type ScopeDeletionTracker,
 } from "../scope-deletions.js";
-import { readStoredLineage } from "../../lineage/lineage.js";
 import type { LineageGatewayPort } from "../../lineage/gateway.js";
 
 export { computeDataPointId } from "../data-point-id.js";
@@ -31,6 +31,7 @@ export { isEntryCoveredByTombstone } from "../scope-deletions.js";
 
 export interface UploadWorkerDeps {
   additions?: DurableAdditionsService;
+  fencedPublication?: FencedPublicationPort;
   storage: DataStoragePort;
   storageAdapter: StorageAdapter;
   gateway: GatewayClient;
@@ -60,9 +61,8 @@ export interface UploadWorkerDeps {
    */
   scopeDeletions?: ScopeDeletionTracker;
   /**
-   * Guarded cleanup queue for ciphertext this worker uploaded and then had to
-   * abandon because a tombstone landed between the deletion guard and the
-   * registration. Used only when deleting that exact blob fails.
+   * Compatibility input for existing hosts. Publication never reclaims a
+   * version key; exact-key cleanup belongs to the durable deletion worker.
    */
   pendingBlobDeletions?: PendingBlobDeletionStore;
 }
@@ -115,45 +115,17 @@ export class DeletedScopeEntryError extends Error {
  * self-heal. Returns without effect when the entry was ingested with
  * knowledge of the tombstone (`afterTombstoneVersion`): a legitimate re-add.
  *
- * When the entry's ciphertext already went up (`uploaded`: the tombstone
- * landed between the deletion guard and the registration), that exact blob
- * is deleted too, so abandoning the entry never leaves owner-decryptable
- * deleted data in storage. If the delete fails the scope is queued for the
- * exact-key cleanup the sync cycle retries.
+ * Remote cleanup belongs to the deletion pipeline. Registry refusal does
+ * not grant this publisher authority to delete a potentially committed blob.
  */
 async function dropIfCoveredByDeletion(
-  deps: Pick<
-    UploadWorkerDeps,
-    "storage" | "storageAdapter" | "pendingBlobDeletions" | "logger"
-  >,
+  deps: Pick<UploadWorkerDeps, "storage" | "logger">,
   entry: IndexEntry,
   tombstone: Pick<DataPointFeedRecord, "expectedVersion">,
   deletedAt: string,
-  uploaded?: { url: string },
 ): Promise<void> {
   const version = tombstoneVersion(tombstone);
   if (!isEntryCoveredByTombstone(entry, { version })) return;
-  if (uploaded) {
-    try {
-      await deps.storageAdapter.delete(uploaded.url);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (deps.pendingBlobDeletions) {
-        await deps.pendingBlobDeletions.add([
-          { scope: entry.scope, version: String(entry.version) },
-        ]);
-      }
-      deps.logger.warn(
-        {
-          scope: entry.scope,
-          url: uploaded.url,
-          error: message,
-          queuedForCleanup: Boolean(deps.pendingBlobDeletions),
-        },
-        "Could not delete the ciphertext uploaded for an entry the tombstone covers",
-      );
-    }
-  }
   await deps.storage.deleteVersion(entry.scope, entry.collectedAt);
   deps.logger.warn(
     {
@@ -231,252 +203,55 @@ export async function uploadOne(
     throw err;
   }
 
-  // 1b. Deletion guard. If the gateway holds a tombstone for this scope, an
-  // unsynced entry from before the deletion must never be uploaded: the
-  // owner deleted it (possibly on another replica) and registering it again
-  // would resurrect the scope. An entry ingested after the deletion is a
-  // real re-add and goes up at a version strictly after the tombstone.
-  let registerVersion = BigInt(entry.version);
-  if (!entry.dataPointId && deps.dataPointFeed) {
-    const remote = await deps.dataPointFeed.getDataPoint({
-      ownerAddress: serverOwner,
-      scope: entry.scope,
-    });
-    const deletedAt = deletionTimestamp(remote);
-    if (remote && deletedAt !== null) {
-      await dropIfCoveredByDeletion(deps, entry, remote, deletedAt);
-      const afterTombstone = BigInt(remote.expectedVersion) + 1n;
-      if (afterTombstone > registerVersion) registerVersion = afterTombstone;
-    }
-  }
-
-  // 2. Derive scope key → hex-encode as OpenPGP password
-  const scopeKey = deriveScopeKey(masterKey, entry.scope);
-  const scopeKeyHex = uint8ToHex(scopeKey);
-
-  // 3. Encrypt with OpenPGP password-based encryption
-  const plaintext = new TextEncoder().encode(JSON.stringify(envelope));
-  const encrypted = await encryptWithPassword(plaintext, scopeKeyHex);
-
-  // 4. Compute the on-chain commitments.
-  //   dataHash     = keccak256 of the plaintext envelope JSON. Commits to the
-  //                  canonical content, not the ciphertext — OpenPGP
-  //                  password-based encryption embeds random salts so
-  //                  re-encrypting the same plaintext yields different bytes;
-  //                  hashing the plaintext keeps the on-chain commitment
-  //                  reproducible across replicas serving the same version.
-  //   metadataHash = keccak256 of canonical-JSON({scope, collectedAt,
-  //                  sizeBytes}). Commits to the off-chain metadata that
-  //                  describes this version without leaking the payload. DPv2
-  //                  is scope-addressed with no schema concept — the gateway
-  //                  neither records nor registers schemas — so no schemaId is
-  //                  looked up or committed.
-  const dataHash = keccak256(plaintext);
-  const metadataHash = keccak256(
-    stringToHex(
-      JSON.stringify({
-        scope: entry.scope,
-        collectedAt: entry.collectedAt,
-        sizeBytes: encrypted.byteLength,
-      }),
-    ),
-  );
-
-  // 5. Upload ciphertext to storage backend FIRST, version-keyed so the
-  // download worker can reconstruct the URL from a DataPointRecord's
-  // (scope, expectedVersion) — DataPointRecords carry no URL. We upload
-  // before registering so the on-chain data point (the synced marker) is
-  // never stamped ahead of a blob that failed to land.
-  const storageKey = `${entry.scope}/${registerVersion}`;
-  let url = await storageAdapter.upload(storageKey, encrypted);
-
-  // 6. DPv2 data-point registration (idempotent — skipped when a prior run
-  // already persisted a dataPointId on this entry). registerDataPoint stamps
-  // the synced marker that excludes this entry from findUnsynced next time.
-  let dataPointId: string;
-  if (entry.dataPointId) {
-    dataPointId = entry.dataPointId;
-  } else {
-    const registerAt = async (version: bigint): Promise<string> => {
-      const addDataSignature = await signer.signAddData({
-        ownerAddress: serverOwner as `0x${string}`,
-        scope: entry.scope,
-        dataHash,
-        metadataHash,
-        expectedVersion: version,
-      });
-
-      const registration = {
-        ownerAddress: serverOwner,
-        scope: entry.scope,
-        dataHash,
-        metadataHash,
-        expectedVersion: String(version),
-        signature: addDataSignature,
-      };
-      // A derivative carries its validated `$lineage` inside the envelope;
-      // the gateway stores the same sources next to this (dataPointId,
-      // version) so lineage can be walked without the plaintext. The
-      // AddData signature is unchanged (dataHash already commits to the
-      // plaintext, `$lineage` included); the plaintext list the gateway
-      // keeps is covered by a separate LineageAttestation signature bound
-      // to this version and dataHash, so a replayed registration cannot
-      // swap it (see lineage/attestation.ts).
-      const lineage = readStoredLineage(
-        envelope.data as Record<string, unknown> | undefined,
-      );
-      // An empty `$lineage` is an explicit root statement and is registered
-      // as such (attested empty list); only an ABSENT `$lineage` makes no
-      // statement and goes through the plain client.
-      let dataPointResult;
-      if (lineage) {
-        if (!deps.lineageGateway) {
-          throw new Error(
-            `Cannot register derivative ${entry.path} (scope=${entry.scope}): lineage registration needs a gateway URL (lineageGateway is not configured)`,
-          );
-        }
-        const lineageSignature = await signer.signLineageAttestation({
-          ownerAddress: serverOwner as `0x${string}`,
+  const readHead = async (): Promise<PublicationRecord | null> =>
+    deps.dataPointFeed
+      ? deps.dataPointFeed.getDataPoint({
+          ownerAddress: serverOwner,
           scope: entry.scope,
-          expectedVersion: version,
-          dataHash,
-          sources: lineage.sources,
-        });
-        dataPointResult = await deps.lineageGateway.registerDataPoint({
-          ...registration,
-          lineage: lineage.sources,
-          lineageSignature,
-        });
-      } else {
-        dataPointResult = await gateway.registerDataPoint(registration);
+        })
+      : gateway.getDataPoint(computeDataPointId(serverOwner, entry.scope));
+  const checkHead = async (remote: PublicationRecord | null) => {
+    const deletedAt =
+      remote?.deletedAt ??
+      (remote?.addedAt
+        ? deletionTimestamp({ ...remote, addedAt: remote.addedAt })
+        : null);
+    if (remote && deletedAt !== null)
+      await dropIfCoveredByDeletion(deps, entry, remote, deletedAt);
+  };
+  const initialHead =
+    !entry.dataPointId && deps.dataPointFeed ? await readHead() : undefined;
+  await checkHead(initialHead ?? null);
+  const proof = entry.dataPointId
+    ? {
+        dataPointId: entry.dataPointId,
+        url: storageAdapter.urlForKey(`${entry.scope}/${entry.version}`),
+        version: BigInt(entry.version),
+        sizeBytes: entry.sizeBytes,
       }
-
-      const id = dataPointResult.dataPointId ?? null;
-      if (!id) {
-        throw new Error(
-          `Gateway registerDataPoint did not return a dataPointId for ${entry.path} (scope=${entry.scope}, version=${version})`,
-        );
-      }
-      return id;
-    };
-
-    try {
-      dataPointId = await registerAt(registerVersion);
-      if (registerVersion !== BigInt(entry.version)) {
-        // Re-add after a deletion: the row must follow the registered
-        // version (the blob key embeds it).
-        await storage.updateEntryVersion(entry.path, Number(registerVersion));
-      }
-    } catch (err) {
-      if (!isStaleVersionConflict(err)) throw err;
-      // The registry's version for this (owner, scope) is ahead of the local
-      // index: pre-DPv2 rows were backfilled to version 1, and other replicas
-      // (PS Lite in the browser) advance the same per-scope sequence. The
-      // gateway 409s precisely so the client can re-sign against the live
-      // version — retrying the same version every cycle head-blocks the
-      // scope's whole upload queue.
-      // Prefer the deletion-aware feed: the SDK client throws on a 410 for
-      // a tombstoned point, which would wedge this entry forever.
-      const record = deps.dataPointFeed
-        ? await deps.dataPointFeed.getDataPoint({
-            ownerAddress: serverOwner,
-            scope: entry.scope,
-          })
-        : await gateway.getDataPoint(
-            computeDataPointId(serverOwner, entry.scope),
-          );
-
-      // The 409 may be a tombstone that landed after the deletion guard in
-      // step 1b ran (a delete on another replica racing this upload). Apply
-      // the same rule again before rebasing: a covered entry is dropped, a
-      // genuine re-add rebases past the tombstone below.
-      const conflictDeletedAt = record ? deletionTimestamp(record) : null;
-      if (record && conflictDeletedAt !== null) {
-        await dropIfCoveredByDeletion(deps, entry, record, conflictDeletedAt, {
-          url,
-        });
-      }
-
-      if (record && record.dataHash.toLowerCase() === dataHash.toLowerCase()) {
-        // Identical content is already registered (this entry, or a replica's
-        // copy of it) — adopt the registered data point rather than minting a
-        // new version of the same bytes.
-        dataPointId = record.id;
-        // Align the local row with the adopted registry version — downstream
-        // consumers sign from the row's version (e.g. x402 RecordDataAccess),
-        // so a stale local version would emit records the registry rejects.
-        const adoptedVersion = Number(record.expectedVersion);
-        if (adoptedVersion !== entry.version) {
-          // Cross-replica adopt: "the registrant already uploaded the blob
-          // under the registered version key" is an assumption, not a fact —
-          // a replica that crashed between register and upload leaves a
-          // registry row whose bytes 404 for every consumer (readers
-          // reconstruct the URL from the record's (scope, expectedVersion);
-          // records carry no URL). Verify, and heal from our identical
-          // plaintext (dataHash matched, so our ciphertext decrypts to the
-          // registered content).
-          const adoptedKey = `${entry.scope}/${adoptedVersion}`;
-          const adoptedBlobExists = await storageAdapter.exists(
-            storageAdapter.urlForKey(adoptedKey),
-          );
-          if (!adoptedBlobExists) {
-            logger.warn(
-              { scope: entry.scope, version: adoptedVersion, dataPointId },
-              "Adopted registry version has no blob in storage; re-uploading from local content",
-            );
-            url = await storageAdapter.upload(adoptedKey, encrypted);
-          }
-          await storage.updateEntryVersion(entry.path, adoptedVersion);
-        }
-      } else {
-        // Rebase onto the gateway's live next-valid version. Two independent
-        // signals for what that is:
-        //   • the registry row — a replica racing AHEAD advances it past the
-        //     version this error was raised against;
-        //   • the 409 message itself — authoritative when the registry
-        //     regressed BEHIND the local index (a moksha/DataRegistry reset,
-        //     or duplicate re-snapshots pushing the local counter ahead), and
-        //     the only signal at all when the reset left no row for
-        //     getDataPoint to return (BUI-715).
-        // Take the max so the scope converges from either direction; when
-        // neither signal is available there is nothing to rebase onto, so
-        // surface the conflict rather than guess.
-        const recordNext = record ? Number(record.expectedVersion) + 1 : 0;
-        const errorNext = parseGatewayNextVersion((err as Error).message) ?? 0;
-        const target = Math.max(recordNext, errorNext);
-        if (target <= 0) throw err;
-        const rebased = BigInt(target);
-        // Known limitation (BUI-715 follow-up): when the registry regressed
-        // BELOW the local index, `target` can land on a version this scope
-        // already has an (older, now-defunct) synced row for. We realign only
-        // this entry, so the scope's other stale rows stay bound to gateway
-        // versions the reset dropped until their next sync cycle re-registers
-        // them. That is transient and fail-safe — readers resolve blobs from
-        // the gateway record (consistent with what we just re-registered), and
-        // x402 signed from a stale local version is rejected by the gateway
-        // rather than serving wrong bytes. A full scope reconcile (clear +
-        // renumber every row for the scope from the gateway's version) is
-        // tracked separately; head-block recovery is the fix that matters here.
-        // The blob key embeds the version (replicas reconstruct URLs from the
-        // registry record), so the rebased version needs its own blob; the one
-        // written under the stale key above is orphaned, which storage
-        // tolerates.
-        url = await storageAdapter.upload(
-          `${entry.scope}/${rebased}`,
-          encrypted,
-        );
-        // A concurrent replica can still win the race to `rebased`; the next
-        // sync cycle re-reads the registry and rebases again, so this stays
-        // convergent without looping here.
-        dataPointId = await registerAt(rebased);
-        await storage.updateEntryVersion(entry.path, Number(rebased));
-      }
-    }
-
-    // 7. Stamp the dataPointId on the local index entry — marks it synced.
+    : await publishVersion({
+        ownerAddress: serverOwner,
+        envelope,
+        preferredVersion: BigInt(entry.version),
+        masterKey,
+        storageAdapter,
+        gateway,
+        signer,
+        lineageGateway: deps.lineageGateway,
+        fencedPublication: deps.fencedPublication,
+        head: initialHead,
+        readHead,
+        checkHead,
+        acknowledgedDeletionVersion:
+          entry.afterTombstoneVersion == null
+            ? undefined
+            : BigInt(entry.afterTombstoneVersion),
+      });
+  const { dataPointId, url, sizeBytes } = proof;
+  if (!entry.dataPointId) {
+    if (proof.version !== BigInt(entry.version))
+      await storage.updateEntryVersion(entry.path, Number(proof.version));
     await storage.updateDataPointId(entry.path, dataPointId);
-    // The registry now holds a live row for the scope (fresh registration or
-    // an adopted one): reads must stop treating it as deleted.
     deps.scopeDeletions?.markLive(entry.scope);
   }
 
@@ -487,7 +262,7 @@ export async function uploadOne(
         collectedAt: envelope.collectedAt,
         data: envelope.data as Record<string, unknown>,
       },
-      { envelope, encryptedSize: encrypted.byteLength },
+      { envelope, encryptedSize: sizeBytes },
     );
   }
 
@@ -543,36 +318,4 @@ export async function uploadAll(
   }
 
   return results;
-}
-
-function uint8ToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
-    "",
-  );
-}
-
-// The gateway rejects a registration whose expectedVersion is not strictly
-// greater than its stored value with a 409; the SDK client surfaces it as
-// `Gateway error: 409 <detail>`. Anything else is not a version conflict.
-function isStaleVersionConflict(err: unknown): err is Error {
-  return err instanceof Error && /Gateway error: 409\b/.test(err.message);
-}
-
-// Extract the gateway's authoritative next-valid version from a 409 body so a
-// rebase can target it directly instead of only inferring from a registry row
-// (which is absent after a reset that dropped the scope's row entirely).
-// Handles the current "Gap in version sequence … next valid version is N"
-// phrasing (and its "effective max (M" form) as well as the older "Stale
-// expectedVersion … must be strictly greater than the stored value N" one.
-// Returns null when no version can be parsed.
-export function parseGatewayNextVersion(message: string): number | null {
-  const nextValid = message.match(/next valid version is (\d+)/i);
-  if (nextValid) return Number(nextValid[1]);
-  const effectiveMax = message.match(/effective max \((\d+)/i);
-  if (effectiveMax) return Number(effectiveMax[1]) + 1;
-  const storedValue = message.match(
-    /strictly greater than the stored value (\d+)/i,
-  );
-  if (storedValue) return Number(storedValue[1]) + 1;
-  return null;
 }
