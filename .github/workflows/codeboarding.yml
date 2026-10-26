@@ -8,7 +8,7 @@ on:
   # Sync keeps one branch's analysis, so this lists exactly one. There is no manual
   # trigger: a dispatch could run sync on any branch.
   push:
-    branches: ['main']
+    branches: ["main"]
 
 # No workflow-level permissions: each job requests only what it needs (least
 # privilege), so the default token starts with none.
@@ -30,11 +30,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
-      contents: read        # check out the repo + read the saved analysis (no writes in review mode)
-      pull-requests: write  # post the architecture-diff PR comment
-      issues: write         # the /codeboarding issue_comment trigger + comment API
-      id-token: write       # mint a GitHub OIDC token for the free hosted tier (write is the only level for id-token)
-      actions: read         # let a repeat review download the analysis an earlier run published, instead of re-deriving the whole PR
+      contents: read # check out the repo + read the saved analysis (no writes in review mode)
+      pull-requests: write # post the architecture-diff PR comment
+      issues: write # the /codeboarding issue_comment trigger + comment API
+      id-token: write # mint a GitHub OIDC token for the free hosted tier (write is the only level for id-token)
+      actions: read # let a repeat review download the analysis an earlier run published, instead of re-deriving the whole PR
     steps:
       - uses: CodeBoarding/CodeBoarding-action@v1
         with:
@@ -47,9 +47,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
-      contents: write       # push the generated analysis to codeboarding/baseline
-      actions: read         # continue from an analysis an earlier run published
-      id-token: write       # identifies this repo to CodeBoarding's hosted tier
+      contents: write # push the generated analysis to codeboarding/baseline
+      actions: read # continue from an analysis an earlier run published
+      id-token: write # identifies this repo to CodeBoarding's hosted tier
     steps:
       - uses: CodeBoarding/CodeBoarding-action@v1
         with:
