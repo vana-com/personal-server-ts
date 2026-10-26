@@ -25,283 +25,36 @@ import type {
   ReadScopeBlocksResponse,
 } from "../storage/blocks/types.js";
 import type { SearchHit } from "./search/index.js";
-import { decodeDataBlockCursor } from "../storage/blocks/index.js";
 import {
-  bytesToBase64,
-  isBinaryEnvelope,
-  parseMetadataHeader,
-} from "../contracts/binary.js";
-import { LINEAGE_KEY } from "../lineage/lineage.js";
+  decodeDataBlockCursor,
+  encodeDataBlockCursor,
+} from "../storage/blocks/index.js";
+import { bytesToBase64, parseMetadataHeader } from "../contracts/binary.js";
 import { signMcpGranteeRequest } from "./grantee.js";
 import {
   assertScopeNotDeleted,
   handlePersonalServerDataRequest,
   isOwnerView,
   reportPersonalServerReadFulfillment,
-  resolveReadDeletion,
   type PersonalServerDataApiDeps,
   type ReadDeletionEntry,
 } from "../api/index.js";
 import { ProtocolError } from "../errors/catalog.js";
+import {
+  allDeliveryLeases,
+  deliver,
+  type DeliveryLease,
+} from "../policy/delivery-lease.js";
+import { authorizeLegacyRead } from "../policy/data-read.js";
+import { storageForReader } from "../storage/disclosure-policy.js";
+import type { IndexEntry } from "../storage/index/types.js";
 
-/**
- * Block sidecars are built from the FULL stored envelope, so they carry the
- * server-stamped `$writtenBy` / `$lineage` keys and the consumed caller
- * lineage field that grantee reads of the record itself never see. The same
- * redaction applies here at serve time: dedicated blocks under those paths
- * are dropped, data-level object payloads (`$.data`, grouped-key blocks,
- * `$.data.metadata`) have the keys stripped, and group labels naming a
- * redacted key are rewritten. The caller lineage field follows the envelope
- * path's contract — dropped from the location the write path consumed
- * (top-level `lineage` for JSON, `metadata.lineage` for binary) only when
- * `$lineage` is stamped — which is why redaction reads the envelope for
- * stamped-ness; if that read fails, both locations are dropped (fail
- * closed).
- */
-interface BlockRedactionContext {
-  dropTopLevelLineage: boolean;
-  dropMetadataLineage: boolean;
-}
-
-const FAIL_CLOSED_CONTEXT: BlockRedactionContext = {
-  dropTopLevelLineage: true,
-  dropMetadataLineage: true,
-};
-
-function pathUnder(path: string, prefix: string): boolean {
-  return (
-    path === prefix ||
-    (path.startsWith(prefix) && /[.[{]/.test(path.charAt(prefix.length)))
-  );
-}
-
-function groupLabelSegments(path: string): string[] {
-  const match = /^\$\.data(?:\.metadata)?\.\{(.+):(.+)\}$/.exec(path);
-  return match ? [match[1]!, match[2]!] : [];
-}
-
-/**
- * Whether the served blocks carry anything the caller-lineage rule could
- * apply to. When they don't (the overwhelmingly common case — ordinary
- * content blocks), no stamped-ness decision is needed and the envelope is
- * never read, keeping bounded reads bounded.
- */
-function servedLineageShaped(
-  blocks: readonly { path: string; value?: unknown }[],
-): boolean {
-  return blocks.some((block) => {
-    if (
-      pathUnder(block.path, "$.data.lineage") ||
-      pathUnder(block.path, "$.data.metadata.lineage")
-    ) {
-      return true;
-    }
-    if (
-      groupLabelSegments(block.path).some(
-        (segment) => segment === "lineage" || segment === LINEAGE_KEY,
-      )
-    ) {
-      return true;
-    }
-    if (!("value" in block) || !isPlainObject(block.value)) return false;
-    const data =
-      block.path === "$" ? (block.value["data"] ?? null) : block.value;
-    return (
-      isPlainObject(data) &&
-      ("lineage" in data ||
-        (isPlainObject(data["metadata"]) && "lineage" in data["metadata"]))
-    );
-  });
-}
-
-/**
- * Stamped-ness evidence visible in the served blocks themselves: a
- * `$.data.$lineage` path (dedicated block or manifest ref) or a `$lineage`
- * key inside a data-level payload. Both occur only on JSON records — the
- * binary block emitter never serializes the stamped keys — so visible
- * evidence always means "JSON record, drop the top-level field".
- */
-function visibleStampEvidence(
-  blocks: readonly { path: string; value?: unknown }[],
-): BlockRedactionContext | null {
-  for (const block of blocks) {
-    if (
-      pathUnder(block.path, `$.data.${LINEAGE_KEY}`) ||
-      groupLabelSegments(block.path).includes(LINEAGE_KEY)
-    ) {
-      return { dropTopLevelLineage: true, dropMetadataLineage: false };
-    }
-    if ("value" in block && isPlainObject(block.value)) {
-      const data =
-        block.path === "$" ? (block.value["data"] ?? null) : block.value;
-      if (isPlainObject(data) && LINEAGE_KEY in data) {
-        return { dropTopLevelLineage: true, dropMetadataLineage: false };
-      }
-    }
-  }
-  return null;
-}
-
-/**
- * The caller-lineage decision for a set of served blocks or manifest refs.
- * Decided from the blocks themselves when possible; the stored envelope is
- * read only when lineage-shaped content is present without visible
- * stamped-ness evidence (a pagination or blockIds slice), and an unreadable
- * envelope redacts both locations rather than serving them.
- */
-async function resolveBlockRedactionContext(
-  storage: Pick<PersonalServerDataApiDeps["storage"], "readEnvelope">,
-  scope: string,
-  collectedAt: string,
-  blocks: readonly { path: string; value?: unknown }[],
-): Promise<BlockRedactionContext> {
-  if (!servedLineageShaped(blocks)) {
-    return { dropTopLevelLineage: false, dropMetadataLineage: false };
-  }
-  const visible = visibleStampEvidence(blocks);
-  if (visible) return visible;
-  try {
-    const envelope = await storage.readEnvelope(scope, collectedAt);
-    if (!(LINEAGE_KEY in envelope.data)) {
-      return { dropTopLevelLineage: false, dropMetadataLineage: false };
-    }
-    return isBinaryEnvelope(envelope)
-      ? { dropTopLevelLineage: false, dropMetadataLineage: true }
-      : { dropTopLevelLineage: true, dropMetadataLineage: false };
-  } catch {
-    return FAIL_CLOSED_CONTEXT;
-  }
-}
-
-function redactedBlockPathPrefixes(ctx: BlockRedactionContext): string[] {
-  return [
-    "$.data.$writtenBy",
-    "$.data.$lineage",
-    ...(ctx.dropTopLevelLineage ? ["$.data.lineage"] : []),
-    ...(ctx.dropMetadataLineage ? ["$.data.metadata.lineage"] : []),
-  ];
-}
-
-function isRedactedBlockPath(
-  path: string,
-  ctx: BlockRedactionContext,
-): boolean {
-  return redactedBlockPathPrefixes(ctx).some(
-    (prefix) =>
-      path === prefix ||
-      (path.startsWith(prefix) && /[.[{]/.test(path.charAt(prefix.length))),
-  );
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function isRedactedKeyName(
-  parent: "data" | "metadata",
-  key: string,
-  ctx: BlockRedactionContext,
-): boolean {
-  if (parent === "data") {
-    return (
-      key === "$writtenBy" ||
-      key === "$lineage" ||
-      (ctx.dropTopLevelLineage && key === "lineage")
-    );
-  }
-  return ctx.dropMetadataLineage && key === "lineage";
-}
-
-/**
- * Group blocks are labeled `<parent>.{first:last}` after the first and last
- * key they pack; a redacted key name in the label is rewritten so not even
- * the key's existence is served.
- */
-function sanitizeGroupLabel(path: string, ctx: BlockRedactionContext): string {
-  const match = /^(\$\.data(?:\.metadata)?)\.\{(.+):(.+)\}$/.exec(path);
-  if (!match) return path;
-  const parent = match[1] === "$.data" ? "data" : "metadata";
-  const first = isRedactedKeyName(parent, match[2]!, ctx) ? "…" : match[2]!;
-  const last = isRedactedKeyName(parent, match[3]!, ctx) ? "…" : match[3]!;
-  return `${match[1]}.{${first}:${last}}`;
-}
-
-function stripMetadataLineage(
-  value: Record<string, unknown>,
-  ctx: BlockRedactionContext,
-): Record<string, unknown> {
-  if (!ctx.dropMetadataLineage || !isPlainObject(value["metadata"])) {
-    return value;
-  }
-  const { lineage: _metadataLineage, ...metadataRest } = value["metadata"];
-  if (Object.keys(metadataRest).length === 0) {
-    const { metadata: _emptied, ...rest } = value;
-    return rest;
-  }
-  return { ...value, metadata: metadataRest };
-}
-
-function stripDataLevelKeys(
-  value: Record<string, unknown>,
-  ctx: BlockRedactionContext,
-): Record<string, unknown> {
-  const { $writtenBy: _writtenBy, $lineage: _lineage, ...rest } = value;
-  let data: Record<string, unknown> = rest;
-  if (ctx.dropTopLevelLineage) {
-    const { lineage: _callerLineage, ...dataRest } = data;
-    data = dataRest;
-  }
-  return stripMetadataLineage(data, ctx);
-}
-
-function redactBlockValue(
-  path: string,
-  value: unknown,
-  ctx: BlockRedactionContext,
-): unknown {
-  if (!isPlainObject(value)) return value;
-  if (path === "$.data" || /^\$\.data\.\{.*\}$/.test(path)) {
-    return stripDataLevelKeys(value, ctx);
-  }
-  if (path === "$.data.metadata" || /^\$\.data\.metadata\.\{.*\}$/.test(path)) {
-    if (!ctx.dropMetadataLineage) return value;
-    const { lineage: _metadataLineage, ...rest } = value;
-    return rest;
-  }
-  if (path === "$" && isPlainObject(value["data"])) {
-    return { ...value, data: stripDataLevelKeys(value["data"], ctx) };
-  }
-  return value;
-}
-
-function redactBlockRefsForGrantee<T extends { path: string }>(
-  blocks: T[],
-  ctx: BlockRedactionContext,
-): T[] {
-  return blocks
-    .filter((block) => !isRedactedBlockPath(block.path, ctx))
-    .map((block) => ({ ...block, path: sanitizeGroupLabel(block.path, ctx) }));
-}
-
-function redactBlockPayloadsForGrantee<
-  T extends { path: string; value: unknown },
->(blocks: T[], ctx: BlockRedactionContext): T[] {
-  return blocks
-    .filter((block) => !isRedactedBlockPath(block.path, ctx))
-    .flatMap((block) => {
-      const value = redactBlockValue(block.path, block.value, ctx);
-      // A group emptied by the strip carried only redacted keys.
-      if (
-        isPlainObject(block.value) &&
-        Object.keys(block.value).length > 0 &&
-        isPlainObject(value) &&
-        Object.keys(value).length === 0
-      ) {
-        return [];
-      }
-      return [{ ...block, path: sanitizeGroupLabel(block.path, ctx), value }];
-    });
-}
+import {
+  resolveBlockRedactionContext,
+  redactBlockRefsForGrantee,
+  redactBlockPayloadsForGrantee,
+} from "../storage/blocks/redaction.js";
+import { blockRepresentationId } from "../storage/blocks/representation.js";
 
 export interface McpScopeMetadata {
   scope: string;
@@ -312,6 +65,13 @@ export interface McpScopeMetadata {
 }
 
 export interface McpDataReadClient {
+  /**
+   * This client, with every read it serves also handing its delivery lease to
+   * `sink`. The MCP server collects the leases of one tool call and releases
+   * the tool result only through them (see `createMcpServerForConnection`).
+   */
+  withDeliveryLeases?(sink: (lease: DeliveryLease) => void): McpDataReadClient;
+
   /**
    * True when reads through this client are x402-payment-enforced (a paid
    * self-signing session). Payment-bypassing shortcuts — notably the optional
@@ -334,12 +94,16 @@ export interface McpDataReadClient {
   }): Promise<McpDataListResult>;
 
   /**
-   * Return lightweight planning metadata for a scope using the storage index
-   * only — no network call, no block read, no auth. Used by list_granted_scopes
-   * to populate sizeBytes/sizeClass/recommendedAccess without reading data.
-   * Returns null when the scope has no local index entry.
+   * Lightweight planning metadata for a scope (size, collection time, block
+   * readiness), read from the storage index. Sizes and times are data, so it
+   * is authorized like a read under `grantId` (metadata only: never charged),
+   * and its release holds the grant and the scope's deletion state. Resolves
+   * null when the scope has no local entry, is deleted, or is not authorized.
    */
-  getScopeMetadata(scope: string): Promise<McpScopeMetadata | null>;
+  getScopeMetadata(
+    scope: string,
+    grantId: string,
+  ): Promise<McpScopeMetadata | null>;
 
   /**
    * Perform a grant-gated bounded block read for MCP. This is the path used by
@@ -347,8 +111,9 @@ export interface McpDataReadClient {
    * reads when the bounded storage path is unavailable.
    *
    * `blockIds` switches the read to block-addressed mode: only those blocks are
-   * returned, `cursor` is ignored, and no `nextCursor` is produced. `maxBytes`
-   * still bounds the response.
+   * returned, cursor positions are ignored but version/layout binding is
+   * checked, and no `nextCursor` is produced. `maxBytes` is a UTF-8 content
+   * budget; a 1–3 byte budget may emit one whole code point (up to 4 bytes).
    */
   readScopeBlocks(params: {
     scope: string;
@@ -375,7 +140,7 @@ export interface McpDataReadClient {
   readBlockManifest?(params: {
     scope: string;
     grantId: string;
-  }): Promise<DataBlockManifest | null>;
+  }): Promise<McpBlockManifest | null>;
 
   /**
    * Perform a grant-gated raw binary read for an approved binary scope. This
@@ -425,6 +190,12 @@ export interface McpDataListResult {
 
 export interface McpDataReadBlocksResult extends ReadScopeBlocksResponse {
   status: number;
+  /**
+   * Stored size of the version this read selected. Part of the authorized
+   * read (same grant, same release dependencies), so a tool may plan with it
+   * without a second authorization.
+   */
+  scopeSizeBytes?: number;
 }
 
 export interface McpDataReadRawFileResult {
@@ -438,6 +209,13 @@ export interface McpDataReadRawFileResult {
   contentBase64: string;
   metadata?: unknown;
 }
+
+/**
+ * A table of contents with the cursor that pins its version. Pass
+ * `versionCursor` as `cursor` with `blockIds` so the selected blocks come
+ * from this version, or the read is refused.
+ */
+export type McpBlockManifest = DataBlockManifest & { versionCursor?: string };
 
 export class McpDataReadError extends Error {
   constructor(
@@ -491,6 +269,11 @@ export function createMcpDataReadClient(
   options: CreateMcpDataReadClientOptions,
 ): McpDataReadClient {
   const basePath = options.basePath ?? "/v1/data";
+  // Every body this client returns goes to a grantee.
+  const granteeStorage = storageForReader(
+    options.dataApiDeps.storage,
+    "grantee",
+  );
 
   /**
    * Same deletion gate as GET /v1/data/:scope, surfaced as the MCP error
@@ -499,9 +282,9 @@ export function createMcpDataReadClient(
   async function assertScopeReadable(
     scope: string,
     entry: ReadDeletionEntry,
-  ): Promise<void> {
+  ): Promise<DeliveryLease> {
     try {
-      await assertScopeNotDeleted(options.dataApiDeps, scope, entry);
+      return await assertScopeNotDeleted(options.dataApiDeps, scope, entry);
     } catch (err) {
       if (err instanceof ProtocolError) {
         throw new McpDataReadError(err.code, err.toJSON());
@@ -570,6 +353,24 @@ export function createMcpDataReadClient(
     }
   }
 
+  /**
+   * Early refusal of a version whose row is known to be PDPP. This client
+   * reads only as a grantee (see the header), so it runs before
+   * `authorizeScopeRead` may settle payment, right after the deletion gate,
+   * in the same order as `/v1/data`. The blocks themselves are read through
+   * `granteeStorage`, which decides on what it actually read.
+   */
+  function authorizeGranteeVersion(entry: Pick<IndexEntry, "pdppOrigin">) {
+    try {
+      authorizeLegacyRead("grantee", { kind: "indexed-version", entry });
+    } catch (err) {
+      if (err instanceof ProtocolError) {
+        throw new McpDataReadError(err.code, err.toJSON());
+      }
+      throw err;
+    }
+  }
+
   async function writeReadAccessLog(
     request: Request,
     params: {
@@ -605,313 +406,458 @@ export function createMcpDataReadClient(
     return { logId, timestamp, ipAddress, userAgent };
   }
 
-  return {
-    enforcesPayment: options.enforcesPayment ?? false,
-    async listScopes({ scopePrefix, limit, offset, grantId } = {}) {
-      const params = new URLSearchParams();
-      if (scopePrefix) params.set("scopePrefix", scopePrefix);
-      if (limit !== undefined) params.set("limit", String(limit));
-      if (offset !== undefined) params.set("offset", String(offset));
-      const query = params.toString();
-      const pathWithQuery = query ? `${basePath}?${query}` : basePath;
+  function client(sink?: (lease: DeliveryLease) => void): McpDataReadClient {
+    /**
+     * The early gate of one read: release it through the dependencies its
+     * selection produced, then hand them to the tool call, whose result is
+     * released through them again.
+     */
+    const releaseRead = (dependencies: DeliveryLease) =>
+      deliver(dependencies, () => sink?.(dependencies));
+    return {
+      withDeliveryLeases: (next) => client(next),
+      enforcesPayment: options.enforcesPayment ?? false,
+      async listScopes({ scopePrefix, limit, offset, grantId } = {}) {
+        const params = new URLSearchParams();
+        if (scopePrefix) params.set("scopePrefix", scopePrefix);
+        if (limit !== undefined) params.set("limit", String(limit));
+        if (offset !== undefined) params.set("offset", String(offset));
+        const query = params.toString();
+        const pathWithQuery = query ? `${basePath}?${query}` : basePath;
 
-      const authorization = await signMcpGranteeRequest({
-        account: options.granteeAccount,
-        aud: options.serverOrigin,
-        method: "GET",
-        uri: basePath,
-        grantId,
-      });
-
-      const url = new URL(pathWithQuery, options.serverOrigin).toString();
-      const request = new Request(url, {
-        method: "GET",
-        headers: { Authorization: authorization },
-      });
-
-      const response = await handlePersonalServerDataRequest(
-        request,
-        options.dataApiDeps,
-        { basePath },
-      );
-
-      const body = await parseJsonOrText(response);
-
-      if (!response.ok) {
-        throw new McpDataReadError(response.status, body);
-      }
-
-      return { status: response.status, ...normalizeListScopesPayload(body) };
-    },
-
-    async getScopeMetadata(scope: string): Promise<McpScopeMetadata | null> {
-      const storage = options.dataApiDeps.storage;
-      const entry = storage.findEntry({ scope });
-      if (!entry) return null;
-      // A tombstoned scope is absent for discovery purposes, exactly like a
-      // scope with no local copy; the same gate the HTTP read applies.
-      if (await resolveReadDeletion(options.dataApiDeps, scope, entry)) {
-        return null;
-      }
-      const hasBlocks =
-        typeof storage.hasScopeBlocks === "function"
-          ? await storage.hasScopeBlocks(scope, entry.collectedAt)
-          : false;
-      return {
-        scope,
-        collectedAt: entry.collectedAt,
-        sizeBytes: entry.sizeBytes,
-        hasBlocks,
-      };
-    },
-
-    async readScopeBlocks({
-      scope,
-      grantId,
-      cursor,
-      maxBytes,
-      payment,
-      blockIds,
-      tool,
-    }) {
-      const storage = options.dataApiDeps.storage;
-      if (!storage.readScopeBlocks) {
-        throw new McpDataReadError(503, {
-          error: "BOUNDED_DATA_UNAVAILABLE",
-          message:
-            "Bounded scope data is unavailable while the storage sidecar is missing or still indexing.",
-          scope,
+        const authorization = await signMcpGranteeRequest({
+          account: options.granteeAccount,
+          aud: options.serverOrigin,
+          method: "GET",
+          uri: basePath,
+          grantId,
         });
-      }
 
-      const pinnedCollectedAt = collectedAtFromCursor(scope, cursor);
-      const selectedEntry = storage.findEntry({
-        scope,
-        ...(pinnedCollectedAt ? { at: pinnedCollectedAt } : {}),
-      });
-      if (!selectedEntry) {
-        throw new McpDataReadError(404, {
-          error: "NOT_FOUND",
-          message: `No data found for scope "${scope}"`,
+        const url = new URL(pathWithQuery, options.serverOrigin).toString();
+        const request = new Request(url, {
+          method: "GET",
+          headers: { Authorization: authorization },
         });
-      }
-      // Before authorizeScopeRead: a payment-enforcing auth port settles
-      // x402 there, and deleted data must never be charged for.
-      await assertScopeReadable(scope, selectedEntry);
 
-      const { request, authResult } = await authorizeScopeRead({
+        const response = await handlePersonalServerDataRequest(
+          request,
+          options.dataApiDeps,
+          { basePath, ...(sink && { onDeliveryLease: sink }) },
+        );
+
+        const body = await parseJsonOrText(response);
+
+        if (!response.ok) {
+          throw new McpDataReadError(response.status, body);
+        }
+
+        return { status: response.status, ...normalizeListScopesPayload(body) };
+      },
+
+      async getScopeMetadata(
+        scope: string,
+        grantId: string,
+      ): Promise<McpScopeMetadata | null> {
+        const storage = options.dataApiDeps.storage;
+        const entry = storage.findEntry({ scope });
+        if (!entry) return null;
+        try {
+          // A tombstoned scope is absent for discovery purposes, exactly like
+          // a scope with no local copy; the same gate the HTTP read applies.
+          const scopeDependency = await assertScopeReadable(scope, entry);
+          const { authResult } = await authorizeScopeRead({
+            scope,
+            grantId,
+            fileId: entry.fileId ?? undefined,
+            at: entry.collectedAt,
+            metadataOnly: true,
+          });
+          const hasBlocks =
+            typeof storage.hasScopeBlocks === "function"
+              ? await storage.hasScopeBlocks(scope, entry.collectedAt)
+              : false;
+          await releaseRead(
+            allDeliveryLeases(authResult?.lease, scopeDependency),
+          );
+          return {
+            scope,
+            collectedAt: entry.collectedAt,
+            sizeBytes: entry.sizeBytes,
+            hasBlocks,
+          };
+        } catch (err) {
+          // Deleted, refused, or ended while this ran: no metadata.
+          if (err instanceof McpDataReadError || err instanceof ProtocolError) {
+            return null;
+          }
+          throw err;
+        }
+      },
+
+      async readScopeBlocks({
         scope,
         grantId,
-        fileId: selectedEntry.fileId ?? undefined,
-        // The exact version this read serves (cursor-pinned or latest) —
-        // a payment-enforcing auth port binds the x402 settlement to it.
-        at: selectedEntry.collectedAt,
+        cursor,
+        maxBytes,
         payment,
-      });
-
-      try {
-        const result = await storage.readScopeBlocks(
-          scope,
-          selectedEntry.collectedAt,
-          {
-            cursor,
-            maxBytes: maxBytes ?? 16_384,
-            ...(blockIds?.length ? { blockIds } : {}),
-          },
-        );
-        const { logId, timestamp, ipAddress, userAgent } =
-          await writeReadAccessLog(request, { scope, grantId, authResult });
-        // A block-addressed read serves a hand-picked subset, so it never
-        // completes the scope the way an uncursored full read does; reporting
-        // fulfillment for it would settle the read on partial data.
-        if (
-          authResult?.grantId &&
-          authResult.builder &&
-          !cursor &&
-          !blockIds?.length &&
-          !result.nextCursor
-        ) {
-          reportPersonalServerReadFulfillment(options.dataApiDeps, {
-            builder: authResult.builder,
-            fileId: selectedEntry.fileId ?? undefined,
-            grantId: authResult.grantId,
-            ipAddress,
-            logId,
-            outcome: "served",
-            scope,
-            servedAt: timestamp,
-            source: "mcp",
-            ...(tool ? { tool } : {}),
-            userAgent,
-          });
-        }
-        return isOwnerView(authResult)
-          ? { status: 200, ...result }
-          : {
-              status: 200,
-              ...result,
-              blocks: redactBlockPayloadsForGrantee(
-                result.blocks,
-                await resolveBlockRedactionContext(
-                  storage,
-                  scope,
-                  selectedEntry.collectedAt,
-                  result.blocks,
-                ),
-              ),
-            };
-      } catch (err) {
-        if (err instanceof ProtocolError) {
-          throw new McpDataReadError(err.code, err.toJSON());
-        }
-        if (err instanceof Error) {
-          const code = dataBlockStorageErrorCode(err);
-          const status = code === "cursor_invalid" ? 400 : 503;
-          throw new McpDataReadError(status, {
-            error:
-              code === "cursor_invalid"
-                ? "INVALID_CURSOR"
-                : "BOUNDED_DATA_UNAVAILABLE",
+        blockIds,
+        tool,
+      }) {
+        const storage = granteeStorage;
+        if (!storage.readScopeBlocks) {
+          throw new McpDataReadError(503, {
+            error: "BOUNDED_DATA_UNAVAILABLE",
             message:
-              code === "cursor_invalid"
-                ? "The bounded read cursor is invalid for this scope."
-                : "Bounded scope data is unavailable while the storage sidecar is missing or still indexing.",
+              "Bounded scope data is unavailable while the storage sidecar is missing or still indexing.",
             scope,
-            ...(code ? { reason: code } : {}),
           });
         }
-        throw err;
-      }
-    },
 
-    async readBlockManifest({ scope, grantId }) {
-      const storage = options.dataApiDeps.storage;
-      if (!storage.readBlockManifest) return null;
-
-      const selectedEntry = storage.findEntry({ scope });
-      if (!selectedEntry) {
-        throw new McpDataReadError(404, {
-          error: "NOT_FOUND",
-          message: `No data found for scope "${scope}"`,
-        });
-      }
-      await assertScopeReadable(scope, selectedEntry);
-
-      const { request, authResult } = await authorizeScopeRead({
-        scope,
-        grantId,
-        fileId: selectedEntry.fileId ?? undefined,
-        metadataOnly: true,
-      });
-      let manifest;
-      try {
-        manifest = await storage.readBlockManifest(
+        const pinnedCollectedAt = collectedAtFromCursor(scope, cursor);
+        const selectedEntry = storage.findEntry({
           scope,
-          selectedEntry.collectedAt,
-        );
-      } catch (err) {
-        if (err instanceof ProtocolError) {
-          throw new McpDataReadError(err.code, err.toJSON());
+          ...(pinnedCollectedAt ? { at: pinnedCollectedAt } : {}),
+        });
+        if (!selectedEntry) {
+          throw new McpDataReadError(404, {
+            error: "NOT_FOUND",
+            message: `No data found for scope "${scope}"`,
+          });
         }
-        throw err;
-      }
-      // Logged like any other grant-gated read, but never reported as a read
-      // fulfillment: a table of contents carries no block values.
-      await writeReadAccessLog(request, { scope, grantId, authResult });
-      if (manifest && !isOwnerView(authResult)) {
-        return {
-          ...manifest,
-          blocks: redactBlockRefsForGrantee(
-            manifest.blocks,
-            await resolveBlockRedactionContext(
-              storage,
+        // Before authorizeScopeRead: a payment-enforcing auth port settles
+        // x402 there, and deleted data must never be charged for.
+        const scopeDependency = await assertScopeReadable(scope, selectedEntry);
+        authorizeGranteeVersion(selectedEntry);
+        // A cursor (from a page or a table of contents) names the version the
+        // logical read started on. Refused before payment when the selected
+        // row is another version.
+        const cursorGeneration = generationFromCursor(scope, cursor);
+        if (selectedEntry.generation !== undefined) {
+          assertSameVersion(scope, cursorGeneration, selectedEntry.generation);
+        }
+
+        try {
+          const pinned = pinnedVersion(
+            scope,
+            await establishVersion(storage, selectedEntry),
+          );
+          const generation = pinned.generation;
+          assertSameVersion(scope, cursorGeneration, generation);
+          // Scope admission is uncharged. Establish the immutable served representation before settlement.
+          const admission = await authorizeScopeRead({
+            scope,
+            grantId,
+            fileId: selectedEntry.fileId ?? undefined,
+            at: selectedEntry.collectedAt,
+            metadataOnly: true,
+          });
+          if (cursor && !isOwnerView(admission.authResult)) {
+            const decoded = decodeDataBlockCursor(cursor);
+            if (!decoded.ok || !decoded.cursor.representationId) {
+              throw new McpDataReadError(409, {
+                error: "VERSION_CHANGED",
+                reason: "representation_mismatch",
+                scope,
+                message:
+                  "This cursor has no block representation identity. Restart without a cursor.",
+              });
+            }
+          }
+          const blockStorage = isOwnerView(admission.authResult)
+            ? options.dataApiDeps.storage
+            : storage;
+          const read = await blockStorage.readScopeBlocks!(
+            scope,
+            selectedEntry.collectedAt,
+            {
+              cursor,
+              maxBytes: maxBytes ?? 16_384,
+              ...(blockIds?.length ? { blockIds } : {}),
+              // Pin the version authorized above: the view serves only its
+              // bytes, never a version published later at the same path.
+              generation,
+              representation: isOwnerView(admission.authResult)
+                ? "stored"
+                : "grantee",
+            },
+          );
+          // The next page continues this version only.
+          const result = read.nextCursor
+            ? { ...read, nextCursor: cursorFor(read.nextCursor, pinned) }
+            : read;
+          const { request, authResult } = await authorizeScopeRead({
+            scope,
+            grantId,
+            fileId: selectedEntry.fileId ?? undefined,
+            // The exact version this read serves (cursor-pinned or latest) —
+            // a payment-enforcing auth port binds the x402 settlement to it.
+            at: selectedEntry.collectedAt,
+            payment,
+          });
+
+          const { logId, timestamp, ipAddress, userAgent } =
+            await writeReadAccessLog(request, { scope, grantId, authResult });
+          const delivered =
+            isOwnerView(authResult) || result.representationId !== undefined
+              ? {
+                  status: 200,
+                  ...result,
+                  scopeSizeBytes: selectedEntry.sizeBytes,
+                }
+              : {
+                  status: 200,
+                  ...result,
+                  scopeSizeBytes: selectedEntry.sizeBytes,
+                  blocks: redactBlockPayloadsForGrantee(
+                    result.blocks,
+                    await resolveBlockRedactionContext(
+                      storage,
+                      scope,
+                      selectedEntry.collectedAt,
+                      result.blocks,
+                    ),
+                  ),
+                };
+          // Early delivery gate, after every await of this read; the lease
+          // then goes to the tool call, whose result is released through it.
+          await releaseRead(
+            allDeliveryLeases(authResult?.lease, scopeDependency),
+          );
+          // A block-addressed read serves a hand-picked subset, so it never
+          // completes the scope the way an uncursored full read does; reporting
+          // fulfillment for it would settle the read on partial data.
+          if (
+            authResult?.grantId &&
+            authResult.builder &&
+            !cursor &&
+            !blockIds?.length &&
+            !result.nextCursor
+          ) {
+            reportPersonalServerReadFulfillment(options.dataApiDeps, {
+              builder: authResult.builder,
+              fileId: selectedEntry.fileId ?? undefined,
+              grantId: authResult.grantId,
+              ipAddress,
+              logId,
+              outcome: "served",
               scope,
-              selectedEntry.collectedAt,
-              manifest.blocks,
-            ),
-          ),
-        };
-      }
-      return manifest;
-    },
+              servedAt: timestamp,
+              source: "mcp",
+              ...(tool ? { tool } : {}),
+              userAgent,
+            });
+          }
+          return delivered;
+        } catch (err) {
+          if (err instanceof ProtocolError) {
+            throw new McpDataReadError(err.code, err.toJSON());
+          }
+          if (err instanceof McpDataReadError) throw err;
+          if (err instanceof Error) {
+            const code = dataBlockStorageErrorCode(err);
+            const status =
+              code === "representation_mismatch"
+                ? 409
+                : code === "cursor_invalid"
+                  ? 400
+                  : 503;
+            throw new McpDataReadError(status, {
+              error:
+                code === "representation_mismatch"
+                  ? "VERSION_CHANGED"
+                  : code === "cursor_invalid"
+                    ? "INVALID_CURSOR"
+                    : "BOUNDED_DATA_UNAVAILABLE",
+              message:
+                code === "cursor_invalid"
+                  ? "The bounded read cursor is invalid for this scope."
+                  : "Bounded scope data is unavailable while the storage sidecar is missing or still indexing.",
+              scope,
+              ...(code ? { reason: code } : {}),
+            });
+          }
+          throw err;
+        }
+      },
 
-    async readRawScopeFile({ scope, grantId, at, fileId, payment }) {
-      const storage = options.dataApiDeps.storage;
-      const selectedEntry = storage.findEntry({
-        scope,
-        ...(fileId ? { fileId } : {}),
-        ...(at ? { at } : {}),
-      });
-      if (!selectedEntry) {
-        throw new McpDataReadError(404, {
-          error: "NOT_FOUND",
-          message: `No data found for scope "${scope}"`,
+      async readBlockManifest({ scope, grantId }) {
+        const storage = granteeStorage;
+        if (!storage.readBlockManifest) return null;
+
+        const selectedEntry = storage.findEntry({ scope });
+        if (!selectedEntry) {
+          throw new McpDataReadError(404, {
+            error: "NOT_FOUND",
+            message: `No data found for scope "${scope}"`,
+          });
+        }
+        const scopeDependency = await assertScopeReadable(scope, selectedEntry);
+        authorizeGranteeVersion(selectedEntry);
+
+        let manifest;
+        let admission: Awaited<ReturnType<typeof authorizeScopeRead>>;
+        let pinned: PinnedVersion;
+        try {
+          pinned = pinnedVersion(
+            scope,
+            await establishVersion(storage, selectedEntry),
+          );
+          admission = await authorizeScopeRead({
+            scope,
+            grantId,
+            fileId: selectedEntry.fileId ?? undefined,
+            at: selectedEntry.collectedAt,
+            metadataOnly: true,
+          });
+          const manifestStorage = isOwnerView(admission.authResult)
+            ? options.dataApiDeps.storage
+            : storage;
+          manifest = await manifestStorage.readBlockManifest!(
+            scope,
+            selectedEntry.collectedAt,
+            { generation: pinned.generation },
+          );
+        } catch (err) {
+          if (err instanceof ProtocolError) {
+            throw new McpDataReadError(err.code, err.toJSON());
+          }
+          throw err;
+        }
+        const { request, authResult } = admission;
+        // Logged like any other grant-gated read, but never reported as a read
+        // fulfillment: a table of contents carries no block values.
+        await writeReadAccessLog(request, { scope, grantId, authResult });
+        let delivered: McpBlockManifest | null = manifest;
+        if (manifest) {
+          // Selection by these block ids reads this version only when the
+          // caller passes this cursor with them.
+          const versionCursor = cursorFor(
+            encodeDataBlockCursor({
+              scope,
+              collectedAt: selectedEntry.collectedAt,
+              blockIndex: 0,
+              representationId:
+                manifest.representationId ??
+                blockRepresentationId(
+                  manifest,
+                  isOwnerView(authResult) ? "stored" : "grantee",
+                  manifest.cursorView,
+                ),
+              ...(manifest.cursorView ? { view: manifest.cursorView } : {}),
+            }),
+            pinned,
+          );
+          delivered = isOwnerView(authResult)
+            ? { ...manifest, versionCursor }
+            : {
+                ...manifest,
+                versionCursor,
+                blocks: redactBlockRefsForGrantee(
+                  manifest.blocks,
+                  await resolveBlockRedactionContext(
+                    storage,
+                    scope,
+                    selectedEntry.collectedAt,
+                    manifest.blocks,
+                  ),
+                ),
+              };
+        }
+        // Early delivery gate, as for block values above.
+        try {
+          await releaseRead(
+            allDeliveryLeases(authResult?.lease, scopeDependency),
+          );
+        } catch (err) {
+          if (err instanceof ProtocolError) {
+            throw new McpDataReadError(err.code, err.toJSON());
+          }
+          throw err;
+        }
+        return delivered;
+      },
+
+      async readRawScopeFile({ scope, grantId, at, fileId, payment }) {
+        const storage = options.dataApiDeps.storage;
+        const selectedEntry = storage.findEntry({
+          scope,
+          ...(fileId ? { fileId } : {}),
+          ...(at ? { at } : {}),
         });
-      }
+        if (!selectedEntry) {
+          throw new McpDataReadError(404, {
+            error: "NOT_FOUND",
+            message: `No data found for scope "${scope}"`,
+          });
+        }
 
-      const safeScope = encodeURIComponent(scope);
-      const signingUri = `${basePath}/${safeScope}`;
-      const query = new URLSearchParams({ content: "raw" });
-      if (fileId) query.set("fileId", fileId);
-      if (at) query.set("at", at);
-      query.set("grantId", grantId);
+        const safeScope = encodeURIComponent(scope);
+        const signingUri = `${basePath}/${safeScope}`;
+        const query = new URLSearchParams({ content: "raw" });
+        if (fileId) query.set("fileId", fileId);
+        if (at) query.set("at", at);
+        query.set("grantId", grantId);
 
-      const authorization = await signMcpGranteeRequest({
-        account: options.granteeAccount,
-        aud: options.serverOrigin,
-        method: "GET",
-        uri: signingUri,
-        grantId,
-      });
-      const url = new URL(
-        `${signingUri}?${query.toString()}`,
-        options.serverOrigin,
-      ).toString();
-      const request = new Request(url, {
-        method: "GET",
-        headers: {
-          Authorization: authorization,
-          ...(payment ? { "X-PAYMENT": payment } : {}),
-        },
-      });
+        const authorization = await signMcpGranteeRequest({
+          account: options.granteeAccount,
+          aud: options.serverOrigin,
+          method: "GET",
+          uri: signingUri,
+          grantId,
+        });
+        const url = new URL(
+          `${signingUri}?${query.toString()}`,
+          options.serverOrigin,
+        ).toString();
+        const request = new Request(url, {
+          method: "GET",
+          headers: {
+            Authorization: authorization,
+            ...(payment ? { "X-PAYMENT": payment } : {}),
+          },
+        });
 
-      const response = await handlePersonalServerDataRequest(
-        request,
-        options.dataApiDeps,
-        { basePath },
-      );
-      if (!response.ok) {
-        throw new McpDataReadError(
-          response.status,
-          await parseJsonOrText(response),
+        const response = await handlePersonalServerDataRequest(
+          request,
+          options.dataApiDeps,
+          // The raw body is materialized into the tool result below; the read
+          // stays held to its lease until the tool result is released.
+          { basePath, ...(sink && { onDeliveryLease: sink }) },
         );
-      }
+        if (!response.ok) {
+          throw new McpDataReadError(
+            response.status,
+            await parseJsonOrText(response),
+          );
+        }
 
-      const mimeType =
-        response.headers.get("content-type") ?? "application/octet-stream";
-      if (mimeType.includes("application/json")) {
-        throw new McpDataReadError(400, {
-          error: "NOT_BINARY_SCOPE",
-          message: `Scope "${scope}" does not expose raw binary content.`,
-        });
-      }
+        const mimeType =
+          response.headers.get("content-type") ?? "application/octet-stream";
+        if (mimeType.includes("application/json")) {
+          throw new McpDataReadError(400, {
+            error: "NOT_BINARY_SCOPE",
+            message: `Scope "${scope}" does not expose raw binary content.`,
+          });
+        }
 
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      const contentDisposition = response.headers.get("content-disposition");
-      const metadataHeader = response.headers.get("x-vana-metadata");
-      return {
-        status: response.status,
-        scope,
-        collectedAt: selectedEntry.collectedAt,
-        fileId: selectedEntry.fileId ?? undefined,
-        mimeType,
-        filename: filenameFromContentDisposition(contentDisposition),
-        sizeBytes: bytes.byteLength,
-        contentBase64: bytesToBase64(bytes),
-        metadata: parseMetadataHeader(metadataHeader),
-      };
-    },
-  };
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const contentDisposition = response.headers.get("content-disposition");
+        const metadataHeader = response.headers.get("x-vana-metadata");
+        return {
+          status: response.status,
+          scope,
+          collectedAt: selectedEntry.collectedAt,
+          fileId: selectedEntry.fileId ?? undefined,
+          mimeType,
+          filename: filenameFromContentDisposition(contentDisposition),
+          sizeBytes: bytes.byteLength,
+          contentBase64: bytesToBase64(bytes),
+          metadata: parseMetadataHeader(metadataHeader),
+        };
+      },
+    };
+  }
+  return client();
 }
 
 async function parseJsonOrText(response: Response): Promise<unknown> {
@@ -930,6 +876,89 @@ function filenameFromContentDisposition(
   const match =
     /filename="([^"]+)"/i.exec(value) ?? /filename=([^;]+)/i.exec(value);
   return match?.[1]?.trim();
+}
+
+/** The generation a cursor was issued for, when it names one. */
+function generationFromCursor(
+  scope: string,
+  cursor: string | undefined,
+): string | undefined {
+  if (!cursor) return undefined;
+  const decoded = decodeDataBlockCursor(cursor);
+  if (!decoded.ok || decoded.cursor.scope !== scope) return undefined;
+  return decoded.cursor.generation;
+}
+
+/** Refuse a cursor issued for another version than the one selected. */
+function assertSameVersion(
+  scope: string,
+  cursorGeneration: string | undefined,
+  generation: string | undefined,
+): void {
+  if (cursorGeneration === undefined || cursorGeneration === generation) {
+    return;
+  }
+  throw new McpDataReadError(409, {
+    error: "VERSION_CHANGED",
+    message:
+      "The version this cursor reads was replaced. Start the read again without the cursor.",
+    scope,
+    reason: "generation_mismatch",
+  });
+}
+
+declare const PINNED: unique symbol;
+
+/**
+ * The version a logical read is pinned to. Only `establishVersion` makes
+ * one, so a cursor (which needs one) cannot name no version.
+ */
+type PinnedVersion = { readonly generation: string; readonly [PINNED]: true };
+
+type VersionIdentity =
+  | { ok: true; version: PinnedVersion }
+  | { ok: false; reason: "identity_unavailable" };
+
+/**
+ * Establish the generation a logical read pins: the row's, or for a row
+ * from before rows recorded one, the value storage backfills from the
+ * published bytes. Fails explicitly when storage cannot establish it, for
+ * example when the row was replaced while it was being backfilled.
+ */
+async function establishVersion(
+  storage: PersonalServerDataApiDeps["storage"],
+  entry: IndexEntry,
+): Promise<VersionIdentity> {
+  const generation =
+    entry.generation ?? (await storage.backfillGeneration?.(entry));
+  return generation
+    ? { ok: true, version: { generation } as PinnedVersion }
+    : { ok: false, reason: "identity_unavailable" };
+}
+
+/** The pinned version, or a retryable refusal: never an unpinned read. */
+function pinnedVersion(
+  scope: string,
+  identity: VersionIdentity,
+): PinnedVersion {
+  if (identity.ok) return identity.version;
+  throw new McpDataReadError(409, {
+    error: "VERSION_CHANGED",
+    message: "The version changed while this read started. Retry the read.",
+    scope,
+    reason: identity.reason,
+    retryable: true,
+  });
+}
+
+/** A cursor that also names the version it reads. */
+function cursorFor(cursor: string, version: PinnedVersion): string {
+  const decoded = decodeDataBlockCursor(cursor);
+  if (!decoded.ok) {
+    throw new Error("Storage returned a cursor that does not decode");
+  }
+  const { version: _version, ...fields } = decoded.cursor;
+  return encodeDataBlockCursor({ ...fields, generation: version.generation });
 }
 
 function collectedAtFromCursor(

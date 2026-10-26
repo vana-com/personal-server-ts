@@ -228,6 +228,7 @@ export async function createPdppAuthDeps(
       declarations: registry.retained.map((d) => d.source_id),
       supportedConnectors,
       requirePkce: config.pdpp.requirePkce,
+      protocolProfile: config.pdpp.protocolProfile,
     },
     "PDPP Authorization Server mounted at /pdpp/v1",
   );
@@ -393,4 +394,17 @@ async function readDeclarations(
     }
   }
   return out;
+}
+
+/**
+ * Whether PDPP is configured on this server, for the publication policy
+ * (`nonOwnerPublicationIsPdpp`). It follows configuration, not whether the
+ * PDPP routes mounted: a service that is enabled but failed to mount (no
+ * retained declarations, no owner) still counts, since PDPP data may exist.
+ */
+export function pdppIsConfigured(
+  config: { pdpp: { enabled: boolean } } | undefined,
+  mounted: unknown,
+): boolean | undefined {
+  return mounted !== undefined ? true : config?.pdpp.enabled;
 }

@@ -4,6 +4,8 @@ import { encodeDataBlockCursor } from "../storage/blocks/index.js";
 import { buildBinaryEnvelopeData } from "../contracts/binary.js";
 import { createScopeDeletionTracker } from "../sync/scope-deletions.js";
 import { ProtocolError } from "../errors/catalog.js";
+import { PDPP_CLASSIFIER_VERSION } from "../sync/pdpp-import.js";
+import { BLOCK_REDACTION_POLICY_VERSION } from "../storage/blocks/redaction.js";
 
 const SERVER_ORIGIN = "https://personal-server.test";
 
@@ -17,6 +19,85 @@ function createAccount() {
 }
 
 describe("mcp/read-client", () => {
+  it("refuses a block read when the selected stored version is PDPP-projected", async () => {
+    const readScopeBlocks = vi.fn();
+    const accessLogWrite = vi.fn();
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          findEntry: vi.fn().mockReturnValue({
+            scope: "oura.sleep",
+            collectedAt: "2026-10-01T00:00:00Z",
+            fileId: "file-1",
+            pdppOrigin: true,
+          }),
+          readScopeBlocks,
+        } as never,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi.fn().mockResolvedValue({
+            builder: "0x2222",
+            grantId: "grant-1",
+          }),
+        },
+        accessLogWriter: { write: accessLogWrite },
+      },
+    });
+
+    await expect(
+      client.readScopeBlocks({ scope: "oura.sleep", grantId: "grant-1" }),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(readScopeBlocks).not.toHaveBeenCalled();
+    expect(accessLogWrite).not.toHaveBeenCalled();
+  });
+
+  it("refuses a read whose version identity storage cannot establish, retryably", async () => {
+    const readScopeBlocks = vi.fn();
+    const readBlockManifest = vi.fn();
+    const settle = vi.fn().mockResolvedValue({ grantId: "grant-1" });
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage: {
+          // A row from before generations, whose backfill lost a race.
+          findEntry: () => ({
+            id: 1,
+            path: "oura/sleep/a.json",
+            scope: "oura.sleep",
+            collectedAt: "2026-10-01T00:00:00Z",
+            fileId: "file-1",
+          }),
+          backfillGeneration: vi.fn().mockResolvedValue(undefined),
+          readScopeBlocks,
+          readBlockManifest,
+        } as never,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: settle,
+        },
+        accessLogWriter: { write: vi.fn() },
+      },
+    });
+
+    for (const read of [
+      client.readScopeBlocks({ scope: "oura.sleep", grantId: "grant-1" }),
+      client.readBlockManifest!({ scope: "oura.sleep", grantId: "grant-1" }),
+    ]) {
+      await expect(read).rejects.toMatchObject({
+        status: 409,
+        body: { error: "VERSION_CHANGED", reason: "identity_unavailable" },
+      });
+    }
+    expect(readScopeBlocks).not.toHaveBeenCalled();
+    expect(readBlockManifest).not.toHaveBeenCalled();
+    expect(settle).not.toHaveBeenCalled();
+  });
+
   it("preserves a projection refusal from the block manifest read", async () => {
     const client = createMcpDataReadClient({
       serverOrigin: SERVER_ORIGIN,
@@ -27,6 +108,8 @@ describe("mcp/read-client", () => {
             scope: "oura.sleep",
             collectedAt: "2026-10-01T00:00:00Z",
             fileId: "file-1",
+            pdppOrigin: false,
+            generation: "gen-1",
           }),
           readBlockManifest: vi
             .fn()
@@ -123,6 +206,8 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -173,6 +258,8 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -221,6 +308,14 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json",
+      // A sidecar bound to the selected version.
+      pdppOrigin: false,
+      envelopeDigest: "gen-1",
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [
         {
           id: "block-42",
@@ -248,6 +343,8 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -281,7 +378,12 @@ describe("mcp/read-client", () => {
     expect(readScopeBlocks).toHaveBeenCalledWith(
       "instagram.profile",
       "2026-06-05T00:00:00Z",
-      { cursor: undefined, maxBytes: 4096, blockIds: ["block-42"] },
+      {
+        cursor: undefined,
+        maxBytes: 4096,
+        blockIds: ["block-42"],
+        representation: "grantee",
+      },
     );
     expect(accessLogWrite).toHaveBeenCalledTimes(1);
     expect(readFulfillmentReport).not.toHaveBeenCalled();
@@ -297,12 +399,21 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json" as const,
+      pdppOrigin: false,
+      pdppClassifier: PDPP_CLASSIFIER_VERSION,
+      envelopeDigest: "gen-1",
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [
         {
           id: "block-1",
           path: "$.items[0]",
           mediaType: "application/json",
           sizeBytes: 18,
+          digest: "block-digest-1",
         },
       ],
       warnings: [],
@@ -323,6 +434,8 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -372,6 +485,14 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json",
+      // A sidecar bound to the selected version.
+      pdppOrigin: false,
+      envelopeDigest: "gen-1",
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [
         {
           id: "block-1",
@@ -399,6 +520,8 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -444,7 +567,7 @@ describe("mcp/read-client", () => {
     expect(readScopeBlocks).toHaveBeenCalledWith(
       "instagram.profile",
       "2026-06-05T00:00:00Z",
-      { cursor: undefined, maxBytes: 4096 },
+      { cursor: undefined, maxBytes: 4096, representation: "grantee" },
     );
     expect(accessLogWrite).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -484,6 +607,14 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json",
+      // A sidecar bound to the selected version.
+      pdppOrigin: false,
+      envelopeDigest: "gen-1",
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [],
       nextCursor,
       warnings: [],
@@ -504,6 +635,8 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -525,13 +658,21 @@ describe("mcp/read-client", () => {
       },
     });
 
-    await expect(
-      client.readScopeBlocks({
-        scope: "instagram.profile",
-        grantId: "grant-1",
-        maxBytes: 4096,
-      }),
-    ).resolves.toMatchObject({ nextCursor });
+    const page = await client.readScopeBlocks({
+      scope: "instagram.profile",
+      grantId: "grant-1",
+      maxBytes: 4096,
+    });
+    // The storage cursor's position, also naming the version the read
+    // started on; decoded by hand, not by the cursor module.
+    expect(
+      JSON.parse(Buffer.from(page.nextCursor!, "base64url").toString("utf8")),
+    ).toMatchObject({
+      scope: "instagram.profile",
+      collectedAt: "2026-06-05T00:00:00Z",
+      blockIndex: 1,
+      generation: "gen-1",
+    });
 
     expect(accessLogWrite).toHaveBeenCalledTimes(1);
     expect(readFulfillmentReport).not.toHaveBeenCalled();
@@ -547,11 +688,20 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       blockIndex: 99,
+      representationId: "fixture-layout",
     });
     const readScopeBlocks = vi.fn().mockResolvedValue({
       scope: "instagram.profile",
       collectedAt: "2026-06-05T00:00:00Z",
       contentKind: "json",
+      // A sidecar bound to the selected version.
+      pdppOrigin: false,
+      envelopeDigest: "gen-1",
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [],
       warnings: [],
     });
@@ -571,6 +721,8 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: 10,
+              pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -616,6 +768,7 @@ describe("mcp/read-client", () => {
       scope: "instagram.profile",
       collectedAt: oldCollectedAt,
       blockIndex: 1,
+      representationId: "fixture-layout",
     });
     const findEntry = vi.fn(
       ({ at }: { at?: string }) =>
@@ -624,12 +777,23 @@ describe("mcp/read-client", () => {
           collectedAt: at ?? latestCollectedAt,
           fileId: at === oldCollectedAt ? "file-old" : "file-latest",
           sizeBytes: 10,
+          pdppOrigin: false,
+          generation: at === oldCollectedAt ? "gen-old" : "gen-latest",
         }) as never,
     );
     const readScopeBlocks = vi.fn().mockResolvedValue({
       scope: "instagram.profile",
       collectedAt: oldCollectedAt,
       contentKind: "json",
+      // A sidecar bound to the cursor's version: served only if that
+      // version's generation is the one pinned.
+      pdppOrigin: false,
+      envelopeDigest: "gen-old",
+      redaction: {
+        policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+        dropTopLevelLineage: false,
+        dropMetadataLineage: false,
+      },
       blocks: [],
       warnings: [],
     });
@@ -676,13 +840,122 @@ describe("mcp/read-client", () => {
     expect(readScopeBlocks).toHaveBeenCalledWith(
       "instagram.profile",
       oldCollectedAt,
-      { cursor, maxBytes: 16_384 },
+      { cursor, maxBytes: 16_384, representation: "grantee" },
     );
     // The auth port sees the pinned version too, so a payment-enforcing port
     // (paid self-signing session) settles against the version actually served.
     expect(authorizeBuilderRead).toHaveBeenCalledWith(
       expect.objectContaining({ at: oldCollectedAt }),
     );
+  });
+
+  it("refuses blocks and manifests bound to a version other than the one authorized", async () => {
+    const collectedAt = "2026-06-05T00:00:00Z";
+    const storage = {
+      kind: "custom" as const,
+      listScopes: () => ({ scopes: [], total: 0 }),
+      listVersions: vi.fn(),
+      countVersions: vi.fn(),
+      findEntry: () =>
+        ({
+          scope: "instagram.profile",
+          collectedAt,
+          fileId: "file-1",
+          sizeBytes: 10,
+          pdppOrigin: false,
+          generation: "gen-authorized",
+        }) as never,
+      findByFileId: vi.fn(),
+      findUnsynced: vi.fn(),
+      // The bytes now at the path are another version.
+      readEnvelope: vi.fn().mockResolvedValue({
+        version: "1.0",
+        scope: "instagram.profile",
+        collectedAt,
+        data: { id: "republished" },
+      }),
+      readScopeBlocks: vi.fn().mockResolvedValue({
+        scope: "instagram.profile",
+        collectedAt,
+        contentKind: "json",
+        pdppOrigin: false,
+        envelopeDigest: "gen-republished",
+        redaction: {
+          policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+          dropTopLevelLineage: false,
+          dropMetadataLineage: false,
+        },
+        blocks: [
+          {
+            id: "block-1",
+            path: "$.data",
+            mediaType: "application/json",
+            value: { id: "republished" },
+            sizeBytes: 18,
+          },
+        ],
+        warnings: [],
+      }),
+      readBlockManifest: vi.fn().mockResolvedValue({
+        version: 1 as const,
+        scope: "instagram.profile",
+        collectedAt,
+        contentKind: "json" as const,
+        pdppOrigin: false,
+        envelopeDigest: "gen-republished",
+        redaction: {
+          policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+          dropTopLevelLineage: false,
+          dropMetadataLineage: false,
+        },
+        blocks: [
+          {
+            id: "block-1",
+            path: "$.data",
+            mediaType: "application/json",
+            sizeBytes: 18,
+            digest: "block-digest-1",
+          },
+        ],
+        warnings: [],
+      }),
+      writeEnvelope: vi.fn(),
+      insertEntry: vi.fn(),
+      updateFileId: vi.fn(),
+      deleteScope: vi.fn(),
+      deleteByFileId: vi.fn(),
+    };
+    const client = createMcpDataReadClient({
+      serverOrigin: SERVER_ORIGIN,
+      granteeAccount: createAccount(),
+      dataApiDeps: {
+        storage,
+        auth: {
+          authorizeOwner: vi.fn(),
+          authorizeBuilderList: vi.fn(),
+          authorizeBuilderRead: vi
+            .fn()
+            .mockResolvedValue({ grantId: "grant-1", builder: "0x2222" }),
+        },
+        accessLogWriter: { write: vi.fn() },
+      },
+    });
+
+    await expect(
+      client.readScopeBlocks({
+        scope: "instagram.profile",
+        grantId: "grant-1",
+      }),
+    ).rejects.toMatchObject({
+      status: 503,
+      body: { reason: "generation_mismatch" },
+    });
+    await expect(
+      client.readBlockManifest?.({
+        scope: "instagram.profile",
+        grantId: "grant-1",
+      }),
+    ).rejects.toMatchObject({ code: "generation_mismatch" });
   });
 
   it("reads raw binary scopes through the grant-gated data API path", async () => {
@@ -706,6 +979,8 @@ describe("mcp/read-client", () => {
               collectedAt: "2026-06-05T00:00:00Z",
               fileId: "file-1",
               sizeBytes: bytes.byteLength,
+              pdppOrigin: false,
+              generation: "gen-1",
             }) as never,
           findByFileId: vi.fn(),
           findUnsynced: vi.fn(),
@@ -964,6 +1239,8 @@ describe("mcp/read-client deletion gate", () => {
                 collectedAt: "2026-06-05T00:00:00Z",
                 fileId: "file-1",
                 sizeBytes: 10,
+                pdppOrigin: false,
+                generation: "gen-1",
               }) as never,
             findByFileId: vi.fn(),
             findUnsynced: vi.fn(),
@@ -974,17 +1251,34 @@ describe("mcp/read-client deletion gate", () => {
               contentKind: "vana-envelope",
               blocks: structuredClone(options.blocks ?? STAMPED_BLOCKS),
               warnings: [],
+              // Sidecars record their envelope's provenance and version.
+              pdppOrigin: false,
+              envelopeDigest: "gen-1",
+              redaction: {
+                policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+                dropTopLevelLineage: false,
+                dropMetadataLineage: false,
+              },
             }),
             readBlockManifest: vi.fn().mockResolvedValue({
               version: 1 as const,
               scope: "spine.health.summary",
               collectedAt: "2026-06-05T00:00:00Z",
               contentKind: "vana-envelope" as const,
+              pdppOrigin: false,
+              pdppClassifier: PDPP_CLASSIFIER_VERSION,
+              envelopeDigest: "gen-1",
+              redaction: {
+                policyVersion: BLOCK_REDACTION_POLICY_VERSION,
+                dropTopLevelLineage: false,
+                dropMetadataLineage: false,
+              },
               blocks: STAMPED_BLOCKS.map(({ id, path, sizeBytes }) => ({
                 id,
                 path,
                 mediaType: "application/json",
                 sizeBytes,
+                digest: `digest-${id}`,
               })),
               warnings: [],
             }),

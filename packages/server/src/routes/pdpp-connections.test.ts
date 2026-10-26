@@ -13,7 +13,7 @@ const C = "conn_223e4567-e89b-42d3-a456-426614174001";
 describe("PDPP connection routes", () => {
   const db = new Database(":memory:");
   const store = createSqliteRecordStore(db);
-  const app = pdppConnectionRoutes({
+  const routeDeps: Parameters<typeof pdppConnectionRoutes>[0] = {
     store,
     auth: {
       async resolveToken(token) {
@@ -51,6 +51,11 @@ describe("PDPP connection routes", () => {
     configuredMethods: new Map(),
     canonicalSourceIds: new Set([SOURCE]),
     sourceIds: new Set([SOURCE]),
+  };
+  const app = pdppConnectionRoutes(routeDeps);
+  const candidateApp = pdppConnectionRoutes({
+    ...routeDeps,
+    protocolProfile: "candidate-0.1.0",
   });
 
   afterEach(() => {
@@ -270,4 +275,22 @@ describe("PDPP connection routes", () => {
     expect(store.getRecord(B, "playlists", "p1")).toBeDefined();
     expect(store.getInstanceBinding(B).deletedAt).toBeNull();
   });
+
+  it.each([undefined, "Bearer stale"])(
+    "challenges rejected connection bearer %s under the candidate profile only",
+    async (authorization) => {
+      const path = `/pdpp/connections?source_id=${encodeURIComponent(SOURCE)}`;
+      const headers = authorization ? { authorization } : undefined;
+      const current = await app.request(path, { headers });
+      expect(current.status).toBe(401);
+      expect(current.headers.get("WWW-Authenticate")).toBeNull();
+
+      const candidate = await candidateApp.request(path, { headers });
+      expect(candidate.status).toBe(401);
+      expect(await candidate.json()).toEqual(await current.json());
+      expect(candidate.headers.get("WWW-Authenticate")).toBe(
+        'Bearer error="invalid_token", resource_metadata="http://localhost/.well-known/oauth-protected-resource"',
+      );
+    },
+  );
 });

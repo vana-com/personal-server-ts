@@ -1154,3 +1154,217 @@ describe("operator per-client grant lifetime policy", () => {
     (GRANT_LIFETIME_SECONDS + 5) * 1000,
   );
 });
+describe("publication signal on real boot", () => {
+  it.each([
+    [true, false],
+    [true, true],
+    [false, false],
+  ])(
+    "configured enabled %s with no retained declarations; connection registry %s",
+    async (enabled, registry) => {
+      const { createTestWallet, buildWeb3SignedHeader } =
+        await import("@opendatalabs/personal-server-ts-core/test-utils");
+      const { WRITE_SIGNATURE_HEADER } =
+        await import("@opendatalabs/personal-server-ts-core/write");
+      const writer = createTestWallet(1),
+        reader = createTestWallet(2);
+      const ownerAddress = await recoverServerOwner(KNOWN_SIG);
+      const grant = (id: string) => ({
+        id,
+        grantorAddress: ownerAddress,
+        granteeId: id === "writer-grant" ? writer.address : reader.address,
+        scopes: ["write:coach.*", "coach.*", "oura.sleep"],
+        revokedAt: null,
+        expiresAt: null,
+        fee: {
+          asset: "0x0000000000000000000000000000000000000000",
+          registrationFee: "0",
+          dataAccessFee: "0",
+          totalDue: "0",
+        },
+      });
+      const gateway = {
+        getBuilder: vi.fn(async (address: string) => ({
+          id: address,
+          granteeAddress: address,
+          ownerAddress,
+          publicKey: "0x04",
+          appUrl: "https://review.test",
+        })),
+        getGrant: vi.fn(async (id: string) => grant(id)),
+        getSchemaForScope: vi.fn(async () => null),
+        getSchema: vi.fn(async () => null),
+        getServer: vi.fn(async () => null),
+      };
+      const cfg = ServerConfigSchema.parse({
+        tunnel: { enabled: false },
+        logging: { level: "error" },
+        pdpp: {
+          enabled,
+          connectionMethods: registry
+            ? [{ source_id: SOURCE_ID, method_id: "spotify" }]
+            : [],
+        },
+      });
+      const { createFakeInferenceProvider } =
+        await import("@opendatalabs/personal-server-ts-core/derivatives");
+      ctx = await createServer(cfg, {
+        inferenceProvider: createFakeInferenceProvider(),
+        serverDir: tempDir,
+        dataDir: join(tempDir, "data"),
+        gatewayClient: gateway as never,
+      });
+      const origin = cfg.server.origin;
+      const handshake = await ctx.app.request("/v1/write/session", {
+        method: "POST",
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: writer,
+            aud: origin,
+            method: "POST",
+            uri: "/v1/write/session",
+            grantId: "writer-grant",
+          }),
+        },
+      });
+      expect(handshake.status, await handshake.clone().text()).toBe(200);
+      const token = (await handshake.json()).access_token;
+      const path = "/v1/data/coach.signal";
+      const body = JSON.stringify({ value: "signal-secret-marker" });
+      const write = await ctx.app.request(path, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+            wallet: writer,
+            aud: origin,
+            method: "POST",
+            uri: path,
+            grantId: "writer-grant",
+            body: new TextEncoder().encode(body),
+          }),
+        },
+        body,
+      });
+      expect(write.status, await write.clone().text()).toBe(201);
+      const response = await ctx.app.request(path, {
+        headers: {
+          Authorization: await buildWeb3SignedHeader({
+            wallet: reader,
+            aud: origin,
+            method: "GET",
+            uri: path,
+            grantId: "reader-grant",
+          }),
+        },
+      });
+      const text = await response.text();
+      const auth = (
+        await ctx.app.request("/pdpp/v1/owner/token", { method: "POST" })
+      ).status;
+      console.log(
+        JSON.stringify({
+          probe: "real-boot-enabled-signal",
+          configuredEnabled: cfg.pdpp.enabled,
+          registry,
+          ASstatus: auth,
+          write: write.status,
+          readerStatus: response.status,
+          leaked: text.includes("signal-secret-marker"),
+        }),
+      );
+      expect(response.status).toBe(enabled ? 403 : 200);
+      expect(text.includes("signal-secret-marker")).toBe(!enabled);
+
+      // The real composition root must give compute the same signal as ingest.
+      const { createNodeDataStorage } =
+        await import("../storage/node-data-storage.js");
+      const storage = createNodeDataStorage({
+        indexManager: ctx.indexManager,
+        hierarchyOptions: { dataDir: join(tempDir, "data") },
+      });
+      const source = {
+        version: "1.0",
+        scope: "oura.sleep",
+        collectedAt: "2026-09-01T00:00:00Z",
+        data: { score: 7 },
+      };
+      const stored = await storage.writeEnvelope(source);
+      await storage.insertEntry({
+        fileId: null,
+        path: stored.relativePath,
+        scope: source.scope,
+        collectedAt: source.collectedAt,
+        sizeBytes: stored.sizeBytes,
+      });
+      const questionPath = "/v1/derivatives/questions";
+      const questionBody = JSON.stringify({
+        derivedScope: "coach.answer",
+        sourceScopes: [source.scope],
+        question: "Explain signal-question-marker",
+      });
+      const registered = await ctx.app.request(questionPath, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          [WRITE_SIGNATURE_HEADER]: await buildWeb3SignedHeader({
+            wallet: writer,
+            aud: origin,
+            method: "POST",
+            uri: questionPath,
+            grantId: "writer-grant",
+            body: new TextEncoder().encode(questionBody),
+          }),
+        },
+        body: questionBody,
+      });
+      expect(registered.status, await registered.clone().text()).toBe(201);
+      const readAnswer = async () =>
+        ctx!.app.request("/v1/data/coach.answer", {
+          headers: {
+            Authorization: await buildWeb3SignedHeader({
+              wallet: reader,
+              aud: origin,
+              method: "GET",
+              uri: "/v1/data/coach.answer",
+              grantId: "reader-grant",
+            }),
+          },
+        });
+      await readAnswer(); // Authorized miss demands the initial compute.
+      await vi.waitFor(async () => {
+        const status = await ctx!.app.request(
+          "/v1/derivatives/status?derivedScope=coach.answer",
+          {
+            headers: {
+              Authorization: await buildWeb3SignedHeader({
+                wallet: reader,
+                aud: origin,
+                method: "GET",
+                uri: "/v1/derivatives/status",
+                grantId: "reader-grant",
+              }),
+            },
+          },
+        );
+        expect((await status.json()).status).toBe("ready");
+      });
+      const answer = await readAnswer();
+      const answerText = await answer.text();
+      console.log(
+        JSON.stringify({
+          probe: "real-boot-compute-signal",
+          enabled,
+          registry,
+          registration: registered.status,
+          readerStatus: answer.status,
+          leaked: answerText.includes("signal-question-marker"),
+        }),
+      );
+      expect(answer.status, answerText).toBe(enabled ? 403 : 200);
+      expect(answerText.includes("signal-question-marker")).toBe(!enabled);
+    },
+  );
+});

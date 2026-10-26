@@ -69,6 +69,7 @@ export {
   createScopeDeletionTracker,
   deletionTimestamp,
   isEntryCoveredByTombstone,
+  laterScopeDeletion,
   tombstoneVersion,
   DEFAULT_SCOPE_DELETION_GATEWAY_RETRY_MS,
   DEFAULT_SCOPE_DELETION_MAX_STALENESS_MS,
@@ -85,10 +86,20 @@ export {
   TOMBSTONE_METADATA_HASH,
   isTombstoneRecord,
 } from "./tombstone.js";
-
 export {
   NeedsFencedPublicationError,
   type FencedPublicationPort,
   type PublicationFence,
   type PublicationRecord,
 } from "../publication/publish.js";
+export {
+  hasPdppOrigin,
+  PDPP_CLASSIFIER_VERSION,
+  inputHasPdppOrigin,
+  isLegacyProjectionBody,
+  isProjectionInput,
+  isPdppProducer,
+  isPdppProjectionProducer,
+  PDPP_PRODUCERS,
+  type PdppProducer,
+} from "./pdpp-import.js";

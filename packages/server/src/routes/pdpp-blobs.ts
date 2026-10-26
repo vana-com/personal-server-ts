@@ -1,10 +1,26 @@
+import {
+  admitPdppRead,
+  type PdppReadAdmission,
+  type PdppChainEnforcementPort,
+} from "../pdpp/read-admission.js";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
-import { resourceMetadataUrlFor } from "./pdpp-records.js";
 import {
+  allDeliveryLeases,
+  deliver,
+  leasedStream,
+  type DeliveryLease,
+} from "@opendatalabs/personal-server-ts-core/policy";
+import {
+  bearerErrorResponse,
+  type PdppProtocolProfile,
+} from "../pdpp/bearer-response.js";
+import {
+  admitBearer,
+  connectionsLease,
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
@@ -13,6 +29,9 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 export interface PdppBlobsRouteDeps {
+  protocolProfile?: PdppProtocolProfile;
+  /** Same deployment authority as records; absent only for a chain-neutral deployment. */
+  chainEnforcement?: PdppChainEnforcementPort;
   store: PdppRecordStore;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
@@ -28,32 +47,92 @@ export interface PdppBlobsRouteDeps {
   ) => Promise<Uint8Array<ArrayBuffer> | undefined>;
 }
 
+/** Bytes released per delivery boundary of a blob body. */
+export const BLOB_DELIVERY_CHUNK_BYTES = 64 * 1024;
+
+/** The blob bytes as a stream of `BLOB_DELIVERY_CHUNK_BYTES` parts. */
+function chunkedBytes(
+  bytes: Uint8Array<ArrayBuffer>,
+): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (offset >= bytes.byteLength) {
+          controller.close();
+          return;
+        }
+        const end = Math.min(
+          offset + BLOB_DELIVERY_CHUNK_BYTES,
+          bytes.byteLength,
+        );
+        controller.enqueue(bytes.subarray(offset, end));
+        offset = end;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+/** A lease refusal as a PDPP error; anything unexpected fails closed. */
+function toLeaseRefusal(err: unknown): PdppError {
+  return err instanceof PdppError
+    ? err
+    : new PdppError("api_error", "Blob delivery could not be authorized");
+}
+
 function requestId(): string {
   return `req_${randomUUID()}`;
 }
 
-function jsonError(
-  c: Context,
-  err: PdppError,
-  reqId: string,
-  extraHeaders?: Record<string, string>,
-) {
-  // Every 401 carries the challenge, not just the missing-token branch: a
-  // client holding a STALE token is exactly who needs the pointer back to the
-  // metadata document in order to re-authorize.
-  const headers: Record<string, string> = {
-    "Request-Id": reqId,
-    "PDPP-Version": PDPP_VERSION,
-    ...(err.status === 401 && {
-      "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
-    }),
-    ...extraHeaders,
-  };
-  return c.json(err.toJSON(reqId), err.status as never, headers);
-}
-
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
+  function jsonError(
+    c: Context,
+    err: PdppError,
+    reqId: string,
+    options?: Parameters<typeof bearerErrorResponse>[4],
+  ) {
+    return bearerErrorResponse(c, err, reqId, deps.protocolProfile, options);
+  }
   const app = new Hono();
+
+  /**
+   * The blob read's release dependencies: the bearer's, and the connection
+   * of the record reference that authorized it (what the read selected).
+   */
+  function blobLease(
+    admission: PdppReadAdmission,
+    selectedInstance: string,
+  ): DeliveryLease {
+    return allDeliveryLeases(
+      admission.lease,
+      connectionsLease([selectedInstance], deps.isConnectionAvailable),
+    );
+  }
+
+  const available = (instance: string) =>
+    deps.isConnectionAvailable?.(instance) !== false;
+
+  /**
+   * Release a response through the read's lease (see `deliver`). Headers
+   * disclose the blob's size and type, so the headers of a GET or a HEAD are
+   * released through it too, before any body part.
+   */
+  async function release(
+    c: Context,
+    lease: DeliveryLease,
+    reqId: string,
+    build: () => Response,
+  ): Promise<Response> {
+    try {
+      return await deliver(lease, build);
+    } catch (err) {
+      const refusal = toLeaseRefusal(err);
+      return jsonError(c, refusal, reqId, {
+        inactiveBearer: refusal.code === "authentication_error",
+      });
+    }
+  }
 
   /**
    * Authorizes a blob fetch through the same path a record read uses (spec §8): finds every
@@ -65,7 +144,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   async function authorizeBlobAccess(
     c: Context,
     blobId: string,
-  ): Promise<{ error: Response } | { ok: true }> {
+  ): Promise<{ error: Response } | { ok: true; lease: DeliveryLease }> {
     const reqId = requestId();
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -75,46 +154,27 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         "Missing or invalid access token",
       );
       return {
-        error: jsonError(c, err, reqId, {
-          // Absolute, derived from this request's origin (RFC 9728 §5.1) --
-          // shares the records route's helper so the two cannot drift.
-          "WWW-Authenticate": `Bearer error="invalid_token", resource_metadata="${resourceMetadataUrlFor(c)}"`,
+        error: jsonError(c, err, reqId),
+      };
+    }
+    let admission: PdppReadAdmission;
+    try {
+      admission = await admitPdppRead(
+        deps,
+        await admitBearer(deps.auth, token),
+      );
+    } catch (err) {
+      const refusal = toLeaseRefusal(err);
+      return {
+        error: jsonError(c, refusal, reqId, {
+          inactiveBearer: refusal.code === "authentication_error",
+          ...(refusal.code === "api_error" && {
+            headers: { "Retry-After": "5" },
+          }),
         }),
       };
     }
-    const context = await deps.auth.resolveToken(token);
-    if (!context.active) {
-      const err = new PdppError("authentication_error", "Invalid access token");
-      return { error: jsonError(c, err, reqId) };
-    }
-
-    // DELETE removes the grant's record references and claim rows. Check its
-    // connection before blob metadata so callers still get the K7 refusal.
-    if (context.tokenKind !== "owner") {
-      const grantInstances = (context.grant?.streams ?? []).flatMap(
-        (stream) => stream.instance_ids,
-      );
-      if (
-        grantInstances.some(
-          (instance) => deps.isConnectionAvailable?.(instance) === false,
-        )
-      ) {
-        const err = new PdppError(
-          "instance_unavailable",
-          "The connection for this grant is unavailable",
-        );
-        return { error: jsonError(c, err, reqId) };
-      }
-    }
-
-    const meta = deps.store.getBlobMeta(blobId);
-    if (!meta) {
-      const err = new PdppError(
-        "blob_not_found",
-        "blob_id is unknown or stale",
-      );
-      return { error: jsonError(c, err, reqId) };
-    }
+    const context = admission.context;
 
     const notFound = () =>
       jsonError(
@@ -122,13 +182,38 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         new PdppError("blob_not_found", "blob_id is unknown or stale"),
         reqId,
       );
+    const unavailable = () =>
+      jsonError(
+        c,
+        new PdppError(
+          "instance_unavailable",
+          "The connection for this grant is unavailable",
+        ),
+        reqId,
+      );
+    // DELETE of a connection removes the grant's record references and claim
+    // rows, so a blob of a deleted connection is no longer found. When nothing
+    // authorizes the blob and one of the grant's connections is gone, answer
+    // with that (the K7 refusal) rather than "not found". A blob that an
+    // available connection still authorizes is not affected by an unrelated
+    // deleted one.
+    const missing = () =>
+      context.tokenKind !== "owner" &&
+      (context.grant?.streams ?? [])
+        .flatMap((stream) => stream.instance_ids)
+        .some((instance) => !available(instance))
+        ? unavailable()
+        : notFound();
+
+    const meta = deps.store.getBlobMeta(blobId);
+    if (!meta) return { error: missing() };
 
     // Identical blob bytes can legitimately be referenced by more than one
     // record or instance (e.g. re-ingested via a different stream). Access
     // is granted if ANY visible reference passes its authorization check —
     // an inaccessible reference must never hide an accessible one.
     const references = deps.store.findBlobReferences(blobId);
-    if (references.length === 0) return { error: notFound() };
+    if (references.length === 0) return { error: missing() };
 
     if (context.tokenKind === "owner") {
       // Owner tokens carry no grant: current-capability read, scoped to the
@@ -149,16 +234,24 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         : context.sourceId
           ? sourceInstances
           : [];
-      const visible = references.some((reference) =>
-        ownedInstances.includes(reference.instance),
-      );
-      if (!visible) return { error: notFound() };
-      return { ok: true };
+      const visible = references
+        .map((reference) => reference.instance)
+        .filter((instance) => ownedInstances.includes(instance));
+      if (visible.length === 0) return { error: notFound() };
+      // One available reference authorizes the bytes, just as for a client.
+      // Other visible connections are alternative authorities, not dependencies.
+      const selected = visible.find(available);
+      if (selected === undefined) return { error: unavailable() };
+      return {
+        ok: true,
+        lease: blobLease(admission, selected),
+      };
     }
 
     // Client token: the blob must be referenced by a record this exact
     // grant can see — instance scope, resources allowlist, time_constraint,
     // and blob_ref must be in the granted fields for that record's stream.
+    let authorizedButUnavailable = false;
     for (const reference of references) {
       const declaration = deps.declarations.forInstance(
         reference.instance,
@@ -191,10 +284,20 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         continue;
       }
 
-      return { ok: true };
+      // Authorized by this reference: the read is selected from its
+      // connection, which must be available; another reference may still
+      // authorize it through an available one.
+      if (!available(reference.instance)) {
+        authorizedButUnavailable = true;
+        continue;
+      }
+      return {
+        ok: true,
+        lease: blobLease(admission, reference.instance),
+      };
     }
 
-    return { error: notFound() };
+    return { error: authorizedButUnavailable ? unavailable() : missing() };
   }
 
   // Hono dispatches HEAD via the GET handler and discards the body, so no separate HEAD handler is
@@ -215,7 +318,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     };
 
     if (c.req.method === "HEAD") {
-      return c.body(null, 200, headers);
+      return release(c, authz.lease, reqId, () => c.body(null, 200, headers));
     }
 
     let bytes: Uint8Array<ArrayBuffer> | undefined;
@@ -250,7 +353,12 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         reqId,
       );
     }
-    return c.body(bytes, 200, headers);
+    // The headers, then each part, are released only through the read's
+    // lease: a grant that ends mid-download errors the body before the next
+    // part.
+    return release(c, authz.lease, reqId, () =>
+      c.body(leasedStream(authz.lease, chunkedBytes(bytes)), 200, headers),
+    );
   });
 
   return app;

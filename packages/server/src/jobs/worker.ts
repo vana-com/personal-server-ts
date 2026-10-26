@@ -7,6 +7,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
   assertScopeNotDeleted,
+  readDeliveryLease,
   redactEnvelopeForGrantee,
   redactJsonEnvelopeBytesForGrantee,
 } from "@opendatalabs/personal-server-ts-core/api";
@@ -27,7 +28,11 @@ import type {
 } from "@opendatalabs/personal-server-ts-core/ports";
 import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
-  verifyDataReadPolicy,
+  deliver,
+  leasedStream,
+  type DeliveryLease,
+  authorizeDataRead,
+  authorizeLegacyRead,
   verifySignedArtifacts,
 } from "@opendatalabs/personal-server-ts-core/policy";
 import type { ScopeDeletionTracker } from "@opendatalabs/personal-server-ts-core/sync";
@@ -51,6 +56,7 @@ import { isAddressEqual, type Address, type Hex } from "viem";
 import { publicKeyToAddress } from "viem/accounts";
 import type { JobExecuteResponse, JobFailureCode } from "./types.js";
 import { openRedactedEnvelopeStream } from "./raw-envelope-stream.js";
+import { storageForReader } from "@opendatalabs/personal-server-ts-core/storage/disclosure-policy";
 
 const RAW_READ = "raw_read";
 const EXECUTE_PATH = "/v1/jobs/execute";
@@ -161,8 +167,9 @@ async function executeJobUnsafe(
   }
 
   let grant;
+  let grantLease;
   try {
-    grant = await verifyDataReadPolicy(
+    ({ grant, lease: grantLease } = await authorizeDataRead(
       {
         signer: request.builder,
         grantId: request.grantId,
@@ -170,7 +177,7 @@ async function executeJobUnsafe(
         serverOwner: deps.serverOwner,
       },
       { authSessionVerifier: deps.gateway, grantVerifier: deps.gateway },
-    );
+    ));
   } catch (error) {
     throw mapPolicyFailure(error);
   }
@@ -286,11 +293,19 @@ async function executeJobUnsafe(
     version: selected.localVersion === 0 ? null : String(selected.localVersion),
     contentType: JSON_CONTENT_TYPE,
   };
-  const body = await openRawReadBodyStream(
-    deps.storage,
-    request.scope,
-    selected.entry,
-  );
+  // A job result goes to the builder: its body is read through the
+  // disclosure policy, which decides on the bytes actually read.
+  let body: ReadableStream<Uint8Array>;
+  try {
+    body = await openRawReadBodyStream(
+      storageForReader(deps.storage, "grantee"),
+      request.scope,
+      selected.entry,
+    );
+  } catch (error) {
+    if (error instanceof ProtocolError) throw mapPolicyFailure(error);
+    throw error;
+  }
   const sealed = await sealJobResultStream(
     result,
     request.builderPublicKey,
@@ -356,6 +371,23 @@ async function executeJobUnsafe(
       byteLength: resultSize,
       bodyHash: `sha256:${digest}`,
     });
+    // The sealed result leaves this server only through the read's delivery
+    // lease: checked once before the upload starts, then before each part of
+    // the upload body. A grant revoked (or past its expiry) or a scope
+    // deleted while the job reads, seals or uploads stops the upload. A job
+    // can outlast the 30 s remote window; the lease then re-verifies the
+    // grant at the gateway.
+    const deliveryLease = watchedLease(
+      readDeliveryLease(
+        { scopeDeletions: deps.scopeDeletions, serverOwner: deps.serverOwner },
+        { grant: grantLease, scope: request.scope, entry: selected.entry },
+      ),
+    );
+    try {
+      await deliver(deliveryLease, () => undefined);
+    } catch (error) {
+      throw mapDeliveryRefusal(error);
+    }
     logExecutionStep(deps, jobId, "upload", executionStartedAt);
     await uploadResult(requestFetch, {
       storageEndpoint: deps.resultUpload.storageEndpoint,
@@ -363,6 +395,7 @@ async function executeJobUnsafe(
       authorization,
       filePath: sealedPath,
       byteLength: resultSize,
+      lease: deliveryLease,
     });
 
     await deps.accessLogWriter.write({
@@ -418,6 +451,13 @@ async function selectJobScope(
   if (!entry) {
     throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
   }
+  // A job result goes to the builder, never the owner. A row known to be
+  // PDPP is refused here; the body read below decides on the bytes.
+  try {
+    authorizeLegacyRead("grantee", { kind: "indexed-version", entry });
+  } catch (error) {
+    throw mapPolicyFailure(error);
+  }
   if (entry.sizeBytes > resultMaxBytes) {
     throw new JobFailure(
       "RESULT_TOO_LARGE",
@@ -456,7 +496,11 @@ async function openRawReadBodyStream(
     );
     return oneChunkStream(bytes);
   }
-  const read = await readDataContract({ storage, scopeParam: scope });
+  const read = await readDataContract({
+    storage,
+    scopeParam: scope,
+    at: entry.collectedAt,
+  });
   if (!read.ok) {
     throw new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
   }
@@ -625,6 +669,8 @@ interface ResultUploadRequest {
   authorization: string;
   filePath: string;
   byteLength: number;
+  /** The read's delivery lease; each part of the body is released through it. */
+  lease: WatchedLease;
 }
 
 async function uploadResult(
@@ -633,7 +679,13 @@ async function uploadResult(
 ): Promise<void> {
   let response: Response;
   const timeoutSignal = AbortSignal.timeout(RESULT_UPLOAD_TIMEOUT_MS);
-  const body = createReadStream(request.filePath);
+  const file = createReadStream(request.filePath);
+  const body = Readable.fromWeb(
+    leasedStream(
+      request.lease,
+      Readable.toWeb(file) as unknown as ReadableStream<Uint8Array>,
+    ) as unknown as Parameters<typeof Readable.fromWeb>[0],
+  );
   try {
     const storageOrigin = new URL(request.storageEndpoint).origin;
     response = await requestFetch(`${storageOrigin}${request.path}`, {
@@ -648,6 +700,11 @@ async function uploadResult(
       signal: timeoutSignal,
     } as unknown as RequestInit & { duplex: "half" });
   } catch {
+    // The lease refused mid-upload: the body errored, so the storage never
+    // received a complete result. Report the refusal, not a transport error.
+    if (request.lease.refusal !== undefined) {
+      throw mapDeliveryRefusal(request.lease.refusal);
+    }
     if (timeoutSignal.aborted) {
       throw new JobFailure(
         "RESULT_UPLOAD_FAILED",
@@ -658,6 +715,7 @@ async function uploadResult(
     throw new JobFailure("RESULT_UPLOAD_FAILED", "result upload failed", true);
   } finally {
     body.destroy();
+    file.destroy();
   }
   if (response.status === 413) {
     throw new JobFailure(
@@ -728,6 +786,55 @@ function normalizeJobId(jobId: string): string {
   }
 
   return jobId.toLowerCase();
+}
+
+/** A delivery-lease refusal as the job failure the read would have had. */
+function mapDeliveryRefusal(error: unknown): JobFailure {
+  if (error instanceof DataDeletedError) {
+    return new JobFailure("SCOPE_NOT_FOUND", "scope not found", false);
+  }
+  return mapPolicyFailure(error);
+}
+
+/** A delivery lease that remembers its refusal, so a failed upload can name it. */
+interface WatchedLease extends DeliveryLease {
+  readonly refusal: unknown;
+}
+
+function watchedLease(lease: DeliveryLease): WatchedLease {
+  let refusal: unknown;
+  const remember = (error: unknown) => {
+    refusal ??= error;
+    return error;
+  };
+  return {
+    get refusal() {
+      return refusal;
+    },
+    evidence: () =>
+      lease.evidence().map(
+        (piece) =>
+          // Preserve the complete live evidence; only observe refresh failures.
+          new Proxy(piece, {
+            get(target, key, receiver) {
+              if (key === "refresh") {
+                return () =>
+                  target.refresh().catch((error: unknown) => {
+                    throw remember(error);
+                  });
+              }
+              return Reflect.get(target, key, receiver);
+            },
+          }),
+      ),
+    assertLocal() {
+      try {
+        lease.assertLocal();
+      } catch (error) {
+        throw remember(error);
+      }
+    },
+  };
 }
 
 function mapPolicyFailure(error: unknown): JobFailure {

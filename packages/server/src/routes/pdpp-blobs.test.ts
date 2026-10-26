@@ -66,6 +66,61 @@ describe.each(backends)("pdpp blobs route ($name store)", ({ createStore }) => {
     stores = [];
   });
 
+  it.each(["owner", "client"] as const)(
+    "%s blob holds one authorizing connection when another is deleted during loading",
+    async (kind) => {
+      const store = newStore();
+      const bytes = new Uint8Array([7]);
+      const meta = store.storeBlobBytes(bytes, "application/octet-stream");
+      store.ingestBatch(
+        ["inst_1", "inst_2"].map((instance) => ({
+          instance,
+          stream: "media",
+          key: "media_1",
+          data: { id: "media_1", blob_ref: { blob_id: meta.blobId } },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        })),
+        () => "append_only",
+        () => ["id"],
+      );
+      let secondDeleted = false;
+      const app = pdppBlobsRoutes({
+        store,
+        declarations,
+        auth: createFixtureAuthorizationService({
+          tok:
+            kind === "owner"
+              ? {
+                  active: true,
+                  tokenKind: "owner",
+                  subjectId: "sub_1",
+                  instanceIds: ["inst_1", "inst_2"],
+                }
+              : {
+                  active: true,
+                  tokenKind: "client",
+                  subjectId: "sub_1",
+                  clientId: "client_1",
+                  grant: clientGrant({ instance_ids: ["inst_1", "inst_2"] }),
+                },
+        }),
+        instancesForSubject: () => ["inst_1", "inst_2"],
+        isConnectionAvailable: (instance) =>
+          instance !== "inst_2" || !secondDeleted,
+        readBlobBytes: async () => {
+          secondDeleted = true;
+          return bytes;
+        },
+      });
+      const res = await app.request(`/${meta.blobId}`, {
+        headers: { Authorization: "Bearer tok" },
+      });
+      expect(secondDeleted).toBe(true);
+      expect(res.status, res.status === 200 ? "" : await res.text()).toBe(200);
+      expect(new Uint8Array(await res.arrayBuffer())).toEqual(bytes);
+    },
+  );
+
   it("returns 404 blob_not_found for an unknown blob_id", async () => {
     const store = newStore();
     const app = pdppBlobsRoutes({

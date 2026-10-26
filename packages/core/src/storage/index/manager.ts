@@ -81,6 +81,17 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateVersion(path: string, version: number): boolean;
+  /**
+   * Compare-and-set a row's generation: set `next` on row `id` only while it
+   * still holds `expected` (null for a row from before generations). Only
+   * storage calls it, with a value it computed from the published bytes.
+   * @returns true if the row was updated
+   */
+  swapGeneration(
+    id: number,
+    expected: string | null,
+    next: string | null,
+  ): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;

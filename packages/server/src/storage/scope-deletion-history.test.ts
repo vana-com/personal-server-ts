@@ -146,3 +146,28 @@ describe("durable scope deletion history", () => {
     }
   });
 });
+
+it("durable deletion observations retain the exact maximum registry version across handles", () => {
+  const db = new Database(":memory:");
+  try {
+    const a = createScopeDeletionHistory(db, "owner");
+    const b = createScopeDeletionHistory(db, "owner");
+    a.remember(SCOPE, {
+      deletedAt: TOMB.deletedAt,
+      version: "9007199254740995",
+    });
+    b.remember(SCOPE, {
+      deletedAt: TOMB.deletedAt,
+      version: "9007199254740993",
+    });
+    expect(a.get(SCOPE)?.version).toBe("9007199254740995");
+    b.remember(SCOPE, TOMB);
+    a.remember(SCOPE, {
+      deletedAt: TOMB.deletedAt,
+      version: "9007199254740997",
+    });
+    expect(a.get(SCOPE)?.version).toBeNull();
+  } finally {
+    db.close();
+  }
+});

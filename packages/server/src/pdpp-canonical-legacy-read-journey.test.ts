@@ -11,6 +11,7 @@
  * checked again and may explicitly return to the file.
  */
 
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -31,6 +32,10 @@ import {
   nextPaymentNonce,
 } from "@opendatalabs/personal-server-ts-core/payment";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
+import {
+  openPdppAuthStore,
+  type Grant,
+} from "@opendatalabs/personal-server-ts-core/pdpp";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -268,12 +273,17 @@ async function upsert(token: string, data: Record<string, unknown>) {
 }
 
 /** A legacy file written the way older collectors write one. */
-async function legacyWrite(scope: string, data: Record<string, unknown>) {
+async function legacyWrite(
+  scope: string,
+  data: Record<string, unknown>,
+  producer?: string,
+) {
   const response = await ctx!.app.request(`/v1/data/${scope}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${ctx!.devToken}`,
       "content-type": "application/json",
+      ...(producer ? { "Vana-Producer": producer } : {}),
     },
     body: JSON.stringify(data),
   });
@@ -299,7 +309,7 @@ async function builderGet(scope: string) {
         wallet: builder,
         aud: ctx!.config.server.origin,
         method: "GET",
-        uri: `/v1/data/${scope}`,
+        uri: `/v1/data/${scope.split("?")[0]}`,
         grantId: GRANT_ID,
       }),
     },
@@ -317,6 +327,10 @@ const day = (id: string, date: string, score = 80) => ({
 
 const STALE = { days: [{ id: "stale-legacy", day: "2026-01-01", score: 1 }] };
 const COVERED_A1 = { days: [day("a1", "2026-09-01")] };
+
+function latestAt(scope: string): string {
+  return ctx!.indexManager.findLatestByScope(scope)!.collectedAt;
+}
 
 function ids(text: string): string[] {
   const body = JSON.parse(text) as { data: { days: { id: string }[] } };
@@ -340,6 +354,225 @@ afterEach(async () => {
 });
 
 describe("GET /v1/data/:scope for a bound connector scope", () => {
+  it("preserves chain-authorized projection of legacy phone records envelopes", async () => {
+    await legacyWrite("oura.activity", {
+      records: [
+        { ...day("stored-pdpp", "2026-09-01", 99), $pdpp: { sourceId: OURA } },
+      ],
+    });
+    const owned = await ownerGet("/v1/data/oura.activity");
+    expect(owned.status).toBe(200);
+    expect(ids(owned.text)).toEqual(["stored-pdpp"]);
+    const read = await builderGet("oura.activity");
+    expect(read.status).toBe(200);
+    expect(ids(read.text)).toEqual(["stored-pdpp"]);
+  });
+  it.each(["pdpp-projector", "pdpp-import-projection"])(
+    "serves a chain grant a historical legacy-format cache version stamped %s",
+    async (producer) => {
+      // An actual legacy file first: the positive control on the same scope.
+      await legacyWrite("oura.activity", STALE);
+      const legacyAt = latestAt("oura.activity");
+      const token = await ownerPdppToken();
+      await replace(
+        token,
+        "activity",
+        [day("cached-pdpp", "2026-09-01", 99)],
+        "2026-09-01T00:00:00Z",
+      );
+      await legacyWrite(
+        "oura.activity",
+        { days: [day("cached-pdpp", "2026-09-01", 99)] },
+        producer,
+      );
+      const path = `oura.activity?at=${encodeURIComponent(latestAt("oura.activity"))}`;
+      const owned = await ownerGet(`/v1/data/${path}`);
+      expect(owned.status).toBe(200);
+      expect(owned.text).toContain("cached-pdpp");
+      // A projection stamp marks the legacy-format projection of the scope
+      // the grant covers, which the grant may read.
+      const read = await builderGet(path);
+      expect(read.status, read.text).toBe(200);
+      expect(ids(read.text)).toEqual(["cached-pdpp"]);
+      const legacy = await builderGet(
+        `oura.activity?at=${encodeURIComponent(legacyAt)}`,
+      );
+      expect(legacy.status, legacy.text).toBe(200);
+      expect(ids(legacy.text)).toEqual(["stale-legacy"]);
+    },
+  );
+  it("denies a chain-only historical native PDPP copy of canonical rows", async () => {
+    await legacyWrite("oura.activity", STALE);
+    const legacyAt = latestAt("oura.activity");
+    const token = await ownerPdppToken();
+    // A canonical row and its retained native-format transport copy. The
+    // current P8 importer refuses method-less imports, so populate the real
+    // canonical store through its authenticated acquisition boundary.
+    await replace(
+      token,
+      "activity",
+      [day("native-pdpp", "2026-09-01", 99)],
+      "2026-09-01T00:00:00Z",
+    );
+    await legacyWrite("oura.activity", {
+      ...day("native-pdpp", "2026-09-01", 99),
+      $pdpp: {
+        version: 1,
+        sourceId: OURA,
+        declaration: {
+          source: "oura",
+          version: "1",
+          digest: `sha256:${createHash("sha256").update(OURA_DECLARATION).digest("hex")}`,
+        },
+        stream: {
+          name: "activity",
+          scope: "oura.activity",
+          primaryKey: ["id"],
+          semantics: "mutable_state",
+        },
+        record: { key: { id: "native-pdpp" }, op: "upsert" },
+      },
+    });
+    const nativeRead = await ctx!.app.request("/v1/streams/activity/records", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(nativeRead.status).toBe(200);
+    const nativeBody = await nativeRead.text();
+    expect(nativeBody).toContain('"id":"native-pdpp"');
+    expect(nativeBody).toContain('"score":99');
+    const path = `oura.activity?at=${encodeURIComponent(latestAt("oura.activity"))}`;
+    const ownerRead = await ownerGet(`/v1/data/${path}`);
+    expect(ownerRead.status).toBe(200);
+    expect(ownerRead.text).toContain("native-pdpp");
+    const builderRead = await builderGet(path);
+    expect(builderRead.status, builderRead.text).toBe(403);
+    expect(builderRead.text).not.toContain('"score"');
+    expect(builderRead.text).not.toContain("native-pdpp");
+    const legacy = await builderGet(
+      `oura.activity?at=${encodeURIComponent(legacyAt)}`,
+    );
+    expect(legacy.status, legacy.text).toBe(200);
+    expect(ids(legacy.text)).toEqual(["stale-legacy"]);
+  });
+  it("serves a live legacy chain grant the legacy projection of a covered scope, and refuses it the canonical PDPP stream", async () => {
+    const token = await ownerPdppToken();
+    await replace(
+      token,
+      "activity",
+      [day("a1", "2026-09-01"), day("a2", "2026-09-02", 99)],
+      "2026-09-10T06:00:00Z",
+    );
+    // Same data and live server: a deny-all implementation cannot pass.
+    const ownerRead = await ownerGet("/v1/data/oura.activity");
+    expect(ownerRead.status).toBe(200);
+    expect(ownerRead.dataSource).toBe("canonical");
+    expect(ids(ownerRead.text)).toEqual(["a1", "a2"]);
+
+    // (a) The grant covers oura.*: it reads the legacy-format projection.
+    const read = await builderGet("oura.activity");
+    expect(read.status).toBe(200);
+    expect(ids(read.text)).toEqual(["a1", "a2"]);
+
+    // (b) The same grant cannot read the canonical PDPP stream: the PDPP
+    // resource server takes a PDPP access token, not a chain-grant signature
+    // (401). A native-form PDPP copy served on the legacy route is refused
+    // 403 (the native PDPP copy test above).
+    for (const path of [
+      "/v1/streams/activity/records",
+      "/v1/streams/activity/records/a2",
+    ]) {
+      const canonical = await ctx!.app.request(path, {
+        headers: {
+          authorization: await buildWeb3SignedHeader({
+            wallet: builder,
+            aud: ctx!.config.server.origin,
+            method: "GET",
+            uri: path,
+            grantId: GRANT_ID,
+          }),
+        },
+      });
+      const text = await canonical.text();
+      expect(canonical.status, text).toBe(401);
+      expect(text).not.toContain('a2"');
+      expect(text).not.toContain('"score"');
+    }
+  });
+
+  it("keeps a narrowed PDPP grant narrow while a legacy grant reads the legacy projection it covers", async () => {
+    const ownerToken = await ownerPdppToken();
+    await replace(
+      ownerToken,
+      "activity",
+      [day("a1", "2026-09-01"), day("a2", "2026-09-02", 99)],
+      "2026-09-10T06:00:00Z",
+    );
+    // Public store setup: the real RS resolves this token and frozen grant.
+    const store = openPdppAuthStore(join(tempDir, "pdpp-auth.db"));
+    try {
+      const narrowed: Grant = {
+        version: "0.1.0",
+        grant_id: "grt_narrowed",
+        subject: { id: owner },
+        client: { client_id: BUILDER_ID },
+        source: { kind: "connector", id: OURA },
+        source_declaration: { version: "1" },
+        purpose_code: "test",
+        access_mode: "continuous",
+        issued_at: new Date().toISOString(),
+        streams: [
+          {
+            name: "activity",
+            instance_ids: [accountOne],
+            fields: ["id", "day"],
+            resources: ["a1"],
+          },
+        ],
+      };
+      store.insertGrant({
+        grant: narrowed,
+        subjectId: owner,
+        reviewDigest: "test",
+      });
+      expect(
+        store.issueAccessToken({
+          token: "narrowed-test-token",
+          grantId: narrowed.grant_id,
+          subjectId: owner,
+          clientId: BUILDER_ID,
+          tokenKind: "client",
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+          consumeSingleUse: false,
+        }),
+      ).toBe(true);
+      const native = await ctx!.app.request("/v1/streams/activity/records", {
+        headers: { authorization: "Bearer narrowed-test-token" },
+      });
+      expect(native.status).toBe(200);
+      const nativeBody = await native.text();
+      expect(
+        JSON.parse(nativeBody).data.map(
+          (row: { data: { id: string } }) => row.data.id,
+        ),
+      ).toEqual(["a1"]);
+      expect(nativeBody).not.toContain('"score"');
+      // The legacy grant is its own consent for the legacy form of oura.*;
+      // it neither widens nor is narrowed by the PDPP grant.
+      const legacy = await builderGet("oura.activity");
+      expect(legacy.status).toBe(200);
+      expect(ids(legacy.text)).toEqual(["a1", "a2"]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("keeps live legacy grants working for data that has never entered the canonical store", async () => {
+    await legacyWrite("oura.activity", STALE);
+    const read = await builderGet("oura.activity");
+    expect(read.status).toBe(200);
+    expect(ids(read.text)).toEqual(["stale-legacy"]);
+  });
+
   it("accepts mutable value drift from a newer canonical collection", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
@@ -839,6 +1072,7 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
 
   it("serves canonical rows to a legacy grant and the owner after coverage", async () => {
     await legacyWrite("oura.activity", COVERED_A1);
+    const legacyAt = latestAt("oura.activity");
     const token = await ownerPdppToken();
     await replace(
       token,
@@ -850,6 +1084,12 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
     const asBuilder = await builderGet("oura.activity");
     expect(asBuilder.status).toBe(200);
     expect(ids(asBuilder.text)).toEqual(["a1", "a2"]);
+    // The same grant still reads the actual legacy file by its version.
+    const legacy = await builderGet(
+      `oura.activity?at=${encodeURIComponent(legacyAt)}`,
+    );
+    expect(legacy.status, legacy.text).toBe(200);
+    expect(ids(legacy.text)).toEqual(["a1"]);
 
     const asOwner = await ownerGet("/v1/data/oura.activity");
     expect(asOwner.status).toBe(200);
@@ -1020,10 +1260,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       SECOND_ACCOUNT,
     );
 
-    for (const read of [
-      await ownerGet("/v1/data/oura.activity"),
-      await builderGet("oura.activity"),
-    ]) {
+    const ownerRead = await ownerGet("/v1/data/oura.activity");
+    const builderRead = await builderGet("oura.activity");
+    for (const read of [ownerRead, builderRead]) {
       expect(read.status).toBe(409);
       expect(JSON.parse(read.text)).toMatchObject({
         error: "CANONICAL_VIEW_UNAVAILABLE",

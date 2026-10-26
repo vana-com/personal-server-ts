@@ -1,3 +1,5 @@
+import { hasPdppOrigin } from "@opendatalabs/personal-server-ts-core/sync";
+import { envelopeGeneration } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   DataBlockManifest,
@@ -333,6 +335,16 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
         ) + 1;
       const indexed: IndexEntry = {
         ...entry,
+        pdppOrigin: hasPdppOrigin(
+          envelopes.get(envelopeKey(entry.scope, entry.collectedAt)),
+        ),
+        ...(envelopes.has(envelopeKey(entry.scope, entry.collectedAt))
+          ? {
+              generation: envelopeGeneration(
+                envelopes.get(envelopeKey(entry.scope, entry.collectedAt)),
+              ),
+            }
+          : {}),
         schemaId: entry.schemaId ?? null,
         version,
         dataPointId: entry.dataPointId ?? null,

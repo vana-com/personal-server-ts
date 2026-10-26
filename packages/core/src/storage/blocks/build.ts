@@ -10,6 +10,13 @@ import {
   BINARY_MARKER,
   type BinaryEnvelopeData,
 } from "../../contracts/binary.js";
+import {
+  hasPdppOrigin,
+  PDPP_CLASSIFIER_VERSION,
+} from "../../sync/pdpp-import.js";
+import { envelopeGeneration } from "../hierarchy/generation.js";
+import { blockRedactionContext } from "./redaction.js";
+import { blockDigest } from "./digest.js";
 
 export type {
   ContentKind,
@@ -132,12 +139,23 @@ function buildDataBlocksInternal(
     ...(input.schemaId ? { schemaId: input.schemaId } : {}),
     contentKind,
     rawSizeBytes,
-    blocks: blocksWithIds.map(({ id, path, mediaType, sizeBytes }) => ({
-      id,
-      path,
-      mediaType,
-      sizeBytes,
-      ...itemCountForPath(path),
+    redaction: blockRedactionContext(input.content),
+    ...(classified.kind === "vana-envelope" && isPlainObject(classified.value)
+      ? {
+          pdppOrigin: hasPdppOrigin(
+            classified.value as { data: unknown; producer?: unknown },
+          ),
+          pdppClassifier: PDPP_CLASSIFIER_VERSION,
+          envelopeDigest: envelopeGeneration(classified.value),
+        }
+      : {}),
+    blocks: blocksWithIds.map((block) => ({
+      id: block.id,
+      path: block.path,
+      mediaType: block.mediaType,
+      sizeBytes: block.sizeBytes,
+      ...itemCountForPath(block.path),
+      digest: blockDigest(block),
     })),
     warnings,
   };
@@ -455,7 +473,21 @@ function findBoundedStringEnd(
   ) {
     end = start + Math.floor((end - start) / 2);
   }
-  return end > start ? end : Math.min(value.length, start + 1);
+  // A string offset may sit between a UTF-16 surrogate pair. Never publish
+  // halves that a later UTF-8 encoder would irreversibly replace.
+  if (
+    end > start &&
+    end < value.length &&
+    /[\uD800-\uDBFF]/.test(value[end - 1]!) &&
+    /[\uDC00-\uDFFF]/.test(value[end]!)
+  )
+    end--;
+  if (end <= start)
+    end = Math.min(
+      value.length,
+      start + (value.codePointAt(start)! > 0xffff ? 2 : 1),
+    );
+  return end;
 }
 
 function createPayload(

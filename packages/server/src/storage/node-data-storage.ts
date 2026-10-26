@@ -1,4 +1,8 @@
 import {
+  hasPdppOrigin,
+  isPdppProducer,
+} from "@opendatalabs/personal-server-ts-core/sync";
+import {
   deleteAllForScope,
   deleteDataFile,
   deleteFirstSeenLedger,
@@ -14,13 +18,17 @@ import {
   writeBlockManifest,
   writeDataFile,
   stageDataFile,
+  assertPublishable,
   publishStagedDataFile,
 } from "./hierarchy.js";
 import { readFile, readdir, stat, unlink } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
-import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
+import {
+  buildDataFilePath,
+  envelopeGeneration,
+} from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
@@ -128,11 +136,9 @@ export async function reindexLegacyDataFiles(
         scope: envelope.scope,
         collectedAt: envelope.collectedAt,
         sizeBytes: bytes,
-        producer:
-          envelope.producer === "pdpp-projector" ||
-          envelope.producer === "pdpp-import-projection"
-            ? envelope.producer
-            : null,
+        producer: isPdppProducer(envelope.producer) ? envelope.producer : null,
+        pdppOrigin: hasPdppOrigin(envelope),
+        generation: envelopeGeneration(raw),
         producerProvenance:
           envelope.producer_provenance &&
           typeof envelope.producer_provenance === "object"
@@ -154,6 +160,28 @@ export function createNodeDataStorage(
   deps: NodeDataStorageDeps,
 ): DataStoragePort {
   const db = indexDatabase(deps.indexManager);
+  /**
+   * PDPP provenance and generation of the bytes at a version path, both from
+   * one read, or undefined when they cannot be read. Read at insert, never on
+   * a read path. Provenance only lets a read that will be refused fail before
+   * payment; the generation is what a non-owner read pins, so it serves only
+   * these bytes.
+   */
+  async function identityOfPublishedBytes(
+    path: string,
+  ): Promise<{ pdppOrigin?: boolean; generation?: string }> {
+    try {
+      const envelope = JSON.parse(
+        await readFile(join(deps.hierarchyOptions.dataDir, path), "utf8"),
+      ) as { data: unknown; producer?: unknown };
+      return {
+        pdppOrigin: hasPdppOrigin(envelope),
+        generation: envelopeGeneration(envelope),
+      };
+    } catch {
+      return {};
+    }
+  }
   const operations = db
     ? createImportOperations(db, deps.indexManager, deps.hierarchyOptions)
     : undefined;
@@ -177,7 +205,9 @@ export function createNodeDataStorage(
     },
     findEntry(lookup: DataStorageEntryLookup) {
       if (lookup.fileId) {
-        return deps.indexManager.findByFileId(lookup.fileId);
+        // A fileId names one version of one scope; never another scope's row.
+        const entry = deps.indexManager.findByFileId(lookup.fileId);
+        return entry?.scope === lookup.scope ? entry : undefined;
       }
       if (lookup.at) {
         return deps.indexManager.findClosestByScope(lookup.scope, lookup.at);
@@ -225,15 +255,42 @@ export function createNodeDataStorage(
       return readScopeBlockManifest(deps.hierarchyOptions, scope, collectedAt);
     },
     writeEnvelope(envelope: DataFileEnvelope) {
+      // Publication refuses different bytes at an existing file. An index row
+      // whose file was lost still names its version: new bytes may restore
+      // it only with the same provenance the row already records.
+      const indexed = deps.indexManager.findByPath(
+        relative(
+          deps.hierarchyOptions.dataDir,
+          buildDataFilePath(
+            deps.hierarchyOptions.dataDir,
+            envelope.scope,
+            envelope.collectedAt,
+          ),
+        ),
+      );
+      if (
+        indexed?.pdppOrigin !== undefined &&
+        indexed.pdppOrigin !== hasPdppOrigin(envelope)
+      ) {
+        return Promise.reject(
+          new Error(
+            `Stored envelope conflicts with publication at ${indexed.path}`,
+          ),
+        );
+      }
       return writeDataFile(deps.hierarchyOptions, envelope);
     },
     async commitEnvelope(envelope, entry, precondition) {
       const staged = await stageDataFile(deps.hierarchyOptions, envelope);
       let indexed = false;
       try {
+        // Refuse a conflicting publication before the index commits: the row
+        // and its revision would otherwise describe bytes that are not there.
+        await assertPublishable(staged.stagePath, staged.finalPath);
         const result = deps.indexManager.insertIfCurrent(
           {
             ...entry,
+            ...staged.identity,
             path: staged.relativePath,
             sizeBytes: entry.sizeBytes ?? staged.sizeBytes,
           },
@@ -269,8 +326,35 @@ export function createNodeDataStorage(
         blocks,
       );
     },
-    insertEntry(entry) {
-      return deps.indexManager.insert(entry);
+    async insertEntry(entry) {
+      // Storage derives provenance and generation from the bytes it
+      // published; a caller's values are never trusted.
+      const {
+        pdppOrigin: _callerOrigin,
+        generation: _callerGeneration,
+        ...callerEntry
+      } = entry;
+      return deps.indexManager.insert({
+        ...callerEntry,
+        ...(await identityOfPublishedBytes(entry.path)),
+      });
+    },
+    async backfillGeneration(entry) {
+      if (entry.generation) return entry.generation;
+      const first = (await identityOfPublishedBytes(entry.path)).generation;
+      if (!first) return undefined;
+      if (!deps.indexManager.swapGeneration(entry.id, null, first)) {
+        const current = deps.indexManager.findByPath(entry.path);
+        return current?.id === entry.id ? current.generation : undefined;
+      }
+      // The bytes are read again: a version replaced between the two reads
+      // is not recorded.
+      const second = (await identityOfPublishedBytes(entry.path)).generation;
+      if (second !== first) {
+        deps.indexManager.swapGeneration(entry.id, first, null);
+        return undefined;
+      }
+      return first;
     },
     updateFileId(path: string, fileId: string) {
       return deps.indexManager.updateFileId(path, fileId);

@@ -9,13 +9,14 @@ function binding(instance: string): PdppInstanceBinding {
   return { instance, method: "m1", generation: 1, resetClock: 0 };
 }
 
-function buildApp() {
+function buildApp(protocolProfile?: "candidate-0.1.0") {
   const resetInstanceBinding = vi.fn((input: { instance: string }) => ({
     binding: { ...binding(input.instance), method: "m2", generation: 2 },
     alreadyReset: false,
   }));
   const getInstanceBinding = vi.fn((instance: string) => binding(instance));
   const app = pdppInstanceBindingRoutes({
+    protocolProfile,
     store: { getInstanceBinding, resetInstanceBinding },
     auth: {
       async resolveToken(token: string) {
@@ -96,4 +97,31 @@ describe("pdpp instance binding routes", () => {
       nextMethod: "m2",
     });
   });
+});
+
+describe("instance-binding bearer challenge", () => {
+  it.each([undefined, "Bearer stale"])(
+    "challenges rejected instance bearer %s under the candidate profile only",
+    async (authorization) => {
+      const headers = authorization ? { authorization } : undefined;
+      const current = await buildApp().app.request(
+        "/pdpp/instances/inst_1/binding",
+        { headers },
+      );
+      expect(current.status).toBe(401);
+      expect(current.headers.get("WWW-Authenticate")).toBeNull();
+
+      const candidate = await buildApp("candidate-0.1.0").app.request(
+        "/pdpp/instances/inst_1/binding",
+        { headers },
+      );
+      expect(candidate.status).toBe(401);
+      expect((await candidate.json()).error).toEqual(
+        (await current.json()).error,
+      );
+      expect(candidate.headers.get("WWW-Authenticate")).toBe(
+        'Bearer error="invalid_token", resource_metadata="http://localhost/.well-known/oauth-protected-resource"',
+      );
+    },
+  );
 });
