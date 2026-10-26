@@ -196,6 +196,13 @@ export interface LegacyScopeBinding {
    * time; see {@link LegacyProjectionWindow}.
    */
   window?: LegacyProjectionWindow;
+  /**
+   * Why this binding builds its whole projection in memory and has no
+   * `window`: one line saying why it stays small, or why it cannot be
+   * windowed. Required of every binding with more than one stream that has no
+   * `window` (`window-guard.test.ts`).
+   */
+  memoryBound?: string;
 }
 
 /**

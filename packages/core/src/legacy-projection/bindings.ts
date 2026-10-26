@@ -965,6 +965,15 @@ const instagramPosts: LegacyScopeBinding = {
     post_likes: ["post_id", "user_id", "username"],
   },
   primaryKey: { posts: ["id"], post_likes: ["post_id", "liker_ordinal"] },
+  // Each post is built from its own post_likes.
+  window: {
+    parentStream: "posts",
+    childStream: "post_likes",
+    childKey: "post_id",
+    arrayKey: "posts",
+    sumKeys: [],
+    parentOrder: primaryKeyOrder("id"),
+  },
   lossy: [
     "nullable media_url, caption, and like_count use the retained collector's empty-string and zero sentinels; every source post is retained",
     "media_url is only available for images and the first image in a carousel; video posts and later carousel images are absent from the artifact's parser output",
@@ -1325,6 +1334,8 @@ const githubHistory: LegacyScopeBinding = {
     ],
   },
   primaryKey: { user: ["id"], issues: ["id"], pull_requests: ["id"] },
+  memoryBound:
+    "Issues and pull requests are two independent lists, each one array, so there is no parent and child to split.",
   lossy: [
     "legacy IDs used gh-issue-/gh-pr- prefixes; projection uses the signed PDPP record ID directly",
     "body is truncated to the legacy connector's 500-character limit",
@@ -1495,6 +1506,8 @@ const githubProfile: LegacyScopeBinding = {
     pinned_repositories: ["id"],
     organizations: ["id"],
   },
+  memoryBound:
+    "One user row, its stats, at most six pinned repositories and the user's organizations: no stream grows with record count.",
   lossy: [
     "profileUrl is derived from the authenticated user's login using GitHub's canonical profile URL pattern",
     "organization label and URL are omitted because the organizations stream carries neither field; description is not substituted for label",
@@ -2080,6 +2093,19 @@ function newestUpdateFirst(
   return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
 }
 
+/**
+ * The output order of a binding that lists its parents in primary-key order,
+ * which is what `orderByPrimaryKey` gives it: the same key `inPrimaryKeyOrder`
+ * sorts by.
+ */
+function primaryKeyOrder(
+  field: string,
+): (a: Record<string, unknown>, b: Record<string, unknown>) => number {
+  const key = (row: Record<string, unknown>) =>
+    JSON.stringify([row[field] ?? null]);
+  return (a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0);
+}
+
 // This is the merged 0.1.3 source declaration. Admission remains a separate
 // decision; this local manifest hash is not the signed OCI artifact digest.
 export const ANTHROPIC_CONNECTOR_ID =
@@ -2245,11 +2271,7 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
       childKey: "conversation_id",
       arrayKey: "conversations",
       sumKeys: ["total", "messageTotal"],
-      parentOrder: (a, b) => {
-        const key = (row: Record<string, unknown>) =>
-          JSON.stringify([row.id ?? null]);
-        return key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0;
-      },
+      parentOrder: primaryKeyOrder("id"),
     },
     lossy: [
       "href is reconstructed from the retained Claude route convention; rawContent and unavailable fetchError are omitted.",
@@ -2468,6 +2490,15 @@ const claudeProjects: LegacyScopeBinding = {
     account_profile: ["id"],
     projects: ["id"],
     project_documents: ["id"],
+  },
+  // Each project is built from its own project_documents.
+  window: {
+    parentStream: "projects",
+    childStream: "project_documents",
+    childKey: "project_id",
+    arrayKey: "projects",
+    sumKeys: ["total"],
+    parentOrder: primaryKeyOrder("id"),
   },
   lossy: [
     "detail carries only declared project and raw document fields. Other raw-only keys and documents dropped by source parsing cannot be recovered; href and label follow the legacy connector's route and label rules.",
@@ -3154,6 +3185,15 @@ const spotifyPlaylists: LegacyScopeBinding = {
     playlists: ["id"],
     playlist_items: ["id"],
   },
+  // Each playlist is built from its own playlist_items.
+  window: {
+    parentStream: "playlists",
+    childStream: "playlist_items",
+    childKey: "playlist_id",
+    arrayKey: "playlists",
+    sumKeys: ["total"],
+    parentOrder: primaryKeyOrder("id"),
+  },
   lossy: [
     "tracks[].uri: raw playlist item URIs are retained when available; older pinned records fall back to a canonical Spotify track ID, and a null ID uses the retained collector's empty-string sentinel.",
     "tracks_total counts joined fetched tracks, as in the retained collector; catalog track_count is not a fetched-row count.",
@@ -3691,6 +3731,15 @@ const amazonOrders: LegacyScopeBinding = {
     order_items: ["order_id", "name", "url", "unit_price"],
   },
   primaryKey: { orders: ["id"], order_items: ["id"] },
+  // Each order is built from its own order_items.
+  window: {
+    parentStream: "orders",
+    childStream: "order_items",
+    childKey: "order_id",
+    arrayKey: "orders",
+    sumKeys: ["total"],
+    parentOrder: primaryKeyOrder("id"),
+  },
   lossy: [
     "items[].quantity: no legacy field (legacy schema does not carry quantity at all; PDPP-side quantity is simply not projected)",
     "items[].price (N-S2): legacy's own connector ALWAYS emits the literal constant '' for this field (amazon-playwright.js:222, `price: ''` — not a fallback for a missing value, the connector never scrapes a real price here at all). This projection instead emits PDPP's real `unit_price` when present, so an app reading this field gets a populated value where legacy always gave it an empty string — a value change, not a gap-fill, and the comment at the call site below previously implied the two matched when they do not.",
@@ -3898,6 +3947,8 @@ const hebNutrition: LegacyScopeBinding = {
     order_items: ["product_id", "name", "product_url"],
   },
   primaryKey: { nutrition: ["id"], orders: ["id"], order_items: ["id"] },
+  memoryBound:
+    "The output is one map keyed by product with whole-scope coverage totals and checks, not one row per parent.",
   lossy: [
     "The legacy map key is the declared H-E-B product_id; no global UPC identity is inferred.",
     "fetched_at is omitted.",
@@ -4110,6 +4161,8 @@ const hebOrders: LegacyScopeBinding = {
     ],
   },
   primaryKey: { orders: ["id"], order_items: ["id"] },
+  memoryBound:
+    "Rejects the whole scope when every order is dropped, a decision a window of orders cannot make.",
   lossy: [
     "orderUrl and address: the signed profile has no equivalent fields; fulfillment_location is not treated as an address.",
     "status_code, store_name, timeslot_start/end, unfulfilled_count, fulfillment_method, and fetched_at are not represented by the legacy schema.",
@@ -4347,6 +4400,8 @@ const wholefoodsOrders: LegacyScopeBinding = {
     ],
   },
   primaryKey: { orders: ["id"], order_items: ["id"] },
+  memoryBound:
+    "Rejects the whole scope when every order is dropped, a decision a window of orders cannot make.",
   lossy: [
     "The retained collector emitted only product-linked named lines; a source line without either field is dropped and counted, and its order is delivered without it.",
     "An order with no usable line and an item_count that is not a known zero is left out and counted; an order whose line count differs from item_count, or whose item_count is unknown, is delivered and reported partial. A missing or duplicate order id still fails the scope.",
@@ -4511,6 +4566,8 @@ const wholefoodsNutrition: LegacyScopeBinding = {
     order_items: ["product_id", "name", "product_url", "image_url"],
   },
   primaryKey: { nutrition: ["product_id"], order_items: ["id"] },
+  memoryBound:
+    "The output is one map keyed by product with whole-scope coverage totals and checks, not one row per parent.",
   lossy: [
     "ingredients and allergens are not collected by the current nutrition stream.",
     "servingsPerContainer is converted from the declared number to the legacy string field.",
@@ -4715,6 +4772,8 @@ const icloudNotes: LegacyScopeBinding = {
     profile: ["id", "user_name"],
   },
   primaryKey: { notes: ["id"], folders: ["id"], profile: ["id"] },
+  memoryBound:
+    "One flat list of notes; folders is a name lookup, so there are no per-parent children to split.",
   lossy: [
     "userName is null when the profile stream has no readable user_name (legacy's fullName default); it is never inferred from an Apple ID or the account id.",
     "folder uses the legacy display-name shape; unresolved folder references fall back to folder_id.",
