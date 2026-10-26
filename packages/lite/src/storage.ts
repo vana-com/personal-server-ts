@@ -20,6 +20,7 @@ import type {
   NewIndexEntry,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
+import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
 import type { PsLiteStorageAdapter } from "./runtime.js";
 import { createStorageReadMethods, sortEntries } from "./storage-utils.js";
 import {
@@ -756,6 +757,30 @@ export async function createPersistentPsLiteStorage(
       };
     },
 
+    async writeEnvelopeAndIndex(envelope, entry): Promise<IndexEntry> {
+      const path = envelopePath(envelope.scope, envelope.collectedAt);
+      // The blob and its row are one step under the path lock, so no erase or
+      // replacement of this path runs between them.
+      return withPathLock(path, async () => {
+        const size = await fileStore.writeEnvelope(path, envelope);
+        if (fileStore.kind !== "indexeddb") {
+          await fallbackStore.deleteEnvelope(path);
+        }
+        try {
+          return await installEntry({
+            ...entry,
+            scope: envelope.scope,
+            collectedAt: envelope.collectedAt,
+            path,
+            sizeBytes: entry.sizeBytes ?? size,
+          });
+        } catch (error) {
+          // The bytes are durable here; the caller's recovery depends on that.
+          throw new IngestPersistedError(path, error);
+        }
+      });
+    },
+
     ...(fileStore.openEnvelopeWriter
       ? {
           async openVersionWriter(
@@ -1076,11 +1101,13 @@ export async function createPersistentPsLiteStorage(
       await persistence.deleteAux?.(ledgerAux(scope));
     },
 
-    // Deletions run under the scope's first-seen sidecar lock (a rebuild in
-    // flight cannot write it back), and the sidecar goes with the scope's last
-    // version, so no delete path leaves a stale ledger behind.
-    deleteScope(scope) {
-      return withScopeLock(scope, async () => {
+    // The ledger barrier runs under the scope lock (a rebuild in flight cannot
+    // write it back). Each row is then erased under its own path lock, the
+    // same owner an ordinary write takes, so no write to a path interleaves
+    // with the erase of that path. The scope lock is never held across those
+    // path locks: lock order is path, scope, queue.
+    async deleteScope(scope) {
+      await withScopeLock(scope, async () => {
         await dropLedger(scope);
         for (const entry of entriesForScope(scope)) {
           readyBlockManifests.delete(
@@ -1089,37 +1116,37 @@ export async function createPersistentPsLiteStorage(
         }
         // Repeat the barrier on retry, even if a failed write cleared the set.
         await persist();
-        // The scope's rows leave the index only after its blobs are gone, so a
-        // failed delete keeps them durable for the next retry. The queue is
-        // held throughout, so no version written meanwhile can be dropped
-        // without its blob.
-        const deleted = await enqueue(async () => {
-          const doomed = state.entries.filter((entry) => entry.scope === scope);
-          await Promise.all(
-            doomed
-              .flatMap((entry) => {
-                const path = envelopePath(entry.scope, entry.collectedAt);
-                const tree = blockTreePath(entry.scope, entry.collectedAt);
-                return [
-                  fileStore.deleteEnvelope(path),
-                  fallbackStore.deleteEnvelope(path),
-                  fileStore.deleteBlockTree?.(tree),
-                  fallbackStore.deleteBlockTree?.(tree),
-                ];
-              })
-              .filter(
-                (promise): promise is Promise<void> => promise !== undefined,
-              ),
-          );
-          await publish({
-            ...state,
-            entries: state.entries.filter((entry) => entry.scope !== scope),
-          });
-          return doomed.length;
-        });
-        await persist();
-        return deleted;
       });
+      // A row a later write adds is not in this snapshot; it is not deleted.
+      const paths = await enqueue(async () =>
+        Array.from(
+          new Set(
+            state.entries
+              .filter((entry) => entry.scope === scope)
+              .map((entry) => entry.path),
+          ),
+        ),
+      );
+      // Each path settles on its own, so one failed blob delete does not stop
+      // the others. Rows whose delete failed stay, for the next retry.
+      const outcomes = await Promise.allSettled(
+        paths.map((path) =>
+          withPathLock(path, () =>
+            eraseUnderPathLock(
+              path,
+              (e) => e.scope === scope && e.path === path,
+            ),
+          ),
+        ),
+      );
+      const failed = outcomes.find(
+        (outcome): outcome is PromiseRejectedResult =>
+          outcome.status === "rejected",
+      );
+      if (failed) throw failed.reason;
+      return outcomes.filter(
+        (outcome) => outcome.status === "fulfilled" && outcome.value === true,
+      ).length;
     },
 
     // Unfenced: by (scope, collectedAt) alone. Fenced: only the row the caller

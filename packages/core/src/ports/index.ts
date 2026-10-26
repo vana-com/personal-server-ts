@@ -267,6 +267,17 @@ export interface DataStoragePort extends RuntimeStoragePort {
   writeFirstSeenLedger?(scope: string, ledger: unknown): Promise<void>;
   /** Idempotent. `deleteScope` also removes the scope's ledger. */
   deleteFirstSeenLedger?(scope: string): Promise<void>;
+  /**
+   * Write one version's envelope and index its row as one step, so no erase
+   * or replacement of that path runs between the blob and the row. Throws
+   * `IngestPersistedError` when the blob is written but the row is not. Optional:
+   * a storage without it gets `writeEnvelope` then `insertEntry`, which can
+   * leave a row with no blob between the two calls.
+   */
+  writeEnvelopeAndIndex?(
+    envelope: DataFileEnvelope,
+    entry: Omit<NewIndexEntry, "path" | "sizeBytes"> & { sizeBytes?: number },
+  ): Promise<IndexEntry>;
   insertEntry(entry: NewIndexEntry): IndexEntry | Promise<IndexEntry>;
   updateFileId(path: string, fileId: string): boolean | Promise<boolean>;
   /** Highest stored DPv2 `version` for a scope; 0 if none. */
