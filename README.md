@@ -100,6 +100,8 @@ All authenticated endpoints use `Authorization: Web3Signed <base64url(json)>.<si
 | `/health`                              | GET    | None            | Health check                   |
 | `/v1/data/{scope}`                     | POST   | Owner           | Ingest data                    |
 | `/v1/data/{scope}/imports/{operation}` | PUT    | Owner           | Accept or replay a JSON import |
+| `/v1/data/{scope}/uploads`             | POST   | Owner           | Begin a streamed write (Lite)  |
+| `/v1/data/{scope}/uploads/{id}/...`    | varies | Owner           | Append, commit or abort it     |
 | `/v1/data`                             | GET    | Builder         | List scopes                    |
 | `/v1/data/{scope}`                     | GET    | Builder + Grant | Read data                      |
 | `/v1/data/{scope}/versions`            | GET    | Builder         | List versions                  |
@@ -166,6 +168,17 @@ First acceptance returns `201`; a matching replay returns `200` with the origina
 Node storage persists the exact prepared envelope and original causal deletion marker in SQLite before publishing it without replacement, then commits the index and immutable receipt together. Startup and subsequent publication recover prepared imports at their original timestamp. Only import PUTs use this journal. Ordinary JSON, binary and replica writes keep their own staged-file and revision-guarded index commit, and are not journaled. Imports take the same short SQLite writer gate and the same revision-guarded index insert, so an import advances the scope's CAS revision like any other write and is refused (`409 SCOPE_CLOSED_FOR_WRITES`) when the index has closed the scope for writes. An import lands after the scope's current newest version. This gives processes sharing one root a single import authority; independent roots retain independent acceptance. Import identities and receipts do not expire. Deleting a version or scope durably retires its operations before cleanup; matching retries return `410 IMPORT_DELETED` with the original accepted receipt in `error.details.importReceipt`, and an intentional re-add needs a new operation. A cancelled preparation has no accepted receipt. Scope cleanup removes the files and index rows captured at retirement, preserving later writes. Failed deletion keeps cleanup retryable.
 
 Older servers reject the dedicated PUT route before ingestion; unsupported storage returns `501 IMPORT_UNSUPPORTED`. Clients must retain pending delivery and request an upgrade, never fall back to POST. Before upgrading a shared root to a build with the owner-import journal, stop all old writers: the index schema version stamp prevents newly starting old binaries, but cannot evict already-open old connections. Back up `index.db`, its WAL and data files as one root; do not discard receipts or downgrade the schema. Historical POST acceptances cannot acquire trustworthy operation receipts retrospectively.
+
+### Streamed scope writes (PS-Lite)
+
+A JSON write holds the whole document in memory several times while it is parsed, stamped and stored. On a phone a scope of a few hundred MB does not fit. PS-Lite therefore also takes one new version of a scope as a sequence of record batches, and holds one batch at a time:
+
+1. `POST /v1/data/{scope}/uploads` with `{ "data"?: {...}, "arrayKey"?: "records" }` returns `201 { uploadId, scope, collectedAt, maxBatchBytes }`. `data` holds the keys written before the record array.
+2. `PUT /v1/data/{scope}/uploads/{id}/batches/{seq}` with `{ "items": [...] }`, `seq` counting from 0. A batch number sent again with the same body returns `200` and stores nothing; with a different body it returns `409 BATCH_CONFLICT`. A gap returns `409 BATCH_OUT_OF_ORDER`.
+3. `POST /v1/data/{scope}/uploads/{id}/commit` with `{ "data"?: {...} }` (keys written after the array) makes the version visible and returns `201 { scope, collectedAt, status, records, sizeBytes }`.
+4. `DELETE /v1/data/{scope}/uploads/{id}` discards it.
+
+The stored envelope is the one `POST /v1/data/{scope}` stores for `{ ...beginData, [arrayKey]: [...all items], ...commitData }`. Nothing is indexed before commit, so readers and sync see the previous version until then, and an abort, a 2-minute idle timeout or a crash leaves the previous version and no partial one. A commit after another write to the scope returns `409 UPLOAD_SUPERSEDED`. One upload is open at a time; a new begin aborts it. Server-owned keys (`$writtenBy`, `$lineage`, `lineage`, `$binary`) are refused. The commit builds no block sidecar or first-seen ledger entry, because both need the whole envelope in memory; reads and `/additions` rebuild them as for any version without them. Storage without a streaming file writer (the IndexedDB fallback, Node) returns `501 UPLOAD_UNSUPPORTED`. `openScopeUpload` on the Lite client handle sends batches of up to 1 MiB.
 
 Windows skips directory fsync barriers; file fsync and journal recovery remain in place. Directory-entry and power-loss durability are outside the Windows guarantee.
 
