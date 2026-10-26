@@ -330,6 +330,20 @@ export interface DataStoragePort extends RuntimeStoragePort {
     fence?: VersionFence,
   ): Promise<boolean>;
   /**
+   * Erases one version (index row + local blob) only while its envelope is
+   * absent and its row is still the one the caller decided on (same local `id`
+   * and `path`). The absence check, the row check and the erase are one step
+   * under the same gate that publishes a version, so a write that restores the
+   * envelope cannot land between them. Resolves false when the envelope is
+   * present or the row was erased or replaced. Rejects when absence cannot be
+   * established (a read fault is not absence), leaving the row in place.
+   */
+  deleteVersionIfEnvelopeMissing?(
+    scope: string,
+    collectedAt: string,
+    fence: VersionFence,
+  ): Promise<boolean>;
+  /**
    * Drop a single unsynced index entry by path, WITHOUT touching any blob.
    * Used by the upload worker to evict an orphaned row whose local payload
    * file is already gone (e.g. a manual `data/<scope>` deletion): the row can

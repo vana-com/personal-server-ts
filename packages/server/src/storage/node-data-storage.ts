@@ -401,6 +401,49 @@ export function createNodeDataStorage(
         return true;
       });
     },
+    async deleteVersionIfEnvelopeMissing(
+      scope: string,
+      collectedAt: string,
+      fence: VersionFence,
+    ) {
+      return withScopeLock(scope, async () => {
+        let removed: boolean;
+        if (operations) {
+          removed = operations.deleteFencedVersionIfMissing(
+            scope,
+            collectedAt,
+            fence,
+          );
+        } else {
+          const current = deps.indexManager.findByPath(fence.path);
+          if (
+            !current ||
+            current.id !== fence.id ||
+            current.scope !== scope ||
+            current.collectedAt !== collectedAt
+          ) {
+            return false;
+          }
+          try {
+            await stat(
+              buildDataFilePath(
+                deps.hierarchyOptions.dataDir,
+                scope,
+                collectedAt,
+              ),
+            );
+            return false;
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          }
+          await deleteDataFile(deps.hierarchyOptions, scope, collectedAt);
+          deps.indexManager.deleteByPath(fence.path);
+          removed = true;
+        }
+        await dropLedgerIfEmpty(scope);
+        return removed;
+      });
+    },
     async dropUnsyncedEntry(path: string) {
       // Index row only — the payload file is already gone (that is why the
       // caller is dropping it). No blob delete. Guarded to unsynced rows: if
