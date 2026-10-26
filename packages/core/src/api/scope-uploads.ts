@@ -36,6 +36,7 @@
 import type { DataStoragePort, DataVersionWriter } from "../ports/index.js";
 import type { WriteResult } from "../storage/hierarchy/index.js";
 import { sha256Hex } from "../contracts/binary.js";
+import { VersionSupersededError } from "../contracts/data.js";
 import { hasReservedLineageKey } from "../lineage/lineage.js";
 import { hasReservedWriterKey } from "../write/attribution.js";
 
@@ -389,20 +390,6 @@ export function createScopeUploadRegistry(
             throw invalid(`data key "${key}" is already in the envelope`);
           }
         }
-        // A version committed since begin is newer than this one: becoming
-        // visible now would not make this upload the scope's latest.
-        const latest = upload.storage.findEntry({ scope: upload.scope });
-        if (
-          latest &&
-          Date.parse(latest.collectedAt) > Date.parse(upload.collectedAt)
-        ) {
-          await end(upload, "aborted");
-          throw new ScopeUploadError(
-            409,
-            "UPLOAD_SUPERSEDED",
-            "A newer version of this scope was written during the upload",
-          );
-        }
         await upload.writer.write(
           "]" +
             Object.entries(tail)
@@ -413,11 +400,28 @@ export function createScopeUploadRegistry(
               .join("") +
             "}}",
         );
-        const writeResult = await upload.writer.commit({
-          fileId: null,
-          schemaId: null,
-          afterTombstoneVersion: input.afterTombstoneVersion,
-        });
+        // A version committed since begin is newer than this one: becoming
+        // visible now would not make this upload the scope's latest. Storage
+        // checks that in the same step that publishes the version.
+        let writeResult: WriteResult;
+        try {
+          writeResult = await upload.writer.commit(
+            {
+              fileId: null,
+              schemaId: null,
+              afterTombstoneVersion: input.afterTombstoneVersion,
+            },
+            { onlyIfNewest: true },
+          );
+        } catch (error) {
+          if (!(error instanceof VersionSupersededError)) throw error;
+          await end(upload, "aborted");
+          throw new ScopeUploadError(
+            409,
+            "UPLOAD_SUPERSEDED",
+            "A newer version of this scope was written during the upload",
+          );
+        }
         await end(upload, "committed");
         return {
           scope: upload.scope,

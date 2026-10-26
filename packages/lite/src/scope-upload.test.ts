@@ -319,6 +319,55 @@ describe("streamed scope uploads", () => {
     });
   });
 
+  it("refuses a commit when a newer version lands between its closing writes and its publication", async () => {
+    const store = createMemoryPsLiteStagedFileStore();
+    const open = store.openEnvelopeWriter!;
+    let closing: () => void = () => {};
+    let reachedClosing: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (closing = resolve));
+    const reached = new Promise<void>((resolve) => (reachedClosing = resolve));
+    store.openEnvelopeWriter = async (path) => {
+      const file = await open(path);
+      return {
+        ...file,
+        async write(text) {
+          // The closing write is the one that ends the records array.
+          if (text.startsWith("]")) {
+            reachedClosing();
+            await gate;
+          }
+          return file.write(text);
+        },
+      };
+    };
+    const runtime = await createRuntime(store);
+    const id = await begin(runtime, {});
+    await call(runtime, "PUT", `/uploads/${id}/batches/0`, {
+      items: [{ id: "streamed" }],
+    });
+
+    const commit = call(runtime, "POST", `/uploads/${id}/commit`);
+    await reached;
+    const plain = await call(runtime, "POST", "", {
+      records: [{ id: "plain" }],
+    });
+    expect(plain.status).toBe(201);
+    closing();
+
+    const res = await commit;
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: { errorCode: "UPLOAD_SUPERSEDED" },
+    });
+    expect((await readLatest(runtime)).data).toEqual({
+      records: [{ id: "plain" }],
+    });
+    const versions = await call(runtime, "GET", "/versions", undefined, OWNER);
+    expect(((await versions.json()) as { total: number }).total).toBe(1);
+    // The superseded upload's file is not left behind.
+    expect(store.files.size).toBe(1);
+  });
+
   it("refuses server-owned keys, builders and stores that cannot stream", async () => {
     const runtime = await createRuntime(createMemoryPsLiteStagedFileStore());
     for (const body of [
