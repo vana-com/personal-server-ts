@@ -2237,6 +2237,20 @@ function claudeConversationsBinding(live = false): LegacyScopeBinding {
       conversations: ["id"],
       messages: ["id"],
     },
+    // Each conversation is built from its own messages. The list is in
+    // primary-key order, the order `inPrimaryKeyOrder` gives it.
+    window: {
+      parentStream: "conversations",
+      childStream: "messages",
+      childKey: "conversation_id",
+      arrayKey: "conversations",
+      sumKeys: ["total", "messageTotal"],
+      parentOrder: (a, b) => {
+        const key = (row: Record<string, unknown>) =>
+          JSON.stringify([row.id ?? null]);
+        return key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0;
+      },
+    },
     lossy: [
       "href is reconstructed from the retained Claude route convention; rawContent and unavailable fetchError are omitted.",
     ],
