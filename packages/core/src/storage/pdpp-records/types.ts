@@ -22,6 +22,10 @@ export interface PdppRecordEnvelopeInput {
 }
 
 export interface PdppStoredRecord {
+  /** Present only on an explicitly permitted provisional replica read. */
+  confirmation?: "not yet confirmed";
+  visibility?: "pending" | "conflicted";
+  status?: "account conflict";
   instance: string;
   stream: string;
   recordKey: string;
@@ -32,6 +36,9 @@ export interface PdppStoredRecord {
 }
 
 export interface PdppTombstoneRecord {
+  confirmation?: "not yet confirmed";
+  visibility?: "pending" | "conflicted";
+  status?: "account conflict";
   instance: string;
   stream: string;
   recordKey: string;
@@ -72,12 +79,20 @@ export interface IngestResult {
 }
 
 export interface ListRecordsOptions {
+  /**
+   * The wire names a record by key alone. When set, a page that would
+   * disclose a key that another read instance also holds visibly throws
+   * `RecordIdentityConflictError` rather than serve two records as one.
+   */
+  oneRecordPerKey?: boolean;
   /** Grant eligibility, evaluated on raw snapshot rows before pagination/projection. */
-  isVisible?: (row: PdppStoredRecord) => boolean;
+  isVisible?: (row: PdppRecordRow) => boolean;
   instanceIds: string[];
   limit: number;
   cursor?: string;
   order: "asc" | "desc";
+  /** Opaque authorization and query fingerprint bound to paginated cursors. */
+  queryBinding?: string;
   /** undefined = no projection restriction (owner reads / unrestricted). */
   fields?: string[];
 }
@@ -91,23 +106,148 @@ export interface ListRecordsPage {
 }
 
 export interface ChangesSinceOptions {
-  /** Candidate visibility policy, evaluated at BOTH historical horizons. */
-  isVisible?: (row: PdppStoredRecord) => boolean;
-  /**
-   * Candidate: a page that reaches a record deleted after the session horizon
-   * fails with `CursorExpiredError` instead of serving that record. Withholding
-   * it could lose it: the next session compares against this horizon, so a
-   * record deleted and recreated unchanged would never reach the client.
-   * The current contract serves every page at the session horizon.
-   */
+  isVisible?: (row: PdppRecordRow) => boolean;
   expireOnErasure?: boolean;
   instanceIds: string[];
-  /** Absent = start a new session anchored at "now". */
   changesSince?: string;
-  /** Page cursor within an already-anchored session. */
   cursor?: string;
   limit: number;
   fields?: string[];
+}
+
+/**
+ * Raw history one sync page reads. Only the sync session owner
+ * (`sync-session.ts`) calls this; it holds no visibility, paging or token policy.
+ */
+export interface SyncWindowRequest {
+  instanceIds: string[];
+  /** Earlier horizon of an incremental session; null for a first sync. */
+  low: string | null;
+  /** Fixed horizon of an anchored session. Absent captures the current one. */
+  high?: string;
+  /**
+   * The session's prepared candidate set to walk (`prepareSyncWindow`). One
+   * that is unfinished, released or expired at `now` is `CursorExpiredError`.
+   */
+  preparation: string;
+  now: number;
+}
+
+/**
+ * The work one sync request may still do, owned by the session service.
+ * Stores call `spend` before each unit of physical work (one history row
+ * read, one index seek) and stop when it returns false.
+ */
+export interface SyncBudget {
+  spend(units?: number): boolean;
+  /**
+   * One unit of work finished (a history row stored, an identity read).
+   * Until the first, `spend` always grants, so every request progresses.
+   */
+  progressed(): void;
+}
+
+export interface SyncPreparationRequest {
+  /** The session's preparation id; the store creates it on first use. */
+  id: string;
+  owner: string;
+  instanceIds: string[];
+  /** The previous session's horizon; null for a first sync. */
+  low: string | null;
+  /** Absent on the first call: the store fixes the horizon then. */
+  high?: string;
+  budget: SyncBudget;
+  now: number;
+  expiresAt: number;
+  /** Preparations one owner keeps; the oldest expire beyond it. */
+  maxPerOwner: number;
+  /** Candidate rows one owner's live preparations may hold. */
+  maxRowsPerOwner: number;
+}
+
+/** The store keeps the preparation's progress, written with its candidates. */
+export interface SyncPreparationResult {
+  high: string;
+  done: boolean;
+}
+
+export interface RecordIdentity {
+  recordKey: string;
+  instance: string;
+}
+
+/** One record key written in (low, high], or present at high for a first sync. */
+export interface SyncWindowChange {
+  /** The key's version at the high horizon. */
+  after: PdppRecordRow;
+  /** The key's version at the low horizon, if any. */
+  before(): PdppRecordRow | undefined;
+  /** True when a deletion of this key committed after the high horizon. */
+  deletedAfterHigh(): boolean;
+}
+
+export interface SyncWindow {
+  high: string;
+  /**
+   * The next identity of the prepared candidate set strictly after `after`,
+   * in `compareRecordIdentity` order: one seek on a unique key, paid from
+   * `budget`. `undefined` at the end, `null` when the budget is spent. A
+   * candidate need not exist at the high horizon.
+   */
+  next(
+    direction: "asc" | "desc",
+    after: RecordIdentity | undefined,
+    budget: SyncBudget,
+  ): RecordIdentity | undefined | null;
+  /** One key's version at the high horizon. */
+  versionAtHigh(instance: string, recordKey: string): PdppRecordRow | undefined;
+  /** One key's change, or undefined if it does not exist at the high horizon. */
+  change(id: RecordIdentity): SyncWindowChange | undefined;
+}
+
+/**
+ * Server-side sync session state, keyed by an opaque handle id. Holds no
+ * policy: the session owner decides what a state means and when it expires.
+ */
+export interface SyncStateStore {
+  /**
+   * Store or replace one state, atomically. With `expect`, only if the live
+   * state is still exactly `expect` (`null`: only if there is none); returns
+   * whether it wrote. Drops expired states, then the owner's oldest states
+   * beyond `maxPerOwner`.
+   */
+  put(entry: {
+    id: string;
+    owner: string;
+    state: string;
+    expiresAt: number;
+    now: number;
+    maxPerOwner: number;
+    expect?: string | null;
+  }): boolean;
+  /** The state, unless it is absent, expired or evicted. */
+  get(id: string, now: number): string | undefined;
+  /** Deletes one state; with `expected`, only if it is still that state. */
+  delete(id: string, expected?: string): void;
+}
+
+/**
+ * A sync request ran out of its work or time budget before it had a page to
+ * serve. Its scan position is saved; the same request resumes there.
+ */
+export class SyncRetryLaterError extends Error {
+  constructor(readonly retryAfterSeconds = 1) {
+    super("sync scan paused; retry the same request");
+    this.name = "SyncRetryLaterError";
+  }
+}
+
+/** Store identity for sync tokens. Both change when the store is rebuilt. */
+export interface SyncTokenScope {
+  /** Store reset epoch carried by current-profile tokens. */
+  epoch: string;
+  /** 32-byte secret that authenticates sync handles. */
+  key: Uint8Array;
 }
 
 export interface ChangesSincePage {
@@ -119,6 +259,9 @@ export interface ChangesSincePage {
 }
 
 export interface StreamListing {
+  confirmation?: "not yet confirmed";
+  visibility?: "pending" | "conflicted";
+  status?: "account conflict";
   stream: string;
   recordCount: number;
   lastUpdated: string | null;
@@ -163,3 +306,40 @@ export class CursorExpiredError extends Error {
 export class InvalidCursorError extends Error {}
 
 export class RecordIdentityMismatchError extends Error {}
+
+/** Two read instances hold a visible record under one key, which the wire cannot tell apart. */
+export class RecordIdentityConflictError extends Error {
+  constructor(public readonly recordKey: string) {
+    super(`More than one read instance holds a visible record '${recordKey}'`);
+  }
+}
+
+/** A read-time removal is explicit and contains no withdrawn record fields. */
+export interface PdppPendingRemoval extends Omit<PdppStoredRecord, "deleted"> {
+  deleted: true;
+  deletedAt: string;
+  confirmation: "not yet confirmed";
+  visibility: "pending";
+  data: Record<string, never>;
+}
+
+export type PdppVisibleRecord = PdppStoredRecord | PdppPendingRemoval;
+
+export interface ListVisibleRecordsPage extends Omit<ListRecordsPage, "data"> {
+  data: PdppVisibleRecord[];
+}
+
+export interface PdppReplicaReadStore {
+  visibleInstanceIds?(instanceIds: string[]): string[];
+  changesSince?(stream: string, options: ChangesSinceOptions): ChangesSincePage;
+  getRecord(
+    instance: string,
+    stream: string,
+    key: string,
+  ): PdppVisibleRecord | undefined;
+  listRecords(
+    stream: string,
+    options: ListRecordsOptions,
+  ): ListVisibleRecordsPage;
+  listStreams(instanceIds: string[]): StreamListing[];
+}

@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { createPdppSyncSessionService } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   readCanonicalLegacyScope,
@@ -427,7 +428,8 @@ describe("strava legacy scopes over the real SQLite record store", () => {
       );
       const before = await read("strava.activities", a);
       // Opening a feed itself ticks the shared write clock, so it comes first.
-      const feed = store.changesSince("activities", {
+      const feed = createPdppSyncSessionService(store).read({
+        stream: "activities",
         instanceIds: ["conn_a"],
         limit: 10,
       }).nextChangesSince!;
@@ -452,7 +454,8 @@ describe("strava legacy scopes over the real SQLite record store", () => {
         }),
       ).toEqual(pageBefore);
       expect(
-        store.changesSince("activities", {
+        createPdppSyncSessionService(store).read({
+          stream: "activities",
           instanceIds: ["conn_a"],
           limit: 10,
           changesSince: feed,

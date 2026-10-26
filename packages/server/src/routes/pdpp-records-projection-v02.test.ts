@@ -203,7 +203,7 @@ it("candidate grant closure survives new schema-required fields on list/detail/s
   for (const path of [
     "/streams/transactions/records?fields=date",
     "/streams/transactions/records/t1?fields=date",
-    "/streams/transactions/records?changes_since=&fields=date",
+    "/streams/transactions/records?changes_since=beginning&fields=date",
   ]) {
     const res = await app.request(path, { headers: AUTH });
     expect(res.status).toBe(200);

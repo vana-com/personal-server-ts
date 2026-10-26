@@ -102,7 +102,7 @@ for (const backend of ["memory", "sqlite"])
           if (!candidate) expect(detail).not.toHaveProperty("instance_id");
 
           const first = await get(
-            `/streams/events/records?changes_since=${candidate ? "beginning" : ""}`,
+            `/streams/events/records?order=asc&changes_since=${candidate ? "beginning" : ""}`,
           );
           expect(first.data).toEqual(
             ["gone", "r1"].map((id) =>
@@ -117,7 +117,7 @@ for (const backend of ["memory", "sqlite"])
             "mutable_state",
           );
           const next = await get(
-            `/streams/events/records?changes_since=${encodeURIComponent(first.next_changes_since)}`,
+            `/streams/events/records?order=asc&changes_since=${encodeURIComponent(first.next_changes_since)}`,
           );
           expect(next.data).toEqual([
             expect.objectContaining({ id: "gone", deleted: true, ...identity }),

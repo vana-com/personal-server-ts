@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
+import { createPdppSyncSessionService } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { createTestBoundRecordStore } from "../__fixtures__/bound-record-store.js";
 import {
   CursorExpiredError,
@@ -49,6 +50,117 @@ describe("sqlite record store", () => {
     expect(result.accepted).toBe(1);
     const record = store.getRecord("inst_1", "messages", "msg_1");
     expect(record?.data).toEqual({ id: "msg_1", content: "hi" });
+  });
+
+  it.each([
+    {
+      name: "legacy update",
+      priorExists: true,
+      preTracking: true,
+      resetGeneration: null,
+      writeGeneration: 1,
+      expected: false,
+    },
+    {
+      name: "legacy delete then reappear",
+      priorExists: true,
+      preTracking: true,
+      resetGeneration: null,
+      writeGeneration: 1,
+      expected: false,
+    },
+    {
+      name: "genuinely new identity",
+      priorExists: false,
+      preTracking: false,
+      resetGeneration: null,
+      writeGeneration: 1,
+      expected: true,
+    },
+    {
+      name: "tracked delete then reappear",
+      priorExists: true,
+      preTracking: false,
+      resetGeneration: null,
+      writeGeneration: 1,
+      expected: false,
+    },
+    {
+      name: "replica reset then replica upsert",
+      priorExists: true,
+      preTracking: true,
+      resetGeneration: 2,
+      writeGeneration: 2,
+      expected: true,
+    },
+    {
+      name: "replica reset then local upsert",
+      priorExists: true,
+      preTracking: true,
+      resetGeneration: 2,
+      writeGeneration: 2,
+      expected: true,
+    },
+  ])("decides first addition admission for $name", ({ expected, ...input }) => {
+    expect(store.shouldCountFirstAddition(input)).toBe(expected);
+  });
+
+  it("keeps first-added time across updates, deletes and reappearance, then resets coverage on erase", () => {
+    const instance = "conn_123e4567-e89b-42d3-a456-426614174000";
+    const sourceId = "https://registry.pdpp.dev/connectors/spotify";
+    store.registerConnection({
+      instance,
+      sourceId,
+      method: "test_method",
+      label: "Test",
+    });
+    const since = new Date(Date.now() - 1000).toISOString();
+    const until = new Date(Date.now() + 60_000).toISOString();
+    const ingest = (data: { id: string; title: string }) =>
+      store.ingestBatch(
+        [
+          {
+            instance,
+            stream: "playlists",
+            key: data.id,
+            data,
+            emitted_at: "2026-04-01T00:00:00.000Z",
+          },
+        ],
+        playlistsSemantics,
+        playlistsPk,
+        { method: "test_method", generation: 1 },
+      );
+
+    expect(ingest({ id: "one", title: "first" }).accepted).toBe(1);
+    const first = store.listFirstAdded([instance], since, until);
+    expect(first).toEqual([{ instance, stream: "playlists", added: 1 }]);
+    expect(ingest({ id: "one", title: "updated" }).accepted).toBe(1);
+    expect(
+      store.deleteRecord(
+        instance,
+        "playlists",
+        "one",
+        "2026-04-02T00:00:00.000Z",
+        "mutable_state",
+      ),
+    ).toBe(true);
+    expect(ingest({ id: "one", title: "returned" }).accepted).toBe(1);
+    expect(store.listFirstAdded([instance], since, until)).toEqual(first);
+
+    const oldCoverage = store.firstAddedCoverage([instance])[0]?.trackedSince;
+    store.resetInstanceBinding({
+      instance,
+      expectedMethod: "test_method",
+      expectedGeneration: 1,
+      nextMethod: "test_method",
+    });
+    expect(store.listFirstAdded([instance], since, until)).toEqual([]);
+    const newCoverage = store.firstAddedCoverage([instance])[0]?.trackedSince;
+    expect(newCoverage).toBeDefined();
+    expect(Date.parse(newCoverage!)).toBeGreaterThanOrEqual(
+      Date.parse(oldCoverage!),
+    );
   });
 
   it("serves the first historical list page without scanning each record's whole instance history", () => {
@@ -524,7 +636,8 @@ describe("sqlite record store", () => {
       playlistsPk,
     );
 
-    const page1 = store.changesSince("playlists", {
+    const page1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 1,
     });
@@ -544,9 +657,10 @@ describe("sqlite record store", () => {
       playlistsPk,
     );
 
-    const page2 = store.changesSince("playlists", {
+    const page2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
-      limit: 10,
+      limit: 1,
       cursor: page1.nextCursor,
     });
     expect(page2.data.map((r) => r.recordKey)).not.toContain("pl_3");
@@ -566,7 +680,8 @@ describe("sqlite record store", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session1 = store.changesSince("playlists", {
+    const session1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
     });
@@ -577,7 +692,8 @@ describe("sqlite record store", () => {
       "2026-04-02T00:00:00.000Z",
       "mutable_state",
     );
-    const session2 = store.changesSince("playlists", {
+    const session2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
       changesSince: session1.nextChangesSince,
@@ -600,10 +716,11 @@ describe("sqlite record store", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session1 = store.changesSince("playlists", {
+    const session1 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
-      fields: ["id", "a"],
+      eligibilityFields: ["id", "a"],
     });
     store.ingestBatch(
       [
@@ -618,10 +735,11 @@ describe("sqlite record store", () => {
       playlistsSemantics,
       playlistsPk,
     );
-    const session2 = store.changesSince("playlists", {
+    const session2 = createPdppSyncSessionService(store).read({
+      stream: "playlists",
       instanceIds: ["inst_1"],
       limit: 10,
-      fields: ["id", "a"],
+      eligibilityFields: ["id", "a"],
       changesSince: session1.nextChangesSince,
     });
     expect(session2.data).toHaveLength(0);
@@ -976,7 +1094,9 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 15 });
+        ).toEqual({ version: 25 });
+        // v14 gives the upgraded store a 32-byte sync token key.
+        expect(upgraded.syncTokenScope().key).toHaveLength(32);
         expect(
           dbAfterUpgrade
             .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
@@ -1117,7 +1237,7 @@ describe("sqlite record store", () => {
         "UPDATE pdpp_schema_version SET version = 9999 WHERE id = 1",
       ).run();
       expect(() => createSqliteRecordStore(db)).toThrow(
-        /newer than this build supports/,
+        /Unsupported index\.db PDPP schema version 9999/,
       );
     });
   });
@@ -1320,6 +1440,7 @@ describe("sqlite record store", () => {
         instanceIds: ["inst_a"],
         limit: 1,
         order: "asc",
+        queryBinding: "grant-a",
       });
       expect(page1.nextCursor).toBeDefined();
 
@@ -1329,20 +1450,23 @@ describe("sqlite record store", () => {
           limit: 1,
           order: "asc",
           cursor: page1.nextCursor,
+          queryBinding: "grant-b",
         }),
       ).toThrow(CursorExpiredError);
     });
 
     it("expires a pre-reset changes_since page cursor", () => {
       seedA();
-      const page1 = store.changesSince("messages", {
+      const page1 = createPdppSyncSessionService(store).read({
+        stream: "messages",
         instanceIds: ["inst_a"],
         limit: 1,
       });
       expect(page1.nextCursor).toBeDefined();
       resetToB();
       expect(() =>
-        store.changesSince("messages", {
+        createPdppSyncSessionService(store).read({
+          stream: "messages",
           instanceIds: ["inst_a"],
           limit: 1,
           cursor: page1.nextCursor,
@@ -1352,7 +1476,8 @@ describe("sqlite record store", () => {
 
     it("expires a changes_since token from an earlier reset epoch", () => {
       seedA();
-      const session1 = store.changesSince("messages", {
+      const session1 = createPdppSyncSessionService(store).read({
+        stream: "messages",
         instanceIds: ["inst_a"],
         limit: 10,
       });
@@ -1360,7 +1485,8 @@ describe("sqlite record store", () => {
       resetToB();
 
       expect(() =>
-        store.changesSince("messages", {
+        createPdppSyncSessionService(store).read({
+          stream: "messages",
           instanceIds: ["inst_a"],
           limit: 10,
           changesSince: session1.nextChangesSince,
@@ -1370,14 +1496,16 @@ describe("sqlite record store", () => {
 
     it("rejects a changes_since token reused against a different stream", () => {
       seedA();
-      const session1 = store.changesSince("messages", {
+      const session1 = createPdppSyncSessionService(store).read({
+        stream: "messages",
         instanceIds: ["inst_a"],
         limit: 10,
       });
       expect(session1.nextChangesSince).toBeDefined();
 
       expect(() =>
-        store.changesSince("playlists", {
+        createPdppSyncSessionService(store).read({
+          stream: "playlists",
           instanceIds: ["inst_a"],
           limit: 10,
           changesSince: session1.nextChangesSince,
@@ -1410,7 +1538,8 @@ describe("sqlite record store", () => {
         offset: 0,
       });
       expect(() =>
-        store.changesSince("messages", {
+        createPdppSyncSessionService(store).read({
+          stream: "messages",
           instanceIds: ["inst_a"],
           limit: 10,
           changesSince: legacyChanges,
@@ -1504,7 +1633,7 @@ describe("v13 emitted-time order key", () => {
         const upgraded = createSqliteRecordStore(after);
         expect(
           after.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 15 });
+        ).toEqual({ version: 25 });
         expect(
           upgraded
             .listRecords("events", {
@@ -1524,6 +1653,135 @@ describe("v13 emitted-time order key", () => {
         ]);
       } finally {
         after.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("v14 upgrade from an earlier v13", () => {
+  it("rebuilds the live summary index as covering when an earlier v13 left it narrow", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-v14-"));
+    const path = join(dir, "records.db");
+    try {
+      const before = new Database(path);
+      createTestBoundRecordStore(before);
+      // An earlier v13 (this branch before its rebase, or #441's first v13)
+      // built the summary index without `emitted_at`, and had no token key.
+      before.exec(`
+        DROP INDEX idx_pdpp_records_live_instance_stream_emitted_key;
+        CREATE INDEX idx_pdpp_records_live_instance_stream_emitted_key
+          ON pdpp_records (instance, stream, emitted_key) WHERE deleted = 0;
+        UPDATE pdpp_store_metadata SET sync_token_key = NULL;
+        UPDATE pdpp_schema_version SET version = 13;
+      `);
+      before.close();
+
+      const after = new Database(path);
+      try {
+        const upgraded = createSqliteRecordStore(after);
+        expect(upgraded.syncTokenScope().key).toHaveLength(32);
+        const columns = (
+          after
+            .prepare(
+              "PRAGMA index_info(idx_pdpp_records_live_instance_stream_emitted_key)",
+            )
+            .all() as { name: string }[]
+        ).map((c) => c.name);
+        expect(columns).toEqual([
+          "instance",
+          "stream",
+          "emitted_key",
+          "emitted_at",
+          "record_key",
+        ]);
+      } finally {
+        after.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("v15 sync session state table", () => {
+  it("adds the table to a database an earlier build already stamped v14", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-v15-"));
+    const path = join(dir, "records.db");
+    try {
+      const before = new Database(path);
+      createTestBoundRecordStore(before);
+      // An earlier v14 had no session-state table.
+      before.exec(`
+        DROP TABLE IF EXISTS pdpp_sync_state;
+        UPDATE pdpp_schema_version SET version = 14;
+      `);
+      before.close();
+
+      const after = new Database(path);
+      try {
+        const upgraded = createSqliteRecordStore(after);
+        expect(
+          after.prepare("SELECT version FROM pdpp_schema_version").get(),
+        ).toEqual({ version: 25 });
+        upgraded.syncStates().put({
+          id: "x",
+          owner: "o",
+          state: "{}",
+          expiresAt: 2,
+          now: 1,
+          maxPerOwner: 1,
+        });
+        expect(upgraded.syncStates().get("x", 1)).toBe("{}");
+      } finally {
+        after.close();
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("upgrade from v15 with live sync state", () => {
+  it("keeps outstanding session state and adds the preparation tables", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pdpp-v15-up-"));
+    const path = join(dir, "records.db");
+    try {
+      const before = new Database(path);
+      const store = createTestBoundRecordStore(before);
+      store.syncStates().put({
+        id: "live",
+        owner: "o",
+        state: '{"r":"checkpoint"}',
+        expiresAt: 10_000,
+        now: 1,
+        maxPerOwner: 10,
+      });
+      // A v15 database: no preparation tables or deletion index yet.
+      before.exec(`
+        DROP TABLE IF EXISTS pdpp_sync_candidate;
+        DROP TABLE IF EXISTS pdpp_sync_preparation;
+        DROP INDEX IF EXISTS idx_pdpp_record_changes_deleted;
+        UPDATE pdpp_schema_version SET version = 15;
+      `);
+      before.close();
+
+      const after = new Database(path);
+      try {
+        const upgraded = createSqliteRecordStore(after);
+        expect(upgraded.syncStates().get("live", 2)).toBe('{"r":"checkpoint"}');
+        expect(upgraded.inspectSyncState()).toMatchObject({
+          preparations: 0,
+          candidates: 0,
+        });
+        upgraded.close();
+        // Reopening at the current version changes nothing.
+        const again = createSqliteRecordStore(new Database(path));
+        expect(again.syncStates().get("live", 2)).toBe('{"r":"checkpoint"}');
+        again.close();
+      } finally {
+        if (after.open) after.close();
       }
     } finally {
       await rm(dir, { recursive: true, force: true });

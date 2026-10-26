@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const DEFAULTS = {
+  legacyWriteShutdownEnabled: false,
   server: {
     port: 8080,
     origin: "http://localhost:8080",
@@ -131,6 +132,9 @@ export const VanaStorageConfigSchema = z.object({
 });
 
 export const ServerConfigSchema = z.object({
+  legacyWriteShutdownEnabled: z
+    .boolean()
+    .default(DEFAULTS.legacyWriteShutdownEnabled),
   server: z
     .object({
       port: z.number().int().min(1).max(65535).default(DEFAULTS.server.port),

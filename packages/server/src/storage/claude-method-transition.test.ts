@@ -87,6 +87,79 @@ it("transitions an existing Claude connection without losing history, fences old
   db.close();
 });
 
+it("preserves first-added time and coverage across the Claude transport transition", () => {
+  const db = new Database(":memory:");
+  const store = createSqliteRecordStore(db);
+  const instance = "claude:0xowner";
+  const sourceId = "https://registry.pdpp.dev/sources/claude";
+  const row = {
+    instance,
+    stream: "conversations",
+    key: "conversation-1",
+    data: { id: "conversation-1" },
+    emitted_at: "2026-10-21T00:00:00.000Z",
+  };
+  store.registerConnection({
+    instance,
+    sourceId,
+    method: "anthropic",
+    label: "Work",
+  });
+  store.ingestBatch(
+    [row],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "anthropic", generation: 1 },
+  );
+  const originalFirstAdded = "2026-10-20T00:00:00.000Z";
+  db.prepare(
+    "UPDATE pdpp_record_first_added SET first_added_at = ? WHERE instance = ? AND stream = ? AND record_key = ?",
+  ).run(originalFirstAdded, instance, "conversations", row.key);
+  const coverageBefore = store.firstAddedCoverage([instance])[0]!.trackedSince;
+
+  const transition = store.transitionClaudeToLive({
+    instance,
+    expectedGeneration: 1,
+    expectedWriteClock: store.transitionWriteClock(),
+    snapshots: {},
+  });
+  const afterTransition = new Date().toISOString();
+  const archive = store.claudeTransition(instance)!.archiveInstance;
+  store.ingestBatch(
+    [row],
+    () => "mutable_state",
+    () => ["id"],
+    { method: "anthropic-live", generation: transition.generation },
+  );
+
+  const firstAdded = db
+    .prepare(
+      "SELECT first_added_at FROM pdpp_record_first_added WHERE instance = ? AND stream = ? AND record_key = ?",
+    )
+    .get(instance, "conversations", row.key) as {
+    first_added_at: string;
+  };
+  expect(store.getRecord(archive, "conversations", row.key)?.data.id).toBe(
+    row.key,
+  );
+  expect(store.getRecord(instance, "conversations", row.key)?.data.id).toBe(
+    row.key,
+  );
+  expect(firstAdded.first_added_at).toBe(originalFirstAdded);
+  expect(store.firstAddedCoverage([instance])[0]!.trackedSince).toBe(
+    coverageBefore,
+  );
+  expect(
+    store.listFirstAdded(
+      [instance],
+      afterTransition,
+      new Date(Date.now() + 60_000).toISOString(),
+    ),
+  ).toEqual([]);
+  store.close();
+  db.close();
+});
+
 it("rejects a stale snapshot and rolls the transition back on database failure", () => {
   const db = new Database(":memory:");
   const store = createSqliteRecordStore(db);

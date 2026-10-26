@@ -1,10 +1,14 @@
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
+import type { PublicationRegistrationAuthority } from "../publication/publish.js";
 import {
   compareLegacyCoverage,
   type LegacyCoverageVerdict,
 } from "./legacy-scope-coverage.js";
 export type { LegacyCoverageVerdict } from "./legacy-scope-coverage.js";
-import { LEGACY_SCOPE_ENTITY_KEYS } from "./legacy-scope-entity-keys.js";
+import {
+  LEGACY_SCOPE_ENTITY_KEYS,
+  LEGACY_SCOPE_SNAPSHOT_EQUIVALENCE,
+} from "./legacy-scope-entity-keys.js";
 import {
   ANTHROPIC_LIVE_BINDINGS,
   GITHUB_BROWSER_BINDINGS,
@@ -58,7 +62,7 @@ const BINDING_PROFILES = [
   OURA_BROWSER_BINDINGS,
 ];
 
-const COVERAGE_RULE_VERSION = 7;
+const COVERAGE_RULE_VERSION = 8;
 
 /** Live Claude omits some account metadata. Preserve known fields from the
  * same organization's saved head; never borrow entities or another identity. */
@@ -146,7 +150,7 @@ function scopeDeclarationCursor(scope: string): string {
  * the rows. Facts must work when the record server is not mounted (its tables
  * may then be absent: no connection, no evidence).
  */
-export interface LegacyScopeAuthority {
+export interface LegacyScopeAuthority extends PublicationRegistrationAuthority {
   /** Connections registered with one of `methods`, deleted ones included. */
   listMethodConnections(
     methods: readonly string[],
@@ -163,16 +167,25 @@ export interface LegacyScopeAuthority {
   arrivalRevision(): number;
   /** Whether a complete canonical read has already superseded the legacy head. */
   hasTakeover(scope: string, instance?: string, generation?: number): boolean;
+  /** Whether this scope has durable canonical authority, independent of its legacy head. */
+  hasCanonicalAuthority?(scope: string): boolean;
   /**
    * Whether a takeover of `scope` is recorded as earned by `method`. Records
    * that do not name their method (written before takeovers did) never match.
    */
   hasMethodTakeover(scope: string, method: string): boolean;
+  /**
+   * Whether a takeover superseded `head`. With `selection`, only one recorded
+   * for exactly that connection and generation counts; a takeover recorded
+   * without an instance never does.
+   */
   hasCoveredHead(
     scope: string,
     head: LegacyScopeHead,
-    instance?: string,
+    selection?: { instance: string; generation: number },
   ): boolean;
+  /** Legacy file whose coverage established canonical authority for this selection. */
+  canonicalBaselineHead?(scope: string): LegacyScopeHead | null;
   isReset(scope: string): boolean;
   cachedVerdict(
     scope: string,
@@ -182,7 +195,7 @@ export interface LegacyScopeAuthority {
     canonicalCursor: string,
   ): LegacyCoverageVerdict | null;
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
-  resetTakeover(scope: string): void;
+  resetTakeover(scope: string): Promise<void>;
   /** Identity of the latest index entry not owned by a known projector. */
   eligibleLegacyHead(scope: string): LegacyScopeHead | null;
   /**
@@ -206,7 +219,12 @@ export interface LegacyScopeAuthority {
       coverage: LegacyCoverageVerdict;
       cached: boolean;
     },
-  ): boolean;
+    selection?: { instance: string; generation: number },
+    options?: {
+      canonicalAuthority?: boolean;
+      baselineHead?: LegacyScopeHead | null;
+    },
+  ): Promise<boolean>;
 }
 
 export interface LegacyScopeVerdictRecord {
@@ -320,7 +338,7 @@ export interface LegacyScopeViewPort {
    */
   ownsScope(scope: string): boolean;
   verdictFor(scope: string): LegacyScopeVerdictRecord[];
-  resetTakeover(scope: string): void;
+  resetTakeover(scope: string): Promise<void>;
   isReset(scope: string): boolean;
 }
 
@@ -387,6 +405,16 @@ export function createLegacyScopeView(
     scope: string,
   ): Map<string, readonly string[]> {
     const methods = scopeMethods(scope);
+    // Canonical authority can be established before a scope has any legacy
+    // head. In that case no method-specific takeover was earned, so keep the
+    // currently configured method eligible when a later legacy write arrives.
+    // When a takeover exists, retain its method gate across later connections.
+    if (
+      authority.hasCanonicalAuthority?.(scope) &&
+      !authority.hasTakeover(scope)
+    ) {
+      return methods;
+    }
     const head = authority.eligibleLegacyHead(scope);
     if (head === null) return methods;
     const gated = new Set(
@@ -477,7 +505,8 @@ export function createLegacyScopeView(
       ? withoutOptedOutMethods(scope)
       : scopeMethods(scope);
     if (streamsByMethod.size === 0) {
-      return authority.hasTakeover(scope)
+      return authority.hasTakeover(scope) ||
+        authority.hasCanonicalAuthority?.(scope)
         ? refused({
             status: "unavailable",
             reason: "connection_unavailable",
@@ -490,6 +519,7 @@ export function createLegacyScopeView(
     ]);
     const owned =
       authority.hasTakeover(scope) ||
+      authority.hasCanonicalAuthority?.(scope) ||
       connections.some(
         (connection) =>
           connection.deletedAt !== null ||
@@ -547,6 +577,7 @@ export function createLegacyScopeView(
   }
 
   function canServeLegacyBeforeTakeover(scope: string): boolean {
+    if (authority.hasCanonicalAuthority?.(scope)) return false;
     const methods = [...scopeMethods(scope).keys()];
     const connections = authority.listMethodConnections(methods);
     if (
@@ -605,6 +636,36 @@ export function createLegacyScopeView(
       return { kind: "file" };
     }
     if (decision.kind !== "canonical") return { kind: decision.kind };
+    if (authority.hasCanonicalAuthority?.(scope)) {
+      const baselineHead = authority.canonicalBaselineHead?.(scope) ?? null;
+      if (baselineHead !== null) {
+        const baselineVerdict = authority
+          .verdictFor(scope)
+          .find(
+            (row) =>
+              row.instance === decision.selection.instance &&
+              row.generation === decision.generation &&
+              row.legacyVersionId === baselineHead.id,
+          );
+        if (
+          baselineVerdict &&
+          baselineVerdict.canonicalCursor.startsWith(
+            currentVerdictCursorPrefix(authority, decision, input.declarations),
+          ) &&
+          baselineVerdict.verdict !== "covered"
+        ) {
+          return { kind: "refused" };
+        }
+      }
+      const collectedAt = listedCollectedAt(
+        decision.records,
+        decision.selection.instance,
+        decision.streams,
+      );
+      return collectedAt === null
+        ? { kind: "refused" }
+        : { kind: "canonical", collectedAt };
+    }
     const hasLegacyHead = legacyHead !== null;
     if (hasLegacyHead && input.readLegacyHead) {
       const verdict = authority
@@ -621,7 +682,7 @@ export function createLegacyScopeView(
       }
       if (
         !verdict.canonicalCursor.startsWith(
-          `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(decision, input.declarations)}:`,
+          currentVerdictCursorPrefix(authority, decision, input.declarations),
         )
       ) {
         return { kind: "refused" };
@@ -649,17 +710,31 @@ export function createLegacyScopeView(
   function readDecision(scope: string) {
     return authority.readSnapshot(() => {
       const decision = decide(scope);
+      const hasCanonicalAuthority =
+        authority.hasCanonicalAuthority?.(scope) ?? false;
       return {
         reset: authority.isReset(scope),
         decision,
         legacyHead: authority.eligibleLegacyHead(scope),
         hasTakeover: authority.hasTakeover(
           scope,
-          decision.kind === "canonical"
-            ? decision.selection.instance
-            : undefined,
-          decision.kind === "canonical" ? decision.generation : undefined,
+          hasCanonicalAuthority
+            ? undefined
+            : decision.kind === "canonical"
+              ? decision.selection.instance
+              : undefined,
+          hasCanonicalAuthority
+            ? undefined
+            : decision.kind === "canonical"
+              ? decision.generation
+              : undefined,
         ),
+        hasCanonicalAuthority,
+        canonicalBaselineHead:
+          decision.kind === "canonical" &&
+          (authority.hasCanonicalAuthority?.(scope) ?? false)
+            ? (authority.canonicalBaselineHead?.(scope) ?? null)
+            : null,
         canServeLegacy: canServeLegacyBeforeTakeover(scope),
         writeClock: authority.writeClock(),
         arrivalRevision: authority.arrivalRevision(),
@@ -677,7 +752,14 @@ export function createLegacyScopeView(
     initial: ReturnType<typeof readDecision>,
   ): Promise<ChosenBody> {
     if (initial.reset) return { kind: "file" };
-    const { decision, legacyHead, hasTakeover, canServeLegacy } = initial;
+    const { decision, hasTakeover, canServeLegacy, hasCanonicalAuthority } =
+      initial;
+    const expectedHead = initial.legacyHead;
+    // Once canonical authority is durable, later legacy heads are retained as
+    // history but do not participate in projection coverage or fallback.
+    const legacyHead = hasCanonicalAuthority
+      ? initial.canonicalBaselineHead
+      : expectedHead;
     if (
       decision.kind === "refused" &&
       decision.refusal.status === "unavailable" &&
@@ -721,9 +803,9 @@ export function createLegacyScopeView(
         : null;
     const cachedProjection = coveredProjection.get(projectionOwner);
     if (cachedCoverage?.covered && cachedProjection?.key === projectionKey) {
-      const confirmed = authority.confirmRead(
+      const confirmed = await authority.confirmRead(
         scope,
-        legacyHead,
+        expectedHead,
         () =>
           sameSelection(decide(scope), decision) &&
           receiptCursor(decision, input.declarations) === initial.receiptCursor,
@@ -737,6 +819,10 @@ export function createLegacyScopeView(
           coverage: cachedCoverage,
           cached: true,
         },
+        undefined,
+        hasCanonicalAuthority
+          ? { canonicalAuthority: true, baselineHead: legacyHead }
+          : undefined,
       );
       if (!confirmed) {
         if (authority.isReset(scope)) return { kind: "file" };
@@ -783,9 +869,9 @@ export function createLegacyScopeView(
         };
       }
       const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
-      const confirmed = authority.confirmRead(
+      const confirmed = await authority.confirmRead(
         scope,
-        legacyHead,
+        expectedHead,
         () =>
           sameSelection(decide(scope), decision) &&
           receiptCursor(decision, input.declarations) === initial.receiptCursor,
@@ -799,6 +885,10 @@ export function createLegacyScopeView(
           coverage: cachedCoverage,
           cached: true,
         },
+        undefined,
+        hasCanonicalAuthority
+          ? { canonicalAuthority: true, baselineHead: legacyHead }
+          : undefined,
       );
       if (!confirmed) {
         if (authority.isReset(scope)) return { kind: "file" };
@@ -829,10 +919,18 @@ export function createLegacyScopeView(
       scope,
       selection: decision.selection,
       profileBy: "method",
-      requireCompletionReceipts: legacyHead !== null && !input.readLegacyHead,
-      allowUnprovenEmptyStreams: legacyHead !== null && !!input.readLegacyHead,
-      includeStreamTimes: legacyHead !== null && !!input.readLegacyHead,
-      requireClaudeRawBlobs: legacyHead !== null && !!input.readLegacyHead,
+      requireCompletionReceipts:
+        (legacyHead !== null || (hasCanonicalAuthority && hasTakeover)) &&
+        !input.readLegacyHead,
+      allowUnprovenEmptyStreams:
+        (legacyHead !== null || (hasCanonicalAuthority && hasTakeover)) &&
+        !!input.readLegacyHead,
+      includeStreamTimes:
+        (legacyHead !== null || (hasCanonicalAuthority && hasTakeover)) &&
+        !!input.readLegacyHead,
+      requireClaudeRawBlobs:
+        (legacyHead !== null || (hasCanonicalAuthority && hasTakeover)) &&
+        !!input.readLegacyHead,
       // The rows must come from a state in which this is still the one
       // connection: a second account appearing between the decision and
       // the rows refuses instead of serving a body chosen while ambiguous.
@@ -866,9 +964,9 @@ export function createLegacyScopeView(
           legacy.data,
           read.reason === "missing_raw_blob" ? read.recordCount : 0,
         );
-        const confirmed = authority.confirmRead(
+        const confirmed = await authority.confirmRead(
           scope,
-          legacyHead,
+          expectedHead,
           () =>
             sameSelection(decide(scope), decision) &&
             receiptCursor(decision, input.declarations) ===
@@ -883,6 +981,10 @@ export function createLegacyScopeView(
             coverage,
             cached: false,
           },
+          undefined,
+          hasCanonicalAuthority
+            ? { canonicalAuthority: true, baselineHead: legacyHead }
+            : undefined,
         );
         if (!confirmed) {
           if (authority.isReset(scope)) return { kind: "file" };
@@ -921,6 +1023,21 @@ export function createLegacyScopeView(
       }
       const { ok: _ok, ...refusal } = read;
       return { kind: "refused", refusal };
+    }
+    if (
+      hasCanonicalAuthority &&
+      hasTakeover &&
+      legacyHead !== null &&
+      input.readLegacyHead &&
+      scope === "claude.conversations" &&
+      decision.selection.method === "anthropic-live"
+    ) {
+      try {
+        const legacy = await input.readLegacyHead(legacyHead);
+        if (legacy.scope === scope) await retainClaudeProfile(read, legacy);
+      } catch {
+        // The retained legacy envelope is optional metadata after takeover.
+      }
     }
     if (legacyHead !== null && input.readLegacyHead) {
       // Coverage compares against the old file, so it cannot see rows the
@@ -969,6 +1086,7 @@ export function createLegacyScopeView(
         coverage = compareLegacyCoverage(legacy.data, read.envelope.data, {
           scope,
           entityKeys: LEGACY_SCOPE_ENTITY_KEYS[scope],
+          exactSnapshot: LEGACY_SCOPE_SNAPSHOT_EQUIVALENCE[scope] === true,
           projectionOmissions: read.projectionOmissions,
           canonicalNewer: allStreamsNewerThan(
             read,
@@ -990,9 +1108,9 @@ export function createLegacyScopeView(
         });
       }
       const alreadyCovered = authority.hasCoveredHead(scope, legacyHead);
-      const confirmed = authority.confirmRead(
+      const confirmed = await authority.confirmRead(
         scope,
-        legacyHead,
+        expectedHead,
         () =>
           sameSelection(decide(scope), decision) &&
           receiptCursor(decision, input.declarations) === initial.receiptCursor,
@@ -1006,6 +1124,10 @@ export function createLegacyScopeView(
           coverage,
           cached,
         },
+        undefined,
+        hasCanonicalAuthority
+          ? { canonicalAuthority: true, baselineHead: legacyHead }
+          : undefined,
       );
       if (!confirmed) {
         if (authority.isReset(scope)) return { kind: "file" };
@@ -1060,11 +1182,19 @@ export function createLegacyScopeView(
         },
       };
     }
-    const confirmed = authority.confirmRead(
+    const confirmed = await authority.confirmRead(
       scope,
-      legacyHead,
+      expectedHead,
       () => sameSelection(decide(scope), decision),
       decision.selection.method,
+      undefined,
+      {
+        instance: decision.selection.instance,
+        generation: decision.generation,
+      },
+      hasCanonicalAuthority
+        ? { canonicalAuthority: true, baselineHead: legacyHead }
+        : undefined,
     );
     if (!confirmed) {
       const current = authority.readSnapshot(() => ({
@@ -1165,8 +1295,28 @@ function isProjectionDataFailure(reason: string): boolean {
   ].includes(reason);
 }
 
+/** The rows and receipts a verdict about one connection is judged against. */
+export interface VerdictSelection {
+  records: Pick<CanonicalLegacyReadStore, "listStreamCompletions">;
+  selection: { instance: string };
+  streams: readonly string[];
+}
+
+/**
+ * The prefix a recorded verdict's `canonicalCursor` keeps while it still
+ * describes the selection's current rows, receipts and declarations. A
+ * verdict without it is stale: it neither covers nor refuses a head.
+ */
+export function currentVerdictCursorPrefix(
+  authority: Pick<LegacyScopeAuthority, "writeClock" | "arrivalRevision">,
+  selection: VerdictSelection,
+  declarations?: ReadCanonicalLegacyScopeInput["declarations"],
+): string {
+  return `${authority.writeClock()}:${authority.arrivalRevision()}:${receiptCursor(selection, declarations)}:`;
+}
+
 function receiptCursor(
-  decision: Extract<Decision, { kind: "canonical" }>,
+  decision: VerdictSelection,
   declarations?: ReadCanonicalLegacyScopeInput["declarations"],
 ): string {
   const receipts = decision.records
@@ -1279,7 +1429,7 @@ function sameSelection(
  * reads. A method id is a binding's connector key; its binding is the one
  * the reader will use for that method.
  */
-function scopeMethods(scope: string): Map<string, readonly string[]> {
+export function scopeMethods(scope: string): Map<string, readonly string[]> {
   const methods = new Map<string, readonly string[]>();
   for (const profile of BINDING_PROFILES) {
     const bound = profile.get(scope);

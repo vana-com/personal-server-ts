@@ -1,3 +1,8 @@
+import {
+  createLegacyDownloadHold,
+  legacyPublicationGateActive,
+  optInLegacyPublicationGate,
+} from "./storage/legacy-publication-fence.js";
 import type { DurableAdditionsOptions } from "@opendatalabs/personal-server-ts-core/additions";
 import {
   createDurableAdditions,
@@ -85,9 +90,17 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/adapters";
 import { createFilePendingBlobDeletionStore } from "./pending-blob-deletions.js";
 import type { Hono } from "hono";
+import { createLegacyPublicationPolicy } from "./storage/legacy-publication-policy.js";
+import { createLegacyCanonicalCoverage } from "./storage/legacy-publication-canonical.js";
+import {
+  withLegacyGatewayFence,
+  withLegacySignerFence,
+  withLegacyStorageFence,
+  withLegacyDeletionFence,
+} from "./storage/legacy-publication-issuance.js";
 import { createApp, type IdentityInfo } from "./app.js";
 import { cleanupExpiredScopeImports } from "./routes/chunked-scope-import.js";
-import { createPdppAuthDeps } from "./pdpp/bootstrap.js";
+import { createPdppAuthDeps, pdppIsConfigured } from "./pdpp/bootstrap.js";
 import {
   createPdppRecordsDeps,
   coLocatedAuthorizationService,
@@ -364,6 +377,11 @@ export async function createServer(
   };
 
   const db = initializeDatabase(indexPath);
+  // Explicit runtime opt-in. Without it, a never-enrolled root behaves as it
+  // did before the gate; enrollment needs the flag, so that cannot change
+  // while this process runs. An enrolled root stays gated with the flag off.
+  if (config.legacyWriteShutdownEnabled) optInLegacyPublicationGate(db);
+  const legacyGateActive = legacyPublicationGateActive(db);
   await migrateLocalState({
     storageRoot,
     dataDir,
@@ -389,6 +407,7 @@ export async function createServer(
     allowOpenMarkerMigration:
       hadIndex && !hadMetadataSentinel && !openMarkerProtocolInitialized,
   });
+  const legacyScopeAuthority = createLegacyScopeAuthority(db);
   db.exec(
     "CREATE TABLE IF NOT EXISTS cas_open_marker_protocol (id INTEGER PRIMARY KEY)",
   );
@@ -440,8 +459,12 @@ export async function createServer(
         : logger.info(issue, "Legacy scope projection left rows out"),
   });
 
-  const gatewayClient =
+  // Gate ports only for an opted-in or enrolled root; off, the raw ports.
+  const rawGatewayClient =
     options?.gatewayClient ?? createGatewayClient(config.gateway.url);
+  const gatewayClient = legacyGateActive
+    ? withLegacyGatewayFence(db, rawGatewayClient)
+    : rawGatewayClient;
 
   // X402 payment enforcement on data reads. When config.payment.enabled is
   // true, GET /v1/data/:scope requires builders to supply a signed X-PAYMENT
@@ -495,10 +518,13 @@ export async function createServer(
       "Server account loaded",
     );
 
-    serverSigner = createServerSigner(serverAccount, {
+    const rawSigner = createServerSigner(serverAccount, {
       chainId: config.gateway.chainId,
       contracts: config.gateway.contracts,
     });
+    serverSigner = legacyGateActive
+      ? withLegacySignerFence(db, rawSigner)
+      : rawSigner;
 
     // Identity starts with serverId=null; background services will populate it
     identity = {
@@ -670,6 +696,12 @@ export async function createServer(
       "Inference E2EE is disabled: prompts and answers travel as plaintext over TLS",
     );
   }
+  // One signal for "PDPP is configured here", shared by the data routes and
+  // the derivative compute. It follows configuration, not whether the PDPP
+  // routes mounted: a configured service that failed to mount (no retained
+  // declarations, say) still counts, because PDPP data may still exist.
+  // Read lazily; `pdppAuth` is resolved further down.
+  const pdppConfigured = () => pdppIsConfigured(config, pdppAuth) ?? true;
   const derivativeScheduler: RecomputeScheduler = createRecomputeScheduler({
     store: questionStore,
     debounceMs: config.inference.recomputeDebounceMs,
@@ -682,6 +714,8 @@ export async function createServer(
           derivativeScheduler.markSourceChanged(event.scope, {
             lineageSources: event.lineageSources,
           }),
+        // Read when a question computes, after the PDPP surface is resolved.
+        pdppEnabled: pdppConfigured,
         storage: dataStorage,
         store: questionStore,
         provider: inferenceProvider,
@@ -746,6 +780,7 @@ export async function createServer(
       masterKey: deriveMasterKey(masterKeySignature),
       signer: options?.additionsWriter?.signer ?? serverSigner,
       gateway: options?.additionsWriter?.gateway ?? gatewayClient,
+      registrationAuthority: legacyScopeAuthority,
     });
   }
 
@@ -758,12 +793,21 @@ export async function createServer(
   ) {
     const masterKey = deriveMasterKey(masterKeySignature);
 
-    const storageAdapter = createVanaSyncStorageAdapter({
+    const remoteStorage = createVanaSyncStorageAdapter({
       config,
       serverOwner,
       serverAccount,
       reads: isEnclave ? "public" : "signed",
     });
+    const storageAdapter = legacyGateActive
+      ? withLegacyStorageFence(
+          db,
+          serverOwner,
+          remoteStorage,
+          masterKey,
+          rawDataStorage,
+        )
+      : remoteStorage;
 
     const cursor = createSyncCursor(syncCursorPath, {
       legacyConfigPath: configPath,
@@ -771,6 +815,7 @@ export async function createServer(
 
     const uploadDeps = {
       additions,
+      registrationAuthority: legacyScopeAuthority,
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -784,6 +829,11 @@ export async function createServer(
     };
 
     const downloadDeps = {
+      // The hold captures foreign bytes as they are; it must not use the
+      // publisher's fenced reader, which refuses non-restore occupants.
+      holdRemoteChange: legacyGateActive
+        ? createLegacyDownloadHold(db, remoteStorage, rawDataStorage, masterKey)
+        : undefined,
       storage: rawDataStorage,
       storageAdapter,
       gateway: gatewayClient,
@@ -806,7 +856,7 @@ export async function createServer(
     // Durable deletion: gateway tombstone signed with the same server
     // account + AddData signer uploads use, storage DELETE authorised with
     // the same Web3Signed signer the storage provider uploads with.
-    const deleteData = isEnclave
+    const gatewayDeleteData = isEnclave
       ? null
       : createGatewayDeleteDataPort({
           gatewayUrl: config.gateway.url,
@@ -819,6 +869,10 @@ export async function createServer(
             signMessage: (message) => serverAccount.signMessage(message),
           },
         });
+    const deleteData =
+      gatewayDeleteData && legacyGateActive
+        ? withLegacyDeletionFence(db, gatewayDeleteData)
+        : gatewayDeleteData;
     const pendingBlobDeletions = createFilePendingBlobDeletionStore(
       pendingBlobDeletionsPath,
     );
@@ -985,6 +1039,8 @@ export async function createServer(
             (declaration) => declaration.source_id,
           ),
         ]),
+        declarations: pdppAuth.retainedDeclarations,
+        nativeStore: createSqliteRecordStore(db),
       }
     : undefined;
 
@@ -1012,7 +1068,32 @@ export async function createServer(
         })
       : undefined;
 
+  // Off a never-enrolled root, the owner policy API is not mounted.
+  const legacyPublicationPolicy =
+    legacyGateActive && serverOwner && serverAccount
+      ? createLegacyPublicationPolicy(db, {
+          owner: serverOwner,
+          serverGeneration: `server-key:${serverAccount.address.toLowerCase()}:legacy-publication-v1`,
+          enabled: () => config.legacyWriteShutdownEnabled,
+          storage: { indexManager, hierarchyOptions },
+          // Native canonical coverage over this server's own record store.
+          canonical:
+            pdppRecords && pdppAuth
+              ? createLegacyCanonicalCoverage({
+                  store: pdppRecords.bindingStore,
+                  declarations: pdppAuth.retainedDeclarations,
+                  streamDeclarations: pdppRecords.declarations,
+                  configuredMethods: pdppRecords.configuredMethods,
+                  authority: legacyScopeAuthority,
+                })
+              : undefined,
+          // No complete inventory/global fence, qualified canonical retention
+          // or coordinated rollback capability is available in this runtime.
+        })
+      : undefined;
   const app = createApp({
+    legacyPublicationPolicy,
+    pdppEnabled: pdppConfigured,
     pdppAuth,
     // Declaration submission, gated on the control-plane credential the
     // deployment already uses for operator surfaces (`PS_ACCESS_TOKEN`).
@@ -1068,7 +1149,7 @@ export async function createServer(
     // file, on a boot that does not mount the RS.
     legacyScopeView: createLegacyScopeView({
       logger,
-      authority: createLegacyScopeAuthority(db),
+      authority: legacyScopeAuthority,
       records: pdppRecords?.bindingStore,
       // Reuse the source-scoped declarations selected by the record server.
       // Declaration schema identity participates in projection revisions and

@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import { request as httpRequest } from "node:http";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import { pino } from "pino";
 import { Hono } from "hono";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/node";
+import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import {
   buildWeb3SignedHeader,
   createTestWallet,
@@ -18,9 +22,38 @@ import { ContentTooLargeError } from "@opendatalabs/personal-server-ts-core/erro
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { initializeDatabase } from "../storage/index-schema.js";
 import { createIndexManager } from "../storage/index-manager.js";
+import { createNodeDataStorage } from "../storage/node-data-storage.js";
+import { retainLegacyVersions } from "../storage/legacy-publication-fence.js";
 import { listenHttpServer } from "../listen.js";
 import { dataRoutes } from "./data.js";
 import { SCOPE_IMPORT_CHUNK_BYTES } from "./chunked-scope-import.js";
+
+/** Holds the next read of an uploaded chunk, as a slow disk or reader would. */
+const chunkRead = vi.hoisted(() => ({
+  armed: false,
+  reached: undefined as (() => void) | undefined,
+  resume: undefined as Promise<void> | undefined,
+}));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof fs>();
+  const createReadStream = ((path: fs.PathLike, ...rest: never[]) => {
+    const stream = actual.createReadStream(path, ...rest);
+    if (!chunkRead.armed || !String(path).endsWith("/chunk-0.bin"))
+      return stream;
+    chunkRead.armed = false;
+    return Readable.from(
+      (async function* () {
+        for await (const bytes of stream) {
+          chunkRead.reached?.();
+          await chunkRead.resume;
+          yield bytes;
+        }
+      })(),
+    );
+  }) as typeof actual.createReadStream;
+  const mocked = { ...actual, createReadStream };
+  return { ...mocked, default: mocked };
+});
 
 const owner = createTestWallet(9);
 const logger = pino({ level: "silent" });
@@ -365,6 +398,179 @@ describe("chunked scope imports over the @hono/node-server HTTP adapter", () => 
       }
     },
   );
+
+  it("stages a streamed import away from version paths, so a seal during the read neither records nor freezes it", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "scope-import-seal-race-"));
+    const db = initializeDatabase(":memory:");
+    const indexManager = createIndexManager(db);
+    const hierarchyOptions: HierarchyManagerOptions = { dataDir };
+    const storage = createNodeDataStorage({ indexManager, hierarchyOptions });
+    // A retained spotify.profile sidecar that chatgpt/conversations aliases.
+    const sealed = "spotify.profile";
+    await storage.commitVersion!({
+      kind: "append",
+      envelope: createDataFileEnvelope(sealed, "2026-10-24T00:00:00Z", {
+        name: "original",
+      }),
+      metadata: {},
+    });
+    const entry = indexManager.findLatestByScope(sealed)!;
+    const built = await buildDataBlocksAsync({
+      scope: sealed,
+      collectedAt: entry.collectedAt,
+      content: await storage.readEnvelope(sealed, entry.collectedAt),
+    });
+    await storage.writeBlockManifest!(
+      sealed,
+      entry.collectedAt,
+      built.manifest,
+      built.blocks,
+    );
+    const blockDir = join(
+      dataDir,
+      "blocks",
+      "spotify",
+      "profile",
+      entry.collectedAt,
+    );
+    fs.mkdirSync(join(dataDir, "chatgpt"));
+    fs.symlinkSync(blockDir, join(dataDir, "chatgpt", "conversations"));
+    const hashes = () =>
+      Object.fromEntries(
+        fs
+          .readdirSync(blockDir)
+          .sort()
+          .map((name) => [
+            name,
+            createHash("sha256")
+              .update(fs.readFileSync(join(blockDir, name)))
+              .digest("hex"),
+          ]),
+      );
+
+    const app = new Hono();
+    app.route(
+      "/v1/data",
+      dataRoutes({
+        indexManager,
+        hierarchyOptions,
+        logger,
+        serverOrigin: "http://127.0.0.1",
+        serverOwner: owner.address,
+        gateway: { isRegisteredBuilder: async () => true } as never,
+        accessLogWriter: { write: async () => undefined },
+        mountPath: "/v1/data",
+      }),
+    );
+    const server = await listenHttpServer({
+      fetch: app.fetch,
+      port: 0,
+      hostname: "127.0.0.1",
+    });
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("Expected a TCP address");
+    const port = address.port;
+    const path = `/v1/data/${scope}/imports`;
+    const chunk = new TextEncoder().encode('{"messages":[]}');
+    const chunkHash = createHash("sha256").update(chunk).digest("hex");
+    const send = async (
+      method: string,
+      requestPath: string,
+      body?: Uint8Array,
+      headers: Record<string, string> = {},
+    ) =>
+      sendHttp(port, {
+        method,
+        path: requestPath,
+        body,
+        headers: {
+          "content-length": String(body?.byteLength ?? 0),
+          ...headers,
+          ...(await signedHeaders({ method, path: requestPath, body })),
+        },
+      });
+    let release!: () => void;
+    try {
+      const beginBytes = new TextEncoder().encode(
+        JSON.stringify({
+          totalBytes: chunk.byteLength,
+          totalChunks: 1,
+          sha256: chunkHash,
+        }),
+      );
+      const begin = await send("POST", path, beginBytes, {
+        "content-type": "application/json",
+      });
+      expect(begin.status, begin.body).toBe(201);
+      const { importId } = JSON.parse(begin.body) as { importId: string };
+      const chunkPath = `${path}/${importId}/chunks/0`;
+      const upload = await send("PUT", chunkPath, chunk, {
+        "content-type": "application/octet-stream",
+        "x-chunk-sha256": chunkHash,
+      });
+      expect(upload.status, upload.body).toBe(200);
+
+      const reached = new Promise<void>((resolve) => {
+        chunkRead.reached = resolve;
+      });
+      chunkRead.resume = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      chunkRead.armed = true;
+      const finalize = send("POST", `${path}/${importId}/finalize`);
+      await reached;
+
+      // The stream is paused with its envelope prefix written. That stage is
+      // private to the import: nothing of it is in the sidecar a seal lists.
+      const importDir = join(dataDir, ".scope-imports", importId);
+      const stages = fs
+        .readdirSync(importDir)
+        .filter((name) => name.endsWith(".stage"));
+      expect(stages).toHaveLength(1);
+      expect(fs.statSync(join(importDir, stages[0])).size).toBeGreaterThan(0);
+      expect(
+        Object.keys(hashes()).filter((n) => n.includes("pending")),
+      ).toEqual([]);
+      const before = hashes();
+      db.transaction(() =>
+        retainLegacyVersions(db, hierarchyOptions, { scope: sealed }),
+      ).immediate();
+      const record = JSON.parse(
+        fs.readFileSync(
+          join(
+            fs.realpathSync(dataDir),
+            ".legacy-retained",
+            "blocks",
+            "spotify",
+            "profile",
+            `${entry.collectedAt}.retained`,
+          ),
+          "utf8",
+        ),
+      ) as { files: Record<string, string> };
+      expect(record.files).toEqual(before);
+
+      release();
+      const result = await finalize;
+
+      // The import resumed into a sealed sidecar and was refused whole.
+      expect(result.status, result.body).toBe(409);
+      expect(result.body).toContain("legacy_history_retained");
+      expect(hashes()).toEqual(record.files);
+      expect(indexManager.findByScope({ scope })).toEqual([]);
+      expect(
+        fs.readdirSync(importDir).filter((name) => name.endsWith(".stage")),
+      ).toEqual([]);
+    } finally {
+      release?.();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+      indexManager.close();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
 
   it("rejects cached bytes that differ from the signed body after JSON parsing", async () => {
     const path = `/v1/data/${scope}/imports`;

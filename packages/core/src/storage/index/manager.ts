@@ -51,10 +51,14 @@ export interface IndexManager {
   findByFileId(fileId: string): IndexEntry | undefined;
   /** Find an index entry by its DPv2 data-point id (download dedup). */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
+  /** A legacy row is history after its scope gains canonical authority. */
+  isHistoryOnly(scope: string, path: string): boolean;
+  /** Retained legacy rows that cleanup must leave on disk and in the index. */
+  findHistoryOnly(scope: string): Pick<IndexEntry, "path" | "collectedAt">[];
   /**
-   * Find all index entries where dataPointId is null (not yet synced /
-   * registered on-chain). Returns entries ordered by created_at ASC (oldest
-   * first).
+   * Find unsynced entries eligible for remote publication, ordered oldest
+   * first. Legacy history remains indexed but is excluded once its scope has
+   * canonical authority.
    */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   /**
@@ -81,6 +85,17 @@ export interface IndexManager {
    * @returns true if row was updated, false if path not found
    */
   updateVersion(path: string, version: number): boolean;
+  /**
+   * Compare-and-set a row's generation: set `next` on row `id` only while it
+   * still holds `expected` (null for a row from before generations). Only
+   * storage calls it, with a value it computed from the published bytes.
+   * @returns true if the row was updated
+   */
+  swapGeneration(
+    id: number,
+    expected: string | null,
+    next: string | null,
+  ): boolean;
   /** Deletes all index entries for a scope. Returns count of deleted rows. */
   deleteByScope(scope: string): number;
   close(): void;

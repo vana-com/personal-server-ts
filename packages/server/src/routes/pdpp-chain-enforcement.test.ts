@@ -151,6 +151,7 @@ interface HarnessOptions {
   granteeAddressFor?: (clientId: string) => `0x${string}` | null;
   /** Omit enforcement entirely: the standalone-PDPP path. */
   enforce?: boolean;
+  protocolProfile?: "current" | "candidate-0.1.0";
   token?: PdppTokenContext;
   /** Deterministic clock for expiry assertions. Defaults to a fixed instant. */
   now?: () => Date;
@@ -201,6 +202,7 @@ function harness(options: HarnessOptions = {}) {
     pdppRecordsRoutes({
       auth: createFixtureAuthorizationService({ "client-tok": token }),
       chainEnforcement: enforcement,
+      protocolProfile: options.protocolProfile,
       declarations,
       instancesForSubject: () => ["inst_1"],
       store,
@@ -275,6 +277,7 @@ describe("expiry is enforced on the bearer path too", () => {
 
     const response = await read(app);
     expect(response.status).toBe(403);
+    expect((await response.json()).error.code).toBe("grant_expired");
   });
 
   it("denies a read once the grant's uint256-seconds expiresAt is in the past", async () => {
@@ -442,5 +445,74 @@ describe("the gate covers every client endpoint, not just record reads", () => {
       headers: { Authorization: "Bearer client-tok" },
     });
     expect(response.status).toBe(403);
+  });
+});
+
+describe("chain-denial classification", () => {
+  it.each([
+    {
+      label: "revoked",
+      chain: { revokedAt: "2026-01-01T00:00:00.000Z" },
+      current: { status: 403, code: "grant_revoked" },
+      candidate: { status: 403, code: "grant_revoked" },
+    },
+    {
+      label: "expired",
+      chain: { expiresAt: "2026-01-01T00:00:00.000Z" },
+      current: { status: 403, code: "grant_expired" },
+      candidate: { status: 403, code: "grant_expired" },
+    },
+    {
+      label: "invalid expiry",
+      chain: { expiresAt: "not-a-date" },
+      current: { status: 403, code: "grant_revoked" },
+      candidate: { status: 403, code: "grant_invalid" },
+    },
+  ])(
+    "reports a $label chain permission by its typed cause",
+    async ({ chain, current, candidate }) => {
+      for (const [protocolProfile, expected] of [
+        ["current", current],
+        ["candidate-0.1.0", candidate],
+      ] as const) {
+        const response = await read(
+          harness({
+            protocolProfile,
+            readChainGrant: async () => chainGrant(chain),
+          }),
+        );
+        expect(response.status).toBe(expected.status);
+        const body = await response.json();
+        expect(body.error.code).toBe(expected.code);
+        expect(response.headers.has("WWW-Authenticate")).toBe(
+          expected.status === 401,
+        );
+      }
+    },
+  );
+
+  it("never reports chain expiry as revocation, in either profile", async () => {
+    for (const protocolProfile of ["current", "candidate-0.1.0"] as const) {
+      const response = await read(
+        harness({
+          protocolProfile,
+          readChainGrant: async () =>
+            chainGrant({ expiresAt: "2026-01-01T00:00:00.000Z" }),
+        }),
+      );
+      expect((await response.json()).error.code).not.toBe("grant_revoked");
+    }
+  });
+
+  it("keeps a binding mismatch as permission denial without claiming revocation", async () => {
+    const response = await read(
+      harness({
+        protocolProfile: "candidate-0.1.0",
+        granteeAddressFor: () => "0x0000000000000000000000000000000000000000",
+      }),
+    );
+    expect(response.status).toBe(403);
+    expect((await response.json()).error.code).toBe("grant_invalid");
+    expect(response.headers.get("WWW-Authenticate")).toBeNull();
   });
 });

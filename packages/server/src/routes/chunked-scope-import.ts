@@ -15,7 +15,19 @@ import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage
 import type { HierarchyManagerOptions } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { buildDataFilePath } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { cacheRequestBodyBytes } from "@opendatalabs/personal-server-ts-core/auth";
-import { publishStagedDataFile } from "../storage/hierarchy.js";
+import { indexDatabase } from "../storage/index-manager.js";
+import {
+  assertLegacyPublicationAllowed,
+  legacyPublicationGateActive,
+  throwRetainedMismatch,
+} from "../storage/legacy-publication-fence.js";
+import { publishIndexedStage } from "../storage/node-data-storage.js";
+import {
+  createStreamedStage,
+  discardDataFile,
+  publishStagedDataFileSync,
+  publishStagedDataFile,
+} from "../storage/hierarchy.js";
 
 export const SCOPE_IMPORT_CHUNK_BYTES = 8 * 1024 * 1024;
 export const SCOPE_IMPORT_MAX_BYTES = 256 * 1024 * 1024;
@@ -431,10 +443,12 @@ async function removeImportArtifacts(
     metadata.scope,
     metadata.collectedAt,
   );
-  await unlink(`${finalPath}.pending.${metadata.id}`).catch(() => undefined);
+  await discardDataFile(`${finalPath}.pending.${metadata.id}`).catch(
+    () => undefined,
+  );
   const relativePath = relative(deps.hierarchyOptions.dataDir, finalPath);
   if (!deps.indexManager.findByPath(relativePath)) {
-    await unlink(finalPath).catch(() => undefined);
+    await discardDataFile(finalPath).catch(() => undefined);
   }
 }
 
@@ -958,8 +972,13 @@ async function finalizeScopeImportAuthorized(
     committedEntry?.scope === scope &&
     committedEntry.collectedAt === metadata.collectedAt
   ) {
-    if (!(await pathExists(finalPath)) && (await pathExists(stagePath))) {
-      await publishStagedDataFile(stagePath, finalPath);
+    if (
+      !(await pathExists(finalPath)) &&
+      (await pathExists(stagePath)) &&
+      !(await publishIndexedStage(deps, stagePath, finalPath))
+    ) {
+      // The held stage is not this version's known identity.
+      throwRetainedMismatch(indexDatabase(deps.indexManager)!, scope);
     }
     if (await pathExists(finalPath)) {
       const receipt = {
@@ -986,7 +1005,7 @@ async function finalizeScopeImportAuthorized(
   // index transaction. Remove that unindexed publication before retrying with
   // a fresh timestamp so repeated retries cannot leave visible orphan files.
   if (!committedEntry && (await pathExists(finalPath))) {
-    await unlink(finalPath);
+    await discardDataFile(finalPath);
   }
   const latestBeforeStage = deps.indexManager.findLatestByScope(scope);
   const latestTime = latestBeforeStage
@@ -1009,18 +1028,17 @@ async function finalizeScopeImportAuthorized(
     scope,
     metadata.collectedAt,
   );
-  stagePath = `${finalPath}.pending.${id}`;
+  // The stream is staged privately in the import directory, never in a version
+  // path, so a retention seal cannot record or freeze it while it is read. It
+  // enters the version path whole, by the no-replace publication below.
+  stagePath = join(importPath(deps, id), `envelope.${randomUUID()}.stage`);
   relativePath = relative(deps.hierarchyOptions.dataDir, finalPath);
-  await mkdir(dirname(finalPath), { recursive: true });
-  const file = await open(stagePath, "wx");
+  const stage = await createStreamedStage(deps.hierarchyOptions, stagePath);
   const hash = createHash("sha256");
   const validator = new JsonObjectStreamValidator();
   let total = 0;
-  const write = async (bytes: Uint8Array) => {
-    await file.writeFile(bytes);
-  };
   try {
-    await write(
+    await stage.write(
       Buffer.from(
         `{"version":"1.0","scope":${JSON.stringify(scope)},"collectedAt":${JSON.stringify(metadata.collectedAt)},"data":`,
       ),
@@ -1044,7 +1062,7 @@ async function finalizeScopeImportAuthorized(
             "Scope data is not valid JSON",
           );
         }
-        await write(bytes);
+        await stage.write(bytes);
       }
       const declared = metadata.chunks[String(index)];
       if (
@@ -1075,14 +1093,14 @@ async function finalizeScopeImportAuthorized(
         "Imported scope size or SHA-256 does not match",
       );
     }
-    await write(Buffer.from("}"));
-    await file.sync();
+    await stage.write(Buffer.from("}"));
+    await stage.sync();
   } catch (error) {
-    await unlink(stagePath).catch(() => undefined);
+    await discardDataFile(stagePath).catch(() => undefined);
     if (error instanceof ScopeImportError) throw error;
     throw error;
   } finally {
-    await file.close();
+    await stage.close();
   }
 
   try {
@@ -1094,7 +1112,7 @@ async function finalizeScopeImportAuthorized(
       latestAtCommit &&
       Date.parse(latestAtCommit.collectedAt) >= Date.parse(metadata.collectedAt)
     ) {
-      await unlink(stagePath).catch(() => undefined);
+      await discardDataFile(stagePath).catch(() => undefined);
       metadata.collectedAt = new Date(
         Date.parse(latestAtCommit.collectedAt) + 1,
       ).toISOString();
@@ -1107,39 +1125,49 @@ async function finalizeScopeImportAuthorized(
     }
     // Publish the complete, fsynced envelope before swapping the SQLite index.
     // Readers continue to resolve the old entry until the new file is ready.
-    await publishStagedDataFile(stagePath, finalPath);
+    const indexDb = indexDatabase(deps.indexManager);
+    const db =
+      indexDb && legacyPublicationGateActive(indexDb) ? indexDb : undefined;
+    if (!db) await publishStagedDataFile(stagePath, finalPath);
     let indexed: ReturnType<typeof deps.indexManager.insertIfCurrent>;
     try {
-      indexed = deps.indexManager.insertIfCurrent(
-        {
-          fileId: null,
-          schemaId: null,
-          path: relativePath,
-          scope,
-          collectedAt: metadata.collectedAt,
-          sizeBytes,
-          dataPointId: null,
-          afterTombstoneVersion,
-          producer: null,
-          producerProvenance: null,
-        },
-        latestAtCommit
-          ? {
-              kind: "match",
-              version: latestAtCommit.casRevision ?? latestAtCommit.version,
-            }
-          : { kind: "none" },
-      );
+      const commit = () => {
+        if (db) {
+          assertLegacyPublicationAllowed(db, scope);
+          publishStagedDataFileSync(stagePath, finalPath);
+        }
+        return deps.indexManager.insertIfCurrent(
+          {
+            fileId: null,
+            schemaId: null,
+            path: relativePath,
+            scope,
+            collectedAt: metadata.collectedAt,
+            sizeBytes,
+            dataPointId: null,
+            afterTombstoneVersion,
+            producer: null,
+            producerProvenance: null,
+          },
+          latestAtCommit
+            ? {
+                kind: "match",
+                version: latestAtCommit.casRevision ?? latestAtCommit.version,
+              }
+            : { kind: "none" },
+        );
+      };
+      indexed = db ? db.transaction(commit).immediate() : commit();
     } catch (error) {
       // The synchronous index API can throw. Keep the data file only if the
       // transaction committed before the error became observable.
       if (!deps.indexManager.findByPath(relativePath)) {
-        await unlink(finalPath).catch(() => undefined);
+        await discardDataFile(finalPath).catch(() => undefined);
       }
       throw error;
     }
     if (!indexed.ok) {
-      await unlink(finalPath).catch(() => undefined);
+      await discardDataFile(finalPath).catch(() => undefined);
       const latest = deps.indexManager.findLatestByScope(scope);
       if (latest) {
         metadata.collectedAt = new Date(
@@ -1173,6 +1201,7 @@ async function finalizeScopeImportAuthorized(
     notifyCommittedScope(deps, scope, metadata.collectedAt);
     return receipt;
   } catch (error) {
+    await discardDataFile(stagePath).catch(() => undefined);
     await removeImportArtifacts(deps, metadata);
     throw error;
   }

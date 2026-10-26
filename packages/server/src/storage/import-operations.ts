@@ -1,4 +1,16 @@
+import {
+  assertLegacyPublicationAllowed,
+  assertLegacyHistoryMutable,
+  assertRetainedVersionRepair,
+  holdLegacyPublication,
+  retainLegacyVersions,
+} from "./legacy-publication-fence.js";
+import {
+  hasPdppOrigin,
+  isPdppProducer,
+} from "@opendatalabs/personal-server-ts-core/sync";
 import { existsSync } from "node:fs";
+import { keccak256, stringToHex } from "viem";
 import type Database from "better-sqlite3";
 import type {
   ImportIntent,
@@ -9,6 +21,8 @@ import type {
 import type { IndexManager } from "@opendatalabs/personal-server-ts-core/storage/index";
 import {
   buildDataFilePath,
+  buildScopeDir,
+  envelopeGeneration,
   type HierarchyManagerOptions,
 } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
 import { ProtocolError } from "@opendatalabs/personal-server-ts-core/errors";
@@ -22,7 +36,12 @@ import {
   PublishedDataFileError,
   snapshotScopeFiles,
 } from "./hierarchy.js";
-import { relative } from "node:path";
+import { join, relative, resolve } from "node:path";
+
+function producerOf(envelope: DataFileEnvelope) {
+  const producer = (envelope as { producer?: unknown }).producer;
+  return isPdppProducer(producer) ? producer : null;
+}
 
 interface OperationRow {
   authority: string;
@@ -41,12 +60,38 @@ interface OperationRow {
 const keyWhere =
   "authority = @authority AND owner = @owner AND scope = @scope AND operation = @operation";
 
+/**
+ * The replica fields a caller may set on an index row. Anything else in the
+ * metadata, such as provenance or a generation, is never copied.
+ */
+function replicaMetadata(
+  metadata: Extract<VersionCommit, { kind: "replica" }>["metadata"],
+) {
+  return {
+    schemaId: metadata.schemaId,
+    dataPointId: metadata.dataPointId,
+    version: metadata.version,
+    ...(metadata.producer === undefined ? {} : { producer: metadata.producer }),
+    ...(metadata.producerProvenance === undefined
+      ? {}
+      : { producerProvenance: metadata.producerProvenance }),
+  };
+}
+
 export function createImportOperations(
   db: Database.Database,
   index: IndexManager,
   options: HierarchyManagerOptions,
 ) {
   const immediate = <T>(run: () => T): T => db.transaction(run).immediate();
+  // A restoration authorized for this exact operation, under a restoring policy.
+  const restoreAuthorized = db.prepare(`
+    SELECT 1 FROM legacy_publication_restore_authorization a
+    JOIN legacy_publication_policy p ON p.scope=a.scope AND p.owner=a.owner
+      AND p.server_generation=a.server_generation AND p.epoch=a.epoch
+      AND p.state='restoring'
+    WHERE a.scope=@scope AND a.owner=@owner AND a.operation=@operation
+      AND a.authority=@authority AND a.body_sha256=@body_sha256`);
   const lookup = db.prepare(
     `SELECT * FROM owner_import_operations WHERE ${keyWhere}`,
   );
@@ -91,8 +136,15 @@ export function createImportOperations(
       .all() as OperationRow[];
     for (const row of rows) {
       if (row.state !== "prepared") {
-        deleteDataFileSync(options, row.scope, row.collected_at, row.operation);
-        index.deleteByPath(row.path);
+        if (!index.isHistoryOnly(row.scope, row.path)) {
+          deleteDataFileSync(
+            options,
+            row.scope,
+            row.collected_at,
+            row.operation,
+          );
+          index.deleteByPath(row.path);
+        }
         db.prepare(
           `UPDATE owner_import_operations SET envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
         ).run(row);
@@ -106,6 +158,32 @@ export function createImportOperations(
         sizeBytes?: number;
         afterTombstoneVersion?: number | null;
       };
+      try {
+        assertLegacyPublicationAllowed(db, row.scope, {
+          operation: row.operation,
+          authority: row.authority,
+          bodySha256: row.body_sha256,
+        });
+      } catch (error) {
+        if (
+          !(error instanceof ProtocolError) ||
+          error.errorCode !== "legacy_scope_retired"
+        )
+          throw error;
+        holdLegacyPublication(
+          db,
+          row.scope,
+          "prepared-import",
+          {
+            operation: row.operation,
+            authority: row.authority,
+            owner: row.owner,
+            path: row.path,
+          },
+          bytes,
+        );
+        continue;
+      }
       const written = publishDataFile(options, envelope, bytes, row.operation);
       let entry = index.findByPath(row.path);
       if (!entry) {
@@ -113,6 +191,14 @@ export function createImportOperations(
           fileId: null,
           schemaId: null,
           path: row.path,
+          pdppOrigin: hasPdppOrigin(envelope),
+          generation: envelopeGeneration(envelope),
+          // Only a restored canonical head records its projector producer, so
+          // it stays publishable under canonical authority. Other imports keep
+          // the producer-less rows they always had.
+          ...(restoreAuthorized.get(row)
+            ? { producer: producerOf(envelope) }
+            : {}),
           scope: row.scope,
           collectedAt: row.collected_at,
           sizeBytes: metadata.sizeBytes ?? written.sizeBytes,
@@ -145,6 +231,22 @@ export function createImportOperations(
       db.prepare(
         `UPDATE owner_import_operations SET state = 'accepted', receipt_json = @receipt, envelope_bytes = NULL, metadata_json = NULL WHERE ${keyWhere}`,
       ).run({ ...row, receipt: JSON.stringify(receipt) });
+      // Protect every restored version at acceptance, including a lost remote
+      // acknowledgement or a later restoration of a newer canonical revision.
+      if (restoreAuthorized.get(row)) {
+        retainLegacyVersions(db, options, { versionId: entry.id });
+        db.prepare(
+          `INSERT OR IGNORE INTO legacy_publication_restore_versions
+          SELECT @version_id, a.owner, a.server_generation, a.epoch, a.operation, @data_hash, 'current'
+          FROM legacy_publication_restore_authorization a
+          WHERE a.scope=@scope AND a.owner=@owner AND a.operation=@operation
+            AND a.authority=@authority AND a.body_sha256=@body_sha256`,
+        ).run({
+          ...row,
+          version_id: entry.id,
+          data_hash: keccak256(stringToHex(JSON.stringify(envelope))),
+        });
+      }
     }
   }
 
@@ -184,9 +286,7 @@ export function createImportOperations(
     );
   }
 
-  async function commitVersion(
-    command: VersionCommit,
-  ): Promise<VersionCommitResult> {
+  function commitVersionSync(command: VersionCommit): VersionCommitResult {
     const intent = command.kind === "append" ? command.import : undefined;
     if (intent) {
       const admitted = immediate(() => {
@@ -194,6 +294,11 @@ export function createImportOperations(
         check(prior, intent);
         recover();
         if (prior) return false;
+        assertLegacyPublicationAllowed(db, command.envelope.scope, {
+          operation: intent.operation,
+          authority: intent.authority,
+          bodySha256: intent.bodySha256,
+        });
         const envelope = reserve(command.envelope);
         const path = relative(
           options.dataDir,
@@ -223,6 +328,8 @@ export function createImportOperations(
         // Report it after the drop commits; a throw here would roll it back.
         if (!row) return undefined;
         check(row, intent);
+        if (row.state !== "accepted")
+          assertLegacyPublicationAllowed(db, row.scope);
         const receipt = JSON.parse(row.receipt_json!) as ImportReceipt;
         if (!admitted) return { kind: "replay", receipt };
         const entry = index.findByPath(row.path)!;
@@ -263,7 +370,32 @@ export function createImportOperations(
           command.kind === "append"
             ? reserve(command.envelope)
             : command.envelope;
+        const path = relative(
+          options.dataDir,
+          buildDataFilePath(
+            options.dataDir,
+            envelope.scope,
+            envelope.collectedAt,
+          ),
+        );
+        // A retained version keeps its bytes and replica identity in every
+        // policy state; a mismatch is refused before any effect.
+        const repairingRetained =
+          command.kind === "replica" &&
+          assertRetainedVersionRepair(
+            db,
+            index.findByPath(path),
+            envelope,
+            command.metadata,
+          );
+        if (!repairingRetained)
+          assertLegacyPublicationAllowed(db, envelope.scope);
         const bytes = Buffer.from(JSON.stringify(envelope, null, 2));
+        // Synchronous with the serialization above: these describe the bytes.
+        const identity = {
+          pdppOrigin: hasPdppOrigin(envelope),
+          generation: envelopeGeneration(envelope),
+        };
         let writeResult;
         try {
           writeResult = publishDataFile(options, envelope, bytes);
@@ -289,11 +421,14 @@ export function createImportOperations(
                 ? (command.metadata.sizeBytes ?? writeResult.sizeBytes)
                 : writeResult.sizeBytes,
             ...(command.kind === "replica"
-              ? command.metadata
+              ? replicaMetadata(command.metadata)
               : {
                   afterTombstoneVersion:
                     command.metadata.afterTombstoneVersion ?? null,
                 }),
+            // Storage's own values, from the bytes it serialized; last, so
+            // nothing a caller passes can replace them.
+            ...identity,
           });
         }
         return { kind: "stored", envelope, entry, writeResult };
@@ -314,28 +449,40 @@ export function createImportOperations(
 
   immediate(recover);
   return {
-    commitVersion,
+    commitVersion: async (command: VersionCommit) => commitVersionSync(command),
+    commitVersionSync,
     deleteScope(scope: string): number {
-      const snapshot = immediate(() => {
-        deleteFirstSeenLedgerSync(options, scope);
-        const files = snapshotScopeFiles(options, scope);
+      return immediate(() => {
+        assertLegacyHistoryMutable(db, scope);
+        const history = index.findHistoryOnly(scope);
+        const dataRoot = resolve(options.dataDir);
+        const preservePaths = history.flatMap((entry) => [
+          resolve(dataRoot, entry.path),
+          join(
+            buildScopeDir(join(dataRoot, "blocks"), scope),
+            entry.collectedAt,
+          ),
+        ]);
+        const files = snapshotScopeFiles(options, scope, preservePaths);
         const entries = db
           .prepare("SELECT id, path FROM data_files WHERE scope = ?")
           .all(scope) as { id: number; path: string }[];
+        const retainedPaths = new Set(history.map((entry) => entry.path));
+        const removableEntries = entries.filter(
+          (entry) => !retainedPaths.has(entry.path),
+        );
+        if (history.length === 0) deleteFirstSeenLedgerSync(options, scope);
         retire("scope = @scope", { scope });
-        return { files, entries };
-      });
-      return immediate(() => {
         recover();
-        deleteScopeFilesSync(snapshot.files);
+        deleteScopeFilesSync(files);
         const remove = db.prepare(
           "DELETE FROM data_files WHERE id = @id AND path = @path",
         );
-        for (const entry of snapshot.entries) remove.run(entry);
+        for (const entry of removableEntries) remove.run(entry);
         if (index.countByScope(scope) === 0) {
           deleteFirstSeenLedgerSync(options, scope);
         }
-        return snapshot.entries.length;
+        return removableEntries.length;
       });
     },
     deleteVersion(
@@ -343,12 +490,6 @@ export function createImportOperations(
       collectedAt: string,
       indexedPath?: string,
     ): boolean {
-      immediate(() => {
-        retire("scope = @scope AND collected_at = @collectedAt", {
-          scope,
-          collectedAt,
-        });
-      });
       return immediate(() => {
         const path =
           indexedPath ??
@@ -356,6 +497,12 @@ export function createImportOperations(
             options.dataDir,
             buildDataFilePath(options.dataDir, scope, collectedAt),
           );
+        assertLegacyHistoryMutable(db, scope, index.findByPath(path)?.id);
+        if (index.isHistoryOnly(scope, path)) return false;
+        retire("scope = @scope AND collected_at = @collectedAt", {
+          scope,
+          collectedAt,
+        });
         const existed = index.findByPath(path) !== undefined;
         recover();
         deleteDataFileSync(options, scope, collectedAt);
@@ -365,7 +512,10 @@ export function createImportOperations(
     },
     dropUnsyncedEntry(path: string): boolean {
       return immediate(() => {
-        if (index.findByPath(path)?.dataPointId !== null) return false;
+        const entry = index.findByPath(path);
+        if (!entry || entry.dataPointId !== null) return false;
+        assertLegacyHistoryMutable(db, entry.scope, entry.id);
+        if (index.isHistoryOnly(entry.scope, path)) return false;
         if (!index.deleteUnsyncedByPath(path)) return false;
         retire("path = @path", { path });
         return true;

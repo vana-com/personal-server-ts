@@ -1,8 +1,11 @@
+import { createMcpDataReadClient } from "@opendatalabs/personal-server-ts-core/mcp";
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type {
   DataBlockManifest,
   DataScopeBlock,
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
+import { buildDataBlocksAsync } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import { createDataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import {
   createMemoryPsLiteStorage,
@@ -11,11 +14,249 @@ import {
 } from "./test-support/memory.js";
 import {
   createPersistentPsLiteStorage,
+  createIndexedDbFallbackDataFileStore,
   type PsLiteDataFileStore,
 } from "./storage.js";
 import { previewEnvelopeValue } from "./storage-utils.js";
 
+/**
+ * An oracle for a generation that does not use the code under test:
+ * SHA-256 (node:crypto) of the JSON value with object keys sorted.
+ */
+function oracleGeneration(value: unknown): string {
+  const sorted = JSON.stringify(value, (_key, item: unknown) =>
+    item !== null && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(
+          Object.entries(item as Record<string, unknown>).sort(([a], [b]) =>
+            a < b ? -1 : a > b ? 1 : 0,
+          ),
+        )
+      : item,
+  );
+  return createHash("sha256").update(sorted).digest("hex");
+}
+
 describe("createPersistentPsLiteStorage", () => {
+  it("refuses to replace a published version with different bytes", async () => {
+    const files = createMemoryPsLiteDataFileStore();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      files,
+    );
+    const legacy = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "legacy" },
+    );
+    const written = await storage.writeEnvelope(legacy);
+    await storage.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: legacy.scope,
+      collectedAt: legacy.collectedAt,
+      sizeBytes: written.sizeBytes,
+      pdppOrigin: false,
+    });
+    const selected = storage.findEntry({ scope: legacy.scope })!;
+
+    // Native PDPP bytes at the same scope and collectedAt.
+    await expect(
+      storage.writeEnvelope({
+        ...legacy,
+        data: { id: "native", $pdpp: { version: 1 } },
+      }),
+    ).rejects.toThrow("Stored envelope conflicts with publication");
+    expect(
+      (await storage.readEnvelope(selected.scope, selected.collectedAt)).data,
+    ).toEqual({ id: "legacy" });
+    // The same bytes again are an idempotent republish.
+    await expect(storage.writeEnvelope(legacy)).resolves.toMatchObject({
+      relativePath: written.relativePath,
+    });
+    // An index row whose bytes were lost keeps its provenance.
+    await files.deleteEnvelope(written.relativePath);
+    await expect(
+      storage.writeEnvelope({
+        ...legacy,
+        data: { id: "native", $pdpp: { version: 1 } },
+      }),
+    ).rejects.toThrow("Stored envelope conflicts with publication");
+
+    // Two concurrent first publications of one path: exactly one wins.
+    const fresh = { ...legacy, collectedAt: "2026-10-02T00:00:00Z" };
+    const results = await Promise.allSettled([
+      storage.writeEnvelope({ ...fresh, data: { id: "first" } }),
+      storage.writeEnvelope({
+        ...fresh,
+        data: { id: "second", $pdpp: { version: 1 } },
+      }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual([
+      "fulfilled",
+      "rejected",
+    ]);
+    expect(
+      (await storage.readEnvelope(fresh.scope, fresh.collectedAt)).data,
+    ).toEqual({ id: "first" });
+  });
+
+  it("refuses different simultaneous publications across storage instances", async () => {
+    // Two instances (tabs) over one file store and one persistence.
+    const files = createMemoryPsLiteDataFileStore();
+    const persistence = createMemoryPsLitePersistence();
+    const a = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      files,
+    );
+    const b = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      files,
+    );
+    const first = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "legacy" },
+    );
+    const second = { ...first, data: { id: "pdpp", $pdpp: { version: 1 } } };
+    const results = await Promise.allSettled([
+      a.writeEnvelope(first),
+      b.writeEnvelope(second),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect((await a.readEnvelope(first.scope, first.collectedAt)).data).toEqual(
+      { id: "legacy" },
+    );
+  });
+
+  it("P2-d: derives provenance from the published bytes, not the caller", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore(),
+    );
+    const native = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "native", $pdpp: { version: 1 } },
+    );
+    const written = await storage.writeEnvelope(native);
+    const inserted = await storage.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: native.scope,
+      collectedAt: native.collectedAt,
+      sizeBytes: written.sizeBytes,
+      pdppOrigin: false,
+    });
+    expect(inserted.pdppOrigin).toBe(true);
+    expect(storage.findEntry({ scope: native.scope })?.pdppOrigin).toBe(true);
+  });
+
+  it("derives the version generation from the published bytes, not the caller", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore(),
+    );
+    const envelope = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "legacy", nested: { b: 1, a: 2 } },
+    );
+    const written = await storage.writeEnvelope(envelope);
+    const inserted = await storage.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: written.sizeBytes,
+      generation: "caller-value",
+    });
+    const reordered = {
+      data: { nested: { a: 2, b: 1 }, id: "legacy" },
+      collectedAt: envelope.collectedAt,
+      scope: envelope.scope,
+      version: envelope.version,
+    };
+    expect(inserted.generation).toBe(oracleGeneration(reordered));
+    expect(storage.findEntry({ scope: envelope.scope })?.generation).toBe(
+      inserted.generation,
+    );
+    const built = await buildDataBlocksAsync({
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      content: envelope,
+    });
+    expect(built.manifest.envelopeDigest).toBe(inserted.generation);
+  });
+
+  it("backfills a pre-generation row once, from the published bytes", async () => {
+    const files = createMemoryPsLiteDataFileStore();
+    const persistence = createMemoryPsLitePersistence();
+    const first = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      persistence,
+      files,
+    );
+    const envelope = createDataFileEnvelope(
+      "oura.activity",
+      "2026-10-01T00:00:00Z",
+      { id: "legacy" },
+    );
+    const written = await first.writeEnvelope(envelope);
+    await first.insertEntry({
+      fileId: null,
+      path: written.relativePath,
+      scope: envelope.scope,
+      collectedAt: envelope.collectedAt,
+      sizeBytes: written.sizeBytes,
+    });
+    // The same state as a row persisted before rows recorded a generation.
+    const saved = (await persistence.read())!;
+    const old = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence({
+        ...saved,
+        entries: saved.entries.map(({ generation: _g, ...entry }) => entry),
+      }),
+      files,
+    );
+    const entry = old.findEntry({ scope: envelope.scope })!;
+    expect(entry.generation).toBeUndefined();
+    const generation = await old.backfillGeneration!(entry);
+    expect(generation).toBe(oracleGeneration(envelope));
+    expect(old.findEntry({ scope: envelope.scope })?.generation).toBe(
+      generation,
+    );
+  });
+
+  it("P2-e: republishes the same envelope in another key order", async () => {
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteDataFileStore(),
+    );
+    const envelope = createDataFileEnvelope(
+      "notes.profile",
+      "2026-10-01T00:00:00Z",
+      { a: 1, b: { c: 2, d: 3 } },
+    );
+    await storage.writeEnvelope(envelope);
+    const reordered = {
+      data: { b: { d: 3, c: 2 }, a: 1 },
+      collectedAt: envelope.collectedAt,
+      scope: envelope.scope,
+      version: envelope.version,
+    } as typeof envelope;
+    await expect(storage.writeEnvelope(reordered)).resolves.toBeDefined();
+    await expect(
+      storage.writeEnvelope({ ...envelope, data: { a: 2 } }),
+    ).rejects.toThrow("Stored envelope conflicts with publication");
+  });
+
   it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {
     const envelope = createDataFileEnvelope(
       "chatgpt.conversations",
@@ -64,6 +305,10 @@ describe("createPersistentPsLiteStorage", () => {
       collectedAt: envelope.collectedAt,
       sizeBytes: write.sizeBytes,
     });
+    // Publication looks for an existing version at the path, and indexing
+    // reads the published bytes for their provenance; only reads after that
+    // are about previews.
+    readEnvelope.mockClear();
 
     expect(storage.readEnvelopePreview).toBeUndefined();
     expect(readEnvelope).not.toHaveBeenCalled();
@@ -837,3 +1082,77 @@ function blockFixture(
     blocks,
   };
 }
+
+it("keeps the verified Lite block snapshot through payment-capable authorization", async () => {
+  const payloads = new Map<string, DataScopeBlock>();
+  const files = createIndexedDbFallbackDataFileStore(
+    new Map(),
+    new Map(),
+    payloads,
+  );
+  const storage = await createPersistentPsLiteStorage(
+    { kind: "custom" },
+    createMemoryPsLitePersistence(),
+    files,
+  );
+  const envelope = createDataFileEnvelope(
+    "test.snapshot",
+    "2026-10-01T00:00:00Z",
+    { nested: { message: "verified-original" } },
+  );
+  const written = await storage.writeEnvelope(envelope);
+  await storage.insertEntry({
+    fileId: null,
+    path: written.relativePath,
+    scope: envelope.scope,
+    collectedAt: envelope.collectedAt,
+    sizeBytes: written.sizeBytes,
+  });
+  const built = await buildDataBlocksAsync({
+    scope: envelope.scope,
+    collectedAt: envelope.collectedAt,
+    content: envelope,
+  });
+  await storage.writeBlockManifest!(
+    envelope.scope,
+    envelope.collectedAt,
+    built.manifest,
+    built.blocks,
+  );
+  const auth = vi.fn(async ({ metadataOnly }: { metadataOnly?: boolean }) => {
+    if (!metadataOnly) {
+      const data = [...payloads.values()].find((b) => b.path === "$.data")!;
+      (data.value as { nested: { message: string } }).nested.message =
+        "mutated-after-verification";
+    }
+    return { grantId: "grant", builder: "0x2222" };
+  });
+  const client = createMcpDataReadClient({
+    serverOrigin: "https://server.test",
+    granteeAccount: {
+      address: "0x1111111111111111111111111111111111111111",
+      publicKey: "0x04deadbeef",
+      signTypedData: vi.fn(),
+      signMessage: vi.fn().mockResolvedValue(`0x${"11".repeat(65)}`),
+    },
+    dataApiDeps: {
+      storage,
+      auth: {
+        authorizeOwner: vi.fn(),
+        authorizeBuilderList: vi.fn(),
+        authorizeBuilderRead: auth,
+      },
+      accessLogWriter: { write: vi.fn() },
+    },
+  });
+  const result = await client.readScopeBlocks({
+    scope: envelope.scope,
+    grantId: "grant",
+    maxBytes: 4096,
+  });
+  expect(auth).toHaveBeenCalledTimes(2);
+  expect(JSON.stringify(result.blocks)).toContain("verified-original");
+  expect(JSON.stringify(result.blocks)).not.toContain(
+    "mutated-after-verification",
+  );
+});

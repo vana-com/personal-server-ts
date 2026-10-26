@@ -63,7 +63,11 @@ const GRANT = {
 
 function auth(kind: "client" | "owner"): PdppAuthorizationService {
   return {
-    async resolveToken() {
+    locality: "local" as const,
+    async resolveToken(token: string) {
+      return this.resolveTokenNow(token);
+    },
+    resolveTokenNow() {
       return kind === "client"
         ? {
             active: true,

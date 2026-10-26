@@ -3,9 +3,12 @@
  * Singleton profiles belong to the selected connection; they need no array key.
  * Grocery nutrition already uses source product IDs as object-map keys.
  *
- * LinkedIn experience/education/skills/languages, Instagram ads, H-E-B delivery
- * addresses, GitHub achievements and Spotify artists retain no upstream ID in
- * the legacy body. Keep those lists unkeyed: names/content are not identities.
+ * LinkedIn connections/experience/education/skills/languages, Instagram ads,
+ * H-E-B delivery addresses, GitHub achievements and Spotify artists retain no
+ * upstream ID in the legacy body. Keep those lists unkeyed: names/content are
+ * not identities. Instagram ads drops source IDs while projecting. LinkedIn
+ * profile, Spotify profile, Instagram profile and YouTube profile are single
+ * records scoped to their selected connection, so they need no array key.
  * GitHub repository URLs/qualified names, organization logins and LinkedIn
  * profile URLs are reusable aliases, not stable IDs. Their source IDs are
  * omitted from the legacy body, so those lists must also stay unkeyed.
@@ -108,3 +111,19 @@ export const LEGACY_SCOPE_ENTITY_KEYS: Readonly<
     "$.watchLater": ["videoId"],
   },
 };
+
+/** ID-less legacy scopes that can only prove coverage by exact body snapshot. */
+export const LEGACY_SCOPE_SNAPSHOT_EQUIVALENCE: Readonly<Record<string, true>> =
+  {
+    "github.repositories": true,
+    // The old starred projection emits updatedAt:null. A non-null old value is
+    // deliberately not reproducible and therefore cannot pass exact equality.
+    "github.starred": true,
+    "instagram.ads": true,
+    "linkedin.connections": true,
+    "linkedin.education": true,
+    "linkedin.experience": true,
+    "linkedin.languages": true,
+    "linkedin.skills": true,
+    "spotify.savedTracks": true,
+  };

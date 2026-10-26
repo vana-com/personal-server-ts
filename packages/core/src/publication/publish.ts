@@ -9,6 +9,11 @@ import {
 import { keccak256, stringToHex } from "viem";
 import { isTombstoneRecord } from "../sync/tombstone.js";
 import { readStoredLineage } from "../lineage/lineage.js";
+import {
+  isPdppProducer,
+  isPdppProjectionProducer,
+  type PdppProducer,
+} from "../sync/pdpp-import.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
 import type { ServerSigner } from "../signing/signer.js";
 import {
@@ -27,6 +32,22 @@ export interface PublicationRecord {
 export interface PublicationFence {
   generation: string;
   head: PublicationRecord | null;
+}
+export type PublicationContentClass = "canonical" | "legacy";
+export interface PublicationRegistrationAuthority {
+  /** Serialize the remote head change with local canonical takeover. */
+  withRegistration<T>(
+    scope: string,
+    contentClass: PublicationContentClass,
+    register: () => Promise<T>,
+  ): Promise<T>;
+}
+export class HistoryOnlyVersionError extends Error {
+  readonly code = "HISTORY_ONLY_VERSION";
+  constructor(readonly scope: string) {
+    super(`Legacy version for ${scope} is retained as history`);
+    this.name = "HistoryOnlyVersionError";
+  }
 }
 type Registration = Parameters<GatewayClient["registerDataPoint"]>[0] & {
   lineage?: readonly string[];
@@ -77,6 +98,9 @@ export interface PublishOptions {
   gateway: Pick<GatewayClient, "registerDataPoint">;
   lineageGateway?: Pick<LineageGatewayPort, "registerDataPoint">;
   fencedPublication?: FencedPublicationPort;
+  registrationAuthority?: PublicationRegistrationAuthority;
+  /** Class of the requested envelope. Recovered candidates carry their own class. */
+  publicationClass?: PublicationContentClass;
   /** Undefined means the caller has no initial registry observation. */
   head?: PublicationRecord | null;
   readHead(): Promise<PublicationRecord | null>;
@@ -90,6 +114,36 @@ function metadata(scope: string, collectedAt: string, sizeBytes: number) {
   return keccak256(
     stringToHex(JSON.stringify({ scope, collectedAt, sizeBytes })),
   );
+}
+
+function publicationClassForProducer(
+  producer: unknown,
+): PublicationContentClass {
+  if (producer === undefined || producer === null) return "legacy";
+  if (!isPdppProducer(producer)) {
+    throw new Error(
+      "Cannot determine publication class from candidate producer",
+    );
+  }
+  return isPdppProjectionProducer(producer) ? "canonical" : "legacy";
+}
+
+function publicationClassForCandidate(
+  candidate: PublicationCandidate,
+): PublicationContentClass {
+  if (
+    candidate.contentClass !== "canonical" &&
+    candidate.contentClass !== "legacy"
+  ) {
+    throw new Error("Cannot determine publication candidate class");
+  }
+  if (
+    candidate.producer !== null &&
+    candidate.contentClass !== publicationClassForProducer(candidate.producer)
+  ) {
+    throw new Error("Publication candidate producer and class do not match");
+  }
+  return candidate.contentClass;
 }
 
 /** Full-envelope preparation and verification for the shared publication owner. */
@@ -108,12 +162,24 @@ export async function publishVersion(
     env: DataFileEnvelope,
     bytes: Uint8Array,
     hash: `0x${string}`,
+    producer: unknown,
+    contentClass = publicationClassForProducer(producer),
   ): PublicationCandidate {
+    const producerClass = publicationClassForProducer(producer);
+    if (
+      producer !== undefined &&
+      producer !== null &&
+      producerClass !== contentClass
+    ) {
+      throw new Error("Publication candidate producer and class do not match");
+    }
     return {
       dataHash: hash,
       metadataHash: metadata(scope, env.collectedAt, bytes.byteLength),
       sizeBytes: bytes.byteLength,
       lineage: readStoredLineage(env.data as Record<string, unknown>),
+      producer: (producer ?? null) as PdppProducer | null,
+      contentClass,
     };
   }
   return publishPreparedVersion({
@@ -125,20 +191,31 @@ export async function publishVersion(
       return {
         encrypted,
         wanted: {
-          ...candidate(envelope, encrypted, keccak256(plaintext)),
+          ...candidate(
+            envelope,
+            encrypted,
+            keccak256(plaintext),
+            (envelope as DataFileEnvelope & { producer?: unknown }).producer,
+            options.publicationClass ??
+              publicationClassForProducer(
+                (envelope as DataFileEnvelope & { producer?: unknown })
+                  .producer,
+              ),
+          ),
           lineage,
         },
         async verifyStored(bytes) {
           const clear = await decryptWithPassword(bytes, password);
-          const env = DataFileEnvelopeSchema.parse(
-            JSON.parse(new TextDecoder().decode(clear)),
-          );
+          const decoded = JSON.parse(new TextDecoder().decode(clear)) as {
+            producer?: unknown;
+          };
+          const env = DataFileEnvelopeSchema.parse(decoded);
           if (
             env.scope !== scope ||
             !Number.isFinite(Date.parse(env.collectedAt))
           )
             throw new Error("Publication envelope scope/timestamp mismatch");
-          return candidate(env, bytes, keccak256(clear));
+          return candidate(env, bytes, keccak256(clear), decoded.producer);
         },
       };
     },
@@ -150,6 +227,8 @@ export interface PublicationCandidate {
   metadataHash: `0x${string}`;
   sizeBytes: number;
   lineage: ReturnType<typeof readStoredLineage>;
+  producer: PdppProducer | null;
+  contentClass: PublicationContentClass;
 }
 export interface PreparedPublication {
   encrypted: Uint8Array;
@@ -210,6 +289,7 @@ export async function publishPreparedVersion(
     value: PublicationCandidate,
     mode: "register" | "adopt",
   ) {
+    const candidateClass = publicationClassForCandidate(value);
     const request = {
       ownerAddress: options.ownerAddress,
       scope,
@@ -246,41 +326,51 @@ export async function publishPreparedVersion(
         }),
       };
     }
-    let id: string | undefined;
-    if (fencedPublication) {
-      const previous = requireFence("registration/adoption");
-      const result = await fencedPublication.commit({
-        ...request,
-        ...lineageFields,
-        mode,
-        fence: previous,
-      });
-      const registered = result.fence.head;
-      if (
-        result.fence.generation !== previous.generation ||
-        !registered ||
-        isDeleted(registered) ||
-        registered.expectedVersion !== String(version) ||
-        !sameHash(registered.dataHash, value.dataHash) ||
-        !sameHash(registered.metadataHash, value.metadataHash) ||
-        registered.id !== result.dataPointId
-      )
-        throw new Error("Gateway returned inconsistent publication evidence");
-      fence = result.fence;
-      head = registered;
-      id = result.dataPointId;
-    } else if (mode === "adopt") {
-      // No remote effect: the caller verified the live row's stored bytes.
-      id = head?.id;
-    } else {
+    const register = async (): Promise<string | undefined> => {
+      if (fencedPublication) {
+        const previous = requireFence("registration/adoption");
+        const result = await fencedPublication.commit({
+          ...request,
+          ...lineageFields,
+          mode,
+          fence: previous,
+        });
+        const registered = result.fence.head;
+        if (
+          result.fence.generation !== previous.generation ||
+          !registered ||
+          isDeleted(registered) ||
+          registered.expectedVersion !== String(version) ||
+          !sameHash(registered.dataHash, value.dataHash) ||
+          !sameHash(registered.metadataHash, value.metadataHash) ||
+          registered.id !== result.dataPointId
+        )
+          throw new Error("Gateway returned inconsistent publication evidence");
+        fence = result.fence;
+        head = registered;
+        return result.dataPointId;
+      }
+      if (mode === "adopt") {
+        // No remote effect: the caller verified the live row's stored bytes.
+        return head?.id;
+      }
       const result = lineageFields
         ? await options.lineageGateway!.registerDataPoint({
             ...request,
             ...lineageFields,
           })
         : await options.gateway.registerDataPoint(request);
-      id = result.dataPointId;
-    }
+      return result.dataPointId;
+    };
+    const id: string | undefined =
+      (mode === "register" || Boolean(fencedPublication)) &&
+      options.registrationAuthority
+        ? await options.registrationAuthority.withRegistration(
+            scope,
+            candidateClass,
+            register,
+          )
+        : await register();
     if (!id)
       throw new Error(
         `Gateway registerDataPoint did not return a dataPointId for ${scope} version ${version}`,

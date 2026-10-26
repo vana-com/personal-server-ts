@@ -100,7 +100,7 @@ describe("pre-v4 historical blob retention", () => {
         ).toEqual({ data });
         expect(
           db.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 15 });
+        ).toEqual({ version: 25 });
         // The v4 reconstruction cannot manufacture a claim from this current row.
         expect(
           db.prepare("SELECT COUNT(*) AS n FROM pdpp_blob_claims").get(),

@@ -1,7 +1,5 @@
 import type { RecordDataValidator } from "./ingest-plan.js";
 import type {
-  ChangesSinceOptions,
-  ChangesSincePage,
   IngestResult,
   ListRecordsOptions,
   ListRecordsPage,
@@ -10,6 +8,12 @@ import type {
   PdppStoredRecord,
   StreamListing,
   StreamSemantics,
+  SyncPreparationRequest,
+  SyncPreparationResult,
+  SyncStateStore,
+  SyncTokenScope,
+  SyncWindow,
+  SyncWindowRequest,
 } from "./types.js";
 
 /**
@@ -67,7 +71,48 @@ export interface PdppRecordStore {
     streamSemantics: StreamSemantics,
   ): boolean;
 
-  changesSince(stream: string, options: ChangesSinceOptions): ChangesSincePage;
+  /**
+   * Runs `read` against one consistent view of the stream's history between
+   * two horizons. Throws `CursorExpiredError` when that history is no longer
+   * available (a reset since either horizon, or a horizon this store never
+   * reached) and `InvalidCursorError` for a malformed horizon. Sync policy
+   * lives in `createPdppSyncSessionService`, not here.
+   */
+  readSyncWindow<T>(
+    stream: string,
+    request: SyncWindowRequest,
+    read: (window: SyncWindow) => T,
+  ): T;
+
+  syncTokenScope(): SyncTokenScope;
+
+  /** Where the sync session owner keeps handle state. */
+  syncStates(): SyncStateStore;
+
+  /**
+   * Adds the next budgeted part of the keys written in (low, high], or held
+   * at high for a first sync, to a session's candidate set. Only the request's
+   * instances are read. Progress is stored with the candidates in one
+   * transaction. Throws `CursorExpiredError` when the preparation expired or
+   * the owner's row cap is exceeded.
+   */
+  prepareSyncWindow(
+    stream: string,
+    request: SyncPreparationRequest,
+  ): SyncPreparationResult;
+
+  /** Keeps a preparation alive until `expiresAt`, or ends it with 0. */
+  touchSyncPreparation(id: string, expiresAt: number, now: number): void;
+
+  /** Frees expired preparations in one bounded step. */
+  sweepSyncPreparations(now: number): void;
+
+  /** Diagnostic counts of stored sync state, for tests and operators. */
+  inspectSyncState(): {
+    states: number;
+    preparations: number;
+    candidates: number;
+  };
 
   listStreams(instanceIds: string[]): StreamListing[];
 

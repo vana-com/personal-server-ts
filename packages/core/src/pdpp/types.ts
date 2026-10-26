@@ -486,6 +486,8 @@ export interface PdppTokenContext {
   sourceId?: string;
   /** Client tokens only. An owner token carries no grant. */
   grant?: Grant;
+  /** Exact declaration revision approved for this grant, never a current substitute. */
+  declarationSnapshot?: DeclarationSnapshot;
   clientId?: string;
   expiresAt?: string;
   inactiveReason?: InactiveReason;

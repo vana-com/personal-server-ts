@@ -1,4 +1,17 @@
 import Database from "better-sqlite3";
+import {
+  armLegacyPublicationGate,
+  initializeLegacyPublicationPolicy,
+  legacyPublicationEnrolled,
+} from "./legacy-publication-fence.js";
+import { PDPP_RECORD_SCHEMA_VERSION } from "./pdpp-records-sqlite-store.js";
+import {
+  CONVERGED_INDEX_SCHEMA_VERSION,
+  LEGACY_GATE_INDEX_SCHEMA_VERSION,
+  assertSupportedSchemaVersions,
+} from "./schema-versions.js";
+
+export { INDEX_SCHEMA_VERSION } from "./schema-versions.js";
 
 const CREATE_TABLE_SQL = `
 CREATE TABLE IF NOT EXISTS data_files (
@@ -15,7 +28,9 @@ CREATE TABLE IF NOT EXISTS data_files (
   data_point_id TEXT,
   after_tombstone_version INTEGER,
   producer TEXT,
-  producer_provenance TEXT
+  producer_provenance TEXT,
+  pdpp_origin INTEGER,
+  generation TEXT
 )`;
 
 const CREATE_SCOPE_REVISIONS_SQL = `
@@ -33,8 +48,6 @@ const CREATE_INDEXES_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_data_files_data_point_id ON data_files (data_point_id)",
   "CREATE INDEX IF NOT EXISTS idx_data_files_scope_cas_revision ON data_files (scope, cas_revision)",
 ];
-
-export const INDEX_SCHEMA_VERSION = 14;
 
 const CREATE_LEGACY_SCOPE_TAKEOVERS_SQL = `
 CREATE TABLE IF NOT EXISTS legacy_scope_takeovers (
@@ -75,6 +88,12 @@ CREATE TABLE IF NOT EXISTS legacy_scope_takeover_resets (
   reset_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 )`;
 
+const CREATE_LEGACY_SCOPE_CANONICAL_AUTHORITY_SQL = `
+CREATE TABLE IF NOT EXISTS legacy_scope_canonical_authority (
+  scope TEXT NOT NULL PRIMARY KEY,
+  established_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+)`;
+
 function hasColumn(
   db: Database.Database,
   table: string,
@@ -93,6 +112,17 @@ function hasTable(db: Database.Database, table: string): boolean {
 }
 
 function migrateSchema(db: Database.Database, currentVersion: number): void {
+  // v15: mark legacy-projection rows in the index. This is an index.db
+  // sequence; pdpp_schema_version migrations have their own version stream.
+  if (!hasColumn(db, "data_files", "pdpp_origin")) {
+    db.exec("ALTER TABLE data_files ADD COLUMN pdpp_origin INTEGER");
+  }
+  // v16: the immutable generation of each version, computed by storage from
+  // the published bytes. Rows from before stay NULL; a non-owner read of one
+  // decides on a full read of its bytes instead.
+  if (!hasColumn(db, "data_files", "generation")) {
+    db.exec("ALTER TABLE data_files ADD COLUMN generation TEXT");
+  }
   if (currentVersion < 2 && !hasColumn(db, "data_files", "schema_id")) {
     db.exec("ALTER TABLE data_files ADD COLUMN schema_id TEXT");
   }
@@ -237,15 +267,19 @@ function migrateSchema(db: Database.Database, currentVersion: number): void {
       db.exec("DROP TABLE legacy_scope_takeover_verdicts_old");
     })();
   }
+  db.exec(`
+    -- Additive authority metadata stays at v14 so a prior runtime can still
+    -- open the index; that runtime ignores this table and does not drop it.
+    INSERT OR IGNORE INTO legacy_scope_canonical_authority (scope)
+    SELECT DISTINCT scope FROM legacy_scope_takeovers
+  `);
 }
 
-function ensureSchemaVersion(db: Database.Database): void {
-  const currentVersion = db.pragma("user_version", { simple: true }) as number;
-  if (currentVersion > INDEX_SCHEMA_VERSION) {
-    throw new Error(
-      `Unsupported index.db schema version ${currentVersion}; runtime supports ${INDEX_SCHEMA_VERSION}`,
-    );
-  }
+function ensureSchemaVersion(db: Database.Database): number {
+  const currentVersion = assertSupportedSchemaVersions(
+    db,
+    PDPP_RECORD_SCHEMA_VERSION,
+  );
   migrateSchema(db, currentVersion);
   // The method that earned a takeover. Added without a version bump: a
   // runtime pinned before it opens the database unchanged and writes ''
@@ -255,7 +289,28 @@ function ensureSchemaVersion(db: Database.Database): void {
       "ALTER TABLE legacy_scope_takeovers ADD COLUMN method TEXT NOT NULL DEFAULT ''",
     );
   }
-  db.pragma(`user_version = ${INDEX_SCHEMA_VERSION}`);
+  return currentVersion;
+}
+
+/**
+ * Stamp the converged runtime (v17), or v18 for a root with durable gate
+ * enrollment history. An experimental gate build stamped enrolled roots 17;
+ * its policy or transition rows, in any state including mirroring after
+ * rollback, move them to 18 here. Gate tables alone are not enrollment.
+ * Stamps never decrease and no history row changes.
+ */
+function stampSchemaVersion(db: Database.Database, currentVersion: number) {
+  const enrolled = db
+    .transaction(() => {
+      const enrolled = legacyPublicationEnrolled(db);
+      const target = enrolled
+        ? LEGACY_GATE_INDEX_SCHEMA_VERSION
+        : CONVERGED_INDEX_SCHEMA_VERSION;
+      db.pragma(`user_version = ${Math.max(currentVersion, target)}`);
+      return enrolled;
+    })
+    .immediate();
+  if (enrolled) armLegacyPublicationGate(db);
 }
 
 /** Open/create SQLite database, run CREATE TABLE IF NOT EXISTS, set WAL mode */
@@ -263,6 +318,10 @@ export function initializeDatabase(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   try {
     db.pragma("busy_timeout = 5000");
+    // `user_version` belongs to the legacy index schema; PDPP records use
+    // `pdpp_schema_version`. Check both before the journal mode or any schema
+    // changes, so an unsupported database is refused untouched.
+    assertSupportedSchemaVersions(db, PDPP_RECORD_SCHEMA_VERSION);
     const deadline = performance.now() + 5000;
     const pause = new Int32Array(new SharedArrayBuffer(4));
     for (;;) {
@@ -287,7 +346,8 @@ export function initializeDatabase(dbPath: string): Database.Database {
     db.exec(CREATE_LEGACY_SCOPE_TAKEOVERS_SQL);
     db.exec(CREATE_LEGACY_SCOPE_VERDICTS_SQL);
     db.exec(CREATE_LEGACY_SCOPE_RESETS_SQL);
-    ensureSchemaVersion(db);
+    db.exec(CREATE_LEGACY_SCOPE_CANONICAL_AUTHORITY_SQL);
+    const currentVersion = ensureSchemaVersion(db);
     db.exec(`CREATE TABLE IF NOT EXISTS owner_import_operations (
     authority TEXT NOT NULL,
     owner TEXT NOT NULL,
@@ -308,9 +368,11 @@ export function initializeDatabase(dbPath: string): Database.Database {
     db.exec(
       "CREATE INDEX IF NOT EXISTS idx_owner_import_operations_recovery ON owner_import_operations(operation) WHERE state = 'prepared' OR (state IN ('deleted', 'cancelled') AND metadata_json IS NOT NULL)",
     );
+    initializeLegacyPublicationPolicy(db);
     for (const sql of CREATE_INDEXES_SQL) {
       db.exec(sql);
     }
+    stampSchemaVersion(db, currentVersion);
 
     return db;
   } catch (err) {

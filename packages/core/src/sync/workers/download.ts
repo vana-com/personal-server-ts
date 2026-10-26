@@ -1,3 +1,4 @@
+import { isReplicaScope } from "../../replication/namespace.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   DataFileEnvelopeSchema,
@@ -33,7 +34,11 @@ import {
 } from "../issues.js";
 import { downloadRetryKey, type DownloadRetryMemory } from "../retry-memory.js";
 import { readStoredLineage } from "../../lineage/lineage.js";
-import { isPermanentRejection, type PdppImporter } from "../pdpp-import.js";
+import {
+  isPdppProducer,
+  isPermanentRejection,
+  type PdppImporter,
+} from "../pdpp-import.js";
 import { recordStoredVersion } from "../../additions/ledger-store.js";
 
 /**
@@ -60,6 +65,14 @@ export interface DownloadDiagnosticsHook {
 }
 
 export interface DownloadWorkerDeps {
+  /** A host may hold a remote head/tombstone under a local retirement policy.
+   * Return true ONLY after preserving its exact record and affected bytes in a
+   * durable quarantine discoverable to policy/recovery, or proving an exact
+   * restored remote head already has those bytes durably stored. A held
+   * foreign change is not ingested.
+   * Throw on persistence/download failure so the cursor remains retryable.
+   */
+  holdRemoteChange?: (record: DataPointFeedRecord) => Promise<boolean>;
   storage: DataStoragePort;
   storageAdapter: StorageAdapter;
   gateway: GatewayClient;
@@ -174,6 +187,7 @@ export async function downloadScopes(
       continue;
     }
 
+    if (await deps.holdRemoteChange?.(dataPoint)) continue;
     const deletedAt = deletionTimestamp(dataPoint);
     if (deletedAt !== null) {
       deps.scopeDeletions?.markDeleted(scope, {
@@ -274,6 +288,7 @@ export async function downloadOne(
   deps: DownloadWorkerDeps,
   record: DataPointRecord,
 ): Promise<DownloadResult | null> {
+  if (isReplicaScope(record.scope)) return null;
   const { storage, storageAdapter, masterKey, logger, diagnostics } = deps;
   const ctx: RecordContext = { dataPointId: record.id, schemaId: null };
 
@@ -451,8 +466,7 @@ export async function downloadOne(
     schemaId: ctx.schemaId,
     dataPointId: record.id,
     version: expectedVersion,
-    ...(envelope.producer === "pdpp-projector" ||
-    envelope.producer === "pdpp-import-projection"
+    ...(isPdppProducer(envelope.producer)
       ? { producer: envelope.producer }
       : {}),
     ...(envelope.producer_provenance &&
@@ -618,6 +632,23 @@ export async function downloadAll(
     { includeDeleted: true },
   );
 
+  const held = new Set<DataPointFeedRecord>();
+  let holdFailed = false;
+  if (deps.holdRemoteChange)
+    for (const record of dataPoints) {
+      try {
+        if (await deps.holdRemoteChange(record)) held.add(record);
+      } catch (error) {
+        // No durable disposition: never skip a record whose bytes were not held.
+        holdFailed = true;
+        held.add(record);
+        logger.error(
+          { scope: record.scope, dataPointId: record.id, error },
+          "Failed to hold fenced remote change",
+        );
+      }
+    }
+
   // Feed the read-side deletion memory before any per-record work so a
   // tombstone is refused by reads even if its local reconcile below fails.
   // Only a listing with no further pages proves the memory complete: a
@@ -626,6 +657,7 @@ export async function downloadAll(
   // what re-validates remembered tombstones; an incremental pass does not.
   if (deps.scopeDeletions) {
     for (const dataPoint of dataPoints) {
+      if (held.has(dataPoint)) continue;
       const deletedAt = deletionTimestamp(dataPoint);
       if (deletedAt !== null) {
         deps.scopeDeletions.markDeleted(dataPoint.scope, {
@@ -636,7 +668,7 @@ export async function downloadAll(
         deps.scopeDeletions.markLive(dataPoint.scope);
       }
     }
-    if (nextCursor === null) {
+    if (nextCursor === null && held.size === 0) {
       deps.scopeDeletions.noteFeedSynced(undefined, {
         full: lastCursor === null,
       });
@@ -644,10 +676,12 @@ export async function downloadAll(
   }
 
   const results: DownloadResult[] = [];
-  let failed = false;
+  let failed = holdFailed;
 
   // 3. Process each data point record
   for (const dataPoint of dataPoints) {
+    if (held.has(dataPoint)) continue;
+    if (isReplicaScope(dataPoint.scope)) continue;
     const deletedAt = deletionTimestamp(dataPoint);
     if (deletedAt !== null) {
       // Tombstone: never download; drop what the deletion covers locally.
@@ -656,6 +690,9 @@ export async function downloadAll(
       try {
         await reconcileDeletedDataPoint(deps, dataPoint, deletedAt);
       } catch (err) {
+        // Retirement can win after the page's initial admission check.
+        if (await deps.holdRemoteChange?.(dataPoint).catch(() => false))
+          continue;
         logger.error(
           {
             dataPointId: dataPoint.id,
@@ -694,6 +731,7 @@ export async function downloadAll(
         results.push(result);
       }
     } catch (err) {
+      if (await deps.holdRemoteChange?.(dataPoint).catch(() => false)) continue;
       const metadata = getSyncFailureMetadata(err);
       const classified = classifySyncFailure({
         error: err,

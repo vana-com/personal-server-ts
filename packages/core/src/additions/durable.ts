@@ -16,6 +16,7 @@ import type { StorageAdapter } from "../storage/adapters/interface.js";
 import {
   publishVersion,
   type FencedPublicationPort,
+  type PublicationRegistrationAuthority,
   NeedsFencedPublicationError,
 } from "../publication/publish.js";
 import { computeDataPointId } from "../sync/data-point-id.js";
@@ -84,6 +85,7 @@ export interface DurableAdditionsOptions {
   signer: Pick<ServerSigner, "signAddData">;
   gateway: Pick<GatewayClient, "registerDataPoint">;
   fencedPublication?: FencedPublicationPort;
+  registrationAuthority?: PublicationRegistrationAuthority;
   /** Summaries remain behind; hosts can expose the retryable recovery reason. */
   onPublicationBlocked?: (error: NeedsFencedPublicationError) => void;
   /** Full PS defaults remain unlimited. Bounded hosts must also supply boundedWork. */
@@ -122,6 +124,12 @@ export interface DurableAdditionsService {
     timezone: string;
     days: number;
     now: Date;
+    /**
+     * Whether a scope, folded through registry version `through`, may be in
+     * this summary (a deletion filter). A scope it excludes contributes
+     * nothing. Absent: every scope is included.
+     */
+    isIncluded?: (scope: string, through: string) => Promise<boolean>;
   }): Promise<AdditionsSummary>;
   recordUpload(
     version: VersionToFold | Pick<VersionToFold, "scope">,
@@ -383,6 +391,8 @@ export function createDurableAdditions(
       signer: options.signer,
       gateway: options.gateway,
       fencedPublication: options.fencedPublication,
+      registrationAuthority: options.registrationAuthority,
+      publicationClass: "canonical",
       head: toHead(snapshot),
       readHead: async () =>
         toHead(await inventory.list(scope, budget.readOptions)),
@@ -677,6 +687,11 @@ export function createDurableAdditions(
           .sort();
         for (const scope of scopes) {
           const result = await recover(scope, budget);
+          if (
+            input.isIncluded &&
+            !(await input.isIncluded(scope, result.through))
+          )
+            continue;
           if (result.ledger)
             ledgers.push({
               ...result.ledger,

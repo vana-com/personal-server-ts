@@ -11,6 +11,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { createPdppSyncSessionService } from "../storage/pdpp-records/sync-session.js";
 import { describe, expect, it } from "vitest";
 import {
   createMemoryRecordStore,
@@ -407,7 +408,8 @@ describe("createPdppImporter", () => {
 
     it("surfaces only real changes through changes_since", () => {
       const { importer, store } = setup();
-      const start = store.changesSince("profile", {
+      const start = createPdppSyncSessionService(store).read({
+        stream: "profile",
         instanceIds: [INSTANCE],
         limit: 50,
       });
@@ -420,7 +422,8 @@ describe("createPdppImporter", () => {
       importer.importEnvelope(envelope());
       importer.importEnvelope(envelope());
 
-      const page = store.changesSince("profile", {
+      const page = createPdppSyncSessionService(store).read({
+        stream: "profile",
         instanceIds: [INSTANCE],
         changesSince: anchor,
         limit: 50,

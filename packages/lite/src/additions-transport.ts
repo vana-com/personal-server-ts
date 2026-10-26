@@ -304,6 +304,8 @@ export function createPsLiteAdditionsTransport(options: {
         metadataHash: prepared.metadataHash,
         sizeBytes: prepared.encrypted.byteLength,
         lineage: null,
+        producer: null,
+        contentClass: "canonical" as const,
       };
       try {
         const result = await publishPreparedVersion({

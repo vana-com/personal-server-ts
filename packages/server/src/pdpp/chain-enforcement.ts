@@ -52,6 +52,7 @@
  * grant read for as long as a caller kept retrying.
  */
 
+import { GrantRevokedError } from "@opendatalabs/personal-server-ts-core/errors";
 import {
   verifyPdppGrantBinding,
   type PdppGrantBindingStore,
@@ -111,6 +112,7 @@ export function chainPermissionEnforcement(
         return {
           ok: false,
           reason: "No chain binding for this grant",
+          cause: "invalid",
           retryable: false,
         };
       }
@@ -120,6 +122,7 @@ export function chainPermissionEnforcement(
         return {
           ok: false,
           reason: "No grantee address for this client",
+          cause: "invalid",
           retryable: false,
         };
       }
@@ -165,6 +168,7 @@ export function chainPermissionEnforcement(
         return {
           ok: false,
           reason: (err as Error).message,
+          cause: err instanceof GrantRevokedError ? "revoked" : "invalid",
           retryable: false,
         };
       }
@@ -180,6 +184,7 @@ export function chainPermissionEnforcement(
         return {
           ok: false,
           reason: "Grant expiry is invalid",
+          cause: "invalid",
           retryable: false,
         };
       }
@@ -191,12 +196,19 @@ export function chainPermissionEnforcement(
           return {
             ok: false,
             reason: "Grant has expired",
+            cause: "expired",
             retryable: false,
           };
         }
       }
 
-      return { ok: true };
+      // The expiry rides with the decision so a read's delivery lease can
+      // refuse at release once it passes, without asking the chain again.
+      return {
+        ok: true,
+        expiresAt:
+          expiresAtSec > 0 ? new Date(expiresAtSec * 1000).toISOString() : null,
+      };
     },
   };
 }

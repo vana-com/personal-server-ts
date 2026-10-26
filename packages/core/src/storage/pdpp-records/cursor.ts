@@ -6,14 +6,21 @@
 
 export interface ListCursorPayload {
   kind: "list";
+  /** Current-view revision. A changed view expires rather than mixes pages. */
+  viewRevision?: string;
+  view?: "owner" | "grant";
+  instanceIds?: string[];
+  /** Final tuple component when records from several connections share time and key. */
+  instance?: string;
   /** Stream this token was minted for. Absent only on legacy cursors. */
   stream?: string;
+  /** Opaque authorization and query fingerprint for PDPP list continuations. */
+  queryBinding?: string;
   /** Store reset epoch this token was minted in. Absent only on legacy cursors. */
   epoch?: string;
   order: "asc" | "desc";
   sortValue: string | null; // cursor_field value of the last row on the page
   recordKey: string; // primary key tiebreaker
-  instance?: string; // final tiebreaker; absent only on legacy cursors
   /**
    * Write clock when page 1 was served. A reset of a read instance after
    * this point expires the cursor (410), so one paginated read never mixes
@@ -39,15 +46,11 @@ export interface ChangesSinceCursorPayload {
   horizon: string;
   /** The previous session's horizon, or null for a first-ever sync. */
   sinceHorizon: string | null;
-  /** Pagination offset within the horizon-anchored result set. */
-  offset: number;
   /**
-   * Page cursors only: the identity order `offset` counts in. `code-point`
-   * is `compareRecordIdentity`; a page cursor without it counted a
-   * locale-dependent key order, so its offset names a different record.
-   * Checkpoints carry no position and need none.
+   * Always 0 on checkpoints. Readable page cursors are no longer issued: the
+   * session owner issues every page cursor as a handle (`sync-session.ts`).
    */
-  orderKey?: "code-point";
+  offset: number;
 }
 
 export type CursorPayload = ListCursorPayload | ChangesSinceCursorPayload;

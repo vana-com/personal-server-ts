@@ -1,3 +1,4 @@
+import type { PdppProducer } from "../../sync/pdpp-import.js";
 export interface IndexEntry {
   id: number;
   fileId: string | null; // null until synced on-chain (Phase 4)
@@ -24,8 +25,26 @@ export interface IndexEntry {
   // without knowledge of any tombstone, so any tombstone covers it. Never a
   // wall-clock comparison: clocks differ across replicas, versions do not.
   afterTombstoneVersion?: number | null;
+  /**
+   * Whether this version's bytes came from PDPP: they carry native `$pdpp`
+   * import metadata, or a PDPP producer stamped them as a canonical cache.
+   * Storage derives it from the published bytes when it indexes them. It is
+   * only an early refusal, so a read that will be refused fails before
+   * payment; the authority is the disclosure view, which decides on the bytes
+   * a non-owner read returns. Undefined (rows from before this field) means
+   * no early refusal.
+   */
+  pdppOrigin?: boolean;
+  /**
+   * The immutable generation of this version: `envelopeGeneration` of the
+   * published bytes, which storage computes when it indexes them and never
+   * takes from the caller. A non-owner read pins it and serves only bytes of
+   * this generation. Undefined (rows from before this field, or unreadable
+   * bytes) means a non-owner read decides on one full read of the envelope.
+   */
+  generation?: string;
   /** Server-stamped origin of a legacy cache version. Null for older/manual writes. */
-  producer?: "pdpp-projector" | "pdpp-import-projection" | null;
+  producer?: PdppProducer | null;
   /** JSON provenance stored outside the grantee-visible data object. */
   producerProvenance?: string | null;
 }

@@ -48,7 +48,7 @@ import {
   PdppTokenService,
   PDPP_DATA_ACCESS_TYPE,
   computeS256Challenge,
-  type DeclarationSnapshot,
+  parseDeclaration,
   type PdppAuthStore,
 } from "@opendatalabs/personal-server-ts-core/pdpp";
 import type {
@@ -151,11 +151,10 @@ function createMockGateway(): GatewayClient {
  * selection request below legal (§6 "Note on `time_range`"). `follows` exists
  * so the journey can prove a NON-granted stream is refused by the RS.
  */
-const SNAPSHOT: DeclarationSnapshot = {
+const DECLARATION_DOCUMENT = JSON.stringify({
   source_id: SOURCE_ID,
   source_kind: "connector",
   version: "2026-09-01",
-  digest: "sha256:integration-fixture-declaration",
   streams: [
     {
       name: "playlists",
@@ -171,7 +170,11 @@ const SNAPSHOT: DeclarationSnapshot = {
       primary_key: ["id"],
     },
   ],
-};
+});
+const parsedDeclaration = parseDeclaration(DECLARATION_DOCUMENT, SOURCE_ID);
+if (!parsedDeclaration.ok)
+  throw new Error("invalid integrated PDPP declaration");
+const SNAPSHOT = parsedDeclaration.snapshot;
 
 /**
  * Bridge the AS's token service to the RS's authorization port.
@@ -194,7 +197,11 @@ const SNAPSHOT: DeclarationSnapshot = {
  */
 function bridgeAsToRs(tokens: PdppTokenService): PdppAuthorizationService {
   return {
-    async resolveToken(accessToken: string) {
+    locality: "local" as const,
+    async resolveToken(token: string) {
+      return this.resolveTokenNow(token);
+    },
+    resolveTokenNow(accessToken: string) {
       const context = tokens.resolveToken(accessToken);
       if (!context.active) {
         // The RS port requires tokenKind/subjectId even on the inactive
@@ -331,6 +338,10 @@ describe("PDPP integrated journey (real AS + real RS in one app)", () => {
         sessions,
         resolveDeclaration: (sourceId) =>
           sourceId === SOURCE_ID ? SNAPSHOT : null,
+        documentForDeclaration: (sourceId, version) =>
+          sourceId === SOURCE_ID && version === SNAPSHOT.version
+            ? DECLARATION_DOCUMENT
+            : null,
         inventoryFor: () => ({ eligibleFor: () => [INSTANCE] }),
         // The owner is already authenticated by the PS session layer; this
         // journey drives that seam with the real owner token.

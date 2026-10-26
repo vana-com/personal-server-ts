@@ -15,6 +15,7 @@ import type { ServerSigner } from "../../signing/signer.js";
 import type { Logger } from "../../logger/index.js";
 import type { DataStoragePort } from "../../ports/index.js";
 import { TOMBSTONE_DATA_HASH, TOMBSTONE_METADATA_HASH } from "../tombstone.js";
+import { HistoryOnlyVersionError } from "../../publication/publish.js";
 
 vi.mock("@opendatalabs/vana-sdk/browser", () => ({
   deriveScopeKey: vi.fn(),
@@ -224,6 +225,33 @@ describe("upload worker", () => {
   });
 
   describe("uploadOne", () => {
+    it("keeps a selected legacy version as history when takeover wins before registration", async () => {
+      const deps = makeMockDeps();
+      let takeoverComplete = false;
+      deps.registrationAuthority = {
+        async withRegistration(_scope, contentClass, register) {
+          if (contentClass === "legacy" && takeoverComplete) {
+            throw new HistoryOnlyVersionError(SCOPE);
+          }
+          return register();
+        },
+      };
+      (
+        deps.storageAdapter.upload as ReturnType<typeof vi.fn>
+      ).mockImplementation(async () => {
+        takeoverComplete = true;
+        return STORAGE_URL;
+      });
+
+      await expect(uploadOne(deps, makeEntry())).rejects.toMatchObject({
+        code: "HISTORY_ONLY_VERSION",
+      });
+
+      expect(deps.storageAdapter.upload).toHaveBeenCalledOnce();
+      expect(deps.gateway.registerDataPoint).not.toHaveBeenCalled();
+      expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
+    });
+
     it("calls encryptWithPassword with correct scope key hex", async () => {
       const deps = makeMockDeps();
       const entry = makeEntry();
@@ -475,6 +503,38 @@ describe("upload worker", () => {
         entry.path,
         DATA_POINT_ID,
       );
+    });
+
+    it("does not let a legacy 409 rebase register after takeover", async () => {
+      const deps = makeMockDeps();
+      let takeoverComplete = false;
+      deps.registrationAuthority = {
+        async withRegistration(_scope, contentClass, register) {
+          if (contentClass === "legacy" && takeoverComplete) {
+            throw new HistoryOnlyVersionError(SCOPE);
+          }
+          return register();
+        },
+      };
+      (
+        deps.gateway.registerDataPoint as ReturnType<typeof vi.fn>
+      ).mockRejectedValueOnce(STALE_409);
+      (
+        deps.gateway.getDataPoint as ReturnType<typeof vi.fn>
+      ).mockImplementation(async () => {
+        takeoverComplete = true;
+        return makeRecord({
+          dataHash: "0x" + "ff".repeat(32),
+          expectedVersion: "7",
+        });
+      });
+
+      await expect(uploadOne(deps, makeEntry())).rejects.toMatchObject({
+        code: "HISTORY_ONLY_VERSION",
+      });
+
+      expect(deps.gateway.registerDataPoint).toHaveBeenCalledOnce();
+      expect(deps.storage.updateDataPointId).not.toHaveBeenCalled();
     });
 
     it("rethrows non-409 gateway errors without a registry lookup", async () => {

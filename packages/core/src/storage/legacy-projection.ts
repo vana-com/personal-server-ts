@@ -26,13 +26,23 @@ import {
   type ProjectionError,
 } from "../legacy-projection/index.js";
 import type { DataStoragePort } from "../ports/index.js";
-import { ProtocolError } from "../errors/catalog.js";
+import { GrantRequiredError, ProtocolError } from "../errors/catalog.js";
 import { isBinaryEnvelope } from "../contracts/binary.js";
+import type { LegacyReader } from "../policy/legacy-disclosure.js";
+import { inputHasPdppOrigin, isPdppProducer } from "../sync/pdpp-import.js";
 import type { IndexEntry } from "./index/types.js";
+import { readEvidence, retainReadEvidence } from "./read-evidence.js";
 import { buildDataBlocksAsync } from "./blocks/build.js";
+import { blockRepresentationMetadata } from "./blocks/representation.js";
 import { readBuiltScopeBlocks } from "./blocks/page.js";
 import type { DataBlockManifest, DataScopeBlock } from "./blocks/types.js";
 import { previewEnvelopeValue } from "./preview.js";
+import {
+  GRANTEE_VIEW,
+  isGuarded,
+  forProjectionInputs,
+  withDisclosurePolicy,
+} from "./disclosure-policy.js";
 
 /** Keys the server stamps into `data`; they are not part of the body. */
 const SERVER_STAMP_KEYS: ReadonlySet<string> = new Set([
@@ -117,6 +127,14 @@ const textEncoder = new TextEncoder();
 export function withLegacyProjection(
   raw: DataStoragePort,
   options: LegacyProjectionOptions = {},
+  /**
+   * The port every read that FEEDS a projection goes through, when it must
+   * decide differently from `raw`. A non-owner's `raw` may let a writer read
+   * back its own stored version; once a projection applies, that exception
+   * does not, so the requested version and every joined sibling are read
+   * through this plain port instead.
+   */
+  projectionRaw: DataStoragePort = raw,
 ): DataStoragePort {
   if ((raw as { [SERVED]?: true })[SERVED]) return raw;
 
@@ -167,7 +185,19 @@ export function withLegacyProjection(
     let cached = forms.get(formKey);
     let own: DataFileEnvelope | undefined;
     if (!cached) {
-      own = await raw.readEnvelope(scope, collectedAt);
+      try {
+        own = await raw.readEnvelope(scope, collectedAt);
+      } catch (error) {
+        // A guarded port refuses canonical PDPP data in its own form. A body
+        // that projects to the legacy form is not refused: it is an input.
+        if (projectionRaw === raw || !(error instanceof GrantRequiredError)) {
+          throw error;
+        }
+        own = await projectionRaw.readEnvelope(scope, collectedAt);
+        if (classifyStoredBody(scope, own.data) !== "pdpp-projected") {
+          throw error;
+        }
+      }
       const form = classifyStoredBody(scope, own.data);
       cached = {
         form,
@@ -236,6 +266,7 @@ export function withLegacyProjection(
         // The index row id changes when a version is deleted and written
         // again under the same collectedAt, so it identifies the content.
         version: entry ? `${entry.id}@${entry.collectedAt}` : null,
+        pdppOrigin: entry?.pdppOrigin === true,
       };
     });
     const key = JSON.stringify([
@@ -246,12 +277,17 @@ export function withLegacyProjection(
     ]);
     if (memo?.key === key) return { view: memo.value, own };
 
-    own ??= await raw.readEnvelope(scope, collectedAt);
+    // A projection applies: its inputs are read through `projectionRaw`.
+    own =
+      projectionRaw === raw
+        ? (own ?? (await raw.readEnvelope(scope, collectedAt)))
+        : await projectionRaw.readEnvelope(scope, collectedAt);
 
     const value = await project(
       scope,
       collectedAt,
       own,
+      requestedEntry,
       inputs,
       binding,
       profileKey,
@@ -289,7 +325,13 @@ export function withLegacyProjection(
     scope: string,
     collectedAt: string,
     own: DataFileEnvelope,
-    inputs: { stream: string; storedScope: string; collectedAt?: string }[],
+    requestedEntry: { pdppOrigin?: boolean } | undefined,
+    inputs: {
+      stream: string;
+      storedScope: string;
+      collectedAt?: string;
+      pdppOrigin: boolean;
+    }[],
     binding: LegacyScopeBinding,
     profileKey?: string,
   ): Promise<Projected | null> {
@@ -298,18 +340,29 @@ export function withLegacyProjection(
     // The projection time is the newest input version, so the same stored
     // data always projects to the same bytes.
     let now = collectedAt;
+    // The served view carries the provenance of EVERY input it joins, not of
+    // the requested version alone: a PDPP sibling joined into an unmarked
+    // scope makes the view PDPP-origin.
+    let viewPdppOrigin = inputHasPdppOrigin(requestedEntry, own);
+    const inputEvidence = [readEvidence(own, requestedEntry)];
     for (const input of inputs) {
       if (!input.collectedAt) continue;
       const envelope =
         input.storedScope === scope
           ? own
-          : await raw.readEnvelope(input.storedScope, input.collectedAt);
+          : await projectionRaw.readEnvelope(
+              input.storedScope,
+              input.collectedAt,
+            );
+      viewPdppOrigin ||= inputHasPdppOrigin(input, envelope);
       if (classifyStoredBody(input.storedScope, envelope.data) === "legacy") {
         continue;
       }
       const rows = (envelope.data as { records: Record<string, unknown>[] })
         .records;
       if (rows.some(isTaggedRecord)) continue;
+      if (input.storedScope !== scope)
+        inputEvidence.push(readEvidence(envelope, input));
       fetchedStreams.push(input.stream);
       if (Date.parse(input.collectedAt) > Date.parse(now)) {
         now = input.collectedAt;
@@ -360,7 +413,15 @@ export function withLegacyProjection(
     }
     // Server stamps signed the stored records, not this view, so they are
     // not carried over. `?view=stored` returns them with the stored body.
-    const envelope = { ...own, data: result.payload } as DataFileEnvelope;
+    const envelope = {
+      ...own,
+      data: result.payload,
+      ...(viewPdppOrigin &&
+      !isPdppProducer((own as { producer?: unknown }).producer)
+        ? { producer: "pdpp-projector" as const }
+        : {}),
+    } as DataFileEnvelope;
+    retainReadEvidence(envelope, inputEvidence);
     return {
       envelope,
       bytes: textEncoder.encode(JSON.stringify(envelope)),
@@ -442,11 +503,18 @@ export function withLegacyProjection(
   }
   if (raw.readBlockManifest) {
     const rawManifest = raw.readBlockManifest.bind(raw);
-    overrides.readBlockManifest = async (scope, collectedAt) => {
+    overrides.readBlockManifest = async (scope, collectedAt, options) => {
       const view = await projected(scope, collectedAt);
-      return view
-        ? (await builtBlocks(scope, view)).manifest
-        : rawManifest(scope, collectedAt);
+      if (!view) return rawManifest(scope, collectedAt, options);
+      const manifest = (await builtBlocks(scope, view)).manifest;
+      return {
+        ...manifest,
+        ...blockRepresentationMetadata(
+          manifest,
+          isGuarded(raw) ? "grantee" : "stored",
+          view.view,
+        ),
+      };
     };
   }
   // Inventory inherits raw metadata readiness. Projection belongs to reads.
@@ -457,7 +525,7 @@ export function withLegacyProjection(
       (await projected(scope, collectedAt)) !== null;
   }
 
-  return new Proxy(raw, {
+  const served: DataStoragePort = new Proxy(raw, {
     get(target, property) {
       if (Object.prototype.hasOwnProperty.call(overrides, property)) {
         return overrides[property as keyof typeof overrides];
@@ -472,6 +540,38 @@ export function withLegacyProjection(
       );
     },
   });
+  // A non-owner's view projects from the guarded raw port, so the requested
+  // version and every joined sibling version are authorized on their bytes.
+  // Built once per served port, so it keeps its own projection caches.
+  // One view per reader identity (the own-write exception depends on who
+  // reads); a few at most.
+  const granteeViews = new Map<string, DataStoragePort>();
+  (overrides as Record<symbol, unknown>)[GRANTEE_VIEW] = isGuarded(raw)
+    ? () => served
+    : (reader: LegacyReader) => {
+        const key =
+          typeof reader === "object"
+            ? `builder:${reader.builder.toLowerCase()}`
+            : "grantee";
+        let view = granteeViews.get(key);
+        if (!view) {
+          if (granteeViews.size >= 16) {
+            granteeViews.delete(granteeViews.keys().next().value!);
+          }
+          // A body served unprojected is decided on its bytes by the
+          // reader-aware guard (an own write may be read back). What a
+          // projection reads are its inputs, not a disclosure: only the
+          // composed legacy projection reaches the reader, stamped as one.
+          view = withLegacyProjection(
+            withDisclosurePolicy(raw, reader),
+            options,
+            forProjectionInputs(raw),
+          );
+          granteeViews.set(key, view);
+        }
+        return view;
+      };
+  return served;
 }
 
 /**

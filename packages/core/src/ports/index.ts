@@ -1,3 +1,4 @@
+import type { PdppProducer } from "../sync/pdpp-import.js";
 import type {
   Builder,
   DataFileEnvelope,
@@ -112,7 +113,7 @@ export type VersionCommit =
         schemaId: string | null;
         dataPointId: string;
         version: number;
-        producer?: "pdpp-projector" | "pdpp-import-projection";
+        producer?: PdppProducer;
         producerProvenance?: string;
       };
     };
@@ -142,6 +143,7 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * so every version of a scope shares one id.
    */
   findByDataPointId(dataPointId: string): IndexEntry | undefined;
+  /** Entries eligible for sync publication; retained canonical-authority history is omitted. */
   findUnsynced(options?: { limit?: number }): IndexEntry[];
   readEnvelope(scope: string, collectedAt: string): Promise<DataFileEnvelope>;
   /**
@@ -170,13 +172,21 @@ export interface DataStoragePort extends RuntimeStoragePort {
     collectedAt: string,
     options: {
       cursor?: string;
+      /** UTF-8 content budget; a 1–3 byte budget may emit one whole code point (up to 4 bytes). */
       maxBytes: number;
       /**
        * Block-addressed read: return only these blocks, in this order. When
-       * set, `cursor` is ignored and no `nextCursor` is produced; `maxBytes`
+       * set, cursor positions are ignored but its version/layout binding is checked; no `nextCursor` is produced; `maxBytes`
        * still applies and any ids it cuts off are reported as warnings.
        */
       blockIds?: readonly string[];
+      /**
+       * The generation of the index row the read was authorized for. A
+       * non-owner view serves only blocks bound to it, and refuses rather
+       * than serve another version's bytes. A raw port ignores it.
+       */
+      generation?: string;
+      representation?: "stored" | "grantee";
     },
   ): Promise<ReadScopeBlocksResponse>;
   /**
@@ -186,6 +196,8 @@ export interface DataStoragePort extends RuntimeStoragePort {
   readBlockManifest?(
     scope: string,
     collectedAt: string,
+    /** As for `readScopeBlocks`. */
+    options?: { generation?: string },
   ): Promise<DataBlockManifest | null>;
   /** Metadata-only readiness hint. Must not read bodies or build/project blocks.
    * Return false when readiness cannot be established cheaply. */
@@ -197,6 +209,16 @@ export interface DataStoragePort extends RuntimeStoragePort {
     scope: string,
     collectedAt: string,
   ): boolean | Promise<boolean>;
+  /**
+   * The generation of an index row from before rows recorded one. Storage
+   * computes it from the bytes published at the row's path, reads them a
+   * second time, and records it on that row only if both reads agree and
+   * the row still has none; otherwise undefined. A row that has a
+   * generation returns it unchanged. Never takes a caller's value.
+   */
+  backfillGeneration?(
+    entry: Pick<IndexEntry, "id" | "path" | "generation">,
+  ): Promise<string | undefined>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
   /** Atomic local legacy write, including a version compare when requested. */
   commitEnvelope?(

@@ -163,11 +163,14 @@ describe("current declarations at the server legacy-read boundary", () => {
     expect(await view.readLatest(scope)).toEqual(after);
   });
 
-  it("invalidates the covered body and persisted verdict on a declaration upgrade", async () => {
+  it("refuses canonical reads after a declaration upgrade without falling back", async () => {
     current = registry(false);
     const baseline = await makeView().readLatest(scope);
     expect(baseline.kind).toBe("canonical");
     if (baseline.kind !== "canonical") return;
+    db.prepare(
+      "DELETE FROM legacy_scope_canonical_authority WHERE scope = ?",
+    ).run(scope);
     db.prepare(
       "INSERT INTO data_files (path, scope, collected_at, size_bytes) VALUES (?, ?, ?, ?)",
     ).run("chatgpt/conversations/old.json", scope, collectedAt, 12);
@@ -180,13 +183,14 @@ describe("current declarations at the server legacy-read boundary", () => {
     expect(readHead).toHaveBeenCalledTimes(1);
 
     current = registry(true);
-    expect(view.listingFor(scope)).toEqual({ kind: "refused" });
+    expect(view.listingFor(scope).kind).toBe("canonical");
     // The old file contains encoded text. A decoded body no longer covers it:
-    // recompute parity and refuse rather than return the stale cached body.
+    // refuse rather than return the stale cached body or file.
     expect((await view.readLatest(scope)).kind).toBe("refused");
     expect(readHead).toHaveBeenCalledTimes(2);
     expect(view.verdictFor(scope)[0]!.canonicalCursor).not.toBe(cursor);
     expect(view.verdictFor(scope)[0]!.verdict).toBe("not_covered");
+    expect(view.listingFor(scope).kind).toBe("refused");
   });
 
   it("does not apply a declaration from another registered source", () => {

@@ -1,3 +1,5 @@
+import { canonicalRetentionConflict } from "./storage/legacy-publication-fence.js";
+import { createServerApiAuth } from "./api-auth.js";
 import { createClaudeMethodTransition } from "./storage/claude-method-transition.js";
 import { randomUUID } from "node:crypto";
 import type { DurableAdditionsService } from "@opendatalabs/personal-server-ts-core/additions";
@@ -30,6 +32,8 @@ import {
   type WriteSessionStore,
 } from "@opendatalabs/personal-server-ts-core/write";
 import { derivativesRoutes } from "./routes/derivatives.js";
+import type { PdppEnabled } from "@opendatalabs/personal-server-ts-core/policy";
+import { pdppIsConfigured } from "./pdpp/bootstrap.js";
 import { grantsRoutes } from "./routes/grants.js";
 import { accessLogsRoutes } from "./routes/access-logs.js";
 import { syncRoutes } from "./routes/sync.js";
@@ -95,7 +99,7 @@ import {
 import { pdppBlobsRoutes } from "./routes/pdpp-blobs.js";
 import { pdppWellKnownRoutes } from "./routes/pdpp-well-known.js";
 import type { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
-import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import type { PdppReadAuthority } from "./pdpp/read-admission.js";
 import type { LegacyScopeViewPort } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
 import type {
   PdppRecordStore,
@@ -108,7 +112,11 @@ export interface IdentityInfo {
   serverId: string | null;
 }
 
+import { legacyPublicationPolicyRoutes } from "./routes/legacy-publication-policy.js";
+import type { createLegacyPublicationPolicy } from "./storage/legacy-publication-policy.js";
+
 export interface AppDeps {
+  legacyPublicationPolicy?: ReturnType<typeof createLegacyPublicationPolicy>;
   additions?: DurableAdditionsService;
   logger: Logger;
   version: string;
@@ -242,17 +250,18 @@ export interface AppDeps {
   writeProofReplayStore?: WriteProofReplayStore;
   profile?: "standard" | "enclave";
   jobWorker?: (envelope: JobRequestEnvelope) => Promise<JobExecuteResponse>;
+  /** PDPP publication state; omitted and unknown fails closed. */
+  pdppEnabled?: PdppEnabled;
   /**
    * PDPP §4/§8 record model + Resource Server query surface. Absent = the
    * PDPP routes are not mounted; existing deployments are unaffected. When
    * present, all three must be present together (record store, token
    * resolution, and stream declarations are mutually required).
    */
-  pdpp?: {
+  pdpp?: PdppReadAuthority & {
     store: PdppRecordStore;
     bindingStore: ReturnType<typeof createSqliteRecordStore>;
     configuredMethods: Map<string, string[]>;
-    auth: PdppAuthorizationService;
     declarations: StreamDeclarationRegistry;
     instancesForSubject?: (subjectId: string) => string[];
     instancesForSource?: (subjectId: string, sourceId: string) => string[];
@@ -372,13 +381,20 @@ export function createApp(deps: AppDeps): Hono {
   // the legacy DPP fileId/scope routes above; mounted only when a pdpp deps
   // bundle is supplied.
   if (deps.pdppConnections) {
-    app.route("/", pdppConnectionRoutes(deps.pdppConnections));
+    app.route(
+      "/",
+      pdppConnectionRoutes({
+        ...deps.pdppConnections,
+        protocolProfile: deps.pdppAuth?.protocolProfile,
+      }),
+    );
   }
 
   if (deps.pdpp) {
     app.route(
       "/",
       pdppInstanceBindingRoutes({
+        protocolProfile: deps.pdppAuth?.protocolProfile,
         store: deps.pdpp.bindingStore,
         auth: deps.pdpp.auth,
         ownerSubjectId: deps.serverOwner!,
@@ -388,11 +404,18 @@ export function createApp(deps: AppDeps): Hono {
         transitionClaude: claudeTransition?.transition,
       }),
     );
+    // One deployment authority for record, metadata and blob reads. Omission
+    // of chainEnforcement retains the explicit chain-neutral contract.
+    const readAuthority = {
+      auth: deps.pdpp.auth,
+      chainEnforcement: deps.pdpp.chainEnforcement,
+      protocolProfile: deps.pdppAuth?.protocolProfile,
+    };
     app.route(
       "/v1",
       pdppRecordsRoutes({
+        ...readAuthority,
         store: deps.pdpp.store,
-        auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         ownerSubjectId: deps.serverOwner,
         instancesForSubject: deps.pdpp.instancesForSubject,
@@ -434,8 +457,8 @@ export function createApp(deps: AppDeps): Hono {
     app.route(
       "/v1/blobs",
       pdppBlobsRoutes({
+        ...readAuthority,
         store: deps.pdpp.store,
-        auth: deps.pdpp.auth,
         declarations: deps.pdpp.declarations,
         instancesForSubject: deps.pdpp.instancesForSubject,
         instancesForSource: deps.pdpp.instancesForSource,
@@ -499,6 +522,11 @@ export function createApp(deps: AppDeps): Hono {
         deps.gatewayUrl ?? deps.config?.gateway.url ?? deps.gatewayConfig?.url,
       paymentEnabled: deps.paymentEnabled,
       lineageGateway: deps.lineageGateway,
+      // The composition root shares this signal with compute. A caller
+      // without configuration or a mounted authority has unknown state.
+      pdppEnabled:
+        deps.pdppEnabled ??
+        pdppIsConfigured(deps.config, deps.pdpp ?? deps.pdppAuth),
       writeSessionStore,
       writeProofReplayStore,
       pdppOwnerBearer: deps.pdpp
@@ -565,6 +593,22 @@ export function createApp(deps: AppDeps): Hono {
       sessionStore: writeSessionStore,
     }),
   );
+
+  if (deps.legacyPublicationPolicy)
+    app.route(
+      "/v1/legacy-publication-policy",
+      legacyPublicationPolicyRoutes({
+        policy: deps.legacyPublicationPolicy,
+        auth: createServerApiAuth({
+          serverOrigin: deps.serverOrigin,
+          serverOwner: deps.serverOwner,
+          gateway: deps.gateway,
+          devToken: deps.devToken,
+          accessToken: deps.accessToken,
+          tokenStore: deps.tokenStore,
+        }),
+      }),
+    );
 
   // Mount grants routes (POST /verify is public, GET / and POST / need owner auth)
   app.route(
@@ -644,6 +688,7 @@ export function createApp(deps: AppDeps): Hono {
     indexManager: deps.indexManager,
     hierarchyOptions: deps.hierarchyOptions,
     dataStorage: deps.dataStorage,
+    scopeDeletions: deps.scopeDeletions,
     runtimeAvailability: deps.runtimeAvailability,
     connectionStore: mcpConnectionStore,
     oauthAuthorizationStore: mcpOAuthAuthorizationStore,
@@ -804,7 +849,8 @@ export function createApp(deps: AppDeps): Hono {
   }
 
   // Global error handler
-  app.onError((err, c) => {
+  app.onError((error, c) => {
+    const err = canonicalRetentionConflict(error) ?? error;
     if (err instanceof ProtocolError) {
       deps.logger.warn({ err }, err.message);
       return c.json(err.toJSON(), err.code as 401 | 403 | 413 | 503);
