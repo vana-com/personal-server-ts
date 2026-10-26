@@ -43,7 +43,7 @@ const open = (role: string) => {
   return { db, store };
 };
 if (mode === "seed") {
-  const { db, store } = open("source");
+  const { store } = open("source");
   const blob = store.storeBlobBytesForInstance({
     instance: "conn",
     method: "export",
