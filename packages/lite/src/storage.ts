@@ -706,6 +706,9 @@ export async function createPersistentPsLiteStorage(
 
     async writeEnvelope(envelope): Promise<WriteResult> {
       const path = envelopePath(envelope.scope, envelope.collectedAt);
+      // An erase of this path in flight must finish first, or its blob delete
+      // would remove this blob by path.
+      await waitForErasesOf(path);
       const sizeBytes = await fileStore.writeEnvelope(path, envelope);
       if (fileStore.kind !== "indexeddb") {
         await fallbackStore.deleteEnvelope(path);
@@ -730,6 +733,8 @@ export async function createPersistentPsLiteStorage(
               write: (text) => file.write(text),
               abort: () => file.abort(),
               async commit(entry): Promise<WriteResult> {
+                // Same reason as writeEnvelope: the rename must not land under an erase in flight.
+                await waitForErasesOf(path);
                 const sizeBytes = await file.commit();
                 try {
                   // The index entry is what makes the version visible.
@@ -1107,30 +1112,19 @@ export async function createPersistentPsLiteStorage(
       });
     },
 
-    async deleteVersion(scope, collectedAt, fence) {
-      if (!fence) {
-        const entry = state.entries.find(
-          (e) => e.scope === scope && e.collectedAt === collectedAt,
-        );
-        if (!entry) return false;
-        return removeEntry(entry);
-      }
-      // Fenced: the row is checked under the scope lock, before its blob goes.
-      return withScopeLock(scope, async () => {
-        const entry = state.entries.find(
-          (e) => e.scope === scope && e.collectedAt === collectedAt,
-        );
-        if (!entry || entry.id !== fence.id || entry.path !== fence.path) {
-          return false;
-        }
-        return removeEntryLocked(entry);
-      });
+    // Unfenced: by (scope, collectedAt) alone. Fenced: only the row the caller
+    // decided on, by its id and path.
+    deleteVersion(scope, collectedAt, fence) {
+      return eraseRow(
+        (e) =>
+          e.scope === scope &&
+          e.collectedAt === collectedAt &&
+          (fence === undefined || (e.id === fence.id && e.path === fence.path)),
+      );
     },
 
-    async deleteByFileId(fileId) {
-      const entry = state.entries.find((e) => e.fileId === fileId);
-      if (!entry) return false;
-      return removeEntry(entry);
+    deleteByFileId(fileId) {
+      return eraseRow((e) => e.fileId === fileId);
     },
   };
 
@@ -1162,41 +1156,123 @@ export async function createPersistentPsLiteStorage(
     }
   }
 
-  async function removeEntry(entry: IndexEntry): Promise<boolean> {
-    return withScopeLock(entry.scope, () => removeEntryLocked(entry));
+  /**
+   * An erase in flight: `path` settles to the row's path once the queued
+   * resolve step has run (null when no row matched), and `done` settles once
+   * the row is gone or the erase has given up.
+   */
+  interface InFlightErase {
+    path: Promise<string | null>;
+    done: Promise<void>;
+  }
+  const inFlightErases = new Set<InFlightErase>();
+
+  /**
+   * Erase the one row that `match` picks from the CURRENT index, with its blob.
+   *
+   * 1. Queued: resolve the row by `match` at its turn, so an update queued
+   *    earlier is seen. Persist the conservative hint. No blob is touched here.
+   * 2. Outside the queue: delete the blob. Index writes to other paths run
+   *    meanwhile. Writers to this path wait (see `waitForErasesOf`).
+   * 3. Queued: remove the row by id, only if that id is still present. A row
+   *    updated in between is still removed. A different id at the same path
+   *    is never removed.
+   *
+   * The in-flight record is added now, synchronously, so a write issued after
+   * this call waits for the erase, whatever happens to the queue.
+   */
+  function eraseRow(match: (entry: IndexEntry) => boolean): Promise<boolean> {
+    const resolved = enqueue(async () => {
+      const entry = state.entries.find(match);
+      if (!entry) return null;
+      // Persist the conservative hint before any destructive file operation.
+      // A partial delete can remove the tree while leaving the row.
+      readyBlockManifests.delete(
+        blockManifestPath(entry.scope, entry.collectedAt),
+      );
+      await persistence.write(snapshotOf(state));
+      return {
+        id: entry.id,
+        scope: entry.scope,
+        collectedAt: entry.collectedAt,
+        path: entry.path,
+      };
+    });
+    let settle!: () => void;
+    const record: InFlightErase = {
+      path: resolved.then(
+        (row) => row?.path ?? null,
+        () => null,
+      ),
+      done: new Promise<void>((resolve) => {
+        settle = resolve;
+      }),
+    };
+    inFlightErases.add(record);
+    // Release waiting writers. Idempotent, so it is also the finally below.
+    const finish = () => {
+      inFlightErases.delete(record);
+      settle();
+    };
+    return (async () => {
+      try {
+        const row = await resolved;
+        if (!row) return false;
+        // The scope lock covers the blob, the row and the sidecar, as an erase
+        // always has: an owner write waits on it before its ledger step.
+        return await withScopeLock(row.scope, async () => {
+          await deleteBlobThenRow(row);
+          finish();
+          // The sidecar goes with the scope's last version.
+          await persist();
+          if (!state.entries.some((e) => e.scope === row.scope)) {
+            await dropLedger(row.scope);
+          }
+          return true;
+        });
+      } finally {
+        finish();
+      }
+    })();
   }
 
-  async function removeEntryLocked(entry: IndexEntry): Promise<boolean> {
-    const blobPath = envelopePath(entry.scope, entry.collectedAt);
-    // Delete the blob FIRST (both stores tolerate a missing blob); only drop the index row once
-    // the blob is gone. If blob deletion throws for a real reason, the row is preserved so the
-    // next sync retry re-attempts instead of orphaning the local blob.
-    // A partial delete can remove the tree while leaving the index row.
-    // Persist the conservative hint before any destructive file operation.
-    readyBlockManifests.delete(
-      blockManifestPath(entry.scope, entry.collectedAt),
-    );
-    await persist();
+  interface ResolvedRow {
+    id: number;
+    scope: string;
+    collectedAt: string;
+    path: string;
+  }
+
+  /** Steps 2 and 3 of `eraseRow`: blob outside the queue, then the row by id. */
+  async function deleteBlobThenRow(row: ResolvedRow): Promise<void> {
+    const blobPath = envelopePath(row.scope, row.collectedAt);
+    const tree = blockTreePath(row.scope, row.collectedAt);
     await Promise.all([
       fileStore.deleteEnvelope(blobPath),
       fallbackStore.deleteEnvelope(blobPath),
-      fileStore.deleteBlockTree?.(
-        blockTreePath(entry.scope, entry.collectedAt),
-      ) ?? Promise.resolve(),
-      fallbackStore.deleteBlockTree?.(
-        blockTreePath(entry.scope, entry.collectedAt),
-      ) ?? Promise.resolve(),
+      fileStore.deleteBlockTree?.(tree) ?? Promise.resolve(),
+      fallbackStore.deleteBlockTree?.(tree) ?? Promise.resolve(),
     ]);
-    await updateIndex((current) => ({
-      ...current,
-      entries: current.entries.filter((e) => e !== entry),
-    }));
-    // The sidecar goes with the scope's last version.
-    await persist();
-    if (!state.entries.some((e) => e.scope === entry.scope)) {
-      await dropLedger(entry.scope);
-    }
-    return true;
+    await enqueue(async () => {
+      if (!state.entries.some((e) => e.id === row.id)) return;
+      await publish({
+        ...state,
+        entries: state.entries.filter((e) => e.id !== row.id),
+      });
+    });
+  }
+
+  /**
+   * Resolves once every erase in flight on `path` at this call is done. Writes
+   * to other paths do not wait for it: they wait only for the queue's turn,
+   * never for another path's blob delete.
+   */
+  async function waitForErasesOf(path: string): Promise<void> {
+    await Promise.all(
+      [...inFlightErases].map(async (erase) => {
+        if ((await erase.path) === path) await erase.done;
+      }),
+    );
   }
 
   if (fileStore.readEnvelopePreview) {
