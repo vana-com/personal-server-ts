@@ -170,6 +170,12 @@ export interface ReplicaCanonicalPort {
   unquarantinedRecordSql(alias: string, generationSql?: string): string;
   assertKeyWritable(instance: string, stream: string, recordKey: string): void;
   assertConnectionWritable(instance: string): void;
+  /**
+   * Strava and Claude method transitions change a connection's method and
+   * generation without journaling a lifecycle operation, so a replica could not
+   * follow them. Refuse them while replication is enabled.
+   */
+  assertMethodTransitionAllowed(): void;
   assertStreamWritable(
     instance: string,
     stream: string,
@@ -262,6 +268,8 @@ export function createReplicaCanonicalPort(db: Database) {
             @stream, @record_key, @operation, @value_json, @blob_ids_json)
   `);
   let visibilityObserver: (() => void) | undefined;
+  let localWriteObserver:
+    ((instance: string, stream: string, recordKey: string) => void) | undefined;
 
   function replicaIntegrityEpoch(connectionKey: string): number {
     return (
@@ -316,6 +324,10 @@ export function createReplicaCanonicalPort(db: Database) {
           .get(instance)
       )
         throw new PdppBindingError("replica_integrity_quarantine");
+    },
+    assertMethodTransitionAllowed() {
+      if (db.prepare("SELECT 1 FROM pdpp_replica_settings").get())
+        throw new PdppBindingError("replica_method_transition_unsupported");
     },
     assertStreamWritable(instance, stream, generation) {
       if (
@@ -393,6 +405,7 @@ export function createReplicaCanonicalPort(db: Database) {
         primaryKey,
         decl,
       );
+      localWriteObserver?.(instance, stream, recordKey);
       visibilityObserver?.();
     },
     captureInvalidation: journal.captureInvalidation,
@@ -462,6 +475,12 @@ export function createReplicaCanonicalPort(db: Database) {
     setReplicaVisibilityObserver(observer: () => void) {
       visibilityObserver = observer;
     },
+    /** Called after a local write is journaled, inside the write's transaction. */
+    setReplicaLocalWriteObserver(
+      observer: (instance: string, stream: string, recordKey: string) => void,
+    ) {
+      localWriteObserver = observer;
+    },
     replicaIntegrityEpoch,
     fenceReplicaConnection,
     replicaBindingConflict(connectionId: string): boolean {
@@ -523,6 +542,7 @@ export function createReplicaRecordStore(
     replication: r.exporter,
     getInstallationWriterId: () => r.writerId,
     setReplicaVisibilityObserver: r.setReplicaVisibilityObserver,
+    setReplicaLocalWriteObserver: r.setReplicaLocalWriteObserver,
     replicaIntegrityEpoch: r.replicaIntegrityEpoch,
     fenceReplicaConnection: r.fenceReplicaConnection,
     replicaBindingConflict: r.replicaBindingConflict,

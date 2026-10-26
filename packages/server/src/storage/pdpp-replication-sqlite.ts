@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_settings (id INTEGER PRIMARY KEY CHECK(i
 CREATE TABLE IF NOT EXISTS pdpp_replica_clock (id INTEGER PRIMARY KEY CHECK(id = 1), counter INTEGER NOT NULL);
 INSERT OR IGNORE INTO pdpp_replica_clock VALUES (1, 0);
 CREATE TABLE IF NOT EXISTS pdpp_replica_operations (sequence INTEGER PRIMARY KEY, operation_json TEXT NOT NULL, digest TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS pdpp_replica_blob_claim_idx ON pdpp_replica_operations (json_extract(operation_json, '$.connectionId'), json_extract(operation_json, '$.generation'), json_extract(operation_json, '$.blob.blobId')) WHERE json_extract(operation_json, '$.kind') = 'blob-claim';
 CREATE TABLE IF NOT EXISTS pdpp_replica_baseline (sequence INTEGER PRIMARY KEY REFERENCES pdpp_replica_operations(sequence));
 CREATE TABLE IF NOT EXISTS pdpp_replica_blob_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_update BEFORE UPDATE ON pdpp_replica_operations BEGIN SELECT RAISE(ABORT, 'replica journal is append-only'); END;
@@ -168,13 +169,12 @@ export function createReplicationJournal(db: Database, writerId: string) {
       copyBinary(db, "canonical", blobId, "pinned");
     else if (!verifyBinary(db, "pinned", blobId, blob.sha256, blob.sizeBytes))
       throw new Error("corrupt pinned replica bytes");
-    const previous = allOperations().some(
-      (op) =>
-        op.kind === "blob-claim" &&
-        op.connectionId === instance &&
-        op.generation === identity.generation &&
-        op.blob.blobId === blobId,
-    );
+    // Indexed by pdpp_replica_blob_claim_idx; the predicate must match it.
+    const previous = db
+      .prepare(
+        "SELECT 1 FROM pdpp_replica_operations WHERE json_extract(operation_json, '$.kind') = 'blob-claim' AND json_extract(operation_json, '$.connectionId') = ? AND json_extract(operation_json, '$.generation') = ? AND json_extract(operation_json, '$.blob.blobId') = ? LIMIT 1",
+      )
+      .get(instance, identity.generation, blobId);
     if (!previous) append({ ...identity, kind: "blob-claim", blob });
   }
   function captureRecord(
@@ -380,6 +380,16 @@ export function createReplicationJournal(db: Database, writerId: string) {
         db.prepare(
           "INSERT INTO pdpp_replica_settings (id, config_json, watermark) VALUES (1, ?, 0)",
         ).run(canonicalJson(normalized));
+        // Method transitions are not journaled, so a replica could not follow them.
+        const transitioned = db
+          .prepare(
+            "SELECT instance FROM pdpp_claude_transition UNION ALL SELECT instance FROM pdpp_strava_transition LIMIT 1",
+          )
+          .get() as { instance: string } | undefined;
+        if (transitioned)
+          throw new Error(
+            `replication cannot be enabled: connection ${transitioned.instance} has a Strava or Claude method transition`,
+          );
         // A legacy orphan is a migration error, never an omitted row.
         const orphan = db
           .prepare(

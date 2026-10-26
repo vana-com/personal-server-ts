@@ -1644,6 +1644,7 @@ export function createSqliteRecordStore(
     input: StravaTransitionInput,
   ): PdppInstanceBinding {
     return connectionMutation(input.instance, () => {
+      replica?.assertMethodTransitionAllowed();
       const current = getInstanceBinding(input.instance);
       if (current.deletedAt !== null)
         throw new PdppBindingError("connection_deleted");
@@ -1696,6 +1697,7 @@ export function createSqliteRecordStore(
     input: ClaudeTransitionInput,
   ): PdppInstanceBinding {
     return connectionMutation(input.instance, () => {
+      replica?.assertMethodTransitionAllowed();
       const current = getInstanceBinding(input.instance);
       if (current.deletedAt !== null)
         throw new PdppBindingError("connection_deleted");
