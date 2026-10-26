@@ -1,4 +1,7 @@
-import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type {
+  DataStoragePort,
+  DataVersionWriter,
+} from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   DataBlockManifest,
   DataScopeBlock,
@@ -55,12 +58,28 @@ export interface PsLiteDataFileStore {
     options: { maxBytes: number },
   ): Promise<{ text: string; truncated: boolean } | null>;
   writeEnvelope(path: string, envelope: DataFileEnvelope): Promise<number>;
+  /**
+   * Write one envelope as a sequence of text pieces. Nothing is at `path`
+   * until `commit`; `abort`, or a crash before `commit`, leaves the path as
+   * it was. Stores without it cannot take streamed scope uploads.
+   */
+  openEnvelopeWriter?(path: string): Promise<PsLiteEnvelopeWriter>;
   deleteEnvelope(path: string): Promise<void>;
   readBlockManifest?(path: string): Promise<DataBlockManifest | null>;
   writeBlockManifest?(path: string, manifest: DataBlockManifest): Promise<void>;
   readBlockPayload?(path: string): Promise<DataScopeBlock | null>;
   writeBlockPayload?(path: string, block: DataScopeBlock): Promise<void>;
   deleteBlockTree?(pathPrefix: string): Promise<void>;
+}
+
+/** One envelope file being written by `PsLiteDataFileStore.openEnvelopeWriter`. */
+export interface PsLiteEnvelopeWriter {
+  /** Append text. Calls must not overlap. */
+  write(text: string): Promise<void>;
+  /** Make the file visible at its path; resolves to its size in bytes. */
+  commit(): Promise<number>;
+  /** Discard what was written. Idempotent. */
+  abort(): Promise<void>;
 }
 
 export interface PsLiteStorageCapabilities {
@@ -295,6 +314,37 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
       await writable.write(encoded);
       await writable.close();
       return new TextEncoder().encode(encoded).length;
+    },
+    async openEnvelopeWriter(path) {
+      const parts = path.split("/").filter(Boolean);
+      const fileName = parts.pop();
+      if (!fileName) throw new Error("OPFS path must include a file name");
+      const dir = await getOrCreateOpfsDirectory(root, parts);
+      const handle = await dir.getFileHandle(fileName, { create: true });
+      // A writable stream writes to a swap file; `close` replaces the file in
+      // one step and `abort` drops the swap file.
+      const writable = await handle.createWritable();
+      let sizeBytes = 0;
+      let open = true;
+      return {
+        async write(text) {
+          const bytes = textEncoder.encode(text);
+          await writable.write(bytes);
+          sizeBytes += bytes.byteLength;
+        },
+        async commit() {
+          open = false;
+          await writable.close();
+          return sizeBytes;
+        },
+        async abort() {
+          if (!open) return;
+          open = false;
+          await writable.abort();
+          // `create: true` left an empty, unindexed file at the path.
+          await dir.removeEntry(fileName).catch(() => undefined);
+        },
+      };
     },
     async deleteEnvelope(path) {
       const parts = path.split("/").filter(Boolean);
@@ -597,6 +647,37 @@ export async function createPersistentPsLiteStorage(
         sizeBytes,
       };
     },
+
+    ...(fileStore.openEnvelopeWriter
+      ? {
+          async openVersionWriter(
+            scope: string,
+            collectedAt: string,
+          ): Promise<DataVersionWriter> {
+            const path = envelopePath(scope, collectedAt);
+            const file = await fileStore.openEnvelopeWriter!(path);
+            return {
+              write: (text) => file.write(text),
+              abort: () => file.abort(),
+              async commit(entry): Promise<WriteResult> {
+                const sizeBytes = await file.commit();
+                if (fileStore.kind !== "indexeddb") {
+                  await fallbackStore.deleteEnvelope(path);
+                }
+                // The index entry is what makes the version visible.
+                await storagePort.insertEntry({
+                  ...entry,
+                  scope,
+                  collectedAt,
+                  path,
+                  sizeBytes,
+                });
+                return { path, relativePath: path, sizeBytes };
+              },
+            };
+          },
+        }
+      : {}),
 
     async readScopeBlocks(scope, collectedAt, options) {
       const manifestPath = blockManifestPath(scope, collectedAt);

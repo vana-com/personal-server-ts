@@ -137,6 +137,18 @@ export interface VersionFence {
   path: string;
 }
 
+/** One version being written by `DataStoragePort.openVersionWriter`. */
+export interface DataVersionWriter {
+  /** Append serialized envelope text. Calls must not overlap. */
+  write(text: string): Promise<void>;
+  /** Finish the file, then index it as the scope's newest version. */
+  commit(
+    entry: Omit<NewIndexEntry, "path" | "sizeBytes" | "scope" | "collectedAt">,
+  ): Promise<WriteResult>;
+  /** Discard everything written. Idempotent; a no-op after `commit`. */
+  abort(): Promise<void>;
+}
+
 export interface DataStoragePort extends RuntimeStoragePort {
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
@@ -208,6 +220,18 @@ export interface DataStoragePort extends RuntimeStoragePort {
     collectedAt: string,
   ): boolean | Promise<boolean>;
   writeEnvelope(envelope: DataFileEnvelope): Promise<WriteResult>;
+  /**
+   * Write one version's envelope as a stream of serialized JSON text, so a
+   * large version never has to exist in memory as one value. Nothing written
+   * is visible until `commit`: until then the version has no index row and
+   * readers keep seeing the previous one. `commit` finishes the file and
+   * indexes it; `abort` (or a crash before `commit`) leaves no version.
+   * Optional: a storage that cannot stream does not offer it.
+   */
+  openVersionWriter?(
+    scope: string,
+    collectedAt: string,
+  ): Promise<DataVersionWriter>;
   /** Atomic local legacy write, including a version compare when requested. */
   commitEnvelope?(
     envelope: DataFileEnvelope,

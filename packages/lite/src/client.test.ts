@@ -5,12 +5,16 @@ import {
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   createMemoryPsLiteAccessLogStore,
+  createMemoryPsLitePersistence,
+  createMemoryPsLiteStagedFileStore,
   createMemoryPsLiteStateStore,
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
+import { createPersistentPsLiteStorage } from "./storage.js";
 import { createPsLiteRuntime, createWeb3SignedPsLiteAuth } from "./runtime.js";
 import { startPersonalServer } from "./client.js";
 
@@ -46,11 +50,14 @@ function createGateway(overrides: Partial<GatewayClient> = {}): GatewayClient {
   };
 }
 
-function createRuntime(gateway: GatewayClient) {
+function createRuntime(
+  gateway: GatewayClient,
+  storage: DataStoragePort = createMemoryPsLiteStorage(),
+) {
   const accessLogs = createMemoryPsLiteAccessLogStore();
   return createPsLiteRuntime({
     active: true,
-    storage: createMemoryPsLiteStorage(),
+    storage,
     accessLogReader: accessLogs,
     accessLogWriter: accessLogs,
     tokenStore: createMemoryPsLiteTokenStore(),
@@ -199,6 +206,45 @@ describe("startPersonalServer lite handle", () => {
       scope: "instagram.profile",
       status: "stored",
     });
+  });
+
+  it("streams a scope version in batches with owner Web3Signed auth", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway, storage),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+
+    const upload = await ps.openScopeUpload!("notes.entries", {
+      ...auth,
+      data: { source: "test" },
+    });
+    // Over the 1 MiB signed-body limit in one call: the client splits it.
+    const items = Array.from({ length: 6 }, (_, i) => ({
+      id: i,
+      text: "y".repeat(300_000),
+    }));
+    await upload.append(items.slice(0, 1));
+    await upload.append(items.slice(1));
+    await expect(upload.commit({ total: 6 })).resolves.toMatchObject({
+      scope: "notes.entries",
+      records: 6,
+    });
+
+    await expect(ps.readData("notes.entries", { auth })).resolves.toMatchObject(
+      {
+        collectedAt: upload.collectedAt,
+        data: { source: "test", records: items, total: 6 },
+      },
+    );
   });
 
   it("exposes typed data and sync helpers through the public handle", async () => {

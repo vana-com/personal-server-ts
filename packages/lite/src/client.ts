@@ -8,6 +8,7 @@ import {
   dataVersionsPath,
   grantRevokePath,
   parsePersonalServerJsonResponse,
+  PersonalServerClientError,
   requestPath,
   submitPersonalServerRegistration,
   type PersonalServerAuthRequestOptions,
@@ -22,6 +23,7 @@ import {
   type PersonalServerListGrantsResult,
   type PersonalServerListVersionsOptions,
   type PersonalServerListVersionsResult,
+  type PersonalServerOpenScopeUploadOptions,
   type PersonalServerOwnerAuth,
   type PersonalServerPostDataOptions,
   type PersonalServerPrepareRegistrationOptions,
@@ -29,6 +31,8 @@ import {
   type PersonalServerReadyOptions,
   type PersonalServerRevokeGrantResult,
   type PersonalServerRegistrationRequest,
+  type PersonalServerScopeUpload,
+  type PersonalServerScopeUploadResult,
   type PersonalServerStatus,
   type PersonalServerSubmitRegistrationOptions,
   type PersonalServerSyncTriggerResult,
@@ -64,6 +68,8 @@ import {
 
 const DEFAULT_LITE_ORIGIN = "https://ps-lite.local";
 
+/** Target body size of one scope-upload batch. */
+const SCOPE_UPLOAD_BATCH_BYTES = 1024 * 1024;
 export interface StartPersonalServerLiteRelayOptions extends Omit<
   PsLiteRelayClientOptions,
   "runtime" | "onStatus" | "sessionId"
@@ -284,6 +290,101 @@ export async function startPersonalServer(
       await callFetch(request),
       "data write",
     );
+  }
+
+  async function openScopeUpload(
+    scope: string,
+    uploadOptions: PersonalServerOpenScopeUploadOptions,
+  ): Promise<PersonalServerScopeUpload> {
+    const origin = requiredApiOrigin(await info());
+    const base = `/v1/data/${encodeURIComponent(scope)}/uploads`;
+    const send = async (
+      method: string,
+      path: string,
+      body: unknown,
+      what: string,
+    ) => {
+      const request = await createOwnerRequest({
+        origin,
+        path,
+        method,
+        body,
+        authOptions: uploadOptions,
+        headers: {
+          "Content-Type": "application/json",
+          ...uploadOptions.headers,
+        },
+      });
+      return parsePersonalServerJsonResponse(await callFetch(request), what);
+    };
+    const begun = (await send(
+      "POST",
+      base,
+      { data: uploadOptions.data, arrayKey: uploadOptions.arrayKey },
+      "scope upload begin",
+    )) as { uploadId: string; collectedAt: string; maxBatchBytes: number };
+    const path = `${base}/${encodeURIComponent(begun.uploadId)}`;
+    // Batches stay at the size Web3Signed owner auth accepts as a body; only
+    // a single larger record goes up alone, up to the server's limit.
+    const batchBytes = Math.min(begun.maxBatchBytes, SCOPE_UPLOAD_BATCH_BYTES);
+    let seq = 0;
+
+    async function appendBatch(items: unknown[]): Promise<void> {
+      const body = { items };
+      if (
+        items.length > 1 &&
+        new TextEncoder().encode(JSON.stringify(body)).byteLength > batchBytes
+      ) {
+        const half = Math.ceil(items.length / 2);
+        await appendBatch(items.slice(0, half));
+        await appendBatch(items.slice(half));
+        return;
+      }
+      const batchPath = `${path}/batches/${seq}`;
+      try {
+        await send("PUT", batchPath, body, "scope upload batch");
+      } catch (err) {
+        // A transport failure may hide a stored batch: resend it under the
+        // same number, which the server answers as a replay if it was.
+        if (err instanceof PersonalServerClientError) throw err;
+        await send("PUT", batchPath, body, "scope upload batch");
+      }
+      seq += 1;
+    }
+
+    return {
+      uploadId: begun.uploadId,
+      collectedAt: begun.collectedAt,
+      maxBatchBytes: begun.maxBatchBytes,
+      async append(items) {
+        if (items.length > 0) await appendBatch(items);
+      },
+      async commit(data) {
+        return (await send(
+          "POST",
+          `${path}/commit`,
+          { data },
+          "scope upload commit",
+        )) as PersonalServerScopeUploadResult;
+      },
+      async abort() {
+        const request = await createOwnerRequest({
+          origin,
+          path,
+          method: "DELETE",
+          authOptions: uploadOptions,
+          headers: uploadOptions.headers,
+        });
+        const response = await callFetch(request);
+        if (
+          !response.ok &&
+          response.status !== 404 &&
+          response.status !== 410
+        ) {
+          await parsePersonalServerJsonResponse(response, "scope upload abort");
+        }
+      },
+    };
   }
 
   async function listData(
@@ -513,6 +614,7 @@ export async function startPersonalServer(
     submitRegistration,
     fetch: callFetch,
     postData,
+    openScopeUpload,
     listData,
     listAccessLogs,
     listVersions,
