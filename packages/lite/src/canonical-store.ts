@@ -291,9 +291,15 @@ export function createLiteCanonicalStore(deps: {
     dirty.add(op.connectionId);
     return { collision: variants.length > 1, opKey };
   }
+  /**
+   * Whether an upsert's blob is claimed and its bytes are readable. Canonical
+   * state needs confirmed bytes; the owner preview also accepts bytes that only
+   * a pending batch carries.
+   */
   async function blobReady(
     tx: LiteCanonicalTransaction,
     op: Extract<RecordOperation, { kind: "upsert" }>,
+    pendingBytes = false,
   ) {
     const ref = op.data.blob_ref as Record<string, unknown> | undefined;
     if (op.blobs.length !== (ref ? 1 : 0)) return false;
@@ -325,6 +331,11 @@ export function createLiteCanonicalStore(deps: {
       if (!claimed) return false;
       const existing = await tx.blob(blob.blobId);
       if (!existing) return false;
+      if (
+        !pendingBytes &&
+        !(await get(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`))
+      )
+        return false;
       if (canonicalJson(existing) !== canonicalJson(blob))
         throw new Error("replica blob metadata conflict");
     }
@@ -442,7 +453,8 @@ export function createLiteCanonicalStore(deps: {
       const record = reducer.record;
       const winner = mapped ? record?.winner : undefined;
       const materialized =
-        winner?.kind === "upsert" && (await blobReady(tx, winner))
+        winner?.kind === "upsert" &&
+        (await blobReady(tx, winner, canonical !== undefined))
           ? winner
           : winner?.kind === "delete"
             ? winner
@@ -455,7 +467,7 @@ export function createLiteCanonicalStore(deps: {
         !prior &&
         !materialized &&
         source?.kind === "upsert" &&
-        (await blobReady(tx, source))
+        (await blobReady(tx, source, canonical !== undefined))
       )
         prior = {
           instance: id,
@@ -520,6 +532,17 @@ export function createLiteCanonicalStore(deps: {
         data === null
           ? { ...base, deleted: true, deletedAt }
           : { ...base, deleted: false, data };
+      // A confirmed winner that shows the canonical content needs no preview
+      // row; a pending winner always gets one, so the owner sees its marker.
+      if (
+        canonical &&
+        winner &&
+        (await canonical.get(operationPath(winner))) !== undefined &&
+        sameContent(canonicalJson(row), await canonical.get(path))
+      ) {
+        await tx.delete(path);
+        continue;
+      }
       await put(tx, path, row);
       await put(tx, `row-generation/${path}`, generation);
     }
@@ -600,13 +623,11 @@ export function createLiteCanonicalStore(deps: {
         // Retry imports can supply formerly absent bytes/declarations. Retaining
         // exact operations again is idempotent; canonical writes compare content.
       }
+      const newlyConfirmed: string[] = [];
       for (const blob of input.blobs ?? []) {
         await tx.attachBlob(blob.stagingId, blob.descriptor);
-        await put(
-          tx,
-          `confirmed-blobs/${keyDigest(blob.descriptor.blobId)}`,
-          true,
-        );
+        if (await confirmBlob(tx, blob.descriptor.blobId))
+          newlyConfirmed.push(blob.descriptor.blobId);
       }
       const dirty = new Set<string>();
       const changed = new Map<
@@ -614,6 +635,18 @@ export function createLiteCanonicalStore(deps: {
         Map<string, { stream: string; key: string }>
       >();
       const full = new Set<string>();
+      if (input.promotion)
+        for (const blob of (await get<PendingBatch>(
+          tx,
+          pendingKey(input.promotion.id),
+        ))!.blobs)
+          if (await confirmBlob(tx, blob.blobId))
+            newlyConfirmed.push(blob.blobId);
+      for (const blobId of newlyConfirmed)
+        for (const id of await claimants(tx, blobId)) {
+          dirty.add(id);
+          full.add(id);
+        }
       const accepted: ReplicaOperation[] = [];
       for (const raw of local ? input.operations! : envelope!.operations) {
         let op: ReplicaOperation;
@@ -708,8 +741,13 @@ export function createLiteCanonicalStore(deps: {
             : op.kind === "upsert"
               ? op.blobs
               : [];
+        // Bytes that only a pending batch carries stay pending: a confirmed
+        // claim must not adopt them.
         for (const blob of confirmedBlobs)
-          if (await tx.blob(blob.blobId))
+          if (
+            (await tx.blob(blob.blobId)) &&
+            !(await get(tx, `pending-blobs/${keyDigest(blob.blobId)}`))
+          )
             await put(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`, true);
         current.counter = Math.max(current.counter, op.revision.counter);
         const { collision, opKey } = await retain(tx, op, dirty);
@@ -815,8 +853,6 @@ export function createLiteCanonicalStore(deps: {
         const path = pendingKey(input.promotion.id);
         const batch = (await get<PendingBatch>(tx, path))!;
         await put(tx, path, { ...batch, state: "confirmed" });
-        for (const blob of batch.blobs)
-          await put(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`, true);
         await indexPending(tx, batch, false, context);
       }
       const previewDirty = new Set(dirty);
@@ -903,6 +939,23 @@ export function createLiteCanonicalStore(deps: {
   }
   // Only writers use this view. Retained canonical and active pending partitions
   // feed the same reducer; derived rows are durable but never enter canonical data.
+  /**
+   * A preview row equals its canonical row when it shows the same content. Its
+   * version and emitted time may differ, for example after a pending reset
+   * re-adds a row. The owner sees such a row without a pending marker, as on
+   * Node.
+   */
+  function sameContent(preview: string, canonical: string | undefined) {
+    if (preview === canonical) return true;
+    if (canonical === undefined) return false;
+    const a = JSON.parse(preview) as PdppRecordRow;
+    const b = JSON.parse(canonical) as PdppRecordRow;
+    return (
+      !a.deleted &&
+      !b.deleted &&
+      canonicalJson(a.data) === canonicalJson(b.data)
+    );
+  }
   function pendingMaterializer(
     tx: LiteCanonicalTransaction,
   ): LiteCanonicalTransaction {
@@ -935,13 +988,8 @@ export function createLiteCanonicalStore(deps: {
       put: async (key, value) => {
         if (!key.startsWith("rows/")) return;
         const before = await tx.get(`preview/${key}`);
-        if (value === (await tx.get(key))) {
-          await tx.delete(`preview/${key}`);
-          await indexPreviewBlobRef(tx, key, before, undefined);
-        } else {
-          await tx.put(`preview/${key}`, value);
-          await indexPreviewBlobRef(tx, key, before, value);
-        }
+        await tx.put(`preview/${key}`, value);
+        await indexPreviewBlobRef(tx, key, before, value);
       },
       delete: async (key) => {
         const before = await tx.get(`preview/${key}`);
@@ -1211,6 +1259,26 @@ export function createLiteCanonicalStore(deps: {
       claimed = true;
     }
     return claimed;
+  }
+  /** Mark a blob's bytes confirmed. True when they were not confirmed before. */
+  async function confirmBlob(tx: LiteCanonicalTransaction, blobId: string) {
+    const path = `confirmed-blobs/${keyDigest(blobId)}`;
+    if (await get(tx, path)) return false;
+    await put(tx, path, true);
+    return true;
+  }
+  /**
+   * Connections with a retained claim on the blob. A row on any of them can
+   * turn visible when the blob's bytes become confirmed.
+   */
+  async function claimants(tx: LiteCanonicalTransaction, blobId: string) {
+    const ids: string[] = [];
+    for await (const entry of scan(tx, "retained-connections/")) {
+      const id = JSON.parse(entry.value) as string;
+      if (await any(tx, `${connectionPrefix(id)}claims/${keyDigest(blobId)}/`))
+        ids.push(id);
+    }
+    return ids;
   }
   async function visibleRow(
     tx: LiteCanonicalTransaction,
@@ -1643,15 +1711,23 @@ export function createLiteCanonicalStore(deps: {
       });
       const visible = await persistence.transaction(async (base) => {
         const tx = trackViews(base);
+        const previewReader = replicaStateVisible(
+          "pending",
+          options.reader,
+          deps.visibilityPolicy,
+        );
         if (
           !(await get(tx, `pending-blobs/${keyDigest(blobId)}`)) ||
           (await get(tx, `confirmed-blobs/${keyDigest(blobId)}`))
-        )
-          return !(await claimedOnlyByQuarantined(tx, blobId));
-        if (
-          !replicaStateVisible("pending", options.reader, deps.visibilityPolicy)
-        )
-          return false;
+        ) {
+          if (!(await claimedOnlyByQuarantined(tx, blobId))) return true;
+          // Every confirmed claimant is quarantined. A live preview row on
+          // another connection still references the confirmed bytes, as on Node.
+          if (!previewReader) return false;
+          await readView(tx, options);
+          return any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`);
+        }
+        if (!previewReader) return false;
         // Pending bytes need a live reference this reader sees, as on Node,
         // and an active batch that carries them. The two are independent: one
         // batch can stage the record and another the bytes, and a later

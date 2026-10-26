@@ -34,6 +34,7 @@ import {
   emptyRefState,
   parseRowId,
   refConnectionStatus,
+  refKeyQuarantined,
   refLive,
   refLocalWritable,
   refPendingRows,
@@ -279,6 +280,7 @@ export async function runCommands(
       });
     }
     let hasLocal = false;
+    const hiddenByWrite = new Set<string>();
     let before = await Promise.all(
       runs.map((run) => run.driver.snapshot(UNIVERSE)),
     );
@@ -339,6 +341,23 @@ export async function runCommands(
           );
         }
       }
+      // A local write that completes a conflict is applied, then hidden. Node
+      // writes the row before it hides it; Lite hides it in the same commit.
+      // The tombstone's version and times therefore differ by port, so the
+      // cross-port comparison skips that row from then on.
+      if (command?.k === "local") {
+        const written = JSON.stringify([
+          command.connection,
+          BINDINGS[command.binding].stream,
+          command.key,
+        ]);
+        if (runs[0].canon.rows.get(written)?.deleted)
+          hiddenByWrite.add(written);
+      }
+      const comparable = (stored: PortSnapshot["stored"]) =>
+        Object.fromEntries(
+          Object.entries(stored).filter(([id]) => !hiddenByWrite.has(id)),
+        );
       // Ports agree on row versions and times whenever their references agree.
       const snapshots = after;
       before = after;
@@ -355,8 +374,8 @@ export async function runCommands(
               port: `${runs[0].driver.name}~${runs[i].driver.name}`,
             },
             "stored versions and times agree across ports",
-            normalize(snapshots[0].stored),
-            normalize(snapshots[i].stored),
+            normalize(comparable(snapshots[0].stored)),
+            normalize(comparable(snapshots[i].stored)),
           );
       if (!failures.length && options.freshReplay && !hasLocal && prefix > 0)
         failures.push(
@@ -372,7 +391,9 @@ export async function runCommands(
 
 /**
  * Connections a command may change. An import also reaches every connection
- * whose retained operation shares a revision id with it (equivocation).
+ * whose retained operation shares a revision id with it (equivocation), and
+ * every connection that claims a blob whose bytes the import delivers: those
+ * bytes can make a row on that connection readable.
  */
 function touchedConnections(
   command: Command | null,
@@ -381,10 +402,18 @@ function touchedConnections(
   if (!command) return undefined;
   if (command.k === "import") {
     const ids = new Set(command.ops.map(revisionId));
+    const delivered = new Set(
+      command.blobs.map((name) => blobOf(name).descriptor.blobId),
+    );
     return new Set([
       ...command.ops.map((op) => op.connectionId),
       ...[...shared.confirmed.values()]
         .filter((op) => ids.has(revisionId(op)))
+        .map((op) => op.connectionId),
+      ...[...shared.confirmed.values(), ...command.ops]
+        .filter(
+          (op) => op.kind === "blob-claim" && delivered.has(op.blob.blobId),
+        )
         .map((op) => op.connectionId),
     ]);
   }
@@ -529,7 +558,20 @@ async function apply(
           blobs: [],
           revision: { counter: 1, writerId: "probe", operationId: "probe" },
         };
-        const admissible = refLocalWritable(world, evidence, op);
+        // Platform difference: Node refuses an ordinary collector write to a
+        // key the retained evidence has quarantined (receiver.md, durable
+        // corruption-quarantine fences; test 64a). Lite journals the write
+        // and keeps the key hidden.
+        const admissible =
+          refLocalWritable(world, evidence, op) &&
+          (!run.driver.name.startsWith("node") ||
+            !refKeyQuarantined(
+              world,
+              evidence,
+              command.connection,
+              binding.stream,
+              command.key,
+            ));
         const before = await run.driver.snapshot(UNIVERSE);
         const error = await attempt(() =>
           run.driver.local({

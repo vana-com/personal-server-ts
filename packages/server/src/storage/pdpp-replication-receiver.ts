@@ -762,6 +762,36 @@ export function createReplicaReceiver(deps: {
     integrityEpoch: store.replicaIntegrityEpoch,
   });
   store.setReplicaVisibilityObserver(view.flush);
+  // A local write journals under the retained declaration. When retained
+  // evidence for its key already names another declaration, or the stream is
+  // append-only and the content differs, the write completes a conflict. The
+  // merge must quarantine the key now, not at the next import. This is only a
+  // trigger: `reconcile` alone decides, so the check may over-approximate.
+  store.setReplicaLocalWriteObserver((instance, stream, recordKey) => {
+    const retainedForKey = (
+      db
+        .prepare(
+          "SELECT operation_json FROM pdpp_replica_view_operations WHERE instance=? AND stream=? AND record_key=? AND confirmed=1 AND kind IN ('upsert','delete')",
+        )
+        .all(instance, stream, recordKey) as { operation_json: string }[]
+    ).map((row) => JSON.parse(row.operation_json) as RecordOperation);
+    const declarations = new Set(
+      retainedForKey.map((op) => canonicalJson(op.declaration)),
+    );
+    const contents = new Set(
+      retainedForKey.map((op) =>
+        canonicalJson(
+          op.kind === "upsert" ? { data: op.data, blobs: op.blobs } : null,
+        ),
+      ),
+    );
+    if (
+      declarations.size > 1 ||
+      (contents.size > 1 &&
+        retainedForKey.some((op) => op.declaration.semantics === "append_only"))
+    )
+      reconcile();
+  });
   function includesPending(reader: ReplicaReader = "grant") {
     return (
       pendingEnabled &&
