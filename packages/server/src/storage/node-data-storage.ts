@@ -228,6 +228,23 @@ export function createNodeDataStorage(
     writeEnvelope(envelope: DataFileEnvelope) {
       return writeDataFile(deps.hierarchyOptions, envelope);
     },
+    // The file is durable at its final path before its row exists, and the
+    // scope lock keeps every erase of the scope (all of which take it) from
+    // running between the two.
+    writeEnvelopeAndIndex(envelope, entry) {
+      return withScopeLock(envelope.scope, async () => {
+        const written = await writeDataFile(deps.hierarchyOptions, envelope);
+        try {
+          return deps.indexManager.insert({
+            ...entry,
+            path: written.relativePath,
+            sizeBytes: entry.sizeBytes ?? written.sizeBytes,
+          });
+        } catch (err) {
+          throw new IngestPersistedError(written.relativePath, err);
+        }
+      });
+    },
     async commitEnvelope(envelope, entry, precondition) {
       const staged = await stageDataFile(deps.hierarchyOptions, envelope);
       let indexed = false;

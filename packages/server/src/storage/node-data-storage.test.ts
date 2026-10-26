@@ -475,3 +475,76 @@ describe("createNodeDataStorage block sidecars", () => {
     expect(page.nextCursor).toBeDefined();
   });
 });
+
+describe("createNodeDataStorage.writeEnvelopeAndIndex", () => {
+  const scope = "github.events";
+  let root: string;
+  let storage: DataStoragePort;
+  let index: ReturnType<typeof createIndexManager>;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "write-envelope-and-index-"));
+    index = createIndexManager(initializeDatabase(join(root, "index.db")));
+    storage = createNodeDataStorage({
+      indexManager: index,
+      hierarchyOptions: { dataDir: join(root, "data") },
+    });
+  });
+
+  afterEach(async () => {
+    index.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("writes the file and its row together and returns the row", async () => {
+    const envelope = createDataFileEnvelope(scope, "2026-10-11T00:00:00.000Z", {
+      value: "a",
+    });
+
+    const row = await storage.writeEnvelopeAndIndex!(envelope, {
+      fileId: null,
+      scope,
+      collectedAt: envelope.collectedAt,
+      dataPointId: "dp-1",
+      version: 3,
+    });
+
+    expect(row).toMatchObject({ scope, dataPointId: "dp-1", version: 3 });
+    expect(index.findByPath(row.path)).toEqual(row);
+    expect(
+      await readFile(
+        buildDataFilePath(join(root, "data"), scope, envelope.collectedAt),
+        "utf-8",
+      ),
+    ).toContain('"value"');
+    expect(
+      (await storage.readEnvelope(scope, envelope.collectedAt)).data,
+    ).toEqual({ value: "a" });
+  });
+
+  it("never leaves a row without its file when a scope erase runs beside it", async () => {
+    const envelope = createDataFileEnvelope(scope, "2026-10-11T00:00:00.000Z", {
+      value: "a",
+    });
+    const entry = {
+      fileId: null,
+      scope,
+      collectedAt: envelope.collectedAt,
+    };
+
+    await Promise.all([
+      storage.writeEnvelopeAndIndex!(envelope, entry),
+      storage.deleteScope(scope),
+    ]);
+
+    const rows = index.findByScope({ scope });
+    const file = await readFile(
+      buildDataFilePath(join(root, "data"), scope, envelope.collectedAt),
+      "utf-8",
+    ).then(
+      () => true,
+      () => false,
+    );
+    expect(rows.length > 0).toBe(file);
+  });
+});
