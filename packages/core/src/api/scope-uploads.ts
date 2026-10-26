@@ -18,10 +18,14 @@
  * `commit`, so until then (and after an abort, an idle timeout or a crash)
  * readers and sync see the previous version and no partial one.
  *
- * Batches are numbered from 0 and must arrive in order. Sending a batch
+ * Batches are numbered from 0 and must arrive in order. Only the latest batch
+ * can be replayed: the server keeps the digest of that one batch, not of every
+ * batch, so memory does not grow with the batch count. Sending the latest
  * number again with the same body is answered as a replay and stores nothing,
- * so a caller that lost a response can retry it; a different body under a
- * used number is refused.
+ * so a caller that lost a response can retry it. A different body under that
+ * number is refused (BATCH_CONFLICT), and any older number is refused
+ * (BATCH_OUT_OF_ORDER). The SDK only ever resends the batch it just sent, so
+ * that is enough.
  *
  * One upload is open per registry at a time, because the storage writer may
  * hold the only file-write slot (PS-Lite's native host has one). A new begin
@@ -118,7 +122,10 @@ interface OpenUpload {
   release(): void;
   arrayKey: string;
   headKeys: Set<string>;
-  digests: string[];
+  /** Batches accepted so far; the next batch number. */
+  batches: number;
+  /** Digest of the latest batch only. Older digests are not kept. */
+  latestDigest: string | null;
   items: number;
   timer: ReturnType<typeof setTimeout> | undefined;
 }
@@ -269,7 +276,8 @@ export function createScopeUploadRegistry(
             release: input.release,
             arrayKey,
             headKeys: new Set(Object.keys(head)),
-            digests: [],
+            batches: 0,
+            latestDigest: null,
             items: 0,
             timer: undefined,
           };
@@ -313,8 +321,9 @@ export function createScopeUploadRegistry(
           );
         }
         const digest = await sha256Hex(textEncoder.encode(input.text));
-        if (input.seq < upload.digests.length) {
-          if (upload.digests[input.seq] !== digest) {
+        const latest = upload.batches - 1;
+        if (input.seq === latest && upload.latestDigest !== null) {
+          if (upload.latestDigest !== digest) {
             throw new ScopeUploadError(
               409,
               "BATCH_CONFLICT",
@@ -323,11 +332,18 @@ export function createScopeUploadRegistry(
           }
           return { seq: input.seq, items: 0, replay: true };
         }
-        if (input.seq !== upload.digests.length) {
+        if (input.seq < latest) {
           throw new ScopeUploadError(
             409,
             "BATCH_OUT_OF_ORDER",
-            `Expected batch ${upload.digests.length}, got ${input.seq}`,
+            `Batch ${input.seq} is older than batch ${latest}, the only one that can be replayed`,
+          );
+        }
+        if (input.seq !== upload.batches) {
+          throw new ScopeUploadError(
+            409,
+            "BATCH_OUT_OF_ORDER",
+            `Expected batch ${upload.batches}, got ${input.seq}`,
           );
         }
         let parsed: unknown;
@@ -352,7 +368,8 @@ export function createScopeUploadRegistry(
           (upload.items > 0 ? "," : "") +
           items.map((item) => JSON.stringify(item)).join(",");
         await upload.writer.write(text);
-        upload.digests.push(digest);
+        upload.batches += 1;
+        upload.latestDigest = digest;
         upload.items += items.length;
         return { seq: input.seq, items: items.length, replay: false };
       });

@@ -270,6 +270,33 @@ describe("streamed scope uploads", () => {
     });
   });
 
+  it("replays only the latest batch, and refuses an older one", async () => {
+    const runtime = await createRuntime(createMemoryPsLiteStagedFileStore());
+    const id = await begin(runtime, {});
+    const put = (seq: number, items: unknown[]) =>
+      call(runtime, "PUT", `/uploads/${id}/batches/${seq}`, { items });
+    await put(0, [{ id: "a" }]);
+    await put(1, [{ id: "b" }]);
+    await put(2, [{ id: "c" }]);
+
+    const latest = await put(2, [{ id: "c" }]);
+    expect(latest.status).toBe(200);
+    expect(await latest.json()).toEqual({ seq: 2, items: 0, replay: true });
+
+    // Only the latest batch's body is remembered, so an older number is refused
+    // even when its body matches what was stored.
+    const older = await put(0, [{ id: "a" }]);
+    expect(older.status).toBe(409);
+    expect(await older.json()).toMatchObject({
+      error: { errorCode: "BATCH_OUT_OF_ORDER" },
+    });
+
+    await call(runtime, "POST", `/uploads/${id}/commit`);
+    expect((await readLatest(runtime)).data).toEqual({
+      records: [{ id: "a" }, { id: "b" }, { id: "c" }],
+    });
+  });
+
   it("refuses to commit under a version written during the upload", async () => {
     const runtime = await createRuntime(createMemoryPsLiteStagedFileStore());
     const id = await begin(runtime, {});
@@ -587,5 +614,50 @@ describe("streamed scope upload memory", () => {
     // The probe itself: the staged store keeps every piece until commit.
     const growth = await peakGrowth(32, createMemoryPsLiteStagedFileStore());
     expect(growth).toBeGreaterThan(24 * 1024 * 1024);
+  }, 120_000);
+
+  it("keeps retained heap flat across 100k one-record batches", async () => {
+    // The large-batch runs above cannot show a cost per batch: this one sends
+    // many tiny batches, where any per-batch record would dominate.
+    const registry = createScopeUploadRegistry({ idleTimeoutMs: 60_000 });
+    const storage = {
+      openVersionWriter: async () => ({
+        write: async () => {},
+        abort: async () => {},
+        commit: async () => {
+          throw new Error("not committed in this test");
+        },
+      }),
+    } as unknown as DataStoragePort;
+    const { uploadId } = await registry.begin({
+      storage,
+      scope: SCOPE,
+      collectedAt: "2026-10-26T00:00:00.000Z",
+      release() {},
+      body: {},
+    });
+    const text = '{"items":[{"id":1}]}';
+    let seq = 0;
+    const appendBatches = async (count: number) => {
+      for (let i = 0; i < count; i += 1) {
+        await registry.append({ scope: SCOPE, uploadId, seq, text });
+        seq += 1;
+      }
+    };
+
+    await appendBatches(10_000);
+    const early = retainedHeap();
+    await appendBatches(100_000);
+    const late = retainedHeap();
+    await registry.abort({ scope: SCOPE, uploadId });
+
+    const MiB = 1024 * 1024;
+    console.info(
+      `scope upload retained heap growth over 90k more batches: ${((late - early) / MiB).toFixed(2)} MiB`,
+    );
+    // Keeping a digest per batch measured about 1.5 KiB each here (the hex
+    // string is built by concatenation and stays a rope): about 145 MiB for
+    // these 90k batches. Allow GC noise only.
+    expect(late - early).toBeLessThan(4 * MiB);
   }, 120_000);
 });
