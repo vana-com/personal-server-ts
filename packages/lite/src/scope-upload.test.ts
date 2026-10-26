@@ -183,6 +183,56 @@ describe("streamed scope uploads", () => {
     expect(commit.status).toBe(404);
   });
 
+  it("keeps the previous version when the commit cannot be persisted", async () => {
+    const files = new Map<string, string>();
+    const memory = createMemoryPsLitePersistence();
+    let diskFull = false;
+    const persistence: PsLitePersistenceAdapter = {
+      ...memory,
+      async write(state) {
+        if (diskFull) throw new Error("ENOSPC: no space left on device");
+        return memory.write(state);
+      },
+    };
+    const runtime = await createRuntime(
+      createMemoryPsLiteStagedFileStore(files),
+      persistence,
+    );
+    const old = await seedOldVersion(runtime);
+    const id = await begin(runtime);
+    await call(runtime, "PUT", `/uploads/${id}/batches/0`, {
+      items: [{ id: "new" }],
+    });
+
+    diskFull = true;
+    const commit = await call(runtime, "POST", `/uploads/${id}/commit`, {});
+    expect(commit.status).toBeGreaterThanOrEqual(500);
+    // The failed commit ends the upload and publishes nothing.
+    expect(await readLatest(runtime)).toEqual(old);
+    const retry = await call(runtime, "POST", `/uploads/${id}/commit`, {});
+    expect(retry.status).toBe(410);
+    // The blob the failed commit wrote is unpublished, so it is removed.
+    expect(files.size).toBe(1);
+
+    // A later write that succeeds persists its own state, not the failed one.
+    diskFull = false;
+    const other = await runtime.fetch(
+      new Request("https://ps.local/v1/data/notes.other", {
+        method: "POST",
+        headers: JSON_OWNER,
+        body: JSON.stringify({ records: [{ id: "unrelated" }] }),
+      }),
+    );
+    expect(other.status).toBe(201);
+    expect(await readLatest(runtime)).toEqual(old);
+
+    const restarted = await createRuntime(
+      createMemoryPsLiteStagedFileStore(files),
+      persistence,
+    );
+    expect(await readLatest(restarted)).toEqual(old);
+  });
+
   it("answers a repeated batch as a replay and stores it once", async () => {
     const runtime = await createRuntime(createMemoryPsLiteStagedFileStore());
     const id = await begin(runtime, {});

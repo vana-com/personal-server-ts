@@ -566,11 +566,23 @@ export async function createPersistentPsLiteStorage(
     opfsAvailable: await isOpfsAvailable(),
   };
 
+  // Every write of the persisted state runs in this queue, one at a time, in
+  // call order. A snapshot is taken when its turn comes, so each write carries
+  // the latest index, and index changes never interleave.
   let persistQueue: Promise<void> = Promise.resolve();
 
-  async function persist(): Promise<void> {
-    const snapshot = {
-      ...state,
+  function enqueue<T>(step: () => Promise<T>): Promise<T> {
+    const run = persistQueue.then(step);
+    persistQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  function snapshotOf(source: PsLitePersistedStorageState) {
+    return {
+      ...source,
       readyBlockManifests: Array.from(readyBlockManifests),
       envelopes:
         fileStore.kind === "indexeddb"
@@ -587,9 +599,67 @@ export async function createPersistentPsLiteStorage(
           ? Array.from(pendingLedgerDeletes)
           : undefined,
     };
-    const write = persistQueue.then(() => persistence.write(snapshot));
-    persistQueue = write.catch(() => undefined);
-    await write;
+  }
+
+  async function persist(): Promise<void> {
+    await enqueue(() => persistence.write(snapshotOf(state)));
+  }
+
+  /**
+   * Make `next` the live index, once it is durable. Call only inside
+   * `enqueue`. A failed write leaves the live index as it was, so a reader
+   * never sees a change that could be lost on restart.
+   */
+  async function publish(next: PsLitePersistedStorageState): Promise<void> {
+    await persistence.write(snapshotOf(next));
+    state = next;
+  }
+
+  /**
+   * Replace the live index with `change(index)`. `change` returns null to
+   * leave the index alone. Resolves to whether the index was written.
+   */
+  function updateIndex(
+    change: (
+      current: PsLitePersistedStorageState,
+    ) => PsLitePersistedStorageState | null,
+  ): Promise<boolean> {
+    return enqueue(async () => {
+      const next = change(state);
+      if (!next) return false;
+      await publish(next);
+      return true;
+    });
+  }
+
+  function updateEntryField(
+    path: string,
+    patch: Partial<Pick<IndexEntry, "fileId" | "dataPointId" | "version">>,
+  ): Promise<boolean> {
+    return updateIndex((current) => {
+      if (!current.entries.some((entry) => entry.path === path)) return null;
+      return {
+        ...current,
+        entries: current.entries.map((entry) =>
+          entry.path === path ? { ...entry, ...patch } : entry,
+        ),
+      };
+    });
+  }
+
+  /**
+   * Remove a blob that no index entry names, after its index write failed. A
+   * blob that an entry does name is kept. Best effort: the commit's own error
+   * is what the caller sees.
+   */
+  function dropUnindexedEnvelope(path: string): Promise<void> {
+    return enqueue(async () => {
+      if (state.entries.some((entry) => entry.path === path)) return;
+      await Promise.all([
+        fileStore.deleteEnvelope(path),
+        fallbackStore.deleteEnvelope(path),
+      ]);
+    }).catch(() => undefined);
   }
 
   function entriesForScope(scope: string): IndexEntry[] {
@@ -661,17 +731,22 @@ export async function createPersistentPsLiteStorage(
               abort: () => file.abort(),
               async commit(entry): Promise<WriteResult> {
                 const sizeBytes = await file.commit();
+                try {
+                  // The index entry is what makes the version visible.
+                  await storagePort.insertEntry({
+                    ...entry,
+                    scope,
+                    collectedAt,
+                    path,
+                    sizeBytes,
+                  });
+                } catch (error) {
+                  await dropUnindexedEnvelope(path);
+                  throw error;
+                }
                 if (fileStore.kind !== "indexeddb") {
                   await fallbackStore.deleteEnvelope(path);
                 }
-                // The index entry is what makes the version visible.
-                await storagePort.insertEntry({
-                  ...entry,
-                  scope,
-                  collectedAt,
-                  path,
-                  sizeBytes,
-                });
                 return { path, relativePath: path, sizeBytes };
               },
             };
@@ -919,48 +994,38 @@ export async function createPersistentPsLiteStorage(
     },
 
     async insertEntry(entry) {
-      const version =
-        entry.version ??
-        state.entries.reduce(
-          (max, e) =>
-            e.scope === entry.scope && e.version > max ? e.version : max,
-          0,
-        ) + 1;
-      const indexed: IndexEntry = {
-        ...entry,
-        schemaId: entry.schemaId ?? null,
-        version,
-        dataPointId: entry.dataPointId ?? null,
-        afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
-        id: state.nextId,
-        createdAt: new Date().toISOString(),
-      };
-      state = {
-        ...state,
-        nextId: state.nextId + 1,
-        entries: [
-          ...state.entries.filter((item) => item.path !== entry.path),
-          indexed,
-        ],
-      };
-      await persist();
-      return indexed;
+      let indexed: IndexEntry | undefined;
+      await updateIndex((current) => {
+        const version =
+          entry.version ??
+          current.entries.reduce(
+            (max, e) =>
+              e.scope === entry.scope && e.version > max ? e.version : max,
+            0,
+          ) + 1;
+        indexed = {
+          ...entry,
+          schemaId: entry.schemaId ?? null,
+          version,
+          dataPointId: entry.dataPointId ?? null,
+          afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
+          id: current.nextId,
+          createdAt: new Date().toISOString(),
+        };
+        return {
+          ...current,
+          nextId: current.nextId + 1,
+          entries: [
+            ...current.entries.filter((item) => item.path !== entry.path),
+            indexed,
+          ],
+        };
+      });
+      return indexed!;
     },
 
-    async updateFileId(path, fileId) {
-      let updated = false;
-      state = {
-        ...state,
-        entries: state.entries.map((entry) => {
-          if (entry.path !== path) return entry;
-          updated = true;
-          return { ...entry, fileId };
-        }),
-      };
-      if (updated) {
-        await persist();
-      }
-      return updated;
+    updateFileId(path, fileId) {
+      return updateEntryField(path, { fileId });
     },
 
     findLatestVersionByScope(scope) {
@@ -970,36 +1035,12 @@ export async function createPersistentPsLiteStorage(
       );
     },
 
-    async updateDataPointId(path, dataPointId) {
-      let updated = false;
-      state = {
-        ...state,
-        entries: state.entries.map((entry) => {
-          if (entry.path !== path) return entry;
-          updated = true;
-          return { ...entry, dataPointId };
-        }),
-      };
-      if (updated) {
-        await persist();
-      }
-      return updated;
+    updateDataPointId(path, dataPointId) {
+      return updateEntryField(path, { dataPointId });
     },
 
-    async updateEntryVersion(path, version) {
-      let updated = false;
-      state = {
-        ...state,
-        entries: state.entries.map((entry) => {
-          if (entry.path !== path) return entry;
-          updated = true;
-          return { ...entry, version };
-        }),
-      };
-      if (updated) {
-        await persist();
-      }
-      return updated;
+    updateEntryVersion(path, version) {
+      return updateEntryField(path, { version });
     },
 
     async readFirstSeenLedger(scope) {
@@ -1033,35 +1074,34 @@ export async function createPersistentPsLiteStorage(
         }
         // Repeat the barrier on retry, even if a failed write cleared the set.
         await persist();
-        let deleted = 0;
-        const deletedPaths: string[] = [];
-        const deletedBlockTrees: string[] = [];
-        state = {
-          ...state,
-          entries: state.entries.filter((entry) => {
-            if (entry.scope !== scope) return true;
-            deleted += 1;
-            deletedPaths.push(envelopePath(entry.scope, entry.collectedAt));
-            deletedBlockTrees.push(
-              blockTreePath(entry.scope, entry.collectedAt),
-            );
-            return false;
-          }),
-        };
-        await Promise.all(
-          [
-            ...deletedPaths.flatMap((path) => [
-              fileStore.deleteEnvelope(path),
-              fallbackStore.deleteEnvelope(path),
-            ]),
-            ...deletedBlockTrees.flatMap((path) => [
-              fileStore.deleteBlockTree?.(path),
-              fallbackStore.deleteBlockTree?.(path),
-            ]),
-          ].filter(
-            (promise): promise is Promise<void> => promise !== undefined,
-          ),
-        );
+        // The scope's rows leave the index only after its blobs are gone, so a
+        // failed delete keeps them durable for the next retry. The queue is
+        // held throughout, so no version written meanwhile can be dropped
+        // without its blob.
+        const deleted = await enqueue(async () => {
+          const doomed = state.entries.filter((entry) => entry.scope === scope);
+          await Promise.all(
+            doomed
+              .flatMap((entry) => {
+                const path = envelopePath(entry.scope, entry.collectedAt);
+                const tree = blockTreePath(entry.scope, entry.collectedAt);
+                return [
+                  fileStore.deleteEnvelope(path),
+                  fallbackStore.deleteEnvelope(path),
+                  fileStore.deleteBlockTree?.(tree),
+                  fallbackStore.deleteBlockTree?.(tree),
+                ];
+              })
+              .filter(
+                (promise): promise is Promise<void> => promise !== undefined,
+              ),
+          );
+          await publish({
+            ...state,
+            entries: state.entries.filter((entry) => entry.scope !== scope),
+          });
+          return doomed.length;
+        });
         await persist();
         return deleted;
       });
@@ -1147,10 +1187,10 @@ export async function createPersistentPsLiteStorage(
         blockTreePath(entry.scope, entry.collectedAt),
       ) ?? Promise.resolve(),
     ]);
-    state = {
-      ...state,
-      entries: state.entries.filter((e) => e !== entry),
-    };
+    await updateIndex((current) => ({
+      ...current,
+      entries: current.entries.filter((e) => e !== entry),
+    }));
     // The sidecar goes with the scope's last version.
     await persist();
     if (!state.entries.some((e) => e.scope === entry.scope)) {
