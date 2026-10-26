@@ -36,12 +36,22 @@ const legacy = {
   pending: null,
 } as const;
 
-/** Legacy rows remain readable; new large values never cross SQLite as one BLOB. */
+/** Read chunk copies when present; fall back to main's whole-value blob row. */
 export function binaryLength(
   db: Database,
   namespace: BinaryNamespace,
   id: string,
 ): number | undefined {
+  const manifest = db
+    .prepare(
+      "SELECT size_bytes AS size FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
+    )
+    .get(namespace, id) as { size: number } | undefined;
+  if (manifest)
+    return Number.isSafeInteger(manifest.size) && manifest.size >= 0
+      ? manifest.size
+      : undefined;
+
   const table = legacy[namespace];
   if (table) {
     const row = db
@@ -49,16 +59,7 @@ export function binaryLength(
       .get(id) as { size: number } | undefined;
     if (row) return row.size;
   }
-  const size = (
-    db
-      .prepare(
-        "SELECT size_bytes AS size FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
-      )
-      .get(namespace, id) as { size: number } | undefined
-  )?.size;
-  return size !== undefined && Number.isSafeInteger(size) && size >= 0
-    ? size
-    : undefined;
+  return undefined;
 }
 
 export function* readBinaryChunks(
@@ -67,7 +68,13 @@ export function* readBinaryChunks(
   id: string,
 ): Generator<Uint8Array> {
   const table = legacy[namespace];
-  if (table) {
+  const hasManifest =
+    db
+      .prepare(
+        "SELECT 1 FROM pdpp_binary_manifests WHERE namespace=? AND blob_id=?",
+      )
+      .get(namespace, id) !== undefined;
+  if (table && !hasManifest) {
     const row = db
       .prepare(`SELECT length(bytes) AS size FROM ${table} WHERE blob_id=?`)
       .get(id) as { size: number } | undefined;
@@ -228,7 +235,7 @@ export function copyBinary(
  */
 export const CANONICAL_INLINE_BYTES = 1024 * 1024;
 
-/** Store canonical bytes: inline up to CANONICAL_INLINE_BYTES, chunked above. */
+/** Store the replica transport copy as chunks above the inline threshold. */
 export function writeCanonicalBinary(
   db: Database,
   id: string,

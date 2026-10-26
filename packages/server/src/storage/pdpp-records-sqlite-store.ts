@@ -2247,6 +2247,8 @@ export function createSqliteRecordStore(
     if (streamSemantics === "append_only") return false;
     let result = false;
     const run = db.transaction(() => {
+      replica?.assertConnectionWritable(instance);
+      replica?.assertKeyWritable(instance, stream, recordKey);
       const existing = getCurrentStmt.get(instance, stream, recordKey) as
         RecordRowDb | undefined;
       if (!existing || existing.deleted) return;
@@ -2491,7 +2493,7 @@ export function createSqliteRecordStore(
     };
   }
 
-  /** Canonical blob bytes: one `pdpp_blob_bytes` row, unless replication stores them. */
+  /** Canonical blob bytes remain in main's `pdpp_blob_bytes` format. */
   const blobBytes: CanonicalBlobBytes = replica?.blobBytes ?? {
     has: (blobId) => getBlobBytesStmt.get(blobId) !== undefined,
     readVerified(meta) {

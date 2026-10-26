@@ -8,6 +8,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import {
   BINARY_CHUNKS_MIGRATION,
+  CANONICAL_INLINE_BYTES,
   binaryLength,
   clearMalformedManifest,
   readBinary,
@@ -217,7 +218,40 @@ export interface ReplicaCanonicalPort {
  */
 export function createReplicaCanonicalPort(db: Database) {
   if (db.readonly) assertReplicaSchema(db);
-  else ensureReplicaSchema(db);
+  else {
+    ensureReplicaSchema(db);
+    // Older replication builds stored large canonical blobs only in the
+    // replica chunk tables. Materialize those bytes in main's canonical table
+    // before a flag-off or main build can be used to read the database.
+    db.transaction(() => {
+      const missing = db
+        .prepare(
+          `SELECT m.blob_id, b.size_bytes, b.sha256
+           FROM pdpp_binary_manifests m
+           JOIN pdpp_blobs b ON b.blob_id = m.blob_id
+           LEFT JOIN pdpp_blob_bytes c ON c.blob_id = m.blob_id
+           WHERE m.namespace = 'canonical' AND c.blob_id IS NULL`,
+        )
+        .all() as { blob_id: string; size_bytes: number; sha256: string }[];
+      const insert = db.prepare(
+        "INSERT OR IGNORE INTO pdpp_blob_bytes (blob_id, bytes) VALUES (?, ?)",
+      );
+      for (const blob of missing) {
+        if (
+          !verifyBinary(
+            db,
+            "canonical",
+            blob.blob_id,
+            `sha256:${blob.sha256}`,
+            blob.size_bytes,
+          )
+        )
+          continue;
+        const bytes = readBinary(db, "canonical", blob.blob_id);
+        if (bytes) insert.run(blob.blob_id, Buffer.from(bytes));
+      }
+    }).immediate();
+  }
   const writerId = (
     db
       .prepare("SELECT writer_id FROM pdpp_installation_writer WHERE id = 1")
@@ -383,22 +417,54 @@ export function createReplicaCanonicalPort(db: Database) {
         throw new CursorExpiredError();
     },
     blobBytes: {
-      has: (blobId) => binaryLength(db, "canonical", blobId) !== undefined,
+      has: (blobId) =>
+        db
+          .prepare("SELECT 1 FROM pdpp_blob_bytes WHERE blob_id = ?")
+          .get(blobId) !== undefined ||
+        binaryLength(db, "canonical", blobId) !== undefined,
       // A forged or incomplete manifest cannot force a whole-value allocation.
-      readVerified: (meta) =>
-        verifyBinary(
-          db,
-          "canonical",
-          meta.blobId,
-          `sha256:${meta.sha256}`,
-          meta.sizeBytes,
-        )
-          ? readBinary(db, "canonical", meta.blobId)
-          : undefined,
+      readVerified: (meta) => {
+        const hasChunkCopy =
+          db
+            .prepare(
+              "SELECT 1 FROM pdpp_binary_manifests WHERE namespace = 'canonical' AND blob_id = ?",
+            )
+            .get(meta.blobId) !== undefined;
+        if (
+          verifyBinary(
+            db,
+            "canonical",
+            meta.blobId,
+            `sha256:${meta.sha256}`,
+            meta.sizeBytes,
+          )
+        ) {
+          const chunked = readBinary(db, "canonical", meta.blobId);
+          if (chunked) return chunked;
+        }
+        if (hasChunkCopy) return undefined;
+        const row = db
+          .prepare("SELECT bytes FROM pdpp_blob_bytes WHERE blob_id = ?")
+          .get(meta.blobId) as { bytes: Buffer } | undefined;
+        if (!row || row.bytes.length !== meta.sizeBytes) return undefined;
+        const bytes = new Uint8Array(row.bytes);
+        return createHash("sha256").update(bytes).digest("hex") === meta.sha256
+          ? (bytes as Uint8Array<ArrayBuffer>)
+          : undefined;
+      },
       // A malformed manifest vetoes every reader; a blob write repairs it.
       clearMalformed: (blobId) =>
         clearMalformedManifest(db, "canonical", blobId),
-      write: (blobId, bytes) => writeCanonicalBinary(db, blobId, bytes),
+      write: (blobId, bytes) => {
+        db.prepare(
+          `INSERT INTO pdpp_blob_bytes (blob_id, bytes) VALUES (?, ?)
+           ON CONFLICT(blob_id) DO UPDATE SET bytes = excluded.bytes`,
+        ).run(blobId, Buffer.from(bytes));
+        // Replica chunks are a derived transport copy; main's row remains the
+        // canonical owner and is readable by rollback builds.
+        if (bytes.length > CANONICAL_INLINE_BYTES)
+          writeCanonicalBinary(db, blobId, bytes);
+      },
     },
   };
 

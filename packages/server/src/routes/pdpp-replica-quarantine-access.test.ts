@@ -430,6 +430,36 @@ async function fixture() {
     assertQuarantined,
     controlWorks,
     controlWithdrawn,
+    deleteAsOwner(recordKey: string) {
+      return fetch(
+        resource!.origin +
+          "/pdpp/v1/streams/messages/records/" +
+          encodeURIComponent(recordKey),
+        {
+          method: "DELETE",
+          headers: { authorization: `Bearer ${issuer.credential}` },
+        },
+      );
+    },
+    quarantineConnection() {
+      db.prepare(
+        "INSERT INTO pdpp_replica_quarantined_connections (instance) VALUES (?)",
+      ).run("conn");
+    },
+    quarantineKey(recordKey: string) {
+      db.prepare(
+        "INSERT INTO pdpp_replica_quarantined_keys (instance, generation, stream, record_key) VALUES (?, ?, ?, ?)",
+      ).run("conn", 1, "messages", recordKey);
+    },
+    deletedFlag(recordKey: string) {
+      return (
+        db
+          .prepare(
+            "SELECT deleted FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
+          )
+          .get("conn", "messages", recordKey) as { deleted: number }
+      ).deleted;
+    },
     cycle: advance,
     withdrawDeclarations() {
       trustedBindings = [];
@@ -471,6 +501,20 @@ async function fixture() {
 }
 
 describe("replica quarantine gates actual consent-authorized app reads", () => {
+  it.each(["connection", "key"] as const)(
+    "owner DELETE refuses a %s-quarantined record and preserves it",
+    async (quarantine) => {
+      const f = await fixture();
+      if (quarantine === "connection") f.quarantineConnection();
+      else f.quarantineKey("z-quarantined");
+
+      const response = await f.deleteAsOwner("z-quarantined");
+
+      expect(response.status).toBe(409);
+      expect(f.deletedFlag("z-quarantined")).toBe(0);
+    },
+  );
+
   it("P0 #5: old page/change cursors cannot recover payload after validated declaration equivocation, including restart", async () => {
     const f = await fixture();
     await f.publish([

@@ -1243,6 +1243,16 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         "PDPP-Version": PDPP_VERSION,
       });
     } catch (err) {
+      if (err instanceof PdppBindingError) {
+        return c.json(
+          {
+            error: { code: err.reason, message: err.reason },
+            request_id: reqId,
+          },
+          409,
+          { "Request-Id": reqId, "PDPP-Version": PDPP_VERSION },
+        );
+      }
       return sendError(
         c,
         mapAndLog(deps, "DELETE /v1/streams/:stream/records/:id", reqId, err),

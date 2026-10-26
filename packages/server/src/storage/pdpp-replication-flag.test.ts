@@ -194,6 +194,47 @@ describe("replication flag off (the default)", () => {
 });
 
 describe("replication flag on", () => {
+  it("keeps large blobs readable through flag-off and plain main stores", () => {
+    const path = file();
+    const bytes = new Uint8Array(2 * 1024 * 1024).fill(0x5a);
+    const writerDb = open(path);
+    const writer = openRecordStore(writerDb, true);
+    register(writer);
+    const blob = storeBytes(writer, bytes);
+    writerDb.close();
+
+    const canonicalDb = open(path);
+    expect(
+      (
+        canonicalDb
+          .prepare(
+            "SELECT length(bytes) AS size FROM pdpp_blob_bytes WHERE blob_id = ?",
+          )
+          .get(blob.blobId) as { size: number }
+      ).size,
+    ).toBe(bytes.byteLength);
+    // Model a database written by the earlier chunk-only implementation. The
+    // next flagged open restores main's canonical row before rollback.
+    canonicalDb
+      .prepare("DELETE FROM pdpp_blob_bytes WHERE blob_id = ?")
+      .run(blob.blobId);
+    canonicalDb.close();
+
+    const repairDb = open(path);
+    openRecordStore(repairDb, true);
+    repairDb.close();
+
+    const offDb = open(path);
+    const off = openRecordStore(offDb, false);
+    expect(off.getBlobBytes(blob.blobId)).toEqual(bytes);
+    offDb.close();
+
+    const mainDb = open(path);
+    const mainStore = createSqliteRecordStore(mainDb);
+    expect(mainStore.getBlobBytes(blob.blobId)).toEqual(bytes);
+    mainDb.close();
+  }, 30_000);
+
   it("applies the replica schema when the store opens, not before", () => {
     const db = open();
     openRecordStore(db, true);
