@@ -5,12 +5,16 @@ import {
   createTestWallet,
 } from "@opendatalabs/personal-server-ts-core/test-utils";
 import type { SyncManager } from "@opendatalabs/personal-server-ts-core/sync";
+import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   createMemoryPsLiteAccessLogStore,
+  createMemoryPsLitePersistence,
+  createMemoryPsLiteStagedFileStore,
   createMemoryPsLiteStateStore,
   createMemoryPsLiteStorage,
   createMemoryPsLiteTokenStore,
 } from "./test-support/memory.js";
+import { createPersistentPsLiteStorage } from "./storage.js";
 import { createPsLiteRuntime, createWeb3SignedPsLiteAuth } from "./runtime.js";
 import { startPersonalServer } from "./client.js";
 
@@ -46,11 +50,14 @@ function createGateway(overrides: Partial<GatewayClient> = {}): GatewayClient {
   };
 }
 
-function createRuntime(gateway: GatewayClient) {
+function createRuntime(
+  gateway: GatewayClient,
+  storage: DataStoragePort = createMemoryPsLiteStorage(),
+) {
   const accessLogs = createMemoryPsLiteAccessLogStore();
   return createPsLiteRuntime({
     active: true,
-    storage: createMemoryPsLiteStorage(),
+    storage,
     accessLogReader: accessLogs,
     accessLogWriter: accessLogs,
     tokenStore: createMemoryPsLiteTokenStore(),
@@ -199,6 +206,131 @@ describe("startPersonalServer lite handle", () => {
       scope: "instagram.profile",
       status: "stored",
     });
+  });
+
+  it("streams a scope version in batches with owner Web3Signed auth", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway, storage),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+
+    const upload = await ps.openScopeUpload!("notes.entries", {
+      ...auth,
+      data: { source: "test" },
+    });
+    // Over the 1 MiB signed-body limit in one call: the client splits it.
+    const items = Array.from({ length: 6 }, (_, i) => ({
+      id: i,
+      text: "y".repeat(300_000),
+    }));
+    await upload.append(items.slice(0, 1));
+    await upload.append(items.slice(1));
+    await expect(upload.commit({ total: 6 })).resolves.toMatchObject({
+      scope: "notes.entries",
+      records: 6,
+    });
+
+    await expect(ps.readData("notes.entries", { auth })).resolves.toMatchObject(
+      {
+        collectedAt: upload.collectedAt,
+        data: { source: "test", records: items, total: 6 },
+      },
+    );
+  });
+
+  it("never serializes more than one batch of a large append at once", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway, storage),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    const items = Array.from({ length: 20 }, (_, i) => ({
+      id: i,
+      text: "z".repeat(200_000),
+    }));
+    const stringify = vi.spyOn(JSON, "stringify");
+    let longest = 0;
+    try {
+      await upload.append(items);
+      for (const result of stringify.mock.results) {
+        if (typeof result.value === "string") {
+          longest = Math.max(longest, result.value.length);
+        }
+      }
+    } finally {
+      stringify.mockRestore();
+    }
+
+    expect(longest).toBeLessThanOrEqual(1024 * 1024);
+    await expect(upload.commit()).resolves.toMatchObject({ records: 20 });
+  });
+
+  it("does not resend a batch that landed before a later batch of the same append failed", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const runtime = createRuntime(gateway, storage);
+    // Batch 1 fails, and so does the SDK's immediate resend of it.
+    let failures = 2;
+    const flaky = {
+      ...runtime,
+      fetch(request: Request) {
+        const isSecondBatch =
+          request.method === "PUT" &&
+          new URL(request.url).pathname.endsWith("/batches/1");
+        if (isSecondBatch && failures > 0) {
+          failures -= 1;
+          return Promise.reject(new TypeError("fetch failed"));
+        }
+        return runtime.fetch(request);
+      },
+    } as typeof runtime;
+    const ps = await startPersonalServer({
+      runtime: flaky,
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    // Each record is over half the batch limit, so [first, second] is two batches.
+    const first = { id: "first", text: "a".repeat(600_000) };
+    const second = { id: "second", text: "b".repeat(600_000) };
+
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    await expect(upload.append([first, second])).rejects.toThrow();
+    // The handle no longer knows where the append stopped, so it refuses
+    // further appends and a commit: it would otherwise resend `first`.
+    await expect(upload.append([first, second])).rejects.toThrow();
+    await expect(upload.commit()).rejects.toThrow();
+    await upload.abort();
+
+    const restart = await ps.openScopeUpload!("notes.entries", auth);
+    await restart.append([first, second]);
+    await expect(restart.commit()).resolves.toMatchObject({ records: 2 });
+    await expect(ps.readData("notes.entries", { auth })).resolves.toMatchObject(
+      { data: { records: [first, second] } },
+    );
   });
 
   it("exposes typed data and sync helpers through the public handle", async () => {

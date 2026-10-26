@@ -446,6 +446,7 @@ export async function downloadOne(
   diagnostics?.onIndexStart(record.id, envelope.scope);
   let relativePath: string;
   let sizeBytes: number;
+  let indexedInline = false;
   const replicaMetadata: Extract<
     VersionCommit,
     { kind: "replica" }
@@ -477,6 +478,17 @@ export async function downloadOne(
         );
       }
       ({ relativePath, sizeBytes } = committed.writeResult);
+    } else if (storage.writeEnvelopeAndIndex) {
+      // The blob and its row are one step under the path lock, so an erase of
+      // this path cannot land between them. The sidecars follow the row.
+      const indexed = await storage.writeEnvelopeAndIndex(envelope, {
+        fileId: null,
+        scope: envelope.scope,
+        collectedAt: envelope.collectedAt,
+        ...replicaMetadata,
+      });
+      ({ path: relativePath, sizeBytes } = indexed);
+      indexedInline = true;
     } else {
       ({ relativePath, sizeBytes } = await storage.writeEnvelope(envelope));
     }
@@ -494,9 +506,10 @@ export async function downloadOne(
     throw err;
   }
 
-  // 8. Insert into local index (with dataPointId + version)
+  // 8. Insert into local index (with dataPointId + version), unless step 7
+  // already indexed the row with its blob
   try {
-    if (!storage.commitVersion) {
+    if (!storage.commitVersion && !indexedInline) {
       await storage.insertEntry({
         fileId: null,
         path: relativePath,

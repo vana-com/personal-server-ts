@@ -14,6 +14,7 @@ import {
   type PsLiteDataFileStore,
 } from "./storage.js";
 import { previewEnvelopeValue } from "./storage-utils.js";
+import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
 
 describe("createPersistentPsLiteStorage", () => {
   it("bounds in-memory previews by traversal work for container-heavy envelopes", () => {
@@ -362,6 +363,599 @@ describe("createPersistentPsLiteStorage", () => {
       dataPointId: "0xdp-synced-1",
     });
     expect(reloaded.findUnsynced()).toEqual([]);
+  });
+
+  describe("a delete queued behind an overlapping row update", () => {
+    const scope = "instagram.profile";
+    const collectedAt = "2026-05-08T00:00:00.000Z";
+
+    async function writeIndexed(
+      storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+      value: string,
+    ) {
+      const envelope = createDataFileEnvelope(scope, collectedAt, {
+        username: value,
+      });
+      const write = await storage.writeEnvelope(envelope);
+      const entry = await storage.insertEntry({
+        fileId: null,
+        path: write.relativePath,
+        scope,
+        collectedAt,
+        sizeBytes: write.sizeBytes,
+      });
+      return { entry, path: write.relativePath };
+    }
+
+    it.each([
+      [
+        "updateFileId",
+        (
+          storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+          path: string,
+        ) => storage.updateFileId(path, "synced-id"),
+      ],
+      [
+        "updateDataPointId",
+        (
+          storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+          path: string,
+        ) => storage.updateDataPointId(path, "0xdp-synced-1"),
+      ],
+      [
+        "updateEntryVersion",
+        (
+          storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+          path: string,
+        ) => storage.updateEntryVersion(path, 7),
+      ],
+    ])(
+      "erases the row and its blob when %s is queued first",
+      async (_name, update) => {
+        const persistence = createMemoryPsLitePersistence();
+        const storage = await createPersistentPsLiteStorage(
+          { kind: "indexeddb" },
+          persistence,
+        );
+        const { path } = await writeIndexed(storage, "race");
+
+        const updated = update(storage, path);
+        const erased = storage.deleteVersion(scope, collectedAt);
+        await updated;
+        await expect(erased).resolves.toBe(true);
+
+        expect(storage.countVersions(scope)).toBe(0);
+        const reloaded = await createPersistentPsLiteStorage(
+          { kind: "indexeddb" },
+          persistence,
+        );
+        expect(reloaded.countVersions(scope)).toBe(0);
+        await expect(reloaded.readEnvelope(scope, collectedAt)).rejects.toThrow(
+          "Envelope not found",
+        );
+      },
+    );
+
+    it("erases by a fileId that a queued update sets just before the delete", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      const { path } = await writeIndexed(storage, "fresh");
+
+      const updated = storage.updateFileId(path, "queued-file-id");
+      const erased = storage.deleteByFileId("queued-file-id");
+      await updated;
+      await expect(erased).resolves.toBe(true);
+
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      expect(reloaded.countVersions(scope)).toBe(0);
+      await expect(reloaded.readEnvelope(scope, collectedAt)).rejects.toThrow(
+        "Envelope not found",
+      );
+    });
+
+    it("keeps a same-path replacement, with its blob, written while an erase of the old version is queued", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      const old = await writeIndexed(storage, "old");
+
+      const erased = storage.deleteVersion(scope, collectedAt, {
+        id: old.entry.id,
+        path: old.path,
+      });
+      const replacement = await writeIndexed(storage, "new");
+      // The old row was still the decided one when the erase was queued.
+      await expect(erased).resolves.toBe(true);
+
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "indexeddb" },
+        persistence,
+      );
+      expect(reloaded.countVersions(scope)).toBe(1);
+      expect(reloaded.findEntry({ scope, at: collectedAt })?.id).toBe(
+        replacement.entry.id,
+      );
+      const envelope = await reloaded.readEnvelope(scope, collectedAt);
+      expect(JSON.stringify(envelope)).toContain("new");
+      expect(JSON.stringify(envelope)).not.toContain("old");
+    });
+  });
+
+  describe("an erase in flight on one path", () => {
+    const scope = "instagram.profile";
+    const X = "2026-05-08T00:00:00.000Z";
+    const Y = "2026-05-09T00:00:00.000Z";
+
+    /** A custom file store whose blob delete of `path` waits until released. */
+    function gatedFiles(path: () => string | undefined) {
+      const backing = createMemoryPsLiteDataFileStore("custom");
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        notifyStarted = resolve;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let paused = false;
+      const files: PsLiteDataFileStore = {
+        ...backing,
+        async deleteEnvelope(target) {
+          if (target === path() && !paused) {
+            paused = true;
+            notifyStarted();
+            await gate;
+          }
+          await backing.deleteEnvelope(target);
+        },
+      };
+      return { files, started, release };
+    }
+
+    async function writeRow(
+      storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+      collectedAt: string,
+      value: string,
+    ) {
+      const envelope = createDataFileEnvelope(scope, collectedAt, {
+        username: value,
+      });
+      const write = await storage.writeEnvelope(envelope);
+      await storage.insertEntry({
+        fileId: null,
+        path: write.relativePath,
+        scope,
+        collectedAt,
+        sizeBytes: write.sizeBytes,
+      });
+      return write.relativePath;
+    }
+
+    /** Resolves "landed" if `work` settles within 500 ms, else "blocked". */
+    async function landsWithin(work: Promise<unknown>) {
+      return Promise.race([
+        work.then(() => "landed" as const),
+        new Promise<"blocked">((resolve) =>
+          setTimeout(() => resolve("blocked"), 500),
+        ),
+      ]);
+    }
+
+    it("does not delay a write to path Y while the erase of path X waits on its blob delete", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const xPath = `data/${scope}/${X}.json`;
+      const gate = gatedFiles(() => xPath);
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        gate.files,
+      );
+      await writeRow(storage, X, "x");
+
+      const erase = storage.deleteVersion(scope, X);
+      await gate.started;
+      const write = writeRow(storage, Y, "y");
+      await expect(landsWithin(write)).resolves.toBe("landed");
+
+      gate.release();
+      await expect(erase).resolves.toBe(true);
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        gate.files,
+      );
+      expect(reloaded.findEntry({ scope, at: X })).toBeUndefined();
+      expect(reloaded.findEntry({ scope, at: Y })).toBeDefined();
+      await expect(reloaded.readEnvelope(scope, Y)).resolves.toBeDefined();
+    });
+
+    it("lands a write to path X issued during X's erase after it, and it survives with its blob", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const xPath = `data/${scope}/${X}.json`;
+      const gate = gatedFiles(() => xPath);
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        gate.files,
+      );
+      await writeRow(storage, X, "old");
+
+      const erase = storage.deleteVersion(scope, X);
+      await gate.started;
+      const replacement = writeRow(storage, X, "new");
+      await expect(landsWithin(replacement)).resolves.toBe("blocked");
+
+      gate.release();
+      await expect(erase).resolves.toBe(true);
+      await replacement;
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        gate.files,
+      );
+      expect(reloaded.countVersions(scope)).toBe(1);
+      const envelope = await reloaded.readEnvelope(scope, X);
+      expect(JSON.stringify(envelope)).toContain("new");
+      expect(JSON.stringify(envelope)).not.toContain("old");
+    });
+  });
+
+  describe("same-path races under the per-path lock", () => {
+    const scope = "instagram.profile";
+    const X = "2026-05-08T00:00:00.000Z";
+    const X_PATH = `data/${scope}/${X}.json`;
+
+    /** A one-shot deferred step: `pass` parks until `open`. */
+    function deferredStep() {
+      let markEntered!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        markEntered = resolve;
+      });
+      let openIt!: () => void;
+      const opened = new Promise<void>((resolve) => {
+        openIt = resolve;
+      });
+      return {
+        entered,
+        pass: async () => {
+          markEntered();
+          await opened;
+        },
+        open: () => openIt(),
+      };
+    }
+
+    /**
+     * A custom file store that can park the nth blob delete of X, park the
+     * streamed rename of X, and fail every block-tree delete.
+     */
+    function scriptedFiles(options: {
+      pauseDelete?: Map<number, ReturnType<typeof deferredStep>>;
+      pauseWrite?: Map<number, ReturnType<typeof deferredStep>>;
+      pauseRename?: ReturnType<typeof deferredStep>;
+      pauseAfterRename?: ReturnType<typeof deferredStep>;
+      failTreeDelete?: boolean;
+    }): PsLiteDataFileStore {
+      const backing = createMemoryPsLiteDataFileStore("custom");
+      let deletes = 0;
+      let writes = 0;
+      return {
+        ...backing,
+        async writeEnvelope(target, envelope) {
+          if (target === X_PATH) {
+            writes += 1;
+            await options.pauseWrite?.get(writes)?.pass();
+          }
+          return backing.writeEnvelope(target, envelope);
+        },
+        async deleteEnvelope(target) {
+          if (target === X_PATH) {
+            deletes += 1;
+            await options.pauseDelete?.get(deletes)?.pass();
+          }
+          await backing.deleteEnvelope(target);
+        },
+        async deleteBlockTree() {
+          if (options.failTreeDelete) {
+            throw new Error("block tree delete failed");
+          }
+        },
+        async openEnvelopeWriter(target) {
+          let text = "";
+          return {
+            write: async (piece) => {
+              text += piece;
+            },
+            abort: async () => {
+              text = "";
+            },
+            commit: async () => {
+              await options.pauseRename?.pass();
+              const size = await backing.writeEnvelope(
+                target,
+                JSON.parse(text) as Parameters<
+                  PsLiteDataFileStore["writeEnvelope"]
+                >[1],
+              );
+              // The blob is in place, the row is not yet installed.
+              await options.pauseAfterRename?.pass();
+              return size;
+            },
+          };
+        },
+      };
+    }
+
+    async function writeRowAt(
+      storage: Awaited<ReturnType<typeof createPersistentPsLiteStorage>>,
+      value: string,
+    ) {
+      const envelope = createDataFileEnvelope(scope, X, { username: value });
+      const write = await storage.writeEnvelope(envelope);
+      return storage.insertEntry({
+        fileId: null,
+        path: write.relativePath,
+        scope,
+        collectedAt: X,
+        sizeBytes: write.sizeBytes,
+      });
+    }
+
+    const pause = (ms: number) =>
+      new Promise((resolve) => setTimeout(resolve, ms));
+
+    it("a fenced erase that waits behind a streamed commit does not delete the commit's blob", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const rename = deferredStep();
+      const files = scriptedFiles({ pauseRename: rename });
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      const oldRow = await writeRowAt(storage, "old");
+
+      // Hold the scope lock, as a concurrent scope operation would, so an
+      // erase that gets past the path lock would wait here.
+      const holdScope = deferredStep();
+      const hold = withScopeLock(scope, () => holdScope.pass());
+
+      const writer = await storage.openVersionWriter!(scope, X);
+      await writer.write(
+        JSON.stringify(createDataFileEnvelope(scope, X, { username: "new" })),
+      );
+      const committed = writer.commit({ fileId: null });
+      await rename.entered;
+
+      const erase = storage.deleteVersion(scope, X, {
+        id: oldRow.id,
+        path: X_PATH,
+      });
+      await pause(50);
+      rename.open();
+      await committed;
+      holdScope.open();
+      await hold;
+
+      // The old row was replaced by the commit before the erase ran.
+      await expect(erase).resolves.toBe(false);
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      expect(reloaded.countVersions(scope)).toBe(1);
+      expect(reloaded.findEntry({ scope, at: X })?.id).not.toBe(oldRow.id);
+      const envelope = await reloaded.readEnvelope(scope, X);
+      expect(JSON.stringify(envelope)).toContain("new");
+    });
+
+    it("a write issued after two erases of X waits for both, so neither removes its blob", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const first = deferredStep();
+      const second = deferredStep();
+      const files = scriptedFiles({
+        pauseDelete: new Map([
+          [1, first],
+          [2, second],
+        ]),
+      });
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      const oldRow = await writeRowAt(storage, "old");
+
+      const firstErase = storage.deleteVersion(scope, X, {
+        id: oldRow.id,
+        path: X_PATH,
+      });
+      await first.entered;
+      const write = writeRowAt(storage, "new");
+      const secondErase = storage.deleteVersion(scope, X, {
+        id: oldRow.id,
+        path: X_PATH,
+      });
+      first.open();
+      await write;
+      // Only now may the second erase reach its blob delete.
+      second.open();
+
+      await expect(firstErase).resolves.toBe(true);
+      await expect(secondErase).resolves.toBe(false);
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      expect(reloaded.countVersions(scope)).toBe(1);
+      const envelope = await reloaded.readEnvelope(scope, X);
+      expect(JSON.stringify(envelope)).toContain("new");
+    });
+
+    it("a writer waits for an erase whose blob delete failed, and the late part does not remove its blob", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const envelopeDelete = deferredStep();
+      const files = scriptedFiles({
+        pauseDelete: new Map([[1, envelopeDelete]]),
+        failTreeDelete: true,
+      });
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      const oldRow = await writeRowAt(storage, "old");
+
+      const erase = storage
+        .deleteVersion(scope, X, { id: oldRow.id, path: X_PATH })
+        .then(
+          (value) => ({ value }),
+          (error: unknown) => ({ error }),
+        );
+      await envelopeDelete.entered;
+      const write = writeRowAt(storage, "new");
+
+      // The erase is still waiting on its envelope delete, so the writer waits.
+      const landedEarly = await Promise.race([
+        write.then(() => true),
+        pause(200).then(() => false),
+      ]);
+      expect(landedEarly).toBe(false);
+
+      envelopeDelete.open();
+      const outcome = await erase;
+      expect(outcome).toMatchObject({
+        error: new Error("block tree delete failed"),
+      });
+      await write;
+
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      expect(reloaded.countVersions(scope)).toBe(1);
+      const envelope = await reloaded.readEnvelope(scope, X);
+      expect(JSON.stringify(envelope)).toContain("new");
+    });
+
+    it("a deleteScope that waits on a same-path write leaves neither the row nor the blob", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const secondWrite = deferredStep();
+      const files = scriptedFiles({ pauseWrite: new Map([[2, secondWrite]]) });
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      await writeRowAt(storage, "old");
+
+      // The write's blob lands under the path lock, and its row is installed
+      // in the same step. deleteScope must not run between the two.
+      const write = storage.writeEnvelopeAndIndex!(
+        createDataFileEnvelope(scope, X, { username: "new" }),
+        { fileId: null, scope, collectedAt: X },
+      );
+      await secondWrite.entered;
+      const deleting = storage.deleteScope(scope);
+      await pause(50);
+      secondWrite.open();
+      await write;
+      await expect(deleting).resolves.toBe(1);
+
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      expect(reloaded.countVersions(scope)).toBe(0);
+      await expect(reloaded.readEnvelope(scope, X)).rejects.toThrow(
+        "Envelope not found",
+      );
+    });
+
+    it("a deleteScope racing a streamed commit that has written its blob does not leave a row with no blob", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const afterRename = deferredStep();
+      const files = scriptedFiles({ pauseAfterRename: afterRename });
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      await writeRowAt(storage, "old");
+
+      const writer = await storage.openVersionWriter!(scope, X);
+      await writer.write(
+        JSON.stringify(createDataFileEnvelope(scope, X, { username: "new" })),
+      );
+      const committed = writer.commit({ fileId: null });
+      await afterRename.entered;
+
+      const deleting = storage.deleteScope(scope);
+      await pause(50);
+      afterRename.open();
+      await committed;
+      await expect(deleting).resolves.toBe(1);
+
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      expect(reloaded.countVersions(scope)).toBe(0);
+      await expect(reloaded.readEnvelope(scope, X)).rejects.toThrow(
+        "Envelope not found",
+      );
+    });
+
+    it("a download repair that rewrites a missing blob, racing a fenced erase of its path, ends consistent", async () => {
+      const persistence = createMemoryPsLitePersistence();
+      const repairWrite = deferredStep();
+      const files = scriptedFiles({ pauseWrite: new Map([[2, repairWrite]]) });
+      const storage = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      const oldRow = await writeRowAt(storage, "old");
+
+      // The repair rewrites the blob and its row as one step. The erase is
+      // fenced to the old row, which the repair replaces, so it must not
+      // remove the repaired version.
+      const repair = storage.writeEnvelopeAndIndex!(
+        createDataFileEnvelope(scope, X, { username: "new" }),
+        { fileId: null, scope, collectedAt: X },
+      );
+      await repairWrite.entered;
+      const erase = storage.deleteVersion(scope, X, {
+        id: oldRow.id,
+        path: X_PATH,
+      });
+      await pause(50);
+      repairWrite.open();
+      await repair;
+      await expect(erase).resolves.toBe(false);
+
+      const reloaded = await createPersistentPsLiteStorage(
+        { kind: "custom" },
+        persistence,
+        files,
+      );
+      expect(reloaded.countVersions(scope)).toBe(1);
+      const envelope = await reloaded.readEnvelope(scope, X);
+      expect(JSON.stringify(envelope)).toContain("new");
+    });
   });
 
   it("persists IndexedDB fallback block sidecars across storage reloads", async () => {

@@ -1,4 +1,7 @@
-import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
+import type {
+  DataStoragePort,
+  DataVersionWriter,
+} from "@opendatalabs/personal-server-ts-core/ports";
 import type {
   DataBlockManifest,
   DataScopeBlock,
@@ -12,8 +15,12 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/blocks";
 import type { DataFileEnvelope } from "@opendatalabs/vana-sdk/browser";
 import type { WriteResult } from "@opendatalabs/personal-server-ts-core/storage/hierarchy";
-import type { IndexEntry } from "@opendatalabs/personal-server-ts-core/storage/index";
+import type {
+  IndexEntry,
+  NewIndexEntry,
+} from "@opendatalabs/personal-server-ts-core/storage/index";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
+import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
 import type { PsLiteStorageAdapter } from "./runtime.js";
 import { createStorageReadMethods, sortEntries } from "./storage-utils.js";
 import {
@@ -55,12 +62,28 @@ export interface PsLiteDataFileStore {
     options: { maxBytes: number },
   ): Promise<{ text: string; truncated: boolean } | null>;
   writeEnvelope(path: string, envelope: DataFileEnvelope): Promise<number>;
+  /**
+   * Write one envelope as a sequence of text pieces. Nothing is at `path`
+   * until `commit`; `abort`, or a crash before `commit`, leaves the path as
+   * it was. Stores without it cannot take streamed scope uploads.
+   */
+  openEnvelopeWriter?(path: string): Promise<PsLiteEnvelopeWriter>;
   deleteEnvelope(path: string): Promise<void>;
   readBlockManifest?(path: string): Promise<DataBlockManifest | null>;
   writeBlockManifest?(path: string, manifest: DataBlockManifest): Promise<void>;
   readBlockPayload?(path: string): Promise<DataScopeBlock | null>;
   writeBlockPayload?(path: string, block: DataScopeBlock): Promise<void>;
   deleteBlockTree?(pathPrefix: string): Promise<void>;
+}
+
+/** One envelope file being written by `PsLiteDataFileStore.openEnvelopeWriter`. */
+export interface PsLiteEnvelopeWriter {
+  /** Append text. Calls must not overlap. */
+  write(text: string): Promise<void>;
+  /** Make the file visible at its path; resolves to its size in bytes. */
+  commit(): Promise<number>;
+  /** Discard what was written. Idempotent. */
+  abort(): Promise<void>;
 }
 
 export interface PsLiteStorageCapabilities {
@@ -296,6 +319,37 @@ export async function createOpfsPsLiteDataFileStore(): Promise<PsLiteDataFileSto
       await writable.close();
       return new TextEncoder().encode(encoded).length;
     },
+    async openEnvelopeWriter(path) {
+      const parts = path.split("/").filter(Boolean);
+      const fileName = parts.pop();
+      if (!fileName) throw new Error("OPFS path must include a file name");
+      const dir = await getOrCreateOpfsDirectory(root, parts);
+      const handle = await dir.getFileHandle(fileName, { create: true });
+      // A writable stream writes to a swap file; `close` replaces the file in
+      // one step and `abort` drops the swap file.
+      const writable = await handle.createWritable();
+      let sizeBytes = 0;
+      let open = true;
+      return {
+        async write(text) {
+          const bytes = textEncoder.encode(text);
+          await writable.write(bytes);
+          sizeBytes += bytes.byteLength;
+        },
+        async commit() {
+          open = false;
+          await writable.close();
+          return sizeBytes;
+        },
+        async abort() {
+          if (!open) return;
+          open = false;
+          await writable.abort();
+          // `create: true` left an empty, unindexed file at the path.
+          await dir.removeEntry(fileName).catch(() => undefined);
+        },
+      };
+    },
     async deleteEnvelope(path) {
       const parts = path.split("/").filter(Boolean);
       const fileName = parts.pop();
@@ -516,11 +570,23 @@ export async function createPersistentPsLiteStorage(
     opfsAvailable: await isOpfsAvailable(),
   };
 
+  // Every write of the persisted state runs in this queue, one at a time, in
+  // call order. A snapshot is taken when its turn comes, so each write carries
+  // the latest index, and index changes never interleave.
   let persistQueue: Promise<void> = Promise.resolve();
 
-  async function persist(): Promise<void> {
-    const snapshot = {
-      ...state,
+  function enqueue<T>(step: () => Promise<T>): Promise<T> {
+    const run = persistQueue.then(step);
+    persistQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  function snapshotOf(source: PsLitePersistedStorageState) {
+    return {
+      ...source,
       readyBlockManifests: Array.from(readyBlockManifests),
       envelopes:
         fileStore.kind === "indexeddb"
@@ -537,9 +603,99 @@ export async function createPersistentPsLiteStorage(
           ? Array.from(pendingLedgerDeletes)
           : undefined,
     };
-    const write = persistQueue.then(() => persistence.write(snapshot));
-    persistQueue = write.catch(() => undefined);
-    await write;
+  }
+
+  async function persist(): Promise<void> {
+    await enqueue(() => persistence.write(snapshotOf(state)));
+  }
+
+  /**
+   * Make `next` the live index, once it is durable. Call only inside
+   * `enqueue`. A failed write leaves the live index as it was, so a reader
+   * never sees a change that could be lost on restart.
+   */
+  async function publish(next: PsLitePersistedStorageState): Promise<void> {
+    await persistence.write(snapshotOf(next));
+    state = next;
+  }
+
+  /**
+   * Replace the live index with `change(index)`. `change` returns null to
+   * leave the index alone. Resolves to whether the index was written.
+   */
+  function updateIndex(
+    change: (
+      current: PsLitePersistedStorageState,
+    ) => PsLitePersistedStorageState | null,
+  ): Promise<boolean> {
+    return enqueue(async () => {
+      const next = change(state);
+      if (!next) return false;
+      await publish(next);
+      return true;
+    });
+  }
+
+  function updateEntryField(
+    path: string,
+    patch: Partial<Pick<IndexEntry, "fileId" | "dataPointId" | "version">>,
+  ): Promise<boolean> {
+    return updateIndex((current) => {
+      if (!current.entries.some((entry) => entry.path === path)) return null;
+      return {
+        ...current,
+        entries: current.entries.map((entry) =>
+          entry.path === path ? { ...entry, ...patch } : entry,
+        ),
+      };
+    });
+  }
+
+  /**
+   * Remove a blob that no index entry names, after its index write failed. A
+   * blob that an entry does name is kept. Best effort: the commit's own error
+   * is what the caller sees.
+   */
+  function dropUnindexedEnvelope(path: string): Promise<void> {
+    return enqueue(async () => {
+      if (state.entries.some((entry) => entry.path === path)) return;
+      await Promise.all([
+        fileStore.deleteEnvelope(path),
+        fallbackStore.deleteEnvelope(path),
+      ]);
+    }).catch(() => undefined);
+  }
+
+  /** Install a row at its path, replacing any row there. Caller holds the path lock. */
+  async function installEntry(entry: NewIndexEntry): Promise<IndexEntry> {
+    let indexed: IndexEntry | undefined;
+    await updateIndex((current) => {
+      const version =
+        entry.version ??
+        current.entries.reduce(
+          (max, e) =>
+            e.scope === entry.scope && e.version > max ? e.version : max,
+          0,
+        ) + 1;
+      indexed = {
+        ...entry,
+        schemaId: entry.schemaId ?? null,
+        version,
+        dataPointId: entry.dataPointId ?? null,
+        afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
+        id: current.nextId,
+        createdAt: new Date().toISOString(),
+      };
+      return {
+        ...current,
+        nextId: current.nextId + 1,
+        entries: [
+          ...current.entries.filter((item) => item.path !== entry.path),
+          indexed,
+        ],
+      };
+    });
+    return indexed!;
   }
 
   function entriesForScope(scope: string): IndexEntry[] {
@@ -586,10 +742,13 @@ export async function createPersistentPsLiteStorage(
 
     async writeEnvelope(envelope): Promise<WriteResult> {
       const path = envelopePath(envelope.scope, envelope.collectedAt);
-      const sizeBytes = await fileStore.writeEnvelope(path, envelope);
-      if (fileStore.kind !== "indexeddb") {
-        await fallbackStore.deleteEnvelope(path);
-      }
+      const sizeBytes = await withPathLock(path, async () => {
+        const size = await fileStore.writeEnvelope(path, envelope);
+        if (fileStore.kind !== "indexeddb") {
+          await fallbackStore.deleteEnvelope(path);
+        }
+        return size;
+      });
       await persist();
       return {
         path,
@@ -597,6 +756,70 @@ export async function createPersistentPsLiteStorage(
         sizeBytes,
       };
     },
+
+    async writeEnvelopeAndIndex(envelope, entry): Promise<IndexEntry> {
+      const path = envelopePath(envelope.scope, envelope.collectedAt);
+      // The blob and its row are one step under the path lock, so no erase or
+      // replacement of this path runs between them.
+      return withPathLock(path, async () => {
+        const size = await fileStore.writeEnvelope(path, envelope);
+        if (fileStore.kind !== "indexeddb") {
+          await fallbackStore.deleteEnvelope(path);
+        }
+        try {
+          return await installEntry({
+            ...entry,
+            scope: envelope.scope,
+            collectedAt: envelope.collectedAt,
+            path,
+            sizeBytes: entry.sizeBytes ?? size,
+          });
+        } catch (error) {
+          // The bytes are durable here; the caller's recovery depends on that.
+          throw new IngestPersistedError(path, error);
+        }
+      });
+    },
+
+    ...(fileStore.openEnvelopeWriter
+      ? {
+          async openVersionWriter(
+            scope: string,
+            collectedAt: string,
+          ): Promise<DataVersionWriter> {
+            const path = envelopePath(scope, collectedAt);
+            const file = await fileStore.openEnvelopeWriter!(path);
+            return {
+              write: (text) => file.write(text),
+              abort: () => file.abort(),
+              async commit(entry): Promise<WriteResult> {
+                // The rename and the index install are one step under the path
+                // lock, so no erase of this path runs between them.
+                return withPathLock(path, async () => {
+                  const sizeBytes = await file.commit();
+                  try {
+                    // The index entry is what makes the version visible.
+                    await installEntry({
+                      ...entry,
+                      scope,
+                      collectedAt,
+                      path,
+                      sizeBytes,
+                    });
+                  } catch (error) {
+                    await dropUnindexedEnvelope(path);
+                    throw error;
+                  }
+                  if (fileStore.kind !== "indexeddb") {
+                    await fallbackStore.deleteEnvelope(path);
+                  }
+                  return { path, relativePath: path, sizeBytes };
+                });
+              },
+            };
+          },
+        }
+      : {}),
 
     async readScopeBlocks(scope, collectedAt, options) {
       const manifestPath = blockManifestPath(scope, collectedAt);
@@ -837,49 +1060,12 @@ export async function createPersistentPsLiteStorage(
       await persist();
     },
 
-    async insertEntry(entry) {
-      const version =
-        entry.version ??
-        state.entries.reduce(
-          (max, e) =>
-            e.scope === entry.scope && e.version > max ? e.version : max,
-          0,
-        ) + 1;
-      const indexed: IndexEntry = {
-        ...entry,
-        schemaId: entry.schemaId ?? null,
-        version,
-        dataPointId: entry.dataPointId ?? null,
-        afterTombstoneVersion: entry.afterTombstoneVersion ?? null,
-        id: state.nextId,
-        createdAt: new Date().toISOString(),
-      };
-      state = {
-        ...state,
-        nextId: state.nextId + 1,
-        entries: [
-          ...state.entries.filter((item) => item.path !== entry.path),
-          indexed,
-        ],
-      };
-      await persist();
-      return indexed;
+    insertEntry(entry) {
+      return withPathLock(entry.path, () => installEntry(entry));
     },
 
-    async updateFileId(path, fileId) {
-      let updated = false;
-      state = {
-        ...state,
-        entries: state.entries.map((entry) => {
-          if (entry.path !== path) return entry;
-          updated = true;
-          return { ...entry, fileId };
-        }),
-      };
-      if (updated) {
-        await persist();
-      }
-      return updated;
+    updateFileId(path, fileId) {
+      return updateEntryField(path, { fileId });
     },
 
     findLatestVersionByScope(scope) {
@@ -889,36 +1075,12 @@ export async function createPersistentPsLiteStorage(
       );
     },
 
-    async updateDataPointId(path, dataPointId) {
-      let updated = false;
-      state = {
-        ...state,
-        entries: state.entries.map((entry) => {
-          if (entry.path !== path) return entry;
-          updated = true;
-          return { ...entry, dataPointId };
-        }),
-      };
-      if (updated) {
-        await persist();
-      }
-      return updated;
+    updateDataPointId(path, dataPointId) {
+      return updateEntryField(path, { dataPointId });
     },
 
-    async updateEntryVersion(path, version) {
-      let updated = false;
-      state = {
-        ...state,
-        entries: state.entries.map((entry) => {
-          if (entry.path !== path) return entry;
-          updated = true;
-          return { ...entry, version };
-        }),
-      };
-      if (updated) {
-        await persist();
-      }
-      return updated;
+    updateEntryVersion(path, version) {
+      return updateEntryField(path, { version });
     },
 
     async readFirstSeenLedger(scope) {
@@ -939,11 +1101,13 @@ export async function createPersistentPsLiteStorage(
       await persistence.deleteAux?.(ledgerAux(scope));
     },
 
-    // Deletions run under the scope's first-seen sidecar lock (a rebuild in
-    // flight cannot write it back), and the sidecar goes with the scope's last
-    // version, so no delete path leaves a stale ledger behind.
-    deleteScope(scope) {
-      return withScopeLock(scope, async () => {
+    // The ledger barrier runs under the scope lock (a rebuild in flight cannot
+    // write it back). Each row is then erased under its own path lock, the
+    // same owner an ordinary write takes, so no write to a path interleaves
+    // with the erase of that path. The scope lock is never held across those
+    // path locks: lock order is path, scope, queue.
+    async deleteScope(scope) {
+      await withScopeLock(scope, async () => {
         await dropLedger(scope);
         for (const entry of entriesForScope(scope)) {
           readyBlockManifests.delete(
@@ -952,64 +1116,70 @@ export async function createPersistentPsLiteStorage(
         }
         // Repeat the barrier on retry, even if a failed write cleared the set.
         await persist();
-        let deleted = 0;
-        const deletedPaths: string[] = [];
-        const deletedBlockTrees: string[] = [];
-        state = {
-          ...state,
-          entries: state.entries.filter((entry) => {
-            if (entry.scope !== scope) return true;
-            deleted += 1;
-            deletedPaths.push(envelopePath(entry.scope, entry.collectedAt));
-            deletedBlockTrees.push(
-              blockTreePath(entry.scope, entry.collectedAt),
-            );
-            return false;
-          }),
-        };
-        await Promise.all(
-          [
-            ...deletedPaths.flatMap((path) => [
-              fileStore.deleteEnvelope(path),
-              fallbackStore.deleteEnvelope(path),
-            ]),
-            ...deletedBlockTrees.flatMap((path) => [
-              fileStore.deleteBlockTree?.(path),
-              fallbackStore.deleteBlockTree?.(path),
-            ]),
-          ].filter(
-            (promise): promise is Promise<void> => promise !== undefined,
-          ),
-        );
-        await persist();
-        return deleted;
       });
+      // A row a later write adds is not in this snapshot; it is not deleted.
+      const paths = await enqueue(async () =>
+        Array.from(
+          new Set(
+            state.entries
+              .filter((entry) => entry.scope === scope)
+              .map((entry) => entry.path),
+          ),
+        ),
+      );
+      // Each path settles on its own, so one failed blob delete does not stop
+      // the others. Rows whose delete failed stay, for the next retry.
+      const outcomes = await Promise.allSettled(
+        paths.map((path) =>
+          withPathLock(path, () =>
+            eraseUnderPathLock(
+              path,
+              (e) => e.scope === scope && e.path === path,
+            ),
+          ),
+        ),
+      );
+      const failed = outcomes.find(
+        (outcome): outcome is PromiseRejectedResult =>
+          outcome.status === "rejected",
+      );
+      if (failed) throw failed.reason;
+      return outcomes.filter(
+        (outcome) => outcome.status === "fulfilled" && outcome.value === true,
+      ).length;
     },
 
-    async deleteVersion(scope, collectedAt, fence) {
-      if (!fence) {
-        const entry = state.entries.find(
-          (e) => e.scope === scope && e.collectedAt === collectedAt,
-        );
-        if (!entry) return false;
-        return removeEntry(entry);
-      }
-      // Fenced: the row is checked under the scope lock, before its blob goes.
-      return withScopeLock(scope, async () => {
-        const entry = state.entries.find(
-          (e) => e.scope === scope && e.collectedAt === collectedAt,
-        );
-        if (!entry || entry.id !== fence.id || entry.path !== fence.path) {
-          return false;
-        }
-        return removeEntryLocked(entry);
-      });
+    // Unfenced: by (scope, collectedAt) alone. Fenced: only the row the caller
+    // decided on, by its id and path.
+    deleteVersion(scope, collectedAt, fence) {
+      // The path is fixed by (scope, collectedAt), so the lock is known now.
+      const path = envelopePath(scope, collectedAt);
+      return withPathLock(path, () =>
+        eraseUnderPathLock(
+          path,
+          (e) =>
+            e.scope === scope &&
+            e.collectedAt === collectedAt &&
+            e.path === path &&
+            (fence === undefined || e.id === fence.id),
+        ),
+      ).then((outcome) => outcome === true);
     },
 
     async deleteByFileId(fileId) {
-      const entry = state.entries.find((e) => e.fileId === fileId);
-      if (!entry) return false;
-      return removeEntry(entry);
+      // The fileId only names the path whose lock to take. The row is
+      // re-resolved under that lock, and looked again if it moved.
+      for (;;) {
+        const path = await enqueue(
+          async () =>
+            state.entries.find((e) => e.fileId === fileId)?.path ?? null,
+        );
+        if (path === null) return false;
+        const outcome = await withPathLock(path, () =>
+          eraseUnderPathLock(path, (e) => e.fileId === fileId),
+        );
+        if (outcome !== "moved") return outcome;
+      }
     },
   };
 
@@ -1041,41 +1211,103 @@ export async function createPersistentPsLiteStorage(
     }
   }
 
-  async function removeEntry(entry: IndexEntry): Promise<boolean> {
-    return withScopeLock(entry.scope, () => removeEntryLocked(entry));
+  /**
+   * The per-path FIFO lock: the one owner of a path's blob and row. An
+   * operation holds it for its whole duration, so operations on one path never
+   * interleave. The slot is taken synchronously at call time, so calls run in
+   * call order.
+   *
+   * Lock order, never reversed: path lock, then scope lock, then the index
+   * queue. Never take a path lock while holding the scope lock or inside the
+   * queue (`enqueue`), or two operations can wait on each other.
+   */
+  const pathTails = new Map<string, Promise<void>>();
+  function withPathLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+    const previous = pathTails.get(path);
+    let release!: () => void;
+    const mine = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous ? previous.then(() => mine) : mine;
+    pathTails.set(path, tail);
+    // A free path starts `fn` now, not a microtask later, so the caller's
+    // index-queue slot is taken in call order.
+    const run = previous
+      ? previous.then(fn)
+      : new Promise<T>((resolve) => resolve(fn()));
+    return run.finally(() => {
+      release();
+      if (pathTails.get(path) === tail) pathTails.delete(path);
+    });
   }
 
-  async function removeEntryLocked(entry: IndexEntry): Promise<boolean> {
-    const blobPath = envelopePath(entry.scope, entry.collectedAt);
-    // Delete the blob FIRST (both stores tolerate a missing blob); only drop the index row once
-    // the blob is gone. If blob deletion throws for a real reason, the row is preserved so the
-    // next sync retry re-attempts instead of orphaning the local blob.
-    // A partial delete can remove the tree while leaving the index row.
-    // Persist the conservative hint before any destructive file operation.
-    readyBlockManifests.delete(
-      blockManifestPath(entry.scope, entry.collectedAt),
-    );
-    await persist();
-    await Promise.all([
-      fileStore.deleteEnvelope(blobPath),
-      fallbackStore.deleteEnvelope(blobPath),
-      fileStore.deleteBlockTree?.(
-        blockTreePath(entry.scope, entry.collectedAt),
-      ) ?? Promise.resolve(),
-      fallbackStore.deleteBlockTree?.(
-        blockTreePath(entry.scope, entry.collectedAt),
-      ) ?? Promise.resolve(),
-    ]);
-    state = {
-      ...state,
-      entries: state.entries.filter((e) => e !== entry),
-    };
-    // The sidecar goes with the scope's last version.
-    await persist();
-    if (!state.entries.some((e) => e.scope === entry.scope)) {
-      await dropLedger(entry.scope);
-    }
-    return true;
+  /** The plain values an erase needs from a row. Never the stored object. */
+  interface ErasedRow {
+    id: number;
+    scope: string;
+    collectedAt: string;
+    path: string;
+  }
+
+  /**
+   * Erase the row `match` picks, and its blob. The caller holds the path lock
+   * for `path`. The row is resolved inside the queue at the moment the lock is
+   * held, so an earlier update or replacement is seen. Resolves "moved" when
+   * the row found sits at another path, and the caller must look again.
+   *
+   * The blob parts run together, and all of them settle before this returns.
+   * If any part fails, the row stays and the first error is rethrown.
+   */
+  async function eraseUnderPathLock(
+    path: string,
+    match: (entry: IndexEntry) => boolean,
+  ): Promise<boolean | "moved"> {
+    const found = await enqueue<ErasedRow | "moved" | null>(async () => {
+      const entry = state.entries.find(match);
+      if (!entry) return null;
+      if (entry.path !== path) return "moved";
+      // Persist the conservative hint before any destructive file operation.
+      // A partial delete can remove the tree while leaving the row.
+      readyBlockManifests.delete(
+        blockManifestPath(entry.scope, entry.collectedAt),
+      );
+      await persistence.write(snapshotOf(state));
+      return {
+        id: entry.id,
+        scope: entry.scope,
+        collectedAt: entry.collectedAt,
+        path: entry.path,
+      };
+    });
+    if (found === null) return false;
+    if (found === "moved") return "moved";
+    return withScopeLock(found.scope, async () => {
+      const blob = envelopePath(found.scope, found.collectedAt);
+      const tree = blockTreePath(found.scope, found.collectedAt);
+      const parts = await Promise.allSettled([
+        fileStore.deleteEnvelope(blob),
+        fallbackStore.deleteEnvelope(blob),
+        fileStore.deleteBlockTree?.(tree) ?? Promise.resolve(),
+        fallbackStore.deleteBlockTree?.(tree) ?? Promise.resolve(),
+      ]);
+      const failed = parts.find(
+        (part): part is PromiseRejectedResult => part.status === "rejected",
+      );
+      if (failed) throw failed.reason;
+      await enqueue(async () => {
+        if (!state.entries.some((e) => e.id === found.id)) return;
+        await publish({
+          ...state,
+          entries: state.entries.filter((e) => e.id !== found.id),
+        });
+      });
+      // The sidecar goes with the scope's last version.
+      await persist();
+      if (!state.entries.some((e) => e.scope === found.scope)) {
+        await dropLedger(found.scope);
+      }
+      return true;
+    });
   }
 
   if (fileStore.readEnvelopePreview) {

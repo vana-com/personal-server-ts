@@ -30,6 +30,7 @@ import {
   handlePersonalServerAccessLogsRequest,
   handlePersonalServerConfigRequest,
   handlePersonalServerDataRequest,
+  createScopeUploadRegistry,
   handleOuraCollectionRequirementsRequest,
   handlePersonalServerGrantsRequest,
   handlePersonalServerOauthTokenRequest,
@@ -780,6 +781,11 @@ export function createPsLiteRuntime(
   const dataStorage = withLegacyProjection(toDataStoragePort(options.storage), {
     onIssue: options.onLegacyProjectionIssue ?? warnLegacyProjectionIssue,
   });
+  // Streamed scope writes need a file store that can append to an unindexed
+  // file; without one the upload routes answer 501.
+  const scopeUploads = dataStorage.openVersionWriter
+    ? createScopeUploadRegistry()
+    : undefined;
   // Wire diagnostics by default so GET /v1/diagnostics is always available.
   const diagnostics = options.diagnostics ?? new DiagnosticsRecorder();
   options = { ...options, diagnostics };
@@ -1169,6 +1175,7 @@ export function createPsLiteRuntime(
               additions: options.additions,
               syncManager: options.syncManager ?? null,
               scopeDeletions: options.scopeDeletions,
+              scopeUploads,
               now,
               createLogId,
               // x402 payment enforcement for builder reads. Only engages with a
