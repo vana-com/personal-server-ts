@@ -1230,7 +1230,7 @@ function pendingReceiver(
   enabled = true,
   visibilityPolicy?: {
     owner: "include-pending" | "confirmed-only";
-    grant: "include-pending" | "confirmed-only";
+    grant: "confirmed-only";
   },
 ) {
   return createReplicaReceiver({
@@ -1448,7 +1448,7 @@ it("flag off preserves exact canonical pages and cursors and does not stage", ()
   ).toEqual([]);
 });
 
-it("owner and grant modes use one policy; canonical cursors page owner pending rows", () => {
+it("only owner mode previews pending rows", () => {
   const d = device();
   const second = {
     ...upsert(21),
@@ -1457,11 +1457,11 @@ it("owner and grant modes use one policy; canonical cursors page owner pending r
   } as ReplicaOperation;
   stagePending(d, [registration(), upsert(), second]);
   const receiver = pendingReceiver(d, true, {
-    owner: "confirmed-only",
-    grant: "include-pending",
+    owner: "include-pending",
+    grant: "confirmed-only",
   });
-  expect(preview(receiver)).toEqual([]);
-  expect(preview(receiver, "grant")).toHaveLength(2);
+  expect(preview(receiver)).toHaveLength(2);
+  expect(preview(receiver, "grant")).toEqual([]);
   const options = {
     reader: "grant" as const,
     stream: "messages",
@@ -1469,12 +1469,27 @@ it("owner and grant modes use one policy; canonical cursors page owner pending r
     limit: 1,
     order: "asc" as const,
   };
-  const first = receiver.readRecords(options);
-  expect(first.data[0].recordKey).toBe("a");
-  expect(first.hasMore).toBe(true);
-  const last = receiver.readRecords({ ...options, cursor: first.nextCursor });
-  expect(last.data[0].recordKey).toBe("b");
-  expect(last.hasMore).toBe(false);
+  expect(receiver.readRecords(options).data).toEqual([]);
+});
+
+it("only enables pending preview when the runtime value is true", () => {
+  const d = device();
+  const receiver = pendingReceiver(d);
+  receiver.stage({
+    credential: "replica-secret",
+    id: "pending",
+    envelope: batch([registration(), upsert()]),
+  });
+  receiver.setPendingEnabled("false" as unknown as boolean);
+  expect(
+    receiver.readRecords({
+      reader: "owner",
+      stream: "messages",
+      instanceIds: ["conn_a"],
+      limit: 10,
+      order: "asc",
+    }).data,
+  ).toEqual([]);
 });
 
 it("pending reset and deletion follow canonical lifecycle semantics without mutating the binding", () => {
@@ -2095,7 +2110,7 @@ it("does not let an unrelated pending connection conflict withdraw owner rows", 
 });
 
 for (const owner of ["confirmed-only", "include-pending"] as const)
-  for (const grant of ["confirmed-only", "include-pending"] as const)
+  for (const grant of ["confirmed-only"] as const)
     it(`keeps two-connection record identities scoped in ${owner}/${grant} mode`, () => {
       const d = device();
       d.store.registerConnection({
@@ -2141,7 +2156,9 @@ for (const owner of ["confirmed-only", "include-pending"] as const)
           order: "asc",
         }).data;
         expect(rows.map((row) => row.recordKey)).toEqual(
-          { owner, grant }[reader] === "include-pending" ? ["a", "p"] : ["a"],
+          reader === "owner" && owner === "include-pending"
+            ? ["a", "p"]
+            : ["a"],
         );
         expect(rows.every((row) => row.instance === "conn_a")).toBe(true);
         expect(view.getRecord("conn_a", "messages", "foreign")).toBeUndefined();
@@ -2854,7 +2871,7 @@ it.each([false, true])(
     const local = value(d)!;
     const receiver = pendingReceiver(d, true, {
       owner: "confirmed-only",
-      grant: "include-pending",
+      grant: "confirmed-only",
     });
     receiver.import({
       credential: "replica-secret",

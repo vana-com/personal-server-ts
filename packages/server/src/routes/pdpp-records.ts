@@ -1211,8 +1211,9 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
         for (const row of page.data) {
           if (
             recordKeyWithinGrantResources(row.recordKey, scope.streamGrant) &&
-            ((row.deleted && context!.tokenKind === "owner") ||
-              recordWithinGrantTimeConstraint(row.data, scope.streamGrant))
+            (row.deleted
+              ? context!.tokenKind === "owner"
+              : recordWithinGrantTimeConstraint(row.data, scope.streamGrant))
           ) {
             visible.push(row);
           } else dropped = true;

@@ -12,6 +12,7 @@ import {
   replicaConflictMetadata,
   replicaConnectionVisibility,
   replicaStateVisible,
+  type ReplicaVisibilityPolicy,
   type ReplicaReader,
 } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import {
@@ -104,6 +105,7 @@ function dropViewObjects(db: Database) {
 export function createReplicaVisibilityView(deps: {
   db: Database;
   owner: string;
+  visibilityPolicy?: ReplicaVisibilityPolicy;
   declarations: () => MergeContext["declarations"];
   /**
    * The store's shared quarantine predicate. `generationSql` is the
@@ -964,7 +966,10 @@ export function createReplicaVisibilityView(deps: {
       return replicaStateVisible(conflict.state, reader, undefined, "local")
         ? "local"
         : "hidden";
-    return preview ? "preview" : "canonical";
+    return preview &&
+      replicaStateVisible("pending", reader, deps.visibilityPolicy)
+      ? "preview"
+      : "canonical";
   }
   const unquarantined = (alias = "r") => deps.unquarantinedRecordSql(alias);
   // Overlay and local-projection rows carry the generation of their value.

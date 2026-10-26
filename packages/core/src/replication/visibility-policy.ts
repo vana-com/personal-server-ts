@@ -5,7 +5,7 @@ export type ReplicaVisibilityState =
 export type ReplicaRecordOrigin = "local" | "received";
 export interface ReplicaVisibilityPolicy {
   owner: "confirmed-only" | "include-pending";
-  grant: "confirmed-only" | "include-pending";
+  grant: "confirmed-only";
 }
 export const DEFAULT_REPLICA_VISIBILITY_POLICY: Readonly<ReplicaVisibilityPolicy> =
   {
@@ -21,7 +21,9 @@ export function replicaStateVisible(
   if (state === "conflicted") return reader === "owner" && origin === "local";
   return (
     state === "confirmed" ||
-    (state === "pending" && policy[reader] === "include-pending")
+    (state === "pending" &&
+      reader === "owner" &&
+      policy.owner === "include-pending")
   );
 }
 
