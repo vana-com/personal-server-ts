@@ -1,10 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { expect, it } from "vitest";
-const memoryRoot = process.env.TMPDIR ?? join(homedir(), ".tmp");
-mkdirSync(memoryRoot, { recursive: true });
+const memoryRoot = tmpdir();
 
 it("bounds real transport-worker memory across 32, 64 and 128 MiB blobs", () => {
   const results: { size: number; published: number; peakRssKiB: number }[] = [];

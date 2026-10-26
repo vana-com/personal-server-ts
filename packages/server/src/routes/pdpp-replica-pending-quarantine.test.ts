@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   canonicalJson,
@@ -32,7 +32,7 @@ import {
 it.each(["key", "connection"] as const)(
   "pending owner reads preserve imported-slot %s quarantine through the real issuer HTTP boundary",
   async (scope) => {
-    const root = mkdtempSync(join(homedir(), ".tmp/8b-pending-quarantine-"));
+    const root = mkdtempSync(join(tmpdir(), "8b-pending-quarantine-"));
     const db = new Database(join(root, "replica.sqlite"));
     const store = createReplicaRecordStore(db);
     const owner = "owner-pending-quarantine";

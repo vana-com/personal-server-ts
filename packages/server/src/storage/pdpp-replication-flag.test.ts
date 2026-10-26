@@ -201,6 +201,7 @@ describe("replication flag on", () => {
     const writer = openRecordStore(writerDb, true);
     register(writer);
     const blob = storeBytes(writer, bytes);
+    expect(storeBytes(writer, bytes).blobId).toBe(blob.blobId);
     writerDb.close();
 
     const canonicalDb = open(path);
@@ -233,6 +234,50 @@ describe("replication flag on", () => {
     const mainStore = createSqliteRecordStore(mainDb);
     expect(mainStore.getBlobBytes(blob.blobId)).toEqual(bytes);
     mainDb.close();
+  }, 30_000);
+
+  it("receiver imports large blobs into bytes the plain store can read", () => {
+    const bytes = new Uint8Array(2 * 1024 * 1024).fill(0x6b);
+    const sourceDb = open();
+    const source = openRecordStore(sourceDb, true);
+    register(source);
+    const blob = storeBytes(source, bytes);
+    ingest(source, "received", "from another device", blob.blobId);
+    source.replication.beginBaseline(baseline);
+    const operations: ReplicaOperation[] = [
+      ...source.replication.readBaselinePage({ limit: 1000 }).operations,
+      ...source.replication.readTailPage({ limit: 1000 }).operations,
+    ];
+
+    const path = file();
+    const receiverDb = open(path);
+    const receiverStore = createReplicaRecordStore(receiverDb);
+    register(receiverStore);
+    receiverStore.replication.beginBaseline(baseline);
+    createReplicaReceiver({
+      db: receiverDb,
+      store: receiverStore,
+      owner: "owner",
+      authenticate: (credential: unknown) =>
+        credential === "replica-secret" ? "owner" : undefined,
+      declarations: () => declarations,
+    }).import({
+      credential: "replica-secret",
+      envelope: {
+        format: "vana-pdpp-replica",
+        version: 1,
+        owner: "owner",
+        batchId: "large-blob-import",
+        operations,
+      },
+      blobs: [{ blobId: blob.blobId, bytes }],
+    });
+    receiverDb.close();
+
+    const plainDb = open(path);
+    const plainStore = createSqliteRecordStore(plainDb);
+    expect(plainStore.getBlobBytes(blob.blobId)).toEqual(bytes);
+    plainDb.close();
   }, 30_000);
 
   it("applies the replica schema when the store opens, not before", () => {
@@ -334,5 +379,176 @@ describe("replication flag on", () => {
     expect(keys(plain)).toEqual(["a", "b"]);
     plain.deleteConnection("conn_a");
     expect(keys(plain)).toEqual([]);
+  });
+
+  it("refuses every connection-scoped mutator after quarantine without changing canonical state", () => {
+    const db = open();
+    const store = openRecordStore(db, true);
+    register(store);
+    const blob = storeBytes(store, new Uint8Array([1, 2, 3]));
+    ingest(store, "a", "before", blob.blobId);
+    db.prepare(
+      "INSERT INTO pdpp_claude_transition (instance, archive_instance, generation, snapshots_json) VALUES (?, ?, ?, ?)",
+    ).run(
+      "conn_a",
+      "retired-claude:test",
+      2,
+      JSON.stringify({ "claude.conversations": {} }),
+    );
+    db.prepare(
+      "INSERT INTO pdpp_strava_transition (instance, archive_instance, generation, snapshots_json) VALUES (?, ?, ?, ?)",
+    ).run(
+      "conn_a",
+      "retired-strava:test",
+      2,
+      JSON.stringify({ "strava.activities": {} }),
+    );
+    db.prepare(
+      "INSERT INTO pdpp_replica_quarantined_connections (instance) VALUES (?)",
+    ).run("conn_a");
+    const state = () => ({
+      records: db
+        .prepare(
+          "SELECT * FROM pdpp_records ORDER BY instance, stream, record_key",
+        )
+        .all(),
+      history: db
+        .prepare("SELECT * FROM pdpp_record_changes ORDER BY id")
+        .all(),
+      bindings: db
+        .prepare("SELECT * FROM pdpp_instance_binding ORDER BY instance")
+        .all(),
+      claude: db
+        .prepare("SELECT * FROM pdpp_claude_transition ORDER BY instance")
+        .all(),
+      strava: db
+        .prepare("SELECT * FROM pdpp_strava_transition ORDER BY instance")
+        .all(),
+      claims: db
+        .prepare("SELECT * FROM pdpp_blob_claims ORDER BY blob_id, instance")
+        .all(),
+      bytes: db
+        .prepare(
+          "SELECT blob_id, length(bytes) AS size FROM pdpp_blob_bytes ORDER BY blob_id",
+        )
+        .all(),
+      clock: db.prepare("SELECT value FROM pdpp_write_clock").get(),
+    });
+    const before = state();
+    const mutations: [string, () => unknown][] = [
+      [
+        "resetInstanceBinding",
+        () =>
+          store.resetInstanceBinding({
+            instance: "conn_a",
+            expectedMethod: "collector",
+            expectedGeneration: 1,
+            nextMethod: "collector",
+          }),
+      ],
+      ["deleteConnection", () => store.deleteConnection("conn_a")],
+      ["registerConnection", () => register(store)],
+      [
+        "storeBlobBytesForInstance",
+        () => storeBytes(store, new Uint8Array([4, 5, 6])),
+      ],
+      ["ingestBatch", () => ingest(store, "b", "after")],
+      [
+        "replaceStream",
+        () =>
+          store.replaceStream({
+            instance: "conn_a",
+            stream: "messages",
+            method: "collector",
+            generation: 1,
+            emittedAt: at,
+            envelopes: [],
+            primaryKey: ["id"],
+          }),
+      ],
+      [
+        "deleteRecord",
+        () =>
+          store.deleteRecord("conn_a", "messages", "a", at, "mutable_state"),
+      ],
+      [
+        "replaceStreams",
+        () =>
+          store.replaceStreams([
+            {
+              instance: "conn_a",
+              stream: "messages",
+              method: "collector",
+              generation: 1,
+              emittedAt: at,
+              envelopes: [],
+              primaryKey: ["id"],
+            },
+          ]),
+      ],
+      [
+        "completeStreams",
+        () =>
+          store.completeStreams(
+            {
+              instance: "conn_a",
+              sourceId,
+              method: "collector",
+              generation: 1,
+              sourceCollectedAt: at,
+              collectionTimeBasis: "host_run_finished",
+              streams: [
+                {
+                  stream: "messages",
+                  coverage: "full_stream",
+                  liveCount: 1,
+                  snapshotSha256: "0".repeat(64),
+                },
+              ],
+            },
+            () => ["id"],
+          ),
+      ],
+      [
+        "transitionClaudeToLive",
+        () =>
+          store.transitionClaudeToLive({
+            instance: "conn_a",
+            expectedGeneration: 1,
+            expectedWriteClock: store.transitionWriteClock(),
+            snapshots: {},
+          }),
+      ],
+      [
+        "transitionStravaToBrowser",
+        () =>
+          store.transitionStravaToBrowser({
+            instance: "conn_a",
+            expectedGeneration: 1,
+            expectedWriteClock: store.transitionWriteClock(),
+            snapshots: {},
+          }),
+      ],
+      [
+        "confirmClaudeTransition",
+        () => store.confirmClaudeTransition("conn_a", 1),
+      ],
+      [
+        "confirmStravaTransition",
+        () => store.confirmStravaTransition("conn_a", 1),
+      ],
+      [
+        "clearClaudeTransitionScope",
+        () => store.clearClaudeTransitionScope("claude.conversations"),
+      ],
+      [
+        "clearStravaTransitionScope",
+        () => store.clearStravaTransitionScope("strava.activities"),
+      ],
+    ];
+    for (const [name, mutate] of mutations) {
+      expect(() => mutate(), name).toThrow("replica_integrity_quarantine");
+      expect(state(), name).toEqual(before);
+    }
   });
 });

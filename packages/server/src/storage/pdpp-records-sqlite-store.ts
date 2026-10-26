@@ -804,6 +804,19 @@ export function createSqliteRecordStore(
     sweepStaleBlobClaims(db);
   }
   const replica = options.replica?.(db);
+  /** Every connection-scoped write enters through this quarantine boundary. */
+  const connectionMutation = <T>(
+    instances: string | readonly string[] | (() => readonly string[]),
+    write: () => T,
+  ): T => {
+    const run = () => {
+      const ids = typeof instances === "function" ? instances() : instances;
+      for (const instance of new Set(typeof ids === "string" ? [ids] : ids))
+        replica?.assertConnectionWritable(instance);
+      return write();
+    };
+    return db.inTransaction ? run() : db.transaction(run).immediate();
+  };
   /** Replica quarantine filter for read SQL; empty without replication. */
   const unquarantined = (alias: string) =>
     replica ? ` AND ${replica.unquarantinedRecordSql(alias)}` : "";
@@ -1028,7 +1041,10 @@ export function createSqliteRecordStore(
       });
     });
 
-    runBatch();
+    connectionMutation(
+      envelopes.map((envelope) => envelope.instance),
+      () => runBatch(),
+    );
     return summarizeIngest(results);
   }
 
@@ -1108,7 +1124,7 @@ export function createSqliteRecordStore(
     ) {
       throw new TypeError("invalid_completion_policy");
     }
-    return db.transaction((): ReplaceStreamResult => {
+    return connectionMutation(input.instance, (): ReplaceStreamResult => {
       checkInstanceBinding(input.instance, input.method, input.generation);
       replica?.assertStreamWritable(
         input.instance,
@@ -1258,7 +1274,7 @@ export function createSqliteRecordStore(
       if (input.sourceCollectedAt !== undefined)
         replica?.captureCompletion(input.instance, input.stream);
       return { ...summary, applied: true, deleted: missing.length };
-    })();
+    });
   }
 
   // Under `preserve_if_unchanged`: true when this replace writes nothing to
@@ -1343,7 +1359,6 @@ export function createSqliteRecordStore(
     if (typeof method !== "string" || method.length === 0) {
       throw new PdppBindingError("method_required");
     }
-    replica?.assertConnectionWritable(instance);
     const current = ensureBinding(db, instance);
     if (current.deleted_at !== null) {
       throw new PdppBindingError("connection_deleted");
@@ -1385,7 +1400,7 @@ export function createSqliteRecordStore(
     expectedGeneration: number;
     nextMethod: string | null;
   }): { binding: PdppInstanceBinding; alreadyReset: boolean } {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
       const current = ensureBinding(db, input.instance);
       if (current.deleted_at !== null) {
         throw new PdppBindingError("connection_deleted");
@@ -1429,7 +1444,7 @@ export function createSqliteRecordStore(
         binding: toBinding(ensureBinding(db, input.instance)),
         alreadyReset: false,
       };
-    })();
+    });
   }
 
   function transitionWriteClock(): number {
@@ -1476,44 +1491,51 @@ export function createSqliteRecordStore(
   }
 
   function confirmClaudeTransition(instance: string, generation: number): void {
-    db.prepare(
-      "UPDATE pdpp_claude_transition SET conversations_covered = 1 WHERE instance = ? AND generation = ?",
-    ).run(instance, generation);
+    connectionMutation(instance, () =>
+      db
+        .prepare(
+          "UPDATE pdpp_claude_transition SET conversations_covered = 1 WHERE instance = ? AND generation = ?",
+        )
+        .run(instance, generation),
+    );
   }
 
   function clearClaudeTransitionScope(scope: string): void {
     if (scope !== "claude.conversations" && scope !== "claude.projects") return;
-    db.transaction(() => {
-      for (const transition of listClaudeTransitions()) {
-        delete transition.snapshots[scope];
-        db.prepare(
-          "UPDATE pdpp_claude_transition SET snapshots_json = ? WHERE instance = ?",
-        ).run(JSON.stringify(transition.snapshots), transition.instance);
-        const streams =
-          scope === "claude.conversations"
-            ? ["conversations", "messages"]
-            : ["projects", "project_documents"];
-        if (Object.keys(transition.snapshots).length === 0)
-          streams.push("account_profile");
-        for (const table of [
-          "pdpp_records",
-          "pdpp_record_changes",
-          "pdpp_stream_completion",
-          "pdpp_record_arrival",
-        ]) {
-          for (const stream of streams)
-            db.prepare(
-              `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
-            ).run(transition.archiveInstance, stream);
-        }
-        db.prepare(
-          `DELETE FROM pdpp_blob_claims WHERE instance = ?
+    connectionMutation(
+      () => listClaudeTransitions().map((transition) => transition.instance),
+      () => {
+        for (const transition of listClaudeTransitions()) {
+          delete transition.snapshots[scope];
+          db.prepare(
+            "UPDATE pdpp_claude_transition SET snapshots_json = ? WHERE instance = ?",
+          ).run(JSON.stringify(transition.snapshots), transition.instance);
+          const streams =
+            scope === "claude.conversations"
+              ? ["conversations", "messages"]
+              : ["projects", "project_documents"];
+          if (Object.keys(transition.snapshots).length === 0)
+            streams.push("account_profile");
+          for (const table of [
+            "pdpp_records",
+            "pdpp_record_changes",
+            "pdpp_stream_completion",
+            "pdpp_record_arrival",
+          ]) {
+            for (const stream of streams)
+              db.prepare(
+                `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
+              ).run(transition.archiveInstance, stream);
+          }
+          db.prepare(
+            `DELETE FROM pdpp_blob_claims WHERE instance = ?
           AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
           AND NOT EXISTS (SELECT 1 FROM pdpp_record_changes c WHERE c.instance = pdpp_blob_claims.instance AND json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id)`,
-        ).run(transition.archiveInstance);
-      }
-      deleteUnclaimedBlobs(db);
-    })();
+          ).run(transition.archiveInstance);
+        }
+        deleteUnclaimedBlobs(db);
+      },
+    );
   }
 
   const STRAVA_SOURCE = "https://registry.pdpp.dev/sources/strava";
@@ -1567,30 +1589,36 @@ export function createSqliteRecordStore(
   }
 
   function confirmStravaTransition(instance: string, generation: number): void {
-    db.prepare(
-      "UPDATE pdpp_strava_transition SET activities_covered = 1 WHERE instance = ? AND generation = ?",
-    ).run(instance, generation);
+    connectionMutation(instance, () =>
+      db
+        .prepare(
+          "UPDATE pdpp_strava_transition SET activities_covered = 1 WHERE instance = ? AND generation = ?",
+        )
+        .run(instance, generation),
+    );
   }
 
   /** A takeover reset drops the saved body and its archived rows. */
   function clearStravaTransitionScope(scope: string): void {
     if (!(scope in STRAVA_SCOPE_STREAMS)) return;
     const stream = STRAVA_SCOPE_STREAMS[scope as StravaTransitionScope];
-    db.transaction(() => {
-      for (const transition of listStravaTransitions()) {
-        delete transition.snapshots[scope as StravaTransitionScope];
-        db.prepare(
-          "UPDATE pdpp_strava_transition SET snapshots_json = ? WHERE instance = ?",
-        ).run(JSON.stringify(transition.snapshots), transition.instance);
-        for (const table of ARCHIVED_TABLES) {
-          if (table === "pdpp_blob_claims") continue;
+    connectionMutation(
+      () => listStravaTransitions().map((transition) => transition.instance),
+      () => {
+        for (const transition of listStravaTransitions()) {
+          delete transition.snapshots[scope as StravaTransitionScope];
           db.prepare(
-            `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
-          ).run(transition.archiveInstance, stream);
-        }
-        // Unreadable retained history may still reference any archived blob.
-        db.prepare(
-          `DELETE FROM pdpp_blob_claims WHERE instance = ?
+            "UPDATE pdpp_strava_transition SET snapshots_json = ? WHERE instance = ?",
+          ).run(JSON.stringify(transition.snapshots), transition.instance);
+          for (const table of ARCHIVED_TABLES) {
+            if (table === "pdpp_blob_claims") continue;
+            db.prepare(
+              `DELETE FROM ${table} WHERE instance = ? AND stream = ?`,
+            ).run(transition.archiveInstance, stream);
+          }
+          // Unreadable retained history may still reference any archived blob.
+          db.prepare(
+            `DELETE FROM pdpp_blob_claims WHERE instance = ?
           AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance = pdpp_blob_claims.instance AND r.blob_id = pdpp_blob_claims.blob_id)
           AND NOT EXISTS (
             SELECT 1 FROM pdpp_record_changes c
@@ -1599,11 +1627,12 @@ export function createSqliteRecordStore(
                 THEN json_extract(c.data, '$.blob_ref.blob_id') = pdpp_blob_claims.blob_id
                 ELSE c.data IS NOT NULL END
           )`,
-        ).run(transition.archiveInstance);
-      }
-      // A scope reset must retain blobs that unreadable history may reference.
-      collectStartupUnclaimedBlobs(db);
-    })();
+          ).run(transition.archiveInstance);
+        }
+        // A scope reset must retain blobs that unreadable history may reference.
+        collectStartupUnclaimedBlobs(db);
+      },
+    );
   }
 
   /**
@@ -1614,7 +1643,7 @@ export function createSqliteRecordStore(
   function transitionStravaToBrowser(
     input: StravaTransitionInput,
   ): PdppInstanceBinding {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
       const current = getInstanceBinding(input.instance);
       if (current.deletedAt !== null)
         throw new PdppBindingError("connection_deleted");
@@ -1660,13 +1689,13 @@ export function createSqliteRecordStore(
         "UPDATE pdpp_instance_binding SET method = ?, generation = ?, reset_clock = ? WHERE instance = ?",
       ).run(STRAVA_BROWSER_METHOD, generation, clock, input.instance);
       return getInstanceBinding(input.instance);
-    })();
+    });
   }
 
   function transitionClaudeToLive(
     input: ClaudeTransitionInput,
   ): PdppInstanceBinding {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
       const current = getInstanceBinding(input.instance);
       if (current.deletedAt !== null)
         throw new PdppBindingError("connection_deleted");
@@ -1720,7 +1749,7 @@ export function createSqliteRecordStore(
         "UPDATE pdpp_instance_binding SET method = 'anthropic-live', generation = ?, reset_clock = ? WHERE instance = ?",
       ).run(generation, clock, input.instance);
       return getInstanceBinding(input.instance);
-    })();
+    });
   }
 
   function listConnections(sourceId: string): PdppInstanceBinding[] {
@@ -1738,7 +1767,7 @@ export function createSqliteRecordStore(
     method: string;
     label: string;
   }): PdppInstanceBinding {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
       const current = ensureBinding(db, input.instance);
       if (current.deleted_at !== null) {
         throw new PdppBindingError("connection_deleted");
@@ -1760,11 +1789,11 @@ export function createSqliteRecordStore(
         replica?.captureLifecycle(input.instance, "connection-register");
       replica?.notifyVisibility();
       return getInstanceBinding(input.instance);
-    })();
+    });
   }
 
   function deleteConnection(instance: string): PdppInstanceBinding {
-    return db.transaction(() => {
+    return connectionMutation(instance, () => {
       const current = ensureBinding(db, instance);
       if (current.deleted_at !== null) return toBinding(current);
       eraseInstanceData(instance);
@@ -1776,7 +1805,7 @@ export function createSqliteRecordStore(
       replica?.captureLifecycle(instance, "connection-delete");
       replica?.notifyVisibility();
       return getInstanceBinding(instance);
-    })();
+    });
   }
 
   function eraseInstanceData(instance: string): void {
@@ -1896,170 +1925,167 @@ export function createSqliteRecordStore(
     declarations: StreamDeclarationResolver,
   ): { receipts: NativeStreamCompletionReceipt[] } {
     const request = parseCompletionRequest(rawRequest);
-    return db
-      .transaction(() => {
-        const binding = db
-          .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
-          .get(request.instance) as BindingRowDb | undefined;
-        if (!binding || binding.source_id === null) {
-          throw new PdppBindingError("connection_required");
+    return connectionMutation(request.instance, () => {
+      const binding = db
+        .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
+        .get(request.instance) as BindingRowDb | undefined;
+      if (!binding || binding.source_id === null) {
+        throw new PdppBindingError("connection_required");
+      }
+      if (binding.deleted_at !== null) {
+        throw new PdppBindingError("connection_deleted");
+      }
+      if (binding.source_id !== request.sourceId) {
+        throw new PdppBindingError("source_mismatch");
+      }
+      if (binding.generation !== request.generation) {
+        throw new PdppBindingError("binding_generation_mismatch");
+      }
+      if (binding.method !== request.method) {
+        throw new PdppBindingError("instance_bound_to_other_method");
+      }
+
+      const clock = readWriteClock();
+      const requestedAt = Date.parse(request.sourceCollectedAt);
+      // Validate every stream before the first receipt is written.
+      const writes: { stream: string; kind: "insert" | "update" | "keep" }[] =
+        [];
+      for (const proof of request.streams) {
+        replica?.assertStreamWritable(
+          request.instance,
+          proof.stream,
+          request.generation,
+        );
+        const primaryKey = declarations(request.sourceId, proof.stream);
+        if (primaryKey === undefined) {
+          throw new StreamCompletionError("unknown_stream");
         }
-        if (binding.deleted_at !== null) {
-          throw new PdppBindingError("connection_deleted");
+        if (
+          primaryKey.length === 0 ||
+          !primaryKey.every((field) => typeof field === "string" && field)
+        ) {
+          throw new StreamCompletionError("invalid_declaration");
         }
-        if (binding.source_id !== request.sourceId) {
-          throw new PdppBindingError("source_mismatch");
+        const rows = db
+          .prepare(
+            "SELECT record_key, data FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
+          )
+          .all(request.instance, proof.stream) as {
+          record_key: string;
+          data: string;
+        }[];
+        if (rows.length !== proof.liveCount) {
+          throw new StreamCompletionError("snapshot_conflict");
         }
-        if (binding.generation !== request.generation) {
-          throw new PdppBindingError("binding_generation_mismatch");
-        }
-        if (binding.method !== request.method) {
-          throw new PdppBindingError("instance_bound_to_other_method");
+        const digest = liveSnapshotDigest(
+          { ...request, stream: proof.stream },
+          primaryKey,
+          rows.map((row) => ({
+            recordKey: row.record_key,
+            dataJson: row.data,
+          })),
+        );
+        if (digest !== proof.snapshotSha256) {
+          throw new StreamCompletionError("snapshot_conflict");
         }
 
-        replica?.assertConnectionWritable(request.instance);
-        const clock = readWriteClock();
-        const requestedAt = Date.parse(request.sourceCollectedAt);
-        // Validate every stream before the first receipt is written.
-        const writes: { stream: string; kind: "insert" | "update" | "keep" }[] =
-          [];
-        for (const proof of request.streams) {
-          replica?.assertStreamWritable(
+        const prior = db
+          .prepare(
+            "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+          )
+          .get(request.instance, proof.stream) as CompletionRowDb | undefined;
+        if (!prior) {
+          writes.push({ stream: proof.stream, kind: "insert" });
+          continue;
+        }
+        // A receipt is deleted by every write that could invalidate it, so a
+        // stored one that disagrees with the live data was tampered with.
+        const native = prior.snapshot_sha256 !== null;
+        if (
+          !receiptInvariantsHold(prior, {
+            method: request.method,
+            generation: request.generation,
+            liveCount: rows.length,
+            clock,
+            lastChange: lastChangeSeq(request.instance, proof.stream),
+            digest: () => digest,
+          })
+        ) {
+          throw new StreamCompletionError("invalid_prior_receipt");
+        }
+        const priorAt = Date.parse(prior.source_collected_at);
+        if (requestedAt < priorAt) {
+          throw new StreamCompletionError("time_conflict");
+        }
+        if (requestedAt === priorAt) {
+          // Same instant: an exact replay keeps its bytes. A digest-less
+          // receipt cannot be relabeled as native proof at its own time.
+          if (!native) throw new StreamCompletionError("time_conflict");
+          writes.push({ stream: proof.stream, kind: "keep" });
+        } else {
+          writes.push({ stream: proof.stream, kind: "update" });
+        }
+      }
+
+      for (const [index, write] of writes.entries()) {
+        const proof = request.streams[index];
+        if (write.kind === "insert") {
+          db.prepare(
+            `INSERT INTO pdpp_stream_completion
+               (instance, stream, method, generation, source_collected_at, write_seq, live_count, snapshot_sha256, collection_time_basis)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
             request.instance,
             proof.stream,
+            request.method,
             request.generation,
+            request.sourceCollectedAt,
+            clock,
+            proof.liveCount,
+            proof.snapshotSha256,
+            request.collectionTimeBasis,
           );
-          const primaryKey = declarations(request.sourceId, proof.stream);
-          if (primaryKey === undefined) {
-            throw new StreamCompletionError("unknown_stream");
-          }
-          if (
-            primaryKey.length === 0 ||
-            !primaryKey.every((field) => typeof field === "string" && field)
-          ) {
-            throw new StreamCompletionError("invalid_declaration");
-          }
-          const rows = db
-            .prepare(
-              "SELECT record_key, data FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
-            )
-            .all(request.instance, proof.stream) as {
-            record_key: string;
-            data: string;
-          }[];
-          if (rows.length !== proof.liveCount) {
-            throw new StreamCompletionError("snapshot_conflict");
-          }
-          const digest = liveSnapshotDigest(
-            { ...request, stream: proof.stream },
-            primaryKey,
-            rows.map((row) => ({
-              recordKey: row.record_key,
-              dataJson: row.data,
-            })),
+        } else if (write.kind === "update") {
+          db.prepare(
+            `UPDATE pdpp_stream_completion
+                SET source_collected_at = ?, write_seq = ?, snapshot_sha256 = ?, collection_time_basis = ?
+              WHERE instance = ? AND stream = ?`,
+          ).run(
+            request.sourceCollectedAt,
+            clock,
+            proof.snapshotSha256,
+            request.collectionTimeBasis,
+            request.instance,
+            proof.stream,
           );
-          if (digest !== proof.snapshotSha256) {
-            throw new StreamCompletionError("snapshot_conflict");
-          }
+        }
+      }
 
-          const prior = db
+      for (const write of writes) {
+        if (write.kind !== "keep")
+          replica?.captureCompletion(request.instance, write.stream);
+      }
+      return {
+        receipts: request.streams.map((proof) => {
+          const row = db
             .prepare(
               "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
             )
-            .get(request.instance, proof.stream) as CompletionRowDb | undefined;
-          if (!prior) {
-            writes.push({ stream: proof.stream, kind: "insert" });
-            continue;
-          }
-          // A receipt is deleted by every write that could invalidate it, so a
-          // stored one that disagrees with the live data was tampered with.
-          const native = prior.snapshot_sha256 !== null;
-          if (
-            !receiptInvariantsHold(prior, {
-              method: request.method,
-              generation: request.generation,
-              liveCount: rows.length,
-              clock,
-              lastChange: lastChangeSeq(request.instance, proof.stream),
-              digest: () => digest,
-            })
-          ) {
-            throw new StreamCompletionError("invalid_prior_receipt");
-          }
-          const priorAt = Date.parse(prior.source_collected_at);
-          if (requestedAt < priorAt) {
-            throw new StreamCompletionError("time_conflict");
-          }
-          if (requestedAt === priorAt) {
-            // Same instant: an exact replay keeps its bytes. A digest-less
-            // receipt cannot be relabeled as native proof at its own time.
-            if (!native) throw new StreamCompletionError("time_conflict");
-            writes.push({ stream: proof.stream, kind: "keep" });
-          } else {
-            writes.push({ stream: proof.stream, kind: "update" });
-          }
-        }
-
-        for (const [index, write] of writes.entries()) {
-          const proof = request.streams[index];
-          if (write.kind === "insert") {
-            db.prepare(
-              `INSERT INTO pdpp_stream_completion
-               (instance, stream, method, generation, source_collected_at, write_seq, live_count, snapshot_sha256, collection_time_basis)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            ).run(
-              request.instance,
-              proof.stream,
-              request.method,
-              request.generation,
-              request.sourceCollectedAt,
-              clock,
-              proof.liveCount,
-              proof.snapshotSha256,
-              request.collectionTimeBasis,
-            );
-          } else if (write.kind === "update") {
-            db.prepare(
-              `UPDATE pdpp_stream_completion
-                SET source_collected_at = ?, write_seq = ?, snapshot_sha256 = ?, collection_time_basis = ?
-              WHERE instance = ? AND stream = ?`,
-            ).run(
-              request.sourceCollectedAt,
-              clock,
-              proof.snapshotSha256,
-              request.collectionTimeBasis,
-              request.instance,
-              proof.stream,
-            );
-          }
-        }
-
-        for (const write of writes) {
-          if (write.kind !== "keep")
-            replica?.captureCompletion(request.instance, write.stream);
-        }
-        return {
-          receipts: request.streams.map((proof) => {
-            const row = db
-              .prepare(
-                "SELECT * FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
-              )
-              .get(request.instance, proof.stream) as CompletionRowDb;
-            return {
-              instance: row.instance,
-              stream: row.stream,
-              method: row.method,
-              generation: row.generation,
-              sourceCollectedAt: row.source_collected_at,
-              writeSeq: row.write_seq,
-              liveCount: row.live_count,
-              snapshotSha256: row.snapshot_sha256 as string,
-              collectionTimeBasis: "host_run_finished" as const,
-            };
-          }),
-        };
-      })
-      .immediate();
+            .get(request.instance, proof.stream) as CompletionRowDb;
+          return {
+            instance: row.instance,
+            stream: row.stream,
+            method: row.method,
+            generation: row.generation,
+            sourceCollectedAt: row.source_collected_at,
+            writeSeq: row.write_seq,
+            liveCount: row.live_count,
+            snapshotSha256: row.snapshot_sha256 as string,
+            collectionTimeBasis: "host_run_finished" as const,
+          };
+        }),
+      };
+    });
   }
 
   function listArrivalOrder(instance: string, stream: string): string[] {
@@ -2246,42 +2272,42 @@ export function createSqliteRecordStore(
   ): boolean {
     if (streamSemantics === "append_only") return false;
     let result = false;
-    const run = db.transaction(() => {
-      replica?.assertConnectionWritable(instance);
-      replica?.assertKeyWritable(instance, stream, recordKey);
-      const existing = getCurrentStmt.get(instance, stream, recordKey) as
-        RecordRowDb | undefined;
-      if (!existing || existing.deleted) return;
+    const run = () =>
+      connectionMutation(instance, () => {
+        replica?.assertKeyWritable(instance, stream, recordKey);
+        const existing = getCurrentStmt.get(instance, stream, recordKey) as
+          RecordRowDb | undefined;
+        if (!existing || existing.deleted) return;
 
-      const version = existing.version + 1;
-      const writtenAt = nextWriteSeq.get() as { value: number };
-      dropCompletion(instance, stream);
-      upsertCurrentStmt.run({
-        instance,
-        stream,
-        record_key: recordKey,
-        data: null,
-        version,
-        emitted_at: deletedAt,
-        deleted: 1,
-        deleted_at: deletedAt,
-        blob_id: null,
+        const version = existing.version + 1;
+        const writtenAt = nextWriteSeq.get() as { value: number };
+        dropCompletion(instance, stream);
+        upsertCurrentStmt.run({
+          instance,
+          stream,
+          record_key: recordKey,
+          data: null,
+          version,
+          emitted_at: deletedAt,
+          deleted: 1,
+          deleted_at: deletedAt,
+          blob_id: null,
+        });
+        insertHistoryStmt.run({
+          instance,
+          stream,
+          record_key: recordKey,
+          version,
+          data: null,
+          emitted_at: deletedAt,
+          deleted: 1,
+          deleted_at: deletedAt,
+          written_at: writtenAt.value,
+        });
+        replica?.recordWritten(instance, stream, recordKey, streamSemantics);
+        forgetArrivalStmt.run(instance, stream, recordKey);
+        result = true;
       });
-      insertHistoryStmt.run({
-        instance,
-        stream,
-        record_key: recordKey,
-        version,
-        data: null,
-        emitted_at: deletedAt,
-        deleted: 1,
-        deleted_at: deletedAt,
-        written_at: writtenAt.value,
-      });
-      replica?.recordWritten(instance, stream, recordKey, streamSemantics);
-      forgetArrivalStmt.run(instance, stream, recordKey);
-      result = true;
-    });
     run();
     return result;
   }
@@ -2581,7 +2607,7 @@ export function createSqliteRecordStore(
     bytes: Uint8Array;
     mimeType: string;
   }): PdppBlobMeta {
-    return db.transaction(() => {
+    return connectionMutation(input.instance, () => {
       const binding = ensureBinding(db, input.instance);
       if (binding.deleted_at !== null) {
         throw new PdppBindingError("connection_deleted");
@@ -2604,7 +2630,7 @@ export function createSqliteRecordStore(
       replica?.captureBlob(input.instance, meta.blobId);
       replica?.notifyVisibility();
       return meta;
-    })();
+    });
   }
 
   function getBlobBytes(blobId: string): Uint8Array<ArrayBuffer> | undefined {

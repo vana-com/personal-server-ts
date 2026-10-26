@@ -2,6 +2,7 @@ import type { Database } from "better-sqlite3";
 import { createHash } from "node:crypto";
 
 export const BINARY_CHUNK_BYTES = 64 * 1024;
+export const CANONICAL_INLINE_BYTES = 1024 * 1024;
 export const BINARY_CHUNKS_MIGRATION = `
 CREATE TABLE IF NOT EXISTS pdpp_binary_manifests (
  namespace TEXT NOT NULL, blob_id TEXT NOT NULL, size_bytes INTEGER NOT NULL,
@@ -79,16 +80,15 @@ export function* readBinaryChunks(
       .prepare(`SELECT length(bytes) AS size FROM ${table} WHERE blob_id=?`)
       .get(id) as { size: number } | undefined;
     if (row) {
-      // One whole legacy read avoids SQLite reloading the value per substring.
-      const value = db
-        .prepare(`SELECT bytes FROM ${table} WHERE blob_id=?`)
-        .get(id) as { bytes: Buffer };
-      for (
-        let offset = 0;
-        offset < value.bytes.length;
-        offset += BINARY_CHUNK_BYTES
-      )
-        yield value.bytes.subarray(offset, offset + BINARY_CHUNK_BYTES);
+      const readPart = db.prepare(
+        `SELECT substr(bytes, ?, ?) AS bytes FROM ${table} WHERE blob_id=?`,
+      );
+      for (let offset = 0; offset < row.size; offset += BINARY_CHUNK_BYTES) {
+        const part = readPart.get(offset + 1, BINARY_CHUNK_BYTES, id) as
+          { bytes: Buffer } | undefined;
+        if (!part?.bytes.length) throw new Error("corrupt binary chunks");
+        yield part.bytes;
+      }
       return;
     }
   }
@@ -230,47 +230,40 @@ export function copyBinary(
 }
 
 /**
- * Canonical values up to this size stay one `pdpp_blob_bytes` row, which a
- * build without replication (or without chunk tables) can still read.
+ * Main's whole-value row owns canonical bytes. The caller keeps the optional
+ * transport copy separate so promotion can release its assembly buffer first.
  */
-export const CANONICAL_INLINE_BYTES = 1024 * 1024;
-
-/** Store the replica transport copy as chunks above the inline threshold. */
 export function writeCanonicalBinary(
   db: Database,
   id: string,
   bytes: Uint8Array,
 ): void {
-  if (bytes.length <= CANONICAL_INLINE_BYTES) {
-    db.prepare(
-      `INSERT INTO ${legacy.canonical} (blob_id, bytes) VALUES (?, ?)`,
-    ).run(id, Buffer.from(bytes));
-    return;
-  }
+  deleteBinary(db, "canonical", id);
+  const view = Buffer.from(
+    bytes.buffer as ArrayBuffer,
+    bytes.byteOffset,
+    bytes.byteLength,
+  );
+  db.prepare(
+    `INSERT INTO ${legacy.canonical} (blob_id, bytes) VALUES (?, ?)
+     ON CONFLICT(blob_id) DO UPDATE SET bytes = excluded.bytes`,
+  ).run(id, view);
+  if (bytes.length <= CANONICAL_INLINE_BYTES) return;
   const writer = binaryWriter(db, "canonical", id);
-  writer.write(bytes);
+  for (let offset = 0; offset < bytes.length; offset += BINARY_CHUNK_BYTES)
+    writer.write(bytes.subarray(offset, offset + BINARY_CHUNK_BYTES));
   writer.finish();
 }
 
-/** Promote verified bytes into canonical storage with the same size rule. */
+/** Promote verified bytes through the canonical writer and its transport copy. */
 export function copyBinaryToCanonical(
   db: Database,
   from: BinaryNamespace,
   sourceId: string,
   targetId = sourceId,
 ): void {
-  const size = binaryLength(db, from, sourceId);
-  if (size === undefined) throw new Error("missing binary bytes");
-  if (size > CANONICAL_INLINE_BYTES) {
-    copyBinary(db, from, sourceId, "canonical", targetId);
-    return;
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of readBinaryChunks(db, from, sourceId)) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
+  const bytes = readBinary(db, from, sourceId);
+  if (!bytes) throw new Error("missing binary bytes");
   writeCanonicalBinary(db, targetId, bytes);
 }
 

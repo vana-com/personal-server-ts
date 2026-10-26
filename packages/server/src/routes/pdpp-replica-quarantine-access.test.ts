@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { keccak256, stringToHex } from "viem";
 import {
@@ -155,7 +155,7 @@ function record(
 }
 
 async function fixture() {
-  const root = mkdtempSync(join(homedir(), ".tmp/8b-quarantine-"));
+  const root = mkdtempSync(join(tmpdir(), "8b-quarantine-"));
   let db = new Database(join(root, "replica.sqlite"));
   let store = createReplicaRecordStore(db);
   const issuer = await openConsentIssuer(root, owner, 3600);

@@ -70,11 +70,15 @@ if (mode === "seed" || mode === "seed-legacy") {
     () => ["id"],
     { method: "export", generation: 1 },
   );
-  if (mode === "seed-legacy")
-    db.prepare("INSERT INTO pdpp_blob_bytes VALUES (?,?)").run(
-      blob.blobId,
-      Buffer.alloc(size, 31),
-    );
+  if (mode === "seed-legacy") {
+    // Keep only main's legacy whole-value row to exercise its fallback reader.
+    db.prepare(
+      "DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=?",
+    ).run(blob.blobId);
+    db.prepare(
+      "DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=?",
+    ).run(blob.blobId);
+  }
   writeFileSync(join(directory, "blob-id"), blob.blobId);
   store.close();
 } else if (mode === "legacy-read") {

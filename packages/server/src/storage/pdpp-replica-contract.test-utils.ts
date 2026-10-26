@@ -6,7 +6,7 @@
 import Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
@@ -72,9 +72,7 @@ export function cleanupHarness() {
   clock.time = Date.parse(at);
 }
 export function scratchDirectory(prefix: string) {
-  const directory = mkdtempSync(
-    join(process.env.TMPDIR ?? join(homedir(), ".tmp"), `${prefix}-`),
-  );
+  const directory = mkdtempSync(join(tmpdir(), `${prefix}-`));
   cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
   return directory;
 }

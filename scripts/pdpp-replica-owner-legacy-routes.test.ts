@@ -1,7 +1,7 @@
 /** Deterministic factory integration; no live grants or network mutations. */
 import { afterEach, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pino from "pino";
 import { privateKeyToAccount } from "viem/accounts";
@@ -46,7 +46,7 @@ afterEach(() => {
 });
 
 function setup() {
-  const root = mkdtempSync(join(homedir(), ".tmp/legacy-routes-test-"));
+  const root = mkdtempSync(join(tmpdir(), "legacy-routes-test-"));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const storage = openReplicaOwnerLegacyStorage({ root });
   cleanups.push(storage.close);
@@ -177,7 +177,7 @@ it.each(["/v1/grants", "/v1/grants/"])(
 );
 
 it("opens real normal raw storage under A's root without creating data or authority", async () => {
-  const root = mkdtempSync(join(homedir(), ".tmp/legacy-storage-test-"));
+  const root = mkdtempSync(join(tmpdir(), "legacy-storage-test-"));
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   const storage = openReplicaOwnerLegacyStorage({ root });
   cleanups.push(storage.close);

@@ -1,6 +1,6 @@
 /**
  * Pure copy-promotion decision, contract v3.1
- * (~/.tmp/cutover-handoff/replica-copy-promotion-contract-1021-v3.md):
+ * (the reviewed cutover handoff contract):
  * v2 §2 rules 1-6 and §5 pure tests, amendments B, C, D, G and I.
  */
 import { describe, expect, it } from "vitest";

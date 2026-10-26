@@ -207,3 +207,46 @@ it("an interrupted quarantineConnection leaves nothing behind", async () => {
   );
   expect(await collect("grant")).toHaveLength(1);
 });
+
+it.each(["connection-delete", "blob-claim"] as const)(
+  "refuses local %s mutations after connection quarantine without changing canonical state",
+  async (kind) => {
+    const { adapter, make } = device();
+    const store = make();
+    await provision(store);
+    if (kind === "blob-claim")
+      await store.import({
+        id: "registration",
+        credential: "replica",
+        envelope: envelope("registration", [registration]),
+      });
+    await store.quarantineConnection({
+      credential: "replica",
+      connectionId: identity.connectionId,
+      reason: "finalized_conflict",
+    });
+    const before = structuredClone({
+      rows: adapter.disk.rows,
+      blobs: adapter.disk.blobs,
+    });
+    const operation =
+      kind === "connection-delete"
+        ? { ...identity, kind }
+        : {
+            ...identity,
+            kind,
+            blob: {
+              blobId: `sha256:${"c".repeat(64)}`,
+              sha256: `sha256:${"c".repeat(64)}`,
+              mimeType: "application/octet-stream",
+              sizeBytes: 2 * 1024 * 1024,
+            },
+          };
+
+    await expect(
+      store.commitLocal(`quarantined-${kind}`, [operation]),
+    ).rejects.toThrow("local connection is quarantined");
+    expect(adapter.disk.rows).toEqual(before.rows);
+    expect(adapter.disk.blobs).toEqual(before.blobs);
+  },
+);

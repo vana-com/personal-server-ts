@@ -15,7 +15,7 @@ import {
 } from "./pdpp-replica-owner-legacy-routes.js";
 import { createAccessLogWriter } from "../packages/server/src/logging/access-log.js";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import {
   createTestWallet,
   buildWeb3SignedHeader,
@@ -40,7 +40,7 @@ afterEach(async () => {
 const origin = "http://127.0.0.1:3286";
 const accountOrigin = "http://localhost:3084";
 async function setup() {
-  const root = mkdtempSync(join(homedir(), ".tmp/composition-test-"));
+  const root = mkdtempSync(join(tmpdir(), "composition-test-"));
   roots.push(root);
   const owner = createTestWallet(0);
   const host = await createOwnerComposition({

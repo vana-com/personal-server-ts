@@ -1,5 +1,5 @@
 import { mkdtempSync, mkdirSync, rmSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
@@ -25,9 +25,7 @@ import {
 } from "./pdpp-replica-live-journey.js";
 
 function temporaryRoot() {
-  const parent = join(homedir(), ".tmp");
-  mkdirSync(parent, { recursive: true });
-  return mkdtempSync(join(parent, "consent-harness-test-"));
+  return mkdtempSync(join(tmpdir(), "consent-harness-test-"));
 }
 function fixture(path: string) {
   const db = new Database(path);

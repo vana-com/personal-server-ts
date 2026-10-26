@@ -8,7 +8,6 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import {
   BINARY_CHUNKS_MIGRATION,
-  CANONICAL_INLINE_BYTES,
   binaryLength,
   clearMalformedManifest,
   readBinary,
@@ -233,9 +232,6 @@ export function createReplicaCanonicalPort(db: Database) {
            WHERE m.namespace = 'canonical' AND c.blob_id IS NULL`,
         )
         .all() as { blob_id: string; size_bytes: number; sha256: string }[];
-      const insert = db.prepare(
-        "INSERT OR IGNORE INTO pdpp_blob_bytes (blob_id, bytes) VALUES (?, ?)",
-      );
       for (const blob of missing) {
         if (
           !verifyBinary(
@@ -248,7 +244,7 @@ export function createReplicaCanonicalPort(db: Database) {
         )
           continue;
         const bytes = readBinary(db, "canonical", blob.blob_id);
-        if (bytes) insert.run(blob.blob_id, Buffer.from(bytes));
+        if (bytes) writeCanonicalBinary(db, blob.blob_id, bytes);
       }
     }).immediate();
   }
@@ -455,16 +451,7 @@ export function createReplicaCanonicalPort(db: Database) {
       // A malformed manifest vetoes every reader; a blob write repairs it.
       clearMalformed: (blobId) =>
         clearMalformedManifest(db, "canonical", blobId),
-      write: (blobId, bytes) => {
-        db.prepare(
-          `INSERT INTO pdpp_blob_bytes (blob_id, bytes) VALUES (?, ?)
-           ON CONFLICT(blob_id) DO UPDATE SET bytes = excluded.bytes`,
-        ).run(blobId, Buffer.from(bytes));
-        // Replica chunks are a derived transport copy; main's row remains the
-        // canonical owner and is readable by rollback builds.
-        if (bytes.length > CANONICAL_INLINE_BYTES)
-          writeCanonicalBinary(db, blobId, bytes);
-      },
+      write: (blobId, bytes) => writeCanonicalBinary(db, blobId, bytes),
     },
   };
 

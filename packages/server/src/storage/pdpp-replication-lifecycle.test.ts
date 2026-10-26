@@ -1,10 +1,9 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, existsSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
-const memoryRoot = process.env.TMPDIR ?? join(homedir(), ".tmp");
-mkdirSync(memoryRoot, { recursive: true });
+const memoryRoot = tmpdir();
 const fixture = new URL("./pdpp-replication-memory.fixture.ts", import.meta.url)
   .pathname;
 const args = (mode: string, directory: string, size: number) => [

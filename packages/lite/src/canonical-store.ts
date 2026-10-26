@@ -501,6 +501,16 @@ export function createLiteCanonicalStore(deps: {
       throw new Error("canonical batch exceeds 192 KiB; split before commit");
     const fingerprint = `sha256:${sha256(toBytes(encoded)).slice(2)}`;
     return persistence.transaction(async (tx) => {
+      if (local) {
+        // One write boundary for every local operation kind. Quarantine is
+        // checked before clocks, staged attachments, receipts, or journals.
+        for (const connectionId of new Set(
+          input.operations!.map((op) => op.connectionId),
+        )) {
+          if ((await blocking(tx, connectionId, context)).blocked)
+            throw new Error("local connection is quarantined");
+        }
+      }
       if (input.promotion) {
         const batch = await get<PendingBatch>(
           tx,
