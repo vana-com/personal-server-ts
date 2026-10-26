@@ -1039,6 +1039,7 @@ export function createSqliteRecordStore(
           );
         }
       });
+      replica?.settleLocalWrites();
     });
 
     connectionMutation(
@@ -1273,6 +1274,7 @@ export function createSqliteRecordStore(
       }
       if (input.sourceCollectedAt !== undefined)
         replica?.captureCompletion(input.instance, input.stream);
+      replica?.settleLocalWrites();
       return { ...summary, applied: true, deleted: missing.length };
     });
   }
@@ -2308,6 +2310,7 @@ export function createSqliteRecordStore(
         });
         replica?.recordWritten(instance, stream, recordKey, streamSemantics);
         forgetArrivalStmt.run(instance, stream, recordKey);
+        replica?.settleLocalWrites();
         result = true;
       });
     run();

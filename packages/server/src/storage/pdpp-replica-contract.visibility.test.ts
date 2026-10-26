@@ -1817,6 +1817,81 @@ describe("64 [Node SQLite] fence dominance", () => {
       "profiles",
     ]);
   });
+  /**
+   * The baseline retains declaration A; an imported record for key k names a
+   * different valid declaration B. A local write under A then completes a
+   * declaration conflict, and reconciliation must have the last word.
+   */
+  const conflictedByLocalWrite = () => {
+    const declB: DeclarationBinding = {
+      ...binding,
+      digest: `sha256:${"c".repeat(64)}`,
+    };
+    const d = nodeLocal({ declarations: decls(binding) });
+    createReplicaReceiver({
+      db: d.db,
+      store: d.store,
+      owner: identity.owner,
+      authenticate: (c) => (c === credential ? identity.owner : undefined),
+      declarations: () => decls(binding, declB),
+    }).import({
+      credential,
+      envelope: {
+        format: "vana-pdpp-replica",
+        version: 1,
+        owner: identity.owner,
+        batchId: "declaration-b",
+        operations: [
+          rec("k", "k-b", 20, { text: "retained", declaration: declB }),
+        ],
+      },
+    });
+    return d;
+  };
+  const arrivals = (d: Local) =>
+    d.db
+      .prepare(
+        "SELECT record_key FROM pdpp_record_arrival WHERE instance = ? AND stream = ?",
+      )
+      .all(C, STREAM);
+  it("64a-l a local replacement that completes a conflict leaves no arrival entry or completion receipt for the fenced key", () => {
+    const d = conflictedByLocalWrite();
+    const result = d.store.replaceStream({
+      instance: C,
+      stream: STREAM,
+      method: identity.methodId,
+      generation: 1,
+      emittedAt: at,
+      envelopes: [
+        {
+          instance: C,
+          stream: STREAM,
+          key: "k",
+          data: { id: "k", text: "local content" },
+          emitted_at: at,
+        },
+      ],
+      primaryKey: ["id"],
+      declaration: binding,
+      sourceCollectedAt: at,
+    });
+    expect(result.applied).toBe(true);
+    for (const phase of ["live", "reopened"]) {
+      if (phase === "reopened") d.reopen();
+      expect(d.store.getRecord(C, STREAM, "k"), phase).toBeUndefined();
+      expect(arrivals(d), `${phase}: arrival`).toEqual([]);
+      expect(
+        d.store.listStreamCompletions(C).map((row) => row.stream),
+        `${phase}: completion`,
+      ).toEqual([]);
+    }
+  });
+  it("64a-i a local ingest that completes a conflict leaves no arrival entry for the fenced key", () => {
+    const d = conflictedByLocalWrite();
+    d.ingest(C, "k", "local content", "mutable_state");
+    expect(d.store.getRecord(C, STREAM, "k")).toBeUndefined();
+    expect(arrivals(d)).toEqual([]);
+  });
   it("64a-w write side: the key fence raises the epoch once; refused entry points, replay and reopen never move it", () => {
     const d = nodeLocal({ declarations: decls(appendDecl, profilesDecl) });
     d.ingestAll(["a", "b"]);

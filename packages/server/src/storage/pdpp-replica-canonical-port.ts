@@ -193,6 +193,13 @@ export interface ReplicaCanonicalPort {
     primaryKey?: string[],
     declaration?: DeclarationBinding,
   ): void;
+  /**
+   * Let the receiver reconcile keys written since the last settle. The store
+   * calls it once its own bookkeeping for the write (arrival entries, the
+   * completion receipt) is done, so reconciliation has the last word on a key
+   * a local write left in conflict.
+   */
+  settleLocalWrites(): void;
   captureInvalidation(instance: string, stream: string): void;
   captureCompletion(instance: string, stream: string): void;
   captureLifecycle(
@@ -273,6 +280,10 @@ export function createReplicaCanonicalPort(db: Database) {
   let visibilityObserver: (() => void) | undefined;
   let localWriteObserver:
     ((instance: string, stream: string, recordKey: string) => void) | undefined;
+  const unsettledLocalWrites = new Map<
+    string,
+    { instance: string; stream: string; recordKey: string }
+  >();
 
   function replicaIntegrityEpoch(connectionKey: string): number {
     return (
@@ -408,8 +419,18 @@ export function createReplicaCanonicalPort(db: Database) {
         primaryKey,
         decl,
       );
-      localWriteObserver?.(instance, stream, recordKey);
+      unsettledLocalWrites.set(JSON.stringify([instance, stream, recordKey]), {
+        instance,
+        stream,
+        recordKey,
+      });
       visibilityObserver?.();
+    },
+    settleLocalWrites() {
+      const writes = [...unsettledLocalWrites.values()];
+      unsettledLocalWrites.clear();
+      for (const { instance, stream, recordKey } of writes)
+        localWriteObserver?.(instance, stream, recordKey);
     },
     captureInvalidation: journal.captureInvalidation,
     captureCompletion: journal.captureCompletion,
@@ -478,7 +499,7 @@ export function createReplicaCanonicalPort(db: Database) {
     setReplicaVisibilityObserver(observer: () => void) {
       visibilityObserver = observer;
     },
-    /** Called after a local write is journaled, inside the write's transaction. */
+    /** Called for each locally written key when the store settles, inside the write's transaction. */
     setReplicaLocalWriteObserver(
       observer: (instance: string, stream: string, recordKey: string) => void,
     ) {
