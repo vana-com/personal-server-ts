@@ -1190,6 +1190,29 @@ export async function createPersistentPsLiteStorage(
       ).then((outcome) => outcome === true);
     },
 
+    // Only while the envelope is absent: the check and the erase both run
+    // under the path lock that every write of this path takes. A store that
+    // throws on read is a fault, not absence, and the row stays.
+    deleteVersionIfEnvelopeMissing(scope, collectedAt, fence) {
+      const path = envelopePath(scope, collectedAt);
+      if (fence.path !== path) return Promise.resolve(false);
+      return withPathLock(path, async () => {
+        const present =
+          (await fileStore.readEnvelope(path)) ??
+          (await fallbackStore.readEnvelope(path));
+        if (present) return false;
+        const outcome = await eraseUnderPathLock(
+          path,
+          (e) =>
+            e.scope === scope &&
+            e.collectedAt === collectedAt &&
+            e.path === path &&
+            e.id === fence.id,
+        );
+        return outcome === true;
+      });
+    },
+
     async deleteByFileId(fileId) {
       // The fileId only names the path whose lock to take. The row is
       // re-resolved under that lock, and looked again if it moved.

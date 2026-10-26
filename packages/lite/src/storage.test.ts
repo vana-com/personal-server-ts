@@ -1431,3 +1431,96 @@ function blockFixture(
     blocks,
   };
 }
+
+describe("deleteVersionIfEnvelopeMissing", () => {
+  const scope = "instagram.profile";
+  const collectedAt = "2026-05-08T00:00:00.000Z";
+
+  async function setup() {
+    const files = createMemoryPsLiteDataFileStore("custom");
+    let readFault: Error | null = null;
+    const store: PsLiteDataFileStore = {
+      ...files,
+      async readEnvelope(path) {
+        if (readFault) throw readFault;
+        return files.readEnvelope(path);
+      },
+    };
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      store,
+    );
+    const envelope = createDataFileEnvelope(scope, collectedAt, { value: 1 });
+    const row = await storage.writeEnvelopeAndIndex!(envelope, {
+      fileId: null,
+      scope,
+      collectedAt,
+      dataPointId: "dp-1",
+    });
+    return {
+      storage,
+      files,
+      row,
+      envelope,
+      fence: { id: row.id, path: row.path },
+      setFault: (error: Error | null) => {
+        readFault = error;
+      },
+    };
+  }
+
+  it("removes the row when the envelope is absent", async () => {
+    const { storage, files, fence } = await setup();
+    await files.deleteEnvelope(fence.path);
+
+    await expect(
+      storage.deleteVersionIfEnvelopeMissing!(scope, collectedAt, fence),
+    ).resolves.toBe(true);
+    expect(storage.countVersions(scope)).toBe(0);
+  });
+
+  it("keeps the row when the envelope is present", async () => {
+    const { storage, fence } = await setup();
+
+    await expect(
+      storage.deleteVersionIfEnvelopeMissing!(scope, collectedAt, fence),
+    ).resolves.toBe(false);
+    expect(storage.countVersions(scope)).toBe(1);
+  });
+
+  it("keeps the row when the read faults instead of reporting absence", async () => {
+    const { storage, fence, setFault } = await setup();
+    setFault(new Error("EIO: input/output error"));
+
+    await expect(
+      storage.deleteVersionIfEnvelopeMissing!(scope, collectedAt, fence),
+    ).rejects.toThrow("EIO");
+    expect(storage.countVersions(scope)).toBe(1);
+  });
+
+  it("keeps a version restored after the absence was observed", async () => {
+    const { storage, files, fence, envelope } = await setup();
+    await files.deleteEnvelope(fence.path);
+
+    // The caller saw the file missing; a restore is queued before its erase.
+    const restore = storage.writeEnvelopeAndIndex!(envelope, {
+      fileId: null,
+      scope,
+      collectedAt,
+      dataPointId: "dp-1",
+    });
+    const erase = storage.deleteVersionIfEnvelopeMissing!(
+      scope,
+      collectedAt,
+      fence,
+    );
+    await restore;
+
+    await expect(erase).resolves.toBe(false);
+    expect(storage.countVersions(scope)).toBe(1);
+    await expect(storage.readEnvelope(scope, collectedAt)).resolves.toEqual(
+      envelope,
+    );
+  });
+});
