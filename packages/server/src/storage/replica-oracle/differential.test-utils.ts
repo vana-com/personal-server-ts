@@ -43,8 +43,6 @@ export const KNOWN_DEFECTS: ReadonlySet<string> = new Set(
   (
     process.env.REPLICA_ORACLE_AVOID ??
     [
-      // Node rewrites a quarantined connection's tombstone on a later import (oracle finding D2).
-      "quarantine-with-deletes",
       // Node shows a row made readable by pending bytes without the pending marker (oracle finding D3).
       "pending-bytes-for-confirmed",
     ].join(",")

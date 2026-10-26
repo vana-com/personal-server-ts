@@ -422,8 +422,9 @@ export function createLiteCanonicalStore(deps: {
         await put(tx, `row-generation/${path}`, generation);
       }
       // The Node receiver's lifecycle cleanup touches live rows only. Preserve
-      // an existing tombstone's original deletion time/version under a reset.
-      if (!materialized && !record && prior?.deleted) continue;
+      // an existing tombstone's original deletion time/version under a reset,
+      // and under a withdrawn winner (oracle D2 on the Lite port).
+      if (!materialized && prior?.deleted) continue;
       // Match the receiver: missing lifecycle/declaration evidence does not
       // retract a previously materialized row. A validated reset does.
       if (

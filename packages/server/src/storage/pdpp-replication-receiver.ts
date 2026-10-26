@@ -343,6 +343,10 @@ export function createReplicaReceiver(deps: {
         "SELECT * FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
       )
       .get(instance, stream, key) as StoredRow | undefined;
+    // Hiding a row that is already a tombstone keeps it. Rewriting it would
+    // bump the version and replace the delete's deletedAt with emittedAt. A
+    // later import for another connection re-plans this one (oracle D2).
+    if (!operation && current?.data === null) return;
     const data =
       operation?.kind === "upsert" ? canonicalJson(operation.data) : null;
     const emittedAt = operation?.emittedAt ?? current?.emitted_at;
