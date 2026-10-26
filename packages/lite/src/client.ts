@@ -298,6 +298,11 @@ export async function startPersonalServer(
   ): Promise<PersonalServerScopeUpload> {
     const origin = requiredApiOrigin(await info());
     const base = `/v1/data/${encodeURIComponent(scope)}/uploads`;
+    // Every request below is already addressed to `origin`, so each goes
+    // straight to the runtime. `callFetch` would ask `info()` for the origin
+    // again, and that is a `/health` request that looks the server up at the
+    // gateway: once per batch of a large upload.
+    const fetchOpened = (request: Request) => runtime.fetch(request);
     const send = async (
       method: string,
       path: string,
@@ -315,7 +320,7 @@ export async function startPersonalServer(
           ...uploadOptions.headers,
         },
       });
-      return parsePersonalServerJsonResponse(await callFetch(request), what);
+      return parsePersonalServerJsonResponse(await fetchOpened(request), what);
     };
     const begun = (await send(
       "POST",
@@ -405,7 +410,7 @@ export async function startPersonalServer(
           authOptions: uploadOptions,
           headers: uploadOptions.headers,
         });
-        const response = await callFetch(request);
+        const response = await fetchOpened(request);
         if (
           !response.ok &&
           response.status !== 404 &&
