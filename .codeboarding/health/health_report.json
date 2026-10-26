@@ -1,7 +1,7 @@
 {
   "repository_name": ".codeboarding-target",
-  "timestamp": "2026-10-26T20:27:42.523277+00:00",
-  "overall_score": 0.9710468681559352,
+  "timestamp": "2026-10-26T21:51:49.149442+00:00",
+  "overall_score": 0.9714407320706534,
   "check_summaries": [
     {
       "check_name": "function_size",
@@ -37,10 +37,10 @@
         "typescript"
       ],
       "check_type": "standard",
-      "total_entities_checked": 4511,
-      "findings_count": 129,
-      "warning_count": 129,
-      "score": 0.9714032365329195,
+      "total_entities_checked": 4644,
+      "findings_count": 131,
+      "warning_count": 131,
+      "score": 0.9717915590008613,
       "finding_groups": [
         {
           "severity": "warning",
@@ -92,16 +92,16 @@
             {
               "entity_name": "packages.core.src.api.index.handlePersonalServerDataRequest",
               "file_path": "packages/core/src/api/index.ts",
-              "line_start": 1682,
-              "line_end": 2673,
-              "metric_value": 991
+              "line_start": 1839,
+              "line_end": 2833,
+              "metric_value": 994
             },
             {
               "entity_name": "packages.core.src.api.index.handlePersonalServerDataRequest.withApiErrors() callback",
               "file_path": "packages/core/src/api/index.ts",
-              "line_start": 1696,
-              "line_end": 2672,
-              "metric_value": 976
+              "line_start": 1853,
+              "line_end": 2832,
+              "metric_value": 979
             },
             {
               "entity_name": "packages.core.src.storage.legacy-scope-view.createLegacyScopeView",
@@ -109,6 +109,13 @@
               "line_start": 384,
               "line_end": 1350,
               "metric_value": 966
+            },
+            {
+              "entity_name": "packages.lite.src.storage.createPersistentPsLiteStorage",
+              "file_path": "packages/lite/src/storage.ts",
+              "line_start": 527,
+              "line_end": 1355,
+              "metric_value": 828
             },
             {
               "entity_name": "packages.enclave.src.fleet.placement.openFleetController",
@@ -120,23 +127,16 @@
             {
               "entity_name": "packages.lite.src.runtime.handleMcpRoute",
               "file_path": "packages/lite/src/runtime.ts",
-              "line_start": 1406,
-              "line_end": 2087,
+              "line_start": 1413,
+              "line_end": 2094,
               "metric_value": 681
-            },
-            {
-              "entity_name": "packages.lite.src.storage.createPersistentPsLiteStorage",
-              "file_path": "packages/lite/src/storage.ts",
-              "line_start": 473,
-              "line_end": 1123,
-              "metric_value": 650
             },
             {
               "entity_name": "packages.lite.src.runtime.createPsLiteRuntime",
               "file_path": "packages/lite/src/runtime.ts",
-              "line_start": 772,
-              "line_end": 1395,
-              "metric_value": 623
+              "line_start": 773,
+              "line_end": 1402,
+              "metric_value": 629
             },
             {
               "entity_name": "packages.core.src.additions.durable.createDurableAdditions",
@@ -151,6 +151,13 @@
               "line_start": 285,
               "line_end": 871,
               "metric_value": 586
+            },
+            {
+              "entity_name": "packages.lite.src.client.startPersonalServer",
+              "file_path": "packages/lite/src/client.ts",
+              "line_start": 95,
+              "line_end": 659,
+              "metric_value": 564
             },
             {
               "entity_name": "packages.server.src.storage.index-manager.createIndexManager",
@@ -209,13 +216,6 @@
               "metric_value": 438
             },
             {
-              "entity_name": "packages.lite.src.client.startPersonalServer",
-              "file_path": "packages/lite/src/client.ts",
-              "line_start": 89,
-              "line_end": 527,
-              "metric_value": 438
-            },
-            {
               "entity_name": "scripts.e2e-job.main",
               "file_path": "scripts/e2e-job.ts",
               "line_start": 1917,
@@ -239,16 +239,16 @@
             {
               "entity_name": "packages.lite.src.runtime.createPsLiteRuntime.fetch",
               "file_path": "packages/lite/src/runtime.ts",
-              "line_start": 1009,
-              "line_end": 1393,
-              "metric_value": 384
+              "line_start": 1015,
+              "line_end": 1400,
+              "metric_value": 385
             },
             {
               "entity_name": "packages.lite.src.runtime.createPsLiteRuntime.fetch.withProtocolErrors() callback",
               "file_path": "packages/lite/src/runtime.ts",
-              "line_start": 1010,
-              "line_end": 1392,
-              "metric_value": 382
+              "line_start": 1016,
+              "line_end": 1399,
+              "metric_value": 383
             },
             {
               "entity_name": "packages.server.src.client.startPersonalServer",
@@ -314,6 +314,13 @@
               "metric_value": 351
             },
             {
+              "entity_name": "packages.lite.src.test-support.memory.createMemoryPsLiteStorage",
+              "file_path": "packages/lite/src/test-support/memory.ts",
+              "line_start": 114,
+              "line_end": 451,
+              "metric_value": 337
+            },
+            {
               "entity_name": "packages.lite.src.additions-transport.openSession",
               "file_path": "packages/lite/src/additions-transport.ts",
               "line_start": 146,
@@ -345,8 +352,15 @@
               "entity_name": "packages.core.src.sync.workers.download.downloadOne",
               "file_path": "packages/core/src/sync/workers/download.ts",
               "line_start": 273,
-              "line_end": 570,
-              "metric_value": 297
+              "line_end": 583,
+              "metric_value": 310
+            },
+            {
+              "entity_name": "packages.core.src.api.scope-uploads.createScopeUploadRegistry",
+              "file_path": "packages/core/src/api/scope-uploads.ts",
+              "line_start": 133,
+              "line_end": 436,
+              "metric_value": 303
             },
             {
               "entity_name": "packages.server.src.api-auth.createServerApiAuth",
@@ -519,8 +533,8 @@
             {
               "entity_name": "packages.core.src.legacy-projection.bindings.claudeConversationsBinding",
               "file_path": "packages/core/src/legacy-projection/bindings.ts",
-              "line_start": 2179,
-              "line_end": 2399,
+              "line_start": 2189,
+              "line_end": 2409,
               "metric_value": 220
             },
             {
@@ -575,8 +589,8 @@
             {
               "entity_name": "packages.core.src.legacy-projection.bindings.claudeProjects.project",
               "file_path": "packages/core/src/legacy-projection/bindings.ts",
-              "line_start": 2452,
-              "line_end": 2657,
+              "line_start": 2462,
+              "line_end": 2667,
               "metric_value": 205
             },
             {
@@ -715,8 +729,8 @@
             {
               "entity_name": "packages.core.src.legacy-projection.bindings.chatgptConversations.project",
               "file_path": "packages/core/src/legacy-projection/bindings.ts",
-              "line_start": 1827,
-              "line_end": 2011,
+              "line_start": 1837,
+              "line_end": 2021,
               "metric_value": 184
             },
             {
@@ -783,17 +797,17 @@
               "metric_value": 170
             },
             {
-              "entity_name": "packages.core.src.sync.workers.download.downloadAll",
-              "file_path": "packages/core/src/sync/workers/download.ts",
-              "line_start": 576,
-              "line_end": 746,
-              "metric_value": 170
-            },
-            {
               "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes.app.post(\"/streams/:stream/records/replace\") callback",
               "file_path": "packages/server/src/routes/pdpp-records.ts",
               "line_start": 1376,
               "line_end": 1546,
+              "metric_value": 170
+            },
+            {
+              "entity_name": "packages.core.src.sync.workers.download.downloadAll",
+              "file_path": "packages/core/src/sync/workers/download.ts",
+              "line_start": 589,
+              "line_end": 759,
               "metric_value": 170
             },
             {
@@ -804,17 +818,17 @@
               "metric_value": 169
             },
             {
-              "entity_name": "packages.core.src.api.index.handleX402Cycle",
-              "file_path": "packages/core/src/api/index.ts",
-              "line_start": 807,
-              "line_end": 976,
-              "metric_value": 169
-            },
-            {
               "entity_name": "packages.lite.src.sync.createPsLiteSyncManager",
               "file_path": "packages/lite/src/sync.ts",
               "line_start": 237,
               "line_end": 406,
+              "metric_value": 169
+            },
+            {
+              "entity_name": "packages.core.src.api.index.handleX402Cycle",
+              "file_path": "packages/core/src/api/index.ts",
+              "line_start": 828,
+              "line_end": 997,
               "metric_value": 169
             },
             {
@@ -925,8 +939,8 @@
             {
               "entity_name": "packages.lite.src.storage.createPersistentPsLiteStorage.storagePort.readScopeBlocks",
               "file_path": "packages/lite/src/storage.ts",
-              "line_start": 601,
-              "line_end": 753,
+              "line_start": 824,
+              "line_end": 976,
               "metric_value": 152
             },
             {
@@ -937,17 +951,17 @@
               "metric_value": 151
             },
             {
-              "entity_name": "packages.core.src.legacy-projection.bindings.claudeConversationsBinding.project",
-              "file_path": "packages/core/src/legacy-projection/bindings.ts",
-              "line_start": 2247,
-              "line_end": 2397,
-              "metric_value": 150
-            },
-            {
               "entity_name": "packages.core.src.payment.x402.verifyPayment",
               "file_path": "packages/core/src/payment/x402.ts",
               "line_start": 449,
               "line_end": 599,
+              "metric_value": 150
+            },
+            {
+              "entity_name": "packages.core.src.legacy-projection.bindings.claudeConversationsBinding.project",
+              "file_path": "packages/core/src/legacy-projection/bindings.ts",
+              "line_start": 2257,
+              "line_end": 2407,
               "metric_value": 150
             }
           ]
