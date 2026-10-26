@@ -329,17 +329,8 @@ export async function startPersonalServer(
     const batchBytes = Math.min(begun.maxBatchBytes, SCOPE_UPLOAD_BATCH_BYTES);
     let seq = 0;
 
-    async function appendBatch(items: unknown[]): Promise<void> {
+    async function sendBatch(items: unknown[]): Promise<void> {
       const body = { items };
-      if (
-        items.length > 1 &&
-        new TextEncoder().encode(JSON.stringify(body)).byteLength > batchBytes
-      ) {
-        const half = Math.ceil(items.length / 2);
-        await appendBatch(items.slice(0, half));
-        await appendBatch(items.slice(half));
-        return;
-      }
       const batchPath = `${path}/batches/${seq}`;
       try {
         await send("PUT", batchPath, body, "scope upload batch");
@@ -352,12 +343,32 @@ export async function startPersonalServer(
       seq += 1;
     }
 
+    /** Group items into batches by their own encoded size, one at a time. */
+    async function appendItems(items: unknown[]): Promise<void> {
+      const encoder = new TextEncoder();
+      const frameBytes = encoder.encode('{"items":[]}').byteLength;
+      let batch: unknown[] = [];
+      let bytes = frameBytes;
+      for (const item of items) {
+        const itemBytes =
+          encoder.encode(JSON.stringify(item) ?? "null").byteLength + 1;
+        if (batch.length > 0 && bytes + itemBytes > batchBytes) {
+          await sendBatch(batch);
+          batch = [];
+          bytes = frameBytes;
+        }
+        batch.push(item);
+        bytes += itemBytes;
+      }
+      if (batch.length > 0) await sendBatch(batch);
+    }
+
     return {
       uploadId: begun.uploadId,
       collectedAt: begun.collectedAt,
       maxBatchBytes: begun.maxBatchBytes,
       async append(items) {
-        if (items.length > 0) await appendBatch(items);
+        await appendItems(items);
       },
       async commit(data) {
         return (await send(

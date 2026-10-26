@@ -120,8 +120,6 @@ interface OpenUpload {
   headKeys: Set<string>;
   digests: string[];
   items: number;
-  /** Serializes the upload's requests; the writer takes one call at a time. */
-  queue: Promise<unknown>;
   timer: ReturnType<typeof setTimeout> | undefined;
 }
 
@@ -155,10 +153,23 @@ export function createScopeUploadRegistry(
     }
   }
 
-  function touch(upload: OpenUpload): void {
-    if (upload.timer !== undefined) clearTimeout(upload.timer);
+  /**
+   * Every begin, request and expiry runs here, one at a time. The writer
+   * takes one call at a time, and an upload cannot end, or give way to a new
+   * one, while one of its requests is still writing.
+   */
+  let queue: Promise<unknown> = Promise.resolve();
+  function exclusive<T>(step: () => Promise<T>): Promise<T> {
+    const run = queue.then(step);
+    queue = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Expire the upload after it has been idle, between requests only. */
+  function armTimer(upload: OpenUpload): void {
+    if (open !== upload) return;
     const timer = setTimeout(() => {
-      void end(upload, "expired").catch(() => undefined);
+      void exclusive(() => end(upload, "expired")).catch(() => undefined);
     }, idleTimeoutMs);
     // Node: an idle upload must not keep the process alive.
     (timer as { unref?: () => void }).unref?.();
@@ -185,15 +196,16 @@ export function createScopeUploadRegistry(
     throw new ScopeUploadError(404, "UPLOAD_NOT_FOUND", "Upload not found");
   }
 
-  /** Run `step` after the upload's earlier requests; a failure aborts it. */
+  /** Run `step` as the upload's next request; a storage failure aborts it. */
   function serialized<T>(
     upload: OpenUpload,
     step: () => Promise<T>,
   ): Promise<T> {
-    const run = upload.queue.then(async () => {
-      // An earlier request may have ended it while this one waited.
+    return exclusive(async () => {
+      // An earlier request or expiry may have ended it while this one waited.
       find(upload.scope, upload.id);
-      touch(upload);
+      if (upload.timer !== undefined) clearTimeout(upload.timer);
+      upload.timer = undefined;
       try {
         return await step();
       } catch (err) {
@@ -203,10 +215,10 @@ export function createScopeUploadRegistry(
           await end(upload, "aborted").catch(() => undefined);
         }
         throw err;
+      } finally {
+        armTimer(upload);
       }
     });
-    upload.queue = run.catch(() => undefined);
-    return run;
   }
 
   return {
@@ -239,42 +251,48 @@ export function createScopeUploadRegistry(
           );
         }
 
-        // One file-write slot: the open upload gives way to the new one.
-        if (open) await end(open, "aborted").catch(() => undefined);
-        const writer = await input.storage.openVersionWriter(
-          input.scope,
-          input.collectedAt,
-        );
-        started = true;
-        const upload: OpenUpload = {
-          id: createId(),
-          scope: input.scope,
-          collectedAt: input.collectedAt,
-          storage: input.storage,
-          writer,
-          release: input.release,
-          arrayKey,
-          headKeys: new Set(Object.keys(head)),
-          digests: [],
-          items: 0,
-          queue: Promise.resolve(),
-          timer: undefined,
-        };
-        open = upload;
-        touch(upload);
-        await serialized(upload, () =>
-          writer.write(
-            `{"version":"1.0","scope":${JSON.stringify(input.scope)},` +
-              `"collectedAt":${JSON.stringify(input.collectedAt)},"data":{` +
-              Object.entries(head)
-                .map(
-                  ([key, value]) =>
-                    `${JSON.stringify(key)}:${JSON.stringify(value)},`,
-                )
-                .join("") +
-              `${JSON.stringify(arrayKey)}:[`,
-          ),
-        );
+        const openVersionWriter = input.storage.openVersionWriter;
+        const upload = await exclusive(async () => {
+          // One file-write slot: the open upload gives way to the new one.
+          if (open) await end(open, "aborted").catch(() => undefined);
+          const writer = await openVersionWriter(
+            input.scope,
+            input.collectedAt,
+          );
+          started = true;
+          const created: OpenUpload = {
+            id: createId(),
+            scope: input.scope,
+            collectedAt: input.collectedAt,
+            storage: input.storage,
+            writer,
+            release: input.release,
+            arrayKey,
+            headKeys: new Set(Object.keys(head)),
+            digests: [],
+            items: 0,
+            timer: undefined,
+          };
+          open = created;
+          try {
+            await writer.write(
+              `{"version":"1.0","scope":${JSON.stringify(input.scope)},` +
+                `"collectedAt":${JSON.stringify(input.collectedAt)},"data":{` +
+                Object.entries(head)
+                  .map(
+                    ([key, value]) =>
+                      `${JSON.stringify(key)}:${JSON.stringify(value)},`,
+                  )
+                  .join("") +
+                `${JSON.stringify(arrayKey)}:[`,
+            );
+          } catch (err) {
+            await end(created, "aborted").catch(() => undefined);
+            throw err;
+          }
+          armTimer(created);
+          return created;
+        });
         return { uploadId: upload.id, collectedAt: upload.collectedAt };
       } finally {
         if (!started) input.release();

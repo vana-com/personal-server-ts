@@ -8,6 +8,7 @@ import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { createScopeUploadRegistry } from "@opendatalabs/personal-server-ts-core/api";
+import type { DataStoragePort } from "@opendatalabs/personal-server-ts-core/ports";
 import {
   createBearerTokenPsLiteAuth,
   createPsLiteRuntime,
@@ -322,6 +323,136 @@ describe("streamed scope uploads", () => {
     ).rejects.toMatchObject({ status: 410, code: "UPLOAD_EXPIRED" });
     expect(storage.findEntry({ scope: SCOPE })).toBeUndefined();
     expect(files.size).toBe(0);
+  });
+
+  it("lets only one of two overlapping begins keep a writer", async () => {
+    const files = new Map<string, string>();
+    const base = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(files),
+    );
+    let writers = 0;
+    let aborted = 0;
+    const storage: DataStoragePort = {
+      ...base,
+      async openVersionWriter(scope, collectedAt) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        const writer = await base.openVersionWriter!(scope, collectedAt);
+        writers += 1;
+        return {
+          ...writer,
+          async abort() {
+            aborted += 1;
+            await writer.abort();
+          },
+        };
+      },
+    };
+    const registry = createScopeUploadRegistry();
+    let released = 0;
+    const input = (collectedAt: string) => ({
+      storage,
+      scope: SCOPE,
+      collectedAt,
+      release: () => {
+        released += 1;
+      },
+      body: {},
+    });
+
+    const [first, second] = await Promise.all([
+      registry.begin(input("2026-10-26T00:00:00.000Z")),
+      registry.begin(input("2026-10-26T00:00:01.000Z")),
+    ]);
+
+    expect(writers).toBe(2);
+    expect(aborted).toBe(1);
+    expect(released).toBe(1);
+    await expect(
+      registry.append({
+        scope: SCOPE,
+        uploadId: first.uploadId,
+        seq: 0,
+        text: '{"items":[1]}',
+      }),
+    ).rejects.toMatchObject({ status: 410, code: "UPLOAD_ABORTED" });
+    await registry.append({
+      scope: SCOPE,
+      uploadId: second.uploadId,
+      seq: 0,
+      text: '{"items":[1]}',
+    });
+    await registry.commit({
+      scope: SCOPE,
+      uploadId: second.uploadId,
+      body: {},
+      afterTombstoneVersion: null,
+    });
+    expect(released).toBe(2);
+    expect(storage.findEntry({ scope: SCOPE })?.collectedAt).toBe(
+      "2026-10-26T00:00:01.000Z",
+    );
+  });
+
+  it("does not expire an upload while its commit is still writing", async () => {
+    const files = new Map<string, string>();
+    const base = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(files),
+    );
+    let aborted = 0;
+    const storage: DataStoragePort = {
+      ...base,
+      async openVersionWriter(scope, collectedAt) {
+        const writer = await base.openVersionWriter!(scope, collectedAt);
+        return {
+          ...writer,
+          async commit(entry) {
+            // Longer than the idle timeout.
+            await new Promise((resolve) => setTimeout(resolve, 80));
+            return writer.commit(entry);
+          },
+          async abort() {
+            aborted += 1;
+            await writer.abort();
+          },
+        };
+      },
+    };
+    const registry = createScopeUploadRegistry({ idleTimeoutMs: 20 });
+    let released = 0;
+    const { uploadId } = await registry.begin({
+      storage,
+      scope: SCOPE,
+      collectedAt: "2026-10-26T00:00:00.000Z",
+      release: () => {
+        released += 1;
+      },
+      body: {},
+    });
+    await registry.append({
+      scope: SCOPE,
+      uploadId,
+      seq: 0,
+      text: '{"items":[1]}',
+    });
+
+    const committed = await registry.commit({
+      scope: SCOPE,
+      uploadId,
+      body: {},
+      afterTombstoneVersion: null,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(committed.records).toBe(1);
+    expect(aborted).toBe(0);
+    expect(released).toBe(1);
+    expect(storage.findEntry({ scope: SCOPE })?.collectedAt).toBe(
+      "2026-10-26T00:00:00.000Z",
+    );
   });
 });
 

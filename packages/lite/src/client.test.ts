@@ -247,6 +247,42 @@ describe("startPersonalServer lite handle", () => {
     );
   });
 
+  it("never serializes more than one batch of a large append at once", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const ps = await startPersonalServer({
+      runtime: createRuntime(gateway, storage),
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    const items = Array.from({ length: 20 }, (_, i) => ({
+      id: i,
+      text: "z".repeat(200_000),
+    }));
+    const stringify = vi.spyOn(JSON, "stringify");
+    let longest = 0;
+    try {
+      await upload.append(items);
+      for (const result of stringify.mock.results) {
+        if (typeof result.value === "string") {
+          longest = Math.max(longest, result.value.length);
+        }
+      }
+    } finally {
+      stringify.mockRestore();
+    }
+
+    expect(longest).toBeLessThanOrEqual(1024 * 1024);
+    await expect(upload.commit()).resolves.toMatchObject({ records: 20 });
+  });
+
   it("exposes typed data and sync helpers through the public handle", async () => {
     const gateway = createGateway();
     const ps = await startPersonalServer({
