@@ -1,0 +1,1158 @@
+{
+  "repository_name": ".codeboarding-target",
+  "timestamp": "2026-10-26T20:27:42.523277+00:00",
+  "overall_score": 0.9710468681559352,
+  "check_summaries": [
+    {
+      "check_name": "function_size",
+      "description": "Checks that functions/methods do not exceed line count thresholds",
+      "languages": [
+        "python"
+      ],
+      "check_type": "standard",
+      "total_entities_checked": 47,
+      "findings_count": 0,
+      "warning_count": 0,
+      "score": 1.0,
+      "finding_groups": []
+    },
+    {
+      "check_name": "unused_code_diagnostics",
+      "description": "Detects unused imports, variables, functions, and dead code via LSP diagnostics",
+      "languages": [
+        "python"
+      ],
+      "check_type": "standard",
+      "total_entities_checked": 0,
+      "findings_count": 0,
+      "warning_count": 0,
+      "score": 1.0,
+      "finding_groups": []
+    },
+    {
+      "check_name": "function_size",
+      "description": "Checks that functions/methods do not exceed line count thresholds",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "check_type": "standard",
+      "total_entities_checked": 4511,
+      "findings_count": 129,
+      "warning_count": 129,
+      "score": 0.9714032365329195,
+      "finding_groups": [
+        {
+          "severity": "warning",
+          "threshold": 150,
+          "description": "Functions exceeding 150.0 lines",
+          "entities": [
+            {
+              "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.createSqliteRecordStore",
+              "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+              "line_start": 682,
+              "line_end": 2543,
+              "metric_value": 1861
+            },
+            {
+              "entity_name": "scripts.e2e-x402-lite.main",
+              "file_path": "scripts/e2e-x402-lite.ts",
+              "line_start": 510,
+              "line_end": 1887,
+              "metric_value": 1377
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes",
+              "file_path": "packages/server/src/routes/pdpp-records.ts",
+              "line_start": 515,
+              "line_end": 1869,
+              "metric_value": 1354
+            },
+            {
+              "entity_name": "scripts.e2e-x402-flow.main",
+              "file_path": "scripts/e2e-x402-flow.ts",
+              "line_start": 399,
+              "line_end": 1626,
+              "metric_value": 1227
+            },
+            {
+              "entity_name": "packages.server.src.bootstrap.createServer",
+              "file_path": "packages/server/src/bootstrap.ts",
+              "line_start": 234,
+              "line_end": 1344,
+              "metric_value": 1110
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-auth.pdppAuthRoutes",
+              "file_path": "packages/server/src/routes/pdpp-auth.ts",
+              "line_start": 435,
+              "line_end": 1474,
+              "metric_value": 1039
+            },
+            {
+              "entity_name": "packages.core.src.api.index.handlePersonalServerDataRequest",
+              "file_path": "packages/core/src/api/index.ts",
+              "line_start": 1682,
+              "line_end": 2673,
+              "metric_value": 991
+            },
+            {
+              "entity_name": "packages.core.src.api.index.handlePersonalServerDataRequest.withApiErrors() callback",
+              "file_path": "packages/core/src/api/index.ts",
+              "line_start": 1696,
+              "line_end": 2672,
+              "metric_value": 976
+            },
+            {
+              "entity_name": "packages.core.src.storage.legacy-scope-view.createLegacyScopeView",
+              "file_path": "packages/core/src/storage/legacy-scope-view.ts",
+              "line_start": 384,
+              "line_end": 1350,
+              "metric_value": 966
+            },
+            {
+              "entity_name": "packages.enclave.src.fleet.placement.openFleetController",
+              "file_path": "packages/enclave/src/fleet/placement.ts",
+              "line_start": 157,
+              "line_end": 896,
+              "metric_value": 739
+            },
+            {
+              "entity_name": "packages.lite.src.runtime.handleMcpRoute",
+              "file_path": "packages/lite/src/runtime.ts",
+              "line_start": 1406,
+              "line_end": 2087,
+              "metric_value": 681
+            },
+            {
+              "entity_name": "packages.lite.src.storage.createPersistentPsLiteStorage",
+              "file_path": "packages/lite/src/storage.ts",
+              "line_start": 473,
+              "line_end": 1123,
+              "metric_value": 650
+            },
+            {
+              "entity_name": "packages.lite.src.runtime.createPsLiteRuntime",
+              "file_path": "packages/lite/src/runtime.ts",
+              "line_start": 772,
+              "line_end": 1395,
+              "metric_value": 623
+            },
+            {
+              "entity_name": "packages.core.src.additions.durable.createDurableAdditions",
+              "file_path": "packages/core/src/additions/durable.ts",
+              "line_start": 210,
+              "line_end": 819,
+              "metric_value": 609
+            },
+            {
+              "entity_name": "packages.server.src.app.createApp",
+              "file_path": "packages/server/src/app.ts",
+              "line_start": 285,
+              "line_end": 871,
+              "metric_value": 586
+            },
+            {
+              "entity_name": "packages.server.src.storage.index-manager.createIndexManager",
+              "file_path": "packages/server/src/storage/index-manager.ts",
+              "line_start": 131,
+              "line_end": 680,
+              "metric_value": 549
+            },
+            {
+              "entity_name": "packages.core.src.storage.legacy-scope-view.createLegacyScopeView.chooseBody",
+              "file_path": "packages/core/src/storage/legacy-scope-view.ts",
+              "line_start": 784,
+              "line_end": 1316,
+              "metric_value": 532
+            },
+            {
+              "entity_name": "packages.core.src.storage.pdpp-records.memory-store.createMemoryRecordStore",
+              "file_path": "packages/core/src/storage/pdpp-records/memory-store.ts",
+              "line_start": 72,
+              "line_end": 596,
+              "metric_value": 524
+            },
+            {
+              "entity_name": "packages.lite.src.additions-transport.createPsLiteAdditionsTransport",
+              "file_path": "packages/lite/src/additions-transport.ts",
+              "line_start": 69,
+              "line_end": 592,
+              "metric_value": 523
+            },
+            {
+              "entity_name": "packages.server.src.storage.legacy-scope-authority.createLegacyScopeAuthority",
+              "file_path": "packages/server/src/storage/legacy-scope-authority.ts",
+              "line_start": 67,
+              "line_end": 575,
+              "metric_value": 508
+            },
+            {
+              "entity_name": "packages.enclave.src.central.bootstrap.startFleetCentral",
+              "file_path": "packages/enclave/src/central/bootstrap.ts",
+              "line_start": 75,
+              "line_end": 564,
+              "metric_value": 489
+            },
+            {
+              "entity_name": "packages.lite.src.relay.startPsLiteRelayClient",
+              "file_path": "packages/lite/src/relay.ts",
+              "line_start": 224,
+              "line_end": 684,
+              "metric_value": 460
+            },
+            {
+              "entity_name": "packages.server.src.mcp.durable-state.openMcpDurableState",
+              "file_path": "packages/server/src/mcp/durable-state.ts",
+              "line_start": 144,
+              "line_end": 582,
+              "metric_value": 438
+            },
+            {
+              "entity_name": "packages.lite.src.client.startPersonalServer",
+              "file_path": "packages/lite/src/client.ts",
+              "line_start": 89,
+              "line_end": 527,
+              "metric_value": 438
+            },
+            {
+              "entity_name": "scripts.e2e-job.main",
+              "file_path": "scripts/e2e-job.ts",
+              "line_start": 1917,
+              "line_end": 2353,
+              "metric_value": 436
+            },
+            {
+              "entity_name": "packages.core.src.mcp.read-client.createMcpDataReadClient",
+              "file_path": "packages/core/src/mcp/read-client.ts",
+              "line_start": 490,
+              "line_end": 915,
+              "metric_value": 425
+            },
+            {
+              "entity_name": "packages.core.src.storage.legacy-scope-coverage.compareLegacyCoverage",
+              "file_path": "packages/core/src/storage/legacy-scope-coverage.ts",
+              "line_start": 180,
+              "line_end": 586,
+              "metric_value": 406
+            },
+            {
+              "entity_name": "packages.lite.src.runtime.createPsLiteRuntime.fetch",
+              "file_path": "packages/lite/src/runtime.ts",
+              "line_start": 1009,
+              "line_end": 1393,
+              "metric_value": 384
+            },
+            {
+              "entity_name": "packages.lite.src.runtime.createPsLiteRuntime.fetch.withProtocolErrors() callback",
+              "file_path": "packages/lite/src/runtime.ts",
+              "line_start": 1010,
+              "line_end": 1392,
+              "metric_value": 382
+            },
+            {
+              "entity_name": "packages.server.src.client.startPersonalServer",
+              "file_path": "packages/server/src/client.ts",
+              "line_start": 74,
+              "line_end": 453,
+              "metric_value": 379
+            },
+            {
+              "entity_name": "scripts.e2e-identity.main",
+              "file_path": "scripts/e2e-identity.ts",
+              "line_start": 84,
+              "line_end": 455,
+              "metric_value": 371
+            },
+            {
+              "entity_name": "packages.core.src.mcp.tools.searchPersonalContext.handler",
+              "file_path": "packages/core/src/mcp/tools.ts",
+              "line_start": 1299,
+              "line_end": 1669,
+              "metric_value": 370
+            },
+            {
+              "entity_name": "packages.server.src.storage.import-operations.createImportOperations",
+              "file_path": "packages/server/src/storage/import-operations.ts",
+              "line_start": 45,
+              "line_end": 405,
+              "metric_value": 360
+            },
+            {
+              "entity_name": "packages.core.src.sync.engine.sync-manager.createSyncManager",
+              "file_path": "packages/core/src/sync/engine/sync-manager.ts",
+              "line_start": 76,
+              "line_end": 435,
+              "metric_value": 359
+            },
+            {
+              "entity_name": "packages.core.src.storage.legacy-projection.withLegacyProjection",
+              "file_path": "packages/core/src/storage/legacy-projection.ts",
+              "line_start": 117,
+              "line_end": 475,
+              "metric_value": 358
+            },
+            {
+              "entity_name": "packages.core.src.pdpp.declaration.parseDeclaration",
+              "file_path": "packages/core/src/pdpp/declaration.ts",
+              "line_start": 475,
+              "line_end": 828,
+              "metric_value": 353
+            },
+            {
+              "entity_name": "packages.server.src.routes.mcp.mcpOAuthRoutes",
+              "file_path": "packages/server/src/routes/mcp.ts",
+              "line_start": 703,
+              "line_end": 1054,
+              "metric_value": 351
+            },
+            {
+              "entity_name": "packages.core.src.derivatives.scheduler.createRecomputeScheduler",
+              "file_path": "packages/core/src/derivatives/scheduler.ts",
+              "line_start": 177,
+              "line_end": 528,
+              "metric_value": 351
+            },
+            {
+              "entity_name": "packages.lite.src.additions-transport.openSession",
+              "file_path": "packages/lite/src/additions-transport.ts",
+              "line_start": 146,
+              "line_end": 481,
+              "metric_value": 335
+            },
+            {
+              "entity_name": "packages.core.src.storage.legacy-scope-coverage.compareLegacyCoverage.compare",
+              "file_path": "packages/core/src/storage/legacy-scope-coverage.ts",
+              "line_start": 230,
+              "line_end": 549,
+              "metric_value": 319
+            },
+            {
+              "entity_name": "packages.enclave.src.jobs.run.runJob",
+              "file_path": "packages/enclave/src/jobs/run.ts",
+              "line_start": 317,
+              "line_end": 634,
+              "metric_value": 317
+            },
+            {
+              "entity_name": "packages.server.src.routes.mcp.mcpStreamableHttpRoutes",
+              "file_path": "packages/server/src/routes/mcp.ts",
+              "line_start": 1065,
+              "line_end": 1381,
+              "metric_value": 316
+            },
+            {
+              "entity_name": "packages.core.src.sync.workers.download.downloadOne",
+              "file_path": "packages/core/src/sync/workers/download.ts",
+              "line_start": 273,
+              "line_end": 570,
+              "metric_value": 297
+            },
+            {
+              "entity_name": "packages.server.src.api-auth.createServerApiAuth",
+              "file_path": "packages/server/src/api-auth.ts",
+              "line_start": 125,
+              "line_end": 410,
+              "metric_value": 285
+            },
+            {
+              "entity_name": "packages.server.src.mcp.tee-ingress.createTeeMcpIngress",
+              "file_path": "packages/server/src/mcp/tee-ingress.ts",
+              "line_start": 93,
+              "line_end": 376,
+              "metric_value": 283
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-instance-bindings.pdppInstanceBindingRoutes",
+              "file_path": "packages/server/src/routes/pdpp-instance-bindings.ts",
+              "line_start": 50,
+              "line_end": 325,
+              "metric_value": 275
+            },
+            {
+              "entity_name": "packages.core.src.storage.canonical-legacy-projection.projectSnapshot",
+              "file_path": "packages/core/src/storage/canonical-legacy-projection.ts",
+              "line_start": 689,
+              "line_end": 964,
+              "metric_value": 275
+            },
+            {
+              "entity_name": "packages.server.src.routes.chunked-scope-import.finalizeScopeImportAuthorized",
+              "file_path": "packages/server/src/routes/chunked-scope-import.ts",
+              "line_start": 912,
+              "line_end": 1179,
+              "metric_value": 267
+            },
+            {
+              "entity_name": "packages.server.src.jobs.worker.executeJobUnsafe",
+              "file_path": "packages/server/src/jobs/worker.ts",
+              "line_start": 132,
+              "line_end": 392,
+              "metric_value": 260
+            },
+            {
+              "entity_name": "packages.core.src.sync.scope-deletions.createScopeDeletionTracker",
+              "file_path": "packages/core/src/sync/scope-deletions.ts",
+              "line_start": 190,
+              "line_end": 445,
+              "metric_value": 255
+            },
+            {
+              "entity_name": "packages.core.src.oura.index.importLocked",
+              "file_path": "packages/core/src/oura/index.ts",
+              "line_start": 190,
+              "line_end": 443,
+              "metric_value": 253
+            },
+            {
+              "entity_name": "packages.core.src.pdpp.selection.validateStreamRequest",
+              "file_path": "packages/core/src/pdpp/selection.ts",
+              "line_start": 307,
+              "line_end": 559,
+              "metric_value": 252
+            },
+            {
+              "entity_name": "packages.server.src.storage.node-data-storage.createNodeDataStorage",
+              "file_path": "packages/server/src/storage/node-data-storage.ts",
+              "line_start": 154,
+              "line_end": 403,
+              "metric_value": 249
+            },
+            {
+              "entity_name": "packages.server.src.pdpp.bootstrap.createPdppAuthDeps",
+              "file_path": "packages/server/src/pdpp/bootstrap.ts",
+              "line_start": 92,
+              "line_end": 340,
+              "metric_value": 248
+            },
+            {
+              "entity_name": "packages.core.src.storage.canonical-legacy-projection.collectSnapshot",
+              "file_path": "packages/core/src/storage/canonical-legacy-projection.ts",
+              "line_start": 414,
+              "line_end": 662,
+              "metric_value": 248
+            },
+            {
+              "entity_name": "packages.core.src.test-utils.e2ee-gateway.createFakeE2eeGateway",
+              "file_path": "packages/core/src/test-utils/e2ee-gateway.ts",
+              "line_start": 102,
+              "line_end": 350,
+              "metric_value": 248
+            },
+            {
+              "entity_name": "packages.server.src.routes.data.dataRoutes",
+              "file_path": "packages/server/src/routes/data.ts",
+              "line_start": 149,
+              "line_end": 395,
+              "metric_value": 246
+            },
+            {
+              "entity_name": "packages.core.src.sync.pdpp-import.createPdppImporter",
+              "file_path": "packages/core/src/sync/pdpp-import.ts",
+              "line_start": 432,
+              "line_end": 677,
+              "metric_value": 245
+            },
+            {
+              "entity_name": "scripts.pdpp-live-journey.main",
+              "file_path": "scripts/pdpp-live-journey.ts",
+              "line_start": 84,
+              "line_end": 326,
+              "metric_value": 242
+            },
+            {
+              "entity_name": "packages.core.src.additions.durable.createDurableAdditions.recover",
+              "file_path": "packages/core/src/additions/durable.ts",
+              "line_start": 413,
+              "line_end": 655,
+              "metric_value": 242
+            },
+            {
+              "entity_name": "scripts.e2e-storage-sync.main",
+              "file_path": "scripts/e2e-storage-sync.ts",
+              "line_start": 274,
+              "line_end": 515,
+              "metric_value": 241
+            },
+            {
+              "entity_name": "packages.lite.src.additions-worker.createService",
+              "file_path": "packages/lite/src/additions-worker.ts",
+              "line_start": 65,
+              "line_end": 306,
+              "metric_value": 241
+            },
+            {
+              "entity_name": "packages.lite.src.additions-session.createPsLiteAdditionsSession",
+              "file_path": "packages/lite/src/additions-session.ts",
+              "line_start": 33,
+              "line_end": 271,
+              "metric_value": 238
+            },
+            {
+              "entity_name": "packages.lite.src.browser-runtime.createIndexedDbPsLiteRuntime",
+              "file_path": "packages/lite/src/browser-runtime.ts",
+              "line_start": 117,
+              "line_end": 347,
+              "metric_value": 230
+            },
+            {
+              "entity_name": "packages.server.src.routes.auth-device.authDeviceRoutes",
+              "file_path": "packages/server/src/routes/auth-device.ts",
+              "line_start": 251,
+              "line_end": 480,
+              "metric_value": 229
+            },
+            {
+              "entity_name": "packages.server.src.routes.mcp.mcpConnectionsRoutes",
+              "file_path": "packages/server/src/routes/mcp.ts",
+              "line_start": 447,
+              "line_end": 676,
+              "metric_value": 229
+            },
+            {
+              "entity_name": "packages.core.src.mcp.tools.getScopeFile.handler",
+              "file_path": "packages/core/src/mcp/tools.ts",
+              "line_start": 1688,
+              "line_end": 1911,
+              "metric_value": 223
+            },
+            {
+              "entity_name": "packages.core.src.legacy-projection.bindings.claudeConversationsBinding",
+              "file_path": "packages/core/src/legacy-projection/bindings.ts",
+              "line_start": 2179,
+              "line_end": 2399,
+              "metric_value": 220
+            },
+            {
+              "entity_name": "packages.enclave.src.agent.additions.signAdditions",
+              "file_path": "packages/enclave/src/agent/additions.ts",
+              "line_start": 62,
+              "line_end": 276,
+              "metric_value": 214
+            },
+            {
+              "entity_name": "scripts.verify-additions-browser.server.createServer() callback",
+              "file_path": "scripts/verify-additions-browser.mjs",
+              "line_start": 89,
+              "line_end": 301,
+              "metric_value": 212
+            },
+            {
+              "entity_name": "packages.core.src.test-utils.memory-storage.createMemoryDataStorage",
+              "file_path": "packages/core/src/test-utils/memory-storage.ts",
+              "line_start": 16,
+              "line_end": 226,
+              "metric_value": 210
+            },
+            {
+              "entity_name": "packages.enclave.src.sandbox.registry.createSandboxRegistry",
+              "file_path": "packages/enclave/src/sandbox/registry.ts",
+              "line_start": 132,
+              "line_end": 341,
+              "metric_value": 209
+            },
+            {
+              "entity_name": "packages.server.src.storage.legacy-scope-authority.createLegacyScopeAuthority.confirmRead",
+              "file_path": "packages/server/src/storage/legacy-scope-authority.ts",
+              "line_start": 327,
+              "line_end": 535,
+              "metric_value": 208
+            },
+            {
+              "entity_name": "packages.enclave.src.fleet.worker.createFleetWorker",
+              "file_path": "packages/enclave/src/fleet/worker.ts",
+              "line_start": 52,
+              "line_end": 260,
+              "metric_value": 208
+            },
+            {
+              "entity_name": "packages.core.src.additions.version-inventory.createVersionInventoryClient",
+              "file_path": "packages/core/src/additions/version-inventory.ts",
+              "line_start": 118,
+              "line_end": 326,
+              "metric_value": 208
+            },
+            {
+              "entity_name": "packages.core.src.legacy-projection.bindings.claudeProjects.project",
+              "file_path": "packages/core/src/legacy-projection/bindings.ts",
+              "line_start": 2452,
+              "line_end": 2657,
+              "metric_value": 205
+            },
+            {
+              "entity_name": "packages.core.src.sync.pdpp-import.importEnvelope",
+              "file_path": "packages/core/src/sync/pdpp-import.ts",
+              "line_start": 470,
+              "line_end": 674,
+              "metric_value": 204
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-blobs.pdppBlobsRoutes",
+              "file_path": "packages/server/src/routes/pdpp-blobs.ts",
+              "line_start": 55,
+              "line_end": 257,
+              "metric_value": 202
+            },
+            {
+              "entity_name": "packages.server.src.routes.ui-registration.uiRegistrationRoutes",
+              "file_path": "packages/server/src/routes/ui-registration.ts",
+              "line_start": 92,
+              "line_end": 294,
+              "metric_value": 202
+            },
+            {
+              "entity_name": "packages.core.src.derivatives.api.handlePersonalServerDerivativesRequest",
+              "file_path": "packages/core/src/derivatives/api.ts",
+              "line_start": 326,
+              "line_end": 527,
+              "metric_value": 201
+            },
+            {
+              "entity_name": "packages.enclave.src.fleet.worker-backend.createFleetWorkerBackend",
+              "file_path": "packages/enclave/src/fleet/worker-backend.ts",
+              "line_start": 28,
+              "line_end": 228,
+              "metric_value": 200
+            },
+            {
+              "entity_name": "packages.core.src.publication.publish.publishPreparedVersion",
+              "file_path": "packages/core/src/publication/publish.ts",
+              "line_start": 174,
+              "line_end": 374,
+              "metric_value": 200
+            },
+            {
+              "entity_name": "packages.enclave.src.mcp.service.startMcpRouter",
+              "file_path": "packages/enclave/src/mcp/service.ts",
+              "line_start": 75,
+              "line_end": 274,
+              "metric_value": 199
+            },
+            {
+              "entity_name": "packages.server.src.jobs.access-reporter.createAccessReporter",
+              "file_path": "packages/server/src/jobs/access-reporter.ts",
+              "line_start": 90,
+              "line_end": 288,
+              "metric_value": 198
+            },
+            {
+              "entity_name": "scripts.verify-additions-enclave.origin.createServer() callback",
+              "file_path": "scripts/verify-additions-enclave.mjs",
+              "line_start": 126,
+              "line_end": 324,
+              "metric_value": 198
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-auth.pdppAuthRoutes.app.post(\"/authorize\") callback",
+              "file_path": "packages/server/src/routes/pdpp-auth.ts",
+              "line_start": 633,
+              "line_end": 829,
+              "metric_value": 196
+            },
+            {
+              "entity_name": "packages.lite.src.additions-transport.openSession.publish",
+              "file_path": "packages/lite/src/additions-transport.ts",
+              "line_start": 276,
+              "line_end": 472,
+              "metric_value": 196
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes.app.post(\"/records/completions\") callback",
+              "file_path": "packages/server/src/routes/pdpp-records.ts",
+              "line_start": 1559,
+              "line_end": 1753,
+              "metric_value": 194
+            },
+            {
+              "entity_name": "scripts.e2e-register-pdf.main",
+              "file_path": "scripts/e2e-register-pdf.ts",
+              "line_start": 267,
+              "line_end": 457,
+              "metric_value": 190
+            },
+            {
+              "entity_name": "packages.core.src.lineage.gateway.createGatewayLineageClient",
+              "file_path": "packages/core/src/lineage/gateway.ts",
+              "line_start": 190,
+              "line_end": 379,
+              "metric_value": 189
+            },
+            {
+              "entity_name": "packages.core.src.mcp.tools.readScope.handler",
+              "file_path": "packages/core/src/mcp/tools.ts",
+              "line_start": 916,
+              "line_end": 1105,
+              "metric_value": 189
+            },
+            {
+              "entity_name": "packages.core.src.sync.delete-data-port.createGatewayDeleteDataPort",
+              "file_path": "packages/core/src/sync/delete-data-port.ts",
+              "line_start": 62,
+              "line_end": 251,
+              "metric_value": 189
+            },
+            {
+              "entity_name": "packages.server.src.storage.strava-method-transition.createStravaMethodTransition",
+              "file_path": "packages/server/src/storage/strava-method-transition.ts",
+              "line_start": 74,
+              "line_end": 261,
+              "metric_value": 187
+            },
+            {
+              "entity_name": "packages.server.src.bootstrap.createServer.context.startBackgroundServices",
+              "file_path": "packages/server/src/bootstrap.ts",
+              "line_start": 1154,
+              "line_end": 1339,
+              "metric_value": 185
+            },
+            {
+              "entity_name": "scripts.e2e-stale-version-rebase.main",
+              "file_path": "scripts/e2e-stale-version-rebase.ts",
+              "line_start": 289,
+              "line_end": 473,
+              "metric_value": 184
+            },
+            {
+              "entity_name": "packages.core.src.legacy-projection.bindings.chatgptConversations.project",
+              "file_path": "packages/core/src/legacy-projection/bindings.ts",
+              "line_start": 1827,
+              "line_end": 2011,
+              "metric_value": 184
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-connections.pdppConnectionRoutes",
+              "file_path": "packages/server/src/routes/pdpp-connections.ts",
+              "line_start": 76,
+              "line_end": 259,
+              "metric_value": 183
+            },
+            {
+              "entity_name": "packages.enclave.src.agent.main.startJobs",
+              "file_path": "packages/enclave/src/agent/main.ts",
+              "line_start": 96,
+              "line_end": 279,
+              "metric_value": 183
+            },
+            {
+              "entity_name": "packages.core.src.pdpp.approval.fetchReview",
+              "file_path": "packages/core/src/pdpp/approval.ts",
+              "line_start": 402,
+              "line_end": 585,
+              "metric_value": 183
+            },
+            {
+              "entity_name": "packages.server.src.pdpp.records-bootstrap.createPdppRecordsDeps",
+              "file_path": "packages/server/src/pdpp/records-bootstrap.ts",
+              "line_start": 146,
+              "line_end": 323,
+              "metric_value": 177
+            },
+            {
+              "entity_name": "packages.core.src.derivatives.compute.computeQuestion",
+              "file_path": "packages/core/src/derivatives/compute.ts",
+              "line_start": 512,
+              "line_end": 684,
+              "metric_value": 172
+            },
+            {
+              "entity_name": "packages.server.src.enclave-main.createEnclaveAdditionsPorts",
+              "file_path": "packages/server/src/enclave-main.ts",
+              "line_start": 240,
+              "line_end": 411,
+              "metric_value": 171
+            },
+            {
+              "entity_name": "packages.core.src.pdpp.client-identity.resolveUrlHostedClientIdentity",
+              "file_path": "packages/core/src/pdpp/client-identity.ts",
+              "line_start": 103,
+              "line_end": 274,
+              "metric_value": 171
+            },
+            {
+              "entity_name": "packages.core.src.pdpp.selection.validateSelectionRequest",
+              "file_path": "packages/core/src/pdpp/selection.ts",
+              "line_start": 569,
+              "line_end": 739,
+              "metric_value": 170
+            },
+            {
+              "entity_name": "packages.core.src.sync.workers.delete.retryPendingBlobDeletions",
+              "file_path": "packages/core/src/sync/workers/delete.ts",
+              "line_start": 555,
+              "line_end": 725,
+              "metric_value": 170
+            },
+            {
+              "entity_name": "packages.core.src.sync.workers.download.downloadAll",
+              "file_path": "packages/core/src/sync/workers/download.ts",
+              "line_start": 576,
+              "line_end": 746,
+              "metric_value": 170
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes.app.post(\"/streams/:stream/records/replace\") callback",
+              "file_path": "packages/server/src/routes/pdpp-records.ts",
+              "line_start": 1376,
+              "line_end": 1546,
+              "metric_value": 170
+            },
+            {
+              "entity_name": "packages.enclave.src.fleet.worker-runtime.startFleetWorker",
+              "file_path": "packages/enclave/src/fleet/worker-runtime.ts",
+              "line_start": 44,
+              "line_end": 213,
+              "metric_value": 169
+            },
+            {
+              "entity_name": "packages.core.src.api.index.handleX402Cycle",
+              "file_path": "packages/core/src/api/index.ts",
+              "line_start": 807,
+              "line_end": 976,
+              "metric_value": 169
+            },
+            {
+              "entity_name": "packages.lite.src.sync.createPsLiteSyncManager",
+              "file_path": "packages/lite/src/sync.ts",
+              "line_start": 237,
+              "line_end": 406,
+              "metric_value": 169
+            },
+            {
+              "entity_name": "packages.core.src.pdpp.issuance.issueGrant",
+              "file_path": "packages/core/src/pdpp/issuance.ts",
+              "line_start": 144,
+              "line_end": 312,
+              "metric_value": 168
+            },
+            {
+              "entity_name": "packages.server.src.storage.declaration-witness.runDeclarationWitness",
+              "file_path": "packages/server/src/storage/declaration-witness.ts",
+              "line_start": 173,
+              "line_end": 340,
+              "metric_value": 167
+            },
+            {
+              "entity_name": "scripts.e2e-read-scope.main",
+              "file_path": "scripts/e2e-read-scope.ts",
+              "line_start": 240,
+              "line_end": 406,
+              "metric_value": 166
+            },
+            {
+              "entity_name": "packages.server.src.routes.pdpp-records.pdppRecordsRoutes.app.get(\"/streams/:stream/records\") callback",
+              "file_path": "packages/server/src/routes/pdpp-records.ts",
+              "line_start": 910,
+              "line_end": 1076,
+              "metric_value": 166
+            },
+            {
+              "entity_name": "packages.server.src.pdpp.declaration-registry.openDeclarationRegistry",
+              "file_path": "packages/server/src/pdpp/declaration-registry.ts",
+              "line_start": 109,
+              "line_end": 273,
+              "metric_value": 164
+            },
+            {
+              "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.completeStreams",
+              "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+              "line_start": 1805,
+              "line_end": 1964,
+              "metric_value": 159
+            },
+            {
+              "entity_name": "scripts.e2e-read-scope-lite.main",
+              "file_path": "scripts/e2e-read-scope-lite.ts",
+              "line_start": 214,
+              "line_end": 372,
+              "metric_value": 158
+            },
+            {
+              "entity_name": "packages.enclave.src.agent.http.handleRequest",
+              "file_path": "packages/enclave/src/agent/http.ts",
+              "line_start": 133,
+              "line_end": 291,
+              "metric_value": 158
+            },
+            {
+              "entity_name": "packages.core.src.legacy-projection.oura-browser-bindings.OURA_BROWSER_BINDINGS.map() callback",
+              "file_path": "packages/core/src/legacy-projection/oura-browser-bindings.ts",
+              "line_start": 24,
+              "line_end": 182,
+              "metric_value": 158
+            },
+            {
+              "entity_name": "packages.server.src.routes.auth-device.approvePage",
+              "file_path": "packages/server/src/routes/auth-device.ts",
+              "line_start": 488,
+              "line_end": 645,
+              "metric_value": 157
+            },
+            {
+              "entity_name": "packages.core.src.derivatives.inference.createOpenAiCompatibleInferenceProvider",
+              "file_path": "packages/core/src/derivatives/inference.ts",
+              "line_start": 243,
+              "line_end": 400,
+              "metric_value": 157
+            },
+            {
+              "entity_name": "packages.core.src.sync.workers.delete.deleteScope",
+              "file_path": "packages/core/src/sync/workers/delete.ts",
+              "line_start": 286,
+              "line_end": 443,
+              "metric_value": 157
+            },
+            {
+              "entity_name": "packages.core.src.derivatives.e2ee.phala.createPhalaE2eeEncryption",
+              "file_path": "packages/core/src/derivatives/e2ee/phala.ts",
+              "line_start": 103,
+              "line_end": 258,
+              "metric_value": 155
+            },
+            {
+              "entity_name": "scripts.e2e-write-api.main",
+              "file_path": "scripts/e2e-write-api.ts",
+              "line_start": 136,
+              "line_end": 290,
+              "metric_value": 154
+            },
+            {
+              "entity_name": "packages.server.src.storage.index-schema.migrateSchema",
+              "file_path": "packages/server/src/storage/index-schema.ts",
+              "line_start": 101,
+              "line_end": 253,
+              "metric_value": 152
+            },
+            {
+              "entity_name": "packages.lite.src.storage.createPersistentPsLiteStorage.storagePort.readScopeBlocks",
+              "file_path": "packages/lite/src/storage.ts",
+              "line_start": 601,
+              "line_end": 753,
+              "metric_value": 152
+            },
+            {
+              "entity_name": "packages.server.src.storage.pdpp-records-sqlite-store.createSqliteRecordStore.completeStreams.db.transaction() callback",
+              "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+              "line_start": 1811,
+              "line_end": 1962,
+              "metric_value": 151
+            },
+            {
+              "entity_name": "packages.core.src.legacy-projection.bindings.claudeConversationsBinding.project",
+              "file_path": "packages/core/src/legacy-projection/bindings.ts",
+              "line_start": 2247,
+              "line_end": 2397,
+              "metric_value": 150
+            },
+            {
+              "entity_name": "packages.core.src.payment.x402.verifyPayment",
+              "file_path": "packages/core/src/payment/x402.ts",
+              "line_start": 449,
+              "line_end": 599,
+              "metric_value": 150
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "check_name": "unused_code_diagnostics",
+      "description": "Detects unused imports, variables, functions, and dead code via LSP diagnostics",
+      "languages": [
+        "javascript",
+        "typescript"
+      ],
+      "check_type": "standard",
+      "total_entities_checked": 8,
+      "findings_count": 8,
+      "warning_count": 0,
+      "score": 0.6,
+      "finding_groups": [
+        {
+          "severity": "info",
+          "threshold": 0,
+          "description": "Variables declared but never used",
+          "entities": [
+            {
+              "entity_name": "[unused_variable] 'xz' is declared but its value is never read.",
+              "file_path": "packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs",
+              "line_start": 13,
+              "line_end": 13,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] 'jC' is declared but its value is never read.",
+              "file_path": "packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs",
+              "line_start": 14,
+              "line_end": 14,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] 'g' is declared but its value is never read.",
+              "file_path": "packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs",
+              "line_start": 19,
+              "line_end": 19,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] 'e' is declared but its value is never read.",
+              "file_path": "packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs",
+              "line_start": 20,
+              "line_end": 20,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] 'i' is declared but its value is never read.",
+              "file_path": "packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs",
+              "line_start": 25,
+              "line_end": 25,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] 'o' is declared but its value is never read.",
+              "file_path": "packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs",
+              "line_start": 75,
+              "line_end": 75,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] 'g' is declared but its value is never read.",
+              "file_path": "packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs",
+              "line_start": 79,
+              "line_end": 79,
+              "metric_value": 0.0
+            },
+            {
+              "entity_name": "[unused_variable] 'i' is declared but its value is never read.",
+              "file_path": "packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs",
+              "line_start": 81,
+              "line_end": 81,
+              "metric_value": 0.0
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "file_summaries": [
+    {
+      "file_path": "packages/server/src/routes/pdpp-records.ts",
+      "total_findings": 4,
+      "warning_findings": 4,
+      "composite_risk_score": 60.0
+    },
+    {
+      "file_path": "packages/lite/src/runtime.ts",
+      "total_findings": 4,
+      "warning_findings": 4,
+      "composite_risk_score": 60.0
+    },
+    {
+      "file_path": "packages/core/src/legacy-projection/bindings.ts",
+      "total_findings": 4,
+      "warning_findings": 4,
+      "composite_risk_score": 60.0
+    },
+    {
+      "file_path": "packages/core/src/legacy-projection/github-browser-0.2.0-oracle.mjs",
+      "total_findings": 8,
+      "warning_findings": 0,
+      "composite_risk_score": 50.0
+    },
+    {
+      "file_path": "packages/server/src/storage/pdpp-records-sqlite-store.ts",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
+      "file_path": "packages/core/src/api/index.ts",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
+      "file_path": "packages/lite/src/additions-transport.ts",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
+      "file_path": "packages/core/src/mcp/tools.ts",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
+      "file_path": "packages/server/src/routes/mcp.ts",
+      "total_findings": 3,
+      "warning_findings": 3,
+      "composite_risk_score": 45.0
+    },
+    {
+      "file_path": "packages/server/src/bootstrap.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/server/src/routes/pdpp-auth.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/core/src/storage/legacy-scope-view.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/lite/src/storage.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/core/src/additions/durable.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/server/src/storage/legacy-scope-authority.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/core/src/storage/legacy-scope-coverage.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/core/src/sync/workers/download.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/core/src/storage/canonical-legacy-projection.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/core/src/pdpp/selection.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    },
+    {
+      "file_path": "packages/core/src/sync/pdpp-import.ts",
+      "total_findings": 2,
+      "warning_findings": 2,
+      "composite_risk_score": 30.0
+    }
+  ]
+}
