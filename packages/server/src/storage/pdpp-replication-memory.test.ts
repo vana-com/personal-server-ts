@@ -26,8 +26,15 @@ const KIB_PER_MIB = 1024;
  * allowance is the worst observed value plus 16 MiB of headroom. It does not
  * scale with blob size. The growth it covers is fragment churn, one 3 MiB
  * fragment in flight at a time.
+ *
+ * Newer Node releases retain more freed buffers before returning them to the
+ * OS. On Node 24.22.1 the same growth is about 350 to 361 MiB at 32, 64 and
+ * 128 MiB alike (still flat, so still independent of blob size). The absolute
+ * allowance therefore depends on the Node major; the spread check above is
+ * the one that proves growth does not follow blob size.
  */
-const WORKER_ALLOWANCE_KIB = 208 * KIB_PER_MIB;
+const WORKER_ALLOWANCE_KIB =
+  (Number(process.versions.node.split(".")[0]) <= 22 ? 208 : 416) * KIB_PER_MIB;
 const WORKER_SPREAD_KIB = 96 * KIB_PER_MIB;
 const PROMOTION_MARGIN_KIB = 16 * KIB_PER_MIB;
 

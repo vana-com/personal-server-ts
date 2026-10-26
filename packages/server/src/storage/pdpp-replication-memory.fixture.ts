@@ -42,7 +42,7 @@ const open = (role: string) => {
   store.replication.beginBaseline(expected);
   return { db, store };
 };
-if (mode === "seed" || mode === "seed-legacy") {
+if (mode === "seed") {
   const { db, store } = open("source");
   const blob = store.storeBlobBytesForInstance({
     instance: "conn",
@@ -72,24 +72,7 @@ if (mode === "seed" || mode === "seed-legacy") {
     () => ["id"],
     { method: "export", generation: 1 },
   );
-  if (mode === "seed-legacy") {
-    // Keep only main's legacy whole-value row to exercise its fallback reader.
-    db.prepare(
-      "DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=?",
-    ).run(blob.blobId);
-    db.prepare(
-      "DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=?",
-    ).run(blob.blobId);
-  }
   writeFileSync(join(directory, "blob-id"), blob.blobId);
-  store.close();
-} else if (mode === "legacy-read") {
-  const { store } = open("source");
-  const bytes = store.getBlobBytes(
-    readFileSync(join(directory, "blob-id"), "utf8"),
-  );
-  if (bytes?.length !== size) throw new Error("legacy read failed");
-  console.log(JSON.stringify({ size: bytes.length }));
   store.close();
 } else if (mode === "measure" || mode === "probe") {
   const startKiB = maxRssKiB();

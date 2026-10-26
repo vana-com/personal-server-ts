@@ -2,7 +2,14 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { expect, it } from "vitest";
+import {
+  BINARY_CHUNK_BYTES,
+  BINARY_CHUNKS_MIGRATION,
+  LEGACY_WINDOWS,
+  readBinaryChunks,
+} from "./pdpp-binary-chunks.js";
 const memoryRoot = tmpdir();
 const fixture = new URL("./pdpp-replication-memory.fixture.ts", import.meta.url)
   .pathname;
@@ -15,25 +22,70 @@ const args = (mode: string, directory: string, size: number) => [
   String(size),
 ];
 
+/**
+ * SQLite reaches a BLOB offset by walking its overflow pages, so reading a
+ * legacy whole-value row one 64 KiB chunk at a time costs O(size^2): 37 s for
+ * 64 MiB. Timing proves nothing on a loaded host, so this checks the read
+ * strategy instead: a bounded number of windows, and a total overflow walk
+ * (the sum of the window offsets) that is a small multiple of the blob.
+ */
 it("reads an existing 64 MiB legacy SQLite blob without a quadratic substr scan", () => {
-  const dir = mkdtempSync(join(memoryRoot, "replica-legacy-"));
-  try {
-    const size = 64 * 1024 * 1024;
-    const seeded = spawnSync(process.execPath, args("seed-legacy", dir, size), {
-      encoding: "utf8",
-      timeout: 30000,
-    });
-    expect(seeded.status, seeded.stderr).toBe(0);
-    const child = spawnSync(process.execPath, args("legacy-read", dir, size), {
-      encoding: "utf8",
-      timeout: 15000,
-    });
-    expect(child.status, child.error?.message ?? child.stderr).toBe(0);
-    expect(JSON.parse(child.stdout).size).toBe(size);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+  for (const size of [16 * 1024 * 1024, 64 * 1024 * 1024]) {
+    const db = new Database(":memory:");
+    try {
+      db.exec(BINARY_CHUNKS_MIGRATION);
+      db.exec(
+        "CREATE TABLE IF NOT EXISTS pdpp_blob_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL)",
+      );
+      const bytes = Buffer.alloc(size, 31);
+      bytes.writeUInt32BE(0xdeadbeef, 0);
+      bytes.writeUInt32BE(0xfeedface, size - 4);
+      db.prepare("INSERT INTO pdpp_blob_bytes VALUES ('legacy', ?)").run(bytes);
+      const starts: number[] = [];
+      const traced = new Proxy(db, {
+        get(target, property) {
+          if (property !== "prepare") {
+            const value = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          }
+          return (sql: string) => {
+            const statement = target.prepare(sql);
+            if (!sql.includes("substr(")) return statement;
+            return new Proxy(statement, {
+              get(inner, member) {
+                if (member !== "get") return Reflect.get(inner, member, inner);
+                return (...args: unknown[]) => {
+                  starts.push(args[0] as number);
+                  return inner.get(...args);
+                };
+              },
+            });
+          };
+        },
+      });
+      let total = 0;
+      let first: Uint8Array | undefined;
+      let last: Uint8Array | undefined;
+      for (const chunk of readBinaryChunks(traced, "canonical", "legacy")) {
+        first ??= chunk;
+        last = chunk;
+        expect(chunk.length).toBeLessThanOrEqual(BINARY_CHUNK_BYTES);
+        total += chunk.length;
+      }
+      expect(total).toBe(size);
+      expect(Buffer.from(first!).readUInt32BE(0)).toBe(0xdeadbeef);
+      expect(Buffer.from(last!).readUInt32BE(last!.length - 4)).toBe(
+        0xfeedface,
+      );
+      expect(starts.length).toBeLessThanOrEqual(LEGACY_WINDOWS);
+      expect(starts.reduce((sum, start) => sum + start, 0)).toBeLessThan(
+        size * 8,
+      );
+    } finally {
+      db.close();
+    }
   }
-}, 40000);
+}, 60000);
 
 it("rejects a second process while payload staging is active and recovers after the holder dies", async () => {
   const dir = mkdtempSync(join(memoryRoot, "replica-lock-"));
