@@ -35,20 +35,12 @@ const seeds = single
   : Array.from({ length: count }, (_, i) => (0x9e3779b9 * (i + 1)) >>> 0);
 
 /**
- * Command shapes that reach defects the oracle found on PR #483 and #483
- * has not fixed yet. The generator leaves them out so PR CI stays green;
- * `regressions.test.ts` holds a minimized `it.fails` case for each.
+ * Command shapes the generator leaves out. Empty by default: every shape the
+ * oracle found on PR #483 is fixed. Set REPLICA_ORACLE_AVOID=<a,b> to exclude
+ * shapes while triaging a new finding.
  */
 export const KNOWN_DEFECTS: ReadonlySet<string> = new Set(
-  (
-    process.env.REPLICA_ORACLE_AVOID ??
-    [
-      // Node shows a row made readable by pending bytes without the pending marker (oracle finding D3).
-      "pending-bytes-for-confirmed",
-    ].join(",")
-  )
-    .split(",")
-    .filter(Boolean),
+  (process.env.REPLICA_ORACLE_AVOID ?? "").split(",").filter(Boolean),
 );
 
 async function check(seed: number, commands: Command[]) {

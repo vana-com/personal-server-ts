@@ -240,9 +240,7 @@ describe("terminal quarantine rejects every mutating path and changes nothing", 
 
 /**
  * Defects the differential found on PR #483 at eb98ded8. Each case is the
- * shrinker's minimized command list. Lite meets the contract; the Node case
- * stays `it.fails` until #483 fixes it, and the generator avoids its shape
- * (see KNOWN_DEFECTS in differential.test-utils.ts).
+ * shrinker's minimized command list and runs on both ports.
  */
 describe("oracle findings on #483", () => {
   const UNIVERSE = {
@@ -389,11 +387,8 @@ describe("oracle findings on #483", () => {
       },
     ],
   ];
-  // Node defects still open on #483. A fix removes its entry here.
-  const openOnNode = new Set(["D3"]);
   for (const [name, run] of cases) {
     it(`Lite ${name}`, () => run(ports.lite));
-    const node = openOnNode.has(name.slice(0, 2)) ? it.fails : it;
-    node(`Node ${name}`, () => run(ports.node));
+    it(`Node ${name}`, () => run(ports.node));
   }
 });
