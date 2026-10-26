@@ -175,6 +175,8 @@ export interface LegacyScopeBinding {
    * and fail the self-check (S1).
    */
   fieldsRead: Record<string, string[]>;
+  /** Optional passthrough fields supplied by newer profiles, absent at the pinned declaration. */
+  optionalFieldsRead?: Record<string, string[]>;
   /** Legacy JSON Schema path this binding's output must validate against, relative to ./legacy-schemas. */
   legacySchemaPath: string;
   /**

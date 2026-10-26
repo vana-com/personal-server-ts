@@ -132,16 +132,48 @@ function runTx<T>(
   return openDb(opts, indexes).then(
     (db) =>
       new Promise<T>((resolve, reject) => {
-        const transaction = db.transaction(opts.storeName, mode);
-        const store = transaction.objectStore(opts.storeName);
-        const request = fn(store);
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-        transaction.oncomplete = () => db.close();
-        transaction.onerror = () => {
-          db.close();
-          reject(transaction.error);
+        let settled = false;
+        let result!: T;
+        const closeDb = () => {
+          try {
+            db.close();
+          } catch {
+            // The transaction result or error remains the useful outcome.
+          }
         };
+        const resolveOnce = (value: T) => {
+          if (settled) return;
+          settled = true;
+          closeDb();
+          resolve(value);
+        };
+        const rejectOnce = (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          closeDb();
+          reject(error);
+        };
+        try {
+          const transaction = db.transaction(opts.storeName, mode);
+          const store = transaction.objectStore(opts.storeName);
+          const request = fn(store);
+          request.onsuccess = () => {
+            result = request.result;
+          };
+          request.onerror = () =>
+            rejectOnce(request.error ?? new Error("IndexedDB request failed"));
+          transaction.oncomplete = () => resolveOnce(result);
+          transaction.onerror = () =>
+            rejectOnce(
+              transaction.error ?? new Error("IndexedDB transaction failed"),
+            );
+          transaction.onabort = () =>
+            rejectOnce(
+              transaction.error ?? new Error("IndexedDB transaction aborted"),
+            );
+        } catch (error) {
+          rejectOnce(error);
+        }
       }),
   );
 }
@@ -183,20 +215,45 @@ function mutateConnectionRecord(
           McpConnectionRecord | undefined
         >;
         let result: McpConnectionRecord | null = null;
+        let settled = false;
+        const resolveOnce = (value: McpConnectionRecord | null) => {
+          if (settled) return;
+          settled = true;
+          db.close();
+          resolve(value);
+        };
+        const rejectOnce = (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          db.close();
+          reject(error);
+        };
         request.onsuccess = () => {
           if (!request.result) return;
-          result = update(structuredClone(request.result));
-          store.put(result);
+          try {
+            result = update(structuredClone(request.result));
+            store.put(result);
+          } catch (error) {
+            try {
+              transaction.abort();
+            } catch {
+              // The transaction may already be inactive; settle with the update error.
+            }
+            rejectOnce(error);
+          }
         };
-        request.onerror = () => reject(request.error);
-        transaction.oncomplete = () => {
-          db.close();
-          resolve(result ? structuredClone(result) : null);
-        };
-        transaction.onerror = () => {
-          db.close();
-          reject(transaction.error);
-        };
+        request.onerror = () =>
+          rejectOnce(request.error ?? new Error("IndexedDB request failed"));
+        transaction.oncomplete = () =>
+          resolveOnce(result ? structuredClone(result) : null);
+        transaction.onerror = () =>
+          rejectOnce(
+            transaction.error ?? new Error("IndexedDB transaction failed"),
+          );
+        transaction.onabort = () =>
+          rejectOnce(
+            transaction.error ?? new Error("IndexedDB transaction aborted"),
+          );
       }),
   );
 }
@@ -225,6 +282,56 @@ export function createIndexedDbMcpConnectionStore(
         "readwrite",
         CONNECTION_INDEXES,
         (store) => store.put({ ...record }),
+      );
+    },
+
+    replacePendingOAuthConnections(clientId, expiredBefore, replacement) {
+      if (
+        replacement.status !== "pending" ||
+        replacement.clientId !== clientId
+      ) {
+        return Promise.reject(
+          new Error("OAuth replacement must be pending for its client"),
+        );
+      }
+      return openDb(resolved, CONNECTION_INDEXES).then(
+        (db) =>
+          new Promise<void>((resolve, reject) => {
+            const transaction = db.transaction(resolved.storeName, "readwrite");
+            const store = transaction.objectStore(resolved.storeName);
+            const request = store.getAll() as IDBRequest<McpConnectionRecord[]>;
+            request.onsuccess = () => {
+              for (const record of request.result) {
+                const expired = Date.parse(record.createdAt) <= expiredBefore;
+                if (
+                  record.status !== "pending" ||
+                  !record.clientId ||
+                  (record.clientId !== clientId && !expired)
+                ) {
+                  continue;
+                }
+                store.put({
+                  ...record,
+                  status: "revoked",
+                  revokedAt: replacement.createdAt,
+                });
+              }
+              store.add({ ...replacement });
+            };
+            request.onerror = () => reject(request.error);
+            transaction.oncomplete = () => {
+              db.close();
+              resolve();
+            };
+            transaction.onerror = () => {
+              db.close();
+              reject(transaction.error);
+            };
+            transaction.onabort = () => {
+              db.close();
+              reject(transaction.error);
+            };
+          }),
       );
     },
 

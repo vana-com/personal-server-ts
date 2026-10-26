@@ -41,6 +41,7 @@
 
 import { Hono, type Context } from "hono";
 import type { Logger } from "pino";
+import { readNamedQueryValues } from "./pdpp-auth-query-keys.js";
 import type {
   ClientIdentityResult,
   ClientIdMetadataDocument,
@@ -211,7 +212,7 @@ function resolveScopedOwnerToken(
   subjectId?: string,
   sourceId?: string,
 ):
-  | { ok: true; subjectId: string; sourceId?: string }
+  | { ok: true; subjectId: string; sourceId?: string; instanceIds?: string[] }
   | { ok: false; failure: ApprovalFailure } {
   if (!ownerToken) {
     return {
@@ -255,15 +256,77 @@ function resolveScopedOwnerToken(
     ok: true,
     subjectId: context.subjectId,
     ...(context.sourceId && { sourceId: context.sourceId }),
+    ...(context.instanceIds && { instanceIds: context.instanceIds }),
   };
+}
+
+const OUTSIDE_INSTANCE_CEILING =
+  "owner token is not scoped to the requested instance";
+
+/**
+ * The owner's consent inventory, narrowed to the instance ceiling of the token
+ * that is deciding. An absent ceiling is source-wide; a present one is the whole
+ * universe, so an empty list covers no instance rather than the whole source.
+ */
+function ceilingInventory(
+  inventory: InstanceInventory,
+  ceiling: string[] | undefined,
+): InstanceInventory {
+  if (!ceiling) return inventory;
+  return {
+    eligibleFor: (streamName) =>
+      inventory.eligibleFor(streamName).filter((id) => ceiling.includes(id)),
+  };
+}
+
+/**
+ * Every instance handle a request names, explicitly or through an owner choice.
+ *
+ * The request is untrusted until validation runs, so any shape is tolerated
+ * here. Validation then answers a malformed `streams` with a 400.
+ */
+function namedInstanceHandles(
+  request: SelectionRequest,
+  choices?: Record<string, string[]>,
+): string[] {
+  const streams = Array.isArray(request.streams) ? request.streams : [];
+  return [
+    ...streams.flatMap((stream) => stream?.instance_ids ?? []),
+    ...Object.values(choices ?? {}).flat(),
+  ];
+}
+
+/** Whether any named handle falls outside the ceiling. No ceiling, nothing does. */
+function namesOutsideCeiling(
+  ceiling: string[] | undefined,
+  handles: string[],
+): boolean {
+  return ceiling !== undefined && handles.some((id) => !ceiling.includes(id));
+}
+
+/** Whether every granted stream stays inside the ceiling. No ceiling, all do. */
+function streamsWithinCeiling(
+  streams: ReadonlyArray<{ instance_ids: string[] }>,
+  ceiling: string[] | undefined,
+): boolean {
+  return (
+    !ceiling ||
+    streams.every((stream) =>
+      stream.instance_ids.every((id) => ceiling.includes(id)),
+    )
+  );
 }
 
 function scopedOwnerCoversSnapshot(
   deps: PdppAuthRouteDeps,
   subjectId: string,
   snapshot: DeclarationSnapshot,
+  ceiling: string[] | undefined,
 ): boolean {
-  const inventory = deps.inventoryFor(subjectId, snapshot.source_id);
+  const inventory = ceilingInventory(
+    deps.inventoryFor(subjectId, snapshot.source_id),
+    ceiling,
+  );
   return snapshot.streams.some(
     (stream) => inventory.eligibleFor(stream.name).length > 0,
   );
@@ -703,7 +766,12 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     if (!owner.ok) {
       return scopedOwnerFailureResponse(c, owner.failure);
     }
-    if (!scopedOwnerCoversSnapshot(deps, subjectId, snapshot)) {
+    if (namesOutsideCeiling(owner.instanceIds, namedInstanceHandles(request))) {
+      return errorResponse(c, 403, "access_denied", OUTSIDE_INSTANCE_CEILING);
+    }
+    if (
+      !scopedOwnerCoversSnapshot(deps, subjectId, snapshot, owner.instanceIds)
+    ) {
       return errorResponse(
         c,
         403,
@@ -783,7 +851,12 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
     if (
       session &&
-      !scopedOwnerCoversSnapshot(deps, session.subject_id, session.snapshot)
+      !scopedOwnerCoversSnapshot(
+        deps,
+        session.subject_id,
+        session.snapshot,
+        owner.instanceIds,
+      )
     ) {
       return errorResponse(
         c,
@@ -791,6 +864,19 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         "access_denied",
         "owner token is not scoped to the requested source",
       );
+    }
+
+    // Refuse any handle outside the token's ceiling before a review is built, so
+    // an out-of-token instance is never resolved, counted, or shown.
+    const instanceChoices = parseInstanceChoices(c);
+    if (
+      session &&
+      namesOutsideCeiling(
+        owner.instanceIds,
+        namedInstanceHandles(session.request, instanceChoices),
+      )
+    ) {
+      return errorResponse(c, 403, "access_denied", OUTSIDE_INSTANCE_CEILING);
     }
 
     const candidate = session?.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE;
@@ -817,11 +903,14 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       tokens: deps.tokens,
       sessionId,
       ownerToken: bearer(c),
-      inventory: deps.inventoryFor(
-        session?.subject_id ?? "",
-        session?.snapshot.source_id ?? "",
+      inventory: ceilingInventory(
+        deps.inventoryFor(
+          session?.subject_id ?? "",
+          session?.snapshot.source_id ?? "",
+        ),
+        owner.instanceIds,
       ),
-      instanceChoices: parseInstanceChoices(c),
+      instanceChoices,
       ownerChoices,
       ownerConditions: parseOwnerConditions(c),
       standingTerms:
@@ -832,9 +921,13 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         ? Array.from(
             new Set(
               session.snapshot.streams.flatMap((stream) =>
-                deps
-                  .inventoryFor(session.subject_id, session.snapshot.source_id)
-                  .eligibleFor(stream.name),
+                ceilingInventory(
+                  deps.inventoryFor(
+                    session.subject_id,
+                    session.snapshot.source_id,
+                  ),
+                  owner.instanceIds,
+                ).eligibleFor(stream.name),
               ),
             ),
           )
@@ -870,7 +963,12 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
     if (
       session &&
-      !scopedOwnerCoversSnapshot(deps, session.subject_id, session.snapshot)
+      !scopedOwnerCoversSnapshot(
+        deps,
+        session.subject_id,
+        session.snapshot,
+        owner.instanceIds,
+      )
     ) {
       return errorResponse(
         c,
@@ -895,6 +993,18 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       return errorResponse(c, 400, "invalid_request", "body must be JSON");
     }
 
+    // The request may have been prepared with a wider token. Its explicit
+    // handles and the choices named now must all sit inside this token's ceiling.
+    if (
+      session &&
+      namesOutsideCeiling(
+        owner.instanceIds,
+        namedInstanceHandles(session.request, body.instance_choices),
+      )
+    ) {
+      return errorResponse(c, 403, "access_denied", OUTSIDE_INSTANCE_CEILING);
+    }
+
     if (session?.request.type === PDPP_DATA_ACCESS_TYPE_CANDIDATE) {
       const invalid = validateCandidateOwnerChoices(
         session.request,
@@ -911,9 +1021,12 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
       sessionId,
       ownerToken: bearer(c),
       reviewDigest: body.review_digest ?? "",
-      inventory: deps.inventoryFor(
-        session?.subject_id ?? "",
-        session?.snapshot.source_id ?? "",
+      inventory: ceilingInventory(
+        deps.inventoryFor(
+          session?.subject_id ?? "",
+          session?.snapshot.source_id ?? "",
+        ),
+        owner.instanceIds,
       ),
       instanceChoices: body.instance_choices,
       ownerChoices: body.owner_choices,
@@ -931,6 +1044,13 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
         approvalOAuthError(result.failure.code),
         result.failure.message,
       );
+    }
+
+    // Recheck what was actually issued against this token's ceiling before any
+    // write. Resolution already used the narrowed inventory; this makes the
+    // boundary hold even if a resolution path ever widened it.
+    if (!streamsWithinCeiling(result.grant.streams, owner.instanceIds)) {
+      return errorResponse(c, 403, "access_denied", OUTSIDE_INSTANCE_CEILING);
     }
 
     // Persist the grant and its authorization code as one durable unit
@@ -993,7 +1113,12 @@ export function pdppAuthRoutes(deps: PdppAuthRouteDeps): Hono {
     }
     if (
       session &&
-      !scopedOwnerCoversSnapshot(deps, session.subject_id, session.snapshot)
+      !scopedOwnerCoversSnapshot(
+        deps,
+        session.subject_id,
+        session.snapshot,
+        owner.instanceIds,
+      )
     ) {
       return errorResponse(
         c,
@@ -1430,12 +1555,14 @@ function asString(value: unknown): string | null {
 function parseInstanceChoices(
   c: Context,
 ): Record<string, string[]> | undefined {
-  const choices: Record<string, string[]> = {};
   const url = new URL(c.req.url);
-  for (const [key, value] of url.searchParams.entries()) {
-    const match = /^instance\[(.+)\]$/.exec(key);
-    if (!match || value.length === 0) continue;
-    (choices[match[1]] ??= []).push(value);
+  const choices: Record<string, string[]> = Object.create(null);
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "instance",
+  )) {
+    const nonemptyValues = values.filter((value) => value.length > 0);
+    if (nonemptyValues.length > 0) choices[name] = nonemptyValues;
   }
   return Object.keys(choices).length > 0 ? choices : undefined;
 }
@@ -1488,36 +1615,47 @@ function parseOwnerChoices(
 ): OwnerChoices | undefined | "invalid" {
   const declined: string[] = [];
   const approved: string[] = [];
-  const fields: Record<string, string[]> = {};
-  const windows: Record<string, { since?: string; until?: string }> = {};
-
   const url = new URL(c.req.url);
-  for (const [key, value] of url.searchParams.entries()) {
-    const approval = /^approve\[(.+)\]$/.exec(key);
-    if (approval && strict && value !== "true") return "invalid";
-    if (approval && value === "true") {
-      approved.push(approval[1]);
-      continue;
-    }
-    const decline = /^decline\[(.+)\]$/.exec(key);
-    if (decline) {
-      declined.push(decline[1]);
-      continue;
-    }
-    const field = /^field\[(.+)\]$/.exec(key);
-    if (field && value.length > 0) {
-      (fields[field[1]] ??= []).push(value);
-      continue;
-    }
-    const since = /^since\[(.+)\]$/.exec(key);
-    if (since && value.length > 0) {
-      (windows[since[1]] ??= {}).since = value;
-      continue;
-    }
-    const until = /^until\[(.+)\]$/.exec(key);
-    if (until && value.length > 0) {
-      (windows[until[1]] ??= {}).until = value;
-    }
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "decline",
+  )) {
+    declined.push(...values.map(() => name));
+  }
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "approve",
+  )) {
+    if (strict && values.some((value) => value !== "true")) return "invalid";
+    approved.push(
+      ...values.filter((value) => value === "true").map(() => name),
+    );
+  }
+
+  const fields: Record<string, string[]> = Object.create(null);
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "field",
+  )) {
+    const nonemptyValues = values.filter((value) => value.length > 0);
+    if (nonemptyValues.length > 0) fields[name] = nonemptyValues;
+  }
+
+  const windows: Record<string, { since?: string; until?: string }> =
+    Object.create(null);
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "since",
+  )) {
+    const value = values.filter((entry) => entry.length > 0).at(-1);
+    if (value !== undefined) (windows[name] ??= {}).since = value;
+  }
+  for (const [name, values] of readNamedQueryValues(
+    url.searchParams,
+    "until",
+  )) {
+    const value = values.filter((entry) => entry.length > 0).at(-1);
+    if (value !== undefined) (windows[name] ??= {}).until = value;
   }
 
   const choices: OwnerChoices = {

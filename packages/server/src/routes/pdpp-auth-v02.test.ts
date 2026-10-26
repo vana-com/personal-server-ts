@@ -118,6 +118,24 @@ function v02Body(streamOverrides: Record<string, unknown> = {}) {
   };
 }
 
+function candidateBody() {
+  return {
+    ...v02Body(),
+    authorization_details: [
+      {
+        type: "https://pdpp.dev/data-access/candidate-0.1.0",
+        source: { id: snapshot.source_id },
+        purpose_code: "https://apps.example.com/purposes/budget",
+        access_mode: "continuous",
+        streams: [
+          { name: "profile", necessity: "required", fields: ["id"] },
+          { name: "transactions", fields: ["date"] },
+        ],
+      },
+    ],
+  };
+}
+
 function post(
   path: string,
   body: unknown,
@@ -486,22 +504,69 @@ describe("recipient commitments over the wire", () => {
 });
 
 describe("candidate opt-in survives HTTP review and approval", () => {
+  it.each(["approve", "decline", "field", "since", "until"])(
+    "rejects line breaks in %s names only after parsing them",
+    async (axis) => {
+      const params = new URLSearchParams();
+      params.append(
+        `${axis}[unknown\nstream]`,
+        axis === "approve" ? "true" : "date",
+      );
+      const { response } = await review(
+        `?${params.toString()}`,
+        candidateBody(),
+      );
+
+      expect(response.status).toBe(400);
+      expect((await response.json()).error).toBe("invalid_owner_choices");
+    },
+  );
+
+  it.each(["__proto__", "constructor", "toString"])(
+    "rejects %s field names as candidate owner choices",
+    async (name) => {
+      const params = new URLSearchParams();
+      params.append(`field[${name}]`, "date");
+      const { response } = await review(
+        `?${params.toString()}`,
+        candidateBody(),
+      );
+
+      expect(response.status).toBe(400);
+      expect((await response.json()).error).toBe("invalid_owner_choices");
+    },
+  );
+
+  it.each(
+    ["since", "until"].flatMap((axis) =>
+      ["__proto__", "constructor", "toString"].map((name) => [axis, name]),
+    ),
+  )("recognizes %s[%s] as an own time-range choice", async (axis, name) => {
+    const params = new URLSearchParams();
+    params.append(`${axis}[${name}]`, "2025-01-01T00:00:00Z");
+    const { response } = await review(`?${params.toString()}`, candidateBody());
+
+    expect(response.status).toBe(400);
+    expect((await response.json()).error).toBe("invalid_owner_choices");
+    if (name === "__proto__") expect(Reflect.get({}, axis)).toBeUndefined();
+  });
+
+  it.each(["__proto__", "constructor", "toString"])(
+    "accepts %s as an instance choice name without throwing",
+    async (name) => {
+      const params = new URLSearchParams();
+      params.append(`instance[${name}]`, INSTANCE);
+      const { response } = await review(
+        `?${params.toString()}`,
+        candidateBody(),
+      );
+
+      expect(response.status).toBe(200);
+    },
+  );
+
   it("retains an optional stream only with affirmative review and approval choices", async () => {
-    const body = {
-      ...v02Body(),
-      authorization_details: [
-        {
-          type: "https://pdpp.dev/data-access/candidate-0.1.0",
-          source: { id: snapshot.source_id },
-          purpose_code: "https://apps.example.com/purposes/budget",
-          access_mode: "continuous",
-          streams: [
-            { name: "profile", necessity: "required", fields: ["id"] },
-            { name: "transactions", fields: ["date"] },
-          ],
-        },
-      ],
-    };
+    const body = candidateBody();
     const ownerToken = scopedOwnerToken();
     const created = await post("/pdpp/v1/authorize", body);
     expect(created.status).toBe(201);

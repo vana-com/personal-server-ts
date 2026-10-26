@@ -8,6 +8,7 @@ import { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 import { META_040_BINDINGS } from "./meta-040-bindings.js";
 import { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
 import { LEGACY_SCHEMA_VERSIONS } from "./legacy-schema-versions.js";
+import { STRAVA_BROWSER_BINDINGS } from "./strava-browser-bindings.js";
 import { classifyAsTestDebris } from "./test-debris.js";
 import {
   decodeDeclaredRecordsForProjection,
@@ -27,7 +28,11 @@ export { ANTHROPIC_LIVE_BINDINGS } from "./bindings.js";
 export { LEGACY_SCOPE_BINDINGS } from "./bindings.js";
 export { GITHUB_BROWSER_BINDINGS } from "./github-browser-bindings.js";
 export { META_040_BINDINGS } from "./meta-040-bindings.js";
-export { OURA_BROWSER_BINDINGS } from "./oura-browser-bindings.js";
+export {
+  OURA_BROWSER_BINDINGS,
+  OURA_BROWSER_DECLARATION_DIGEST,
+} from "./oura-browser-bindings.js";
+export { STRAVA_BROWSER_BINDINGS } from "./strava-browser-bindings.js";
 export type { LegacyScopeBindingProvenance } from "./provenance.js";
 export { classifyAsTestDebris } from "./test-debris.js";
 export type {
@@ -52,6 +57,7 @@ const ALTERNATE_PROFILE_BINDINGS: ReadonlyMap<
   ["github-browser", GITHUB_BROWSER_BINDINGS],
   ["meta", META_040_BINDINGS],
   ["oura-browser", OURA_BROWSER_BINDINGS],
+  ["strava-browser", STRAVA_BROWSER_BINDINGS],
 ]);
 
 export function hasAlternateLegacyProfile(profileKey: string): boolean {

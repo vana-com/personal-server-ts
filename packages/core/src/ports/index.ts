@@ -127,6 +127,16 @@ export type VersionCommitResult =
     }
   | { kind: "replay"; receipt: ImportReceipt };
 
+/**
+ * The row a conditional erase was decided for. `id` is the local row id, which
+ * storage never reuses for another row; `path` is its data file. A replacement
+ * that takes the same collection stamp has a different id.
+ */
+export interface VersionFence {
+  id: number;
+  path: string;
+}
+
 export interface DataStoragePort extends RuntimeStoragePort {
   listScopes(options: DataStorageScopeListOptions): {
     scopes: ScopeSummary[];
@@ -266,7 +276,17 @@ export interface DataStoragePort extends RuntimeStoragePort {
    * deletion reconciliation to drop the exact versions a gateway tombstone
    * covers while leaving a newer local re-ingest in place.
    */
-  deleteVersion(scope: string, collectedAt: string): Promise<boolean>;
+  /**
+   * Erases one version (index row + local blob). With `fence`, erases only
+   * while the row is still the one the caller decided on: same local `id` and
+   * `path`. A row erased or replaced since then is left alone (false). Without
+   * `fence` the erase is by (scope, collectedAt) alone.
+   */
+  deleteVersion(
+    scope: string,
+    collectedAt: string,
+    fence?: VersionFence,
+  ): Promise<boolean>;
   /**
    * Drop a single unsynced index entry by path, WITHOUT touching any blob.
    * Used by the upload worker to evict an orphaned row whose local payload

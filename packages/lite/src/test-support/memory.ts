@@ -405,9 +405,14 @@ export function createMemoryPsLiteStorage(): DataStoragePort {
       return deleted;
     },
 
-    async deleteVersion(scope, collectedAt) {
+    async deleteVersion(scope, collectedAt, fence) {
       for (const [path, entry] of entries.entries()) {
-        if (entry.scope === scope && entry.collectedAt === collectedAt) {
+        if (
+          entry.scope === scope &&
+          entry.collectedAt === collectedAt &&
+          (fence === undefined ||
+            (entry.id === fence.id && entry.path === fence.path))
+        ) {
           entries.delete(path);
           envelopes.delete(envelopeKey(entry.scope, entry.collectedAt));
           const key = blockKey(entry.scope, entry.collectedAt);

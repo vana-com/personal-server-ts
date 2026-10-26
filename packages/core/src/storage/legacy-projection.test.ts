@@ -622,6 +622,58 @@ describe("withLegacyProjection", () => {
     ).toEqual(body);
   });
 
+  // Strava gained a browser profile; both profiles are the same identity, so
+  // stored rows written before identity tags keep projecting.
+  it.each([
+    ["unmarked", {}],
+    [
+      "strava-browser",
+      {
+        $pdpp: { sourceId: "https://registry.pdpp.dev/sources/strava-browser" },
+      },
+    ],
+    [
+      "strava",
+      { $pdpp: { sourceId: "https://registry.pdpp.dev/sources/strava" } },
+    ],
+  ])("serves %s stored Strava activities", async (_name, mark) => {
+    const raw = createMemoryDataStorage();
+    const at = "2026-10-01T00:00:01.000Z";
+    await store(raw, "strava.activities", at, {
+      records: [{ id: "ride-1", activity_type: "Ride", ...mark }],
+    });
+
+    const served = await withLegacyProjection(raw).readEnvelope(
+      "strava.activities",
+      at,
+    );
+
+    expect(served.data).toEqual({
+      activities: [{ id: "ride-1", activity_type: "Ride" }],
+    });
+  });
+
+  it("refuses stored Strava activities from two producers", async () => {
+    const raw = createMemoryDataStorage();
+    const at = "2026-10-01T00:00:01.000Z";
+    const from = (key: string) => ({
+      $pdpp: { sourceId: `https://registry.pdpp.dev/sources/${key}` },
+    });
+    await store(raw, "strava.activities", at, {
+      records: [
+        { id: "ride-1", ...from("strava") },
+        { id: "ride-2", ...from("strava-browser") },
+      ],
+    });
+
+    await expect(
+      withLegacyProjection(raw).readEnvelope("strava.activities", at),
+    ).rejects.toMatchObject({
+      code: 409,
+      errorCode: "LEGACY_PROJECTION_UNAVAILABLE",
+    });
+  });
+
   it.each([
     ["after", "2026-10-01T00:00:02.000Z", "2026-10-02T00:00:02.000Z"],
     ["before", "2026-10-01T00:00:00.000Z", "2026-10-02T00:00:00.000Z"],

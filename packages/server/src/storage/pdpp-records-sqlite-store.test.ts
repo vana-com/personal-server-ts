@@ -37,6 +37,43 @@ describe("sqlite record store", () => {
     store.close();
   });
 
+  it("atomically replaces a complete multi-stream batch and rolls back any rejected stream", () => {
+    store.registerConnection({
+      instance: "oura-test",
+      sourceId: "https://test.invalid/oura",
+      method: "oura-browser",
+      label: "Test",
+    });
+    const batch = ["sleep", "readiness", "activity"].map((stream) => ({
+      instance: "oura-test",
+      stream,
+      method: "oura-browser",
+      generation: 1,
+      primaryKey: ["id"],
+      emittedAt: "2026-10-16T00:00:00.000Z",
+      sourceCollectedAt: "2026-10-16T00:00:00.000Z",
+      envelopes: [
+        {
+          instance: "oura-test",
+          stream,
+          key: stream,
+          data: { id: stream },
+          emitted_at: "2026-10-16T00:00:00.000Z",
+        },
+      ],
+    }));
+    const rejected = structuredClone(batch);
+    rejected[2]!.envelopes[0]!.key = "";
+    expect(() => store.replaceStreams(rejected)).toThrow();
+    expect(store.listStreamCompletions("oura-test")).toEqual([]);
+    expect(store.getRecord("oura-test", "sleep", "sleep")).toBeUndefined();
+    store.replaceStreams(batch);
+    expect(store.listStreamCompletions("oura-test")).toHaveLength(3);
+    expect(store.getRecord("oura-test", "sleep", "sleep")?.data).toEqual({
+      id: "sleep",
+    });
+  });
+
   it("ingests and reads back a record", () => {
     const envelope: PdppRecordEnvelopeInput = {
       instance: "inst_1",
@@ -976,7 +1013,7 @@ describe("sqlite record store", () => {
           dbAfterUpgrade
             .prepare("SELECT version FROM pdpp_schema_version WHERE id = 1")
             .get(),
-        ).toEqual({ version: 14 });
+        ).toEqual({ version: 16 });
         expect(
           dbAfterUpgrade
             .prepare("SELECT value FROM pdpp_record_arrival_clock WHERE id = 1")
@@ -1117,7 +1154,7 @@ describe("sqlite record store", () => {
         "UPDATE pdpp_schema_version SET version = 9999 WHERE id = 1",
       ).run();
       expect(() => createSqliteRecordStore(db)).toThrow(
-        /newer than this build supports/,
+        "Unsupported index.db PDPP schema version 9999; runtime supports 16",
       );
     });
   });
@@ -1504,7 +1541,7 @@ describe("v13 emitted-time order key", () => {
         const upgraded = createSqliteRecordStore(after);
         expect(
           after.prepare("SELECT version FROM pdpp_schema_version").get(),
-        ).toEqual({ version: 14 });
+        ).toEqual({ version: 16 });
         expect(
           upgraded
             .listRecords("events", {
