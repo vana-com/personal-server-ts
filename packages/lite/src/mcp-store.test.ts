@@ -3,12 +3,150 @@ import { IDBFactory } from "fake-indexeddb";
 import {
   approveMcpConnection,
   createMcpConnection,
+  createMcpOAuthAuthorization,
+  createInMemoryMcpOAuthAuthorizationStore,
+  McpConnectionStateError,
   requestMcpScopeAccess,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import { createIndexedDbMcpConnectionStore } from "./mcp-store.js";
 
 describe("IndexedDB MCP connection mutations", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("keeps one pending OAuth connection after concurrent registrations", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const connectionStore = createIndexedDbMcpConnectionStore({
+      dbName: "mcp-oauth-replacement-concurrency",
+    });
+    const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
+
+    await Promise.all(
+      Array.from({ length: 100 }, () =>
+        createMcpOAuthAuthorization(
+          {
+            clientId: "same-client",
+            redirectUri: "https://claude.ai/api/mcp/auth_callback",
+            codeChallenge: "challenge",
+            codeChallengeMethod: "S256",
+          },
+          {
+            connectionStore,
+            authorizationStore,
+            publicOrigin: "https://ps.local",
+          },
+        ),
+      ),
+    );
+
+    expect(
+      (await connectionStore.list()).filter(
+        (connection) =>
+          connection.clientId === "same-client" &&
+          connection.status === "pending",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("settles approval with a state error when cleanup already revoked the row", async () => {
+    vi.stubGlobal("indexedDB", new IDBFactory());
+    const connectionStore = createIndexedDbMcpConnectionStore({
+      dbName: "mcp-oauth-approve-after-cleanup",
+    });
+    const authorizationStore = createInMemoryMcpOAuthAuthorizationStore();
+    const stale = await createMcpConnection(
+      { displayName: "Claude", clientId: "same-client" },
+      { store: connectionStore, publicOrigin: "https://ps.local" },
+    );
+    await createMcpOAuthAuthorization(
+      {
+        clientId: "same-client",
+        redirectUri: "https://claude.ai/api/mcp/auth_callback",
+        codeChallenge: "challenge",
+        codeChallengeMethod: "S256",
+      },
+      {
+        connectionStore,
+        authorizationStore,
+        publicOrigin: "https://ps.local",
+      },
+    );
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutGuard = new Promise<never>((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("approval timed out")),
+        1_000,
+      );
+    });
+    try {
+      await expect(
+        Promise.race([
+          approveMcpConnection(
+            {
+              connectionId: stale.connectionId,
+              grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+            },
+            { store: connectionStore },
+          ),
+          timeoutGuard,
+        ]),
+      ).rejects.toBeInstanceOf(McpConnectionStateError);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  });
+
+  it("rejects a write when its request succeeds but the transaction aborts", async () => {
+    const factory = new IDBFactory();
+    const abortingIndexedDB = {
+      open(name: string, version?: number) {
+        const request =
+          version === undefined
+            ? factory.open(name)
+            : factory.open(name, version);
+        request.addEventListener("success", () => {
+          const db = request.result;
+          const originalTransaction = db.transaction.bind(db);
+          db.transaction = ((
+            ...args: Parameters<IDBDatabase["transaction"]>
+          ) => {
+            const transaction = originalTransaction(...args);
+            if (transaction.mode === "readwrite") {
+              const originalObjectStore =
+                transaction.objectStore.bind(transaction);
+              transaction.objectStore = (storeName: string) => {
+                const store = originalObjectStore(storeName);
+                const originalPut = store.put.bind(store);
+                store.put = ((
+                  ...putArgs: Parameters<IDBObjectStore["put"]>
+                ) => {
+                  const write = originalPut(...putArgs);
+                  write.addEventListener("success", () =>
+                    queueMicrotask(() => transaction.abort()),
+                  );
+                  return write;
+                }) as IDBObjectStore["put"];
+                return store;
+              };
+            }
+            return transaction;
+          }) as IDBDatabase["transaction"];
+        });
+        return request;
+      },
+    } as unknown as IDBFactory;
+    vi.stubGlobal("indexedDB", abortingIndexedDB);
+    const store = createIndexedDbMcpConnectionStore({
+      dbName: "mcp-write-aborted-after-request-success",
+    });
+
+    await expect(
+      createMcpConnection(
+        { displayName: "Claude" },
+        { store, publicOrigin: "https://ps.local" },
+      ),
+    ).rejects.toThrow("IndexedDB transaction aborted");
+  });
 
   it("atomically preserves concurrent requests on a legacy record", async () => {
     vi.stubGlobal("indexedDB", new IDBFactory());
