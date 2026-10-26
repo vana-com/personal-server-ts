@@ -117,9 +117,18 @@ export interface PersonalServerScopeUpload {
   /**
    * Append records. A list over 1 MiB serialized is sent as several batches;
    * one record over that goes alone (Web3Signed auth refuses it).
+   *
+   * Retry contract: if `append` throws, the server may already hold some of
+   * its batches, and the handle does not record which. The handle then refuses
+   * every later `append` and `commit` with `UPLOAD_FAILED`, so a retry cannot
+   * resend a batch that landed. Call `abort()`, then start a new upload with
+   * the full list. `abort()` is the only call that still works.
    */
   append(items: unknown[]): Promise<void>;
-  /** Write `data` after the record array and make the version visible. */
+  /**
+   * Write `data` after the record array and make the version visible. Throws
+   * `UPLOAD_FAILED` if an earlier `append` failed; see `append`.
+   */
   commit(
     data?: Record<string, unknown>,
   ): Promise<PersonalServerScopeUploadResult>;

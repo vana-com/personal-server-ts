@@ -328,6 +328,16 @@ export async function startPersonalServer(
     // a single larger record goes up alone, up to the server's limit.
     const batchBytes = Math.min(begun.maxBatchBytes, SCOPE_UPLOAD_BATCH_BYTES);
     let seq = 0;
+    // Set when an append fails: the server may hold some of its batches, and
+    // the handle does not know which, so it takes no more appends or commits.
+    let failed = false;
+    const failedUpload = () =>
+      new PersonalServerClientError({
+        message:
+          "An earlier append to this upload failed, so the server may hold part of it. Abort the upload and start over.",
+        status: 409,
+        errorCode: "UPLOAD_FAILED",
+      });
 
     async function sendBatch(items: unknown[]): Promise<void> {
       const body = { items };
@@ -368,9 +378,18 @@ export async function startPersonalServer(
       collectedAt: begun.collectedAt,
       maxBatchBytes: begun.maxBatchBytes,
       async append(items) {
-        await appendItems(items);
+        if (failed) throw failedUpload();
+        try {
+          await appendItems(items);
+        } catch (err) {
+          failed = true;
+          throw err;
+        }
       },
       async commit(data) {
+        // A partial append must not become a version: it would publish a
+        // prefix of the records as if it were the whole scope.
+        if (failed) throw failedUpload();
         return (await send(
           "POST",
           `${path}/commit`,

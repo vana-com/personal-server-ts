@@ -283,6 +283,56 @@ describe("startPersonalServer lite handle", () => {
     await expect(upload.commit()).resolves.toMatchObject({ records: 20 });
   });
 
+  it("does not resend a batch that landed before a later batch of the same append failed", async () => {
+    const gateway = createGateway();
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const runtime = createRuntime(gateway, storage);
+    // Batch 1 fails, and so does the SDK's immediate resend of it.
+    let failures = 2;
+    const flaky = {
+      ...runtime,
+      fetch(request: Request) {
+        const isSecondBatch =
+          request.method === "PUT" &&
+          new URL(request.url).pathname.endsWith("/batches/1");
+        if (isSecondBatch && failures > 0) {
+          failures -= 1;
+          return Promise.reject(new TypeError("fetch failed"));
+        }
+        return runtime.fetch(request);
+      },
+    } as typeof runtime;
+    const ps = await startPersonalServer({
+      runtime: flaky,
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    // Each record is over half the batch limit, so [first, second] is two batches.
+    const first = { id: "first", text: "a".repeat(600_000) };
+    const second = { id: "second", text: "b".repeat(600_000) };
+
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    await expect(upload.append([first, second])).rejects.toThrow();
+    // The handle no longer knows where the append stopped, so it refuses
+    // further appends and a commit: it would otherwise resend `first`.
+    await expect(upload.append([first, second])).rejects.toThrow();
+    await expect(upload.commit()).rejects.toThrow();
+    await upload.abort();
+
+    const restart = await ps.openScopeUpload!("notes.entries", auth);
+    await restart.append([first, second]);
+    await expect(restart.commit()).resolves.toMatchObject({ records: 2 });
+    await expect(ps.readData("notes.entries", { auth })).resolves.toMatchObject(
+      { data: { records: [first, second] } },
+    );
+  });
+
   it("exposes typed data and sync helpers through the public handle", async () => {
     const gateway = createGateway();
     const ps = await startPersonalServer({
