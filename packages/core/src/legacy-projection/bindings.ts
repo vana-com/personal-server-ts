@@ -1507,7 +1507,7 @@ const githubProfile: LegacyScopeBinding = {
     organizations: ["id"],
   },
   memoryBound:
-    "One user row, its stats, at most six pinned repositories and the user's organizations: no stream grows with record count.",
+    "The output is one profile object; user_stats gains a row per day and is read in full to pick the latest, and the window has no parent and child to split.",
   lossy: [
     "profileUrl is derived from the authenticated user's login using GitHub's canonical profile URL pattern",
     "organization label and URL are omitted because the organizations stream carries neither field; description is not substituted for label",
