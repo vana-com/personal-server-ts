@@ -51,6 +51,12 @@ export const DEFAULTS = {
     enabled: false,
     lastProcessedTimestamp: null,
   },
+  replication: {
+    // Off by default. When false, no replica code runs and no replica
+    // schema is created. When true, the record store is built with the
+    // replica port and applies the replica schema on open.
+    enabled: false,
+  },
   tunnel: {
     enabled: true,
     serverAddr: "frpc.server.vana.org",
@@ -209,6 +215,11 @@ export const ServerConfigSchema = z.object({
         .default(DEFAULTS.sync.lastProcessedTimestamp),
     })
     .default(DEFAULTS.sync),
+  replication: z
+    .object({
+      enabled: z.boolean().default(DEFAULTS.replication.enabled),
+    })
+    .default(DEFAULTS.replication),
   tunnel: z
     .object({
       enabled: z.boolean().default(DEFAULTS.tunnel.enabled),

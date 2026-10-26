@@ -94,8 +94,8 @@ import {
   coLocatedAuthorizationService,
   createPdppSyncImporter,
   registerLegacyDataConnections,
+  openRecordStore,
 } from "./pdpp/records-bootstrap.js";
-import { createSqliteRecordStore } from "./storage/pdpp-records-sqlite-store.js";
 import { createLegacyScopeAuthority } from "./storage/legacy-scope-authority.js";
 import { createScopeDeletionHistory } from "./storage/scope-deletion-history.js";
 import { createLegacyScopeView } from "@opendatalabs/personal-server-ts-core/storage/legacy-scope-view";
@@ -950,6 +950,7 @@ export async function createServer(
         .listDistinctScopes()
         .scopes.map(({ scope }) => scope),
       logger,
+      replication: config.replication.enabled,
     });
   }
 
@@ -967,11 +968,12 @@ export async function createServer(
     resource: effectiveOrigin,
     logger,
     configuredMethods: pdppAuth?.configuredMethods,
+    replication: config.replication.enabled,
   });
 
   const pdppConnections = pdppAuth
     ? {
-        store: createSqliteRecordStore(db),
+        store: openRecordStore(db, config.replication.enabled),
         auth: pdppRecords?.auth ?? coLocatedAuthorizationService(pdppAuth),
         ownerSubjectId: serverOwner!,
         connectionMethods: new Map(pdppAuth.connectionMethods),

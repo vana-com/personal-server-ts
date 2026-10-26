@@ -562,6 +562,7 @@ export async function createOwnerComposition(options: CompositionOptions) {
       resource: options.origin,
       logger: pino({ level: "silent" }),
       configuredMethods: [{ sourceId, methodId: source.methodId }],
+      replication: true,
     });
     assert(deps, "Normal PDPP records bootstrap is required");
     collector = runtime;

@@ -56,6 +56,22 @@ import {
   createSqliteRecordStore,
   PdppBindingError,
 } from "../storage/pdpp-records-sqlite-store.js";
+import { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
+
+/**
+ * The record store for this boot. With `replication` off (the default
+ * config), this is the plain store: no replica code runs and no replica
+ * schema is created. With it on, every store on this database carries the
+ * replica port, so no canonical write skips capture.
+ */
+export function openRecordStore(
+  db: Database,
+  replication: boolean,
+): ReturnType<typeof createSqliteRecordStore> {
+  return replication
+    ? createReplicaRecordStore(db)
+    : createSqliteRecordStore(db);
+}
 
 export interface PdppRecordsDeps {
   store: PdppRecordStore;
@@ -124,6 +140,8 @@ export interface CreatePdppRecordsDepsOptions {
   resource: string;
   logger: Logger;
   configuredMethods?: { sourceId: string; methodId: string }[];
+  /** `config.replication.enabled`; see `openRecordStore`. */
+  replication: boolean;
 }
 
 /** Restore account-one registry rows for legacy scopes before Desktop reads the registry. */
@@ -133,10 +151,12 @@ export function registerLegacyDataConnections(options: {
   connectionMethods: Map<string, string[]>;
   legacyScopes: string[];
   logger: Logger;
+  /** `config.replication.enabled`; see `openRecordStore`. */
+  replication: boolean;
 }): void {
   if (!options.serverOwner) return;
 
-  const store = createSqliteRecordStore(options.db);
+  const store = openRecordStore(options.db, options.replication);
   const scopesWithData = new Set(
     options.legacyScopes.map((scope) => scope.split(".", 1)[0]?.toLowerCase()),
   );
@@ -228,7 +248,7 @@ export function createPdppRecordsDeps(
     methodIds.push(configured.methodId);
     configuredMethods.set(source.sourceId, methodIds);
   }
-  const store = createSqliteRecordStore(options.db);
+  const store = openRecordStore(options.db, options.replication);
 
   // Register account 1 only for an empty source registry. Never add a legacy
   // fallback beside a connection that the owner already registered.
