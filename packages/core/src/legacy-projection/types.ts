@@ -191,4 +191,35 @@ export interface LegacyScopeBinding {
    */
   rowOrder?: "arrival";
   scope: string;
+  /**
+   * Present when the projection can be computed a window of parent rows at a
+   * time; see {@link LegacyProjectionWindow}.
+   */
+  window?: LegacyProjectionWindow;
+}
+
+/**
+ * A binding whose output holds one row per `parentStream` row, built from
+ * that row, the `childStream` rows whose `childKey` holds its primary key,
+ * and whole copies of the binding's other streams. Projecting the parents a
+ * window at a time, each with exactly its own children, and joining the
+ * windows' arrays in `parentOrder` gives the whole projection's array, when
+ * the caller passes `orderByPrimaryKey`. Every other payload key is the same
+ * in each window, except `sumKeys`, which add up.
+ *
+ * A child row that is not an object or names no parent is not in any window,
+ * so a caller must refuse such input rather than window it.
+ */
+export interface LegacyProjectionWindow {
+  parentStream: string;
+  childStream: string;
+  childKey: string;
+  /** The payload key of the output array. */
+  arrayKey: string;
+  sumKeys: string[];
+  /** The output array's order, as a total order on parent rows. */
+  parentOrder: (
+    a: Record<string, unknown>,
+    b: Record<string, unknown>,
+  ) => number;
 }

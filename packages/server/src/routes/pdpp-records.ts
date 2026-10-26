@@ -582,6 +582,8 @@ export function pdppRecordsRoutes(deps: PdppRecordsRouteDeps): Hono {
   app.use("*", async (c, next) => {
     const reqId = requestId();
     c.set("reqId" as never, reqId as never);
+    // Record responses carry personal data: no shared or stored copies.
+    c.header("Cache-Control", "private, no-store");
     await next();
   });
 

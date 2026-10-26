@@ -1807,6 +1807,16 @@ const chatgptConversations: LegacyScopeBinding = {
     ],
   },
   primaryKey: { conversations: ["id"], messages: ["id"] },
+  // Each conversation is built from its own messages; the list is ordered by
+  // the conversation's own update_time and id.
+  window: {
+    parentStream: "conversations",
+    childStream: "messages",
+    childKey: "conversation_id",
+    arrayKey: "conversations",
+    sumKeys: ["total"],
+    parentOrder: newestUpdateFirst,
+  },
   lossy: [
     "Conversation create/update times pass through as null when the source lacks them, matching legacy's listed?.create_time ?? fetched.create_time ?? null fallback.",
     "fetched_at is the projection time (options.now, else the wall clock), matching legacy's per-run toConversationRecord timestamp.",

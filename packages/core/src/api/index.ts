@@ -93,6 +93,7 @@ import {
   type StoredLineage,
 } from "../lineage/lineage.js";
 import type { LineageGatewayPort } from "../lineage/gateway.js";
+import { ScopeUploadError, type ScopeUploadRegistry } from "./scope-uploads.js";
 import {
   deletionHistoryOf,
   type LegacyScopeRefusal,
@@ -419,6 +420,12 @@ export interface PersonalServerDataApiDeps {
     lineageSources?: string[];
   }) => void;
   /**
+   * Open streamed writes behind `/v1/data/:scope/uploads` (see
+   * `scope-uploads.ts`). Absent = those routes answer 501 and owners write
+   * a scope as one JSON body.
+   */
+  scopeUploads?: ScopeUploadRegistry;
+  /**
    * Import a locally-ingested envelope into the PDPP record store, when the
    * deployment mounted one.
    *
@@ -501,7 +508,21 @@ export interface PersonalServerApiDispatchOptions {
 }
 
 type JsonStatus =
-  200 | 201 | 400 | 401 | 403 | 404 | 405 | 429 | 500 | 502 | 503;
+  | 200
+  | 201
+  | 400
+  | 401
+  | 403
+  | 404
+  | 405
+  | 409
+  | 410
+  | 413
+  | 429
+  | 500
+  | 501
+  | 502
+  | 503;
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   const headers = new Headers(init?.headers);
@@ -1679,6 +1700,142 @@ export function redactEnvelopeForGrantee(
 
 export { redactJsonEnvelopeBytesForGrantee } from "./raw-envelope.js";
 
+/**
+ * `/v1/data/:scope/uploads...`: an owner writes one new version of a scope as
+ * a sequence of record batches. The protocol and its guarantees are in
+ * `scope-uploads.ts`; this adds HTTP, owner auth and the post-commit hooks.
+ */
+async function handleScopeUploadRequest(
+  request: Request,
+  deps: PersonalServerDataApiDeps,
+  parts: string[],
+): Promise<Response> {
+  const route = (() => {
+    if (parts.length === 2) return { kind: "begin", method: "POST" } as const;
+    if (parts.length === 3) return { kind: "abort", method: "DELETE" } as const;
+    if (parts.length === 4 && parts[3] === "commit")
+      return { kind: "commit", method: "POST" } as const;
+    if (parts.length === 5 && parts[3] === "batches")
+      return { kind: "append", method: "PUT" } as const;
+    return undefined;
+  })();
+  if (!route) {
+    return errorResponse(404, "NOT_FOUND", "Unknown upload route");
+  }
+  if (request.method !== route.method) return methodNotAllowed();
+  await deps.auth.authorizeOwner(request);
+  const scopeResult = parseDataScopeContract(decodePathPart(parts[0]));
+  if (!scopeResult.ok) return contractErrorResponse(scopeResult);
+  const scope = scopeResult.scope;
+  const uploads = deps.scopeUploads;
+  if (!uploads) {
+    return errorResponse(
+      501,
+      "UPLOAD_UNSUPPORTED",
+      "This server cannot stream a scope version",
+    );
+  }
+  const readBody = async (): Promise<unknown> => {
+    const text = await request.text();
+    if (text.trim() === "") return {};
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      throw new ScopeUploadError(
+        400,
+        "INVALID_UPLOAD",
+        "Request body must be valid JSON",
+      );
+    }
+  };
+
+  try {
+    switch (route.kind) {
+      case "begin": {
+        const body = await readBody();
+        const stamp = reserveIngestStamp(
+          deps.now ?? (() => new Date()),
+          deps.storage,
+          scope,
+        );
+        if (!stamp) {
+          return errorResponse(
+            429,
+            "INGEST_CAPACITY",
+            "Too many writes for this scope; retry when the clock advances",
+          );
+        }
+        const begun = await uploads.begin({
+          storage: deps.storage,
+          scope,
+          collectedAt: stamp.collectedAt,
+          release: stamp.release,
+          body,
+        });
+        return jsonResponse(
+          { ...begun, scope, maxBatchBytes: uploads.maxBatchBytes },
+          { status: 201 },
+        );
+      }
+      case "append": {
+        const seqText = decodePathPart(parts[4]);
+        const appended = await uploads.append({
+          scope,
+          uploadId: decodePathPart(parts[2]),
+          seq: /^\d{1,9}$/.test(seqText) ? Number(seqText) : Number.NaN,
+          text: await request.text(),
+        });
+        return jsonResponse(appended, {
+          status: appended.replay ? 200 : 201,
+        });
+      }
+      case "commit": {
+        const body = await readBody();
+        const committed = await uploads.commit({
+          scope,
+          uploadId: decodePathPart(parts[2]),
+          body,
+          afterTombstoneVersion: await ingestTombstoneMarker(deps, scope),
+        });
+        deps.logger?.info?.(
+          {
+            scope,
+            collectedAt: committed.collectedAt,
+            path: committed.writeResult.relativePath,
+            records: committed.records,
+          },
+          "Streamed data file committed",
+        );
+        // Block sidecars and the first-seen ledger are not built here: both
+        // need the whole envelope in memory, which is what an upload avoids.
+        // Both are caches: a scope with no block manifest is read whole, and
+        // the owner's `/additions` read folds the version into the ledger.
+        notifyNewData(deps.syncManager);
+        notifyDataWritten(deps, { scope, collectedAt: committed.collectedAt });
+        return jsonResponse(
+          {
+            scope,
+            collectedAt: committed.collectedAt,
+            status: deps.syncManager ? "syncing" : "stored",
+            records: committed.records,
+            sizeBytes: committed.writeResult.sizeBytes,
+          },
+          { status: 201 },
+        );
+      }
+      case "abort": {
+        await uploads.abort({ scope, uploadId: decodePathPart(parts[2]) });
+        return new Response(null, { status: 204 });
+      }
+    }
+  } catch (err) {
+    if (err instanceof ScopeUploadError) {
+      return errorResponse(err.status, err.code, err.message);
+    }
+    throw err;
+  }
+}
+
 export async function handlePersonalServerDataRequest(
   request: Request,
   deps: PersonalServerDataApiDeps,
@@ -1749,6 +1906,9 @@ export async function handlePersonalServerDataRequest(
     }
 
     const parts = pathname.split("/").filter(Boolean);
+    if (parts.length >= 2 && parts[1] === "uploads") {
+      return await handleScopeUploadRequest(request, deps, parts);
+    }
     if (parts.length === 3 && parts[1] === "imports") {
       if (request.method !== "PUT") return methodNotAllowed();
       await deps.auth.authorizeOwner(request);
@@ -2895,3 +3055,12 @@ export {
   readOuraCollectionRequirements,
   OURA_LEGACY_TAKEOVER_CONTRACT,
 } from "./oura-collection-requirements.js";
+
+export {
+  createScopeUploadRegistry,
+  ScopeUploadError,
+  SCOPE_UPLOAD_MAX_BATCH_BYTES,
+  SCOPE_UPLOAD_IDLE_TIMEOUT_MS,
+  type ScopeUploadRegistry,
+  type ScopeUploadRegistryOptions,
+} from "./scope-uploads.js";

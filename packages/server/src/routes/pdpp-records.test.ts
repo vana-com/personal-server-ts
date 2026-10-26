@@ -194,6 +194,45 @@ describe("pdpp records routes: 500 observability", () => {
   });
 });
 
+describe("pdpp records routes: caching", () => {
+  it("marks every response private and no-store, including errors", async () => {
+    const store = createMemoryRecordStore();
+    store.ingestBatch(
+      [
+        {
+          instance: "inst_1",
+          stream: "playlists",
+          key: "pl_1",
+          data: { id: "pl_1", name: "personal" },
+          emitted_at: "2026-04-01T00:00:00.000Z",
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+    );
+    const { app } = buildApp(
+      {
+        "client-tok": {
+          active: true,
+          tokenKind: "client",
+          subjectId: "sub_1",
+          grant: clientGrant(),
+        },
+      },
+      { store },
+    );
+    const authorized = { headers: { Authorization: "Bearer client-tok" } };
+    const responses = [
+      await app.request("/streams/playlists/records", authorized),
+      await app.request("/streams/playlists/records/pl_1", authorized),
+      await app.request("/streams/playlists/records"),
+    ];
+    expect(responses.map((res) => res.status)).toEqual([200, 200, 401]);
+    for (const res of responses)
+      expect(res.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+});
+
 describe("pdpp records routes: field projection", () => {
   it("never exposes an unprojected field to a client token via list/get", async () => {
     const store = createMemoryRecordStore();
