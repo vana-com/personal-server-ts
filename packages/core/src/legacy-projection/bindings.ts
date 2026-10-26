@@ -3369,9 +3369,10 @@ const ouraActivity: LegacyScopeBinding = {
       "contributors",
     ],
   },
+  optionalFieldsRead: { activity: ["timestamp"] },
   primaryKey: { activity: ["id"] },
   lossy: [
-    "timestamp: no source field; omitted (legacy schema makes it optional)",
+    "timestamp: preserved when supplied; absent or null source timestamps are omitted",
     "target_calories: has no legacy field and is not projected",
     "Legacy integer fields: fractional source numbers are rounded with Math.round at projection time",
   ],
@@ -3400,6 +3401,9 @@ const ouraActivity: LegacyScopeBinding = {
         days: rows.map((r) => ({
           id: r.id,
           day: r.day,
+          ...(typeof r.timestamp === "string"
+            ? { timestamp: r.timestamp }
+            : {}),
           score: ouraInteger(r.score),
           ...ifDefinedOuraInteger(r, "active_calories", "activeCalories"),
           ...ifDefinedOuraInteger(r, "total_calories", "totalCalories"),
@@ -3444,9 +3448,10 @@ const ouraReadiness: LegacyScopeBinding = {
       "contributors",
     ],
   },
+  optionalFieldsRead: { readiness: ["timestamp"] },
   primaryKey: { readiness: ["id"] },
   lossy: [
-    "timestamp: no source field; omitted (legacy schema makes it optional)",
+    "timestamp: preserved when supplied; absent or null source timestamps are omitted",
     "Legacy integer fields: fractional source numbers are rounded with Math.round at projection time",
   ],
   provenance: [
@@ -3474,6 +3479,9 @@ const ouraReadiness: LegacyScopeBinding = {
         days: rows.map((r) => ({
           id: r.id,
           day: r.day,
+          ...(typeof r.timestamp === "string"
+            ? { timestamp: r.timestamp }
+            : {}),
           score: ouraInteger(r.score),
           ...ifDefined(r, "temperature_deviation", "temperatureDeviation"),
           ...ifDefined(

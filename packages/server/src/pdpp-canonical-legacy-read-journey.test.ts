@@ -6,8 +6,8 @@
  * legacy files written through POST /v1/data, and the legacy read auth
  * (owner control-plane token, and a builder's Web3Signed legacy grant).
  *
- * A stored legacy head remains latest until its canonical projection covers
- * it. A regression against a covered head refuses; a newer legacy head is
+ * A stored legacy head remains latest until a fresh complete import replaces
+ * it wholesale or its canonical projection covers it. A regression against a covered head refuses; a newer legacy head is
  * checked again and may explicitly return to the file.
  */
 
@@ -120,6 +120,7 @@ function grant(): GatewayGrantResponse {
     settleTxHash: null,
     settleSubmittedAt: null,
     revocationTxHash: null,
+    revocationSubmittedAt: null,
     fee: {
       asset: "0x0000000000000000000000000000000000000000",
       registrationFee: "0",
@@ -339,6 +340,25 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
+function expectCompletedReplacement(scope: string): void {
+  const db = new Database(join(tempDir, "index.db"), {
+    readonly: true,
+    fileMustExist: true,
+  });
+  try {
+    const head = ctx!.indexManager.findLatestByScope(scope)!;
+    const row = db
+      .prepare(
+        "SELECT replacement_cursor FROM legacy_scope_takeovers WHERE scope = ? AND superseded_path = ?",
+      )
+      .get(scope, head.path) as { replacement_cursor: string } | undefined;
+    expect(row?.replacement_cursor).toEqual(expect.any(String));
+    expect(row!.replacement_cursor.length).toBeGreaterThan(0);
+  } finally {
+    db.close();
+  }
+}
+
 describe("GET /v1/data/:scope for a bound connector scope", () => {
   it("accepts mutable value drift from a newer canonical collection", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -361,9 +381,8 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       expect(
         JSON.parse((await ownerGet("/v1/data/oura.activity/takeover")).text)
           .verdicts,
-      ).toMatchObject([
-        { comparisonCase: "canonical_newer", verdict: "covered" },
-      ]);
+      ).toEqual([]);
+      expectCompletedReplacement("oura.activity");
     } finally {
       vi.useRealTimers();
     }
@@ -382,6 +401,9 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       expect((await ownerGet("/v1/data/oura.activity")).dataSource).toBe(
         "legacy",
       );
+      const historicalVerdicts = JSON.parse(
+        (await ownerGet("/v1/data/oura.activity/takeover")).text,
+      ).verdicts;
       await replace(
         token,
         "activity",
@@ -394,13 +416,8 @@ describe("GET /v1/data/:scope for a bound connector scope", () => {
       expect(
         JSON.parse((await ownerGet("/v1/data/oura.activity/takeover")).text)
           .verdicts,
-      ).toMatchObject([
-        {
-          comparisonCase: "canonical_newer",
-          verdict: "covered",
-          reasonCounts: { missing_entity: 1 },
-        },
-      ]);
+      ).toEqual(historicalVerdicts);
+      expectCompletedReplacement("oura.activity");
     } finally {
       vi.useRealTimers();
     }
@@ -1560,7 +1577,7 @@ describe("selectors, payment, restart and deletion around a canonical scope", ()
     };
     const signature = await builder.signTypedData({
       domain: escrowPaymentDomain(ctx!.config.gateway),
-      types: GENERIC_PAYMENT_TYPES,
+      types: { GenericPayment: [...GENERIC_PAYMENT_TYPES.GenericPayment] },
       primaryType: "GenericPayment",
       message,
     });
@@ -2011,17 +2028,14 @@ describe.each([
       }
       const read = await ownerGet(`/v1/data/${scope}`);
       expect(read.status).toBe(200);
-      const hasUnkeyedEntities = [
-        "linkedin.connections",
-        "github.repositories",
-        "github.starred",
-        "spotify.savedTracks",
-      ].includes(scope);
-      const canonical = complete && !hasUnkeyedEntities;
+      // Fresh complete imports replace the whole dataset, including bodies
+      // whose old entities have no comparable key. Incomplete imports do not.
+      const canonical = complete;
       expect(read.dataSource).toBe(canonical ? "canonical" : "legacy");
       expect(JSON.parse(read.text).data).toEqual(
         canonical ? canonicalBody : fixture.legacyBody,
       );
+      if (canonical) expectCompletedReplacement(scope);
     },
   );
 });

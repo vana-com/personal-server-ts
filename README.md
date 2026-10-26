@@ -135,6 +135,28 @@ Deletion/reset removes the corresponding saved baseline and archived data. This
 is a one-way method transition, not an arbitrary method-switching API. Saved
 provider sessions stay at their existing host-owned credential boundary.
 
+### Strava export-to-browser transition
+
+The owner-only `POST /pdpp/instances/:instance/transition-strava-browser`
+accepts `{ "expected_generation": N }` for the single registered Strava
+connection, configured as `strava` or `strava-browser`. It follows the Claude
+transition: it captures the readable `strava.activities` and
+`strava.coverage_diagnostics` bodies, archives the export rows and binds
+`strava-browser` at N+1 in one SQLite transaction. Replays never clear browser
+data. Unreadable, nonempty activities refuse the transition.
+
+Strava browser records carry no athlete id. The saved activities stay
+authoritative until a browser run with a completion receipt holds every saved
+activity id; nothing is deleted before then. A completed run that misses saved
+ids keeps the export. `GET /pdpp/instances/:instance/strava-browser-transition`
+reports `none`, `pending`, `account_mismatch` or `covered`, so a host can tell
+the owner the signed-in account does not match the saved data. After the
+handover, `strava.activities` follows the normal legacy view. The saved
+`strava.coverage_diagnostics` body stays readable and frozen; the browser
+method does not collect diagnostics. Reset or deletion removes the saved bodies
+and archive. The server exports `STRAVA_BROWSER_TRANSITION_CONTRACT`
+(`strava-browser-transition-v1`) for hosts to check before use.
+
 ### Owner import acceptance
 
 `PUT /v1/data/{scope}/imports/{operation}` accepts an owner root JSON object up to the data-ingest limit (512 MiB). `operation` is a stable 64-character lowercase hexadecimal identifier for one intended import; derive it from the owner, saved run identity and scope, excluding the body digest and server port. Ordinary `POST` continues to create a distinct write on each request. Binary, lineage and query parameters (including `supersede`) are refused on import PUT.

@@ -195,12 +195,15 @@ export function createMemoryDataStorage(): MemoryDataStorage {
         return removed;
       });
     },
-    async deleteVersion(scope, collectedAt) {
+    async deleteVersion(scope, collectedAt, fence) {
       return withScopeLock(scope, async () => {
         const removed =
           remove(
             (entry) =>
-              entry.scope === scope && entry.collectedAt === collectedAt,
+              entry.scope === scope &&
+              entry.collectedAt === collectedAt &&
+              (fence === undefined ||
+                (entry.id === fence.id && entry.path === fence.path)),
           ) > 0;
         dropEmptyLedger(scope);
         return removed;

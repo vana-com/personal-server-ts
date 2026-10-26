@@ -185,3 +185,13 @@ export {
   type PsLitePersistenceBundle,
   type PsLitePersistenceRuntimeOptions,
 } from "./persistence.js";
+
+export {
+  importOuraBrowserRecords,
+  type OuraBrowserImportInput,
+  type OuraBrowserImportOptions,
+  type OuraBrowserImportResult,
+  type OuraImportReceipt,
+} from "./oura-import.js";
+
+export { OURA_LEGACY_TAKEOVER_CONTRACT } from "@opendatalabs/personal-server-ts-core/api";

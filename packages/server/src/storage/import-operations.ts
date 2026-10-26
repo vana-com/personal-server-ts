@@ -23,6 +23,7 @@ import {
   snapshotScopeFiles,
 } from "./hierarchy.js";
 import { relative } from "node:path";
+import type { VersionFence } from "@opendatalabs/personal-server-ts-core/ports";
 
 interface OperationRow {
   authority: string;
@@ -336,6 +337,35 @@ export function createImportOperations(
           deleteFirstSeenLedgerSync(options, scope);
         }
         return snapshot.entries.length;
+      });
+    },
+    /**
+     * Erases one version only while its row is still the one the caller
+     * decided on (same local id and path). The check, the retirement of that
+     * row's import operation and the erase run in one immediate transaction,
+     * the same kind every owner import commits in, so a replacement row cannot
+     * land between them. A row erased or replaced since is left alone.
+     */
+    deleteFencedVersion(
+      scope: string,
+      collectedAt: string,
+      fence: VersionFence,
+    ): boolean {
+      return immediate(() => {
+        recover();
+        const row = index.findByPath(fence.path);
+        if (
+          !row ||
+          row.id !== fence.id ||
+          row.scope !== scope ||
+          row.collectedAt !== collectedAt
+        ) {
+          return false;
+        }
+        retire("path = @path", { path: fence.path });
+        deleteDataFileSync(options, scope, collectedAt);
+        index.deleteByPath(fence.path);
+        return true;
       });
     },
     deleteVersion(

@@ -2889,3 +2889,9 @@ export async function handlePersonalServerOauthTokenRequest(
 }
 
 export type { DataReadPolicyPorts };
+
+export {
+  handleOuraCollectionRequirementsRequest,
+  readOuraCollectionRequirements,
+  OURA_LEGACY_TAKEOVER_CONTRACT,
+} from "./oura-collection-requirements.js";

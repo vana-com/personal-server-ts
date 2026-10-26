@@ -964,3 +964,36 @@ describe("legacy scope coverage", () => {
     expect(verdict.appliedExceptions).toEqual([]);
   });
 });
+
+describe("Oura frozen integer schema defect", () => {
+  const payload = (averageHrv: unknown) => ({
+    sleepPeriods: [{ id: "session", averageHrv }],
+  });
+  const options = {
+    scope: "oura.sleep",
+    entityKeys: { "$.sleepPeriods": ["id"] },
+  };
+  it("accepts only the exact schema rounding of a fractional legacy averageHrv", () => {
+    const verdict = compareLegacyCoverage(payload(48.6), payload(49), options);
+    expect(verdict.covered).toBe(true);
+    expect(verdict.appliedExceptions).toHaveLength(1);
+    expect(
+      compareLegacyCoverage(payload(48.6), payload(48), options).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(payload(48), payload(49), options).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(payload(48.6), payload("49"), options).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(payload(48.6), payload(null), options).covered,
+    ).toBe(false);
+    expect(
+      compareLegacyCoverage(payload(48.6), payload(49), {
+        ...options,
+        scope: "other.sleep",
+      }).covered,
+    ).toBe(false);
+  });
+});
