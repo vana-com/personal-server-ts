@@ -4,7 +4,9 @@ import { join } from "node:path";
 import { createCipheriv, randomBytes } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  approveMcpOAuthAuthorization,
   createMcpConnection,
+  createMcpOAuthAuthorization,
   MAX_MCP_OAUTH_CLIENTS,
 } from "@opendatalabs/personal-server-ts-core/mcp";
 import {
@@ -86,6 +88,81 @@ afterEach(async () => {
 });
 
 describe("TEE MCP durable state", () => {
+  it("keeps one pending OAuth connection under concurrent registration and preserves approval", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "mcp-oauth-replace-"));
+    directories.push(directory);
+    const state = await openMcpDurableState({
+      path: join(directory, "state.sealed"),
+      key: randomBytes(32),
+    });
+    const authorize = () =>
+      createMcpOAuthAuthorization(
+        {
+          clientId: "same-client",
+          redirectUri: "https://claude.ai/api/mcp/auth_callback",
+          codeChallenge: "challenge",
+          codeChallengeMethod: "S256",
+        },
+        {
+          connectionStore: state.connections,
+          authorizationStore: state.authorizations,
+          publicOrigin: "https://mcp.example.test",
+        },
+      );
+
+    const registrations = await Promise.all(
+      Array.from({ length: 100 }, authorize),
+    );
+    const connections = await state.connections.list();
+    expect(
+      connections.filter(
+        (connection) =>
+          connection.clientId === "same-client" &&
+          connection.status === "pending",
+      ),
+    ).toHaveLength(1);
+
+    const pendingConnection = connections.find(
+      (connection) =>
+        connection.clientId === "same-client" &&
+        connection.status === "pending",
+    );
+    const pendingAuthorization = (
+      await Promise.all(
+        registrations.map(({ authorizationId }) =>
+          state.authorizations.getById(authorizationId),
+        ),
+      )
+    ).find(
+      (authorization) =>
+        authorization?.connectionId === pendingConnection?.id &&
+        authorization.status === "pending",
+    );
+    expect(pendingAuthorization).toBeDefined();
+    await approveMcpOAuthAuthorization(
+      {
+        authorizationId: pendingAuthorization!.id,
+        grants: [{ grantId: "grant-1", scopes: ["chatgpt.history"] }],
+      },
+      {
+        connectionStore: state.connections,
+        authorizationStore: state.authorizations,
+      },
+    );
+
+    await authorize();
+    expect(
+      await state.connections.getById(pendingAuthorization!.connectionId),
+    ).toMatchObject({ status: "approved" });
+    expect(
+      (await state.connections.list()).filter(
+        (connection) =>
+          connection.clientId === "same-client" &&
+          connection.status === "pending",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("restores only the latest sealed owner wakeup envelope after a process restart", async () => {
     const directory = await mkdtemp(join(tmpdir(), "mcp-wakeup-"));
     directories.push(directory);

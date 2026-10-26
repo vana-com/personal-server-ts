@@ -31,6 +31,35 @@ export function createInMemoryMcpConnectionStore(): McpConnectionStore {
       byTokenHash.set(record.tokenHash, record.id);
     },
 
+    async replacePendingOAuthConnections(clientId, expiredBefore, replacement) {
+      if (
+        replacement.status !== "pending" ||
+        replacement.clientId !== clientId
+      ) {
+        throw new Error("OAuth replacement must be pending for its client");
+      }
+      if (byId.has(replacement.id)) {
+        throw new Error(`mcp connection ${replacement.id} already exists`);
+      }
+      for (const [id, record] of byId) {
+        const expired = Date.parse(record.createdAt) <= expiredBefore;
+        if (
+          record.status !== "pending" ||
+          !record.clientId ||
+          (record.clientId !== clientId && !expired)
+        ) {
+          continue;
+        }
+        byId.set(id, {
+          ...record,
+          status: "revoked",
+          revokedAt: replacement.createdAt,
+        });
+      }
+      byId.set(replacement.id, { ...replacement });
+      byTokenHash.set(replacement.tokenHash, replacement.id);
+    },
+
     async list() {
       return Array.from(byId.values()).map((r) => ({ ...r }));
     },

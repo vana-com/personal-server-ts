@@ -58,6 +58,10 @@ import {
 
 const TOKEN_BYTES = 32;
 const OAUTH_AUTHORIZATION_TTL_MS = 10 * 60 * 1000;
+const pendingOAuthReplacements = new WeakMap<
+  McpConnectionStore,
+  Promise<void>
+>();
 
 /**
  * Default lifetime of a grant the server signs itself for an MCP connection
@@ -188,6 +192,15 @@ export async function createMcpConnection(
   input: CreateMcpConnectionInput,
   options: CreateMcpConnectionOptions,
 ): Promise<CreateMcpConnectionOutput> {
+  const { record, output } = await buildMcpConnection(input, options);
+  await options.store.create(record);
+  return output;
+}
+
+async function buildMcpConnection(
+  input: CreateMcpConnectionInput,
+  options: Pick<CreateMcpConnectionOptions, "publicOrigin" | "now">,
+): Promise<{ record: McpConnectionRecord; output: CreateMcpConnectionOutput }> {
   const grantee = generateMcpGrantee();
   const token = randomToken();
   const tokenHash = await hashConnectionToken(token);
@@ -209,14 +222,15 @@ export async function createMcpConnection(
     ...(input.clientId ? { clientId: input.clientId } : {}),
   };
 
-  await options.store.create(record);
-
   return {
-    connectionId: id,
-    granteeAddress: grantee.key.address,
-    connectionToken: token,
-    mcpUrl: buildMcpUrl(options.publicOrigin, token),
-    createdAt,
+    record,
+    output: {
+      connectionId: id,
+      granteeAddress: grantee.key.address,
+      connectionToken: token,
+      mcpUrl: buildMcpUrl(options.publicOrigin, token),
+      createdAt,
+    },
   };
 }
 
@@ -954,18 +968,22 @@ export async function createMcpOAuthAuthorization(
   const expiresAt = new Date(
     now.getTime() + OAUTH_AUTHORIZATION_TTL_MS,
   ).toISOString();
-  await revokeStalePending(input.clientId, now, options.connectionStore);
-  const created = await createMcpConnection(
+  const { record: connection, output: created } = await buildMcpConnection(
     {
       displayName: input.clientName ?? DEFAULT_MCP_CLIENT_NAME,
       ingress: input.ingress,
       clientId: input.clientId,
     },
     {
-      store: options.connectionStore,
       publicOrigin: options.publicOrigin,
       now: () => now,
     },
+  );
+  await replacePendingOAuthConnections(
+    options.connectionStore,
+    input.clientId,
+    now.getTime() - OAUTH_AUTHORIZATION_TTL_MS,
+    connection,
   );
   const authorizationId = randomId();
   const record: McpOAuthAuthorizationRecord = {
@@ -994,27 +1012,52 @@ export async function createMcpOAuthAuthorization(
   };
 }
 
-/**
- * Revoke never-approved OAuth connections a new authorize makes moot: the
- * same client's earlier tries (a retry or restart replaces them) and any
- * whose authorization expired. Owner-made connections carry no clientId and
- * are kept. Runs before the new connection exists, so two racing tries leave
- * an extra row at worst, never none.
- */
-async function revokeStalePending(
-  clientId: string,
-  now: Date,
+async function replacePendingOAuthConnections(
   store: McpConnectionStore,
+  clientId: string,
+  expiredBefore: number,
+  replacement: McpConnectionRecord,
 ): Promise<void> {
-  const cutoff = now.getTime() - OAUTH_AUTHORIZATION_TTL_MS;
-  for (const connection of await store.list()) {
-    if (connection.status !== "pending" || !connection.clientId) continue;
-
-    const expired = Date.parse(connection.createdAt) <= cutoff;
-    if (connection.clientId !== clientId && !expired) continue;
-
-    await revokeMcpConnection(connection.id, { store, now: () => now });
+  if (store.replacePendingOAuthConnections) {
+    await store.replacePendingOAuthConnections(
+      clientId,
+      expiredBefore,
+      replacement,
+    );
+    return;
   }
+
+  const previous = pendingOAuthReplacements.get(store) ?? Promise.resolve();
+  const operation = previous.then(async () => {
+    for (const connection of await store.list()) {
+      const expired = Date.parse(connection.createdAt) <= expiredBefore;
+      if (
+        connection.status !== "pending" ||
+        !connection.clientId ||
+        (connection.clientId !== clientId && !expired)
+      ) {
+        continue;
+      }
+      await store.mutate(connection.id, (latest) =>
+        latest.status === "pending"
+          ? {
+              ...latest,
+              status: "revoked",
+              revokedAt: replacement.createdAt,
+            }
+          : latest,
+      );
+    }
+    await store.create(replacement);
+  });
+  pendingOAuthReplacements.set(
+    store,
+    operation.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  await operation;
 }
 
 /** A superseded or removed authorization has a revoked connection; refuse it. */

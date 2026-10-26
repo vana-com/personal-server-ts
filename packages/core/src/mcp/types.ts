@@ -142,6 +142,12 @@ export interface McpConnectionRecord {
 
 export interface McpConnectionStore {
   create(record: McpConnectionRecord): Promise<void>;
+  /** Atomically replace pending OAuth connections when the store can transact. */
+  replacePendingOAuthConnections?(
+    clientId: string,
+    expiredBefore: number,
+    replacement: McpConnectionRecord,
+  ): Promise<void>;
   list(): Promise<McpConnectionRecord[]>;
   getById(id: string): Promise<McpConnectionRecord | null>;
   /**
