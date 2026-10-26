@@ -674,6 +674,53 @@ describe("replication flag on", () => {
     store.close();
   });
 
+  it("never reconciles a write whose transaction rolled back", () => {
+    const db = open();
+    const store = createReplicaRecordStore(db);
+    register(store);
+    store.replication.beginBaseline(baseline);
+    const reconciled: string[] = [];
+    store.setReplicaLocalWriteObserver((_instance, _stream, recordKey) => {
+      reconciled.push(recordKey);
+    });
+    const envelope = (key: string) => ({
+      instance: "conn_a",
+      stream: "messages",
+      key,
+      data: { id: key, text: key },
+      emitted_at: at,
+    });
+    const queued = () =>
+      (
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM temp.pdpp_replica_unsettled_writes",
+          )
+          .get() as { n: number }
+      ).n;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let calls = 0;
+      expect(() =>
+        store.ingestBatch(
+          [envelope(`failed-${attempt}-a`), envelope(`failed-${attempt}-b`)],
+          // The first envelope is written and queued; the second throws.
+          () => {
+            if (++calls === 2) throw new Error("boom");
+            return "mutable_state";
+          },
+          () => ["id"],
+          { method: "collector", generation: 1 },
+        ),
+      ).toThrow("boom");
+      expect(queued()).toBe(0);
+    }
+    expect(reconciled).toEqual([]);
+    ingest(store, "kept", "written");
+    expect(reconciled).toEqual(["kept"]);
+    expect(queued()).toBe(0);
+    expect(keys(store)).toEqual(["kept"]);
+  });
+
   it("looks up an existing blob claim through the index, however long the journal is", () => {
     const db = open();
     const seen: string[] = [];

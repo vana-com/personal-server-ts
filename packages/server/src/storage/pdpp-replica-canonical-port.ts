@@ -280,10 +280,19 @@ export function createReplicaCanonicalPort(db: Database) {
   let visibilityObserver: (() => void) | undefined;
   let localWriteObserver:
     ((instance: string, stream: string, recordKey: string) => void) | undefined;
-  const unsettledLocalWrites = new Map<
-    string,
-    { instance: string; stream: string; recordKey: string }
-  >();
+  // Keys written since the last settle. A TEMP table, so a rolled-back write
+  // (at any transaction or savepoint depth) takes its queued key with it and is
+  // never reconciled. It lives on this connection only and is not part of the
+  // database file.
+  db.exec(
+    "CREATE TEMP TABLE IF NOT EXISTS pdpp_replica_unsettled_writes (instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL, PRIMARY KEY (instance, stream, record_key))",
+  );
+  const queueLocalWrite = db.prepare(
+    "INSERT OR IGNORE INTO pdpp_replica_unsettled_writes VALUES (?, ?, ?)",
+  );
+  const takeLocalWrites = db.prepare(
+    "DELETE FROM pdpp_replica_unsettled_writes RETURNING instance, stream, record_key",
+  );
 
   function replicaIntegrityEpoch(connectionKey: string): number {
     return (
@@ -419,18 +428,17 @@ export function createReplicaCanonicalPort(db: Database) {
         primaryKey,
         decl,
       );
-      unsettledLocalWrites.set(JSON.stringify([instance, stream, recordKey]), {
-        instance,
-        stream,
-        recordKey,
-      });
+      queueLocalWrite.run(instance, stream, recordKey);
       visibilityObserver?.();
     },
     settleLocalWrites() {
-      const writes = [...unsettledLocalWrites.values()];
-      unsettledLocalWrites.clear();
-      for (const { instance, stream, recordKey } of writes)
-        localWriteObserver?.(instance, stream, recordKey);
+      const writes = takeLocalWrites.all() as {
+        instance: string;
+        stream: string;
+        record_key: string;
+      }[];
+      for (const { instance, stream, record_key } of writes)
+        localWriteObserver?.(instance, stream, record_key);
     },
     captureInvalidation: journal.captureInvalidation,
     captureCompletion: journal.captureCompletion,
