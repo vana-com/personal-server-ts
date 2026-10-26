@@ -274,10 +274,26 @@ describe("replication flag on", () => {
     });
     receiverDb.close();
 
+    // Promotion writes main's whole row itself; no startup repair runs between
+    // the import and the rollback, so replication never solely owns the bytes.
     const plainDb = open(path);
+    expect(
+      (
+        plainDb
+          .prepare(
+            "SELECT length(bytes) AS size FROM pdpp_blob_bytes WHERE blob_id = ?",
+          )
+          .get(blob.blobId) as { size: number } | undefined
+      )?.size,
+    ).toBe(bytes.byteLength);
     const plainStore = createSqliteRecordStore(plainDb);
     expect(plainStore.getBlobBytes(blob.blobId)).toEqual(bytes);
     plainDb.close();
+
+    const offDb = open(path);
+    expect(openRecordStore(offDb, false).getBlobBytes(blob.blobId)).toEqual(
+      bytes,
+    );
   }, 30_000);
 
   it("applies the replica schema when the store opens, not before", () => {
