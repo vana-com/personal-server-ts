@@ -357,8 +357,11 @@ describe("oracle findings on #483", () => {
       },
     ],
   ];
+  // Node defects still open on #483. A fix removes its entry here.
+  const openOnNode = new Set(["D2", "D3"]);
   for (const [name, run] of cases) {
     it(`Lite ${name}`, () => run(ports.lite));
-    it.fails(`Node ${name} (open on #483)`, () => run(ports.node));
+    const node = openOnNode.has(name.slice(0, 2)) ? it.fails : it;
+    node(`Node ${name}`, () => run(ports.node));
   }
 });

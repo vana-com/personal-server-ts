@@ -430,7 +430,25 @@ export function createReplicaReceiver(deps: {
       }
       return !store.replicaBindingConflict(op.connectionId);
     });
-    const plan = planReplicaMerge(context, eligible);
+    // Operation-ID equivocation is global. An unprovisioned variant that
+    // differs from a provisioned one still withdraws that connection (oracle
+    // D1). Only such variants enter the plan. Their connection has no local
+    // binding, so the planner never materializes them.
+    const revisionKey = (op: ReplicaOperation) =>
+      canonicalJson([op.revision.writerId, op.revision.operationId]);
+    const contents = new Map<string, Set<string>>();
+    for (const op of all)
+      contents.set(
+        revisionKey(op),
+        (contents.get(revisionKey(op)) ?? new Set()).add(canonicalJson(op)),
+      );
+    const mappedRevisions = new Set(eligible.map(revisionKey));
+    const colliding = unavailable.filter(
+      (op) =>
+        mappedRevisions.has(revisionKey(op)) &&
+        contents.get(revisionKey(op))!.size > 1,
+    );
+    const plan = planReplicaMerge(context, [...eligible, ...colliding]);
     if (unavailable.length)
       plan.pending.push({
         reason: "missing_local_connection",
