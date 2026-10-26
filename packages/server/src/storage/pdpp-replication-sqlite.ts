@@ -28,12 +28,18 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_settings (id INTEGER PRIMARY KEY CHECK(i
 CREATE TABLE IF NOT EXISTS pdpp_replica_clock (id INTEGER PRIMARY KEY CHECK(id = 1), counter INTEGER NOT NULL);
 INSERT OR IGNORE INTO pdpp_replica_clock VALUES (1, 0);
 CREATE TABLE IF NOT EXISTS pdpp_replica_operations (sequence INTEGER PRIMARY KEY, operation_json TEXT NOT NULL, digest TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS pdpp_replica_blob_claim_idx ON pdpp_replica_operations (json_extract(operation_json, '$.connectionId'), json_extract(operation_json, '$.generation'), json_extract(operation_json, '$.blob.blobId')) WHERE json_extract(operation_json, '$.kind') = 'blob-claim';
 CREATE TABLE IF NOT EXISTS pdpp_replica_baseline (sequence INTEGER PRIMARY KEY REFERENCES pdpp_replica_operations(sequence));
 CREATE TABLE IF NOT EXISTS pdpp_replica_blob_bytes (blob_id TEXT PRIMARY KEY, bytes BLOB NOT NULL);
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_update BEFORE UPDATE ON pdpp_replica_operations BEGIN SELECT RAISE(ABORT, 'replica journal is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_delete BEFORE DELETE ON pdpp_replica_operations BEGIN SELECT RAISE(ABORT, 'replica journal is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_replace BEFORE INSERT ON pdpp_replica_operations WHEN EXISTS (SELECT 1 FROM pdpp_replica_operations WHERE sequence = NEW.sequence) BEGIN SELECT RAISE(ABORT, 'replica journal is append-only'); END;
+`;
+/**
+ * Its own migration: a database already past REPLICATION_MIGRATION must still
+ * get the index that captureBlob's existence lookup relies on.
+ */
+export const REPLICA_BLOB_CLAIM_INDEX_MIGRATION = `
+CREATE INDEX IF NOT EXISTS pdpp_replica_blob_claim_idx ON pdpp_replica_operations (json_extract(operation_json, '$.connectionId'), json_extract(operation_json, '$.generation'), json_extract(operation_json, '$.blob.blobId')) WHERE json_extract(operation_json, '$.kind') = 'blob-claim';
 `;
 export interface BaselineConfiguration {
   owner: string;
@@ -371,16 +377,9 @@ export function createReplicationJournal(db: Database, writerId: string) {
       throw new Error("duplicate retained declaration");
     return db
       .transaction(() => {
-        const prior = settings();
-        if (prior) {
-          if (prior.config_json !== canonicalJson(normalized))
-            throw new Error("replication binding is immutable");
-          return { watermark: prior.watermark };
-        }
-        db.prepare(
-          "INSERT INTO pdpp_replica_settings (id, config_json, watermark) VALUES (1, ?, 0)",
-        ).run(canonicalJson(normalized));
         // Method transitions are not journaled, so a replica could not follow them.
+        // Check before the idempotent return: a transition made while the flag
+        // was off must also block re-enabling an already-baselined database.
         const transitioned = db
           .prepare(
             "SELECT instance FROM pdpp_claude_transition UNION ALL SELECT instance FROM pdpp_strava_transition LIMIT 1",
@@ -390,6 +389,15 @@ export function createReplicationJournal(db: Database, writerId: string) {
           throw new Error(
             `replication cannot be enabled: connection ${transitioned.instance} has a Strava or Claude method transition`,
           );
+        const prior = settings();
+        if (prior) {
+          if (prior.config_json !== canonicalJson(normalized))
+            throw new Error("replication binding is immutable");
+          return { watermark: prior.watermark };
+        }
+        db.prepare(
+          "INSERT INTO pdpp_replica_settings (id, config_json, watermark) VALUES (1, ?, 0)",
+        ).run(canonicalJson(normalized));
         // A legacy orphan is a migration error, never an omitted row.
         const orphan = db
           .prepare(

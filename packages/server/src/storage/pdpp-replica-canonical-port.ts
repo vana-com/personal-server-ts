@@ -23,6 +23,7 @@ import {
 import {
   createReplicationJournal,
   REPLICATION_MIGRATION,
+  REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
   type ReplicationExport,
 } from "./pdpp-replication-sqlite.js";
 import {
@@ -84,6 +85,8 @@ DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id NOT IN
   REPLICA_COPY_MIGRATION,
   // Removing a quarantine fact raises the integrity epoch.
   REPLICA_FACT_REMOVAL_MIGRATION,
+  // Indexed blob-claim existence lookup for captureBlob.
+  REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
 ];
 
 /**

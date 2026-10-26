@@ -16,6 +16,7 @@ import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import {
   REPLICA_MIGRATIONS,
   createReplicaRecordStore,
+  ensureReplicaSchema,
 } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
@@ -589,6 +590,35 @@ describe("replication flag on", () => {
       }
     });
 
+    it("refuses re-enabling after a transition made while the flag was off", () => {
+      const path = file();
+      const first = open(path);
+      const on = createReplicaRecordStore(first);
+      on.registerConnection({
+        instance: "strava_a",
+        sourceId: "https://registry.pdpp.dev/sources/strava",
+        method: "strava",
+        label: "Strava",
+      });
+      on.replication.beginBaseline(baseline);
+      on.close();
+
+      const offDb = open(path);
+      const off = openRecordStore(offDb, false);
+      off.transitionStravaToBrowser({
+        instance: "strava_a",
+        expectedGeneration: 1,
+        expectedWriteClock: off.transitionWriteClock(),
+        snapshots: {},
+      });
+      off.close();
+
+      const again = createReplicaRecordStore(open(path));
+      expect(() => again.replication.beginBaseline(baseline)).toThrow(
+        /connection strava_a has a Strava or Claude method transition/,
+      );
+    });
+
     it("refuses new transitions once replication is enabled, leaving canonical state alone", () => {
       const db = open();
       const store = createReplicaRecordStore(db);
@@ -611,6 +641,37 @@ describe("replication flag on", () => {
         before,
       );
     });
+  });
+
+  it("gives an existing database the blob-claim index through a new migration", () => {
+    const db = open();
+    // A database that migrated before the index existed: every earlier
+    // migration applied, the index absent, the version one behind.
+    const store = createReplicaRecordStore(db);
+    db.exec("DROP INDEX pdpp_replica_blob_claim_idx");
+    db.prepare("UPDATE pdpp_replica_schema_version SET version = ?").run(
+      REPLICA_MIGRATIONS.length - 1,
+    );
+    const names = () =>
+      (
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'pdpp_replica_blob_claim_idx'",
+          )
+          .all() as { name: string }[]
+      ).length;
+    expect(names()).toBe(0);
+    ensureReplicaSchema(db);
+    expect(names()).toBe(1);
+    const plan = db
+      .prepare(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM pdpp_replica_operations WHERE json_extract(operation_json, '$.kind') = 'blob-claim' AND json_extract(operation_json, '$.connectionId') = ? AND json_extract(operation_json, '$.generation') = ? AND json_extract(operation_json, '$.blob.blobId') = ? LIMIT 1",
+      )
+      .all("conn_a", 1, "sha256:x") as { detail: string }[];
+    expect(plan.map((row) => row.detail).join("\n")).toContain(
+      "pdpp_replica_blob_claim_idx",
+    );
+    store.close();
   });
 
   it("looks up an existing blob claim through the index, however long the journal is", () => {
