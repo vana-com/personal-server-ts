@@ -141,9 +141,16 @@ export interface VersionFence {
 export interface DataVersionWriter {
   /** Append serialized envelope text. Calls must not overlap. */
   write(text: string): Promise<void>;
-  /** Finish the file, then index it as the scope's newest version. */
+  /**
+   * Finish the file, then index it as the scope's newest version. With
+   * `onlyIfNewest`, the index publishes it only if no version of the scope
+   * with a later `collectedAt` is already there; the check and the
+   * publication are one step. Otherwise nothing is published and the call
+   * throws `VersionSupersededError`.
+   */
   commit(
     entry: Omit<NewIndexEntry, "path" | "sizeBytes" | "scope" | "collectedAt">,
+    options?: { onlyIfNewest?: boolean },
   ): Promise<WriteResult>;
   /** Discard everything written. Idempotent; a no-op after `commit`. */
   abort(): Promise<void>;
