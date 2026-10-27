@@ -18,6 +18,16 @@ import {
 import { sha256, toBytes } from "viem";
 import { createReplicaRecordReducer } from "@opendatalabs/personal-server-ts-core/replication/record-reducer";
 import {
+  operationDigest,
+  type CompletionOperation,
+} from "@opendatalabs/personal-server-ts-core/replication/completion";
+import {
+  blobReady as engineBlobReady,
+  completionAvailability,
+  connectionFromFacts,
+  type ConnectionProjection,
+} from "@opendatalabs/personal-server-ts-core/replication/visibility-engine";
+import {
   replicaStateVisible,
   replicaPendingMetadata,
   type ReplicaReader,
@@ -49,6 +59,16 @@ export interface LiteCommitReceipt {
 }
 export interface LiteReplicaReadOptions {
   reader?: ReplicaReader;
+}
+type CompletionEvent = Extract<
+  ReplicaOperation,
+  { kind: "stream-complete" | "stream-invalidate" }
+>;
+/** Per key: whether it keeps its stream's completion unavailable. */
+interface CompletionBlocker {
+  stream: string;
+  quarantined: boolean;
+  unresolved: boolean;
 }
 export type LiteVisibleRecord = PdppRecordRow;
 interface PendingBatch {
@@ -255,11 +275,14 @@ export function createLiteCanonicalStore(deps: {
     const bindingPath = `binding-evidence/${keyDigest(op.connectionId)}`;
     const binding = { sourceId: op.sourceId, methodId: op.methodId };
     const priorBinding = await get<Connection>(tx, bindingPath);
+    const conflictPath = `binding-conflicts/${keyDigest(op.connectionId)}`;
+    // The first binding that differs: with the first binding it shows the
+    // conflict to `connectionFromFacts`. Written once, so no view moves again.
     if (
       priorBinding &&
       canonicalJson(priorBinding) !== canonicalJson(binding)
     ) {
-      await put(tx, `binding-conflicts/${keyDigest(op.connectionId)}`, true);
+      if (!(await tx.get(conflictPath))) await put(tx, conflictPath, binding);
     } else await put(tx, bindingPath, binding);
     const opKey = operationPath(op);
     await put(tx, opKey, op);
@@ -292,81 +315,75 @@ export function createLiteCanonicalStore(deps: {
     return { collision: variants.length > 1, opKey };
   }
   /**
-   * Whether an upsert's blob is claimed and its bytes are readable. Canonical
-   * state needs confirmed bytes; the owner preview also accepts bytes that only
-   * a pending batch carries.
+   * The engine's `blobReady` over this connection's retained claims and the
+   * bytes Lite holds. Canonical state needs confirmed bytes; the owner
+   * preview also accepts bytes that only a pending batch carries.
    */
   async function blobReady(
     tx: LiteCanonicalTransaction,
     op: Extract<RecordOperation, { kind: "upsert" }>,
     pendingBytes = false,
   ) {
-    const ref = op.data.blob_ref as Record<string, unknown> | undefined;
-    if (op.blobs.length !== (ref ? 1 : 0)) return false;
+    const claims: ReplicaOperation[] = [];
+    const verified = new Set<string>();
     for (const blob of op.blobs) {
-      if (
-        ref?.blob_id !== blob.blobId ||
-        (ref.sha256 !== undefined && ref.sha256 !== blob.sha256.slice(7)) ||
-        (ref.mime_type !== undefined && ref.mime_type !== blob.mimeType) ||
-        (ref.size_bytes !== undefined && ref.size_bytes !== blob.sizeBytes)
-      )
-        return false;
-      let claimed = false;
       for await (const entry of scan(
         tx,
         `${connectionPrefix(op.connectionId)}claims/${keyDigest(blob.blobId)}/`,
-      )) {
-        const claim = replicaOperationSchema.parse(JSON.parse(entry.value));
-        if (
-          claim.kind === "blob-claim" &&
-          claim.generation === op.generation &&
-          claim.sourceId === op.sourceId &&
-          claim.methodId === op.methodId &&
-          canonicalJson(claim.blob) === canonicalJson(blob)
-        ) {
-          claimed = true;
-          break;
-        }
-      }
-      if (!claimed) return false;
-      const existing = await tx.blob(blob.blobId);
-      if (!existing) return false;
+      ))
+        claims.push(replicaOperationSchema.parse(JSON.parse(entry.value)));
       if (
-        !pendingBytes &&
-        !(await get(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`))
+        (await tx.blob(blob.blobId)) &&
+        (pendingBytes ||
+          (await get(tx, `confirmed-blobs/${keyDigest(blob.blobId)}`)))
       )
-        return false;
-      if (canonicalJson(existing) !== canonicalJson(blob))
-        throw new Error("replica blob metadata conflict");
+        verified.add(blob.blobId);
     }
+    if (!engineBlobReady(op, claims, verified)) return false;
+    for (const blob of op.blobs)
+      if (canonicalJson(await tx.blob(blob.blobId)) !== canonicalJson(blob))
+        throw new Error("replica blob metadata conflict");
     return true;
   }
   /**
-   * Reconcile's whole blocking decision for one connection, shared with the
-   * confirmed-blob gate so the two cannot drift: the terminal-batch fact,
-   * binding conflicts, equivocations, lifecycle-plan conflicts, and retained
-   * binding evidence that disagrees with the local mapping. A blocked
-   * connection is withdrawn from every reader.
+   * The engine's eligibility for one connection, from Lite's indexes: the
+   * terminal-batch fact, equivocations, retained bindings and the
+   * connection's globally unique lifecycle. A withdrawn connection is hidden
+   * from every reader. An unprovisioned connection has no projection; it is
+   * judged against its first retained binding, so that its quarantine answer
+   * and the blob gate still see its terminal fact, equivocations and
+   * conflicting bindings.
    */
-  async function blocking(
+  async function connectionState(
     tx: LiteCanonicalTransaction,
     id: string,
     context: MergeContext,
   ) {
-    const lifecycle = await operations(tx, `${connectionPrefix(id)}lifecycle/`);
-    const lifecyclePlan = planReplicaMerge(context, lifecycle);
-    const mapped = await get<Connection>(tx, `connections/${keyDigest(id)}`);
-    const binding = await get<Connection>(
-      tx,
-      `binding-evidence/${keyDigest(id)}`,
-    );
-    const blocked =
-      !!(await get(tx, `${CONNECTION_QUARANTINE}${keyDigest(id)}`)) ||
-      !!(await get(tx, `binding-conflicts/${keyDigest(id)}`)) ||
-      (await any(tx, `equivocations/${keyDigest(id)}/`)) ||
-      lifecyclePlan.conflicts.length > 0 ||
-      !!(mapped && binding && canonicalJson(mapped) !== canonicalJson(binding));
-    return { lifecycle, lifecyclePlan, mapped, blocked };
+    const d = keyDigest(id);
+    const lifecycle: ReplicaOperation[] = [];
+    for (const op of await operations(tx, `${connectionPrefix(id)}lifecycle/`))
+      if (!(await any(tx, `equivocations/${d}/${operationId(op)}`)))
+        lifecycle.push(op);
+    const mapped = await get<Connection>(tx, `connections/${d}`);
+    const bindings = [
+      await get<Connection>(tx, `binding-evidence/${d}`),
+      await get<Connection>(tx, `binding-conflicts/${d}`),
+    ].filter((binding): binding is Connection => binding !== undefined);
+    const connection = connectionFromFacts(context, {
+      mapping: mapped ?? bindings[0] ?? { sourceId: "", methodId: "" },
+      terminal: !!(await get(tx, `${CONNECTION_QUARANTINE}${d}`)),
+      equivocated: await any(tx, `equivocations/${d}/`),
+      bindings,
+      lifecycle,
+      appliedGeneration:
+        (await get<number>(tx, `connection-generation/${d}`)) ?? 1,
+    });
+    return {
+      lifecycle,
+      mapped,
+      connection,
+      blocked: connection.status === "withdrawn",
+    };
   }
   async function reconcile(
     tx: LiteCanonicalTransaction,
@@ -375,25 +392,22 @@ export function createLiteCanonicalStore(deps: {
     only?: readonly { stream: string; key: string }[],
     canonical?: LiteCanonicalTransaction,
   ) {
-    const { lifecycle, lifecyclePlan, mapped, blocked } = await blocking(
+    const { lifecycle, mapped, connection, blocked } = await connectionState(
       tx,
       id,
       context,
     );
-    const pendingLifecycle = lifecyclePlan.pending.length > 0;
-    const deleted = lifecyclePlan.suppressed.some(
-      (issue) => issue.reason === "connection_deleted",
-    );
-    const generation = Math.max(
-      1,
-      ...lifecycle
-        .filter((op) => op.kind === "connection-reset")
-        .map((op) => op.generation),
-    );
+    const pendingLifecycle = connection.status === "held";
+    const deleted = connection.status === "deleted";
+    const generation = connection.generation;
     const activeGeneration =
       (await get<number>(tx, `connection-generation/${keyDigest(id)}`)) ?? 1;
     const reset =
-      !blocked && !pendingLifecycle && generation > activeGeneration;
+      connection.status === "active" && generation > activeGeneration;
+    // Completion inputs are kept for canonical rows of provisioned, active
+    // connections only; the preview certifies nothing.
+    const certify =
+      canonical === undefined && !!mapped && connection.status === "active";
     // Keep canonical lifecycle suppression in the source view. Only provisional
     // removals are omitted when deriving the value they would provisionally remove.
     const sourceLifecycle: ReplicaOperation[] = [];
@@ -421,6 +435,9 @@ export function createLiteCanonicalStore(deps: {
       let sourceReducer:
         ReturnType<typeof createReplicaRecordReducer> | undefined;
       let sourceGeneration = 0;
+      // An unresolved pending or rejected operation of the key, as the
+      // planner judges it alone with the lifecycle; conflicts quarantine.
+      let unresolved = false;
       if (!blocked && !pendingLifecycle && (!deleted || provisionalRemoval)) {
         for await (const variant of scan(
           tx,
@@ -430,6 +447,12 @@ export function createLiteCanonicalStore(deps: {
           if (op.kind !== "upsert" && op.kind !== "delete")
             throw new Error("invalid record partition");
           if (!deleted) reducer.push(op);
+          if (certify) {
+            const issues = planReplicaMerge(context, [...lifecycle, op]);
+            unresolved ||= [...issues.pending, ...issues.rejected].some(
+              (issue) => issue.reason !== "missing_declaration",
+            );
+          }
           if (provisionalRemoval && op.generation >= sourceGeneration) {
             // As in the planner, a newer eligible generation supersedes older
             // evidence. Retain just that generation's bounded reducer state.
@@ -460,6 +483,19 @@ export function createLiteCanonicalStore(deps: {
             ? winner
             : null;
       const path = rowKey(id, stream, key);
+      if (certify) {
+        const blocker: CompletionBlocker = {
+          stream,
+          quarantined: record?.quarantined === true,
+          // An unmaterializable winner is unresolved even without a row.
+          unresolved:
+            unresolved || (winner?.kind === "upsert" && !materialized),
+        };
+        const blockerPath = `completion-blockers/${keyDigest(id)}/${recordId(stream, key)}`;
+        if (blocker.quarantined || blocker.unresolved)
+          await put(tx, blockerPath, blocker);
+        else await tx.delete(blockerPath);
+      }
       if (canonical) await tx.delete(path);
       let prior = await get<PdppRecordRow>(tx, path);
       const source = mapped ? sourceReducer?.record?.winner : undefined;
@@ -548,6 +584,117 @@ export function createLiteCanonicalStore(deps: {
     }
     if (!blocked && !pendingLifecycle)
       await put(tx, `connection-generation/${keyDigest(id)}`, generation);
+    if (canonical === undefined)
+      await certifyCompletions(
+        tx,
+        id,
+        context,
+        mapped ? connection : undefined,
+      );
+  }
+  /**
+   * Persist the engine's completion availability for each stream of a
+   * connection, from Lite's indexes: completion evidence at the
+   * connection's generation, the per-key blockers `reconcile` keeps, live
+   * canonical rows, and dependency variants of provisioned connections.
+   * Reads every canonical row of a stream that has completion evidence.
+   */
+  async function certifyCompletions(
+    tx: LiteCanonicalTransaction,
+    id: string,
+    context: MergeContext,
+    connection: ConnectionProjection | undefined,
+  ) {
+    const d = keyDigest(id);
+    const available = new Map<string, CompletionOperation>();
+    const events = new Map<string, CompletionEvent[]>();
+    if (connection?.status === "active")
+      for await (const entry of scan(
+        tx,
+        `${connectionPrefix(id)}completions/`,
+      )) {
+        const op = replicaOperationSchema.parse(JSON.parse(entry.value));
+        if (
+          (op.kind !== "stream-complete" && op.kind !== "stream-invalidate") ||
+          op.generation !== connection.generation
+        )
+          continue;
+        const stream = op.declaration.stream;
+        events.set(stream, [...(events.get(stream) ?? []), op]);
+      }
+    if (connection && events.size) {
+      const blockers = new Map<string, CompletionBlocker>();
+      for await (const entry of scan(tx, `completion-blockers/${d}/`)) {
+        const blocker = JSON.parse(entry.value) as CompletionBlocker;
+        const prior = blockers.get(blocker.stream);
+        blockers.set(blocker.stream, {
+          stream: blocker.stream,
+          quarantined: blocker.quarantined || !!prior?.quarantined,
+          unresolved: blocker.unresolved || !!prior?.unresolved,
+        });
+      }
+      const live = new Map<string, { recordKey: string; dataJson: string }[]>();
+      for await (const entry of scan(tx, `rows/${d}/`)) {
+        const row = JSON.parse(entry.value) as PdppRecordRow;
+        if (row.deleted || !events.has(row.stream)) continue;
+        live.set(row.stream, [
+          ...(live.get(row.stream) ?? []),
+          { recordKey: row.recordKey, dataJson: canonicalJson(row.data) },
+        ]);
+      }
+      const variants = new Map<string, string[]>();
+      for (const list of events.values())
+        for (const op of list)
+          if (op.kind === "stream-complete")
+            for (const dependency of op.dependencies) {
+              const revision = keyDigest([
+                dependency.writerId,
+                dependency.operationId,
+              ]);
+              if (variants.has(revision)) continue;
+              const digests = new Set<string>();
+              for await (const entry of scan(tx, `revisions/${revision}/`)) {
+                const variant = JSON.parse(entry.value) as {
+                  connectionId: string;
+                  opKey: string;
+                };
+                // Unmapped evidence never satisfies a dependency.
+                if (
+                  !(await tx.get(
+                    `connections/${keyDigest(variant.connectionId)}`,
+                  ))
+                )
+                  continue;
+                const value = await tx.get(variant.opKey);
+                if (value === undefined)
+                  throw new Error("missing retained replica operation");
+                digests.add(operationDigest(JSON.parse(value)));
+              }
+              variants.set(revision, [...digests]);
+            }
+      for (const [stream, list] of events) {
+        const result = completionAvailability({
+          connection,
+          connectionId: id,
+          events: list,
+          declarations: context.declarations,
+          quarantinedKey: !!blockers.get(stream)?.quarantined,
+          unresolved: !!blockers.get(stream)?.unresolved,
+          variantDigests: (writerId, operationId) =>
+            variants.get(keyDigest([writerId, operationId])) ?? [],
+          liveRows: live.get(stream) ?? [],
+        });
+        if (result) available.set(stream, result.operation);
+      }
+    }
+    const prefix = `stream-completions/${d}/`;
+    for await (const entry of scan(tx, prefix)) {
+      const stream = (JSON.parse(entry.value) as CompletionOperation)
+        .declaration.stream;
+      if (!available.has(stream)) await tx.delete(entry.key);
+    }
+    for (const [stream, operation] of available)
+      await put(tx, `${prefix}${keyDigest(stream)}`, operation);
   }
   async function commit(input: {
     id: string;
@@ -593,7 +740,7 @@ export function createLiteCanonicalStore(deps: {
         for (const connectionId of new Set(
           input.operations!.map((op) => op.connectionId),
         )) {
-          if ((await blocking(tx, connectionId, context)).blocked)
+          if ((await connectionState(tx, connectionId, context)).blocked)
             throw new Error("local connection is quarantined");
         }
       }
@@ -977,11 +1124,9 @@ export function createLiteCanonicalStore(deps: {
                 (JSON.parse(entry.value) as { binding: Connection }).binding,
               ),
             );
-          if (key.startsWith("binding-evidence/"))
-            return bindings.values().next().value;
-          return (
-            (await tx.get(key)) ?? (bindings.size > 1 ? "true" : undefined)
-          );
+          const [first, second] = bindings;
+          if (key.startsWith("binding-evidence/")) return first;
+          return (await tx.get(key)) ?? second;
         }
         return tx.get(key);
       },
@@ -1242,7 +1387,7 @@ export function createLiteCanonicalStore(deps: {
    * True when connections claim the blob and every one of them is
    * quarantined. A quarantined connection's confirmed bytes are not served,
    * as on Node; bytes another live connection claims still are. Quarantined
-   * means `blocking`, the decision `reconcile` withdraws a connection on.
+   * means withdrawn by `connectionState`, as `reconcile` judges it.
    */
   async function claimedOnlyByQuarantined(
     tx: LiteCanonicalTransaction,
@@ -1255,7 +1400,8 @@ export function createLiteCanonicalStore(deps: {
         !(await any(tx, `${connectionPrefix(id)}claims/${keyDigest(blobId)}/`))
       )
         continue;
-      if (!(await blocking(tx, id, deps.context())).blocked) return false;
+      if (!(await connectionState(tx, id, deps.context())).blocked)
+        return false;
       claimed = true;
     }
     return claimed;
@@ -1486,7 +1632,7 @@ export function createLiteCanonicalStore(deps: {
       enabled();
       return persistence.transaction(
         async (tx) =>
-          (await blocking(tx, connectionId, deps.context())).blocked,
+          (await connectionState(tx, connectionId, deps.context())).blocked,
       );
     },
     /**
@@ -1562,6 +1708,30 @@ export function createLiteCanonicalStore(deps: {
         await clock(tx);
         const view = await readView(tx, options);
         return visibleRow(tx, view, rowKey(connection, stream, key));
+      });
+    },
+    /**
+     * The certified completions of a connection's canonical streams, by
+     * stream. A completion describes canonical rows as stored, so a reader
+     * that sees the pending preview gets none, as on Node.
+     */
+    async readStreamCompletions(
+      connection: string,
+      options: LiteReplicaReadOptions = {},
+    ): Promise<CompletionOperation[]> {
+      enabled();
+      if (replicaStateVisible("pending", options.reader, deps.visibilityPolicy))
+        return [];
+      return persistence.transaction(async (tx) => {
+        const completions: CompletionOperation[] = [];
+        for await (const entry of scan(
+          tx,
+          `stream-completions/${keyDigest(connection)}/`,
+        ))
+          completions.push(JSON.parse(entry.value) as CompletionOperation);
+        return completions.sort((a, b) =>
+          a.declaration.stream < b.declaration.stream ? -1 : 1,
+        );
       });
     },
     /** Host-only current-row page. Includes tombstones; not a public query cursor. */

@@ -155,6 +155,31 @@ it("a lifecycle conflict (generation-3 reset after generation 1, fresh operation
   await hiddenFromBoth(make, collect);
 });
 
+// A binding conflict cancels deletion in the engine: evidence that names
+// another binding is not about this connection.
+it("deletion evidence that names another binding withdraws an unprovisioned connection instead of deleting it", async () => {
+  const { make } = device();
+  await make().import({
+    id: "foreign-delete",
+    credential: "replica",
+    envelope: envelope("foreign-delete", [
+      registration,
+      {
+        ...identity,
+        methodId: "other",
+        kind: "connection-delete",
+        revision: { counter: 2, writerId: "device-a", operationId: "delete" },
+      },
+    ]),
+  });
+  expect(await make().isConnectionQuarantined(identity.connectionId)).toBe(
+    true,
+  );
+  await expect(provision(make())).rejects.toThrow(
+    "retained connection source or method mismatch",
+  );
+});
+
 it("quarantineConnection records the terminal fact for a provisioned connection and withdraws it in the same transaction, across reopen and retry", async () => {
   const { make } = device();
   const { collect } = await confirmedBlobRow(make);

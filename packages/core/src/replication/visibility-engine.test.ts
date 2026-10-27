@@ -24,6 +24,7 @@ import {
   evaluate,
   evidenceDigest,
   INITIAL_VISIBILITY_EPOCH,
+  projectEvidence,
   rowId,
   visibilityEpoch,
   VisibilityEpochConflict,
@@ -209,8 +210,12 @@ describe("completion availability", () => {
     ],
     ["it has no dependencies", { events: [completion([], [a.data, b.data])] }],
     [
-      "the events name two declarations",
+      "the events name two trusted declarations",
       {
+        declarations: [
+          ...world.declarations,
+          { ...world.declarations[0], binding: { ...binding, version: "2" } },
+        ],
         events: [
           done,
           {
@@ -240,6 +245,25 @@ describe("completion availability", () => {
     it(`is unavailable when ${name}`, () => {
       expect(completionAvailability({ ...facts, ...change })).toBeNull();
     });
+
+  it("ignores events under a declaration the host does not trust", () => {
+    const untrusted = { ...binding, version: "2" };
+    expect(
+      completionAvailability({
+        ...facts,
+        events: [
+          done,
+          {
+            ...identity,
+            kind: "stream-invalidate",
+            declaration: untrusted,
+            revision: { counter: 11, writerId: "device-a", operationId: "inv" },
+          },
+          { ...completion([a], [a.data], 12), declaration: untrusted },
+        ],
+      }),
+    ).toEqual({ operation: done });
+  });
 
   it("never counts a dependency held only by an unmapped connection", async () => {
     const elsewhere = { ...key("x", "X", 4), connectionId: "unmapped" };
@@ -406,6 +430,33 @@ describe("host authority", () => {
     expect(Object.keys(after.projection.rows)).toEqual([
       rowId("unmapped", binding.stream, "a"),
     ]);
+  });
+  it("never deletes a connection on deletion evidence that names another binding", async () => {
+    const deletion: ReplicaOperation = {
+      ...identity,
+      methodId: "other",
+      kind: "connection-delete",
+      revision: { counter: 7, writerId: "device-a", operationId: "delete" },
+    };
+    const withdrawn = {
+      status: "withdrawn",
+      reason: "local_mapping_conflict",
+      generation: 1,
+    };
+    const result = await run([evidence(registration, a), evidence(deletion)]);
+    expect(result.projection.connections[C]).toEqual(withdrawn);
+    expect(result.projection.rows[rowId(C, binding.stream, "a")]).toEqual({
+      state: "withdrawn",
+      reason: "connection_withdrawn",
+    });
+    const full = projectEvidence(EMPTY_PROJECTION, world, [
+      registration,
+      a,
+      deletion,
+    ]);
+    expect(full.connections[C]).toEqual(withdrawn);
+    // From nothing, a withdrawal never materializes a key; no tombstone either.
+    expect(full.rows).toEqual({});
   });
   it("keeps the owner's local rows visible, marked, under a binding conflict only", () => {
     const conflicted = connectionVisibilityState({
