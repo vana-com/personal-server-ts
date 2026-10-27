@@ -19,6 +19,7 @@ import { pdppRecordsRoutes } from "../routes/pdpp-records.js";
 import { pdppBlobsRoutes } from "../routes/pdpp-blobs.js";
 import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
+import { createReplicaVisibilityView } from "./pdpp-replica-visibility-view.js";
 import { binaryWriter, deleteBinary } from "./pdpp-binary-chunks.js";
 
 const sourceId = "https://source.invalid/declaration";
@@ -4810,6 +4811,25 @@ it.each(["owner", "grant"] as const)(
   },
 );
 
+it("A6 epoch: a fresh visibility store starts at zero", () => {
+  const d = device();
+  expect(
+    d.db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_visibility_epoch'",
+      )
+      .get(),
+  ).toBeUndefined();
+
+  pendingReceiver(d);
+  expect(
+    d.db
+      .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+      .pluck()
+      .get(),
+  ).toBe(0);
+});
+
 it("A6 crash: no-op reopen preserves the durable projection epoch", () => {
   const d = device();
   stagePending(d);
@@ -4826,7 +4846,7 @@ it("A6 crash: no-op reopen preserves the durable projection epoch", () => {
   expect(after).toBe(before);
 });
 
-it("A6 migration: first signature initializes the legacy epoch for an offline edit", () => {
+it("A6 migration crash: signature sync can restart after schema migration", () => {
   const d = device();
   d.close();
   // Created by the actual ff971abe receiver before the signature column existed.
@@ -4841,6 +4861,11 @@ it("A6 migration: first signature initializes the legacy epoch for an offline ed
     .all() as { name: string }[];
   expect(columns.some(({ name }) => name === "signature")).toBe(false);
   expect(value(d)?.data.text).toBe("before");
+  // Exercise initialization: its transaction commits before the later sync.
+  d.db.prepare("UPDATE pdpp_replica_view_schema SET version=version-1").run();
+  expect(
+    d.db.prepare("SELECT version FROM pdpp_replica_view_schema").pluck().get(),
+  ).toBe(9);
 
   const beforeEpoch = d.db
     .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
@@ -4850,27 +4875,34 @@ it("A6 migration: first signature initializes the legacy epoch for an offline ed
     "bc1cd8ceba303305c6e17ae9726c6a3cc605b42d33902dc673ab4160ff29bcc2";
   put(d, "offline changed");
   expect(value(d)?.data.text).toBe("offline changed");
+  d.db.exec(`
+    CREATE TRIGGER fail_legacy_epoch_signature_update
+    BEFORE UPDATE OF signature ON pdpp_replica_visibility_epoch
+    BEGIN SELECT RAISE(ABORT, 'simulated process stop before signature sync'); END;
+  `);
+  expect(() =>
+    createReplicaVisibilityView({
+      db: d.db,
+      owner: "owner",
+      declarations: () => declarations,
+      blobsValid: () => true,
+      unquarantinedRecordSql: d.store.unquarantinedRecordSql,
+      integrityEpoch: d.store.replicaIntegrityEpoch,
+    }),
+  ).toThrow("simulated process stop before signature sync");
 
-  const migrated = pendingReceiver(d);
-  const afterView = migrated.readView("grant").visibilityEpoch;
+  d.close();
+  d.reopen();
+  d.db.exec("DROP TRIGGER fail_legacy_epoch_signature_update");
+  const reopened = pendingReceiver(d);
   const afterEpoch = d.db
     .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
     .pluck()
     .get() as number;
   expect(afterEpoch).toBe(beforeEpoch + 1);
-  expect(afterView).not.toBe(beforeView);
+  expect(reopened.readView("grant").visibilityEpoch).not.toBe(beforeView);
   expect(
-    migrated.readStore({ reader: "grant" }).getRecord("conn_a", "messages", "a")
+    reopened.readStore({ reader: "grant" }).getRecord("conn_a", "messages", "a")
       ?.data.text,
   ).toBe("offline changed");
-
-  d.reopen();
-  const reopened = pendingReceiver(d);
-  expect(
-    d.db
-      .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
-      .pluck()
-      .get(),
-  ).toBe(afterEpoch);
-  expect(reopened.readView("grant").visibilityEpoch).toBe(afterView);
 });

@@ -200,7 +200,6 @@ export function createReplicaVisibilityView(deps: {
   let syncProbe: Statement<[]> | undefined;
   let dataVersionStatement: Statement<[]> | undefined;
   let transitions: string[] | undefined;
-  let migratedEpochSignature = false;
   db.transaction(() => {
     const schema = db
       .prepare(
@@ -270,7 +269,9 @@ export function createReplicaVisibilityView(deps: {
       db.exec(
         "ALTER TABLE pdpp_replica_visibility_epoch ADD COLUMN signature TEXT NOT NULL DEFAULT ''",
       );
-      migratedEpochSignature = true;
+      db.prepare(
+        "UPDATE pdpp_replica_visibility_epoch SET epoch=epoch+1 WHERE id=1",
+      ).run();
     }
     for (const table of ["pdpp_replica_operations", "pdpp_replica_received"])
       db.exec(`
@@ -925,10 +926,9 @@ export function createReplicaVisibilityView(deps: {
     const signature = visibilitySignature();
     db.prepare(
       `UPDATE pdpp_replica_visibility_epoch
-       SET epoch=epoch+CASE WHEN ?=1 OR (signature<>'' AND signature<>?) THEN 1 ELSE 0 END,
+       SET epoch=epoch+CASE WHEN signature<>'' AND signature<>? THEN 1 ELSE 0 END,
            signature=? WHERE id=1`,
-    ).run(migratedEpochSignature ? 1 : 0, signature, signature);
-    migratedEpochSignature = false;
+    ).run(signature, signature);
   }
   /**
    * Latest owner-preview emitted_at of one stream: present overlay rows and
