@@ -2,6 +2,7 @@ import { resolveGrantForRawScopeResource } from "./resources.js";
 import { describe, expect, it, vi } from "vitest";
 import { McpActivityRecorder } from "./activity.js";
 import {
+  connectionDataScopes,
   MAX_MCP_TOOL_TIMEOUT_MS,
   MCP_TOOLS,
   resolveGrantForScope,
@@ -59,6 +60,22 @@ function createMinimalReadClient(
 }
 
 describe("mcp/tools", () => {
+  it("names the data scope behind each write grant, so hydration fetches what remember rewrites", () => {
+    const connection = {
+      ...createConnection(),
+      grants: [
+        { grantId: "g1", scopes: ["memory.*", "write:memory.claude"] },
+        { grantId: "g2", scopes: ["write:memory.claude", "instagram.*"] },
+      ],
+    };
+
+    expect(connectionDataScopes(connection)).toEqual([
+      "instagram.*",
+      "memory.*",
+      "memory.claude",
+    ]);
+  });
+
   it("keeps the MCP tools/list response parseable and under the tunnel budget", async () => {
     const response = await handleMcpStreamableHttpRequest(
       new Request("http://localhost/mcp/test-token", {
@@ -83,10 +100,10 @@ describe("mcp/tools", () => {
     expect(response.status).toBe(200);
     const body = await response.text();
     expect(() => JSON.parse(body)).not.toThrow();
-    // Budget raised from 4000 when list_scope_blocks was added; the point is
-    // that tools/list stays small enough to cross the relay in one go, not the
-    // exact number.
-    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(5000);
+    // Budget raised from 4000 when list_scope_blocks was added and from 5000
+    // when remember was added; the point is that tools/list stays small enough
+    // to cross the relay in one go, not the exact number.
+    expect(new TextEncoder().encode(body).byteLength).toBeLessThan(5500);
   });
 
   it("advertises no timeoutMs larger than the dispatcher will allow", async () => {

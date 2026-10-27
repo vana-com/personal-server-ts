@@ -26,6 +26,12 @@
 import { generateMcpGrantee } from "./grantee.js";
 import { createGrantContract } from "../contracts/index.js";
 import {
+  isWriteScopeEntry,
+  scopeCoveredByWriteGrant,
+  WRITE_SCOPE_PREFIX,
+} from "../policy/data-write.js";
+import { isSystemScope } from "../policy/reserved-scopes.js";
+import {
   ScopeSchema,
   type DataPortabilityGatewayConfig,
   type GatewayClient,
@@ -336,6 +342,14 @@ export async function approveMcpConnection(
 }
 
 function grantCoversScope(grant: McpConnectionGrant, scope: string): boolean {
+  // A `write:` request is covered only by a write entry, never by a read
+  // wildcard such as `*`.
+  if (isWriteScopeEntry(scope)) {
+    return scopeCoveredByWriteGrant(
+      scope.slice(WRITE_SCOPE_PREFIX.length),
+      grant.scopes,
+    );
+  }
   return grant.scopes.some(
     (granted) =>
       granted === "*" ||
@@ -666,6 +680,21 @@ function requirePendingScopeRequest(
   return pending;
 }
 
+/**
+ * A scope the owner may approve on a connection: a read scope the SDK accepts,
+ * or `write:` plus a concrete one (never a wildcard: a memory write grant names
+ * the one scope the agent saves into).
+ */
+function isApprovableScope(scope: string): boolean {
+  if (!isWriteScopeEntry(scope)) return ScopeSchema.safeParse(scope).success;
+  const target = scope.slice(WRITE_SCOPE_PREFIX.length);
+  return (
+    !target.includes("*") &&
+    !isSystemScope(target) &&
+    ScopeSchema.safeParse(target).success
+  );
+}
+
 function parseApprovedScopes(
   value: unknown,
   pending: McpScopeAccessRequest,
@@ -679,7 +708,7 @@ function parseApprovedScopes(
   const scopes: string[] = [];
   for (const raw of value) {
     const scope = typeof raw === "string" ? raw.trim() : "";
-    if (!ScopeSchema.safeParse(scope).success) {
+    if (!isApprovableScope(scope)) {
       throw new McpScopeRequestError(
         "INVALID_SCOPE",
         `Invalid scope: ${JSON.stringify(raw)}`,
@@ -1219,6 +1248,21 @@ export async function approveMcpOAuthAuthorizationWithScopes(
     throw new McpOAuthAuthorizationError(
       "scopes_required",
       "Approve requires at least one scope",
+    );
+  }
+  // Read entries are signed as before. A `write:` entry follows the same rule
+  // as a scope-request approval: one concrete scope, never a wildcard, since
+  // `remember` makes a write grant on this connection usable.
+  const badWrite = input.scopes.find(
+    (scope) =>
+      typeof scope === "string" &&
+      isWriteScopeEntry(scope) &&
+      !isApprovableScope(scope),
+  );
+  if (badWrite !== undefined) {
+    throw new McpOAuthAuthorizationError(
+      "invalid_scope",
+      `Invalid write scope: ${JSON.stringify(badWrite)}`,
     );
   }
 

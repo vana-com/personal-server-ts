@@ -39,6 +39,8 @@ import {
 export interface HandleMcpRequestOptions {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
+  /** Absent: `remember` answers write_unavailable. */
+  writeClient?: McpToolContext["writeClient"];
   activityRecorder?: McpActivityRecorder;
   requestScopeAccess?: McpToolContext["requestScopeAccess"];
   scopeRequestApprovalUrl?: McpToolContext["scopeRequestApprovalUrl"];
@@ -134,7 +136,9 @@ function buildActivityStartParams(
     tool,
   };
   if (
-    (tool === "read_scope" || tool === "get_scope_file") &&
+    (tool === "read_scope" ||
+      tool === "get_scope_file" ||
+      tool === "remember") &&
     typeof args.scope === "string"
   ) {
     params.scopes = [args.scope];
@@ -419,6 +423,7 @@ export function createMcpServerForConnection(
   const ctx: McpToolContext = {
     connection: options.connection,
     readClient: options.readClient,
+    writeClient: options.writeClient,
     activityRecorder: options.activityRecorder,
     requestScopeAccess: options.requestScopeAccess,
     scopeRequestApprovalUrl: options.scopeRequestApprovalUrl,
