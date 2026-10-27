@@ -1,4 +1,5 @@
 import type { Database, Statement } from "better-sqlite3";
+import { createHash } from "node:crypto";
 import {
   canonicalJson,
   type ReplicaOperation,
@@ -215,6 +216,8 @@ export function createReplicaVisibilityView(deps: {
     if (!initialized) dropViewObjects(db);
     db.exec(`
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_schema (version INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS pdpp_replica_visibility_epoch (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL);
+      INSERT OR IGNORE INTO pdpp_replica_visibility_epoch VALUES (1,0);
       -- Sparse overlay. present: shown in owner pages; live: a visible value;
       -- base_live: canonical row was live when this row was derived.
       CREATE TABLE IF NOT EXISTS pdpp_replica_view (
@@ -788,6 +791,15 @@ export function createReplicaVisibilityView(deps: {
           .all() as { instance: string }[]
       ).map((row) => row.instance),
     );
+    const hasProjectionWork =
+      dirtyOps.length > 0 ||
+      connections.size > 0 ||
+      !!db
+        .prepare("SELECT 1 FROM pdpp_replica_view_dirty_keys LIMIT 1")
+        .get() ||
+      !!db
+        .prepare("SELECT 1 FROM pdpp_replica_view_dirty_latest LIMIT 1")
+        .get();
     for (const op of dirtyOps) {
       const { writerId, operationId } = op.revision;
       const previous = db
@@ -913,6 +925,10 @@ export function createReplicaVisibilityView(deps: {
     db.exec(
       "DELETE FROM pdpp_replica_view_dirty_operations; DELETE FROM pdpp_replica_view_dirty_keys; DELETE FROM pdpp_replica_view_dirty_connections; DELETE FROM pdpp_replica_view_dirty_latest;",
     );
+    if (hasProjectionWork)
+      db.prepare(
+        "UPDATE pdpp_replica_visibility_epoch SET epoch=epoch+1 WHERE id=1",
+      ).run();
   }
   /**
    * Latest owner-preview emitted_at of one stream: present overlay rows and
@@ -1400,6 +1416,21 @@ export function createReplicaVisibilityView(deps: {
       }),
     ]);
   }
+  function cursorVisibilityEpoch(
+    stream: string,
+    ids: string[],
+    reader: ReplicaReader,
+    preview: boolean,
+  ): string {
+    const orderedIds = [...new Set(ids)].sort();
+    const modes = new Map(
+      orderedIds.map((instance) => [
+        instance,
+        readBranch(instance, reader, preview),
+      ]),
+    );
+    return cursorRevision(stream, orderedIds, modes);
+  }
   function getRecord(
     instance: string,
     stream: string,
@@ -1460,6 +1491,7 @@ export function createReplicaVisibilityView(deps: {
         if (
           cursor &&
           (cursor.viewRevision !== viewRevision ||
+            cursor.visibilityEpoch !== viewRevision ||
             cursor.epoch !== epoch ||
             cursor.stream !== stream ||
             cursor.view !== reader ||
@@ -1577,6 +1609,7 @@ export function createReplicaVisibilityView(deps: {
                   stream,
                   epoch,
                   viewRevision,
+                  visibilityEpoch: viewRevision,
                   view: reader,
                   instanceIds: ids,
                   instance: last.instance,
@@ -1787,6 +1820,51 @@ export function createReplicaVisibilityView(deps: {
     const query = blobReferenceQuery(id, reader, preview, true);
     return !!db.prepare(query.sql).get(...query.args);
   }
+  function visibilityEpoch(): string {
+    const row = db
+      .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+      .get() as { epoch: number } | undefined;
+    if (!row) throw new Error("replica visibility epoch is unavailable");
+    const integrity = db
+      .prepare(
+        "SELECT instance, fences FROM pdpp_replica_integrity_fences ORDER BY instance",
+      )
+      .all();
+    const bindings = db
+      .prepare(
+        "SELECT instance, generation, method, reset_clock FROM pdpp_instance_binding ORDER BY instance",
+      )
+      .all();
+    const quarantinedConnections = db
+      .prepare(
+        "SELECT instance FROM pdpp_replica_quarantined_connections ORDER BY instance",
+      )
+      .all();
+    const quarantinedKeys = db
+      .prepare(
+        "SELECT instance, stream, record_key, generation FROM pdpp_replica_quarantined_keys ORDER BY instance, stream, record_key, generation",
+      )
+      .all();
+    const bindingConflicts = hasBindingConflictFacts
+      ? db
+          .prepare(
+            "SELECT instance, reason FROM pdpp_replica_binding_conflicts ORDER BY instance",
+          )
+          .all()
+      : [];
+    return createHash("sha256")
+      .update(
+        JSON.stringify([
+          row.epoch,
+          integrity,
+          bindings,
+          quarantinedConnections,
+          quarantinedKeys,
+          bindingConflicts,
+        ]),
+      )
+      .digest("hex");
+  }
   /** Descriptor of a pending blob; canonical blobs keep their metadata in pdpp_blobs. */
   function getBlobMeta(id: string): PdppBlobMeta | undefined {
     const row = db
@@ -1809,6 +1887,8 @@ export function createReplicaVisibilityView(deps: {
     sync,
     snapshot,
     exclusive,
+    visibilityEpoch,
+    cursorVisibilityEpoch: reading(cursorVisibilityEpoch),
     reconcileAll,
     addPending,
     removePending,

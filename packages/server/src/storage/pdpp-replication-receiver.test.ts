@@ -4102,7 +4102,7 @@ it("never reads a whole blob value through its store to decide preview visibilit
 });
 
 it.each(["point", "page", "streams", "changes"] as const)(
-  "selects conflict policy and %s values from one SQLite snapshot",
+  "A6 race: %s keeps its projection snapshot when a writer commits between fence and rows",
   (surface) => {
     const d = device();
     installBindingConflictFixture(d);
@@ -4193,6 +4193,7 @@ it.each(["point", "page", "streams", "changes"] as const)(
             .data.map((row) => !row.deleted && row.data.text),
         ).toEqual(["before-conflict"]);
       expect(interleaved).toBe(true);
+      expect(receiver.readView("grant")).toMatchObject({ reader: "grant" });
     } finally {
       d.db.prepare = prepare;
       other.close();

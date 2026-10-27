@@ -1211,11 +1211,23 @@ export function createLiteCanonicalStore(deps: {
     ids: Iterable<string>,
   ) {
     const { canonical, preview } = await changedViews(tx);
+    let changed = false;
     for (const id of new Set(ids)) {
       const digest = keyDigest(id);
-      if (canonical.has(digest)) await advanceCanonicalView(tx, id);
-      else if (preview.has(digest)) await advancePreview(tx, id);
+      if (canonical.has(digest)) {
+        await advanceCanonicalView(tx, id);
+        changed = true;
+      } else if (preview.has(digest)) {
+        await advancePreview(tx, id);
+        changed = true;
+      }
     }
+    if (changed)
+      await put(
+        tx,
+        "visibility-epoch",
+        ((await get<number>(tx, "visibility-epoch")) ?? 0) + 1,
+      );
   }
   async function refreshPendingRevision(
     tx: LiteCanonicalTransaction,
@@ -1405,6 +1417,44 @@ export function createLiteCanonicalStore(deps: {
       claimed = true;
     }
     return claimed;
+  }
+  async function blobReadState(
+    tx: LiteCanonicalTransaction,
+    blobId: string,
+    options: LiteReplicaReadOptions,
+  ) {
+    const previewReader = replicaStateVisible(
+      "pending",
+      options.reader,
+      deps.visibilityPolicy,
+    );
+    let visible: boolean;
+    if (
+      !(await get(tx, `pending-blobs/${keyDigest(blobId)}`)) ||
+      (await get(tx, `confirmed-blobs/${keyDigest(blobId)}`))
+    ) {
+      visible = !(await claimedOnlyByQuarantined(tx, blobId));
+      // Every confirmed claimant is quarantined. A live preview row on
+      // another connection still references the confirmed bytes, as on Node.
+      if (!visible && previewReader) {
+        await readView(tx, options);
+        visible = await any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`);
+      }
+    } else if (!previewReader) {
+      visible = false;
+    } else {
+      // Pending bytes need a live reference this reader sees, and an active
+      // batch that carries them. One batch can stage the record and another
+      // the bytes; either can later be withdrawn independently.
+      await readView(tx, options);
+      visible =
+        (await any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`)) &&
+        (await any(tx, `pending-blob-active/${keyDigest(blobId)}/`));
+    }
+    return {
+      visible,
+      epoch: (await get<number>(tx, "visibility-epoch")) ?? 0,
+    };
   }
   /** Mark a blob's bytes confirmed. True when they were not confirmed before. */
   async function confirmBlob(tx: LiteCanonicalTransaction, blobId: string) {
@@ -1875,42 +1925,22 @@ export function createLiteCanonicalStore(deps: {
     },
     async *readBlob(blobId: string, options: LiteReplicaReadOptions = {}) {
       enabled();
-      await persistence.transaction(async (base) => {
+      const state = await persistence.transaction(async (base) => {
         const tx = trackViews(base);
         await clock(tx);
+        return blobReadState(tx, blobId, options);
       });
-      const visible = await persistence.transaction(async (base) => {
-        const tx = trackViews(base);
-        const previewReader = replicaStateVisible(
-          "pending",
-          options.reader,
-          deps.visibilityPolicy,
-        );
-        if (
-          !(await get(tx, `pending-blobs/${keyDigest(blobId)}`)) ||
-          (await get(tx, `confirmed-blobs/${keyDigest(blobId)}`))
-        ) {
-          if (!(await claimedOnlyByQuarantined(tx, blobId))) return true;
-          // Every confirmed claimant is quarantined. A live preview row on
-          // another connection still references the confirmed bytes, as on Node.
-          if (!previewReader) return false;
-          await readView(tx, options);
-          return any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`);
-        }
-        if (!previewReader) return false;
-        // Pending bytes need a live reference this reader sees, as on Node,
-        // and an active batch that carries them. The two are independent: one
-        // batch can stage the record and another the bytes, and a later
-        // deletion or operation-ID variant can hide the record while its
-        // carrier stays active.
-        await readView(tx, options); // throws until the writer upgraded the indexes
-        return (
-          (await any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`)) &&
-          (await any(tx, `pending-blob-active/${keyDigest(blobId)}/`))
-        );
-      });
-      if (!visible) throw new Error("missing committed blob");
-      yield* persistence.readBlob(blobId);
+      if (!state.visible) throw new Error("missing committed blob");
+      for await (const chunk of persistence.readBlob(blobId)) {
+        const current = await persistence.transaction(async (base) => {
+          const tx = trackViews(base);
+          await clock(tx);
+          return blobReadState(tx, blobId, options);
+        });
+        if (!current.visible || current.epoch !== state.epoch)
+          throw new Error("visibility changed during blob read");
+        yield chunk;
+      }
     },
   };
 }

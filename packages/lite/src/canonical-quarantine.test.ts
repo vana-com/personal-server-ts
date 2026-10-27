@@ -47,11 +47,13 @@ async function provision(store: Store) {
   });
 }
 /** A provisioned connection with one confirmed blob-backed row. */
-async function confirmedBlobRow(make: () => Store) {
+async function confirmedBlobRow(
+  make: () => Store,
+  bytes = new TextEncoder().encode("quarantined blob"),
+) {
   const { sha256 } = await import("viem");
   const store = make();
   await provision(store);
-  const bytes = new TextEncoder().encode("quarantined blob");
   const hash = `sha256:${sha256(bytes).slice(2)}`;
   const blob = {
     blobId: hash,
@@ -62,7 +64,8 @@ async function confirmedBlobRow(make: () => Store) {
   const stagingId = await store.stageBlob(
     blob,
     (async function* () {
-      yield bytes;
+      for (let offset = 0; offset < bytes.length; offset += 128 * 1024)
+        yield bytes.slice(offset, offset + 128 * 1024);
     })(),
   );
   await store.import({
@@ -91,8 +94,10 @@ async function confirmedBlobRow(make: () => Store) {
     return parts;
   };
   for (const reader of ["owner", "grant"] as const)
-    expect(await collect(reader)).toEqual([bytes]);
-  return { store, collect };
+    expect(
+      Uint8Array.from((await collect(reader)).flatMap((part) => [...part])),
+    ).toEqual(bytes);
+  return { store, collect, hash, bytes };
 }
 async function hiddenFromBoth(
   make: () => Store,
@@ -125,6 +130,39 @@ it("a healthy provisioned connection is not quarantined", async () => {
   expect(await make().isConnectionQuarantined(identity.connectionId)).toBe(
     false,
   );
+});
+
+it("A6 race: stops the next blob chunk when quarantine moves visibility", async () => {
+  const { make } = device();
+  const bytes = new Uint8Array(256 * 1024 + 7).fill(0x6d);
+  const { store, hash } = await confirmedBlobRow(make, bytes);
+  const readers = (["owner", "grant"] as const).map((reader) =>
+    make().readBlob(hash, { reader })[Symbol.asyncIterator](),
+  );
+
+  for (const reader of readers) {
+    const first = await reader.next();
+    expect(first.done).toBe(false);
+    expect(first.value).toHaveLength(128 * 1024);
+  }
+
+  await store.quarantineConnection({
+    credential: "replica",
+    connectionId: identity.connectionId,
+    reason: "race test",
+  });
+
+  for (const reader of readers) {
+    let nextError: unknown;
+    try {
+      await reader.next();
+    } catch (error) {
+      nextError = error;
+    }
+    expect(nextError).toMatchObject({
+      message: "visibility changed during blob read",
+    });
+  }
 });
 
 // The #438 lane's reproduction (3eaec57d, it.fails there): reconcile blocks
