@@ -1004,6 +1004,32 @@ describe("binding-conflict precedence, as in the engine", () => {
     expect(value(d)?.data.text).toBe("local");
     d.reopen();
     expect(d.store.getInstanceBinding("conn_a").deletedAt).toBeNull();
+    expect(
+      d.receiver
+        .readStore({ reader: "owner" })
+        .getRecord("conn_a", "messages", "a")?.data.text,
+    ).toBe("local");
+  });
+  it("applies a deletion under the mapping that follows one naming another binding", () => {
+    const deletion = (counter: number): ReplicaOperation => ({
+      ...registration(),
+      kind: "connection-delete",
+      revision: {
+        counter,
+        writerId: "remote",
+        operationId: `delete-${counter}`,
+      },
+    });
+    // provisionOver renames the first deletion's method; the second keeps
+    // the mapping's.
+    const d = provisionOver([registration(), deletion(2)]);
+    expect(d.store.getInstanceBinding("conn_a").deletedAt).toBeNull();
+    send(d, [deletion(3)]);
+    d.receiver.retry({ credential: "replica-secret" });
+    expect(d.store.getInstanceBinding("conn_a").deletedAt).toBe(
+      "replica-deleted",
+    );
+    expect(d.store.replicaBindingConflict("conn_a")).toBe(true);
   });
   it("applies an operation-ID equivocation's terminal quarantine", () => {
     const record = upsert();

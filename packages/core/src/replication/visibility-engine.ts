@@ -346,21 +346,27 @@ function connectionFromPlan(
     );
   const withdrawn = (reason: ConnectionWithdrawal) =>
     ({ status: "withdrawn", reason, generation: applied }) as const;
-  // As in `connectionFromFacts`: evidence naming another binding never deletes.
-  const conflict: ConnectionWithdrawal | undefined = ops.some(
-    (op) =>
-      op.sourceId !== mapping.sourceId || op.methodId !== mapping.methodId,
+  // As in `connectionFromFacts`: only a deletion under the mapping deletes.
+  if (
+    plan.suppressed.some(
+      (issue) =>
+        issue.reason === "connection_deleted" &&
+        issue.operations.some(
+          (op) =>
+            op.connectionId === id &&
+            op.kind === "connection-delete" &&
+            sameBinding(op, mapping),
+        ),
+    )
   )
-    ? "local_mapping_conflict"
-    : touches("incompatible_connection_binding", plan.conflicts)
-      ? "source_binding_conflict"
-      : undefined;
-  if (!conflict && touches("connection_deleted", plan.suppressed))
     return { status: "deleted", generation: applied };
   if (world.terminal.has(id)) return withdrawn("terminal_quarantine");
   if (touches("operation_id_equivocation", plan.conflicts))
     return withdrawn("operation_id_equivocation");
-  if (conflict) return withdrawn(conflict);
+  if (ops.some((op) => !sameBinding(op, mapping)))
+    return withdrawn("local_mapping_conflict");
+  if (touches("incompatible_connection_binding", plan.conflicts))
+    return withdrawn("source_binding_conflict");
   // A mapped connection without any evidence has no registration either.
   if (!ops.some((op) => op.kind === "connection-register"))
     return {
@@ -417,11 +423,16 @@ export interface ConnectionFacts {
   readonly appliedGeneration: number;
 }
 
+const sameBinding = (
+  op: Pick<ReplicaOperation, "sourceId" | "methodId">,
+  mapping: ConnectionMapping,
+) => op.sourceId === mapping.sourceId && op.methodId === mapping.methodId;
+
 /**
  * Whether retained evidence names another source or method than the host
- * mapping. In `connectionFromFacts` it cancels deletion and ranks below
- * terminal quarantine and equivocation; a host that keeps the disagreement
- * as its own durable fact records it whenever this holds.
+ * mapping. In `connectionFromFacts` it ranks below deletion under the
+ * mapping, terminal quarantine and equivocation; a host that keeps the
+ * disagreement as its own durable fact records it whenever this holds.
  */
 export function contradictsMapping(
   facts: Pick<ConnectionFacts, "mapping" | "bindings">,
@@ -432,9 +443,10 @@ export function contradictsMapping(
 
 /**
  * Connection eligibility from bounded facts. Must equal the planner derivation.
- * Precedence: deletion, terminal quarantine, equivocation, binding conflict.
- * A binding conflict cancels deletion: evidence that names another binding
- * is not about this connection, so its deletion never deletes it.
+ * Precedence: a deletion whose source and method match the mapping, then
+ * terminal quarantine, equivocation and a binding conflict. A deletion that
+ * names another binding is not about this connection: it never deletes, and
+ * counts only as binding-conflict evidence.
  */
 export function connectionFromFacts(
   context: MergeContext,
@@ -446,16 +458,18 @@ export function connectionFromFacts(
   const plan = planReplicaMerge(context, facts.lifecycle);
   const has = (bucket: ReplicaMergePlan["conflicts"], reason: string) =>
     bucket.some((issue) => issue.reason === reason);
-  const conflict: ConnectionWithdrawal | undefined = contradictsMapping(facts)
-    ? "local_mapping_conflict"
-    : has(plan.conflicts, "incompatible_connection_binding")
-      ? "source_binding_conflict"
-      : undefined;
-  if (!conflict && has(plan.suppressed, "connection_deleted"))
+  // `lifecycle` holds only unequivocated operations, as the planner's groups.
+  if (
+    facts.lifecycle.some(
+      (op) => op.kind === "connection-delete" && sameBinding(op, facts.mapping),
+    )
+  )
     return { status: "deleted", generation: applied };
   if (facts.terminal) return withdrawn("terminal_quarantine");
   if (facts.equivocated) return withdrawn("operation_id_equivocation");
-  if (conflict) return withdrawn(conflict);
+  if (contradictsMapping(facts)) return withdrawn("local_mapping_conflict");
+  if (has(plan.conflicts, "incompatible_connection_binding"))
+    return withdrawn("source_binding_conflict");
   if (!facts.lifecycle.some((op) => op.kind === "connection-register"))
     return {
       status: "held",

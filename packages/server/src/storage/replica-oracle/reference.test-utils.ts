@@ -170,9 +170,17 @@ export function refConnectionStatus(
       (op) =>
         op.sourceId !== mapping.sourceId || op.methodId !== mapping.methodId,
     );
-  // A connection deletion suppresses the connection first, unless the
-  // evidence names another binding: that evidence is not about it.
-  if (!conflicted && ops.some((op) => op.kind === "connection-delete"))
+  // A deletion under the mapping's source and method deletes the connection
+  // before anything else. One that names another binding is not about this
+  // connection: it never deletes, and only counts as a conflicting binding.
+  if (
+    ops.some(
+      (op) =>
+        op.kind === "connection-delete" &&
+        op.sourceId === mapping.sourceId &&
+        op.methodId === mapping.methodId,
+    )
+  )
     return { status: "deleted", generation: 1 };
   if (
     world.terminal.has(connection) ||
