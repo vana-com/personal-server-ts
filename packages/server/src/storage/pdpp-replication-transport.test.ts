@@ -9,6 +9,7 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
+import { unprovisionConnection } from "./pdpp-replica-contract.test-utils.js";
 import {
   createDpv2ReplicaTransport,
   replicaChainCommitment,
@@ -700,7 +701,7 @@ it("recovers pending imported operations after local connection authority arrive
   await cycles([a], 2);
   const b = device(net);
   // Provisioning is a separate authority. Transport must not invent a missing connection.
-  b.db.prepare("DELETE FROM pdpp_instance_binding WHERE instance='conn'").run();
+  unprovisionConnection(b.db, "conn");
   await b.cycle();
   expect(b.get()).toBeUndefined();
   expect(inbox(b).some((r) => r.state === "imported")).toBe(true);

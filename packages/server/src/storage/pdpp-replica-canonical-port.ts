@@ -32,6 +32,7 @@ import {
   type CanonicalBlobBytes,
   type SqliteRecordStoreOptions,
 } from "./pdpp-records-sqlite-store.js";
+import { admitReplication, captureWrites } from "./pdpp-replication-door.js";
 
 /**
  * The replica schema. It is versioned by `pdpp_replica_schema_version`, apart
@@ -260,6 +261,8 @@ export interface ReplicaCanonicalPort {
 export function createReplicaCanonicalPort(db: Database) {
   if (db.readonly) assertReplicaSchema(db);
   else {
+    // Refuse behind a closed door before any replica write.
+    admitReplication(db);
     ensureReplicaSchema(db);
     db.exec(CANONICAL_CHUNKS_TRIGGER);
     // Older replication builds stored large canonical blobs only in the
@@ -475,8 +478,12 @@ export function createReplicaCanonicalPort(db: Database) {
       journal.captureLifecycle(instance, kind),
     captureBlob: journal.captureBlob,
     notifyVisibility: () => visibilityObserver?.(),
-    exclusive: (write) =>
-      writeBoundary ? writeBoundary(write) : db.transaction(write).immediate(),
+    exclusive: (write) => {
+      const captured = () => captureWrites(db, write);
+      return writeBoundary
+        ? writeBoundary(captured)
+        : db.transaction(captured).immediate();
+    },
     snapshot: (read) =>
       readBoundary ? readBoundary(read) : db.transaction(read).deferred(),
     cursorBinding,

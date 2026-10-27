@@ -28,6 +28,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 import { timeSortKey } from "@opendatalabs/personal-server-ts-core/pdpp";
 import { replicaOperationDigest } from "./pdpp-replication-sqlite.js";
+import { captureWrites } from "./pdpp-replication-door.js";
 
 type Evidence = { op: ReplicaOperation; confirmed: boolean; pending: number };
 type CanonicalRow = {
@@ -652,9 +653,12 @@ export function createReplicaVisibilityView(deps: {
    * savepoint of the caller's transaction.
    */
   function exclusive<T>(write: () => T): T {
-    if (!db.inTransaction) return guarded("immediate", write, markSynced);
+    // Receiver imports and local captures both enter here: neither trips
+    // the replication door's fence.
+    const captured = () => captureWrites(db, write);
+    if (!db.inTransaction) return guarded("immediate", captured, markSynced);
     assertNestedMatches();
-    return db.transaction(write).immediate();
+    return db.transaction(captured).immediate();
   }
 
   function markOperation(digest: string, json: string) {

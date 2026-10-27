@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
+import { ReplicationRefusedError } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { ServerConfigSchema } from "@opendatalabs/personal-server-ts-core/schemas";
 import { openRecordStore } from "../pdpp/records-bootstrap.js";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
@@ -360,9 +361,26 @@ describe("replication flag on", () => {
     expect(peer.getBlobBytes(blob.blobId)).toEqual(new Uint8Array([4, 5, 6]));
   });
 
-  it.todo(
-    "on → off → write → on: re-enabling re-baselines, so a replica sees the writes made while off (§5, pending Tim's decision)",
-  );
+  it("on → off → write → on: the enabled open is refused, and the rows written while off stay", () => {
+    const path = file();
+    const onDb = open(path);
+    const on = openRecordStore(onDb, true);
+    register(on);
+    (
+      on as ReturnType<typeof createReplicaRecordStore>
+    ).replication.beginBaseline(baseline);
+    ingest(on, "a", "written while on");
+    on.close();
+
+    const offDb = open(path);
+    ingest(openRecordStore(offDb, false), "b", "written while off");
+    offDb.close();
+
+    expect(() => openRecordStore(open(path), true)).toThrow(
+      new ReplicationRefusedError("reenable_refused"),
+    );
+    expect(keys(createSqliteRecordStore(open(path)))).toEqual(["a", "b"]);
+  });
 
   it("rollback: a database used with replication on opens under the plain store with main's objects unchanged", () => {
     const path = file();
@@ -590,7 +608,7 @@ describe("replication flag on", () => {
       }
     });
 
-    it("refuses re-enabling after a transition made while the flag was off", () => {
+    it("refuses re-enabling after a transition made while the flag was off, at the door", () => {
       const path = file();
       const first = open(path);
       const on = createReplicaRecordStore(first);
@@ -613,9 +631,10 @@ describe("replication flag on", () => {
       });
       off.close();
 
-      const again = createReplicaRecordStore(open(path));
-      expect(() => again.replication.beginBaseline(baseline)).toThrow(
-        /connection strava_a has a Strava or Claude method transition/,
+      // The transition wrote fenced tables outside capture, so the door
+      // refuses the open before the baseline's own transition check runs.
+      expect(() => createReplicaRecordStore(open(path))).toThrow(
+        new ReplicationRefusedError("reenable_refused"),
       );
     });
 

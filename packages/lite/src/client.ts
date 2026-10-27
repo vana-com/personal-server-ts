@@ -641,8 +641,14 @@ export async function startPersonalServer(
     setStatus("stopped");
   }
 
+  // Only a runtime this function built has passed the door. A supplied
+  // runtime's storage is the caller's, so its handle reports no status.
+  const replicationStatus = runtimeBundle?.replication;
   return {
     kind: "lite",
+    ...(replicationStatus && {
+      replication: { status: () => replicationStatus },
+    }),
     ready: (_options?: PersonalServerReadyOptions) => info(),
     info,
     prepareRegistration,

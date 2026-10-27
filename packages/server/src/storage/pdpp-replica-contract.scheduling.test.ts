@@ -30,6 +30,7 @@ import {
   type Network,
   type TransportDevice,
   type WorkRecord,
+  unprovisionConnection,
 } from "./pdpp-replica-contract.test-utils.js";
 
 afterEach(() => {
@@ -1119,7 +1120,7 @@ async function mappingFixture(crash?: CrashController) {
   const net = network();
   const a = await publishedWriter(net, (d) => d.put("needs mapping", "a"));
   const b = transportDevice(net, { crash });
-  b.db.prepare("DELETE FROM pdpp_instance_binding WHERE instance='conn'").run();
+  unprovisionConnection(b.db, "conn");
   const reports = await steps(b, 4, 0);
   expect(b.get("a")).toBeUndefined();
   expect(
