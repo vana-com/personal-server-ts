@@ -1399,10 +1399,11 @@ it("keeps conflict clauses out of every view trigger body", () => {
   d.db.exec(
     "CREATE TABLE IF NOT EXISTS pdpp_replica_binding_conflicts (instance TEXT PRIMARY KEY, reason TEXT NOT NULL, evidence_json TEXT NOT NULL)",
   );
+  // View triggers are TEMP triggers of the enabling connection.
   const before = new Set(
     (
       d.db
-        .prepare("SELECT name FROM sqlite_master WHERE type='trigger'")
+        .prepare("SELECT name FROM sqlite_temp_master WHERE type='trigger'")
         .all() as {
         name: string;
       }[]
@@ -1411,7 +1412,7 @@ it("keeps conflict clauses out of every view trigger body", () => {
   pendingReceiver(d);
   const triggers = (
     d.db
-      .prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger'")
+      .prepare("SELECT name,sql FROM sqlite_temp_master WHERE type='trigger'")
       .all() as { name: string; sql: string }[]
   ).filter((row) => !before.has(row.name));
   expect(triggers.length).toBeGreaterThan(20);

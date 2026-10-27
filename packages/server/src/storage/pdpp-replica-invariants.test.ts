@@ -176,7 +176,7 @@ it("(3) every reader-visible blob namespace has manifest insert and delete trigg
   const { db } = device();
   const triggers = db
     .prepare(
-      "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='pdpp_binary_manifests'",
+      "SELECT sql FROM sqlite_temp_master WHERE type='trigger' AND tbl_name='pdpp_binary_manifests'",
     )
     .all() as { sql: string }[];
   const visible = Object.entries(BINARY_NAMESPACE_ROLE)

@@ -82,6 +82,21 @@ const operationColumns = Object.entries(operationExpressions)
   .map(([column, sql]) => `${sql} AS ${column}`)
   .join(",");
 
+/**
+ * Triggers the view's maintenance used to create as persistent objects. They
+ * are now TEMP triggers of the enabling connection, so a persistent one is a
+ * leftover of an earlier build; on a canonical table it would fire for a
+ * plain open's writes. Drops every one, on every enabled open.
+ */
+function dropPersistentViewTriggers(db: Database) {
+  for (const { name } of db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type='trigger' AND (name GLOB 'pdpp_replica_view*' OR name GLOB 'pdpp_replica_local*' OR name GLOB 'pdpp_records_summary_*')",
+    )
+    .all() as { name: string }[])
+    db.exec(`DROP TRIGGER IF EXISTS main."${name}"`);
+}
+
 /** Drops only derived view objects. Canonical, retained and pending tables stay. */
 function dropViewObjects(db: Database) {
   const objects = db
@@ -165,6 +180,7 @@ export function createReplicaVisibilityView(deps: {
           { version: number } | undefined)
       : undefined;
     const initialized = schema?.version === VIEW_SCHEMA;
+    dropPersistentViewTriggers(db);
     // Derived state only: an earlier view layout is dropped and rebuilt here, at
     // construction inside this write transaction, never during a read.
     if (!initialized) dropViewObjects(db);
@@ -226,7 +242,7 @@ export function createReplicaVisibilityView(deps: {
     `);
     for (const table of ["pdpp_replica_operations", "pdpp_replica_received"])
       db.exec(`
-        CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_retained_${table} AFTER INSERT ON ${table}
+        CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_retained_${table} AFTER INSERT ON ${table}
         WHEN json_extract(NEW.operation_json,'$.kind') NOT IN ('upsert','delete')
           OR EXISTS (SELECT 1 FROM pdpp_replica_view_operations o WHERE o.writer=json_extract(NEW.operation_json,'$.revision.writerId') AND o.operation_id=json_extract(NEW.operation_json,'$.revision.operationId') AND o.digest<>NEW.digest)
           OR ${touches("json_extract(NEW.operation_json,'$.connectionId')", "json_extract(NEW.operation_json,'$.declaration.stream')", "json_extract(NEW.operation_json,'$.recordKey')")}
@@ -234,11 +250,14 @@ export function createReplicaVisibilityView(deps: {
           INSERT INTO pdpp_replica_view_dirty_operations SELECT NEW.digest,NEW.operation_json WHERE NOT EXISTS (SELECT 1 FROM pdpp_replica_view_dirty_operations d WHERE d.digest=NEW.digest);
         END;
       `);
+    // Every maintenance trigger is a TEMP trigger: it lives on this connection
+    // only. A plain open of the same file (replication off, or a main build)
+    // then runs none of this SQL, and a persistent one would fire on its writes.
     db.exec(`
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_insert AFTER INSERT ON pdpp_records BEGIN ${markKey("NEW")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_update AFTER UPDATE ON pdpp_records WHEN ${recordChanged} BEGIN ${markKey("NEW")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_record_delete AFTER DELETE ON pdpp_records BEGIN ${markKey("OLD")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_binding AFTER UPDATE ON pdpp_instance_binding
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_record_insert AFTER INSERT ON pdpp_records BEGIN ${markKey("NEW")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_record_update AFTER UPDATE ON pdpp_records WHEN ${recordChanged} BEGIN ${markKey("NEW")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_record_delete AFTER DELETE ON pdpp_records BEGIN ${markKey("OLD")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_binding AFTER UPDATE ON pdpp_instance_binding
       WHEN NEW.generation != OLD.generation OR NEW.deleted_at IS NOT OLD.deleted_at OR NEW.source_id IS NOT OLD.source_id OR NEW.method IS NOT OLD.method OR NEW.reset_clock IS NOT OLD.reset_clock BEGIN
         -- Binding and lifecycle changes expire every stream cursor of the connection.
         UPDATE pdpp_replica_view_streams SET revision=revision+1 WHERE instance=NEW.instance;
@@ -248,51 +267,44 @@ export function createReplicaVisibilityView(deps: {
       -- can arrive or leave without any new record operation (a replayed claim,
       -- another connection's import, another pending batch), so their arrival
       -- and removal mark every dependent key the view can reach.
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_received AFTER INSERT ON pdpp_replica_received_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_received_delete AFTER DELETE ON pdpp_replica_received_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_canonical AFTER INSERT ON pdpp_blob_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_canonical_delete AFTER DELETE ON pdpp_blob_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_pending AFTER INSERT ON pdpp_replica_pending_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_pending_delete AFTER DELETE ON pdpp_replica_pending_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_received AFTER INSERT ON pdpp_replica_received_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_received_delete AFTER DELETE ON pdpp_replica_received_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_canonical AFTER INSERT ON pdpp_blob_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_canonical_delete AFTER DELETE ON pdpp_blob_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_pending AFTER INSERT ON pdpp_replica_pending_bytes BEGIN ${markBlobDependents("NEW.blob_id")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_pending_delete AFTER DELETE ON pdpp_replica_pending_bytes BEGIN ${markBlobDependents("OLD.blob_id")} END;
       -- Chunked bytes (#439) exist once their manifest is published after EOF,
       -- and are gone once it is deleted. Pending chunks are keyed [batch, blob].
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_chunked AFTER INSERT ON pdpp_binary_manifests WHEN NEW.namespace IN ('canonical','received','pending') BEGIN ${markBlobDependents(chunkedBlobId("NEW"))} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_chunked_delete AFTER DELETE ON pdpp_binary_manifests WHEN OLD.namespace IN ('canonical','received','pending') BEGIN ${markBlobDependents(chunkedBlobId("OLD"))} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_chunked AFTER INSERT ON pdpp_binary_manifests WHEN NEW.namespace IN ('canonical','received','pending') BEGIN ${markBlobDependents(chunkedBlobId("NEW"))} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_chunked_delete AFTER DELETE ON pdpp_binary_manifests WHEN OLD.namespace IN ('canonical','received','pending') BEGIN ${markBlobDependents(chunkedBlobId("OLD"))} END;
       -- Pending bytes, legacy rows or chunks, count only while their batch is
       -- pending. blobs_json lists both.
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_batch AFTER UPDATE OF state ON pdpp_replica_pending_batches WHEN NEW.state IS NOT OLD.state BEGIN
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_bytes_batch AFTER UPDATE OF state ON pdpp_replica_pending_batches WHEN NEW.state IS NOT OLD.state BEGIN
         ${markBlobDependents("SELECT blob_id FROM pdpp_replica_pending_bytes WHERE batch_id=NEW.id UNION SELECT json_extract(value,'$.blobId') FROM json_each(CASE WHEN json_valid(NEW.blobs_json) THEN NEW.blobs_json ELSE '[]' END)")}
       END;
       -- Mode 1's last_updated is the owner preview's latest row, derived at
       -- write time: overlay rows can mask any number of newer canonical rows.
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_overlay_insert AFTER INSERT ON pdpp_replica_view BEGIN ${markLatest("NEW")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_overlay_update AFTER UPDATE ON pdpp_replica_view BEGIN ${markLatest("NEW")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_overlay_delete AFTER DELETE ON pdpp_replica_view BEGIN ${markLatest("OLD")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_record_insert AFTER INSERT ON pdpp_records WHEN ${hasOverlaySummary("NEW")} BEGIN ${markLatest("NEW")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_record_update AFTER UPDATE ON pdpp_records WHEN ${recordChanged} AND ${hasOverlaySummary("NEW")} BEGIN ${markLatest("NEW")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_latest_record_delete AFTER DELETE ON pdpp_records WHEN ${hasOverlaySummary("OLD")} BEGIN ${markLatest("OLD")} END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_insert AFTER INSERT ON pdpp_replica_view BEGIN
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_latest_overlay_insert AFTER INSERT ON pdpp_replica_view BEGIN ${markLatest("NEW")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_latest_overlay_update AFTER UPDATE ON pdpp_replica_view BEGIN ${markLatest("NEW")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_latest_overlay_delete AFTER DELETE ON pdpp_replica_view BEGIN ${markLatest("OLD")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_latest_record_insert AFTER INSERT ON pdpp_records WHEN ${hasOverlaySummary("NEW")} BEGIN ${markLatest("NEW")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_latest_record_update AFTER UPDATE ON pdpp_records WHEN ${recordChanged} AND ${hasOverlaySummary("NEW")} BEGIN ${markLatest("NEW")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_latest_record_delete AFTER DELETE ON pdpp_records WHEN ${hasOverlaySummary("OLD")} BEGIN ${markLatest("OLD")} END;
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_insert AFTER INSERT ON pdpp_replica_view BEGIN
         INSERT INTO pdpp_replica_view_streams VALUES (1,NEW.instance,NEW.stream,NEW.live-NEW.base_live,NEW.present-NEW.base_live,NEW.pending,NULL,1)
         ON CONFLICT(preview,instance,stream) DO UPDATE SET revision=revision+1,live_count=live_count+NEW.live-NEW.base_live,row_count=row_count+NEW.present-NEW.base_live,pending_count=pending_count+NEW.pending;
       END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_update AFTER UPDATE ON pdpp_replica_view BEGIN
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_update AFTER UPDATE ON pdpp_replica_view BEGIN
         UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count+(NEW.live-NEW.base_live)-(OLD.live-OLD.base_live),row_count=row_count+(NEW.present-NEW.base_live)-(OLD.present-OLD.base_live),pending_count=pending_count+NEW.pending-OLD.pending
         WHERE preview=1 AND instance=OLD.instance AND stream=OLD.stream;
       END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_delete AFTER DELETE ON pdpp_replica_view BEGIN
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_view_overlay_delete AFTER DELETE ON pdpp_replica_view BEGIN
         UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count-(OLD.live-OLD.base_live),row_count=row_count-(OLD.present-OLD.base_live),pending_count=pending_count-OLD.pending
         WHERE preview=1 AND instance=OLD.instance AND stream=OLD.stream;
       END;
     `);
     // The local journal projection exists only for connections with a durable
     // binding-conflict fact; the fact table is monotone.
-    const localInitialized =
-      hasBindingConflictFacts &&
-      !!db
-        .prepare(
-          "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='pdpp_replica_local_conflict'",
-        )
-        .get();
     if (hasBindingConflictFacts) {
       const conflicted = (instance: string) =>
         `EXISTS (SELECT 1 FROM pdpp_replica_binding_conflicts f WHERE f.instance=${instance})`;
@@ -300,17 +312,17 @@ export function createReplicaVisibilityView(deps: {
       CREATE TABLE IF NOT EXISTS pdpp_replica_local_view (instance TEXT NOT NULL,stream TEXT NOT NULL,record_key TEXT NOT NULL,emitted_at TEXT NOT NULL,row_json TEXT NOT NULL,blob_id TEXT,pending INTEGER NOT NULL,deleted INTEGER NOT NULL,blob_json TEXT,sequence INTEGER NOT NULL,generation INTEGER NOT NULL,source_id TEXT NOT NULL,method TEXT NOT NULL,emitted_key TEXT GENERATED ALWAYS AS (pdpp_time_key(emitted_at)) VIRTUAL,PRIMARY KEY(instance,stream,record_key));
       CREATE INDEX IF NOT EXISTS pdpp_replica_local_page ON pdpp_replica_local_view(instance,stream,emitted_key,record_key) WHERE deleted=0;
       CREATE INDEX IF NOT EXISTS pdpp_replica_local_blob ON pdpp_replica_local_view(blob_id) WHERE deleted=0 AND blob_id IS NOT NULL;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_journal AFTER INSERT ON pdpp_replica_own_writes
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_local_journal AFTER INSERT ON pdpp_replica_own_writes
       WHEN ${conflicted("NEW.connection_id")} AND NEW.writer_id=(SELECT writer_id FROM pdpp_installation_writer WHERE id=1) AND EXISTS (SELECT 1 FROM pdpp_instance_binding b WHERE b.instance=NEW.connection_id AND b.generation=NEW.generation AND b.source_id=NEW.source_id AND b.method=NEW.method AND b.source_id IS NOT NULL AND b.method IS NOT NULL AND b.deleted_at IS NULL) BEGIN
         INSERT INTO pdpp_replica_local_view VALUES (NEW.connection_id,NEW.stream,NEW.record_key,json_extract(NEW.value_json,'$.emittedAt'),NEW.value_json,json_extract(NEW.value_json,'$.data.blob_ref.blob_id'),0,json_extract(NEW.value_json,'$.deleted'),NULL,NEW.sequence,NEW.generation,NEW.source_id,NEW.method)
         ON CONFLICT(instance,stream,record_key) DO UPDATE SET emitted_at=excluded.emitted_at,row_json=excluded.row_json,blob_id=excluded.blob_id,deleted=excluded.deleted,sequence=excluded.sequence,generation=excluded.generation,source_id=excluded.source_id,method=excluded.method WHERE excluded.sequence>pdpp_replica_local_view.sequence;
       END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_binding AFTER UPDATE ON pdpp_instance_binding
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_local_binding AFTER UPDATE ON pdpp_instance_binding
       WHEN ${conflicted("NEW.instance")} AND (NEW.generation IS NOT OLD.generation OR NEW.source_id IS NOT OLD.source_id OR NEW.method IS NOT OLD.method OR NEW.deleted_at IS NOT OLD.deleted_at) BEGIN
         DELETE FROM pdpp_replica_local_view WHERE instance=NEW.instance;
         INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id=NEW.instance;
       END;
-      CREATE TRIGGER IF NOT EXISTS pdpp_replica_local_conflict AFTER INSERT ON pdpp_replica_binding_conflicts BEGIN
+      CREATE TEMP TRIGGER IF NOT EXISTS pdpp_replica_local_conflict AFTER INSERT ON pdpp_replica_binding_conflicts BEGIN
         DELETE FROM pdpp_replica_local_view WHERE instance=NEW.instance;
         INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id=NEW.instance;
       END;
@@ -324,26 +336,58 @@ export function createReplicaVisibilityView(deps: {
     ] as const) {
       const latest = `SELECT emitted_at FROM ${table} WHERE instance=OLD.instance AND stream=OLD.stream AND deleted=0 ORDER BY emitted_at DESC,record_key DESC LIMIT 1`;
       db.exec(`
-        CREATE TRIGGER IF NOT EXISTS ${table}_summary_insert AFTER INSERT ON ${table} BEGIN
+        CREATE TEMP TRIGGER IF NOT EXISTS ${table}_summary_insert AFTER INSERT ON ${table} BEGIN
           INSERT INTO pdpp_replica_view_streams VALUES (${preview},NEW.instance,NEW.stream,1-NEW.deleted,1-NEW.deleted,0,CASE WHEN NEW.deleted=0 THEN NEW.emitted_at ELSE NULL END,1)
           ON CONFLICT(preview,instance,stream) DO UPDATE SET revision=revision+1,
             live_count=live_count+1-NEW.deleted,row_count=row_count+1-NEW.deleted,
             last_updated=CASE WHEN NEW.deleted=0 AND (last_updated IS NULL OR NEW.emitted_at>last_updated) THEN NEW.emitted_at ELSE last_updated END;
         END;
-        CREATE TRIGGER IF NOT EXISTS ${table}_summary_update AFTER UPDATE ON ${table} ${preview === 0 ? `WHEN ${recordChanged}` : ""} BEGIN
+        CREATE TEMP TRIGGER IF NOT EXISTS ${table}_summary_update AFTER UPDATE ON ${table} ${preview === 0 ? `WHEN ${recordChanged}` : ""} BEGIN
           UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count+OLD.deleted-NEW.deleted,
             row_count=row_count+OLD.deleted-NEW.deleted,last_updated=(${latest}) WHERE preview=${preview} AND instance=OLD.instance AND stream=OLD.stream;
         END;
-        CREATE TRIGGER IF NOT EXISTS ${table}_summary_delete AFTER DELETE ON ${table} BEGIN
+        CREATE TEMP TRIGGER IF NOT EXISTS ${table}_summary_delete AFTER DELETE ON ${table} BEGIN
           UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=live_count-(1-OLD.deleted),row_count=row_count-(1-OLD.deleted),last_updated=(${latest})
           WHERE preview=${preview} AND instance=OLD.instance AND stream=OLD.stream;
         END;
       `);
     }
-    if (hasBindingConflictFacts && !localInitialized)
-      db.exec(
-        `DELETE FROM pdpp_replica_local_view; INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id IN (SELECT instance FROM pdpp_replica_binding_conflicts);`,
-      );
+    if (hasBindingConflictFacts) {
+      // Re-derive the local projection unless it already matches. A plain open
+      // can change a binding without any trigger to follow it.
+      const projected = `SELECT * FROM (${localProjection} AND j.connection_id IN (SELECT instance FROM pdpp_replica_binding_conflicts))`;
+      const stored =
+        "SELECT instance,stream,record_key,emitted_at,row_json,blob_id,pending,deleted,blob_json,sequence,generation,source_id,method FROM pdpp_replica_local_view";
+      const drifted = db
+        .prepare(
+          `SELECT 1 FROM (${stored} EXCEPT ${projected}) UNION ALL SELECT 1 FROM (${projected} EXCEPT ${stored}) LIMIT 1`,
+        )
+        .get();
+      if (drifted)
+        db.exec(
+          `DELETE FROM pdpp_replica_local_view; INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id IN (SELECT instance FROM pdpp_replica_binding_conflicts);`,
+        );
+    }
+    if (initialized) {
+      // The triggers above exist only on this connection. Writes made while
+      // replication was off (a plain open or a main build) fed none of them,
+      // so derive again what they maintain, from canonical rows. Summaries
+      // that already match are left alone and keep their cursor revisions.
+      // Keys that can differ from canonical are those of a connection with an
+      // overlay row, pending work or a conflict; flush() below reconciles them.
+      db.exec(`
+        INSERT INTO pdpp_replica_view_streams SELECT 0,instance,stream,SUM(1-deleted),SUM(1-deleted),0,MAX(CASE WHEN deleted=0 THEN emitted_at END),1 FROM pdpp_records WHERE true GROUP BY instance,stream
+        ON CONFLICT(preview,instance,stream) DO UPDATE SET revision=revision+1,live_count=excluded.live_count,row_count=excluded.row_count,last_updated=excluded.last_updated
+        WHERE live_count IS NOT excluded.live_count OR row_count IS NOT excluded.row_count OR last_updated IS NOT excluded.last_updated;
+        UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=0,row_count=0,last_updated=NULL
+        WHERE preview=0 AND (live_count<>0 OR row_count<>0 OR last_updated IS NOT NULL)
+          AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance=pdpp_replica_view_streams.instance AND r.stream=pdpp_replica_view_streams.stream);
+        INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view;
+        INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view_pending;
+        INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view_conflicts;
+        INSERT OR IGNORE INTO pdpp_replica_view_dirty_latest SELECT instance,stream FROM pdpp_replica_view_streams WHERE preview=1;
+      `);
+    }
     if (!initialized) {
       // One-time rebuild. Thereafter persisted dirty queues also cover downtime/restarts.
       // Only pending work, confirmed operation-ID variants and deleted bindings can

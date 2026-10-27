@@ -75,10 +75,11 @@ BEGIN SELECT RAISE(ABORT, 'local write log is append-only'); END;
 `,
   REPLICATION_MIGRATION,
   RECEIVER_MIGRATION,
-  BINARY_CHUNKS_MIGRATION +
-    `CREATE TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END;
-DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs);
-DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs);`,
+  // Earlier builds also created the persistent trigger
+  // `pdpp_canonical_chunks_delete` on `pdpp_blobs` here. It would fire on a
+  // plain open's blob deletes, so `ensureReplicaSchema` drops it and the
+  // port recreates it as a TEMP trigger. See `CANONICAL_CHUNKS_TRIGGER`.
+  BINARY_CHUNKS_MIGRATION,
   // Integrity fences and binding-conflict facts.
   REPLICA_INTEGRITY_MIGRATION,
   // Batch copies, finalized facts, dispositions, receipts.
@@ -119,8 +120,26 @@ export function ensureReplicaSchema(db: Database): void {
     db.prepare(
       "UPDATE pdpp_replica_schema_version SET version = ? WHERE id = 1",
     ).run(REPLICA_MIGRATIONS.length);
+    // A database a canary build opened has the chunk trigger as a persistent
+    // object. Replica triggers on canonical tables must exist only on a
+    // connection that enabled replication, so remove it.
+    db.exec("DROP TRIGGER IF EXISTS pdpp_canonical_chunks_delete");
+    // A plain open can delete a blob without clearing its replica chunks.
+    // Clear what such deletes left, on every enabled open.
+    db.exec(`
+      DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs);
+      DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id NOT IN (SELECT blob_id FROM pdpp_blobs);
+    `);
   }).immediate();
 }
+
+/**
+ * Deleting a canonical blob deletes its replica chunks. TEMP, so it lives on
+ * the connection that enabled replication and never fires for a plain open's
+ * writes; a plain open leaves the chunks, and the next enabled open clears
+ * them (see `ensureReplicaSchema`).
+ */
+const CANONICAL_CHUNKS_TRIGGER = `CREATE TEMP TRIGGER IF NOT EXISTS pdpp_canonical_chunks_delete AFTER DELETE ON pdpp_blobs BEGIN DELETE FROM pdpp_binary_chunks WHERE namespace='canonical' AND blob_id=OLD.blob_id; DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id=OLD.blob_id; END`;
 
 function assertReplicaSchema(db: Database): void {
   const row = db
@@ -235,6 +254,7 @@ export function createReplicaCanonicalPort(db: Database) {
   if (db.readonly) assertReplicaSchema(db);
   else {
     ensureReplicaSchema(db);
+    db.exec(CANONICAL_CHUNKS_TRIGGER);
     // Older replication builds stored large canonical blobs only in the
     // replica chunk tables. Materialize those bytes in main's canonical table
     // before a flag-off or main build can be used to read the database.
