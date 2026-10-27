@@ -18,17 +18,20 @@ fits fragments, and there is no agreed opt-in or off switch.
 2. **Each device signs its batches with its existing registered PS server
    key.** The owner's `ServerRegistration` roster at the gateway is membership;
    deregistration is removal.
-3. **Receivers bind each writer to the server registration that first
-   published it**, by server address and gateway registration id, and
-   quarantine any later batch from another signer. Owner, chain and
-   environment must match the receiver.
+3. **Writer ids are derived from the signer:** a hash of owner, server
+   address, gateway registration id, role and a disclosed nonce. Receivers
+   recompute them from the verified signature and the roster record, and
+   require the roster owner, statement owner and receiver owner to match.
+   Nothing is bound on first contact.
 4. **Peers import only from servers registered now.** After removal they
    refuse unimported batches and keep imported data. A re-registered server is
    a new incarnation with new writers.
 5. **The host owns timing and cancellation; the coordinator owns retries.**
    Adapters take an abort signal and byte cap and never retry.
-6. **Limits bound work and memory per step,** with resumable framing and no
-   blob-size cap, so no rule can stall a device's later changes.
+6. **Limits bound work and memory per step,** with no blob-size cap, so no
+   rule can stall a device's later changes. This needs engine work in A7:
+   admission by next resumable unit, and resumable retention, hashing,
+   preparation and import staging.
 7. **Opt-in is per device and one-way.** The Account entitlement
    `replication_internal` (`opendatalabs.xyz` only) gates the UI. A SQLite
    mutation fence detects any write outside the capture path, by any build,
@@ -51,11 +54,16 @@ Enclave or the OS keychain, certified by the server key. It would stop a copied
 `key.json` from signing and let batch keys be wrapped to each current device.
 DPv2's cost (about two minutes of finality per hop, one registration per
 fragment) may also justify a different carrier, which needs its own design.
+Plan item A12 replaces per-fragment registration with one registration per
+device sync, a manifest of content-addressed fragments.
 
 ## Alternatives considered
 
 - **Wallet signs batches.** Needs a wallet prompt or a custodial signer per
   batch.
+- **Bind a writer to the first server seen publishing it.** A registered
+  server that reaches a fresh receiver first takes the writer, and nothing
+  constrains the operation writer. Two review rounds found gaps in this table.
 - **Accept batches published before revocation.** Needs a trusted publication
   time and lets a key used during the gap keep its writes.
 - **Record-store write clock as the off-time detector.** Some reads advance it

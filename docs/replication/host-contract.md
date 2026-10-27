@@ -60,7 +60,9 @@ decision.
 Later: DPv2 costs about two minutes of chain finality per hop (dev median
 122 s, p90 134 s, 2026-10-21) and one registration per fragment (4,310 for one
 101 MiB blob on Lite). That cost may justify a different carrier before
-production. A new carrier is its own design and may need engine changes.
+production. A new carrier is its own design and may need engine changes. Plan
+item A12 replaces per-fragment registration with one registration per device
+sync: a manifest that lists content-addressed fragments.
 
 ## 3. Who may write
 
@@ -78,7 +80,45 @@ is deregistration through the existing Account intent
 The wallet never signs batches. The master-key signature only derives
 encryption keys.
 
-### 3.2 The batch statement
+### 3.2 Writer ids come from the signer
+
+A writer id is not chosen and not bound on first contact. It is derived from
+the identity that signs, so a receiver checks it from the signature alone:
+
+```
+writerId(role) = first 16 bytes of SHA-256(
+  "vana-pdpp-replica-writer-v1",
+  owner,          // 20 bytes, the owner wallet
+  server,         // 20 bytes, the signing server address
+  serverId,       // 32 bytes, the gateway registration id (incarnation)
+  role,           // "transport" or "operation"
+  writerNonce,    // 16 bytes, disclosed in every statement
+)
+```
+
+Fields are length-prefixed. The result is 32 lowercase hex characters, the
+existing writer token format (`transport.ts:14`, `envelope.ts:23`). The
+transport writer and the operation writer use the same nonce, so they always
+come as a pair from one server.
+
+The nonce is still needed. Without it, every database under one registration
+would derive the same writer ids. A reset, a new database or a restored copy on
+the same server would then restart sequences and revision counters under ids
+that peers have already imported. PS picks a random nonce when it creates
+writer identity: on first enable, on reset, and on the clone and restore
+rotation (`packages/server/src/storage/pdpp-replication.md`, "Capture and
+retention"). The nonce gives no authority. Any id it produces includes the
+signer's address and incarnation.
+
+PS derives its ids at first enable, from its own gateway record. If the server
+is not registered yet, enable waits. Today's random ids
+(`pdpp-replication-transport.ts:287-299`, `pdpp-replica-canonical-port.ts:113-118`)
+are replaced. Dev databases that used them start fresh.
+
+The derivation uses only the signer's identity and the nonce, not scope names,
+so it carries over unchanged to a per-sync manifest (A12).
+
+### 3.3 The batch statement
 
 The server key signs an EIP-712 statement for each batch (domain
 `"Vana PDPP Replica"`, version `"1"`, `chainId`):
@@ -86,11 +126,10 @@ The server key signs an EIP-712 statement for each batch (domain
 ```
 PdppReplicaBatch {
   address owner;
-  address server;          // signer; a registered server of owner
-  bytes32 serverId;        // the gateway registration id of that server
+  address server;          // signer
+  bytes32 serverId;        // gateway registration id of the signer
   string  environment;     // "dev" | "prod"
-  string  transportWriter;
-  string  operationWriter;
+  bytes16 writerNonce;
   string  batch;
   uint64  sequence;
   bytes32 previous;        // digest of the previous batch, or zero
@@ -103,32 +142,36 @@ PdppReplicaBatch {
 Fragment format version 2 carries the statement and signature inside the
 encrypted body (version 1 is at `transport.ts:17-34`).
 
-### 3.3 Receiver checks
+### 3.4 Receiver checks
 
-In this order. Each failure is a typed outcome.
+In this order. Each failure is a typed quarantine of that item only. A batch
+that fails any check never touches writer state, so it cannot occupy a
+sequence or a predecessor slot of a real writer.
 
 1. Decrypt and decode the fragment.
 2. Recover the signer. It must equal `server`.
-3. `owner`, `chainId` and `environment` must equal the receiver's partition.
-4. Roster: the gateway record for `server` must exist, have no `revokedAt`, and
-   have `id` equal to `serverId`
-   (`data-gateway@37bc1fe api/v1/servers/[address].ts:122-130`). The receiver
-   caches a roster answer for at most 5 minutes. If it cannot read the roster
-   and has no fresh answer, it waits. It never accepts on an unknown roster.
-5. Writer binding: the first accepted batch of a `transportWriter` binds it,
-   durably and immutably, to `(server, serverId, operationWriter)`. A later
-   batch of that writer with any other value is quarantined as
-   `writer_binding_conflict`.
+3. Partition: `statement.owner`, `chainId` and `environment` must equal the
+   receiver's. Addresses are compared after normalizing to lowercase.
+4. Roster: the gateway record for `server` must exist, have no `revokedAt`,
+   have `id` equal to `serverId`, and have `ownerAddress` equal to
+   `statement.owner` (`data-gateway@37bc1fe api/v1/servers/[address].ts:122-130`).
+   So roster owner, statement owner and receiver owner are one address. The
+   receiver caches a roster answer for at most 5 minutes. If it cannot read the
+   roster and has no fresh answer, it waits. It never accepts on an unknown
+   roster.
+5. Writer ids: derive both ids from `owner`, `server`, `serverId` and
+   `writerNonce`. With DPv2, the writer in the fragment's scope must equal the
+   derived transport writer.
 6. Finalized DPv2 evidence, as today.
 7. Assemble and check `digest`. Every operation's `revision.writerId` must
-   equal `operationWriter`. Then import.
+   equal the derived operation writer. Then import.
 
 This implements the receiver's `authenticate` hook. New codes in
 `packages/core/src/replication/outcome.ts`: dependency kind `roster`;
 quarantine reasons `signature_invalid`, `partition_mismatch`,
-`server_not_registered` and `writer_binding_conflict`.
+`server_not_registered`, `roster_owner_mismatch` and `writer_mismatch`.
 
-### 3.4 Removal and re-registration
+### 3.5 Removal and re-registration
 
 The rule for testers: import only from servers that are registered now. After
 a server is deregistered, peers refuse its batches that they have not yet
@@ -139,18 +182,21 @@ imported. Removal lag is the receiver's roster cache plus the gateway CDN TTL.
 The gateway lets a revoked address register again. It refuses the same
 `serverId` (`data-gateway@37bc1fe lib/servers.ts:525-531`), then clears
 `revokedAt` and writes the new `id` (`:533-551`). The new `serverId` makes it a
-new incarnation. Old writer bindings name the old `serverId`, so they fail step
-4 and their batches stay refused. The device must start new writer ids after
-re-registration, by the same rotation that clone and restore need
-(`packages/server/src/storage/pdpp-replication.md`, "Capture and retention").
-It does not inherit old bindings, because the gap between removal and return is
-when a lost or copied key is most likely in use.
+new incarnation. Writer ids include `serverId`, so the device derives new ids
+and starts new sequences. Batches under the old ids name the old `serverId`,
+fail step 4 and stay refused. The new incarnation inherits nothing, because
+the gap between removal and return is when a lost or copied key is most likely
+in use.
 
-### 3.5 Known tester limits
+### 3.6 Known tester limits
 
 - **Copied key.** Anyone who has a copy of a device's `key.json` (or the Lite
   identity and master key) can sign as that device and its writers until the
   owner deregisters it. Testers accept this.
+- **Another device can delay a peer.** Storage PUT overwrites (section 1), so
+  any registered server of the owner can replace another device's stored
+  ciphertext. The peer then fails the registered hash and cannot import that
+  fragment. It never accepts forged data.
 - **Removed devices can still read.** Every device holds the owner master key,
   and storage reads are public (section 1). A removed device that kept the
   master key can read and decrypt new batches. This must be fixed before
@@ -364,26 +410,44 @@ There is no blob-size cap.
   Initial values: phone 20 units, 8 MiB, 30 s; Desktop 50 units, 64 MiB, 30 s.
 - **Memory:** at most one fragment per direction in memory. Fragments are
   1 MiB on Lite and 4 MiB on Node.
-- **Resumable framing:** preparing a batch writes each fragment durably and
-  records a cursor, so a large blob is framed across many steps. Today
-  preparation frames a whole batch in one run and discards it on error
-  (`pdpp-replication-transport.ts:590-627`). Assembly on import streams from
-  stored fragments instead of holding the batch.
-- **No permanent stall:** a batch becomes Unsupported only at a true protocol
-  limit, 100,000 fragments per batch (`transport.ts:11`). That is about
-  97 GiB at 1 MiB fragments. A large blob is slow, not blocked. A peer holds a
-  writer's later batches behind an Unsupported one
-  (`pdpp-replication-transport.ts:628-666`), so no tester limit may produce
+- **No permanent stall:** a batch becomes Unsupported only at the protocol
+  limit of 100,000 fragments per batch (`transport.ts:11`), about 97 GiB at
+  1 MiB fragments. A peer holds a writer's later batches behind an Unsupported
+  one (`pdpp-replication-transport.ts:628-666`), so no tester limit may produce
   one.
 - **Reclaim instead of a lifetime cap:** the outbox keeps plaintext and
   ciphertext and the batch table keeps the payload
   (`pdpp-replication-transport.ts:79-110`). After a batch's registration is
-  finalized, no phase should need to send it again, so PS drops those bytes
-  and keeps hashes and metadata. A test must prove that no outbound phase reads
-  them after that point. After import, PS drops inbox bytes.
+  finalized, PS drops those bytes and keeps hashes and metadata. A test must
+  prove that no outbound phase reads them after that point. After import, PS
+  drops inbox bytes.
 
-D2 measures peak memory and steps per large blob on the phone before these
-values are final.
+### 6.1 Engine work the step bound needs
+
+The engine cannot meet these bounds today. Preparation advertises the bytes of
+the whole batch (`pdpp-replication-transport.ts:579`), and the coordinator
+skips any item larger than the remaining byte budget (`coordinator.ts:458`).
+So on the phone, a batch over 8 MiB is deferred on every step and never makes
+progress. Preparation also frames a whole batch in one run and discards partial
+work on error (`pdpp-replication-transport.ts:590-627`).
+
+Plan item A7 (the bounded coordinator) owns these changes, and builds on the
+atomic checkpoints of A5:
+
+1. **Bounded admission:** an item advertises the bytes of its next resumable
+   unit, at most one fragment, not the whole batch.
+2. **Resumable retention and hashing:** capturing a batch's payload and
+   computing its digest continue across steps from a durable checkpoint.
+3. **Resumable preparation:** each framed and encrypted fragment is committed
+   with a cursor, so a restart continues from the last fragment.
+4. **Resumable import staging:** inbound fragments are staged as they arrive,
+   and assembly reads them across steps.
+5. **Kept as today:** the whole-batch digest check before import, and atomic
+   promotion of the batch in one commit.
+
+Each of retention, hashing, preparation and import staging needs a test that
+aborts a multi-step batch part-way, restarts, and proves the batch completes
+with earlier progress kept and the same final result.
 
 ## 7. Two-device acceptance suite (D2)
 
@@ -403,15 +467,21 @@ item needs a test that fails when the property fails.
 10. Door: off then on is refused. So is on, then a write by a build without
     replication, then on.
 11. Removal: after deregistration, B refuses A's unimported batches and keeps
-    imported data. A re-registered A starts new writers that B accepts.
-12. A batch signed by another registered server for A's writer is quarantined
-    as `writer_binding_conflict`. A tampered statement is `signature_invalid`.
-    A batch for another owner, chain or environment is `partition_mismatch`.
-13. Switching account or network on one device does not mix partitions.
-14. Phone background aborts the step within the grace time; the next
+    imported data. A re-registered A derives new writers that B accepts.
+12. First-contact impersonation: registered server C publishes under A's
+    transport writer and reaches a fresh receiver first. C's batch is
+    `writer_mismatch`, and A's real batches then import.
+13. Operation-writer reuse: C publishes under its own transport writer with
+    operations carrying A's operation writer. The batch is `writer_mismatch`.
+14. Foreign owner: a server registered under another wallet signs a batch into
+    the victim's partition. It is `roster_owner_mismatch`.
+15. A tampered statement is `signature_invalid`. A batch for another chain or
+    environment is `partition_mismatch`.
+16. Switching account or network on one device does not mix partitions.
+17. Phone background aborts the step within the grace time; the next
     foreground step completes the work.
 
 ## 8. Open question
 
 When a device is removed, its changes that other devices have not yet imported
-are lost to them (section 3.4). Is that acceptable for testers?
+are lost to them (section 3.5). Is that acceptable for testers?
