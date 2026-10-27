@@ -299,20 +299,19 @@ export const COALESCE_MAX_WAIT_MS = 10 * 60_000;
 interface CoalescedScope {
   /** The scope's latest local version: what readers serve. */
   head: IndexEntry;
-  /** Older unsynced snapshots in this batch that the head supersedes. */
-  superseded: IndexEntry[];
   /** Still inside the quiet window: publish on a later pass. */
   deferred: boolean;
 }
 
 const at = (entry: IndexEntry) => Date.parse(entry.collectedAt);
+const VERSION_PAGE = 200;
 
 /**
  * One plan per coalesced scope in the batch. The head is the scope's latest
- * local version (`findEntry`), not the batch's latest, so a head beyond the
- * batch page is still the one published. Every scope version is a full state
- * (readers serve the latest), so publishing only the head loses intermediate
- * history, never current data.
+ * local version (`findEntry`), not the batch's latest. Only the head is ever
+ * published: readers serve the latest version, which is a full state, so an
+ * older unpublished snapshot is never what anyone sees and publishing it would
+ * roll the scope back.
  */
 function coalescePlan(
   deps: UploadWorkerDeps,
@@ -329,15 +328,35 @@ function coalescePlan(
     const batchHead = inBatch.reduce((a, b) => (at(b) > at(a) ? b : a));
     const latest = deps.storage.findEntry?.({ scope });
     const head = latest && at(latest) >= at(batchHead) ? latest : batchHead;
-    const superseded = inBatch.filter((entry) => entry.id !== head.id);
     const oldest = Math.min(...inBatch.map(at), at(head));
     const deferred =
       head.dataPointId === null &&
       nowMs - at(head) < COALESCE_QUIET_MS &&
       nowMs - oldest < COALESCE_MAX_WAIT_MS;
-    plans.set(scope, { head, superseded, deferred });
+    plans.set(scope, { head, deferred });
   }
   return plans;
+}
+
+/** Every unpublished version of `head`'s scope older than `head`. */
+function olderUnsynced(deps: UploadWorkerDeps, head: IndexEntry): IndexEntry[] {
+  const older: IndexEntry[] = [];
+  for (let offset = 0; ; offset += VERSION_PAGE) {
+    const page = deps.storage.listVersions(head.scope, {
+      limit: VERSION_PAGE,
+      offset,
+    });
+    for (const entry of page) {
+      if (
+        entry.id !== head.id &&
+        entry.dataPointId === null &&
+        at(entry) < at(head)
+      ) {
+        older.push(entry);
+      }
+    }
+    if (page.length < VERSION_PAGE) return older;
+  }
 }
 
 /**
@@ -391,21 +410,22 @@ export async function uploadAll(
 
   for (const entry of entries) {
     const plan = plans.get(entry.scope);
-    // A coalesced scope whose head is already published (for example a newer
-    // version downloaded from another of the owner's servers) falls back to
-    // publishing each version: erasing local snapshots that were never
-    // published would drop data.
-    const coalesce = plan !== undefined && plan.head.dataPointId === null;
-    if (coalesce) {
+    if (plan) {
       if (handled.has(entry.scope)) continue;
       handled.add(entry.scope);
       if (plan.deferred) continue;
+      if (plan.head.dataPointId !== null) {
+        // The latest version is already published: older unpublished
+        // snapshots are superseded, never published.
+        await eraseSuperseded(deps, olderUnsynced(deps, plan.head));
+        continue;
+      }
     }
-    const target = coalesce ? plan.head : entry;
+    const target = plan ? plan.head : entry;
     try {
       const result = await uploadOne(deps, target);
       results.push(result);
-      if (coalesce) await eraseSuperseded(deps, plan.superseded);
+      if (plan) await eraseSuperseded(deps, olderUnsynced(deps, plan.head));
     } catch (err) {
       // A dropped orphan is a self-heal, not a failure: the row is already
       // gone, there is nothing to retry, and surfacing it would keep the

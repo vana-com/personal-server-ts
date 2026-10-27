@@ -73,6 +73,13 @@ function makeSchema(): Schema {
   };
 }
 
+/** Wire `listVersions` to return the given versions of their scope. */
+function withVersions(deps: UploadWorkerDeps, versions: IndexEntry[]): void {
+  deps.storage.listVersions = vi.fn((scope: string) =>
+    versions.filter((entry) => entry.scope === scope),
+  );
+}
+
 function makeMockDeps(): UploadWorkerDeps {
   const mockStorage: Partial<DataStoragePort> = {
     findUnsynced: vi.fn().mockReturnValue([]),
@@ -381,6 +388,7 @@ describe("upload worker", () => {
         other,
         newer,
       ]);
+      withVersions(deps, [older, newer]);
 
       const results = await uploadAll(deps);
 
@@ -423,6 +431,7 @@ describe("upload worker", () => {
         fresh,
         staleNewest,
       ]);
+      withVersions(deps, [stale, fresh, staleNewest]);
 
       const results = await uploadAll(deps, { now: () => now });
 
@@ -454,6 +463,7 @@ describe("upload worker", () => {
         older,
         newer,
       ]);
+      withVersions(deps, [older, newer]);
 
       const results = await uploadAll(deps);
 
@@ -484,6 +494,7 @@ describe("upload worker", () => {
         inPage,
       ]);
       deps.storage.findEntry = vi.fn().mockReturnValue(head);
+      withVersions(deps, [inPage, head]);
 
       const results = await uploadAll(deps);
 
@@ -495,7 +506,7 @@ describe("upload worker", () => {
       );
     });
 
-    it("falls back to publishing each version when the scope's latest version is already published", async () => {
+    it("erases, and never publishes, unsynced snapshots older than an already-published latest version", async () => {
       const deps = makeMockDeps();
       deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
       const unsynced = makeEntry({
@@ -503,6 +514,12 @@ describe("upload worker", () => {
         path: "memory.claude/local.json",
         scope: "memory.claude",
         collectedAt: "2026-10-27T10:00:00.000Z",
+      });
+      const leftover = makeEntry({
+        id: 62,
+        path: "memory.claude/leftover.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:05.000Z",
       });
       const publishedHead = makeEntry({
         id: 69,
@@ -515,11 +532,19 @@ describe("upload worker", () => {
         unsynced,
       ]);
       deps.storage.findEntry = vi.fn().mockReturnValue(publishedHead);
+      // `leftover` is beyond this batch page but still erased.
+      withVersions(deps, [unsynced, leftover, publishedHead]);
 
       const results = await uploadAll(deps);
 
-      expect(results.map((r) => r.path)).toEqual(["memory.claude/local.json"]);
-      expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
+      expect(results).toEqual([]);
+      expect(deps.storageAdapter.upload).not.toHaveBeenCalled();
+      expect(deps.storage.deleteVersion).toHaveBeenCalledTimes(2);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.claude",
+        leftover.collectedAt,
+        { id: leftover.id, path: leftover.path },
+      );
     });
 
     it("keeps older memory snapshots when the newest one fails to publish", async () => {
