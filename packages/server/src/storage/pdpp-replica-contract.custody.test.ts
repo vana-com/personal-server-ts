@@ -779,18 +779,20 @@ describe("section C: destination custody and crash boundaries", () => {
     );
     expectMatrix(report);
   }, 300_000);
+  // Walks every crash index (CI took up to 325 s; the 300 s limit flaked).
   it("40 partial download: an incomplete batch never imports; resume fetches only missing fragments", async () => {
     const report = await crashMatrix("40 partial download", () =>
       destinationScenario({ text: "f".repeat(2000), chunk: 600 }),
     );
     expectMatrix(report);
-  }, 300_000);
+  }, 600_000);
+  // Walks every crash index (CI took up to 325 s; the 300 s limit flaked).
   it("41/42 verified staging and import receipt: no public blob or record without the committed receipt; no orphan staging", async () => {
     const report = await crashMatrix("41 staged blob import", () =>
       destinationScenario({ blobBytes: 3000, chunk: 1500 }),
     );
     expectMatrix(report);
-  }, 300_000);
+  }, 600_000);
 });
 
 // ------------------------------------------------ quarantine atomicity (44)

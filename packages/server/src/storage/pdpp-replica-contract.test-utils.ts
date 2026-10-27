@@ -4,7 +4,7 @@
  * devices, injects process loss and reads durable state without interpretation.
  */
 import Database from "better-sqlite3";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
@@ -429,47 +429,6 @@ export type Network = ReturnType<typeof network>;
 export type TransportWorker = ReturnType<typeof createReplicaTransportWorker>;
 export type Receiver = ReturnType<typeof createReplicaReceiver>;
 
-/**
- * Schema-only file image for transport devices. Opening a fresh file runs the
- * worker's additive column migrations (ALTER TABLE, about 17 ms per open), and
- * the crash matrices open two fresh devices per trace point. The image is built
- * once per process by the same constructors; they write no rows (the transport
- * state row is inserted on first use, not on construction), so a copy is the
- * schema a fresh open would produce.
- */
-let schemaImage: Buffer | undefined;
-function schemaOnlyImage(): Buffer {
-  if (schemaImage) return schemaImage;
-  const directory = mkdtempSync(join(tmpdir(), "replica-schema-"));
-  try {
-    const path = join(directory, "records.sqlite");
-    const db = new Database(path);
-    const store = createReplicaRecordStore(db);
-    const receiver = createReplicaReceiver({
-      db,
-      store,
-      owner,
-      authenticate: () => undefined,
-      declarations: () => [],
-    });
-    createReplicaTransportWorker({
-      db,
-      exporter: store.replication,
-      receiver,
-      credential,
-      expected: () => ({ owner, declarations: [] }),
-      // Constructed but never run: the port is only read by phases.
-      transport: {} as ReplicaTransportPort,
-      now: clock.now,
-    });
-    db.close();
-    schemaImage = readFileSync(path);
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-  return schemaImage;
-}
-
 /** One SQLite device: record store + receiver + transport worker on one file. */
 export function transportDevice(
   net: Network,
@@ -488,7 +447,6 @@ export function transportDevice(
   const directory = scratchDirectory("replica-contract");
   const path = join(directory, "records.sqlite");
   const instance = opts.instance ?? "conn";
-  writeFileSync(path, schemaOnlyImage());
   let real = new Database(path);
   let db = opts.crash ? crashableDatabase(real, opts.crash) : real;
   let store = createReplicaRecordStore(db);
