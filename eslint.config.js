@@ -18,6 +18,8 @@ export default tseslint.config(
     files: [
       "packages/core/src/legacy-projection/**/*.ts",
       "packages/core/src/additions/**/*.ts",
+      "packages/core/src/replication/**/*.ts",
+      "packages/core/src/storage/pdpp-records/completion.ts",
     ],
     ignores: [
       "**/*.test.ts",
