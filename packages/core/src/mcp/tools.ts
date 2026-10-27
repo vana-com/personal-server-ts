@@ -1,4 +1,4 @@
-import { isSystemScope } from "../policy/reserved-scopes.js";
+import { isMemoryScope, isSystemScope } from "../policy/reserved-scopes.js";
 /**
  * MCP tool surface. Phase 1 / §4 of 260604-PLAN-vana-mcp-personal-server.md.
  *
@@ -2144,6 +2144,18 @@ function resolveMemoryTarget(
       ),
     };
   }
+  if (!isMemoryScope(scope)) {
+    return {
+      error: textResult(
+        {
+          error: "scope_not_memory",
+          scope,
+          message: `Memories live in memory.<app> scopes; ${scope} is not one.`,
+        },
+        true,
+      ),
+    };
+  }
   const grant = resolveWriteGrantForScope(connection, scope);
   if (!grant) {
     const requestScope = `${WRITE_SCOPE_PREFIX}${scope}`;
@@ -2347,7 +2359,7 @@ const forget: McpToolDefinition = {
     const { scope, grantId } = target;
     if (!writeClient) return WRITE_UNAVAILABLE;
 
-    const forgotten: string[] = [];
+    let forgotten: string[] = [];
     let memoryCount = 0;
     try {
       await writeClient.updateScope({
@@ -2358,10 +2370,10 @@ const forget: McpToolDefinition = {
             current.data === null
               ? []
               : storedMemoryRecords(scope, current.data);
-          const keep = records.filter(
-            (record) =>
-              !((id && record.id === id) || (key && record.key === key)),
-          );
+          // With both id and key, a record must match both.
+          const matches = (record: MemoryRecord) =>
+            (!id || record.id === id) && (!key || record.key === key);
+          const keep = records.filter((record) => !matches(record));
           if (keep.length === records.length) {
             throw new RememberRefusal({
               error: "not_found",
@@ -2369,11 +2381,8 @@ const forget: McpToolDefinition = {
               message: "No saved memory matches that id or key.",
             });
           }
-          forgotten.push(
-            ...records
-              .filter((record) => !keep.includes(record))
-              .map((record) => record.id),
-          );
+          // Reset on every attempt: a 412 retry re-runs this callback.
+          forgotten = records.filter(matches).map((record) => record.id);
           memoryCount = keep.length;
           return memoryBody(keep, scope);
         },
