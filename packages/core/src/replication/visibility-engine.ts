@@ -706,7 +706,7 @@ export function diffProjection(
   ) => {
     const out = dict<T>();
     for (const key of Object.keys(after).sort())
-      if (canonicalJson(own(before, key) ?? null) !== canonicalJson(after[key]))
+      if (exactJson(own(before, key) ?? null) !== exactJson(after[key]))
         out[key] = after[key];
     return out;
   };
@@ -795,6 +795,31 @@ const hash = (text: string) =>
   `sha256:${bytesToHex(sha256(new TextEncoder().encode(text)))}`;
 
 /**
+ * Canonical JSON for the values the engine digests and compares: requests,
+ * deltas, checkpoints, retained evidence. Same ordering as `canonicalJson`,
+ * but it keeps every own key. `canonicalJson` parses with zod, which drops an
+ * own `__proto__` key, so values differing only there would share a digest.
+ */
+function exactJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(exactJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${exactJson(record[key])}`)
+      .join(",")}}`;
+  }
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  )
+    return JSON.stringify(value);
+  throw new TypeError(`not a JSON value: ${typeof value}`);
+}
+
+/**
  * Digest of the facts a projection derives from. It names the evidence SET:
  * equal retained evidence and host facts give equal digests, whatever the
  * delivery order or duplication. Declaration validators are host code and
@@ -806,21 +831,19 @@ export function evidenceDigest(
 ): string {
   const sorted = (values: Iterable<string>) => [...new Set(values)].sort();
   return hash(
-    canonicalJson({
+    exactJson({
       owner: world.owner,
       declarations: sorted(
         world.declarations.map((d) =>
-          canonicalJson({ sourceId: d.sourceId, binding: d.binding }),
+          exactJson({ sourceId: d.sourceId, binding: d.binding }),
         ),
       ),
       mappings: sorted(
-        [...world.mappings].map(([id, mapping]) =>
-          canonicalJson([id, mapping]),
-        ),
+        [...world.mappings].map(([id, mapping]) => exactJson([id, mapping])),
       ),
       verifiedBlobs: sorted(world.verifiedBlobs),
       terminal: sorted(world.terminal),
-      evidence: sorted(evidence.map(operationDigest)),
+      evidence: sorted(evidence.map((op) => hash(exactJson(op)))),
     }),
   );
 }
@@ -858,7 +881,8 @@ export class VisibilityEpochConflict extends Error {
  * Retrying any committed request, even after later commits, returns its
  * original receipt and changes nothing. Any other stale commit throws
  * `VisibilityEpochConflict` and changes nothing; the caller re-evaluates
- * from a fresh snapshot.
+ * from a fresh snapshot. Known limit: receipt retention grows without bound,
+ * one entry per distinct committed request; A5/A7 must bound it.
  */
 export interface VisibilityCommitter {
   commit(
@@ -869,10 +893,10 @@ export interface VisibilityCommitter {
 }
 
 export function deltaDigest(delta: ProjectionDelta): string {
-  return hash(canonicalJson(delta));
+  return hash(exactJson(delta));
 }
 export function checkpointDigest(checkpoint: CheckpointDelta): string {
-  return hash(canonicalJson(checkpoint));
+  return hash(exactJson(checkpoint));
 }
 /** Identifies one commit request, for lost-acknowledgement replay. */
 export function commitRequestDigest(
@@ -881,7 +905,7 @@ export function commitRequestDigest(
   checkpoint: CheckpointDelta,
 ): string {
   return hash(
-    canonicalJson([expected, deltaDigest(delta), checkpointDigest(checkpoint)]),
+    exactJson([expected, deltaDigest(delta), checkpointDigest(checkpoint)]),
   );
 }
 

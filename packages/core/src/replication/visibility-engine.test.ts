@@ -13,11 +13,13 @@ import {
   applyChange,
   blobReady,
   checkpointDigest,
+  commitRequestDigest,
   completionAvailability,
   completionId,
   connectionVisibilityState,
   createMemoryVisibilityCommitter,
   deltaDigest,
+  diffProjection,
   EMPTY_PROJECTION,
   evaluate,
   evidenceDigest,
@@ -488,6 +490,104 @@ describe("host-chosen keys", () => {
       "hasOwnProperty",
       "toString",
     ]);
+  });
+
+  // `canonicalJson`'s zod parse drops an own `__proto__` key, so a digest
+  // built with it cannot tell these values apart.
+  const proto = <T>(value: T) => Object.fromEntries([["__proto__", value]]);
+  const empty = () =>
+    evaluate(
+      {
+        epoch: INITIAL_VISIBILITY_EPOCH,
+        projection: EMPTY_PROJECTION,
+        world: { ...world, mappings: new Map() },
+        evidence: [],
+      },
+      { kind: "host" },
+    );
+  it("stores two writes in a row of a __proto__ checkpoint key", async () => {
+    const committer = createMemoryVisibilityCommitter();
+    await committer.commit(INITIAL_VISIBILITY_EPOCH, empty(), {});
+    const first = await committer.commit(
+      INITIAL_VISIBILITY_EPOCH,
+      empty(),
+      proto("1"),
+    );
+    expect(Object.entries(committer.read().checkpoint)).toEqual([
+      ["__proto__", "1"],
+    ]);
+    const second = await committer.commit(
+      INITIAL_VISIBILITY_EPOCH,
+      empty(),
+      proto("2"),
+    );
+    expect(second).not.toBe(first);
+    expect(second.checkpointDigest).not.toBe(first.checkpointDigest);
+    expect(Object.entries(committer.read().checkpoint)).toEqual([
+      ["__proto__", "2"],
+    ]);
+  });
+  it("deletes a __proto__ checkpoint key", async () => {
+    const committer = createMemoryVisibilityCommitter();
+    await committer.commit(INITIAL_VISIBILITY_EPOCH, empty(), proto("1"));
+    await committer.commit(INITIAL_VISIBILITY_EPOCH, empty(), proto(null));
+    expect(Object.entries(committer.read().checkpoint)).toEqual([]);
+  });
+  it("tells apart connection deltas that differ only under __proto__", async () => {
+    const active = {
+      ...empty(),
+      connections: proto({ status: "active", generation: 1 } as const),
+    };
+    const withdrawn = {
+      ...empty(),
+      connections: proto({
+        status: "withdrawn",
+        reason: "terminal_quarantine",
+        generation: 1,
+      } as const),
+    };
+    expect(deltaDigest(active)).not.toBe(deltaDigest(withdrawn));
+    expect(deltaDigest(active)).not.toBe(deltaDigest(empty()));
+    expect(commitRequestDigest(INITIAL_VISIBILITY_EPOCH, active, {})).not.toBe(
+      commitRequestDigest(INITIAL_VISIBILITY_EPOCH, withdrawn, {}),
+    );
+    const committer = createMemoryVisibilityCommitter();
+    expect(
+      (await committer.commit(INITIAL_VISIBILITY_EPOCH, active, {})).epoch,
+    ).toBe(1);
+    await expect(
+      committer.commit(INITIAL_VISIBILITY_EPOCH, withdrawn, {}),
+    ).rejects.toBeInstanceOf(VisibilityEpochConflict);
+  });
+  it("tells apart rows and evidence that differ only under a __proto__ data key", () => {
+    // The planner's operation parse drops the key before rows exist, so this
+    // states the engine's own comparison and digest directly.
+    const withData = (value: string) =>
+      ({
+        ...a,
+        data: Object.fromEntries([
+          ["id", "a"],
+          ["__proto__", value],
+        ]),
+      }) as typeof a;
+    const id = rowId(C, binding.stream, "a");
+    const projection = (value: string): VisibilityProjection => ({
+      ...EMPTY_PROJECTION,
+      rows: { [id]: { state: "live", winner: withData(value) } },
+    });
+    expect(
+      Object.keys(
+        diffProjection(
+          INITIAL_VISIBILITY_EPOCH,
+          projection("x"),
+          projection("y"),
+          "digest",
+        ).rows,
+      ),
+    ).toEqual([id]);
+    expect(evidenceDigest(world, [registration, withData("x")])).not.toBe(
+      evidenceDigest(world, [registration, withData("y")]),
+    );
   });
 });
 
