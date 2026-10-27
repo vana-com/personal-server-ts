@@ -204,3 +204,4 @@ This is an unpublished implementation requiring the Gateway contract at `data-ga
 
 - [DPv1 Protocol Spec](docs/260121-data-portability-protocol-spec.md) — canonical protocol behavior
 - [Architecture](docs/260127-personal-server-scaffold.md) — design decisions and repo structure
+- [Replication host contract](docs/replication/host-contract.md) — transport, device identity, host ports and opt-in for replication ([ADR 0001](docs/replication/adr-0001-transport-and-device-identity.md))
