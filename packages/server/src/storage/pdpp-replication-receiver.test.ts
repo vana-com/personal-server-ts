@@ -958,13 +958,16 @@ it("makes a completion unavailable, not the import a failure, when live rows do 
   expect(value(d)?.data.text).toBe("snapshot");
 });
 
-describe("lifecycle evidence outranks a binding conflict, as in the engine", () => {
+describe("binding-conflict precedence, as in the engine", () => {
   // Evidence for conn_a names another method; the host then maps conn_a.
   const foreign = (op: ReplicaOperation): ReplicaOperation => ({
     ...op,
     methodId: "other",
   });
-  function provisionOver(operations: ReplicaOperation[]) {
+  function provisionOver(
+    operations: ReplicaOperation[],
+    local?: (d: ReturnType<typeof device>) => void,
+  ) {
     const d = device(false);
     send(d, operations.map(foreign));
     d.store.registerConnection({
@@ -973,22 +976,34 @@ describe("lifecycle evidence outranks a binding conflict, as in the engine", () 
       method: "collector",
       label: "A",
     });
+    local?.(d);
     d.receiver.retry({ credential: "replica-secret" });
     expect(d.store.replicaBindingConflict("conn_a")).toBe(true);
     return d;
   }
-  it("applies a deletion", () => {
-    const d = provisionOver([
-      registration(),
-      {
-        ...registration(),
-        kind: "connection-delete",
-        revision: { counter: 2, writerId: "remote", operationId: "delete" },
-      },
-    ]);
-    expect(d.store.getInstanceBinding("conn_a").deletedAt).toBe(
-      "replica-deleted",
+  it("never applies a deletion that names another binding", () => {
+    const d = provisionOver(
+      [
+        registration(),
+        {
+          ...registration(),
+          kind: "connection-delete",
+          revision: { counter: 2, writerId: "remote", operationId: "delete" },
+        },
+      ],
+      (d) => put(d, "local"),
     );
+    expect(d.store.getInstanceBinding("conn_a").deletedAt).toBeNull();
+    expect(
+      d.db
+        .prepare(
+          "SELECT record_key FROM pdpp_records WHERE instance = 'conn_a' AND deleted = 1",
+        )
+        .all(),
+    ).toEqual([]);
+    expect(value(d)?.data.text).toBe("local");
+    d.reopen();
+    expect(d.store.getInstanceBinding("conn_a").deletedAt).toBeNull();
   });
   it("applies an operation-ID equivocation's terminal quarantine", () => {
     const record = upsert();

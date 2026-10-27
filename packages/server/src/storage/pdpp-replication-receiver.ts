@@ -403,7 +403,7 @@ export function createReplicaReceiver(deps: {
       });
       // A retained disagreement is a durable, connection-scoped fact, never
       // a throw that would block every import and retry (#428 F2). It holds
-      // even when deletion or equivocation outranks it (#426).
+      // even when terminal quarantine or equivocation outranks it (#426).
       if (contradictsMapping(facts))
         recordBindingConflict(id, ops, facts.mapping, !mapping);
       if (mapping) statuses.set(id, connectionFromFacts(context, facts));

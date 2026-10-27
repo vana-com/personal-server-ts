@@ -160,21 +160,24 @@ export function refConnectionStatus(
   }
   const all = owned.filter((op) => op.connectionId === connection);
   const ops = unique.filter((op) => op.connectionId === connection);
-  // A connection deletion suppresses the connection first.
-  if (ops.some((op) => op.kind === "connection-delete"))
-    return { status: "deleted", generation: 1 };
   // Equivocated variants still count as binding evidence.
   const bindings = new Set(
     all.map((op) => JSON.stringify([op.sourceId, op.methodId])),
   );
-  if (
-    world.terminal.has(connection) ||
-    equivocated.has(connection) ||
+  const conflicted =
     bindings.size > 1 ||
     all.some(
       (op) =>
         op.sourceId !== mapping.sourceId || op.methodId !== mapping.methodId,
-    )
+    );
+  // A connection deletion suppresses the connection first, unless the
+  // evidence names another binding: that evidence is not about it.
+  if (!conflicted && ops.some((op) => op.kind === "connection-delete"))
+    return { status: "deleted", generation: 1 };
+  if (
+    world.terminal.has(connection) ||
+    equivocated.has(connection) ||
+    conflicted
   )
     return { status: "withdrawn", generation: 1 };
   if (!ops.some((op) => op.kind === "connection-register"))
