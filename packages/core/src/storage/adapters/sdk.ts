@@ -90,7 +90,7 @@ export function createSdkStorageAdapter(
 // neither and so surface as errors — safe, never a false "missing". When
 // vana-sdk grows a status field on StorageError, the property check takes
 // over and the regex becomes dead fallback.
-function isDefinitiveNotFound(err: unknown): boolean {
+export function isDefinitiveNotFound(err: unknown): boolean {
   const status =
     numericProperty(err, "status") ?? numericProperty(err, "statusCode");
   if (status !== undefined) {

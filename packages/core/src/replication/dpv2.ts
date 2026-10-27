@@ -21,6 +21,8 @@ import {
   type Hex,
 } from "viem";
 import type { BoundedStorageAdapter } from "../storage/adapters/interface.js";
+import { isDefinitiveNotFound } from "../storage/adapters/sdk.js";
+import { abortable } from "./coordinator.js";
 import {
   AdditionsBudget,
   AdditionsBudgetExceeded,
@@ -37,6 +39,8 @@ import {
 const tombstoneDataHash = keccak256(
   stringToHex("vana.data-point.tombstone.v1"),
 );
+/** Every peer read has a finite default, including existence probes. */
+export const REPLICA_RECEIVE_TIMEOUT_MS = 30_000;
 const tombstoneMetadataHash = keccak256(
   stringToHex("vana.data-point.tombstone.metadata.v1"),
 );
@@ -133,7 +137,11 @@ export interface ReplicaTransportPort {
     read: ReplicaRead,
   ): Promise<Uint8Array>;
   /** False only when storage definitively has no object at the address. */
-  hasFragment(scope: string, digest: string): Promise<boolean>;
+  hasFragment(
+    scope: string,
+    digest: string,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
   put(manifest: PreparedManifest): Promise<void>;
   /** The batch's single AddData registration, at version `manifest.version`. */
   register(manifest: PreparedManifest): Promise<void>;
@@ -171,14 +179,21 @@ export function createDpv2ReplicaTransport(deps: {
   const fragmentUrl = (scope: string, digest: string) =>
     deps.storage.urlForKey(replicaFragmentKey(scope, digest));
   async function download(url: string, read: ReplicaRead) {
+    const timeout = AbortSignal.timeout(REPLICA_RECEIVE_TIMEOUT_MS);
+    const signal = read.signal
+      ? AbortSignal.any([read.signal, timeout])
+      : timeout;
     let bytes: Uint8Array;
     // The bounded reader charges the chunks and their contiguous copy.
     try {
-      bytes = await deps.storage.downloadBounded(
-        url,
-        new AdditionsBudget(2 * read.maxBytes, undefined, read.signal),
+      bytes = await abortable(signal, () =>
+        deps.storage.downloadBounded(
+          url,
+          new AdditionsBudget(2 * read.maxBytes, undefined, signal),
+        ),
       );
     } catch (error) {
+      signal.throwIfAborted();
       if (error instanceof AdditionsBudgetExceeded)
         throw new ReplicaObjectRefused("oversize");
       throw error;
@@ -201,8 +216,18 @@ export function createDpv2ReplicaTransport(deps: {
     },
     getFragment: (scope, digest, read) =>
       download(fragmentUrl(scope, digest), read),
-    hasFragment: (scope, digest) =>
-      deps.storage.exists(fragmentUrl(scope, digest)),
+    async hasFragment(scope, digest, signal) {
+      try {
+        // A zero-byte bounded probe proves presence as soon as bytes arrive.
+        // StorageAdapter.exists may hide a full SDK download; never call it.
+        await download(fragmentUrl(scope, digest), { maxBytes: 0, signal });
+        return true;
+      } catch (error) {
+        if (error instanceof ReplicaObjectRefused) return true;
+        if (isDefinitiveNotFound(error)) return false;
+        throw error;
+      }
+    },
     async put(manifest) {
       await deps.storage.upload(
         replicaManifestKey(manifest.scope, manifest.version),

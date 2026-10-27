@@ -78,6 +78,88 @@ afterEach(() => {
 });
 
 describe("bounded reads", () => {
+  for (const fragment of [false, true])
+    it(`cancels a stalled ${fragment ? "fragment" : "manifest"} read at its default deadline`, async () => {
+      const controller = new AbortController();
+      const timeout = vi
+        .spyOn(AbortSignal, "timeout")
+        .mockReturnValue(controller.signal);
+      let cancelled = false;
+      vi.stubGlobal(
+        "fetch",
+        async () =>
+          new Response(
+            new ReadableStream({
+              start(stream) {
+                stream.enqueue(new Uint8Array([1]));
+              },
+              cancel() {
+                cancelled = true;
+              },
+            }),
+          ),
+      );
+      const storage = createVanaSyncStorageAdapter({
+        config: ServerConfigSchema.parse({
+          storage: {
+            config: { vana: { apiUrl: "https://storage.test.invalid" } },
+          },
+          gateway: { chainId: 14800 },
+        }),
+        serverOwner: owner,
+        serverAccount: {
+          address: owner,
+          signMessage: async () => "0x12" as const,
+        },
+        reads: "public",
+      });
+      const port = createDpv2ReplicaTransport({
+        owner,
+        masterKey: new Uint8Array(32).fill(5),
+        storage,
+        gateway: { registerDataPoint: async () => ({}) as never },
+        feed: {
+          listDataPointsByOwner: async () => ({ dataPoints: [], cursor: null }),
+        } as never,
+        signer: { signAddData: async () => "0x12" },
+        evidence: async () => ({ head: null, chain: null, pending: false }),
+      });
+      const request = fragment
+        ? port.getFragment(scope, `sha256:${"0".repeat(64)}`, {
+            maxBytes: 4096,
+          })
+        : port.get(scope, 1, { maxBytes: 4096 });
+      // Let the reader acquire the stream and block on the next chunk.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const result = request.then(
+        () => "completed",
+        () => "aborted",
+      );
+      controller.abort();
+      expect(
+        await Promise.race([
+          result,
+          new Promise((resolve) =>
+            setTimeout(() => resolve("still pending"), 30),
+          ),
+        ]),
+      ).toBe("aborted");
+      expect(timeout).toHaveBeenCalledWith(30_000);
+      expect(cancelled).toBe(true);
+    });
+
+  it("bounds existence probes instead of calling the adapter's unbounded exists", async () => {
+    const objects = new Map<string, Uint8Array>();
+    const { port, reads } = transport(objects, true);
+    const digest = `sha256:${"0".repeat(64)}`;
+    objects.set(
+      replicaFragmentKey(scope, digest),
+      new Uint8Array(8 * 1024 * 1024),
+    );
+    await expect(port.hasFragment(scope, digest)).resolves.toBe(true);
+    expect(reads.length).toBe(1);
+    expect(reads[0]).toBeLessThanOrEqual(2048);
+  });
   it("refuses a storage adapter without bounded reads", () => {
     expect(() => transport(new Map(), false)).toThrow(
       "replication needs a storage adapter with bounded reads",

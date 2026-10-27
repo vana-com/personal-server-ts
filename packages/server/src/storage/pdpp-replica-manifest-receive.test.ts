@@ -19,6 +19,7 @@ import {
   prepareReplicaManifest,
   replicaDigest,
   replicaManifestFacts,
+  replicaFragmentKey,
   replicaMetadataHash,
   replicaScope,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
@@ -503,3 +504,209 @@ it("random and mutated manifests that match their commitment never retry as down
     expect(row, slots[index]).toMatchObject({ state: "quarantined" });
   expect(rows.some((row) => row?.reason === "download_failed")).toBe(false);
 }, 60000);
+
+it("fragment JSON crosses the same bounded parse before allocation as manifest JSON", async () => {
+  const net = network({ cap: 32768 });
+  const receiver = transportDevice(net, { cap: 32768 });
+  const r = remoteReplicaTestWriter(net.roster, owner);
+  const signed = await injectReplicaBatch(net, {
+    writer: r.writers.transport,
+    operations: [upsert(r.writers.operation, "signed")],
+    sign: r.sign,
+  });
+  const text = `{"collectedAt":${JSON.stringify(at)},"data":{"fragment":null,"padding":${"[".repeat(6000)}0${"]".repeat(6000)}},"scope":${JSON.stringify(signed.manifest.scope)},"version":"1.0"}`;
+  const encrypted = await net.port.encrypt(
+    signed.manifest.scope,
+    new TextEncoder().encode(text),
+  );
+  const wrapper = wrapperOf(signed.manifest.plaintext);
+  const manifest = wrapper.data.manifest;
+  manifest.batch = "c".repeat(32);
+  manifest.fragments = [
+    { digest: replicaDigest(encrypted), bytes: encrypted.length },
+  ];
+  // Make the framed bound large enough, independently of the invalid JSON.
+  manifest.totalBytes = 32768;
+  manifest.authority = await r.sign(replicaManifestFacts(manifest, 2));
+  net.blobs.set(
+    replicaFragmentKey(signed.manifest.scope, replicaDigest(encrypted)),
+    encrypted,
+  );
+  const slot = await registerPlaintext(
+    net,
+    signed.manifest.scope,
+    2,
+    encode(wrapper),
+  );
+  const parse = vi.spyOn(JSON, "parse");
+  try {
+    await cycles([receiver], 3);
+    expect(rowOf(receiver, slot)).toMatchObject({
+      state: "quarantined",
+      reason: "fragment_mismatch",
+    });
+    expect(parse.mock.calls.some(([input]) => input === text)).toBe(false);
+  } finally {
+    parse.mockRestore();
+  }
+});
+
+it("a deep inbox processes at most fifty manifests per step even with a larger host quantum", async () => {
+  const net = network();
+  const receiver = transportDevice(net, {
+    worker: {
+      quantum: {
+        retain: 0,
+        prepare: 0,
+        publish: 0,
+        discover: 0,
+        download: 1000,
+        fetch: 0,
+        import: 0,
+        revalidate: 0,
+        reconcile: 0,
+      },
+    },
+  });
+  // Seed already-discovered slots. This tests processing independently of the
+  // feed's page size and the separate discovery admission bound.
+  const writer = "a".repeat(32);
+  const scope = replicaScope(writer);
+  for (let version = 1; version <= 151; version++) {
+    receiver.db
+      .prepare(
+        "INSERT INTO pdpp_transport_manifests_in (slot,scope,version,writer) VALUES (?,?,?,?)",
+      )
+      .run(slotKey(scope, version), scope, version, writer);
+  }
+  await receiver.step({ units: Infinity });
+  expect(
+    net.calls.evidence.filter((key) => key.startsWith(`${scope}/`)),
+  ).toHaveLength(50);
+});
+
+it("fragment outcomes distinguish definitive absence, transient failure, and committed invalid bytes", async () => {
+  for (const kind of ["missing", "offline", "corrupt", "invalid"] as const) {
+    const net = network();
+    const receiver = transportDevice(net);
+    const r = remoteReplicaTestWriter(net.roster, owner);
+    const signed = await injectReplicaBatch(net, {
+      writer: r.writers.transport,
+      operations: [upsert(r.writers.operation, kind)],
+      sign: r.sign,
+    });
+    const entry = wrapperOf(signed.manifest.plaintext).data.manifest
+      .fragments[0];
+    const key = replicaFragmentKey(signed.manifest.scope, entry.digest);
+    const original = net.blobs.get(key)!;
+    if (kind === "missing") net.blobs.delete(key);
+    if (kind === "offline")
+      net.faults.get = (url) =>
+        url.includes("/fragments/") ? new Error("offline") : undefined;
+    if (kind === "corrupt") net.blobs.set(key, new Uint8Array(original.length));
+    let slot = signed.slot;
+    if (kind === "invalid") {
+      const encrypted = await net.port.encrypt(
+        signed.manifest.scope,
+        new TextEncoder().encode("not JSON"),
+      );
+      const wrapper = wrapperOf(signed.manifest.plaintext);
+      wrapper.data.manifest.batch = "c".repeat(32);
+      wrapper.data.manifest.fragments = [
+        { digest: replicaDigest(encrypted), bytes: encrypted.length },
+      ];
+      wrapper.data.manifest.authority = await r.sign(
+        replicaManifestFacts(wrapper.data.manifest, 2),
+      );
+      net.blobs.set(
+        replicaFragmentKey(signed.manifest.scope, replicaDigest(encrypted)),
+        encrypted,
+      );
+      slot = await registerPlaintext(
+        net,
+        signed.manifest.scope,
+        2,
+        encode(wrapper),
+      );
+    }
+    await cycles([receiver], 3);
+    if (kind === "offline") {
+      expect(rowOf(receiver, slot)).toMatchObject({ state: "ready" });
+      expect(
+        receiver.db
+          .prepare(
+            "SELECT outcome,reason FROM pdpp_transport_fragments_in WHERE slot=?",
+          )
+          .get(slot),
+      ).toMatchObject({ outcome: "retry", reason: "download_failed" });
+      net.faults.get = undefined;
+      await cycles([receiver], 4);
+      expect(receiver.get()).toMatchObject({ text: kind });
+    } else
+      expect(rowOf(receiver, slot), kind).toMatchObject({
+        state: "quarantined",
+        reason: kind === "missing" ? "fragment_missing" : "fragment_mismatch",
+      });
+  }
+});
+
+it("committed fragment profiles are refused before an Argon2 KDF runs", async () => {
+  const net = network({ realCrypto: true });
+  const receiver = transportDevice(net);
+  const r = remoteReplicaTestWriter(net.roster, owner);
+  const signed = await injectReplicaBatch(net, {
+    writer: r.writers.transport,
+    operations: [upsert(r.writers.operation, "honest")],
+    sign: r.sign,
+  });
+  const encrypted = await openpgp.encrypt({
+    message: await openpgp.createMessage({ binary: new Uint8Array([1]) }),
+    passwords: ["not-the-scope-key"],
+    format: "binary",
+    config: {
+      aeadProtect: true,
+      s2kType: openpgp.enums.s2k.argon2,
+      s2kArgon2Params: { passes: 1, parallelism: 1, memoryExponent: 10 },
+    },
+  });
+  const s2k = (
+    (await openpgp.readMessage({ binaryMessage: encrypted }))
+      .packets[0] as unknown as { s2k: { produceKey(): unknown } }
+  ).s2k;
+  const wrapper = wrapperOf(signed.manifest.plaintext);
+  wrapper.data.manifest.batch = "c".repeat(32);
+  wrapper.data.manifest.fragments = [
+    { digest: replicaDigest(encrypted), bytes: encrypted.length },
+  ];
+  wrapper.data.manifest.authority = await r.sign(
+    replicaManifestFacts(wrapper.data.manifest, 2),
+  );
+  net.blobs.set(
+    replicaFragmentKey(signed.manifest.scope, replicaDigest(encrypted)),
+    encrypted,
+  );
+  const slot = await registerPlaintext(
+    net,
+    signed.manifest.scope,
+    2,
+    encode(wrapper),
+  );
+  const kdf = vi
+    .spyOn(
+      Object.getPrototypeOf(s2k) as { produceKey(): unknown },
+      "produceKey",
+    )
+    .mockImplementation(() => {
+      throw new Error("the fragment KDF ran");
+    });
+  try {
+    await cycles([receiver], 3);
+    expect(rowOf(receiver, slot)).toMatchObject({
+      state: "quarantined",
+      reason: "fragment_mismatch",
+    });
+    expect(kdf).not.toHaveBeenCalled();
+  } finally {
+    kdf.mockRestore();
+  }
+}, 30000);

@@ -22,10 +22,7 @@ import {
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
-  decodeReplicaFragment,
-  fragmentMatchesManifest,
   prepareReplicaManifest,
-  replicaDigest,
   replicaManifestFacts,
   replicaScope,
   replicaWriterOf,
@@ -45,7 +42,11 @@ import {
   type ReplicaTransportPort,
   type ReplicaRegistrationEvidence,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
-import { receiveReplicaManifest } from "@opendatalabs/personal-server-ts-core/replication/receive";
+import {
+  receiveReplicaManifest,
+  receiveReplicaFragment,
+  REPLICA_RECEIVE_TIMEOUT_MS,
+} from "@opendatalabs/personal-server-ts-core/replication/receive";
 import {
   abortable,
   createReplicaCoordinator,
@@ -1305,9 +1306,13 @@ export function createReplicaTransportWorker(deps: {
           scope: row.scope,
           owner: state().owner,
           maxBytes: cap,
-          read: () =>
+          signal,
+          read: (readSignal) =>
             call(signal, () =>
-              transport.get(row.scope, row.version, { maxBytes: cap, signal }),
+              transport.get(row.scope, row.version, {
+                maxBytes: cap,
+                signal: readSignal,
+              }),
             ),
           decrypt: (encrypted) =>
             call(signal, () => transport.decrypt(row.scope, encrypted)),
@@ -1435,53 +1440,45 @@ export function createReplicaTransportWorker(deps: {
     async run(item, signal) {
       const row = item.row;
       const scope = replicaScope(row.writer);
-      let encrypted: Uint8Array;
+      let fragment: ReplicaFragment;
       try {
-        encrypted = await call(signal, () =>
-          transport.getFragment(scope, row.digest, {
-            maxBytes: row.bytes,
-            signal,
-          }),
-        );
+        const receipt = await receiveReplicaFragment({
+          scope,
+          owner: state().owner,
+          manifest: manifestOf(row.slot),
+          index: row.position,
+          maxBytes: row.bytes,
+          signal,
+          read: (readSignal) =>
+            call(readSignal, () =>
+              transport.getFragment(scope, row.digest, {
+                maxBytes: row.bytes,
+                signal: readSignal,
+              }),
+            ),
+          decrypt: (encrypted) => transport.decrypt(scope, encrypted),
+        });
+        if (receipt.tag === "refused")
+          return quarantineFragment(row, receipt.reason);
+        fragment = receipt.fragment;
       } catch (error) {
-        // More bytes than the finalized manifest names are not this fragment.
+        if (signal.aborted)
+          return verdict(retryFromError(error, "download_failed"));
         if (error instanceof ReplicaObjectRefused)
           return quarantineFragment(row, "fragment_mismatch");
-        // Only a definitive not-found is proof; anything else is transient.
+        // Only definitive absence proves a missing fragment. Transient read,
+        // deadline and cancellation failures remain retries.
         try {
           if (
             !(await call(signal, () =>
-              transport.hasFragment(scope, row.digest),
+              transport.hasFragment(scope, row.digest, signal),
             ))
           )
             return quarantineFragment(row, "fragment_missing");
         } catch {
-          // The original failure decides the retry.
+          // Preserve the original transient failure.
         }
         return verdict(retryFromError(error, "download_failed"));
-      }
-      // The finalized manifest names these exact bytes. Storage overwrites
-      // without checks and reads without auth, so anything else is rejected
-      // before it is decrypted.
-      if (
-        encrypted.length !== row.bytes ||
-        replicaDigest(encrypted) !== row.digest
-      )
-        return quarantineFragment(row, "fragment_mismatch");
-      let fragment: ReplicaFragment;
-      try {
-        // The bytes are committed: a fragment that does not decrypt, decode
-        // or match its manifest is the writer's fault, not storage damage.
-        const plaintext = await transport.decrypt(scope, encrypted);
-        fragment = decodeReplicaFragment(plaintext, scope, state().owner);
-        if (
-          !fragmentMatchesManifest(fragment, manifestOf(row.slot), row.position)
-        )
-          return quarantineFragment(row, "fragment_mismatch");
-      } catch (error) {
-        if (signal.aborted)
-          return verdict(retryFromError(error, "download_failed"));
-        return quarantineFragment(row, "fragment_mismatch");
       }
       return withPlan(
         { tag: "progress", receipt: { phase: "fetch", key: item.id } },
@@ -2181,15 +2178,17 @@ export function createReplicaTransportWorker(deps: {
       prepare: 4,
       publish: 50,
       discover: 1,
-      download: 50,
       fetch: 50,
       revalidate: 50,
       import: 50,
       reconcile: 1,
       ...deps.quantum,
+      // A host may reduce this quantum, but a deep inbox cannot remove the
+      // per-step memory bound by increasing it (even to Infinity).
+      download: Math.min(50, deps.quantum?.download ?? 50),
     },
     perWriter: deps.perWriter,
-    deadlineMs: deps.deadlineMs,
+    deadlineMs: deps.deadlineMs ?? REPLICA_RECEIVE_TIMEOUT_MS,
     background: ["revalidate"],
     clock: now,
     ...(transport.finality && {

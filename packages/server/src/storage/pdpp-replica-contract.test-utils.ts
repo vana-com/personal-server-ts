@@ -354,7 +354,7 @@ export function network(
         if (error) throw error;
       }
       const bytes = blobs.get(key);
-      if (!bytes) throw new Error("404");
+      if (!bytes) throw Object.assign(new Error("404"), { status: 404 });
       return new Uint8Array(bytes);
     },
     /** The production bounded reader over this storage's bytes. */

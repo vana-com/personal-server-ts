@@ -122,7 +122,12 @@ function boundedBlobDownload(
     });
     if (!response.ok) {
       await response.body?.cancel();
-      throw new Error(`Blob download failed (${response.status})`);
+      throw Object.assign(
+        new Error(`Blob download failed (${response.status})`),
+        {
+          status: response.status,
+        },
+      );
     }
     return readBoundedResponse(response, budget);
   };

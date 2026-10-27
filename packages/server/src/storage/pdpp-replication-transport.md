@@ -154,15 +154,17 @@ only if the version is still next when the manifest commits. Fragments (format
 version 3) carry no statement: the signed manifest names their exact bytes.
 
 **Receiver checks**, in §3.4 order. The receiver waits for finality, then
-passes the manifest through one boundary, `receiveReplicaManifest`
-(`core/src/replication/receive.ts`), which returns a typed receipt. The read
-stops at the storage cap (`maxBlobBytes`); the DPv2 transport refuses a
+passes the manifest through `receiveReplicaManifest` and fragments through
+`receiveReplicaFragment`. Both use the same read/decrypt/parse boundary,
+`receiveReplicaJson` (`core/src/replication/receive.ts`), and return typed
+receipts. Every object read has a 30-second deadline and propagates
+cancellation, including fragment existence probes. The read stops at the storage cap (`maxBlobBytes`); the DPv2 transport refuses a
 storage adapter without `downloadBounded`, so no read is unbounded. Before any
-KDF runs, decryption refuses a compressed OpenPGP message and any message
-outside the profile the SDK writers emit: one v4 password packet with
-iterated, salted SHA-256 S2K at count byte 224 or less, then one v1
-integrity-protected data packet. The plaintext is then scanned without
-recursion, and nesting deeper than `REPLICA_MAX_JSON_DEPTH` (16) or more
+KDF runs, decryption refuses any message outside the profile the SDK writers
+emit: one v4 password packet with iterated, salted SHA-256 S2K at count byte 224 or less, then one v1
+integrity-protected data packet. Compression inside the encrypted packet is
+refused during decryption before inflation. The plaintext is then scanned
+without recursion, and nesting deeper than `REPLICA_MAX_JSON_DEPTH` (16) or more
 structural tokens than `REPLICA_MAX_JSON_TOKENS` is refused before
 `JSON.parse`. No writer makes any of these bytes, and none can be checked
 against the commitment, whose data hash is over the plaintext and whose
@@ -177,18 +179,23 @@ classified: any throw while classifying them is a typed refusal,
 terminal for that slot. Only an authorized manifest's
 fragments are fetched. Each fragment read stops at its manifest entry's
 length and is charged against the step's byte budget; its sha256 is checked
-before it is decrypted.
+before it is decrypted. The same packet-profile and bounded-JSON checks
+apply to fragments. Once their ciphertext matches the signed entry, a decrypt,
+parse or binding failure is `fragment_mismatch`. Definitive absence is
+`fragment_missing`; a transient failure, abort or deadline retries. Existence
+probes use zero-byte bounded reads, since `StorageAdapter.exists` can hide a
+full SDK download.
 
-| Check                                                                                                                                             | Refusal                 |
-| ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
-| Wrapper is the canonical envelope; fragment lengths are not zero; sequence, predecessor and `collectedAt` agree; entry bytes fit the framed bound | `manifest_invalid`      |
-| Statement parses, signs this manifest at this version, recovers to `server`                                                                       | `signature_invalid`     |
-| Owner, chain id and environment match this receiver                                                                                               | `partition_mismatch`    |
-| Roster has a record for the server                                                                                                                | `server_not_registered` |
-| Roster owner is the statement owner                                                                                                               | `roster_owner_mismatch` |
-| Record is not revoked and has the statement's registration id                                                                                     | `server_not_registered` |
-| The slot's scope writer is the transport writer the statement derives                                                                             | `writer_mismatch`       |
-| Every operation names the operation writer the statement derives (at import)                                                                      | `writer_mismatch`       |
+| Check                                                                                                                                                                                                                                    | Refusal                 |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| Wrapper is the canonical envelope; fragment lengths are positive safe integers; hashes are unique; all numeric fields are finite safe integers in range; sequence, predecessor and `collectedAt` agree; entry bytes fit the framed bound | `manifest_invalid`      |
+| Statement parses, signs this manifest at this version, recovers to `server`                                                                                                                                                              | `signature_invalid`     |
+| Owner, chain id and environment match this receiver                                                                                                                                                                                      | `partition_mismatch`    |
+| Roster has a record for the server                                                                                                                                                                                                       | `server_not_registered` |
+| Roster owner is the statement owner                                                                                                                                                                                                      | `roster_owner_mismatch` |
+| Record is not revoked and has the statement's registration id                                                                                                                                                                            | `server_not_registered` |
+| The slot's scope writer is the transport writer the statement derives                                                                                                                                                                    | `writer_mismatch`       |
+| Every operation names the operation writer the statement derives (at import)                                                                                                                                                             | `writer_mismatch`       |
 
 Each refusal is a typed quarantine of that slot. The framed bound ties the
 sum of entry bytes to the signed `totalBytes`: each fragment is encrypted
@@ -271,6 +278,10 @@ imported batch identities. One worker per database is the host contract.
    withdrawn.
 
 Due outbox/inbox entries are selected by retry deadline, then insertion order.
+Each step processes at most 50 inbox manifests, even when the host requests a
+larger download quantum. This bounds each step independently of inbox depth.
+The server defaults each attempt to a 30-second deadline (`deadlineMs` can
+override it); object reads retain their own 30-second limit.
 Expected finality waits have a separate durable state and do not increment the
 error counter. The optional `finality.head()` hint polls the finalized height at
 most once per two seconds. Parked waits are filtered before the 50-row budget;

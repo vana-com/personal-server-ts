@@ -192,29 +192,38 @@ version 3) carry neither; the signed list names their exact bytes.
 
 ### 3.4 Receiver checks
 
-In this order. Steps 1 to 6 apply to the manifest, after its registration is
-finalized and its bytes match the registered hash, and before any fragment is
-fetched. Each fragment is then checked for length and sha256 against the
-manifest before it is decrypted. Each failure is a typed quarantine of that
+In this order. Steps 1 to 6 apply to the manifest after its registration is
+finalized, and before any fragment is fetched. Step 1 checks its bytes against
+the registered hash. Each fragment is then checked for length and sha256
+against the manifest before it is decrypted. Each failure is a typed quarantine of that
 item only. A batch that fails any check never touches writer state, so it
 cannot occupy a sequence or a predecessor slot of a real writer.
 
-1. One boundary, `receiveReplicaManifest` (`core/src/replication/receive.ts`),
-   runs this step. Read the manifest, stopping at the storage cap. Before any
-   KDF runs, refuse a compressed OpenPGP message and any message outside the
+1. The manifest and fragment entry points share `receiveReplicaJson`
+   (`core/src/replication/receive.ts`). Both read with a byte bound and a
+   30-second deadline, propagate cancellation, check the packet profile,
+   decrypt and scan JSON before parsing it. Read the manifest, stopping at
+   the storage cap. Before any KDF runs, refuse any message outside the
    writers' profile: one v4 password packet with iterated, salted SHA-256 S2K
    at count byte 224 or less, then one v1 integrity-protected data packet.
-   Decrypt, then refuse plaintext nested deeper than 16 or with more
-   structural tokens than a manifest at the fragment limit needs, before it
+   During decryption refuse compression before inflation. Then refuse
+   plaintext nested deeper than 16 or with more structural tokens than a manifest at the fragment limit needs, before it
    is parsed. Each refusal is `manifest_invalid`, because no writer makes such
    bytes and the commitment hashes plaintext the receiver would have to make
    or parse. Check the plaintext's hash pair against the finalized
    commitment; a mismatch, or plaintext with no `collectedAt`, retries as
    `commitment_mismatch`. Only then decode. A wrapper that is not the
-   canonical envelope, a zero fragment length, facts that disagree with each
-   other, entry bytes over the framed bound (§6), or anything else that throws
-   while decoding is `manifest_invalid`. A manifest without a statement is
-   `signature_invalid`.
+   canonical envelope, a zero fragment length, duplicate fragment hashes,
+   negative, fractional, non-finite or unsafe numeric fields, facts that
+   disagree with each other, entry bytes over the framed bound (§6), or
+   anything else that throws while decoding is `manifest_invalid`. A manifest without a statement is
+   `signature_invalid`. A fragment is checked against its ciphertext commitment
+   before decryption, then crosses the same packet, decrypt and bounded-parse
+   checks. A failed fragment check is `fragment_mismatch`; definitive storage
+   absence is `fragment_missing`. Both quarantine the slot. Transient reads,
+   cancellation and deadlines retry. No fragment is fetched before the manifest
+   is authorized. At most 50 inbox manifests are processed per step, even if
+   the host requests a larger download quantum.
 2. Recover the signer. It must equal `server`, and the statement must sign
    this manifest at the version it is registered at.
 3. Partition: `statement.owner`, `chainId` and `environment` must equal the
@@ -342,7 +351,11 @@ length. The DPv2 adapter reads only through the storage adapter's
 `downloadBounded`, which stops on `Content-Length` or cancels the stream; it
 refuses at construction a storage adapter without one. Both Vana storage
 adapters, signed and public-read, provide it. An oversize read throws
-`ReplicaObjectRefused`.
+`ReplicaObjectRefused`. The fragment existence probe also uses a zero-byte
+bounded read, never `StorageAdapter.exists`, which may buffer a whole object.
+Object reads default to a 30-second deadline, including the probe; the server
+worker also defaults each attempt to 30 seconds. A host can configure the
+worker attempt deadline. Deadline and cancellation failures remain retries.
 
 The adapter must stop its I/O on abort. `abortable` (`coordinator.ts:100-123`)
 only drops a late result. Adapters do not retry; a failure is a verdict the

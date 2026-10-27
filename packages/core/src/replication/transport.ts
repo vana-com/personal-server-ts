@@ -280,7 +280,15 @@ export function decodeReplicaFragment(
   scope: string,
   owner: string,
 ): ReplicaFragment {
-  const { encoded, value } = parseReplicaJson(plaintext);
+  return decodeParsedReplicaFragment(parseReplicaJson(plaintext), scope, owner);
+}
+
+/** Fragment decoding after the shared receive boundary's bounded parse. */
+export function decodeParsedReplicaFragment(
+  { encoded, value }: ParsedReplicaJson,
+  scope: string,
+  owner: string,
+): ReplicaFragment {
   const wrapper = DataFileEnvelopeSchema.parse(value);
   const fragment = replicaFragmentSchema.parse(wrapper.data.fragment);
   if (
@@ -475,6 +483,8 @@ export function decodeParsedReplicaManifest(
     if (
       wrapper.data.collectedAt !== manifest.collectedAt ||
       (manifest.sequence === 1) !== (manifest.previous === null) ||
+      new Set(manifest.fragments.map((entry) => entry.digest)).size !==
+        manifest.fragments.length ||
       manifest.fragments.length > manifest.totalBytes ||
       manifest.fragments.reduce((sum, f) => sum + f.bytes, 0) >
         replicaFramedBytesBound(manifest.totalBytes, manifest.fragments.length)
