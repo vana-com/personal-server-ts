@@ -384,7 +384,7 @@ describe("upload worker", () => {
 
       const results = await uploadAll(deps);
 
-      expect(results.map((r) => r.path)).toEqual([
+      expect(results.map((r) => r.path).sort()).toEqual([
         "a/1.json",
         "memory.claude/2.json",
       ]);
@@ -433,6 +433,93 @@ describe("upload worker", () => {
         stale.collectedAt,
         { id: stale.id, path: stale.path },
       );
+    });
+
+    it("orders memory snapshots by time, not by string, for sub-second stamps", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const older = makeEntry({
+        id: 41,
+        path: "memory.claude/a.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00Z",
+      });
+      const newer = makeEntry({
+        id: 42,
+        path: "memory.claude/b.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.500Z",
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        older,
+        newer,
+      ]);
+
+      const results = await uploadAll(deps);
+
+      expect(results.map((r) => r.path)).toEqual(["memory.claude/b.json"]);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.claude",
+        older.collectedAt,
+        { id: older.id, path: older.path },
+      );
+    });
+
+    it("publishes the scope's latest local version even when it is beyond the batch page", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const inPage = makeEntry({
+        id: 51,
+        path: "memory.claude/old.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.000Z",
+      });
+      const head = makeEntry({
+        id: 59,
+        path: "memory.claude/head.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:09.000Z",
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        inPage,
+      ]);
+      deps.storage.findEntry = vi.fn().mockReturnValue(head);
+
+      const results = await uploadAll(deps);
+
+      expect(results.map((r) => r.path)).toEqual(["memory.claude/head.json"]);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.claude",
+        inPage.collectedAt,
+        { id: inPage.id, path: inPage.path },
+      );
+    });
+
+    it("falls back to publishing each version when the scope's latest version is already published", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const unsynced = makeEntry({
+        id: 61,
+        path: "memory.claude/local.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.000Z",
+      });
+      const publishedHead = makeEntry({
+        id: 69,
+        path: "memory.claude/remote.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:09.000Z",
+        dataPointId: DATA_POINT_ID,
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        unsynced,
+      ]);
+      deps.storage.findEntry = vi.fn().mockReturnValue(publishedHead);
+
+      const results = await uploadAll(deps);
+
+      expect(results.map((r) => r.path)).toEqual(["memory.claude/local.json"]);
+      expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
     });
 
     it("keeps older memory snapshots when the newest one fails to publish", async () => {

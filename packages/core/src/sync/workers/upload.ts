@@ -1,3 +1,4 @@
+import { isMemoryScope } from "../../policy/reserved-scopes.js";
 import type { DurableAdditionsService } from "../../additions/durable.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import type { GatewayClient } from "@opendatalabs/vana-sdk/browser";
@@ -280,62 +281,63 @@ export async function uploadOne(
 }
 
 /**
- * Scopes whose every version is a full snapshot of the one before plus a
- * change (agent memory, written by the `remember` MCP tool). Publishing each
- * intermediate snapshot would cost one registration per save; the newest
- * snapshot already contains everything, so only it is published.
+ * Agent-memory scopes (see `isMemoryScope`): every save stores a full snapshot,
+ * so publishing each intermediate one would cost a registration per save.
  */
-export const COALESCED_SCOPE_PREFIX = "memory.";
-
 export function isCoalescedScope(scope: string): boolean {
-  return scope.startsWith(COALESCED_SCOPE_PREFIX);
+  return isMemoryScope(scope);
 }
 
 /**
- * A coalesced scope is published once its newest unsynced snapshot has been
- * quiet this long (saves have stopped) ...
+ * A coalesced scope is published once its newest snapshot has been quiet this
+ * long (saves have stopped) ...
  */
 export const COALESCE_QUIET_MS = 2 * 60_000;
-/** ... or once its oldest unsynced snapshot has waited this long. */
+/** ... or once its oldest unpublished snapshot has waited this long. */
 export const COALESCE_MAX_WAIT_MS = 10 * 60_000;
 
+interface CoalescedScope {
+  /** The scope's latest local version: what readers serve. */
+  head: IndexEntry;
+  /** Older unsynced snapshots in this batch that the head supersedes. */
+  superseded: IndexEntry[];
+  /** Still inside the quiet window: publish on a later pass. */
+  deferred: boolean;
+}
+
+const at = (entry: IndexEntry) => Date.parse(entry.collectedAt);
+
 /**
- * For coalesced scopes: the older entries the batch's newest entry per scope
- * supersedes, and the scopes still inside their quiet window (published on a
- * later pass). Other scopes are not listed.
+ * One plan per coalesced scope in the batch. The head is the scope's latest
+ * local version (`findEntry`), not the batch's latest, so a head beyond the
+ * batch page is still the one published. Every scope version is a full state
+ * (readers serve the latest), so publishing only the head loses intermediate
+ * history, never current data.
  */
-function coalescePlan(entries: readonly IndexEntry[], nowMs: number) {
-  const newest = new Map<string, IndexEntry>();
-  const oldest = new Map<string, IndexEntry>();
+function coalescePlan(
+  deps: UploadWorkerDeps,
+  entries: readonly IndexEntry[],
+  nowMs: number,
+): Map<string, CoalescedScope> {
+  const byScope = new Map<string, IndexEntry[]>();
   for (const entry of entries) {
     if (!isCoalescedScope(entry.scope)) continue;
-    const head = newest.get(entry.scope);
-    if (!head || entry.collectedAt > head.collectedAt) {
-      newest.set(entry.scope, entry);
-    }
-    const tail = oldest.get(entry.scope);
-    if (!tail || entry.collectedAt < tail.collectedAt) {
-      oldest.set(entry.scope, entry);
-    }
+    byScope.set(entry.scope, [...(byScope.get(entry.scope) ?? []), entry]);
   }
-  const deferred = new Set<string>();
-  for (const [scope, head] of newest) {
-    const quietFor = nowMs - Date.parse(head.collectedAt);
-    const waitedFor = nowMs - Date.parse(oldest.get(scope)!.collectedAt);
-    if (quietFor < COALESCE_QUIET_MS && waitedFor < COALESCE_MAX_WAIT_MS) {
-      deferred.add(scope);
-    }
+  const plans = new Map<string, CoalescedScope>();
+  for (const [scope, inBatch] of byScope) {
+    const batchHead = inBatch.reduce((a, b) => (at(b) > at(a) ? b : a));
+    const latest = deps.storage.findEntry?.({ scope });
+    const head = latest && at(latest) >= at(batchHead) ? latest : batchHead;
+    const superseded = inBatch.filter((entry) => entry.id !== head.id);
+    const oldest = Math.min(...inBatch.map(at), at(head));
+    const deferred =
+      head.dataPointId === null &&
+      nowMs - at(head) < COALESCE_QUIET_MS &&
+      nowMs - oldest < COALESCE_MAX_WAIT_MS;
+    plans.set(scope, { head, superseded, deferred });
   }
-  const superseded = new Map<string, IndexEntry[]>();
-  for (const entry of entries) {
-    const head = newest.get(entry.scope);
-    if (!head || head === entry) continue;
-    superseded.set(entry.scope, [
-      ...(superseded.get(entry.scope) ?? []),
-      entry,
-    ]);
-  }
-  return { superseded, deferred };
+  return plans;
 }
 
 /**
@@ -383,17 +385,27 @@ export async function uploadAll(
   const batchSize = options?.batchSize ?? 50;
   const entries = deps.storage.findUnsynced({ limit: batchSize });
   const nowMs = (options?.now ?? (() => new Date()))().getTime();
-  const { superseded, deferred } = coalescePlan(entries, nowMs);
-  const skipped = new Set([...superseded.values()].flat());
+  const plans = coalescePlan(deps, entries, nowMs);
+  const handled = new Set<string>();
   const results: UploadResult[] = [];
 
   for (const entry of entries) {
-    if (skipped.has(entry) || deferred.has(entry.scope)) continue;
+    const plan = plans.get(entry.scope);
+    // A coalesced scope whose head is already published (for example a newer
+    // version downloaded from another of the owner's servers) falls back to
+    // publishing each version: erasing local snapshots that were never
+    // published would drop data.
+    const coalesce = plan !== undefined && plan.head.dataPointId === null;
+    if (coalesce) {
+      if (handled.has(entry.scope)) continue;
+      handled.add(entry.scope);
+      if (plan.deferred) continue;
+    }
+    const target = coalesce ? plan.head : entry;
     try {
-      const result = await uploadOne(deps, entry);
+      const result = await uploadOne(deps, target);
       results.push(result);
-      const older = superseded.get(entry.scope);
-      if (older) await eraseSuperseded(deps, older);
+      if (coalesce) await eraseSuperseded(deps, plan.superseded);
     } catch (err) {
       // A dropped orphan is a self-heal, not a failure: the row is already
       // gone, there is nothing to retry, and surfacing it would keep the

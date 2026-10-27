@@ -372,6 +372,45 @@ describe("MCP remember tool", () => {
     expect(envelope.data.records.map((r) => r.id)).toEqual([kept.payload.id]);
   });
 
+  it("only saves into memory.<app> scopes, whatever else the connection may write", async () => {
+    const t = await setup(["write:notes.daily"]);
+
+    const result = await t.callTool("remember", {
+      scope: "notes.daily",
+      text: "should not land",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.payload.error).toBe("scope_not_memory");
+  });
+
+  it("forgets only the record matching both id and key when both are given", async () => {
+    const t = await setup([`write:${MEMORY_SCOPE}`]);
+    const editor = await t.callTool("remember", {
+      text: "Editor: Zed.",
+      key: "editor",
+    });
+    const city = await t.callTool("remember", {
+      text: "City: Kraków.",
+      key: "city",
+    });
+
+    const result = await t.callTool("forget", {
+      id: city.payload.id,
+      key: "editor",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.payload.error).toBe("not_found");
+    const envelope = (await (await t.ownerRead(MEMORY_SCOPE)).json()) as {
+      data: { records: Array<{ id: string }> };
+    };
+    expect(envelope.data.records.map((r) => r.id)).toEqual([
+      editor.payload.id,
+      city.payload.id,
+    ]);
+  });
+
   it("converts an earlier memories list to records, keeping ids", async () => {
     const t = await setup([`write:${MEMORY_SCOPE}`]);
     expect(

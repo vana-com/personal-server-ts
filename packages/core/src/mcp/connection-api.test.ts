@@ -981,6 +981,13 @@ describe("mcp/connection-api scope request answers", () => {
         approveOptions(store, gateway),
       ),
     ).rejects.toMatchObject({ code: "INVALID_SCOPE", status: 400 });
+    // MCP clients only write agent memory.
+    await expect(
+      approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["write:notes.daily"] },
+        approveOptions(store, gateway),
+      ),
+    ).rejects.toMatchObject({ status: 400 });
     expect(gateway.createGrant).not.toHaveBeenCalled();
 
     const result = await approveMcpScopeAccessRequest(
