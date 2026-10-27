@@ -1,14 +1,21 @@
 /**
- * Node, Lite and the visibility engine judged against each other on
- * completion availability and visible rows.
+ * Node, Lite and the visibility engine judged against each other on the
+ * whole state a reader can observe.
  *
  * Each scenario is a set of steps: batch deliveries, repeated deliveries,
  * late bytes, late declarations, late provisioning and local writes. Every
- * round shuffles the steps and, after each one, requires:
- * - Node's stored completions to equal Lite's certified completions;
- * - both to equal the engine fed the same changes one by one (incremental),
- *   and the engine fed all of the host's evidence at once (full history);
- * - Node's and Lite's grant-visible rows to equal the incremental engine's.
+ * round shuffles the steps and, after each one, compares each host's state:
+ * live rows and tombstones from point reads, list pages, pending markers,
+ * referenced blob bytes and completion listings, for the owner and a grant
+ * reader; stored completions; and which connections are withdrawn or
+ * deleted. It requires:
+ * - Node's state to equal Lite's, except connection state where the hosts
+ *   map different connections (Lite refuses a mapping its retained evidence
+ *   contradicts; Node maps it and records the binding conflict);
+ * - each host's state to equal the engine fed the same changes one by one
+ *   (incremental);
+ * - the incremental engine to equal the engine fed all of the host's
+ *   evidence at once (full history) on connections, rows and completions.
  *
  * The engine is fed each host's own local journal, since local writes mint
  * host-specific revisions. PR CI runs a few orders per scenario;
@@ -41,6 +48,7 @@ import {
   nodeDriver,
   OWNER,
   SOURCE,
+  type PortSnapshot,
   type ReplicaPortDriver,
 } from "./ports.test-utils.js";
 
@@ -146,6 +154,15 @@ const claim: ReplicaOperation = {
   blob,
   revision: rev(6, "claim-b0"),
 };
+const del1: ReplicaOperation = {
+  ...at("c1"),
+  kind: "delete",
+  declaration: BINDINGS.m,
+  recordKey: "k1",
+  emittedAt: "2026-10-27T00:00:00Z",
+  deletedAt: "2026-10-27T00:00:02Z",
+  revision: rev(9, "c1-k1-delete"),
+};
 const withBlob = {
   ...put("c1", "k2", { blob_ref: { blob_id: blob.blobId } }, 7),
   blobs: [blob],
@@ -243,6 +260,41 @@ const SCENARIOS: Record<
       { k: "batch", id: "done", ops: [done01] },
     ],
   },
+  "a record deletion": {
+    declared: ["m", "a"],
+    provisioned: ["c1"],
+    steps: [
+      { k: "batch", id: "k0", ops: [k0] },
+      { k: "batch", id: "k1", ops: [k1] },
+      { k: "batch", id: "done", ops: [done01] },
+      { k: "batch", id: "delete", ops: [del1] },
+      { k: "again", id: "k1" },
+    ],
+  },
+  "a connection deletion that names another binding": {
+    declared: ["m", "a"],
+    provisioned: ["c1"],
+    // Delivered before c2 is provisioned, the deletion names another method
+    // than c2's mapping. It withdraws c2 on Node and deletes nothing.
+    steps: [
+      { k: "batch", id: "c2", ops: [put("c2", "k0", { text: "c2" }, 2)] },
+      {
+        k: "batch",
+        id: "foreign-delete",
+        ops: [
+          {
+            ...at("c2", "other"),
+            kind: "connection-delete",
+            revision: rev(4, "c2-delete"),
+          },
+        ],
+      },
+      { k: "provision", connection: "c2" },
+      { k: "batch", id: "k0", ops: [k0] },
+      { k: "batch", id: "k1", ops: [k1] },
+      { k: "batch", id: "done", ops: [done01] },
+    ],
+  },
   "local writes interleaved with delivery": {
     declared: ["m", "a"],
     provisioned: ["c1"],
@@ -322,12 +374,231 @@ function engineCompletions(projection: VisibilityProjection) {
     }),
   );
 }
+/** Rows a reader of the projection sees. */
 function engineRows(projection: VisibilityProjection) {
   const rows: Record<string, Data> = {};
   for (const [id, row] of Object.entries(projection.rows))
     if (row.state === "live") rows[id] = row.winner.data;
   return rows;
 }
+/**
+ * Keys the projection holds and does not show: a deleted row, or one a
+ * withdrawal hid after it was shown.
+ */
+const engineTombstones = (projection: VisibilityProjection) =>
+  Object.entries(projection.rows)
+    .filter(([, row]) => row.state !== "live")
+    .map(([id]) => id)
+    .sort();
+type ConnectionState = "readable" | "withdrawn" | "deleted";
+function engineConnections(run: Run, projection: VisibilityProjection) {
+  return Object.fromEntries(
+    [...run.world.mappings.keys()].sort().map((c) => {
+      const status = projection.connections[c]?.status;
+      return [
+        c,
+        status === "withdrawn" || status === "deleted" ? status : "readable",
+      ];
+    }),
+  ) as Record<string, ConnectionState>;
+}
+
+interface ReaderState {
+  /** Live rows from point reads. */
+  point: Record<string, Data>;
+  /** Live rows from full list pagination. */
+  list: Record<string, Data>;
+  pending: string[];
+  blobs: Record<string, string | null>;
+  /** Streams with a completion listed to this reader, by connection. */
+  completions: Record<string, string[]>;
+}
+interface HostState {
+  owner: ReaderState;
+  grant: ReaderState;
+  /** Stored tombstones. */
+  tombstones: string[];
+  /** Stored completions of c1, by stream. */
+  completions: Record<string, ReturnType<typeof shape>>;
+  /** Mapped connections only. */
+  connections: Record<string, ConnectionState>;
+}
+const UNIVERSE = {
+  connections: CONNECTIONS,
+  streams: STREAMS.map((stream) => ({ stream })),
+  keys: KEYS,
+};
+type NodeHost = ReturnType<typeof nodeDriver>;
+type LiteHost = Awaited<ReturnType<typeof liteDriver>>;
+const tombstonesOf = (snapshot: PortSnapshot) =>
+  Object.entries(snapshot.stored)
+    .filter(([, row]) => row.deleted)
+    .map(([id]) => id)
+    .sort();
+/**
+ * The state each host shows its readers, and what it stores. Node and Lite
+ * expose the same facts through different APIs. Node's reads skip
+ * tombstones, so the oracle reads them from its table; Lite's grant reads
+ * return canonical rows, tombstones included. Lite keeps no deletion
+ * marker, so its deleted connection shows only as tombstones.
+ */
+async function nodeState(node: NodeHost, run: Run): Promise<HostState> {
+  const snapshot = await node.snapshot(UNIVERSE);
+  const quarantined = new Set(
+    (
+      node.db
+        .prepare("SELECT instance FROM pdpp_replica_quarantined_connections")
+        .all() as { instance: string }[]
+    ).map((row) => row.instance),
+  );
+  const reader = (kind: "owner" | "grant"): ReaderState => {
+    const read = node.receiver.readStore({ reader: kind });
+    return {
+      ...snapshot[kind],
+      completions: Object.fromEntries(
+        CONNECTIONS.map((c) => [
+          c,
+          read.listStreamCompletions(c).map((receipt) => receipt.stream),
+        ]),
+      ),
+    };
+  };
+  return {
+    owner: reader("owner"),
+    grant: reader("grant"),
+    tombstones: tombstonesOf(snapshot),
+    completions: storedCompletions(node),
+    connections: Object.fromEntries(
+      [...run.world.mappings.keys()]
+        .sort()
+        .map((c) => [
+          c,
+          node.store.getInstanceBinding(c).deletedAt !== null
+            ? "deleted"
+            : quarantined.has(c) || node.store.replicaBindingConflict(c)
+              ? "withdrawn"
+              : "readable",
+        ]),
+    ),
+  };
+}
+async function liteState(lite: LiteHost, run: Run): Promise<HostState> {
+  const snapshot = await lite.snapshot(UNIVERSE);
+  const reader = async (kind: "owner" | "grant"): Promise<ReaderState> => {
+    const completions: Record<string, string[]> = {};
+    for (const c of CONNECTIONS)
+      completions[c] = (
+        await lite.store.readStreamCompletions(c, { reader: kind })
+      ).map((op) => op.declaration.stream);
+    return { ...snapshot[kind], completions };
+  };
+  const connections: Record<string, ConnectionState> = {};
+  for (const c of [...run.world.mappings.keys()].sort())
+    connections[c] = (await lite.store.isConnectionQuarantined(c))
+      ? "withdrawn"
+      : "readable";
+  return {
+    owner: await reader("owner"),
+    grant: await reader("grant"),
+    tombstones: tombstonesOf(snapshot),
+    completions: Object.fromEntries(
+      (await lite.store.readStreamCompletions("c1")).map((op) => [
+        op.declaration.stream,
+        shape(op),
+      ]),
+    ),
+    connections,
+  };
+}
+function storedCompletions(node: NodeHost) {
+  return Object.fromEntries(
+    (
+      node.db
+        .prepare(
+          "SELECT stream, generation, live_count, snapshot_sha256 FROM pdpp_stream_completion WHERE instance = 'c1'",
+        )
+        .all() as {
+        stream: string;
+        generation: number;
+        live_count: number;
+        snapshot_sha256: string;
+      }[]
+    ).map((row) => [
+      row.stream,
+      {
+        generation: row.generation,
+        liveCount: row.live_count,
+        snapshotSha256: row.snapshot_sha256,
+      },
+    ]),
+  );
+}
+/**
+ * The state the engine's projection implies for a host. No scenario stages
+ * a pending batch or writes locally on a conflicted connection, so the
+ * owner sees the rows a grant reader sees. The owner reads the pending
+ * preview, so it is listed no completion; a grant reader is listed the
+ * stored ones.
+ */
+function expectedState(
+  run: Run,
+  projection: VisibilityProjection,
+  host: HostState,
+): HostState {
+  const point = engineRows(projection);
+  const reader: ReaderState = {
+    point,
+    list: point,
+    pending: [],
+    // Each blob a live row references; the bytes are compared across hosts
+    // and checked readable separately.
+    blobs: Object.fromEntries(
+      Object.values(point).flatMap((data) => {
+        const id = (data.blob_ref as { blob_id?: string } | undefined)?.blob_id;
+        return id ? [[id, host.grant.blobs[id]]] : [];
+      }),
+    ),
+    completions: Object.fromEntries(
+      CONNECTIONS.map((c) => [
+        c,
+        c === "c1" ? Object.keys(engineCompletions(projection)) : [],
+      ]),
+    ),
+  };
+  const owner: ReaderState = {
+    ...reader,
+    completions: Object.fromEntries(CONNECTIONS.map((c) => [c, []])),
+  };
+  const connections = engineConnections(run, projection);
+  // Lite keeps no deletion marker: its deleted connection reads as readable.
+  if (run.driver.name === "lite")
+    for (const c of Object.keys(connections))
+      if (connections[c] === "deleted") connections[c] = "readable";
+  return {
+    owner,
+    grant: reader,
+    tombstones: engineTombstones(projection),
+    completions: engineCompletions(projection),
+    connections,
+  };
+}
+/**
+ * The full-history projection hides a withdrawn key by leaving it out; the
+ * incremental one marks it withdrawn. Both hide it from every reader.
+ */
+const comparable = (run: Run, projection: VisibilityProjection) => ({
+  connections: Object.fromEntries(
+    [...run.world.mappings.keys()]
+      .sort()
+      .map((c) => [c, projection.connections[c]]),
+  ),
+  rows: engineRows(projection),
+  tombstones: Object.entries(projection.rows)
+    .filter(([, row]) => row.state === "deleted")
+    .map(([id]) => id)
+    .sort(),
+  completions: engineCompletions(projection),
+});
 
 const seen = new Set<string>();
 describe("visibility differential: Node, Lite and the engine", () => {
@@ -446,60 +717,34 @@ describe("visibility differential: Node, Lite and the engine", () => {
               if (step.k === "batch") delivered.set(step.id, step.ops);
 
               const [nodeRun, liteRun] = runs;
-              const nodeStored = Object.fromEntries(
-                (
-                  node.db
-                    .prepare(
-                      "SELECT stream, generation, live_count, snapshot_sha256 FROM pdpp_stream_completion WHERE instance = 'c1'",
-                    )
-                    .all() as {
-                    stream: string;
-                    generation: number;
-                    live_count: number;
-                    snapshot_sha256: string;
-                  }[]
-                ).map((row) => [
-                  row.stream,
-                  {
-                    generation: row.generation,
-                    liveCount: row.live_count,
-                    snapshotSha256: row.snapshot_sha256,
-                  },
-                ]),
+              const states = {
+                node: await nodeState(node, nodeRun),
+                lite: await liteState(lite, liteRun),
+              };
+              seen.add(
+                `${name}:${Object.keys(states.node.completions).length}`,
               );
-              const liteStored = Object.fromEntries(
-                (await lite.store.readStreamCompletions("c1")).map((op) => [
-                  op.declaration.stream,
-                  shape(op),
-                ]),
-              );
-              // Reader gating: a reader that sees the pending preview gets
-              // no completion on either host; others get the stored ones.
-              for (const reader of ["owner", "grant"] as const)
-                expect({
-                  ...where,
-                  reader,
-                  lite: (
-                    await lite.store.readStreamCompletions("c1", { reader })
-                  ).map((op) => op.declaration.stream),
-                }).toEqual({
-                  ...where,
-                  reader,
-                  lite: node.receiver
-                    .readStore({ reader })
-                    .listStreamCompletions("c1")
-                    .map((receipt) => receipt.stream),
-                });
-              seen.add(`${name}:${Object.keys(nodeStored).length}`);
-              expect({ ...where, lite: liteStored }).toEqual({
-                ...where,
-                lite: nodeStored,
+              for (const [c, state] of Object.entries(states.node.connections))
+                seen.add(`${name}:${c}:${state}`);
+              if (states.node.tombstones.length) seen.add(`${name}:tombstone`);
+              // Connection state is compared where both hosts map the
+              // connection; everything else always.
+              const shared = (state: HostState) => ({
+                ...state,
+                connections: Object.fromEntries(
+                  Object.entries(state.connections).filter(
+                    ([c]) =>
+                      nodeRun.world.mappings.has(c) &&
+                      liteRun.world.mappings.has(c),
+                  ),
+                ),
               });
-              for (const [run, stored] of [
-                [nodeRun, nodeStored],
-                [liteRun, liteStored],
-              ] as const) {
-                const host = run.driver.name;
+              expect({ ...where, lite: shared(states.lite) }).toEqual({
+                ...where,
+                lite: shared(states.node),
+              });
+              for (const run of runs) {
+                const host = run.driver.name as "node" | "lite";
                 const incremental = run.committer.read().projection;
                 const full = evaluate(
                   {
@@ -510,34 +755,34 @@ describe("visibility differential: Node, Lite and the engine", () => {
                   },
                   { kind: "evidence", operations: run.evidence },
                 );
-                expect({ ...where, host, stored }).toEqual({
+                expect({ ...where, host, state: states[host] }).toEqual({
                   ...where,
                   host,
-                  stored: engineCompletions(incremental),
+                  state: expectedState(run, incremental, states[host]),
                 });
+                // Every blob a live row references is readable.
+                for (const reader of ["owner", "grant"] as const)
+                  expect({
+                    ...where,
+                    host,
+                    reader,
+                    unreadable: Object.entries(states[host][reader].blobs)
+                      .filter(([, bytes]) => bytes === null)
+                      .map(([id]) => id),
+                  }).toEqual({ ...where, host, reader, unreadable: [] });
                 expect({
                   ...where,
                   host,
-                  full: engineCompletions({
+                  full: comparable(run, {
                     ...EMPTY_PROJECTION,
+                    connections: full.connections,
+                    rows: full.rows,
                     completions: full.completions,
                   } as VisibilityProjection),
                 }).toEqual({
                   ...where,
                   host,
-                  full: engineCompletions(incremental),
-                });
-                const visible = (
-                  await run.driver.snapshot({
-                    connections: CONNECTIONS,
-                    streams: STREAMS.map((stream) => ({ stream })),
-                    keys: KEYS,
-                  })
-                ).grant.point;
-                expect({ ...where, host, visible }).toEqual({
-                  ...where,
-                  host,
-                  visible: engineRows(incremental),
+                  full: comparable(run, incremental),
                 });
               }
             }
@@ -563,5 +808,11 @@ describe("visibility differential: Node, Lite and the engine", () => {
           available: true,
         });
     }
+  });
+  it("reached a tombstone and a binding conflict over a foreign deletion", () => {
+    expect(seen.has("a record deletion:tombstone")).toBe(true);
+    const foreign = "a connection deletion that names another binding";
+    expect(seen.has(`${foreign}:c2:withdrawn`)).toBe(true);
+    expect(seen.has(`${foreign}:c2:deleted`)).toBe(false);
   });
 });
