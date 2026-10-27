@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -18,6 +19,7 @@ import { pdppRecordsRoutes } from "../routes/pdpp-records.js";
 import { pdppBlobsRoutes } from "../routes/pdpp-blobs.js";
 import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
+import { createReplicaVisibilityView } from "./pdpp-replica-visibility-view.js";
 import { binaryWriter, deleteBinary } from "./pdpp-binary-chunks.js";
 
 const sourceId = "https://source.invalid/declaration";
@@ -4585,3 +4587,322 @@ it.each(["store", "contract"] as const)(
   "a generation-2 key fact hides no generation-1 canonical or local row (%s predicate)",
   (predicate) => futureFactOverCurrentRows(predicate),
 );
+
+it.each(["owner", "grant"] as const)(
+  "A6 race: blob reader checks the grant-scoped reference before loading bytes for %s",
+  async (reader) => {
+    const d = device();
+    installBindingConflictFixture(d);
+    const bytes = new Uint8Array([10, 20, 30]);
+    const blob = d.store.storeBlobBytesForInstance({
+      instance: "conn_a",
+      method: "collector",
+      generation: 1,
+      bytes,
+      mimeType: "application/octet-stream",
+    });
+    d.store.ingestBatch(
+      [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          emitted_at: at,
+          data: { id: "a", blob_ref: { blob_id: blob.blobId } },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const receiver = pendingReceiver(d);
+    const operation = all(d).find((op) => op.kind === "upsert")!;
+    const grant: Grant = {
+      version: "0.2.0",
+      grant_id: "review-grant",
+      issued_at: at,
+      subject: { id: "owner" },
+      client: { client_id: "client" },
+      source: { kind: "provider_native", id: sourceId },
+      source_declaration: { version: "1" },
+      purpose_code: "review",
+      access_mode: "continuous",
+      streams: [
+        { name: "messages", instance_ids: ["conn_a"], fields: ["blob_ref"] },
+      ],
+    };
+    const app = pdppBlobsRoutes({
+      store: d.store,
+      reads: (mode) => {
+        const readStore = receiver.readStore({ reader: mode });
+        let snapshots = 0;
+        return {
+          ...readStore,
+          withReadSnapshot<T>(read: () => T) {
+            snapshots++;
+            if (snapshots === 2)
+              receiver.quarantineImported({
+                credential: "replica-secret",
+                envelope: batch([operation]),
+              });
+            return readStore.withReadSnapshot(read);
+          },
+        };
+      },
+      auth: createFixtureAuthorizationService({
+        [reader]:
+          reader === "owner"
+            ? {
+                active: true,
+                tokenKind: "owner",
+                subjectId: "owner",
+                instanceIds: ["conn_a"],
+              }
+            : {
+                active: true,
+                tokenKind: "client",
+                subjectId: "owner",
+                clientId: "client",
+                grant,
+              },
+      }),
+      declarations: createStreamDeclarationRegistry([
+        {
+          name: "messages",
+          semantics: "mutable_state",
+          primaryKey: ["id"],
+          cursorField: "emitted_at",
+          requiredFields: ["id"],
+          declaredFields: ["id", "blob_ref"],
+        },
+      ]),
+      instancesForSubject: () => ["conn_a"],
+      readBlobBytes: async (id) => {
+        receiver.quarantineImported({
+          credential: "replica-secret",
+          envelope: batch([operation]),
+        });
+        return d.store.getBlobBytes(id);
+      },
+    });
+
+    const response = await app.request(`/${blob.blobId}`, {
+      headers: { Authorization: `Bearer ${reader}` },
+    });
+    expect(response.status).not.toBe(200);
+    expect(await response.text()).not.toContain("10,20,30");
+  },
+);
+
+it.each(["owner", "grant"] as const)(
+  "A6 race: HTTP blob stream aborts after quarantine for %s",
+  async (reader) => {
+    const d = device();
+    installBindingConflictFixture(d);
+    const bytes = new Uint8Array(8 * 1024 * 1024).fill(0x6d);
+    const blob = d.store.storeBlobBytesForInstance({
+      instance: "conn_a",
+      method: "collector",
+      generation: 1,
+      bytes,
+      mimeType: "application/octet-stream",
+    });
+    d.store.ingestBatch(
+      [
+        {
+          instance: "conn_a",
+          stream: "messages",
+          key: "a",
+          emitted_at: at,
+          data: { id: "a", blob_ref: { blob_id: blob.blobId } },
+        },
+      ],
+      () => "mutable_state",
+      () => ["id"],
+      { method: "collector", generation: 1 },
+    );
+    const receiver = pendingReceiver(d);
+    const operation = all(d).find((op) => op.kind === "upsert")!;
+    const grant: Grant = {
+      version: "0.2.0",
+      grant_id: "review-grant",
+      issued_at: at,
+      subject: { id: "owner" },
+      client: { client_id: "client" },
+      source: { kind: "provider_native", id: sourceId },
+      source_declaration: { version: "1" },
+      purpose_code: "review",
+      access_mode: "continuous",
+      streams: [
+        { name: "messages", instance_ids: ["conn_a"], fields: ["blob_ref"] },
+      ],
+    };
+    const app = pdppBlobsRoutes({
+      store: d.store,
+      reads: (mode) => receiver.readStore({ reader: mode }),
+      auth: createFixtureAuthorizationService({
+        [reader]:
+          reader === "owner"
+            ? {
+                active: true,
+                tokenKind: "owner",
+                subjectId: "owner",
+                instanceIds: ["conn_a"],
+              }
+            : {
+                active: true,
+                tokenKind: "client",
+                subjectId: "owner",
+                clientId: "client",
+                grant,
+              },
+      }),
+      declarations: createStreamDeclarationRegistry([
+        {
+          name: "messages",
+          semantics: "mutable_state",
+          primaryKey: ["id"],
+          cursorField: "emitted_at",
+          requiredFields: ["id"],
+          declaredFields: ["id", "blob_ref"],
+        },
+      ]),
+      instancesForSubject: () => ["conn_a"],
+      readBlobBytes: async (id) => d.store.getBlobBytes(id),
+    });
+    const { serve } = await import("@hono/node-server");
+    const server = serve({
+      fetch: app.fetch,
+      hostname: "127.0.0.1",
+      port: 0,
+    });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    try {
+      const address = server.address() as { port: number };
+      const response = await fetch(
+        `http://127.0.0.1:${address.port}/${blob.blobId}`,
+        { headers: { Authorization: `Bearer ${reader}` } },
+      );
+      expect(response.status).toBe(200);
+      const body = response.body!.getReader();
+      const first = await body.read();
+      expect(first.done).toBe(false);
+      receiver.quarantineImported({
+        credential: "replica-secret",
+        envelope: batch([operation]),
+      });
+      let receivedAfterQuarantine = 0;
+      let streamFailed = false;
+      try {
+        for (;;) {
+          const next = await body.read();
+          if (next.done) break;
+          receivedAfterQuarantine += next.value.byteLength;
+        }
+      } catch {
+        streamFailed = true;
+      }
+      expect(streamFailed).toBe(true);
+      expect(receivedAfterQuarantine).toBeLessThan(bytes.byteLength / 2);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);
+
+it("A6 epoch: a fresh visibility store starts at zero", () => {
+  const d = device();
+  expect(
+    d.db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_visibility_epoch'",
+      )
+      .get(),
+  ).toBeUndefined();
+
+  pendingReceiver(d);
+  expect(
+    d.db
+      .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+      .pluck()
+      .get(),
+  ).toBe(0);
+});
+
+it("A6 crash: no-op reopen preserves the durable projection epoch", () => {
+  const d = device();
+  stagePending(d);
+  const before = d.db
+    .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+    .pluck()
+    .get();
+  d.reopen();
+  pendingReceiver(d);
+  const after = d.db
+    .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+    .pluck()
+    .get();
+  expect(after).toBe(before);
+});
+
+it("A6 migration crash: signature sync can restart after schema migration", () => {
+  const d = device();
+  d.close();
+  // Created by the actual ff971abe receiver before the signature column existed.
+  const fixture = new URL(
+    "./fixtures/replica-visibility-epoch-ff971abe.sqlite.gz",
+    import.meta.url,
+  );
+  writeFileSync(d.path, gunzipSync(readFileSync(fixture)));
+  d.reopen();
+  const columns = d.db
+    .prepare("PRAGMA table_info(pdpp_replica_visibility_epoch)")
+    .all() as { name: string }[];
+  expect(columns.some(({ name }) => name === "signature")).toBe(false);
+  expect(value(d)?.data.text).toBe("before");
+  // Exercise initialization: its transaction commits before the later sync.
+  d.db.prepare("UPDATE pdpp_replica_view_schema SET version=version-1").run();
+  expect(
+    d.db.prepare("SELECT version FROM pdpp_replica_view_schema").pluck().get(),
+  ).toBe(9);
+
+  const beforeEpoch = d.db
+    .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+    .pluck()
+    .get() as number;
+  const beforeView =
+    "bc1cd8ceba303305c6e17ae9726c6a3cc605b42d33902dc673ab4160ff29bcc2";
+  put(d, "offline changed");
+  expect(value(d)?.data.text).toBe("offline changed");
+  d.db.exec(`
+    CREATE TRIGGER fail_legacy_epoch_signature_update
+    BEFORE UPDATE OF signature ON pdpp_replica_visibility_epoch
+    BEGIN SELECT RAISE(ABORT, 'simulated process stop before signature sync'); END;
+  `);
+  expect(() =>
+    createReplicaVisibilityView({
+      db: d.db,
+      owner: "owner",
+      declarations: () => declarations,
+      blobsValid: () => true,
+      unquarantinedRecordSql: d.store.unquarantinedRecordSql,
+      integrityEpoch: d.store.replicaIntegrityEpoch,
+    }),
+  ).toThrow("simulated process stop before signature sync");
+
+  d.close();
+  d.reopen();
+  d.db.exec("DROP TRIGGER fail_legacy_epoch_signature_update");
+  const reopened = pendingReceiver(d);
+  const afterEpoch = d.db
+    .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+    .pluck()
+    .get() as number;
+  expect(afterEpoch).toBe(beforeEpoch + 1);
+  expect(reopened.readView("grant").visibilityEpoch).not.toBe(beforeView);
+  expect(
+    reopened.readStore({ reader: "grant" }).getRecord("conn_a", "messages", "a")
+      ?.data.text,
+  ).toBe("offline changed");
+});

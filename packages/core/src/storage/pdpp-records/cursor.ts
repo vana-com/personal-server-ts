@@ -13,6 +13,8 @@ interface IntegrityBinding {
   query?: string;
   /** Integrity epoch of each read connection when page 1 was served. */
   integrity?: Record<string, number>;
+  /** Projection epoch seen when the token was minted by replication reads. */
+  visibilityEpoch?: string;
 }
 
 export interface ListCursorPayload extends IntegrityBinding {
@@ -66,6 +68,29 @@ export interface ChangesSinceCursorPayload extends IntegrityBinding {
 }
 
 export type CursorPayload = ListCursorPayload | ChangesSinceCursorPayload;
+
+export interface VisibilitySnapshot {
+  readonly visibilityEpoch: string;
+  readonly reader?: string;
+}
+export interface ValidCursor {
+  readonly kind: "valid";
+  readonly payload: CursorPayload;
+}
+export interface Expired {
+  readonly kind: "expired";
+}
+
+/** Old enabled-mode tokens expire because their projection boundary is unknown. */
+export function validateCursor(
+  cursor: string,
+  snapshot: VisibilitySnapshot,
+): ValidCursor | Expired {
+  const payload = decodeCursor(cursor);
+  return payload.visibilityEpoch === snapshot.visibilityEpoch
+    ? { kind: "valid", payload }
+    : { kind: "expired" };
+}
 
 // Base64url encode/decode via the universally-available `atob`/`btoa` + Web
 // text codecs rather than Node's Buffer, so this module stays browser-safe
