@@ -431,8 +431,10 @@ export async function startPersonalServer(
     await context.cleanup();
   }
 
+  const replicationStatus = context.replicationStatus;
   return {
     kind: "node",
+    replication: { status: () => replicationStatus },
     ready,
     info,
     prepareRegistration,

@@ -381,6 +381,47 @@ describe("startPersonalServer node handle", () => {
     });
   });
 
+  it("reports the replication door at ready, and a refused boot is still ready", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "ps-client-"));
+    cleanupFns.push(() => rm(rootPath, { recursive: true, force: true }));
+    const boot = async (enabled: boolean) => {
+      const port = await getFreePort();
+      const ps = await startPersonalServer({
+        rootPath,
+        config: ServerConfigSchema.parse({
+          server: { port, origin: `http://localhost:${port}` },
+          logging: { level: "fatal", pretty: false },
+          devUi: { enabled: false },
+          sync: { enabled: false, lastProcessedTimestamp: null },
+          tunnel: { enabled: false },
+          replication: { enabled },
+        }),
+        ownerSignature: await createOwnerSignature(),
+        gatewayClient: createGateway(),
+        localApproval: false,
+        startBackgroundServices: false,
+      });
+      try {
+        await expect(ps.ready()).resolves.toMatchObject({ status: "ready" });
+        expect((await fetch(`http://127.0.0.1:${port}/health`)).status).toBe(
+          200,
+        );
+        return ps.replication?.status();
+      } finally {
+        await ps.stop();
+      }
+    };
+
+    expect(await boot(false)).toEqual({ state: "never" });
+    expect(await boot(true)).toEqual({ state: "on" });
+    expect(await boot(true)).toEqual({ state: "on" });
+    expect(await boot(false)).toEqual({ state: "off" });
+    expect(await boot(true)).toEqual({
+      state: "refused",
+      refusal: "reenable_refused",
+    });
+  }, 30_000);
+
   it("stops idempotently", async () => {
     const { ps } = await startTestServer();
 

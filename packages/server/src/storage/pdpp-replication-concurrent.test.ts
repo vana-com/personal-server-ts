@@ -15,6 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
+import { ReplicationRefusedError } from "@opendatalabs/personal-server-ts-core/replication/door";
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
@@ -203,7 +204,7 @@ describe("replication on: derived state follows other connections", () => {
     ).toThrow();
   });
 
-  it("refuses a cursor minted before a restart when a plain open changed content meanwhile", () => {
+  it("never honours a cursor minted before a restart when a plain open changed content meanwhile", () => {
     const path = file();
     const aDb = open(path);
     const a = createReplicaRecordStore(aDb);
@@ -229,18 +230,11 @@ describe("replication on: derived state follows other connections", () => {
     ingest(createSqliteRecordStore(plainDb), "b", "changed");
     plainDb.close();
 
-    const againDb = open(path);
-    const again = createReplicaRecordStore(againDb);
-    expect(() =>
-      receiverOf(againDb, again)
-        .readStore({ reader: "owner" })
-        .listRecords("messages", {
-          instanceIds: ["conn_a"],
-          limit: 1,
-          order: "asc",
-          cursor: first.nextCursor,
-        }),
-    ).toThrow();
+    // The plain write closed the replication door, so the enabled reopen
+    // that could have honoured the cursor is refused.
+    expect(() => createReplicaRecordStore(open(path))).toThrow(
+      ReplicationRefusedError,
+    );
   });
 
   it("a write after another connection's commit counts both writers' rows", () => {

@@ -6,6 +6,7 @@
 import Database from "better-sqlite3";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { captureWrites } from "./pdpp-replication-door.js";
 import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
@@ -64,6 +65,21 @@ export const clock = {
     clock.time += ms;
   },
 };
+
+/**
+ * Model a device on which `instance` was never provisioned. The fixture
+ * deletes the binding inside a capture guard: a device reaches that state
+ * without an uncaptured write, so the replication door must stay open.
+ */
+export function unprovisionConnection(db: Database.Database, instance: string) {
+  db.transaction(() =>
+    captureWrites(db, () =>
+      db
+        .prepare("DELETE FROM pdpp_instance_binding WHERE instance = ?")
+        .run(instance),
+    ),
+  )();
+}
 
 const cleanups: (() => void)[] = [];
 /** Call from afterEach in every contract test file. */

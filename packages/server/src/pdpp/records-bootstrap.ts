@@ -57,6 +57,11 @@ import {
   PdppBindingError,
 } from "../storage/pdpp-records-sqlite-store.js";
 import { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
+import { retireReplication } from "../storage/pdpp-replication-door.js";
+import {
+  ReplicationRefusedError,
+  type ReplicationDoorStatus,
+} from "@opendatalabs/personal-server-ts-core/replication/door";
 
 /**
  * The record store for this boot. With `replication` off (the default
@@ -71,6 +76,37 @@ export function openRecordStore(
   return replication
     ? createReplicaRecordStore(db)
     : createSqliteRecordStore(db);
+}
+
+/**
+ * Pass the replication door once per boot, before any store opens. With the
+ * flag off this closes the door if replication was ever on. With it on, it
+ * opens the replica store, which creates the door on the first enable and
+ * refuses a closed one. A refusal does not stop the boot: the server runs as
+ * a flag-off boot, which also closes the door, and reports `refused`. Pass `enabled` to every
+ * `openRecordStore` of this boot.
+ */
+export function resolveReplication(
+  db: Database,
+  requested: boolean,
+  logger: Pick<Logger, "warn">,
+): { enabled: boolean; status: ReplicationDoorStatus } {
+  if (!requested) return { enabled: false, status: retireReplication(db) };
+  try {
+    createReplicaRecordStore(db);
+    return { enabled: true, status: { state: "on" } };
+  } catch (error) {
+    if (!(error instanceof ReplicationRefusedError)) throw error;
+    retireReplication(db);
+    logger.warn(
+      { refusal: error.reason },
+      "Replication was turned off on this database before; it stays off",
+    );
+    return {
+      enabled: false,
+      status: { state: "refused", refusal: error.reason },
+    };
+  }
 }
 
 export interface PdppRecordsDeps {

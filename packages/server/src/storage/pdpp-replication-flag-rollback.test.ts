@@ -1,8 +1,10 @@
 /**
- * Replica triggers live only on the connection that enabled replication.
- * A database used with the flag on, then opened plain (flag off, or a main
- * build), runs no replica SQL: its writes touch no replica table and the file
- * holds no trigger on a canonical table. The next enabled open converges.
+ * Replica triggers live only on the connection that enabled replication,
+ * except the replication door's fence (`pdpp-replication-door.ts`). A
+ * database used with the flag on, then opened plain (flag off, or a main
+ * build), runs no replica SQL: its writes touch no replica table except the
+ * door's one row, and the file holds no other trigger on a canonical table.
+ * The next enabled open is refused.
  *
  * The statement proxy in `pdpp-replication-flag.test.ts` cannot see SQL that
  * runs inside a trigger, so these tests compare table state.
@@ -16,6 +18,7 @@ import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replica
 import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
+import { ReplicationRefusedError } from "@opendatalabs/personal-server-ts-core/replication/door";
 
 const sourceId = "https://source.invalid/declaration";
 const at = "2026-10-20T00:00:00.000Z";
@@ -111,9 +114,18 @@ const triggersOnDisk = (db: Database.Database) =>
       "SELECT name, tbl_name AS tableName FROM sqlite_master WHERE type='trigger' ORDER BY name",
     )
     .all() as { name: string; tableName: string }[];
+/** Replica triggers on canonical tables, apart from the door's fence. */
+const replicaTriggersOnCanonicalTables = (db: Database.Database) =>
+  triggersOnDisk(db).filter(
+    ({ name, tableName }) =>
+      !/^pdpp_replica_|^pdpp_binary_|^pdpp_transport_/.test(tableName) &&
+      !name.startsWith("pdpp_replica_door_"),
+  );
+const door = (db: Database.Database) =>
+  db.prepare("SELECT capturing, uncaptured, off FROM pdpp_replica_door").get();
 
 describe("a database used with replication on, then opened plain", () => {
-  it("runs no replica SQL: replica tables stay untouched and no replica trigger sits on a canonical table", () => {
+  it("runs no replica SQL: only the door's fence marks its row, and no other replica trigger sits on a canonical table", () => {
     const path = file();
     const onDb = open(path);
     const on = createReplicaRecordStore(onDb);
@@ -150,13 +162,8 @@ describe("a database used with replication on, then opened plain", () => {
     // Reopen plain and add nothing replica-related.
     const plain = createSqliteRecordStore(db);
     // Neither the file nor this connection may hold a replica trigger that
-    // reaches a canonical table.
-    expect(
-      triggersOnDisk(db).filter(
-        ({ tableName }) =>
-          !/^pdpp_replica_|^pdpp_binary_|^pdpp_transport_/.test(tableName),
-      ),
-    ).toEqual([]);
+    // reaches a canonical table, other than the door's fence.
+    expect(replicaTriggersOnCanonicalTables(db)).toEqual([]);
     expect(
       db
         .prepare("SELECT name FROM sqlite_temp_master WHERE type='trigger'")
@@ -175,29 +182,20 @@ describe("a database used with replication on, then opened plain", () => {
     expect(keys(plain)).toEqual([]);
     expect(plain.getBlobMeta(large.blobId)).toBeUndefined();
 
-    expect(replicaState(db)).toEqual(before);
-    expect(
-      triggersOnDisk(db).filter(
-        ({ tableName }) =>
-          !/^pdpp_replica_|^pdpp_binary_|^pdpp_transport_/.test(tableName),
-      ),
-    ).toEqual([]);
+    // The fence marked the door's row; no other replica row moved.
+    expect(door(db)).toEqual({ capturing: 0, uncaptured: 1, off: 0 });
+    expect({ ...replicaState(db), pdpp_replica_door: [] }).toEqual({
+      ...before,
+      pdpp_replica_door: [],
+    });
+    expect(replicaTriggersOnCanonicalTables(db)).toEqual([]);
 
-    // The plain delete left the erased blob's replica chunks. The next
-    // enabled open clears them.
-    const chunks = (handle: Database.Database) =>
-      (
-        handle
-          .prepare(
-            "SELECT count(*) AS n FROM pdpp_binary_chunks WHERE namespace = 'canonical' AND blob_id = ?",
-          )
-          .get(large.blobId) as { n: number }
-      ).n;
-    expect(chunks(db)).toBeGreaterThan(0);
+    // The plain delete left the erased blob's replica chunks. They stay:
+    // the door is closed, so no enabled open clears them.
     db.close();
-    const againDb = open(path);
-    createReplicaRecordStore(againDb);
-    expect(chunks(againDb)).toBe(0);
+    expect(() => createReplicaRecordStore(open(path))).toThrow(
+      ReplicationRefusedError,
+    );
   }, 30_000);
 
   it("an enabled open removes persistent replica triggers an earlier build left", () => {
@@ -260,7 +258,7 @@ describe("a database used with replication on, then opened plain", () => {
     ).toEqual({ live_count: 2 });
   });
 
-  it("converges on the next enabled open: summaries match writes made while plain", () => {
+  it("refuses the next enabled open after writes made while plain, and leaves the data readable", () => {
     const path = file();
     const onDb = open(path);
     const on = createReplicaRecordStore(onDb);
@@ -300,10 +298,11 @@ describe("a database used with replication on, then opened plain", () => {
     plainDb.close();
 
     const againDb = open(path);
-    const again = createReplicaRecordStore(againDb);
-    receiver(againDb, again);
-    expect(summary(againDb)).toMatchObject({ live: 3, rows: 3 });
-    expect(summary(againDb).revision).toBeGreaterThan(revisionBefore);
-    expect(keys(again)).toEqual(["b", "c", "d"]);
+    expect(() => createReplicaRecordStore(againDb)).toThrow(
+      ReplicationRefusedError,
+    );
+    // The refusal deletes nothing and leaves the summaries as they were.
+    expect(summary(againDb).revision).toBe(revisionBefore);
+    expect(keys(createSqliteRecordStore(againDb))).toEqual(["b", "c", "d"]);
   });
 });

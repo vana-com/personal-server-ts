@@ -28,6 +28,7 @@ import {
   type CanonicalAdapter,
   type Network,
   type TransportDevice,
+  unprovisionConnection,
 } from "./pdpp-replica-contract.test-utils.js";
 
 afterEach(cleanupHarness);
@@ -177,9 +178,7 @@ describe("01 Progress with retained custody, not premature availability", () => 
     await at_(a, 10000);
     const b = transportDevice(net);
     // Provisioning is a separate authority: transport must not invent the mapping.
-    b.db
-      .prepare("DELETE FROM pdpp_instance_binding WHERE instance='conn'")
-      .run();
+    unprovisionConnection(b.db, "conn");
     const reports: (ProgressReport | undefined)[] = [];
     for (let i = 0; i < 4; i++) reports.push(await at_(b, 10000));
 
