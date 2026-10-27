@@ -156,9 +156,9 @@ export interface VisibilityProjection {
   readonly completions: Readonly<Record<string, CompletionProjection>>;
 }
 export const EMPTY_PROJECTION: VisibilityProjection = Object.freeze({
-  connections: Object.freeze({}),
-  rows: Object.freeze({}),
-  completions: Object.freeze({}),
+  connections: Object.freeze(dict<ConnectionProjection>()),
+  rows: Object.freeze(dict<RowProjection>()),
+  completions: Object.freeze(dict<CompletionProjection>()),
 });
 
 export const rowId = (
@@ -296,12 +296,10 @@ export function projectEvidence(
     evidence,
   );
   const owned = evidence.filter((op) => op.owner === world.owner);
-  const connections: Record<string, ConnectionProjection> = {
-    ...prior.connections,
-  };
-  const rows: Record<string, RowProjection> = { ...prior.rows };
+  const connections = dict(prior.connections);
+  const rows = dict(prior.rows);
   for (const [id, mapping] of [...world.mappings].sort(byKey)) {
-    const applied = prior.connections[id]?.generation ?? 1;
+    const applied = own(prior.connections, id)?.generation ?? 1;
     const ops = owned.filter((op) => op.connectionId === id);
     const connection = connectionFromPlan(
       plan,
@@ -318,13 +316,13 @@ export function projectEvidence(
       const { identity } = record;
       if (identity.connectionId !== id) continue;
       const key = rowId(id, identity.stream, identity.recordKey);
-      const row = recordRow(rows[key], record, (op) =>
+      const row = recordRow(own(rows, key), record, (op) =>
         blobReady(op, ops, world.verifiedBlobs),
       );
       if (row) rows[key] = row;
     }
   }
-  const projection = { connections, rows, completions: {} };
+  const projection = { connections, rows, completions: dict() };
   return {
     ...projection,
     completions: projectCompletions(plan, world, owned, projection),
@@ -639,16 +637,17 @@ function projectCompletions(
   for (const op of owned) {
     if (op.kind !== "stream-complete" && op.kind !== "stream-invalidate")
       continue;
-    const connection = projection.connections[op.connectionId];
+    const connection = own(projection.connections, op.connectionId);
     if (!connection || connection.generation !== op.generation) continue;
     const key = completionId(op.connectionId, op.declaration.stream);
     groups.set(key, [...(groups.get(key) ?? []), op]);
   }
   const issues = [...plan.pending, ...plan.conflicts, ...plan.rejected];
-  const result: Record<string, CompletionProjection> = {};
+  const result = dict<CompletionProjection>();
   for (const [key, events] of [...groups].sort(byKey)) {
     const [connectionId, stream] = JSON.parse(key) as [string, string];
-    const connection = projection.connections[connectionId];
+    // Grouped above only when the connection is projected.
+    const connection = own(projection.connections, connectionId)!;
     const inStream = (op: ReplicaOperation) =>
       op.connectionId === connectionId &&
       (!("declaration" in op) || op.declaration.stream === stream);
@@ -705,9 +704,9 @@ export function diffProjection(
     before: Readonly<Record<string, T>>,
     after: Readonly<Record<string, T>>,
   ) => {
-    const out: Record<string, T> = {};
+    const out = dict<T>();
     for (const key of Object.keys(after).sort())
-      if (canonicalJson(before[key] ?? null) !== canonicalJson(after[key]))
+      if (canonicalJson(own(before, key) ?? null) !== canonicalJson(after[key]))
         out[key] = after[key];
     return out;
   };
@@ -716,14 +715,14 @@ export function diffProjection(
     next.completions,
   );
   for (const key of Object.keys(prior.completions))
-    if (!(key in next.completions)) completions[key] = null;
+    if (!Object.hasOwn(next.completions, key)) completions[key] = null;
   const connections = changed(prior.connections, next.connections);
   const rows = changed(prior.rows, next.rows);
   const fences = new Set(Object.keys(connections));
   const quarantined = (row: RowProjection | undefined) =>
     row?.state === "withdrawn" && row.reason === "quarantined";
   for (const key of Object.keys(rows))
-    if (quarantined(prior.rows[key]) !== quarantined(rows[key]))
+    if (quarantined(own(prior.rows, key)) !== quarantined(rows[key]))
       fences.add((JSON.parse(key) as string[])[0]);
   const before = blobReferences(prior);
   const after = blobReferences(next);
@@ -779,15 +778,13 @@ export function applyProjectionDelta(
   projection: VisibilityProjection,
   delta: ProjectionDelta,
 ): VisibilityProjection {
-  const completions: Record<string, CompletionProjection> = {
-    ...projection.completions,
-  };
+  const completions = dict(projection.completions);
   for (const [key, value] of Object.entries(delta.completions))
     if (value === null) delete completions[key];
     else completions[key] = value;
   return {
-    connections: { ...projection.connections, ...delta.connections },
-    rows: { ...projection.rows, ...delta.rows },
+    connections: dict(projection.connections, delta.connections),
+    rows: dict(projection.rows, delta.rows),
     completions,
   };
 }
@@ -856,10 +853,12 @@ export class VisibilityEpochConflict extends Error {
  * Host port. One atomic transaction: check that the committed epoch is
  * `expected` (and `delta.base`), apply the projection delta with its fences,
  * blob references and completions, apply the checkpoint, and advance the
- * epoch by one if and only if the delta is not empty. Retrying the commit
- * whose acknowledgement was lost returns its original receipt and changes
- * nothing. Any other stale commit throws `VisibilityEpochConflict` and
- * changes nothing; the caller re-evaluates from a fresh snapshot.
+ * epoch by one if and only if the delta is not empty. The host stores each
+ * commit's `commitRequestDigest` with its receipt in the same transaction.
+ * Retrying any committed request, even after later commits, returns its
+ * original receipt and changes nothing. Any other stale commit throws
+ * `VisibilityEpochConflict` and changes nothing; the caller re-evaluates
+ * from a fresh snapshot.
  */
 export interface VisibilityCommitter {
   commit(
@@ -875,6 +874,16 @@ export function deltaDigest(delta: ProjectionDelta): string {
 export function checkpointDigest(checkpoint: CheckpointDelta): string {
   return hash(canonicalJson(checkpoint));
 }
+/** Identifies one commit request, for lost-acknowledgement replay. */
+export function commitRequestDigest(
+  expected: VisibilityEpoch,
+  delta: ProjectionDelta,
+  checkpoint: CheckpointDelta,
+): string {
+  return hash(
+    canonicalJson([expected, deltaDigest(delta), checkpointDigest(checkpoint)]),
+  );
+}
 
 /** Reference committer: the semantics every host committer must match. */
 export function createMemoryVisibilityCommitter(
@@ -886,8 +895,8 @@ export function createMemoryVisibilityCommitter(
 ) {
   let epoch = initial.epoch ?? INITIAL_VISIBILITY_EPOCH;
   let projection = initial.projection ?? EMPTY_PROJECTION;
-  const checkpoint: Record<string, string> = { ...initial.checkpoint };
-  let last: VisibilityReceipt | undefined;
+  const checkpoint = dict<string>(initial.checkpoint ?? {});
+  const receipts = new Map<string, VisibilityReceipt>();
   const committer: VisibilityCommitter & {
     read(): {
       epoch: VisibilityEpoch;
@@ -896,6 +905,11 @@ export function createMemoryVisibilityCommitter(
     };
   } = {
     async commit(expected, delta, changes) {
+      const request = commitRequestDigest(expected, delta, changes);
+      const committed = receipts.get(request);
+      if (committed) return committed;
+      if (delta.base !== expected || epoch !== expected)
+        throw new VisibilityEpochConflict(expected, epoch);
       const receipt: VisibilityReceipt = {
         epoch: isEmptyDelta(delta) ? expected : visibilityEpoch(expected + 1),
         previous: expected,
@@ -903,18 +917,15 @@ export function createMemoryVisibilityCommitter(
         deltaDigest: deltaDigest(delta),
         checkpointDigest: checkpointDigest(changes),
       };
-      if (last && canonicalJson(last) === canonicalJson(receipt)) return last;
-      if (delta.base !== expected || epoch !== expected)
-        throw new VisibilityEpochConflict(expected, epoch);
       projection = applyProjectionDelta(projection, delta);
       for (const [key, value] of Object.entries(changes))
         if (value === null) delete checkpoint[key];
         else checkpoint[key] = value;
       epoch = receipt.epoch;
-      last = receipt;
+      receipts.set(request, receipt);
       return receipt;
     },
-    read: () => ({ epoch, projection, checkpoint: { ...checkpoint } }),
+    read: () => ({ epoch, projection, checkpoint: dict(checkpoint) }),
   };
   return committer;
 }
@@ -941,6 +952,25 @@ export function connectionVisibilityState(
 }
 
 // ----------------------------------------------------------------- helpers
+
+/**
+ * A dictionary keyed by host strings. It has no prototype, so a connection id
+ * or checkpoint key such as `__proto__` or `constructor` is an ordinary key.
+ */
+function dict<T>(...sources: Readonly<Record<string, T>>[]): Record<string, T> {
+  const out = Object.create(null) as Record<string, T>;
+  for (const source of sources)
+    for (const key of Object.keys(source)) out[key] = source[key];
+  return out;
+}
+
+/** Own-property lookup: never an inherited member. */
+function own<T>(
+  record: Readonly<Record<string, T>>,
+  key: string,
+): T | undefined {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
+}
 
 function byKey<T>(a: [string, T], b: [string, T]) {
   return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;

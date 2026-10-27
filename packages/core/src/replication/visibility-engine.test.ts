@@ -12,10 +12,12 @@ import { binding, identity, registration, upsert } from "./fixtures.js";
 import {
   applyChange,
   blobReady,
+  checkpointDigest,
   completionAvailability,
   completionId,
   connectionVisibilityState,
   createMemoryVisibilityCommitter,
+  deltaDigest,
   EMPTY_PROJECTION,
   evaluate,
   evidenceDigest,
@@ -430,6 +432,65 @@ describe("host authority", () => {
   });
 });
 
+describe("host-chosen keys", () => {
+  // Connection ids and checkpoint keys are host strings. None may reach an
+  // inherited object property.
+  const HOSTILE = ["__proto__", "constructor", "toString", "hasOwnProperty"];
+  const mapping = { sourceId: identity.sourceId, methodId: identity.methodId };
+  const at = (id: string, op: ReplicaOperation): ReplicaOperation => ({
+    ...op,
+    connectionId: id,
+    revision: {
+      ...op.revision,
+      operationId: `${id}:${op.revision.operationId}`,
+    },
+  });
+  it.each(HOSTILE)("treats connection id %s as an ordinary id", async (id) => {
+    const result = await run(
+      [
+        { kind: "host", provision: { [id]: mapping } },
+        evidence(at(id, registration), at(id, a)),
+      ],
+      { ...world, mappings: new Map() },
+    );
+    expect(Object.keys(result.deltas[0].connections)).toEqual([id]);
+    expect(Object.keys(result.projection.connections)).toEqual([id]);
+    expect(Object.hasOwn(result.projection.connections, id)).toBe(true);
+    expect(result.projection.connections[id]).toEqual({
+      status: "active",
+      generation: 1,
+    });
+    expect(Object.keys(result.projection.rows)).toEqual([
+      rowId(id, binding.stream, "a"),
+    ]);
+  });
+  it("treats every checkpoint key as an ordinary key", async () => {
+    const committer = createMemoryVisibilityCommitter();
+    const empty = evaluate(
+      {
+        epoch: INITIAL_VISIBILITY_EPOCH,
+        projection: EMPTY_PROJECTION,
+        world: { ...world, mappings: new Map() },
+        evidence: [],
+      },
+      { kind: "host" },
+    );
+    const keys = Object.fromEntries(HOSTILE.map((key) => [key, key]));
+    await committer.commit(INITIAL_VISIBILITY_EPOCH, empty, keys);
+    expect(Object.keys(committer.read().checkpoint).sort()).toEqual(
+      [...HOSTILE].sort(),
+    );
+    await committer.commit(INITIAL_VISIBILITY_EPOCH, empty, {
+      ["__proto__"]: null,
+      constructor: null,
+    });
+    expect(Object.keys(committer.read().checkpoint).sort()).toEqual([
+      "hasOwnProperty",
+      "toString",
+    ]);
+  });
+});
+
 describe("commit", () => {
   const change = evidence(registration, a);
   const delta = evaluate(
@@ -475,6 +536,62 @@ describe("commit", () => {
     expect(
       await committer.commit(INITIAL_VISIBILITY_EPOCH, delta, { cursor: "1" }),
     ).toBe(receipt);
+    expect(committer.read()).toEqual(state);
+  });
+  /** A committer at epoch 1 with the visible commit and its receipt. */
+  async function visible() {
+    const committer = createMemoryVisibilityCommitter();
+    const receipt = await committer.commit(INITIAL_VISIBILITY_EPOCH, delta, {
+      cursor: "1",
+    });
+    const empty = evaluate(
+      {
+        epoch: receipt.epoch,
+        projection: committer.read().projection,
+        world,
+        evidence: [registration, a],
+      },
+      change,
+    );
+    return { committer, receipt, empty };
+  }
+  it("binds the receipt to the delta and checkpoint digests", async () => {
+    const { receipt } = await visible();
+    expect(receipt.deltaDigest).toBe(deltaDigest(delta));
+    expect(receipt.checkpointDigest).toBe(checkpointDigest({ cursor: "1" }));
+  });
+  it("replays an earlier checkpoint-only commit without moving the checkpoint back", async () => {
+    const { committer, empty } = await visible();
+    const first = await committer.commit(visibilityEpoch(1), empty, {
+      cursor: "2",
+    });
+    await committer.commit(visibilityEpoch(1), empty, { cursor: "3" });
+    const state = committer.read();
+    expect(
+      await committer.commit(visibilityEpoch(1), empty, { cursor: "2" }),
+    ).toBe(first);
+    expect(committer.read()).toEqual(state);
+    expect(state.checkpoint).toEqual({ cursor: "3" });
+  });
+  it("replays a visible commit after a later checkpoint-only commit", async () => {
+    const { committer, receipt, empty } = await visible();
+    await committer.commit(visibilityEpoch(1), empty, { cursor: "2" });
+    const state = committer.read();
+    expect(
+      await committer.commit(INITIAL_VISIBILITY_EPOCH, delta, { cursor: "1" }),
+    ).toBe(receipt);
+    expect(committer.read()).toEqual(state);
+  });
+  it("refuses a retry whose delta was altered", async () => {
+    const { committer } = await visible();
+    const state = committer.read();
+    for (const altered of [
+      { ...delta, rows: {} },
+      { ...delta, evidenceDigest: `sha256:${"0".repeat(64)}` },
+    ])
+      await expect(
+        committer.commit(INITIAL_VISIBILITY_EPOCH, altered, { cursor: "1" }),
+      ).rejects.toBeInstanceOf(VisibilityEpochConflict);
     expect(committer.read()).toEqual(state);
   });
   it("refuses a stale or mismatched epoch atomically", async () => {
