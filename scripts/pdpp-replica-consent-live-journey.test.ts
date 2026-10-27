@@ -178,6 +178,7 @@ describe("single issuer harness through real HTTP AS/RS and SQLite", () => {
       owner,
       master: Array(32).fill(1),
       serverKey: generatePrivateKey(),
+      offlineRegistration: { serverId: `0x${"ab".repeat(32)}` },
       scriptSha256: digest(
         readFileSync(
           new URL("./pdpp-replica-live-journey.ts", import.meta.url),

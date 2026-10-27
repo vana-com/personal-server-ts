@@ -23,6 +23,12 @@ import {
 import { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "../storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../storage/pdpp-replication-transport.js";
+import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
+import {
+  enableReplicaTestIdentity,
+  remoteReplicaTestWriter,
+  replicaTestAuthority,
+} from "../storage/pdpp-replica-writer-identity.test-utils.js";
 import {
   approveNarrowConsent,
   openConsentIssuer,
@@ -35,9 +41,14 @@ it.each(["key", "connection"] as const)(
     const root = mkdtempSync(join(tmpdir(), "8b-pending-quarantine-"));
     const db = new Database(join(root, "replica.sqlite"));
     const store = createReplicaRecordStore(db);
-    const owner = "owner-pending-quarantine";
+    // Batch statements name the owner wallet, so it is an address.
+    const owner = "0x00000000000000000000000000000000000000bb";
     const sourceId = "https://replica-journey.invalid/declaration";
     const credential = "local-receiver";
+    const roster = createTestReplicaRoster();
+    const authority = replicaTestAuthority(roster);
+    const remote = remoteReplicaTestWriter(roster, owner);
+    const writerId = remote.writers.operation;
     const identity = {
       owner,
       sourceId,
@@ -55,7 +66,7 @@ it.each(["key", "connection"] as const)(
     const registration: ReplicaOperation = {
       ...identity,
       kind: "connection-register",
-      revision: { counter: 1, writerId: "remote", operationId: "register" },
+      revision: { counter: 1, writerId, operationId: "register" },
     };
     for (const instance of ["conn", "conn-other"])
       store.registerConnection({
@@ -64,6 +75,7 @@ it.each(["key", "connection"] as const)(
         method: "collector",
         label: "trusted local mapping",
       });
+    enableReplicaTestIdentity(db, { owner, roster, authority });
     store.replication.beginBaseline({
       owner,
       declarations: [{ sourceId, binding }],
@@ -96,7 +108,7 @@ it.each(["key", "connection"] as const)(
       mimeType: "application/octet-stream",
     };
     const target = {
-      ...upsert("quarantined-target", 5),
+      ...upsert("quarantined-target", 5, undefined, writerId),
       ...identity,
       recordKey: "quarantined-id",
       data: {
@@ -117,7 +129,7 @@ it.each(["key", "connection"] as const)(
       ...identity,
       kind: "blob-claim",
       blob,
-      revision: { counter: 4, writerId: "remote", operationId: "target-blob" },
+      revision: { counter: 4, writerId, operationId: "target-blob" },
     };
     const batch = "1".repeat(32);
     const operations = [
@@ -127,7 +139,7 @@ it.each(["key", "connection"] as const)(
     ];
     const parts = await fragmentReplicaPayload({
       owner,
-      writer: "2".repeat(32),
+      writer: remote.writers.transport,
       batch,
       sequence: 1,
       previous: null,
@@ -138,6 +150,7 @@ it.each(["key", "connection"] as const)(
           blobs: [{ blobId, bytes: toBase64(bytes) }],
         }),
       ),
+      sign: remote.sign,
       encrypt: async (_scope, value) => value,
     });
     let conflicted = false;
@@ -190,6 +203,7 @@ it.each(["key", "connection"] as const)(
       receiver,
       credential,
       transport: port,
+      authority,
     });
     const issuer = await openConsentIssuer(root, owner, 3600);
     let resource:

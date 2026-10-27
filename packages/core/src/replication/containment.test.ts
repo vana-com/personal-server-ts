@@ -1,4 +1,5 @@
 import { expect, it, vi } from "vitest";
+import { unsignedReplicaBatch } from "./writer-identity.test-utils.js";
 import {
   ScopeSchema,
   DataFileEnvelopeSchema,
@@ -50,6 +51,7 @@ it("PS-Lite 1.33.2-shaped cache accepts fragments but exact legacy reads ignore 
     batch: "b".repeat(32),
     sequence: 1,
     previous: null,
+    sign: unsignedReplicaBatch,
     bytes: new TextEncoder().encode("opaque"),
     collectedAt: "2026-10-20T00:00:00.000Z",
     encrypt: async (_scope, bytes) => bytes,

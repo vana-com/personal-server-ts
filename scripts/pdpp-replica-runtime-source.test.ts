@@ -109,6 +109,7 @@ it("opens a real-source runtime without process fetch hooks and refuses fixture 
     owner: "0x1111111111111111111111111111111111111111",
     master: Array(32).fill(1),
     serverKey: `0x${"01".repeat(32)}`,
+    offlineRegistration: { serverId: `0x${"ab".repeat(32)}` },
     scriptSha256: digest(
       readFileSync(
         fileURLToPath(
@@ -159,6 +160,7 @@ it("runs the source descriptor through Device IPC and exposes only the separated
     owner: "0x1111111111111111111111111111111111111111",
     master: Array(32).fill(1),
     serverKey: `0x${"01".repeat(32)}`,
+    offlineRegistration: { serverId: `0x${"ab".repeat(32)}` },
     scriptSha256: digest(
       readFileSync(new URL("./pdpp-replica-live-journey.ts", import.meta.url)),
     ),

@@ -12,6 +12,11 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
+import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
+import {
+  enableReplicaTestIdentity,
+  replicaTestAuthority,
+} from "./pdpp-replica-writer-identity.test-utils.js";
 import {
   createDpv2ReplicaTransport,
   replicaChainCommitment,
@@ -418,6 +423,8 @@ export function network(
   };
   return {
     port,
+    /** The owner's gateway server roster. */
+    roster: createTestReplicaRoster(),
     blobs,
     head,
     chain,
@@ -542,6 +549,18 @@ export function transportDevice(
       () => ["id"],
       { method: "export", generation: 1 },
     );
+  // Drawn from node:crypto, so a seeded run gets the same keys and writers.
+  const authority = replicaTestAuthority(
+    net.roster,
+    randomBytes(16).toString("hex"),
+  );
+  enableReplicaTestIdentity(db, {
+    owner,
+    roster: net.roster,
+    authority,
+    serverId: `0x${randomBytes(32).toString("hex")}`,
+    nonce: `0x${randomBytes(16).toString("hex")}`,
+  });
   if (opts.preexisting) put(opts.preexisting);
   store.replication.beginBaseline(expected);
   let declarations = expected.declarations;
@@ -567,6 +586,7 @@ export function transportDevice(
       enabled: opts.enabled ?? true,
       expected: () => ({ owner, declarations }),
       transport: net.port,
+      authority,
       now: clock.now,
       targetChunkBytes: opts.chunk ?? 4000,
       maxBlobBytes: opts.cap ?? 8192,
@@ -578,6 +598,8 @@ export function transportDevice(
   const device = {
     path,
     instance,
+    /** The server key and roster this device signs and checks with. */
+    authority,
     get db() {
       return db;
     },

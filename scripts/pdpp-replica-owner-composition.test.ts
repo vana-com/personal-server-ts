@@ -206,6 +206,7 @@ it("reuses the existing authority with an exact verified dynamic declaration and
     owner: owner.address,
     master: Array(32).fill(1),
     serverKey: `0x${"01".repeat(32)}`,
+    offlineRegistration: { serverId: `0x${"ab".repeat(32)}` },
     scriptSha256: digest(
       readFileSync(new URL("./pdpp-replica-live-journey.ts", import.meta.url)),
     ),
@@ -391,6 +392,7 @@ it("reuses the existing authority with an exact verified dynamic declaration and
     owner: owner.address,
     master: Array(32).fill(1),
     serverKey: `0x${"02".repeat(32)}`,
+    offlineRegistration: { serverId: `0x${"ab".repeat(32)}` },
     scriptSha256: digest(
       readFileSync(new URL("./pdpp-replica-live-journey.ts", import.meta.url)),
     ),

@@ -70,6 +70,28 @@ function hasDoor(db: Database): boolean {
   return db.prepare(REPLICATION_DOOR_PROBE).get() !== undefined;
 }
 
+/**
+ * The door row is exactly open. A committed `capturing = 1` cannot survive a
+ * rollback, so it is corruption, and it would silence every trigger.
+ */
+function doorOpen(db: Database): boolean {
+  const door = db
+    .prepare(
+      "SELECT capturing, uncaptured, off FROM pdpp_replica_door WHERE id = 1",
+    )
+    .get() as Record<string, unknown> | undefined;
+  return door?.capturing === 0 && door.uncaptured === 0 && door.off === 0;
+}
+
+/**
+ * Whether replication may still capture and publish on this database: the
+ * door exists and is open. Read-only. A write outside capture, or a flag-off
+ * open, closes it while a worker runs; the worker checks before each step.
+ */
+export function replicationAdmitted(db: Database): boolean {
+  return hasDoor(db) && doorOpen(db);
+}
+
 /** A database a pre-door build enabled: baselined, with no record of off periods. */
 function enabledWithoutDoor(db: Database): boolean {
   return (
@@ -90,16 +112,9 @@ function enabledWithoutDoor(db: Database): boolean {
 export function admitReplication(db: Database): void {
   db.transaction(() => {
     if (hasDoor(db)) {
-      // Admit only a door row that is exactly open. A committed
-      // `capturing = 1` cannot survive a rollback, so it is corruption, and it
-      // would silence every trigger. Refusing also closes the door for good.
-      const door = db
-        .prepare(
-          "SELECT capturing, uncaptured, off FROM pdpp_replica_door WHERE id = 1",
-        )
-        .get() as Record<string, unknown> | undefined;
-      if (door?.capturing !== 0 || door.uncaptured !== 0 || door.off !== 0)
-        throw new ReplicationRefusedError("reenable_refused");
+      // Admit only a door row that is exactly open. Refusing also closes the
+      // door for good.
+      if (!doorOpen(db)) throw new ReplicationRefusedError("reenable_refused");
     } else if (enabledWithoutDoor(db)) {
       // Unbaselined replica tables are harmless: the baseline reads every
       // canonical row. A baseline without a door may have missed writes.

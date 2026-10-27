@@ -1,4 +1,5 @@
 import { expect, it } from "vitest";
+import { unsignedReplicaBatch } from "./writer-identity.test-utils.js";
 import {
   fragmentReplicaPayload,
   replicaScope,
@@ -13,6 +14,7 @@ it("fragments a large export without changing bytes or exceeding encrypted cap",
     batch: "b".repeat(32),
     sequence: 1,
     previous: null,
+    sign: unsignedReplicaBatch,
     bytes,
     collectedAt: "2026-10-20T00:00:00Z",
     encrypt: async (_scope, bytes) =>
@@ -37,6 +39,7 @@ it("reassembles byte-identical content and rejects missing, overlapping, swapped
     batch: "b".repeat(32),
     sequence: 1,
     previous: null,
+    sign: unsignedReplicaBatch,
     bytes,
     collectedAt: "2026-10-20T00:00:00.000Z",
     targetChunkBytes: 1500,
@@ -86,6 +89,7 @@ it("reduces fragment size using actual DPv2 encryption overhead", async () => {
     batch: "b".repeat(32),
     sequence: 1,
     previous: null,
+    sign: unsignedReplicaBatch,
     bytes,
     collectedAt: "2026-10-20T00:00:00.000Z",
     targetChunkBytes: 6500,

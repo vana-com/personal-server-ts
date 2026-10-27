@@ -23,6 +23,7 @@ import {
 import {
   decodeReplicaFragment,
   isReplicaScope,
+  ReplicaFragmentUnsigned,
   replicaMetadataHash,
   REPLICA_MAX_BLOB_BYTES,
   REPLICA_SCOPE_PREFIX,
@@ -61,6 +62,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/outcome";
 import { replicaCopyKey } from "@opendatalabs/personal-server-ts-core/replication/copy-promotion";
 import { REPLICA_REFETCH_BUDGET } from "./pdpp-replica-copies.js";
+import { captureWrites, replicationAdmitted } from "./pdpp-replication-door.js";
 import {
   defaultReplicaBackoff,
   REPLICA_TERMINAL,
@@ -69,7 +71,27 @@ import {
   type ReplicaEligibility,
   type ReplicaWorkState,
 } from "@opendatalabs/personal-server-ts-core/replication/schedule";
+import {
+  createCachedReplicaRoster,
+  type ReplicaRosterPort,
+} from "@opendatalabs/personal-server-ts-core/replication/roster";
+import {
+  authorizeReplicaBatch,
+  replicaOperationWriterRefusal,
+  signReplicaBatch,
+  type ReplicaAuthorityRefusal,
+  type ReplicaBatchFacts,
+  type ReplicaBatchSigner,
+  type ReplicaEnvironment,
+  type ReplicaPartition,
+} from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
+import { REPLICA_WAIT_FALLBACK_MS } from "@opendatalabs/personal-server-ts-core/replication/schedule";
 import type { ReplicationExport } from "./pdpp-replication-sqlite.js";
+import {
+  currentReplicaWriterIdentity,
+  enableReplicaWriterIdentity,
+  type ReplicaWriterIdentity,
+} from "./pdpp-replica-writer-identity.js";
 import type { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
 // One process owns a transport writer per database; other local instances serialize cycles.
@@ -205,6 +227,22 @@ export function createReplicaTransportWorker(deps: {
   receiver: ReturnType<typeof createReplicaReceiver>;
   credential: unknown;
   transport: ReplicaTransportPort;
+  /** Who may write (host contract §3). */
+  authority: {
+    /**
+     * The registered PS server key: Node `key.json`, or the Lite server
+     * identity. Never the owner wallet or the Lite owner sync signer.
+     */
+    signer: ReplicaBatchSigner;
+    /**
+     * The gateway roster, uncached. The worker caches each answer for at most
+     * REPLICA_ROSTER_MAX_AGE_MS on its own clock.
+     */
+    roster: ReplicaRosterPort;
+    /** EIP-712 domain chain and environment of this owner's partition. */
+    chainId: number;
+    environment: ReplicaEnvironment;
+  };
   now?: () => number;
   maxBlobBytes?: number;
   targetChunkBytes?: number;
@@ -226,6 +264,8 @@ export function createReplicaTransportWorker(deps: {
 }) {
   const { db, transport } = deps;
   const now = deps.now ?? Date.now;
+  const roster = createCachedReplicaRoster(deps.authority.roster, { now });
+  const server = deps.authority.signer.address.toLowerCase();
   const cap = deps.maxBlobBytes ?? REPLICA_MAX_BLOB_BYTES;
   if (!Number.isSafeInteger(cap) || cap < 1 || cap > REPLICA_MAX_BLOB_BYTES)
     throw new RangeError("invalid storage cap");
@@ -281,23 +321,84 @@ export function createReplicaTransportWorker(deps: {
 
   /**
    * One validated authority context for every phase: the expected owner, the
-   * persisted binding and the transport port's owner must agree. Checked before
-   * any phase runs, so a wrong-owner reopen cannot encrypt, publish or import.
+   * persisted binding, the transport port's owner and the writer identity's
+   * owner must agree. Checked before any phase runs, so a wrong-owner reopen
+   * cannot encrypt, publish or import. False, with nothing written, when the
+   * replication door closed since the step began.
    */
-  function authority() {
+  function authority(identity: ReplicaWriterIdentity): boolean {
     const owner = deps.expected().owner;
-    db.prepare(
-      "INSERT OR IGNORE INTO pdpp_transport_state (id,owner,writer) VALUES (1,?,?)",
-    ).run(owner, randomUUID().replaceAll("-", ""));
-    const bound = state();
-    if (
-      bound.owner !== owner ||
-      (transport.owner !== undefined &&
-        transport.owner.toLowerCase() !== owner.toLowerCase())
-    )
-      throw new ReplicaAuthorityError();
-    return bound;
+    return db
+      .transaction(() => {
+        if (!replicationAdmitted(db)) return false;
+        db.prepare(
+          "INSERT OR IGNORE INTO pdpp_transport_state (id,owner,writer) VALUES (1,?,?)",
+        ).run(owner, identity.transportWriter);
+        const bound = state();
+        if (
+          bound.owner !== owner ||
+          identity.seed.owner !== owner.toLowerCase() ||
+          (transport.owner !== undefined &&
+            transport.owner.toLowerCase() !== owner.toLowerCase())
+        )
+          throw new ReplicaAuthorityError();
+        if (bound.writer !== identity.transportWriter) startWriter(identity);
+        return true;
+      })
+      .immediate();
   }
+  /**
+   * A new writer identity (re-registration, reset or restore) starts its own
+   * chain at sequence 1, and its first publication is a full current-state
+   * baseline under the new writer. The old writer's unprepared batches and
+   * unpublished fragments are abandoned: their operations name the old
+   * operation writer, which no receiver accepts from the new one. The
+   * baseline carries their effect instead, so a peer that missed any old
+   * batch still converges. The same transaction switches the writer and pins
+   * the baseline; a crash resumes it from its durable cursor. The rebaseline
+   * is a capture, so the door's fence does not count it as a bypass.
+   */
+  function startWriter(identity: ReplicaWriterIdentity) {
+    const baseline = captureWrites(db, () => deps.exporter.rebaseline());
+    db.prepare(
+      "UPDATE pdpp_transport_state SET writer=?,sequence=0,previous_json=NULL,baseline_cursor=?,baseline_done=0,tail_cursor=NULL WHERE id=1",
+    ).run(identity.transportWriter, baseline?.after ?? 0);
+    db.prepare("DELETE FROM pdpp_transport_batches").run();
+    db.prepare(
+      "UPDATE pdpp_transport_outbox SET state='abandoned' WHERE state='ready'",
+    ).run();
+  }
+  /** This receiver's partition: its owner, chain and environment. */
+  const partition = (): ReplicaPartition => ({
+    owner: state().owner,
+    chainId: deps.authority.chainId,
+    environment: deps.authority.environment,
+  });
+  const factsOf = (fragment: ReplicaFragment): ReplicaBatchFacts => ({
+    batch: fragment.batch,
+    sequence: fragment.sequence,
+    previous: fragment.previous,
+    digest: fragment.digest,
+    totalBytes: fragment.totalBytes,
+    count: fragment.count,
+  });
+  /** Receiver checks 2-5 (host contract §3.4) for one fragment's statement. */
+  const authorizeFragment = (fragment: ReplicaFragment, signal: AbortSignal) =>
+    authorizeReplicaBatch({
+      authority: fragment.authority,
+      facts: factsOf(fragment),
+      transportWriter: fragment.writer,
+      receiver: partition(),
+      roster: (address) => roster.server(address, { signal }),
+    });
+  const refused = (
+    reason: ReplicaAuthorityRefusal,
+    key: string,
+  ): ReplicaPhaseOutcome => ({ tag: "quarantine", proof: { reason, key } });
+  const rosterWait = (address: string): ReplicaPhaseOutcome => ({
+    tag: "wait",
+    dependency: { kind: "roster", key: address },
+  });
 
   /** An attempt with no durable effect besides its outcome. */
   const verdict = (outcome: ReplicaPhaseOutcome): ReplicaAttempt => ({
@@ -584,9 +685,13 @@ export function createReplicaTransportWorker(deps: {
       const batch = item.row;
       const token = randomUUID();
       const s = state();
+      const identity = currentReplicaWriterIdentity(db);
       let chunkBytes = deps.targetChunkBytes ?? 4 * 1024 * 1024;
       let preparedCount = 0;
       try {
+        // Batches belong to the current writer; startWriter drops older ones.
+        if (identity?.transportWriter !== s.writer)
+          throw new ReplicaProblemError("prepare_failed");
         while (true) {
           try {
             preparedCount = 0;
@@ -602,6 +707,13 @@ export function createReplicaTransportWorker(deps: {
               digest: batch.digest,
               totalBytes: batch.total_bytes,
               bytes: () => payloadBytes(batch),
+              sign: (facts) =>
+                signReplicaBatch({
+                  signer: deps.authority.signer,
+                  partition: partition(),
+                  seed: identity.seed,
+                  facts,
+                }),
               encrypt: (scope, bytes) =>
                 call(signal, () => transport.encrypt(scope, bytes)),
               maxBlobBytes: cap,
@@ -931,19 +1043,31 @@ export function createReplicaTransportWorker(deps: {
         const plaintext = await call(signal, () =>
           transport.decrypt(row.scope, encrypted),
         );
-        const fragment = decodeReplicaFragment(
-          plaintext,
-          row.scope,
-          state().owner,
-        );
+        let fragment: ReplicaFragment | undefined;
+        let collectedAt: string;
+        try {
+          fragment = decodeReplicaFragment(plaintext, row.scope, state().owner);
+          collectedAt = fragment.collectedAt;
+        } catch (error) {
+          if (!(error instanceof ReplicaFragmentUnsigned)) throw error;
+          collectedAt = error.collectedAt;
+        }
         const dataHash = keccak256(plaintext);
         const metadataHash = replicaMetadataHash(
           row.scope,
-          fragment.collectedAt,
+          collectedAt,
           encrypted.length,
         );
         if (dataHash !== head.dataHash || metadataHash !== head.metadataHash)
           throw new ReplicaProblemError("commitment_mismatch");
+        // Authority runs only on bytes that match the registered commitment,
+        // so replacing stored ciphertext cannot get a real fragment refused.
+        if (!fragment) return verdict(refused("signature_invalid", row.scope));
+        const authorized = await authorizeFragment(fragment, signal);
+        if (authorized.tag === "refused")
+          return verdict(refused(authorized.reason, row.scope));
+        if (authorized.tag === "wait")
+          return verdict(rosterWait(authorized.server));
         return withPlan(
           { tag: "progress", receipt: { phase: "download", key: row.scope } },
           () =>
@@ -1562,6 +1686,33 @@ export function createReplicaTransportWorker(deps: {
         ).fragment_json,
       ) as ReplicaFragment;
       const pendingId = canonicalJson([writer, batch]);
+      /** Terminal for this batch; the receiver drops any staged copy of it. */
+      const refuse = (
+        proof: { reason: ReplicaAuthorityRefusal | "batch_equivocation" },
+        receiverReason: string = proof.reason,
+      ) =>
+        withPlan(
+          { tag: "quarantine", proof: { reason: proof.reason, key: id } },
+          () => {
+            deps.receiver.quarantine({
+              credential: deps.credential,
+              id: pendingId,
+              reason: receiverReason,
+            });
+            for (const row of metadata)
+              db.prepare(
+                "UPDATE pdpp_transport_inbox SET state='quarantined',error=? WHERE scope=?",
+              ).run(proof.reason, row.scope);
+          },
+        );
+      // Every import attempt asks the roster again, so a batch admitted at
+      // download on an answer up to REPLICA_ROSTER_MAX_AGE_MS old is
+      // revalidated before it is staged or promoted.
+      const authorized = await authorizeFragment(first, signal);
+      if (authorized.tag === "wait")
+        return verdict(rosterWait(authorized.server));
+      if (authorized.tag === "refused")
+        return refuse({ reason: authorized.reason });
       const imported = db
         .prepare(
           "SELECT digest,sequence FROM pdpp_transport_imported WHERE writer=? AND batch=?",
@@ -1580,23 +1731,7 @@ export function createReplicaTransportWorker(deps: {
             imported.sequence !== first.sequence)) ||
         (sequenceHolder && sequenceHolder.batch !== batch)
       )
-        return withPlan(
-          {
-            tag: "quarantine",
-            proof: { reason: "batch_equivocation", key: id },
-          },
-          () => {
-            deps.receiver.quarantine({
-              credential: deps.credential,
-              id: pendingId,
-              reason: "batch equivocation",
-            });
-            for (const row of metadata)
-              db.prepare(
-                "UPDATE pdpp_transport_inbox SET state='quarantined',error='batch_equivocation' WHERE scope=?",
-              ).run(row.scope);
-          },
-        );
+        return refuse({ reason: "batch_equivocation" }, "batch equivocation");
       const staging: string[] = [];
       /**
        * Copy custody of this download, if its copy is not retained yet. It
@@ -1642,6 +1777,12 @@ export function createReplicaTransportWorker(deps: {
           signal.throwIfAborted();
           if (payload.envelope.batchId !== first.batch)
             throw new ReplicaProblemError("payload_invalid");
+          // Check 7: every operation names the signer's operation writer.
+          const misattributed = replicaOperationWriterRefusal(
+            payload.envelope.operations,
+            authorized.writers,
+          );
+          if (misattributed) return refuse({ reason: misattributed });
           // Trusted retained declarations, never claims copied from the envelope.
           // An unknown declaration is a dependency the host can supply later.
           const expected = deps.expected();
@@ -1941,14 +2082,50 @@ export function createReplicaTransportWorker(deps: {
   async function step(
     input: { budget?: ReplicaBudget; signal?: AbortSignal } = {},
   ): Promise<ProgressReport> {
-    if (!enabled() || running || activeDatabases.has(databaseKey))
+    // A closed door stops replication for good: no identity, capture or
+    // publish work.
+    if (
+      !enabled() ||
+      running ||
+      activeDatabases.has(databaseKey) ||
+      !replicationAdmitted(db)
+    )
       return idle();
-    authority();
+    // Writer ids come from this server's own registration. Until it is
+    // registered under the owner, nothing runs.
+    running = true;
+    let own;
+    try {
+      own = await enableReplicaWriterIdentity({
+        db,
+        owner: deps.expected().owner,
+        server,
+        roster,
+        signal: input.signal,
+      });
+    } finally {
+      running = false;
+    }
+    if (own.tag === "refused") return idle();
+    if (own.tag === "waiting")
+      return {
+        ...idle(),
+        waits: [
+          {
+            id: "writer-identity",
+            phase: "retain",
+            dependency: { kind: "roster", key: server },
+          },
+        ],
+        nextWake: now() + REPLICA_WAIT_FALLBACK_MS,
+      };
     const writerToken = randomUUID();
     acquireWriter(writerToken);
     running = true;
     activeDatabases.add(databaseKey);
     try {
+      // Under the writer lock: a new identity resets the writer's chain.
+      if (!authority(own.identity)) return idle();
       // Only this process owns the worker. None of these hidden stages can be published.
       db.transaction(() => {
         db.prepare("DELETE FROM pdpp_transport_preparing").run();

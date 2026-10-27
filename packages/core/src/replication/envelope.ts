@@ -22,6 +22,7 @@ const base = {
     counter: integer.min(1),
     writerId: token,
     operationId: token,
+    origin: z.strictObject({ writerId: token, operationId: token }).optional(),
   }),
 };
 const record = {

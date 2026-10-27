@@ -20,6 +20,7 @@ import {
   ensureReplicaSchema,
 } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
+import { REPLICA_BLOB_CLAIM_INDEX_MIGRATION } from "./pdpp-replication-sqlite.js";
 
 interface SchemaObject {
   type: string;
@@ -665,11 +666,11 @@ describe("replication flag on", () => {
   it("gives an existing database the blob-claim index through a new migration", () => {
     const db = open();
     // A database that migrated before the index existed: every earlier
-    // migration applied, the index absent, the version one behind.
+    // migration applied, the index absent, the version just before it.
     const store = createReplicaRecordStore(db);
     db.exec("DROP INDEX pdpp_replica_blob_claim_idx");
     db.prepare("UPDATE pdpp_replica_schema_version SET version = ?").run(
-      REPLICA_MIGRATIONS.length - 1,
+      REPLICA_MIGRATIONS.indexOf(REPLICA_BLOB_CLAIM_INDEX_MIGRATION),
     );
     const names = () =>
       (
@@ -763,7 +764,7 @@ describe("replication flag on", () => {
     expect(lookup).toBeDefined();
     const plan = db
       .prepare(`EXPLAIN QUERY PLAN ${lookup}`)
-      .all("conn_a", 1, blob.blobId) as { detail: string }[];
+      .all("conn_a", 1, blob.blobId, "writer") as { detail: string }[];
     expect(plan.map((row) => row.detail).join("\n")).toContain(
       "pdpp_replica_blob_claim_idx",
     );

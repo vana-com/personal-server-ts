@@ -7,9 +7,9 @@ routes and Lite. This change does not enable production replication.
 ## Wire and authority
 
 Each address is `pdpp_replica_v1.<writer-token>_<batch-token>.<fragment-index>`.
-Writer and batch tokens are independent 128-bit random identifiers, without
-source, account or connection names. This three-part name passes the current
-SDK `ScopeSchema`. The first component is reserved from grants, ordinary
+The writer token is the derived transport writer id (see below). The batch
+token is a 128-bit random identifier. Neither contains source, account or
+connection names. This three-part name passes the current SDK `ScopeSchema`. The first component is reserved from grants, ordinary
 inventory, MCP and the upgraded legacy upload/download workers.
 
 Every object uses DPv2 version **1**, the existing per-scope key derivation,
@@ -31,6 +31,107 @@ length/digest while streaming. It does not allocate the advertised total. The ca
 replica envelope plus content-addressed binary bytes. Existing retained
 source/declaration bindings validate operations before receiver import. Binary
 digest/length, MIME and generation-bound claims remain receiver requirements.
+
+## Writer identity and batch authority
+
+This implements host contract §3 (docs/replication/host-contract.md and ADR
+0001). The worker takes an `authority` dependency: the device's registered PS
+server key (Node: `key.json`; Lite: the server identity account, not the owner
+signer), an uncached roster port over gateway `GET /v1/servers/:address`, the
+chain id and the environment.
+
+**Writer ids.** `pdpp-replica-writer-identity.ts` keeps an append-only table of
+incarnations. Each row holds the owner, server address, gateway registration id,
+a 128-bit writer nonce and the two ids derived from them: the first 16 bytes of
+a length-prefixed SHA-256 over the domain, role (`transport` or `operation`),
+owner, server, registration id and nonce. The highest incarnation is current.
+Derivation uses no fragment scope, so it does not depend on the carrier layout.
+
+- Each step first reads the server's own roster record. The step waits (a
+  `roster` dependency on its own address) until the server is registered under
+  the owner and not revoked. If the roster is unavailable, a server that already
+  has an identity continues with it; a server without one waits.
+- The first identity requires an empty replica journal. A database that
+  captured operations under the old random installation writer id fails with
+  `replica_identity_requires_fresh_journal`: **dev databases start fresh.**
+  Operations captured before the first identity keep that local id; receivers
+  refuse them, so they never leave the device.
+- A new registration id for the same address (re-registration) starts a new
+  incarnation with a new nonce at the next step.
+- After a replication reset, a new database, or a restore or clone, the host
+  must call `rotateReplicaWriterIdentity` before the first new write. It keeps
+  the registration and draws a new nonce. PS cannot detect a copied database.
+  A restored copy that does not rotate reuses its old sequences: peers
+  quarantine the reused sequence as `batch_equivocation`, keep the first
+  batch, and block the copy's later batches behind it.
+- On a writer change the worker starts a new chain at sequence 1, and its
+  first publication is a full current-state baseline. In the same transaction
+  as the switch, the journal's `rebaseline` re-captures every connection
+  lifecycle, blob claim, record, tombstone and completion under the new
+  operation writer and pins them as the new baseline; the tail resumes after
+  it. Unprepared batches and unpublished outbox rows of the old writer are
+  abandoned, because no receiver accepts the old operation writer from the new
+  signer; the baseline carries their effect. A peer that missed the old
+  writer's batches (refused after re-registration, never published, or
+  written between a gateway change and the next step) therefore converges.
+  Each re-issued record and completion takes the order of the highest
+  retained operation, own or received, with the same key and effect (record
+  data, tombstone, or completion snapshot): its counter, plus that
+  operation's writer and operation id as `revision.origin` (or its origin, if
+  it was itself a re-issue). `compareRevisions` orders by counter, then the
+  origin's ids, then the operation's own, so the re-issue wins and loses
+  exactly where the original does. A state no retained operation explains
+  takes a new counter. The rebaseline runs inside the door's capture guard. A
+  crash during the baseline resumes from its durable cursor.
+- Every step checks the replication door first. The roster read writes
+  nothing; the identity write (establish or rotate) checks the door in its own
+  transaction and refuses once it is closed, and the writer switch and
+  rebaseline check it again in theirs. So a door that closes during the roster
+  read leaves no new identity, rebaseline or publication.
+- Completion dependencies and blob-claim reuse consider only the current
+  operation writer, so every dependency a completion names is in a batch the
+  current writer publishes.
+
+**Signing.** Each batch carries a fragment-version-2 `authority`: an EIP-712
+`PdppReplicaBatch` statement (domain "Vana PDPP Replica", version "1",
+chainId) that names the owner, server, registration id, environment, writer
+nonce, batch, sequence, predecessor digest, payload digest, total bytes and
+fragment count, signed by the server key. Every fragment of a batch carries the
+same statement.
+
+**Receiver checks**, in §3.4 order, after the commitment check passes (so
+replaced storage bytes cannot get a real fragment quarantined):
+
+| Check                                                                        | Refusal                 |
+| ---------------------------------------------------------------------------- | ----------------------- |
+| Statement parses, covers this batch, and recovers to its `server`            | `signature_invalid`     |
+| Owner, chain id and environment match this receiver                          | `partition_mismatch`    |
+| Roster has a record for the server                                           | `server_not_registered` |
+| Roster owner is the statement owner                                          | `roster_owner_mismatch` |
+| Record is not revoked and has the statement's registration id                | `server_not_registered` |
+| Fragment writer is the transport writer the statement derives                | `writer_mismatch`       |
+| Every operation names the operation writer the statement derives (at import) | `writer_mismatch`       |
+
+Each refusal is a typed quarantine. An unsigned (version-1) fragment is
+`signature_invalid`. A roster that cannot answer is a `roster` wait, never a
+refusal. A re-registered server's old incarnation names the old registration
+id, so its unimported batches are refused; imported data stays. A deregistered
+server's unimported batches are refused the same way.
+
+**Staleness.** The worker caches roster answers, including proven absence, for
+at most `REPLICA_ROSTER_MAX_AGE_MS` (5 minutes) on its own clock, bounded in
+entries, with one read in flight per address. An expired answer is never used,
+even when the gateway is down. Removal therefore takes effect within 5 minutes
+plus the gateway's own cache time; until then a peer can still import a
+removed server's batch. A batch admitted at download is
+authorized again on every import attempt, so an import that waits (finality,
+mapping) past the cache age is revalidated before it is staged or promoted.
+
+**Known limits.** A rebaseline re-issues the whole current state, including
+records that peers wrote, as content-equal operations, so its size is the
+database's live state. Its capture runs in one transaction, like the first
+baseline, and keeps one revision per record key and effect in memory. The roster is the
+gateway's current view; there is no history of past registrations.
 
 ## Durable progress
 
@@ -192,9 +293,9 @@ Live gateway/storage write acceptance, 100 MiB boundary memory use, registry
 cardinality/cost, real process termination during I/O, and mobile persistence
 are unproven. Pages and reassembled payloads are
 buffered in memory; large-device/phone memory measurements are required before
-promotion. A restored or cloned database must rotate its persisted writer
-identity before producing new batches; automated clone detection is not part
-of this experimental worker. Hosts must keep owner identity encoding consistent
+promotion. A restored or cloned database must call
+`rotateReplicaWriterIdentity` before producing new batches; automated clone
+detection is not part of this experimental worker. Hosts must keep owner identity encoding consistent
 between baseline configuration and authoritative evidence.
 
 ## Retained inbox upgrade

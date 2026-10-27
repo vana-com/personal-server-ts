@@ -3,6 +3,11 @@ import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { sha256, keccak256, stringToHex } from "viem";
 import { canonicalJson } from "./envelope.js";
 import { ReplicaFramingUnsupported } from "./outcome.js";
+import {
+  replicaBatchAuthoritySchema,
+  type ReplicaBatchAuthority,
+  type ReplicaBatchFacts,
+} from "./writer-identity.js";
 
 /** Reserved across ordinary reads, grants, inventory, MCP and legacy sync. */
 import { REPLICA_SCOPE_PREFIX } from "./namespace.js";
@@ -17,7 +22,8 @@ const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const predecessorSchema = z.strictObject({ batch: token, digest });
 export const replicaFragmentSchema = z.strictObject({
   format: z.literal("vana-pdpp-replica-fragment"),
-  version: z.literal(1),
+  /** Version 2 carries the signed batch statement. Version 1 is refused. */
+  version: z.literal(2),
   owner: z.string().min(1),
   writer: token,
   batch: token,
@@ -31,6 +37,8 @@ export const replicaFragmentSchema = z.strictObject({
   offset: integer,
   chunkDigest: digest,
   content: z.string(),
+  /** The batch statement signed by the writer's server key (host contract §3.3). */
+  authority: replicaBatchAuthoritySchema,
 });
 export type ReplicaFragment = z.infer<typeof replicaFragmentSchema>;
 export type Predecessor = z.infer<typeof predecessorSchema>;
@@ -100,6 +108,18 @@ export function replicaMetadataHash(
     stringToHex(JSON.stringify({ scope, collectedAt, sizeBytes })),
   );
 }
+/**
+ * A decoded fragment without a valid batch statement: version 1, or a
+ * missing or malformed `authority`. Receivers refuse it as
+ * `signature_invalid` once its bytes match the registered commitment.
+ */
+export class ReplicaFragmentUnsigned extends Error {
+  constructor(readonly collectedAt: string) {
+    super("replica fragment is not signed");
+    this.name = "ReplicaFragmentUnsigned";
+  }
+}
+
 export function decodeReplicaFragment(
   plaintext: Uint8Array,
   scope: string,
@@ -107,7 +127,21 @@ export function decodeReplicaFragment(
 ): ReplicaFragment {
   const encoded = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
   const wrapper = DataFileEnvelopeSchema.parse(JSON.parse(encoded));
-  const fragment = replicaFragmentSchema.parse(wrapper.data.fragment);
+  const parsed = replicaFragmentSchema.safeParse(wrapper.data.fragment);
+  if (!parsed.success) {
+    const claimed = wrapper.data.fragment as
+      { version?: unknown; authority?: unknown } | null | undefined;
+    if (
+      wrapper.scope === scope &&
+      typeof claimed === "object" &&
+      claimed !== null &&
+      (claimed.version !== 2 ||
+        !replicaBatchAuthoritySchema.safeParse(claimed.authority).success)
+    )
+      throw new ReplicaFragmentUnsigned(wrapper.collectedAt);
+    throw parsed.error;
+  }
+  const fragment = parsed.data;
   if (
     canonicalJson(wrapper) !== encoded ||
     wrapper.scope !== scope ||
@@ -143,12 +177,13 @@ export async function prepareReplicaFragment(input: {
   index: number;
   offset: number;
   chunk: Uint8Array;
+  authority: ReplicaBatchAuthority;
   encrypt: (scope: string, bytes: Uint8Array) => Promise<Uint8Array>;
 }): Promise<PreparedFragment> {
   const scope = replicaScope(input.writer, input.batch, input.index);
   const fragment = replicaFragmentSchema.parse({
     format: "vana-pdpp-replica-fragment",
-    version: 1,
+    version: 2,
     owner: input.owner,
     writer: input.writer,
     batch: input.batch,
@@ -162,6 +197,7 @@ export async function prepareReplicaFragment(input: {
     offset: input.offset,
     chunkDigest: replicaDigest(input.chunk),
     content: toBase64(input.chunk),
+    authority: input.authority,
   });
   const plaintext = new TextEncoder().encode(
     canonicalJson({
@@ -195,6 +231,8 @@ export async function fragmentReplicaPayload(input: {
   previous: Predecessor | null;
   bytes: Uint8Array;
   collectedAt: string;
+  /** Signs the batch statement; called again when adaptive framing changes the count. */
+  sign: (facts: ReplicaBatchFacts) => Promise<ReplicaBatchAuthority>;
   encrypt: (scope: string, bytes: Uint8Array) => Promise<Uint8Array>;
   maxBlobBytes?: number;
   targetChunkBytes?: number;
@@ -219,6 +257,14 @@ export async function fragmentReplicaPayload(input: {
         REPLICA_MAX_FRAGMENTS,
         "fragment_count",
       );
+    const authority = await input.sign({
+      batch: input.batch,
+      sequence: input.sequence,
+      previous: input.previous,
+      digest,
+      totalBytes: input.bytes.length,
+      count,
+    });
     const parts: PreparedFragment[] = [];
     let oversized = 0;
     for (let index = 0; index < count; index++) {
@@ -232,6 +278,7 @@ export async function fragmentReplicaPayload(input: {
         index,
         offset,
         chunk,
+        authority,
       });
       if (part.encrypted.length > cap) {
         oversized = part.encrypted.length;
@@ -270,6 +317,7 @@ export function assembleReplicaPayload(
       digest: f.digest,
       totalBytes: f.totalBytes,
       count: f.count,
+      authority: f.authority,
     });
   for (let index = 0; index < sorted.length; index++) {
     const f = sorted[index]!;

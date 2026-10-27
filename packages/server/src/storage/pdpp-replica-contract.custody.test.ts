@@ -1485,6 +1485,7 @@ describe("section C: fences, outcomes and claims", () => {
       }),
       credential,
       transport: net.port,
+      authority: a.authority,
       now: clock.now,
     });
     let release = () => {};

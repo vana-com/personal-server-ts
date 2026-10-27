@@ -4,6 +4,8 @@
  * bounded cause chains: exception text never crosses this boundary.
  */
 
+import type { ReplicaAuthorityRefusal } from "./writer-identity.js";
+
 export type ReplicaPhase =
   | "retain"
   | "prepare"
@@ -24,6 +26,8 @@ export type ReplicaDependency =
   | { kind: "declaration"; key: string }
   | { kind: "blob"; key: string }
   | { kind: "reset"; key: string }
+  /** The gateway roster for a server address could not be read. */
+  | { kind: "roster"; key: string }
   /**
    * Every retained copy of a batch is disproved and the refetch budget is
    * spent (copy_conflict_unresolved). A new finalized fact for the batch
@@ -124,7 +128,9 @@ export interface ReplicaQuarantineProof {
     | "finalized_conflict"
     | "batch_equivocation"
     | "source_binding_conflict"
-    | "local_mapping_conflict";
+    | "local_mapping_conflict"
+    /** Writer authority (host contract §3.4). None of these touch writer state. */
+    | ReplicaAuthorityRefusal;
   key: string;
 }
 
