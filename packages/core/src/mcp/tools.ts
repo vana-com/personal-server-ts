@@ -2071,7 +2071,7 @@ const remember: McpToolDefinition = {
   name: REMEMBER_TOOL,
   title: "Remember",
   description:
-    "Save a short memory about the user (fact, preference, decision) for any allowed agent to recall. Needs a write:<scope> grant (writableScopes).",
+    "Save a fact, preference, goal or decision the user shares, without being asked, so any allowed agent can recall it. Tell the user briefly. Never save secrets, passwords, IDs or account numbers. Needs a write:<scope> grant (writableScopes).",
   inputSchema: {
     text: z
       .string()
