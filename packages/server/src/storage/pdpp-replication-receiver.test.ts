@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -923,6 +923,86 @@ it("makes competing known declaration completions unavailable instead of overwri
   send(d, second);
   expect(value(d)).toBeUndefined();
   expect(d.store.listStreamCompletions("conn_a")).toEqual([]);
+});
+
+it("makes a completion unavailable, not the import a failure, when live rows do not fit its declaration's key", () => {
+  const operations = completedReplica();
+  const d = device();
+  send(
+    d,
+    operations.filter((op) => op.kind !== "stream-complete"),
+  );
+  expect(value(d)?.data.text).toBe("snapshot");
+  // A second trusted declaration of the stream keys rows by a field the
+  // stored rows lack, so their snapshot digest cannot be computed.
+  const keyed = {
+    ...binding,
+    digest: `sha256:${"c".repeat(64)}`,
+    primaryKey: ["other"],
+  };
+  d.declare([
+    ...declarations,
+    { sourceId, binding: keyed, validateData: () => true },
+  ]);
+  const completion = operations.find((op) => op.kind === "stream-complete")!;
+  expect(() =>
+    send(d, [
+      {
+        ...completion,
+        declaration: keyed,
+        revision: { ...completion.revision, operationId: "keyed-complete" },
+      },
+    ]),
+  ).not.toThrow();
+  expect(d.store.listStreamCompletions("conn_a")).toEqual([]);
+  expect(value(d)?.data.text).toBe("snapshot");
+});
+
+describe("lifecycle evidence outranks a binding conflict, as in the engine", () => {
+  // Evidence for conn_a names another method; the host then maps conn_a.
+  const foreign = (op: ReplicaOperation): ReplicaOperation => ({
+    ...op,
+    methodId: "other",
+  });
+  function provisionOver(operations: ReplicaOperation[]) {
+    const d = device(false);
+    send(d, operations.map(foreign));
+    d.store.registerConnection({
+      instance: "conn_a",
+      sourceId,
+      method: "collector",
+      label: "A",
+    });
+    d.receiver.retry({ credential: "replica-secret" });
+    expect(d.store.replicaBindingConflict("conn_a")).toBe(true);
+    return d;
+  }
+  it("applies a deletion", () => {
+    const d = provisionOver([
+      registration(),
+      {
+        ...registration(),
+        kind: "connection-delete",
+        revision: { counter: 2, writerId: "remote", operationId: "delete" },
+      },
+    ]);
+    expect(d.store.getInstanceBinding("conn_a").deletedAt).toBe(
+      "replica-deleted",
+    );
+  });
+  it("applies an operation-ID equivocation's terminal quarantine", () => {
+    const record = upsert();
+    const d = provisionOver([
+      registration(),
+      record,
+      { ...record, data: { id: "a", text: "twin" } },
+    ]);
+    expect(
+      d.db
+        .prepare("SELECT instance FROM pdpp_replica_quarantined_connections")
+        .all(),
+    ).toEqual([{ instance: "conn_a" }]);
+  });
 });
 
 it.each([false, true])(
