@@ -233,6 +233,8 @@ export interface ReplicaCanonicalPort {
    * from derived state matching canonical rows (see the visibility view).
    */
   exclusive<T>(write: () => T): T;
+  /** The read counterpart of `exclusive`: a snapshot over matching derived state. */
+  snapshot<T>(read: () => T): T;
   cursorBinding(
     instanceIds: string[],
     fields: string[] | undefined,
@@ -304,6 +306,7 @@ export function createReplicaCanonicalPort(db: Database) {
   `);
   let visibilityObserver: (() => void) | undefined;
   let writeBoundary: (<T>(write: () => T) => T) | undefined;
+  let readBoundary: (<T>(read: () => T) => T) | undefined;
   let localWriteObserver:
     ((instance: string, stream: string, recordKey: string) => void) | undefined;
   // Keys written since the last settle. A TEMP table, so a rolled-back write
@@ -474,6 +477,8 @@ export function createReplicaCanonicalPort(db: Database) {
     notifyVisibility: () => visibilityObserver?.(),
     exclusive: (write) =>
       writeBoundary ? writeBoundary(write) : db.transaction(write).immediate(),
+    snapshot: (read) =>
+      readBoundary ? readBoundary(read) : db.transaction(read).deferred(),
     cursorBinding,
     assertCursorIntegrity(payload, instanceIds, fields) {
       const current = cursorBinding(instanceIds, fields);
@@ -535,9 +540,13 @@ export function createReplicaCanonicalPort(db: Database) {
     setReplicaVisibilityObserver(observer: () => void) {
       visibilityObserver = observer;
     },
-    /** The visibility view's `exclusive`: where top-level canonical writes begin. */
-    setReplicaWriteBoundary(boundary: <T>(write: () => T) => T) {
-      writeBoundary = boundary;
+    /** The visibility view's `exclusive` and `snapshot`: where canonical transactions begin. */
+    setReplicaWriteBoundary(
+      write: <T>(write: () => T) => T,
+      read: <T>(read: () => T) => T,
+    ) {
+      writeBoundary = write;
+      readBoundary = read;
     },
     /** Called for each locally written key when the store settles, inside the write's transaction. */
     setReplicaLocalWriteObserver(

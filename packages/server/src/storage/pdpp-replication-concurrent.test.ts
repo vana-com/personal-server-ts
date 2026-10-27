@@ -289,7 +289,8 @@ describe("replication on: derived state follows other connections", () => {
     ).toEqual(["messages", "other"]);
   });
 
-  it("an outer transaction is not committed or rolled back by following", () => {
+  /** An enabled store that is current, then a plain commit of a new stream. */
+  function staleAfterForeignStream() {
     const path = file();
     const aDb = open(path);
     const a = createReplicaRecordStore(aDb);
@@ -300,20 +301,78 @@ describe("replication on: derived state follows other connections", () => {
     });
     const reads = receiverOf(aDb, a).readStore({ reader: "owner" });
     ingest(a, "mine");
-
-    ingest(createSqliteRecordStore(open(path)), "theirs", "theirs", "other");
-    // Inside the caller's transaction a read cannot follow (no write there), and
-    // must not disturb the transaction; the next top-level read follows.
-    aDb.exec("BEGIN");
     reads.listStreams(["conn_a"]);
+    const plain = createSqliteRecordStore(open(path));
+    ingest(plain, "theirs", "theirs", "other");
+    ingest(plain, "theirs");
+    return { aDb, a, reads };
+  }
+  const listed = (reads: ReturnType<typeof staleAfterForeignStream>["reads"]) =>
+    reads
+      .listStreams(["conn_a"])
+      .map((s) => s.stream)
+      .sort();
+
+  it("readSnapshot opens over derived state that already includes another connection's commit", () => {
+    const { a, reads } = staleAfterForeignStream();
+    expect(a.readSnapshot(() => listed(reads))).toEqual(["messages", "other"]);
+  });
+
+  it("writeTransaction opens over derived state that already includes another connection's commit", () => {
+    const { a, reads } = staleAfterForeignStream();
+    expect(a.writeTransaction(() => listed(reads))).toEqual([
+      "messages",
+      "other",
+    ]);
+  });
+
+  it("replaceStreams runs over derived state that already includes another connection's commit", () => {
+    const { aDb, a } = staleAfterForeignStream();
+    // Replacing `messages` tombstones the other connection's row. Counts built
+    // on a stale summary end at 0; the stream holds one live row. Read the
+    // summary itself: a later read would re-derive it and hide the defect.
+    a.replaceStreams([
+      {
+        instance: "conn_a",
+        stream: "messages",
+        method: "collector",
+        generation: 1,
+        emittedAt: at,
+        envelopes: [envelope("conn_a", "messages", "mine")],
+        primaryKey: ["id"],
+      },
+    ]);
+    expect(
+      aDb
+        .prepare(
+          "SELECT live_count FROM pdpp_replica_view_streams WHERE preview=0 AND instance='conn_a' AND stream='messages'",
+        )
+        .pluck()
+        .get(),
+    ).toBe(1);
+  });
+
+  it("a transaction the caller opened itself fails closed when it cannot show the derived state is current", () => {
+    const { aDb, a, reads } = staleAfterForeignStream();
+    aDb.exec("BEGIN");
+    expect(() => reads.listStreams(["conn_a"])).toThrow(
+      /not opened through the replica boundary/,
+    );
+    expect(() => ingest(a, "late", "late", "other")).toThrow(
+      /not opened through the replica boundary/,
+    );
+    // The caller's transaction is left as it was.
     expect(aDb.inTransaction).toBe(true);
     aDb.exec("ROLLBACK");
-    expect(
-      reads
-        .listStreams(["conn_a"])
-        .map((s) => s.stream)
-        .sort(),
-    ).toEqual(["messages", "other"]);
+    expect(listed(reads)).toEqual(["messages", "other"]);
+  });
+
+  it("a transaction the caller opened itself works while the derived state is current", () => {
+    const { aDb, reads } = staleAfterForeignStream();
+    listed(reads); // follow the other connection's commit
+    aDb.exec("BEGIN");
+    expect(listed(reads)).toEqual(["messages", "other"]);
+    aDb.exec("ROLLBACK");
   });
 
   it("matches a plain open's listing after any mix of other-connection writes", () => {

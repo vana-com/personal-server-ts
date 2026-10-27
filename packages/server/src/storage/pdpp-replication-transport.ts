@@ -322,13 +322,13 @@ export function createReplicaTransportWorker(deps: {
       write: (outcome: ReplicaOutcome, work: ReplicaWorkState, item: I) => void,
     ) =>
     (item: I, attempt: ReplicaAttempt, settle: ReplicaSettle): ReplicaOutcome =>
-      db
-        .transaction(() => {
-          const settled = settle(attempt.plan?.() ?? attempt.outcome);
-          write(settled.outcome, settled.state, item);
-          return settled.outcome;
-        })
-        .immediate();
+      // The receiver's own boundary: its plans read and write derived state,
+      // which a transaction opened on the raw connection would not refresh.
+      deps.receiver.atomically(() => {
+        const settled = settle(attempt.plan?.() ?? attempt.outcome);
+        write(settled.outcome, settled.state, item);
+        return settled.outcome;
+      });
   /** Network calls stop at the attempt's deadline or the host's abort. */
   const call = <T>(signal: AbortSignal, start: () => Promise<T>) =>
     abortable(signal, start);

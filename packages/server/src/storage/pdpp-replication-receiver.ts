@@ -762,7 +762,7 @@ export function createReplicaReceiver(deps: {
     integrityEpoch: store.replicaIntegrityEpoch,
   });
   store.setReplicaVisibilityObserver(view.flush);
-  store.setReplicaWriteBoundary(view.exclusive);
+  store.setReplicaWriteBoundary(view.exclusive, view.snapshot);
   // A local write journals under the retained declaration. When retained
   // evidence for its key already names another declaration, or the stream is
   // append-only and the content differs, the write completes a conflict. The
@@ -1668,6 +1668,14 @@ export function createReplicaReceiver(deps: {
         view.reconcileAll();
         return plan;
       });
+    },
+    /**
+     * Runs `run` in one write transaction whose derived state is current.
+     * Hosts that combine receiver calls with their own writes enter here, so
+     * the nested receiver calls can trust the transaction's view.
+     */
+    atomically<T>(run: () => T): T {
+      return view.exclusive(run);
     },
     retry(input: { credential: unknown }): ReplicaMergePlan {
       authorize(input.credential);

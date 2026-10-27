@@ -57,6 +57,18 @@ type OverlayRow = {
 const VIEW_SCHEMA = 10;
 /** How often a transaction may find another connection committed first. */
 const SYNC_ATTEMPTS = 16;
+/**
+ * Thrown by a view call inside a caller's transaction that cannot be shown to
+ * match canonical rows: another connection committed before the transaction
+ * took its snapshot, and a transaction cannot write the re-derivation.
+ */
+class DerivedStateStale extends Error {
+  constructor() {
+    super(
+      "replica view is stale inside a transaction not opened through the replica boundary; open it with readSnapshot or writeTransaction",
+    );
+  }
+}
 /** Thrown inside a transaction that started after another connection committed. */
 class DerivedStateMoved extends Error {
   constructor() {
@@ -183,6 +195,7 @@ export function createReplicaVisibilityView(deps: {
    * canonical rows. It moves only when another connection commits.
    */
   let seen = -1;
+  let syncProbe: Statement<[]> | undefined;
   let dataVersionStatement: Statement<[]> | undefined;
   let transitions: string[] | undefined;
   db.transaction(() => {
@@ -582,6 +595,23 @@ export function createReplicaVisibilityView(deps: {
     (...args: A): R =>
       snapshot(() => read(...args));
   /**
+   * Whether the derived state matches the snapshot this transaction reads. The
+   * first read fixes the snapshot of a deferred transaction, and the version
+   * is stable from then on.
+   */
+  function matchesSnapshot(): boolean {
+    (syncProbe ??= db.prepare("SELECT 1 FROM pdpp_replica_view_sync")).get();
+    return dataVersion() === seen;
+  }
+  /**
+   * Inside a transaction the view cannot re-derive. A transaction opened
+   * through `snapshot` or `exclusive` matches by construction; any other must
+   * show it does, or the call fails rather than answer from stale summaries.
+   */
+  function assertNestedMatches(): void {
+    if (!matchesSnapshot()) throw new DerivedStateStale();
+  }
+  /**
    * Runs `fn` in a transaction that starts from a derived state matching
    * canonical rows. Another connection can commit between `sync` and the
    * transaction starting; the transaction then notices, rolls back untouched
@@ -597,9 +627,7 @@ export function createReplicaVisibilityView(deps: {
       try {
         return db
           .transaction(() => {
-            // The first read fixes the snapshot a deferred transaction sees.
-            db.prepare("SELECT 1 FROM pdpp_replica_view_sync").get();
-            if (dataVersion() !== seen) throw new DerivedStateMoved();
+            if (!matchesSnapshot()) throw new DerivedStateMoved();
             const result = fn();
             afterwards?.();
             return result;
@@ -613,7 +641,9 @@ export function createReplicaVisibilityView(deps: {
   }
   /** A read transaction over derived state that matches canonical rows. */
   function snapshot<T>(read: () => T): T {
-    return db.inTransaction ? read() : guarded("deferred", read);
+    if (!db.inTransaction) return guarded("deferred", read);
+    assertNestedMatches();
+    return read();
   }
   /**
    * A write transaction (`BEGIN IMMEDIATE`) over derived state that matches
@@ -622,9 +652,9 @@ export function createReplicaVisibilityView(deps: {
    * savepoint of the caller's transaction.
    */
   function exclusive<T>(write: () => T): T {
-    return db.inTransaction
-      ? db.transaction(write).immediate()
-      : guarded("immediate", write, markSynced);
+    if (!db.inTransaction) return guarded("immediate", write, markSynced);
+    assertNestedMatches();
+    return db.transaction(write).immediate();
   }
 
   function markOperation(digest: string, json: string) {

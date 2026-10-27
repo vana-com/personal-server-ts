@@ -826,7 +826,7 @@ export function createSqliteRecordStore(
     // a mutator that throws undoes its own writes even if the caller catches
     // the error and commits. That is what main's per-mutator
     // `db.transaction` gave every one of these.
-    if (replica && !db.inTransaction) return replica.exclusive(run);
+    if (replica) return replica.exclusive(run);
     const atomic = db.transaction(run);
     return begin === "immediate" ? atomic.immediate() : atomic();
   };
@@ -2709,19 +2709,23 @@ export function createSqliteRecordStore(
         };
       });
     },
-    readSnapshot: <T>(read: () => T): T => db.transaction(read).deferred(),
+    readSnapshot: <T>(read: () => T): T =>
+      replica ? replica.snapshot(read) : db.transaction(read).deferred(),
     writeTransaction: <T>(write: () => T): T =>
-      db.transaction(write).immediate(),
+      replica ? replica.exclusive(write) : db.transaction(write).immediate(),
     resetInstanceBinding,
     storeBlobBytesForInstance,
     replaceStream,
-    replaceStreams: (inputs) =>
-      db.transaction(() => {
+    replaceStreams: (inputs) => {
+      const replaceAll = () => {
         for (const input of inputs) {
           if (!replaceStream(input).applied)
             throw new Error("canonical_batch_rejected");
         }
-      })(),
+      };
+      if (replica) replica.exclusive(replaceAll);
+      else db.transaction(replaceAll)();
+    },
     listStreamCompletions,
     completeStreams,
     listArrivalOrder,

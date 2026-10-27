@@ -166,6 +166,12 @@ interface Port<D extends ReplicaPortDriver> {
    * cursors.test.ts), so Lite compares repeats without those counters.
    */
   repeatDump(driver: D): unknown;
+  /**
+   * A dump with state that a reopen legitimately moves removed. Used only to
+   * compare a state from before a reopen with one after it; every other
+   * comparison uses the dumps whole.
+   */
+  acrossReopen(dump: unknown): unknown;
   /** Entry points whose repeat returns the original receipt. */
   stableReceipts: readonly string[];
   /** Whether local writes carry a request id that rejects changed content. */
@@ -217,6 +223,7 @@ const litePort = (sqlite: boolean): Port<LiteDriver> => ({
       provisioned: ["c1", "c2"],
     }),
   dump: (driver) => driver.persistence.dump(),
+  acrossReopen: (dump) => dump,
   repeatDump: (driver) => withoutViewRevisions(driver.persistence.dump()),
   stableReceipts: ["import", "local write", "promotion", "terminal quarantine"],
   requestIds: true,
@@ -232,7 +239,8 @@ const litePort = (sqlite: boolean): Port<LiteDriver> => ({
 /**
  * A reopen advances every cursor revision (cursors never outlive a restart:
  * nothing can tell what a plain open changed meanwhile), so a crash and
- * reopen is compared without the revision counters, which are no state.
+ * reopen is compared without the revision counters, which are no state. Only
+ * the comparisons of a state from before a reopen with one after it use it.
  */
 function withoutNodeRevisions(dump: Record<string, string[]>) {
   const streams = dump.pdpp_replica_view_streams;
@@ -257,7 +265,9 @@ const nodePort: Port<NodeDriver> = {
       declarations: [BINDINGS.m, BINDINGS.a],
       provisioned: ["c1", "c2"],
     }),
-  dump: (driver) => withoutNodeRevisions(sqliteDump(driver.db)),
+  dump: (driver) => sqliteDump(driver.db),
+  acrossReopen: (dump) =>
+    withoutNodeRevisions(dump as Record<string, string[]>),
   // A repeated unchanged ingest refreshes key arrival order. That predates
   // replication (it is on main) and changes no record, change or journal row.
   repeatDump: (driver) => {
@@ -265,7 +275,7 @@ const nodePort: Port<NodeDriver> = {
       pdpp_record_arrival: _arrival,
       pdpp_record_arrival_clock: _clock,
       ...rest
-    } = withoutNodeRevisions(sqliteDump(driver.db));
+    } = sqliteDump(driver.db);
     return rest;
   },
   // Node local writes carry no request id and a repeated promotion returns
@@ -363,7 +373,9 @@ function matrix<D extends ReplicaPortDriver>(name: string, port: Port<D>) {
             expect(crashed.error, point).toBe(`interrupted:${point}`);
             fired.push(point);
             if (!committed) {
-              expect(port.dump(driver), point).toEqual(before);
+              expect(port.acrossReopen(port.dump(driver)), point).toEqual(
+                port.acrossReopen(before),
+              );
               port.ids(driver, ids);
             }
             // Retrying the same request after reopen reaches the reference.
