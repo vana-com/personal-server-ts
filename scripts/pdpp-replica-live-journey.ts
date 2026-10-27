@@ -444,17 +444,17 @@ export async function openReplicaRuntime(init: Init) {
       )
       .run(key);
   const getManifest = transport.get;
-  transport.get = async (scope, version) => {
+  transport.get = async (scope, version, read) => {
     recordGet(replicaManifestKey(scope, version));
-    return getManifest(scope, version);
+    return getManifest(scope, version, read);
   };
   const getFragment = transport.getFragment;
-  transport.getFragment = async (scope, fragmentDigest) => {
+  transport.getFragment = async (scope, fragmentDigest, read) => {
     const key = replicaFragmentKey(scope, fragmentDigest);
     recordGet(key);
     if (stopAtDownload && killKeys.has(key) && ++downloads === stopAtDownload)
       bodyBarrier = { url: storage.urlForKey(key), key };
-    return getFragment(scope, fragmentDigest);
+    return getFragment(scope, fragmentDigest, read);
   };
   const worker = createReplicaTransportWorker({
     db,

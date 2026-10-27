@@ -14,6 +14,10 @@ import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
 import {
+  readBoundedResponse,
+  type ByteBudget,
+} from "@opendatalabs/personal-server-ts-core/additions";
+import {
   enableReplicaTestIdentity,
   replicaTestAuthority,
 } from "./pdpp-replica-writer-identity.test-utils.js";
@@ -352,6 +356,13 @@ export function network(
       const bytes = blobs.get(key);
       if (!bytes) throw new Error("404");
       return new Uint8Array(bytes);
+    },
+    /** The production bounded reader over this storage's bytes. */
+    async downloadBounded(key: string, budget: ByteBudget) {
+      return readBoundedResponse(
+        new Response(await storage.download(key)),
+        budget,
+      );
     },
     delete: async () => false,
     exists: async (key: string) => blobs.has(key),

@@ -15,6 +15,12 @@ export { REPLICA_SCOPE_PREFIX, isReplicaScope } from "./namespace.js";
 export const REPLICA_MAX_FRAGMENTS = 100000;
 /** vana-storage DEFAULT_MAX_BLOB_SIZE. Compare the actual encrypted request. */
 export const REPLICA_MAX_BLOB_BYTES = 100 * 1024 * 1024;
+/**
+ * Bytes an encrypted fragment adds to the base64 of its chunk: the envelope,
+ * the fragment fields and the OpenPGP framing. Bounds the fragment bytes a
+ * manifest may name for its payload length (`replicaFramedBytesBound`).
+ */
+export const REPLICA_FRAGMENT_OVERHEAD_BYTES = 4096;
 const token = z.string().regex(/^[a-f0-9]{32}$/);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -171,14 +177,53 @@ export function replicaMetadataHash(
   );
 }
 /**
- * A decoded manifest without a well-formed batch statement. Receivers refuse
- * it as `signature_invalid` once its bytes match the registered commitment.
+ * A manifest that can never be valid at its slot, with the refusal of the
+ * first check it fails. The caller has already matched its bytes to the
+ * slot's finalized commitment, so the refusal is terminal.
  */
-export class ReplicaManifestUnsigned extends Error {
-  constructor(readonly collectedAt: string) {
-    super("replica manifest is not signed");
-    this.name = "ReplicaManifestUnsigned";
+export class ReplicaManifestRefused extends Error {
+  constructor(
+    readonly reason:
+      | "signature_invalid"
+      | "partition_mismatch"
+      | "writer_mismatch"
+      | "manifest_invalid",
+  ) {
+    super(`replica manifest refused: ${reason}`);
+    this.name = "ReplicaManifestRefused";
   }
+}
+
+/**
+ * The envelope `collectedAt` of manifest plaintext, which the slot's metadata
+ * hash commits to. Undefined when there is none, so the bytes cannot match.
+ */
+export function replicaManifestCollectedAt(
+  plaintext: Uint8Array,
+): string | undefined {
+  try {
+    const value: unknown = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(plaintext),
+    );
+    const collectedAt =
+      typeof value === "object" && value !== null
+        ? (value as { collectedAt?: unknown }).collectedAt
+        : undefined;
+    return typeof collectedAt === "string" ? collectedAt : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The most encrypted fragment bytes a batch of `totalBytes` needs in `count`
+ * fragments: the base64 of every chunk plus a fixed overhead per fragment.
+ */
+export function replicaFramedBytesBound(totalBytes: number, count: number) {
+  return (
+    4 * Math.ceil(totalBytes / 3) +
+    count * (4 + REPLICA_FRAGMENT_OVERHEAD_BYTES)
+  );
 }
 
 /** The facts a manifest at `version` claims; its statement must sign exactly these. */
@@ -346,43 +391,53 @@ export async function prepareReplicaManifest(input: {
 }
 
 /**
- * Decode a manifest fetched from `<scope>/<version>`. The caller must also
- * compare its hash pair to the finalized commitment of that slot, then
- * authorize its statement against `replicaManifestFacts(manifest, version)`;
- * this check binds only owner and writer scope. Throws ReplicaManifestUnsigned
- * for a manifest of this scope whose statement is missing or malformed.
+ * Decode a manifest fetched from `<scope>/<version>`, after its hash pair
+ * matches the finalized commitment of that slot. The caller then authorizes
+ * its statement against `replicaManifestFacts(manifest, version)`; this check
+ * binds only owner and writer scope. Throws ReplicaManifestRefused.
  */
 export function decodeReplicaManifest(
   plaintext: Uint8Array,
   scope: string,
   owner: string,
 ): ReplicaManifest {
-  const encoded = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
-  const wrapper = DataFileEnvelopeSchema.parse(JSON.parse(encoded));
-  const parsed = replicaManifestSchema.safeParse(wrapper.data.manifest);
-  if (!parsed.success) {
-    const claimed = wrapper.data.manifest as
-      { authority?: unknown } | null | undefined;
-    if (
-      wrapper.scope === scope &&
-      typeof claimed === "object" &&
-      claimed !== null &&
-      !replicaBatchAuthoritySchema.safeParse(claimed.authority).success
-    )
-      throw new ReplicaManifestUnsigned(wrapper.collectedAt);
-    throw parsed.error;
+  let encoded: string;
+  let wrapper: ReturnType<typeof DataFileEnvelopeSchema.parse>;
+  try {
+    encoded = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
+    wrapper = DataFileEnvelopeSchema.parse(JSON.parse(encoded));
+  } catch {
+    throw new ReplicaManifestRefused("manifest_invalid");
   }
+  if (canonicalJson(wrapper) !== encoded)
+    throw new ReplicaManifestRefused("manifest_invalid");
+  if (wrapper.scope !== scope)
+    throw new ReplicaManifestRefused("writer_mismatch");
+  const claimed = wrapper.data.manifest;
+  const parsed = replicaManifestSchema.safeParse(claimed);
+  if (!parsed.success)
+    throw new ReplicaManifestRefused(
+      typeof claimed === "object" &&
+        claimed !== null &&
+        !replicaBatchAuthoritySchema.safeParse(
+          (claimed as { authority?: unknown }).authority,
+        ).success
+        ? "signature_invalid"
+        : "manifest_invalid",
+    );
   const manifest = parsed.data;
+  if (manifest.owner !== owner)
+    throw new ReplicaManifestRefused("partition_mismatch");
+  if (scope !== replicaScope(manifest.writer))
+    throw new ReplicaManifestRefused("writer_mismatch");
   if (
-    canonicalJson(wrapper) !== encoded ||
-    wrapper.scope !== scope ||
     wrapper.collectedAt !== manifest.collectedAt ||
-    manifest.owner !== owner ||
-    scope !== replicaScope(manifest.writer) ||
     (manifest.sequence === 1) !== (manifest.previous === null) ||
-    manifest.fragments.length > manifest.totalBytes
+    manifest.fragments.length > manifest.totalBytes ||
+    manifest.fragments.reduce((sum, f) => sum + f.bytes, 0) >
+      replicaFramedBytesBound(manifest.totalBytes, manifest.fragments.length)
   )
-    throw new Error("invalid replica manifest binding");
+    throw new ReplicaManifestRefused("manifest_invalid");
   return manifest;
 }
 

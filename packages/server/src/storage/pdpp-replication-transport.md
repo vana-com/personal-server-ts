@@ -153,25 +153,36 @@ signature. Prepare claims the scope's next version, signs, and keeps the claim
 only if the version is still next when the manifest commits. Fragments (format
 version 3) carry no statement: the signed manifest names their exact bytes.
 
-**Receiver checks**, in §3.4 order. The receiver waits for finality, fetches
-the manifest and checks its bytes against the finalized commitment (so
-replaced storage bytes cannot get a real manifest quarantined). It then checks
-the statement against the manifest and the slot it is registered at. Only an
-authorized manifest's fragments are fetched, and each one's length and sha256
-is checked against the manifest before it is decrypted.
+**Receiver checks**, in §3.4 order. The receiver waits for finality, then
+reads the manifest. The read stops at the storage cap (`maxBlobBytes`), and
+decryption refuses a compressed OpenPGP message before it inflates. No writer
+makes either, and neither can be checked against the commitment, whose data
+hash is over the plaintext, so both are `manifest_invalid`. The receiver then
+checks the plaintext's hash pair against the finalized commitment. A mismatch
+is `commitment_mismatch` and retries, so replaced storage bytes cannot get a
+real manifest quarantined. Only matching bytes are classified, and each
+refusal below is terminal for that slot. Only an authorized manifest's
+fragments are fetched. Each fragment read stops at its manifest entry's
+length and is charged against the step's byte budget; its sha256 is checked
+before it is decrypted.
 
-| Check                                                                        | Refusal                 |
-| ---------------------------------------------------------------------------- | ----------------------- |
-| Statement parses, signs this manifest at this version, recovers to `server`  | `signature_invalid`     |
-| Owner, chain id and environment match this receiver                          | `partition_mismatch`    |
-| Roster has a record for the server                                           | `server_not_registered` |
-| Roster owner is the statement owner                                          | `roster_owner_mismatch` |
-| Record is not revoked and has the statement's registration id                | `server_not_registered` |
-| The slot's scope writer is the transport writer the statement derives        | `writer_mismatch`       |
-| Every operation names the operation writer the statement derives (at import) | `writer_mismatch`       |
+| Check                                                                                                                                             | Refusal                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- |
+| Wrapper is the canonical envelope; fragment lengths are not zero; sequence, predecessor and `collectedAt` agree; entry bytes fit the framed bound | `manifest_invalid`      |
+| Statement parses, signs this manifest at this version, recovers to `server`                                                                       | `signature_invalid`     |
+| Owner, chain id and environment match this receiver                                                                                               | `partition_mismatch`    |
+| Roster has a record for the server                                                                                                                | `server_not_registered` |
+| Roster owner is the statement owner                                                                                                               | `roster_owner_mismatch` |
+| Record is not revoked and has the statement's registration id                                                                                     | `server_not_registered` |
+| The slot's scope writer is the transport writer the statement derives                                                                             | `writer_mismatch`       |
+| Every operation names the operation writer the statement derives (at import)                                                                      | `writer_mismatch`       |
 
-Each refusal is a typed quarantine of that slot. A manifest without a
-well-formed statement is `signature_invalid`. A signed manifest registered
+Each refusal is a typed quarantine of that slot. The framed bound ties the
+sum of entry bytes to the signed `totalBytes`: each fragment is encrypted
+JSON holding the base64 of its chunk, so the sum is at most
+`replicaFramedBytesBound(totalBytes, count)`. That bounds what one manifest
+can make a receiver fetch without capping what a user stores. A manifest
+without a well-formed statement is `signature_invalid`. A signed manifest registered
 again at another version is `signature_invalid`; registered in another scope it
 is `writer_mismatch`. A roster that cannot answer is a `roster` wait, never a
 refusal. A re-registered server's old incarnation names the old registration

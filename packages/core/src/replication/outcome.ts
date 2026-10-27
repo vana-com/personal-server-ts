@@ -133,7 +133,10 @@ export interface ReplicaQuarantineProof {
     | "batch_equivocation"
     | "source_binding_conflict"
     | "local_mapping_conflict"
-    /** A finalized manifest decodes to an invalid statement. */
+    /**
+     * A finalized manifest is over the storage cap or compressed, or its
+     * authentic bytes decode to an invalid statement.
+     */
     | "manifest_invalid"
     /**
      * Storage has no object at a fragment address of a finalized manifest.

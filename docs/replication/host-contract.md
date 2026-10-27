@@ -199,7 +199,14 @@ manifest before it is decrypted. Each failure is a typed quarantine of that
 item only. A batch that fails any check never touches writer state, so it
 cannot occupy a sequence or a predecessor slot of a real writer.
 
-1. Decrypt and decode the manifest. A manifest without a statement is
+1. Read the manifest, stopping at the storage cap, and decrypt it, refusing
+   a compressed OpenPGP message. Either refusal is `manifest_invalid`, because
+   no writer makes such bytes and the commitment hashes plaintext the receiver
+   would have to inflate. Check the plaintext's hash pair against the
+   finalized commitment; a mismatch retries as `commitment_mismatch`. Only
+   then decode. A wrapper that is not the canonical envelope, a zero fragment
+   length, facts that disagree with each other, or entry bytes over the
+   framed bound (§6) is `manifest_invalid`. A manifest without a statement is
    `signature_invalid`.
 2. Recover the signer. It must equal `server`, and the statement must sign
    this manifest at the version it is registered at.
@@ -225,7 +232,9 @@ cannot occupy a sequence or a predecessor slot of a real writer.
 This implements the receiver's `authenticate` hook. New codes in
 `packages/core/src/replication/outcome.ts`: dependency kind `roster`;
 quarantine reasons `signature_invalid`, `partition_mismatch`,
-`server_not_registered`, `roster_owner_mismatch` and `writer_mismatch`.
+`server_not_registered`, `roster_owner_mismatch` and `writer_mismatch`. Every
+refusal after the commitment check is terminal: authentic bytes do not change
+on retry.
 
 ### 3.5 Removal and re-registration
 
@@ -319,6 +328,12 @@ export interface ReplicaCall {
 // register(manifest, call), evidence(scope, version, call),
 // get(scope, version, call & { maxBytes: number }), list(cursor, call)
 ```
+
+Today `get` and `getFragment` take `ReplicaRead` (`{ maxBytes, signal }`):
+`get` is bounded by the storage cap and `getFragment` by the manifest entry's
+length. The DPv2 adapter uses the storage adapter's `downloadBounded`, which
+stops on `Content-Length` or cancels the stream, and otherwise checks the
+length after the read. An oversize read throws `ReplicaObjectRefused`.
 
 The adapter must stop its I/O on abort. `abortable` (`coordinator.ts:100-123`)
 only drops a late result. Adapters do not retry; a failure is a verdict the
@@ -479,6 +494,12 @@ There is no blob-size cap.
   Initial values: phone 20 units, 8 MiB, 30 s; Desktop 50 units, 64 MiB, 30 s.
 - **Memory:** at most one fragment per direction in memory. Fragments are
   1 MiB on Lite and 4 MiB on Node.
+- **Receive bound:** a manifest read stops at the storage cap and a fragment
+  read at its entry's length. Fragment reads count against the step's byte
+  budget. The sum of a manifest's entry bytes must fit
+  `replicaFramedBytesBound(totalBytes, count)` (`transport.ts`): the base64
+  of the signed `totalBytes` plus a fixed per-fragment overhead. This is a
+  consistency bound on what one batch can make a peer fetch, not a size cap.
 - **No permanent stall:** a batch becomes Unsupported only at the protocol
   limit of 100,000 fragments per batch (`transport.ts:11`), about 97 GiB at
   1 MiB fragments. A peer holds a writer's later batches behind an Unsupported

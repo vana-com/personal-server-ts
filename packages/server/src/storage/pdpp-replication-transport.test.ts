@@ -582,10 +582,10 @@ it("fragments large JSON and resumes a partial download in reverse/duplicate lis
   // Two of the sender's fragments arrive, then the connection drops.
   const getFragment = net.port.getFragment;
   let served = 0;
-  net.port.getFragment = async (scope, digest) => {
+  net.port.getFragment = async (scope, digest, read) => {
     if (scope === a.scope && served++ >= 2)
       throw new Error("download disconnected");
-    return getFragment(scope, digest);
+    return getFragment(scope, digest, read);
   };
   const b = device(net, { chunk: 1800 });
   await cycles([b], 2);

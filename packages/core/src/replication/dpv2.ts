@@ -1,11 +1,11 @@
 import type { ReplicaFinalityHints } from "./finality.js";
 export { createReplicaFinalityHints } from "./finality.js";
 import {
-  decryptWithPassword,
   deriveScopeKey,
   encryptWithPassword,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
+import { CompressedDataPacket, decrypt, readMessage } from "openpgp";
 import {
   bytesToHex,
   encodeAbiParameters,
@@ -14,6 +14,10 @@ import {
   type Hex,
 } from "viem";
 import type { StorageAdapter } from "../storage/adapters/interface.js";
+import {
+  AdditionsBudget,
+  AdditionsBudgetExceeded,
+} from "../additions/budget.js";
 import type { DataPointFeedPort } from "../ports/index.js";
 import type { ServerSigner } from "../signing/signer.js";
 import {
@@ -79,11 +83,28 @@ export function replicaChainCommitment(dataHash: Hex, metadataHash: Hex): Hex {
     ),
   );
 }
+/**
+ * The carrier will not read an object: it is larger than the caller's bound,
+ * or it is a compressed OpenPGP message, whose plaintext size the ciphertext
+ * does not bound. Writers never compress.
+ */
+export class ReplicaObjectRefused extends Error {
+  constructor(readonly cause_: "oversize" | "compressed") {
+    super(`replica object refused: ${cause_}`);
+    this.name = "ReplicaObjectRefused";
+  }
+}
+/** One bounded read: stop reading and throw ReplicaObjectRefused past `maxBytes`. */
+export interface ReplicaRead {
+  maxBytes: number;
+  signal?: AbortSignal;
+}
 export interface ReplicaTransportPort {
   /** The owner whose keys and signer this port uses. A worker refuses any other binding. */
   owner?: string;
   finality?: ReplicaFinalityHints;
   encrypt(scope: string, plaintext: Uint8Array): Promise<Uint8Array>;
+  /** Refuses a compressed message, so the plaintext is never larger than `encrypted`. */
   decrypt(scope: string, encrypted: Uint8Array): Promise<Uint8Array>;
   /** Finalized evidence of one slot, plus the Gateway head of its scope. */
   evidence(
@@ -94,13 +115,17 @@ export interface ReplicaTransportPort {
   putFragment(
     fragment: Pick<PreparedFragment, "scope" | "digest" | "encrypted">,
   ): Promise<void>;
-  getFragment(scope: string, digest: string): Promise<Uint8Array>;
+  getFragment(
+    scope: string,
+    digest: string,
+    read: ReplicaRead,
+  ): Promise<Uint8Array>;
   /** False only when storage definitively has no object at the address. */
   hasFragment(scope: string, digest: string): Promise<boolean>;
   put(manifest: PreparedManifest): Promise<void>;
   /** The batch's single AddData registration, at version `manifest.version`. */
   register(manifest: PreparedManifest): Promise<void>;
-  get(scope: string, version: number): Promise<Uint8Array>;
+  get(scope: string, version: number, read: ReplicaRead): Promise<Uint8Array>;
   /** Owner feed page: every scope with the Gateway's latest version of it. */
   list(cursor: string | null): Promise<{
     points: { scope: string; version: string }[];
@@ -128,11 +153,30 @@ export function createDpv2ReplicaTransport(deps: {
     bytesToHex(deriveScopeKey(deps.masterKey, scope)).slice(2);
   const fragmentUrl = (scope: string, digest: string) =>
     deps.storage.urlForKey(replicaFragmentKey(scope, digest));
+  async function download(url: string, read: ReplicaRead) {
+    let bytes: Uint8Array;
+    if (deps.storage.downloadBounded) {
+      // The bounded reader charges the chunks and their contiguous copy.
+      try {
+        bytes = await deps.storage.downloadBounded(
+          url,
+          new AdditionsBudget(2 * read.maxBytes, undefined, read.signal),
+        );
+      } catch (error) {
+        if (error instanceof AdditionsBudgetExceeded)
+          throw new ReplicaObjectRefused("oversize");
+        throw error;
+      }
+    } else bytes = await deps.storage.download(url);
+    if (bytes.length > read.maxBytes)
+      throw new ReplicaObjectRefused("oversize");
+    return bytes;
+  }
   return {
     owner: deps.owner,
     finality: deps.finality,
     encrypt: (scope, bytes) => encryptWithPassword(bytes, password(scope)),
-    decrypt: (scope, bytes) => decryptWithPassword(bytes, password(scope)),
+    decrypt: (scope, bytes) => decryptUncompressed(bytes, password(scope)),
     evidence: deps.evidence,
     async putFragment(fragment) {
       await deps.storage.upload(
@@ -140,8 +184,8 @@ export function createDpv2ReplicaTransport(deps: {
         fragment.encrypted,
       );
     },
-    getFragment: (scope, digest) =>
-      deps.storage.download(fragmentUrl(scope, digest)),
+    getFragment: (scope, digest, read) =>
+      download(fragmentUrl(scope, digest), read),
     hasFragment: (scope, digest) =>
       deps.storage.exists(fragmentUrl(scope, digest)),
     async put(manifest) {
@@ -164,9 +208,10 @@ export function createDpv2ReplicaTransport(deps: {
         signature: await deps.signer.signAddData(msg),
       });
     },
-    get: (scope, version) =>
-      deps.storage.download(
+    get: (scope, version, read) =>
+      download(
         deps.storage.urlForKey(replicaManifestKey(scope, version)),
+        read,
       ),
     async list(cursor) {
       const page = await deps.feed.listDataPointsByOwner(deps.owner, cursor, {
@@ -183,6 +228,42 @@ export function createDpv2ReplicaTransport(deps: {
       };
     },
   };
+}
+
+/**
+ * The SDK's password decryption, refusing compression before it inflates
+ * anything. OpenPGP 6.3 constructs the allowed class for tag 8 before it reads
+ * the packet, and wraps what `read` throws, so the refusal is a flag.
+ */
+async function decryptUncompressed(encrypted: Uint8Array, password: string) {
+  let compressed = false;
+  class RefusedCompressedPacket extends CompressedDataPacket {
+    override async read(): Promise<void> {
+      compressed = true;
+      throw new Error("compressed OpenPGP packet");
+    }
+  }
+  const config = {
+    additionalAllowedPackets: [RefusedCompressedPacket],
+    maxDecompressedMessageSize: 0,
+    ignoreUnsupportedPackets: false,
+    ignoreMalformedPackets: false,
+  };
+  try {
+    const message = await readMessage({ binaryMessage: encrypted, config });
+    const { data } = await decrypt({
+      message,
+      passwords: [password],
+      format: "binary",
+      config,
+    });
+    if (!(data instanceof Uint8Array))
+      throw new Error("unexpected OpenPGP stream");
+    return data;
+  } catch (error) {
+    if (compressed) throw new ReplicaObjectRefused("compressed");
+    throw error;
+  }
 }
 
 const isTombstone = (head: ReplicaCommitment) =>

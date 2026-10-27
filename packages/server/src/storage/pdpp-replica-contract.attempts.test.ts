@@ -106,9 +106,9 @@ it("S2b-2 a late download result after its deadline never retains a manifest", a
   const get = net.port.get;
   const held: (() => void)[] = [];
   const release = () => held.splice(0).forEach((go) => go());
-  net.port.get = (scope, version) =>
+  net.port.get = (scope, version, read) =>
     new Promise((resolve, reject) => {
-      held.push(() => void get(scope, version).then(resolve, reject));
+      held.push(() => void get(scope, version, read).then(resolve, reject));
     });
   await within(2000, step(b), "first step");
   const timedOut = workRecords(b.db).filter(

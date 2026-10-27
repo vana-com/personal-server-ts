@@ -27,10 +27,11 @@ import {
   fragmentMatchesManifest,
   prepareReplicaManifest,
   replicaDigest,
+  replicaManifestCollectedAt,
   replicaManifestFacts,
   replicaMetadataHash,
   replicaScope,
-  ReplicaManifestUnsigned,
+  ReplicaManifestRefused,
   replicaWriterOf,
   REPLICA_MAX_BLOB_BYTES,
   type ManifestEntry,
@@ -43,6 +44,7 @@ import {
   replicaAwaitingFinality,
   replicaRegistrationInactive,
   replicaChainCommitment,
+  ReplicaObjectRefused,
   type ReplicaSlot,
   type ReplicaTransportPort,
   type ReplicaRegistrationEvidence,
@@ -1254,8 +1256,11 @@ export function createReplicaTransportWorker(deps: {
       )
       .run(at, key, at).changes;
   }
-  /** A slot whose manifest fails writer authority: terminal for that slot only. */
-  const refuseSlot = (slot: string, reason: ReplicaAuthorityRefusal) =>
+  /** A slot whose finalized manifest can never be valid: terminal for that slot only. */
+  const refuseSlot = (
+    slot: string,
+    reason: ReplicaAuthorityRefusal | "manifest_invalid",
+  ) =>
     withPlan(quarantine(reason, slot), () =>
       db
         .prepare(
@@ -1294,32 +1299,36 @@ export function createReplicaTransportWorker(deps: {
         );
         if (replicaRegistrationState(evidence, slot) !== "confirmed")
           return verdict(unconfirmed(evidence, slot));
-        const encrypted = await call(signal, () =>
-          transport.get(row.scope, row.version),
-        );
-        if (encrypted.length > cap)
-          throw new ReplicaProblemError("download_failed");
-        const plaintext = await call(signal, () =>
-          transport.decrypt(row.scope, encrypted),
-        );
-        let manifest: ReplicaManifest | undefined;
-        let collectedAt: string;
+        // No writer makes a manifest over the cap or compresses one, and
+        // without compression the plaintext is smaller than the ciphertext.
+        // These bytes cannot be checked against the commitment, whose data
+        // hash is over the plaintext, so the refusal comes first.
+        let plaintext: Uint8Array;
+        let encrypted: Uint8Array;
         try {
-          manifest = decodeReplicaManifest(plaintext, row.scope, state().owner);
-          collectedAt = manifest.collectedAt;
+          encrypted = await call(signal, () =>
+            transport.get(row.scope, row.version, { maxBytes: cap, signal }),
+          );
+          if (encrypted.length > cap)
+            throw new ReplicaObjectRefused("oversize");
+          plaintext = await call(signal, () =>
+            transport.decrypt(row.scope, encrypted),
+          );
         } catch (error) {
-          if (!(error instanceof ReplicaManifestUnsigned)) throw error;
-          collectedAt = error.collectedAt;
+          if (error instanceof ReplicaObjectRefused)
+            return refuseSlot(row.slot, "manifest_invalid");
+          throw error;
         }
+        const collectedAt = replicaManifestCollectedAt(plaintext);
         const dataHash = keccak256(plaintext);
-        const metadataHash = replicaMetadataHash(
-          row.scope,
-          collectedAt,
-          encrypted.length,
-        );
+        const metadataHash =
+          collectedAt === undefined
+            ? undefined
+            : replicaMetadataHash(row.scope, collectedAt, encrypted.length);
         // Storage is not trusted: bytes that are not the finalized
         // commitment are a refetch, never data.
         if (
+          !metadataHash ||
           replicaRegistrationState(evidence, {
             ...slot,
             dataHash,
@@ -1327,10 +1336,17 @@ export function createReplicaTransportWorker(deps: {
           }) !== "confirmed"
         )
           throw new ReplicaProblemError("commitment_mismatch");
-        // Authority runs only on bytes that match the finalized commitment,
-        // so replacing stored bytes cannot get a real manifest refused. No
-        // fragment is fetched before the manifest is authorized.
-        if (!manifest) return refuseSlot(row.slot, "signature_invalid");
+        // Every other check runs only on bytes that match the finalized
+        // commitment, so replacing stored bytes cannot get a real manifest
+        // refused. No fragment is fetched before the manifest is authorized.
+        let manifest: ReplicaManifest;
+        try {
+          manifest = decodeReplicaManifest(plaintext, row.scope, state().owner);
+        } catch (error) {
+          if (error instanceof ReplicaManifestRefused)
+            return refuseSlot(row.slot, error.reason);
+          throw error;
+        }
         const authorized = await authorizeManifest(manifest, row, signal);
         if (authorized.tag === "refused")
           return refuseSlot(row.slot, authorized.reason);
@@ -1436,6 +1452,7 @@ export function createReplicaTransportWorker(deps: {
         phase: "fetch",
         writer: row.writer,
         state: workState(row),
+        bytes: row.bytes,
         row,
       }));
     },
@@ -1445,9 +1462,15 @@ export function createReplicaTransportWorker(deps: {
       let encrypted: Uint8Array;
       try {
         encrypted = await call(signal, () =>
-          transport.getFragment(scope, row.digest),
+          transport.getFragment(scope, row.digest, {
+            maxBytes: row.bytes,
+            signal,
+          }),
         );
       } catch (error) {
+        // More bytes than the finalized manifest names are not this fragment.
+        if (error instanceof ReplicaObjectRefused)
+          return quarantineFragment(row, "fragment_mismatch");
         // Only a definitive not-found is proof; anything else is transient.
         try {
           if (
