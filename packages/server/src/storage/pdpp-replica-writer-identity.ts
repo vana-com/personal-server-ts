@@ -14,8 +14,8 @@ import {
 /**
  * This server's replica writer identity (host contract §3.2). Each row is one
  * incarnation: the gateway registration and writer nonce it was derived
- * from, the two writer ids, and the first journal sequence it owns. The
- * current identity is the highest incarnation. Rows are never changed, so an
+ * from, and the two writer ids. The current identity is the highest
+ * incarnation. Rows are never changed, so an
  * older writer id can never be derived again on this database.
  */
 export const REPLICA_WRITER_IDENTITY_MIGRATION = `
@@ -26,8 +26,7 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_writer_identity (
   server_id TEXT NOT NULL,
   writer_nonce TEXT NOT NULL UNIQUE,
   transport_writer TEXT NOT NULL UNIQUE,
-  operation_writer TEXT NOT NULL UNIQUE,
-  first_sequence INTEGER NOT NULL CHECK (first_sequence >= 1)
+  operation_writer TEXT NOT NULL UNIQUE
 );
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_writer_identity_no_update BEFORE UPDATE ON pdpp_replica_writer_identity
 BEGIN SELECT RAISE(ABORT, 'replica writer identity is append-only'); END;
@@ -40,8 +39,6 @@ export interface ReplicaWriterIdentity {
   seed: ReplicaWriterSeed;
   transportWriter: string;
   operationWriter: string;
-  /** Journal operations below this sequence belong to older incarnations. */
-  firstSequence: number;
 }
 
 type Row = {
@@ -52,7 +49,6 @@ type Row = {
   writer_nonce: string;
   transport_writer: string;
   operation_writer: string;
-  first_sequence: number;
 };
 
 /** Writer identity cannot be created or changed for this database. */
@@ -88,7 +84,6 @@ export function currentReplicaWriterIdentity(
         },
         transportWriter: row.transport_writer,
         operationWriter: row.operation_writer,
-        firstSequence: row.first_sequence,
       }
     : undefined;
 }
@@ -96,13 +91,8 @@ export function currentReplicaWriterIdentity(
 function insert(db: Database, seed: ReplicaWriterSeed) {
   const s = replicaWriterSeedSchema.parse(seed);
   const writers = deriveReplicaWriters(s);
-  const { last } = db
-    .prepare(
-      "SELECT coalesce(max(sequence), 0) AS last FROM pdpp_replica_operations",
-    )
-    .get() as { last: number };
   db.prepare(
-    "INSERT INTO pdpp_replica_writer_identity (owner,server,server_id,writer_nonce,transport_writer,operation_writer,first_sequence) VALUES (?,?,?,?,?,?,?)",
+    "INSERT INTO pdpp_replica_writer_identity (owner,server,server_id,writer_nonce,transport_writer,operation_writer) VALUES (?,?,?,?,?,?)",
   ).run(
     s.owner,
     s.server,
@@ -110,7 +100,6 @@ function insert(db: Database, seed: ReplicaWriterSeed) {
     s.writerNonce,
     writers.transport,
     writers.operation,
-    last + 1,
   );
   return currentReplicaWriterIdentity(db)!;
 }

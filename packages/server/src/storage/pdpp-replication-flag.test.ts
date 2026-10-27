@@ -764,7 +764,7 @@ describe("replication flag on", () => {
     expect(lookup).toBeDefined();
     const plan = db
       .prepare(`EXPLAIN QUERY PLAN ${lookup}`)
-      .all("conn_a", 1, blob.blobId) as { detail: string }[];
+      .all("conn_a", 1, blob.blobId, "writer") as { detail: string }[];
     expect(plan.map((row) => row.detail).join("\n")).toContain(
       "pdpp_replica_blob_claim_idx",
     );

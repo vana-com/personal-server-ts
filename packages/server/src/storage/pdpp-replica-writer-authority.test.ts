@@ -6,7 +6,7 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   canonicalJson,
   type ReplicaOperation,
@@ -406,6 +406,193 @@ it("restore with a copied nonce: a rotated restore imports under new writers", a
     ).n,
   ).toBe(0);
   expect(receiver.get()).toEqual(a.get());
+});
+
+// A new identity's first publication is a full current-state baseline. Each
+// case below leaves a peer without some of the old writer's batches and
+// never writes the affected record again: only that baseline can deliver it.
+describe("a new writer identity republishes the current state", () => {
+  /** Re-register A at the gateway and let A's next step rotate to it. */
+  async function reRegister(a: TransportDevice) {
+    net!.roster.deregister(a.authority.signer.address);
+    net!.roster.register(a.authority.signer.address, owner);
+    clock.advance(REPLICA_ROSTER_MAX_AGE_MS);
+  }
+  let net: Network | undefined;
+
+  it("old published batches refused after re-registration", async () => {
+    net = network();
+    const a = transportDevice(net, { preexisting: "kept" });
+    a.put("only in refused batches", "b");
+    await cycles([a], 3);
+    const old = identity(a);
+    const published = net.calls.registrations.filter((s) =>
+      s.includes(old.transportWriter),
+    );
+    expect(published.length).toBeGreaterThan(0);
+    // The peer first appears after A re-registered.
+    await reRegister(a);
+    await a.step();
+    const peer = transportDevice(net);
+    await cycles([a, peer], 4);
+    expect(new Set(refusals(peer, published))).toEqual(
+      new Set(["server_not_registered"]),
+    );
+    expect(peer.get("b")).toEqual({ id: "b", text: "only in refused batches" });
+    expect(peer.get()).toEqual({ id: "a", text: "kept" });
+  });
+
+  it("old batches with a tombstone, a blob and a completion", async () => {
+    net = network();
+    const a = transportDevice(net, { preexisting: "kept" });
+    a.put("deleted later", "b");
+    const peer = transportDevice(net);
+    await cycles([a, peer], 3);
+    expect(peer.get("b")).toEqual({ id: "b", text: "deleted later" });
+    // Replace the stream: b becomes a tombstone, k carries a blob, and the
+    // stream gets a completion. The peer misses all of it.
+    const blob = a.store.storeBlobBytesForInstance({
+      instance: a.instance,
+      method: "export",
+      generation: 1,
+      bytes: new Uint8Array([1, 2, 3]),
+      mimeType: "application/octet-stream",
+    });
+    const k = {
+      id: "k",
+      blob_ref: {
+        blob_id: blob.blobId,
+        mime_type: blob.mimeType,
+        size_bytes: 3,
+      },
+    };
+    a.store.replaceStream({
+      instance: a.instance,
+      stream: "messages",
+      method: "export",
+      generation: 1,
+      emittedAt: at,
+      envelopes: [
+        {
+          instance: a.instance,
+          stream: "messages",
+          key: "a",
+          data: { id: "a", text: "kept" },
+          emitted_at: at,
+        },
+        {
+          instance: a.instance,
+          stream: "messages",
+          key: "k",
+          data: k,
+          emitted_at: at,
+        },
+      ],
+      primaryKey: ["id"],
+      sourceCollectedAt: at,
+    });
+    await cycles([a], 3);
+    await reRegister(a);
+    await a.step();
+    await cycles([a, peer], 5);
+    const completion = (d: TransportDevice) =>
+      d.db
+        .prepare(
+          "SELECT live_count, snapshot_sha256 FROM pdpp_stream_completion WHERE stream='messages'",
+        )
+        .get();
+    expect(a.get("b")).toBeUndefined();
+    expect(peer.get("b")).toBeUndefined();
+    expect(peer.get("k")).toEqual(k);
+    expect(peer.store.getBlobBytes(blob.blobId)).toEqual(
+      new Uint8Array([1, 2, 3]),
+    );
+    expect(completion(a)).toMatchObject({ live_count: 2 });
+    expect(completion(peer)).toEqual(completion(a));
+  });
+
+  it("old batches never published", async () => {
+    net = network();
+    const a = transportDevice(net, { preexisting: "kept" });
+    const peer = transportDevice(net);
+    await cycles([a, peer], 3);
+    // Retained and prepared, but the network refuses every upload.
+    net.faults.encrypt = () => new Error("offline");
+    a.put("never published", "b");
+    await cycles([a], 2);
+    const old = identity(a);
+    expect(
+      a.db
+        .prepare(
+          "SELECT count(*) AS n FROM pdpp_transport_batches WHERE prepared=0",
+        )
+        .get(),
+    ).toEqual({ n: 1 });
+    const oldScopes = () =>
+      net!.calls.registrations.filter((s) => s.includes(old.transportWriter));
+    const before = oldScopes().length;
+    // A host reset rotates the nonce; the old writer's batch is abandoned.
+    rotateReplicaWriterIdentity(a.db);
+    net.faults.encrypt = undefined;
+    await cycles([a, peer], 4);
+    expect(oldScopes()).toHaveLength(before);
+    expect(peer.get("b")).toEqual({ id: "b", text: "never published" });
+  });
+
+  it("writes between re-registration and the next step", async () => {
+    net = network();
+    const a = transportDevice(net, { preexisting: "kept" });
+    const peer = transportDevice(net);
+    await cycles([a, peer], 3);
+    await reRegister(a);
+    // The gateway changed; A's worker has not stepped yet.
+    a.put("written before the rotation", "b");
+    await cycles([a, peer], 4);
+    expect(identity(a).incarnation).toBe(2);
+    expect(peer.get("b")).toEqual({
+      id: "b",
+      text: "written before the rotation",
+    });
+  });
+
+  it("a crash in the middle of the baseline resumes it", async () => {
+    net = network();
+    const a = transportDevice(net, { preexisting: "kept", pageSize: 2 });
+    for (const id of ["b", "c", "d", "e", "f"]) a.put(`value ${id}`, id);
+    await cycles([a], 3);
+    await reRegister(a);
+    // One retain page of the new baseline, then the process dies.
+    await a.step({ units: 1 });
+    const state = a.db
+      .prepare(
+        "SELECT baseline_done, baseline_cursor FROM pdpp_transport_state",
+      )
+      .get() as { baseline_done: number; baseline_cursor: number };
+    expect(state.baseline_done).toBe(0);
+    a.crashReopen();
+    const peer = transportDevice(net);
+    await cycles([a, peer], 8);
+    for (const id of ["b", "c", "d", "e", "f"])
+      expect(peer.get(id)).toEqual({ id, text: `value ${id}` });
+  });
+
+  it("a restored copy republishes its state without overriding a newer write", async () => {
+    net = network();
+    const a = transportDevice(net, { preexisting: "v1" });
+    const peer = transportDevice(net);
+    await cycles([a, peer], 3);
+    const image = a.image();
+    a.put("v2");
+    await cycles([a, peer], 3);
+    a.restore(image);
+    rotateReplicaWriterIdentity(a.db);
+    // A peer that never saw A's old batches.
+    const late = transportDevice(net);
+    await cycles([a, peer, late], 5);
+    // v1 is republished at its own counter, so the newer v2 still wins.
+    for (const d of [a, peer, late])
+      expect(d.get()).toEqual({ id: "a", text: "v2" });
+  });
 });
 
 it.runIf(nightly)(

@@ -60,6 +60,12 @@ export interface ReplicationExport {
   readBaselinePage(options: ReplicaPageOptions): ReplicaPage;
   readTailPage(options: ReplicaPageOptions): ReplicaPage;
   getBaselineCheckpoint(): number;
+  /**
+   * A new writer identity re-captures the current state under its own writer
+   * as a new baseline (see `rebaseline` below). Undefined before a baseline
+   * began.
+   */
+  rebaseline(): { after: number } | undefined;
   /** CAS acknowledgment after the page is durable at its consumer; retry is idempotent. */
   acknowledgeBaselinePage(expected: number, next: number): void;
   readPinnedBlobBytes(blobId: string): Uint8Array | undefined;
@@ -86,6 +92,28 @@ type WithoutRevision<T> = T extends ReplicaOperation
 
 export function replicaOperationDigest(operation: ReplicaOperation): string {
   return `sha256:${createHash("sha256").update(canonicalJson(operation)).digest("hex")}`;
+}
+
+/** Records and completions a rebaseline re-issues at their retained counter. */
+function reissueKey(
+  op: WithoutRevision<ReplicaOperation> | ReplicaOperation,
+): string | undefined {
+  if (op.kind === "upsert" || op.kind === "delete")
+    return canonicalJson([
+      "record",
+      op.connectionId,
+      op.generation,
+      op.declaration.stream,
+      op.recordKey,
+    ]);
+  if (op.kind === "stream-complete")
+    return canonicalJson([
+      "complete",
+      op.connectionId,
+      op.generation,
+      op.declaration.stream,
+    ]);
+  return undefined;
 }
 
 /** Owns original revisions, pinned values/bytes and exporter progress on the canonical DB. */
@@ -126,6 +154,11 @@ export function createReplicationJournal(
     if (!found) throw new Error(`missing retained declaration: ${stream}`);
     return found.binding;
   }
+  /**
+   * While a rebaseline runs: the revision counter each re-issued record or
+   * completion keeps (see `rebaseline`).
+   */
+  let reissue: Map<string, number> | undefined;
   function append(value: WithoutRevision<ReplicaOperation>): ReplicaOperation {
     if (!db.inTransaction)
       throw new Error("replication capture requires canonical transaction");
@@ -135,9 +168,14 @@ export function createReplicationJournal(
     if (!Number.isSafeInteger(prior.counter + 1))
       throw new Error("replication counter exhausted");
     const counter = prior.counter + 1;
+    const key = reissueKey(value);
     const operation = replicaOperationSchema.parse({
       ...value,
-      revision: { counter, writerId: writerId(), operationId: randomUUID() },
+      revision: {
+        counter: (key !== undefined && reissue?.get(key)) || counter,
+        writerId: writerId(),
+        operationId: randomUUID(),
+      },
     });
     db.prepare("UPDATE pdpp_replica_clock SET counter = ? WHERE id = 1").run(
       counter,
@@ -182,9 +220,9 @@ export function createReplicationJournal(
     // Indexed by pdpp_replica_blob_claim_idx; the predicate must match it.
     const previous = db
       .prepare(
-        "SELECT 1 FROM pdpp_replica_operations WHERE json_extract(operation_json, '$.kind') = 'blob-claim' AND json_extract(operation_json, '$.connectionId') = ? AND json_extract(operation_json, '$.generation') = ? AND json_extract(operation_json, '$.blob.blobId') = ? LIMIT 1",
+        "SELECT 1 FROM pdpp_replica_operations WHERE json_extract(operation_json, '$.kind') = 'blob-claim' AND json_extract(operation_json, '$.connectionId') = ? AND json_extract(operation_json, '$.generation') = ? AND json_extract(operation_json, '$.blob.blobId') = ? AND json_extract(operation_json, '$.revision.writerId') = ? LIMIT 1",
       )
-      .get(instance, identity.generation, blobId);
+      .get(instance, identity.generation, blobId, writerId());
     if (!previous) append({ ...identity, kind: "blob-claim", blob });
   }
   function captureRecord(
@@ -330,9 +368,13 @@ export function createReplicationJournal(
     );
     if (row.snapshot_sha256 !== null && digest !== row.snapshot_sha256)
       throw new Error("stale replication completion digest");
+    // Only this writer's operations: a peer that missed an older writer's
+    // batches still gets every dependency, from the rebaseline.
+    const current = writerId();
     const dependencies = allOperations()
       .filter(
         (op) =>
+          op.revision.writerId === current &&
           op.connectionId === instance &&
           op.kind !== "stream-complete" &&
           (op.kind.startsWith("connection-") ||
@@ -362,6 +404,38 @@ export function createReplicationJournal(
       kind: "stream-invalidate",
       declaration: declaration(instance, stream),
     });
+  }
+  /** Lifecycle, blob claims, every record and tombstone, then completions. */
+  function captureCurrentState() {
+    const bindings = db
+      .prepare("SELECT * FROM pdpp_instance_binding ORDER BY instance")
+      .all() as Binding[];
+    for (const binding of bindings) {
+      if (!binding.source_id || !binding.method) {
+        throw new Error("unbound baseline connection");
+      }
+      captureLifecycle(binding.instance, "connection-register", 1);
+      for (let generation = 2; generation <= binding.generation; generation++)
+        captureLifecycle(binding.instance, "connection-reset", generation);
+      if (binding.deleted_at !== null)
+        captureLifecycle(binding.instance, "connection-delete");
+    }
+    for (const row of db
+      .prepare("SELECT * FROM pdpp_blob_claims ORDER BY instance, blob_id")
+      .all() as { instance: string; blob_id: string }[])
+      captureBlob(row.instance, row.blob_id);
+    for (const row of db
+      .prepare(
+        "SELECT instance, stream, record_key FROM pdpp_records ORDER BY instance, stream, record_key",
+      )
+      .all() as { instance: string; stream: string; record_key: string }[])
+      captureRecord(row.instance, row.stream, row.record_key);
+    for (const row of db
+      .prepare(
+        "SELECT instance, stream FROM pdpp_stream_completion ORDER BY instance, stream",
+      )
+      .all() as { instance: string; stream: string }[])
+      captureCompletion(row.instance, row.stream);
   }
   function beginBaseline(input: BaselineConfiguration) {
     // Validate before persisting; canonical order makes identical retries stable.
@@ -409,39 +483,7 @@ export function createReplicationJournal(
           )
           .get();
         if (orphan) throw new Error("unbound baseline records");
-        const bindings = db
-          .prepare("SELECT * FROM pdpp_instance_binding ORDER BY instance")
-          .all() as Binding[];
-        for (const binding of bindings) {
-          if (!binding.source_id || !binding.method) {
-            throw new Error("unbound baseline connection");
-          }
-          captureLifecycle(binding.instance, "connection-register", 1);
-          for (
-            let generation = 2;
-            generation <= binding.generation;
-            generation++
-          )
-            captureLifecycle(binding.instance, "connection-reset", generation);
-          if (binding.deleted_at !== null)
-            captureLifecycle(binding.instance, "connection-delete");
-        }
-        for (const row of db
-          .prepare("SELECT * FROM pdpp_blob_claims ORDER BY instance, blob_id")
-          .all() as { instance: string; blob_id: string }[])
-          captureBlob(row.instance, row.blob_id);
-        for (const row of db
-          .prepare(
-            "SELECT instance, stream, record_key FROM pdpp_records ORDER BY instance, stream, record_key",
-          )
-          .all() as { instance: string; stream: string; record_key: string }[])
-          captureRecord(row.instance, row.stream, row.record_key);
-        for (const row of db
-          .prepare(
-            "SELECT instance, stream FROM pdpp_stream_completion ORDER BY instance, stream",
-          )
-          .all() as { instance: string; stream: string }[])
-          captureCompletion(row.instance, row.stream);
+        captureCurrentState();
         const { counter } = db
           .prepare("SELECT counter FROM pdpp_replica_clock")
           .get() as { counter: number };
@@ -454,6 +496,55 @@ export function createReplicationJournal(
         return { watermark: counter };
       })
       .immediate();
+  }
+  /**
+   * The current state, re-captured under the current writer as a new
+   * baseline. A new writer identity calls it before it publishes: a peer that
+   * missed the old writer's batches, unpublished or refused, still converges.
+   * Records and completions keep the counter of the newest retained
+   * operation for the same key, so the copy keeps its order against every
+   * other writer: it never overrides a newer write it has not seen. Lifecycle
+   * and blob-claim operations take new counters.
+   */
+  function rebaseline(): { after: number } | undefined {
+    if (!settings()) return undefined;
+    const { counter: after } = db
+      .prepare("SELECT counter FROM pdpp_replica_clock")
+      .get() as { counter: number };
+    const received = db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_received'",
+      )
+      .get();
+    reissue = new Map();
+    for (const { operation_json, own } of db
+      .prepare(
+        `SELECT operation_json, 1 AS own FROM pdpp_replica_operations${received ? " UNION ALL SELECT operation_json, 0 FROM pdpp_replica_received" : ""}`,
+      )
+      .iterate() as Iterable<{ operation_json: string; own: number }>) {
+      const op = JSON.parse(operation_json) as ReplicaOperation;
+      const key = reissueKey(op);
+      // A completion keeps this server's own order; a peer's completion may
+      // describe a different snapshot.
+      if (key === undefined || (op.kind === "stream-complete" && !own))
+        continue;
+      reissue.set(key, Math.max(reissue.get(key) ?? 0, op.revision.counter));
+    }
+    try {
+      captureCurrentState();
+    } finally {
+      reissue = undefined;
+    }
+    const { counter } = db
+      .prepare("SELECT counter FROM pdpp_replica_clock")
+      .get() as { counter: number };
+    db.prepare(
+      "INSERT INTO pdpp_replica_baseline SELECT sequence FROM pdpp_replica_operations WHERE sequence > ?",
+    ).run(after);
+    db.prepare(
+      "UPDATE pdpp_replica_settings SET watermark = ?, checkpoint = ? WHERE id = 1",
+    ).run(counter, after);
+    return { after };
   }
   function page(options: ReplicaPageOptions, baseline: boolean): ReplicaPage {
     const state = settings();
@@ -487,6 +578,7 @@ export function createReplicationJournal(
   }
   const exporter: ReplicationExport = {
     beginBaseline,
+    rebaseline: () => db.transaction(rebaseline).immediate(),
     readBaselinePage: (options) => page(options, true),
     readTailPage: (options) => page(options, false),
     getBaselineCheckpoint: () => {

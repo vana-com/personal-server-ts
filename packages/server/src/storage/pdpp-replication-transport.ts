@@ -343,22 +343,19 @@ export function createReplicaTransportWorker(deps: {
   }
   /**
    * A new writer identity (re-registration, reset or restore) starts its own
-   * chain at sequence 1. The old writer's unprepared batches and unpublished
-   * fragments are abandoned: their operations name the old operation writer,
-   * so no receiver could accept them under the new one. Peers lose those
-   * changes. Published fragments stay published.
+   * chain at sequence 1, and its first publication is a full current-state
+   * baseline under the new writer. The old writer's unprepared batches and
+   * unpublished fragments are abandoned: their operations name the old
+   * operation writer, which no receiver accepts from the new one. The
+   * baseline carries their effect instead, so a peer that missed any old
+   * batch still converges. The same transaction switches the writer and pins
+   * the baseline; a crash resumes it from its durable cursor.
    */
   function startWriter(identity: ReplicaWriterIdentity) {
+    const baseline = deps.exporter.rebaseline();
     db.prepare(
-      "UPDATE pdpp_transport_state SET writer=?,sequence=0,previous_json=NULL WHERE id=1",
-    ).run(identity.transportWriter);
-    // Operations below firstSequence name an older operation writer. They
-    // exist only after the baseline began, so firstSequence - 1 is at or
-    // past its watermark and the tail resumes there.
-    if (identity.firstSequence > 1)
-      db.prepare(
-        "UPDATE pdpp_transport_state SET baseline_done=1,tail_cursor=max(coalesce(tail_cursor,0),?) WHERE id=1",
-      ).run(identity.firstSequence - 1);
+      "UPDATE pdpp_transport_state SET writer=?,sequence=0,previous_json=NULL,baseline_cursor=?,baseline_done=0,tail_cursor=NULL WHERE id=1",
+    ).run(identity.transportWriter, baseline?.after ?? 0);
     db.prepare("DELETE FROM pdpp_transport_batches").run();
     db.prepare(
       "UPDATE pdpp_transport_outbox SET state='abandoned' WHERE state='ready'",

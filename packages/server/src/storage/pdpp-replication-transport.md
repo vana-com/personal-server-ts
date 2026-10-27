@@ -57,18 +57,31 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   Operations captured before the first identity keep that local id; receivers
   refuse them, so they never leave the device.
 - A new registration id for the same address (re-registration) starts a new
-  incarnation with a new nonce at the next step. Writes made between the gateway
-  change and that step stay local.
+  incarnation with a new nonce at the next step.
 - After a replication reset, a new database, or a restore or clone, the host
-  calls `rotateReplicaWriterIdentity` before new writes. It keeps the
-  registration and draws a new nonce. Automatic clone detection is not part of
-  this worker. A restored copy that does not rotate reuses its old sequences;
-  peers quarantine the reused sequence as `batch_equivocation` and keep the
-  first batch.
-- On a writer change the worker starts a new chain at sequence 1. Unprepared
-  batches and unpublished outbox rows of the old writer are abandoned. Their
-  changes do not reach peers; the new writer exports only journal operations
-  from its first sequence.
+  must call `rotateReplicaWriterIdentity` before the first new write. It keeps
+  the registration and draws a new nonce. PS cannot detect a copied database.
+  A restored copy that does not rotate reuses its old sequences: peers
+  quarantine the reused sequence as `batch_equivocation`, keep the first
+  batch, and block the copy's later batches behind it.
+- On a writer change the worker starts a new chain at sequence 1, and its
+  first publication is a full current-state baseline. In the same transaction
+  as the switch, the journal's `rebaseline` re-captures every connection
+  lifecycle, blob claim, record, tombstone and completion under the new
+  operation writer and pins them as the new baseline; the tail resumes after
+  it. Unprepared batches and unpublished outbox rows of the old writer are
+  abandoned, because no receiver accepts the old operation writer from the new
+  signer; the baseline carries their effect. A peer that missed the old
+  writer's batches (refused after re-registration, never published, or
+  written between a gateway change and the next step) therefore converges.
+  Each re-issued record and completion keeps the counter of the newest
+  retained operation for its key (journal and received operations for
+  records, this server's own for completions), so it keeps its order against
+  other writers and never overrides a newer write it has not seen. A crash
+  during the baseline resumes from its durable cursor.
+- Completion dependencies and blob-claim reuse consider only the current
+  operation writer, so every dependency a completion names is in a batch the
+  current writer publishes.
 
 **Signing.** Each batch carries a fragment-version-2 `authority`: an EIP-712
 `PdppReplicaBatch` statement (domain "Vana PDPP Replica", version "1",
@@ -99,14 +112,17 @@ server's unimported batches are refused the same way.
 **Staleness.** The worker caches roster answers, including proven absence, for
 at most `REPLICA_ROSTER_MAX_AGE_MS` (5 minutes) on its own clock, bounded in
 entries, with one read in flight per address. An expired answer is never used,
-even when the gateway is down. Removal therefore takes effect within the cache
-age plus the gateway's own cache time. A batch admitted at download is
+even when the gateway is down. Removal therefore takes effect within 5 minutes
+plus the gateway's own cache time; until then a peer can still import a
+removed server's batch. A batch admitted at download is
 authorized again on every import attempt, so an import that waits (finality,
 mapping) past the cache age is revalidated before it is staged or promoted.
 
-**Known limits.** After re-registration, a peer that never imported the old
-incarnation's batches never receives that data. The roster is the gateway's
-current view; there is no history of past registrations.
+**Known limits.** A rebaseline re-issues the whole current state, including
+records that peers wrote, as content-equal operations, so its size is the
+database's live state. Its capture runs in one transaction, like the first
+baseline, and keeps one counter per record key in memory. The roster is the
+gateway's current view; there is no history of past registrations.
 
 ## Durable progress
 

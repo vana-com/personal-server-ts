@@ -118,6 +118,27 @@ are replaced. Dev databases that used them start fresh.
 The derivation uses only the signer's identity and the nonce, not scope names,
 so it carries over unchanged to a per-sync manifest (A12).
 
+A new identity (re-registration, reset, restore or clone) publishes a full
+current-state baseline before its tail: every live record, every tombstone,
+every blob claim and every completion, signed under the new writer ids. So a
+peer that missed old batches, whether refused, never published, or written
+between a gateway change and the next worker step, still converges. Each
+re-issued record and completion keeps the revision counter of the newest
+retained operation for its key, so it keeps its order against every other
+writer and never overrides a newer write. The baseline is published in the
+usual bounded, fragmented batches and resumes from its durable cursor after a
+crash.
+
+**Host requirement: rotate on every copy.** PS cannot detect that its database
+is a copy. Every host path that restores, clones or reinstalls a database
+(Desktop backup restore, phone restore or device transfer, reinstall onto
+existing data) must call `rotateReplicaWriterIdentity` before the first new
+write. If a host does not, the copy continues the old writer's sequences.
+Peers that already imported the original's batch at a sequence quarantine the
+copy's batch at that sequence as `batch_equivocation` and keep the first one.
+Every later batch of the copy needs that quarantined predecessor, so all of
+the copy's later changes stay blocked at those peers.
+
 ### 3.3 The batch statement
 
 The server key signs an EIP-712 statement for each batch (domain
@@ -158,7 +179,10 @@ sequence or a predecessor slot of a real writer.
    So roster owner, statement owner and receiver owner are one address. The
    receiver caches a roster answer for at most 5 minutes. If it cannot read the
    roster and has no fresh answer, it waits. It never accepts on an unknown
-   roster.
+   roster. So a peer can still import a removed server's batch for up to 5
+   minutes after removal, plus the gateway's CDN cache time. The check runs
+   again on every import attempt, so a batch downloaded before removal is
+   refused once the cached answer expires.
 5. Writer ids: derive both ids from `owner`, `server`, `serverId` and
    `writerNonce`. With DPv2, the writer in the fragment's scope must equal the
    derived transport writer.
@@ -177,16 +201,18 @@ The rule for testers: import only from servers that are registered now. After
 a server is deregistered, peers refuse its batches that they have not yet
 imported, including batches it published before removal. Data already imported
 stays. Peers lose any of the removed device's changes that they had not yet
-imported. Removal lag is the receiver's roster cache plus the gateway CDN TTL.
+imported. Removal lag is up to 5 minutes (the receiver's roster cache) plus the
+gateway CDN TTL.
 
 The gateway lets a revoked address register again. It refuses the same
 `serverId` (`data-gateway@37bc1fe lib/servers.ts:525-531`), then clears
 `revokedAt` and writes the new `id` (`:533-551`). The new `serverId` makes it a
 new incarnation. Writer ids include `serverId`, so the device derives new ids
 and starts new sequences. Batches under the old ids name the old `serverId`,
-fail step 4 and stay refused. The new incarnation inherits nothing, because
-the gap between removal and return is when a lost or copied key is most likely
-in use.
+fail step 4 and stay refused. The new incarnation inherits no writer state,
+because the gap between removal and return is when a lost or copied key is most
+likely in use. Its first publication is the current-state baseline (section
+3.2), so peers still receive the returning device's data.
 
 ### 3.6 Known tester limits
 

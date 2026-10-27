@@ -92,6 +92,11 @@ not attest remote persistence. Baseline reads without an explicit offset resume
 from that checkpoint. A tail consumer must persist its own delivery checkpoint
 with the eventual publisher; that publisher is outside this slice.
 
+`rebaseline` (called when the writer identity changes) appends a new
+current-state capture under the current writer, adds it to the baseline
+membership, moves the checkpoint to just before it and the watermark to its
+end. Earlier membership is never removed.
+
 ## Evidence and limits
 
 `pdpp-replication-baseline.test.ts` exercises 1,205 live rows through frozen pages
