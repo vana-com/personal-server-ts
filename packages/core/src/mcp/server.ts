@@ -152,7 +152,8 @@ function buildActivityStartParams(
   if (
     (tool === "read_scope" ||
       tool === "get_scope_file" ||
-      tool === "remember") &&
+      tool === "remember" ||
+      tool === "forget") &&
     typeof args.scope === "string"
   ) {
     params.scopes = [args.scope];
