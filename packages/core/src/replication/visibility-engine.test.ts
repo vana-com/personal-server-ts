@@ -209,8 +209,12 @@ describe("completion availability", () => {
     ],
     ["it has no dependencies", { events: [completion([], [a.data, b.data])] }],
     [
-      "the events name two declarations",
+      "the events name two trusted declarations",
       {
+        declarations: [
+          ...world.declarations,
+          { ...world.declarations[0], binding: { ...binding, version: "2" } },
+        ],
         events: [
           done,
           {
@@ -240,6 +244,25 @@ describe("completion availability", () => {
     it(`is unavailable when ${name}`, () => {
       expect(completionAvailability({ ...facts, ...change })).toBeNull();
     });
+
+  it("ignores events under a declaration the host does not trust", () => {
+    const untrusted = { ...binding, version: "2" };
+    expect(
+      completionAvailability({
+        ...facts,
+        events: [
+          done,
+          {
+            ...identity,
+            kind: "stream-invalidate",
+            declaration: untrusted,
+            revision: { counter: 11, writerId: "device-a", operationId: "inv" },
+          },
+          { ...completion([a], [a.data], 12), declaration: untrusted },
+        ],
+      }),
+    ).toEqual({ operation: done });
+  });
 
   it("never counts a dependency held only by an unmapped connection", async () => {
     const elsewhere = { ...key("x", "X", 4), connectionId: "unmapped" };

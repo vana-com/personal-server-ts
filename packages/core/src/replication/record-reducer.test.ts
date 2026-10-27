@@ -28,11 +28,11 @@ import {
   EMPTY_PROJECTION,
   evaluate,
   evidenceDigest,
+  indexEvidence,
   recordRow,
   rowId,
   stepConnectionRows,
   type CompletionProjection,
-  type ConnectionFacts,
   type EvidenceChange,
   type RowProjection,
   type VisibilityProjection,
@@ -394,25 +394,7 @@ function boundedProject(
 ): VisibilityProjection {
   const context = { owner: world.owner, declarations: world.declarations };
   const owned = evidence.filter((op) => op.owner === world.owner);
-  const revisionId = (op: ReplicaOperation) =>
-    canonicalJson([op.revision.writerId, op.revision.operationId]);
-  const variants = new Map<string, Set<string>>();
-  for (const op of owned)
-    variants.set(
-      revisionId(op),
-      (variants.get(revisionId(op)) ?? new Set()).add(operationDigest(op)),
-    );
-  const unique = (op: ReplicaOperation) =>
-    variants.get(revisionId(op))!.size === 1;
-  const mappedVariants = new Map<string, Set<string>>();
-  for (const op of owned)
-    if (world.mappings.has(op.connectionId))
-      mappedVariants.set(
-        revisionId(op),
-        (mappedVariants.get(revisionId(op)) ?? new Set()).add(
-          operationDigest(op),
-        ),
-      );
+  const index = indexEvidence(owned);
   const connections = { ...prior.connections };
   const rows: Record<string, RowProjection> = { ...prior.rows };
   const streams = new Map<
@@ -421,16 +403,11 @@ function boundedProject(
   >();
   for (const [id, mapping] of world.mappings) {
     const mine = owned.filter((op) => op.connectionId === id);
-    const facts: ConnectionFacts = {
+    const facts = index.connectionFacts(id, {
       mapping,
       terminal: world.terminal.has(id),
-      equivocated: mine.some((op) => !unique(op)),
-      bindings: mine.map(({ sourceId, methodId }) => ({ sourceId, methodId })),
-      lifecycle: mine.filter(
-        (op) => op.kind.startsWith("connection-") && unique(op),
-      ),
       appliedGeneration: prior.connections[id]?.generation ?? 1,
-    };
+    });
     const connection = connectionFromFacts(context, facts);
     connections[id] = connection;
     stepConnectionRows(rows, id, facts.appliedGeneration, connection);
@@ -497,9 +474,7 @@ function boundedProject(
       declarations: world.declarations,
       quarantinedKey: state.quarantined,
       unresolved: state.unresolved,
-      variantDigests: (writerId, operationId) => [
-        ...(mappedVariants.get(canonicalJson([writerId, operationId])) ?? []),
-      ],
+      variantDigests: index.variantDigests((id) => world.mappings.has(id)),
       liveRows: Object.entries(rows).flatMap(([id, row]) => {
         const [c, s, recordKey] = JSON.parse(id) as string[];
         return c === connectionId && s === stream && row.state === "live"

@@ -416,6 +416,19 @@ export interface ConnectionFacts {
   readonly appliedGeneration: number;
 }
 
+/**
+ * Whether retained evidence names another source or method than the host
+ * mapping. `connectionFromFacts` ranks it below deletion, terminal
+ * quarantine and equivocation; a host that keeps the disagreement as its own
+ * durable fact records it whenever this holds.
+ */
+export function contradictsMapping(
+  facts: Pick<ConnectionFacts, "mapping" | "bindings">,
+): boolean {
+  const mapped = canonicalJson(facts.mapping);
+  return facts.bindings.some((binding) => canonicalJson(binding) !== mapped);
+}
+
 /** Connection eligibility from bounded facts. Must equal the planner derivation. */
 export function connectionFromFacts(
   context: MergeContext,
@@ -431,9 +444,7 @@ export function connectionFromFacts(
     return { status: "deleted", generation: applied };
   if (facts.terminal) return withdrawn("terminal_quarantine");
   if (facts.equivocated) return withdrawn("operation_id_equivocation");
-  const mapped = canonicalJson(facts.mapping);
-  if (facts.bindings.some((binding) => canonicalJson(binding) !== mapped))
-    return withdrawn("local_mapping_conflict");
+  if (contradictsMapping(facts)) return withdrawn("local_mapping_conflict");
   if (has(plan.conflicts, "incompatible_connection_binding"))
     return withdrawn("source_binding_conflict");
   if (!facts.lifecycle.some((op) => op.kind === "connection-register"))
@@ -451,6 +462,64 @@ export function connectionFromFacts(
       generation: applied,
     };
   return { status: "active", generation: lifecycleGeneration(facts.lifecycle) };
+}
+
+/** Facts the host alone establishes for one connection. */
+export type HostConnectionFacts = Pick<
+  ConnectionFacts,
+  "mapping" | "terminal" | "appliedGeneration"
+>;
+
+/**
+ * `ConnectionFacts` and dependency variants from the complete retained
+ * evidence, for a host that keeps every operation (the Node receiver). A
+ * bounded host reads the same facts from its durable indexes instead.
+ */
+export function indexEvidence(owned: readonly ReplicaOperation[]) {
+  const revision = (op: ReplicaOperation) =>
+    canonicalJson([op.revision.writerId, op.revision.operationId]);
+  /** Revision id -> digest -> variant. */
+  const variants = new Map<string, Map<string, ReplicaOperation>>();
+  const byConnection = new Map<string, ReplicaOperation[]>();
+  for (const op of owned) {
+    const id = revision(op);
+    variants.set(
+      id,
+      (variants.get(id) ?? new Map()).set(operationDigest(op), op),
+    );
+    byConnection.set(op.connectionId, [
+      ...(byConnection.get(op.connectionId) ?? []),
+      op,
+    ]);
+  }
+  const unique = (op: ReplicaOperation) =>
+    variants.get(revision(op))!.size === 1;
+  return {
+    connectionFacts(
+      connectionId: string,
+      host: HostConnectionFacts,
+    ): ConnectionFacts {
+      const mine = byConnection.get(connectionId) ?? [];
+      return {
+        ...host,
+        equivocated: mine.some((op) => !unique(op)),
+        bindings: mine.map(({ sourceId, methodId }) => ({
+          sourceId,
+          methodId,
+        })),
+        lifecycle: mine.filter(
+          (op) => op.kind.startsWith("connection-") && unique(op),
+        ),
+      };
+    },
+    /** `CompletionFacts.variantDigests` over the connections `mapped` accepts. */
+    variantDigests(mapped: (connectionId: string) => boolean) {
+      return (writerId: string, operationId: string) =>
+        [
+          ...(variants.get(canonicalJson([writerId, operationId])) ?? []),
+        ].flatMap(([digest, op]) => (mapped(op.connectionId) ? [digest] : []));
+    },
+  };
 }
 
 /**
@@ -558,15 +627,24 @@ export interface CompletionFacts {
 /**
  * The available completion, or null. Available means: the connection is
  * active on the events' generation, no key of the stream is quarantined, the
- * events name one declaration the host trusts, the newest event is a
- * completion, every dependency has exactly one retained variant with the
+ * events under declarations the host trusts name exactly one declaration,
+ * the newest of those events is a completion, every dependency has exactly one retained variant with the
  * pinned digest, nothing touching the stream is unresolved, and the live rows
  * match the declared count and snapshot digest.
  */
 export function completionAvailability(
   facts: CompletionFacts,
 ): CompletionProjection | null {
-  const first = facts.events[0];
+  const trusted = (op: CompletionEvent) =>
+    facts.declarations.find(
+      (entry) =>
+        entry.sourceId === op.sourceId &&
+        canonicalJson(entry.binding) === canonicalJson(op.declaration),
+    );
+  // An event under a declaration the host does not trust waits for it, as
+  // an undeclared record operation does; it neither certifies nor withdraws.
+  const events = facts.events.filter(trusted);
+  const first = events[0];
   if (!first) return null;
   if (
     facts.connection.status !== "active" ||
@@ -575,15 +653,10 @@ export function completionAvailability(
     facts.unresolved
   )
     return null;
-  if (new Set(facts.events.map((op) => canonicalJson(op.declaration))).size > 1)
+  if (new Set(events.map((op) => canonicalJson(op.declaration))).size > 1)
     return null;
-  const declaration = facts.declarations.find(
-    (entry) =>
-      entry.sourceId === first.sourceId &&
-      canonicalJson(entry.binding) === canonicalJson(first.declaration),
-  );
-  if (!declaration) return null;
-  const completion = selectStreamCompletion(facts.events);
+  const declaration = trusted(first)!;
+  const completion = selectStreamCompletion(events);
   if (!completion) return null;
   if (!completionDependenciesCovered(completion, facts.variantDigests))
     return null;
