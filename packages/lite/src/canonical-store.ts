@@ -1395,28 +1395,36 @@ export function createLiteCanonicalStore(deps: {
       );
     return previewRows(tx);
   }
-  /**
-   * True when connections claim the blob and every one of them is
-   * quarantined. A quarantined connection's confirmed bytes are not served,
-   * as on Node; bytes another live connection claims still are. Quarantined
-   * means withdrawn by `connectionState`, as `reconcile` judges it.
-   */
-  async function claimedOnlyByQuarantined(
+  /** A confirmed claim is usable only while a current live row references it. */
+  async function hasCurrentConfirmedReference(
     tx: LiteCanonicalTransaction,
     blobId: string,
+    context: MergeContext,
   ) {
-    let claimed = false;
     for await (const entry of scan(tx, "retained-connections/")) {
       const id = JSON.parse(entry.value) as string;
+      const digest = keyDigest(id);
       if (
         !(await any(tx, `${connectionPrefix(id)}claims/${keyDigest(blobId)}/`))
       )
         continue;
-      if (!(await connectionState(tx, id, deps.context())).blocked)
-        return false;
-      claimed = true;
+      const { connection, blocked } = await connectionState(tx, id, context);
+      if (blocked || connection.status !== "active") continue;
+      for await (const rowEntry of scan(tx, `rows/${digest}/`)) {
+        const row = JSON.parse(rowEntry.value) as PdppRecordRow;
+        if (row.deleted) continue;
+        const generation = await get<number>(
+          tx,
+          `row-generation/${rowEntry.key}`,
+        );
+        if (generation !== connection.generation) continue;
+        const reference = (
+          row.data.blob_ref as { blob_id?: unknown } | undefined
+        )?.blob_id;
+        if (reference === blobId) return true;
+      }
     }
-    return claimed;
+    return false;
   }
   async function blobReadState(
     tx: LiteCanonicalTransaction,
@@ -1428,21 +1436,16 @@ export function createLiteCanonicalStore(deps: {
       options.reader,
       deps.visibilityPolicy,
     );
-    let visible: boolean;
-    if (
-      !(await get(tx, `pending-blobs/${keyDigest(blobId)}`)) ||
-      (await get(tx, `confirmed-blobs/${keyDigest(blobId)}`))
-    ) {
-      visible = !(await claimedOnlyByQuarantined(tx, blobId));
-      // Every confirmed claimant is quarantined. A live preview row on
-      // another connection still references the confirmed bytes, as on Node.
-      if (!visible && previewReader) {
+    const pendingBytes = await get(tx, `pending-blobs/${keyDigest(blobId)}`);
+    const confirmed = await get(tx, `confirmed-blobs/${keyDigest(blobId)}`);
+    let visible = false;
+    if (confirmed) {
+      visible = await hasCurrentConfirmedReference(tx, blobId, deps.context());
+      if (previewReader) {
         await readView(tx, options);
-        visible = await any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`);
+        visible ||= await any(tx, `${PREVIEW_BLOB_REFS}${keyDigest(blobId)}/`);
       }
-    } else if (!previewReader) {
-      visible = false;
-    } else {
+    } else if (pendingBytes && previewReader) {
       // Pending bytes need a live reference this reader sees, and an active
       // batch that carries them. One batch can stage the record and another
       // the bytes; either can later be withdrawn independently.

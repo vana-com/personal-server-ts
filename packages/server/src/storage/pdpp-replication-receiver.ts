@@ -1499,6 +1499,7 @@ export function createReplicaReceiver(deps: {
     },
     readStore(input: { reader?: ReplicaReader } = {}): PdppReplicaReadStore & {
       connectionVisibility: typeof view.connectionVisibility;
+      withReadSnapshot: typeof readSnapshot;
     } {
       const reader = input.reader ?? "grant";
       const hasPreview = () => includesPending(reader);
@@ -1515,6 +1516,7 @@ export function createReplicaReceiver(deps: {
         view.hasBlobReference(id, reader, hasPreview());
       return {
         connectionVisibility: view.connectionVisibility,
+        withReadSnapshot: readSnapshot,
         getRecord: (instance: string, stream: string, key: string) =>
           readSnapshot(() => {
             // The enclosing snapshot carries point reads atomically.

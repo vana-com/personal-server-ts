@@ -165,6 +165,133 @@ it("A6 race: stops the next blob chunk when quarantine moves visibility", async 
   }
 });
 
+it.each(["connection-delete", "delete", "connection-reset"] as const)(
+  "A6 blob visibility: fresh read after %s requires a current reference",
+  async (kind) => {
+    const { make } = device();
+    const { store, collect, bytes, hash } = await confirmedBlobRow(make);
+    const operation =
+      kind === "delete"
+        ? {
+            ...identity,
+            kind,
+            declaration: binding,
+            recordKey: upsert("a", 3).recordKey,
+            emittedAt: "2026-10-21T00:00:00.000Z",
+            deletedAt: "2026-10-21T00:00:00.000Z",
+            revision: {
+              counter: 100,
+              writerId: "device-a",
+              operationId: "delete-row-review",
+            },
+          }
+        : {
+            ...identity,
+            kind,
+            ...(kind === "connection-reset"
+              ? { generation: 2, previousGeneration: 1 }
+              : {}),
+            revision: {
+              counter: 100,
+              writerId: "device-a",
+              operationId: "remove-review",
+            },
+          };
+    await store.import({
+      id: "review-remove",
+      credential: "replica",
+      envelope: envelope("review-remove", [operation]),
+    });
+    for (const reader of ["owner", "grant"] as const) {
+      const row = await make().readRecord(
+        identity.connectionId,
+        binding.stream,
+        upsert("a", 3).recordKey,
+        { reader },
+      );
+      expect(!row || row.deleted).toBe(true);
+      await expect(collect(reader)).rejects.toThrow("missing committed blob");
+    }
+    expect(bytes).toBeDefined();
+    expect(hash).toBeTruthy();
+  },
+);
+
+it("A6 blob visibility: keeps bytes while another live record references them", async () => {
+  const { make } = device();
+  const { store, collect, bytes, hash } = await confirmedBlobRow(make);
+  const descriptor = {
+    blobId: hash,
+    sha256: hash,
+    mimeType: "text/plain",
+    sizeBytes: bytes.length,
+  };
+  await store.provisionConnection("connection-b", {
+    sourceId: identity.sourceId,
+    methodId: identity.methodId,
+  });
+  await store.import({
+    id: "second-live-reference",
+    credential: "replica",
+    envelope: envelope("second-live-reference", [
+      {
+        ...registration,
+        connectionId: "connection-b",
+        revision: {
+          counter: 1,
+          writerId: "device-a",
+          operationId: "register-second-reference",
+        },
+      },
+      {
+        ...identity,
+        connectionId: "connection-b",
+        kind: "blob-claim",
+        revision: {
+          counter: 5,
+          writerId: "device-a",
+          operationId: "claim-second-reference",
+        },
+        blob: descriptor,
+      },
+      {
+        ...upsert("b", 4),
+        connectionId: "connection-b",
+        recordKey: "other-key",
+        blobs: [descriptor],
+        data: { id: "other-key", blob_ref: { blob_id: hash } },
+      },
+    ]),
+  });
+  expect(
+    await make().readRecord("connection-b", binding.stream, "other-key", {
+      reader: "owner",
+    }),
+  ).toMatchObject({ deleted: false });
+  const deletion = {
+    ...identity,
+    kind: "delete" as const,
+    declaration: binding,
+    recordKey: upsert("a", 3).recordKey,
+    emittedAt: "2026-10-21T00:00:00.000Z",
+    deletedAt: "2026-10-21T00:00:00.000Z",
+    revision: {
+      counter: 100,
+      writerId: "device-a",
+      operationId: "delete-original-review",
+    },
+  };
+  await store.import({
+    id: "delete-original-reference",
+    credential: "replica",
+    envelope: envelope("delete-original-reference", [deletion]),
+  });
+  for (const reader of ["owner", "grant"] as const) {
+    const chunks = await collect(reader);
+    expect(Uint8Array.from(chunks.flatMap((part) => [...part]))).toEqual(bytes);
+  }
+});
+
 // The #438 lane's reproduction (3eaec57d, it.fails there): reconcile blocks
 // the connection on a lifecycle-plan conflict, so the confirmed-blob gate must too.
 it("a lifecycle conflict (generation-3 reset after generation 1, fresh operation ID) quarantines the connection, including confirmed blob bytes, after reopen", async () => {

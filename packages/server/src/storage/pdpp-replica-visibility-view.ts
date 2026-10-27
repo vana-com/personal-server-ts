@@ -216,8 +216,8 @@ export function createReplicaVisibilityView(deps: {
     if (!initialized) dropViewObjects(db);
     db.exec(`
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_schema (version INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS pdpp_replica_visibility_epoch (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL);
-      INSERT OR IGNORE INTO pdpp_replica_visibility_epoch VALUES (1,0);
+      CREATE TABLE IF NOT EXISTS pdpp_replica_visibility_epoch (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL, signature TEXT NOT NULL DEFAULT '');
+      INSERT OR IGNORE INTO pdpp_replica_visibility_epoch(id,epoch) VALUES (1,0);
       -- Sparse overlay. present: shown in owner pages; live: a visible value;
       -- base_live: canonical row was live when this row was derived.
       CREATE TABLE IF NOT EXISTS pdpp_replica_view (
@@ -262,6 +262,13 @@ export function createReplicaVisibilityView(deps: {
       -- last write. It rolls back with the transaction that moved it.
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_sync (id INTEGER PRIMARY KEY CHECK(id=1), change_mark INTEGER NOT NULL, structure TEXT NOT NULL);
     `);
+    const epochColumns = db
+      .prepare("PRAGMA table_info(pdpp_replica_visibility_epoch)")
+      .all() as { name: string }[];
+    if (!epochColumns.some((column) => column.name === "signature"))
+      db.exec(
+        "ALTER TABLE pdpp_replica_visibility_epoch ADD COLUMN signature TEXT NOT NULL DEFAULT ''",
+      );
     for (const table of ["pdpp_replica_operations", "pdpp_replica_received"])
       db.exec(`
         CREATE INDEX IF NOT EXISTS pdpp_replica_view_ops_key_${table} ON ${table}(${expression("instance")},${expression("stream")},${expression("record_key")}) WHERE ${expression("record_key")} IS NOT NULL;
@@ -496,11 +503,7 @@ export function createReplicaVisibilityView(deps: {
         `DELETE FROM pdpp_replica_local_view; INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id IN (SELECT instance FROM pdpp_replica_binding_conflicts);`,
       );
   }
-  /**
-   * Derives everything again from canonical rows. Content can change without
-   * moving a count or a timestamp, and nothing here can tell what changed, so
-   * every cursor revision advances: no cursor outlives this call.
-   */
+  /** Re-derives every projection from canonical rows without invalidating unchanged cursors. */
   function rederive(): void {
     rederiveLocalView();
     db.exec(`
@@ -791,15 +794,6 @@ export function createReplicaVisibilityView(deps: {
           .all() as { instance: string }[]
       ).map((row) => row.instance),
     );
-    const hasProjectionWork =
-      dirtyOps.length > 0 ||
-      connections.size > 0 ||
-      !!db
-        .prepare("SELECT 1 FROM pdpp_replica_view_dirty_keys LIMIT 1")
-        .get() ||
-      !!db
-        .prepare("SELECT 1 FROM pdpp_replica_view_dirty_latest LIMIT 1")
-        .get();
     for (const op of dirtyOps) {
       const { writerId, operationId } = op.revision;
       const previous = db
@@ -925,10 +919,12 @@ export function createReplicaVisibilityView(deps: {
     db.exec(
       "DELETE FROM pdpp_replica_view_dirty_operations; DELETE FROM pdpp_replica_view_dirty_keys; DELETE FROM pdpp_replica_view_dirty_connections; DELETE FROM pdpp_replica_view_dirty_latest;",
     );
-    if (hasProjectionWork)
-      db.prepare(
-        "UPDATE pdpp_replica_visibility_epoch SET epoch=epoch+1 WHERE id=1",
-      ).run();
+    const signature = visibilitySignature();
+    db.prepare(
+      `UPDATE pdpp_replica_visibility_epoch
+       SET epoch=epoch+CASE WHEN signature<>'' AND signature<>? THEN 1 ELSE 0 END,
+           signature=? WHERE id=1`,
+    ).run(signature, signature);
   }
   /**
    * Latest owner-preview emitted_at of one stream: present overlay rows and
@@ -1861,6 +1857,70 @@ export function createReplicaVisibilityView(deps: {
           quarantinedConnections,
           quarantinedKeys,
           bindingConflicts,
+        ]),
+      )
+      .digest("hex");
+  }
+  /** Stable digest of reader-visible state; excludes derivation queues and cursor revisions. */
+  function visibilitySignature(): string {
+    const projectionRows = db
+      .prepare(
+        "SELECT instance,stream,record_key,emitted_at,row_json,blob_id,blob_json,present,live,pending,base_live,generation FROM pdpp_replica_view ORDER BY instance,stream,record_key",
+      )
+      .all();
+    const streamViews = db
+      .prepare(
+        "SELECT preview,instance,stream,live_count,row_count,last_updated FROM pdpp_replica_view_streams ORDER BY preview,instance,stream",
+      )
+      .all();
+    const localRows = hasBindingConflictFacts
+      ? db
+          .prepare(
+            "SELECT instance,stream,record_key,emitted_at,row_json,blob_id,pending,deleted,blob_json,sequence,generation,source_id,method FROM pdpp_replica_local_view ORDER BY instance,stream,record_key",
+          )
+          .all()
+      : [];
+    const completions = db
+      .prepare(
+        "SELECT instance,stream,method,generation,source_collected_at,write_seq,live_count,snapshot_sha256,collection_time_basis FROM pdpp_stream_completion ORDER BY instance,stream",
+      )
+      .all();
+    return createHash("sha256")
+      .update(
+        JSON.stringify([
+          maxChangeId(),
+          structureSignature(),
+          projectionRows,
+          streamViews,
+          db
+            .prepare(
+              "SELECT writer,operation_id,instance,digest FROM pdpp_replica_view_conflicts ORDER BY writer,operation_id,instance",
+            )
+            .all(),
+          localRows,
+          completions,
+          db
+            .prepare(
+              "SELECT instance,fences FROM pdpp_replica_integrity_fences ORDER BY instance",
+            )
+            .all(),
+          db
+            .prepare(
+              "SELECT instance FROM pdpp_replica_quarantined_connections ORDER BY instance",
+            )
+            .all(),
+          db
+            .prepare(
+              "SELECT instance,generation,stream,record_key FROM pdpp_replica_quarantined_keys ORDER BY instance,generation,stream,record_key",
+            )
+            .all(),
+          hasBindingConflictFacts
+            ? db
+                .prepare(
+                  "SELECT instance,reason,evidence_json FROM pdpp_replica_binding_conflicts ORDER BY instance",
+                )
+                .all()
+            : [],
         ]),
       )
       .digest("hex");
