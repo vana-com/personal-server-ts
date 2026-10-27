@@ -26,8 +26,33 @@ export interface MergeContext {
     validateData: (data: Record<string, unknown>) => boolean;
   }[];
 }
+/**
+ * Every reason a plan issue can carry. Hosts branch on these strings, so a new
+ * reason is a profile change. The last group is added by the Node receiver to
+ * its own copy of the plan; `visibility-engine.ts` states those decisions as
+ * typed projection fields instead.
+ */
+export type MergeIssueReason =
+  | "wrong_owner"
+  | "operation_id_equivocation"
+  | "connection_deleted"
+  | "incompatible_connection_binding"
+  | "missing_connection_registration"
+  | "invalid_generation_reset"
+  | "missing_generation_reset"
+  | "old_generation"
+  | "missing_declaration"
+  | "append_only_delete"
+  | "invalid_record_data"
+  | "incompatible_record_declaration"
+  | "append_only_content_conflict"
+  // Host-added.
+  | "missing_local_connection"
+  | "missing_or_invalid_blob"
+  | "unverified_completion"
+  | "incompatible_completion_declaration";
 export interface MergeIssue {
-  reason: string;
+  reason: MergeIssueReason;
   operations: ReplicaOperation[];
 }
 export interface MergedRecord {
@@ -54,6 +79,8 @@ export interface ReplicaMergePlan {
 /**
  * Recompute from the complete retained operation set, including lifecycle evidence.
  * The host must retain losers, conflicts, pending operations and tombstones across calls.
+ * This is the full-history oracle: `evaluate` in `visibility-engine.ts` derives
+ * the projection from it, and every bounded engine is tested against it.
  * This converges; it cannot establish which offline scrape is freshest upstream.
  * No I/O, local history version allocation, grant copying, or repair authorization.
  */
@@ -70,7 +97,7 @@ export function planReplicaMerge(
   };
   const issue = (
     bucket: MergeIssue[],
-    reason: string,
+    reason: MergeIssueReason,
     operations: ReplicaOperation[],
   ) => bucket.push({ reason, operations });
   const byId = new Map<string, Map<string, ReplicaOperation>>();
