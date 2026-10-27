@@ -49,6 +49,10 @@ Recreation requires a new logical connection ID. No missing batch implies delete
 Operation identity is `(writerId, operationId)`. Identical replay has no extra
 multiplicity. Different bytes for that identity quarantine all affected
 connections. Clone/restore must rotate writer identity before making new writes.
+Writer ids are derived from the server's gateway registration and a writer
+nonce (`writer-identity.ts`); receivers accept a batch only when its signed
+`PdppReplicaBatch` statement and the roster (`roster.ts`) authorize the
+transport writer and every operation writer.
 `nextLamportCounter` advances past every observed counter; the host must persist
 it with its mutation. Slice 1 journal sequence and local record version are
 neither a Lamport counter nor evidence of cross-device ordering.

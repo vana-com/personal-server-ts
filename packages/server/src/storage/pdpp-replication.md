@@ -35,10 +35,12 @@ A baseline cannot reconstruct rows or operation evidence erased before enablemen
 `pdpp_replica_operations` stores canonical profile operations with persisted
 `(counter, writerId, operationId)` revisions and SHA-256 digests. Its counter is
 separate from local query clocks and the Slice 1 journal. Every tail revision is
-greater than the baseline watermark. The installation writer ID is reused. A
-future receiver must advance this clock past observed remote revisions, and
-clone/restore must rotate writer identity before new writes; neither is supplied
-by this export-only slice.
+greater than the baseline watermark. Operations name the current derived
+operation writer id from `pdpp_replica_writer_identity` (see the transport
+document); before the first identity they keep the installation writer id and
+never leave the device. The receiver advances this clock past observed remote
+revisions. Clone/restore must call `rotateReplicaWriterIdentity` before new
+writes.
 
 Ingest and owner deletion capture full values or data-free tombstones. Replace
 captures changed values and explicit deletions of every removed live key; absent

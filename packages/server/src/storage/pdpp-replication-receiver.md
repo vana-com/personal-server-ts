@@ -6,6 +6,11 @@ Call `store.replication.beginBaseline` before importing. Its immutable owner bin
 
 ## Local authority
 
+The receiver does not check writer authority. The transport worker authorizes
+each batch (signature, partition, roster and writer ids) before it calls the
+receiver; see the transport document. A direct caller of `import` must do the
+same.
+
 The export profile uses the canonical instance ID as the logical connection ID. Import requires a locally registered connection with the same source and acquisition method. Imported registration evidence cannot create that mapping or change its method. An absent mapping or declaration remains pending. After the host provisions a mapping, call `retry` with replica credentials. After trusted declaration documents or validators change, call `reconcileDeclarations` instead (see below). A source or method mismatch rejects the transaction. A complete reset chain can advance the registered connection's generation; older record operations remain suppressed. Connection deletion dominates record operations.
 
 The declaration resolver is trusted host configuration, not connector metadata. It must bind source, declaration digest, version, stream, primary key, semantics and schema digest to the retained document and exact validator. The receiver does not fetch declarations or accept schemas from incoming operations.
