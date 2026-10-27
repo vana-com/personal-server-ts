@@ -27,7 +27,8 @@ export type PsLiteStateKey =
   | "pending-blob-deletions-v1"
   | `additions-publication-v1:${string}`
   | `additions-deletion-v1:${string}`
-  | "derivative-questions-v1";
+  | "derivative-questions-v1"
+  | "replication-door-v1";
 
 /** Implementations must settle on abort and prevent late mutations. */
 export interface PsLiteBoundedStateStore {

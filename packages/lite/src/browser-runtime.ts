@@ -1,3 +1,5 @@
+import type { ReplicationDoorStatus } from "@opendatalabs/personal-server-ts-core/replication/door";
+import { resolveLiteReplication } from "./replication-door.js";
 import { withLegacyProjection } from "@opendatalabs/personal-server-ts-core/storage/legacy-projection";
 import type { ServerConfig } from "@opendatalabs/personal-server-ts-core/schemas";
 import type { Logger } from "@opendatalabs/personal-server-ts-core/logger";
@@ -112,6 +114,8 @@ export interface IndexedDbPsLiteRuntime {
   syncManager: PsLiteRuntimeOptions["syncManager"];
   /** The compute layer; hosts call `scheduler.stop()` on teardown. */
   derivatives: PsLiteRuntimeOptions["derivatives"];
+  /** This boot's replication door, from `resolveLiteReplication`. */
+  replication: ReplicationDoorStatus;
 }
 
 export async function createIndexedDbPsLiteRuntime(
@@ -132,6 +136,10 @@ export async function createIndexedDbPsLiteRuntime(
   const config = await loadOrCreatePsLiteConfig(
     stateStore,
     options.configDefaults,
+  );
+  const replication = await resolveLiteReplication(
+    stateStore,
+    config.replication.enabled,
   );
   const identity = await loadOrCreatePsLiteServerIdentity({
     store: stateStore,
@@ -343,5 +351,6 @@ export async function createIndexedDbPsLiteRuntime(
     accessLogStore,
     syncManager,
     derivatives,
+    replication,
   };
 }
