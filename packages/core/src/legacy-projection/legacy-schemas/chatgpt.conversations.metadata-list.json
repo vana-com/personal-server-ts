@@ -1,0 +1,94 @@
+{
+  "name": "ChatGPT conversation metadata list",
+  "version": "1.0.0",
+  "scope": "chatgpt.conversations",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "conversations": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "create_time": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "update_time": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "current_node": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message_count_on_current_branch": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "is_archived": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "is_starred": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "gizmo_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "create_time",
+            "update_time",
+            "current_node",
+            "message_count_on_current_branch",
+            "is_archived",
+            "is_starred",
+            "workspace_id",
+            "gizmo_id"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "conversations"
+    ],
+    "additionalProperties": false
+  }
+}

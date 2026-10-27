@@ -18,6 +18,7 @@ import type {
   LegacyScopeLookupResult,
   PdppRecord,
   ProjectionDiagnostic,
+  ProjectionError,
   ProjectPdppRecordsOptions,
   ProjectionResult,
 } from "./types.js";
@@ -153,6 +154,74 @@ export function projectPdppRecordsToLegacyPayload(
     }
     return { ok: false, error: { kind: "unknown_scope", scope } };
   }
+  return projectPdppRecordsUsingBinding(binding, records, options);
+}
+
+/** Resolve a retained body's contract before reading any canonical rows. */
+export function resolveLegacyProjection(
+  scope: string,
+  options: { profileKey?: string; targetLegacyPayload?: unknown } = {},
+):
+  | {
+      ok: true;
+      binding: LegacyScopeBinding;
+      contractId: string;
+      requireProvenOrder?: boolean;
+    }
+  | { ok: false; error: ProjectionError } {
+  const binding = bindingFor(scope, options.profileKey);
+  if (!binding) {
+    return {
+      ok: false,
+      error:
+        LEGACY_SCOPE_BINDINGS.has(scope) && options.profileKey
+          ? {
+              kind: "unsupported_profile",
+              scope,
+              profileKey: options.profileKey,
+            }
+          : { kind: "unknown_scope", scope },
+    };
+  }
+  if (options.targetLegacyPayload === undefined || !binding.representations) {
+    return {
+      ok: true,
+      binding,
+      contractId: binding.representations?.[0]?.id ?? `${scope}/historical/1`,
+    };
+  }
+  const representation = binding.representations.find((candidate) =>
+    candidate.acceptsPayload(options.targetLegacyPayload),
+  );
+  if (!representation) {
+    return {
+      ok: false,
+      error: {
+        kind: "invalid_value",
+        scope,
+        reason: "Unsupported retained payload contract",
+      },
+    };
+  }
+  return {
+    ok: true,
+    binding: {
+      ...binding,
+      project: representation.project,
+      rowOrder: representation.rowOrder,
+      legacySchemaPath: representation.legacySchemaPath,
+    },
+    contractId: representation.id,
+    requireProvenOrder: representation.requireProvenOrder,
+  };
+}
+
+export function projectPdppRecordsUsingBinding(
+  binding: LegacyScopeBinding,
+  records: PdppRecord[],
+  options: ProjectPdppRecordsOptions,
+): ProjectionResult {
+  const scope = binding.scope;
   let decodeDiagnostics: ProjectionDiagnostic[] = [];
   try {
     const decoded = decodeDeclaredRecordsForProjection(

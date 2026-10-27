@@ -218,7 +218,6 @@ describe("current declarations at the server legacy-read boundary", () => {
     expect(before).toEqual(expect.any(String));
     expect(before.length).toBeGreaterThan(0);
     expect(view.verdictFor(scope)).toEqual([]);
-    expect(readHead).not.toHaveBeenCalled();
     const oldParts = before.split(":");
     oldParts[oldParts.length - 3] = "10";
     const oldRuleCursor = oldParts.join(":");
@@ -238,7 +237,7 @@ describe("current declarations at the server legacy-read boundary", () => {
       envelope: { data: { conversations: [{ id: "cv1", title: decoded }] } },
     });
     expect(replacementCursor()).not.toBe(before);
-    expect(readHead).not.toHaveBeenCalled();
+    expect(view.verdictFor(scope)).toEqual([]);
   });
 
   it("does not apply a declaration from another registered source", () => {

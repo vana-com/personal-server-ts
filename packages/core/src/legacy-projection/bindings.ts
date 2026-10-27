@@ -1,5 +1,6 @@
 import type {
   LegacyScopeBinding,
+  LegacyProjectionRepresentation,
   PdppRecord,
   ProjectPdppRecordsOptions,
   ProjectionDiagnostic,
@@ -1778,6 +1779,133 @@ const chatgptMemories: LegacyScopeBinding = {
   },
 };
 
+const nullableString = (value: unknown) =>
+  value === null || typeof value === "string";
+const nullableBoolean = (value: unknown) =>
+  value === null || typeof value === "boolean";
+const CHATGPT_METADATA_FIELDS: Record<string, (value: unknown) => boolean> = {
+  id: isNonEmptyString,
+  title: nullableString,
+  create_time: nullableString,
+  update_time: nullableString,
+  current_node: nullableString,
+  message_count_on_current_branch: (value) =>
+    value === null ||
+    (typeof value === "number" && Number.isInteger(value) && value >= 0),
+  is_archived: nullableBoolean,
+  is_starred: nullableBoolean,
+  workspace_id: nullableString,
+  gizmo_id: nullableString,
+};
+
+function hasExactKeys(
+  row: Record<string, unknown>,
+  required: string[],
+  optional: string[] = [],
+): boolean {
+  return (
+    required.every((key) => Object.hasOwn(row, key)) &&
+    Object.keys(row).every(
+      (key) => required.includes(key) || optional.includes(key),
+    )
+  );
+}
+
+function hasChatgptMetadataFields(
+  value: unknown,
+): value is Record<string, unknown> {
+  return (
+    isObjectRow(value) &&
+    Object.entries(CHATGPT_METADATA_FIELDS).every(([key, accepts]) =>
+      accepts(value[key]),
+    )
+  );
+}
+
+function isChatgptThread(value: unknown): boolean {
+  if (
+    !isObjectRow(value) ||
+    !hasExactKeys(
+      value,
+      [
+        "id",
+        "title",
+        "create_time",
+        "update_time",
+        "message_count",
+        "messages",
+      ],
+      ["fetched_at"],
+    )
+  )
+    return false;
+  const timestamp = (value: unknown) =>
+    value === null ||
+    typeof value === "string" ||
+    (typeof value === "number" && Number.isFinite(value));
+  return (
+    typeof value.id === "string" &&
+    typeof value.title === "string" &&
+    timestamp(value.create_time) &&
+    timestamp(value.update_time) &&
+    typeof value.message_count === "number" &&
+    Number.isFinite(value.message_count) &&
+    (!Object.hasOwn(value, "fetched_at") ||
+      typeof value.fetched_at === "string") &&
+    Array.isArray(value.messages) &&
+    value.messages.every(
+      (message: unknown) =>
+        isObjectRow(message) &&
+        hasExactKeys(
+          message,
+          ["id", "role", "content"],
+          ["content_type", "create_time", "model"],
+        ) &&
+        typeof message.id === "string" &&
+        typeof message.role === "string" &&
+        typeof message.content === "string" &&
+        (!Object.hasOwn(message, "content_type") ||
+          typeof message.content_type === "string") &&
+        (!Object.hasOwn(message, "create_time") ||
+          nullableString(message.create_time)) &&
+        (!Object.hasOwn(message, "model") || nullableString(message.model)),
+    )
+  );
+}
+
+const CHATGPT_CONVERSATION_REPRESENTATIONS: readonly LegacyProjectionRepresentation[] =
+  [
+    {
+      id: "chatgpt.full-threads/1",
+      legacySchemaPath: "chatgpt.conversations.json",
+      acceptsPayload: (payload) =>
+        isObjectRow(payload) &&
+        hasExactKeys(payload, ["conversations", "total"]) &&
+        typeof payload.total === "number" &&
+        Number.isFinite(payload.total) &&
+        Array.isArray(payload.conversations) &&
+        payload.conversations.every(isChatgptThread),
+      project: projectChatgptConversations,
+    },
+    {
+      id: "chatgpt.metadata-list/1",
+      requireProvenOrder: true,
+      legacySchemaPath: "chatgpt.conversations.metadata-list.json",
+      rowOrder: "arrival",
+      acceptsPayload: (payload) =>
+        isObjectRow(payload) &&
+        hasExactKeys(payload, ["conversations"]) &&
+        Array.isArray(payload.conversations) &&
+        payload.conversations.every(
+          (row) =>
+            hasChatgptMetadataFields(row) &&
+            hasExactKeys(row, Object.keys(CHATGPT_METADATA_FIELDS)),
+        ),
+      project: (records, options) =>
+        projectChatgptConversations(records, options, true),
+    },
+  ];
+
 // Signed ChatGPT 0.1.1 is the source; Desktop ingest remains disabled until
 // catalog admission and static_secret host setup land separately.
 const chatgptConversations: LegacyScopeBinding = {
@@ -1793,6 +1921,10 @@ const chatgptConversations: LegacyScopeBinding = {
       "update_time",
       "current_node",
       "message_count_on_current_branch",
+      "is_archived",
+      "is_starred",
+      "workspace_id",
+      "gizmo_id",
     ],
     messages: [
       "id",
@@ -1824,192 +1956,216 @@ const chatgptConversations: LegacyScopeBinding = {
       path: "declarations/chatgpt-0.2.0.collection-profile.json#streams[name=conversations,messages]",
     },
   ],
-  project(records, options): ProjectionResult {
-    const scope = "chatgpt.conversations";
-    const guard = requireStreams(scope, options, ["conversations"]);
-    if (guard) return guard;
-    // Without a messages stream at all, a read-time caller still serves the
-    // conversation list (titles and times) with empty threads, and says so.
-    const messagesMissing = !options.fetchedStreams.includes("messages");
-    if (messagesMissing && !options.allowMissingJoinStreams)
-      return missingStream(scope, "messages");
-    const fetchedAt = projectionTime(options);
+  representations: CHATGPT_CONVERSATION_REPRESENTATIONS,
+  project: projectChatgptConversations,
+};
 
-    // One malformed conversation must not make the whole scope unreadable:
-    // it is left out and counted, by reason.
-    const dropped = new Map<string, number>();
-    const drop = (reason: string) =>
-      dropped.set(reason, (dropped.get(reason) ?? 0) + 1);
-    let malformedMessages = 0;
-    let unlinkedMessages = 0;
+function projectChatgptConversations(
+  records: PdppRecord[],
+  options: ProjectPdppRecordsOptions,
+  metadataOnly = false,
+): ProjectionResult {
+  const scope = "chatgpt.conversations";
+  const guard = requireStreams(scope, options, ["conversations"]);
+  if (guard) return guard;
+  // Without a messages stream at all, a read-time caller still serves the
+  // conversation list (titles and times) with empty threads, and says so.
+  const messagesMissing = !options.fetchedStreams.includes("messages");
+  if (messagesMissing && (metadataOnly || !options.allowMissingJoinStreams))
+    return missingStream(scope, "messages");
+  const fetchedAt = projectionTime(options);
 
-    const messagesByConversation = new Map<string, Record<string, unknown>[]>();
-    for (const message of byStream(records, "messages")) {
-      if (!isObjectRow(message)) {
-        malformedMessages += 1;
-        continue;
-      }
-      if (typeof message.conversation_id !== "string") {
-        unlinkedMessages += 1;
-        continue;
-      }
-      const group = messagesByConversation.get(message.conversation_id) ?? [];
-      group.push(message);
-      messagesByConversation.set(message.conversation_id, group);
+  // One malformed conversation must not make the whole scope unreadable:
+  // it is left out and counted, by reason.
+  const dropped = new Map<string, number>();
+  const drop = (reason: string) =>
+    dropped.set(reason, (dropped.get(reason) ?? 0) + 1);
+  let malformedMessages = 0;
+  let unlinkedMessages = 0;
+
+  const messagesByConversation = new Map<string, Record<string, unknown>[]>();
+  for (const message of byStream(records, "messages")) {
+    if (!isObjectRow(message)) {
+      malformedMessages += 1;
+      continue;
     }
-
-    const sourceConversations: Record<string, unknown>[] = [];
-    for (const row of byStream(records, "conversations")) {
-      if (isObjectRow(row)) sourceConversations.push(row);
-      else drop("Conversation record is not an object");
+    if (typeof message.conversation_id !== "string") {
+      unlinkedMessages += 1;
+      continue;
     }
-    const sourceIds = new Set(sourceConversations.map((c) => c.id));
-    let orphanMessages = 0;
-    for (const [id, group] of messagesByConversation) {
-      if (!sourceIds.has(id)) orphanMessages += group.length;
+    const group = messagesByConversation.get(message.conversation_id) ?? [];
+    group.push(message);
+    messagesByConversation.set(message.conversation_id, group);
+  }
+
+  const sourceConversations: Record<string, unknown>[] = [];
+  for (const row of byStream(records, "conversations")) {
+    if (isObjectRow(row)) sourceConversations.push(row);
+    else drop("Conversation record is not an object");
+  }
+  const sourceIds = new Set(sourceConversations.map((c) => c.id));
+  let orphanMessages = 0;
+  for (const [id, group] of messagesByConversation) {
+    if (!sourceIds.has(id)) orphanMessages += group.length;
+  }
+
+  const conversations: Record<string, unknown>[] = [];
+  for (const conversation of sourceConversations) {
+    if (metadataOnly && !hasChatgptMetadataFields(conversation)) {
+      drop("Conversation does not match the metadata-list contract");
+      continue;
     }
-
-    const conversations: Record<string, unknown>[] = [];
-    for (const conversation of sourceConversations) {
-      const {
-        id,
-        create_time,
-        update_time,
-        current_node,
-        message_count_on_current_branch,
-      } = conversation;
-      if (!isOptionalString(create_time) || !isOptionalString(update_time)) {
-        drop("Conversation timestamps must be strings, null, or absent");
-        continue;
-      }
-      if (!isNonEmptyString(id)) {
-        drop("Conversation lacks an id");
-        continue;
-      }
-      const title =
-        typeof conversation.title === "string" && conversation.title.length > 0
-          ? conversation.title
-          : "Untitled";
-      if (messagesMissing) {
-        conversations.push({
-          id,
-          title,
-          create_time: create_time ?? null,
-          update_time: update_time ?? null,
-          message_count: 0,
-          messages: [],
-          fetched_at: fetchedAt,
-        });
-        continue;
-      }
-      if (
-        typeof message_count_on_current_branch !== "number" ||
-        !Number.isInteger(message_count_on_current_branch) ||
-        message_count_on_current_branch < 0
-      ) {
-        drop("Conversation lacks a current-branch message count");
-        continue;
-      }
-
-      // Legacy names a message by its source node id. Messages are stored
-      // under their record id: the bare node id before ChatGPT 0.3.0,
-      // `<conversation_id>:<node_id>` since. An instance that holds both
-      // forms of one node uses the current one.
-      const { byNode, unkeyed } = chatgptMessagesByNode(
-        id,
-        messagesByConversation.get(id),
-      );
-      const branch = [...byNode.values(), ...unkeyed].filter(
-        (m) => m.on_current_branch === true,
-      );
-      if (branch.length !== message_count_on_current_branch) {
-        drop("Current branch message count does not match conversation");
-        continue;
-      }
-      const ordered: Record<string, unknown>[] = [];
-      const seen = new Set<string>();
-      let node = typeof current_node === "string" ? current_node : null;
-      while (node && !seen.has(node)) {
-        const message = byNode.get(node);
-        if (!message || message.on_current_branch !== true) break;
-        seen.add(node);
-        ordered.push(message);
-        node =
-          typeof message.parent_id === "string"
-            ? chatgptNodeId(id, message.parent_id)
-            : null;
-      }
-      if (ordered.length !== branch.length) {
-        drop("Current branch message chain is incomplete");
-        continue;
-      }
-      ordered.reverse();
-      const messages = ordered
-        .filter(
-          (m) =>
-            (m.role === "user" || m.role === "assistant") &&
-            (m.content_type === "text" ||
-              m.content_type === "multimodal_text") &&
-            typeof m.content === "string" &&
-            m.content.length > 0,
-        )
-        .map((m) => ({
-          id: chatgptNodeId(id, m.id as string),
-          role: m.role,
-          content: m.content,
-          content_type: m.content_type,
-          create_time: typeof m.create_time === "string" ? m.create_time : null,
-          model: typeof m.model_slug === "string" ? m.model_slug : null,
-        }));
+    const {
+      id,
+      create_time,
+      update_time,
+      current_node,
+      message_count_on_current_branch,
+    } = conversation;
+    if (!isOptionalString(create_time) || !isOptionalString(update_time)) {
+      drop("Conversation timestamps must be strings, null, or absent");
+      continue;
+    }
+    if (!isNonEmptyString(id)) {
+      drop("Conversation lacks an id");
+      continue;
+    }
+    const title =
+      typeof conversation.title === "string" && conversation.title.length > 0
+        ? conversation.title
+        : "Untitled";
+    if (messagesMissing) {
       conversations.push({
         id,
         title,
         create_time: create_time ?? null,
         update_time: update_time ?? null,
-        message_count: messages.length,
-        messages,
+        message_count: 0,
+        messages: [],
         fetched_at: fetchedAt,
       });
+      continue;
+    }
+    if (
+      typeof message_count_on_current_branch !== "number" ||
+      !Number.isInteger(message_count_on_current_branch) ||
+      message_count_on_current_branch < 0
+    ) {
+      drop("Conversation lacks a current-branch message count");
+      continue;
     }
 
-    const diagnostics: ProjectionDiagnostic[] = [];
-    if (dropped.size > 0) {
-      diagnostics.push({
-        kind: "records_dropped",
-        scope,
-        stream: "conversations",
-        count: [...dropped.values()].reduce((sum, n) => sum + n, 0),
-        reasons: [...dropped.keys()],
-      });
+    // Legacy names a message by its source node id. Messages are stored
+    // under their record id: the bare node id before ChatGPT 0.3.0,
+    // `<conversation_id>:<node_id>` since. An instance that holds both
+    // forms of one node uses the current one.
+    const { byNode, unkeyed } = chatgptMessagesByNode(
+      id,
+      messagesByConversation.get(id),
+    );
+    const branch = [...byNode.values(), ...unkeyed].filter(
+      (m) => m.on_current_branch === true,
+    );
+    if (branch.length !== message_count_on_current_branch) {
+      drop("Current branch message count does not match conversation");
+      continue;
     }
-    if (orphanMessages + malformedMessages + unlinkedMessages > 0) {
-      diagnostics.push({
-        kind: "records_dropped",
-        scope,
-        stream: "messages",
-        count: orphanMessages + malformedMessages + unlinkedMessages,
-        reasons: [
-          ...(orphanMessages > 0
-            ? ["Messages have no matching conversation"]
-            : []),
-          ...(malformedMessages > 0 ? ["Message record is not an object"] : []),
-          ...(unlinkedMessages > 0 ? ["Message lacks a conversation id"] : []),
-        ],
-      });
+    const ordered: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
+    let node = typeof current_node === "string" ? current_node : null;
+    while (node && !seen.has(node)) {
+      const message = byNode.get(node);
+      if (!message || message.on_current_branch !== true) break;
+      seen.add(node);
+      ordered.push(message);
+      node =
+        typeof message.parent_id === "string"
+          ? chatgptNodeId(id, message.parent_id)
+          : null;
     }
-    if (messagesMissing) {
-      diagnostics.push({ kind: "stream_missing", scope, stream: "messages" });
+    if (ordered.length !== branch.length) {
+      drop("Current branch message chain is incomplete");
+      continue;
     }
-    // Legacy delivered the conversation list in ChatGPT's own order: most
-    // recently updated first. A stable order keeps that order, not id order.
-    if (options.orderByPrimaryKey) conversations.sort(newestUpdateFirst);
-    return {
-      ok: true,
-      payload: { conversations, total: conversations.length },
-      ...(diagnostics.length > 0 ? { diagnostics } : {}),
-    };
-  },
-};
+    ordered.reverse();
+    if (metadataOnly) {
+      conversations.push(
+        Object.fromEntries(
+          Object.keys(CHATGPT_METADATA_FIELDS).map((key) => [
+            key,
+            conversation[key],
+          ]),
+        ),
+      );
+      continue;
+    }
+    const messages = ordered
+      .filter(
+        (m) =>
+          (m.role === "user" || m.role === "assistant") &&
+          (m.content_type === "text" || m.content_type === "multimodal_text") &&
+          typeof m.content === "string" &&
+          m.content.length > 0,
+      )
+      .map((m) => ({
+        id: chatgptNodeId(id, m.id as string),
+        role: m.role,
+        content: m.content,
+        content_type: m.content_type,
+        create_time: typeof m.create_time === "string" ? m.create_time : null,
+        model: typeof m.model_slug === "string" ? m.model_slug : null,
+      }));
+    conversations.push({
+      id,
+      title,
+      create_time: create_time ?? null,
+      update_time: update_time ?? null,
+      message_count: messages.length,
+      messages,
+      fetched_at: fetchedAt,
+    });
+  }
+
+  const diagnostics: ProjectionDiagnostic[] = [];
+  if (dropped.size > 0) {
+    diagnostics.push({
+      kind: "records_dropped",
+      scope,
+      stream: "conversations",
+      count: [...dropped.values()].reduce((sum, n) => sum + n, 0),
+      reasons: [...dropped.keys()],
+    });
+  }
+  if (orphanMessages + malformedMessages + unlinkedMessages > 0) {
+    diagnostics.push({
+      kind: "records_dropped",
+      scope,
+      stream: "messages",
+      count: orphanMessages + malformedMessages + unlinkedMessages,
+      reasons: [
+        ...(orphanMessages > 0
+          ? ["Messages have no matching conversation"]
+          : []),
+        ...(malformedMessages > 0 ? ["Message record is not an object"] : []),
+        ...(unlinkedMessages > 0 ? ["Message lacks a conversation id"] : []),
+      ],
+    });
+  }
+  if (messagesMissing) {
+    diagnostics.push({ kind: "stream_missing", scope, stream: "messages" });
+  }
+  // Legacy delivered the conversation list in ChatGPT's own order: most
+  // recently updated first. A stable order keeps that order, not id order.
+  if (!metadataOnly && options.orderByPrimaryKey)
+    conversations.sort(newestUpdateFirst);
+  return {
+    ok: true,
+    payload: metadataOnly
+      ? { conversations }
+      : { conversations, total: conversations.length },
+    ...(diagnostics.length > 0 ? { diagnostics } : {}),
+  };
+}
 
 /**
  * The source node id of a ChatGPT message record id. ChatGPT 0.3.0 and later

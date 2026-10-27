@@ -950,12 +950,45 @@ export function createLegacyScopeView(
           }
         : { kind: "file" };
     }
+    let legacyForProjection: DataFileEnvelope | undefined;
+    if (
+      legacyHead &&
+      input.readLegacyHead &&
+      legacyBindingsForProfile(decision.selection.method).get(scope)
+        ?.representations
+    ) {
+      try {
+        legacyForProjection = await input.readLegacyHead(legacyHead);
+      } catch {
+        return hasTakeover
+          ? {
+              kind: "refused",
+              refusal: {
+                status: "unavailable",
+                reason: "store_inconsistent_read",
+                detail: "indexed legacy head could not be read",
+              },
+            }
+          : { kind: "file" };
+      }
+      if (legacyForProjection.scope !== scope) {
+        return {
+          kind: "refused",
+          refusal: {
+            status: "unavailable",
+            reason: "store_inconsistent_read",
+            detail: "indexed legacy head has another scope",
+          },
+        };
+      }
+    }
     const read = await readCanonicalLegacyScope({
       store: decision.records,
       declarations: input.declarations,
       scope,
       selection: decision.selection,
       profileBy: "method",
+      targetLegacyPayload: legacyForProjection?.data,
       // Completion proves initial Oura admission. Once a takeover is earned,
       // partial refreshes still face coverage checks without requiring receipts.
       requireCompletionReceipts:
@@ -979,7 +1012,8 @@ export function createLegacyScopeView(
       ) {
         let legacy: DataFileEnvelope;
         try {
-          legacy = await input.readLegacyHead(legacyHead);
+          legacy =
+            legacyForProjection ?? (await input.readLegacyHead(legacyHead));
         } catch {
           const { ok: _ok, ...refusal } = read;
           return { kind: "refused", refusal };
@@ -1155,7 +1189,8 @@ export function createLegacyScopeView(
       if (!coverage || decision.selection.method === "anthropic-live") {
         let legacy: DataFileEnvelope;
         try {
-          legacy = await input.readLegacyHead(legacyHead);
+          legacy =
+            legacyForProjection ?? (await input.readLegacyHead(legacyHead));
         } catch {
           return hasTakeover
             ? {

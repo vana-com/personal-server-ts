@@ -1400,7 +1400,7 @@ describe("legacy scope view over the real SQLite record store", () => {
         "SELECT canonical_cursor FROM legacy_scope_takeover_verdicts WHERE scope = ?",
       )
       .get("oura.activity") as { canonical_cursor: string };
-    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/9");
+    expect(storedCursor.canonical_cursor).toContain("canonical-legacy-view/11");
     const callsAfterFirstRead = listRecords.mock.calls.length;
     expect(callsAfterFirstRead).toBeGreaterThan(0);
     expect((await parityView.readLatest("oura.activity")).kind).toBe(
@@ -1879,6 +1879,104 @@ describe("legacy scope view over the real SQLite record store", () => {
       { scope: "oura.activity", collectedAt: "2026-09-12T00:00:00.000Z" },
     ]);
     expect(view.listCanonicalScopes("github.")).toEqual([]);
+  });
+
+  it("selects a new retained ChatGPT contract after a covered projection was cached", async () => {
+    const scope = "chatgpt.conversations";
+    const source = "https://registry.pdpp.dev/sources/chatgpt";
+    const collectedAt = "2026-10-27T00:00:00.000Z";
+    const conversations = ["a", "b"].map((id, index) => ({
+      id,
+      title: id,
+      create_time: null,
+      update_time: `2026-10-0${index + 1}T00:00:00.000Z`,
+      current_node: null,
+      message_count_on_current_branch: 0,
+      is_archived: false,
+      is_starred: null,
+      workspace_id: null,
+      gizmo_id: null,
+    }));
+    connect(store, "conn_chatgpt", "chatgpt", source);
+    for (const [stream, rows] of [
+      ["conversations", conversations],
+      ["messages", []],
+    ] as const) {
+      store.replaceStream({
+        instance: "conn_chatgpt",
+        stream,
+        method: "chatgpt",
+        generation: 1,
+        emittedAt: collectedAt,
+        sourceCollectedAt: collectedAt,
+        primaryKey: ["id"],
+        envelopes: rows.map((data) => ({
+          instance: "conn_chatgpt",
+          stream,
+          key: data.id,
+          data,
+          emitted_at: collectedAt,
+        })),
+      });
+    }
+    const historical = {
+      conversations: ["b", "a"].map((id) => ({
+        id,
+        title: id,
+        create_time: null,
+        update_time:
+          id === "a" ? "2026-10-01T00:00:00.000Z" : "2026-10-02T00:00:00.000Z",
+        message_count: 0,
+        messages: [],
+        fetched_at: collectedAt,
+      })),
+      total: 2,
+    };
+    const bodies: Record<string, Record<string, unknown>> = {
+      metadata: { conversations },
+      historical,
+      unsupported: { conversations, unknown: true },
+    };
+    const insert = db.prepare(
+      "INSERT INTO data_files (scope, path, collected_at) VALUES (?, ?, ?)",
+    );
+    insert.run(scope, "metadata", collectedAt);
+    const readLegacyHead = async (head: {
+      path: string;
+      collectedAt: string;
+    }) => ({
+      version: "1.0" as const,
+      scope,
+      collectedAt: head.collectedAt,
+      data: bodies[head.path]!,
+    });
+    const current = createLegacyScopeView({
+      authority: createLegacyScopeAuthority(db),
+      records: store,
+      configuredMethods: (sourceId) => (sourceId === source ? ["chatgpt"] : []),
+      readLegacyHead,
+    });
+    const first = await current.readLatest(scope);
+    expect(first.kind === "canonical" && first.envelope.data).toEqual({
+      conversations,
+    });
+    expect(await current.readLatest(scope)).toEqual(first);
+    insert.run(scope, "historical", "2026-10-27T00:00:01.000Z");
+    const changed = await current.readLatest(scope);
+    expect(changed.kind === "canonical" && changed.envelope.data).toEqual(
+      historical,
+    );
+    expect(
+      changed.kind === "canonical" &&
+        first.kind === "canonical" &&
+        changed.revision,
+    ).not.toBe(first.kind === "canonical" && first.revision);
+    insert.run(scope, "unsupported", "2026-10-27T00:00:02.000Z");
+    expect((await current.readLatest(scope)).kind).toBe("file");
+    expect(current.verdictFor(scope)[0]).toMatchObject({
+      verdict: "not_covered",
+      reasonCounts: { projection_unavailable: 1 },
+    });
   });
 
   it("does not rebind a non-head replacement cursor when legacy metadata changes", async () => {

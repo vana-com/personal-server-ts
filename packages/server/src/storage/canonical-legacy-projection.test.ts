@@ -1870,6 +1870,262 @@ describe("canonical legacy projection over the real SQLite record store", () => 
       ...extras,
     });
 
+    const metadataRow = (
+      id = "metadata",
+      extras: Record<string, unknown> = {},
+    ) => ({
+      ...conversation(id, "2026-09-03T00:00:00.000Z"),
+      is_archived: false,
+      is_starred: null,
+      workspace_id: null,
+      gizmo_id: null,
+      ...extras,
+    });
+
+    it.each([
+      [
+        "missing row field",
+        (row: Record<string, unknown>) => {
+          const { gizmo_id: _gizmo, ...missing } = row;
+          return { conversations: [missing] };
+        },
+      ],
+      [
+        "wrong flag type",
+        (row: Record<string, unknown>) => ({
+          conversations: [{ ...row, is_archived: "false" }],
+        }),
+      ],
+      [
+        "numeric metadata timestamp",
+        (row: Record<string, unknown>) => ({
+          conversations: [{ ...row, update_time: 0 }],
+        }),
+      ],
+      [
+        "unknown row field",
+        (row: Record<string, unknown>) => ({
+          conversations: [{ ...row, unknown: true }],
+        }),
+      ],
+      [
+        "unknown root field",
+        (row: Record<string, unknown>) => ({
+          conversations: [row],
+          unknown: true,
+        }),
+      ],
+      [
+        "mixed representations",
+        (row: Record<string, unknown>) => ({
+          conversations: [
+            row,
+            {
+              id: "thread",
+              title: "Thread",
+              create_time: null,
+              update_time: null,
+              messages: [],
+              message_count: 0,
+            },
+          ],
+        }),
+      ],
+    ])("refuses a retained metadata body with %s", async (_name, target) => {
+      const selection = connect("conn_metadata", "chatgpt");
+      const metadata = metadataRow();
+      replace("conn_metadata", "conversations", [metadata]);
+      replace("conn_metadata", "messages", []);
+      expect(
+        await readCanonicalLegacyScope({
+          store,
+          scope: "chatgpt.conversations",
+          selection,
+          targetLegacyPayload: target(metadata),
+        }),
+      ).toMatchObject({
+        ok: false,
+        reason: "projection_rejected",
+        error: { kind: "invalid_value" },
+      });
+    });
+
+    it.each([
+      ["missing field", { gizmo_id: undefined }],
+      ["wrong flag type", { is_starred: 0 }],
+      ["wrong count type", { message_count_on_current_branch: false }],
+      ["unknown branch count", { message_count_on_current_branch: null }],
+      ["numeric timestamp", { create_time: 0 }],
+    ])("refuses a canonical metadata row with %s", async (_name, extras) => {
+      const selection = connect("conn_metadata", "chatgpt");
+      replace("conn_metadata", "conversations", [
+        metadataRow("metadata", extras),
+      ]);
+      replace("conn_metadata", "messages", []);
+      expect(
+        await readCanonicalLegacyScope({
+          store,
+          scope: "chatgpt.conversations",
+          selection,
+          targetLegacyPayload: { conversations: [metadataRow()] },
+        }),
+      ).toMatchObject({ ok: false, reason: "all_rows_rejected" });
+    });
+
+    it("distinguishes empty metadata and historical thread contracts without changing the no-head default", async () => {
+      const selection = connect("conn_metadata", "chatgpt");
+      replace("conn_metadata", "conversations", []);
+      replace("conn_metadata", "messages", []);
+      const read = (targetLegacyPayload?: unknown) =>
+        readCanonicalLegacyScope({
+          store,
+          scope: "chatgpt.conversations",
+          selection,
+          targetLegacyPayload,
+        });
+      const metadata = await read({ conversations: [] });
+      const historical = await read({ conversations: [], total: 0 });
+      const noHead = await read();
+      expect(metadata.ok && metadata.envelope.data).toEqual({
+        conversations: [],
+      });
+      expect(historical.ok && historical.envelope.data).toEqual({
+        conversations: [],
+        total: 0,
+      });
+      expect(noHead).toEqual(historical);
+      expect(metadata.ok && historical.ok && metadata.revision).not.toBe(
+        historical.ok && historical.revision,
+      );
+    });
+
+    it.each(["count", "chain"])(
+      "refuses incomplete message %s evidence even when rendering only metadata",
+      async (failure) => {
+        const selection = connect("conn_metadata", "chatgpt");
+        const metadata = metadataRow("metadata", {
+          current_node: "tip",
+          message_count_on_current_branch: 1,
+        });
+        replace("conn_metadata", "conversations", [metadata]);
+        replace(
+          "conn_metadata",
+          "messages",
+          failure === "count"
+            ? []
+            : [
+                {
+                  id: "other",
+                  conversation_id: "metadata",
+                  on_current_branch: true,
+                  parent_id: null,
+                },
+              ],
+        );
+        expect(
+          await readCanonicalLegacyScope({
+            store,
+            scope: "chatgpt.conversations",
+            selection,
+            targetLegacyPayload: { conversations: [metadata] },
+          }),
+        ).toMatchObject({
+          ok: false,
+          reason: "all_rows_rejected",
+          stream: "conversations",
+        });
+      },
+    );
+
+    it.each(["conversations", "messages"])(
+      "honors an explicit current completion receipt requirement for %s when rendering metadata",
+      async (stream) => {
+        const selection = connect("conn_metadata", "chatgpt");
+        replace("conn_metadata", "conversations", [metadataRow()]);
+        replace("conn_metadata", "messages", []);
+        db.prepare("DELETE FROM pdpp_stream_completion WHERE stream = ?").run(
+          stream,
+        );
+        expect(
+          await readCanonicalLegacyScope({
+            store,
+            scope: "chatgpt.conversations",
+            selection,
+            requireCompletionReceipts: true,
+            allowUnprovenEmptyStreams: true,
+            targetLegacyPayload: { conversations: [metadataRow()] },
+          }),
+        ).toMatchObject({
+          ok: false,
+          reason: "stream_completion_unknown",
+          streams: [stream],
+        });
+      },
+    );
+
+    it.each(["conversations", "messages"])(
+      "requires source arrival proof for %s when rendering metadata",
+      async (stream) => {
+        const selection = connect("conn_metadata", "chatgpt");
+        const rows = [metadataRow("a"), metadataRow("b")];
+        replace("conn_metadata", "conversations", rows);
+        replace("conn_metadata", "messages", [
+          { id: "message-a", conversation_id: "a", on_current_branch: false },
+          { id: "message-b", conversation_id: "b", on_current_branch: false },
+        ]);
+        db.prepare("DELETE FROM pdpp_record_arrival WHERE stream = ?").run(
+          stream,
+        );
+        expect(
+          await readCanonicalLegacyScope({
+            store,
+            scope: "chatgpt.conversations",
+            selection,
+            targetLegacyPayload: { conversations: rows },
+          }),
+        ).toMatchObject({
+          ok: false,
+          reason: "projection_rejected",
+          error: {
+            kind: "incomplete_scope",
+            scope: "chatgpt.conversations",
+          },
+        });
+      },
+    );
+
+    it("preserves metadata nulls, false and zero from canonical fields while ignoring additional source fields", async () => {
+      const selection = connect("conn_metadata", "chatgpt");
+      const metadata = {
+        id: "metadata",
+        title: null,
+        create_time: null,
+        update_time: null,
+        current_node: null,
+        message_count_on_current_branch: 0,
+        is_archived: false,
+        is_starred: null,
+        workspace_id: null,
+        gizmo_id: null,
+      };
+      replace("conn_metadata", "conversations", [
+        { ...metadata, future_source_field: true },
+      ]);
+      replace("conn_metadata", "messages", []);
+      const read = await readCanonicalLegacyScope({
+        store,
+        scope: "chatgpt.conversations",
+        selection,
+        targetLegacyPayload: {
+          conversations: [{ ...metadata, title: "Retained value" }],
+        },
+      });
+      expect(read).toMatchObject({ ok: true, complete: true });
+      expect(read.ok && read.envelope.data).toEqual({
+        conversations: [metadata],
+      });
+    });
+
     it("returns valid peers with omissions for a bad timestamp and missing title", async () => {
       const selection = connect("conn_chatgpt", "chatgpt");
       replace("conn_chatgpt", "conversations", [

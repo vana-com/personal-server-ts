@@ -5,10 +5,9 @@ import {
 } from "../legacy-projection/bindings.js";
 import {
   hasAlternateLegacyProfile,
-  LEGACY_SCOPE_BINDINGS,
-  legacyBindingsForProfile,
   legacyScopeToPdppSelection,
-  projectPdppRecordsToLegacyPayload,
+  projectPdppRecordsUsingBinding,
+  resolveLegacyProjection,
   type LegacyScopeBinding,
   type LegacyScopeLookupError,
   type ProjectionError,
@@ -54,7 +53,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/9";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/11";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -254,6 +253,8 @@ export interface ReadCanonicalLegacyScopeInput {
   declarations?: Pick<StreamDeclarationRegistry, "forInstance">;
   scope: string;
   selection: CanonicalConnectionSelection;
+  /** Exact retained body used only to select a supported render contract. */
+  targetLegacyPayload?: unknown;
   /**
    * How the selected connection's declaration profile is found.
    * `"source"` (default): from the last segment of the source id.
@@ -339,13 +340,18 @@ export async function readCanonicalLegacyScope(
     ? profileKeyForMethod(selection.method)
     : profileKeyForSource(selection.sourceId);
   const lookup = legacyScopeToPdppSelection(scope, { profileKey });
-  const binding = bindingFor(scope, profileKey);
-  if (!lookup.ok || !binding) {
+  if (!lookup.ok) {
     return unavailable({
       reason: "unbound_scope",
-      lookup: lookup.ok ? { kind: "unknown_scope", scope } : lookup.error,
+      lookup: lookup.error,
     });
   }
+  const resolved = resolveLegacyProjection(scope, {
+    profileKey,
+    targetLegacyPayload: input.targetLegacyPayload,
+  });
+  if (!resolved.ok) return rejection(resolved.error, {});
+  const { binding, contractId } = resolved;
   if (
     (binding.pdppSource === ANTHROPIC_CONNECTOR_ID &&
       selection.sourceId !== CLAUDE_SOURCE_ID) ||
@@ -386,6 +392,8 @@ export async function readCanonicalLegacyScope(
     selection,
     streams,
     binding,
+    contractId,
+    requireProvenOrder: resolved.requireProvenOrder === true,
     profileKey,
     includeStreamTimes: input.includeStreamTimes === true,
     requireClaudeRawBlobs: input.requireClaudeRawBlobs === true,
@@ -681,6 +689,8 @@ interface ProjectInput extends Snapshot {
   selection: CanonicalConnectionSelection;
   streams: string[];
   binding: LegacyScopeBinding;
+  contractId: string;
+  requireProvenOrder: boolean;
   profileKey: string | undefined;
   includeStreamTimes: boolean;
   requireClaudeRawBlobs: boolean;
@@ -703,6 +713,17 @@ async function projectSnapshot(
   const sourceRowCounts = Object.fromEntries(
     streams.map((stream) => [stream, rowsByStream.get(stream)?.length ?? 0]),
   );
+
+  if (input.requireProvenOrder && orderGaps.length > 0) {
+    return rejection(
+      {
+        kind: "incomplete_scope",
+        scope,
+        reason: `Source arrival order is unavailable for ${orderGaps.join(", ")}`,
+      },
+      sourceRowCounts,
+    );
+  }
 
   const expanded = [];
   const canExpandClaude =
@@ -831,7 +852,7 @@ async function projectSnapshot(
       });
     }
   }
-  const projected = projectPdppRecordsToLegacyPayload(scope, records, {
+  const projected = projectPdppRecordsUsingBinding(binding, records, {
     fetchedStreams: streams,
     ...(profileKey ? { profileKey } : {}),
     now: collectedAt,
@@ -895,6 +916,7 @@ async function projectSnapshot(
     scope,
     selection,
     binding,
+    contractId: input.contractId,
     profileKey,
     generation: input.generation,
     streams,
@@ -1106,6 +1128,7 @@ async function viewRevision(input: {
   scope: string;
   selection: CanonicalConnectionSelection;
   binding: LegacyScopeBinding;
+  contractId: string;
   profileKey: string | undefined;
   generation: number;
   streams: string[];
@@ -1137,6 +1160,7 @@ async function viewRevision(input: {
   const digest = await sha256Hex(
     JSON.stringify({
       contract: CANONICAL_LEGACY_VIEW_CONTRACT,
+      representation: input.contractId,
       streamSchemas: input.streamSchemas,
       scope: input.scope,
       instance: input.selection.instance,
@@ -1184,15 +1208,6 @@ async function sha256Hex(text: string): Promise<string> {
   return Array.from(new Uint8Array(bytes), (b) =>
     b.toString(16).padStart(2, "0"),
   ).join("");
-}
-
-function bindingFor(
-  scope: string,
-  profileKey: string | undefined,
-): LegacyScopeBinding | undefined {
-  return profileKey
-    ? legacyBindingsForProfile(profileKey).get(scope)
-    : LEGACY_SCOPE_BINDINGS.get(scope);
 }
 
 /** Alternate declaration profiles are keyed by the source's last segment. */
