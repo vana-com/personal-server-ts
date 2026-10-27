@@ -358,6 +358,113 @@ describe("upload worker", () => {
       expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(3);
     });
 
+    it("publishes only the newest unsynced snapshot of a memory scope and erases the older ones", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const older = makeEntry({
+        id: 11,
+        path: "memory.claude/1.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.000Z",
+        version: 1,
+      });
+      const newer = makeEntry({
+        id: 12,
+        path: "memory.claude/2.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:05.000Z",
+        version: 2,
+      });
+      const other = makeEntry({ id: 3, path: "a/1.json" });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        older,
+        other,
+        newer,
+      ]);
+
+      const results = await uploadAll(deps);
+
+      expect(results.map((r) => r.path)).toEqual([
+        "a/1.json",
+        "memory.claude/2.json",
+      ]);
+      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(2);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.claude",
+        older.collectedAt,
+        { id: older.id, path: older.path },
+      );
+    });
+
+    it("waits for a quiet period before publishing a memory scope, but not longer than the max wait", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const now = new Date("2026-10-27T10:05:00.000Z");
+      const fresh = makeEntry({
+        id: 21,
+        path: "memory.claude/fresh.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:04:30.000Z", // 30 s old: still active
+      });
+      const stale = makeEntry({
+        id: 31,
+        path: "memory.hermes/old.json",
+        scope: "memory.hermes",
+        collectedAt: "2026-10-27T09:50:00.000Z", // oldest unsynced 15 min ago
+      });
+      const staleNewest = makeEntry({
+        id: 32,
+        path: "memory.hermes/new.json",
+        scope: "memory.hermes",
+        collectedAt: "2026-10-27T10:04:50.000Z", // newest is fresh, max wait hit
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        stale,
+        fresh,
+        staleNewest,
+      ]);
+
+      const results = await uploadAll(deps, { now: () => now });
+
+      expect(results.map((r) => r.path)).toEqual(["memory.hermes/new.json"]);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledTimes(1);
+      expect(deps.storage.deleteVersion).toHaveBeenCalledWith(
+        "memory.hermes",
+        stale.collectedAt,
+        { id: stale.id, path: stale.path },
+      );
+    });
+
+    it("keeps older memory snapshots when the newest one fails to publish", async () => {
+      const deps = makeMockDeps();
+      deps.storage.deleteVersion = vi.fn().mockResolvedValue(true);
+      const older = makeEntry({
+        id: 11,
+        path: "memory.claude/1.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:00.000Z",
+      });
+      const newer = makeEntry({
+        id: 12,
+        path: "memory.claude/2.json",
+        scope: "memory.claude",
+        collectedAt: "2026-10-27T10:00:05.000Z",
+      });
+      (deps.storage.findUnsynced as ReturnType<typeof vi.fn>).mockReturnValue([
+        older,
+        newer,
+      ]);
+      (
+        deps.storageAdapter.upload as ReturnType<typeof vi.fn>
+      ).mockRejectedValue(new Error("storage 500"));
+
+      const results = await uploadAll(deps, { onError: vi.fn() });
+
+      expect(results).toHaveLength(0);
+      expect(deps.storageAdapter.upload).toHaveBeenCalledTimes(1);
+      expect(deps.storage.deleteVersion).not.toHaveBeenCalled();
+    });
+
     it("continues on individual entry failure (logs error)", async () => {
       const deps = makeMockDeps();
       const onError = vi.fn();

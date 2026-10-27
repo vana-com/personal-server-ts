@@ -2785,6 +2785,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       "get_scope_file",
       "search_personal_context",
       "remember",
+      "forget",
     ]);
   });
 });
