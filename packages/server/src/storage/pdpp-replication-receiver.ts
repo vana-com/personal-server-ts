@@ -35,8 +35,17 @@ import {
   type ReplicaMergePlan,
 } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
 import { selectStreamCompletion } from "@opendatalabs/personal-server-ts-core/replication/completion";
+import {
+  blobReady,
+  completionAvailability,
+  connectionFromFacts,
+  contradictsMapping,
+  indexEvidence,
+  recordRow,
+  type ConnectionMapping,
+  type ConnectionProjection,
+} from "@opendatalabs/personal-server-ts-core/replication/visibility-engine";
 import { replicaOperationDigest } from "./pdpp-replication-sqlite.js";
-import { liveSnapshotDigest } from "./pdpp-stream-completion.js";
 import type { ReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 
 import {
@@ -110,6 +119,10 @@ type Binding = {
   deleted_at: string | null;
 };
 type BlobDescriptor = Extract<ReplicaOperation, { kind: "blob-claim" }>["blob"];
+type CompletionEvent = Extract<
+  ReplicaOperation,
+  { kind: "stream-complete" | "stream-invalidate" }
+>;
 interface StoredRow {
   data: string | null;
   version: number;
@@ -199,52 +212,6 @@ export function createReplicaReceiver(deps: {
     if (hidden) store.fenceReplicaConnection(instance);
     return hidden;
   }
-  /**
-   * Durable binding-conflict facts from retained evidence, before planning:
-   * two sources or methods for one connection id (equivocated variants
-   * count), or evidence that disagrees with the local mapping. Each fact
-   * quarantines only its connection; other connections keep importing.
-   */
-  function recordBindingConflicts(all: ReplicaOperation[]) {
-    const byConnection = new Map<string, ReplicaOperation[]>();
-    for (const op of all)
-      byConnection.set(op.connectionId, [
-        ...(byConnection.get(op.connectionId) ?? []),
-        op,
-      ]);
-    for (const [id, ops] of byConnection) {
-      const local = binding(id);
-      const disagreeing = local?.source_id
-        ? ops.find(
-            (op) =>
-              op.sourceId !== local.source_id || op.methodId !== local.method,
-          )
-        : undefined;
-      if (disagreeing)
-        store.markReplicaBindingConflict({
-          connectionId: id,
-          reason: "local_mapping_conflict",
-          evidence: {
-            sourceId: disagreeing.sourceId,
-            methodId: disagreeing.methodId,
-            revision: disagreeing.revision,
-          },
-        });
-      else if (
-        new Set(ops.map((op) => op.sourceId)).size > 1 ||
-        new Set(ops.map((op) => op.methodId)).size > 1
-      )
-        store.markReplicaBindingConflict({
-          connectionId: id,
-          reason: "source_binding_conflict",
-          evidence: [
-            ...new Set(ops.map((op) => `${op.sourceId} ${op.methodId}`)),
-          ]
-            .sort()
-            .slice(0, 8),
-        });
-    }
-  }
   function retained(): ReplicaOperation[] {
     return (
       db
@@ -266,40 +233,20 @@ export function createReplicaReceiver(deps: {
       ? namespace
       : undefined;
   }
-  function materializeBlob(
+  /** Blob ids whose bytes are verified against a descriptor, for `blobReady`. */
+  function verifiedBlobs(blobs: readonly BlobDescriptor[]): Set<string> {
+    return new Set(
+      blobs.flatMap((blob) => (verifiedBytes(blob) ? [blob.blobId] : [])),
+    );
+  }
+  /**
+   * Persist the bytes and claims of an upsert `blobReady` accepted: metadata,
+   * the canonical copy, and the connection's claim.
+   */
+  function persistBlobs(
     operation: Extract<ReplicaOperation, { kind: "upsert" }>,
-    operations: ReplicaOperation[],
-  ): boolean {
-    const ref = operation.data.blob_ref as
-      | {
-          blob_id?: unknown;
-          sha256?: unknown;
-          size_bytes?: unknown;
-          mime_type?: unknown;
-        }
-      | undefined;
-    if (operation.blobs.length !== (ref ? 1 : 0)) return false;
+  ) {
     for (const blob of operation.blobs) {
-      if (
-        ref?.blob_id !== blob.blobId ||
-        (ref.sha256 !== undefined &&
-          ref.sha256 !== blob.sha256.replace("sha256:", "")) ||
-        (ref.size_bytes !== undefined && ref.size_bytes !== blob.sizeBytes) ||
-        (ref.mime_type !== undefined && ref.mime_type !== blob.mimeType)
-      )
-        return false;
-      const claimed = operations.some(
-        (op) =>
-          op.kind === "blob-claim" &&
-          op.owner === owner &&
-          op.connectionId === operation.connectionId &&
-          op.sourceId === operation.sourceId &&
-          op.methodId === operation.methodId &&
-          op.generation === operation.generation &&
-          canonicalJson(op.blob) === canonicalJson(blob),
-      );
-      const bytes = verifiedBytes(blob);
-      if (!claimed || !bytes) return false;
       const meta = store.getBlobMeta(blob.blobId);
       if (
         meta &&
@@ -325,12 +272,11 @@ export function createReplicaReceiver(deps: {
           )
         )
           throw new Error("corrupt canonical blob bytes");
-      } else copyBinaryToCanonical(db, bytes, blob.blobId);
+      } else copyBinaryToCanonical(db, verifiedBytes(blob)!, blob.blobId);
       db.prepare(
         "INSERT INTO pdpp_blob_claims VALUES (?, ?, ?) ON CONFLICT(blob_id, instance) DO UPDATE SET generation = excluded.generation",
       ).run(blob.blobId, operation.connectionId, operation.generation);
     }
-    return true;
   }
   function write(
     instance: string,
@@ -419,38 +365,64 @@ export function createReplicaReceiver(deps: {
       "UPDATE pdpp_record_arrival_clock SET value = value + 1 WHERE id = 1",
     ).run();
   }
+  /** The host mapping of a connection, or undefined while unprovisioned. */
+  function mappingOf(id: string): ConnectionMapping | undefined {
+    const local = binding(id);
+    return local?.source_id
+      ? { sourceId: local.source_id, methodId: local.method ?? "" }
+      : undefined;
+  }
+  /**
+   * Adapter around the core engine. The engine decides each provisioned
+   * connection's eligibility, which rows show and which completions are
+   * available; this function persists those decisions in the canonical
+   * tables and keeps Node's lifecycle fences.
+   *
+   * Node withdraws a terminal connection through its quarantine fact, which
+   * readers apply, and not by deciding its rows: rows keep following the
+   * evidence. So eligibility is judged here without the terminal fact, and
+   * completions with it.
+   */
   function reconcile(): ReplicaMergePlan {
     const all = retained();
     const context = { owner, declarations: deps.declarations() };
-    // A retained disagreement is a connection-scoped fact, never a throw that
-    // would block every import and retry (#428 F2).
-    recordBindingConflicts(all);
+    const index = indexEvidence(all);
+    const statuses = new Map<string, ConnectionProjection>();
+    for (const id of new Set(all.map((op) => op.connectionId))) {
+      const ops = all.filter((op) => op.connectionId === id);
+      const mapping = mappingOf(id);
+      // An unprovisioned connection whose evidence names two bindings
+      // contradicts any mapping the host can provision later.
+      const facts = index.connectionFacts(id, {
+        mapping: mapping ?? {
+          sourceId: ops[0].sourceId,
+          methodId: ops[0].methodId,
+        },
+        terminal: false,
+        appliedGeneration: binding(id)?.generation ?? 1,
+      });
+      // A retained disagreement is a durable, connection-scoped fact, never
+      // a throw that would block every import and retry (#428 F2). It holds
+      // even when terminal quarantine or equivocation outranks it (#426).
+      if (contradictsMapping(facts))
+        recordBindingConflict(id, ops, facts.mapping, !mapping);
+      if (mapping) statuses.set(id, connectionFromFacts(context, facts));
+    }
     const unavailable: ReplicaOperation[] = [];
     const eligible = all.filter((op) => {
-      const local = binding(op.connectionId);
-      if (!local?.source_id) {
-        unavailable.push(op);
-        return false;
-      }
-      return !store.replicaBindingConflict(op.connectionId);
+      const connection = statuses.get(op.connectionId);
+      if (!connection) unavailable.push(op);
+      return connection !== undefined && !bindingConflict(connection);
     });
-    // Operation-ID equivocation is global. An unprovisioned variant that
-    // differs from a provisioned one still withdraws that connection (oracle
-    // D1). Only such variants enter the plan. Their connection has no local
-    // binding, so the planner never materializes them.
+    // Variants that share a revision with eligible evidence enter the plan,
+    // so the planner never materializes one side of an equivocation. Their
+    // connections are unprovisioned or conflicted, so it shows none of them.
     const revisionKey = (op: ReplicaOperation) =>
       canonicalJson([op.revision.writerId, op.revision.operationId]);
-    const contents = new Map<string, Set<string>>();
-    for (const op of all)
-      contents.set(
-        revisionKey(op),
-        (contents.get(revisionKey(op)) ?? new Set()).add(canonicalJson(op)),
-      );
-    const mappedRevisions = new Set(eligible.map(revisionKey));
-    const colliding = unavailable.filter(
-      (op) =>
-        mappedRevisions.has(revisionKey(op)) &&
-        contents.get(revisionKey(op))!.size > 1,
+    const included = new Set(eligible);
+    const eligibleRevisions = new Set(eligible.map(revisionKey));
+    const colliding = all.filter(
+      (op) => !included.has(op) && eligibleRevisions.has(revisionKey(op)),
     );
     const plan = planReplicaMerge(context, [...eligible, ...colliding]);
     if (unavailable.length)
@@ -460,42 +432,15 @@ export function createReplicaReceiver(deps: {
       });
     // Lifecycle evidence gates canonical state, but never creates a connection or
     // changes its acquisition method. Only the local authority provisions that.
-    for (const id of new Set(eligible.map((op) => op.connectionId))) {
+    for (const [id, connection] of statuses) {
+      if (bindingConflict(connection)) continue;
       const local = binding(id)!;
-      const entries = eligible.filter((op) => op.connectionId === id);
-      const blocked = plan.conflicts.some(
-        (issue) =>
-          issue.reason !== "append_only_content_conflict" &&
-          issue.reason !== "incompatible_record_declaration" &&
-          issue.operations.some((op) => op.connectionId === id),
-      );
-      const deleted = plan.suppressed.some(
-        (issue) =>
-          issue.reason === "connection_deleted" &&
-          issue.operations.some((op) => op.connectionId === id),
-      );
-      const missingLifecycle = plan.pending.some(
-        (issue) =>
-          issue.operations.some((op) => op.connectionId === id) &&
-          [
-            "missing_connection_registration",
-            "missing_generation_reset",
-          ].includes(issue.reason) &&
-          issue.operations.some(
-            (op) =>
-              op.kind === "connection-register" ||
-              op.kind === "connection-reset",
-          ),
-      );
-      const generation = Math.max(
-        1,
-        ...entries
-          .filter((op) => op.kind === "connection-reset")
-          .map((op) => op.generation),
-      );
-      const newlyBlocked = blocked && quarantineConnection(id);
+      const deleted = connection.status === "deleted";
+      const blocked = connection.status === "withdrawn";
       const reset =
-        !blocked && !missingLifecycle && generation > local.generation;
+        connection.status === "active" &&
+        connection.generation > local.generation;
+      const newlyBlocked = blocked && quarantineConnection(id);
       // A receiver-derived deletion can become equivocated later. Retract only
       // that derived marker; an actual local deletion remains in the merge set.
       const retractDeletion =
@@ -527,7 +472,7 @@ export function createReplicaReceiver(deps: {
         db.prepare(
           "UPDATE pdpp_instance_binding SET generation = ?, deleted_at = ?, reset_clock = ? WHERE instance = ?",
         ).run(
-          reset ? generation : local.generation,
+          reset ? connection.generation : local.generation,
           deleted
             ? (local.deleted_at ?? "replica-deleted")
             : retractDeletion
@@ -548,14 +493,19 @@ export function createReplicaReceiver(deps: {
         write(connectionId, stream, recordKey, null);
         continue;
       }
-      const winner = record.winner;
-      if (winner?.kind === "upsert" && !materializeBlob(winner, eligible)) {
+      // `write` turns a withdrawal into a tombstone only for a stored row, so
+      // the engine's "no prior row" case is the same as a withdrawal here.
+      const row = recordRow(undefined, record, (op) =>
+        blobReady(op, eligible, verifiedBlobs(op.blobs)),
+      );
+      const shown = row && row.state !== "withdrawn" ? row.winner : null;
+      if (record.winner?.kind === "upsert" && !shown)
         plan.pending.push({
           reason: "missing_or_invalid_blob",
-          operations: [winner],
+          operations: [record.winner],
         });
-        write(connectionId, stream, recordKey, null);
-      } else write(connectionId, stream, recordKey, winner);
+      if (shown?.kind === "upsert") persistBlobs(shown);
+      write(connectionId, stream, recordKey, shown);
     }
     const materialized = new Set(
       plan.records.map((record) => canonicalJson(record.identity)),
@@ -583,156 +533,171 @@ export function createReplicaReceiver(deps: {
           write(op.connectionId, op.declaration.stream, op.recordKey, null);
       }
     }
-    reconcileCompletions(eligible, plan);
+    reconcileCompletions(all, plan, index, context);
     return plan;
   }
-  function reconcileCompletions(
-    operations: ReplicaOperation[],
-    plan: ReplicaMergePlan,
+  function bindingConflict(
+    connection: ConnectionProjection,
+  ): connection is Extract<ConnectionProjection, { status: "withdrawn" }> & {
+    reason: "local_mapping_conflict" | "source_binding_conflict";
+  } {
+    return (
+      connection.status === "withdrawn" &&
+      (connection.reason === "local_mapping_conflict" ||
+        connection.reason === "source_binding_conflict")
+    );
+  }
+  /** Persist the engine's binding conflict with the evidence that shows it. */
+  function recordBindingConflict(
+    id: string,
+    ops: readonly ReplicaOperation[],
+    mapping: ConnectionMapping,
+    unprovisioned: boolean,
   ) {
-    const grouped = new Map<
-      string,
-      Extract<
-        ReplicaOperation,
-        { kind: "stream-complete" | "stream-invalidate" }
-      >[]
-    >();
-    const declarations = deps.declarations();
-    for (const op of operations) {
+    const disagreeing = ops.find(
+      (op) =>
+        op.sourceId !== mapping.sourceId || op.methodId !== mapping.methodId,
+    )!;
+    store.markReplicaBindingConflict(
+      unprovisioned
+        ? {
+            connectionId: id,
+            reason: "source_binding_conflict",
+            evidence: [
+              ...new Set(ops.map((op) => `${op.sourceId} ${op.methodId}`)),
+            ]
+              .sort()
+              .slice(0, 8),
+          }
+        : {
+            connectionId: id,
+            reason: "local_mapping_conflict",
+            evidence: {
+              sourceId: disagreeing.sourceId,
+              methodId: disagreeing.methodId,
+              revision: disagreeing.revision,
+            },
+          },
+    );
+  }
+  /**
+   * Persist the engine's completion availability for every provisioned
+   * stream with completion evidence at its connection's generation. The
+   * terminal quarantine fact applies here, unlike to rows.
+   */
+  function reconcileCompletions(
+    all: readonly ReplicaOperation[],
+    plan: ReplicaMergePlan,
+    index: ReturnType<typeof indexEvidence>,
+    context: MergeContext,
+  ) {
+    const issues = [...plan.pending, ...plan.conflicts, ...plan.rejected];
+    const variantDigests = index.variantDigests(
+      (id) => mappingOf(id) !== undefined,
+    );
+    const trusted = (op: CompletionEvent) =>
+      context.declarations.some(
+        (d) =>
+          d.sourceId === op.sourceId &&
+          canonicalJson(d.binding) === canonicalJson(op.declaration),
+      );
+    const visible = new Map<string, ConnectionProjection>();
+    const grouped = new Map<string, CompletionEvent[]>();
+    for (const op of all) {
       if (op.kind !== "stream-complete" && op.kind !== "stream-invalidate")
         continue;
-      if (
-        !declarations.some(
-          (d) =>
-            d.sourceId === op.sourceId &&
-            canonicalJson(d.binding) === canonicalJson(op.declaration),
-        )
-      ) {
+      const mapping = mappingOf(op.connectionId);
+      if (!mapping) continue;
+      if (!trusted(op))
         plan.pending.push({ reason: "missing_declaration", operations: [op] });
-        continue;
-      }
-      const key = canonicalJson([
-        op.connectionId,
-        op.generation,
-        op.declaration.stream,
-      ]);
+      if (!visible.has(op.connectionId))
+        visible.set(
+          op.connectionId,
+          connectionFromFacts(
+            context,
+            index.connectionFacts(op.connectionId, {
+              mapping,
+              terminal: !!db
+                .prepare(
+                  "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ?",
+                )
+                .get(op.connectionId),
+              appliedGeneration: binding(op.connectionId)!.generation,
+            }),
+          ),
+        );
+      if (visible.get(op.connectionId)!.generation !== op.generation) continue;
+      const key = canonicalJson([op.connectionId, op.declaration.stream]);
       grouped.set(key, [...(grouped.get(key) ?? []), op]);
     }
-    for (const entries of grouped.values()) {
-      const first = entries[0];
-      const local = binding(first.connectionId)!;
-      if (local.deleted_at || local.generation !== first.generation) continue;
+    for (const events of grouped.values()) {
+      const first = events[0];
+      const { connectionId, generation } = first;
       const stream = first.declaration.stream;
-      if (
-        db
+      const connection = visible.get(connectionId)!;
+      const available = completionAvailability({
+        connection,
+        connectionId,
+        events,
+        declarations: context.declarations,
+        quarantinedKey: !!db
           .prepare(
-            "SELECT 1 FROM pdpp_replica_quarantined_connections WHERE instance = ? UNION ALL SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND generation = ? AND stream = ? LIMIT 1",
+            "SELECT 1 FROM pdpp_replica_quarantined_keys WHERE instance = ? AND generation = ? AND stream = ? LIMIT 1",
           )
-          .get(first.connectionId, first.connectionId, first.generation, stream)
-      ) {
-        db.prepare(
-          "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
-        ).run(first.connectionId, stream);
-        continue;
-      }
-      if (
-        new Set(entries.map((op) => canonicalJson(op.declaration))).size > 1
-      ) {
-        plan.conflicts.push({
-          reason: "incompatible_completion_declaration",
-          operations: entries,
-        });
-        db.prepare(
-          "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
-        ).run(first.connectionId, stream);
-        continue;
-      }
-      const relevantIssue = [
-        ...plan.pending,
-        ...plan.conflicts,
-        ...plan.rejected,
-      ].some(
-        (issue) =>
-          issue.reason !== "missing_declaration" &&
-          issue.operations.some(
-            (op) =>
-              op.connectionId === first.connectionId &&
-              (!("declaration" in op) || op.declaration.stream === stream),
-          ),
-      );
-      const declaration = deps
-        .declarations()
-        .find(
-          (d) =>
-            d.sourceId === first.sourceId &&
-            canonicalJson(d.binding) === canonicalJson(first.declaration),
-        );
-      const completion = selectStreamCompletion(entries);
-      const dependencies =
-        completion?.dependencies.every((dep) => {
-          const matches = operations.filter(
-            (op) =>
-              op.revision.writerId === dep.writerId &&
-              op.revision.operationId === dep.operationId,
-          );
-          return (
-            matches.length === 1 &&
-            replicaOperationDigest(matches[0]) === dep.digest
-          );
-        }) && completion.dependencies.length > 0;
-      const rows = db
-        .prepare(
-          "SELECT record_key AS recordKey, data AS dataJson FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
-        )
-        .all(first.connectionId, stream) as {
-        recordKey: string;
-        dataJson: string;
-      }[];
-      const digest = declaration
-        ? liveSnapshotDigest(
-            {
-              sourceId: first.sourceId,
-              instance: first.connectionId,
-              method: first.methodId,
-              generation: first.generation,
-              stream,
-            },
-            declaration.binding.primaryKey,
-            rows,
+          .get(connectionId, generation, stream),
+        unresolved: issues.some(
+          (issue) =>
+            issue.reason !== "missing_declaration" &&
+            issue.operations.some(
+              (op) =>
+                op.connectionId === connectionId &&
+                (!("declaration" in op) || op.declaration.stream === stream),
+            ),
+        ),
+        variantDigests,
+        liveRows: db
+          .prepare(
+            "SELECT record_key AS recordKey, data AS dataJson FROM pdpp_records WHERE instance = ? AND stream = ? AND deleted = 0",
           )
-        : undefined;
-      if (
-        completion &&
-        declaration &&
-        dependencies &&
-        !relevantIssue &&
-        rows.length === completion.liveCount &&
-        `sha256:${digest}` === completion.snapshotSha256 &&
-        (completion.proof.kind !== "native" ||
-          completion.proof.snapshotSha256 === completion.snapshotSha256)
-      ) {
+          .all(connectionId, stream) as {
+          recordKey: string;
+          dataJson: string;
+        }[],
+      });
+      if (available) {
+        const completion = available.operation;
         const seq = (
           db.prepare("SELECT value FROM pdpp_write_clock").get() as {
             value: number;
           }
         ).value;
+        const native = completion.proof.kind === "native";
         db.prepare(
           "INSERT INTO pdpp_stream_completion (instance,stream,method,generation,source_collected_at,write_seq,live_count,snapshot_sha256,collection_time_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(instance,stream) DO UPDATE SET method=excluded.method,generation=excluded.generation,source_collected_at=excluded.source_collected_at,write_seq=excluded.write_seq,live_count=excluded.live_count,snapshot_sha256=excluded.snapshot_sha256,collection_time_basis=excluded.collection_time_basis WHERE method IS NOT excluded.method OR generation IS NOT excluded.generation OR source_collected_at IS NOT excluded.source_collected_at OR live_count IS NOT excluded.live_count OR snapshot_sha256 IS NOT excluded.snapshot_sha256 OR collection_time_basis IS NOT excluded.collection_time_basis",
         ).run(
-          first.connectionId,
+          connectionId,
           stream,
           first.methodId,
-          first.generation,
+          generation,
           completion.sourceCollectedAt,
           seq,
           completion.liveCount,
-          completion.proof.kind === "native" ? digest! : null,
-          completion.proof.kind === "native" ? "host_run_finished" : null,
+          native ? completion.snapshotSha256.slice(7) : null,
+          native ? "host_run_finished" : null,
         );
-      } else {
-        db.prepare(
-          "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
-        ).run(first.connectionId, stream);
+        continue;
+      }
+      db.prepare(
+        "DELETE FROM pdpp_stream_completion WHERE instance = ? AND stream = ?",
+      ).run(connectionId, stream);
+      // Diagnostics only: the engine already decided.
+      if (new Set(events.map((op) => canonicalJson(op.declaration))).size > 1)
+        plan.conflicts.push({
+          reason: "incompatible_completion_declaration",
+          operations: events,
+        });
+      else {
+        const completion = selectStreamCompletion(events);
         if (completion)
           plan.pending.push({
             reason: "unverified_completion",
@@ -990,46 +955,34 @@ export function createReplicaReceiver(deps: {
   function readSnapshot<T>(read: () => T): T {
     return view.snapshot(read);
   }
+  /**
+   * The preview's blob readiness: the engine's `blobReady`, with bytes any
+   * retained or pending custody copy verifies, and stored metadata that does
+   * not contradict the descriptor.
+   */
   function previewBlobsValid(
     op: Extract<ReplicaOperation, { kind: "upsert" }>,
     operations: ReplicaOperation[],
   ): boolean {
-    const ref = op.data.blob_ref as
-      | {
-          blob_id?: string;
-          sha256?: string;
-          size_bytes?: number;
-          mime_type?: string;
-        }
-      | undefined;
-    if (op.blobs.length !== (ref ? 1 : 0)) return false;
-    return op.blobs.every((blob) => {
-      if (
-        ref?.blob_id !== blob.blobId ||
-        (ref.sha256 !== undefined && ref.sha256 !== blob.sha256.slice(7)) ||
-        (ref.size_bytes !== undefined && ref.size_bytes !== blob.sizeBytes) ||
-        (ref.mime_type !== undefined && ref.mime_type !== blob.mimeType)
-      )
-        return false;
-      const meta = store.getBlobMeta(blob.blobId);
-      if (
-        meta &&
-        (meta.sha256 !== blob.sha256.slice(7) ||
-          meta.mimeType !== blob.mimeType ||
-          meta.sizeBytes !== blob.sizeBytes)
-      )
-        return false;
-      return (
-        operations.some(
-          (claim) =>
-            claim.kind === "blob-claim" &&
-            claim.connectionId === op.connectionId &&
-            claim.generation === op.generation &&
-            canonicalJson(claim.blob) === canonicalJson(blob),
-        ) &&
-        verifiedCopy(blob.blobId, blob.sha256, blob.sizeBytes) !== undefined
-      );
-    });
+    const verified = new Set(
+      op.blobs.flatMap((blob) =>
+        verifiedCopy(blob.blobId, blob.sha256, blob.sizeBytes)
+          ? [blob.blobId]
+          : [],
+      ),
+    );
+    return (
+      blobReady(op, operations, verified) &&
+      op.blobs.every((blob) => {
+        const meta = store.getBlobMeta(blob.blobId);
+        return (
+          !meta ||
+          (meta.sha256 === blob.sha256.slice(7) &&
+            meta.mimeType === blob.mimeType &&
+            meta.sizeBytes === blob.sizeBytes)
+        );
+      })
+    );
   }
   /**
    * Withdraw a connection from every reader: the quarantine fact (raises the

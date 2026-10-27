@@ -21,7 +21,7 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
   to open the record store (`packages/server/src/bootstrap.ts:953-976`), and
   "This boot has no replica receiver"
   (`packages/server/src/pdpp/records-bootstrap.ts:78`). Lite has a canonical
-  store (`packages/lite/src/canonical-store.ts:204`) but no transport, runtime
+  store (`packages/lite/src/canonical-store.ts:224`) but no transport, runtime
   or routes for replication. Neither app enables it
   (`unity-surfaces@9af449a2 apps/desktop/src/hooks/usePersonalServer.ts:871-885`);
   the phone has no replication code.
@@ -37,7 +37,7 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
   (`packages/server/src/storage/pdpp-replica-canonical-port.ts:113-118`).
   Neither is bound to a key. The receiver takes `authenticate(credential)` as
   an injected function and says the host "must verify a replica-specific
-  credential" (`packages/server/src/storage/pdpp-replication-receiver.ts:122-132`).
+  credential" (`packages/server/src/storage/pdpp-replication-receiver.ts:135-145`).
 - vana-storage does not protect replica objects by itself:
   - Blob GET and HEAD are public. The auth middleware skips them
     (`vana-storage@b1d3d83 src/middleware/auth.ts:153-170`), and PS relies on
