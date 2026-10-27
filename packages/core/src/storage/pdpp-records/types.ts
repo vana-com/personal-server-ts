@@ -6,6 +6,10 @@
  * that module serves existing non-PDPP callers and is left untouched.
  */
 
+import type { ReplicaReader } from "../../replication/visibility-policy.js";
+import type { CanonicalStreamCompletion } from "../canonical-legacy-projection.js";
+import type { BlobReference } from "./interface.js";
+
 export type StreamSemantics = "append_only" | "mutable_state";
 
 export type EnvelopeKey = string | string[];
@@ -22,6 +26,10 @@ export interface PdppRecordEnvelopeInput {
 }
 
 export interface PdppStoredRecord {
+  /** Present only on an explicitly permitted provisional replica read. */
+  confirmation?: "not yet confirmed";
+  visibility?: "pending" | "conflicted";
+  status?: "account conflict";
   instance: string;
   stream: string;
   recordKey: string;
@@ -32,6 +40,9 @@ export interface PdppStoredRecord {
 }
 
 export interface PdppTombstoneRecord {
+  confirmation?: "not yet confirmed";
+  visibility?: "pending" | "conflicted";
+  status?: "account conflict";
   instance: string;
   stream: string;
   recordKey: string;
@@ -73,7 +84,7 @@ export interface IngestResult {
 
 export interface ListRecordsOptions {
   /** Grant eligibility, evaluated on raw snapshot rows before pagination/projection. */
-  isVisible?: (row: PdppStoredRecord) => boolean;
+  isVisible?: (row: PdppVisibleRecord) => boolean;
   instanceIds: string[];
   limit: number;
   cursor?: string;
@@ -119,6 +130,9 @@ export interface ChangesSincePage {
 }
 
 export interface StreamListing {
+  confirmation?: "not yet confirmed";
+  visibility?: "pending" | "conflicted";
+  status?: "account conflict";
   stream: string;
   recordCount: number;
   lastUpdated: string | null;
@@ -163,3 +177,51 @@ export class CursorExpiredError extends Error {
 export class InvalidCursorError extends Error {}
 
 export class RecordIdentityMismatchError extends Error {}
+
+/** A read-time removal is explicit and contains no withdrawn record fields. */
+export interface PdppPendingRemoval extends Omit<PdppStoredRecord, "deleted"> {
+  deleted: true;
+  deletedAt: string;
+  confirmation: "not yet confirmed";
+  visibility: "pending";
+  /** Empty on removals; never expose the withdrawn value as current data. */
+  data: Record<string, never>;
+}
+export type PdppVisibleRecord = PdppStoredRecord | PdppPendingRemoval;
+export interface ListVisibleRecordsPage extends Omit<ListRecordsPage, "data"> {
+  data: PdppVisibleRecord[];
+}
+/**
+ * Every canonical-derived read one reader class may make. The trusted host
+ * selects the reader from the authenticated token, never from request input.
+ * Without a replica receiver the canonical store itself is this port for
+ * every reader; with one, the receiver's reader-specific view is. All methods
+ * are required, so a host cannot leave one surface on the raw store.
+ */
+export interface PdppReplicaReadStore {
+  /** Confirmed history only; an identity conflict cannot establish row provenance. */
+  changesSince(stream: string, options: ChangesSinceOptions): ChangesSincePage;
+  getRecord(
+    instance: string,
+    stream: string,
+    key: string,
+  ): PdppVisibleRecord | undefined;
+  listRecords(
+    stream: string,
+    options: ListRecordsOptions,
+  ): ListVisibleRecordsPage;
+  listStreams(instanceIds: string[]): StreamListing[];
+  getBlobMeta(blobId: string): PdppBlobMeta | undefined;
+  /** Verified bytes of a blob this reader can reach through a visible reference. */
+  getBlobBytes(blobId: string): Uint8Array | undefined;
+  findBlobReferences(blobId: string): BlobReference[];
+  /**
+   * Completion receipts of one connection. A receipt describes canonical
+   * rows, so a reader that does not see that connection's canonical rows
+   * as stored gets none.
+   */
+  listStreamCompletions(instance: string): CanonicalStreamCompletion[];
+}
+
+/** The host's reader capability: one complete read port per reader class. */
+export type PdppReplicaReads = (reader: ReplicaReader) => PdppReplicaReadStore;

@@ -204,6 +204,10 @@
       "types": "./dist/storage/pdpp-records/memory-store.d.ts",
       "import": "./dist/storage/pdpp-records/memory-store.js"
     },
+    "./replication/*": {
+      "types": "./dist/replication/*.d.ts",
+      "import": "./dist/replication/*.js"
+    },
     "./storage/legacy-scope-coverage": {
       "types": "./dist/storage/legacy-scope-coverage.d.ts",
       "import": "./dist/storage/legacy-scope-coverage.js"
@@ -227,6 +231,7 @@
     "minisearch": "^7.2.0",
     "unpdf": "^1.6.2",
     "viem": "^2.54.2",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "@noble/hashes": "1.8.0"
   }
 }

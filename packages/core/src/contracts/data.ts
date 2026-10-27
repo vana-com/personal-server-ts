@@ -1,3 +1,4 @@
+import { isReplicaScope } from "../replication/namespace.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import type { DurableAdditionsService } from "../additions/durable.js";
 import {
@@ -346,6 +347,8 @@ function invalidScope(message: string): DataContractError {
 export function parseDataScopeContract(
   scopeParam: string,
 ): { ok: true; scope: string } | DataContractError {
+  if (isReplicaScope(scopeParam))
+    return invalidScope("Replica transport scopes are reserved");
   const scopeResult = ScopeSchema.safeParse(scopeParam);
   if (!scopeResult.success) {
     return invalidScope(

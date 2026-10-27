@@ -1,3 +1,4 @@
+import { isReplicaScope } from "../../replication/namespace.js";
 import type { StorageAdapter } from "../../storage/adapters/interface.js";
 import {
   DataFileEnvelopeSchema,
@@ -274,6 +275,7 @@ export async function downloadOne(
   deps: DownloadWorkerDeps,
   record: DataPointRecord,
 ): Promise<DownloadResult | null> {
+  if (isReplicaScope(record.scope)) return null;
   const { storage, storageAdapter, masterKey, logger, diagnostics } = deps;
   const ctx: RecordContext = { dataPointId: record.id, schemaId: null };
 
@@ -661,6 +663,7 @@ export async function downloadAll(
 
   // 3. Process each data point record
   for (const dataPoint of dataPoints) {
+    if (isReplicaScope(dataPoint.scope)) continue;
     const deletedAt = deletionTimestamp(dataPoint);
     if (deletedAt !== null) {
       // Tombstone: never download; drop what the deletion covers locally.

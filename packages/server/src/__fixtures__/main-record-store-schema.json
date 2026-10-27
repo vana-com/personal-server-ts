@@ -1,0 +1,222 @@
+{
+  "source": "createSqliteRecordStore(new Database(':memory:')) on personal-server-ts main 50f529f2 (#475), before replication landed. Regenerate only for a deliberate change to main's record-store schema.",
+  "schemaVersion": 16,
+  "objects": [
+    {
+      "type": "index",
+      "name": "idx_pdpp_record_arrival_order",
+      "tableName": "pdpp_record_arrival",
+      "sql": "CREATE INDEX idx_pdpp_record_arrival_order\n  ON pdpp_record_arrival (instance, stream, arrival)"
+    },
+    {
+      "type": "index",
+      "name": "idx_pdpp_record_changes_blob_ref",
+      "tableName": "pdpp_record_changes",
+      "sql": "CREATE INDEX idx_pdpp_record_changes_blob_ref\n  ON pdpp_record_changes (CAST(CASE WHEN json_valid(data) THEN json_extract(data, '$.blob_ref.blob_id') END AS TEXT))"
+    },
+    {
+      "type": "index",
+      "name": "idx_pdpp_record_changes_horizon",
+      "tableName": "pdpp_record_changes",
+      "sql": "CREATE INDEX idx_pdpp_record_changes_horizon\n  ON pdpp_record_changes (stream, instance, written_at)"
+    },
+    {
+      "type": "index",
+      "name": "idx_pdpp_record_changes_lookup",
+      "tableName": "pdpp_record_changes",
+      "sql": "CREATE INDEX idx_pdpp_record_changes_lookup\n  ON pdpp_record_changes (instance, stream, record_key, version)"
+    },
+    {
+      "type": "index",
+      "name": "idx_pdpp_record_changes_snapshot_key_order",
+      "tableName": "pdpp_record_changes",
+      "sql": "CREATE INDEX idx_pdpp_record_changes_snapshot_key_order\n  ON pdpp_record_changes (stream, emitted_key, record_key, instance, written_at)"
+    },
+    {
+      "type": "index",
+      "name": "idx_pdpp_record_changes_snapshot_latest",
+      "tableName": "pdpp_record_changes",
+      "sql": "CREATE INDEX idx_pdpp_record_changes_snapshot_latest\n  ON pdpp_record_changes (instance, stream, record_key, written_at DESC, version DESC)"
+    },
+    {
+      "type": "index",
+      "name": "idx_pdpp_records_blob_id",
+      "tableName": "pdpp_records",
+      "sql": "CREATE INDEX idx_pdpp_records_blob_id\n  ON pdpp_records (blob_id)"
+    },
+    {
+      "type": "index",
+      "name": "idx_pdpp_records_live_instance_stream_emitted_at",
+      "tableName": "pdpp_records",
+      "sql": "CREATE INDEX idx_pdpp_records_live_instance_stream_emitted_at\n  ON pdpp_records (instance, stream, emitted_at)\n  WHERE deleted = 0"
+    },
+    {
+      "type": "index",
+      "name": "idx_pdpp_records_live_instance_stream_emitted_key",
+      "tableName": "pdpp_records",
+      "sql": "CREATE INDEX idx_pdpp_records_live_instance_stream_emitted_key\n  ON pdpp_records (instance, stream, emitted_key, emitted_at)\n  WHERE deleted = 0"
+    },
+    {
+      "type": "index",
+      "name": "idx_pdpp_records_stream",
+      "tableName": "pdpp_records",
+      "sql": "CREATE INDEX idx_pdpp_records_stream\n  ON pdpp_records (stream, instance, emitted_at)"
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_blob_bytes_1",
+      "tableName": "pdpp_blob_bytes",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_blob_claims_1",
+      "tableName": "pdpp_blob_claims",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_blobs_1",
+      "tableName": "pdpp_blobs",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_claude_transition_1",
+      "tableName": "pdpp_claude_transition",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_claude_transition_2",
+      "tableName": "pdpp_claude_transition",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_instance_binding_1",
+      "tableName": "pdpp_instance_binding",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_record_arrival_1",
+      "tableName": "pdpp_record_arrival",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_records_1",
+      "tableName": "pdpp_records",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_strava_transition_1",
+      "tableName": "pdpp_strava_transition",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_strava_transition_2",
+      "tableName": "pdpp_strava_transition",
+      "sql": null
+    },
+    {
+      "type": "index",
+      "name": "sqlite_autoindex_pdpp_stream_completion_1",
+      "tableName": "pdpp_stream_completion",
+      "sql": null
+    },
+    {
+      "type": "table",
+      "name": "pdpp_blob_bytes",
+      "tableName": "pdpp_blob_bytes",
+      "sql": "CREATE TABLE pdpp_blob_bytes (\n  blob_id TEXT PRIMARY KEY REFERENCES pdpp_blobs (blob_id),\n  bytes BLOB NOT NULL\n)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_blob_claims",
+      "tableName": "pdpp_blob_claims",
+      "sql": "CREATE TABLE pdpp_blob_claims (\n  blob_id TEXT NOT NULL REFERENCES pdpp_blobs (blob_id),\n  instance TEXT NOT NULL,\n  generation INTEGER NOT NULL,\n  PRIMARY KEY (blob_id, instance)\n)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_blobs",
+      "tableName": "pdpp_blobs",
+      "sql": "CREATE TABLE pdpp_blobs (\n  blob_id TEXT PRIMARY KEY,\n  mime_type TEXT NOT NULL,\n  size_bytes INTEGER NOT NULL,\n  sha256 TEXT NOT NULL\n)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_claude_transition",
+      "tableName": "pdpp_claude_transition",
+      "sql": "CREATE TABLE pdpp_claude_transition (\n    instance TEXT PRIMARY KEY,\n    archive_instance TEXT NOT NULL UNIQUE,\n    generation INTEGER NOT NULL,\n    snapshots_json TEXT NOT NULL,\n    conversations_covered INTEGER NOT NULL DEFAULT 0\n  )"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_instance_binding",
+      "tableName": "pdpp_instance_binding",
+      "sql": "CREATE TABLE pdpp_instance_binding (\n  instance TEXT PRIMARY KEY,\n  method TEXT,\n  generation INTEGER NOT NULL CHECK (generation > 0),\n  reset_clock INTEGER NOT NULL DEFAULT 0\n, source_id TEXT, label TEXT NOT NULL DEFAULT '', deleted_at TEXT)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_record_arrival",
+      "tableName": "pdpp_record_arrival",
+      "sql": "CREATE TABLE pdpp_record_arrival (\n  instance TEXT NOT NULL,\n  stream TEXT NOT NULL,\n  record_key TEXT NOT NULL,\n  generation INTEGER NOT NULL,\n  arrival INTEGER NOT NULL,\n  PRIMARY KEY (instance, stream, record_key)\n)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_record_arrival_clock",
+      "tableName": "pdpp_record_arrival_clock",
+      "sql": "CREATE TABLE pdpp_record_arrival_clock (\n  id INTEGER PRIMARY KEY CHECK (id = 1),\n  value INTEGER NOT NULL\n)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_record_changes",
+      "tableName": "pdpp_record_changes",
+      "sql": "CREATE TABLE pdpp_record_changes (\n  id INTEGER PRIMARY KEY AUTOINCREMENT,\n  instance TEXT NOT NULL,\n  stream TEXT NOT NULL,\n  record_key TEXT NOT NULL,\n  version INTEGER NOT NULL,\n  data TEXT, -- JSON; NULL for a tombstone version\n  emitted_at TEXT NOT NULL,\n  deleted INTEGER NOT NULL DEFAULT 0,\n  deleted_at TEXT,\n  written_at INTEGER NOT NULL -- monotonic write sequence, for changes_since horizons\n, emitted_key TEXT)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_records",
+      "tableName": "pdpp_records",
+      "sql": "CREATE TABLE pdpp_records (\n  instance TEXT NOT NULL,\n  stream TEXT NOT NULL,\n  record_key TEXT NOT NULL,\n  data TEXT, -- JSON; NULL when deleted = 1\n  version INTEGER NOT NULL,\n  emitted_at TEXT NOT NULL,\n  deleted INTEGER NOT NULL DEFAULT 0,\n  deleted_at TEXT, blob_id TEXT, emitted_key TEXT,\n  PRIMARY KEY (instance, stream, record_key)\n)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_schema_version",
+      "tableName": "pdpp_schema_version",
+      "sql": "CREATE TABLE pdpp_schema_version (\n      id INTEGER PRIMARY KEY CHECK (id = 1),\n      version INTEGER NOT NULL\n    )"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_store_metadata",
+      "tableName": "pdpp_store_metadata",
+      "sql": "CREATE TABLE pdpp_store_metadata (\n  id INTEGER PRIMARY KEY CHECK (id = 1),\n  epoch TEXT NOT NULL\n)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_strava_transition",
+      "tableName": "pdpp_strava_transition",
+      "sql": "CREATE TABLE pdpp_strava_transition (\n    instance TEXT PRIMARY KEY,\n    archive_instance TEXT NOT NULL UNIQUE,\n    generation INTEGER NOT NULL,\n    snapshots_json TEXT NOT NULL,\n    activities_covered INTEGER NOT NULL DEFAULT 0\n  )"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_stream_completion",
+      "tableName": "pdpp_stream_completion",
+      "sql": "CREATE TABLE pdpp_stream_completion (\n  instance TEXT NOT NULL,\n  stream TEXT NOT NULL,\n  method TEXT NOT NULL,\n  generation INTEGER NOT NULL,\n  source_collected_at TEXT NOT NULL,\n  write_seq INTEGER NOT NULL,\n  live_count INTEGER NOT NULL, snapshot_sha256 TEXT, collection_time_basis TEXT,\n  PRIMARY KEY (instance, stream)\n)"
+    },
+    {
+      "type": "table",
+      "name": "pdpp_write_clock",
+      "tableName": "pdpp_write_clock",
+      "sql": "CREATE TABLE pdpp_write_clock (\n  id INTEGER PRIMARY KEY CHECK (id = 1),\n  value INTEGER NOT NULL\n)"
+    },
+    {
+      "type": "table",
+      "name": "sqlite_sequence",
+      "tableName": "sqlite_sequence",
+      "sql": "CREATE TABLE sqlite_sequence(name,seq)"
+    }
+  ]
+}
