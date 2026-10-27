@@ -29,6 +29,14 @@ import {
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import type { MergeContext } from "@opendatalabs/personal-server-ts-core/replication/merge-plan";
+import {
+  fragmentReplicaPayload,
+  prepareReplicaManifest,
+  replicaDigest,
+  replicaScope,
+  type Predecessor,
+} from "@opendatalabs/personal-server-ts-core/replication/transport";
+import type { ReplicaBatchFacts } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import { createLiteCanonicalStore } from "../../../lite/src/canonical-store.js";
 import type {
   LiteCanonicalPersistence,
@@ -551,6 +559,60 @@ export function network(
   };
 }
 export type Network = ReturnType<typeof network>;
+
+/**
+ * Publish a hand-built batch straight to the network, as another registered
+ * server of the owner could: its fragments unregistered, its manifest at the
+ * next version of `writer`'s scope. `sign` gets the facts of exactly that
+ * manifest and slot, and returns the statement the manifest carries.
+ */
+export async function injectReplicaBatch(
+  net: Network,
+  input: {
+    writer: string;
+    operations: ReplicaOperation[];
+    sign: (facts: ReplicaBatchFacts) => Promise<unknown>;
+    sequence?: number;
+    previous?: Predecessor | null;
+  },
+) {
+  const batch = randomBytes(16).toString("hex");
+  const statement = {
+    owner,
+    writer: input.writer,
+    batch,
+    sequence: input.sequence ?? 1,
+    previous: input.previous ?? null,
+    collectedAt: at,
+  };
+  const bytes = Buffer.from(
+    canonicalJson({ envelope: envelope(input.operations, batch), blobs: [] }),
+  );
+  const fragments = await fragmentReplicaPayload({
+    ...statement,
+    bytes,
+    encrypt: net.port.encrypt,
+  });
+  for (const fragment of fragments) await net.port.putFragment(fragment);
+  const scope = replicaScope(input.writer);
+  const version = net.registrationsOf(scope) + 1;
+  const prepared = await prepareReplicaManifest({
+    ...statement,
+    version,
+    digest: replicaDigest(bytes),
+    totalBytes: bytes.length,
+    fragments: fragments.map((f) => ({
+      digest: f.digest,
+      bytes: f.encrypted.length,
+    })),
+    sign: input.sign,
+    encrypt: net.port.encrypt,
+  });
+  const manifest = { ...prepared, version };
+  await net.port.put(manifest);
+  await net.port.register(manifest);
+  return { batch, slot: slotKey(scope, version), manifest };
+}
 
 // ------------------------------------------------------- transport devices
 

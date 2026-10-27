@@ -12,18 +12,21 @@ one registration.
 - **Scope.** Each writer has one stable scope, `pdpp_replica_v1.<writer-token>`.
   The writer token is the derived transport writer id (see "Writer identity
   and batch authority"), without source, account or connection names. The prefix is reserved from grants, ordinary inventory,
-  MCP and the upgraded legacy upload/download workers. Devices never share a
-  scope, so their versions never contend. Each batch appends a version: a
+  MCP and the upgraded legacy upload/download workers. Honest devices never
+  share a scope, so their versions never contend (but see "Known limits").
+  Each batch appends a version: a
   reader of only the latest version would see only the last batch, so the
   receiver discovers and reads every version.
 - **Fragments.** A batch payload is cut into fragments (default target 4 MiB).
   Each encrypted fragment is stored **unregistered** at its content address,
   `<scope>/fragments/<sha256 of the encrypted bytes>`. A fragment is never
   registered and is never trusted on its own.
-- **Manifest.** The batch has one manifest. It carries the batch statement
-  (owner, writer, batch, sequence, predecessor batch and digest, collection
-  time, payload digest and length) and lists every fragment, in index order,
-  by digest and encrypted size. The manifest is the only registered object: a
+- **Manifest.** The batch has one manifest. It names the owner, writer,
+  batch, sequence, predecessor batch and digest, collection time, payload
+  digest and length, and lists every fragment, in index order, by digest and
+  encrypted size. It carries the batch statement that the server key signed
+  over all of these and the version it registers at (see "Signing"). The
+  manifest is the only registered object: a
   DPv2 AddData at the next version of the writer scope, stored at
   `<scope>/<version>`. The version is a publication slot, not the batch
   sequence. The slot is claimed when the batch is prepared, so a batch that
@@ -137,28 +140,40 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   operation writer, so every dependency a completion names is in a batch the
   current writer publishes.
 
-**Signing.** Each batch carries a fragment-version-2 `authority`: an EIP-712
+**Signing.** Each manifest carries an `authority`: an EIP-712
 `PdppReplicaBatch` statement (domain "Vana PDPP Replica", version "1",
-chainId) that names the owner, server, registration id, environment, writer
-nonce, batch, sequence, predecessor digest, payload digest, total bytes and
-fragment count, signed by the server key. Every fragment of a batch carries the
-same statement.
+chainId) signed by the server key. It names the owner, server, registration
+id, environment and writer nonce, which derive the writer and so the scope,
+and the scope version the manifest registers at. It also names the batch,
+sequence, predecessor batch and digest, collection time, payload digest, total
+bytes, fragment count, and the SHA-256 of the ordered fragment list (each
+entry's 32-byte digest, then its length as 8 bytes, big-endian). So no field
+that a receiver reads from a manifest, and not its slot, is outside the
+signature. Prepare claims the scope's next version, signs, and keeps the claim
+only if the version is still next when the manifest commits. Fragments (format
+version 3) carry no statement: the signed manifest names their exact bytes.
 
-**Receiver checks**, in §3.4 order, after the commitment check passes (so
-replaced storage bytes cannot get a real fragment quarantined):
+**Receiver checks**, in §3.4 order. The receiver waits for finality, fetches
+the manifest and checks its bytes against the finalized commitment (so
+replaced storage bytes cannot get a real manifest quarantined). It then checks
+the statement against the manifest and the slot it is registered at. Only an
+authorized manifest's fragments are fetched, and each one's length and sha256
+is checked against the manifest before it is decrypted.
 
 | Check                                                                        | Refusal                 |
 | ---------------------------------------------------------------------------- | ----------------------- |
-| Statement parses, covers this batch, and recovers to its `server`            | `signature_invalid`     |
+| Statement parses, signs this manifest at this version, recovers to `server`  | `signature_invalid`     |
 | Owner, chain id and environment match this receiver                          | `partition_mismatch`    |
 | Roster has a record for the server                                           | `server_not_registered` |
 | Roster owner is the statement owner                                          | `roster_owner_mismatch` |
 | Record is not revoked and has the statement's registration id                | `server_not_registered` |
-| Fragment writer is the transport writer the statement derives                | `writer_mismatch`       |
+| The slot's scope writer is the transport writer the statement derives        | `writer_mismatch`       |
 | Every operation names the operation writer the statement derives (at import) | `writer_mismatch`       |
 
-Each refusal is a typed quarantine. An unsigned (version-1) fragment is
-`signature_invalid`. A roster that cannot answer is a `roster` wait, never a
+Each refusal is a typed quarantine of that slot. A manifest without a
+well-formed statement is `signature_invalid`. A signed manifest registered
+again at another version is `signature_invalid`; registered in another scope it
+is `writer_mismatch`. A roster that cannot answer is a `roster` wait, never a
 refusal. A re-registered server's old incarnation names the old registration
 id, so its unimported batches are refused; imported data stays. A deregistered
 server's unimported batches are refused the same way.
@@ -172,7 +187,11 @@ removed server's batch. A batch admitted at download is
 authorized again on every import attempt, so an import that waits (finality,
 mapping) past the cache age is revalidated before it is staged or promoted.
 
-**Known limits.** A rebaseline re-issues the whole current state, including
+**Known limits.** Any party that can register under the owner, such as
+another registered server, can register its own manifest at a device's next
+scope version first. Receivers refuse it, but it holds that version, so the
+device's own manifest there is `immutable_registration_conflict` and the
+device's sync stops at that version (host contract §3.6). A rebaseline re-issues the whole current state, including
 records that peers wrote, as content-equal operations, so its size is the
 database's live state. Its capture runs in one transaction, like the first
 baseline, and keeps one revision per record key and effect in memory. The roster is the

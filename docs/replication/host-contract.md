@@ -169,31 +169,40 @@ PdppReplicaBatch {
   bytes32 serverId;        // gateway registration id of the signer
   string  environment;     // "dev" | "prod"
   bytes16 writerNonce;
+  uint64  version;         // scope version the manifest registers at
   string  batch;
   uint64  sequence;
   bytes32 previous;        // digest of the previous batch, or zero
+  string  previousBatch;   // id of the previous batch, or ""
+  string  collectedAt;
   bytes32 digest;          // sha256 of the assembled batch
   uint64  totalBytes;
-  uint32  count;
+  uint32  count;           // number of fragments
+  bytes32 fragments;       // sha256 of the ordered fragment list
 }
 ```
 
-Fragment format version 2 carries the statement and signature inside the
-encrypted body (version 1 is at `transport.ts:17-34`). With the A12 manifest,
-the statement and signature go in the manifest instead: it is the one
-registered object of the batch, and it already names every fragment by
-digest.
+The fragment list digest is the SHA-256 of each fragment's 32-byte digest
+followed by its length as 8 bytes, big-endian, in index order. The writer
+nonce and server fields derive the writer, and so the scope
+`pdpp_replica_v1.<writer>`. So the statement covers everything a receiver uses
+from the manifest and its slot. The manifest carries the statement and
+signature: it is the one registered object of the batch. Fragments (format
+version 3) carry neither; the signed list names their exact bytes.
 
 ### 3.4 Receiver checks
 
-In this order. With the A12 manifest, steps 1 to 6 apply to the manifest,
-and each fragment is then checked against the manifest digest before it is
-decrypted. Each failure is a typed quarantine of that item only. A batch
-that fails any check never touches writer state, so it cannot occupy a
-sequence or a predecessor slot of a real writer.
+In this order. Steps 1 to 6 apply to the manifest, after its registration is
+finalized and its bytes match the registered hash, and before any fragment is
+fetched. Each fragment is then checked for length and sha256 against the
+manifest before it is decrypted. Each failure is a typed quarantine of that
+item only. A batch that fails any check never touches writer state, so it
+cannot occupy a sequence or a predecessor slot of a real writer.
 
-1. Decrypt and decode the fragment.
-2. Recover the signer. It must equal `server`.
+1. Decrypt and decode the manifest. A manifest without a statement is
+   `signature_invalid`.
+2. Recover the signer. It must equal `server`, and the statement must sign
+   this manifest at the version it is registered at.
 3. Partition: `statement.owner`, `chainId` and `environment` must equal the
    receiver's. Addresses are compared after normalizing to lowercase.
 4. Roster: the gateway record for `server` must exist, have no `revokedAt`,
@@ -207,8 +216,8 @@ sequence or a predecessor slot of a real writer.
    again on every import attempt, so a batch downloaded before removal is
    refused once the cached answer expires.
 5. Writer ids: derive both ids from `owner`, `server`, `serverId` and
-   `writerNonce`. With DPv2, the writer in the fragment's scope must equal the
-   derived transport writer.
+   `writerNonce`. The writer in the manifest's scope must equal the derived
+   transport writer.
 6. Finalized DPv2 evidence, as today.
 7. Assemble and check `digest`. Every operation's `revision.writerId` must
    equal the derived operation writer. Then import.
@@ -248,6 +257,13 @@ likely in use. Its first publication is the current-state baseline (section
   fragment. It never accepts forged data, but the overwrite destroys the
   fragment's availability and blocks that writer's later batches until the
   original content is restored. Downloading again cannot repair it.
+- **Another device can take a writer's next version.** Each writer has one
+  scope and registers its next version there. Any registered server of the
+  owner can register its own manifest at that version first. Receivers refuse
+  it (`writer_mismatch` or `signature_invalid`), so forged data is never
+  imported. But the version is taken, so the writer's own manifest there fails
+  with `immutable_registration_conflict` and its later manifests wait behind
+  it. Nothing moves the writer past a taken version yet.
 - **Removed devices can still read.** Every device holds the owner master key,
   and storage reads are public (section 1). A removed device that kept the
   master key can read and decrypt new batches. This must be fixed before

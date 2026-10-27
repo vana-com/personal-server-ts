@@ -3,6 +3,10 @@ import { DataFileEnvelopeSchema } from "@opendatalabs/vana-sdk/browser";
 import { sha256, keccak256, stringToHex } from "viem";
 import { canonicalJson } from "./envelope.js";
 import { ReplicaFramingUnsupported } from "./outcome.js";
+import {
+  replicaBatchAuthoritySchema,
+  type ReplicaBatchFacts,
+} from "./writer-identity.js";
 
 /** Reserved across ordinary reads, grants, inventory, MCP and legacy sync. */
 import { REPLICA_SCOPE_PREFIX } from "./namespace.js";
@@ -17,7 +21,12 @@ const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const predecessorSchema = z.strictObject({ batch: token, digest });
 export const replicaFragmentSchema = z.strictObject({
   format: z.literal("vana-pdpp-replica-fragment"),
-  version: z.literal(1),
+  /**
+   * Version 3 is stored unregistered and is trusted only through the signed
+   * manifest that names its digest, so it carries no statement of its own.
+   * Versions 1 and 2 were registered one fragment per scope.
+   */
+  version: z.literal(3),
   owner: z.string().min(1),
   writer: token,
   batch: token,
@@ -47,10 +56,11 @@ export const manifestEntrySchema = z.strictObject({
 export type ManifestEntry = z.infer<typeof manifestEntrySchema>;
 /**
  * The one registered object of a batch. Its DPv2 slot is the writer's scope at
- * the next free version. It carries the batch statement and lists every
- * fragment, in index order, by digest and size. The version is a publication
- * slot, not the batch sequence: a batch that cannot be framed takes no slot,
- * so its successors still publish.
+ * the next free version. It lists every fragment, in index order, by digest
+ * and size, and carries the batch statement signed by the writer's server
+ * key, which covers every other field and the slot. The version is a
+ * publication slot, not the batch sequence: a batch that cannot be framed
+ * takes no slot, so its successors still publish.
  */
 export const replicaManifestSchema = z.strictObject({
   format: z.literal("vana-pdpp-replica-manifest"),
@@ -64,6 +74,8 @@ export const replicaManifestSchema = z.strictObject({
   digest,
   totalBytes: integer.min(1),
   fragments: z.array(manifestEntrySchema).min(1).max(REPLICA_MAX_FRAGMENTS),
+  /** The batch statement signed by the writer's server key (host contract §3.3). */
+  authority: replicaBatchAuthoritySchema,
 });
 export type ReplicaManifest = z.infer<typeof replicaManifestSchema>;
 /** An unregistered, content-addressed fragment ready for storage. */
@@ -158,6 +170,34 @@ export function replicaMetadataHash(
     stringToHex(JSON.stringify({ scope, collectedAt, sizeBytes })),
   );
 }
+/**
+ * A decoded manifest without a well-formed batch statement. Receivers refuse
+ * it as `signature_invalid` once its bytes match the registered commitment.
+ */
+export class ReplicaManifestUnsigned extends Error {
+  constructor(readonly collectedAt: string) {
+    super("replica manifest is not signed");
+    this.name = "ReplicaManifestUnsigned";
+  }
+}
+
+/** The facts a manifest at `version` claims; its statement must sign exactly these. */
+export function replicaManifestFacts(
+  manifest: Omit<ReplicaManifest, "authority">,
+  version: number,
+): ReplicaBatchFacts {
+  return {
+    version,
+    batch: manifest.batch,
+    sequence: manifest.sequence,
+    previous: manifest.previous,
+    collectedAt: manifest.collectedAt,
+    digest: manifest.digest,
+    totalBytes: manifest.totalBytes,
+    fragments: manifest.fragments,
+  };
+}
+
 export function decodeReplicaFragment(
   plaintext: Uint8Array,
   scope: string,
@@ -206,7 +246,7 @@ export async function prepareReplicaFragment(input: {
   const scope = replicaScope(input.writer);
   const fragment = replicaFragmentSchema.parse({
     format: "vana-pdpp-replica-fragment",
-    version: 1,
+    version: 3,
     owner: input.owner,
     writer: input.writer,
     batch: input.batch,
@@ -241,10 +281,15 @@ export async function prepareReplicaFragment(input: {
   };
 }
 
-/** Encode, check and encrypt the manifest of a fully prepared batch. */
+/**
+ * Encode, sign, check and encrypt the manifest of a fully prepared batch for
+ * its registration at `version`. `sign` receives the facts of exactly this
+ * manifest and slot.
+ */
 export async function prepareReplicaManifest(input: {
   owner: string;
   writer: string;
+  version: number;
   batch: string;
   sequence: number;
   previous: Predecessor | null;
@@ -252,10 +297,11 @@ export async function prepareReplicaManifest(input: {
   digest: string;
   totalBytes: number;
   fragments: readonly ManifestEntry[];
+  sign: (facts: ReplicaBatchFacts) => Promise<unknown>;
   encrypt: (scope: string, bytes: Uint8Array) => Promise<Uint8Array>;
-}): Promise<Omit<PreparedManifest, "version">> {
+}): Promise<PreparedManifest> {
   const scope = replicaScope(input.writer);
-  const manifest = replicaManifestSchema.parse({
+  const unsigned = replicaManifestSchema.omit({ authority: true }).parse({
     format: "vana-pdpp-replica-manifest",
     version: 1,
     owner: input.owner,
@@ -271,6 +317,10 @@ export async function prepareReplicaManifest(input: {
       bytes: f.bytes,
     })),
   });
+  const manifest = {
+    ...unsigned,
+    authority: await input.sign(replicaManifestFacts(unsigned, input.version)),
+  };
   const plaintext = new TextEncoder().encode(
     canonicalJson({
       version: "1.0",
@@ -283,6 +333,7 @@ export async function prepareReplicaManifest(input: {
   const encrypted = await input.encrypt(scope, plaintext);
   return {
     scope,
+    version: integer.min(1).parse(input.version),
     plaintext,
     encrypted,
     dataHash: keccak256(plaintext),
@@ -296,8 +347,10 @@ export async function prepareReplicaManifest(input: {
 
 /**
  * Decode a manifest fetched from `<scope>/<version>`. The caller must also
- * compare its hash pair to the finalized commitment of that slot; this check
- * binds only owner and writer scope.
+ * compare its hash pair to the finalized commitment of that slot, then
+ * authorize its statement against `replicaManifestFacts(manifest, version)`;
+ * this check binds only owner and writer scope. Throws ReplicaManifestUnsigned
+ * for a manifest of this scope whose statement is missing or malformed.
  */
 export function decodeReplicaManifest(
   plaintext: Uint8Array,
@@ -306,7 +359,20 @@ export function decodeReplicaManifest(
 ): ReplicaManifest {
   const encoded = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
   const wrapper = DataFileEnvelopeSchema.parse(JSON.parse(encoded));
-  const manifest = replicaManifestSchema.parse(wrapper.data.manifest);
+  const parsed = replicaManifestSchema.safeParse(wrapper.data.manifest);
+  if (!parsed.success) {
+    const claimed = wrapper.data.manifest as
+      { authority?: unknown } | null | undefined;
+    if (
+      wrapper.scope === scope &&
+      typeof claimed === "object" &&
+      claimed !== null &&
+      !replicaBatchAuthoritySchema.safeParse(claimed.authority).success
+    )
+      throw new ReplicaManifestUnsigned(wrapper.collectedAt);
+    throw parsed.error;
+  }
+  const manifest = parsed.data;
   if (
     canonicalJson(wrapper) !== encoded ||
     wrapper.scope !== scope ||

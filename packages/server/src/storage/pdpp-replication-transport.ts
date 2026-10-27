@@ -27,12 +27,13 @@ import {
   fragmentMatchesManifest,
   prepareReplicaManifest,
   replicaDigest,
+  replicaManifestFacts,
   replicaMetadataHash,
   replicaScope,
+  ReplicaManifestUnsigned,
   replicaWriterOf,
   REPLICA_MAX_BLOB_BYTES,
   type ManifestEntry,
-  type PreparedManifest,
   type ReplicaFragment,
   type ReplicaManifest,
   type Predecessor,
@@ -84,9 +85,13 @@ import {
   type ReplicaRosterPort,
 } from "@opendatalabs/personal-server-ts-core/replication/roster";
 import {
+  authorizeReplicaBatch,
+  replicaOperationWriterRefusal,
+  signReplicaBatch,
   type ReplicaAuthorityRefusal,
   type ReplicaBatchSigner,
   type ReplicaEnvironment,
+  type ReplicaPartition,
 } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import { REPLICA_WAIT_FALLBACK_MS } from "@opendatalabs/personal-server-ts-core/replication/schedule";
 import type { ReplicationExport } from "./pdpp-replication-sqlite.js";
@@ -420,6 +425,33 @@ export function createReplicaTransportWorker(deps: {
     ])
       db.prepare(`DELETE FROM ${table}`).run();
   }
+  /** This receiver's partition: its owner, chain and environment. */
+  const partition = (): ReplicaPartition => ({
+    owner: state().owner,
+    chainId: deps.authority.chainId,
+    environment: deps.authority.environment,
+  });
+  /**
+   * Receiver checks 2-5 (host contract §3.4) for the manifest registered at
+   * `slot`: its statement must sign this manifest at this version, and the
+   * writer it derives must be the one the slot's scope names.
+   */
+  const authorizeManifest = (
+    manifest: ReplicaManifest,
+    slot: { writer: string; version: number },
+    signal: AbortSignal,
+  ) =>
+    authorizeReplicaBatch({
+      authority: manifest.authority,
+      facts: replicaManifestFacts(manifest, slot.version),
+      transportWriter: slot.writer,
+      receiver: partition(),
+      roster: (address) => roster.server(address, { signal }),
+    });
+  const rosterWait = (address: string): ReplicaPhaseOutcome => ({
+    tag: "wait",
+    dependency: { kind: "roster", key: address },
+  });
   /** An attempt with no durable effect besides its outcome. */
   const verdict = (outcome: ReplicaPhaseOutcome): ReplicaAttempt => ({
     outcome,
@@ -827,7 +859,7 @@ export function createReplicaTransportWorker(deps: {
         call(signal, () => transport.encrypt(scope, bytes));
       let chunkBytes = deps.targetChunkBytes ?? 4 * 1024 * 1024;
       let entries: ManifestEntry[] = [];
-      let manifest: Omit<PreparedManifest, "version">;
+      let manifest: Awaited<ReturnType<typeof prepareReplicaManifest>>;
       const unsupportedPlan = (error: ReplicaFramingUnsupported) => {
         const admission = unsupported(error);
         return withPlan({ tag: "unsupported", admission }, () =>
@@ -888,9 +920,24 @@ export function createReplicaTransportWorker(deps: {
             return unsupportedPlan(error);
           }
         }
+        // The statement signs the version, so the batch claims the scope's
+        // next version before signing. The commit plan rechecks the claim.
+        const { version } = db
+          .prepare(
+            "SELECT coalesce(max(version),0)+1 AS version FROM pdpp_transport_manifests_out WHERE scope=?",
+          )
+          .get(replicaScope(s.writer)) as { version: number };
         manifest = await prepareReplicaManifest({
           ...statement,
+          version,
           fragments: entries,
+          sign: (facts) =>
+            signReplicaBatch({
+              signer: deps.authority.signer,
+              partition: partition(),
+              seed: identity.seed,
+              facts,
+            }),
           encrypt,
         });
         if (manifest.encrypted.length > cap)
@@ -928,20 +975,23 @@ export function createReplicaTransportWorker(deps: {
               entries.length !== Math.ceil(batch.total_bytes / chunkBytes)
             )
               throw new ReplicaProblemError("prepare_failed");
-            // The batch claims the writer's next version now, in the same
-            // transaction as its manifest, so a retry or a lost
-            // acknowledgement can never register it at a second version.
-            const { version } = db
+            // The batch keeps the version it signed only if that is still the
+            // scope's next one, in the same transaction as its manifest, so a
+            // retry or a lost acknowledgement can never register it at a
+            // second version.
+            const { next } = db
               .prepare(
-                "SELECT coalesce(max(version),0)+1 AS version FROM pdpp_transport_manifests_out WHERE scope=?",
+                "SELECT coalesce(max(version),0)+1 AS next FROM pdpp_transport_manifests_out WHERE scope=?",
               )
-              .get(manifest.scope) as { version: number };
+              .get(manifest.scope) as { next: number };
+            if (next !== manifest.version)
+              throw new ReplicaProblemError("prepare_failed");
             db.prepare(
               "INSERT INTO pdpp_transport_manifests_out (batch,scope,version,plaintext,encrypted,data_hash,metadata_hash) VALUES (?,?,?,?,?,?,?)",
             ).run(
               batch.batch,
               manifest.scope,
-              version,
+              manifest.version,
               manifest.plaintext,
               manifest.encrypted,
               manifest.dataHash,
@@ -1007,7 +1057,7 @@ export function createReplicaTransportWorker(deps: {
       );
       let status = replicaRegistrationState(evidence, expected);
       if (status === "absent") {
-        const manifest: PreparedManifest = {
+        const manifest = {
           scope: row.scope,
           version: row.version,
           plaintext: row.plaintext,
@@ -1204,6 +1254,15 @@ export function createReplicaTransportWorker(deps: {
       )
       .run(at, key, at).changes;
   }
+  /** A slot whose manifest fails writer authority: terminal for that slot only. */
+  const refuseSlot = (slot: string, reason: ReplicaAuthorityRefusal) =>
+    withPlan(quarantine(reason, slot), () =>
+      db
+        .prepare(
+          `UPDATE pdpp_transport_manifests_in SET ${QUARANTINE_SET(reason)} WHERE slot=?`,
+        )
+        .run(slot),
+    );
   const download: ReplicaPhaseHandler<Item<Slot>> = {
     phase: "download",
     due(e, limit) {
@@ -1243,15 +1302,19 @@ export function createReplicaTransportWorker(deps: {
         const plaintext = await call(signal, () =>
           transport.decrypt(row.scope, encrypted),
         );
-        const manifest = decodeReplicaManifest(
-          plaintext,
-          row.scope,
-          state().owner,
-        );
+        let manifest: ReplicaManifest | undefined;
+        let collectedAt: string;
+        try {
+          manifest = decodeReplicaManifest(plaintext, row.scope, state().owner);
+          collectedAt = manifest.collectedAt;
+        } catch (error) {
+          if (!(error instanceof ReplicaManifestUnsigned)) throw error;
+          collectedAt = error.collectedAt;
+        }
         const dataHash = keccak256(plaintext);
         const metadataHash = replicaMetadataHash(
           row.scope,
-          manifest.collectedAt,
+          collectedAt,
           encrypted.length,
         );
         // Storage is not trusted: bytes that are not the finalized
@@ -1264,6 +1327,15 @@ export function createReplicaTransportWorker(deps: {
           }) !== "confirmed"
         )
           throw new ReplicaProblemError("commitment_mismatch");
+        // Authority runs only on bytes that match the finalized commitment,
+        // so replacing stored bytes cannot get a real manifest refused. No
+        // fragment is fetched before the manifest is authorized.
+        if (!manifest) return refuseSlot(row.slot, "signature_invalid");
+        const authorized = await authorizeManifest(manifest, row, signal);
+        if (authorized.tag === "refused")
+          return refuseSlot(row.slot, authorized.reason);
+        if (authorized.tag === "wait")
+          return verdict(rosterWait(authorized.server));
         const record = factOf(row, evidence, manifest);
         return {
           outcome: {
@@ -1551,6 +1623,7 @@ export function createReplicaTransportWorker(deps: {
   type Refetch = { attempts: number; budget: number };
   type Group = Work & {
     slot: string;
+    version: number;
     writer: string;
     batch: string;
     sequence: number;
@@ -1760,9 +1833,9 @@ export function createReplicaTransportWorker(deps: {
       return (
         db
           .prepare(
-            `WITH complete AS (SELECT m.slot,m.writer,m.batch,m.sequence FROM pdpp_transport_manifests_in m WHERE m.state='ready' AND m.manifest_json IS NOT NULL
+            `WITH complete AS (SELECT m.slot,m.version,m.writer,m.batch,m.sequence FROM pdpp_transport_manifests_in m WHERE m.state='ready' AND m.manifest_json IS NOT NULL
               AND NOT EXISTS (SELECT 1 FROM pdpp_transport_fragments_in f WHERE f.slot=m.slot AND (f.fragment_json IS NULL OR f.state<>'ready'))),
-            candidates AS (SELECT c.slot,c.writer,c.batch,c.sequence,coalesce(w.attempts,0) AS attempts,coalesce(w.next_attempt,0) AS next_attempt,w.wait_since,w.checked_block FROM complete c LEFT JOIN pdpp_transport_import_work w ON w.writer=c.writer AND w.batch=c.batch WHERE w.writer IS NULL OR (${replicaEligibleAtSql(e, { outcome: "w.outcome", dependency: "w.dependency", next: "w.next_attempt", since: "w.wait_since", checked: "w.checked_block" })} <= ${e.now} AND coalesce(w.outcome,'') NOT IN ('quarantine','unsupported')))
+            candidates AS (SELECT c.slot,c.version,c.writer,c.batch,c.sequence,coalesce(w.attempts,0) AS attempts,coalesce(w.next_attempt,0) AS next_attempt,w.wait_since,w.checked_block FROM complete c LEFT JOIN pdpp_transport_import_work w ON w.writer=c.writer AND w.batch=c.batch WHERE w.writer IS NULL OR (${replicaEligibleAtSql(e, { outcome: "w.outcome", dependency: "w.dependency", next: "w.next_attempt", since: "w.wait_since", checked: "w.checked_block" })} <= ${e.now} AND coalesce(w.outcome,'') NOT IN ('quarantine','unsupported')))
             SELECT * FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY writer ORDER BY next_attempt,sequence,batch) AS writer_rank FROM candidates) WHERE writer_rank<=? ORDER BY writer_rank, writer<=?, writer, next_attempt, sequence, batch LIMIT ?`,
           )
           .all(limit.perWriter, limit.after ?? "", limit.total) as Group[]
@@ -1818,6 +1891,13 @@ export function createReplicaTransportWorker(deps: {
         (sequenceHolder && sequenceHolder.batch !== batch)
       )
         return refuse("batch_equivocation", "batch equivocation");
+      // Every import attempt asks the roster again, so a batch admitted at
+      // download on an answer up to REPLICA_ROSTER_MAX_AGE_MS old is
+      // revalidated before it is staged or promoted.
+      const authorized = await authorizeManifest(manifest, item.row, signal);
+      if (authorized.tag === "wait")
+        return verdict(rosterWait(authorized.server));
+      if (authorized.tag === "refused") return refuse(authorized.reason);
       const staging: string[] = [];
       /**
        * Copy custody of this download, if its copy is not retained yet. It
@@ -1862,6 +1942,12 @@ export function createReplicaTransportWorker(deps: {
           signal.throwIfAborted();
           if (payload.envelope.batchId !== manifest.batch)
             throw new ReplicaProblemError("payload_invalid");
+          // Check 7: every operation names the signer's operation writer.
+          const misattributed = replicaOperationWriterRefusal(
+            payload.envelope.operations,
+            authorized.writers,
+          );
+          if (misattributed) return refuse(misattributed);
           // Trusted retained declarations, never claims copied from the envelope.
           // An unknown declaration is a dependency the host can supply later.
           const expected = deps.expected();

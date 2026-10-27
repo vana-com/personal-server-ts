@@ -222,6 +222,7 @@ async function fixture() {
       previous: after?.previous ?? null,
       collectedAt: at,
       bytes,
+      sign: remote.sign,
     });
     if (runCycle) await advance();
     const chain: Chain = {

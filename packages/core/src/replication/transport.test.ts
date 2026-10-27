@@ -10,8 +10,12 @@ import {
   replicaManifestKey,
   replicaScope,
   replicaWriterOf,
+  replicaManifestFacts,
+  ReplicaManifestUnsigned,
   fromBase64,
 } from "./transport.js";
+import { canonicalJson } from "./envelope.js";
+import { unsignedReplicaBatch } from "./writer-identity.test-utils.js";
 
 it("fragments a large export without changing bytes or exceeding encrypted cap", async () => {
   const bytes = new TextEncoder().encode("😺large JSON record".repeat(2000));
@@ -63,17 +67,18 @@ it("binds a manifest to its owner, writer scope and version, and its fragments t
   });
   const manifest = await prepareReplicaManifest({
     ...base,
+    version: 2,
     digest: replicaDigest(bytes),
     totalBytes: bytes.length,
     fragments: parts.map((p) => ({
       digest: p.digest,
       bytes: p.encrypted.length,
     })),
+    sign: unsignedReplicaBatch,
     encrypt: async (_scope, bytes) => bytes,
   });
   const scope = replicaScope(writer);
-  expect(manifest).toMatchObject({ scope });
-  expect(manifest).not.toHaveProperty("version");
+  expect(manifest).toMatchObject({ scope, version: 2 });
   expect(replicaManifestKey(scope, 2)).toBe(`${scope}/2`);
   expect(replicaFragmentKey(scope, parts[0]!.digest)).toBe(
     `${scope}/fragments/${parts[0]!.digest.slice(7)}`,
@@ -82,6 +87,22 @@ it("binds a manifest to its owner, writer scope and version, and its fragments t
   expect(replicaWriterOf(`${scope}.0`)).toBeUndefined();
   const decoded = decodeReplicaManifest(manifest.plaintext, scope, "owner");
   expect(decoded.fragments).toHaveLength(parts.length);
+  // The statement is signed over this manifest at its version.
+  expect(decoded.authority).toEqual(
+    await unsignedReplicaBatch(replicaManifestFacts(decoded, 2)),
+  );
+  // Without a statement the manifest is unsigned, not malformed.
+  const { authority: _authority, ...bare } = decoded;
+  const wrapper = JSON.parse(new TextDecoder().decode(manifest.plaintext));
+  expect(() =>
+    decodeReplicaManifest(
+      new TextEncoder().encode(
+        canonicalJson({ ...wrapper, data: { manifest: bare } }),
+      ),
+      scope,
+      "owner",
+    ),
+  ).toThrow(ReplicaManifestUnsigned);
   expect(() =>
     decodeReplicaManifest(manifest.plaintext, scope, "other"),
   ).toThrow();

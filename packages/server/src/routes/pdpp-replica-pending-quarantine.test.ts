@@ -138,6 +138,7 @@ it.each(["key", "connection"] as const)(
       writer: remote.writers.transport,
       batch,
       collectedAt: "2026-10-20T00:00:00Z",
+      sign: remote.sign,
       bytes: Buffer.from(
         canonicalJson({
           envelope: envelope(batch, operations),

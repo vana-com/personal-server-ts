@@ -35,10 +35,12 @@ import {
   replicaDigest,
   replicaFragmentKey,
   replicaManifestKey,
+  replicaScope,
   type PreparedFragment,
   type PreparedManifest,
   type Predecessor,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
+import type { ReplicaBatchFacts } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import type { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
 
 const sourceId = "https://replica-journey.invalid/declaration";
@@ -473,7 +475,10 @@ export function finalizedReplicaNetwork(owner: string) {
       return evidence.get(slot) ?? { head: null, chain: null, pending: false };
     },
   };
-  /** Store a batch's fragments and register its manifest at the next version. */
+  /**
+   * Store a batch's fragments and register its manifest at the next version.
+   * `sign` is the writer's server key, as `remoteReplicaTestWriter().sign`.
+   */
   async function publish(input: {
     writer: string;
     batch: string;
@@ -481,6 +486,7 @@ export function finalizedReplicaNetwork(owner: string) {
     previous?: Predecessor | null;
     collectedAt: string;
     bytes: Uint8Array;
+    sign: (facts: ReplicaBatchFacts) => Promise<unknown>;
   }): Promise<{
     slot: string;
     manifest: PreparedManifest;
@@ -500,20 +506,18 @@ export function finalizedReplicaNetwork(owner: string) {
       encrypt: port.encrypt,
     });
     for (const fragment of fragments) await port.putFragment(fragment);
-    const prepared = await prepareReplicaManifest({
+    const manifest = await prepareReplicaManifest({
       ...statement,
+      version: (latest.get(replicaScope(input.writer)) ?? 0) + 1,
       digest: replicaDigest(input.bytes),
       totalBytes: input.bytes.length,
       fragments: fragments.map((f) => ({
         digest: f.digest,
         bytes: f.encrypted.length,
       })),
+      sign: input.sign,
       encrypt: port.encrypt,
     });
-    const manifest = {
-      ...prepared,
-      version: (latest.get(prepared.scope) ?? 0) + 1,
-    };
     return { slot: register(manifest), manifest, fragments };
   }
   return { port, objects, evidence, observed, publish };

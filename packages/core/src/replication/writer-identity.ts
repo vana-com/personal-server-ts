@@ -26,6 +26,7 @@ export type ReplicaEnvironment = "dev" | "prod";
 const address = z.string().regex(/^0x[0-9a-f]{40}$/);
 const bytes32 = z.string().regex(/^0x[0-9a-f]{64}$/);
 const bytes16 = z.string().regex(/^0x[0-9a-f]{32}$/);
+const token = z.string().regex(/^[a-f0-9]{32}$/);
 const uint = (max: number) => z.number().int().min(1).max(max);
 const UINT32_MAX = 2 ** 32 - 1;
 
@@ -87,21 +88,32 @@ export function randomReplicaWriterNonce(): string {
   return bytesToHex(globalThis.crypto.getRandomValues(new Uint8Array(16)));
 }
 
-/** The signed batch statement (EIP-712 `PdppReplicaBatch`). */
+/**
+ * The signed batch statement (EIP-712 `PdppReplicaBatch`). With the writer
+ * scope, which the seed derives, it covers every field a receiver reads from
+ * a manifest and the registration slot the manifest is valid at.
+ */
 export const replicaBatchStatementSchema = z.strictObject({
   owner: address,
   server: address,
   serverId: bytes32,
   environment: z.enum(["dev", "prod"]),
   writerNonce: bytes16,
-  batch: z.string().regex(/^[a-f0-9]{32}$/),
+  /** The DPv2 version of the writer scope that registers this batch. */
+  version: uint(Number.MAX_SAFE_INTEGER),
+  batch: token,
   sequence: uint(Number.MAX_SAFE_INTEGER),
   /** Digest of the previous batch, or zero for sequence 1. */
   previous: bytes32,
+  /** Id of the previous batch, or empty for sequence 1. */
+  previousBatch: z.union([token, z.literal("")]),
+  collectedAt: z.string().datetime({ offset: true }),
   /** SHA-256 of the assembled batch. */
   digest: bytes32,
   totalBytes: uint(Number.MAX_SAFE_INTEGER),
   count: uint(UINT32_MAX),
+  /** replicaFragmentListDigest of the batch's fragments, in index order. */
+  fragments: bytes32,
 });
 export type ReplicaBatchStatement = z.infer<typeof replicaBatchStatementSchema>;
 
@@ -120,12 +132,16 @@ const BATCH_TYPES = {
     { name: "serverId", type: "bytes32" },
     { name: "environment", type: "string" },
     { name: "writerNonce", type: "bytes16" },
+    { name: "version", type: "uint64" },
     { name: "batch", type: "string" },
     { name: "sequence", type: "uint64" },
     { name: "previous", type: "bytes32" },
+    { name: "previousBatch", type: "string" },
+    { name: "collectedAt", type: "string" },
     { name: "digest", type: "bytes32" },
     { name: "totalBytes", type: "uint64" },
     { name: "count", type: "uint32" },
+    { name: "fragments", type: "bytes32" },
   ],
 } as const;
 
@@ -146,6 +162,8 @@ export function replicaBatchTypedData(
       writerNonce: statement.writerNonce as Hex,
       previous: statement.previous as Hex,
       digest: statement.digest as Hex,
+      fragments: statement.fragments as Hex,
+      version: BigInt(statement.version),
       sequence: BigInt(statement.sequence),
       totalBytes: BigInt(statement.totalBytes),
       count: statement.count,
@@ -170,17 +188,59 @@ export interface ReplicaPartition {
 
 /** What the carrier claims about a batch; the statement must sign exactly this. */
 export interface ReplicaBatchFacts {
+  /** The DPv2 version of the writer scope that registers the batch. */
+  version: number;
   batch: string;
   sequence: number;
   previous: { batch: string; digest: string } | null;
+  collectedAt: string;
   /** `sha256:<hex>` of the assembled batch. */
   digest: string;
   totalBytes: number;
-  count: number;
+  /** Every fragment in index order: sha256 of its exact stored bytes and their length. */
+  fragments: readonly { digest: string; bytes: number }[];
 }
 
 const ZERO32 = `0x${"0".repeat(64)}`;
 const digestBytes = (digest: string) => `0x${digest.replace(/^sha256:/, "")}`;
+
+/**
+ * SHA-256 over the ordered fragment list: for each entry its 32-byte digest,
+ * then its length as 8 bytes, big-endian.
+ */
+export function replicaFragmentListDigest(
+  fragments: ReplicaBatchFacts["fragments"],
+): string {
+  const framed = new Uint8Array(fragments.length * 40);
+  const view = new DataView(framed.buffer);
+  fragments.forEach((fragment, index) => {
+    const digest = hexToBytes(
+      bytes32.parse(digestBytes(fragment.digest)) as Hex,
+    );
+    framed.set(digest, index * 40);
+    view.setBigUint64(
+      index * 40 + 32,
+      BigInt(uint(Number.MAX_SAFE_INTEGER).parse(fragment.bytes)),
+    );
+  });
+  return sha256(framed, "hex");
+}
+
+/** The statement fields that come from the facts. Throws on malformed facts. */
+function signedFacts(facts: ReplicaBatchFacts) {
+  return {
+    version: facts.version,
+    batch: facts.batch,
+    sequence: facts.sequence,
+    previous: facts.previous ? digestBytes(facts.previous.digest) : ZERO32,
+    previousBatch: facts.previous?.batch ?? "",
+    collectedAt: facts.collectedAt,
+    digest: digestBytes(facts.digest),
+    totalBytes: facts.totalBytes,
+    count: facts.fragments.length,
+    fragments: replicaFragmentListDigest(facts.fragments),
+  };
+}
 
 function statementOf(
   partition: ReplicaPartition,
@@ -190,12 +250,7 @@ function statementOf(
   return replicaBatchStatementSchema.parse({
     ...seed,
     environment: partition.environment,
-    batch: facts.batch,
-    sequence: facts.sequence,
-    previous: facts.previous ? digestBytes(facts.previous.digest) : ZERO32,
-    digest: digestBytes(facts.digest),
-    totalBytes: facts.totalBytes,
-    count: facts.count,
+    ...signedFacts(facts),
   });
 }
 
@@ -241,7 +296,7 @@ export type ReplicaAuthorityVerdict =
   /** The roster could not be read and no fresh answer is cached. */
   | { tag: "wait"; server: string };
 
-// Recovery is pure; one batch's fragments share a statement.
+// Recovery is pure; a batch is authorized at download and at each import.
 const recovered = new Map<string, string>();
 async function recoverSigner(authority: ReplicaBatchAuthority) {
   const key = JSON.stringify(authority);
@@ -261,8 +316,8 @@ async function recoverSigner(authority: ReplicaBatchAuthority) {
 
 /**
  * Receiver checks 2-5 of host contract §3.4, in order. The carrier supplies
- * its claimed facts and transport writer, so this does not depend on how the
- * carrier names objects (per-fragment scopes or a per-sync manifest).
+ * its claimed facts and the transport writer of the scope it was registered
+ * in, so this does not depend on how the carrier names objects.
  * `roster` throws when it cannot answer; that is a Wait, never acceptance.
  */
 export async function authorizeReplicaBatch(input: {
@@ -279,15 +334,16 @@ export async function authorizeReplicaBatch(input: {
   if (!parsed.success) return refused("signature_invalid");
   const authority = parsed.data;
   const { statement } = authority;
-  const { facts } = input;
+  let claimed: ReturnType<typeof signedFacts>;
+  try {
+    claimed = signedFacts(input.facts);
+  } catch {
+    return refused("signature_invalid");
+  }
   if (
-    statement.batch !== facts.batch ||
-    statement.sequence !== facts.sequence ||
-    statement.previous !==
-      (facts.previous ? digestBytes(facts.previous.digest) : ZERO32) ||
-    statement.digest !== digestBytes(facts.digest) ||
-    statement.totalBytes !== facts.totalBytes ||
-    statement.count !== facts.count
+    Object.entries(claimed).some(
+      ([key, value]) => statement[key as keyof typeof claimed] !== value,
+    )
   )
     return refused("signature_invalid");
   let signer: string;

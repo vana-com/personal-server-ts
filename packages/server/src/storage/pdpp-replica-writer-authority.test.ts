@@ -7,14 +7,7 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  canonicalJson,
-  type ReplicaOperation,
-} from "@opendatalabs/personal-server-ts-core/replication/envelope";
-import {
-  fragmentReplicaPayload,
-  type Predecessor,
-} from "@opendatalabs/personal-server-ts-core/replication/transport";
+import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { REPLICA_ROSTER_MAX_AGE_MS } from "@opendatalabs/personal-server-ts-core/replication/roster";
 import { compareRevisions } from "@opendatalabs/personal-server-ts-core/replication/revision";
 import { ReplicationRefusedError } from "@opendatalabs/personal-server-ts-core/replication/door";
@@ -22,6 +15,7 @@ import {
   deriveReplicaWriters,
   replicaBatchTypedData,
   signReplicaBatch,
+  type ReplicaBatchFacts,
 } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
 import {
   createTestReplicaSigner,
@@ -34,8 +28,8 @@ import {
   clock,
   credential,
   cycles,
-  envelope,
   expected,
+  injectReplicaBatch,
   network,
   owner,
   scratchDirectory,
@@ -84,51 +78,27 @@ function upsert(writerId: string, text: string, counter = 1000) {
   } as ReplicaOperation;
 }
 
-/** Publish a hand-built batch straight to the network, as another device could. */
+/** Publish a hand-built batch straight to the network; its registered slot. */
 async function inject(
   net: Network,
-  input: {
-    writer: string;
-    operations: ReplicaOperation[];
-    sign: Parameters<typeof fragmentReplicaPayload>[0]["sign"];
-    sequence?: number;
-    previous?: Predecessor | null;
-  },
+  input: Parameters<typeof injectReplicaBatch>[1],
 ) {
-  const batch = hex(16);
-  const parts = await fragmentReplicaPayload({
-    owner,
-    writer: input.writer,
-    batch,
-    sequence: input.sequence ?? 1,
-    previous: input.previous ?? null,
-    collectedAt: at,
-    bytes: Buffer.from(
-      canonicalJson({ envelope: envelope(input.operations, batch), blobs: [] }),
-    ),
-    sign: input.sign,
-    encrypt: net.port.encrypt,
-  });
-  for (const part of parts) {
-    await net.port.put(part);
-    await net.port.register(part);
-  }
-  return parts.map((part) => part.scope);
+  return [(await injectReplicaBatch(net, input)).slot];
 }
 
 const inbox = (d: TransportDevice) =>
   d.db
-    .prepare("SELECT scope,state,reason,error FROM pdpp_transport_inbox")
+    .prepare("SELECT slot,state,reason,error FROM pdpp_transport_manifests_in")
     .all() as {
-    scope: string;
+    slot: string;
     state: string;
     reason: string | null;
     error: string | null;
   }[];
-/** The quarantine reason a receiver recorded for each of these scopes. */
-const refusals = (d: TransportDevice, scopes: string[]) =>
-  scopes.map((scope) => {
-    const row = inbox(d).find((r) => r.scope === scope);
+/** The quarantine reason a receiver recorded for each of these slots. */
+const refusals = (d: TransportDevice, slots: string[]) =>
+  slots.map((slot) => {
+    const row = inbox(d).find((r) => r.slot === slot);
     return row?.state === "quarantined"
       ? (row.error ?? row.reason)
       : row?.state;
@@ -141,7 +111,15 @@ const importedWriters = (d: TransportDevice) =>
       .all() as { writer: string }[]
   ).map((r) => r.writer);
 
-it("first contact: another server's batch under A's transport writer is refused, and A's real batches import", async () => {
+/** A's manifests that the gateway refused because another object holds their slot. */
+const blocked = (d: TransportDevice) =>
+  d.db
+    .prepare(
+      "SELECT version FROM pdpp_transport_manifests_out WHERE state='quarantined' AND reason='immutable_registration_conflict'",
+    )
+    .all();
+
+it("first contact: another server's batch under A's transport writer is refused, and can only block A's version", async () => {
   const net = network();
   const a = transportDevice(net, { preexisting: "real" });
   const receiver = transportDevice(net);
@@ -156,12 +134,15 @@ it("first contact: another server's batch under A's transport writer is refused,
   await cycles([receiver], 2);
   expect(refusals(receiver, forged)).toEqual(["writer_mismatch"]);
   await cycles([a, receiver], 3);
-  expect(receiver.get()).toEqual({ id: "a", text: "real" });
-  expect(importedWriters(receiver)).toContain(identity(a).transportWriter);
+  // The forged manifest holds version 1 of A's scope, so A's own version 1
+  // is refused at registration (host contract §3.6). Nothing forged imports.
+  expect(blocked(a)).toEqual([{ version: 1 }]);
+  expect(receiver.get()).toBeUndefined();
+  expect(importedWriters(receiver)).not.toContain(identity(a).transportWriter);
 });
 
 it.runIf(nightly)(
-  "first contact variants: a stolen server claim, an unsigned fragment and an unregistered signer",
+  "first contact variants: a stolen server claim, an invalid signature and an unregistered signer",
   async () => {
     const net = network();
     const a = transportDevice(net, { preexisting: "real" });
@@ -173,7 +154,7 @@ it.runIf(nightly)(
     const claimsA = await inject(net, {
       writer,
       operations,
-      sign: async (facts) => {
+      sign: async (facts: ReplicaBatchFacts) => {
         const statement = (await unsignedReplicaBatch(facts)).statement;
         const forged = {
           ...statement,
@@ -209,7 +190,8 @@ it.runIf(nightly)(
     expect(refusals(receiver, unsigned)).toEqual(["signature_invalid"]);
     expect(refusals(receiver, unregistered)).toEqual(["server_not_registered"]);
     await cycles([a, receiver], 3);
-    expect(receiver.get()).toEqual({ id: "a", text: "real" });
+    expect(blocked(a)).toEqual([{ version: 1 }]);
+    expect(receiver.get()).toBeUndefined();
   },
 );
 
@@ -298,8 +280,8 @@ it("deregistration mid-stream: imported data stays, unimported batches are refus
   await cycles([receiver], 3);
   expect(receiver.get()).toEqual({ id: "a", text: "before removal" });
   const unimported = late.filter(
-    (scope) =>
-      !inbox(receiver).some((r) => r.scope === scope && r.state === "imported"),
+    (slot) =>
+      !inbox(receiver).some((r) => r.slot === slot && r.state === "imported"),
   );
   expect(unimported.length).toBeGreaterThan(0);
   expect(new Set(refusals(receiver, unimported))).toEqual(
@@ -329,12 +311,12 @@ it.runIf(nightly)(
     const held = net.calls.registrations.filter(
       (s) =>
         s.includes(identity(a).transportWriter) &&
-        !inbox(receiver).some((r) => r.scope === s),
+        !inbox(receiver).some((r) => r.slot === s),
     );
     // Downloaded and authorized, but not finalized: the import waits.
-    for (const scope of held) {
-      net.chain.delete(scope);
-      net.pending.add(scope);
+    for (const slot of held) {
+      net.chain.delete(slot);
+      net.pending.add(slot);
     }
     await cycles([receiver], 2);
     expect(refusals(receiver, held).every((s) => s === "ready")).toBe(true);
@@ -360,7 +342,7 @@ it("re-registration is a new incarnation: old batches stay refused, new writers 
   const unimported = net.calls.registrations.filter(
     (s) =>
       s.includes(old.transportWriter) &&
-      !inbox(receiver).some((r) => r.scope === s),
+      !inbox(receiver).some((r) => r.slot === s),
   );
   net.roster.deregister(a.authority.signer.address);
   net.roster.register(a.authority.signer.address, owner);
@@ -753,7 +735,7 @@ it("the door closes while the roster read is pending: no new identity, nothing p
 });
 
 it.runIf(nightly)(
-  "restore with a copied nonce, not rotated: the reused sequence is equivocation and the first batch stays",
+  "restore with a copied nonce, not rotated: the reused version is refused at registration and the first batch stays",
   async () => {
     const net = network();
     const a = transportDevice(net, { preexisting: "v1" });
@@ -762,17 +744,21 @@ it.runIf(nightly)(
     const image = a.image();
     a.put("v2");
     await cycles([a, receiver], 3);
+    const registered = [...net.head.keys()];
     a.restore(image);
     a.put("v2 from the restored copy");
     await cycles([a, receiver], 4);
     expect(receiver.get()).toEqual({ id: "a", text: "v2" });
+    // The copy signs the scope version the original already registered, so
+    // the gateway keeps the original and the copy quarantines its manifest.
+    expect([...net.head.keys()]).toEqual(registered);
     expect(
-      receiver.db
+      a.db
         .prepare(
-          "SELECT reason FROM pdpp_transport_import_work WHERE outcome='quarantine'",
+          "SELECT reason FROM pdpp_transport_manifests_out WHERE state='quarantined'",
         )
         .all(),
-    ).toEqual([{ reason: "batch_equivocation" }]);
+    ).toEqual([{ reason: "immutable_registration_conflict" }]);
   },
 );
 
