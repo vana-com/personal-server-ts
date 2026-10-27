@@ -25,11 +25,7 @@
 
 import { generateMcpGrantee } from "./grantee.js";
 import { createGrantContract } from "../contracts/index.js";
-import {
-  isWriteScopeEntry,
-  scopeCoveredByWriteGrant,
-  WRITE_SCOPE_PREFIX,
-} from "../policy/data-write.js";
+import { isWriteScopeEntry, WRITE_SCOPE_PREFIX } from "../policy/data-write.js";
 import { isSystemScope } from "../policy/reserved-scopes.js";
 import {
   ScopeSchema,
@@ -342,14 +338,10 @@ export async function approveMcpConnection(
 }
 
 function grantCoversScope(grant: McpConnectionGrant, scope: string): boolean {
-  // A `write:` request is covered only by a write entry, never by a read
-  // wildcard such as `*`.
-  if (isWriteScopeEntry(scope)) {
-    return scopeCoveredByWriteGrant(
-      scope.slice(WRITE_SCOPE_PREFIX.length),
-      grant.scopes,
-    );
-  }
+  // A `write:` request is covered only by the same exact write entry: not by
+  // a read wildcard such as `*`, and not by a write wildcard, which `remember`
+  // ignores (the agent must still be able to ask for the exact grant).
+  if (isWriteScopeEntry(scope)) return grant.scopes.includes(scope);
   return grant.scopes.some(
     (granted) =>
       granted === "*" ||

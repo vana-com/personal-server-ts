@@ -951,6 +951,18 @@ describe("mcp/connection-api scope request answers", () => {
     ]);
   });
 
+  it("records an exact write: request when only a write wildcard is held", async () => {
+    // remember ignores write wildcards, so the exact grant must stay requestable.
+    const { store, id } = await connectionWithRequest(
+      [{ grantId: "0xgrant1", scopes: ["write:memory.*"] }],
+      ["write:memory.claude"],
+    );
+
+    expect((await store.getById(id))?.scopeAccessRequest?.scopes).toEqual([
+      "write:memory.claude",
+    ]);
+  });
+
   it("records and approves a write: scope even when a read wildcard is held, but never a write wildcard", async () => {
     // A read grant of "*" must not count as covering a write request.
     const { store, id } = await connectionWithRequest(
