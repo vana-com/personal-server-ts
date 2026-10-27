@@ -221,19 +221,6 @@ const events: Event[] = [
   },
 ];
 
-/** Cases a port still fails, with the finding that explains each. */
-const KNOWN: Record<string, string> = {
-  // D4: a Lite retry or repeated import bumps the connection's view
-  // revisions though nothing visible changes, which expires every token on
-  // the connection.
-  "lite-memory/unchanged retry": "D4",
-  "lite-sqlite/unchanged retry": "D4",
-  "lite-memory/duplicate evidence": "D4",
-  "lite-memory/duplicate evidence after reopen": "D4",
-  "lite-sqlite/duplicate evidence": "D4",
-  "lite-sqlite/duplicate evidence after reopen": "D4",
-};
-
 const opened: ReplicaPortDriver[] = [];
 afterEach(() => {
   for (const driver of opened.splice(0)) driver.close();
@@ -242,10 +229,7 @@ afterEach(() => {
 function fenceSuite<D extends ReplicaPortDriver>(name: string, port: Port<D>) {
   describe(`${name} cursor fences`, () => {
     for (const event of events) {
-      const known = KNOWN[`${name}/${event.name}`];
-      const test =
-        known && !process.env.REPLICA_ORACLE_SHOW_KNOWN ? it.fails : it;
-      test(`${event.name} ${event.expires ? "expires" : "keeps"} tokens${known ? ` (open: ${known})` : ""}`, async () => {
+      it(`${event.name} ${event.expires ? "expires" : "keeps"} tokens`, async () => {
         const driver = await port.open();
         opened.push(driver);
         await driver.importBatch("seed", seed, []);

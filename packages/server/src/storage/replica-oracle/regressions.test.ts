@@ -240,9 +240,7 @@ describe("terminal quarantine rejects every mutating path and changes nothing", 
 
 /**
  * Defects the differential found on PR #483 at eb98ded8. Each case is the
- * shrinker's minimized command list. Lite meets the contract; the Node case
- * stays `it.fails` until #483 fixes it, and the generator avoids its shape
- * (see KNOWN_DEFECTS in differential.test-utils.ts).
+ * shrinker's minimized command list and runs on both ports.
  */
 describe("oracle findings on #483", () => {
   const UNIVERSE = {
@@ -341,6 +339,38 @@ describe("oracle findings on #483", () => {
       },
     ],
     [
+      // Seed 387276957, replayed. The upsert's blob bytes never arrive, so the
+      // winner is withdrawn. Withdrawal must not rewrite the delete's tombstone.
+      "D2b: a withdrawn upsert leaves an existing tombstone unchanged",
+      async (open) => {
+        const driver = await open();
+        await driver.provision("c3");
+        await driver.importBatch(
+          "batch-5",
+          [
+            {
+              ...base("c3"),
+              kind: "delete",
+              declaration: BINDINGS.m,
+              recordKey: "k0",
+              emittedAt: "2026-10-20T00:00:00Z",
+              deletedAt: "2026-10-21T00:00:11Z",
+              revision: revision(7, "w-c-12"),
+            },
+          ],
+          [],
+        );
+        const before = (await driver.snapshot(UNIVERSE)).stored;
+        const [, record] = blobRecord(
+          blobPayload(new TextEncoder().encode("oracle blob d2")),
+          "k0",
+          11,
+        );
+        await driver.importBatch("batch-9", [record], []);
+        expect((await driver.snapshot(UNIVERSE)).stored).toEqual(before);
+      },
+    ],
+    [
       // Seed 147926629. Pending bytes and claim make a confirmed record
       // readable for the owner; the row is not confirmed, so it is marked.
       "D3: a row readable only through pending bytes carries the pending marker",
@@ -359,6 +389,6 @@ describe("oracle findings on #483", () => {
   ];
   for (const [name, run] of cases) {
     it(`Lite ${name}`, () => run(ports.lite));
-    it.fails(`Node ${name} (open on #483)`, () => run(ports.node));
+    it(`Node ${name}`, () => run(ports.node));
   }
 });

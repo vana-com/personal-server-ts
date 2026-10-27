@@ -191,6 +191,80 @@ export function refConnectionStatus(
   return { status: "active", generation };
 }
 
+/** Operations whose revision id carries one content. */
+function uniqueOps(owned: readonly ReplicaOperation[]) {
+  return [...variantsOf(owned).values()]
+    .filter((group) => group.size === 1)
+    .map((group) => [...group.values()][0]);
+}
+
+/** Valid record operations of one connection and generation, grouped by key. */
+function keyedCandidates(
+  world: RefWorld,
+  unique: readonly ReplicaOperation[],
+  connection: string,
+  generation: number,
+) {
+  const keys = new Map<string, RecordOperation[]>();
+  for (const op of unique) {
+    if (op.connectionId !== connection || !isRecord(op)) continue;
+    if (op.generation !== generation) continue;
+    if (!declared(world, op) || !validData(op)) continue;
+    const id = rowId(connection, op.declaration.stream, op.recordKey);
+    keys.set(id, [...(keys.get(id) ?? []), op]);
+  }
+  return keys;
+}
+
+/**
+ * A key's candidates conflict when they name two declarations, or when an
+ * append-only key carries two contents. A conflict hides the key for good.
+ */
+function keyConflicted(candidates: readonly RecordOperation[]) {
+  const bindings = new Set(
+    candidates.map((op) => canonicalJson(op.declaration)),
+  );
+  const contents = new Set(
+    candidates.map((op) =>
+      canonicalJson(
+        op.kind === "upsert" ? { data: op.data, blobs: op.blobs } : null,
+      ),
+    ),
+  );
+  return (
+    bindings.size > 1 ||
+    (candidates[0].declaration.semantics === "append_only" && contents.size > 1)
+  );
+}
+
+/**
+ * Whether the retained evidence has already quarantined a key on the
+ * connection's active generation. The receiver refuses ordinary collector
+ * writes to such a key (receiver.md: corruption-quarantine fences).
+ */
+export function refKeyQuarantined(
+  world: RefWorld,
+  evidence: readonly ReplicaOperation[],
+  connection: string,
+  stream: string,
+  key: string,
+): boolean {
+  const { status, generation } = refConnectionStatus(
+    world,
+    evidence,
+    connection,
+  );
+  if (status !== "active") return false;
+  const owned = evidence.filter((op) => op.owner === world.owner);
+  const candidates = keyedCandidates(
+    world,
+    uniqueOps(owned),
+    connection,
+    generation,
+  ).get(rowId(connection, stream, key));
+  return candidates !== undefined && keyConflicted(candidates);
+}
+
 /** Recompute every mapped connection from the complete retained evidence. */
 export function refProject(
   prior: RefState,
@@ -199,10 +273,7 @@ export function refProject(
 ): RefState {
   const next = cloneRefState(prior);
   const owned = evidence.filter((op) => op.owner === world.owner);
-  const variants = variantsOf(owned);
-  const unique = [...variants.values()]
-    .filter((group) => group.size === 1)
-    .map((group) => [...group.values()][0]);
+  const unique = uniqueOps(owned);
   const withdraw = (id: string) => {
     next.winners.delete(id);
     if (next.rows.get(id)?.deleted === false)
@@ -226,32 +297,15 @@ export function refProject(
       next.generations.set(connection, generation);
     }
     const claims = owned.filter((op) => op.connectionId === connection);
-    const keys = new Map<string, RecordOperation[]>();
-    for (const op of unique) {
-      if (op.connectionId !== connection || !isRecord(op)) continue;
-      if (op.generation !== generation) continue;
-      if (!declared(world, op) || !validData(op)) continue;
-      const id = rowId(connection, op.declaration.stream, op.recordKey);
-      keys.set(id, [...(keys.get(id) ?? []), op]);
-    }
-    for (const [id, candidates] of keys) {
+    for (const [id, candidates] of keyedCandidates(
+      world,
+      unique,
+      connection,
+      generation,
+    )) {
       candidates.sort(compareRevision);
-      const bindings = new Set(
-        candidates.map((op) => canonicalJson(op.declaration)),
-      );
-      const contents = new Set(
-        candidates.map((op) =>
-          canonicalJson(
-            op.kind === "upsert" ? { data: op.data, blobs: op.blobs } : null,
-          ),
-        ),
-      );
-      const conflicted =
-        bindings.size > 1 ||
-        (candidates[0].declaration.semantics === "append_only" &&
-          contents.size > 1);
       const winner = candidates[candidates.length - 1];
-      if (conflicted) withdraw(id);
+      if (keyConflicted(candidates)) withdraw(id);
       else if (winner.kind === "delete") {
         next.rows.set(id, { deleted: true });
         next.winners.set(id, revisionId(winner));
