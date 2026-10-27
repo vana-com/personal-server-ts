@@ -1192,7 +1192,7 @@ describe("unreached crash indexes", () => {
     // scenario run records one point more than every later run.
     let calls = 0;
     const prepare = async (): Promise<World> => {
-      const world = await sourceWorld({ text: "u", window: "publish" });
+      const world = await quarantineWorld();
       return {
         ...world,
         scenario() {
@@ -1211,17 +1211,29 @@ describe("unreached crash indexes", () => {
         },
       };
     };
-    const report = await crashMatrix("unreached control", prepare);
-    const last = report.points - 1;
-    expect(report.failures.join("\n")).toMatch(/\[unreached\] crash index/);
-    calls = 0;
-    const named = await crashMatrix("unreached control named", prepare, {
-      expectedUnreached: {
-        indexes: [last],
-        reason: "the control adds one point to the recording run only",
-      },
-    });
-    expect(named.failures.join("\n")).not.toMatch(/\[unreached\]/);
+    // Each method records its own trace (restore and warm differ in length), so
+    // each is run directly and its own last index is the one named.
+    for (const method of ["restore", "warm"] as const) {
+      calls = 0;
+      const report = await runMatrix("unreached control", prepare, method, {});
+      const last = report.points - 1;
+      expect(report.failures.join("\n"), method).toMatch(
+        /\[unreached\] crash index/,
+      );
+      calls = 0;
+      const named = await runMatrix(
+        "unreached control named",
+        prepare,
+        method,
+        {
+          expectedUnreached: {
+            indexes: [last],
+            reason: "the control adds one point to the recording run only",
+          },
+        },
+      );
+      expect(named.failures.join("\n"), method).not.toMatch(/\[unreached\]/);
+    }
   }, 60_000);
 });
 
