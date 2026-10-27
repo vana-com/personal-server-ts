@@ -74,11 +74,18 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   signer; the baseline carries their effect. A peer that missed the old
   writer's batches (refused after re-registration, never published, or
   written between a gateway change and the next step) therefore converges.
-  Each re-issued record and completion keeps the counter of the newest
-  retained operation for its key (journal and received operations for
-  records, this server's own for completions), so it keeps its order against
-  other writers and never overrides a newer write it has not seen. A crash
-  during the baseline resumes from its durable cursor.
+  Each re-issued record and completion takes the order of the highest
+  retained operation, own or received, with the same key and effect (record
+  data, tombstone, or completion snapshot): its counter, plus that
+  operation's writer and operation id as `revision.origin` (or its origin, if
+  it was itself a re-issue). `compareRevisions` orders by counter, then the
+  origin's ids, then the operation's own, so the re-issue wins and loses
+  exactly where the original does. A state no retained operation explains
+  takes a new counter. The rebaseline runs inside the door's capture guard. A
+  crash during the baseline resumes from its durable cursor.
+- Every step checks the replication door first, and again in the authority
+  transaction after the roster read. Once the door is closed, the step returns
+  idle with no identity, rebaseline or publish work.
 - Completion dependencies and blob-claim reuse consider only the current
   operation writer, so every dependency a completion names is in a batch the
   current writer publishes.
@@ -121,7 +128,7 @@ mapping) past the cache age is revalidated before it is staged or promoted.
 **Known limits.** A rebaseline re-issues the whole current state, including
 records that peers wrote, as content-equal operations, so its size is the
 database's live state. Its capture runs in one transaction, like the first
-baseline, and keeps one counter per record key in memory. The roster is the
+baseline, and keeps one revision per record key and effect in memory. The roster is the
 gateway's current view; there is no history of past registrations.
 
 ## Durable progress

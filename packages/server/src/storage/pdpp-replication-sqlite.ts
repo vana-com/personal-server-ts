@@ -15,6 +15,10 @@ import {
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
+  compareRevisions,
+  type ReplicaRevision,
+} from "@opendatalabs/personal-server-ts-core/replication/revision";
+import {
   computeRecordKeyFromData,
   type StreamSemantics,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
@@ -94,7 +98,7 @@ export function replicaOperationDigest(operation: ReplicaOperation): string {
   return `sha256:${createHash("sha256").update(canonicalJson(operation)).digest("hex")}`;
 }
 
-/** Records and completions a rebaseline re-issues at their retained counter. */
+/** Records and completions a rebaseline re-issues in their retained order. */
 function reissueKey(
   op: WithoutRevision<ReplicaOperation> | ReplicaOperation,
 ): string | undefined {
@@ -114,6 +118,14 @@ function reissueKey(
       op.declaration.stream,
     ]);
   return undefined;
+}
+
+/** What a record or completion operation leaves in the canonical state. */
+function effect(op: WithoutRevision<ReplicaOperation>): string {
+  if (op.kind === "upsert")
+    return `upsert:${createHash("sha256").update(canonicalJson(op.data)).digest("hex")}`;
+  if (op.kind === "stream-complete") return `complete:${op.snapshotSha256}`;
+  return op.kind;
 }
 
 /** Owns original revisions, pinned values/bytes and exporter progress on the canonical DB. */
@@ -155,10 +167,25 @@ export function createReplicationJournal(
     return found.binding;
   }
   /**
-   * While a rebaseline runs: the revision counter each re-issued record or
-   * completion keeps (see `rebaseline`).
+   * While a rebaseline runs: the highest retained revision, own or received,
+   * of each record and completion (`reissueKey`) and effect.
    */
-  let reissue: Map<string, number> | undefined;
+  let reissue: Map<string, Map<string, ReplicaRevision>> | undefined;
+  /**
+   * A re-issued operation takes the order of the highest retained operation
+   * with the same key and effect: the counter, and that operation (or its own
+   * origin) as origin. With none, the state is a new write and takes a new
+   * counter.
+   */
+  function reissued(
+    value: WithoutRevision<ReplicaOperation>,
+  ): Pick<ReplicaRevision, "counter" | "origin"> | undefined {
+    const key = reissueKey(value);
+    const found = key && reissue?.get(key)?.get(effect(value));
+    if (!found) return undefined;
+    const { counter, writerId, operationId, origin } = found;
+    return { counter, origin: origin ?? { writerId, operationId } };
+  }
   function append(value: WithoutRevision<ReplicaOperation>): ReplicaOperation {
     if (!db.inTransaction)
       throw new Error("replication capture requires canonical transaction");
@@ -168,13 +195,13 @@ export function createReplicationJournal(
     if (!Number.isSafeInteger(prior.counter + 1))
       throw new Error("replication counter exhausted");
     const counter = prior.counter + 1;
-    const key = reissueKey(value);
     const operation = replicaOperationSchema.parse({
       ...value,
       revision: {
-        counter: (key !== undefined && reissue?.get(key)) || counter,
+        counter,
         writerId: writerId(),
         operationId: randomUUID(),
+        ...reissued(value),
       },
     });
     db.prepare("UPDATE pdpp_replica_clock SET counter = ? WHERE id = 1").run(
@@ -501,10 +528,12 @@ export function createReplicationJournal(
    * The current state, re-captured under the current writer as a new
    * baseline. A new writer identity calls it before it publishes: a peer that
    * missed the old writer's batches, unpublished or refused, still converges.
-   * Records and completions keep the counter of the newest retained
-   * operation for the same key, so the copy keeps its order against every
-   * other writer: it never overrides a newer write it has not seen. Lifecycle
-   * and blob-claim operations take new counters.
+   * Records and completions keep the order of the retained operation whose
+   * effect they copy (`reissued`), so against every other writer the copy
+   * wins and loses exactly where that operation does: it never overrides a
+   * newer write, and never loses a tie the original won. A peer's operation
+   * is re-issued the same way: the new writer signs it, its origin keeps the
+   * peer's order. Lifecycle and blob-claim operations take new counters.
    */
   function rebaseline(): { after: number } | undefined {
     if (!settings()) return undefined;
@@ -517,18 +546,19 @@ export function createReplicationJournal(
       )
       .get();
     reissue = new Map();
-    for (const { operation_json, own } of db
+    for (const { operation_json } of db
       .prepare(
-        `SELECT operation_json, 1 AS own FROM pdpp_replica_operations${received ? " UNION ALL SELECT operation_json, 0 FROM pdpp_replica_received" : ""}`,
+        `SELECT operation_json FROM pdpp_replica_operations${received ? " UNION ALL SELECT operation_json FROM pdpp_replica_received" : ""}`,
       )
-      .iterate() as Iterable<{ operation_json: string; own: number }>) {
+      .iterate() as Iterable<{ operation_json: string }>) {
       const op = JSON.parse(operation_json) as ReplicaOperation;
       const key = reissueKey(op);
-      // A completion keeps this server's own order; a peer's completion may
-      // describe a different snapshot.
-      if (key === undefined || (op.kind === "stream-complete" && !own))
-        continue;
-      reissue.set(key, Math.max(reissue.get(key) ?? 0, op.revision.counter));
+      if (key === undefined) continue;
+      const effects = reissue.get(key) ?? new Map<string, ReplicaRevision>();
+      reissue.set(key, effects);
+      const prior = effects.get(effect(op));
+      if (!prior || compareRevisions(op.revision, prior) > 0)
+        effects.set(effect(op), op.revision);
     }
     try {
       captureCurrentState();

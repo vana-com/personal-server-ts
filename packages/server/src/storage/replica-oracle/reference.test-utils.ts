@@ -72,19 +72,21 @@ export const cloneRefState = (state: RefState): RefState => ({
 
 export const revisionId = (op: ReplicaOperation) =>
   JSON.stringify([op.revision.writerId, op.revision.operationId]);
-/** Lamport order: counter, then writer id, then operation id, by code unit. */
+/**
+ * Lamport order: counter, then writer id, then operation id, by code unit. A
+ * re-issue compares by its origin's ids first, then by its own.
+ */
 function compareRevision(a: ReplicaOperation, b: ReplicaOperation): number {
-  const left = [
-    a.revision.counter,
-    a.revision.writerId,
-    a.revision.operationId,
+  const key = ({ revision: r }: ReplicaOperation) => [
+    r.counter,
+    (r.origin ?? r).writerId,
+    (r.origin ?? r).operationId,
+    r.writerId,
+    r.operationId,
   ];
-  const right = [
-    b.revision.counter,
-    b.revision.writerId,
-    b.revision.operationId,
-  ];
-  for (let i = 0; i < 3; i++) {
+  const left = key(a);
+  const right = key(b);
+  for (let i = 0; i < left.length; i++) {
     if (left[i] < right[i]) return -1;
     if (left[i] > right[i]) return 1;
   }

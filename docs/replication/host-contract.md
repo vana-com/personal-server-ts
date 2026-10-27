@@ -123,11 +123,16 @@ current-state baseline before its tail: every live record, every tombstone,
 every blob claim and every completion, signed under the new writer ids. So a
 peer that missed old batches, whether refused, never published, or written
 between a gateway change and the next worker step, still converges. Each
-re-issued record and completion keeps the revision counter of the newest
-retained operation for its key, so it keeps its order against every other
-writer and never overrides a newer write. The baseline is published in the
-usual bounded, fragmented batches and resumes from its durable cursor after a
-crash.
+re-issued record and completion orders exactly as the retained operation whose
+effect it copies, own or a peer's: it keeps that operation's counter and names
+its writer and operation id in the signed `revision.origin`, which
+`compareRevisions` reads before the re-issue's own ids. So a re-issue never
+overrides a newer write and never loses a tie the original won. A state no
+retained operation explains takes a new counter, like a local write. The
+baseline is published in the usual bounded, fragmented batches and resumes
+from its durable cursor after a crash. A worker step first checks the
+replication door (`replicationAdmitted`): once it is closed, the step does no
+identity, rebaseline or publish work.
 
 **Host requirement: rotate on every copy.** PS cannot detect that its database
 is a copy. Every host path that restores, clones or reinstalls a database

@@ -16,6 +16,7 @@ import {
   type Predecessor,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import { REPLICA_ROSTER_MAX_AGE_MS } from "@opendatalabs/personal-server-ts-core/replication/roster";
+import { compareRevisions } from "@opendatalabs/personal-server-ts-core/replication/revision";
 import {
   deriveReplicaWriters,
   replicaBatchTypedData,
@@ -51,6 +52,7 @@ import {
   remoteReplicaTestWriter,
   replicaTestAuthority,
 } from "./pdpp-replica-writer-identity.test-utils.js";
+import { replicationAdmitted } from "./pdpp-replication-door.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 
@@ -593,6 +595,116 @@ describe("a new writer identity republishes the current state", () => {
     for (const d of [a, peer, late])
       expect(d.get()).toEqual({ id: "a", text: "v2" });
   });
+
+  // A's write and another device's write share a counter, so writer ids
+  // break the tie. A's write is retained but never published; A then
+  // rotates to a writer id on the other side of the other device's. The
+  // peer sees only the other write and A's re-issue, which must tie as A's
+  // original did.
+  it.each([
+    ["record", "record"],
+    ["record", "tombstone"],
+    ["tombstone", "record"],
+  ] as const)(
+    "an equal-counter tie: A's %s against another device's %s",
+    async (mine, theirs) => {
+      net = network();
+      const a = transportDevice(net, { preexisting: "kept" });
+      const peer = transportDevice(net);
+      await cycles([a, peer], 3);
+      net.faults.encrypt = () => new Error("offline");
+      if (mine === "record") a.put("from A");
+      else
+        a.store.replaceStream({
+          instance: a.instance,
+          stream: "messages",
+          method: "export",
+          generation: 1,
+          emittedAt: at,
+          envelopes: [],
+          primaryKey: ["id"],
+          sourceCollectedAt: at,
+        });
+      await cycles([a], 2);
+      const original = (
+        a.db
+          .prepare(
+            "SELECT operation_json FROM pdpp_replica_operations WHERE json_extract(operation_json,'$.recordKey')='a' ORDER BY sequence DESC LIMIT 1",
+          )
+          .get() as { operation_json: string }
+      ).operation_json;
+      const theirOp = (counter: number, writerId: string) => {
+        const op = upsert(writerId, "from the other device", counter);
+        if (theirs === "record") return op;
+        const {
+          data: _data,
+          blobs: _blobs,
+          ...rest
+        } = op as Extract<ReplicaOperation, { kind: "upsert" }>;
+        return { ...rest, kind: "delete", deletedAt: at } as ReplicaOperation;
+      };
+      const mineOp = JSON.parse(original) as ReplicaOperation;
+      const other = remoteReplicaTestWriter(net.roster, owner);
+      const old = identity(a);
+      const theirWriter = other.writers.operation;
+      // The first nonce whose operation writer sorts on the other side of
+      // theirs from A's old one.
+      let nonce = "";
+      for (let i = 1; !nonce; i++) {
+        const candidate = `0x${i.toString(16).padStart(32, "0")}`;
+        const next = deriveReplicaWriters({
+          ...old.seed,
+          writerNonce: candidate,
+        }).operation;
+        if (next < theirWriter !== old.operationWriter < theirWriter)
+          nonce = candidate;
+      }
+      rotateReplicaWriterIdentity(a.db, { nonce });
+      net.faults.encrypt = undefined;
+      const op = theirOp(mineOp.revision.counter, theirWriter);
+      await inject(net, {
+        writer: other.writers.transport,
+        operations: [op],
+        sign: other.sign,
+      });
+      await cycles([a, peer], 5);
+      const expected =
+        compareRevisions(mineOp.revision, op.revision) > 0
+          ? mine === "record"
+            ? { id: "a", text: "from A" }
+            : undefined
+          : theirs === "record"
+            ? { id: "a", text: "from the other device" }
+            : undefined;
+      expect(identity(a).seed.writerNonce).toBe(nonce);
+      expect(a.get()).toEqual(expected);
+      expect(peer.get()).toEqual(expected);
+    },
+  );
+});
+
+it("a write outside capture closes the door: the next step publishes nothing", async () => {
+  const net = network();
+  const a = transportDevice(net, { preexisting: "kept" });
+  await cycles([a], 3);
+  // A rotation the worker has not acted on yet.
+  rotateReplicaWriterIdentity(a.db);
+  a.put("captured before the door closed", "b");
+  const published = net.calls.registrations.length;
+  const transport = () =>
+    a.db.prepare("SELECT writer, sequence FROM pdpp_transport_state").get();
+  const before = transport();
+  expect(replicationAdmitted(a.db)).toBe(true);
+  a.db
+    .prepare(
+      "UPDATE pdpp_records SET emitted_at = emitted_at WHERE record_key='a'",
+    )
+    .run();
+  expect(replicationAdmitted(a.db)).toBe(false);
+  await cycles([a], 3);
+  expect(net.calls.registrations).toHaveLength(published);
+  // No identity or rebaseline work either.
+  expect(transport()).toEqual(before);
 });
 
 it.runIf(nightly)(

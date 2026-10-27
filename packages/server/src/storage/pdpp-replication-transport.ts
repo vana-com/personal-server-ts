@@ -62,6 +62,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/outcome";
 import { replicaCopyKey } from "@opendatalabs/personal-server-ts-core/replication/copy-promotion";
 import { REPLICA_REFETCH_BUDGET } from "./pdpp-replica-copies.js";
+import { captureWrites, replicationAdmitted } from "./pdpp-replication-door.js";
 import {
   defaultReplicaBackoff,
   REPLICA_TERMINAL,
@@ -322,24 +323,29 @@ export function createReplicaTransportWorker(deps: {
    * One validated authority context for every phase: the expected owner, the
    * persisted binding, the transport port's owner and the writer identity's
    * owner must agree. Checked before any phase runs, so a wrong-owner reopen
-   * cannot encrypt, publish or import.
+   * cannot encrypt, publish or import. False, with nothing written, when the
+   * replication door closed since the step began.
    */
-  function authority(identity: ReplicaWriterIdentity) {
+  function authority(identity: ReplicaWriterIdentity): boolean {
     const owner = deps.expected().owner;
-    db.transaction(() => {
-      db.prepare(
-        "INSERT OR IGNORE INTO pdpp_transport_state (id,owner,writer) VALUES (1,?,?)",
-      ).run(owner, identity.transportWriter);
-      const bound = state();
-      if (
-        bound.owner !== owner ||
-        identity.seed.owner !== owner.toLowerCase() ||
-        (transport.owner !== undefined &&
-          transport.owner.toLowerCase() !== owner.toLowerCase())
-      )
-        throw new ReplicaAuthorityError();
-      if (bound.writer !== identity.transportWriter) startWriter(identity);
-    }).immediate();
+    return db
+      .transaction(() => {
+        if (!replicationAdmitted(db)) return false;
+        db.prepare(
+          "INSERT OR IGNORE INTO pdpp_transport_state (id,owner,writer) VALUES (1,?,?)",
+        ).run(owner, identity.transportWriter);
+        const bound = state();
+        if (
+          bound.owner !== owner ||
+          identity.seed.owner !== owner.toLowerCase() ||
+          (transport.owner !== undefined &&
+            transport.owner.toLowerCase() !== owner.toLowerCase())
+        )
+          throw new ReplicaAuthorityError();
+        if (bound.writer !== identity.transportWriter) startWriter(identity);
+        return true;
+      })
+      .immediate();
   }
   /**
    * A new writer identity (re-registration, reset or restore) starts its own
@@ -349,10 +355,11 @@ export function createReplicaTransportWorker(deps: {
    * operation writer, which no receiver accepts from the new one. The
    * baseline carries their effect instead, so a peer that missed any old
    * batch still converges. The same transaction switches the writer and pins
-   * the baseline; a crash resumes it from its durable cursor.
+   * the baseline; a crash resumes it from its durable cursor. The rebaseline
+   * is a capture, so the door's fence does not count it as a bypass.
    */
   function startWriter(identity: ReplicaWriterIdentity) {
-    const baseline = deps.exporter.rebaseline();
+    const baseline = captureWrites(db, () => deps.exporter.rebaseline());
     db.prepare(
       "UPDATE pdpp_transport_state SET writer=?,sequence=0,previous_json=NULL,baseline_cursor=?,baseline_done=0,tail_cursor=NULL WHERE id=1",
     ).run(identity.transportWriter, baseline?.after ?? 0);
@@ -2075,7 +2082,14 @@ export function createReplicaTransportWorker(deps: {
   async function step(
     input: { budget?: ReplicaBudget; signal?: AbortSignal } = {},
   ): Promise<ProgressReport> {
-    if (!enabled() || running || activeDatabases.has(databaseKey))
+    // A closed door stops replication for good: no identity, capture or
+    // publish work.
+    if (
+      !enabled() ||
+      running ||
+      activeDatabases.has(databaseKey) ||
+      !replicationAdmitted(db)
+    )
       return idle();
     // Writer ids come from this server's own registration. Until it is
     // registered under the owner, nothing runs.
@@ -2110,7 +2124,7 @@ export function createReplicaTransportWorker(deps: {
     activeDatabases.add(databaseKey);
     try {
       // Under the writer lock: a new identity resets the writer's chain.
-      authority(own.identity);
+      if (!authority(own.identity)) return idle();
       // Only this process owns the worker. None of these hidden stages can be published.
       db.transaction(() => {
         db.prepare("DELETE FROM pdpp_transport_preparing").run();
