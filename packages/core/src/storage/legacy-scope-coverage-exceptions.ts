@@ -13,3 +13,14 @@ export const LEGACY_COVERAGE_EXCEPTIONS = [
 export const LEGACY_INTEGER_ROUNDING_EXCEPTIONS = [
   { scope: "oura.sleep", path: "$.sleepPeriods[].averageHrv" },
 ] as const;
+
+/** Legacy ChatGPT conversation updates used Unix seconds rather than ISO strings. */
+export const LEGACY_EPOCH_TIMESTAMP_EXCEPTIONS = [
+  {
+    scope: "chatgpt.conversations",
+    path: "$.conversations[].update_time",
+    reason:
+      "legacy collector wrote Unix seconds; canonical carries an ISO timestamp",
+    authority: "canonical",
+  },
+] as const;
