@@ -10,6 +10,11 @@ import {
   replicaWriterSeedSchema,
   type ReplicaWriterSeed,
 } from "@opendatalabs/personal-server-ts-core/replication/writer-identity";
+import {
+  ReplicationRefusedError,
+  type ReplicationRefusal,
+} from "@opendatalabs/personal-server-ts-core/replication/door";
+import { replicationAdmitted } from "./pdpp-replication-door.js";
 
 /**
  * This server's replica writer identity (host contract §3.2). Each row is one
@@ -88,7 +93,14 @@ export function currentReplicaWriterIdentity(
     : undefined;
 }
 
+/**
+ * The only identity write. Run inside the caller's transaction, so the door
+ * check and the insert are atomic: once the door is closed, no identity is
+ * established or rotated.
+ */
 function insert(db: Database, seed: ReplicaWriterSeed) {
+  if (!replicationAdmitted(db))
+    throw new ReplicationRefusedError("reenable_refused");
   const s = replicaWriterSeedSchema.parse(seed);
   const writers = deriveReplicaWriters(s);
   db.prepare(
@@ -122,7 +134,8 @@ function registeredId(record: ReplicaRosterRecord | null, owner: string) {
  *
  * The first identity requires an empty replica journal: operations captured
  * before it carry another writer id, which receivers refuse. A database that
- * captured under the old random writer ids starts fresh.
+ * captured under the old random writer ids starts fresh. Throws
+ * `ReplicationRefusedError` instead of writing once the door is closed.
  */
 export function establishReplicaWriterIdentity(
   db: Database,
@@ -167,7 +180,10 @@ export function establishReplicaWriterIdentity(
 /**
  * A new nonce under the same registration, before new writes. Hosts call it
  * after a replication reset and after restoring or cloning a database: both
- * copies would otherwise continue the same writer sequences.
+ * copies would otherwise continue the same writer sequences. On a database
+ * whose replication door is closed it throws `ReplicationRefusedError` and
+ * writes nothing: that database never replicates again, so it has no writer
+ * to rotate, and a restore path may ignore the refusal.
  */
 export function rotateReplicaWriterIdentity(
   db: Database,
@@ -191,13 +207,17 @@ export type ReplicaWriterIdentityState =
   | {
       tag: "waiting";
       reason: "server_not_registered" | "roster_unavailable";
-    };
+    }
+  /** The replication door closed; it stays closed. */
+  | { tag: "refused"; reason: ReplicationRefusal };
 
 /**
  * Enable step: read this server's own roster record and establish or
  * update the identity from it. Waits while the server is not registered,
  * revoked, or registered under another owner. While the roster is
- * unavailable an existing identity stays usable; a missing one waits.
+ * unavailable an existing identity stays usable; a missing one waits. The
+ * roster read writes nothing; if the door closes during it, the identity
+ * write refuses.
  */
 export async function enableReplicaWriterIdentity(input: {
   db: Database;
@@ -232,6 +252,8 @@ export async function enableReplicaWriterIdentity(input: {
       error.code === "replica_identity_not_registered"
     )
       return { tag: "waiting", reason: "server_not_registered" };
+    if (error instanceof ReplicationRefusedError)
+      return { tag: "refused", reason: error.reason };
     throw error;
   }
 }

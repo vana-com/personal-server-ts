@@ -17,6 +17,7 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import { REPLICA_ROSTER_MAX_AGE_MS } from "@opendatalabs/personal-server-ts-core/replication/roster";
 import { compareRevisions } from "@opendatalabs/personal-server-ts-core/replication/revision";
+import { ReplicationRefusedError } from "@opendatalabs/personal-server-ts-core/replication/door";
 import {
   deriveReplicaWriters,
   replicaBatchTypedData,
@@ -701,10 +702,54 @@ it("a write outside capture closes the door: the next step publishes nothing", a
     )
     .run();
   expect(replicationAdmitted(a.db)).toBe(false);
+  // Rotation, the restore path, refuses too and writes nothing.
+  const incarnation = identity(a).incarnation;
+  expect(() => rotateReplicaWriterIdentity(a.db)).toThrow(
+    ReplicationRefusedError,
+  );
+  expect(identity(a).incarnation).toBe(incarnation);
   await cycles([a], 3);
   expect(net.calls.registrations).toHaveLength(published);
   // No identity or rebaseline work either.
   expect(transport()).toEqual(before);
+});
+
+it("the door closes while the roster read is pending: no new identity, nothing published", async () => {
+  const net = network();
+  const a = transportDevice(net, { preexisting: "kept" });
+  await cycles([a], 3);
+  // Re-registered at the gateway: the next roster answer differs from the
+  // stored identity.
+  net.roster.deregister(a.authority.signer.address);
+  net.roster.register(a.authority.signer.address, owner);
+  clock.advance(REPLICA_ROSTER_MAX_AGE_MS);
+  const read = net.roster.port.server.bind(net.roster.port);
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  let asked!: () => void;
+  const reading = new Promise<void>((resolve) => (asked = resolve));
+  net.roster.port.server = async (...args) => {
+    asked();
+    await held;
+    return read(...args);
+  };
+  const identities = () =>
+    a.db
+      .prepare("SELECT count(*) AS n FROM pdpp_replica_writer_identity")
+      .get();
+  const before = identities();
+  const published = net.calls.registrations.length;
+  const step = a.step();
+  await reading;
+  a.db
+    .prepare(
+      "UPDATE pdpp_records SET emitted_at = emitted_at WHERE record_key='a'",
+    )
+    .run();
+  release();
+  await step;
+  expect(identities()).toEqual(before);
+  expect(net.calls.registrations).toHaveLength(published);
 });
 
 it.runIf(nightly)(

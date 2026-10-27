@@ -142,7 +142,10 @@ write. If a host does not, the copy continues the old writer's sequences.
 Peers that already imported the original's batch at a sequence quarantine the
 copy's batch at that sequence as `batch_equivocation` and keep the first one.
 Every later batch of the copy needs that quarantined predecessor, so all of
-the copy's later changes stay blocked at those peers.
+the copy's later changes stay blocked at those peers. On a database whose
+replication door is closed, rotation throws `ReplicationRefusedError` and
+writes nothing; that database never replicates again, so the host may ignore
+the refusal.
 
 ### 3.3 The batch statement
 

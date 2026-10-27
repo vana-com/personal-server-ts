@@ -83,9 +83,11 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
   exactly where the original does. A state no retained operation explains
   takes a new counter. The rebaseline runs inside the door's capture guard. A
   crash during the baseline resumes from its durable cursor.
-- Every step checks the replication door first, and again in the authority
-  transaction after the roster read. Once the door is closed, the step returns
-  idle with no identity, rebaseline or publish work.
+- Every step checks the replication door first. The roster read writes
+  nothing; the identity write (establish or rotate) checks the door in its own
+  transaction and refuses once it is closed, and the writer switch and
+  rebaseline check it again in theirs. So a door that closes during the roster
+  read leaves no new identity, rebaseline or publication.
 - Completion dependencies and blob-claim reuse consider only the current
   operation writer, so every dependency a completion names is in a batch the
   current writer publishes.

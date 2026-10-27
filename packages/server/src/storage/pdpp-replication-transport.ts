@@ -2106,6 +2106,7 @@ export function createReplicaTransportWorker(deps: {
     } finally {
       running = false;
     }
+    if (own.tag === "refused") return idle();
     if (own.tag === "waiting")
       return {
         ...idle(),
