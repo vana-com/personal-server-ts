@@ -21,6 +21,14 @@ export const REPLICA_MAX_BLOB_BYTES = 100 * 1024 * 1024;
  * manifest may name for its payload length (`replicaFramedBytesBound`).
  */
 export const REPLICA_FRAGMENT_OVERHEAD_BYTES = 4096;
+/** Nesting that no manifest or fragment reaches. */
+export const REPLICA_MAX_JSON_DEPTH = 16;
+/**
+ * Structural characters (`[`, `{`, `,` and `:`) of a manifest at the
+ * fragment limit, with room for its statement. A small document of tiny
+ * values allocates far more than its size, so this is bounded before parsing.
+ */
+export const REPLICA_MAX_JSON_TOKENS = 8 * REPLICA_MAX_FRAGMENTS + 4096;
 const token = z.string().regex(/^[a-f0-9]{32}$/);
 const digest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const integer = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
@@ -194,25 +202,49 @@ export class ReplicaManifestRefused extends Error {
   }
 }
 
-/**
- * The envelope `collectedAt` of manifest plaintext, which the slot's metadata
- * hash commits to. Undefined when there is none, so the bytes cannot match.
- */
-export function replicaManifestCollectedAt(
-  plaintext: Uint8Array,
-): string | undefined {
-  try {
-    const value: unknown = JSON.parse(
-      new TextDecoder("utf-8", { fatal: true }).decode(plaintext),
-    );
-    const collectedAt =
-      typeof value === "object" && value !== null
-        ? (value as { collectedAt?: unknown }).collectedAt
-        : undefined;
-    return typeof collectedAt === "string" ? collectedAt : undefined;
-  } catch {
-    return undefined;
+/** Replica JSON over a bound that no writer reaches. */
+export class ReplicaJsonRefused extends Error {
+  constructor() {
+    super("replica JSON over its depth or token bound");
+    this.name = "ReplicaJsonRefused";
   }
+}
+
+export interface ParsedReplicaJson {
+  encoded: string;
+  value: unknown;
+}
+
+/**
+ * Parse replica JSON. One pass without recursion bounds nesting and
+ * structural tokens before `JSON.parse` allocates anything, so the recursive
+ * work after it (schemas, `canonicalJson`) stays inside those bounds. Throws
+ * ReplicaJsonRefused over a bound, and the parser's own error for bytes that
+ * are not UTF-8 JSON.
+ */
+export function parseReplicaJson(plaintext: Uint8Array): ParsedReplicaJson {
+  const encoded = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
+  let depth = 0;
+  let tokens = 0;
+  let quoted = false;
+  for (let index = 0; index < encoded.length; index++) {
+    const code = encoded.charCodeAt(index);
+    if (quoted) {
+      if (code === 0x5c) index++;
+      else if (code === 0x22) quoted = false;
+      continue;
+    }
+    if (code === 0x22) quoted = true;
+    else if (code === 0x5d || code === 0x7d) depth--;
+    else if (code === 0x5b || code === 0x7b || code === 0x2c || code === 0x3a) {
+      if (
+        ++tokens > REPLICA_MAX_JSON_TOKENS ||
+        ((code === 0x5b || code === 0x7b) && ++depth > REPLICA_MAX_JSON_DEPTH)
+      )
+        throw new ReplicaJsonRefused();
+    }
+  }
+  return { encoded, value: JSON.parse(encoded) };
 }
 
 /**
@@ -248,8 +280,8 @@ export function decodeReplicaFragment(
   scope: string,
   owner: string,
 ): ReplicaFragment {
-  const encoded = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
-  const wrapper = DataFileEnvelopeSchema.parse(JSON.parse(encoded));
+  const { encoded, value } = parseReplicaJson(plaintext);
+  const wrapper = DataFileEnvelopeSchema.parse(value);
   const fragment = replicaFragmentSchema.parse(wrapper.data.fragment);
   if (
     canonicalJson(wrapper) !== encoded ||
@@ -391,54 +423,69 @@ export async function prepareReplicaManifest(input: {
 }
 
 /**
- * Decode a manifest fetched from `<scope>/<version>`, after its hash pair
- * matches the finalized commitment of that slot. The caller then authorizes
- * its statement against `replicaManifestFacts(manifest, version)`; this check
- * binds only owner and writer scope. Throws ReplicaManifestRefused.
+ * Decode manifest plaintext. A received manifest goes through
+ * `receiveReplicaManifest`, which matches its bytes to the slot's finalized
+ * commitment first. The caller then authorizes its statement against
+ * `replicaManifestFacts(manifest, version)`; this check binds only owner and
+ * writer scope. Throws ReplicaManifestRefused and nothing else.
  */
 export function decodeReplicaManifest(
   plaintext: Uint8Array,
   scope: string,
   owner: string,
 ): ReplicaManifest {
-  let encoded: string;
-  let wrapper: ReturnType<typeof DataFileEnvelopeSchema.parse>;
+  let parsed: ParsedReplicaJson;
   try {
-    encoded = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
-    wrapper = DataFileEnvelopeSchema.parse(JSON.parse(encoded));
+    parsed = parseReplicaJson(plaintext);
   } catch {
     throw new ReplicaManifestRefused("manifest_invalid");
   }
-  if (canonicalJson(wrapper) !== encoded)
+  return decodeParsedReplicaManifest(parsed, scope, owner);
+}
+
+/** `decodeReplicaManifest` after `parseReplicaJson`. Throws ReplicaManifestRefused and nothing else. */
+export function decodeParsedReplicaManifest(
+  { encoded, value }: ParsedReplicaJson,
+  scope: string,
+  owner: string,
+): ReplicaManifest {
+  try {
+    const wrapper = DataFileEnvelopeSchema.safeParse(value);
+    if (!wrapper.success || canonicalJson(wrapper.data) !== encoded)
+      throw new ReplicaManifestRefused("manifest_invalid");
+    if (wrapper.data.scope !== scope)
+      throw new ReplicaManifestRefused("writer_mismatch");
+    const claimed = wrapper.data.data.manifest;
+    const parsed = replicaManifestSchema.safeParse(claimed);
+    if (!parsed.success)
+      throw new ReplicaManifestRefused(
+        typeof claimed === "object" &&
+          claimed !== null &&
+          !replicaBatchAuthoritySchema.safeParse(
+            (claimed as { authority?: unknown }).authority,
+          ).success
+          ? "signature_invalid"
+          : "manifest_invalid",
+      );
+    const manifest = parsed.data;
+    if (manifest.owner !== owner)
+      throw new ReplicaManifestRefused("partition_mismatch");
+    if (scope !== replicaScope(manifest.writer))
+      throw new ReplicaManifestRefused("writer_mismatch");
+    if (
+      wrapper.data.collectedAt !== manifest.collectedAt ||
+      (manifest.sequence === 1) !== (manifest.previous === null) ||
+      manifest.fragments.length > manifest.totalBytes ||
+      manifest.fragments.reduce((sum, f) => sum + f.bytes, 0) >
+        replicaFramedBytesBound(manifest.totalBytes, manifest.fragments.length)
+    )
+      throw new ReplicaManifestRefused("manifest_invalid");
+    return manifest;
+  } catch (error) {
+    // Pure checks of authentic bytes: whatever they throw is terminal.
+    if (error instanceof ReplicaManifestRefused) throw error;
     throw new ReplicaManifestRefused("manifest_invalid");
-  if (wrapper.scope !== scope)
-    throw new ReplicaManifestRefused("writer_mismatch");
-  const claimed = wrapper.data.manifest;
-  const parsed = replicaManifestSchema.safeParse(claimed);
-  if (!parsed.success)
-    throw new ReplicaManifestRefused(
-      typeof claimed === "object" &&
-        claimed !== null &&
-        !replicaBatchAuthoritySchema.safeParse(
-          (claimed as { authority?: unknown }).authority,
-        ).success
-        ? "signature_invalid"
-        : "manifest_invalid",
-    );
-  const manifest = parsed.data;
-  if (manifest.owner !== owner)
-    throw new ReplicaManifestRefused("partition_mismatch");
-  if (scope !== replicaScope(manifest.writer))
-    throw new ReplicaManifestRefused("writer_mismatch");
-  if (
-    wrapper.collectedAt !== manifest.collectedAt ||
-    (manifest.sequence === 1) !== (manifest.previous === null) ||
-    manifest.fragments.length > manifest.totalBytes ||
-    manifest.fragments.reduce((sum, f) => sum + f.bytes, 0) >
-      replicaFramedBytesBound(manifest.totalBytes, manifest.fragments.length)
-  )
-    throw new ReplicaManifestRefused("manifest_invalid");
-  return manifest;
+  }
 }
 
 /**

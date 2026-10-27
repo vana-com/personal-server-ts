@@ -154,14 +154,27 @@ only if the version is still next when the manifest commits. Fragments (format
 version 3) carry no statement: the signed manifest names their exact bytes.
 
 **Receiver checks**, in §3.4 order. The receiver waits for finality, then
-reads the manifest. The read stops at the storage cap (`maxBlobBytes`), and
-decryption refuses a compressed OpenPGP message before it inflates. No writer
-makes either, and neither can be checked against the commitment, whose data
-hash is over the plaintext, so both are `manifest_invalid`. The receiver then
-checks the plaintext's hash pair against the finalized commitment. A mismatch
-is `commitment_mismatch` and retries, so replaced storage bytes cannot get a
-real manifest quarantined. Only matching bytes are classified, and each
-refusal below is terminal for that slot. Only an authorized manifest's
+passes the manifest through one boundary, `receiveReplicaManifest`
+(`core/src/replication/receive.ts`), which returns a typed receipt. The read
+stops at the storage cap (`maxBlobBytes`); the DPv2 transport refuses a
+storage adapter without `downloadBounded`, so no read is unbounded. Before any
+KDF runs, decryption refuses a compressed OpenPGP message and any message
+outside the profile the SDK writers emit: one v4 password packet with
+iterated, salted SHA-256 S2K at count byte 224 or less, then one v1
+integrity-protected data packet. The plaintext is then scanned without
+recursion, and nesting deeper than `REPLICA_MAX_JSON_DEPTH` (16) or more
+structural tokens than `REPLICA_MAX_JSON_TOKENS` is refused before
+`JSON.parse`. No writer makes any of these bytes, and none can be checked
+against the commitment, whose data hash is over the plaintext and whose
+metadata hash needs the parsed `collectedAt`, so all are `manifest_invalid`.
+The receiver then checks the plaintext's hash pair against the finalized
+commitment. A mismatch, plaintext that is not JSON, or JSON without a string
+`collectedAt` is `commitment_mismatch` and retries, and a read or decrypt
+error retries as `download_failed`, so replaced storage bytes that pass the
+checks above cannot get a real manifest quarantined. Only matching bytes are
+classified: any throw while classifying them is a typed refusal,
+`manifest_invalid` unless a check below names another, and each refusal is
+terminal for that slot. Only an authorized manifest's
 fragments are fetched. Each fragment read stops at its manifest entry's
 length and is charged against the step's byte budget; its sha256 is checked
 before it is decrypted.

@@ -4,7 +4,7 @@ import { StorageError } from "@opendatalabs/vana-sdk/storage/index";
 import { ServerSigningUnavailableError } from "../../errors/catalog.js";
 import type { ServerConfig } from "../../schemas/server-config.js";
 import type { ServerAccount } from "../../keys/server-account.js";
-import type { StorageAdapter } from "./interface.js";
+import type { BoundedStorageAdapter, StorageAdapter } from "./interface.js";
 import { createAudienceVanaAdapter } from "./vana-audience.js";
 import { createSdkStorageAdapter } from "./sdk.js";
 
@@ -33,7 +33,7 @@ export function createVanaSyncStorageAdapter(params: {
   reads?: "signed" | "public";
   /** Authentication origin, independently of a preview routing endpoint. */
   audience?: string;
-}): StorageAdapter {
+}): BoundedStorageAdapter {
   const endpoint = resolveVanaStorageEndpoint(params.config);
   // The SDK's vana-storage provider lowercases the owner before building the
   // blob path (and its URL validator compares against the lowercased form),
@@ -51,9 +51,15 @@ export function createVanaSyncStorageAdapter(params: {
 
   // enclave sandbox --> public blob GET ----------> vana-storage
   // desktop/cloud ---> signed PUT / GET / DELETE -> vana-storage
+  const downloadBounded = boundedBlobDownload(
+    `${endpoint}/v1/chains/${chainId}/blobs/${owner}/`,
+  );
   if (params.reads === PUBLIC_READS) {
     // TODO(decision): blob reads stay public (architecture, resolved 2026-09-02); revisit if storage adds read auth.
-    return createPublicReadAdapter({ endpoint, chainId, owner });
+    return {
+      ...createPublicReadAdapter({ endpoint, chainId, owner }),
+      downloadBounded,
+    };
   }
 
   const adapter =
@@ -90,30 +96,35 @@ export function createVanaSyncStorageAdapter(params: {
             },
           },
         );
-  // Blob GET is public by the existing storage contract. Use the supported
-  // canonical URL directly so bounded recovery never enters SDK blob buffering.
-  return {
-    ...adapter,
-    async downloadBounded(url, budget) {
-      const prefix = `${endpoint}/v1/chains/${chainId}/blobs/${owner}/`;
-      const parsed = new URL(url);
-      if (
-        !parsed.href.startsWith(prefix) ||
-        ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)
-      )
-        throw new Error("Blob URL does not match configured namespace");
-      budget.charge();
-      const response = await fetch(parsed.href, {
-        signal: budget.signal,
-        cache: "no-store",
-        redirect: "error",
-      });
-      if (!response.ok) {
-        await response.body?.cancel();
-        throw new Error(`Blob download failed (${response.status})`);
-      }
-      return readBoundedResponse(response, budget);
-    },
+  return { ...adapter, downloadBounded };
+}
+
+/**
+ * Blob GET is public by the existing storage contract, so signed and public
+ * adapters read the canonical URL directly. The read never enters SDK blob
+ * buffering: it stops on `Content-Length` or cancels the stream at the budget.
+ */
+function boundedBlobDownload(
+  prefix: string,
+): BoundedStorageAdapter["downloadBounded"] {
+  return async (url, budget) => {
+    const parsed = new URL(url);
+    if (
+      !parsed.href.startsWith(prefix) ||
+      ENCODED_PATH_SEPARATOR_PATTERN.test(parsed.pathname)
+    )
+      throw new Error("Blob URL does not match configured namespace");
+    budget.charge();
+    const response = await fetch(parsed.href, {
+      signal: budget.signal,
+      cache: "no-store",
+      redirect: "error",
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(`Blob download failed (${response.status})`);
+    }
+    return readBoundedResponse(response, budget);
   };
 }
 

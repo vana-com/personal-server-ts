@@ -199,14 +199,21 @@ manifest before it is decrypted. Each failure is a typed quarantine of that
 item only. A batch that fails any check never touches writer state, so it
 cannot occupy a sequence or a predecessor slot of a real writer.
 
-1. Read the manifest, stopping at the storage cap, and decrypt it, refusing
-   a compressed OpenPGP message. Either refusal is `manifest_invalid`, because
-   no writer makes such bytes and the commitment hashes plaintext the receiver
-   would have to inflate. Check the plaintext's hash pair against the
-   finalized commitment; a mismatch retries as `commitment_mismatch`. Only
-   then decode. A wrapper that is not the canonical envelope, a zero fragment
-   length, facts that disagree with each other, or entry bytes over the
-   framed bound (§6) is `manifest_invalid`. A manifest without a statement is
+1. One boundary, `receiveReplicaManifest` (`core/src/replication/receive.ts`),
+   runs this step. Read the manifest, stopping at the storage cap. Before any
+   KDF runs, refuse a compressed OpenPGP message and any message outside the
+   writers' profile: one v4 password packet with iterated, salted SHA-256 S2K
+   at count byte 224 or less, then one v1 integrity-protected data packet.
+   Decrypt, then refuse plaintext nested deeper than 16 or with more
+   structural tokens than a manifest at the fragment limit needs, before it
+   is parsed. Each refusal is `manifest_invalid`, because no writer makes such
+   bytes and the commitment hashes plaintext the receiver would have to make
+   or parse. Check the plaintext's hash pair against the finalized
+   commitment; a mismatch, or plaintext with no `collectedAt`, retries as
+   `commitment_mismatch`. Only then decode. A wrapper that is not the
+   canonical envelope, a zero fragment length, facts that disagree with each
+   other, entry bytes over the framed bound (§6), or anything else that throws
+   while decoding is `manifest_invalid`. A manifest without a statement is
    `signature_invalid`.
 2. Recover the signer. It must equal `server`, and the statement must sign
    this manifest at the version it is registered at.
@@ -331,9 +338,11 @@ export interface ReplicaCall {
 
 Today `get` and `getFragment` take `ReplicaRead` (`{ maxBytes, signal }`):
 `get` is bounded by the storage cap and `getFragment` by the manifest entry's
-length. The DPv2 adapter uses the storage adapter's `downloadBounded`, which
-stops on `Content-Length` or cancels the stream, and otherwise checks the
-length after the read. An oversize read throws `ReplicaObjectRefused`.
+length. The DPv2 adapter reads only through the storage adapter's
+`downloadBounded`, which stops on `Content-Length` or cancels the stream; it
+refuses at construction a storage adapter without one. Both Vana storage
+adapters, signed and public-read, provide it. An oversize read throws
+`ReplicaObjectRefused`.
 
 The adapter must stop its I/O on abort. `abortable` (`coordinator.ts:100-123`)
 only drops a late result. Adapters do not retry; a failure is a verdict the
@@ -495,7 +504,9 @@ There is no blob-size cap.
 - **Memory:** at most one fragment per direction in memory. Fragments are
   1 MiB on Lite and 4 MiB on Node.
 - **Receive bound:** a manifest read stops at the storage cap and a fragment
-  read at its entry's length. Fragment reads count against the step's byte
+  read at its entry's length. A received OpenPGP message runs at most one
+  iterated SHA-256 KDF over 16 MiB, and received JSON is at most 16 deep
+  (`REPLICA_MAX_JSON_DEPTH`). Fragment reads count against the step's byte
   budget. The sum of a manifest's entry bytes must fit
   `replicaFramedBytesBound(totalBytes, count)` (`transport.ts`): the base64
   of the signed `totalBytes` plus a fixed per-fragment overhead. This is a

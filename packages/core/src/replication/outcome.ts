@@ -134,8 +134,9 @@ export interface ReplicaQuarantineProof {
     | "source_binding_conflict"
     | "local_mapping_conflict"
     /**
-     * A finalized manifest is over the storage cap or compressed, or its
-     * authentic bytes decode to an invalid statement.
+     * A finalized manifest is over the storage cap, compressed, outside the
+     * writers' OpenPGP profile or the JSON bounds, or its authentic bytes
+     * decode to an invalid statement.
      */
     | "manifest_invalid"
     /**

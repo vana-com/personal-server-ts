@@ -12,6 +12,10 @@ import {
   ReplicaCarrierMismatchError,
 } from "./pdpp-replication-transport.js";
 import { unprovisionConnection } from "./pdpp-replica-contract.test-utils.js";
+import {
+  readBoundedResponse,
+  type ByteBudget,
+} from "@opendatalabs/personal-server-ts-core/additions";
 import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
 import {
   enableReplicaTestIdentity,
@@ -133,6 +137,12 @@ function network(realCrypto = false, cap = 8192) {
       const bytes = blobs.get(key);
       if (!bytes) throw new Error("404");
       return new Uint8Array(bytes);
+    },
+    async downloadBounded(key: string, budget: ByteBudget) {
+      return readBoundedResponse(
+        new Response(await storage.download(key)),
+        budget,
+      );
     },
     delete: async () => false,
     exists: async (key: string) => blobs.has(key),

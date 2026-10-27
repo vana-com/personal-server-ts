@@ -1,4 +1,4 @@
-export type { StorageAdapter } from "./interface.js";
+export type { BoundedStorageAdapter, StorageAdapter } from "./interface.js";
 export { StoredBlobConflictError } from "./interface.js";
 export {
   createSdkStorageAdapter,

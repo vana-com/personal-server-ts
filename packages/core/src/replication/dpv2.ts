@@ -5,7 +5,14 @@ import {
   encryptWithPassword,
   type GatewayClient,
 } from "@opendatalabs/vana-sdk/browser";
-import { CompressedDataPacket, decrypt, readMessage } from "openpgp";
+import {
+  CompressedDataPacket,
+  decrypt,
+  enums,
+  readMessage,
+  SymEncryptedIntegrityProtectedDataPacket,
+  SymEncryptedSessionKeyPacket,
+} from "openpgp";
 import {
   bytesToHex,
   encodeAbiParameters,
@@ -13,7 +20,7 @@ import {
   stringToHex,
   type Hex,
 } from "viem";
-import type { StorageAdapter } from "../storage/adapters/interface.js";
+import type { BoundedStorageAdapter } from "../storage/adapters/interface.js";
 import {
   AdditionsBudget,
   AdditionsBudgetExceeded,
@@ -85,11 +92,12 @@ export function replicaChainCommitment(dataHash: Hex, metadataHash: Hex): Hex {
 }
 /**
  * The carrier will not read an object: it is larger than the caller's bound,
- * or it is a compressed OpenPGP message, whose plaintext size the ciphertext
- * does not bound. Writers never compress.
+ * it is a compressed OpenPGP message, whose plaintext size the ciphertext
+ * does not bound, or its packets are outside the profile every writer emits,
+ * which bounds the password KDF. Writers never make any of these.
  */
 export class ReplicaObjectRefused extends Error {
-  constructor(readonly cause_: "oversize" | "compressed") {
+  constructor(readonly cause_: "oversize" | "compressed" | "profile") {
     super(`replica object refused: ${cause_}`);
     this.name = "ReplicaObjectRefused";
   }
@@ -104,7 +112,11 @@ export interface ReplicaTransportPort {
   owner?: string;
   finality?: ReplicaFinalityHints;
   encrypt(scope: string, plaintext: Uint8Array): Promise<Uint8Array>;
-  /** Refuses a compressed message, so the plaintext is never larger than `encrypted`. */
+  /**
+   * Refuses a message outside the writers' OpenPGP profile before its KDF
+   * runs, and a compressed message, so the plaintext is never larger than
+   * `encrypted`.
+   */
   decrypt(scope: string, encrypted: Uint8Array): Promise<Uint8Array>;
   /** Finalized evidence of one slot, plus the Gateway head of its scope. */
   evidence(
@@ -138,7 +150,8 @@ export function createDpv2ReplicaTransport(deps: {
   finality?: ReplicaFinalityHints;
   owner: `0x${string}`;
   masterKey: Uint8Array;
-  storage: StorageAdapter;
+  /** Every read is bounded, so an adapter without bounded reads is refused. */
+  storage: BoundedStorageAdapter;
   gateway: Pick<GatewayClient, "registerDataPoint">;
   feed: DataPointFeedPort;
   signer: Pick<ServerSigner, "signAddData">;
@@ -149,25 +162,27 @@ export function createDpv2ReplicaTransport(deps: {
     version: number,
   ) => Promise<ReplicaRegistrationEvidence>;
 }): ReplicaTransportPort {
+  if (typeof deps.storage.downloadBounded !== "function")
+    throw new TypeError(
+      "replication needs a storage adapter with bounded reads",
+    );
   const password = (scope: string) =>
     bytesToHex(deriveScopeKey(deps.masterKey, scope)).slice(2);
   const fragmentUrl = (scope: string, digest: string) =>
     deps.storage.urlForKey(replicaFragmentKey(scope, digest));
   async function download(url: string, read: ReplicaRead) {
     let bytes: Uint8Array;
-    if (deps.storage.downloadBounded) {
-      // The bounded reader charges the chunks and their contiguous copy.
-      try {
-        bytes = await deps.storage.downloadBounded(
-          url,
-          new AdditionsBudget(2 * read.maxBytes, undefined, read.signal),
-        );
-      } catch (error) {
-        if (error instanceof AdditionsBudgetExceeded)
-          throw new ReplicaObjectRefused("oversize");
-        throw error;
-      }
-    } else bytes = await deps.storage.download(url);
+    // The bounded reader charges the chunks and their contiguous copy.
+    try {
+      bytes = await deps.storage.downloadBounded(
+        url,
+        new AdditionsBudget(2 * read.maxBytes, undefined, read.signal),
+      );
+    } catch (error) {
+      if (error instanceof AdditionsBudgetExceeded)
+        throw new ReplicaObjectRefused("oversize");
+      throw error;
+    }
     if (bytes.length > read.maxBytes)
       throw new ReplicaObjectRefused("oversize");
     return bytes;
@@ -231,9 +246,42 @@ export function createDpv2ReplicaTransport(deps: {
 }
 
 /**
- * The SDK's password decryption, refusing compression before it inflates
- * anything. OpenPGP 6.3 constructs the allowed class for tag 8 before it reads
- * the packet, and wraps what `read` throws, so the refusal is a flag.
+ * The iterated S2K count byte of OpenPGP.js's default, which the SDK's
+ * `encryptWithPassword` uses: 16 MiB hashed per password attempt.
+ */
+const REPLICA_S2K_MAX_COUNT_BYTE = 224;
+
+/**
+ * Refuse packets outside the profile the SDK's `encryptWithPassword` emits on
+ * OpenPGP.js defaults, before decrypt runs the password KDF: exactly one v4
+ * password packet whose S2K is iterated and salted SHA-256 at no more than
+ * the default count, then one v1 integrity-protected data packet. So the KDF
+ * runs once, takes no memory parameter (Argon2 is refused) and hashes at most
+ * 16 MiB. Reading the packets runs no KDF.
+ */
+function checkReplicaProfile(packets: readonly unknown[]) {
+  const [session, data, ...rest] = packets;
+  const s2k = (session as { s2k?: { type?: unknown } } | undefined)?.s2k as
+    { type?: unknown; algorithm?: unknown; c?: unknown } | undefined;
+  if (
+    rest.length !== 0 ||
+    !(session instanceof SymEncryptedSessionKeyPacket) ||
+    (session as unknown as { version: unknown }).version !== 4 ||
+    s2k?.type !== "iterated" ||
+    s2k.algorithm !== enums.hash.sha256 ||
+    typeof s2k.c !== "number" ||
+    s2k.c > REPLICA_S2K_MAX_COUNT_BYTE ||
+    !(data instanceof SymEncryptedIntegrityProtectedDataPacket) ||
+    (data as unknown as { version: unknown }).version !== 1
+  )
+    throw new ReplicaObjectRefused("profile");
+}
+
+/**
+ * The SDK's password decryption inside the writers' profile, refusing
+ * compression before it inflates anything. OpenPGP 6.3 constructs the allowed
+ * class for tag 8 before it reads the packet, and wraps what `read` throws,
+ * so the refusal is a flag.
  */
 async function decryptUncompressed(encrypted: Uint8Array, password: string) {
   let compressed = false;
@@ -251,6 +299,7 @@ async function decryptUncompressed(encrypted: Uint8Array, password: string) {
   };
   try {
     const message = await readMessage({ binaryMessage: encrypted, config });
+    checkReplicaProfile(message.packets);
     const { data } = await decrypt({
       message,
       passwords: [password],

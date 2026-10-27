@@ -7,7 +7,7 @@
  * a retry. Real workers and receivers over the contract network.
  */
 import { randomUUID } from "node:crypto";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { bytesToHex, keccak256 } from "viem";
 import * as openpgp from "openpgp";
 import { deriveScopeKey } from "@opendatalabs/vana-sdk/browser";
@@ -362,3 +362,144 @@ it("fragment reads are charged to the step's byte budget", async () => {
   expect(fragmentReads(net, scope).length).toBeGreaterThan(0);
   expect(receiver.get()).toEqual({ id: "a", text: "budgeted" });
 });
+
+it("a stored manifest asking for a 1 GiB Argon2 KDF is manifest_invalid, and the KDF never runs", async () => {
+  const net = network({ realCrypto: true });
+  const receiver = transportDevice(net);
+  const r = remoteReplicaTestWriter(net.roster, owner);
+  const signed = await injectReplicaBatch(net, {
+    writer: r.writers.transport,
+    operations: [upsert(r.writers.operation, "signed")],
+    sign: r.sign,
+  });
+  // A 166-byte message whose Argon2 S2K asks for 2^20 KiB: the memory
+  // exponent is the last byte of the S2K specifier.
+  const small = await openpgp.encrypt({
+    message: await openpgp.createMessage({ binary: new Uint8Array([1]) }),
+    passwords: ["not-the-scope-key"],
+    format: "binary",
+    config: {
+      aeadProtect: true,
+      s2kType: openpgp.enums.s2k.argon2,
+      s2kArgon2Params: { passes: 1, parallelism: 1, memoryExponent: 10 },
+    },
+  });
+  const s2k = (
+    (await openpgp.readMessage({ binaryMessage: small }))
+      .packets[0] as unknown as {
+      s2k: { write(): Uint8Array; produceKey(): unknown };
+    }
+  ).s2k;
+  const specifier = s2k.write();
+  const hostile = new Uint8Array(small);
+  hostile[
+    Buffer.from(small).indexOf(Buffer.from(specifier)) + specifier.length - 1
+  ] = 20;
+  const kdf = vi
+    .spyOn(
+      Object.getPrototypeOf(s2k) as { produceKey(): unknown },
+      "produceKey",
+    )
+    .mockImplementation(() => {
+      throw new Error("the KDF ran");
+    });
+  try {
+    net.blobs.set(signed.slot, hostile);
+    await cycles([receiver], 2);
+    expect(kdf).not.toHaveBeenCalled();
+  } finally {
+    kdf.mockRestore();
+  }
+  // No writer makes these bytes, and the commitment cannot be checked
+  // without running the KDF, so they are refused before it.
+  expect(rowOf(receiver, signed.slot)).toMatchObject({
+    state: "quarantined",
+    reason: "manifest_invalid",
+  });
+  expect(fragmentReads(net, signed.manifest.scope)).toEqual([]);
+}, 30000);
+
+it("an authentic wrapper nested 6000 arrays deep is manifest_invalid, not a retry", async () => {
+  const cap = 32768;
+  const net = network({ cap });
+  const receiver = transportDevice(net, { cap });
+  const r = remoteReplicaTestWriter(net.roster, owner);
+  const signed = await injectReplicaBatch(net, {
+    writer: r.writers.transport,
+    operations: [upsert(r.writers.operation, "signed")],
+    sign: r.sign,
+  });
+  const scope = signed.manifest.scope;
+  const plaintext = new TextEncoder().encode(
+    `{"collectedAt":${JSON.stringify(at)},"data":{"manifest":null,"padding":${"[".repeat(6000)}0${"]".repeat(6000)}},"scope":${JSON.stringify(scope)},"version":"1.0"}`,
+  );
+  const slot = await registerPlaintext(net, scope, 2, plaintext);
+  await cycles([receiver], 2);
+  expect(rowOf(receiver, slot)).toMatchObject({
+    state: "quarantined",
+    reason: "manifest_invalid",
+  });
+  expect(admitted(receiver, slot)).toBe(0);
+  expect(receiver.get()).toMatchObject({ text: "signed" });
+});
+
+it("random and mutated manifests that match their commitment never retry as download_failed", async () => {
+  const cap = 65536;
+  const net = network({ cap });
+  const receiver = transportDevice(net, { cap });
+  const r = remoteReplicaTestWriter(net.roster, owner);
+  const signed = await injectReplicaBatch(net, {
+    writer: r.writers.transport,
+    operations: [upsert(r.writers.operation, "signed")],
+    sign: r.sign,
+  });
+  const scope = signed.manifest.scope;
+  const honest = new TextDecoder().decode(signed.manifest.plaintext);
+  // mulberry32, seeded so a failure replays.
+  let seed = 27;
+  const next = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const hostile = [
+    `${"[".repeat(3000)}0${"]".repeat(3000)}`,
+    `[${"0,".repeat(20000)}0]`,
+    "null",
+    "0",
+    "-1",
+    "1e308",
+    '"x"',
+    "[]",
+    "{}",
+    JSON.stringify("x".repeat(5000)),
+    JSON.stringify(`sha256:${"f".repeat(64)}`),
+    JSON.stringify(owner),
+  ];
+  const slots: string[] = [];
+  for (let version = 2; version < 42; version++) {
+    // Replace one value of the honest text, keeping the top-level collectedAt
+    // so the receiver can rebuild the commitment.
+    const values = [...honest.matchAll(/:(?:"[^"]*"|-?\d+|null|true|false)/g)];
+    const target = values[1 + Math.floor(next() * (values.length - 1))]!;
+    const replacement = hostile[Math.floor(next() * hostile.length)]!;
+    const text =
+      honest.slice(0, target.index + 1) +
+      replacement +
+      honest.slice(target.index + target[0].length);
+    slots.push(
+      await registerPlaintext(
+        net,
+        scope,
+        version,
+        new TextEncoder().encode(text),
+      ),
+    );
+  }
+  await cycles([receiver], 6);
+  const rows = slots.map((slot) => rowOf(receiver, slot));
+  for (const [index, row] of rows.entries())
+    expect(row, slots[index]).toMatchObject({ state: "quarantined" });
+  expect(rows.some((row) => row?.reason === "download_failed")).toBe(false);
+}, 60000);

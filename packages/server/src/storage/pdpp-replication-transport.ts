@@ -1,6 +1,6 @@
 import type { Database } from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { keccak256, type Hex } from "viem";
+import type { Hex } from "viem";
 import { createHash } from "node:crypto";
 import {
   binaryWriter,
@@ -23,15 +23,11 @@ import {
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import {
   decodeReplicaFragment,
-  decodeReplicaManifest,
   fragmentMatchesManifest,
   prepareReplicaManifest,
   replicaDigest,
-  replicaManifestCollectedAt,
   replicaManifestFacts,
-  replicaMetadataHash,
   replicaScope,
-  ReplicaManifestRefused,
   replicaWriterOf,
   REPLICA_MAX_BLOB_BYTES,
   type ManifestEntry,
@@ -49,6 +45,7 @@ import {
   type ReplicaTransportPort,
   type ReplicaRegistrationEvidence,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
+import { receiveReplicaManifest } from "@opendatalabs/personal-server-ts-core/replication/receive";
 import {
   abortable,
   createReplicaCoordinator,
@@ -1299,54 +1296,33 @@ export function createReplicaTransportWorker(deps: {
         );
         if (replicaRegistrationState(evidence, slot) !== "confirmed")
           return verdict(unconfirmed(evidence, slot));
-        // No writer makes a manifest over the cap or compresses one, and
-        // without compression the plaintext is smaller than the ciphertext.
-        // These bytes cannot be checked against the commitment, whose data
-        // hash is over the plaintext, so the refusal comes first.
-        let plaintext: Uint8Array;
-        let encrypted: Uint8Array;
-        try {
-          encrypted = await call(signal, () =>
-            transport.get(row.scope, row.version, { maxBytes: cap, signal }),
-          );
-          if (encrypted.length > cap)
-            throw new ReplicaObjectRefused("oversize");
-          plaintext = await call(signal, () =>
-            transport.decrypt(row.scope, encrypted),
-          );
-        } catch (error) {
-          if (error instanceof ReplicaObjectRefused)
-            return refuseSlot(row.slot, "manifest_invalid");
-          throw error;
-        }
-        const collectedAt = replicaManifestCollectedAt(plaintext);
-        const dataHash = keccak256(plaintext);
-        const metadataHash =
-          collectedAt === undefined
-            ? undefined
-            : replicaMetadataHash(row.scope, collectedAt, encrypted.length);
-        // Storage is not trusted: bytes that are not the finalized
-        // commitment are a refetch, never data.
-        if (
-          !metadataHash ||
-          replicaRegistrationState(evidence, {
-            ...slot,
-            dataHash,
-            metadataHash,
-          }) !== "confirmed"
-        )
+        // Every peer-supplied manifest crosses this one boundary. Bytes that
+        // are not the finalized commitment are a refetch, never data, so
+        // replacing stored bytes cannot get a real manifest refused; after
+        // the commitment every failure is terminal. No fragment is fetched
+        // before the manifest is authorized.
+        const receipt = await receiveReplicaManifest({
+          scope: row.scope,
+          owner: state().owner,
+          maxBytes: cap,
+          read: () =>
+            call(signal, () =>
+              transport.get(row.scope, row.version, { maxBytes: cap, signal }),
+            ),
+          decrypt: (encrypted) =>
+            call(signal, () => transport.decrypt(row.scope, encrypted)),
+          committed: (dataHash, metadataHash) =>
+            replicaRegistrationState(evidence, {
+              ...slot,
+              dataHash,
+              metadataHash,
+            }) === "confirmed",
+        });
+        if (receipt.tag === "refused")
+          return refuseSlot(row.slot, receipt.reason);
+        if (receipt.tag === "mismatch")
           throw new ReplicaProblemError("commitment_mismatch");
-        // Every other check runs only on bytes that match the finalized
-        // commitment, so replacing stored bytes cannot get a real manifest
-        // refused. No fragment is fetched before the manifest is authorized.
-        let manifest: ReplicaManifest;
-        try {
-          manifest = decodeReplicaManifest(plaintext, row.scope, state().owner);
-        } catch (error) {
-          if (error instanceof ReplicaManifestRefused)
-            return refuseSlot(row.slot, error.reason);
-          throw error;
-        }
+        const { manifest, dataHash, metadataHash } = receipt;
         const authorized = await authorizeManifest(manifest, row, signal);
         if (authorized.tag === "refused")
           return refuseSlot(row.slot, authorized.reason);
