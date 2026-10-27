@@ -815,7 +815,11 @@ export function createSqliteRecordStore(
         replica?.assertConnectionWritable(instance);
       return write();
     };
-    return db.inTransaction ? run() : db.transaction(run).immediate();
+    // Inside an outer transaction better-sqlite3 runs this as a SAVEPOINT, so
+    // a mutator that throws undoes its own writes even if the caller catches
+    // the error and commits. That is what main's per-mutator
+    // `db.transaction` gave every one of these.
+    return db.transaction(run).immediate();
   };
   /** Replica quarantine filter for read SQL; empty without replication. */
   const unquarantined = (alias: string) =>
