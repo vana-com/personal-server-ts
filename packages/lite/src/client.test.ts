@@ -283,6 +283,45 @@ describe("startPersonalServer lite handle", () => {
     await expect(upload.commit()).resolves.toMatchObject({ records: 20 });
   });
 
+  it("does not look the server up at the gateway once per batch", async () => {
+    const getServer = vi.fn().mockResolvedValue(null);
+    const gateway = createGateway({ getServer });
+    const storage = await createPersistentPsLiteStorage(
+      { kind: "custom" },
+      createMemoryPsLitePersistence(),
+      createMemoryPsLiteStagedFileStore(),
+    );
+    const runtime = createRuntime(gateway, storage);
+    const health = vi.fn();
+    const counted = {
+      ...runtime,
+      fetch(request: Request) {
+        if (new URL(request.url).pathname === "/health") health();
+        return runtime.fetch(request);
+      },
+    } as typeof runtime;
+    const ps = await startPersonalServer({
+      runtime: counted,
+      relay: false,
+      localOrigin: ORIGIN,
+      gateway,
+    });
+    const auth = { signMessage: ownerWallet.signMessage };
+    const upload = await ps.openScopeUpload!("notes.entries", auth);
+    const before = health.mock.calls.length;
+    // 12 records of 200 kB: at least three batches.
+    await upload.append(
+      Array.from({ length: 12 }, (_, i) => ({
+        id: i,
+        text: "q".repeat(200_000),
+      })),
+    );
+    await upload.append([{ id: 12, text: "last" }]);
+    await expect(upload.commit()).resolves.toMatchObject({ records: 13 });
+    // Appends and the commit address the opened origin; none asks for health.
+    expect(health.mock.calls.length).toBe(before);
+  });
+
   it("does not resend a batch that landed before a later batch of the same append failed", async () => {
     const gateway = createGateway();
     const storage = await createPersistentPsLiteStorage(

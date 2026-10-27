@@ -228,6 +228,23 @@ export function createNodeDataStorage(
     writeEnvelope(envelope: DataFileEnvelope) {
       return writeDataFile(deps.hierarchyOptions, envelope);
     },
+    // The file is durable at its final path before its row exists, and the
+    // scope lock keeps every erase of the scope (all of which take it) from
+    // running between the two.
+    writeEnvelopeAndIndex(envelope, entry) {
+      return withScopeLock(envelope.scope, async () => {
+        const written = await writeDataFile(deps.hierarchyOptions, envelope);
+        try {
+          return deps.indexManager.insert({
+            ...entry,
+            path: written.relativePath,
+            sizeBytes: entry.sizeBytes ?? written.sizeBytes,
+          });
+        } catch (err) {
+          throw new IngestPersistedError(written.relativePath, err);
+        }
+      });
+    },
     async commitEnvelope(envelope, entry, precondition) {
       const staged = await stageDataFile(deps.hierarchyOptions, envelope);
       let indexed = false;
@@ -382,6 +399,49 @@ export function createNodeDataStorage(
         deps.indexManager.deleteByPath(entry.path);
         await dropLedgerIfEmpty(scope);
         return true;
+      });
+    },
+    async deleteVersionIfEnvelopeMissing(
+      scope: string,
+      collectedAt: string,
+      fence: VersionFence,
+    ) {
+      return withScopeLock(scope, async () => {
+        let removed: boolean;
+        if (operations) {
+          removed = operations.deleteFencedVersionIfMissing(
+            scope,
+            collectedAt,
+            fence,
+          );
+        } else {
+          const current = deps.indexManager.findByPath(fence.path);
+          if (
+            !current ||
+            current.id !== fence.id ||
+            current.scope !== scope ||
+            current.collectedAt !== collectedAt
+          ) {
+            return false;
+          }
+          try {
+            await stat(
+              buildDataFilePath(
+                deps.hierarchyOptions.dataDir,
+                scope,
+                collectedAt,
+              ),
+            );
+            return false;
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          }
+          await deleteDataFile(deps.hierarchyOptions, scope, collectedAt);
+          deps.indexManager.deleteByPath(fence.path);
+          removed = true;
+        }
+        await dropLedgerIfEmpty(scope);
+        return removed;
       });
     },
     async dropUnsyncedEntry(path: string) {

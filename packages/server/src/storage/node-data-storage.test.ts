@@ -475,3 +475,164 @@ describe("createNodeDataStorage block sidecars", () => {
     expect(page.nextCursor).toBeDefined();
   });
 });
+
+describe("createNodeDataStorage.writeEnvelopeAndIndex", () => {
+  const scope = "github.events";
+  let root: string;
+  let storage: DataStoragePort;
+  let index: ReturnType<typeof createIndexManager>;
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "write-envelope-and-index-"));
+    index = createIndexManager(initializeDatabase(join(root, "index.db")));
+    storage = createNodeDataStorage({
+      indexManager: index,
+      hierarchyOptions: { dataDir: join(root, "data") },
+    });
+  });
+
+  afterEach(async () => {
+    index.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("writes the file and its row together and returns the row", async () => {
+    const envelope = createDataFileEnvelope(scope, "2026-10-11T00:00:00.000Z", {
+      value: "a",
+    });
+
+    const row = await storage.writeEnvelopeAndIndex!(envelope, {
+      fileId: null,
+      scope,
+      collectedAt: envelope.collectedAt,
+      dataPointId: "dp-1",
+      version: 3,
+    });
+
+    expect(row).toMatchObject({ scope, dataPointId: "dp-1", version: 3 });
+    expect(index.findByPath(row.path)).toEqual(row);
+    expect(
+      await readFile(
+        buildDataFilePath(join(root, "data"), scope, envelope.collectedAt),
+        "utf-8",
+      ),
+    ).toContain('"value"');
+    expect(
+      (await storage.readEnvelope(scope, envelope.collectedAt)).data,
+    ).toEqual({ value: "a" });
+  });
+
+  it("never leaves a row without its file when a scope erase runs beside it", async () => {
+    const envelope = createDataFileEnvelope(scope, "2026-10-11T00:00:00.000Z", {
+      value: "a",
+    });
+    const entry = {
+      fileId: null,
+      scope,
+      collectedAt: envelope.collectedAt,
+    };
+
+    await Promise.all([
+      storage.writeEnvelopeAndIndex!(envelope, entry),
+      storage.deleteScope(scope),
+    ]);
+
+    const rows = index.findByScope({ scope });
+    const file = await readFile(
+      buildDataFilePath(join(root, "data"), scope, envelope.collectedAt),
+      "utf-8",
+    ).then(
+      () => true,
+      () => false,
+    );
+    expect(rows.length > 0).toBe(file);
+  });
+});
+
+describe("createNodeDataStorage.deleteVersionIfEnvelopeMissing", () => {
+  const scope = "github.events";
+  const collectedAt = "2026-10-11T00:00:00.000Z";
+  let root: string;
+  let dataDir: string;
+  let storage: DataStoragePort;
+  let index: ReturnType<typeof createIndexManager>;
+
+  const replica = () => ({
+    kind: "replica" as const,
+    envelope: createDataFileEnvelope(scope, collectedAt, { value: "a" }),
+    metadata: { schemaId: null, dataPointId: "dp-1", version: 1 },
+  });
+
+  async function storeReplica() {
+    const stored = await storage.commitVersion!(replica());
+    if (stored.kind !== "stored") throw new Error("not stored");
+    return {
+      filePath: stored.writeResult.path,
+      fence: { id: stored.entry.id, path: stored.entry.path },
+    };
+  }
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "delete-if-missing-"));
+    dataDir = join(root, "data");
+    index = createIndexManager(initializeDatabase(join(root, "index.db")));
+    storage = createNodeDataStorage({
+      indexManager: index,
+      hierarchyOptions: { dataDir },
+    });
+  });
+
+  afterEach(async () => {
+    index.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("removes the row when the envelope file is absent", async () => {
+    const { filePath, fence } = await storeReplica();
+    await rm(filePath);
+
+    await expect(
+      storage.deleteVersionIfEnvelopeMissing!(scope, collectedAt, fence),
+    ).resolves.toBe(true);
+    expect(index.findByPath(fence.path)).toBeUndefined();
+  });
+
+  it("keeps the row when the envelope file is present", async () => {
+    const { fence } = await storeReplica();
+
+    await expect(
+      storage.deleteVersionIfEnvelopeMissing!(scope, collectedAt, fence),
+    ).resolves.toBe(false);
+    expect(index.findByPath(fence.path)).toBeDefined();
+  });
+
+  it("keeps the row when the file cannot be checked, which is not absence", async () => {
+    const { filePath, fence } = await storeReplica();
+    // A file where the directory should be: stat fails with ENOTDIR, not ENOENT.
+    await rm(dirname(filePath), { recursive: true });
+    await writeFile(dirname(filePath), "not a directory");
+
+    await expect(
+      storage.deleteVersionIfEnvelopeMissing!(scope, collectedAt, fence),
+    ).rejects.toMatchObject({ code: "ENOTDIR" });
+    expect(index.findByPath(fence.path)).toBeDefined();
+  });
+
+  it("keeps a version a replica write restored after the absence was seen", async () => {
+    const { filePath, fence } = await storeReplica();
+    await rm(filePath);
+    // The caller has seen the file missing. A replica write restores it and
+    // keeps the same row id, then the caller's erase runs.
+    const restored = await storage.commitVersion!(replica());
+    if (restored.kind !== "stored") throw new Error("not stored");
+    expect(restored.entry.id).toBe(fence.id);
+
+    await expect(
+      storage.deleteVersionIfEnvelopeMissing!(scope, collectedAt, fence),
+    ).resolves.toBe(false);
+    expect(index.findByPath(fence.path)).toBeDefined();
+    await expect(
+      storage.readEnvelope(scope, collectedAt),
+    ).resolves.toMatchObject({ data: { value: "a" } });
+  });
+});

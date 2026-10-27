@@ -20,7 +20,10 @@ import type {
   NewIndexEntry,
 } from "@opendatalabs/personal-server-ts-core/storage/index";
 import { withScopeLock } from "@opendatalabs/personal-server-ts-core/additions";
-import { IngestPersistedError } from "@opendatalabs/personal-server-ts-core/contracts";
+import {
+  IngestPersistedError,
+  VersionSupersededError,
+} from "@opendatalabs/personal-server-ts-core/contracts";
 import type { PsLiteStorageAdapter } from "./runtime.js";
 import { createStorageReadMethods, sortEntries } from "./storage-utils.js";
 import {
@@ -666,10 +669,28 @@ export async function createPersistentPsLiteStorage(
     }).catch(() => undefined);
   }
 
-  /** Install a row at its path, replacing any row there. Caller holds the path lock. */
-  async function installEntry(entry: NewIndexEntry): Promise<IndexEntry> {
+  /**
+   * Install a row at its path, replacing any row there. Caller holds the path
+   * lock. With `onlyIfNewest`, the row is refused when the scope already has a
+   * later `collectedAt`; that check runs in the index queue, so it is atomic
+   * with the publication.
+   */
+  async function installEntry(
+    entry: NewIndexEntry,
+    options: { onlyIfNewest?: boolean } = {},
+  ): Promise<IndexEntry> {
     let indexed: IndexEntry | undefined;
     await updateIndex((current) => {
+      if (
+        options.onlyIfNewest &&
+        current.entries.some(
+          (e) =>
+            e.scope === entry.scope &&
+            Date.parse(e.collectedAt) > Date.parse(entry.collectedAt),
+        )
+      ) {
+        throw new VersionSupersededError(entry.scope);
+      }
       const version =
         entry.version ??
         current.entries.reduce(
@@ -792,20 +813,23 @@ export async function createPersistentPsLiteStorage(
             return {
               write: (text) => file.write(text),
               abort: () => file.abort(),
-              async commit(entry): Promise<WriteResult> {
+              async commit(entry, options): Promise<WriteResult> {
                 // The rename and the index install are one step under the path
                 // lock, so no erase of this path runs between them.
                 return withPathLock(path, async () => {
                   const sizeBytes = await file.commit();
                   try {
                     // The index entry is what makes the version visible.
-                    await installEntry({
-                      ...entry,
-                      scope,
-                      collectedAt,
-                      path,
-                      sizeBytes,
-                    });
+                    await installEntry(
+                      {
+                        ...entry,
+                        scope,
+                        collectedAt,
+                        path,
+                        sizeBytes,
+                      },
+                      options,
+                    );
                   } catch (error) {
                     await dropUnindexedEnvelope(path);
                     throw error;
@@ -1164,6 +1188,29 @@ export async function createPersistentPsLiteStorage(
             (fence === undefined || e.id === fence.id),
         ),
       ).then((outcome) => outcome === true);
+    },
+
+    // Only while the envelope is absent: the check and the erase both run
+    // under the path lock that every write of this path takes. A store that
+    // throws on read is a fault, not absence, and the row stays.
+    deleteVersionIfEnvelopeMissing(scope, collectedAt, fence) {
+      const path = envelopePath(scope, collectedAt);
+      if (fence.path !== path) return Promise.resolve(false);
+      return withPathLock(path, async () => {
+        const present =
+          (await fileStore.readEnvelope(path)) ??
+          (await fallbackStore.readEnvelope(path));
+        if (present) return false;
+        const outcome = await eraseUnderPathLock(
+          path,
+          (e) =>
+            e.scope === scope &&
+            e.collectedAt === collectedAt &&
+            e.path === path &&
+            e.id === fence.id,
+        );
+        return outcome === true;
+      });
     },
 
     async deleteByFileId(fileId) {

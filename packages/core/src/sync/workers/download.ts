@@ -1097,9 +1097,11 @@ async function repairMissingBlockSidecars(
   logger: Logger,
   ctx: RecordContext,
   entry: {
+    id: number;
     scope: string;
     collectedAt: string;
     fileId: string | null;
+    dataPointId: string | null;
     schemaId: string | null;
     path: string;
   },
@@ -1144,9 +1146,49 @@ async function repairMissingBlockSidecars(
       },
       "Bounded block sidecar repair skipped because local envelope is unavailable",
     );
-    // Remove the stale index entry whose payload is gone. We can only target
-    // it by gateway fileId; DataPoint-only entries (fileId === null) are left
-    // in place (no path-keyed delete on the port) and self-heal on re-download.
+    // A failed read is not proof the envelope is gone, and one can be restored
+    // before an erase runs. Storage rechecks absence and the row's identity
+    // in the same step as the erase, and leaves the row on any fault. A row
+    // that was never synced (no fileId, no dataPointId) could not be fetched
+    // again, so it is kept.
+    if (storage.deleteVersionIfEnvelopeMissing) {
+      if (!entry.fileId && !entry.dataPointId) return "not-repaired";
+      diagnostics?.onRepair(
+        entry.scope,
+        "index exists without local payload; removing stale local index entry",
+      );
+      let removed: boolean;
+      try {
+        removed = await storage.deleteVersionIfEnvelopeMissing(
+          entry.scope,
+          entry.collectedAt,
+          { id: entry.id, path: entry.path },
+        );
+      } catch (removeError) {
+        logger.warn(
+          {
+            dataPointId: ctx.dataPointId,
+            scope: entry.scope,
+            collectedAt: entry.collectedAt,
+            error: (removeError as Error).message,
+          },
+          "Could not confirm the local envelope is missing; keeping index entry",
+        );
+        return "not-repaired";
+      }
+      logger.warn(
+        {
+          dataPointId: ctx.dataPointId,
+          scope: entry.scope,
+          collectedAt: entry.collectedAt,
+          removed,
+        },
+        "Removed stale local index entry missing local envelope",
+      );
+      return removed ? "missing-envelope" : "not-repaired";
+    }
+    // Storage without the conditional erase: a gateway-file row can still be
+    // removed by fileId; a DataPoint-only row is left in place.
     if (entry.fileId) {
       diagnostics?.onRepair(
         entry.scope,

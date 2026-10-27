@@ -141,9 +141,16 @@ export interface VersionFence {
 export interface DataVersionWriter {
   /** Append serialized envelope text. Calls must not overlap. */
   write(text: string): Promise<void>;
-  /** Finish the file, then index it as the scope's newest version. */
+  /**
+   * Finish the file, then index it as the scope's newest version. With
+   * `onlyIfNewest`, the index publishes it only if no version of the scope
+   * with a later `collectedAt` is already there; the check and the
+   * publication are one step. Otherwise nothing is published and the call
+   * throws `VersionSupersededError`.
+   */
   commit(
     entry: Omit<NewIndexEntry, "path" | "sizeBytes" | "scope" | "collectedAt">,
+    options?: { onlyIfNewest?: boolean },
   ): Promise<WriteResult>;
   /** Discard everything written. Idempotent; a no-op after `commit`. */
   abort(): Promise<void>;
@@ -321,6 +328,20 @@ export interface DataStoragePort extends RuntimeStoragePort {
     scope: string,
     collectedAt: string,
     fence?: VersionFence,
+  ): Promise<boolean>;
+  /**
+   * Erases one version (index row + local blob) only while its envelope is
+   * absent and its row is still the one the caller decided on (same local `id`
+   * and `path`). The absence check, the row check and the erase are one step
+   * under the same gate that publishes a version, so a write that restores the
+   * envelope cannot land between them. Resolves false when the envelope is
+   * present or the row was erased or replaced. Rejects when absence cannot be
+   * established (a read fault is not absence), leaving the row in place.
+   */
+  deleteVersionIfEnvelopeMissing?(
+    scope: string,
+    collectedAt: string,
+    fence: VersionFence,
   ): Promise<boolean>;
   /**
    * Drop a single unsynced index entry by path, WITHOUT touching any blob.

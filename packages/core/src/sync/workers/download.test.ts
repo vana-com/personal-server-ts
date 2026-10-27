@@ -177,6 +177,86 @@ describe("download worker", () => {
       expect(deps.storageAdapter.download).not.toHaveBeenCalled();
     });
 
+    describe("a data point whose row has no readable envelope", () => {
+      const row: IndexEntry = {
+        id: 7,
+        fileId: null,
+        schemaId: null,
+        path: RELATIVE_PATH,
+        scope: SCOPE,
+        collectedAt: COLLECTED_AT,
+        createdAt: "2026-01-21T10:00:00Z",
+        sizeBytes: 128,
+        version: 1,
+        dataPointId: DATA_POINT_ID,
+      };
+
+      function depsWithMissingEnvelope(
+        erase: (scope: string, at: string, fence: object) => Promise<boolean>,
+      ) {
+        const deps = makeMockDeps();
+        (
+          deps.storage.findByDataPointId as ReturnType<typeof vi.fn>
+        ).mockReturnValue(row);
+        deps.storage.writeBlockManifest = vi.fn();
+        deps.storage.hasScopeBlocks = vi.fn().mockResolvedValue(false);
+        deps.storage.readEnvelope = vi
+          .fn()
+          .mockRejectedValue(new Error("Envelope not found"));
+        deps.storage.deleteVersionIfEnvelopeMissing = vi.fn(erase);
+        return deps;
+      }
+
+      it("downloads it again once storage confirms the envelope is gone", async () => {
+        const deps = depsWithMissingEnvelope(async () => true);
+
+        const result = await downloadOne(deps, makeDataPointRecord());
+
+        // Storage rechecks absence and the row's identity itself.
+        expect(
+          deps.storage.deleteVersionIfEnvelopeMissing,
+        ).toHaveBeenCalledWith(SCOPE, COLLECTED_AT, {
+          id: 7,
+          path: RELATIVE_PATH,
+        });
+        expect(deps.storageAdapter.download).toHaveBeenCalledTimes(1);
+        expect(result).not.toBeNull();
+      });
+
+      it("keeps the row when storage finds the envelope restored", async () => {
+        const deps = depsWithMissingEnvelope(async () => false);
+
+        const result = await downloadOne(deps, makeDataPointRecord());
+
+        expect(result).toBeNull();
+        expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      });
+
+      it("keeps the row when absence cannot be confirmed", async () => {
+        const deps = depsWithMissingEnvelope(async () => {
+          throw new Error("EIO: input/output error");
+        });
+
+        const result = await downloadOne(deps, makeDataPointRecord());
+
+        expect(result).toBeNull();
+        expect(deps.storageAdapter.download).not.toHaveBeenCalled();
+      });
+
+      it("keeps a row that was never synced", async () => {
+        const deps = depsWithMissingEnvelope(async () => true);
+        (
+          deps.storage.findByDataPointId as ReturnType<typeof vi.fn>
+        ).mockReturnValue({ ...row, dataPointId: null });
+
+        await downloadOne(deps, makeDataPointRecord());
+
+        expect(
+          deps.storage.deleteVersionIfEnvelopeMissing,
+        ).not.toHaveBeenCalled();
+      });
+    });
+
     it("downloads a newer version of a data point indexed at an older one", async () => {
       // DPv2 ids are per (owner, scope): every version of a scope shares
       // one id, so the id alone must not dedup a new version away.

@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import type Database from "better-sqlite3";
 import type {
   ImportIntent,
@@ -361,6 +361,40 @@ export function createImportOperations(
           row.collectedAt !== collectedAt
         ) {
           return false;
+        }
+        retire("path = @path", { path: fence.path });
+        deleteDataFileSync(options, scope, collectedAt);
+        index.deleteByPath(fence.path);
+        return true;
+      });
+    },
+    /**
+     * Like `deleteFencedVersion`, and only while the envelope file is absent.
+     * The file check runs in the same immediate transaction that a replica
+     * write publishes in, so a restored file cannot be erased. Only ENOENT is
+     * absence; any other fault throws and the row stays.
+     */
+    deleteFencedVersionIfMissing(
+      scope: string,
+      collectedAt: string,
+      fence: VersionFence,
+    ): boolean {
+      return immediate(() => {
+        recover();
+        const row = index.findByPath(fence.path);
+        if (
+          !row ||
+          row.id !== fence.id ||
+          row.scope !== scope ||
+          row.collectedAt !== collectedAt
+        ) {
+          return false;
+        }
+        try {
+          statSync(buildDataFilePath(options.dataDir, scope, collectedAt));
+          return false;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
         retire("path = @path", { path: fence.path });
         deleteDataFileSync(options, scope, collectedAt);

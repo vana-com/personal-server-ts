@@ -8,6 +8,7 @@ export {
   listDataVersionsContract,
   parseDataScopeContract,
   readDataContract,
+  VersionSupersededError,
 } from "./data.js";
 export {
   BINARY_MARKER,

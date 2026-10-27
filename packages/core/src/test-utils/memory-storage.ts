@@ -209,6 +209,21 @@ export function createMemoryDataStorage(): MemoryDataStorage {
         return removed;
       });
     },
+    async deleteVersionIfEnvelopeMissing(scope, collectedAt, fence) {
+      return withScopeLock(scope, async () => {
+        if (envelopes.has(key(scope, collectedAt))) return false;
+        const removed =
+          remove(
+            (entry) =>
+              entry.scope === scope &&
+              entry.collectedAt === collectedAt &&
+              entry.id === fence.id &&
+              entry.path === fence.path,
+          ) > 0;
+        dropEmptyLedger(scope);
+        return removed;
+      });
+    },
     async dropUnsyncedEntry(path) {
       const entry = entries.find(
         (row) => row.path === path && row.dataPointId === null,

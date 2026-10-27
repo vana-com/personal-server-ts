@@ -188,6 +188,17 @@ export class IngestPersistedError extends Error {
   }
 }
 
+/**
+ * Thrown by `DataVersionWriter.commit` when a version newer than the one being
+ * written is already in the index. Nothing was published.
+ */
+export class VersionSupersededError extends Error {
+  constructor(public readonly scope: string) {
+    super(`A newer version of ${scope} was written during the upload`);
+    this.name = "VersionSupersededError";
+  }
+}
+
 async function indexWrittenEnvelope(
   storage: IngestDataContractInput["storage"],
   entry: Parameters<IngestDataContractInput["storage"]["insertEntry"]>[0],
