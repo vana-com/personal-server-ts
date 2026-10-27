@@ -487,6 +487,107 @@ describe("legacy scope coverage", () => {
     expect(proven.reasonCounts.missing_entity).toBe(1);
   });
 
+  it("covers legacy ChatGPT epoch-second update times with ISO projection timestamps", () => {
+    const verdict = compareLegacyCoverage(
+      { conversations: [{ id: "a", update_time: 1704067200.123 }] },
+      { conversations: [{ id: "a", update_time: "2024-01-01T00:00:00.123Z" }] },
+      {
+        scope: "chatgpt.conversations",
+        entityKeys: LEGACY_SCOPE_ENTITY_KEYS["chatgpt.conversations"],
+        canonicalNewer: true,
+      },
+    );
+    expect(verdict.covered).toBe(true);
+    expect(verdict.reasonCounts.type_mismatch).toBe(0);
+    expect(verdict.appliedExceptions).toEqual([
+      expect.objectContaining({ path: "$.conversations[].update_time" }),
+    ]);
+  });
+
+  it.each([
+    {
+      label: "same-time changed instant",
+      newer: false,
+      value: "2024-01-02T00:00:00Z",
+    },
+    { label: "malformed timestamp", value: "2024-01-01Tinvalid" },
+    { label: "date-only timestamp", value: "2024-01-01" },
+    { label: "null timestamp", value: null },
+    {
+      label: "millisecond epoch",
+      legacy: 1704067200123,
+      value: "2024-01-01T00:00:00.123Z",
+    },
+    {
+      label: "other scope",
+      scope: "other.conversations",
+      value: "2024-01-01T00:00:00.123Z",
+    },
+    {
+      label: "other field",
+      field: "create_time",
+      value: "2024-01-01T00:00:00.123Z",
+    },
+    { label: "nested field", nested: true, value: "2024-01-01T00:00:00.123Z" },
+    { label: "changed identity", id: "b", value: "2024-01-01T00:00:00.123Z" },
+    {
+      label: "missing conversation",
+      missing: true,
+      value: "2024-01-01T00:00:00.123Z",
+    },
+  ])(
+    "retains coverage protection for ChatGPT epoch timestamps: $label",
+    (test) => {
+      const field = test.field ?? "update_time";
+      const row = (id: string, value: unknown) => ({
+        id,
+        ...(test.nested
+          ? { metadata: { [field]: value } }
+          : { [field]: value }),
+      });
+      const verdict = compareLegacyCoverage(
+        { conversations: [row("a", test.legacy ?? 1704067200.123)] },
+        {
+          conversations: test.missing ? [] : [row(test.id ?? "a", test.value)],
+        },
+        {
+          scope: test.scope ?? "chatgpt.conversations",
+          entityKeys: LEGACY_SCOPE_ENTITY_KEYS["chatgpt.conversations"],
+          canonicalNewer: test.newer ?? true,
+        },
+      );
+      expect(verdict.covered).toBe(false);
+    },
+  );
+
+  it.each([false, true])(
+    "compares converted ChatGPT timestamps using the existing time policy (newer=%s)",
+    (canonicalNewer) => {
+      const body = (update_time: unknown) => ({
+        conversations: [{ id: "a", update_time }],
+      });
+      const options = {
+        scope: "chatgpt.conversations",
+        entityKeys: LEGACY_SCOPE_ENTITY_KEYS["chatgpt.conversations"],
+        canonicalNewer,
+      };
+      expect(
+        compareLegacyCoverage(
+          body(1704067200.123),
+          body("2023-12-31T19:00:00.123-05:00"),
+          options,
+        ).covered,
+      ).toBe(true);
+      expect(
+        compareLegacyCoverage(
+          body(1704067200.123),
+          body("2024-01-02T00:00:00Z"),
+          options,
+        ).covered,
+      ).toBe(canonicalNewer);
+    },
+  );
+
   it("compares ISO timestamp instants at millisecond precision", () => {
     const legacy = { updatedAt: "2024-01-01T00:00:00.123456Z" };
     const sameInstant = compareLegacyCoverage(legacy, {

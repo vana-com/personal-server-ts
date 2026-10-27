@@ -61,8 +61,8 @@ const BINDING_PROFILES = [
   STRAVA_BROWSER_BINDINGS,
 ];
 
-// Invalidate persisted witnesses created before completion-horizon fencing.
-const COVERAGE_RULE_VERSION = 11;
+// Invalidate witnesses predating legacy ChatGPT epoch-second compatibility.
+const COVERAGE_RULE_VERSION = 12;
 const OURA_RUN_STREAMS: readonly string[] = ["sleep", "readiness", "activity"];
 
 /** Live Claude omits some account metadata. Preserve known fields from the

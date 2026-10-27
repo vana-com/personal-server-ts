@@ -7,6 +7,7 @@
 import type { ProjectionOmission } from "../legacy-projection/types.js";
 import {
   LEGACY_COVERAGE_EXCEPTIONS,
+  LEGACY_EPOCH_TIMESTAMP_EXCEPTIONS,
   LEGACY_INTEGER_ROUNDING_EXCEPTIONS,
 } from "./legacy-scope-coverage-exceptions.js";
 
@@ -238,6 +239,25 @@ export function compareLegacyCoverage(
     entityPath?: string,
     entityKey?: string | number | boolean,
   ): void {
+    const epochException = LEGACY_EPOCH_TIMESTAMP_EXCEPTIONS.find(
+      (entry) => entry.scope === options.scope && entry.path === arrayPath,
+    );
+    if (
+      epochException &&
+      typeof legacy === "number" &&
+      Number.isFinite(legacy) &&
+      timestampFormat(canonical) === "iso_datetime" &&
+      Number.isFinite(Date.parse(canonical as string))
+    ) {
+      const date = new Date(legacy * 1000);
+      if (Number.isFinite(date.getTime())) {
+        const iso = date.toISOString();
+        if (timestampFormat(iso) === "iso_datetime") {
+          appliedExceptions.set(arrayPath, epochException);
+          legacy = iso;
+        }
+      }
+    }
     if (jsonType(legacy) !== jsonType(canonical)) {
       mark("type_mismatch", path);
       return;
