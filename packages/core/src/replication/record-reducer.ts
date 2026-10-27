@@ -12,8 +12,11 @@ import {
 /**
  * Bounded materialization evidence for ONE key. Original operations, including
  * losers, stay in the durable journal; this is not compaction. Every decision is
- * made by planReplicaMerge. Global identity equivocation and binding conflicts
- * must be detected by the caller's durable indexes before partitioning by key.
+ * made by planReplicaMerge. The reducer cannot see a cross-key or
+ * cross-connection operation-id collision or a binding conflict: the caller
+ * supplies those as `ConnectionFacts` and uses the reducer only while
+ * `connectionFromFacts` (visibility-engine.ts) says the connection is active.
+ * `lifecycle` must be that connection's globally unique lifecycle operations.
  */
 export function createReplicaRecordReducer(
   context: MergeContext,

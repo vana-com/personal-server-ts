@@ -99,9 +99,11 @@ export const replicaEnvelopeSchema = z.strictObject({
 });
 export type ReplicaEnvelope = z.infer<typeof replicaEnvelopeSchema>;
 
+/** Built once: `z.json()` constructs a new recursive schema on every call. */
+const jsonValueSchema = z.json();
 /** Canonical JSON for this profile: recursive code-unit key ordering, JSON numbers. */
 export function canonicalJson(value: unknown): string {
-  const json = z.json().parse(value);
+  const json = jsonValueSchema.parse(value);
   function encode(value: ReturnType<typeof z.json>["_output"]): string {
     if (Array.isArray(value)) return `[${value.map(encode).join(",")}]`;
     if (value !== null && typeof value === "object") {

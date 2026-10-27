@@ -1,3 +1,5 @@
+import { sha256 } from "@noble/hashes/sha256";
+import { bytesToHex } from "@noble/hashes/utils";
 import {
   canonicalJson,
   replicaOperationSchema,
@@ -11,7 +13,29 @@ export type CompletionOperation = Extract<
   { kind: "stream-complete" }
 >;
 
-/** Dependency coverage only. The receiver must also check lifecycle, merge conflicts and snapshot digest. */
+/** `sha256:<hex>` of an operation's canonical JSON, as completion dependencies pin it. */
+export function operationDigest(operation: ReplicaOperation): string {
+  return `sha256:${bytesToHex(sha256(new TextEncoder().encode(canonicalJson(operation))))}`;
+}
+
+/**
+ * Dependency coverage only: every dependency has exactly one retained variant
+ * and it has the pinned digest. `variantDigests` returns the distinct digests
+ * of every retained variant of an operation id, across all connections. The
+ * rest of availability is `completionAvailability` in `visibility-engine.ts`.
+ */
+export function completionDependenciesCovered(
+  completion: CompletionOperation,
+  variantDigests: (writerId: string, operationId: string) => readonly string[],
+): boolean {
+  if (completion.dependencies.length === 0) return false;
+  return completion.dependencies.every((dependency) => {
+    const digests = variantDigests(dependency.writerId, dependency.operationId);
+    return digests.length === 1 && digests[0] === dependency.digest;
+  });
+}
+
+/** Dependency coverage over a list of imported operations. */
 export async function hasCompletionDependencies(
   completion: CompletionOperation,
   imported: readonly ReplicaOperation[],
@@ -25,23 +49,11 @@ export async function hasCompletionDependencies(
       operation.revision.writerId,
       operation.revision.operationId,
     ]);
-    const variants = byId.get(key) ?? new Set<string>();
-    variants.add(canonicalJson(operation));
-    byId.set(key, variants);
+    byId.set(key, (byId.get(key) ?? new Set()).add(operationDigest(operation)));
   }
-  for (const dependency of completion.dependencies) {
-    const variants = byId.get(
-      canonicalJson([dependency.writerId, dependency.operationId]),
-    );
-    if (!variants || variants.size !== 1) return false;
-    const bytes = new TextEncoder().encode([...variants][0]);
-    const digest = new Uint8Array(
-      await globalThis.crypto.subtle.digest("SHA-256", bytes),
-    );
-    const actual = `sha256:${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-    if (actual !== dependency.digest) return false;
-  }
-  return true;
+  return completionDependenciesCovered(completion, (writerId, operationId) => [
+    ...(byId.get(canonicalJson([writerId, operationId])) ?? []),
+  ]);
 }
 
 /** Select current receipt state for ONE validated stream/generation; this is not an availability check. */
