@@ -281,6 +281,24 @@ describe("the door after replication was on", () => {
     expect(boot(path, true)).toEqual({ state: "on" });
   });
 
+  it("refuses a door row it cannot trust, and closes the door", () => {
+    // A committed `capturing = 1` cannot come from a rollback, so it is
+    // corruption; left alone, it would silence every trigger.
+    for (const sql of [
+      "UPDATE pdpp_replica_door SET capturing = 1",
+      "DELETE FROM pdpp_replica_door",
+    ]) {
+      const path = enabledDatabase();
+      const db = open(path);
+      db.exec(sql);
+      db.close();
+      expect(boot(path, true), sql).toEqual(refused);
+      expect(fenceTriggers(path), sql).toBe(0);
+      expect(boot(path, true), sql).toEqual(refused);
+      boot(path, false, (store) => expect(keys(store), sql).toEqual(["a"]));
+    }
+  });
+
   it("fences every replicated table against raw SQL from any build", () => {
     const writes = [
       "UPDATE pdpp_records SET data = data",

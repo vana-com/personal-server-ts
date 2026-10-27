@@ -90,10 +90,15 @@ function enabledWithoutDoor(db: Database): boolean {
 export function admitReplication(db: Database): void {
   db.transaction(() => {
     if (hasDoor(db)) {
+      // Admit only a door row that is exactly open. A committed
+      // `capturing = 1` cannot survive a rollback, so it is corruption, and it
+      // would silence every trigger. Refusing also closes the door for good.
       const door = db
-        .prepare("SELECT uncaptured, off FROM pdpp_replica_door")
-        .get() as { uncaptured: number; off: number } | undefined;
-      if (!door || door.uncaptured || door.off)
+        .prepare(
+          "SELECT capturing, uncaptured, off FROM pdpp_replica_door WHERE id = 1",
+        )
+        .get() as Record<string, unknown> | undefined;
+      if (door?.capturing !== 0 || door.uncaptured !== 0 || door.off !== 0)
         throw new ReplicationRefusedError("reenable_refused");
     } else if (enabledWithoutDoor(db)) {
       // Unbaselined replica tables are harmless: the baseline reads every
