@@ -187,6 +187,7 @@ export function unquarantinedRecordSql(
 export interface ReplicaCursorBinding {
   query: string;
   integrity: Record<string, number>;
+  visibilityEpoch: string;
 }
 
 /**
@@ -197,6 +198,7 @@ export interface ReplicaCursorBinding {
  */
 export interface ReplicaCanonicalPort {
   unquarantinedRecordSql(alias: string, generationSql?: string): string;
+  replicaVisibilityEpoch(instanceIds?: string[]): string;
   assertKeyWritable(instance: string, stream: string, recordKey: string): void;
   assertConnectionWritable(instance: string): void;
   /**
@@ -252,7 +254,11 @@ export interface ReplicaCanonicalPort {
    * minted before integrity binding expires: it may span a quarantine.
    */
   assertCursorIntegrity(
-    payload: { query?: string; integrity?: Record<string, number> },
+    payload: {
+      query?: string;
+      integrity?: Record<string, number>;
+      visibilityEpoch?: string;
+    },
     instanceIds: string[],
     fields: string[] | undefined,
   ): void;
@@ -348,6 +354,23 @@ export function createReplicaCanonicalPort(db: Database) {
         .get(connectionKey, connectionKey) as { epoch: number }
     ).epoch;
   }
+  function replicaVisibilityEpoch(instanceIds?: string[]): string {
+    if (instanceIds) {
+      const ids = [...new Set(instanceIds)].sort();
+      const state = ids.map((id) => [id, replicaIntegrityEpoch(id)]);
+      return createHash("sha256").update(JSON.stringify(state)).digest("hex");
+    }
+    const exists = db
+      .prepare(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pdpp_replica_visibility_epoch'",
+      )
+      .get();
+    if (!exists) return "uninitialized";
+    const row = db
+      .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+      .get() as { epoch: number } | undefined;
+    return row ? String(row.epoch) : "uninitialized";
+  }
   function fenceReplicaConnection(connectionKey: string): void {
     if (!db.inTransaction)
       throw new Error("an integrity fence requires the hiding transaction");
@@ -360,18 +383,21 @@ export function createReplicaCanonicalPort(db: Database) {
     fields: string[] | undefined,
   ): ReplicaCursorBinding {
     const ids = [...new Set(instanceIds)].sort();
+    const integrity = Object.fromEntries(
+      ids.map((id) => [id, replicaIntegrityEpoch(id)]),
+    );
     return {
       query: createHash("sha256")
         .update(JSON.stringify([ids, fields ? [...fields].sort() : null]))
         .digest("hex"),
-      integrity: Object.fromEntries(
-        ids.map((id) => [id, replicaIntegrityEpoch(id)]),
-      ),
+      integrity,
+      visibilityEpoch: replicaVisibilityEpoch(ids),
     };
   }
 
   const port: ReplicaCanonicalPort = {
     unquarantinedRecordSql,
+    replicaVisibilityEpoch,
     assertKeyWritable(instance, stream, recordKey) {
       if (
         db
@@ -505,7 +531,9 @@ export function createReplicaCanonicalPort(db: Database) {
         throw new InvalidCursorError();
       if (
         payload.query === undefined ||
-        JSON.stringify(payload.integrity) !== JSON.stringify(current.integrity)
+        JSON.stringify(payload.integrity) !==
+          JSON.stringify(current.integrity) ||
+        payload.visibilityEpoch !== current.visibilityEpoch
       )
         throw new CursorExpiredError();
     },
@@ -574,6 +602,7 @@ export function createReplicaCanonicalPort(db: Database) {
       localWriteObserver = observer;
     },
     replicaIntegrityEpoch,
+    replicaVisibilityEpoch,
     fenceReplicaConnection,
     replicaBindingConflict(connectionId: string): boolean {
       return !!db
@@ -637,6 +666,7 @@ export function createReplicaRecordStore(
     setReplicaWriteBoundary: r.setReplicaWriteBoundary,
     setReplicaLocalWriteObserver: r.setReplicaLocalWriteObserver,
     replicaIntegrityEpoch: r.replicaIntegrityEpoch,
+    replicaVisibilityEpoch: r.replicaVisibilityEpoch,
     fenceReplicaConnection: r.fenceReplicaConnection,
     replicaBindingConflict: r.replicaBindingConflict,
     markReplicaBindingConflict: r.markReplicaBindingConflict,

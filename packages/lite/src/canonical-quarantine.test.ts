@@ -47,11 +47,13 @@ async function provision(store: Store) {
   });
 }
 /** A provisioned connection with one confirmed blob-backed row. */
-async function confirmedBlobRow(make: () => Store) {
+async function confirmedBlobRow(
+  make: () => Store,
+  bytes = new TextEncoder().encode("quarantined blob"),
+) {
   const { sha256 } = await import("viem");
   const store = make();
   await provision(store);
-  const bytes = new TextEncoder().encode("quarantined blob");
   const hash = `sha256:${sha256(bytes).slice(2)}`;
   const blob = {
     blobId: hash,
@@ -62,7 +64,8 @@ async function confirmedBlobRow(make: () => Store) {
   const stagingId = await store.stageBlob(
     blob,
     (async function* () {
-      yield bytes;
+      for (let offset = 0; offset < bytes.length; offset += 128 * 1024)
+        yield bytes.slice(offset, offset + 128 * 1024);
     })(),
   );
   await store.import({
@@ -91,8 +94,10 @@ async function confirmedBlobRow(make: () => Store) {
     return parts;
   };
   for (const reader of ["owner", "grant"] as const)
-    expect(await collect(reader)).toEqual([bytes]);
-  return { store, collect };
+    expect(
+      Uint8Array.from((await collect(reader)).flatMap((part) => [...part])),
+    ).toEqual(bytes);
+  return { store, collect, hash, bytes };
 }
 async function hiddenFromBoth(
   make: () => Store,
@@ -125,6 +130,166 @@ it("a healthy provisioned connection is not quarantined", async () => {
   expect(await make().isConnectionQuarantined(identity.connectionId)).toBe(
     false,
   );
+});
+
+it("A6 race: stops the next blob chunk when quarantine moves visibility", async () => {
+  const { make } = device();
+  const bytes = new Uint8Array(256 * 1024 + 7).fill(0x6d);
+  const { store, hash } = await confirmedBlobRow(make, bytes);
+  const readers = (["owner", "grant"] as const).map((reader) =>
+    make().readBlob(hash, { reader })[Symbol.asyncIterator](),
+  );
+
+  for (const reader of readers) {
+    const first = await reader.next();
+    expect(first.done).toBe(false);
+    expect(first.value).toHaveLength(128 * 1024);
+  }
+
+  await store.quarantineConnection({
+    credential: "replica",
+    connectionId: identity.connectionId,
+    reason: "race test",
+  });
+
+  for (const reader of readers) {
+    let nextError: unknown;
+    try {
+      await reader.next();
+    } catch (error) {
+      nextError = error;
+    }
+    expect(nextError).toMatchObject({
+      message: "visibility changed during blob read",
+    });
+  }
+});
+
+it.each(["connection-delete", "delete", "connection-reset"] as const)(
+  "A6 blob visibility: fresh read after %s requires a current reference",
+  async (kind) => {
+    const { make } = device();
+    const { store, collect, bytes, hash } = await confirmedBlobRow(make);
+    const operation =
+      kind === "delete"
+        ? {
+            ...identity,
+            kind,
+            declaration: binding,
+            recordKey: upsert("a", 3).recordKey,
+            emittedAt: "2026-10-21T00:00:00.000Z",
+            deletedAt: "2026-10-21T00:00:00.000Z",
+            revision: {
+              counter: 100,
+              writerId: "device-a",
+              operationId: "delete-row-review",
+            },
+          }
+        : {
+            ...identity,
+            kind,
+            ...(kind === "connection-reset"
+              ? { generation: 2, previousGeneration: 1 }
+              : {}),
+            revision: {
+              counter: 100,
+              writerId: "device-a",
+              operationId: "remove-review",
+            },
+          };
+    await store.import({
+      id: "review-remove",
+      credential: "replica",
+      envelope: envelope("review-remove", [operation]),
+    });
+    for (const reader of ["owner", "grant"] as const) {
+      const row = await make().readRecord(
+        identity.connectionId,
+        binding.stream,
+        upsert("a", 3).recordKey,
+        { reader },
+      );
+      expect(!row || row.deleted).toBe(true);
+      await expect(collect(reader)).rejects.toThrow("missing committed blob");
+    }
+    expect(bytes).toBeDefined();
+    expect(hash).toBeTruthy();
+  },
+);
+
+it("A6 blob visibility: keeps bytes while another live record references them", async () => {
+  const { make } = device();
+  const { store, collect, bytes, hash } = await confirmedBlobRow(make);
+  const descriptor = {
+    blobId: hash,
+    sha256: hash,
+    mimeType: "text/plain",
+    sizeBytes: bytes.length,
+  };
+  await store.provisionConnection("connection-b", {
+    sourceId: identity.sourceId,
+    methodId: identity.methodId,
+  });
+  await store.import({
+    id: "second-live-reference",
+    credential: "replica",
+    envelope: envelope("second-live-reference", [
+      {
+        ...registration,
+        connectionId: "connection-b",
+        revision: {
+          counter: 1,
+          writerId: "device-a",
+          operationId: "register-second-reference",
+        },
+      },
+      {
+        ...identity,
+        connectionId: "connection-b",
+        kind: "blob-claim",
+        revision: {
+          counter: 5,
+          writerId: "device-a",
+          operationId: "claim-second-reference",
+        },
+        blob: descriptor,
+      },
+      {
+        ...upsert("b", 4),
+        connectionId: "connection-b",
+        recordKey: "other-key",
+        blobs: [descriptor],
+        data: { id: "other-key", blob_ref: { blob_id: hash } },
+      },
+    ]),
+  });
+  expect(
+    await make().readRecord("connection-b", binding.stream, "other-key", {
+      reader: "owner",
+    }),
+  ).toMatchObject({ deleted: false });
+  const deletion = {
+    ...identity,
+    kind: "delete" as const,
+    declaration: binding,
+    recordKey: upsert("a", 3).recordKey,
+    emittedAt: "2026-10-21T00:00:00.000Z",
+    deletedAt: "2026-10-21T00:00:00.000Z",
+    revision: {
+      counter: 100,
+      writerId: "device-a",
+      operationId: "delete-original-review",
+    },
+  };
+  await store.import({
+    id: "delete-original-reference",
+    credential: "replica",
+    envelope: envelope("delete-original-reference", [deletion]),
+  });
+  for (const reader of ["owner", "grant"] as const) {
+    const chunks = await collect(reader);
+    expect(Uint8Array.from(chunks.flatMap((part) => [...part]))).toEqual(bytes);
+  }
 });
 
 // The #438 lane's reproduction (3eaec57d, it.fails there): reconcile blocks

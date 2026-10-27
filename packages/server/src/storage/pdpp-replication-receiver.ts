@@ -64,6 +64,8 @@ import {
   type PdppVisibleRecord,
   type ListVisibleRecordsPage,
   type PdppReplicaReadStore,
+  validateCursor,
+  type VisibilitySnapshot,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
 export const RECEIVER_MIGRATION = `
@@ -766,6 +768,7 @@ export function createReplicaReceiver(deps: {
   }
   type IntegrityBoundChanges = ChangesSinceCursorPayload & {
     integrity?: Record<string, number>;
+    visibilityEpoch?: string;
   };
   /**
    * Bind changes tokens to the integrity epoch of every requested connection,
@@ -776,15 +779,19 @@ export function createReplicaReceiver(deps: {
    * synthesis lane's store binds into its own tokens.
    */
   function bindChangesIntegrity(
+    stream: string,
+    reader: ReplicaReader,
     options: ChangesSinceOptions,
     read: () => ChangesSincePage,
   ): ChangesSincePage {
     const epochOf = store.replicaIntegrityEpoch;
     if (!epochOf) return read();
-    const integrity = JSON.stringify(
-      Object.fromEntries(
-        [...new Set(options.instanceIds)].sort().map((id) => [id, epochOf(id)]),
-      ),
+    const integrityValue = Object.fromEntries(
+      [...new Set(options.instanceIds)].sort().map((id) => [id, epochOf(id)]),
+    );
+    const integrity = JSON.stringify(integrityValue);
+    const visibilityEpoch = store.replicaVisibilityEpoch(
+      [...new Set(options.instanceIds)].sort(),
     );
     for (const token of [options.cursor, options.changesSince]) {
       if (!token) continue;
@@ -796,7 +803,8 @@ export function createReplicaReceiver(deps: {
       }
       if (
         payload.kind === "changes_since" &&
-        JSON.stringify(payload.integrity ?? null) !== integrity
+        (JSON.stringify(payload.integrity ?? null) !== integrity ||
+          payload.visibilityEpoch !== visibilityEpoch)
       )
         throw new CursorExpiredError();
     }
@@ -804,6 +812,7 @@ export function createReplicaReceiver(deps: {
       if (!token) return token;
       const payload = decodeCursor(token) as IntegrityBoundChanges;
       payload.integrity = JSON.parse(integrity) as Record<string, number>;
+      payload.visibilityEpoch = visibilityEpoch;
       return encodeCursor(payload);
     };
     const page = read();
@@ -954,6 +963,35 @@ export function createReplicaReceiver(deps: {
   }
   function readSnapshot<T>(read: () => T): T {
     return view.snapshot(read);
+  }
+  function readView(
+    reader: ReplicaReader,
+    cursor?: string,
+  ): VisibilitySnapshot {
+    return readSnapshot(() => {
+      const payload = cursor ? decodeCursor(cursor) : undefined;
+      const instanceIds = payload
+        ? payload.kind === "list"
+          ? (payload.instanceIds ?? [])
+          : Object.keys(payload.integrity ?? {})
+        : undefined;
+      const snapshot = {
+        visibilityEpoch: payload
+          ? payload.kind === "list" && payload.viewRevision
+            ? view.cursorVisibilityEpoch(
+                payload.stream ?? "",
+                instanceIds ?? [],
+                reader,
+                includesPending(reader),
+              )
+            : store.replicaVisibilityEpoch(instanceIds)
+          : view.visibilityEpoch(),
+        reader,
+      };
+      if (cursor && validateCursor(cursor, snapshot).kind === "expired")
+        throw new CursorExpiredError();
+      return snapshot;
+    });
   }
   /**
    * The preview's blob readiness: the engine's `blobReady`, with bytes any
@@ -1435,10 +1473,12 @@ export function createReplicaReceiver(deps: {
     },
     connectionVisibility: view.connectionVisibility,
     readVisibleRecords,
+    readView,
     readRecords(
       input: ListRecordsOptions & { stream: string; reader?: ReplicaReader },
     ): ListVisibleRecordsPage {
       return readSnapshot(() => {
+        if (input.cursor) readView(input.reader ?? "grant", input.cursor);
         if (
           !pendingEnabled &&
           !input.instanceIds.some((id) => view.connectionVisibility(id))
@@ -1459,39 +1499,45 @@ export function createReplicaReceiver(deps: {
     },
     readStore(input: { reader?: ReplicaReader } = {}): PdppReplicaReadStore & {
       connectionVisibility: typeof view.connectionVisibility;
+      withReadSnapshot: typeof readSnapshot;
     } {
       const reader = input.reader ?? "grant";
       const hasPreview = () => includesPending(reader);
       const needsReferenceGate = () =>
         hasPreview() || view.hasBindingConflictFacts;
       const refs = (id: string) =>
-        readSnapshot(() =>
-          needsReferenceGate()
+        readSnapshot(() => {
+          // The enclosing snapshot carries point reads across projection commits.
+          return needsReferenceGate()
             ? view.findBlobReferences(id, reader, hasPreview())
-            : store.findBlobReferences(id),
-        );
+            : store.findBlobReferences(id);
+        });
       const canReadBlob = (id: string) =>
         view.hasBlobReference(id, reader, hasPreview());
       return {
         connectionVisibility: view.connectionVisibility,
+        withReadSnapshot: readSnapshot,
         getRecord: (instance: string, stream: string, key: string) =>
-          readSnapshot(() =>
-            hasPreview() || view.connectionVisibility(instance)
+          readSnapshot(() => {
+            // The enclosing snapshot carries point reads atomically.
+            return hasPreview() || view.connectionVisibility(instance)
               ? view.getRecord(instance, stream, key, reader, hasPreview())
-              : store.getRecord(instance, stream, key),
-          ),
+              : store.getRecord(instance, stream, key);
+          }),
         listRecords: (stream: string, options: ListRecordsOptions) =>
           api.readRecords({ ...options, stream, reader }),
         listStreams: (ids: string[]) =>
-          readSnapshot(() =>
-            pendingEnabled || ids.some((id) => view.connectionVisibility(id))
+          readSnapshot(() => {
+            return pendingEnabled ||
+              ids.some((id) => view.connectionVisibility(id))
               ? view.listStreams(ids, hasPreview(), reader)
-              : store.listStreams(ids),
-          ),
+              : store.listStreams(ids);
+          }),
         // Changes sessions allocate a canonical horizon. Reserve the writer before
         // selecting policy so that the horizon and conflict fence cannot race.
         changesSince: (stream: string, options: ChangesSinceOptions) =>
           view.exclusive(() => {
+            readView(reader, options.cursor ?? options.changesSince);
             const visible = options.instanceIds.filter((instance) => {
               const visibility = view.connectionVisibility(instance);
               return (
@@ -1504,35 +1550,38 @@ export function createReplicaReceiver(deps: {
                 )
               );
             });
-            return bindChangesIntegrity(options, () =>
+            return bindChangesIntegrity(stream, reader, options, () =>
               store.changesSinceForInstances(stream, options, visible),
             );
           }),
         getBlobBytes: (id: string) =>
-          readSnapshot(() =>
-            !needsReferenceGate()
+          readSnapshot(() => {
+            // The enclosing snapshot carries blob-byte reads atomically.
+            return !needsReferenceGate()
               ? store.getBlobBytes(id)
               : canReadBlob(id)
                 ? verifiedVisibleBlob(id)
-                : undefined,
-          ),
+                : undefined;
+          }),
         getBlobMeta: (id: string) =>
-          readSnapshot(() =>
-            !needsReferenceGate()
+          readSnapshot(() => {
+            // The enclosing snapshot carries blob-metadata reads atomically.
+            return !needsReferenceGate()
               ? store.getBlobMeta(id)
               : canReadBlob(id)
                 ? (store.getBlobMeta(id) ?? view.getBlobMeta(id))
-                : undefined,
-          ),
+                : undefined;
+          }),
         findBlobReferences: refs,
         // Receipts describe canonical rows as stored: a preview or a hidden or
         // local-only connection shows other rows, so it gets none.
         listStreamCompletions: (instance: string) =>
-          readSnapshot(() =>
-            hasPreview() || view.connectionVisibility(instance)
+          readSnapshot(() => {
+            // The enclosing snapshot carries completion reads atomically.
+            return hasPreview() || view.connectionVisibility(instance)
               ? []
-              : store.listStreamCompletions(instance),
-          ),
+              : store.listStreamCompletions(instance);
+          }),
       };
     },
     /** Called only after the transport proves a finalized immutable-slot conflict.

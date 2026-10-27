@@ -1917,6 +1917,13 @@ it("withdraws a quarantined connection from records, pages, cursors and confirme
           revision: { counter: 300, writerId: "device-b", operationId: "c" },
           blob,
         },
+        {
+          ...upsert("other-reference", 301),
+          ...other,
+          recordKey: "other-key",
+          blobs: [blob],
+          data: { id: "other-key", blob_ref: { blob_id: hash } },
+        },
       ],
     },
   });

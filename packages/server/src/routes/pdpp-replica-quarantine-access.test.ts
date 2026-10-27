@@ -59,6 +59,18 @@ const controlText = "unaffected finalized control 8b";
 const controlBytes = Buffer.from("independent control bytes 8b");
 const controlId = replicaDigest(controlBytes);
 const credential = "isolated-receiver-credential";
+function cursorVisibilityEpoch(cursor: string): string | undefined {
+  const normalized = cursor.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(
+    normalized + "=".repeat((4 - (normalized.length % 4)) % 4),
+  );
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return (
+    JSON.parse(new TextDecoder().decode(bytes)) as {
+      visibilityEpoch?: string;
+    }
+  ).visibilityEpoch;
+}
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
@@ -310,6 +322,9 @@ async function fixture() {
     expect(response.status).toBe(200);
     expect(Buffer.from(await response.arrayBuffer())).toEqual(controlBytes);
   }
+  async function readView(cursor?: string) {
+    return activeReceiver.readView("grant", cursor);
+  }
   // Independent literal expectations make fixture/import failures distinct from
   // a denial: target and control must be readable with the actual issued token.
   expect(
@@ -329,10 +344,17 @@ async function fixture() {
   expect(changes.next_cursor).toBeTypeOf("string");
   const allChanges = await json("/streams/messages/records?changes_since=");
   expect(allChanges.next_changes_since).toBeTypeOf("string");
+  for (const token of [
+    list.next_cursor,
+    changes.next_cursor,
+    allChanges.next_changes_since,
+  ])
+    expect(cursorVisibilityEpoch(token)).toBeTypeOf("string");
   // Every quarantine raises the connection's integrity epoch, so a saved
   // cursor expires instead of continuing over a shifted, filtered page set
   // (finding k: offset pagination skipped clean rows after a withdrawal).
   async function assertQuarantined() {
+    await expect(readView(list.next_cursor)).rejects.toThrow(/expired/);
     const savedCursorStatus = 410;
     const paths = [
       ["/streams/messages/records/z-quarantined", 404],
@@ -401,6 +423,7 @@ async function fixture() {
   }
   return {
     network,
+    readView,
     target,
     targetBatch,
     /** The target's writer: an operation-id equivocation continues it. */
@@ -489,7 +512,7 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
     },
   );
 
-  it("P0 #5: old page/change cursors cannot recover payload after validated declaration equivocation, including restart", async () => {
+  it("A6 race: old list and change cursors expire after quarantine, including restart", async () => {
     const f = await fixture();
     await f.publish([
       {
