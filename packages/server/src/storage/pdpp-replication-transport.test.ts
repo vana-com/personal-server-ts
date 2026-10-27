@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
+import { retireReplication } from "./pdpp-replication-door.js";
 import {
   createReplicaTransportWorker,
   ReplicaCarrierMismatchError,
@@ -378,6 +379,7 @@ function device(
       return store;
     },
     put,
+    step: () => engine.step(),
     get(id = "a") {
       return store.getRecord("conn", "messages", id)?.data;
     },
@@ -542,6 +544,139 @@ it("resumes uncertain publication with identical durable ciphertext, adopting on
   expect(net.registrations.filter((s) => s === original[0]!.slot)).toHaveLength(
     1,
   );
+});
+
+it("does not resubmit a registration while accepted evidence is temporarily hidden", async () => {
+  const net = network();
+  const a = device(net);
+  const originalRegister = net.port.register;
+  const calls: string[] = [];
+  let hidden: Parameters<ReplicaTransportPort["register"]>[0] | undefined;
+  net.port.register = async (manifest) => {
+    calls.push(slotKey(manifest.scope, manifest.version));
+    await originalRegister(manifest);
+    hidden = manifest;
+    const slot = slotKey(manifest.scope, manifest.version);
+    net.head.delete(slot);
+    net.chain.delete(slot);
+  };
+
+  await a.cycle();
+  const slot = outbox(a)[0]!.slot;
+  expect(calls).toEqual([slot]);
+  a.reopen();
+
+  for (let poll = 0; poll < 5; poll++) {
+    time += 1_000;
+    await a.cycle();
+  }
+  expect(calls).toEqual([slot]);
+
+  const manifest = hidden!;
+  const registered = {
+    owner,
+    scope: manifest.scope,
+    version: String(manifest.version),
+    dataHash: manifest.dataHash,
+    metadataHash: manifest.metadataHash,
+    deleted: false,
+  };
+  net.head.set(slot, registered);
+  net.chain.set(slot, net.chainRow(slot, registered));
+  await cycles([a], 2);
+  expect(outbox(a).find((row) => row.slot === slot)?.state).toBe("published");
+});
+
+it("reports a pending predecessor and re-registers that same slot after authoritative absence", async () => {
+  const net = network();
+  const a = device(net, {
+    pageSize: 1,
+    worker: { registrationIntentTimeoutMs: 5_000 },
+  });
+  const originalRegister = net.port.register;
+  const calls: string[] = [];
+  net.port.register = async (manifest) => {
+    calls.push(slotKey(manifest.scope, manifest.version));
+    await originalRegister(manifest);
+  };
+
+  net.beforePut((key) => net.pending.add(key));
+  a.put("first", "first");
+  await a.cycle();
+  const predecessor = outbox(a)[0]!;
+  expect(predecessor.version).toBe(1);
+
+  // Later captured work can be retained while v1 remains pending.
+  a.put("second", "second");
+  for (let poll = 0; poll < 8; poll++) {
+    time += 1_000;
+    await a.cycle();
+  }
+  expect(outbox(a).map((row) => row.version)).toContain(2);
+
+  time += 2_000;
+  const status = await a.step();
+  const successor = outbox(a).find((row) => row.version === 2)!;
+  const pending = status.waits.find((wait) => wait.id === successor.slot);
+  expect(pending?.dependency).toMatchObject({
+    kind: "registration_pending",
+    version: 1,
+    since: expect.any(Number),
+  });
+  expect(pending?.ageMs).toEqual(expect.any(Number));
+  expect(pending!.dependency.since).toBeLessThanOrEqual(time);
+
+  net.head.delete(predecessor.slot);
+  net.chain.delete(predecessor.slot);
+  net.pending.delete(predecessor.slot);
+  net.beforePut(() => {});
+  time += 5_000;
+  await cycles([a], 4);
+
+  expect(calls.filter((value) => value === predecessor.slot)).toHaveLength(2);
+  expect(outbox(a).find((row) => row.version === 1)?.state).toBe("published");
+  expect(outbox(a).find((row) => row.version === 2)?.state).toBe("published");
+});
+
+it("aborts later outbound writes when the door closes after a fragment upload", async () => {
+  const net = network();
+  const a = device(net);
+  const originalPutFragment = net.port.putFragment;
+  net.port.putFragment = async (fragment) => {
+    await originalPutFragment(fragment);
+    retireReplication(a.db);
+  };
+  const manifestPut = vi.spyOn(net.port, "put");
+  const register = vi.spyOn(net.port, "register");
+
+  await a.cycle();
+
+  expect(net.puts.some(({ key }) => key.includes("/fragments/"))).toBe(true);
+  expect(manifestPut).not.toHaveBeenCalled();
+  expect(register).not.toHaveBeenCalled();
+  expect(outbox(a)[0]?.state).toBe("ready");
+});
+
+it("does not let a stale outbound receipt overwrite a newer quarantine", async () => {
+  const net = network();
+  const a = device(net);
+  const originalPutFragment = net.port.putFragment;
+  net.port.putFragment = async (fragment) => {
+    await originalPutFragment(fragment);
+    a.db
+      .prepare(
+        "UPDATE pdpp_transport_fragments_out SET state='quarantined',outcome='quarantine',reason='fragment_mismatch' WHERE digest=?",
+      )
+      .run(fragment.digest);
+  };
+
+  await a.cycle();
+
+  expect(fragmentsOut(a)[0]).toMatchObject({
+    state: "quarantined",
+    outcome: "quarantine",
+    reason: "fragment_mismatch",
+  });
 });
 
 it("retries absence after a failed PUT at the same address with exact persisted bytes", async () => {
@@ -1284,13 +1419,20 @@ it("uses advancing finalized-head hints to wake waiting rows but still verifies 
   time += 2000;
   await a.cycle();
   await b.cycle(); // records inclusion hints without checking unchanged finalized slots
-  const count = evidence.mock.calls.length;
+  const waitingRow = outbox(a).at(-1)!;
+  const count = evidence.mock.calls.filter(
+    ([scope, version]) => slotKey(scope, version) === waitingRow.slot,
+  ).length;
   for (let i = 0; i < 5; i++) {
     time += 2000;
     await a.cycle();
     await b.cycle();
   }
-  expect(evidence.mock.calls.length).toBe(count);
+  expect(
+    evidence.mock.calls.filter(
+      ([scope, version]) => slotKey(scope, version) === waitingRow.slot,
+    ),
+  ).toHaveLength(count);
   a.reopen();
   b.reopen();
   finalized = 140n;
@@ -1535,27 +1677,31 @@ it("bounds repeated high hints and never regresses the verified checked height",
   });
   net.port.evidence = evidence;
   await a.cycle();
+  const waiting = outbox(a)[0]!;
   time += 2000;
   await a.cycle(); // high hint, unchanged verified head: durable cooldown
-  const count = evidence.mock.calls.length;
+  const count = evidence.mock.calls.filter(
+    ([scope, version]) => slotKey(scope, version) === waiting.slot,
+  ).length;
   for (let i = 0; i < 14; i++) {
     time += 2000;
     await a.cycle();
   }
-  expect(evidence.mock.calls.length).toBe(count);
+  expect(
+    evidence.mock.calls.filter(
+      ([scope, version]) => slotKey(scope, version) === waiting.slot,
+    ),
+  ).toHaveLength(count);
   verified = 120n;
   time += 2000;
   await a.cycle();
   const rows = outbox(a);
   expect(rows.length).toBeGreaterThan(0);
-  expect(
-    rows.every(
-      (r) =>
-        r.checked_block === "123" &&
-        r.attempts === 0 &&
-        r.next_attempt === time + 30000,
-    ),
-  ).toBe(true);
+  expect(rows[0]).toMatchObject({
+    checked_block: "123",
+    attempts: 0,
+    next_attempt: time + 30000,
+  });
   expect(acceptedSlots(a, a)).toBe(0);
 });
 

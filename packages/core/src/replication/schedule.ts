@@ -59,7 +59,10 @@ export function settleReplicaWork(
       };
     case "wait": {
       const since = previous.waitSince ?? now;
-      if (outcome.dependency.kind !== "finality")
+      if (
+        outcome.dependency.kind !== "finality" &&
+        outcome.dependency.kind !== "registration_pending"
+      )
         return {
           outcome,
           state: {
@@ -70,6 +73,16 @@ export function settleReplicaWork(
           },
         };
       const observed = outcome.dependency.checkedBlock;
+      if (observed === undefined)
+        return {
+          outcome,
+          state: {
+            attempts: 0,
+            nextEligible: now + FINALITY_POLL_MS,
+            waitSince: since,
+            checkedBlock: previous.checkedBlock,
+          },
+        };
       const progressed =
         previous.checkedBlock === null ||
         BigInt(observed) > BigInt(previous.checkedBlock);
@@ -189,7 +202,7 @@ export function replicaEligibleAtSql(
   if (head === undefined)
     return `(CASE WHEN ${terminal} THEN NULL ELSE ${next} END)`;
   const h = head.toString();
-  const parked = `(${outcome} = 'wait' AND ${dependency} LIKE 'finality:%' AND ${checked} IS NOT NULL AND ${since} IS NOT NULL
+  const parked = `(${outcome} = 'wait' AND (${dependency} LIKE 'finality:%' OR ${dependency} LIKE 'registration_pending:%') AND ${checked} IS NOT NULL AND ${since} IS NOT NULL
     AND (length(${checked}) > ${h.length} OR (length(${checked}) = ${h.length} AND ${checked} >= '${h}'))
     AND ${since} + ${LONG_WAIT_MS} > ${now})`;
   return `(CASE WHEN ${terminal} THEN NULL WHEN ${parked} THEN max(${next}, min(${since} + ${LONG_WAIT_MS}, ${hintRefreshAt ?? now})) ELSE ${next} END)`;

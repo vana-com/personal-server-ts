@@ -22,6 +22,8 @@ import {
 export const REPLICATION_DOOR_PROBE =
   "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pdpp_replica_door'";
 
+const runningSteps = new WeakMap<Database, Set<AbortController>>();
+
 /**
  * Canonical tables a replicated mutation writes, and the operations fenced on
  * each. Blob claims fence INSERT and UPDATE only: startup GC deletes stale
@@ -92,6 +94,87 @@ export function replicationAdmitted(db: Database): boolean {
   return hasDoor(db) && doorOpen(db);
 }
 
+/**
+ * Bind one running transport step to its host signal and the durable door.
+ * `retireReplication` aborts it immediately in this process; polling also
+ * observes closure by another database connection or an older build.
+ */
+export function beginReplicationStep(
+  db: Database,
+  parent?: AbortSignal,
+): { signal: AbortSignal; close: () => void } {
+  if (!replicationAdmitted(db))
+    throw new ReplicationRefusedError("reenable_refused");
+  const controller = new AbortController();
+  const active = runningSteps.get(db) ?? new Set<AbortController>();
+  active.add(controller);
+  runningSteps.set(db, active);
+  const abort = (reason: unknown) => {
+    if (!controller.signal.aborted) controller.abort(reason);
+  };
+  const onParentAbort = () => abort(parent?.reason);
+  parent?.addEventListener("abort", onParentAbort, { once: true });
+  const poll = setInterval(() => {
+    try {
+      if (!replicationAdmitted(db))
+        abort(new ReplicationRefusedError("reenable_refused"));
+    } catch (error) {
+      abort(error);
+    }
+  }, 25);
+  poll.unref?.();
+  if (parent?.aborted) onParentAbort();
+  return {
+    signal: controller.signal,
+    close() {
+      clearInterval(poll);
+      parent?.removeEventListener("abort", onParentAbort);
+      active.delete(controller);
+      if (active.size === 0) runningSteps.delete(db);
+    },
+  };
+}
+
+/** Check immediately before/after I/O that can send a transport write. */
+export function assertReplicationStepOpen(
+  db: Database,
+  signal: AbortSignal,
+): void {
+  if (!replicationAdmitted(db)) {
+    abortRunningSteps(db, new ReplicationRefusedError("reenable_refused"));
+  }
+  if (signal.aborted)
+    throw signal.reason ?? new ReplicationRefusedError("reenable_refused");
+}
+
+/** Check after the receiver raises its capture guard inside the write tx. */
+export function assertReplicationTransactionOpen(
+  db: Database,
+  signal: AbortSignal,
+): void {
+  const door = db
+    .prepare(
+      "SELECT capturing, uncaptured, off FROM pdpp_replica_door WHERE id = 1",
+    )
+    .get() as Record<string, unknown> | undefined;
+  if (
+    door?.capturing !== 1 ||
+    door.uncaptured !== 0 ||
+    door.off !== 0 ||
+    signal.aborted
+  ) {
+    const error =
+      signal.reason ?? new ReplicationRefusedError("reenable_refused");
+    abortRunningSteps(db, error);
+    throw error;
+  }
+}
+
+function abortRunningSteps(db: Database, reason: unknown): void {
+  for (const controller of runningSteps.get(db) ?? [])
+    if (!controller.signal.aborted) controller.abort(reason);
+}
+
 /** A database a pre-door build enabled: baselined, with no record of off periods. */
 function enabledWithoutDoor(db: Database): boolean {
   return (
@@ -134,6 +217,7 @@ export function admitReplication(db: Database): void {
 export function retireReplication(db: Database): ReplicationDoorStatus {
   if (!hasDoor(db)) return { state: "never" };
   db.transaction(() => db.exec(CLOSE_DOOR)).immediate();
+  abortRunningSteps(db, new ReplicationRefusedError("reenable_refused"));
   return { state: "off" };
 }
 
