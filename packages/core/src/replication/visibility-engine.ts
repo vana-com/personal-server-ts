@@ -801,7 +801,13 @@ const hash = (text: string) =>
  * own `__proto__` key, so values differing only there would share a digest.
  */
 function exactJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(exactJson).join(",")}]`;
+  if (Array.isArray(value)) {
+    // `map` skips holes, which would encode `new Array(1)` as `[]`.
+    for (let index = 0; index < value.length; index++)
+      if (!Object.hasOwn(value, index))
+        throw new TypeError(`not a JSON value: array hole at ${index}`);
+    return `[${value.map(exactJson).join(",")}]`;
+  }
   if (value !== null && typeof value === "object") {
     const record = value as Record<string, unknown>;
     return `{${Object.keys(record)

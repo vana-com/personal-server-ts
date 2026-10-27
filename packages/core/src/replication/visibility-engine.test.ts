@@ -533,6 +533,14 @@ describe("host-chosen keys", () => {
     await committer.commit(INITIAL_VISIBILITY_EPOCH, empty(), proto(null));
     expect(Object.entries(committer.read().checkpoint)).toEqual([]);
   });
+  it("refuses a sparse array instead of encoding its hole as nothing", () => {
+    // `[].map` skips holes, so `new Array(1)` would encode as `[]`.
+    const sparse = { ...empty(), fences: new Array<string>(1) };
+    expect(() => deltaDigest(sparse)).toThrow(TypeError);
+    expect(() =>
+      commitRequestDigest(INITIAL_VISIBILITY_EPOCH, sparse, {}),
+    ).toThrow(TypeError);
+  });
   it("tells apart connection deltas that differ only under __proto__", async () => {
     const active = {
       ...empty(),
