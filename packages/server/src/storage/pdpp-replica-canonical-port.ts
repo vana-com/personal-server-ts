@@ -228,6 +228,11 @@ export interface ReplicaCanonicalPort {
   captureBlob(instance: string, blobId: string): void;
   /** Tell the visibility view that canonical state moved. */
   notifyVisibility(): void;
+  /**
+   * Runs a top-level canonical mutation in a write transaction that starts
+   * from derived state matching canonical rows (see the visibility view).
+   */
+  exclusive<T>(write: () => T): T;
   cursorBinding(
     instanceIds: string[],
     fields: string[] | undefined,
@@ -298,6 +303,7 @@ export function createReplicaCanonicalPort(db: Database) {
             @stream, @record_key, @operation, @value_json, @blob_ids_json)
   `);
   let visibilityObserver: (() => void) | undefined;
+  let writeBoundary: (<T>(write: () => T) => T) | undefined;
   let localWriteObserver:
     ((instance: string, stream: string, recordKey: string) => void) | undefined;
   // Keys written since the last settle. A TEMP table, so a rolled-back write
@@ -466,6 +472,8 @@ export function createReplicaCanonicalPort(db: Database) {
       journal.captureLifecycle(instance, kind),
     captureBlob: journal.captureBlob,
     notifyVisibility: () => visibilityObserver?.(),
+    exclusive: (write) =>
+      writeBoundary ? writeBoundary(write) : db.transaction(write).immediate(),
     cursorBinding,
     assertCursorIntegrity(payload, instanceIds, fields) {
       const current = cursorBinding(instanceIds, fields);
@@ -526,6 +534,10 @@ export function createReplicaCanonicalPort(db: Database) {
     exporter: journal.exporter as ReplicationExport,
     setReplicaVisibilityObserver(observer: () => void) {
       visibilityObserver = observer;
+    },
+    /** The visibility view's `exclusive`: where top-level canonical writes begin. */
+    setReplicaWriteBoundary(boundary: <T>(write: () => T) => T) {
+      writeBoundary = boundary;
     },
     /** Called for each locally written key when the store settles, inside the write's transaction. */
     setReplicaLocalWriteObserver(
@@ -594,6 +606,7 @@ export function createReplicaRecordStore(
     replication: r.exporter,
     getInstallationWriterId: () => r.writerId,
     setReplicaVisibilityObserver: r.setReplicaVisibilityObserver,
+    setReplicaWriteBoundary: r.setReplicaWriteBoundary,
     setReplicaLocalWriteObserver: r.setReplicaLocalWriteObserver,
     replicaIntegrityEpoch: r.replicaIntegrityEpoch,
     fenceReplicaConnection: r.fenceReplicaConnection,

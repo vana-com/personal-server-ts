@@ -762,6 +762,7 @@ export function createReplicaReceiver(deps: {
     integrityEpoch: store.replicaIntegrityEpoch,
   });
   store.setReplicaVisibilityObserver(view.flush);
+  store.setReplicaWriteBoundary(view.exclusive);
   // A local write journals under the retained declaration. When retained
   // evidence for its key already names another declaration, or the stream is
   // append-only and the content differs, the write completes a conflict. The
@@ -987,7 +988,7 @@ export function createReplicaReceiver(deps: {
     return bytes;
   }
   function readSnapshot<T>(read: () => T): T {
-    return db.transaction(read).deferred();
+    return view.snapshot(read);
   }
   function previewBlobsValid(
     op: Extract<ReplicaOperation, { kind: "upsert" }>,
@@ -1190,13 +1191,11 @@ export function createReplicaReceiver(deps: {
   /** Copy-path mutation: authenticated, one transaction, view flushed inside it. */
   function copyTransaction<T>(credential: unknown, effect: () => T): T {
     authorize(credential);
-    return db
-      .transaction(() => {
-        const result = effect();
-        view.flush();
-        return result;
-      })
-      .immediate();
+    return view.exclusive(() => {
+      const result = effect();
+      view.flush();
+      return result;
+    });
   }
   const api = {
     setPendingEnabled(enabled: boolean) {
@@ -1355,7 +1354,7 @@ export function createReplicaReceiver(deps: {
           size: b.sizeBytes,
         })),
       ]);
-      db.transaction(() => {
+      view.exclusive(() => {
         const previous = db
           .prepare("SELECT * FROM pdpp_replica_pending_batches WHERE id=?")
           .get(input.id) as PendingBatch | undefined;
@@ -1397,7 +1396,7 @@ export function createReplicaReceiver(deps: {
         }
         if (!previous) view.addPending(input.id, envelope.operations);
         view.flush();
-      }).immediate();
+      });
     },
     /** Durable state of a staged batch, or undefined when never staged. */
     pendingState(
@@ -1414,13 +1413,13 @@ export function createReplicaReceiver(deps: {
       // A copy-backed batch fails closed through the terminal transition.
       if (hasCopies(input.id))
         return api.copies.terminate({ ...input, reason: "finalized_conflict" });
-      db.transaction(() => {
+      view.exclusive(() => {
         db.prepare(
           "UPDATE pdpp_replica_pending_batches SET state='quarantined',reason=? WHERE id=? AND state='pending'",
         ).run(input.reason, input.id);
         view.removePending(input.id);
         view.flush();
-      }).immediate();
+      });
     },
     /** Trusted host hook: caller must verify every fragment against finalized #433 evidence first. */
     promote(input: { credential: unknown; id: string }) {
@@ -1434,57 +1433,52 @@ export function createReplicaReceiver(deps: {
           );
         return;
       }
-      return db
-        .transaction(() => {
-          const row = db
-            .prepare("SELECT * FROM pdpp_replica_pending_batches WHERE id=?")
-            .get(input.id) as PendingBatch | undefined;
-          if (!row) throw new Error("pending replica batch not found");
-          if (row.state === "quarantined")
-            throw new Error("pending replica batch quarantined");
-          if (row.state === "confirmed") return;
-          const legacy = (
-            db
-              .prepare(
-                "SELECT blob_id,bytes FROM pdpp_replica_pending_bytes WHERE batch_id=?",
-              )
-              .all(input.id) as { blob_id: string; bytes: Buffer }[]
-          ).map((b) => ({ blobId: b.blob_id, bytes: b.bytes }));
-          const chunked = (
-            JSON.parse(row.blobs_json) as { blobId: string; size: number }[]
-          ).filter(
-            (b) =>
-              !legacy.some((l) => l.blobId === b.blobId) &&
-              binaryLength(
-                db,
-                "pending",
-                pendingBlobKey(input.id, b.blobId),
-              ) !== undefined,
-          );
-          const result = api.import({
-            credential: input.credential,
-            envelope: JSON.parse(row.envelope_json),
-            blobs: legacy,
-            stagedBlobs: chunked.map((b) => ({
-              blobId: b.blobId,
-              key: pendingBlobKey(input.id, b.blobId),
-              sizeBytes: b.size,
-              namespace: "pending" as const,
-            })),
-          });
-          db.prepare(
-            "UPDATE pdpp_replica_pending_batches SET state='confirmed' WHERE id=?",
-          ).run(input.id);
-          db.prepare(
-            "DELETE FROM pdpp_replica_pending_bytes WHERE batch_id=?",
-          ).run(input.id);
-          for (const b of chunked)
-            deleteBinary(db, "pending", pendingBlobKey(input.id, b.blobId));
-          view.removePending(input.id);
-          view.flush();
-          return result;
-        })
-        .immediate();
+      return view.exclusive(() => {
+        const row = db
+          .prepare("SELECT * FROM pdpp_replica_pending_batches WHERE id=?")
+          .get(input.id) as PendingBatch | undefined;
+        if (!row) throw new Error("pending replica batch not found");
+        if (row.state === "quarantined")
+          throw new Error("pending replica batch quarantined");
+        if (row.state === "confirmed") return;
+        const legacy = (
+          db
+            .prepare(
+              "SELECT blob_id,bytes FROM pdpp_replica_pending_bytes WHERE batch_id=?",
+            )
+            .all(input.id) as { blob_id: string; bytes: Buffer }[]
+        ).map((b) => ({ blobId: b.blob_id, bytes: b.bytes }));
+        const chunked = (
+          JSON.parse(row.blobs_json) as { blobId: string; size: number }[]
+        ).filter(
+          (b) =>
+            !legacy.some((l) => l.blobId === b.blobId) &&
+            binaryLength(db, "pending", pendingBlobKey(input.id, b.blobId)) !==
+              undefined,
+        );
+        const result = api.import({
+          credential: input.credential,
+          envelope: JSON.parse(row.envelope_json),
+          blobs: legacy,
+          stagedBlobs: chunked.map((b) => ({
+            blobId: b.blobId,
+            key: pendingBlobKey(input.id, b.blobId),
+            sizeBytes: b.size,
+            namespace: "pending" as const,
+          })),
+        });
+        db.prepare(
+          "UPDATE pdpp_replica_pending_batches SET state='confirmed' WHERE id=?",
+        ).run(input.id);
+        db.prepare(
+          "DELETE FROM pdpp_replica_pending_bytes WHERE batch_id=?",
+        ).run(input.id);
+        for (const b of chunked)
+          deleteBinary(db, "pending", pendingBlobKey(input.id, b.blobId));
+        view.removePending(input.id);
+        view.flush();
+        return result;
+      });
     },
     connectionVisibility: view.connectionVisibility,
     readVisibleRecords,
@@ -1544,25 +1538,23 @@ export function createReplicaReceiver(deps: {
         // Changes sessions allocate a canonical horizon. Reserve the writer before
         // selecting policy so that the horizon and conflict fence cannot race.
         changesSince: (stream: string, options: ChangesSinceOptions) =>
-          db
-            .transaction(() => {
-              const visible = options.instanceIds.filter((instance) => {
-                const visibility = view.connectionVisibility(instance);
-                return (
-                  !visibility ||
-                  replicaStateVisible(
-                    visibility.state,
-                    reader,
-                    deps.visibilityPolicy,
-                    "received",
-                  )
-                );
-              });
-              return bindChangesIntegrity(options, () =>
-                store.changesSinceForInstances(stream, options, visible),
+          view.exclusive(() => {
+            const visible = options.instanceIds.filter((instance) => {
+              const visibility = view.connectionVisibility(instance);
+              return (
+                !visibility ||
+                replicaStateVisible(
+                  visibility.state,
+                  reader,
+                  deps.visibilityPolicy,
+                  "received",
+                )
               );
-            })
-            .immediate(),
+            });
+            return bindChangesIntegrity(options, () =>
+              store.changesSinceForInstances(stream, options, visible),
+            );
+          }),
         getBlobBytes: (id: string) =>
           readSnapshot(() =>
             !needsReferenceGate()
@@ -1604,7 +1596,7 @@ export function createReplicaReceiver(deps: {
         envelope.operations.some((op) => op.owner !== owner)
       )
         throw new Error("wrong replica owner");
-      db.transaction(() => {
+      view.exclusive(() => {
         for (const op of envelope.operations) validateMapping(op);
         const records = envelope.operations.filter(
           (op): op is RecordOperation =>
@@ -1646,7 +1638,7 @@ export function createReplicaReceiver(deps: {
         // reads apply the quarantine predicate. The record withdrawals above
         // marked their keys dirty; flush re-derives only those.
         view.flush();
-      }).immediate();
+      });
     },
     import(input: {
       credential: unknown;
@@ -1666,28 +1658,24 @@ export function createReplicaReceiver(deps: {
         envelope.operations.some((op) => op.owner !== owner)
       )
         throw new Error("wrong replica owner");
-      return db.transaction(() => importParsed(envelope, input)).immediate();
+      return view.exclusive(() => importParsed(envelope, input));
     },
     /** Trusted host notification after declaration documents or validators change. */
     reconcileDeclarations(input: { credential: unknown }): ReplicaMergePlan {
       authorize(input.credential);
-      return db
-        .transaction(() => {
-          const plan = reconcile();
-          view.reconcileAll();
-          return plan;
-        })
-        .immediate();
+      return view.exclusive(() => {
+        const plan = reconcile();
+        view.reconcileAll();
+        return plan;
+      });
     },
     retry(input: { credential: unknown }): ReplicaMergePlan {
       authorize(input.credential);
-      return db
-        .transaction(() => {
-          const plan = reconcile();
-          view.flush();
-          return plan;
-        })
-        .immediate();
+      return view.exclusive(() => {
+        const plan = reconcile();
+        view.flush();
+        return plan;
+      });
     },
   };
   return api;

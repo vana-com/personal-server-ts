@@ -78,6 +78,12 @@ interface Fence {
   /** Resolves to the first record key of the resumed page; rejects when expired. */
   resume(): Promise<string | undefined>;
   first: string;
+  /**
+   * A listing cursor binds to the derived view's revisions, and the view cannot
+   * know what a plain open changed while it was closed: no listing cursor
+   * outlives a restart. A changes feed cursor binds to history and survives.
+   */
+  expiresOnReopen?: boolean;
 }
 interface Port<D extends ReplicaPortDriver> {
   open(): Promise<D>;
@@ -103,6 +109,7 @@ const nodePort: Port<NodeDriver> = {
       out.push(
         {
           label: `${reader} listRecords`,
+          expiresOnReopen: true,
           first: listed.data[0].recordKey,
           token: listed.nextCursor,
           resume: async () =>
@@ -163,6 +170,8 @@ const litePort = (sqlite: boolean): Port<LiteDriver> => ({
 interface Event {
   name: string;
   expires: boolean;
+  /** The event reopens the store, which expires the cursors that `expiresOnReopen`. */
+  reopens?: boolean;
   run(driver: ReplicaPortDriver): Promise<unknown>;
 }
 const events: Event[] = [
@@ -205,7 +214,7 @@ const events: Event[] = [
     expires: false,
     run: (d) => d.importBatch("unrelated", [put("c2", 1, "other", 3)], []),
   },
-  { name: "reopen", expires: false, run: (d) => d.reopen() },
+  { name: "reopen", expires: false, reopens: true, run: (d) => d.reopen() },
   {
     name: "duplicate evidence",
     expires: false,
@@ -214,6 +223,7 @@ const events: Event[] = [
   {
     name: "duplicate evidence after reopen",
     expires: false,
+    reopens: true,
     run: async (d) => {
       await d.reopen();
       await d.importBatch("seed", seed, []);
@@ -229,7 +239,7 @@ afterEach(() => {
 function fenceSuite<D extends ReplicaPortDriver>(name: string, port: Port<D>) {
   describe(`${name} cursor fences`, () => {
     for (const event of events) {
-      it(`${event.name} ${event.expires ? "expires" : "keeps"} tokens`, async () => {
+      it(`${event.name} ${event.expires ? "expires" : event.reopens ? "keeps only history-bound" : "keeps"} tokens`, async () => {
         const driver = await port.open();
         opened.push(driver);
         await driver.importBatch("seed", seed, []);
@@ -241,7 +251,7 @@ function fenceSuite<D extends ReplicaPortDriver>(name: string, port: Port<D>) {
             (first) => ({ first }),
             (error: unknown) => ({ error }),
           );
-          if (event.expires) {
+          if (event.expires || (event.reopens && fence.expiresOnReopen)) {
             expect(
               "error" in resumed && port.expired(resumed.error),
               fence.label,

@@ -229,6 +229,27 @@ const litePort = (sqlite: boolean): Port<LiteDriver> => ({
     return driver.idCount;
   },
 });
+/**
+ * A reopen advances every cursor revision (cursors never outlive a restart:
+ * nothing can tell what a plain open changed meanwhile), so a crash and
+ * reopen is compared without the revision counters, which are no state.
+ */
+function withoutNodeRevisions(dump: Record<string, string[]>) {
+  const streams = dump.pdpp_replica_view_streams;
+  if (!streams) return dump;
+  return {
+    ...dump,
+    pdpp_replica_view_streams: streams
+      .map((row) => {
+        const { revision: _revision, ...rest } = JSON.parse(row) as Record<
+          string,
+          unknown
+        >;
+        return JSON.stringify(rest);
+      })
+      .sort(),
+  };
+}
 const nodePort: Port<NodeDriver> = {
   open: async () =>
     nodeDriver({
@@ -236,7 +257,7 @@ const nodePort: Port<NodeDriver> = {
       declarations: [BINDINGS.m, BINDINGS.a],
       provisioned: ["c1", "c2"],
     }),
-  dump: (driver) => sqliteDump(driver.db),
+  dump: (driver) => withoutNodeRevisions(sqliteDump(driver.db)),
   // A repeated unchanged ingest refreshes key arrival order. That predates
   // replication (it is on main) and changes no record, change or journal row.
   repeatDump: (driver) => {
@@ -244,7 +265,7 @@ const nodePort: Port<NodeDriver> = {
       pdpp_record_arrival: _arrival,
       pdpp_record_arrival_clock: _clock,
       ...rest
-    } = sqliteDump(driver.db);
+    } = withoutNodeRevisions(sqliteDump(driver.db));
     return rest;
   },
   // Node local writes carry no request id and a repeated promotion returns

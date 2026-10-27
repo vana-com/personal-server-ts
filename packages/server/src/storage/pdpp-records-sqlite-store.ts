@@ -804,10 +804,17 @@ export function createSqliteRecordStore(
     sweepStaleBlobClaims(db);
   }
   const replica = options.replica?.(db);
-  /** Every connection-scoped write enters through this quarantine boundary. */
+  /**
+   * Every connection-scoped write enters through this quarantine boundary.
+   * Without replication a top-level call begins the transaction main began:
+   * deferred, so a mutation that writes nothing takes no write lock.
+   * With replication the transaction is immediate and starts from derived
+   * state that matches canonical rows.
+   */
   const connectionMutation = <T>(
     instances: string | readonly string[] | (() => readonly string[]),
     write: () => T,
+    begin: "deferred" | "immediate" = "deferred",
   ): T => {
     const run = () => {
       const ids = typeof instances === "function" ? instances() : instances;
@@ -819,8 +826,15 @@ export function createSqliteRecordStore(
     // a mutator that throws undoes its own writes even if the caller catches
     // the error and commits. That is what main's per-mutator
     // `db.transaction` gave every one of these.
-    return db.transaction(run).immediate();
+    if (replica && !db.inTransaction) return replica.exclusive(run);
+    const atomic = db.transaction(run);
+    return begin === "immediate" ? atomic.immediate() : atomic();
   };
+  /** The one mutation main opened with `BEGIN IMMEDIATE`: a stream completion. */
+  const immediateConnectionMutation = <T>(
+    instance: string,
+    write: () => T,
+  ): T => connectionMutation(instance, write, "immediate");
   /** Replica quarantine filter for read SQL; empty without replication. */
   const unquarantined = (alias: string) =>
     replica ? ` AND ${replica.unquarantinedRecordSql(alias)}` : "";
@@ -1933,7 +1947,7 @@ export function createSqliteRecordStore(
     declarations: StreamDeclarationResolver,
   ): { receipts: NativeStreamCompletionReceipt[] } {
     const request = parseCompletionRequest(rawRequest);
-    return connectionMutation(request.instance, () => {
+    return immediateConnectionMutation(request.instance, () => {
       const binding = db
         .prepare("SELECT * FROM pdpp_instance_binding WHERE instance = ?")
         .get(request.instance) as BindingRowDb | undefined;

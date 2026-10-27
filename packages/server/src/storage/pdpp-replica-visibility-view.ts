@@ -1,4 +1,4 @@
-import type { Database } from "better-sqlite3";
+import type { Database, Statement } from "better-sqlite3";
 import {
   canonicalJson,
   type ReplicaOperation,
@@ -55,6 +55,14 @@ type OverlayRow = {
 
 /** Bump when the derived view layout changes; construction then rebuilds it. */
 const VIEW_SCHEMA = 10;
+/** How often a transaction may find another connection committed first. */
+const SYNC_ATTEMPTS = 16;
+/** Thrown inside a transaction that started after another connection committed. */
+class DerivedStateMoved extends Error {
+  constructor() {
+    super("replica view could not catch up with concurrent writers");
+  }
+}
 /**
  * Revisions are comparable only within one view layout, so the layout version
  * tags every cursor. 70d52db0 cursors carry an untagged revision and expire.
@@ -170,6 +178,13 @@ export function createReplicaVisibilityView(deps: {
   const markKey = (alias: string) =>
     `INSERT INTO pdpp_replica_view_dirty_keys SELECT ${alias}.instance,${alias}.stream,${alias}.record_key WHERE ${touches(`${alias}.instance`, `${alias}.stream`, `${alias}.record_key`)} AND ${notDirtyKey(alias)};`;
 
+  /**
+   * `PRAGMA data_version` as of the last time the derived state matched
+   * canonical rows. It moves only when another connection commits.
+   */
+  let seen = -1;
+  let dataVersionStatement: Statement<[]> | undefined;
+  let transitions: string[] | undefined;
   db.transaction(() => {
     const schema = db
       .prepare(
@@ -226,6 +241,9 @@ export function createReplicaVisibilityView(deps: {
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_connections (instance TEXT PRIMARY KEY);
       -- Streams whose owner-preview latest row may have moved; flush recomputes them.
       CREATE TABLE IF NOT EXISTS pdpp_replica_view_dirty_latest (instance TEXT NOT NULL, stream TEXT NOT NULL, PRIMARY KEY(instance,stream));
+      -- What the derived state above was last made to match, as of this connection's
+      -- last write. It rolls back with the transaction that moved it.
+      CREATE TABLE IF NOT EXISTS pdpp_replica_view_sync (id INTEGER PRIMARY KEY CHECK(id=1), change_mark INTEGER NOT NULL, structure TEXT NOT NULL);
     `);
     for (const table of ["pdpp_replica_operations", "pdpp_replica_received"])
       db.exec(`
@@ -352,42 +370,11 @@ export function createReplicaVisibilityView(deps: {
         END;
       `);
     }
-    if (hasBindingConflictFacts) {
-      // Re-derive the local projection unless it already matches. A plain open
-      // can change a binding without any trigger to follow it.
-      const projected = `SELECT * FROM (${localProjection} AND j.connection_id IN (SELECT instance FROM pdpp_replica_binding_conflicts))`;
-      const stored =
-        "SELECT instance,stream,record_key,emitted_at,row_json,blob_id,pending,deleted,blob_json,sequence,generation,source_id,method FROM pdpp_replica_local_view";
-      const drifted = db
-        .prepare(
-          `SELECT 1 FROM (${stored} EXCEPT ${projected}) UNION ALL SELECT 1 FROM (${projected} EXCEPT ${stored}) LIMIT 1`,
-        )
-        .get();
-      if (drifted)
-        db.exec(
-          `DELETE FROM pdpp_replica_local_view; INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id IN (SELECT instance FROM pdpp_replica_binding_conflicts);`,
-        );
-    }
-    if (initialized) {
-      // The triggers above exist only on this connection. Writes made while
-      // replication was off (a plain open or a main build) fed none of them,
-      // so derive again what they maintain, from canonical rows. Summaries
-      // that already match are left alone and keep their cursor revisions.
-      // Keys that can differ from canonical are those of a connection with an
-      // overlay row, pending work or a conflict; flush() below reconciles them.
-      db.exec(`
-        INSERT INTO pdpp_replica_view_streams SELECT 0,instance,stream,SUM(1-deleted),SUM(1-deleted),0,MAX(CASE WHEN deleted=0 THEN emitted_at END),1 FROM pdpp_records WHERE true GROUP BY instance,stream
-        ON CONFLICT(preview,instance,stream) DO UPDATE SET revision=revision+1,live_count=excluded.live_count,row_count=excluded.row_count,last_updated=excluded.last_updated
-        WHERE live_count IS NOT excluded.live_count OR row_count IS NOT excluded.row_count OR last_updated IS NOT excluded.last_updated;
-        UPDATE pdpp_replica_view_streams SET revision=revision+1,live_count=0,row_count=0,last_updated=NULL
-        WHERE preview=0 AND (live_count<>0 OR row_count<>0 OR last_updated IS NOT NULL)
-          AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance=pdpp_replica_view_streams.instance AND r.stream=pdpp_replica_view_streams.stream);
-        INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view;
-        INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view_pending;
-        INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view_conflicts;
-        INSERT OR IGNORE INTO pdpp_replica_view_dirty_latest SELECT instance,stream FROM pdpp_replica_view_streams WHERE preview=1;
-      `);
-    }
+    // The triggers above exist only on this connection. Writes made while
+    // replication was off (a plain open or a main build) fed none of them, so
+    // derive again from canonical rows what they maintain.
+    if (initialized) rederive();
+    else rederiveLocalView();
     if (!initialized) {
       // One-time rebuild. Thereafter persisted dirty queues also cover downtime/restarts.
       // Only pending work, confirmed operation-ID variants and deleted bindings can
@@ -411,7 +398,234 @@ export function createReplicaVisibilityView(deps: {
         VIEW_SCHEMA,
       );
     }
+    markSynced();
+    seen = dataVersion();
   }).immediate();
+
+  // ---- Following commits by other connections --------------------------------
+  // The maintenance triggers are TEMP triggers: they see this connection's writes
+  // only. A commit by another connection (a flag-off build, or main, running on
+  // the same file) fed none of them. `PRAGMA data_version` says exactly when such
+  // a commit happened, so every read and write that trusts the derived state
+  // runs through `snapshot` or `exclusive`, which first make that state match
+  // canonical rows again.
+  function dataVersion(): number {
+    dataVersionStatement ??= db.prepare("PRAGMA data_version").pluck();
+    return dataVersionStatement.get() as number;
+  }
+  function maxChangeId(): number {
+    return (
+      db
+        .prepare("SELECT COALESCE(MAX(id),0) AS id FROM pdpp_record_changes")
+        .get() as { id: number }
+    ).id;
+  }
+  function transitionTables(): string[] {
+    return (transitions ??= [
+      "pdpp_claude_transition",
+      "pdpp_strava_transition",
+    ].filter(
+      (name) =>
+        !!db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+          .get(name),
+    ));
+  }
+  /**
+   * Everything besides record history that can move canonical rows or decide
+   * their visibility without a history row: connection lifecycle and the
+   * archive moves of method transitions. A change here re-derives everything.
+   */
+  function structureSignature(): string {
+    return JSON.stringify([
+      db
+        .prepare(
+          "SELECT instance,generation,deleted_at,source_id,method,reset_clock FROM pdpp_instance_binding ORDER BY instance",
+        )
+        .all(),
+      ...transitionTables().map((table) =>
+        db.prepare(`SELECT * FROM ${table} ORDER BY instance`).all(),
+      ),
+    ]);
+  }
+  /** Records that the derived state matches canonical rows as of now. */
+  function markSynced(): void {
+    const mark = maxChangeId();
+    const structure = structureSignature();
+    // Written only when it moved: an idle transaction writes no view row.
+    const moved = db
+      .prepare(
+        "UPDATE pdpp_replica_view_sync SET change_mark=?,structure=? WHERE id=1 AND (change_mark<>? OR structure<>?)",
+      )
+      .run(mark, structure, mark, structure).changes;
+    if (!moved)
+      db.prepare(
+        "INSERT OR IGNORE INTO pdpp_replica_view_sync VALUES (1,?,?)",
+      ).run(mark, structure);
+  }
+  /** Re-derives the local journal projection unless it already matches. */
+  function rederiveLocalView(): void {
+    if (!hasBindingConflictFacts) return;
+    const projected = `SELECT * FROM (${localProjection} AND j.connection_id IN (SELECT instance FROM pdpp_replica_binding_conflicts))`;
+    const stored =
+      "SELECT instance,stream,record_key,emitted_at,row_json,blob_id,pending,deleted,blob_json,sequence,generation,source_id,method FROM pdpp_replica_local_view";
+    const drifted = db
+      .prepare(
+        `SELECT 1 FROM (${stored} EXCEPT ${projected}) UNION ALL SELECT 1 FROM (${projected} EXCEPT ${stored}) LIMIT 1`,
+      )
+      .get();
+    if (drifted)
+      db.exec(
+        `DELETE FROM pdpp_replica_local_view; INSERT INTO pdpp_replica_local_view ${localProjection} AND j.connection_id IN (SELECT instance FROM pdpp_replica_binding_conflicts);`,
+      );
+  }
+  /**
+   * Derives everything again from canonical rows. Content can change without
+   * moving a count or a timestamp, and nothing here can tell what changed, so
+   * every cursor revision advances: no cursor outlives this call.
+   */
+  function rederive(): void {
+    rederiveLocalView();
+    db.exec(`
+      UPDATE pdpp_replica_view_streams SET revision=revision+1;
+      INSERT INTO pdpp_replica_view_streams SELECT 0,instance,stream,SUM(1-deleted),SUM(1-deleted),0,MAX(CASE WHEN deleted=0 THEN emitted_at END),1 FROM pdpp_records WHERE true GROUP BY instance,stream
+      ON CONFLICT(preview,instance,stream) DO UPDATE SET live_count=excluded.live_count,row_count=excluded.row_count,last_updated=excluded.last_updated
+      WHERE live_count IS NOT excluded.live_count OR row_count IS NOT excluded.row_count OR last_updated IS NOT excluded.last_updated;
+      UPDATE pdpp_replica_view_streams SET live_count=0,row_count=0,last_updated=NULL
+      WHERE preview=0 AND (live_count<>0 OR row_count<>0 OR last_updated IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM pdpp_records r WHERE r.instance=pdpp_replica_view_streams.instance AND r.stream=pdpp_replica_view_streams.stream);
+      INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view;
+      INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view_pending;
+      INSERT OR IGNORE INTO pdpp_replica_view_dirty_connections SELECT DISTINCT instance FROM pdpp_replica_view_conflicts;
+      INSERT OR IGNORE INTO pdpp_replica_view_dirty_latest SELECT instance,stream FROM pdpp_replica_view_streams WHERE preview=1;
+    `);
+  }
+  /**
+   * Another connection committed record writes (history rows `from` < id <=
+   * `to`): re-derive the streams and keys they name. Every record write
+   * appends a history row in the same transaction, so the window names every
+   * changed key.
+   */
+  function applyChangeWindow(from: number, to: number): void {
+    db.prepare(
+      `INSERT INTO pdpp_replica_view_dirty_keys SELECT DISTINCT c.instance,c.stream,c.record_key FROM pdpp_record_changes c WHERE c.id>? AND c.id<=? AND ${touches("c.instance", "c.stream", "c.record_key")} AND ${notDirtyKey("c")}`,
+    ).run(from, to);
+    const changed = db.prepare(
+      "SELECT DISTINCT instance,stream FROM pdpp_record_changes WHERE id>? AND id<=?",
+    );
+    const bump = db.prepare(
+      "UPDATE pdpp_replica_view_streams SET revision=revision+1 WHERE preview<>0 AND instance=@instance AND stream=@stream",
+    );
+    const summarize = db.prepare(
+      `INSERT INTO pdpp_replica_view_streams SELECT 0,@instance,@stream,live,live,0,(SELECT emitted_at FROM pdpp_records WHERE instance=@instance AND stream=@stream AND deleted=0 ORDER BY emitted_at DESC,record_key DESC LIMIT 1),1
+       FROM (SELECT COUNT(*) AS live FROM pdpp_records WHERE instance=@instance AND stream=@stream AND deleted=0) WHERE true
+       ON CONFLICT(preview,instance,stream) DO UPDATE SET revision=revision+1,live_count=excluded.live_count,row_count=excluded.row_count,last_updated=excluded.last_updated`,
+    );
+    const latest = db.prepare(
+      "INSERT OR IGNORE INTO pdpp_replica_view_dirty_latest SELECT instance,stream FROM pdpp_replica_view_streams WHERE preview=1 AND instance=@instance AND stream=@stream",
+    );
+    for (const row of changed.all(from, to) as {
+      instance: string;
+      stream: string;
+    }[]) {
+      summarize.run(row);
+      bump.run(row);
+      latest.run(row);
+    }
+  }
+  /** Blob bytes arrive and leave without a history row; revisit what depends on them. */
+  function revisitBlobDependents(): void {
+    // Each branch repeats its table's partial index predicate so the index
+    // serves it; the operations view would scan every retained operation.
+    const retained = (table: string) =>
+      `SELECT ${expression("instance")} AS instance,${expression("stream")} AS stream,${expression("record_key")} AS record_key FROM ${table} WHERE ${expression("blob_id")} IS NOT NULL AND ${expression("kind")}='upsert' AND ${expression("record_key")} IS NOT NULL`;
+    db.exec(
+      `INSERT INTO pdpp_replica_view_dirty_keys SELECT DISTINCT o.instance,o.stream,o.record_key FROM (
+         ${retained("pdpp_replica_operations")}
+         UNION ALL ${retained("pdpp_replica_received")}
+         UNION ALL SELECT instance,stream,record_key FROM pdpp_replica_view_pending WHERE blob_id IS NOT NULL AND kind='upsert' AND record_key IS NOT NULL
+       ) o WHERE ${touches("o.instance", "o.stream", "o.record_key")} AND ${notDirtyKey("o")}`,
+    );
+  }
+  /** Must run in a write transaction, after nobody else can commit. */
+  function followOtherConnections(): void {
+    const marked = db
+      .prepare("SELECT change_mark,structure FROM pdpp_replica_view_sync")
+      .get() as { change_mark: number; structure: string } | undefined;
+    const upTo = maxChangeId();
+    if (
+      !marked ||
+      marked.structure !== structureSignature() ||
+      upTo < marked.change_mark
+    )
+      rederive();
+    else if (upTo > marked.change_mark)
+      applyChangeWindow(marked.change_mark, upTo);
+    revisitBlobDependents();
+    markSynced();
+    flush();
+  }
+  /** Brings the derived state up to date unless it already is. Never inside a transaction. */
+  function sync(): void {
+    if (db.inTransaction || dataVersion() === seen) return;
+    seen = db
+      .transaction(() => {
+        const version = dataVersion();
+        followOtherConnections();
+        return version;
+      })
+      .immediate();
+  }
+  /** A public read: it answers from derived state that matches canonical rows. */
+  const reading =
+    <A extends unknown[], R>(read: (...args: A) => R) =>
+    (...args: A): R =>
+      snapshot(() => read(...args));
+  /**
+   * Runs `fn` in a transaction that starts from a derived state matching
+   * canonical rows. Another connection can commit between `sync` and the
+   * transaction starting; the transaction then notices, rolls back untouched
+   * and tries again.
+   */
+  function guarded<T>(
+    begin: "deferred" | "immediate",
+    fn: () => T,
+    afterwards?: () => void,
+  ): T {
+    for (let attempt = 1; ; attempt++) {
+      sync();
+      try {
+        return db
+          .transaction(() => {
+            // The first read fixes the snapshot a deferred transaction sees.
+            db.prepare("SELECT 1 FROM pdpp_replica_view_sync").get();
+            if (dataVersion() !== seen) throw new DerivedStateMoved();
+            const result = fn();
+            afterwards?.();
+            return result;
+          })
+          [begin]();
+      } catch (error) {
+        if (!(error instanceof DerivedStateMoved) || attempt >= SYNC_ATTEMPTS)
+          throw error;
+      }
+    }
+  }
+  /** A read transaction over derived state that matches canonical rows. */
+  function snapshot<T>(read: () => T): T {
+    return db.inTransaction ? read() : guarded("deferred", read);
+  }
+  /**
+   * A write transaction (`BEGIN IMMEDIATE`) over derived state that matches
+   * canonical rows. Everything this connection wrote is derived by the
+   * triggers, so it ends by recording the new horizon. Nested, it is a
+   * savepoint of the caller's transaction.
+   */
+  function exclusive<T>(write: () => T): T {
+    return db.inTransaction
+      ? db.transaction(write).immediate()
+      : guarded("immediate", write, markSynced);
+  }
 
   function markOperation(digest: string, json: string) {
     db.prepare(
@@ -629,17 +843,30 @@ export function createReplicaVisibilityView(deps: {
       ReturnType<typeof connectionInvolvement>
     >();
     // Cursor revisions advance in the summary triggers, only for rows that change.
-    for (const row of db
-      .prepare("SELECT * FROM pdpp_replica_view_dirty_keys")
-      .all() as { instance: string; stream: string; record_key: string }[]) {
-      if (!involvement.has(row.instance))
-        involvement.set(row.instance, connectionInvolvement(row.instance));
-      reconcileKey(
-        row.instance,
-        row.stream,
-        row.record_key,
-        involvement.get(row.instance)!,
-      );
+    // A deleted or conflicted connection queues every canonical key. Take the
+    // queue a page at a time, in key order, so memory does not grow with it.
+    const page = db.prepare(
+      "SELECT * FROM pdpp_replica_view_dirty_keys WHERE (instance,stream,record_key)>(@instance,@stream,@record_key) ORDER BY instance,stream,record_key LIMIT 1000",
+    );
+    let after = { instance: "", stream: "", record_key: "" };
+    for (;;) {
+      const rows = page.all(after) as {
+        instance: string;
+        stream: string;
+        record_key: string;
+      }[];
+      for (const row of rows) {
+        if (!involvement.has(row.instance))
+          involvement.set(row.instance, connectionInvolvement(row.instance));
+        reconcileKey(
+          row.instance,
+          row.stream,
+          row.record_key,
+          involvement.get(row.instance)!,
+        );
+      }
+      if (rows.length < 1000) break;
+      after = rows[rows.length - 1]!;
     }
     // The scan below can step over every masked canonical row of a stream,
     // so it runs here, once per changed stream, and never in a read.
@@ -1545,16 +1772,19 @@ export function createReplicaVisibilityView(deps: {
   flush();
   return {
     flush,
+    sync,
+    snapshot,
+    exclusive,
     reconcileAll,
     addPending,
     removePending,
     connectionVisibility,
     hasBindingConflictFacts,
-    getRecord,
-    listRecords,
-    listStreams,
-    findBlobReferences,
-    hasBlobReference,
-    getBlobMeta,
+    getRecord: reading(getRecord),
+    listRecords: reading(listRecords),
+    listStreams: reading(listStreams),
+    findBlobReferences: reading(findBlobReferences),
+    hasBlobReference: reading(hasBlobReference),
+    getBlobMeta: reading(getBlobMeta),
   };
 }
