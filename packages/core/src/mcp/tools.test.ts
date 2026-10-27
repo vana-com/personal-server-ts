@@ -7,7 +7,11 @@ import {
   MCP_TOOLS,
   resolveGrantForScope,
 } from "./tools.js";
-import { handleMcpStreamableHttpRequest } from "./server.js";
+import {
+  handleMcpHandshake,
+  handleMcpStreamableHttpRequest,
+  MCP_SERVER_INSTRUCTIONS,
+} from "./server.js";
 import type { McpConnectionRecord } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
@@ -104,6 +108,56 @@ describe("mcp/tools", () => {
     // when remember was added; the point is that tools/list stays small enough
     // to cross the relay in one go, not the exact number.
     expect(new TextEncoder().encode(body).byteLength).toBeLessThan(5500);
+  });
+
+  it("tells the client in initialize to use remember proactively, on the full and handshake paths", async () => {
+    const initialize = () =>
+      new Request("http://localhost/mcp/test-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "claude-ai", version: "1.0.0" },
+          },
+        }),
+      });
+
+    const full = await handleMcpStreamableHttpRequest(initialize(), {
+      connection: createConnection(),
+      readClient: createMinimalReadClient(),
+    });
+    const handshake = await handleMcpHandshake(initialize());
+
+    for (const response of [full, handshake]) {
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        result: { instructions?: string };
+      };
+      expect(body.result.instructions).toBe(MCP_SERVER_INSTRUCTIONS);
+    }
+    // Without these, Claude saved "I'm training for a half marathon" to its
+    // own built-in memory instead of calling remember.
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("remember");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("without being asked");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("built-in memory");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("search_personal_context");
+    expect(MCP_SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(600);
+  });
+
+  it("describes remember as proactive, bounded and grant-gated", () => {
+    const { description } = getTool("remember");
+    expect(description).toContain("without being asked");
+    expect(description).toContain("secrets");
+    expect(description).toContain("write:<scope>");
+    expect(description.length).toBeLessThanOrEqual(260);
   });
 
   it("advertises no timeoutMs larger than the dispatcher will allow", async () => {
