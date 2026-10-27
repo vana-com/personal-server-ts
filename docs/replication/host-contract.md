@@ -193,10 +193,12 @@ in use.
 - **Copied key.** Anyone who has a copy of a device's `key.json` (or the Lite
   identity and master key) can sign as that device and its writers until the
   owner deregisters it. Testers accept this.
-- **Another device can delay a peer.** Storage PUT overwrites (section 1), so
+- **Another device can block a peer.** Storage PUT overwrites (section 1), so
   any registered server of the owner can replace another device's stored
   ciphertext. The peer then fails the registered hash and cannot import that
-  fragment. It never accepts forged data.
+  fragment. It never accepts forged data, but the overwrite destroys the
+  fragment's availability and blocks that writer's later batches until the
+  original content is restored. Downloading again cannot repair it.
 - **Removed devices can still read.** Every device holds the owner master key,
   and storage reads are public (section 1). A removed device that kept the
   master key can read and decrypt new batches. This must be fixed before
