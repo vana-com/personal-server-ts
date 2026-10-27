@@ -2,7 +2,7 @@ import { readBinary } from "./pdpp-binary-chunks.js";
 import Database from "better-sqlite3";
 import { keccak256, stringToHex } from "viem";
 import { afterEach, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
@@ -10,6 +10,11 @@ import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "./pdpp-replication-transport.js";
 import { unprovisionConnection } from "./pdpp-replica-contract.test-utils.js";
+import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
+import {
+  enableReplicaTestIdentity,
+  replicaTestAuthority,
+} from "./pdpp-replica-writer-identity.test-utils.js";
 import {
   createDpv2ReplicaTransport,
   replicaChainCommitment,
@@ -189,6 +194,7 @@ function network(realCrypto = false, cap = 8192) {
   };
   return {
     port,
+    roster: createTestReplicaRoster(),
     blobs,
     head,
     chainRow,
@@ -221,19 +227,23 @@ function device(
     pageSize?: number;
     enabled?: boolean;
     preexisting?: string;
+    /** Open a copy of another device's database, with its server key. */
+    copyOf?: ReturnType<typeof device>;
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), "replica-transport-"));
   directories.push(dir);
   const path = join(dir, "records.sqlite");
+  if (opts.copyOf) writeFileSync(path, opts.copyOf.db.serialize());
   let db = new Database(path);
   let store = createReplicaRecordStore(db);
-  store.registerConnection({
-    instance: "conn",
-    sourceId,
-    method: "export",
-    label: "C",
-  });
+  if (!opts.copyOf)
+    store.registerConnection({
+      instance: "conn",
+      sourceId,
+      method: "export",
+      label: "C",
+    });
   const put = (text: string, id = "a") =>
     store.ingestBatch(
       [
@@ -249,8 +259,12 @@ function device(
       () => ["id"],
       { method: "export", generation: 1 },
     );
-  if (opts.preexisting) put(opts.preexisting);
-  store.replication.beginBaseline(expected);
+  const authority = opts.copyOf?.authority ?? replicaTestAuthority(net.roster);
+  if (!opts.copyOf) {
+    enableReplicaTestIdentity(db, { owner, roster: net.roster, authority });
+    if (opts.preexisting) put(opts.preexisting);
+    store.replication.beginBaseline(expected);
+  }
   let declarations = expected.declarations;
   function worker() {
     const receiver = createReplicaReceiver({
@@ -272,6 +286,7 @@ function device(
       enabled: opts.enabled ?? true,
       expected: () => ({ owner, declarations }),
       transport: net.port,
+      authority,
       now: () => time,
       targetChunkBytes: opts.chunk ?? 4000,
       maxBlobBytes: opts.cap ?? 8192,
@@ -280,6 +295,7 @@ function device(
   }
   let engine = worker();
   const d = {
+    authority,
     get db() {
       return db;
     },
@@ -805,22 +821,17 @@ it("does not acknowledge or apply a different batch reusing an imported writer s
   const b = device(net);
   await cycles([b], 2);
   expect(b.get()).toEqual(a.get());
-  const writer = (
-    a.db.prepare("SELECT writer FROM pdpp_transport_state").get() as {
-      writer: string;
-    }
-  ).writer;
-  const clone = device(net, { preexisting: "conflicting clone" });
-  clone.db
-    .prepare(
-      "INSERT INTO pdpp_transport_state (id,owner,writer) VALUES (1,?,?)",
-    )
-    .run(owner, writer);
+  // A copied database that was not rotated keeps A's writer and sequence.
+  const clone = device(net, { copyOf: a });
+  a.put("accepted next");
+  await cycles([a, b], 2);
+  expect(b.get()).toEqual({ id: "a", text: "accepted next" });
+  clone.put("conflicting clone");
   await cycles([clone, b], 2);
   expect(b.get()).toEqual(a.get());
   // A second batch on an imported writer sequence is proven equivocation:
   // terminal and never imported, instead of a hot retry on a UNIQUE error.
-  const cloneScope = outbox(clone)[0]!.scope;
+  const cloneScope = outbox(clone).at(-1)!.scope;
   expect(inbox(b).find((r) => r.scope === cloneScope)?.state).toBe(
     "quarantined",
   );
@@ -1504,6 +1515,7 @@ it("protects a live same-process writer opened through a different directory ali
     }),
     credential: "replica-secret",
     transport: net.port,
+    authority: a.authority,
   });
   const running = a.cycle();
   try {

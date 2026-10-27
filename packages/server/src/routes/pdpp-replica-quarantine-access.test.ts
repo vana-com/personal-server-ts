@@ -27,6 +27,12 @@ import {
 import { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "../storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../storage/pdpp-replication-transport.js";
+import { createTestReplicaRoster } from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
+import {
+  enableReplicaTestIdentity,
+  remoteReplicaTestWriter,
+  replicaTestAuthority,
+} from "../storage/pdpp-replica-writer-identity.test-utils.js";
 
 // Local finalized-evidence injection exercises the real worker, SQLite receiver,
 // issuer HTTP routes and token-bearing RS reads. This is not live chain proof.
@@ -173,6 +179,9 @@ async function fixture() {
     method: "collector",
     label: "local trusted mapping",
   });
+  const roster = createTestReplicaRoster();
+  const authority = replicaTestAuthority(roster);
+  enableReplicaTestIdentity(db, { owner, roster, authority });
   store.replication.beginBaseline({
     owner,
     declarations: [{ sourceId, binding }],
@@ -211,6 +220,7 @@ async function fixture() {
       receiver: (activeReceiver = receiver()),
       credential,
       transport: network.port,
+      authority,
       now: () => time,
     });
   // Each cycle advances a fixed clock past the one-second first error backoff.
@@ -221,39 +231,62 @@ async function fixture() {
   };
   let transport = worker();
   let batchIndex = 0;
+  type Chain = {
+    remote: ReturnType<typeof remoteReplicaTestWriter>;
+    sequence: number;
+    previous: { batch: string; digest: string } | null;
+  };
+  /**
+   * Publish one batch. By default it is its own registered remote writer at
+   * sequence 1; `after` continues that writer's chain instead. Operations
+   * name the writer's derived operation writer.
+   */
   async function publish(
     operations: ReplicaOperation[],
     blobs: { blobId: string; bytes: Buffer }[] = [],
     runCycle = true,
+    after?: Chain,
   ) {
     const batch = (++batchIndex).toString(16).padStart(32, "0");
+    const remote = after?.remote ?? remoteReplicaTestWriter(roster, owner);
+    const sequence = (after?.sequence ?? 0) + 1;
+    const bytes = Buffer.from(
+      canonicalJson({
+        envelope: {
+          format: "vana-pdpp-replica",
+          version: 1,
+          owner,
+          batchId: batch,
+          operations: operations.map((op) => ({
+            ...op,
+            revision: { ...op.revision, writerId: remote.writers.operation },
+          })),
+        },
+        blobs: blobs.map((b) => ({
+          blobId: b.blobId,
+          bytes: toBase64(b.bytes),
+        })),
+      }),
+    );
     const parts = await fragmentReplicaPayload({
       owner,
-      writer: batch,
+      writer: remote.writers.transport,
       batch,
-      sequence: 1,
-      previous: null,
+      sequence,
+      previous: after?.previous ?? null,
       collectedAt: at,
-      bytes: Buffer.from(
-        canonicalJson({
-          envelope: {
-            format: "vana-pdpp-replica",
-            version: 1,
-            owner,
-            batchId: batch,
-            operations,
-          },
-          blobs: blobs.map((b) => ({
-            blobId: b.blobId,
-            bytes: toBase64(b.bytes),
-          })),
-        }),
-      ),
+      bytes,
+      sign: remote.sign,
       encrypt: network.port.encrypt,
     });
     for (const part of parts) network.register(part);
     if (runCycle) await advance();
-    return parts;
+    const chain: Chain = {
+      remote,
+      sequence,
+      previous: { batch, digest: replicaDigest(bytes) },
+    };
+    return Object.assign(parts, { chain });
   }
   const claim = (r: Upsert): ReplicaOperation => ({
     kind: "blob-claim",
@@ -426,6 +459,8 @@ async function fixture() {
     network,
     target,
     targetParts,
+    /** The target's writer: an operation-id equivocation continues it. */
+    targetChain: targetParts.chain,
     publish,
     assertQuarantined,
     controlWorks,
@@ -545,9 +580,12 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
 
   it("P0 #5: validated operation-ID equivocation also fences saved history across restart", async () => {
     const f = await fixture();
-    await f.publish([
-      { ...f.target, data: { ...f.target.data, text: substituted } },
-    ]);
+    await f.publish(
+      [{ ...f.target, data: { ...f.target.data, text: substituted } }],
+      [],
+      true,
+      f.targetChain,
+    );
     expect(f.quarantinedConnections()).toEqual([{ instance: "conn" }]);
     await f.assertQuarantined();
     await f.restart();

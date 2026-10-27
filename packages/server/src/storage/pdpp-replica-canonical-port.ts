@@ -27,6 +27,10 @@ import {
   type ReplicationExport,
 } from "./pdpp-replication-sqlite.js";
 import {
+  currentReplicaWriterIdentity,
+  REPLICA_WRITER_IDENTITY_MIGRATION,
+} from "./pdpp-replica-writer-identity.js";
+import {
   createSqliteRecordStore,
   PdppBindingError,
   type CanonicalBlobBytes,
@@ -89,6 +93,8 @@ BEGIN SELECT RAISE(ABORT, 'local write log is append-only'); END;
   REPLICA_FACT_REMOVAL_MIGRATION,
   // Indexed blob-claim existence lookup for captureBlob.
   REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
+  // Writer ids derived from the registered server key (host contract §3.2).
+  REPLICA_WRITER_IDENTITY_MIGRATION,
 ];
 
 /**
@@ -299,7 +305,13 @@ export function createReplicaCanonicalPort(db: Database) {
       .prepare("SELECT writer_id FROM pdpp_installation_writer WHERE id = 1")
       .get() as { writer_id: string }
   ).writer_id;
-  const journal = createReplicationJournal(db, writerId);
+  // Captured operations name the derived operation writer. Before the first
+  // enable they name the installation writer and stay local: no receiver
+  // accepts them, and enabling refuses a journal that has them.
+  const journal = createReplicationJournal(
+    db,
+    () => currentReplicaWriterIdentity(db)?.operationWriter ?? writerId,
+  );
   const insertLocalWrite = db.prepare(`
     INSERT INTO pdpp_replica_own_writes
       (operation_id, writer_id, source_id, connection_id, method, generation,

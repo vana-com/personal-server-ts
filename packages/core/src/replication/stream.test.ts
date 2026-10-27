@@ -1,4 +1,5 @@
 import { expect, it } from "vitest";
+import { unsignedReplicaBatch } from "./writer-identity.test-utils.js";
 import { canonicalJson, type ReplicaEnvelope } from "./envelope.js";
 import { binding, identity, upsert } from "./fixtures.js";
 import {
@@ -64,6 +65,7 @@ it("streams the existing canonical wire bytes and fragments, including metadata 
       batch: envelope.batchId,
       sequence: 1,
       previous: null,
+      sign: unsignedReplicaBatch,
       collectedAt: "2026-10-20T00:00:00.000Z",
       encrypt: async (_scope: string, bytes: Uint8Array) => bytes,
       maxBlobBytes: 8 * 1024 * 1024,

@@ -12,6 +12,11 @@ import {
   type ReplicaTransportPort,
   type ReplicaCommitment,
 } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
+import {
+  createTestReplicaRoster,
+  createTestReplicaSigner,
+} from "@opendatalabs/personal-server-ts-core/replication/writer-identity.test-utils";
+import { establishReplicaWriterIdentity } from "./pdpp-replica-writer-identity.js";
 
 const [mode, directory, sizeArg] = process.argv.slice(2);
 // Peak RSS only rises, so each marker bounds everything that ran before it.
@@ -29,10 +34,30 @@ const binding = {
   schemaDigest: `sha256:${"b".repeat(64)}`,
 };
 const expected = { owner, declarations: [{ sourceId, binding }] };
+// Fixed server keys and registration ids, so seed and measure runs agree.
+const roster = createTestReplicaRoster();
+const authorityOf = (role: string) => {
+  const signer = createTestReplicaSigner(role);
+  const id = `0x${createHash("sha256").update(role).digest("hex")}`;
+  roster.register(signer.address, owner, id);
+  return {
+    signer,
+    id,
+    roster: roster.port,
+    chainId: 14800,
+    environment: "dev" as const,
+  };
+};
 const open = (role: string) => {
   const db = new Database(join(directory, `${role}.sqlite`));
   db.pragma("cache_size=-2048");
   const store = createReplicaRecordStore(db);
+  const authority = authorityOf(role);
+  establishReplicaWriterIdentity(db, {
+    owner,
+    server: authority.signer.address,
+    record: { owner, id: authority.id, revokedAt: null },
+  });
   store.registerConnection({
     instance: "conn",
     sourceId,
@@ -40,7 +65,7 @@ const open = (role: string) => {
     label: "memory",
   });
   store.replication.beginBaseline(expected);
-  return { db, store };
+  return { db, store, authority };
 };
 if (mode === "seed") {
   const { store } = open("source");

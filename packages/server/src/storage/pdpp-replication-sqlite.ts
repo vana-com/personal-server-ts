@@ -89,7 +89,11 @@ export function replicaOperationDigest(operation: ReplicaOperation): string {
 }
 
 /** Owns original revisions, pinned values/bytes and exporter progress on the canonical DB. */
-export function createReplicationJournal(db: Database, writerId: string) {
+export function createReplicationJournal(
+  db: Database,
+  /** Read per operation, inside its canonical transaction. */
+  writerId: () => string,
+) {
   const settings = () =>
     db.prepare("SELECT * FROM pdpp_replica_settings WHERE id = 1").get() as
       | { config_json: string; watermark: number; checkpoint: number }
@@ -133,7 +137,7 @@ export function createReplicationJournal(db: Database, writerId: string) {
     const counter = prior.counter + 1;
     const operation = replicaOperationSchema.parse({
       ...value,
-      revision: { counter, writerId, operationId: randomUUID() },
+      revision: { counter, writerId: writerId(), operationId: randomUUID() },
     });
     db.prepare("UPDATE pdpp_replica_clock SET counter = ? WHERE id = 1").run(
       counter,

@@ -40,6 +40,8 @@ import { createGatewayDataPointFeed } from "../packages/core/src/sync/data-point
 import { createReplicaRecordStore } from "../packages/server/src/storage/pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "../packages/server/src/storage/pdpp-replication-receiver.js";
 import { createReplicaTransportWorker } from "../packages/server/src/storage/pdpp-replication-transport.js";
+import { enableReplicaWriterIdentity } from "../packages/server/src/storage/pdpp-replica-writer-identity.js";
+import { createGatewayReplicaRoster } from "../packages/core/src/replication/roster.js";
 import {
   buildReplicaRuntimeSource,
   type ReplicaRuntimeSource,
@@ -126,6 +128,12 @@ export type Init = {
   scriptSha256: string;
   consent?: { issuerOrigin: string; credential: string };
   source?: ReplicaRuntimeSource;
+  /**
+   * Offline harnesses only: this server's registration id, trusted without a
+   * gateway read so a runtime can open with no network. Live runs register
+   * first and omit it.
+   */
+  offlineRegistration?: { serverId: Hex };
 };
 type HostRequest = {
   id: number;
@@ -253,6 +261,28 @@ export async function openReplicaRuntime(init: Init) {
       binding,
     })),
   };
+  // Writer ids derive from this server's own registration, before capture.
+  const roster = createGatewayReplicaRoster({
+    gatewayUrl,
+    fetch: boundedFetch,
+  });
+  const offline = init.offlineRegistration;
+  const identity = await enableReplicaWriterIdentity({
+    db,
+    owner: init.owner,
+    server: serverAccount(init.serverKey).address,
+    roster: offline
+      ? {
+          server: async () => ({
+            owner: init.owner,
+            id: offline.serverId,
+            revokedAt: null,
+          }),
+        }
+      : roster,
+  });
+  if (identity.tag !== "ready")
+    throw new Error(`Replica writer identity unavailable: ${identity.reason}`);
   store.replication.beginBaseline(expected);
   const receiver = createReplicaReceiver({
     enabled: true,
@@ -399,6 +429,12 @@ export async function openReplicaRuntime(init: Init) {
     enabled: true,
     expected: () => expected,
     transport,
+    authority: {
+      signer: account,
+      roster,
+      chainId: 14800,
+      environment: "dev",
+    },
     targetChunkBytes: 4 * 1024 * 1024,
   });
   function put(
