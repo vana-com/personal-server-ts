@@ -947,6 +947,38 @@ describe("mcp/connection-api scope request answers", () => {
     ]);
   });
 
+  it("records and approves a write: scope even when a read wildcard is held, but never a write wildcard", async () => {
+    // A read grant of "*" must not count as covering a write request.
+    const { store, id } = await connectionWithRequest(
+      [{ grantId: "0xgrant1", scopes: ["*"] }],
+      ["write:memory.claude", "write:memory.*"],
+    );
+    expect((await store.getById(id))?.scopeAccessRequest?.scopes).toEqual([
+      "write:memory.*",
+      "write:memory.claude",
+    ]);
+    const gateway = gatewayMock(liveGrant({ scopes: ["*"] }));
+
+    await expect(
+      approveMcpScopeAccessRequest(
+        { connectionId: id, scopes: ["write:memory.*"] },
+        approveOptions(store, gateway),
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_SCOPE", status: 400 });
+    expect(gateway.createGrant).not.toHaveBeenCalled();
+
+    const result = await approveMcpScopeAccessRequest(
+      { connectionId: id, scopes: ["write:memory.claude"] },
+      approveOptions(store, gateway),
+    );
+
+    expect(gateway.createGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ scopes: ["*", "write:memory.claude"] }),
+    );
+    expect(result.approvedScopes).toEqual(["write:memory.claude"]);
+    expect(result.deniedScopes).toEqual(["write:memory.*"]);
+  });
+
   it("leaves the request pending when the gateway refuses the grant", async () => {
     const { store, id } = await connectionWithRequest();
     const gateway = gatewayMock();
@@ -1256,6 +1288,39 @@ describe("mcp/connection-api superseded OAuth authorizations", () => {
     expect(
       (await stores.connectionStore.getById(other.connectionId))?.status,
     ).toBe("pending");
+  });
+
+  it("signs no grant for a wildcard write scope", async () => {
+    const stores = newStores();
+    const created = await authorize(stores, "client-a");
+    const gateway = {
+      getBuilder: vi.fn(async () => ({ id: "0xbuilder" })),
+      createGrant: vi.fn(async () => ({ grantId: "0xgrant" })),
+    };
+
+    for (const writeScope of ["write:*", "write:memory.*"]) {
+      await expect(
+        approveMcpOAuthAuthorizationWithScopes(
+          {
+            authorizationId: created.authorizationId,
+            scopes: ["chatgpt.history", writeScope],
+          },
+          {
+            ...stores,
+            gateway: gateway as never,
+            gatewayConfig: GATEWAY_CONFIG as never,
+            gatewayUrl: "https://gateway.test",
+            serverOwner: "0x00000000000000000000000000000000000000aa",
+            serverSigner: {
+              signGrantRegistration: vi.fn(
+                async () => "0xsig" as `0x${string}`,
+              ),
+            },
+          },
+        ),
+      ).rejects.toMatchObject({ code: "invalid_scope", status: 400 });
+    }
+    expect(gateway.createGrant).not.toHaveBeenCalled();
   });
 
   it("signs no grant for a superseded authorization", async () => {

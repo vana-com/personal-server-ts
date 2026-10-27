@@ -2775,7 +2775,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
     expect(payload.truncatedScopes).toEqual(["github.profile"]);
   });
 
-  it("exposes stable list/read/search MCP tools", () => {
+  it("exposes stable list/read/search/remember MCP tools", () => {
     expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([
       "list_granted_sources",
       "list_granted_scopes",
@@ -2784,6 +2784,7 @@ describe("MCP read_scope tool (grant-gated + access-logged)", () => {
       "list_scope_blocks",
       "get_scope_file",
       "search_personal_context",
+      "remember",
     ]);
   });
 });

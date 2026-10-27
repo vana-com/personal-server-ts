@@ -2,13 +2,18 @@ import { isSystemScope } from "../policy/reserved-scopes.js";
 /**
  * MCP tool surface. Phase 1 / §4 of 260604-PLAN-vana-mcp-personal-server.md.
  *
- * Read-only, small, and only over scopes that the connection's grants cover.
- * No write tools. No grant-approval tools. No raw owner/admin status tools.
+ * Small, and only over scopes that the connection's grants cover. No
+ * grant-approval tools. No raw owner/admin status tools.
  *
  * Every tool that returns data first picks a covering grant from the
  * connection's grant list, signs a Web3Signed request as the per-connection
  * grantee, and uses the bounded sidecar read path — so reads are grant-gated,
  * access-logged, and safe for large scopes.
+ *
+ * The one write tool, `remember`, saves only into a scope a `write:` grant
+ * entry covers, and goes through the delegated-write path a builder uses
+ * (see write-client.ts). A read grant never confers write access, and a
+ * `write:` entry never confers read access.
  */
 
 import { z } from "zod";
@@ -18,6 +23,13 @@ import {
 } from "./types.js";
 import type { McpDataReadClient } from "./read-client.js";
 import { McpDataReadError } from "./read-client.js";
+import type { McpDataWriteClient } from "./write-client.js";
+import { McpDataWriteError } from "./write-client.js";
+import {
+  isWriteScopeEntry,
+  writeScopePatterns,
+  WRITE_SCOPE_PREFIX,
+} from "../policy/data-write.js";
 import { toMcpScopeAccessRequestView } from "./connection-api.js";
 import type { McpActivityRecorder } from "./activity.js";
 import type {
@@ -35,6 +47,12 @@ import {
 export interface McpToolContext {
   connection: McpConnectionRecord;
   readClient: McpDataReadClient;
+  /**
+   * Writes as the connection grantee. Absent on hosts that do not support MCP
+   * writes (PS-Lite, self-signing sessions): `remember` then reports
+   * `write_unavailable`.
+   */
+  writeClient?: McpDataWriteClient;
   activityRecorder?: McpActivityRecorder;
   requestScopeAccess?(input: { scopes: string[]; reason?: string }): Promise<{
     connection: McpConnectionRecord;
@@ -139,20 +157,102 @@ function textResult(value: unknown, isError = false): McpToolResult {
   };
 }
 
+/** A grant entry that names readable data: not a system scope, not `write:`. */
+function isReadableScopeEntry(scope: string): boolean {
+  return !isSystemScope(scope) && !isWriteScopeEntry(scope);
+}
+
 function uniqueScopes(connection: McpConnectionRecord): string[] {
   const set = new Set<string>();
   for (const grant of connection.grants) {
     for (const scope of grant.scopes) {
-      if (!isSystemScope(scope)) set.add(scope);
+      if (isReadableScopeEntry(scope)) set.add(scope);
     }
   }
   return Array.from(set).sort();
 }
 
+/**
+ * A scope `remember` may save into under these grant entries: an exact
+ * `write:<scope>` entry. MCP writes never honor a `write:` wildcard, even one
+ * an older grant still carries, although builder writes do: a memory grant
+ * names the one scope the agent saves into.
+ */
+function exactWriteScopes(grantScopes: readonly string[]): string[] {
+  return writeScopePatterns(grantScopes).filter(
+    (scope) => !scope.includes("*") && !isSystemScope(scope),
+  );
+}
+
+/** Scopes the connection may save into, `write:` prefix stripped. */
+function uniqueWritableScopes(connection: McpConnectionRecord): string[] {
+  const set = new Set<string>();
+  for (const grant of connection.grants) {
+    for (const scope of exactWriteScopes(grant.scopes)) set.add(scope);
+  }
+  return Array.from(set).sort();
+}
+
+/**
+ * Every data scope (or pattern) the connection may read or write, `write:`
+ * prefix stripped. A host that copies data in before serving a connection
+ * (the enclave) must copy write targets too: `remember` rewrites the whole
+ * memory list from the local copy, so a missing copy would drop memories.
+ */
+export function connectionDataScopes(
+  connection: McpConnectionRecord,
+): string[] {
+  const set = new Set<string>();
+  for (const grant of connection.grants) {
+    for (const scope of grant.scopes) {
+      const target = isWriteScopeEntry(scope)
+        ? scope.slice(WRITE_SCOPE_PREFIX.length)
+        : scope;
+      if (target) set.add(target);
+    }
+  }
+  return Array.from(set).sort();
+}
+
+/**
+ * Resolve a scope to a grant with an exact `write:` entry for it (see
+ * exactWriteScopes). The server-side write policy still runs on every save;
+ * this only narrows what the tool will attempt.
+ */
+export function resolveWriteGrantForScope(
+  connection: McpConnectionRecord,
+  scope: string,
+): { grantId: string; scopes: string[] } | null {
+  for (const grant of connection.grants) {
+    if (exactWriteScopes(grant.scopes).includes(scope)) {
+      return { grantId: grant.grantId, scopes: grant.scopes };
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether the connection already holds `scope` as a scope request names it:
+ * a `write:` entry is covered only by write grants, anything else by reads.
+ */
+function connectionCoversRequestedScope(
+  connection: McpConnectionRecord,
+  scope: string,
+): boolean {
+  return isWriteScopeEntry(scope)
+    ? Boolean(
+        resolveWriteGrantForScope(
+          connection,
+          scope.slice(WRITE_SCOPE_PREFIX.length),
+        ),
+      )
+    : Boolean(resolveGrantForScope(connection, scope));
+}
+
 function uniqueSources(connection: McpConnectionRecord): string[] {
   const set = new Set<string>();
   for (const grant of connection.grants) {
-    if (!grant.scopes.some((scope) => !isSystemScope(scope))) continue;
+    if (!grant.scopes.some(isReadableScopeEntry)) continue;
     const sourceId =
       typeof grant.sourceId === "string" ? grant.sourceId.trim() : "";
     if (sourceId) {
@@ -160,7 +260,7 @@ function uniqueSources(connection: McpConnectionRecord): string[] {
       continue;
     }
     for (const scope of grant.scopes) {
-      if (isSystemScope(scope)) continue;
+      if (!isReadableScopeEntry(scope)) continue;
       const [scopeSourceId] = scope.split(".");
       if (scopeSourceId && scopeSourceId !== "*") {
         set.add(scopeSourceId);
@@ -260,7 +360,7 @@ const scopeAccessRequestInputShape = {
     .array(z.string().min(1).max(SEARCH_SCOPE_MAX_CHARS))
     .min(1)
     .max(MCP_SCOPE_ACCESS_REQUEST_LIMIT)
-    .describe("Exact scope ids the MCP client wants to read."),
+    .describe("Exact scope ids to read, or write:<scope> to save into."),
   reason: z
     .string()
     .max(500)
@@ -747,8 +847,10 @@ const listGrantedScopes: McpToolDefinition = {
     );
     // Lets an agent that asked for more scopes see whether the owner has
     // answered yet without re-recording the request.
+    const writableScopes = uniqueWritableScopes(connection);
     return textResult({
       scopes: scopeEntries,
+      ...(writableScopes.length > 0 ? { writableScopes } : {}),
       ...(connection.scopeAccessRequest
         ? {
             pendingScopeRequest: toMcpScopeAccessRequestView(
@@ -779,10 +881,10 @@ const requestScopeAccess: McpToolDefinition = {
     const previousDecision = connection.scopeAccessDecision;
     let effectiveConnection = connection;
     let grantedRequestedScopes = requestedScopes.filter((scope) =>
-      Boolean(resolveGrantForScope(effectiveConnection, scope)),
+      connectionCoversRequestedScope(effectiveConnection, scope),
     );
     let missingScopes = requestedScopes.filter(
-      (scope) => !resolveGrantForScope(connection, scope),
+      (scope) => !connectionCoversRequestedScope(connection, scope),
     );
     const reason = typeof args.reason === "string" ? args.reason.trim() : "";
     const approvalRequired = missingScopes.length > 0;
@@ -802,10 +904,10 @@ const requestScopeAccess: McpToolDefinition = {
       requestRecorded = outcome.requestRecorded;
       readToken = outcome.readToken;
       grantedRequestedScopes = requestedScopes.filter((scope) =>
-        Boolean(resolveGrantForScope(effectiveConnection, scope)),
+        connectionCoversRequestedScope(effectiveConnection, scope),
       );
       missingScopes = requestedScopes.filter(
-        (scope) => !resolveGrantForScope(effectiveConnection, scope),
+        (scope) => !connectionCoversRequestedScope(effectiveConnection, scope),
       );
     }
     const finalApprovalRequired = missingScopes.length > 0;
@@ -1911,6 +2013,217 @@ const getScopeFile: McpToolDefinition = {
   },
 };
 
+const REMEMBER_TOOL = "remember";
+const REMEMBER_TEXT_MAX_CHARS = 4_000;
+const REMEMBER_KEY_MAX_CHARS = 128;
+/**
+ * Every save rewrites the scope's whole memory list (one stored version per
+ * save), so the list is bounded to keep each write and each recall small.
+ */
+export const MAX_MEMORIES_PER_SCOPE = 1_000;
+
+/** One saved memory, as stored in a memory scope's `memories` list. */
+export interface StoredMemory {
+  id: string;
+  text: string;
+  savedAt: string;
+  /** Saving again under the same key replaces the earlier memory. */
+  key?: string;
+}
+
+class RememberRefusal extends Error {
+  constructor(public readonly body: Record<string, unknown>) {
+    super(String(body.message));
+    this.name = "RememberRefusal";
+  }
+}
+
+/**
+ * The memory list of a stored record. A memory scope holds exactly
+ * `{ memories: [...] }`; anything else was written by someone else and is
+ * never overwritten by `remember`.
+ */
+function storedMemories(
+  scope: string,
+  data: Record<string, unknown>,
+): StoredMemory[] {
+  const memories = data.memories;
+  const isMemoryList =
+    Object.keys(data).every((key) => key === "memories") &&
+    Array.isArray(memories) &&
+    memories.every(
+      (item) =>
+        typeof item === "object" &&
+        item !== null &&
+        typeof (item as { text?: unknown }).text === "string",
+    );
+  if (!isMemoryList) {
+    throw new RememberRefusal({
+      error: "scope_not_memory",
+      scope,
+      message: `Scope ${scope} holds data that is not a memory list; remember will not overwrite it. Save into another write scope.`,
+    });
+  }
+  return memories as StoredMemory[];
+}
+
+const remember: McpToolDefinition = {
+  name: REMEMBER_TOOL,
+  title: "Remember",
+  description:
+    "Save a short memory about the user (fact, preference, decision) for any allowed agent to recall. Needs a write:<scope> grant (writableScopes).",
+  inputSchema: {
+    text: z
+      .string()
+      .min(1)
+      .max(REMEMBER_TEXT_MAX_CHARS)
+      .describe("Self-contained; readable without this chat."),
+    scope: z
+      .string()
+      .min(1)
+      .max(SEARCH_SCOPE_MAX_CHARS)
+      .optional()
+      .describe("e.g. memory.claude; optional with one writable scope."),
+    key: z
+      .string()
+      .min(1)
+      .max(REMEMBER_KEY_MAX_CHARS)
+      .optional()
+      .describe("Saving again with the same key replaces the memory."),
+  },
+  async handler(args, { connection, writeClient }) {
+    const text = typeof args.text === "string" ? args.text.trim() : "";
+    if (!text) {
+      return textResult(
+        { error: "invalid_arguments", message: "text must not be empty." },
+        true,
+      );
+    }
+    const key =
+      typeof args.key === "string" && args.key.trim()
+        ? args.key.trim()
+        : undefined;
+    const writableScopes = uniqueWritableScopes(connection);
+    const namedScope = typeof args.scope === "string" ? args.scope.trim() : "";
+    const onlyScope =
+      writableScopes.length === 1 && !writableScopes[0]!.includes("*")
+        ? writableScopes[0]!
+        : "";
+    const scope = namedScope || onlyScope;
+    if (!scope) {
+      return textResult(
+        {
+          error: "scope_required",
+          writableScopes,
+          message:
+            writableScopes.length === 0
+              ? 'This connection cannot save memories. Call request_scope_access with scopes ["write:memory.<app>"] and ask the user to approve it.'
+              : "Name the scope to save into; this connection can write to more than one.",
+        },
+        true,
+      );
+    }
+
+    const grant = resolveWriteGrantForScope(connection, scope);
+    if (!grant) {
+      const requestScope = `${WRITE_SCOPE_PREFIX}${scope}`;
+      return textResult(
+        {
+          error: "scope_not_granted",
+          scope,
+          requestScope,
+          writableScopes,
+          message: `This connection may not save into ${scope}. Call request_scope_access with scopes ["${requestScope}"] and ask the user to approve it.`,
+        },
+        true,
+      );
+    }
+    if (!writeClient) {
+      return textResult(
+        {
+          error: "write_unavailable",
+          message: "This Personal Server does not accept MCP writes.",
+        },
+        true,
+      );
+    }
+
+    const memory: StoredMemory = {
+      id: crypto.randomUUID(),
+      text,
+      savedAt: new Date().toISOString(),
+      ...(key ? { key } : {}),
+    };
+    let replaced = false;
+    let memoryCount = 0;
+    try {
+      await writeClient.updateScope({
+        scope,
+        grantId: grant.grantId,
+        update(current) {
+          const existing =
+            current.data === null ? [] : storedMemories(scope, current.data);
+          const kept = key
+            ? existing.filter((item) => item.key !== key)
+            : existing;
+          if (kept.length >= MAX_MEMORIES_PER_SCOPE) {
+            throw new RememberRefusal({
+              error: "memory_full",
+              scope,
+              limit: MAX_MEMORIES_PER_SCOPE,
+              message: `Scope ${scope} already holds ${MAX_MEMORIES_PER_SCOPE} memories. Replace one by key instead.`,
+            });
+          }
+          replaced = kept.length !== existing.length;
+          // Newest last: a replaced memory moves to the end, so list order is
+          // the order the memories were last saved in.
+          const memories = [...kept, memory];
+          memoryCount = memories.length;
+          return { memories };
+        },
+      });
+    } catch (err) {
+      if (err instanceof RememberRefusal) return textResult(err.body, true);
+      if (err instanceof McpDataWriteError) {
+        const body = err.body as {
+          error?: { errorCode?: string; message?: string } | string;
+          message?: string;
+        } | null;
+        const detail =
+          typeof body?.error === "object" && body.error !== null
+            ? body.error
+            : { errorCode: body?.error, message: body?.message };
+        return textResult(
+          {
+            error:
+              err.status === 401 || err.status === 403
+                ? "unauthorized"
+                : err.status === 412
+                  ? "write_conflict"
+                  : "write_failed",
+            status: err.status,
+            scope,
+            ...(detail.errorCode ? { errorCode: detail.errorCode } : {}),
+            ...(detail.message ? { message: detail.message } : {}),
+          },
+          true,
+        );
+      }
+      throw err;
+    }
+
+    return textResult({
+      saved: true,
+      scope,
+      id: memory.id,
+      savedAt: memory.savedAt,
+      ...(key ? { key } : {}),
+      replaced,
+      memoryCount,
+    });
+  },
+};
+
 export const MCP_TOOLS: readonly McpToolDefinition[] = [
   listGrantedSources,
   listGrantedScopes,
@@ -1919,4 +2232,5 @@ export const MCP_TOOLS: readonly McpToolDefinition[] = [
   listScopeBlocks,
   getScopeFile,
   searchPersonalContext,
+  remember,
 ] as const;
