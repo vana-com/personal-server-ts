@@ -6,31 +6,73 @@ routes and Lite. This change does not enable production replication.
 
 ## Wire and authority
 
-Each address is `pdpp_replica_v1.<writer-token>_<batch-token>.<fragment-index>`.
-The writer token is the derived transport writer id (see below). The batch
-token is a 128-bit random identifier. Neither contains source, account or
-connection names. This three-part name passes the current SDK `ScopeSchema`. The first component is reserved from grants, ordinary
-inventory, MCP and the upgraded legacy upload/download workers.
+A device sync is one batch, up to the batch bounds below, and one batch costs
+one registration.
 
-Every object uses DPv2 version **1**, the existing per-scope key derivation,
-OpenPGP encryption, plaintext keccak commitment, metadata commitment and
-AddData signature. Storage keys are `<scope>/1`. The worker never calls the
-legacy uploader or its file-head recovery/rebase path.
+- **Scope.** Each writer has one stable scope, `pdpp_replica_v1.<writer-token>`.
+  The writer token is the derived transport writer id (see "Writer identity
+  and batch authority"), without source, account or connection names. The prefix is reserved from grants, ordinary inventory,
+  MCP and the upgraded legacy upload/download workers. Devices never share a
+  scope, so their versions never contend. Each batch appends a version: a
+  reader of only the latest version would see only the last batch, so the
+  receiver discovers and reads every version.
+- **Fragments.** A batch payload is cut into fragments (default target 4 MiB).
+  Each encrypted fragment is stored **unregistered** at its content address,
+  `<scope>/fragments/<sha256 of the encrypted bytes>`. A fragment is never
+  registered and is never trusted on its own.
+- **Manifest.** The batch has one manifest. It carries the batch statement
+  (owner, writer, batch, sequence, predecessor batch and digest, collection
+  time, payload digest and length) and lists every fragment, in index order,
+  by digest and encrypted size. The manifest is the only registered object: a
+  DPv2 AddData at the next version of the writer scope, stored at
+  `<scope>/<version>`. The version is a publication slot, not the batch
+  sequence. The slot is claimed when the batch is prepared, so a batch that
+  cannot be framed takes no slot and its successors still publish. A manifest
+  at version _v_ publishes only after version _v−1_ is published, because
+  DataRegistryV2 accepts only `expectedVersion = current + 1`.
+- **Bounds.** One batch covers at most `maxBatchOperations` operations
+  (default 10,000) and about `maxBatchBytes` payload bytes (default 32 MiB).
+  One operation always fits, so a single larger blob makes a larger batch. An
+  operation that only references blobs already in the batch is bounded by its
+  JSON bytes: cutting it into the next batch would send the blob twice.
+  Every payload carries the bytes of every blob its operations reference, so
+  a blob whose claim and record fall in different batches is sent in both.
+  When one commit writes all its blob claims before its records and is
+  larger than the bound, most of its blob bytes go out twice. Removing that
+  needs a payload that can refer to bytes an earlier batch carried.
+- **Coalescing.** While a batch is on its way to a finalized registration, no
+  new batch is cut; new operations wait for the next one. A batch in Retry or
+  Unsupported does not hold this window, so one failing batch never blocks its
+  successors.
 
-The plaintext is a standard version-1.0 data-file envelope, containing a
-version-1 replica fragment under `data.fragment`. PS-Lite 1.33.2's downloader
-can validate/cache this envelope; exact legacy scope lookups do not select it.
-This compatibility promise means old app reads remain stale or absent. It does
-not mean an unmodified old runtime skips downloading internal objects, or
-that its wildcard grants gain the upgraded runtime's private-scope policy.
+Every object uses the existing per-scope key derivation, OpenPGP encryption,
+plaintext keccak commitment, metadata commitment and AddData signature. The
+worker never calls the legacy uploader or its file-head recovery/rebase path.
 
-Each fragment binds owner, writer, batch, sequence, predecessor batch/digest,
-collection time, total payload digest/length, fragment count/index/offset,
-chunk digest and base64 bytes. Reassembly verifies each chunk and the cumulative
-length/digest while streaming. It does not allocate the advertised total. The canonical payload contains the existing
-replica envelope plus content-addressed binary bytes. Existing retained
-source/declaration bindings validate operations before receiver import. Binary
-digest/length, MIME and generation-bound claims remain receiver requirements.
+Manifest and fragment plaintexts are standard version-1.0 data-file envelopes,
+with the replica object under `data.manifest` or `data.fragment`. Exact legacy
+scope lookups do not select them. This compatibility promise means old app
+reads remain stale or absent. It does not mean an unmodified old runtime skips
+downloading internal objects, or that its wildcard grants gain the upgraded
+runtime's private-scope policy.
+
+vana-storage overwrites on PUT without checks, and GET and HEAD need no auth.
+So storage contents are never trusted. A receiver fetches a manifest only
+after its registration is finalized, and checks the fetched bytes against the
+finalized commitment. It then fetches each fragment and checks the exact
+encrypted bytes (length and sha256) against the manifest entry **before it
+decrypts them**. A fragment that differs is quarantined as
+`fragment_mismatch`; a fragment that storage definitively does not have is
+quarantined as `fragment_missing`. Nothing of that batch becomes visible.
+`readmitFragments()` re-admits such fragments for another fetch after storage
+is repaired; the finalized manifest still decides which bytes are accepted.
+
+Reassembly verifies each chunk and the cumulative length and digest while
+streaming. It does not allocate the advertised total. The canonical payload
+contains the existing replica envelope plus content-addressed binary bytes.
+Existing retained source/declaration bindings validate operations before
+receiver import. Binary digest/length, MIME and generation-bound claims remain
+receiver requirements.
 
 ## Writer identity and batch authority
 
@@ -61,16 +103,19 @@ Derivation uses no fragment scope, so it does not depend on the carrier layout.
 - After a replication reset, a new database, or a restore or clone, the host
   must call `rotateReplicaWriterIdentity` before the first new write. It keeps
   the registration and draws a new nonce. PS cannot detect a copied database.
-  A restored copy that does not rotate reuses its old sequences: peers
-  quarantine the reused sequence as `batch_equivocation`, keep the first
-  batch, and block the copy's later batches behind it.
+  A restored copy that does not rotate reuses its old writer, scope and
+  versions. Whichever device registers a version first keeps it; the other
+  device's batch at that version is `immutable_registration_conflict` on that
+  device and never reaches a peer. A copy batch that a peer does receive on an
+  already imported sequence is `batch_equivocation` there.
 - On a writer change the worker starts a new chain at sequence 1, and its
   first publication is a full current-state baseline. In the same transaction
   as the switch, the journal's `rebaseline` re-captures every connection
   lifecycle, blob claim, record, tombstone and completion under the new
   operation writer and pins them as the new baseline; the tail resumes after
-  it. Unprepared batches and unpublished outbox rows of the old writer are
-  abandoned, because no receiver accepts the old operation writer from the new
+  it. The new writer publishes in its own scope from version 1. The old
+  writer's unpublished batches, fragments and manifests are abandoned, so its
+  scope gets no new version, because no receiver accepts the old operation writer from the new
   signer; the baseline carries their effect. A peer that missed the old
   writer's batches (refused after re-registration, never published, or
   written between a gateway change and the next step) therefore converges.
@@ -138,33 +183,49 @@ gateway's current view; there is no history of past registrations.
 A single canonical SQLite database owns transport state, outbox, inbox and
 imported batch identities. One worker per database is the host contract.
 
-1. Stream a pinned baseline or journal tail page into hidden 64 KiB payload
-   chunks. After the encoder verifies the complete source digests, one immediate
-   transaction retains the batch identity/sequence/predecessor and advances the
-   independent export cursor.
+1. Stream a pinned baseline or journal tail into hidden 64 KiB payload
+   chunks, up to the batch bounds. After the encoder verifies the complete
+   source digests, one immediate transaction retains the batch identity,
+   sequence and predecessor and advances the independent export cursor.
    Baseline acknowledgment transfers responsibility to the durable local queue;
    it does not claim publication. No source history is removed.
-2. Encrypt fragments and atomically retain **all exact ciphertext bytes and
-   commitments before network I/O**. A restart before that commit can encrypt
-   again; a restart after it reuses the committed bytes. The default chunk target
-   is 4 MiB. The actual encrypted request must fit the effective cap, which may
-   be configured lower than the vana-storage 100 MiB default. Adaptive splitting
-   handles both large JSON records and binary payloads.
-3. Before every upload attempt, reconcile the exact address. Confirmed evidence
-   must match the owner/scope/version-1 head to a finalized DataRegistryV2
-   version-1 commitment and Active status. Absence retries the same address
-   and bytes; pending settlement waits. Only finalized later versions or a
-   commitment mismatch against the durable expected hash pair quarantine. Gateway disagreement stays pending.
-   Registration responses alone do not acknowledge publication.
-4. Repeated paginated owner scans retain discovered addresses before advancing
-   their scan cursor. End-of-scan restarts at page one. Independently retry due
-   downloads, verify settled commitments and decryption, then persist fragments.
-5. A complete batch waits for its exact predecessor. Complete groups run in
+2. Encrypt the fragments and the manifest and atomically retain **all exact
+   ciphertext bytes, digests and commitments, and the claimed version, before
+   network I/O**. A restart before that commit can encrypt again; a restart
+   after it reuses the committed bytes. The actual encrypted request must fit
+   the effective cap, which may be configured lower than the vana-storage
+   100 MiB default. Adaptive splitting handles both large JSON records and
+   binary payloads.
+3. Store every fragment. A fragment PUT is safe to repeat: the address is the
+   content, and nothing refers to it until the manifest is finalized. Then
+   store the manifest and register it once. Before every registration attempt,
+   reconcile the slot. Confirmed evidence must match the owner/scope/version
+   head to a finalized DataRegistryV2 commitment at that version and Active
+   status. Absence retries the same slot and bytes; pending settlement waits.
+   Only a finalized commitment at the slot that differs from the durable
+   expected hash pair quarantines. A later version is normal: versions append.
+   Gateway disagreement stays pending. A registration response alone does not
+   acknowledge publication, so a lost acknowledgement and its retry register
+   once. A crash between fragment upload and registration leaves only
+   unregistered fragments, which no receiver can reach.
+4. Repeated paginated owner scans list each writer scope with its current
+   version. Discovery retains new slots, at most 256 per writer scope per pass,
+   before it advances the scan cursor. End-of-scan restarts at page one. A
+   slot's manifest is downloaded only under confirmed evidence; its fragments
+   are then fetched, checked and persisted independently.
+5. A complete batch waits for its exact predecessor. Complete batches run in
    sequence order. A canonical parser writes decoded binary chunks into hidden
-   staging and verifies the complete payload before import. Operations, received
-   bytes, canonical bytes and the batch receipt commit together on the receiver's database. Missing local authority remains
-   durably retained by the receiver, whose retry method runs each cycle. Imported
-   operations never enter the local journal or become fresh outbound operations.
+   staging and verifies the complete payload before import. Operations,
+   received bytes, canonical bytes and the batch receipt commit together on the
+   receiver's database, and the fragment bodies are then dropped. Missing local
+   authority remains durably retained by the receiver, whose retry method runs
+   each cycle. Imported operations never enter the local journal or become
+   fresh outbound operations.
+6. Imported slots are revalidated round-robin against finalized evidence
+   (`revalidateIntervalMs`, default 0: every step). A finalized commitment
+   that differs from the imported one is a terminal copy decision: the
+   writer is quarantined from that sequence on and the batch's data is
+   withdrawn.
 
 Due outbox/inbox entries are selected by retry deadline, then insertion order.
 Expected finality waits have a separate durable state and do not increment the
@@ -196,7 +257,7 @@ retirement or sole-history deletion is implemented.
 `createDpv2ReplicaTransport` uses the existing SDK gateway, feed, signer and
 storage ports. Supply `createReplicaEvidenceAdapter` from
 `@opendatalabs/personal-server-ts-core/replication/evidence` as its mandatory
-`evidence(scope)` port:
+`evidence(scope, version)` port:
 
 ```ts
 const evidence = createReplicaEvidenceAdapter({
@@ -215,7 +276,7 @@ Hosts must supply a timeout-bounded fetch and RPC transport, as the dev
 preflight does; the adapter does not install network timeouts itself.
 The adapter checks configured chain identity, reads a `finalized` block with
 number/hash/timestamp, and pins
-`currentVersion(owner, scope)`, `dataCommitment(owner, scope, 1)` and the exact
+`currentVersion(owner, scope)`, `dataCommitment(owner, scope, version)` and the exact
 nine-field `dataPoints(owner, scope)` tuple to that block number. It rechecks
 the block hash and freshness after I/O. The default freshness limit is 1,800
 seconds, including normal chain finality lag; hosts can choose a tighter bound
@@ -233,22 +294,27 @@ Chain evidence carries the actual bytes32 commitment, current version, status,
 configured chain/registry, and finalized block coordinates. It never invents
 `dataHash` or `metadataHash` preimages.
 
-Confirmation requires a live version-1 head, finalized currentVersion 1,
-Active chain status, and exact
-`keccak256(abi.encode(bytes32 dataHash, bytes32 metadataHash))` equality.
-Only finalized immutable-slot facts quarantine: currentVersion greater than 1,
-or a version-1 commitment that differs from the commitment of the known
-durable expected hash pair. This includes a finalized tombstone-at-version-1
-pair that differs from the prepared replica. Gateway-only contradictions remain pending:
-wrong owner/scope, version 9 while chain is still 1, mismatched hashes,
-missing head, tombstones, or lifecycle refusal (`inactive`, `unavailable`,
-or a `deleted` signal). They can roll back or heal and never cause PUT or
-registration refresh fights. Non-Active chain status also remains pending
-because status can reactivate. A downloader without local expected hashes
-holds a head/chain mismatch pending rather than quarantining it.
+Confirmation of a slot requires a live Gateway head at or above the slot,
+finalized `currentVersion` at or above the slot, Active chain status, and a
+slot commitment equal to
+`keccak256(abi.encode(bytes32 dataHash, bytes32 metadataHash))`. A head at
+exactly the slot must also carry that pair. A later head says nothing about
+the slot's preimages; the finalized commitment binds them. Only one finalized
+fact quarantines: a commitment at the slot that differs from the known
+durable expected hash pair. This includes a finalized tombstone pair that
+differs from the prepared manifest. Gateway-only contradictions remain
+pending: wrong owner/scope, mismatched hashes at the slot, a missing head,
+tombstones, or lifecycle refusal (`inactive`, `unavailable`, or a `deleted`
+signal). They can roll back or heal and never cause PUT or registration
+refresh fights. Non-Active chain status is a Wait, not an error, because
+status can reactivate; a receiver that has not fetched the slot yet waits
+on any finalized commitment, because it fetches nothing until the status is
+Active. A downloader without local expected hashes holds a head/chain
+mismatch pending rather than quarantining it.
 
-Only a missing head together with currentVersion 0, zero commitment and the
-contract's default None tuple is absent. Any head with chain version 0 stays
+A slot is absent only when no head is at or above it, the finalized
+commitment at it is zero, and the chain either holds earlier versions or has
+the contract's default None tuple. Any head with chain version 0 stays
 pending. Unavailable finalized evidence stays pending or throws retryably;
 explicit `pending: true` prevents confirmation or absence.
 
@@ -258,11 +324,10 @@ hash-pair authenticity: the independent chain commitment binds the exact
 head preimages. The Gateway remains trusted for discovery availability and
 can withhold a head or report an optimistic mutation to delay progress.
 The finalized snapshot does not prove that no mutation occurred after that
-block. The downloader retains the verified head and compares downloaded
-plaintext plus scope/collectedAt/encrypted-size metadata to that exact head.
-Before import it also combines the downloaded hash pair and compares it
-directly to the finalized chain commitment; the chain is the authority.
-A registration timeout reuses durable ciphertext and scope/version 1; it
+block. The downloader hashes the fetched manifest plaintext and its
+scope/collectedAt/encrypted-size metadata, combines the pair and compares it
+directly to the finalized commitment at the slot; the chain is the authority.
+A registration timeout reuses the durable ciphertext and the claimed slot; it
 never rebases or treats the registration response as settlement.
 
 The read-only dev prerequisite check uses a random in-memory owner and reads
@@ -272,10 +337,12 @@ no `.env` or account files:
 ./node_modules/.bin/tsx scripts/pdpp-replica-dev-preflight.ts
 ```
 
-It checks dev Gateway/storage health and finalized registry absence. It does
+It checks dev Gateway/storage health and finalized registry absence of
+version 1 of a fresh writer scope. It does
 not publish, write storage, register data, or verify the complete two-device
 journey. Live acceptance must still verify repeated PUT of identical
-ciphertext at an existing key after registration failure. Preparation currently
+ciphertext at an existing key after registration failure, and one
+registration per sync against the dev Gateway. Preparation currently
 quarantines any `RangeError`, including a possible allocation failure;
 distinguish runtime errors from impossible framing before promotion.
 Runtime scheduling and Lite publisher wiring remain outside this change.
@@ -284,28 +351,26 @@ The in-process oracle uses two file-backed SQLite stores and real receiver
 imports, an encrypted storage fake with a size cap, and independent fake
 head and finalized-chain stores with the contiguous-version guard. Real SDK
 OpenPGP and signing-adapter behavior are exercised; high-cardinality fault
-tests use a fast authenticated codec. Tests cover byte-exact resumed retries, fragmented
-JSON/binary reassembly, reversed/duplicate/tampered fragments, predecessor and
-local-authority delays, late feed entries, false heads, pending/deleted
-registrations, starvation and atomic import checkpoints.
+tests use a fast authenticated codec. Tests cover one registration for a sync of many
+fragments, byte-exact resumed retries, a lost registration acknowledgement,
+a crash between fragment upload and registration, fragmented JSON/binary
+reassembly, tampered and missing fragments, predecessor and local-authority
+delays, late feed entries, false heads, pending/deleted registrations,
+starvation and atomic import checkpoints.
 
-Live gateway/storage write acceptance, 100 MiB boundary memory use, registry
-cardinality/cost, real process termination during I/O, and mobile persistence
-are unproven. Pages and reassembled payloads are
+Live gateway/storage write acceptance, 100 MiB boundary memory use, real
+process termination during I/O, and mobile persistence are unproven. Pages and reassembled payloads are
 buffered in memory; large-device/phone memory measurements are required before
 promotion. A restored or cloned database must call
 `rotateReplicaWriterIdentity` before producing new batches; automated clone
-detection is not part of this experimental worker. Hosts must keep owner identity encoding consistent
+detection is not part of this experimental worker. A copy that skips it
+keeps the original's writer and contends for the same scope versions. Hosts must keep owner identity encoding consistent
 between baseline configuration and authoritative evidence.
 
-## Retained inbox upgrade
+## Databases from the per-fragment carrier
 
-When an enabled worker opens an older inbox, a ready row with retained
-`fragment_json` but a missing `data_hash` or `metadata_hash` is requeued for
-validation. Startup clears the fragment, both hash preimages, finality flag,
-retry deadline and old error. Normal download/decrypt/hash/structure checks
-regenerate the preimages; every fragment still needs finalized commitment
-verification before promotion. Imported and quarantined rows are untouched.
-A disabled worker does not requeue these rows. The upgrade deliberately requires
-storage to be available again; old decoded JSON alone cannot establish the
-missing commitment preimages.
+The earlier carrier registered every fragment under its own scope and kept
+its state in `pdpp_transport_outbox`, `pdpp_transport_inbox` and
+`pdpp_transport_preparing`. This worker cannot read that state. If any of
+those tables exists, the worker throws `ReplicaCarrierMismatchError` before
+it creates or changes a table. Testers start such a database fresh.

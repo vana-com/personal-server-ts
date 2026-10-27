@@ -82,8 +82,8 @@ export function createReplicaEvidenceAdapter(deps: {
   now?: () => number;
   /** Includes ordinary chain finality lag; default 30 minutes. Never use latest as fallback. */
   maxFinalizedAgeSeconds?: number;
-}): (scope: string) => Promise<ReplicaRegistrationEvidence> {
-  return async (scope) => {
+}): (scope: string, version: number) => Promise<ReplicaRegistrationEvidence> {
+  return async (scope, version) => {
     try {
       address.parse(deps.owner);
       address.parse(deps.registry);
@@ -93,6 +93,8 @@ export function createReplicaEvidenceAdapter(deps: {
         deps.chainId <= 0 ||
         /^0x0{40}$/i.test(deps.registry) ||
         !scope ||
+        !Number.isSafeInteger(version) ||
+        version < 1 ||
         !Number.isFinite(maxAge) ||
         maxAge <= 0
       )
@@ -135,7 +137,7 @@ export function createReplicaEvidenceAdapter(deps: {
           address: deps.registry,
           abi,
           functionName: "dataCommitment",
-          args: [deps.owner, scope, 1n],
+          args: [deps.owner, scope, BigInt(version)],
           blockNumber: block.number,
         }),
         deps.rpc.readContract({
@@ -151,7 +153,7 @@ export function createReplicaEvidenceAdapter(deps: {
         currentVersion < 0n ||
         currentVersion > (1n << 256n) - 1n ||
         !bytes32.safeParse(commitment).success ||
-        (currentVersion === 0n) !==
+        currentVersion < BigInt(version) !==
           ((commitment as string).toLowerCase() === zero)
       )
         throw new Error("invalid registry result");
@@ -176,7 +178,7 @@ export function createReplicaEvidenceAdapter(deps: {
       } else if (
         info.owner.toLowerCase() !== deps.owner.toLowerCase() ||
         info.scope !== scope ||
-        (currentVersion === 1n &&
+        (currentVersion === BigInt(version) &&
           info.currentCommitment.toLowerCase() !==
             (commitment as string).toLowerCase())
       )
@@ -232,7 +234,7 @@ export function createReplicaEvidenceAdapter(deps: {
         chain: {
           owner: deps.owner,
           scope,
-          version: "1",
+          version: String(version),
           currentVersion: currentVersion.toString(),
           status: statuses[info.status]!,
           commitment: commitment as Hex,

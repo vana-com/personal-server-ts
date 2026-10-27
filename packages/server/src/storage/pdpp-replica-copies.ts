@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS pdpp_replica_finalized_facts (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   chain_id INTEGER NOT NULL, registry TEXT NOT NULL, owner TEXT NOT NULL,
   scope TEXT NOT NULL, fragment_index INTEGER NOT NULL, id TEXT NOT NULL,
-  current_version TEXT NOT NULL, status TEXT NOT NULL, commitment TEXT NOT NULL,
+  slot_version TEXT NOT NULL DEFAULT '1', current_version TEXT NOT NULL, status TEXT NOT NULL, commitment TEXT NOT NULL,
   block_number TEXT NOT NULL, block_hash TEXT NOT NULL, eligible INTEGER NOT NULL,
   observed_at INTEGER NOT NULL
 );
@@ -193,6 +193,7 @@ export function createReplicaCopies(deps: {
       chain_id: number;
       registry: string;
       owner: string;
+      slot_version: string;
       current_version: string;
       status: string;
       commitment: string;
@@ -208,6 +209,7 @@ export function createReplicaCopies(deps: {
           chainId: f.chain_id,
           registry: f.registry,
           owner: f.owner,
+          version: f.slot_version,
           currentVersion: f.current_version,
           status: f.status,
           commitment: f.commitment as Hex,
@@ -472,7 +474,7 @@ export function createReplicaCopies(deps: {
         .immediate();
     },
     /**
-     * Append a verified finalized fact for one fragment scope (F2). A fact
+     * Append a verified finalized fact for one registered slot (F2). A fact
      * from another owner is refused (a diagnostic, never a fact). Returns
      * true when it is new.
      */
@@ -490,13 +492,14 @@ export function createReplicaCopies(deps: {
       const latest = (
         db
           .prepare(
-            "SELECT current_version,status,commitment,block_number,eligible FROM pdpp_replica_finalized_facts WHERE chain_id=? AND registry=? AND owner=? AND scope=? ORDER BY seq",
+            "SELECT current_version,status,commitment,block_number,eligible FROM pdpp_replica_finalized_facts WHERE chain_id=? AND registry=? AND owner=? AND scope=? AND slot_version=? ORDER BY seq",
           )
           .all(
             input.fact.chainId,
             input.fact.registry.toLowerCase(),
             input.fact.owner.toLowerCase(),
             input.scope,
+            input.fact.version,
           ) as {
           current_version: string;
           status: string;
@@ -532,7 +535,7 @@ export function createReplicaCopies(deps: {
       return (
         db
           .prepare(
-            "INSERT INTO pdpp_replica_finalized_facts (chain_id,registry,owner,scope,fragment_index,id,current_version,status,commitment,block_number,block_hash,eligible,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO pdpp_replica_finalized_facts (chain_id,registry,owner,scope,fragment_index,id,slot_version,current_version,status,commitment,block_number,block_hash,eligible,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
           )
           .run(
             input.fact.chainId,
@@ -541,6 +544,7 @@ export function createReplicaCopies(deps: {
             input.scope,
             input.fragmentIndex,
             input.id,
+            input.fact.version,
             input.fact.currentVersion,
             input.fact.status,
             input.fact.commitment.toLowerCase(),

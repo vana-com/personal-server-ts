@@ -38,10 +38,10 @@ Network destinations are fixed to dev Gateway `dp-rpc-dev.vana.org`, dev storage
 ## Acceptance checks
 
 1. A publishes canonical records and referenced binary bytes. B must hold equal records and independently matching SHA-256 blob digests. Repeat from B to A. Importing peer data must not append an echo to the local mutation journal.
-2. A writes an incompressible 101 MiB source blob. The worker uses its normal 4 MiB chunk target. Every encrypted fragment must fit the 100 MiB storage cap, and the receiver must reconstruct the source digest. Each child has a 2 GiB V8 heap and a measured 3 GiB RSS budget. Exceeding the RSS budget terminates the run; the report records the observed peak.
+2. A writes an incompressible 101 MiB source blob. The worker uses its normal 4 MiB chunk target. Every encrypted fragment must fit the 100 MiB storage cap, the whole sync must register exactly one manifest, and the receiver must reconstruct the source digest. Each child has a 2 GiB V8 heap and a measured 3 GiB RSS budget. Exceeding the RSS budget terminates the run; the report records the observed peak.
 3. B pauses its real storage GET after response bytes begin, with at least two fragments of that large batch already durable. The parent sends SIGKILL. A new B process must retain those fragments and avoid downloading them again. A second SIGKILL occurs after `receiver.import` returns inside the worker's outer transaction, before COMMIT. Restart must show that canonical records, received operations and history rolled back. The final import must add exactly one record-history row. A subsequent steady-state cycle must add none.
 4. Offline edits on the same key must reach both devices. The winner must equal the maximum persisted `(counter, writerId, operationId)` tuple, with tied counters exercising the writer tie-break. Canonical deletion propagates. Reset must converge the live view and generation, remain empty through additional cycles, then allow a generation-2 record to replicate.
-5. Every published/imported scope must retain Active version-one finalized registry evidence, with a block number and hash. The final stores must have no receiver quarantine or inbox errors. The sender-crash probe separately kills A after a successful storage PUT and before registration, then requires two PUT attempts at the same scope with the same ciphertext SHA-256.
+5. Every published/imported slot (`<scope>/<version>`) must retain Active finalized registry evidence at or above its version, with a block number and hash. The final stores must have no receiver quarantine or inbox errors. The sender-crash probe separately kills A after a successful storage PUT and before registration, then requires two PUT attempts at the same storage key with the same ciphertext SHA-256.
 
 Reset here means convergence of the live canonical view and generation. It does not assert erasure of retained operations, transport payloads or historical blob bytes.
 
@@ -60,6 +60,8 @@ Promotion also requires the Lite publisher host and scheduling, phone/Desktop pe
 Authority and ordering decisions remain open: accept the provisional Lamport/writer/operation order versus stronger upstream freshness; retain one authority/issuer versus replicate authorization state with revocation and rollback protection; and accept stale/absent legacy reads versus a separate compatibility bridge. This harness keeps the existing ordering and single-issuer defaults.
 
 ## Verified dev run — 21 October 2026
+
+This run used the per-fragment carrier, before A12. The manifest carrier has not had a live dev run yet.
 
 [Committed receipts](../docs/261021-pdpp-replica-live-journey.json) bind the full passing run to `da4157e8b94fe6a6eb1331ccb748980e4793c735` and harness SHA-256 `89fcb8175836bf6049f08ef771e3174b970035e397151e7759f8b419c4d33982`. It ran from 02:23:21.596 to 02:52:06.924 UTC on Node 22.23.1. The package/script worktree was clean.
 

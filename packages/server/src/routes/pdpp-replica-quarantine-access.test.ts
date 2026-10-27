@@ -8,19 +8,14 @@ import {
   canonicalJson,
   type ReplicaOperation,
 } from "@opendatalabs/personal-server-ts-core/replication/envelope";
+import { replicaChainCommitment } from "@opendatalabs/personal-server-ts-core/replication/dpv2";
 import {
-  replicaChainCommitment,
-  type ReplicaRegistrationEvidence,
-  type ReplicaTransportPort,
-} from "@opendatalabs/personal-server-ts-core/replication/dpv2";
-import {
-  fragmentReplicaPayload,
   replicaDigest,
   toBase64,
-  type PreparedFragment,
 } from "@opendatalabs/personal-server-ts-core/replication/transport";
 import {
   approveNarrowConsent,
+  finalizedReplicaNetwork,
   openConsentIssuer,
   openReplicaResourceServer,
 } from "./pdpp-replica-quarantine-fixture.js";
@@ -68,54 +63,6 @@ const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
-
-function finalizedNetwork() {
-  const fragments = new Map<string, PreparedFragment>();
-  const evidence = new Map<string, ReplicaRegistrationEvidence>();
-  const observed: string[] = [];
-  function register(part: PreparedFragment) {
-    fragments.set(part.scope, part);
-    evidence.set(part.scope, {
-      head: {
-        owner,
-        scope: part.scope,
-        version: "1",
-        dataHash: part.dataHash,
-        metadataHash: part.metadataHash,
-        deleted: false,
-      },
-      chain: {
-        owner,
-        scope: part.scope,
-        version: "1",
-        currentVersion: "1",
-        status: "Active",
-        commitment: replicaChainCommitment(part.dataHash, part.metadataHash),
-        chainId: 14800,
-        registry: `0x${"2".repeat(40)}`,
-        blockNumber: 123n,
-        blockHash: `0x${"3".repeat(64)}`,
-        blockTimestamp: 1000n,
-      },
-      pending: false,
-    });
-  }
-  // Codec identity is deliberate: crypto is covered by transport tests; here
-  // finalized hash bindings and the authorization/read boundary are the oracle.
-  const port: ReplicaTransportPort = {
-    encrypt: async (_scope, bytes) => bytes,
-    decrypt: async (_scope, bytes) => bytes,
-    put: async () => {},
-    register: async (part) => register(part),
-    get: async (scope) => fragments.get(scope)!.encrypted,
-    list: async () => ({ scopes: [...fragments.keys()], cursor: null }),
-    evidence: async (scope) => {
-      observed.push(scope);
-      return evidence.get(scope) ?? { head: null, chain: null, pending: false };
-    },
-  };
-  return { port, evidence, observed, register, fragments };
-}
 
 type Upsert = Extract<ReplicaOperation, { kind: "upsert" }>;
 function record(
@@ -186,7 +133,7 @@ async function fixture() {
     owner,
     declarations: [{ sourceId, binding }],
   });
-  const network = finalizedNetwork();
+  const network = finalizedReplicaNetwork(owner);
   const target = record("z-quarantined", secret, 20, blobBytes, blobId);
   const control = record("a-control", controlText, 10, controlBytes, controlId);
   let trustedBindings = [binding, alternateBinding];
@@ -268,25 +215,21 @@ async function fixture() {
         })),
       }),
     );
-    const parts = await fragmentReplicaPayload({
-      owner,
+    const published = await network.publish({
       writer: remote.writers.transport,
       batch,
       sequence,
       previous: after?.previous ?? null,
       collectedAt: at,
       bytes,
-      sign: remote.sign,
-      encrypt: network.port.encrypt,
     });
-    for (const part of parts) network.register(part);
     if (runCycle) await advance();
     const chain: Chain = {
       remote,
       sequence,
       previous: { batch, digest: replicaDigest(bytes) },
     };
-    return Object.assign(parts, { chain });
+    return Object.assign(published, { chain });
   }
   const claim = (r: Upsert): ReplicaOperation => ({
     kind: "blob-claim",
@@ -322,7 +265,7 @@ async function fixture() {
     ],
     [{ blobId: controlId, bytes: controlBytes }],
   );
-  const targetParts = await publish(
+  const targetBatch = await publish(
     [claim(target), target],
     [{ blobId, bytes: blobBytes }],
   );
@@ -458,9 +401,9 @@ async function fixture() {
   return {
     network,
     target,
-    targetParts,
+    targetBatch,
     /** The target's writer: an operation-id equivocation continues it. */
-    targetChain: targetParts.chain,
+    targetChain: targetBatch.chain,
     publish,
     assertQuarantined,
     controlWorks,
@@ -499,17 +442,12 @@ async function fixture() {
     withdrawDeclarations() {
       trustedBindings = [];
     },
-    clearPins(scope: string) {
-      db.prepare(
-        "UPDATE pdpp_transport_inbox SET data_hash=NULL,metadata_hash=NULL WHERE scope=?",
-      ).run(scope);
-    },
-    pins: (scope: string) =>
+    pins: (slot: string) =>
       db
         .prepare(
-          "SELECT data_hash,metadata_hash FROM pdpp_transport_inbox WHERE scope=?",
+          "SELECT data_hash,metadata_hash FROM pdpp_transport_manifests_in WHERE slot=?",
         )
-        .get(scope) as {
+        .get(slot) as {
         data_hash: string | null;
         metadata_hash: string | null;
       },
@@ -530,8 +468,8 @@ async function fixture() {
       db.prepare("SELECT * FROM pdpp_replica_quarantined_keys").all(),
     inbox: () =>
       db
-        .prepare("SELECT scope,state,error FROM pdpp_transport_inbox")
-        .all() as { scope: string; state: string; error: string | null }[],
+        .prepare("SELECT slot,state,reason FROM pdpp_transport_manifests_in")
+        .all() as { slot: string; state: string; reason: string | null }[],
   };
 }
 
@@ -595,23 +533,22 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
   // Publishes and revalidates 55 slots: about 3-4 s alone, more under full-suite load.
   it("revalidates at most 50 retained slots per cycle and reaches all 55 staged slots", async () => {
     const f = await fixture();
-    const staged: PreparedFragment[] = [];
+    const staged: string[] = [];
     for (let index = 0; index < 55; index++)
-      staged.push(...(await f.publish([f.target], [], false)));
+      staged.push((await f.publish([f.target], [], false)).slot);
     await f.cycle();
     await f.cycle();
     expect(
       staged.every(
-        (part) =>
-          f.inbox().find((row) => row.scope === part.scope)?.state ===
-          "imported",
+        (slot) =>
+          f.inbox().find((row) => row.slot === slot)?.state === "imported",
       ),
     ).toBe(true);
-    for (const part of staged) {
-      const previous = f.network.evidence.get(part.scope)!;
-      f.network.evidence.set(part.scope, {
+    for (const slot of staged) {
+      const previous = f.network.evidence.get(slot)!;
+      f.network.evidence.set(slot, {
         ...previous,
-        chain: { ...previous.chain!, currentVersion: "9" },
+        chain: { ...previous.chain!, commitment: `0x${"f".repeat(64)}` },
       });
     }
     for (let cycle = 0; cycle < 2; cycle++) {
@@ -619,56 +556,41 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
       await f.cycle();
       // Only revalidation reads of the staged slots count against its quantum;
       // the clock now advances, so the fixture's own publish wait also polls.
-      const scopes = new Set(staged.map((part) => part.scope));
+      const slots = new Set(staged);
       expect(
-        f.network.observed.filter((scope) => scopes.has(scope)).length,
+        f.network.observed.filter((slot) => slots.has(slot)).length,
       ).toBeLessThanOrEqual(50);
     }
     expect(
       staged.every(
-        (part) =>
-          f.inbox().find((row) => row.scope === part.scope)?.state ===
-          "quarantined",
+        (slot) =>
+          f.inbox().find((row) => row.slot === slot)?.state === "quarantined",
       ),
     ).toBe(true);
     await f.assertQuarantined();
     await f.controlWithdrawn();
   }, 30_000);
 
-  it("pins legacy retained hash pairs only from the exact fragment and finalized commitment", async () => {
+  it("pins a slot only from the exact manifest of its finalized commitment", async () => {
     const f = await fixture();
-    const part = f.targetParts[0];
-    const verified = f.network.evidence.get(part.scope)!;
-    f.clearPins(part.scope);
+    const { slot, manifest } = await f.publish([f.target], [], false);
+    const verified = f.network.evidence.get(slot)!;
     // An optimistic head cannot supply a durable pair while finality is absent.
-    f.network.evidence.set(part.scope, {
-      ...verified,
-      chain: null,
-      pending: true,
-    });
+    f.network.evidence.set(slot, { ...verified, chain: null, pending: true });
     await f.cycle();
-    expect(f.pins(part.scope)).toEqual({
-      data_hash: null,
-      metadata_hash: null,
-    });
-    f.network.evidence.set(part.scope, verified);
-    // Even confirmed evidence cannot pin bytes differing from retained history.
-    f.network.fragments.set(part.scope, {
-      ...part,
-      encrypted: Buffer.from("malformed substituted bytes"),
-    });
+    expect(f.pins(slot)).toEqual({ data_hash: null, metadata_hash: null });
+    f.network.evidence.set(slot, verified);
+    // Even confirmed evidence cannot pin stored bytes other than the commitment.
+    f.network.objects.set(slot, Buffer.from("malformed substituted bytes"));
     await f.cycle();
-    expect(f.pins(part.scope)).toEqual({
-      data_hash: null,
-      metadata_hash: null,
-    });
-    f.network.fragments.set(part.scope, part);
+    expect(f.pins(slot)).toEqual({ data_hash: null, metadata_hash: null });
+    f.network.objects.set(slot, manifest.encrypted);
     await f.cycle();
-    expect(f.pins(part.scope)).toEqual({
-      data_hash: part.dataHash,
-      metadata_hash: part.metadataHash,
+    expect(f.pins(slot)).toEqual({
+      data_hash: manifest.dataHash,
+      metadata_hash: manifest.metadataHash,
     });
-    f.network.evidence.set(part.scope, {
+    f.network.evidence.set(slot, {
       ...verified,
       chain: { ...verified.chain!, commitment: `0x${"f".repeat(64)}` },
     });
@@ -680,21 +602,22 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
   it("retracts known immutable conflicts even after the original declaration is withdrawn", async () => {
     const f = await fixture();
     f.withdrawDeclarations();
-    const part = f.targetParts[0];
-    const previous = f.network.evidence.get(part.scope)!;
-    f.network.evidence.set(part.scope, {
+    const { slot } = f.targetBatch;
+    const previous = f.network.evidence.get(slot)!;
+    f.network.evidence.set(slot, {
       ...previous,
-      chain: { ...previous.chain!, currentVersion: "9" },
+      chain: { ...previous.chain!, commitment: `0x${"f".repeat(64)}` },
     });
     await f.cycle();
     expect
-      .soft(f.inbox().find((row) => row.scope === part.scope)?.state)
+      .soft(f.inbox().find((row) => row.slot === slot)?.state)
       .toBe("quarantined");
     await f.assertQuarantined();
   });
 
+  // A later finalized version of the scope is an appended batch, not a
+  // conflict: each batch owns its own slot.
   it.each([
-    ["finalized immutable version", { currentVersion: "9" }],
     [
       "version-one commitment mismatch",
       { commitment: `0x${"f".repeat(64)}` as const },
@@ -712,21 +635,19 @@ describe("replica quarantine gates actual consent-authorized app reads", () => {
     "P0 #6: revalidates an imported slot after %s and withdraws the batch's connection (contract v3.1 A)",
     async (_label, conflict) => {
       const f = await fixture();
-      for (const part of f.targetParts) {
-        const previous = f.network.evidence.get(part.scope)!;
-        f.network.evidence.set(part.scope, {
-          ...previous,
-          chain: { ...previous.chain!, ...conflict },
-        });
-      }
+      const { slot } = f.targetBatch;
+      const previous = f.network.evidence.get(slot)!;
+      f.network.evidence.set(slot, {
+        ...previous,
+        chain: { ...previous.chain!, ...conflict },
+      });
       await f.cycle();
-      for (const part of f.targetParts)
-        expect
-          .soft(
-            f.inbox().find((r) => r.scope === part.scope)?.state,
-            "known immutable conflict commits quarantine",
-          )
-          .toBe("quarantined");
+      expect
+        .soft(
+          f.inbox().find((r) => r.slot === slot)?.state,
+          "known immutable conflict commits quarantine",
+        )
+        .toBe("quarantined");
       await f.assertQuarantined();
       await f.controlWithdrawn();
       await f.restart();

@@ -856,7 +856,7 @@ describe("coordinator transitions", () => {
 
   it("07 Retry then Wait then Retry: waits are not failures and the next error is B(1)", async () => {
     const world = newWorld();
-    addRow(world, "c1", "confirm", "A");
+    addRow(world, "c1", "fetch", "A");
     script(
       world,
       "c1",
@@ -874,7 +874,7 @@ describe("coordinator transitions", () => {
     expect(waited.waits).toEqual([
       {
         id: "c1",
-        phase: "confirm",
+        phase: "fetch",
         dependency: { kind: "finality", key: "scope-1", checkedBlock: "10" },
       },
     ]);
@@ -907,7 +907,7 @@ describe("coordinator transitions", () => {
 
   it("08 Wait then Retry keeps the verified height and uses B(1); a hint-free wait then resumes polling", async () => {
     const world = newWorld();
-    addRow(world, "c1", "confirm", "A");
+    addRow(world, "c1", "fetch", "A");
     script(
       world,
       "c1",
@@ -933,7 +933,7 @@ describe("coordinator transitions", () => {
 
   it("30 coordinator hints() decides the poll cadence and never lowers checkedBlock", async () => {
     const world = newWorld();
-    addRow(world, "c1", "confirm", "A");
+    addRow(world, "c1", "fetch", "A");
     script(
       world,
       "c1",
@@ -956,7 +956,7 @@ describe("coordinator transitions", () => {
 
   it("32 a finality notification before the Retry deadline never runs the item or shortens its deadline", async () => {
     const world = newWorld();
-    addRow(world, "c1", "confirm", "A");
+    addRow(world, "c1", "fetch", "A");
     script(world, "c1", new Error("rpc"), finalityWait("5"));
     const co = build(world, { backoff: expBackoff, hint: silentHint });
     await stepAt(world, co, T0);
@@ -1505,7 +1505,7 @@ describe("coordinator fairness", () => {
   it("20 parked waits are never run or charged: the one due item runs on a one-unit budget", async () => {
     const world = newWorld();
     for (let i = 0; i < 100; i += 1) {
-      addRow(world, `park${i}`, "confirm", "A");
+      addRow(world, `park${i}`, "fetch", "A");
       parkAsWait(
         world,
         `park${i}`,
@@ -1513,17 +1513,17 @@ describe("coordinator fairness", () => {
         T0 + 2000 + i,
       );
     }
-    addRow(world, "b1", "confirm", "B", { state: { nextEligible: T0 } });
+    addRow(world, "b1", "fetch", "B", { state: { nextEligible: T0 } });
     const report = await stepAt(
       world,
-      build(world, { quantum: { confirm: 1 } }),
+      build(world, { quantum: { fetch: 1 } }),
       T0,
       {
         units: 1,
       },
     );
     expect(runIds(world)).toEqual(["b1"]);
-    expect(report.receipts).toEqual([{ phase: "confirm", key: "b1" }]);
+    expect(report.receipts).toEqual([{ phase: "fetch", key: "b1" }]);
     expect(report.nextWake).toBe(T0 + 2000);
     expect(world.dueCalls.length).toBeLessThanOrEqual(2);
   });
@@ -1755,7 +1755,7 @@ describe("coordinator dependency wakes", () => {
       ["decl-d", "import", { kind: "declaration", key: "D" }],
       ["pred-p", "import", { kind: "predecessor", key: "w:1" }],
       ["blob-b", "download", { kind: "blob", key: "B" }],
-      ["fin-s", "confirm", { kind: "finality", key: "S", checkedBlock: "1" }],
+      ["fin-s", "fetch", { kind: "finality", key: "S", checkedBlock: "1" }],
     ];
     for (const [id, phase, dependency] of rows) {
       addRow(world, id, phase, "A");
@@ -1901,7 +1901,7 @@ describe("coordinator nextWake", () => {
     addRow(world, "r2", "download", "A", {
       state: { nextEligible: T0 + 30_000, attempts: 1 },
     });
-    addRow(world, "f1", "confirm", "B");
+    addRow(world, "f1", "fetch", "B");
     parkAsWait(
       world,
       "f1",
@@ -1970,7 +1970,7 @@ describe("coordinator settle", () => {
   it("45 settle gets exactly the pure outcome and state for each run, once, after the run resolves", async () => {
     const world = newWorld();
     addRow(world, "r1", "publish", "A", { state: { nextEligible: 1 } });
-    addRow(world, "w1", "confirm", "B", { state: { nextEligible: 2 } });
+    addRow(world, "w1", "fetch", "B", { state: { nextEligible: 2 } });
     addRow(world, "p1", "prepare", "C", { state: { nextEligible: 3 } });
     addRow(world, "q1", "import", "D", { state: { nextEligible: 4 } });
     const retry: ReplicaPhaseOutcome = {

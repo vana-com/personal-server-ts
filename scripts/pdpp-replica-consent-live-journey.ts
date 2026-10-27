@@ -747,7 +747,7 @@ async function main() {
         JSON.stringify({
           stage: label,
           elapsedMs: Date.now() - start,
-          imported: receiving.importedFragments,
+          imported: receiving.importedManifests,
           errors: receiving.inboxErrors,
         }),
       );

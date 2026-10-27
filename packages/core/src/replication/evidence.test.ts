@@ -40,7 +40,7 @@ it("pins all registry reads to the same fresh finalized block and proves genuine
     gatewayUrl: "https://gateway.invalid",
     fetch: fetcher,
     now: () => 1010_000,
-  })("scope");
+  })("scope", 1);
   expect(evidence).toMatchObject({
     head: null,
     chain: {
@@ -131,16 +131,15 @@ function fixture() {
       fetch: fetcher,
       now: () => 1010_000,
       maxFinalizedAgeSeconds: 300,
-    })(scope);
+    })(scope, 1);
   return { rpc, fetcher, read };
 }
 it("verifies head preimages against the independent commitment, including the false head 9 case", async () => {
   const f = fixture();
-  expect(replicaRegistrationState(await f.read(), { owner, scope })).toBe(
-    "confirmed",
-  );
+  expect(
+    replicaRegistrationState(await f.read(), { owner, scope, version: 1 }),
+  ).toBe("confirmed");
   for (const patch of [
-    { expectedVersion: "9" },
     { dataHash: `0x${"3".repeat(64)}` },
     { metadataHash: `0x${"3".repeat(64)}` },
     { deletedAt: "2026-10-20T00:00:00Z" },
@@ -148,19 +147,28 @@ it("verifies head preimages against the independent commitment, including the fa
     f.fetcher.mockImplementation(async () =>
       Response.json({ data: { ...head, ...patch } }),
     );
-    expect(replicaRegistrationState(await f.read(), { owner, scope })).toBe(
-      "pending",
-    );
+    expect(
+      replicaRegistrationState(await f.read(), { owner, scope, version: 1 }),
+    ).toBe("pending");
   }
+  // A head at version 9 is later than this slot, so it cannot speak for the
+  // slot's preimages: the finalized commitment binds them. It can delay a
+  // slot it claims but the chain has not finalized.
+  f.fetcher.mockImplementation(async () =>
+    Response.json({ data: { ...head, expectedVersion: "9" } }),
+  );
+  expect(
+    replicaRegistrationState(await f.read(), { owner, scope, version: 1 }),
+  ).toBe("confirmed");
 });
 it("treats missing head and unsettled head as propagation lag", async () => {
   const f = fixture();
   f.fetcher.mockImplementation(async () =>
     Response.json({ error: "Data point not found" }, { status: 404 }),
   );
-  expect(replicaRegistrationState(await f.read(), { owner, scope })).toBe(
-    "pending",
-  );
+  expect(
+    replicaRegistrationState(await f.read(), { owner, scope, version: 1 }),
+  ).toBe("pending");
   f.fetcher.mockImplementation(async () => Response.json({ data: head }));
   f.rpc.readContract.mockImplementation(async ({ functionName }) =>
     functionName === "currentVersion"
@@ -169,21 +177,65 @@ it("treats missing head and unsettled head as propagation lag", async () => {
         ? info(0n)
         : `0x${"0".repeat(64)}`,
   );
-  expect(replicaRegistrationState(await f.read(), { owner, scope })).toBe(
-    "pending",
-  );
+  expect(
+    replicaRegistrationState(await f.read(), { owner, scope, version: 1 }),
+  ).toBe("pending");
 });
-it("keeps later chain versions conflicting even when the head still claims version 1", async () => {
+it("reads the requested slot: later versions append and only a different slot commitment conflicts", async () => {
   const f = fixture();
-  f.rpc.readContract.mockImplementation(async ({ functionName }) =>
+  const other = replicaChainCommitment(metadataHash, dataHash);
+  f.rpc.readContract.mockImplementation(async ({ functionName, args }) =>
     functionName === "currentVersion"
       ? 2n
       : functionName === "dataPoints"
-        ? info(2n)
-        : replicaChainCommitment(dataHash, metadataHash),
+        ? { ...info(2n), currentCommitment: other }
+        : args[2] === 1n
+          ? replicaChainCommitment(dataHash, metadataHash)
+          : other,
   );
-  expect(replicaRegistrationState(await f.read(), { owner, scope })).toBe(
+  const expected = { owner, scope, version: 1, dataHash, metadataHash };
+  // The Gateway is behind the chain; slot 1 is still finalized and Active.
+  expect(replicaRegistrationState(await f.read(), expected)).toBe("confirmed");
+  expect(f.rpc.readContract).toHaveBeenCalledWith(
+    expect.objectContaining({
+      functionName: "dataCommitment",
+      args: [owner, scope, 1n],
+    }),
+  );
+  const slot2 = await createReplicaEvidenceAdapter({
+    owner,
+    registry,
+    chainId: 14800,
+    rpc: f.rpc,
+    gatewayUrl: "https://gateway.invalid",
+    fetch: f.fetcher,
+    now: () => 1010_000,
+  })(scope, 2);
+  expect(slot2.chain).toMatchObject({ version: "2", commitment: other });
+  expect(replicaRegistrationState(slot2, { ...expected, version: 2 })).toBe(
     "conflict",
+  );
+  // Slot 3 is not on chain yet and no head claims it: genuinely absent.
+  f.rpc.readContract.mockImplementation(async ({ functionName, args }) =>
+    functionName === "currentVersion"
+      ? 2n
+      : functionName === "dataPoints"
+        ? { ...info(2n), currentCommitment: other }
+        : args[2] === 3n
+          ? `0x${"0".repeat(64)}`
+          : other,
+  );
+  const slot3 = await createReplicaEvidenceAdapter({
+    owner,
+    registry,
+    chainId: 14800,
+    rpc: f.rpc,
+    gatewayUrl: "https://gateway.invalid",
+    fetch: f.fetcher,
+    now: () => 1010_000,
+  })(scope, 3);
+  expect(replicaRegistrationState(slot3, { ...expected, version: 3 })).toBe(
+    "absent",
   );
 });
 it("retains a 410 tombstone body and rejects bare 410 as retryable", async () => {
@@ -194,9 +246,9 @@ it("retains a 410 tombstone body and rejects bare 410 as retryable", async () =>
       { status: 410 },
     ),
   );
-  expect(replicaRegistrationState(await f.read(), { owner, scope })).toBe(
-    "pending",
-  );
+  expect(
+    replicaRegistrationState(await f.read(), { owner, scope, version: 1 }),
+  ).toBe("pending");
   f.fetcher.mockImplementation(async () => new Response(null, { status: 410 }));
   await expect(f.read()).rejects.toMatchObject({ retryable: true });
 });
@@ -260,10 +312,10 @@ it("uses a configurable freshness window that allows ordinary finality lag", asy
       fetch: f.fetcher,
       now: () => 1400_000,
       maxFinalizedAgeSeconds,
-    })(scope);
-  expect(replicaRegistrationState(await read(), { owner, scope })).toBe(
-    "confirmed",
-  );
+    })(scope, 1);
+  expect(
+    replicaRegistrationState(await read(), { owner, scope, version: 1 }),
+  ).toBe("confirmed");
   await expect(read(300)).rejects.toMatchObject({ retryable: true });
 });
 it("accepts an injected viem client and uses real ABI RPC decoding", async () => {
@@ -300,8 +352,10 @@ it("accepts an injected viem client and uses real ABI RPC decoding", async () =>
     fetch: async () =>
       Response.json({ error: "Data point not found" }, { status: 404 }),
     now: () => 1010_000,
-  })(scope);
-  expect(replicaRegistrationState(evidence, { owner, scope })).toBe("absent");
+  })(scope, 1);
+  expect(replicaRegistrationState(evidence, { owner, scope, version: 1 })).toBe(
+    "absent",
+  );
   expect(
     requests.filter((r) => r.method === "eth_call").map((r) => r.params?.[1]),
   ).toEqual(["0x7b", "0x7b", "0x7b"]);
@@ -319,9 +373,9 @@ it("holds chain-only soft deletion pending at version 1 and validates all nine t
     );
     const evidence = await f.read();
     expect(evidence.head?.deleted).toBe(false);
-    expect(replicaRegistrationState(evidence, { owner, scope })).toBe(
-      "pending",
-    );
+    expect(
+      replicaRegistrationState(evidence, { owner, scope, version: 1 }),
+    ).toBe("pending");
   }
   for (const patch of [
     { status: 4 },
@@ -355,6 +409,7 @@ it("keeps Gateway lifecycle refusal pending before deletedAt is populated", asyn
       replicaRegistrationState(evidence, {
         owner,
         scope,
+        version: 1,
         dataHash,
         metadataHash,
       }),
@@ -367,6 +422,7 @@ it("keeps Gateway lifecycle refusal pending before deletedAt is populated", asyn
     replicaRegistrationState(await f.read(), {
       owner,
       scope,
+      version: 1,
       dataHash,
       metadataHash,
     }),
@@ -405,7 +461,7 @@ it("does not treat a missing Gateway route as authoritative head absence", async
   f.fetcher.mockImplementation(async () =>
     Response.json({ error: "Data point not found" }, { status: 404 }),
   );
-  expect(replicaRegistrationState(await f.read(), { owner, scope })).toBe(
-    "absent",
-  );
+  expect(
+    replicaRegistrationState(await f.read(), { owner, scope, version: 1 }),
+  ).toBe("absent");
 });

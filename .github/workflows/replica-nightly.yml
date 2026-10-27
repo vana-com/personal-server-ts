@@ -2,7 +2,8 @@ name: Replica nightly
 
 # Runs the large mode of the replica tests: the differential oracle at nightly
 # volume (REPLICA_ORACLE_NIGHTLY=1), every crash index of the custody matrices,
-# by restore and from a warm process, and the writer-authority attack variants.
+# by restore and from a warm process, the writer-authority attack variants,
+# and every crash point of a manifest sync.
 # Pull requests run a smaller deterministic set. Run it locally: npm run test:replica-nightly
 
 on:

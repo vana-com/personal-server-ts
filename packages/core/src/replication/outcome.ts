@@ -12,7 +12,7 @@ export type ReplicaPhase =
   | "publish"
   | "discover"
   | "download"
-  | "confirm"
+  | "fetch"
   | "revalidate"
   | "import"
   | "reconcile";
@@ -105,8 +105,12 @@ export class ReplicaFramingUnsupported extends Error {
   constructor(
     readonly actual: number,
     readonly limit: number,
-    /** fragment_bytes: one encrypted fragment exceeds the cap. fragment_count: too many fragments. */
-    readonly dimension: "fragment_bytes" | "fragment_count" = "fragment_bytes",
+    /**
+     * fragment_bytes: one encrypted fragment exceeds the cap. fragment_count:
+     * too many fragments. manifest_bytes: the encrypted manifest exceeds the cap.
+     */
+    readonly dimension:
+      "fragment_bytes" | "fragment_count" | "manifest_bytes" = "fragment_bytes",
   ) {
     super("replica_framing_unsupported");
     this.name = "ReplicaFramingUnsupported";
@@ -129,6 +133,16 @@ export interface ReplicaQuarantineProof {
     | "batch_equivocation"
     | "source_binding_conflict"
     | "local_mapping_conflict"
+    /** A finalized manifest decodes to an invalid statement. */
+    | "manifest_invalid"
+    /**
+     * Storage has no object at a fragment address of a finalized manifest.
+     * Storage reads are strongly consistent and the writer stores every
+     * fragment before it registers the manifest.
+     */
+    | "fragment_missing"
+    /** Fetched fragment bytes or their content disagree with the finalized manifest. */
+    | "fragment_mismatch"
     /** Writer authority (host contract §3.4). None of these touch writer state. */
     | ReplicaAuthorityRefusal;
   key: string;

@@ -118,27 +118,31 @@ if (mode === "seed") {
   preflight.close();
   const source = open("source"),
     destination = open("destination");
-  const heads = new Map<string, ReplicaCommitment>();
+  // Every registered version of each scope, in order: versions append.
+  const slots = new Map<string, ReplicaCommitment[]>();
   let published = 0;
+  const file = (key: string) =>
+    join(directory, createHash("sha256").update(key).digest("hex"));
   const transport: ReplicaTransportPort = {
     // Crypto scratch is bounded by fragment size. The worker still validates every fragment and commitment.
     encrypt: async (_scope, bytes) => new Uint8Array(bytes),
     decrypt: async (_scope, bytes) => new Uint8Array(bytes),
-    async evidence(scope) {
-      const head = heads.get(scope) ?? null;
+    async evidence(scope, version) {
+      const rows = slots.get(scope) ?? [];
+      const row = rows[version - 1];
       return {
-        head,
+        head: rows.at(-1) ?? null,
         pending: false,
         chain: {
           owner,
           scope,
-          version: "1",
-          currentVersion: head ? "1" : "0",
-          status: head ? "Active" : "None",
-          commitment: head
+          version: String(version),
+          currentVersion: String(rows.length),
+          status: rows.length ? "Active" : "None",
+          commitment: row
             ? replicaChainCommitment(
-                head.dataHash as `0x${string}`,
-                head.metadataHash as `0x${string}`,
+                row.dataHash as `0x${string}`,
+                row.metadataHash as `0x${string}`,
               )
             : `0x${"0".repeat(64)}`,
           chainId: 14800,
@@ -149,30 +153,50 @@ if (mode === "seed") {
         },
       };
     },
-    async put(part) {
+    async putFragment(fragment) {
       writeFileSync(
-        join(directory, createHash("sha256").update(part.scope).digest("hex")),
-        part.encrypted,
+        file(`${fragment.scope}#${fragment.digest}`),
+        fragment.encrypted,
       );
     },
-    async register(part) {
-      heads.set(part.scope, {
+    async getFragment(scope, digest) {
+      return readFileSync(file(`${scope}#${digest}`));
+    },
+    async hasFragment(scope, digest) {
+      return existsSync(file(`${scope}#${digest}`));
+    },
+    async put(manifest) {
+      writeFileSync(
+        file(`${manifest.scope}/${manifest.version}`),
+        manifest.encrypted,
+      );
+    },
+    async register(manifest) {
+      const rows = slots.get(manifest.scope) ?? [];
+      if (manifest.version !== rows.length + 1)
+        throw new Error("409 stale expectedVersion");
+      rows.push({
         owner,
-        scope: part.scope,
-        version: "1",
-        dataHash: part.dataHash,
-        metadataHash: part.metadataHash,
+        scope: manifest.scope,
+        version: String(manifest.version),
+        dataHash: manifest.dataHash,
+        metadataHash: manifest.metadataHash,
         deleted: false,
       });
+      slots.set(manifest.scope, rows);
       published++;
     },
-    async get(scope) {
-      return readFileSync(
-        join(directory, createHash("sha256").update(scope).digest("hex")),
-      );
+    async get(scope, version) {
+      return readFileSync(file(`${scope}/${version}`));
     },
     async list() {
-      return { scopes: [...heads.keys()], cursor: null };
+      return {
+        points: [...slots].map(([scope, rows]) => ({
+          scope,
+          version: String(rows.length),
+        })),
+        cursor: null,
+      };
     },
   };
   const worker = (device: typeof source) =>

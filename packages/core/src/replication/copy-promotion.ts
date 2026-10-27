@@ -11,8 +11,9 @@ export type Hex = `0x${string}`;
 
 /**
  * keccak256(abi.encode(string "pdpp.replica.copy.v1", bytes32[] commitments)),
- * commitments in fragment index order. Always recomputed locally from the
- * fragments' (dataHash, metadataHash) commitments, never taken from a sender.
+ * commitments in slot order. A manifest-carried batch has one slot: its
+ * manifest. Always recomputed locally from the verified (dataHash,
+ * metadataHash) pairs, never taken from a sender.
  */
 export function replicaCopyKey(fragmentCommitments: readonly Hex[]): Hex {
   return keccak256(
@@ -34,15 +35,16 @@ export interface RetainedCopy {
   validity: "valid" | "corrupt";
 }
 
-/** What the finalized chain says about one fragment index. */
+/** What the finalized chain says about one registered slot of a copy. */
 export type IndexEvidence =
   /** Never verified, or the last attempt was unavailable. */
   | { kind: "unknown" }
-  /** Finalized currentVersion 0, status None: not registered yet. */
+  /** Finalized currentVersion below the slot: not registered yet. */
   | { kind: "absent" }
   /**
-   * Finalized currentVersion 1, any status. `eligible`: the registration
-   * state was "confirmed" at that fact (status Active, matching live head).
+   * Finalized currentVersion at or above the slot, any status. `eligible`:
+   * the registration state was "confirmed" at that fact (status Active,
+   * agreeing live head).
    */
   | { kind: "committed"; commitment: Hex; eligible: boolean }
   /** Absorbing, derived from the fact history. */
@@ -154,11 +156,13 @@ export function decideCopyPromotion(input: CopyDecisionInput): CopyDecision {
   };
 }
 
-/** One verified finalized fact for one fragment scope (contract F2). */
+/** One verified finalized fact for one registered slot (contract F2). */
 export interface FinalizedFact {
   chainId: number;
   registry: string;
   owner: string;
+  /** The slot's version. Its commitment is write-once on chain. */
+  version: string;
   currentVersion: string;
   status: string;
   commitment: Hex;
@@ -169,12 +173,13 @@ export interface FinalizedFact {
 }
 
 /**
- * The evidence of one fragment index from its verified fact history
- * (amendment D). Contradiction is absorbing: two version-1 commitments, a
- * version above 1, a version-0 fact later than a version-1 fact, one block
- * number with two hashes, or facts from two authorities. Otherwise the fact
- * with the highest block number decides, and among facts at that block the
- * last observed. `facts` must be in observation order.
+ * The evidence of one slot from its verified fact history (amendment D).
+ * Versions append, so a currentVersion above the slot is normal. A slot's
+ * commitment is write-once, so contradiction is absorbing: two commitments
+ * for the slot, an absent fact later than a committed one, facts about two
+ * slots, one block number with two hashes, or facts from two authorities.
+ * Otherwise the fact with the highest block number decides, and among facts
+ * at that block the last observed. `facts` must be in observation order.
  */
 export function indexEvidenceFromFacts(
   facts: readonly FinalizedFact[],
@@ -183,9 +188,11 @@ export function indexEvidenceFromFacts(
   const authority = (f: FinalizedFact) =>
     `${f.chainId} ${f.registry.toLowerCase()} ${f.owner.toLowerCase()}`;
   if (new Set(facts.map(authority)).size > 1) return { kind: "contradiction" };
-  const versions = facts.map((f) => BigInt(f.currentVersion));
-  if (versions.some((v) => v > 1n)) return { kind: "contradiction" };
-  const committedFacts = facts.filter((f) => f.currentVersion === "1");
+  if (new Set(facts.map((f) => f.version)).size > 1)
+    return { kind: "contradiction" };
+  const slot = BigInt(facts[0]!.version);
+  const committed = (f: FinalizedFact) => BigInt(f.currentVersion) >= slot;
+  const committedFacts = facts.filter(committed);
   if (new Set(committedFacts.map((f) => f.commitment.toLowerCase())).size > 1)
     return { kind: "contradiction" };
   const hashes = new Map<bigint, string>();
@@ -202,9 +209,7 @@ export function indexEvidenceFromFacts(
   );
   if (
     firstCommitted !== undefined &&
-    facts.some(
-      (f) => f.currentVersion === "0" && f.blockNumber > firstCommitted,
-    )
+    facts.some((f) => !committed(f) && f.blockNumber > firstCommitted)
   )
     return { kind: "contradiction" };
   // Facts arrive in observation order. At one block, a later observation
@@ -213,7 +218,7 @@ export function indexEvidenceFromFacts(
   const latest = facts.reduce((a, b) =>
     b.blockNumber >= a.blockNumber ? b : a,
   );
-  return latest.currentVersion === "1"
+  return committed(latest)
     ? {
         kind: "committed",
         commitment: latest.commitment.toLowerCase() as Hex,

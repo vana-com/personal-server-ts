@@ -263,6 +263,7 @@ function prove(
       chainId: 1,
       registry: hex(0xabc),
       owner: "owner",
+      version: "1",
       currentVersion: options.version ?? "1",
       status: options.eligible === false ? "Inactive" : "Active",
       commitment:
@@ -765,6 +766,7 @@ describe("evidence authority (F2)", () => {
           chainId: 1,
           registry: hex(0xabc),
           owner: "someone-else",
+          version: "1",
           currentVersion: "1",
           status: "Active",
           commitment: hex(1),

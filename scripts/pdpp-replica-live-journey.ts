@@ -32,6 +32,11 @@ import {
   createDpv2ReplicaTransport,
   createReplicaFinalityHints,
 } from "../packages/core/src/replication/dpv2.js";
+import {
+  replicaFragmentKey,
+  replicaManifestKey,
+  replicaScope,
+} from "../packages/core/src/replication/transport.js";
 import { ServerConfigSchema } from "../packages/core/src/schemas/server-config.js";
 import type { SignTypedDataParams } from "../packages/core/src/keys/server-account.js";
 import { createServerSigner } from "../packages/core/src/signing/signer.js";
@@ -157,10 +162,11 @@ export type Snapshot = {
   canonicalRecords: CanonicalRecord[];
   blobs: Record<string, { sha256: string; bytes: number }>;
   published: number;
-  importedFragments: number;
+  importedManifests: number;
   stagedFragments: number;
   pid: number;
   evidence: {
+    slot: string;
     head: { scope: string } | null;
     chain: {
       status: string;
@@ -170,7 +176,7 @@ export type Snapshot = {
       commitment: string;
     } | null;
   }[];
-  importedScopes: string[];
+  importedSlots: string[];
   importedBatches: number;
   received: number;
   journal: number;
@@ -182,12 +188,21 @@ export type Snapshot = {
   writer: string;
   operations: ReplicaOperation[];
   receivedOperations: ReplicaOperation[];
-  staged: { scope: string; writer: string; batch: string }[];
-  gets: { scope: string; attempts: number }[];
-  puts: { scope: string; sha256: string; attempts: number }[];
+  staged: { key: string; writer: string; batch: string }[];
+  gets: { key: string; attempts: number }[];
+  puts: { key: string; sha256: string; attempts: number }[];
   inboxErrors: unknown[];
   quarantines: number;
-  wire: unknown[];
+  wire: WireObject[];
+};
+
+/** One outbound storage object: a batch's fragments, then its one manifest. */
+type WireObject = {
+  key: string;
+  kind: "fragment" | "manifest";
+  batch: string;
+  state: string;
+  bytes: number;
 };
 
 export async function openReplicaRuntime(init: Init) {
@@ -305,7 +320,7 @@ export async function openReplicaRuntime(init: Init) {
     : undefined;
   const account = serverAccount(init.serverKey);
   // The SDK captures global fetch at construction, so install before creating storage.
-  let bodyBarrier: { url: string; scope: string } | undefined;
+  let bodyBarrier: { url: string; key: string } | undefined;
   const hostFetch = globalThis.fetch;
   // Fault-injection fetch interception belongs only to the original fixture child.
   // An in-process A shares the parent's AS and must never replace its fetch hook.
@@ -323,7 +338,7 @@ export async function openReplicaRuntime(init: Init) {
         assert(!first.done && first.value.length > 0);
         process.send?.({
           checkpoint: "download",
-          scope: bodyBarrier.scope,
+          key: bodyBarrier.key,
           bytesStarted: first.value.length,
         });
         await new Promise(() => {});
@@ -359,13 +374,13 @@ export async function openReplicaRuntime(init: Init) {
     }),
   });
   db.exec(
-    "CREATE TABLE IF NOT EXISTS harness_evidence (scope TEXT PRIMARY KEY, json TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS harness_evidence (slot TEXT PRIMARY KEY, json TEXT NOT NULL)",
   );
   const evidence = transport.evidence;
-  transport.evidence = async (scope) => {
-    const result = await evidence(scope);
+  transport.evidence = async (scope, version) => {
+    const result = await evidence(scope, version);
     db.prepare("INSERT OR REPLACE INTO harness_evidence VALUES (?,?)").run(
-      scope,
+      replicaManifestKey(scope, version),
       JSON.stringify(result, (_key, value) =>
         typeof value === "bigint" ? value.toString() : value,
       ),
@@ -373,24 +388,39 @@ export async function openReplicaRuntime(init: Init) {
     return result;
   };
   db.exec(
-    "CREATE TABLE IF NOT EXISTS harness_gets (scope TEXT PRIMARY KEY, attempts INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS harness_gets (key TEXT PRIMARY KEY, attempts INTEGER NOT NULL)",
   );
   db.exec(
-    "CREATE TABLE IF NOT EXISTS harness_puts (scope TEXT NOT NULL, sha256 TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS harness_puts (key TEXT NOT NULL, sha256 TEXT NOT NULL)",
   );
+  // Every storage PUT, fragment or manifest, keyed by its storage address.
   let killPut = false;
-  const putFragment = transport.put;
-  transport.put = async (part) => {
-    db.prepare("INSERT INTO harness_puts VALUES (?,?)").run(
-      part.scope,
-      digest(part.encrypted),
-    );
-    await putFragment(part);
+  async function recordPut(
+    key: string,
+    bytes: Uint8Array,
+    put: () => Promise<void>,
+  ) {
+    db.prepare("INSERT INTO harness_puts VALUES (?,?)").run(key, digest(bytes));
+    await put();
     if (killPut) {
-      process.send?.({ checkpoint: "put-complete", scope: part.scope });
+      process.send?.({ checkpoint: "put-complete", key });
       await new Promise(() => {});
     }
-  };
+  }
+  const putFragment = transport.putFragment;
+  transport.putFragment = (fragment) =>
+    recordPut(
+      replicaFragmentKey(fragment.scope, fragment.digest),
+      fragment.encrypted,
+      () => putFragment(fragment),
+    );
+  const putManifest = transport.put;
+  transport.put = (manifest) =>
+    recordPut(
+      replicaManifestKey(manifest.scope, manifest.version),
+      manifest.encrypted,
+      () => putManifest(manifest),
+    );
   let killImportRecord: string | undefined;
   const importReplica = receiver.import;
   receiver.import = (input) => {
@@ -404,22 +434,27 @@ export async function openReplicaRuntime(init: Init) {
       process.kill(process.pid, "SIGKILL");
     return result;
   };
-  let killScopes = new Set<string>();
+  let killKeys = new Set<string>();
   let stopAtDownload = 0,
     downloads = 0;
-  const get = transport.get;
-  transport.get = async (scope) => {
-    db.prepare(
-      "INSERT INTO harness_gets VALUES (?,1) ON CONFLICT(scope) DO UPDATE SET attempts=attempts+1",
-    ).run(scope);
-    if (
-      stopAtDownload &&
-      killScopes.has(scope) &&
-      ++downloads === stopAtDownload
-    ) {
-      bodyBarrier = { url: storage.urlForKey(`${scope}/1`), scope };
-    }
-    return get(scope);
+  const recordGet = (key: string) =>
+    db
+      .prepare(
+        "INSERT INTO harness_gets VALUES (?,1) ON CONFLICT(key) DO UPDATE SET attempts=attempts+1",
+      )
+      .run(key);
+  const getManifest = transport.get;
+  transport.get = async (scope, version) => {
+    recordGet(replicaManifestKey(scope, version));
+    return getManifest(scope, version);
+  };
+  const getFragment = transport.getFragment;
+  transport.getFragment = async (scope, fragmentDigest) => {
+    const key = replicaFragmentKey(scope, fragmentDigest);
+    recordGet(key);
+    if (stopAtDownload && killKeys.has(key) && ++downloads === stopAtDownload)
+      bodyBarrier = { url: storage.urlForKey(key), key };
+    return getFragment(scope, fragmentDigest);
   };
   const worker = createReplicaTransportWorker({
     db,
@@ -526,32 +561,43 @@ export async function openReplicaRuntime(init: Init) {
           }),
       ),
       pid: process.pid,
-      importedScopes: (
+      importedSlots: (
         db
           .prepare(
-            "SELECT scope FROM pdpp_transport_inbox WHERE state='imported'",
+            "SELECT slot FROM pdpp_transport_manifests_in WHERE state='imported'",
           )
-          .all() as { scope: string }[]
-      ).map((r) => r.scope),
+          .all() as { slot: string }[]
+      ).map((r) => r.slot),
       receivedOperations: (
         db
           .prepare("SELECT operation_json FROM pdpp_replica_received")
           .all() as { operation_json: string }[]
       ).map((r) => JSON.parse(r.operation_json) as ReplicaOperation),
-      staged: db
-        .prepare(
-          "SELECT scope,json_extract(fragment_json,'$.writer') AS writer,json_extract(fragment_json,'$.batch') AS batch FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL AND state='ready'",
-        )
-        .all() as Snapshot["staged"],
+      staged: (
+        db
+          .prepare(
+            "SELECT m.scope,f.digest,m.writer,m.batch FROM pdpp_transport_fragments_in f JOIN pdpp_transport_manifests_in m USING(slot) WHERE f.fragment_json IS NOT NULL AND f.state='ready'",
+          )
+          .all() as {
+          scope: string;
+          digest: string;
+          writer: string;
+          batch: string;
+        }[]
+      ).map((r) => ({
+        key: replicaFragmentKey(r.scope, r.digest),
+        writer: r.writer,
+        batch: r.batch,
+      })),
       gets: db.prepare("SELECT * FROM harness_gets").all() as Snapshot["gets"],
       puts: db
         .prepare(
-          "SELECT scope,sha256,COUNT(*) AS attempts FROM harness_puts GROUP BY scope,sha256",
+          "SELECT key,sha256,COUNT(*) AS attempts FROM harness_puts GROUP BY key,sha256",
         )
         .all() as Snapshot["puts"],
       inboxErrors: db
         .prepare(
-          "SELECT state,error,COUNT(*) AS n FROM pdpp_transport_inbox WHERE error IS NOT NULL OR state='quarantined' GROUP BY state,error",
+          "SELECT state,error,COUNT(*) AS n FROM (SELECT state,error FROM pdpp_transport_manifests_in UNION ALL SELECT state,error FROM pdpp_transport_fragments_in) WHERE error IS NOT NULL OR state='quarantined' GROUP BY state,error",
         )
         .all(),
       quarantines:
@@ -559,26 +605,29 @@ export async function openReplicaRuntime(init: Init) {
         n("pdpp_replica_quarantined_connections"),
       evidence: (
         db
-          .prepare("SELECT json FROM harness_evidence ORDER BY scope")
-          .all() as { json: string }[]
-      ).map((r) => JSON.parse(r.json)),
+          .prepare("SELECT slot,json FROM harness_evidence ORDER BY slot")
+          .all() as { slot: string; json: string }[]
+      ).map((r) => ({ slot: r.slot, ...JSON.parse(r.json) })),
       records,
       canonicalRecords,
       blobs,
-      published: n("pdpp_transport_outbox", "WHERE state='published'"),
-      importedFragments: n("pdpp_transport_inbox", "WHERE state='imported'"),
+      published: n("pdpp_transport_manifests_out", "WHERE state='published'"),
+      importedManifests: n(
+        "pdpp_transport_manifests_in",
+        "WHERE state='imported'",
+      ),
       stagedFragments: n(
-        "pdpp_transport_inbox",
+        "pdpp_transport_fragments_in",
         "WHERE fragment_json IS NOT NULL AND state='ready'",
       ),
       importedBatches: n("pdpp_transport_imported"),
       received: n("pdpp_replica_received"),
       journal: n("pdpp_replica_operations"),
       history: n("pdpp_record_changes"),
-      pending: n("pdpp_transport_outbox", "WHERE state!='published'"),
+      pending: n("pdpp_transport_manifests_out", "WHERE state!='published'"),
       errors: db
         .prepare(
-          "SELECT error,COUNT(*) AS n FROM pdpp_transport_outbox WHERE error IS NOT NULL GROUP BY error",
+          "SELECT error,COUNT(*) AS n FROM (SELECT error FROM pdpp_transport_manifests_out UNION ALL SELECT error FROM pdpp_transport_fragments_out) WHERE error IS NOT NULL GROUP BY error",
         )
         .all() as Snapshot["errors"],
       peakRssKiB: process.resourceUsage().maxRSS,
@@ -593,12 +642,44 @@ export async function openReplicaRuntime(init: Init) {
           .prepare("SELECT operation_json FROM pdpp_replica_operations")
           .all() as { operation_json: string }[]
       ).map((r) => JSON.parse(r.operation_json) as ReplicaOperation),
-      wire: db
-        .prepare(
-          "SELECT scope,batch,state,length(encrypted) AS bytes FROM pdpp_transport_outbox ORDER BY rowid",
-        )
-        .all(),
+      wire: wire(),
     };
+  }
+  /** Outbound objects in publication order. */
+  function wire(): WireObject[] {
+    const writer = (
+      db.prepare("SELECT writer FROM pdpp_transport_state").get() as
+        { writer: string } | undefined
+    )?.writer;
+    if (!writer) return [];
+    const scope = replicaScope(writer);
+    const rows = db
+      .prepare(
+        `SELECT 'fragment' AS kind,f.batch,f.digest,NULL AS version,f.state,length(f.encrypted) AS bytes,b.sequence,f.position
+           FROM pdpp_transport_fragments_out f JOIN pdpp_transport_batches b USING(batch)
+         UNION ALL
+         SELECT 'manifest',m.batch,NULL,m.version,m.state,length(m.encrypted),b.sequence,1e9
+           FROM pdpp_transport_manifests_out m JOIN pdpp_transport_batches b USING(batch)
+         ORDER BY 7,8`,
+      )
+      .all() as {
+      kind: WireObject["kind"];
+      batch: string;
+      digest: string | null;
+      version: number | null;
+      state: string;
+      bytes: number;
+    }[];
+    return rows.map((r) => ({
+      key:
+        r.kind === "fragment"
+          ? replicaFragmentKey(scope, r.digest!)
+          : replicaManifestKey(scope, r.version!),
+      kind: r.kind,
+      batch: r.batch,
+      state: r.state,
+      bytes: r.bytes,
+    }));
   }
   async function call<T = Snapshot>(
     command: string,
@@ -613,19 +694,16 @@ export async function openReplicaRuntime(init: Init) {
       await worker.cycle();
       result = snapshot();
     } else if (command === "cleanupStorage") {
-      const scopes = db
-        .prepare("SELECT scope FROM pdpp_transport_outbox")
-        .all() as { scope: string }[];
+      const keys = wire().map((r) => r.key);
       const cleanup = {
-        attempted: scopes.length,
+        attempted: keys.length,
         deleted: 0,
         absent: 0,
         failed: 0,
       };
-      for (const { scope } of scopes) {
+      for (const key of keys) {
         try {
-          if (await storage.delete(storage.urlForKey(`${scope}/1`)))
-            cleanup.deleted++;
+          if (await storage.delete(storage.urlForKey(key))) cleanup.deleted++;
           else cleanup.absent++;
         } catch {
           cleanup.failed++;
@@ -664,7 +742,7 @@ export async function openReplicaRuntime(init: Init) {
       result = { blobId: blob.blobId, sha256, bytes: bytes.length };
     } else if (command === "armKill") {
       stopAtDownload = Number(args.after);
-      killScopes = new Set(args.scopes as string[]);
+      killKeys = new Set(args.keys as string[]);
       downloads = 0;
       result = true;
     } else if (command === "armPutKill") {
@@ -964,13 +1042,13 @@ async function main() {
           A: {
             published: x.published,
             pending: x.pending,
-            imported: x.importedFragments,
+            imported: x.importedManifests,
             errors: x.errors,
           },
           B: {
             published: y.published,
             pending: y.pending,
-            imported: y.importedFragments,
+            imported: y.importedManifests,
             errors: y.errors,
           },
         }),
@@ -1180,7 +1258,7 @@ async function main() {
           x.pending === 0,
       );
       const retried = resumed.A.puts.filter(
-        (row) => row.scope === before.puts[0].scope,
+        (row) => row.key === before.puts[0].key,
       );
       assert.equal(retried.length, 1);
       assert.equal(retried[0].sha256, before.puts[0].sha256);
@@ -1260,9 +1338,10 @@ async function main() {
       (x) => x.pending === 0 && x.wire.length > reverse.A.wire.length + 1,
       [a],
     );
-    const largeFragments = publishedLarge.A.wire.slice(
-      reverse.A.wire.length,
-    ) as { scope: string; batch: string; bytes: number }[];
+    const largeObjects = publishedLarge.A.wire.slice(reverse.A.wire.length);
+    const largeFragments = largeObjects.filter((r) => r.kind === "fragment");
+    // One registration for the whole large sync, however many fragments.
+    assert.equal(largeObjects.filter((r) => r.kind === "manifest").length, 1);
     const largeOperations = publishedLarge.A.operations.filter(
       (op) =>
         (op.kind === "blob-claim" && op.blob.blobId === large.blobId) ||
@@ -1274,7 +1353,7 @@ async function main() {
     );
     await b.call("armKill", {
       after: 3,
-      scopes: largeFragments.map((r) => r.scope),
+      keys: largeFragments.map((r) => r.key),
     });
     const checkpoint = new Promise<void>((resolve) => {
       b.checkpoint = resolve;
@@ -1355,9 +1434,9 @@ async function main() {
     );
     assert.deepEqual(resumed.A.records, resumed.B.records);
     assert.deepEqual(resumed.A.blobs, resumed.B.blobs);
-    const largeWire = resumed.A.wire.slice(reverse.A.wire.length) as {
-      bytes: number;
-    }[];
+    const largeWire = resumed.A.wire
+      .slice(reverse.A.wire.length)
+      .filter((r) => r.kind === "fragment");
     assert(largeWire.length > 1);
     assert(largeWire.every((row) => row.bytes <= 100 * 1024 * 1024));
     const rssBudgetKiB = 3 * 1024 * 1024;
@@ -1369,8 +1448,8 @@ async function main() {
     assert.equal(resumed.B.received - partial.received, largeOperations.length);
     for (const row of partial.staged)
       assert.equal(
-        resumed.B.gets.find((r) => r.scope === row.scope)?.attempts,
-        partial.gets.find((r) => r.scope === row.scope)?.attempts,
+        resumed.B.gets.find((r) => r.key === row.key)?.attempts,
+        partial.gets.find((r) => r.key === row.key)?.attempts,
       );
     const before = resumed.B;
     await b.call("cycle");
@@ -1554,19 +1633,20 @@ async function main() {
     });
     for (const d of devices) {
       const final = await d.call("snapshot");
-      const scopes = [
-        ...final.importedScopes,
-        ...(final.wire as { scope: string; state: string }[])
-          .filter((r) => r.state === "published")
-          .map((r) => r.scope),
+      const slots = [
+        ...final.importedSlots,
+        ...final.wire
+          .filter((r) => r.kind === "manifest" && r.state === "published")
+          .map((r) => r.key),
       ];
-      for (const scope of scopes) {
-        const evidence = final.evidence.find(
-          (row) => row.head?.scope === scope,
-        );
+      for (const slot of slots) {
+        const evidence = final.evidence.find((row) => row.slot === slot);
         assert(evidence?.chain);
         assert.equal(evidence.chain.status, "Active");
-        assert.equal(evidence.chain.currentVersion, "1");
+        assert(
+          BigInt(evidence.chain.currentVersion) >=
+            BigInt(slot.slice(slot.lastIndexOf("/") + 1)),
+        );
         assert(/^\d+$/.test(evidence.chain.blockNumber));
         assert(/^0x[0-9a-fA-F]{64}$/.test(evidence.chain.blockHash));
       }

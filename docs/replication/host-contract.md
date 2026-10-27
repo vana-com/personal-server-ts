@@ -25,12 +25,13 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
   or routes for replication. Neither app enables it
   (`unity-surfaces@9af449a2 apps/desktop/src/hooks/usePersonalServer.ts:871-885`);
   the phone has no replication code.
-- The carrier is DPv2. Each fragment is one vana-storage object at
+- The carrier is DPv2. In #483 each fragment is one vana-storage object at
   `<scope>/1`, one gateway AddData registration at `expectedVersion "1"`, and
   one finalized DataRegistryV2 commitment
   (`packages/core/src/replication/dpv2.ts:80-129`). Scopes are
   `pdpp_replica_v1.<writer>_<batch>.<index>`
-  (`packages/core/src/replication/transport.ts:44-53`).
+  (`packages/core/src/replication/transport.ts:44-53`). Plan item A12
+  replaces this with one registered manifest per sync (section 2).
 - Both writer ids are random: the transport writer token
   (`packages/server/src/storage/pdpp-replication-transport.ts:287-299`) and the
   installation writer used in operation revisions
@@ -57,12 +58,21 @@ repositories are cited as `repo@sha path:line`: `unity-surfaces@9af449a2`,
 Testers use the DPv2 carrier as built. This PR makes no production transport
 decision.
 
-Later: DPv2 costs about two minutes of chain finality per hop (dev median
-122 s, p90 134 s, 2026-10-21) and one registration per fragment (4,310 for one
-101 MiB blob on Lite). That cost may justify a different carrier before
-production. A new carrier is its own design and may need engine changes. Plan
-item A12 replaces per-fragment registration with one registration per device
-sync: a manifest that lists content-addressed fragments.
+Plan item A12 changes the registration count, not the carrier. Each writer
+has one stable scope, `pdpp_replica_v1.<writer>`. A sync is one batch, within
+the batch bounds (default 10,000 operations and 32 MiB). Its fragments are
+stored unregistered at `<scope>/fragments/<sha256>`. One manifest lists them
+by digest and size, carries the batch statement, and is the only registered
+object, at the next version of the scope. A receiver fetches the manifest only
+when its registration is finalized, and checks each fragment against the
+manifest digest before it decrypts it. Details:
+`packages/server/src/storage/pdpp-replication-transport.md`.
+
+Later: DPv2 still costs about two minutes of chain finality per hop (dev
+median 122 s, p90 134 s, 2026-10-21). Before A12 it also cost one registration
+per fragment (4,310 for one 101 MiB blob on Lite); with A12 that blob costs one.
+Finality alone may justify a different carrier before production. A new
+carrier is its own design and may need engine changes.
 
 ## 3. Who may write
 
@@ -169,11 +179,16 @@ PdppReplicaBatch {
 ```
 
 Fragment format version 2 carries the statement and signature inside the
-encrypted body (version 1 is at `transport.ts:17-34`).
+encrypted body (version 1 is at `transport.ts:17-34`). With the A12 manifest,
+the statement and signature go in the manifest instead: it is the one
+registered object of the batch, and it already names every fragment by
+digest.
 
 ### 3.4 Receiver checks
 
-In this order. Each failure is a typed quarantine of that item only. A batch
+In this order. With the A12 manifest, steps 1 to 6 apply to the manifest,
+and each fragment is then checked against the manifest digest before it is
+decrypted. Each failure is a typed quarantine of that item only. A batch
 that fails any check never touches writer state, so it cannot occupy a
 sequence or a predecessor slot of a real writer.
 
@@ -283,8 +298,10 @@ export interface ReplicaCall {
   /** Stop reading and reject when a response passes this size. */
   maxBytes?: number;
 }
-// put(fragment, call), register(fragment, call), evidence(scope, call),
-// get(scope, call & { maxBytes: number }), list(cursor, call)
+// putFragment(fragment, call), getFragment(scope, digest, call & { maxBytes }),
+// hasFragment(scope, digest, call), put(manifest, call),
+// register(manifest, call), evidence(scope, version, call),
+// get(scope, version, call & { maxBytes: number }), list(cursor, call)
 ```
 
 The adapter must stop its I/O on abort. `abortable` (`coordinator.ts:100-123`)

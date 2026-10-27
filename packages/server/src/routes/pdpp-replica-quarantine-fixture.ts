@@ -24,6 +24,21 @@ import {
   type PdppRecordsRouteDeps,
 } from "./pdpp-records.js";
 import { pdppBlobsRoutes, type PdppBlobsRouteDeps } from "./pdpp-blobs.js";
+import {
+  replicaChainCommitment,
+  type ReplicaRegistrationEvidence,
+  type ReplicaTransportPort,
+} from "@opendatalabs/personal-server-ts-core/replication/dpv2";
+import {
+  fragmentReplicaPayload,
+  prepareReplicaManifest,
+  replicaDigest,
+  replicaFragmentKey,
+  replicaManifestKey,
+  type PreparedFragment,
+  type PreparedManifest,
+  type Predecessor,
+} from "@opendatalabs/personal-server-ts-core/replication/transport";
 import type { createReplicaRecordStore } from "../storage/pdpp-replica-canonical-port.js";
 
 const sourceId = "https://replica-journey.invalid/declaration";
@@ -361,3 +376,145 @@ export async function approveNarrowConsent(
   };
 }
 export type ApprovedConsent = Awaited<ReturnType<typeof approveNarrowConsent>>;
+
+/** Finalized DPv2 evidence of one registered manifest slot. */
+export function finalizedEvidence(
+  owner: string,
+  manifest: Pick<
+    PreparedManifest,
+    "scope" | "version" | "dataHash" | "metadataHash"
+  >,
+  currentVersion = String(manifest.version),
+): ReplicaRegistrationEvidence {
+  return {
+    head: {
+      owner,
+      scope: manifest.scope,
+      version: String(manifest.version),
+      dataHash: manifest.dataHash,
+      metadataHash: manifest.metadataHash,
+      deleted: false,
+    },
+    chain: {
+      owner,
+      scope: manifest.scope,
+      version: String(manifest.version),
+      currentVersion,
+      status: "Active",
+      commitment: replicaChainCommitment(
+        manifest.dataHash,
+        manifest.metadataHash,
+      ),
+      chainId: 14800,
+      registry: `0x${"2".repeat(40)}`,
+      blockNumber: 123n,
+      blockHash: `0x${"3".repeat(64)}`,
+      blockTimestamp: 1000n,
+    },
+    pending: false,
+  };
+}
+
+/**
+ * An in-memory storage and registry with finalized evidence. Codec identity
+ * is deliberate: crypto is covered by transport tests; here the finalized
+ * hash bindings and the authorization/read boundary are the oracle.
+ */
+export function finalizedReplicaNetwork(owner: string) {
+  const objects = new Map<string, Uint8Array>();
+  const evidence = new Map<string, ReplicaRegistrationEvidence>();
+  const latest = new Map<string, number>();
+  const observed: string[] = [];
+  const register = (manifest: PreparedManifest) => {
+    const slot = replicaManifestKey(manifest.scope, manifest.version);
+    objects.set(slot, manifest.encrypted);
+    evidence.set(slot, finalizedEvidence(owner, manifest));
+    latest.set(
+      manifest.scope,
+      Math.max(latest.get(manifest.scope) ?? 0, manifest.version),
+    );
+    return slot;
+  };
+  const read = (key: string) => {
+    const bytes = objects.get(key);
+    if (!bytes) throw new Error("not found");
+    return bytes;
+  };
+  const port: ReplicaTransportPort = {
+    encrypt: async (_scope, bytes) => bytes,
+    decrypt: async (_scope, bytes) => bytes,
+    putFragment: async (f) => {
+      objects.set(replicaFragmentKey(f.scope, f.digest), f.encrypted);
+    },
+    getFragment: async (scope, digest) =>
+      read(replicaFragmentKey(scope, digest)),
+    hasFragment: async (scope, digest) =>
+      objects.has(replicaFragmentKey(scope, digest)),
+    put: async (manifest) => {
+      objects.set(
+        replicaManifestKey(manifest.scope, manifest.version),
+        manifest.encrypted,
+      );
+    },
+    register: async (manifest) => {
+      register(manifest);
+    },
+    get: async (scope, version) => read(replicaManifestKey(scope, version)),
+    list: async () => ({
+      points: [...latest].map(([scope, version]) => ({
+        scope,
+        version: String(version),
+      })),
+      cursor: null,
+    }),
+    evidence: async (scope, version) => {
+      const slot = replicaManifestKey(scope, version);
+      observed.push(slot);
+      return evidence.get(slot) ?? { head: null, chain: null, pending: false };
+    },
+  };
+  /** Store a batch's fragments and register its manifest at the next version. */
+  async function publish(input: {
+    writer: string;
+    batch: string;
+    sequence?: number;
+    previous?: Predecessor | null;
+    collectedAt: string;
+    bytes: Uint8Array;
+  }): Promise<{
+    slot: string;
+    manifest: PreparedManifest;
+    fragments: PreparedFragment[];
+  }> {
+    const statement = {
+      owner,
+      writer: input.writer,
+      batch: input.batch,
+      sequence: input.sequence ?? 1,
+      previous: input.previous ?? null,
+      collectedAt: input.collectedAt,
+    };
+    const fragments = await fragmentReplicaPayload({
+      ...statement,
+      bytes: input.bytes,
+      encrypt: port.encrypt,
+    });
+    for (const fragment of fragments) await port.putFragment(fragment);
+    const prepared = await prepareReplicaManifest({
+      ...statement,
+      digest: replicaDigest(input.bytes),
+      totalBytes: input.bytes.length,
+      fragments: fragments.map((f) => ({
+        digest: f.digest,
+        bytes: f.encrypted.length,
+      })),
+      encrypt: port.encrypt,
+    });
+    const manifest = {
+      ...prepared,
+      version: (latest.get(prepared.scope) ?? 0) + 1,
+    };
+    return { slot: register(manifest), manifest, fragments };
+  }
+  return { port, objects, evidence, observed, publish };
+}
