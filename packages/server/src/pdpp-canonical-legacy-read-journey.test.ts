@@ -2041,7 +2041,7 @@ describe.each([
 });
 
 describe("ChatGPT conversation-list preservation", () => {
-  it("serves the same-time conversation list from canonical rows without expanding threads or changing source order", async () => {
+  it("serves the same-time conversation list from upserted canonical rows without completion receipts, expanding threads or changing source order", async () => {
     const collectedAt = "2026-10-27T00:00:00.000Z";
     const conversations = [
       {
@@ -2111,27 +2111,36 @@ describe("ChatGPT conversation-list preservation", () => {
         "chatgpt",
       );
       for (const [stream, rows] of Object.entries(streams)) {
-        const response = await ctx.app.request(
-          `/v1/streams/${stream}/records/replace?method=chatgpt&binding_generation=1`,
-          {
-            method: "POST",
-            headers: {
-              authorization: `Bearer ${token}`,
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({
-              instance: `chatgpt:${owner}`,
-              emitted_at: collectedAt,
-              source_collected_at: collectedAt,
-              records: rows.map((data) => ({
+        for (const data of rows) {
+          const response = await ctx.app.request(
+            `/v1/streams/${stream}/records/ingest?method=chatgpt&binding_generation=1`,
+            {
+              method: "POST",
+              headers: {
+                authorization: `Bearer ${token}`,
+                "content-type": "application/json",
+              },
+              body: JSON.stringify({
+                instance: `chatgpt:${owner}`,
                 key: data.id,
                 data,
                 emitted_at: collectedAt,
-              })),
-            }),
-          },
-        );
-        expect(response.status, await response.text()).toBe(200);
+              }),
+            },
+          );
+          expect(response.status, await response.text()).toBe(200);
+        }
+      }
+      const db = new Database(join(tempDir, "index.db"), {
+        readonly: true,
+        fileMustExist: true,
+      });
+      try {
+        expect(
+          db.prepare("SELECT count(*) AS n FROM pdpp_stream_completion").get(),
+        ).toEqual({ n: 0 });
+      } finally {
+        db.close();
       }
       const read = await ownerGet("/v1/data/chatgpt.conversations");
       const takeover = await ownerGet(
