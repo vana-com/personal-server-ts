@@ -7,13 +7,19 @@ const memoryRoot = tmpdir();
 const KIB_PER_MIB = 1024;
 
 /**
- * Peak RSS is monotonic, so each figure bounds everything before it in its
- * process. Three contracts, all measured in child processes:
+ * COARSE SMOKE GUARD. This test does not prove that memory is independent of
+ * blob size. Peak RSS is noisy, and the signal from a worker that retains part
+ * of each blob is smaller than that noise, so a slope over three RSS peaks
+ * cannot separate the two. The size-independence property is asserted in
+ * pdpp-binary-chunks.test.ts, which meters each read. This test only catches
+ * gross blow-ups.
  *
- * 1. Worker phases (fetch, decrypt, verify, chunk staging) grow with neither
- *    blob size nor the canonical copy. Their peak, measured before promotion,
- *    must stay within WORKER_ALLOWANCE_KIB above the process's startup peak,
- *    and the slope of growth against blob size must stay under WORKER_MAX_SLOPE.
+ * Peak RSS is monotonic, so each figure bounds everything before it in its
+ * process. Three guards, all measured in child processes:
+ *
+ * 1. Worker phases (fetch, decrypt, verify, chunk staging) must stay within
+ *    WORKER_ALLOWANCE_KIB above the process's startup peak, measured before
+ *    promotion.
  *
  * 2. Replicated promotion writes main's whole `pdpp_blob_bytes` row, which
  *    costs what main's own blob write costs. It must cost no more than that
@@ -23,31 +29,16 @@ const KIB_PER_MIB = 1024;
  * WORKER_ALLOWANCE_KIB is the worker's own growth above startup, measured on
  * Node 22.21.1. The typical growth is about 164 MiB at both 32 and 128 MiB.
  * Some runs spike to about 188 to 192 MiB inside the worker phases, so the
- * allowance is the worst observed value plus 16 MiB of headroom. It does not
- * scale with blob size. The growth it covers is fragment churn, one 3 MiB
- * fragment in flight at a time.
+ * allowance is the worst observed value plus 16 MiB of headroom. It is not
+ * meant to scale with blob size. The growth it covers is fragment churn, one
+ * 3 MiB fragment in flight at a time.
  *
  * Newer Node releases retain more freed buffers before returning them to the
  * OS. On Node 24.22.1 the same growth is about 358 to 394 MiB at 32, 64 and
- * 128 MiB. The absolute allowance therefore depends on the Node major, and
- * is only a secondary guard; the slope check proves growth does not follow
- * blob size.
+ * 128 MiB. The absolute allowance therefore depends on the Node major.
  */
 const WORKER_ALLOWANCE_KIB =
   (Number(process.versions.node.split(".")[0]) <= 22 ? 208 : 448) * KIB_PER_MIB;
-/**
- * Growth must not follow blob size. The slope is
- * (growth at the largest blob - growth at the smallest) / (size difference).
- * A worker that retained half of each blob would show 0.5. Measured slopes are
- * negative:
- *   Node 22 (CI run 40413700106): growth 154.1, 142.1 and 149.6 MiB at 32, 64
- *     and 128 MiB, so slope -0.05.
- *   Node 24.22.1 (local): growth 394.0, 388.9 and 358.4 MiB, so slope -0.37.
- * Earlier runs on Node 22 spiked about 28 MiB inside the worker phases (slope
- * 0.29 if the spike hits the largest blob only), so the limit is 0.375: it
- * passes that noise and fails a 0.5 retention (+48 MiB).
- */
-const WORKER_MAX_SLOPE = 0.375;
 const PROMOTION_MARGIN_KIB = 16 * KIB_PER_MIB;
 
 type Measurement = { size: number; deltaKiB: number };
@@ -83,7 +74,7 @@ function runFixture(mode: string, directory: string, sizeBytes: number) {
   return child.stdout;
 }
 
-it("bounds real transport-worker memory across 32, 64 and 128 MiB blobs", () => {
+it("smoke-guards transport-worker RSS at 32, 64 and 128 MiB blobs (coarse, not a size-independence proof)", () => {
   const results: {
     sizeMiB: number;
     worker: WorkerMeasurement;
@@ -116,15 +107,6 @@ it("bounds real transport-worker memory across 32, 64 and 128 MiB blobs", () => 
     }
   }
   console.log("replica memory", results);
-  const growth = (r: (typeof results)[number]) =>
-    r.worker.workerPeakKiB - r.worker.startKiB;
-  const smallest = results[0];
-  const largest = results[results.length - 1];
-  const slope =
-    (growth(largest) - growth(smallest)) /
-    ((largest.sizeMiB - smallest.sizeMiB) * KIB_PER_MIB);
-  console.log("replica memory worker growth slope", slope);
-  expect(slope).toBeLessThan(WORKER_MAX_SLOPE);
   for (const { sizeMiB, worker, promote, plain } of results) {
     expect(worker.published, `${sizeMiB} MiB`).toBeGreaterThan(0);
     expect(
