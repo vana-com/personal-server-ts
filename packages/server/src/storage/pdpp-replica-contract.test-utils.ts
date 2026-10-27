@@ -664,8 +664,8 @@ const labelKind = (label: string) =>
  * The trace is cut into steps. A step is the writes since the last boundary and
  * the boundary that ends it: a transaction commit or one network effect. Steps
  * with the same label sequence are the same code path run again (one per
- * fragment, per scope, per page). For the first and the last run of every
- * distinct step, the tier takes:
+ * fragment, per scope, per page). For the first, the middle and the last run of
+ * every distinct step, the tier takes:
  * - the step's first write;
  * - its last write, the last point where the transaction still rolls back;
  * - its boundary: the commit, or the network effect itself. Both sides of an
@@ -690,7 +690,11 @@ export function pullRequestTier(trace: readonly string[]): number[] {
   }
   const picked = new Set<number>([0, trace.length - 1]);
   for (const list of runs.values())
-    for (const step of new Set([list[0]!, list.at(-1)!])) {
+    for (const step of new Set([
+      list[0]!,
+      list[Math.floor((list.length - 1) / 2)]!,
+      list.at(-1)!,
+    ])) {
       picked.add(step[0]!);
       picked.add(step.at(-1)!);
       picked.add(step.at(-2) ?? step[0]!);

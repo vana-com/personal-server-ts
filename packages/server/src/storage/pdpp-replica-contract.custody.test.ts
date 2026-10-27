@@ -237,24 +237,101 @@ function safely<T>(
 }
 const categoryOf = (v: Violation) => /^\[([^\]]+)\]/.exec(v)?.[1] ?? "state";
 
-/** Nightly: REPLICA_ORACLE_NIGHTLY=1 (the replica oracle's switch) walks every index. */
+/** Nightly: REPLICA_ORACLE_NIGHTLY=1 (the replica oracle's switch) walks every index, by both methods. */
 const everyIndex = process.env.REPLICA_ORACLE_NIGHTLY === "1";
-/** Pull-request tier: seconds. Nightly: every index, up to 325 s seen in CI before this change. */
-const matrixLimit = everyIndex ? 900_000 : 60_000;
+/** Pull-request tier: seconds. Nightly: every index twice (restore, then warm). */
+const matrixLimit = everyIndex ? 1_800_000 : 60_000;
 
+interface MatrixOptions {
+  /**
+   * Trace indexes that may be missing from a run, with the reason. Any other
+   * index the recording run saw but a crash run did not reach fails the test.
+   */
+  expectedUnreached?: { indexes: number[]; reason: string };
+}
+
+/**
+ * - restore: the devices run once up to the window; each index puts them back
+ *   and reopens them. Used by the pull-request tier and by the nightly run.
+ * - warm: each index builds the devices from scratch and runs the window on the
+ *   process that built them, with no reopen, as the matrix did before restore
+ *   existed. It covers the warm-worker paths a reopened process skips (e.g. the
+ *   dependency-wake UPDATE that a warm process with an unchanged fingerprint
+ *   does not repeat). Nightly only.
+ */
+type Method = "restore" | "warm";
+
+/** Pull-request tier: a derived subset by restore. Nightly: every index by restore, then by warm. */
 async function crashMatrix(
   name: string,
   prepare: () => Promise<World>,
+  options: MatrixOptions = {},
 ): Promise<MatrixReport> {
-  const world = await prepare();
-  // Every run of the window, the recording run included, starts on devices
-  // reopened from the pre-window files. A reopened process rebuilds the derived
-  // view (a stamp that counts process starts) and re-initializes its worker
-  // once, so a live-built process and a reopened one trace slightly different
-  // windows; mixing them would misalign trace indexes.
-  world.rewind();
+  const restored = await runMatrix(name, prepare, "restore", options);
+  if (!everyIndex) return restored;
+  const warm = await runMatrix(name, prepare, "warm", options);
+  const categories = { ...restored.categories };
+  for (const [k, n] of Object.entries(warm.categories))
+    categories[k] = (categories[k] ?? 0) + n;
+  return {
+    name,
+    points: Math.min(restored.points, warm.points),
+    failedIndexes: restored.failedIndexes + warm.failedIndexes,
+    categories,
+    failures: [...restored.failures, ...warm.failures].slice(0, 8),
+    summary: `${restored.summary}\n${warm.summary}`,
+  };
+}
+
+async function runMatrix(
+  name: string,
+  prepare: () => Promise<World>,
+  method: Method,
+  options: MatrixOptions,
+): Promise<MatrixReport> {
+  // Seeded randomness: ids and keys come from a counter that restarts at the
+  // same value for every run, so the trace, and the tier chosen from it, are
+  // the same on every run.
+  const wasOn = det.on;
+  det.on = true;
+  try {
+    return await runSeededMatrix(name, prepare, method, options);
+  } finally {
+    det.on = wasOn;
+  }
+}
+
+async function runSeededMatrix(
+  name: string,
+  prepare: () => Promise<World>,
+  method: Method,
+  options: MatrixOptions,
+): Promise<MatrixReport> {
+  const all = everyIndex;
+  let world: World | undefined;
+  let start = 0;
+  det.count = 0;
+  if (method === "restore") {
+    world = await prepare();
+    start = det.count;
+  }
+  /** A scenario at the start of the window. */
+  const begin = async (): Promise<Scenario> => {
+    if (world) {
+      // Every run of the window, the recording run included, starts on devices
+      // reopened from the pre-window files. A reopened process rebuilds the
+      // derived view (a stamp that counts process starts) and re-initializes
+      // its worker once, so a warm process and a reopened one trace slightly
+      // different windows; mixing them would misalign trace indexes.
+      det.count = start;
+      world.rewind();
+      return world.scenario();
+    }
+    det.count = 0;
+    return (await prepare()).scenario();
+  };
   // 1. Recording run: the trace of the armed window, then the reference outcome.
-  const ref = world.scenario();
+  const ref = await begin();
   const before = ref.reads();
   ref.crash.arm();
   await settle(ref.run());
@@ -277,6 +354,7 @@ async function crashMatrix(
       []),
   ];
   void afterRun;
+  if (method === "warm") cleanupHarness();
 
   const failures = new Map<number, Violation[]>();
   if (referenceViolations.length) failures.set(-1, referenceViolations);
@@ -285,20 +363,27 @@ async function crashMatrix(
       failures.set(k, [...(failures.get(k) ?? []), ...violations]);
   };
 
-  // 2. One restart from the pre-window state per walked index, killed exactly there.
-  const walked = everyIndex ? trace.map((_, k) => k) : pullRequestTier(trace);
+  // 2. One run from the pre-window state per walked index, killed exactly there.
+  const walked = all ? trace.map((_, k) => k) : pullRequestTier(trace);
   let unreached = 0;
+  let allowedMissing = 0;
+  const allowed = new Set(options.expectedUnreached?.indexes);
   for (const k of walked) {
     const label = trace[k]!;
     const frame: Frame = { index: k, label, before, final };
-    world.rewind();
-    const s = world.scenario();
+    const s = await begin();
     s.crash.arm(k);
     await settle(s.run());
     if (!s.crash.dead) {
-      // Random batch identities can reorder a trace (e.g. discovery order), so
-      // a point may not exist in this run. Count it; it is not a crash result.
+      // The randomness is seeded, so the recording run's trace is this run's
+      // trace: a missing point is a defect unless the test names it.
       unreached++;
+      if (allowed.has(k)) allowedMissing++;
+      else
+        add(k, [
+          `[unreached] crash index ${k} (${label}) was in the recording run's trace but this run did not reach it`,
+        ]);
+      if (method === "warm") cleanupHarness();
       continue;
     }
     s.restart();
@@ -348,6 +433,7 @@ async function crashMatrix(
       else resumed.push(...result.value!);
     }
     add(k, resumed);
+    if (method === "warm") cleanupHarness();
   }
 
   const categories: Record<string, number> = {};
@@ -360,7 +446,7 @@ async function crashMatrix(
     );
   }
   const failedIndexes = [...failures.keys()].filter((k) => k >= 0).length;
-  const summary = `${name}: ${everyIndex ? "every index" : "pull-request tier"}, trace N=${trace.length}, walked ${walked.length}, indexes passed ${walked.length - unreached - failedIndexes}, failed ${failedIndexes}, unreached ${unreached}, reference ${failures.has(-1) ? "FAILED" : "ok"}, by category ${JSON.stringify(categories)}`;
+  const summary = `${name}: ${method}, ${all ? "every index" : "pull-request tier"}, trace N=${trace.length}, walked ${walked.length}, indexes passed ${walked.length - allowedMissing - failedIndexes}, failed ${failedIndexes}, unreached ${unreached} (${allowedMissing} named as expected), reference ${failures.has(-1) ? "FAILED" : "ok"}, by category ${JSON.stringify(categories)}`;
   console.info(`[crash-matrix] ${summary}`);
   return {
     name,
@@ -950,7 +1036,8 @@ function dumpWorld(world: World) {
         JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? `${x}n` : x)),
       ]),
       pending: [...net.pending],
-      calls: net.calls,
+      // A copy: the resumes after the capture keep appending to the live history.
+      calls: structuredClone(net.calls),
     },
     clock: clock.time,
   };
@@ -1036,6 +1123,16 @@ describe("restore equivalence: a restored pre-window state behaves as a restarte
           await settle(ref.run());
           const trace = [...ref.crash.trace];
           cleanupHarness();
+          // Seeded randomness: a second recording gives the same trace, so the
+          // tier chosen from it is the same on every run.
+          det.count = 0;
+          const again = await prepare();
+          again.rewind();
+          const ref2 = again.scenario();
+          ref2.crash.arm();
+          await settle(ref2.run());
+          expect([...ref2.crash.trace]).toEqual(trace);
+          cleanupHarness();
           const tier = pullRequestTier(trace);
           // The window ends, a commit and the write before it, a network
           // effect, and points spread across the pull-request tier.
@@ -1073,6 +1170,61 @@ describe("restore equivalence: a restored pre-window state behaves as a restarte
     );
 });
 
+describe("captured state is a copy", () => {
+  it("a captured network history does not follow the live history, and a different history differs", async () => {
+    const world = await sourceWorld({ text: "copy", window: "publish" });
+    const captured = dumpWorld(world);
+    const frozen = structuredClone(captured.network.calls);
+    // The resumes after a capture append to the live history.
+    world.net.calls.gets.push("late-get");
+    world.net.calls.puts.push("late-put");
+    expect(captured.network.calls).toEqual(frozen);
+    // One extra failed GET before the crash, offset by one fewer GET later,
+    // would be invisible to an aliased capture; a copy shows it.
+    expect(dumpWorld(world).network.calls).not.toEqual(captured.network.calls);
+    cleanupHarness();
+  });
+});
+
+describe("unreached crash indexes", () => {
+  it("fail the matrix unless the test names them with a reason", async () => {
+    // A world whose crash run never reaches the last recorded point: the first
+    // scenario run records one point more than every later run.
+    let calls = 0;
+    const prepare = async (): Promise<World> => {
+      const world = await sourceWorld({ text: "u", window: "publish" });
+      return {
+        ...world,
+        scenario() {
+          const scenario = world.scenario();
+          const run = scenario.run.bind(scenario);
+          return {
+            ...scenario,
+            async run() {
+              try {
+                await run();
+              } finally {
+                if (calls++ === 0) world.crash.point("extra-point");
+              }
+            },
+          };
+        },
+      };
+    };
+    const report = await crashMatrix("unreached control", prepare);
+    const last = report.points - 1;
+    expect(report.failures.join("\n")).toMatch(/\[unreached\] crash index/);
+    calls = 0;
+    const named = await crashMatrix("unreached control named", prepare, {
+      expectedUnreached: {
+        indexes: [last],
+        reason: "the control adds one point to the recording run only",
+      },
+    });
+    expect(named.failures.join("\n")).not.toMatch(/\[unreached\]/);
+  }, 60_000);
+});
+
 describe("pull-request tier selection", () => {
   it("takes the window ends, every distinct step's ends and rollback point, and both sides of an effect", () => {
     const trace = [
@@ -1096,8 +1248,10 @@ describe("pull-request tier selection", () => {
     expect(tier).toEqual(expect.arrayContaining([15, 16]));
     // Both sides of both effects.
     expect(tier).toEqual(expect.arrayContaining([5, 6, 17, 18]));
-    // The middle run is the same code path as the first and last: not walked.
-    expect(tier).not.toContain(11);
+    // The middle run of the repeated step: first write 7, rollback point 10, commit 11.
+    expect(tier).toEqual(expect.arrayContaining([7, 10, 11]));
+    // Interior writes of a run are not walked.
+    expect(tier).not.toContain(8);
     expect(tier).toEqual([...tier].sort((x, y) => x - y));
   });
 });
