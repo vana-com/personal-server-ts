@@ -635,7 +635,9 @@ async function destinationScenario(options: DestinationOptions) {
     await cycleAll([a], 2);
     a.put(`later ${i}`, `k${i}`);
   }
-  await cycleAll([a], 4);
+  // Two source cycles reach the steady state (every batch published, no new
+  // puts); further cycles only repeat no-op phases before the window opens.
+  await cycleAll([a], 2);
   if (options.pageSize) net.pageSize(options.pageSize);
   const b = transportDevice(net, { chunk, cap: 64 * 1024, crash });
   const journalBefore = count(
