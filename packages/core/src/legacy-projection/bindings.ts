@@ -1889,7 +1889,6 @@ const CHATGPT_CONVERSATION_REPRESENTATIONS: readonly LegacyProjectionRepresentat
     },
     {
       id: "chatgpt.metadata-list/1",
-      requireCompletionReceipts: true,
       requireProvenOrder: true,
       legacySchemaPath: "chatgpt.conversations.metadata-list.json",
       rowOrder: "arrival",

@@ -53,7 +53,7 @@ import {
  */
 
 /** Bump when a change to this module (or the pure projector) can change bytes. */
-export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/10";
+export const CANONICAL_LEGACY_VIEW_CONTRACT = "canonical-legacy-view/11";
 
 const DEFAULT_PAGE_SIZE = 500;
 const MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
@@ -379,8 +379,7 @@ export async function readCanonicalLegacyScope(
             (input.blobByteBudget ?? -1) >= 0
             ? Math.min(MAX_BLOB_READ_BYTES, input.blobByteBudget!)
             : MAX_BLOB_READ_BYTES,
-          input.requireCompletionReceipts === true ||
-            resolved.requireCompletionReceipts === true,
+          input.requireCompletionReceipts === true,
           input.allowUnprovenEmptyStreams === true,
           new Set(binding.ancillaryBlobStreams),
           input.declarations,

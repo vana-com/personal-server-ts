@@ -166,7 +166,6 @@ export function resolveLegacyProjection(
       ok: true;
       binding: LegacyScopeBinding;
       contractId: string;
-      requireCompletionReceipts?: boolean;
       requireProvenOrder?: boolean;
     }
   | { ok: false; error: ProjectionError } {
@@ -213,7 +212,6 @@ export function resolveLegacyProjection(
       legacySchemaPath: representation.legacySchemaPath,
     },
     contractId: representation.id,
-    requireCompletionReceipts: representation.requireCompletionReceipts,
     requireProvenOrder: representation.requireProvenOrder,
   };
 }

@@ -144,7 +144,6 @@ export interface LegacyProjectionRepresentation {
   id: string;
   legacySchemaPath: string;
   rowOrder?: "arrival";
-  requireCompletionReceipts?: boolean;
   requireProvenOrder?: boolean;
   acceptsPayload: (payload: unknown) => boolean;
   project: LegacyScopeBinding["project"];

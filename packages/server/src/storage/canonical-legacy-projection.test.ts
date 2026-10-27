@@ -2038,7 +2038,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
     );
 
     it.each(["conversations", "messages"])(
-      "requires a current completion receipt for %s when rendering metadata",
+      "honors an explicit current completion receipt requirement for %s when rendering metadata",
       async (stream) => {
         const selection = connect("conn_metadata", "chatgpt");
         replace("conn_metadata", "conversations", [metadataRow()]);
@@ -2051,6 +2051,7 @@ describe("canonical legacy projection over the real SQLite record store", () => 
             store,
             scope: "chatgpt.conversations",
             selection,
+            requireCompletionReceipts: true,
             allowUnprovenEmptyStreams: true,
             targetLegacyPayload: { conversations: [metadataRow()] },
           }),
