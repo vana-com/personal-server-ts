@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -4823,4 +4824,53 @@ it("A6 crash: no-op reopen preserves the durable projection epoch", () => {
     .pluck()
     .get();
   expect(after).toBe(before);
+});
+
+it("A6 migration: first signature initializes the legacy epoch for an offline edit", () => {
+  const d = device();
+  d.close();
+  // Created by the actual ff971abe receiver before the signature column existed.
+  const fixture = new URL(
+    "./fixtures/replica-visibility-epoch-ff971abe.sqlite.gz",
+    import.meta.url,
+  );
+  writeFileSync(d.path, gunzipSync(readFileSync(fixture)));
+  d.reopen();
+  const columns = d.db
+    .prepare("PRAGMA table_info(pdpp_replica_visibility_epoch)")
+    .all() as { name: string }[];
+  expect(columns.some(({ name }) => name === "signature")).toBe(false);
+  expect(value(d)?.data.text).toBe("before");
+
+  const beforeEpoch = d.db
+    .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+    .pluck()
+    .get() as number;
+  const beforeView =
+    "bc1cd8ceba303305c6e17ae9726c6a3cc605b42d33902dc673ab4160ff29bcc2";
+  put(d, "offline changed");
+  expect(value(d)?.data.text).toBe("offline changed");
+
+  const migrated = pendingReceiver(d);
+  const afterView = migrated.readView("grant").visibilityEpoch;
+  const afterEpoch = d.db
+    .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+    .pluck()
+    .get() as number;
+  expect(afterEpoch).toBe(beforeEpoch + 1);
+  expect(afterView).not.toBe(beforeView);
+  expect(
+    migrated.readStore({ reader: "grant" }).getRecord("conn_a", "messages", "a")
+      ?.data.text,
+  ).toBe("offline changed");
+
+  d.reopen();
+  const reopened = pendingReceiver(d);
+  expect(
+    d.db
+      .prepare("SELECT epoch FROM pdpp_replica_visibility_epoch WHERE id=1")
+      .pluck()
+      .get(),
+  ).toBe(afterEpoch);
+  expect(reopened.readView("grant").visibilityEpoch).toBe(afterView);
 });
