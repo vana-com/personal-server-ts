@@ -2039,3 +2039,112 @@ describe.each([
     },
   );
 });
+
+describe("ChatGPT conversation-list preservation", () => {
+  it("serves the same-time conversation list from canonical rows without expanding threads or changing source order", async () => {
+    const collectedAt = "2026-10-27T00:00:00.000Z";
+    const conversations = [
+      {
+        id: "conversation-a",
+        title: "First in the source list",
+        create_time: "2026-10-01T00:00:00.000Z",
+        update_time: "2026-10-02T00:00:00.000Z",
+        current_node: "node-a",
+        message_count_on_current_branch: 1,
+        is_archived: false,
+        is_starred: null,
+        workspace_id: null,
+        gizmo_id: "gizmo-a",
+      },
+      {
+        id: "conversation-b",
+        title: "Second in the source list",
+        create_time: "2026-10-01T00:00:00.000Z",
+        update_time: "2026-10-03T00:00:00.000Z",
+        current_node: "node-b",
+        message_count_on_current_branch: 1,
+        is_archived: true,
+        is_starred: true,
+        workspace_id: "workspace-b",
+        gizmo_id: null,
+      },
+    ];
+    const messages = conversations.map((conversation) => ({
+      id: `${conversation.id}:${conversation.current_node}`,
+      conversation_id: conversation.id,
+      parent_id: null,
+      role: "user",
+      content: "x".repeat(160_000),
+      content_type: "text",
+      model_slug: null,
+      create_time: conversation.create_time,
+      on_current_branch: true,
+    }));
+    const streams = { conversations, messages };
+    const source = "https://registry.pdpp.dev/sources/chatgpt";
+    await ctx!.cleanup();
+    ctx = await boot("chatgpt", {
+      declaration: JSON.stringify({
+        source_id: source,
+        source_kind: "connector",
+        version: "1",
+        streams: Object.entries(streams).map(([name, rows]) => ({
+          name,
+          fields: [...new Set(rows.flatMap((row) => Object.keys(row)))],
+          required_fields: ["id"],
+          primary_key: ["id"],
+        })),
+      }),
+    });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(collectedAt));
+      await legacyWrite("chatgpt.conversations", { conversations });
+      const storedBefore = await ownerGet(
+        "/v1/data/chatgpt.conversations?view=stored",
+      );
+      const token = await registerTestConnection(
+        ctx.app,
+        ctx.devToken!,
+        owner,
+        source,
+        "chatgpt",
+      );
+      for (const [stream, rows] of Object.entries(streams)) {
+        const response = await ctx.app.request(
+          `/v1/streams/${stream}/records/replace?method=chatgpt&binding_generation=1`,
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${token}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({
+              instance: `chatgpt:${owner}`,
+              emitted_at: collectedAt,
+              source_collected_at: collectedAt,
+              records: rows.map((data) => ({
+                key: data.id,
+                data,
+                emitted_at: collectedAt,
+              })),
+            }),
+          },
+        );
+        expect(response.status, await response.text()).toBe(200);
+      }
+      const read = await ownerGet("/v1/data/chatgpt.conversations");
+      const takeover = await ownerGet(
+        "/v1/data/chatgpt.conversations/takeover",
+      );
+      expect(read.status).toBe(200);
+      expect(read.dataSource, takeover.text).toBe("canonical");
+      expect(JSON.parse(read.text).data).toEqual({ conversations });
+      expect(
+        (await ownerGet("/v1/data/chatgpt.conversations?view=stored")).text,
+      ).toBe(storedBefore.text);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
