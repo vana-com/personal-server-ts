@@ -3,19 +3,30 @@
  *
  * Every scenario here runs as an exhaustive crash matrix. A recording run
  * enumerates every durable mutation, outermost commit and network effect of the
- * window under test. Then one fresh scenario per index loses the process at that
- * exact point, reopens the same SQLite file, checks raw durable state and public
- * reads BEFORE any resume, resumes twice and compares the result with the
- * no-crash reference. No index is sampled.
+ * window under test. Then, for each index, the process is lost at that exact
+ * point, the same SQLite file is reopened, raw durable state and public reads are
+ * checked BEFORE any resume, and two resumes are compared with the no-crash
+ * reference.
+ *
+ * Every index starts from the same pre-window state. The devices run once up to
+ * the point where the window opens; each index puts back each device's own file,
+ * the in-memory network and the clock (`checkpoint`). A device never receives
+ * another device's file. The restore is proven equal to a fresh build in
+ * pdpp-replica-contract.custody-restore.test.ts.
+ *
+ * Tiers: the pull-request run walks the indexes chosen by `pullRequestTier`
+ * from the recorded trace. The nightly run walks every index.
+ * Full matrix, one command: npm run test:replica-crash-full
  *
  * Fields that do not exist on today's schema (outcome, reason, dependency,
  * integrity epoch) are read through narrow typed accessors, so each case fails at
  * its own assertion and not with a file-level error.
  */
 import Database from "better-sqlite3";
+import type * as Crypto from "node:crypto";
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReplicaOperation } from "@opendatalabs/personal-server-ts-core/replication/envelope";
 import { createReplicaRecordStore } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
@@ -35,6 +46,8 @@ import {
   transportDevice,
   transportInvariantViolations,
   workRecords,
+  checkpoint,
+  pullRequestTier,
   type Network,
   type TransportDevice,
 } from "./pdpp-replica-contract.test-utils.js";
@@ -43,6 +56,24 @@ import {
 // Their fsync cost dominates on a disk-backed directory; keep them on tmpfs.
 // (Only kilobytes per file: this is not a build tree.)
 process.env.TMPDIR = "/tmp";
+
+/**
+ * Off by default. The restore-equivalence test turns it on so two builds draw
+ * the same ids and keys and can be compared byte for byte.
+ */
+const det = vi.hoisted(() => ({ on: false, count: 0 }));
+vi.mock("node:crypto", async (original) => {
+  const real = await original<typeof Crypto>();
+  return {
+    ...real,
+    randomUUID: () =>
+      det.on
+        ? `00000000-0000-4000-8000-${(det.count++).toString(16).padStart(12, "0")}`
+        : real.randomUUID(),
+    randomBytes: (size: number) =>
+      det.on ? Buffer.alloc(size, det.count++ & 0xff) : real.randomBytes(size),
+  };
+});
 
 afterEach(cleanupHarness);
 
@@ -170,6 +201,19 @@ interface Scenario {
   /** Checks after two resumes. */
   checkResumed?(frame: Frame): Violation[];
 }
+/** A scenario whose devices have run up to the point where the window opens. */
+interface World {
+  crash: CrashController;
+  net: Network;
+  /** Every device of the scenario, for inspection. */
+  devices: TransportDevice[];
+  /** The devices `rewind` restores, and so reopens: those the window runs on. */
+  windowDevices: TransportDevice[];
+  /** Put every device, the network and the clock back to the pre-window state. */
+  rewind(): void;
+  /** Fresh check state over the same devices. Call after `rewind`. */
+  scenario(): Scenario;
+}
 interface MatrixReport {
   name: string;
   points: number;
@@ -193,12 +237,24 @@ function safely<T>(
 }
 const categoryOf = (v: Violation) => /^\[([^\]]+)\]/.exec(v)?.[1] ?? "state";
 
+/** Nightly: REPLICA_ORACLE_NIGHTLY=1 (the replica oracle's switch) walks every index. */
+const everyIndex = process.env.REPLICA_ORACLE_NIGHTLY === "1";
+/** Pull-request tier: seconds. Nightly: every index, up to 325 s seen in CI before this change. */
+const matrixLimit = everyIndex ? 900_000 : 60_000;
+
 async function crashMatrix(
   name: string,
-  build: () => Promise<Scenario>,
+  prepare: () => Promise<World>,
 ): Promise<MatrixReport> {
+  const world = await prepare();
+  // Every run of the window, the recording run included, starts on devices
+  // reopened from the pre-window files. A reopened process rebuilds the derived
+  // view (a stamp that counts process starts) and re-initializes its worker
+  // once, so a live-built process and a reopened one trace slightly different
+  // windows; mixing them would misalign trace indexes.
+  world.rewind();
   // 1. Recording run: the trace of the armed window, then the reference outcome.
-  const ref = await build();
+  const ref = world.scenario();
   const before = ref.reads();
   ref.crash.arm();
   await settle(ref.run());
@@ -221,7 +277,6 @@ async function crashMatrix(
       []),
   ];
   void afterRun;
-  cleanupHarness();
 
   const failures = new Map<number, Violation[]>();
   if (referenceViolations.length) failures.set(-1, referenceViolations);
@@ -230,21 +285,20 @@ async function crashMatrix(
       failures.set(k, [...(failures.get(k) ?? []), ...violations]);
   };
 
-  // 2. One fresh process per trace index, killed exactly there.
+  // 2. One restart from the pre-window state per walked index, killed exactly there.
+  const walked = everyIndex ? trace.map((_, k) => k) : pullRequestTier(trace);
   let unreached = 0;
-  for (let k = 0; k < trace.length; k++) {
+  for (const k of walked) {
     const label = trace[k]!;
     const frame: Frame = { index: k, label, before, final };
-    const T0 = performance.now();
-    const s = await build();
-    const T1 = performance.now();
+    world.rewind();
+    const s = world.scenario();
     s.crash.arm(k);
     await settle(s.run());
     if (!s.crash.dead) {
       // Random batch identities can reorder a trace (e.g. discovery order), so
       // a point may not exist in this run. Count it; it is not a crash result.
       unreached++;
-      cleanupHarness();
       continue;
     }
     s.restart();
@@ -294,12 +348,6 @@ async function crashMatrix(
       else resumed.push(...result.value!);
     }
     add(k, resumed);
-    const T3 = performance.now();
-    cleanupHarness();
-    if (process.env.PROF)
-      console.error(
-        `k=${k} build=${(T1 - T0).toFixed(0)} rest=${(T3 - T1).toFixed(0)} clean=${(performance.now() - T3).toFixed(0)}`,
-      );
   }
 
   const categories: Record<string, number> = {};
@@ -312,7 +360,7 @@ async function crashMatrix(
     );
   }
   const failedIndexes = [...failures.keys()].filter((k) => k >= 0).length;
-  const summary = `${name}: trace N=${trace.length}, indexes passed ${trace.length - failedIndexes}, failed ${failedIndexes}, unreached ${unreached}, reference ${failures.has(-1) ? "FAILED" : "ok"}, by category ${JSON.stringify(categories)}`;
+  const summary = `${name}: ${everyIndex ? "every index" : "pull-request tier"}, trace N=${trace.length}, walked ${walked.length}, indexes passed ${walked.length - unreached - failedIndexes}, failed ${failedIndexes}, unreached ${unreached}, reference ${failures.has(-1) ? "FAILED" : "ok"}, by category ${JSON.stringify(categories)}`;
   console.info(`[crash-matrix] ${summary}`);
   return {
     name,
@@ -347,7 +395,7 @@ interface SourceOptions {
  * fail during the window so that the trace stays on the phase under test; the
  * resume clears every fault.
  */
-async function sourceScenario(options: SourceOptions) {
+async function sourceWorld(options: SourceOptions): Promise<World> {
   const crash = new CrashController();
   const net = network({ crash });
   const a = transportDevice(net, {
@@ -370,210 +418,255 @@ async function sourceScenario(options: SourceOptions) {
     net.faults.evidence = undefined;
     prelude = { outbox: outboxSnapshot(a.db), encrypts: net.calls.encrypts };
   }
-  let capturedOutbox: Record<string, OutboxRow> = {};
-  let capturedBatches: ReturnType<typeof batchSnapshot> = [];
-  let putsAtCrash = new Map<string, number>();
+  const rewind = checkpoint(net, [a, b], crash);
+  const scenario = (): Scenario => {
+    let capturedOutbox: Record<string, OutboxRow> = {};
+    let capturedBatches: ReturnType<typeof batchSnapshot> = [];
+    let putsAtCrash = new Map<string, number>();
 
-  const scenario: Scenario = {
-    crash,
-    restart: () => a.crashReopen(),
-    invariants: () =>
-      transportInvariantViolations(a).map((v) => `[invariant] ${v}`),
-    async run() {
-      clock.advance(10_000);
-      if (options.loseRegistrationResponse)
-        net.faults.loseRegistrationResponse = true;
-      await a.cycle();
-    },
-    async resume() {
-      net.faults.list = undefined;
-      net.faults.evidence = undefined;
-      await cycleAll([a, b], 6);
-    },
-    reads: () => ({
-      dest: b.get(),
-      destList: publicList(b),
-      source: a.get(),
-    }),
-    digest: () => ({
-      batches: batchSnapshot(a.db).length,
-      outbox: Object.keys(outboxSnapshot(a.db)).length,
-      published: Object.values(outboxSnapshot(a.db)).every(
-        (r) => r.state === "published",
-      ),
-      registrations: [...registrationsPerScope(net).values()].sort(),
-      destChanges: count(b.db, "SELECT count(*) AS n FROM pdpp_record_changes"),
-      destImportedPerBatch: (
-        b.db
-          .prepare(
-            "SELECT count(*) AS n FROM pdpp_transport_imported GROUP BY batch",
+    return {
+      crash,
+      restart: () => a.crashReopen(),
+      invariants: () =>
+        transportInvariantViolations(a).map((v) => `[invariant] ${v}`),
+      async run() {
+        clock.advance(10_000);
+        if (options.loseRegistrationResponse)
+          net.faults.loseRegistrationResponse = true;
+        await a.cycle();
+      },
+      async resume() {
+        net.faults.list = undefined;
+        net.faults.evidence = undefined;
+        await cycleAll([a, b], 6);
+      },
+      reads: () => ({
+        dest: b.get(),
+        destList: publicList(b),
+        source: a.get(),
+      }),
+      digest: () => ({
+        batches: batchSnapshot(a.db).length,
+        outbox: Object.keys(outboxSnapshot(a.db)).length,
+        published: Object.values(outboxSnapshot(a.db)).every(
+          (r) => r.state === "published",
+        ),
+        registrations: [...registrationsPerScope(net).values()].sort(),
+        destChanges: count(
+          b.db,
+          "SELECT count(*) AS n FROM pdpp_record_changes",
+        ),
+        destImportedPerBatch: (
+          b.db
+            .prepare(
+              "SELECT count(*) AS n FROM pdpp_transport_imported GROUP BY batch",
+            )
+            .all() as { n: number }[]
+        ).map((r) => r.n),
+        destJournal: count(
+          b.db,
+          "SELECT count(*) AS n FROM pdpp_replica_own_writes",
+        ),
+      }),
+      checkCrashed({ label }) {
+        const out: Violation[] = [];
+        // The local value is readable at every point.
+        if (!isDeepStrictEqual(a.get(), sourceValue))
+          out.push(`[local-read] local value changed after ${label}`);
+        capturedOutbox = outboxSnapshot(a.db);
+        capturedBatches = batchSnapshot(a.db);
+        if (process.env.PROF)
+          console.error(
+            `DBG ${label} batches=${capturedBatches.length} outbox=${Object.values(
+              capturedOutbox,
+            )
+              .map((r) => r.state)
+              .join(
+                ",",
+              )} regs=${net.calls.registrations.length} puts=${net.calls.puts.length} cp=${a.store.replication.getBaselineCheckpoint()}`,
+          );
+        putsAtCrash = putsPerScope(net);
+        // Export cursor and batch row commit together.
+        const checkpoint = a.store.replication.getBaselineCheckpoint();
+        if (checkpoint > 0 !== capturedBatches.length >= 1)
+          out.push(
+            `[retain] export cursor ${checkpoint} but ${capturedBatches.length} retained batch rows`,
+          );
+        // No outbound effect before custody of the immutable bytes.
+        for (const scope of net.calls.puts)
+          if (!capturedOutbox[scope])
+            out.push(
+              `[custody] PUT for ${scope} without a persisted outbox row`,
+            );
+        for (const scope of net.calls.registrations)
+          if (!capturedOutbox[scope])
+            out.push(
+              `[custody] registration for ${scope} without an outbox row`,
+            );
+        // Bytes in the store are the persisted ciphertext, never a re-encryption.
+        for (const [scope, bytes] of net.blobs)
+          if (
+            capturedOutbox[scope] &&
+            Buffer.from(bytes).toString("hex") !==
+              capturedOutbox[scope].encrypted
           )
-          .all() as { n: number }[]
-      ).map((r) => r.n),
-      destJournal: count(
-        b.db,
-        "SELECT count(*) AS n FROM pdpp_replica_own_writes",
-      ),
-    }),
-    checkCrashed({ label }) {
-      const out: Violation[] = [];
-      // The local value is readable at every point.
-      if (!isDeepStrictEqual(a.get(), sourceValue))
-        out.push(`[local-read] local value changed after ${label}`);
-      capturedOutbox = outboxSnapshot(a.db);
-      capturedBatches = batchSnapshot(a.db);
-      if (process.env.PROF)
-        console.error(
-          `DBG ${label} batches=${capturedBatches.length} outbox=${Object.values(
-            capturedOutbox,
+            out.push(
+              `[custody] stored bytes of ${scope} differ from the outbox ciphertext`,
+            );
+        if (
+          prelude &&
+          !isDeepStrictEqual(
+            stableOutbox(capturedOutbox),
+            stableOutbox(prelude.outbox),
           )
-            .map((r) => r.state)
-            .join(
-              ",",
-            )} regs=${net.calls.registrations.length} puts=${net.calls.puts.length} cp=${a.store.replication.getBaselineCheckpoint()}`,
-        );
-      putsAtCrash = putsPerScope(net);
-      // Export cursor and batch row commit together.
-      const checkpoint = a.store.replication.getBaselineCheckpoint();
-      if (checkpoint > 0 !== capturedBatches.length >= 1)
-        out.push(
-          `[retain] export cursor ${checkpoint} but ${capturedBatches.length} retained batch rows`,
-        );
-      // No outbound effect before custody of the immutable bytes.
-      for (const scope of net.calls.puts)
-        if (!capturedOutbox[scope])
-          out.push(`[custody] PUT for ${scope} without a persisted outbox row`);
-      for (const scope of net.calls.registrations)
-        if (!capturedOutbox[scope])
-          out.push(`[custody] registration for ${scope} without an outbox row`);
-      // Bytes in the store are the persisted ciphertext, never a re-encryption.
-      for (const [scope, bytes] of net.blobs)
+        )
+          out.push(
+            "[custody] outbox ciphertext or hashes changed before resume",
+          );
+        if (prelude && net.calls.encrypts !== prelude.encrypts)
+          out.push(
+            `[custody] re-encrypted after custody (${net.calls.encrypts - prelude.encrypts} encrypt calls)`,
+          );
+        return out;
+      },
+      checkResumed() {
+        const out: Violation[] = [];
+        const outbox = outboxSnapshot(a.db);
+        // No ciphertext that existed before the crash is ever replaced.
+        for (const [scope, row] of Object.entries(capturedOutbox))
+          if (outbox[scope]?.encrypted !== row.encrypted)
+            out.push(`[custody] ciphertext of ${scope} changed after resume`);
+        if (prelude) {
+          if (
+            !isDeepStrictEqual(
+              stableOutbox(outbox),
+              stableOutbox(prelude.outbox),
+            )
+          )
+            out.push(
+              "[custody] outbox set or bytes differ from the pre-window snapshot",
+            );
+        }
+        // No regenerated batch identity.
+        const batches = batchSnapshot(a.db);
+        for (const old of capturedBatches) {
+          const now = batches.find((x) => x.batch === old.batch);
+          if (
+            !now ||
+            now.sequence !== old.sequence ||
+            now.digest !== old.digest
+          )
+            out.push(
+              `[identity] batch ${old.batch} was regenerated or re-sequenced`,
+            );
+        }
+        if (batches.length !== 1)
+          out.push(
+            `[identity] ${batches.length} batches retained for one local commit`,
+          );
+        // One registration per scope, never a rebase.
+        for (const scope of Object.keys(outbox)) {
+          const registrations = registrationsPerScope(net).get(scope) ?? 0;
+          if (registrations !== 1)
+            out.push(
+              `[publication] ${registrations} registrations for ${scope}`,
+            );
+          const puts = putsPerScope(net).get(scope) ?? 0;
+          if (puts < 1 || puts > 2 || puts < (putsAtCrash.get(scope) ?? 0))
+            out.push(`[publication] ${puts} PUTs for ${scope}`);
+          const head = net.head.get(scope);
+          if (
+            !head ||
+            head.version !== "1" ||
+            head.dataHash !== outbox[scope]!.dataHash
+          )
+            out.push(
+              `[publication] head of ${scope} is not version 1 with the persisted hash`,
+            );
+          if (
+            net.blobs.has(scope) &&
+            Buffer.from(net.blobs.get(scope)!).toString("hex") !==
+              outbox[scope]!.encrypted
+          )
+            out.push(
+              `[custody] remote bytes of ${scope} differ from the persisted ciphertext`,
+            );
+        }
         if (
-          capturedOutbox[scope] &&
-          Buffer.from(bytes).toString("hex") !== capturedOutbox[scope].encrypted
+          count(b.db, "SELECT count(*) AS n FROM pdpp_replica_own_writes") !==
+          journalBefore
         )
-          out.push(
-            `[custody] stored bytes of ${scope} differ from the outbox ciphertext`,
-          );
-      if (
-        prelude &&
-        !isDeepStrictEqual(
-          stableOutbox(capturedOutbox),
-          stableOutbox(prelude.outbox),
-        )
-      )
-        out.push("[custody] outbox ciphertext or hashes changed before resume");
-      if (prelude && net.calls.encrypts !== prelude.encrypts)
-        out.push(
-          `[custody] re-encrypted after custody (${net.calls.encrypts - prelude.encrypts} encrypt calls)`,
-        );
-      return out;
-    },
-    checkResumed() {
-      const out: Violation[] = [];
-      const outbox = outboxSnapshot(a.db);
-      // No ciphertext that existed before the crash is ever replaced.
-      for (const [scope, row] of Object.entries(capturedOutbox))
-        if (outbox[scope]?.encrypted !== row.encrypted)
-          out.push(`[custody] ciphertext of ${scope} changed after resume`);
-      if (prelude) {
-        if (
-          !isDeepStrictEqual(stableOutbox(outbox), stableOutbox(prelude.outbox))
-        )
-          out.push(
-            "[custody] outbox set or bytes differ from the pre-window snapshot",
-          );
-      }
-      // No regenerated batch identity.
-      const batches = batchSnapshot(a.db);
-      for (const old of capturedBatches) {
-        const now = batches.find((x) => x.batch === old.batch);
-        if (!now || now.sequence !== old.sequence || now.digest !== old.digest)
-          out.push(
-            `[identity] batch ${old.batch} was regenerated or re-sequenced`,
-          );
-      }
-      if (batches.length !== 1)
-        out.push(
-          `[identity] ${batches.length} batches retained for one local commit`,
-        );
-      // One registration per scope, never a rebase.
-      for (const scope of Object.keys(outbox)) {
-        const registrations = registrationsPerScope(net).get(scope) ?? 0;
-        if (registrations !== 1)
-          out.push(`[publication] ${registrations} registrations for ${scope}`);
-        const puts = putsPerScope(net).get(scope) ?? 0;
-        if (puts < 1 || puts > 2 || puts < (putsAtCrash.get(scope) ?? 0))
-          out.push(`[publication] ${puts} PUTs for ${scope}`);
-        const head = net.head.get(scope);
-        if (
-          !head ||
-          head.version !== "1" ||
-          head.dataHash !== outbox[scope]!.dataHash
-        )
-          out.push(
-            `[publication] head of ${scope} is not version 1 with the persisted hash`,
-          );
-        if (
-          net.blobs.has(scope) &&
-          Buffer.from(net.blobs.get(scope)!).toString("hex") !==
-            outbox[scope]!.encrypted
-        )
-          out.push(
-            `[custody] remote bytes of ${scope} differ from the persisted ciphertext`,
-          );
-      }
-      if (
-        count(b.db, "SELECT count(*) AS n FROM pdpp_replica_own_writes") !==
-        journalBefore
-      )
-        out.push("[echo] receiver journal grew after replay");
-      return out;
-    },
+          out.push("[echo] receiver journal grew after replay");
+        return out;
+      },
+    };
   };
-  return scenario;
+  return {
+    crash,
+    net,
+    devices: [a, b],
+    windowDevices: [a, b],
+    rewind,
+    scenario,
+  };
 }
 
 describe("section C: custody and crash boundaries", () => {
-  it("35 local commit to retain/enqueue: export cursor and batch row commit together, no regenerated identity", async () => {
-    const report = await crashMatrix("35 retain", () =>
-      sourceScenario({ text: "local commit", window: "retain" }),
-    );
-    expectMatrix(report);
-  }, 120_000);
+  it(
+    "35 local commit to retain/enqueue: export cursor and batch row commit together, no regenerated identity",
+    async () => {
+      const report = await crashMatrix("35 retain", () =>
+        sourceWorld({ text: "local commit", window: "retain" }),
+      );
+      expectMatrix(report);
+    },
+    matrixLimit,
+  );
 
-  it("36 prepared ciphertext before external PUT: same address, same bytes after every crash point", async () => {
-    const report = await crashMatrix("36 publish", () =>
-      sourceScenario({ text: "prepared ciphertext", window: "publish" }),
-    );
-    expect(
-      report.points,
-      "the publication window must contain a PUT and a registration",
-    ).toBeGreaterThan(0);
-    expectMatrix(report);
-  }, 120_000);
+  it(
+    "36 prepared ciphertext before external PUT: same address, same bytes after every crash point",
+    async () => {
+      const report = await crashMatrix("36 publish", () =>
+        sourceWorld({ text: "prepared ciphertext", window: "publish" }),
+      );
+      expect(
+        report.points,
+        "the publication window must contain a PUT and a registration",
+      ).toBeGreaterThan(0);
+      expectMatrix(report);
+    },
+    matrixLimit,
+  );
 
-  it("37 remote PUT accepted, local acknowledgment lost: multi-fragment batch, no rebase or second ciphertext", async () => {
-    const report = await crashMatrix("37 multi-fragment publish", () =>
-      sourceScenario({
-        text: "x".repeat(1500),
-        chunk: 600,
-        window: "publish",
-      }),
-    );
-    expectMatrix(report);
-  }, 120_000);
+  it(
+    "37 remote PUT accepted, local acknowledgment lost: multi-fragment batch, no rebase or second ciphertext",
+    async () => {
+      const report = await crashMatrix("37 multi-fragment publish", () =>
+        sourceWorld({
+          text: "x".repeat(1500),
+          chunk: 600,
+          window: "publish",
+        }),
+      );
+      expectMatrix(report);
+    },
+    matrixLimit,
+  );
 
-  it("38 registration commits, response lost: one registration per scope, no replacement PUT", async () => {
-    const report = await crashMatrix("38 lost registration response", () =>
-      sourceScenario({
-        text: "lost response",
-        window: "publish",
-        loseRegistrationResponse: true,
-      }),
-    );
-    expectMatrix(report);
-  }, 120_000);
+  it(
+    "38 registration commits, response lost: one registration per scope, no replacement PUT",
+    async () => {
+      const report = await crashMatrix("38 lost registration response", () =>
+        sourceWorld({
+          text: "lost response",
+          window: "publish",
+          loseRegistrationResponse: true,
+        }),
+      );
+      expectMatrix(report);
+    },
+    matrixLimit,
+  );
 });
 
 // -------------------------------------------- destination-side scenarios
@@ -593,7 +686,7 @@ interface DestinationOptions {
  * window is destination B's cycles: discovery, download, confirmation, staging
  * and import. B's process is lost at every point of that window.
  */
-async function destinationScenario(options: DestinationOptions) {
+async function destinationWorld(options: DestinationOptions): Promise<World> {
   const crash = new CrashController();
   const net = network({ crash, cap: 64 * 1024 });
   const chunk = options.chunk ?? 600;
@@ -644,155 +737,369 @@ async function destinationScenario(options: DestinationOptions) {
     b.db,
     "SELECT count(*) AS n FROM pdpp_replica_own_writes",
   );
-  let fetchedAtCrash = new Set<string>();
-  let getsAtCrash = 0;
-  const scenario: Scenario = {
-    crash,
-    restart: () => b.crashReopen(),
-    invariants: () =>
-      transportInvariantViolations(b).map((v) => `[invariant] ${v}`),
-    async run() {
-      clock.advance(10_000);
-      await b.cycle();
-      clock.advance(10_000);
-      await b.cycle();
-    },
-    async resume() {
-      await cycleAll([b], 6);
-    },
-    reads: () => ({
-      list: publicList(b),
-      blob: blobId ? sha(b.store.getBlobBytes(blobId)) : null,
-    }),
-    digest: () => ({
-      imported: (
-        b.db
-          .prepare(
-            "SELECT count(*) AS n FROM pdpp_transport_imported GROUP BY batch",
-          )
-          .all() as { n: number }[]
-      ).map((r) => r.n),
-      inbox: (
-        b.db
-          .prepare("SELECT state FROM pdpp_transport_inbox ORDER BY scope")
-          .all() as { state: string }[]
-      ).map((r) => r.state),
-      changes: count(b.db, "SELECT count(*) AS n FROM pdpp_record_changes"),
-      journal: count(b.db, "SELECT count(*) AS n FROM pdpp_replica_own_writes"),
-      staging: count(
-        b.db,
-        "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace='staging'",
-      ),
-    }),
-    checkReference() {
-      // Every durable work item carries a typed outcome after a clean run.
-      const records = workRecords(b.db).filter(
-        (r) => r.table !== "pdpp_transport_outbox",
-      );
-      const untyped = records.filter(
-        (r) => r.outcome === undefined || r.outcome === null,
-      );
-      return untyped.length
-        ? [`[outcome] ${untyped.length} work records without a typed outcome`]
-        : [];
-    },
-    checkCrashed() {
-      const out: Violation[] = [];
-      fetchedAtCrash = new Set(
-        (
+  // Only B runs in the window; A is never touched, and the equivalence test compares it anyway.
+  const rewind = checkpoint(net, [b], crash);
+  const scenario = (): Scenario => {
+    let fetchedAtCrash = new Set<string>();
+    let getsAtCrash = 0;
+    return {
+      crash,
+      restart: () => b.crashReopen(),
+      invariants: () =>
+        transportInvariantViolations(b).map((v) => `[invariant] ${v}`),
+      async run() {
+        clock.advance(10_000);
+        await b.cycle();
+        clock.advance(10_000);
+        await b.cycle();
+      },
+      async resume() {
+        await cycleAll([b], 6);
+      },
+      reads: () => ({
+        list: publicList(b),
+        blob: blobId ? sha(b.store.getBlobBytes(blobId)) : null,
+      }),
+      digest: () => ({
+        imported: (
           b.db
             .prepare(
-              "SELECT scope FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL",
+              "SELECT count(*) AS n FROM pdpp_transport_imported GROUP BY batch",
             )
-            .all() as { scope: string }[]
-        ).map((r) => r.scope),
-      );
-      getsAtCrash = net.calls.gets.length;
-      // Discovery: an admitted scope is never lost behind an advanced cursor.
-      const cursor = (
-        b.db.prepare("SELECT scan_cursor FROM pdpp_transport_state").get() as
-          { scan_cursor: string | null } | undefined
-      )?.scan_cursor;
-      if (cursor) {
-        const admitted = count(
+            .all() as { n: number }[]
+        ).map((r) => r.n),
+        inbox: (
+          b.db
+            .prepare("SELECT state FROM pdpp_transport_inbox ORDER BY scope")
+            .all() as { state: string }[]
+        ).map((r) => r.state),
+        changes: count(b.db, "SELECT count(*) AS n FROM pdpp_record_changes"),
+        journal: count(
           b.db,
-          "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE scope<=?",
-          cursor,
+          "SELECT count(*) AS n FROM pdpp_replica_own_writes",
+        ),
+        staging: count(
+          b.db,
+          "SELECT count(*) AS n FROM pdpp_binary_manifests WHERE namespace='staging'",
+        ),
+      }),
+      checkReference() {
+        // Every durable work item carries a typed outcome after a clean run.
+        const records = workRecords(b.db).filter(
+          (r) => r.table !== "pdpp_transport_outbox",
         );
-        const listed = [...net.head.keys()].filter((k) => k <= cursor).length;
-        if (admitted !== listed)
-          out.push(
-            `[discovery] cursor ${cursor} advanced past ${listed - admitted} unadmitted scopes`,
+        const untyped = records.filter(
+          (r) => r.outcome === undefined || r.outcome === null,
+        );
+        return untyped.length
+          ? [`[outcome] ${untyped.length} work records without a typed outcome`]
+          : [];
+      },
+      checkCrashed() {
+        const out: Violation[] = [];
+        fetchedAtCrash = new Set(
+          (
+            b.db
+              .prepare(
+                "SELECT scope FROM pdpp_transport_inbox WHERE fragment_json IS NOT NULL",
+              )
+              .all() as { scope: string }[]
+          ).map((r) => r.scope),
+        );
+        getsAtCrash = net.calls.gets.length;
+        // Discovery: an admitted scope is never lost behind an advanced cursor.
+        const cursor = (
+          b.db.prepare("SELECT scan_cursor FROM pdpp_transport_state").get() as
+            { scan_cursor: string | null } | undefined
+        )?.scan_cursor;
+        if (cursor) {
+          const admitted = count(
+            b.db,
+            "SELECT count(*) AS n FROM pdpp_transport_inbox WHERE scope<=?",
+            cursor,
           );
-      }
-      // No receipt/progress without the evidence it claims.
-      const imports = workRecords(b.db).filter(
-        (r) =>
-          r.table === "pdpp_transport_import_work" && r.outcome === "progress",
-      );
-      for (const r of imports)
+          const listed = [...net.head.keys()].filter((k) => k <= cursor).length;
+          if (admitted !== listed)
+            out.push(
+              `[discovery] cursor ${cursor} advanced past ${listed - admitted} unadmitted scopes`,
+            );
+        }
+        // No receipt/progress without the evidence it claims.
+        const imports = workRecords(b.db).filter(
+          (r) =>
+            r.table === "pdpp_transport_import_work" &&
+            r.outcome === "progress",
+        );
+        for (const r of imports)
+          if (
+            count(
+              b.db,
+              "SELECT count(*) AS n FROM pdpp_transport_imported WHERE writer||':'||batch=?",
+              r.id,
+            ) === 0 &&
+            count(
+              b.db,
+              "SELECT count(*) AS n FROM pdpp_transport_imported WHERE batch=?",
+              r.id,
+            ) === 0
+          )
+            out.push(`[outcome] import ${r.id} progress without a receipt`);
+        const downloads = workRecords(b.db).filter(
+          (r) => r.table === "pdpp_transport_inbox" && r.outcome === "progress",
+        );
+        for (const r of downloads)
+          if (!fetchedAtCrash.has(r.id))
+            out.push(
+              `[outcome] download ${r.id} progress without retained fragment`,
+            );
+        return out;
+      },
+      checkResumed() {
+        const out: Violation[] = [];
+        // Retry needs only missing fragments: retained ones are not fetched again.
+        const after = net.calls.gets.slice(getsAtCrash);
+        for (const scope of after)
+          if (fetchedAtCrash.has(scope))
+            out.push(`[download] re-fetched retained fragment ${scope}`);
         if (
-          count(
-            b.db,
-            "SELECT count(*) AS n FROM pdpp_transport_imported WHERE writer||':'||batch=?",
-            r.id,
-          ) === 0 &&
-          count(
-            b.db,
-            "SELECT count(*) AS n FROM pdpp_transport_imported WHERE batch=?",
-            r.id,
-          ) === 0
+          count(b.db, "SELECT count(*) AS n FROM pdpp_replica_own_writes") !==
+          journalBefore
         )
-          out.push(`[outcome] import ${r.id} progress without a receipt`);
-      const downloads = workRecords(b.db).filter(
-        (r) => r.table === "pdpp_transport_inbox" && r.outcome === "progress",
-      );
-      for (const r of downloads)
-        if (!fetchedAtCrash.has(r.id))
-          out.push(
-            `[outcome] download ${r.id} progress without retained fragment`,
-          );
-      return out;
-    },
-    checkResumed() {
-      const out: Violation[] = [];
-      // Retry needs only missing fragments: retained ones are not fetched again.
-      const after = net.calls.gets.slice(getsAtCrash);
-      for (const scope of after)
-        if (fetchedAtCrash.has(scope))
-          out.push(`[download] re-fetched retained fragment ${scope}`);
-      if (
-        count(b.db, "SELECT count(*) AS n FROM pdpp_replica_own_writes") !==
-        journalBefore
-      )
-        out.push("[echo] receiver journal grew after replay");
-      return out;
-    },
+          out.push("[echo] receiver journal grew after replay");
+        return out;
+      },
+    };
   };
-  return scenario;
+  return { crash, net, devices: [a, b], windowDevices: [b], rewind, scenario };
 }
 
 describe("section C: destination custody and crash boundaries", () => {
-  it("39 discovery pages: replay dedupes admissions and never skips a scope behind the cursor", async () => {
-    const report = await crashMatrix("39 discovery", () =>
-      destinationScenario({ batches: 3, pageSize: 1 }),
+  it(
+    "39 discovery pages: replay dedupes admissions and never skips a scope behind the cursor",
+    async () => {
+      const report = await crashMatrix("39 discovery", () =>
+        destinationWorld({ batches: 3, pageSize: 1 }),
+      );
+      expectMatrix(report);
+    },
+    matrixLimit,
+  );
+  it(
+    "40 partial download: an incomplete batch never imports; resume fetches only missing fragments",
+    async () => {
+      const report = await crashMatrix("40 partial download", () =>
+        destinationWorld({ text: "f".repeat(2000), chunk: 600 }),
+      );
+      expectMatrix(report);
+    },
+    matrixLimit,
+  );
+  it(
+    "41/42 verified staging and import receipt: no public blob or record without the committed receipt; no orphan staging",
+    async () => {
+      const report = await crashMatrix("41 staged blob import", () =>
+        destinationWorld({ blobBytes: 3000, chunk: 1500 }),
+      );
+      expectMatrix(report);
+    },
+    matrixLimit,
+  );
+});
+
+// ------------------------------------------------- restore equivalence
+
+/** Every table row of a device, ordered, with bytes as hex: journal, epochs, checkpoints, writer id. */
+function dumpDevice(d: TransportDevice) {
+  const names = (
+    d.db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      )
+      .all() as { name: string }[]
+  ).map((t) => t.name);
+  return Object.fromEntries(
+    names.map((name) => [
+      name,
+      (d.db.prepare(`SELECT * FROM "${name}"`).all() as object[])
+        .map((row) =>
+          JSON.stringify(row, (k, v) =>
+            // The store stamps wall-clock time on finalized facts.
+            k === "observed_at"
+              ? "wall-clock"
+              : Buffer.isBuffer(v)
+                ? `hex:${v.toString("hex")}`
+                : v,
+          ),
+        )
+        .sort(),
+    ]),
+  );
+}
+function dumpWorld(world: World) {
+  const { net } = world;
+  return {
+    devices: world.devices.map(dumpDevice),
+    network: {
+      blobs: [...net.blobs].map(([k, v]) => [
+        k,
+        Buffer.from(v).toString("hex"),
+      ]),
+      head: [...net.head],
+      chain: [...net.chain].map(([k, v]) => [
+        k,
+        JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? `${x}n` : x)),
+      ]),
+      pending: [...net.pending],
+      calls: net.calls,
+    },
+    clock: clock.time,
+  };
+}
+
+/**
+ * A crash at index k reaches the same state whether the pre-window state was
+ * just built and restarted (fresh) or put back by `rewind` after another run
+ * dirtied it (restore). Compared right after process loss and after two resumes.
+ */
+async function crashAt(
+  prepare: () => Promise<World>,
+  k: number,
+  how: "fresh" | "restore",
+) {
+  det.count = 0;
+  const world = await prepare();
+  const start = det.count;
+  if (how === "restore") {
+    // Dirty every device and the network with a full unrelated run first.
+    const other = world.scenario();
+    other.crash.arm();
+    await settle(other.run());
+    other.crash.disarm();
+    await other.resume();
+    det.count = start;
+    world.rewind();
+  }
+  // The matrix always starts the window on restarted processes (see
+  // `crashMatrix`), so the build side restarts every window device on its own
+  // file once, as a restore does.
+  if (how === "fresh") for (const d of world.windowDevices) d.reopen();
+  const s = world.scenario();
+  s.crash.arm(k);
+  await settle(s.run());
+  const reached = s.crash.dead;
+  s.restart();
+  revive(s.crash);
+  const crashed = dumpWorld(world);
+  await s.resume();
+  await s.resume();
+  const result = {
+    reached,
+    crashed,
+    resumed: dumpWorld(world),
+    reads: s.reads(),
+    digest: s.digest(),
+  };
+  cleanupHarness();
+  return result;
+}
+
+describe("restore equivalence: a restored pre-window state behaves as a restarted fresh build", () => {
+  const worlds: [string, () => Promise<World>][] = [
+    [
+      "source publish",
+      () => sourceWorld({ text: "equivalence", window: "publish" }),
+    ],
+    [
+      "source retain",
+      () => sourceWorld({ text: "equivalence", window: "retain" }),
+    ],
+    [
+      "destination partial download",
+      () => destinationWorld({ text: "e".repeat(1300), chunk: 600 }),
+    ],
+    [
+      "destination staged blob",
+      () => destinationWorld({ blobBytes: 1500, chunk: 1500 }),
+    ],
+  ];
+  for (const [name, prepare] of worlds)
+    it(
+      name,
+      async () => {
+        det.on = true;
+        try {
+          det.count = 0;
+          const probe = await prepare();
+          probe.rewind();
+          const ref = probe.scenario();
+          ref.crash.arm();
+          await settle(ref.run());
+          const trace = [...ref.crash.trace];
+          cleanupHarness();
+          const tier = pullRequestTier(trace);
+          // The window ends, a commit and the write before it, a network
+          // effect, and points spread across the pull-request tier.
+          const commit = trace.indexOf("commit");
+          const effect = trace.findIndex((l) => l.startsWith("net-"));
+          const spread = [0, 1, 2, 3, 4].map(
+            (i) => tier[Math.floor((i * (tier.length - 1)) / 4)]!,
+          );
+          const indexes = [
+            ...new Set([...spread, commit, commit - 1, effect]),
+          ].filter((i) => i >= 0);
+          expect(indexes.length).toBeGreaterThanOrEqual(5);
+          for (const k of indexes) {
+            const fresh = await crashAt(prepare, k, "fresh");
+            const restored = await crashAt(prepare, k, "restore");
+            expect(fresh.reached, `index ${k} reached`).toBe(true);
+            const at = `index ${k} ${trace[k]}`;
+            // Every row of every device (journal, checkpoints, epoch, writer
+            // id), the network, the clock, the public reads and the digest.
+            expect(restored.crashed, `${at}: right after process loss`).toEqual(
+              fresh.crashed,
+            );
+            expect(restored.resumed, `${at}: after two resumes`).toEqual(
+              fresh.resumed,
+            );
+            expect(restored.reads).toEqual(fresh.reads);
+            expect(restored.digest).toEqual(fresh.digest);
+          }
+        } finally {
+          det.on = false;
+          cleanupHarness();
+        }
+      },
+      60_000,
     );
-    expectMatrix(report);
-  }, 300_000);
-  // Walks every crash index (CI took up to 325 s; the 300 s limit flaked).
-  it("40 partial download: an incomplete batch never imports; resume fetches only missing fragments", async () => {
-    const report = await crashMatrix("40 partial download", () =>
-      destinationScenario({ text: "f".repeat(2000), chunk: 600 }),
-    );
-    expectMatrix(report);
-  }, 600_000);
-  // Walks every crash index (CI took up to 325 s; the 300 s limit flaked).
-  it("41/42 verified staging and import receipt: no public blob or record without the committed receipt; no orphan staging", async () => {
-    const report = await crashMatrix("41 staged blob import", () =>
-      destinationScenario({ blobBytes: 3000, chunk: 1500 }),
-    );
-    expectMatrix(report);
-  }, 600_000);
+});
+
+describe("pull-request tier selection", () => {
+  it("takes the window ends, every distinct step's ends and rollback point, and both sides of an effect", () => {
+    const trace = [
+      ...["before-insert:a", "after-insert:a", "before-update:b"],
+      ...["after-update:b", "commit"],
+      ...["net-before-put:s1", "net-after-put:s1"],
+      ...["before-insert:a", "after-insert:a", "before-update:b"],
+      ...["after-update:b", "commit"],
+      ...["before-insert:a", "after-insert:a", "before-update:b"],
+      ...["after-update:b", "commit"],
+      ...["net-before-put:s2", "net-after-put:s2"],
+      ...["before-insert:c", "after-insert:c"],
+    ];
+    const tier = pullRequestTier(trace);
+    // Window ends.
+    expect(tier).toContain(0);
+    expect(tier).toContain(trace.length - 1);
+    // First run of the repeated step: first write 0, rollback point 3, commit 4.
+    expect(tier).toEqual(expect.arrayContaining([0, 3, 4]));
+    // Last run of that step.
+    expect(tier).toEqual(expect.arrayContaining([15, 16]));
+    // Both sides of both effects.
+    expect(tier).toEqual(expect.arrayContaining([5, 6, 17, 18]));
+    // The middle run is the same code path as the first and last: not walked.
+    expect(tier).not.toContain(11);
+    expect(tier).toEqual([...tier].sort((x, y) => x - y));
+  });
 });
 
 // ------------------------------------------------ quarantine atomicity (44)
@@ -823,9 +1130,7 @@ const appendUpsert = (text: string, counter: number): ReplicaOperation => ({
   blobs: [],
 });
 
-async function quarantineScenario(): Promise<
-  Scenario & { epochBefore: number }
-> {
+async function quarantineWorld(): Promise<World> {
   const crash = new CrashController();
   const net = network({ crash });
   const b = transportDevice(net, { crash });
@@ -848,8 +1153,8 @@ async function quarantineScenario(): Promise<
   } catch {
     epochBefore = Number.NaN;
   }
-  const scenario: Scenario & { epochBefore: number } = {
-    epochBefore,
+  const rewind = checkpoint(net, [b], crash);
+  const scenario = (): Scenario => ({
     crash,
     restart: () => {
       b.crashReopen();
@@ -909,15 +1214,19 @@ async function quarantineScenario(): Promise<
         );
       return out;
     },
-  };
-  return scenario;
+  });
+  return { crash, net, devices: [b], windowDevices: [b], rewind, scenario };
 }
 
 describe("section C: fences, outcomes and claims", () => {
-  it("44 quarantine transaction atomicity: old snapshot or fully fenced, epoch bumps exactly once across replay", async () => {
-    const report = await crashMatrix("44 key quarantine", quarantineScenario);
-    expectMatrix(report, 2);
-  }, 120_000);
+  it(
+    "44 quarantine transaction atomicity: old snapshot or fully fenced, epoch bumps exactly once across replay",
+    async () => {
+      const report = await crashMatrix("44 key quarantine", quarantineWorld);
+      expectMatrix(report, 2);
+    },
+    matrixLimit,
+  );
 
   it("43 a quarantine committed between computing and applying a projection cannot resurrect fenced data", async () => {
     const net = network();

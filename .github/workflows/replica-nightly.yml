@@ -1,0 +1,25 @@
+name: Replica nightly
+
+# Runs the large mode of the replica tests: the differential oracle at nightly
+# volume (REPLICA_ORACLE_NIGHTLY=1) and every crash index of the custody matrices.
+# Pull requests run a smaller deterministic set. Run it locally: npm run test:replica-nightly
+
+on:
+  schedule:
+    - cron: "17 7 * * *" # daily
+  workflow_dispatch:
+
+jobs:
+  replica-nightly:
+    name: Replica oracle and crash matrices, every index
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:replica-nightly

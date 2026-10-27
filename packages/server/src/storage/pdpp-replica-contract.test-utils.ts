@@ -4,7 +4,7 @@
  * devices, injects process loss and reads durable state without interpretation.
  */
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
@@ -420,6 +420,61 @@ export function network(
     pageSize(n: number) {
       pageSize = n;
     },
+    /**
+     * Capture the whole in-memory network state; the returned function puts it
+     * back in place (same maps, arrays and fault slots, so references held by
+     * the transport adapter stay valid).
+     */
+    snapshot() {
+      const saved = {
+        blobs: [...blobs].map(([k, v]) => [k, new Uint8Array(v)] as const),
+        head: [...head],
+        chain: [...chain],
+        pending: [...pending],
+        calls: {
+          puts: [...calls.puts],
+          gets: [...calls.gets],
+          registrations: [...calls.registrations],
+          evidence: [...calls.evidence],
+          lists: calls.lists,
+          encrypts: calls.encrypts,
+        },
+        faults: { ...faults, put: new Set(faults.put) },
+        pageSize,
+      };
+      return () => {
+        blobs.clear();
+        for (const [k, v] of saved.blobs) blobs.set(k, new Uint8Array(v));
+        head.clear();
+        for (const [k, v] of saved.head) head.set(k, v);
+        chain.clear();
+        for (const [k, v] of saved.chain) chain.set(k, v);
+        pending.clear();
+        for (const k of saved.pending) pending.add(k);
+        calls.puts.splice(0, calls.puts.length, ...saved.calls.puts);
+        calls.gets.splice(0, calls.gets.length, ...saved.calls.gets);
+        calls.registrations.splice(
+          0,
+          calls.registrations.length,
+          ...saved.calls.registrations,
+        );
+        calls.evidence.splice(
+          0,
+          calls.evidence.length,
+          ...saved.calls.evidence,
+        );
+        calls.lists = saved.calls.lists;
+        calls.encrypts = saved.calls.encrypts;
+        faults.put.clear();
+        for (const k of saved.faults.put) faults.put.add(k);
+        faults.evidence = saved.faults.evidence;
+        faults.get = saved.faults.get;
+        faults.encrypt = saved.faults.encrypt;
+        faults.list = saved.faults.list;
+        faults.loseRegistrationResponse = saved.faults.loseRegistrationResponse;
+        pageSize = saved.pageSize;
+      };
+    },
   };
 }
 export type Network = ReturnType<typeof network>;
@@ -553,6 +608,21 @@ export function transportDevice(
       store = createReplicaRecordStore(db);
       worker = make();
     },
+    /** The device's own database file as bytes (WAL content included). */
+    image() {
+      return real.serialize();
+    },
+    /**
+     * Put this same device's file back to an image taken from it earlier, then
+     * rebuild every component on it. It never takes an image of another device.
+     */
+    restore(image: Uint8Array) {
+      if (real.open) real.close();
+      for (const suffix of ["-wal", "-shm", "-journal"])
+        rmSync(path + suffix, { force: true });
+      writeFileSync(path, image);
+      device.reopen();
+    },
     close() {
       if (real.open) real.close();
     },
@@ -561,6 +631,72 @@ export function transportDevice(
   return device;
 }
 export type TransportDevice = ReturnType<typeof transportDevice>;
+
+/**
+ * Record the exact state of these devices, their network and the clock, and
+ * return a function that puts all of it back. Each device gets back its own
+ * file; no image is ever shared between devices.
+ */
+export function checkpoint(
+  net: Network,
+  devices: TransportDevice[],
+  crash?: CrashController,
+) {
+  const restoreNetwork = net.snapshot();
+  const images = devices.map((d) => d.image());
+  const time = clock.time;
+  return () => {
+    crash?.disarm();
+    devices.forEach((d, i) => d.restore(images[i]!));
+    restoreNetwork();
+    clock.time = time;
+  };
+}
+
+const isEffect = (label: string) => label.startsWith("net-");
+/** A label without the ids that change from run to run ("net-get:<scope>" is "net-get"). */
+const labelKind = (label: string) =>
+  isEffect(label) ? label.replace(/:.*/, "") : label;
+
+/**
+ * The pull-request subset of a recorded trace, derived from its labels.
+ *
+ * The trace is cut into steps. A step is the writes since the last boundary and
+ * the boundary that ends it: a transaction commit or one network effect. Steps
+ * with the same label sequence are the same code path run again (one per
+ * fragment, per scope, per page). For the first and the last run of every
+ * distinct step, the tier takes:
+ * - the step's first write;
+ * - its last write, the last point where the transaction still rolls back;
+ * - its boundary: the commit, or the network effect itself. Both sides of an
+ *   effect are steps of their own ("net-before-put", "net-after-put").
+ * It always includes the first and last point of the window.
+ */
+export function pullRequestTier(trace: readonly string[]): number[] {
+  const steps: number[][] = [];
+  let current: number[] = [];
+  trace.forEach((label, i) => {
+    current.push(i);
+    if (label === "commit" || isEffect(label)) {
+      steps.push(current);
+      current = [];
+    }
+  });
+  if (current.length) steps.push(current);
+  const runs = new Map<string, number[][]>();
+  for (const step of steps) {
+    const key = step.map((i) => labelKind(trace[i]!)).join(">");
+    runs.set(key, [...(runs.get(key) ?? []), step]);
+  }
+  const picked = new Set<number>([0, trace.length - 1]);
+  for (const list of runs.values())
+    for (const step of new Set([list[0]!, list.at(-1)!])) {
+      picked.add(step[0]!);
+      picked.add(step.at(-1)!);
+      picked.add(step.at(-2) ?? step[0]!);
+    }
+  return [...picked].sort((x, y) => x - y);
+}
 
 /** Advance the clock and cycle every device n times. */
 export async function cycles(devices: TransportDevice[], n = 12, ms = 10000) {
