@@ -27,6 +27,7 @@ import anthropicDeclaration from "./declarations/anthropic-0.1.3.collection-prof
 import amazonOrdersSchema from "./legacy-schemas/amazon.orders.json";
 import chatgptMemoriesSchema from "./legacy-schemas/chatgpt.memories.json";
 import chatgptConversationsSchema from "./legacy-schemas/chatgpt.conversations.json";
+import chatgptMetadataSchema from "./legacy-schemas/chatgpt.conversations.metadata-list.json";
 import githubRepositoriesSchema from "./legacy-schemas/github.repositories.json";
 import githubStarredSchema from "./legacy-schemas/github.starred.json";
 import icloudNotesSchema from "./legacy-schemas/icloud_notes.notes.json";
@@ -105,6 +106,7 @@ const DECLARATIONS: Record<string, CollectionProfile> = {
 };
 
 const LEGACY_SCHEMAS: Record<string, { schema: unknown }> = {
+  "chatgpt.conversations.metadata-list.json": chatgptMetadataSchema,
   "instagram.posts.json": instagramPostsSchema,
   "instagram.ads.json": instagramAdsSchema,
   "instagram.following.json": instagramFollowingSchema,
@@ -473,6 +475,40 @@ describe("legacy scope binding self-check", () => {
         `${scope}: expected ok=${expectedOk} when every stream was fetched but returned zero records, got ${JSON.stringify(result)}`,
       ).toBe(expectedOk);
     });
+
+    for (const representation of binding.representations ?? []) {
+      it(`${representation.id}: its rendered payload matches its schema and retained-body contract`, () => {
+        const schema = LEGACY_SCHEMAS[representation.legacySchemaPath];
+        expect(schema, representation.legacySchemaPath).toBeDefined();
+        const result = representation.project(
+          [
+            {
+              stream: "conversations",
+              data: {
+                id: "conversation",
+                title: null,
+                create_time: null,
+                update_time: null,
+                current_node: null,
+                message_count_on_current_branch: 0,
+                is_archived: false,
+                is_starred: null,
+                workspace_id: null,
+                gizmo_id: null,
+              },
+            },
+          ],
+          { fetchedStreams: [...binding.pdppStreams] },
+        );
+        expect(result.ok).toBe(true);
+        if (!result.ok) return;
+        const validate = new Ajv({ strict: false }).compile(schema.schema);
+        expect(validate(result.payload), JSON.stringify(validate.errors)).toBe(
+          true,
+        );
+        expect(representation.acceptsPayload(result.payload)).toBe(true);
+      });
+    }
 
     it(`${scope}: a null-filled declared record projects validly or fails closed when evidence is missing (B3)`, () => {
       const legacySchema = LEGACY_SCHEMAS[binding.legacySchemaPath];

@@ -139,11 +139,24 @@ export interface ProjectPdppRecordsOptions {
   orderByPrimaryKey?: boolean;
 }
 
+/** One supported retained-body shape and its canonical evidence requirements. */
+export interface LegacyProjectionRepresentation {
+  id: string;
+  legacySchemaPath: string;
+  rowOrder?: "arrival";
+  requireCompletionReceipts?: boolean;
+  requireProvenOrder?: boolean;
+  acceptsPayload: (payload: unknown) => boolean;
+  project: LegacyScopeBinding["project"];
+}
+
 /**
  * One legacy scope's binding. An unbound scope has no binding entry, so no
  * mapping is fabricated.
  */
 export interface LegacyScopeBinding {
+  /** Exact retained payload contracts; the first describes the historical default. */
+  representations?: readonly LegacyProjectionRepresentation[];
   /**
    * Streams whose `blob_ref` is only a copy of the raw source envelope: the
    * declared typed fields already carry the full record, so a reader neither
