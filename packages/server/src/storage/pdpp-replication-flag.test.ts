@@ -16,6 +16,7 @@ import { createSqliteRecordStore } from "./pdpp-records-sqlite-store.js";
 import {
   REPLICA_MIGRATIONS,
   createReplicaRecordStore,
+  ensureReplicaSchema,
 } from "./pdpp-replica-canonical-port.js";
 import { createReplicaReceiver } from "./pdpp-replication-receiver.js";
 
@@ -566,5 +567,186 @@ describe("replication flag on", () => {
       expect(() => mutate(), name).toThrow("replica_integrity_quarantine");
       expect(state(), name).toEqual(before);
     }
+  });
+  describe("method transitions (Strava and Claude) are not journaled", () => {
+    const transitionRow = (table: string, archive: string) =>
+      `INSERT INTO ${table} (instance, archive_instance, generation, snapshots_json) VALUES ('conn_a', '${archive}', 2, '{}')`;
+
+    it("refuses enabling replication while a transition exists, naming the connection", () => {
+      for (const [table, archive] of [
+        ["pdpp_claude_transition", "retired-claude:test"],
+        ["pdpp_strava_transition", "retired-strava:test"],
+      ]) {
+        const path = file();
+        const db = open(path);
+        const off = openRecordStore(db, false);
+        register(off);
+        db.prepare(transitionRow(table, archive)).run();
+        off.close();
+        const on = createReplicaRecordStore(open(path));
+        expect(() => on.replication.beginBaseline(baseline)).toThrow(
+          /connection conn_a has a Strava or Claude method transition/,
+        );
+      }
+    });
+
+    it("refuses re-enabling after a transition made while the flag was off", () => {
+      const path = file();
+      const first = open(path);
+      const on = createReplicaRecordStore(first);
+      on.registerConnection({
+        instance: "strava_a",
+        sourceId: "https://registry.pdpp.dev/sources/strava",
+        method: "strava",
+        label: "Strava",
+      });
+      on.replication.beginBaseline(baseline);
+      on.close();
+
+      const offDb = open(path);
+      const off = openRecordStore(offDb, false);
+      off.transitionStravaToBrowser({
+        instance: "strava_a",
+        expectedGeneration: 1,
+        expectedWriteClock: off.transitionWriteClock(),
+        snapshots: {},
+      });
+      off.close();
+
+      const again = createReplicaRecordStore(open(path));
+      expect(() => again.replication.beginBaseline(baseline)).toThrow(
+        /connection strava_a has a Strava or Claude method transition/,
+      );
+    });
+
+    it("refuses new transitions once replication is enabled, leaving canonical state alone", () => {
+      const db = open();
+      const store = createReplicaRecordStore(db);
+      register(store);
+      store.replication.beginBaseline(baseline);
+      const before = db.prepare("SELECT * FROM pdpp_instance_binding").all();
+      const input = {
+        instance: "conn_a",
+        expectedGeneration: 1,
+        expectedWriteClock: store.transitionWriteClock(),
+        snapshots: {},
+      };
+      expect(() => store.transitionClaudeToLive(input)).toThrow(
+        "replica_method_transition_unsupported",
+      );
+      expect(() => store.transitionStravaToBrowser(input)).toThrow(
+        "replica_method_transition_unsupported",
+      );
+      expect(db.prepare("SELECT * FROM pdpp_instance_binding").all()).toEqual(
+        before,
+      );
+    });
+  });
+
+  it("gives an existing database the blob-claim index through a new migration", () => {
+    const db = open();
+    // A database that migrated before the index existed: every earlier
+    // migration applied, the index absent, the version one behind.
+    const store = createReplicaRecordStore(db);
+    db.exec("DROP INDEX pdpp_replica_blob_claim_idx");
+    db.prepare("UPDATE pdpp_replica_schema_version SET version = ?").run(
+      REPLICA_MIGRATIONS.length - 1,
+    );
+    const names = () =>
+      (
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'pdpp_replica_blob_claim_idx'",
+          )
+          .all() as { name: string }[]
+      ).length;
+    expect(names()).toBe(0);
+    ensureReplicaSchema(db);
+    expect(names()).toBe(1);
+    const plan = db
+      .prepare(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM pdpp_replica_operations WHERE json_extract(operation_json, '$.kind') = 'blob-claim' AND json_extract(operation_json, '$.connectionId') = ? AND json_extract(operation_json, '$.generation') = ? AND json_extract(operation_json, '$.blob.blobId') = ? LIMIT 1",
+      )
+      .all("conn_a", 1, "sha256:x") as { detail: string }[];
+    expect(plan.map((row) => row.detail).join("\n")).toContain(
+      "pdpp_replica_blob_claim_idx",
+    );
+    store.close();
+  });
+
+  it("never reconciles a write whose transaction rolled back", () => {
+    const db = open();
+    const store = createReplicaRecordStore(db);
+    register(store);
+    store.replication.beginBaseline(baseline);
+    const reconciled: string[] = [];
+    store.setReplicaLocalWriteObserver((_instance, _stream, recordKey) => {
+      reconciled.push(recordKey);
+    });
+    const envelope = (key: string) => ({
+      instance: "conn_a",
+      stream: "messages",
+      key,
+      data: { id: key, text: key },
+      emitted_at: at,
+    });
+    const queued = () =>
+      (
+        db
+          .prepare(
+            "SELECT count(*) AS n FROM temp.pdpp_replica_unsettled_writes",
+          )
+          .get() as { n: number }
+      ).n;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let calls = 0;
+      expect(() =>
+        store.ingestBatch(
+          [envelope(`failed-${attempt}-a`), envelope(`failed-${attempt}-b`)],
+          // The first envelope is written and queued; the second throws.
+          () => {
+            if (++calls === 2) throw new Error("boom");
+            return "mutable_state";
+          },
+          () => ["id"],
+          { method: "collector", generation: 1 },
+        ),
+      ).toThrow("boom");
+      expect(queued()).toBe(0);
+    }
+    expect(reconciled).toEqual([]);
+    ingest(store, "kept", "written");
+    expect(reconciled).toEqual(["kept"]);
+    expect(queued()).toBe(0);
+    expect(keys(store)).toEqual(["kept"]);
+  });
+
+  it("looks up an existing blob claim through the index, however long the journal is", () => {
+    const db = open();
+    const seen: string[] = [];
+    const store = createReplicaRecordStore(traced(db, seen));
+    register(store);
+    store.replication.beginBaseline(baseline);
+    const insert = db.prepare(
+      "INSERT INTO pdpp_replica_operations (sequence, operation_json, digest) VALUES (?, ?, 'x')",
+    );
+    db.transaction(() => {
+      for (let sequence = 1000; sequence < 21000; sequence++)
+        insert.run(sequence, JSON.stringify({ kind: "filler", sequence }));
+    })();
+    const blob = storeBytes(store, new Uint8Array([7, 8, 9]));
+    ingest(store, "a", "with blob", blob.blobId);
+    const lookup = seen.find(
+      (sql) =>
+        sql.includes("blob-claim") &&
+        sql.startsWith("SELECT 1 FROM pdpp_replica_operations"),
+    );
+    expect(lookup).toBeDefined();
+    const plan = db
+      .prepare(`EXPLAIN QUERY PLAN ${lookup}`)
+      .all("conn_a", 1, blob.blobId) as { detail: string }[];
+    expect(plan.map((row) => row.detail).join("\n")).toContain(
+      "pdpp_replica_blob_claim_idx",
+    );
   });
 });

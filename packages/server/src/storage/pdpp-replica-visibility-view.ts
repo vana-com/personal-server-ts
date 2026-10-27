@@ -851,6 +851,11 @@ export function createReplicaVisibilityView(deps: {
             row = undefined;
             blobId = null;
           } else {
+            // A confirmed winner is still pending when its content is not the
+            // canonical row, for example when its bytes arrive only as pending
+            // evidence (oracle D3).
+            const differs =
+              canonicalJson(winner.data) !== canonicalJson(base?.data ?? null);
             row = {
               instance,
               stream,
@@ -859,7 +864,7 @@ export function createReplicaVisibilityView(deps: {
               version: current?.version ?? 0,
               emittedAt: winner.emittedAt,
               deleted: false,
-              ...(pending ? replicaPendingMetadata() : {}),
+              ...(pending || differs ? replicaPendingMetadata() : {}),
             };
             const descriptor = winner.blobs[0];
             blobId = descriptor?.blobId ?? null;

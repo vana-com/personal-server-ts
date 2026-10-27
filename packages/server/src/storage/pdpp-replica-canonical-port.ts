@@ -23,6 +23,7 @@ import {
 import {
   createReplicationJournal,
   REPLICATION_MIGRATION,
+  REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
   type ReplicationExport,
 } from "./pdpp-replication-sqlite.js";
 import {
@@ -84,6 +85,8 @@ DELETE FROM pdpp_binary_manifests WHERE namespace='canonical' AND blob_id NOT IN
   REPLICA_COPY_MIGRATION,
   // Removing a quarantine fact raises the integrity epoch.
   REPLICA_FACT_REMOVAL_MIGRATION,
+  // Indexed blob-claim existence lookup for captureBlob.
+  REPLICA_BLOB_CLAIM_INDEX_MIGRATION,
 ];
 
 /**
@@ -170,6 +173,12 @@ export interface ReplicaCanonicalPort {
   unquarantinedRecordSql(alias: string, generationSql?: string): string;
   assertKeyWritable(instance: string, stream: string, recordKey: string): void;
   assertConnectionWritable(instance: string): void;
+  /**
+   * Strava and Claude method transitions change a connection's method and
+   * generation without journaling a lifecycle operation, so a replica could not
+   * follow them. Refuse them while replication is enabled.
+   */
+  assertMethodTransitionAllowed(): void;
   assertStreamWritable(
     instance: string,
     stream: string,
@@ -184,6 +193,13 @@ export interface ReplicaCanonicalPort {
     primaryKey?: string[],
     declaration?: DeclarationBinding,
   ): void;
+  /**
+   * Let the receiver reconcile keys written since the last settle. The store
+   * calls it once its own bookkeeping for the write (arrival entries, the
+   * completion receipt) is done, so reconciliation has the last word on a key
+   * a local write left in conflict.
+   */
+  settleLocalWrites(): void;
   captureInvalidation(instance: string, stream: string): void;
   captureCompletion(instance: string, stream: string): void;
   captureLifecycle(
@@ -262,6 +278,21 @@ export function createReplicaCanonicalPort(db: Database) {
             @stream, @record_key, @operation, @value_json, @blob_ids_json)
   `);
   let visibilityObserver: (() => void) | undefined;
+  let localWriteObserver:
+    ((instance: string, stream: string, recordKey: string) => void) | undefined;
+  // Keys written since the last settle. A TEMP table, so a rolled-back write
+  // (at any transaction or savepoint depth) takes its queued key with it and is
+  // never reconciled. It lives on this connection only and is not part of the
+  // database file.
+  db.exec(
+    "CREATE TEMP TABLE IF NOT EXISTS pdpp_replica_unsettled_writes (instance TEXT NOT NULL, stream TEXT NOT NULL, record_key TEXT NOT NULL, PRIMARY KEY (instance, stream, record_key))",
+  );
+  const queueLocalWrite = db.prepare(
+    "INSERT OR IGNORE INTO pdpp_replica_unsettled_writes VALUES (?, ?, ?)",
+  );
+  const takeLocalWrites = db.prepare(
+    "DELETE FROM pdpp_replica_unsettled_writes RETURNING instance, stream, record_key",
+  );
 
   function replicaIntegrityEpoch(connectionKey: string): number {
     return (
@@ -316,6 +347,10 @@ export function createReplicaCanonicalPort(db: Database) {
           .get(instance)
       )
         throw new PdppBindingError("replica_integrity_quarantine");
+    },
+    assertMethodTransitionAllowed() {
+      if (db.prepare("SELECT 1 FROM pdpp_replica_settings").get())
+        throw new PdppBindingError("replica_method_transition_unsupported");
     },
     assertStreamWritable(instance, stream, generation) {
       if (
@@ -393,7 +428,17 @@ export function createReplicaCanonicalPort(db: Database) {
         primaryKey,
         decl,
       );
+      queueLocalWrite.run(instance, stream, recordKey);
       visibilityObserver?.();
+    },
+    settleLocalWrites() {
+      const writes = takeLocalWrites.all() as {
+        instance: string;
+        stream: string;
+        record_key: string;
+      }[];
+      for (const { instance, stream, record_key } of writes)
+        localWriteObserver?.(instance, stream, record_key);
     },
     captureInvalidation: journal.captureInvalidation,
     captureCompletion: journal.captureCompletion,
@@ -462,6 +507,12 @@ export function createReplicaCanonicalPort(db: Database) {
     setReplicaVisibilityObserver(observer: () => void) {
       visibilityObserver = observer;
     },
+    /** Called for each locally written key when the store settles, inside the write's transaction. */
+    setReplicaLocalWriteObserver(
+      observer: (instance: string, stream: string, recordKey: string) => void,
+    ) {
+      localWriteObserver = observer;
+    },
     replicaIntegrityEpoch,
     fenceReplicaConnection,
     replicaBindingConflict(connectionId: string): boolean {
@@ -523,6 +574,7 @@ export function createReplicaRecordStore(
     replication: r.exporter,
     getInstallationWriterId: () => r.writerId,
     setReplicaVisibilityObserver: r.setReplicaVisibilityObserver,
+    setReplicaLocalWriteObserver: r.setReplicaLocalWriteObserver,
     replicaIntegrityEpoch: r.replicaIntegrityEpoch,
     fenceReplicaConnection: r.fenceReplicaConnection,
     replicaBindingConflict: r.replicaBindingConflict,

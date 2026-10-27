@@ -34,6 +34,13 @@ CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_update BEFORE UPDATE ON pdpp_replic
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_delete BEFORE DELETE ON pdpp_replica_operations BEGIN SELECT RAISE(ABORT, 'replica journal is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS pdpp_replica_no_replace BEFORE INSERT ON pdpp_replica_operations WHEN EXISTS (SELECT 1 FROM pdpp_replica_operations WHERE sequence = NEW.sequence) BEGIN SELECT RAISE(ABORT, 'replica journal is append-only'); END;
 `;
+/**
+ * Its own migration: a database already past REPLICATION_MIGRATION must still
+ * get the index that captureBlob's existence lookup relies on.
+ */
+export const REPLICA_BLOB_CLAIM_INDEX_MIGRATION = `
+CREATE INDEX IF NOT EXISTS pdpp_replica_blob_claim_idx ON pdpp_replica_operations (json_extract(operation_json, '$.connectionId'), json_extract(operation_json, '$.generation'), json_extract(operation_json, '$.blob.blobId')) WHERE json_extract(operation_json, '$.kind') = 'blob-claim';
+`;
 export interface BaselineConfiguration {
   owner: string;
   /** Trusted retained bindings, not supplied by connector ingest. Missing entries fail closed. */
@@ -168,13 +175,12 @@ export function createReplicationJournal(db: Database, writerId: string) {
       copyBinary(db, "canonical", blobId, "pinned");
     else if (!verifyBinary(db, "pinned", blobId, blob.sha256, blob.sizeBytes))
       throw new Error("corrupt pinned replica bytes");
-    const previous = allOperations().some(
-      (op) =>
-        op.kind === "blob-claim" &&
-        op.connectionId === instance &&
-        op.generation === identity.generation &&
-        op.blob.blobId === blobId,
-    );
+    // Indexed by pdpp_replica_blob_claim_idx; the predicate must match it.
+    const previous = db
+      .prepare(
+        "SELECT 1 FROM pdpp_replica_operations WHERE json_extract(operation_json, '$.kind') = 'blob-claim' AND json_extract(operation_json, '$.connectionId') = ? AND json_extract(operation_json, '$.generation') = ? AND json_extract(operation_json, '$.blob.blobId') = ? LIMIT 1",
+      )
+      .get(instance, identity.generation, blobId);
     if (!previous) append({ ...identity, kind: "blob-claim", blob });
   }
   function captureRecord(
@@ -371,6 +377,18 @@ export function createReplicationJournal(db: Database, writerId: string) {
       throw new Error("duplicate retained declaration");
     return db
       .transaction(() => {
+        // Method transitions are not journaled, so a replica could not follow them.
+        // Check before the idempotent return: a transition made while the flag
+        // was off must also block re-enabling an already-baselined database.
+        const transitioned = db
+          .prepare(
+            "SELECT instance FROM pdpp_claude_transition UNION ALL SELECT instance FROM pdpp_strava_transition LIMIT 1",
+          )
+          .get() as { instance: string } | undefined;
+        if (transitioned)
+          throw new Error(
+            `replication cannot be enabled: connection ${transitioned.instance} has a Strava or Claude method transition`,
+          );
         const prior = settings();
         if (prior) {
           if (prior.config_json !== canonicalJson(normalized))

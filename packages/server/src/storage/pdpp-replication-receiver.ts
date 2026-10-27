@@ -343,6 +343,10 @@ export function createReplicaReceiver(deps: {
         "SELECT * FROM pdpp_records WHERE instance = ? AND stream = ? AND record_key = ?",
       )
       .get(instance, stream, key) as StoredRow | undefined;
+    // Hiding a row that is already a tombstone keeps it. Rewriting it would
+    // bump the version and replace the delete's deletedAt with emittedAt. A
+    // later import for another connection re-plans this one (oracle D2).
+    if (!operation && current?.data === null) return;
     const data =
       operation?.kind === "upsert" ? canonicalJson(operation.data) : null;
     const emittedAt = operation?.emittedAt ?? current?.emitted_at;
@@ -430,7 +434,25 @@ export function createReplicaReceiver(deps: {
       }
       return !store.replicaBindingConflict(op.connectionId);
     });
-    const plan = planReplicaMerge(context, eligible);
+    // Operation-ID equivocation is global. An unprovisioned variant that
+    // differs from a provisioned one still withdraws that connection (oracle
+    // D1). Only such variants enter the plan. Their connection has no local
+    // binding, so the planner never materializes them.
+    const revisionKey = (op: ReplicaOperation) =>
+      canonicalJson([op.revision.writerId, op.revision.operationId]);
+    const contents = new Map<string, Set<string>>();
+    for (const op of all)
+      contents.set(
+        revisionKey(op),
+        (contents.get(revisionKey(op)) ?? new Set()).add(canonicalJson(op)),
+      );
+    const mappedRevisions = new Set(eligible.map(revisionKey));
+    const colliding = unavailable.filter(
+      (op) =>
+        mappedRevisions.has(revisionKey(op)) &&
+        contents.get(revisionKey(op))!.size > 1,
+    );
+    const plan = planReplicaMerge(context, [...eligible, ...colliding]);
     if (unavailable.length)
       plan.pending.push({
         reason: "missing_local_connection",
@@ -740,6 +762,36 @@ export function createReplicaReceiver(deps: {
     integrityEpoch: store.replicaIntegrityEpoch,
   });
   store.setReplicaVisibilityObserver(view.flush);
+  // A local write journals under the retained declaration. When retained
+  // evidence for its key already names another declaration, or the stream is
+  // append-only and the content differs, the write completes a conflict. The
+  // merge must quarantine the key now, not at the next import. This is only a
+  // trigger: `reconcile` alone decides, so the check may over-approximate.
+  store.setReplicaLocalWriteObserver((instance, stream, recordKey) => {
+    const retainedForKey = (
+      db
+        .prepare(
+          "SELECT operation_json FROM pdpp_replica_view_operations WHERE instance=? AND stream=? AND record_key=? AND confirmed=1 AND kind IN ('upsert','delete')",
+        )
+        .all(instance, stream, recordKey) as { operation_json: string }[]
+    ).map((row) => JSON.parse(row.operation_json) as RecordOperation);
+    const declarations = new Set(
+      retainedForKey.map((op) => canonicalJson(op.declaration)),
+    );
+    const contents = new Set(
+      retainedForKey.map((op) =>
+        canonicalJson(
+          op.kind === "upsert" ? { data: op.data, blobs: op.blobs } : null,
+        ),
+      ),
+    );
+    if (
+      declarations.size > 1 ||
+      (contents.size > 1 &&
+        retainedForKey.some((op) => op.declaration.semantics === "append_only"))
+    )
+      reconcile();
+  });
   function includesPending(reader: ReplicaReader = "grant") {
     return (
       pendingEnabled &&
