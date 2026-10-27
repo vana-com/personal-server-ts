@@ -1,19 +1,33 @@
+import type { ReplicaReader } from "@opendatalabs/personal-server-ts-core/replication/visibility-policy";
 import { Hono, type Context } from "hono";
 import { randomUUID } from "node:crypto";
 import { PdppError } from "@opendatalabs/personal-server-ts-core/errors/pdpp";
 import { PDPP_VERSION } from "@opendatalabs/personal-server-ts-core/pdpp-version";
 import type { PdppAuthorizationService } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
+import { PdppAuthorizationUnavailableError } from "@opendatalabs/personal-server-ts-core/ports/pdpp-auth";
 import { resourceMetadataUrlFor } from "./pdpp-records.js";
 import {
   recordKeyWithinGrantResources,
   recordWithinGrantTimeConstraint,
   resolveReadScope,
   type PdppRecordStore,
+  type PdppReplicaReadStore,
   type StreamDeclarationRegistry,
 } from "@opendatalabs/personal-server-ts-core/storage/pdpp-records";
 
+type BlobReadStore = Pick<
+  PdppReplicaReadStore,
+  "getBlobMeta" | "findBlobReferences" | "getRecord" | "getBlobBytes"
+>;
 export interface PdppBlobsRouteDeps {
+  /** The canonical store: decides whether bytes come from `readBlobBytes`. */
   store: PdppRecordStore;
+  /**
+   * Reader capability that authorizes every blob read. The app host
+   * (`createApp`) always supplies it. Absent only when the route runs without
+   * a host, in tests: then every token class reads `store`.
+   */
+  reads?: (reader: ReplicaReader) => BlobReadStore;
   auth: PdppAuthorizationService;
   declarations: StreamDeclarationRegistry;
   instancesForSubject?: (subjectId: string) => string[];
@@ -49,11 +63,15 @@ function jsonError(
     }),
     ...extraHeaders,
   };
+  if (err instanceof PdppAuthorizationUnavailableError) {
+    headers["Retry-After"] = String(err.retryAfterSeconds);
+  }
   return c.json(err.toJSON(reqId), err.status as never, headers);
 }
 
 export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   const app = new Hono();
+  const readsFor = deps.reads ?? (() => deps.store);
 
   /**
    * Authorizes a blob fetch through the same path a record read uses (spec §8): finds every
@@ -65,7 +83,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
   async function authorizeBlobAccess(
     c: Context,
     blobId: string,
-  ): Promise<{ error: Response } | { ok: true }> {
+  ): Promise<{ error: Response } | { ok: true; store: BlobReadStore }> {
     const reqId = requestId();
     const header = c.req.header("Authorization");
     const token = header?.match(/^Bearer\s+(.+)$/i)?.[1];
@@ -82,7 +100,13 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         }),
       };
     }
-    const context = await deps.auth.resolveToken(token);
+    let context;
+    try {
+      context = await deps.auth.resolveToken(token);
+    } catch (error) {
+      if (!(error instanceof PdppAuthorizationUnavailableError)) throw error;
+      return { error: jsonError(c, error, reqId) };
+    }
     if (!context.active) {
       const err = new PdppError("authentication_error", "Invalid access token");
       return { error: jsonError(c, err, reqId) };
@@ -107,7 +131,8 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       }
     }
 
-    const meta = deps.store.getBlobMeta(blobId);
+    const store = readsFor(context.tokenKind === "owner" ? "owner" : "grant");
+    const meta = store.getBlobMeta(blobId);
     if (!meta) {
       const err = new PdppError(
         "blob_not_found",
@@ -127,7 +152,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     // record or instance (e.g. re-ingested via a different stream). Access
     // is granted if ANY visible reference passes its authorization check —
     // an inaccessible reference must never hide an accessible one.
-    const references = deps.store.findBlobReferences(blobId);
+    const references = store.findBlobReferences(blobId);
     if (references.length === 0) return { error: notFound() };
 
     if (context.tokenKind === "owner") {
@@ -153,7 +178,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
         ownedInstances.includes(reference.instance),
       );
       if (!visible) return { error: notFound() };
-      return { ok: true };
+      return { ok: true, store };
     }
 
     // Client token: the blob must be referenced by a record this exact
@@ -179,19 +204,20 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
       }
       if (!scope.fields?.includes("blob_ref")) continue;
 
-      const record = deps.store.getRecord(
+      const record = store.getRecord(
         reference.instance,
         reference.stream,
         reference.recordKey,
       );
       if (
         !record ||
+        record.deleted ||
         !recordWithinGrantTimeConstraint(record.data, scope.streamGrant)
       ) {
         continue;
       }
 
-      return { ok: true };
+      return { ok: true, store };
     }
 
     return { error: notFound() };
@@ -204,7 +230,7 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
     const authz = await authorizeBlobAccess(c, blobId);
     if ("error" in authz) return authz.error;
 
-    const meta = deps.store.getBlobMeta(blobId)!;
+    const meta = authz.store.getBlobMeta(blobId)!;
     const reqId = requestId();
     const headers: Record<string, string> = {
       "Request-Id": reqId,
@@ -220,7 +246,12 @@ export function pdppBlobsRoutes(deps: PdppBlobsRouteDeps): Hono {
 
     let bytes: Uint8Array<ArrayBuffer> | undefined;
     try {
-      bytes = await deps.readBlobBytes?.(blobId);
+      // The reader authorized this blob. Bytes it holds only as a replica
+      // (no canonical row) come from the reader; canonical bytes from the host.
+      if (!deps.store.getBlobMeta(blobId)) {
+        const payload = authz.store.getBlobBytes(blobId);
+        bytes = payload === undefined ? undefined : new Uint8Array(payload);
+      } else bytes = await deps.readBlobBytes?.(blobId);
     } catch {
       // A throwing reader must not leak past this route to app.ts's generic
       // handler, which returns a different (legacy) error shape. Map it to

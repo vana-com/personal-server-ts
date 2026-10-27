@@ -24,6 +24,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "vitest run --config tests/e2e/vitest.config.ts",
+    "test:replica-crash-full": "REPLICA_ORACLE_NIGHTLY=1 vitest run packages/server/src/storage/pdpp-replica-contract.custody.test.ts",
+    "test:replica-nightly": "REPLICA_ORACLE_NIGHTLY=1 vitest run packages/server/src/storage/pdpp-replica-contract.custody.test.ts packages/server/src/storage/replica-oracle",
     "lint": "tsc --build --force",
     "lint:eslint": "eslint 'packages/*/src/**/*.ts'",
     "lint:eslint:fix": "eslint --fix 'packages/*/src/**/*.ts'",
