@@ -4,6 +4,10 @@ export type LiteBlobDescriptor = Extract<
   ReplicaOperation,
   { kind: "blob-claim" }
 >["blob"];
+declare const liteStagingIdBrand: unique symbol;
+export type LiteStagingId = string & {
+  readonly [liteStagingIdBrand]: true;
+};
 export interface LiteStorageEntry {
   key: string;
   value: string;
@@ -21,7 +25,10 @@ export interface LiteCanonicalTransaction {
   /** Exclusive bytewise key cursor; snapshot stable for this transaction. */
   scan(prefix: string, after?: string): Promise<LiteStoragePage>;
   /** Verify staged length/hash/MIME and publish its immutable reference in THIS transaction. */
-  attachBlob(stagingId: string, expected: LiteBlobDescriptor): Promise<void>;
+  attachBlob(
+    stagingId: LiteStagingId,
+    expected: LiteBlobDescriptor,
+  ): Promise<void>;
   blob(blobId: string): Promise<LiteBlobDescriptor | undefined>;
 }
 
@@ -36,7 +43,7 @@ export interface LiteCanonicalPersistence {
   stageBlob(
     descriptor: LiteBlobDescriptor,
     chunks: AsyncIterable<Uint8Array>,
-  ): Promise<string>;
+  ): Promise<LiteStagingId>;
   /** Internal bytes, not a grant-authorized read API. Missing/uncommitted blobs throw. */
   readBlob(blobId: string): AsyncIterable<Uint8Array>;
 }
